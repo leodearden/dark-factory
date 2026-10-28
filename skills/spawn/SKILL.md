@@ -7,7 +7,7 @@ description: "Spawn a new Claude Code CLI session in a new terminal window with 
 
 A one-shot helper that opens a new terminal window and launches an independent `claude` CLI session inside it with a given prompt. The spawn happens via a background Bash task that **blocks until the spawned session exits**, so the caller can treat the background task's completion as a reliable "session finished" signal — even on emulators (gnome-terminal, konsole, macOS Terminal) whose launcher process normally detaches immediately. The spawned session is otherwise fully independent — separate terminal, separate Claude conversation, separate tool state.
 
-Use this whenever a skill needs to hand a task off to a fresh interactive Claude — most commonly, escalation-watcher spawning `/unblock <task_id>` so a human can drive resolution in a dedicated window.
+Use this whenever a skill needs to hand a task off to a fresh interactive Claude — most commonly, escalation-watcher spawning `/unblock <task_id>` so a human can drive resolution in a dedicated window. When the spawner is itself a T3 Code thread the session lives in a T3 thread instead of a window — see [T3 lane](#t3-lane).
 
 ## Resolving the prompt for a fresh context
 
@@ -84,21 +84,23 @@ Where:
 
 If `$CLAUDE_TERMINAL_CMD` (preferred) or `$ESCALATION_TERMINAL_CMD` (legacy) is set, the script honours it; otherwise it discovers an emulator in `$PATH`. **Do not** re-implement discovery in the skill — the script is the single source of truth.
 
+`CLAUDE_SPAWN_BACKEND` (an env var, like `CLAUDE_SPAWN_MODEL`) names where the session lives: `auto` (the default when unset), `t3`, `tmux`, or `wm` (emulator discovery as above). Any other value exits `2`. See [T3 lane](#t3-lane) for what `auto` and `t3` select.
+
 ### Sibling mode (`CLAUDE_SPAWN_MODE=sibling`)
 
 By default (`CLAUDE_SPAWN_MODE` unset, or any value other than `sibling`) a spawned session's parent-of-record is its **direct spawner** — this invocation's own inherited identity — and `spawn-claude.sh` blocks until the spawned session exits, exactly as described in [Verification](#verification) below.
 
 Set `CLAUDE_SPAWN_MODE=sibling` when a session should hand off to a fresh session that runs *alongside* it rather than *beneath* it — see [Generalized handoff pattern](#generalized-handoff-pattern-authorexecute-investigatefix) below. Sibling mode changes two things:
 
-- **Parent-of-record.** The child's parent is set to *this invocation's own parent* (the shared ancestor it was itself spawned under), not this invocation's own session id — so a chain of handoffs stays flat under one shared ancestor instead of nesting one level deeper on every handoff. A spawner with no parent of its own (a human-launched root) produces a child with no parent either (null → root).
-- **Fire-and-forget.** `spawn-claude.sh` returns **immediately** once the child is launched, with **no blocking wait** for it to finish — the exit-code contract in [Verification](#verification) does not apply to a sibling spawn's own return code. The child is launched **detached** (`setsid` on the emulator branches that need it, and only where the host can actually run it — the macOS `Terminal` lane deliberately uses none, since `open`'s LaunchServices handoff already detaches it and stock macOS does not ship `setsid`; any other launcher on such a host degrades to a plain background job rather than a dropped launch — plus its stdio redirected off this script's own output) so it survives the spawner's process exiting. Because of this, sibling handoff pairs best with a launcher that already keeps the window alive independent of the launching client — a daemon-owned emulator (`gnome-terminal`, `konsole`) or the tmux lane (`$CLAUDE_SPAWN_BACKEND=tmux`, Fleet Cockpit C6) — rather than one whose only lifetime is the launching terminal's own session.
+- **Parent-of-record.** The child's parent is set to *this invocation's own parent* (the shared ancestor it was itself spawned under), not this invocation's own session id — so a chain of handoffs stays flat under one shared ancestor instead of nesting one level deeper on every handoff. A spawner with no parent of its own (a human-launched root) produces a child with no parent either (null → root). When the spawner has no `CLAUDE_SPAWN_SESSION_ID` (a T3-hosted or hand-launched session), its children's `parent_session_id` comes from the spawner's own registry record, found via `self-record`, on every lane; sibling mode then uses that record's parent.
+- **Fire-and-forget.** `spawn-claude.sh` returns **immediately** once the child is launched (on the [T3 lane](#t3-lane), once the thread has started or the started grace has run out), with **no blocking wait** for it to finish — the exit-code contract in [Verification](#verification) does not apply to a sibling spawn's own return code. The child is launched **detached** (`setsid` on the emulator branches that need it, and only where the host can actually run it — the macOS `Terminal` lane deliberately uses none, since `open`'s LaunchServices handoff already detaches it and stock macOS does not ship `setsid`; any other launcher on such a host degrades to a plain background job rather than a dropped launch — plus its stdio redirected off this script's own output) so it survives the spawner's process exiting. Because of this, sibling handoff pairs best with a launcher that already keeps the window alive independent of the launching client — a daemon-owned emulator (`gnome-terminal`, `konsole`) or the tmux lane (`CLAUDE_SPAWN_BACKEND=tmux`, Fleet Cockpit C6) or the [T3 lane](#t3-lane) — rather than one whose only lifetime is the launching terminal's own session.
 - **The join is not the exit code.** Since there is no blocking wait, a caller cannot join a sibling spawn the way it would a normal one. Read the session-registry record (best-effort refreshed to `running` once launched) and, authoritatively, the child's own [result.md](#result-handback-resultmd) once it writes one.
 
 ### What a spawned session inherits
 
 `spawn-claude.sh` unsets the **entire `CLAUDE_SPAWN_*` namespace** inside the payload that execs `claude`, then re-exports only the values it computed for *that* child. A spawned session therefore never carries its own launch parameters forward, and cannot re-serve them to a session it spawns in turn.
 
-Exactly five vars are visible to the spawned session:
+Exactly five vars are visible to a session spawned onto a terminal or tmux lane (on the [T3 lane](#t3-lane) none are):
 
 | Var | What it is for |
 |-----|----------------|
@@ -120,18 +122,58 @@ Why the namespace is cleared wholesale rather than by an exemption list: a sessi
 
 Callers do not need to scrub the namespace themselves — prefixing an invocation with `env -u CLAUDE_SPAWN_...` is unnecessary, and a caller that sets a var deliberately still has it honoured for that launch.
 
+## T3 lane
+
+**Selection.** Under `CLAUDE_SPAWN_BACKEND=auto` (or unset) the script picks the t3 lane when the spawner is itself T3-hosted — its process ancestry reaches the running T3 server and it has no controlling tty — and otherwise discovers a terminal emulator as before. `CLAUDE_SPAWN_BACKEND=t3` forces the lane; `tmux` and `wm` bypass it.
+
+**What the lane changes.**
+
+- **Host.** The session is a T3 thread titled `<title>`, in the T3 project whose workspace root is `<cwd>`. No terminal, no sentinel, no `claude` argv.
+- **Identity transport.** No env var reaches a T3 thread, so `$CLAUDE_SPAWN_SESSION_ID` and `$CLAUDE_SPAWN_RESULT_FILE` are **absent** inside a T3-spawned session. The registry record is linked by transcript discovery instead, and its `display.kind` is `t3` with `display.t3_thread_id`.
+- **Vocabularies.** `CLAUDE_SPAWN_MODEL` passes through as the thread's model (T3 resolves aliases). Permissions are the project's T3 runtime mode, not `--dangerously-skip-permissions`.
+- **Self-exit.** Under `CLAUDE_SPAWN_SELF_EXIT=1` the trailer asks the session to archive its own thread (`t3_thread_organize`, action `archive`) as its last action, in place of the `exit-requested` marker.
+
+**Refusals (exit `145`, before anything is launched).** `skip_permissions` other than `true`; a non-empty `CLAUDE_SPAWN_CLAUDE_ARGS`; a `<cwd>` that is not a registered T3 project's workspace root. A `.worktrees/<id>` cwd is refused too, because T3 would silently run the thread in the project root. Pass the project root, or set `CLAUDE_SPAWN_BACKEND=tmux` or `wm`.
+
+**Join.** "Finished" never means a process exit on this lane.
+
+| Mode | Script exit |
+|------|-------------|
+| `sibling` | `0`, but only after the thread leaves preparing/queued/starting and transcript discovery has run, bounded by the started grace (`SPAWN_STARTED_GRACE_SECS`, default 300s on this lane). It can take that long and still exit `0` with the record unbound; read the record and `result.md`. |
+| child, final `result.md` written (`outcome:` other than `in-progress`) or thread archived | `0` |
+| child, latest run failed / cancelled / interrupted, no newer run and no final `result.md` | `1` |
+| child, server unreachable beyond its grace, or thread deleted (its `thread show` fails the same way) | `126` |
+| child, `thread show` succeeds but reports no thread | `127` |
+
+A thread that has merely settled (idle, waiting on a human) is not finished.
+
+**Link.** The thread is linkable as `t3-thread://v1/<thread id>`; the id is `display.t3_thread_id` on the record.
+
+**A T3-spawned session finding its own record.** With the env vars absent, a skill that needs its own record or result file runs
+
+```
+PYTHONPATH=$DARK_FACTORY_ROOT/orchestrator/src python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/spawn_t3_lane.py self-record
+```
+
+which prints `slug=<slug|none> parent=<slug|none>`. The result file is `<fleet_root>/sessions/<slug>/result.md`, with `fleet_root` = `$CLAUDE_FLEET_ROOT` if set, else `~/.claude/fleet`. `slug=none` means no record: skip fail-soft.
+
+**Hand-offs from inside T3.** A child-mode wait from inside a T3-hosted spawner is bounded by that spawner's own idle release (T3 releases an idle provider process after about 30 minutes, deferred while background work is pending, up to roughly 4 hours of silence). A hand-off that may run for hours should use `CLAUDE_SPAWN_MODE=sibling`.
+
+**Known identity gap.** After an idle release, a failed resume that binds a fresh session with a context handoff is not re-linked to the spawn record once the spawner has gone.
+
 ## Verification
 
 The background task's completion is a reliable **liveness** signal: it tells you the spawned session's process is gone, present vs. died-silent. As of Attention Rail T5, exit codes are documented as **liveness-only** — they are not, and should not be treated as, the semantic outcome channel. That channel is an explicit file the session writes: see [Result-handback (result.md)](#result-handback-resultmd) below. All codes below are still returned unchanged (nothing here is a breaking change); only their meaning narrows to "was the process alive, and how did it stop," not "did the work succeed." Script-level exit codes the caller should distinguish:
 
 | Exit code | Meaning |
 |-----------|---------|
-| `0..125`  | The spawned `claude` session's own exit code. Liveness only — a `0` means the process exited cleanly, not that the work succeeded or is complete; check `result.md` for the outcome. |
-| `126`     | No terminal emulator found — prompt the user for `$CLAUDE_TERMINAL_CMD` and retry. Suggest they export it in their shell profile for future sessions. |
-| `127`     | Launcher failed to start the session (the emulator binary errored before running the payload — no sentinel was ever written, or the sentinel never settled to a numeric exit code within the launch grace). Surface the error to the caller. |
+| `0..125`  | The spawned `claude` session's own exit code (t3 lane, child mode: `0` when the thread finished, `1` when its run failed; see [T3 lane](#t3-lane)). Liveness only — a `0` means the process exited cleanly, not that the work succeeded or is complete; check `result.md` for the outcome. |
+| `126`     | No usable launcher. Emulator lanes: no terminal emulator found (or `tmux` missing under `CLAUDE_SPAWN_BACKEND=tmux`) — prompt the user for `$CLAUDE_TERMINAL_CMD` and retry; suggest they export it in their shell profile for future sessions. T3 lane: `t3`, `python3` or T3's `server-runtime.json` missing, or (child mode) the T3 server unreachable beyond its grace — which is also how a deleted thread ends, since its `thread show` fails. |
+| `127`     | Launcher failed to start the session (the emulator binary errored before running the payload — no sentinel was ever written, or the sentinel never settled to a numeric exit code within the launch grace). T3 lane: the thread launch failed, a successful `thread show` reported no thread, or the lane module faulted during the join (stderr says JOIN LOST; the thread may still be running). Surface the error to the caller. |
 | `129`     | Terminal window closed while the session was still alive (SIGHUP reached the running session) — **or** a session that had *already finished cleanly* raced its own window teardown and still surfaced as 129 (see "The 129-on-clean-exit race" below). Inconclusive by construction: never read `129` as "the session failed" or "the work was lost" — read `result.md`. |
-| `144`     | Claude never started — no new transcript appeared under `~/.claude/projects/<encoded-cwd>/` and no `claude` process was detected within the started-grace window; the background started-watchdog marked the session-registry record `failed-to-start` and emitted a loud caller-visible line on the spawn's stderr. This is the silent-no-transcript hang (2026-07-06 incident), now surfaced within grace instead of hanging. Additive; all existing codes retain their meaning. |
-| `2`       | Bad usage — caller bug, not user-recoverable. Includes a relative or unreadable `--prompt-file` path. |
+| `144`     | Claude never started. On the t3 lane: the thread did not leave its preparing/queued/starting state within the started-grace (default 300s there), or its status became failed, cancelled or rolled_back before any transcript naming the record appeared (once a transcript exists the thread has started, and a later failed run is exit `1` from the join). Elsewhere: no new transcript appeared under `~/.claude/projects/<encoded-cwd>/` and no `claude` process was detected within the started-grace window; the background started-watchdog marked the session-registry record `failed-to-start` and emitted a loud caller-visible line on the spawn's stderr. This is the silent-no-transcript hang (2026-07-06 incident), now surfaced within grace instead of hanging. Additive; all existing codes retain their meaning. |
+| `145`     | The selected lane refused an input it cannot honour — nothing was launched. Today only the t3 lane refuses; see [T3 lane](#t3-lane). The message names the input and whether the lane was chosen explicitly or by `auto`. Caller bug or lane mismatch: fix the input, or set `CLAUDE_SPAWN_BACKEND=tmux` or `wm`. |
+| `2`       | Bad usage — caller bug, not user-recoverable. Includes a relative or unreadable `--prompt-file` path and an unknown `CLAUDE_SPAWN_BACKEND` value. |
 
 The transcript path used by the `144` check encodes the session's `cwd` by replacing every `/` and `.` with `-`, matching `session_registry.transcript_path_for_cwd` byte-for-byte — e.g. `/home/leo/src/dark-factory` → `~/.claude/projects/-home-leo-src-dark-factory/`. The started-grace window defaults to ~90s and is tunable via `$SPAWN_STARTED_GRACE_SECS`.
 
@@ -147,7 +189,7 @@ If you want to confirm the spawned session is alive mid-run, `ps -ef | grep clau
 
 Exit codes (above) only tell you the process is gone and roughly how it stopped — never what happened. The semantic outcome channel is an explicit file the spawned session writes before it ends:
 
-- `spawn-claude.sh` allocates `<record-dir>/result.md` — the same session-registry record directory captured as `SESSION_RECORD_DIR` — and exports its path into the spawned session's own environment as `$CLAUDE_SPAWN_RESULT_FILE`. The identical path is stored in the session-registry record's `result_file` field, so a parent reading the record never has to recompute or guess the path. It is one of the five vars a spawned session may read from its own environment — see [What a spawned session inherits](#what-a-spawned-session-inherits).
+- `spawn-claude.sh` allocates `<record-dir>/result.md` — the same session-registry record directory captured as `SESSION_RECORD_DIR` — and exports its path into the spawned session's own environment as `$CLAUDE_SPAWN_RESULT_FILE`. The identical path is stored in the session-registry record's `result_file` field, so a parent reading the record never has to recompute or guess the path. It is one of the five vars a spawned session may read from its own environment — see [What a spawned session inherits](#what-a-spawned-session-inherits). A T3-spawned session has no such var; it resolves the file through `self-record` ([T3 lane](#t3-lane)).
 - The prompt handed to the spawned session gets a standard trailer appended, asking it to write — before ending, whether it finishes, hands off, or gets blocked — a small structured markdown header followed by a few sentences of prose context. The header's lines are `outcome: done|blocked|abandoned|handed-off|in-progress`, `changed` (commits/branches/task ids touched), and `action_needed` (what a human or parent should do next). `in-progress` marks a checkpoint written before the work is done; the session rewrites the file with a final outcome before it ends. The trailer also asks the session to run `/reflect` before it ends, and under `CLAUDE_SPAWN_SELF_EXIT=1` to write the `exit-requested` marker into its record dir as its last action.
 - This is **best-effort**: nothing in `spawn-claude.sh`, and nothing the trailer asks for, blocks the session's own exit. A parent joining a completed spawn (e.g. escalation-watcher on a `/spawn` background task's completion) should read `record.result_file` (equivalently `<record-dir>/result.md`) for the authoritative outcome, and fall back to exploring the worktree/task only when the file is absent, empty, or unparsable.
 - **Fail-soft, matching the registry's own fail-soft contract:** if the session-registry `launching` write itself faults (missing `python3`, an unwritable fleet root, etc.), `SESSION_RECORD_DIR` is empty and both the env export and the prompt trailer are cleanly skipped — no bogus `/result.md` path is ever exported, referenced, or created. Skipped means **absent**, not inherited: the payload's namespace unset has already run, so a spawner's own `$CLAUDE_SPAWN_RESULT_FILE` cannot survive into the child on this path and be written over. The exit-code contract above is unaffected either way.

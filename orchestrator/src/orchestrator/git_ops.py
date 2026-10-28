@@ -97,6 +97,7 @@ from orchestrator.lane_lifecycle import (
     LaneLifecycle,
     LaneState,
 )
+from orchestrator.lane_task_dir import archive_root_for, evict_previous_occupant
 from orchestrator.recut_ruling import ParkedIncarnation, RecutRuling, RecutRulingViolation
 from orchestrator.teardown import complete_despite_cancellation, path_confirmed_absent
 from orchestrator.tree_removal import remove_tree
@@ -384,6 +385,15 @@ class TrainStackResult:
 #     otherwise-unmatched subjects such as a ``resolve:``-prefixed commit
 #     that cites the task in parens — closing a latent false ``no_citation``
 #     that stranded genuinely-landed tasks using one of these forms.
+#   - A trailing qualifier after the id in the conventional-scope and
+#     ``(task N)`` alternatives (task 4862): ``impl(4369 step-8):``,
+#     ``feat(3043/step-16):``, ``fix(N, esc-N-2):``, ``(task 5018 step-3)``,
+#     ``(task 3770, step-19)``. The separator is the CLOSED class ``[ ,/]``:
+#     a dot would let subtask ``(15.2 …)`` cite parent 15, a hyphen would
+#     read ``(2-phase …)`` or a range ``(4369-4370)`` as a citation, and the
+#     class plus ``\b`` keeps ``(43690 …)`` from citing 4369. The bare
+#     ``({tid})`` arm is deliberately NOT widened: ``(30 s)`` / ``(3 files)``
+#     is the task-4705 false-positive class.
 #
 # The ``{tid}`` placeholder is interpolated via ``str.format`` with the
 # escaped task id; a ``\b`` (word boundary) at each side of the
@@ -392,7 +402,8 @@ class TrainStackResult:
 # alternatives instead use the literal ``\(``...``\)`` as an exact numeric
 # boundary (no ``\b`` needed): ``(1175)`` never matches tid ``117`` or
 # ``11750``. ``#`` and the space in ``(task 50)`` are literals in both
-# engines, so the widened pattern stays valid as ERE and as Python ``re``.
+# engines, and ``[ ,/]``, ``[^)]`` and ``?`` are standard in both, so the
+# widened pattern stays valid as ERE and as Python ``re``.
 #
 # Collision assumption (task 2870, esc-5252-9): the unanchored ``(#{tid})``
 # and bare ``({tid})`` alternatives assume a parenthesized number in a
@@ -406,7 +417,11 @@ class TrainStackResult:
 # attribution gate: a landed but unrelated commit whose subject happened to
 # carry ``(1175)`` for a non-task reason WOULD be attributed to task 1175
 # (its effect genuinely is on main). That collision is accepted as a
-# deliberate tradeoff given the convention above. If this repo ever begins
+# deliberate tradeoff given the convention above. The widened
+# ``(task N <words>)`` arm likewise reads a parenthetical mention of ANOTHER
+# task, e.g. ``(task 4211 lock-contention seam)`` in a 4930 commit, as citing
+# it: the same accepted collision, tolerable because every landing caller
+# pre-establishes the branch's content on main. If this repo ever begins
 # emitting ``(#N)``/``(N)`` where N is a non-task number (e.g. a PR id),
 # narrow these two alternatives to a citation-prefix-qualified form (or drop
 # the bare-number arm) to restore disambiguation.
@@ -427,10 +442,10 @@ class TrainStackResult:
 # ``--extended-regexp`` (ERE) pattern *and* a Python ``re`` pattern.
 DEFAULT_COMMIT_CITATION_PATTERN: str = (
     r'^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
-    r'(\(\b{tid}\b[):]|.*\btask/{tid}\b)'
+    r'(\(\b{tid}\b([):]|[ ,/][^)]*\))|.*\btask/{tid}\b)'
     r'|^Merge task/{tid} into '
     r'|\(#?{tid}\)'
-    r'|\(task {tid}\)'
+    r'|\(task {tid}([ ,/][^)]*)?\)'
 )
 
 # Fixed name for the persistent warm merge-verify worktree (task 1692).
@@ -1242,22 +1257,12 @@ class WorktreeInfo:
     The base_commit is the SHA of main at worktree creation time, pinned to
     ensure stable diffs even if main advances during task execution.
 
-    stale_commits: how far local main was behind the remote at worktree creation
-    time.  None means either (a) the fetch was unavailable (no remote configured),
-    or (b) the worktree is train-stacked — branched from a sibling's tip rather
-    than from main, so the "behind remote" concept does not apply.  0 means
-    already current.  A positive stale_commits value means the remote was ahead by
-    N commits.  When local main has diverged (has unpushed commits), the worktree
-    is based on local main despite the positive count — check this field together
-    with base_commit to determine actual freshness.
-
     reify_debug_port: per-worktree reify-debug port allocated during provisioning
     by running scripts/setup-worktree-debug-port.sh in the worktree.  None when
     no such script is present (non-reify projects) or provisioning failed (fail-open).
     """
     path: Path
     base_commit: str
-    stale_commits: int | None = None
     reify_debug_port: int | None = None
 
 
@@ -4331,20 +4336,19 @@ class GitOps:
         )
         return False
 
-    async def _freshen_main(self) -> tuple[str, int | None]:
+    async def _freshen_main(self) -> str:
         """Fetch from remote and return the freshest ref to use as worktree base.
 
         Returns:
-            (ref, stale_commits) where:
-            - ref: the git ref to pass to ``git worktree add`` / ``git rev-parse``
-            - stale_commits: None  → fetch failed (no remote configured)
-                             0     → local main is already current with remote
-                             N > 0 → local main was N commits behind remote
+            The git ref to pass to ``git worktree add`` / ``git rev-parse``:
+            the remote-tracking ref when local main is strictly behind it,
+            otherwise local main.  The behind/ahead counts are logged here
+            and not returned.
 
         Design decisions:
         - Best-effort fetch: if fetch fails (no remote in tests), return
-          (main_branch, None) silently — matches the pattern in
-          _create_merge_worktree (line 578).
+          main_branch silently — matches the pattern in
+          ``_create_merge_worktree``.
         - No mutation of local main ref: advance_main() uses CAS on the local
           main ref; updating it here could cause spurious CAS failures.  We
           return the remote-tracking ref (origin/main) as the start-point
@@ -4366,7 +4370,7 @@ class GitOps:
                 '_freshen_main: fetch from %s failed — using local %s',
                 self.config.remote, self.config.main_branch,
             )
-            return self.config.main_branch, None
+            return self.config.main_branch
 
         # Count commits local main is BEHIND origin/main
         rc, behind_out, _ = await _run(
@@ -4379,17 +4383,17 @@ class GitOps:
                 '_freshen_main: rev-list (behind) failed (rc=%d) — using local %s',
                 rc, self.config.main_branch,
             )
-            return self.config.main_branch, None
+            return self.config.main_branch
         try:
             behind = int(behind_out.strip())
         except ValueError:
             logger.warning(
                 '_freshen_main: unexpected behind-count output: %r', behind_out,
             )
-            return self.config.main_branch, None
+            return self.config.main_branch
 
         if behind == 0:
-            return self.config.main_branch, 0
+            return self.config.main_branch
 
         # Check for divergence: count commits local main is AHEAD of origin/main
         rc, ahead_out, _ = await _run(
@@ -4402,15 +4406,14 @@ class GitOps:
                 '_freshen_main: rev-list (ahead) failed (rc=%d) — using local %s',
                 rc, self.config.main_branch,
             )
-            return self.config.main_branch, behind
+            return self.config.main_branch
         try:
             ahead = int(ahead_out.strip())
         except ValueError:
             logger.warning(
                 '_freshen_main: unexpected ahead-count output: %r', ahead_out,
             )
-            # Fall back to local main; report behind count as-is (ref is local, not remote)
-            return self.config.main_branch, behind
+            return self.config.main_branch
 
         if ahead > 0:
             logger.warning(
@@ -4418,14 +4421,14 @@ class GitOps:
                 '— using local ref to avoid losing advance_main commits',
                 self.config.main_branch, remote_ref, ahead, behind,
             )
-            return self.config.main_branch, behind
+            return self.config.main_branch
 
         # Strictly behind: use remote-tracking ref as worktree start-point
         logger.info(
             '_freshen_main: local %s is %d commits behind %s — using %s',
             self.config.main_branch, behind, remote_ref, remote_ref,
         )
-        return remote_ref, behind
+        return remote_ref
 
     async def _train_predecessor(self, train: TrainMembership) -> TrainPredecessor:
         """Resolve the predecessor for a train member with order > 0.
@@ -4607,7 +4610,6 @@ class GitOps:
             # as start_ref so the new worktree stacks directly on top.
             # Guard (raise RuntimeError on None) is in _resolve_predecessor_tip.
             start_ref, _ = await self._resolve_predecessor_tip(train, branch_name)
-            stale_commits = None  # "behind remote" does not apply to sibling branches
         else:
             # ── Freshen main from remote (best-effort) ────────────────────
             # If origin/main has advanced since session start, use the remote-
@@ -4615,11 +4617,8 @@ class GitOps:
             # code.  Falls back to local main silently when no remote is configured
             # (e.g. in test repos).  Never mutates the local main ref — that would
             # interfere with advance_main's CAS logic.
-            start_ref, stale_commits = await self._freshen_main()
-        logger.info(
-            'create_worktree: freshening result: ref=%s, stale_commits=%s',
-            start_ref, stale_commits,
-        )
+            start_ref = await self._freshen_main()
+        logger.info('create_worktree: start ref=%s', start_ref)
 
         # Capture the freshened ref's SHA (used as stable base for diffs)
         rc, base_sha, _ = await _run(
@@ -4668,13 +4667,7 @@ class GitOps:
                 branch_name, start_ref, expected_title=expected_title,
             )
             if isinstance(pool_info, WorktreeInfo):
-                # Carry stale_commits from the freshen result onto the pool info
-                return WorktreeInfo(
-                    path=pool_info.path,
-                    base_commit=pool_info.base_commit,
-                    stale_commits=stale_commits,
-                    reify_debug_port=pool_info.reify_debug_port,
-                )
+                return pool_info
             # β: pool is enabled — no cold-path fall-through.  Route discriminant
             # to the appropriate exception so callers get typed failure signals.
             if pool_info is WarmLaneUnavailable.EXHAUSTED:
@@ -4920,7 +4913,6 @@ class GitOps:
                 return WorktreeInfo(
                     path=worktree_path,
                     base_commit=actual_base,
-                    stale_commits=stale_commits,
                     reify_debug_port=port,
                 )
             elif worktree_path.exists():
@@ -5017,7 +5009,7 @@ class GitOps:
             # fresh-create unchanged.
             if not worktree_path.exists() and await self._orphan_has_commits(full_branch):
                 reattached = await self._reattach_cold_worktree(
-                    worktree_path, full_branch, stale_commits,
+                    worktree_path, full_branch,
                     branch_name=branch_name, expected_title=expected_title,
                 )
                 if reattached is not None:
@@ -5050,8 +5042,8 @@ class GitOps:
             )
 
         logger.info(
-            'Created worktree at %s on branch %s (base=%s, stale_commits=%s)',
-            worktree_path, full_branch, base_sha[:8], stale_commits,
+            'Created worktree at %s on branch %s (base=%s)',
+            worktree_path, full_branch, base_sha[:8],
         )
 
         # Re-capture base from the worktree's own merge-base after
@@ -5072,7 +5064,6 @@ class GitOps:
         return WorktreeInfo(
             path=worktree_path,
             base_commit=post_create_base,
-            stale_commits=stale_commits,
             reify_debug_port=port,
         )
 
@@ -5080,7 +5071,6 @@ class GitOps:
         self,
         worktree_path: Path,
         full_branch: str,
-        stale_commits: int | None,
         *,
         branch_name: str,
         expected_title: str | None = None,
@@ -5147,9 +5137,7 @@ class GitOps:
                 anything.
 
         Returns:
-            WorktreeInfo for the resumed worktree, with *stale_commits*
-            carried over from the freshen result (mirrors create_worktree's
-            reuse-existing path); or ``None`` if a confirmed identity
+            WorktreeInfo for the resumed worktree; or ``None`` if a confirmed identity
             mismatch caused the orphan to be quarantined — the caller must
             fall through to a fresh create.
         """
@@ -5221,13 +5209,7 @@ class GitOps:
                 await self._relocate_foreign_meta_root(worktree_path, dest)
                 return None
 
-        info = await self._reuse_warm_lane(worktree_path, full_branch)
-        return WorktreeInfo(
-            path=info.path,
-            base_commit=info.base_commit,
-            stale_commits=stale_commits,
-            reify_debug_port=info.reify_debug_port,
-        )
+        return await self._reuse_warm_lane(worktree_path, full_branch)
 
     async def create_interactive_worktree(
         self, slug: str, *, start_ref: str | None = None,
@@ -8114,15 +8096,11 @@ class GitOps:
                             f'Inspect the branch and, once wanted work is preserved, '
                             f'remove the other worktree and retry.'
                         )
-                    # Reaching this guard means .task/ (if present) belongs to
-                    # the lane's PREVIOUS occupant — the same-task case already
-                    # returned via the disk-backstop reuse above.  checkout -f
-                    # replaces tracked files but leaves untracked .task/ intact,
-                    # and _reuse_warm_lane deliberately preserves .task/ (its
-                    # same-task contract) — clear it here or the incoming task
-                    # inherits a foreign plan.json/iterations.jsonl/reviews/
-                    # (reify esc-4920-163: _lane-26 4949→4920 contamination).
-                    await remove_tree(lane / '.task', ignore_errors=True)
+                    # See orchestrator/src/orchestrator/lane_task_dir.py::evict_previous_occupant.
+                    await evict_previous_occupant(
+                        lane / '.task', keep_task_id=branch_name,
+                        archive_root=archive_root_for(self.transcript_archive, self.project_root),
+                    )
                     # The sibling .task-meta/<name> (W11 ε1) belongs to the same
                     # previous occupant but, unlike .task/, lives OUTSIDE the
                     # worktree — checkout -f cannot touch it, so it must be
@@ -8391,14 +8369,15 @@ class GitOps:
         return True
 
     async def _clean_lane_retaining_artifacts(
-        self, cwd: Path, *, caller: str = 'git_ops',
+        self, cwd: Path, *, caller: str = 'git_ops', also_retain: tuple[str, ...] = (),
     ) -> tuple[bool, str]:
         """Run a single ``git clean -xfd`` preserving artifact dirs and reseed-trash siblings.
 
         Builds one invocation excluding ALL configured artifact dirs (via
         ``self.config.reap_build_artifact_dirs``) and their
         ``<dir>.reseed-trash.*`` siblings — single-pass so >1 artifact dir all
-        survive (per-dir-loop step-19 regression).  A benign ENOENT race (R3:
+        survive (per-dir-loop step-19 regression) — plus the caller's own
+        *also_retain* exclude patterns.  A benign ENOENT race (R3:
         concurrent detached ``rm -rf`` already removed the path before git clean
         reached it) is treated as success and logged at WARNING level.
 
@@ -8412,7 +8391,10 @@ class GitOps:
             ``(True, err)`` if the failure was a benign ENOENT race (logged at WARNING).
             ``(False, err)`` on a genuine clean failure.
         """
-        clean_cmd = ['git', 'clean', '-xfd']
+        clean_cmd = [
+            'git', 'clean', '-xfd',
+            *(arg for pattern in also_retain for arg in ('-e', pattern)),
+        ]
         for artifact_dir in self.config.reap_build_artifact_dirs:
             clean_cmd += ['-e', artifact_dir, '-e', f'{artifact_dir}.reseed-trash.*']
         rc, _, err = await _run(clean_cmd, cwd=cwd)
@@ -8513,7 +8495,12 @@ class GitOps:
         in-worktree reset succeeds, the sibling ``.task-meta/<name>`` (which
         the reset above cannot touch) is cleared too (W11 ε1).
 
-        Added as a stub here (step-8); fully exercised by step-10 tests.
+        The previous occupant's ``.task/`` is evicted, transcripts archived
+        first, by orchestrator/src/orchestrator/lane_task_dir.py::evict_previous_occupant,
+        and the clean then skips ``.task/``: the eviction owns it, and a
+        transcript the archive refused is held there for the next boot's
+        orchestrator/src/orchestrator/harness.py::Harness._sweep_orphaned_transcripts
+        rather than deleted unarchived.
         """
         # -f (force) discards local modifications to tracked files before the
         # branch switch — required when the lane is being reused from a prior
@@ -8527,8 +8514,13 @@ class GitOps:
                 f'_reset_warm_lane: checkout -f -B {full_branch} {target_commit} '
                 f'failed for {lane_dir}: {err}'
             )
+        task_dir = lane_dir / '.task'
+        await evict_previous_occupant(
+            task_dir, keep_task_id=None,
+            archive_root=archive_root_for(self.transcript_archive, self.project_root),
+        )
         ok, err = await self._clean_lane_retaining_artifacts(
-            lane_dir, caller='_reset_warm_lane',
+            lane_dir, caller='_reset_warm_lane', also_retain=(f'/{task_dir.name}/',),
         )
         if not ok:
             raise RuntimeError(
@@ -10831,11 +10823,11 @@ class GitOps:
         anything relative to main as it stood immediately before it?" — which
         is well-defined after the fact and answers the same question.
 
-        ``--ancestry-path`` (not a plain ``--merges`` walk) is what makes the
-        result *this branch's* landing rather than merely the oldest merge in
-        the range: it restricts the walk to commits that are simultaneously
-        descendants of *head* and ancestors of *upstream*, so an unrelated
-        merge that happened to land in the same window is excluded.
+        ``--ancestry-path`` keeps only descendants of *head* that are ancestors
+        of *upstream*, excluding an unrelated merge landed in the same window.
+        ``--topo-order`` makes "oldest" TOPOLOGICAL: rev-list's default order
+        is COMMIT DATE, which ``--reverse`` merely flips, so a skewed or tied
+        date can put a later merge first (``orchestrator/tests/test_group_merge_candidate_ordering.py``).
 
         Returns ``None`` when there is no such merge — a fast-forward or
         rebase landing leaves none — and also on any git failure.  The two are
@@ -10845,8 +10837,8 @@ class GitOps:
         a refusal is ``not_landed`` or ``git_error``.
         """
         rc, out, _ = await _run(
-            ['git', 'rev-list', '--ancestry-path', '--merges', '--reverse',
-             f'{head}..{upstream}'],
+            ['git', 'rev-list', '--topo-order', '--ancestry-path', '--merges',
+             '--reverse', f'{head}..{upstream}'],
             cwd=self.project_root,
         )
         if rc != 0 or not out.strip():
@@ -11878,6 +11870,7 @@ class GitOps:
 
     async def find_equivalent_commit(
         self, worktree: Path, base_sha: str, target_sha: str,
+        *, patch_id_only: bool = False,
     ) -> str | None:
         """Recover the sha a rebase replayed *target_sha* onto, via ``git patch-id``.
 
@@ -11890,6 +11883,8 @@ class GitOps:
 
         The search over ``base_sha..HEAD`` is :meth:`_find_replay`'s two
         tiers (patch-id, then unique exact subject), unnarrowed.
+        *patch_id_only* drops the subject tier's hit, for a caller whose
+        anchor must carry *target_sha*'s diff (task 4862).
 
         Fully fail-safe: any git error, an unresolvable/GC'd *target_sha*, or
         empty patch-id output yields ``None``, letting the caller fall through
@@ -11901,7 +11896,9 @@ class GitOps:
         """
         try:
             match = await self._find_replay(worktree, target_sha, f'{base_sha}..HEAD')
-            return match[0] if match is not None else None
+            if match is None or (patch_id_only and match[1] != 'patch-id'):
+                return None
+            return match[0]
         except Exception:
             # Fully fail-safe: any git error / unresolvable target yields None so
             # the caller falls through to its existing escalation path. Log at
@@ -12098,11 +12095,24 @@ class GitOps:
             return None
 
     async def get_changed_files(self, from_sha: str, to_sha: str) -> list[str]:
-        """Return list of files changed between two commits."""
-        _, output, _ = await _run(
+        """Return list of files changed between two commits.
+
+        Fails open: a git error (e.g. an unresolvable SHA) returns ``[]`` and
+        is logged at WARNING rather than raised.  An empty list is therefore
+        ambiguous between "no changes" and "git failed"; a caller that must
+        tell them apart uses :meth:`get_merge_diff_files`' ``(files, error)``
+        contract instead.
+        """
+        rc, output, stderr = await _run(
             ['git', 'diff', '--name-only', from_sha, to_sha],
             cwd=self.project_root,
         )
+        if rc != 0:
+            logger.warning(
+                'get_changed_files: git diff %s..%s failed (rc=%s): %s',
+                from_sha, to_sha, rc, (stderr or '').strip()[:200],
+            )
+            return []
         return [f for f in output.strip().splitlines() if f.strip()]
 
     async def get_commit_changed_files(self, sha: str) -> list[str]:

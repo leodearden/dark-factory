@@ -1622,7 +1622,9 @@ class ReconciliationConfig(BaseModel):
             'only remedy if the archive root breaks: fused-memory installs no '
             'archival-failure storm consumer. Green-tier for that reason; both '
             'archive leaves are read live per stage and per GC through '
-            'reconciliation/cli_stage_runner.py::recon_archive_root.'
+            'reconciliation/cli_stage_runner.py::recon_archive_root. It also '
+            "governs TaskCurator's per-process config-dir archival (task 6008): "
+            'off, the dead-PID sweep removes curator config dirs unarchived.'
         ),
     )
     transcript_archive_root: str = Field(
@@ -1631,7 +1633,8 @@ class ReconciliationConfig(BaseModel):
             'Archive root, resolved against explore_codebase_root (NOT data_dir). '
             "The default deliberately equals the orchestrator's archive root, "
             "which docs/legibility/legibility.yaml's agent_transcript_roots "
-            'already mines.'
+            'already mines. TaskCurator archives its config-dir transcripts '
+            'here too, keyed fm-curator-<pid> (task 6008).'
         ),
     )
 
@@ -1755,7 +1758,6 @@ class ReconciliationConfig(BaseModel):
         return self
 
     # Safety
-    max_mutations_per_stage: int = Field(default=50)
     halt_on_judge_serious: bool = Field(default=True)
 
     # Done-provenance gate — when True, set_task_status(done) rejects calls
@@ -2382,8 +2384,8 @@ class CuratorConfig(BaseModel):
     # (get_tasks over the whole tree + an embedder call + a qdrant query).
     # That path now hands the prepared bundle to ``curate``, so a smaller
     # batch no longer costs a rebuild.
-    entry_description_chars: int = Field(default=2000)
-    entry_details_chars: int = Field(default=1500)
+    entry_description_chars: int = Field(default=2000, ge=1)
+    entry_details_chars: int = Field(default=1500, ge=1)
 
     # Batch-curator knobs — the worker drains up to batch_max tickets per
     # round-trip; timeout, turns, and budget scale linearly with N and are
@@ -2451,13 +2453,13 @@ class CuratorConfig(BaseModel):
     # degrade-to-create contract.
     # Open after this many CONSECUTIVE ZOT curator LLM failures (reset on
     # any successful LLM call; a non-ZOT failure neither increments nor
-    # resets it — see task_curator.py::TaskCurator._consecutive_zero_output_timeouts).
+    # resets it — see middleware/zero_output_breaker.py::ZeroOutputBreaker).
     zero_output_breaker_threshold: int = Field(default=2, ge=1)
     # How long the breaker stays open / short-circuits to action='create'
     # before allowing a half-open probe; a successful LLM call (including a
     # concurrent batch round-trip) closes the breaker early rather than
     # waiting out the cooldown — see
-    # task_curator.py::TaskCurator._reset_zero_output_breaker and
+    # middleware/zero_output_breaker.py::ZeroOutputBreaker.close and
     # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker.
     zero_output_breaker_cooldown_seconds: float = Field(default=600.0, gt=0)
     # Post-ZOT duplicate sweep (fused_memory/middleware/curator_zot_duplicate_sweep.py).
@@ -2873,8 +2875,10 @@ class WriteTriageConfig(BaseModel):
         ge=1,
         description=(
             'Per-field character cap applied to the new entry and to every '
-            'candidate before the judge sees them; a cut field is marked '
-            '`…[elided]` so the model knows it is reading a truncation. Why '
+            'candidate before the judge sees them; a cut field is marked with '
+            'how many characters were elided (utils/clip_disclosure.py::elide_text), '
+            'so the model knows it is reading a truncation and how much is '
+            'missing. Why '
             '4000 replaced 1,200 — the measured recall loss at the old cap and '
             'the call cost at the new one — is the decision record '
             'calibration/write_triage_judge_field_chars_report.md. Bounded ge=1 '

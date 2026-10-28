@@ -79,7 +79,7 @@ from escalation.models import (
 from escalation.note_to_file import file_note_to_file, note_to_file_refusal
 from escalation.pins import classify_pins
 from escalation.project_root_guard import ProjectRootGuard
-from escalation.queue import AmendmentOutcome, EscalationQueue, ResolveOutcome
+from escalation.queue import AmendmentOutcome, EscalationQueue, blank_resolve_outcome
 from escalation.queue import observed_submit_response as _observed_submit_response
 from escalation.related_pending import related_pending
 from escalation.server_instructions import ESCALATION_SERVER_INSTRUCTIONS
@@ -725,6 +725,30 @@ _COMPACT_ESCALATION_FIELDS = (
     # and giving absence a second, different meaning on a neighbouring key would
     # be exactly the legibility trap that contract exists to prevent.
     'pin_declared_by',
+    # project_id (task 4951) is DELIBERATELY NOT PROJECTED — decided in task 5776
+    # (won't-fix), so do not re-file it as an oversight.
+    #
+    # THE GAP IS REAL BUT NARROW: the reconciliation queue is shared across
+    # projects, so a compact row there cannot name its subject project.  An
+    # orchestrator queue is per-project (each endpoint serves one project), so
+    # for those the answer is already the endpoint itself.
+    #
+    # WHY IT IS NOT WORTH A KEY ON EVERY ROW: (1) the in-repo consumers
+    # (orphaned_recon_escalation_sweep.py::escalation_project_id and
+    # derive_orphaned_recon_escalations.py) read FULL records, so nothing needs
+    # it; (2) `None` means UNSTAMPED, and `attach_dedupe_child` never backfills a
+    # folded parent, so a parent filed before 4951 never gains it — a compact
+    # reader would see `null`, could not tell "legacy" from "no project", and
+    # would STILL need a get_escalation round-trip for exactly the records it
+    # cares about; (3) it costs ~20 bytes (`"project_id":null`) on
+    # EVERY compact row, including the dashboard's fetch_pins_recovery poll that
+    # reads nothing but `pins_recovery`, for a value that is null on the
+    # overwhelming majority.
+    #
+    # IF A PROJECT-SCOPED COMPACT DRAIN EVER EXISTS: add a server-side
+    # `project_id` filter to get_pending_escalations (one filtered value per
+    # call, no per-row cost) rather than widening this tuple — and note that no
+    # such filter exists today.
 )
 
 # get_pending_escalations(compact=True) additionally keeps its computed
@@ -2533,11 +2557,13 @@ def create_server(
                 }
         identity = headers.get(_IDENTITY_HEADER)
 
-        # Single record lookup reused by the capability gate below, the Table B
-        # gate further down, and the pre-stamp write after it. queue.get() reads
-        # from disk, so identity-mapped callers previously paid for two reads
-        # per resolve (once for the ceiling check, again for Table B); one
-        # fetch is now shared by both gates (efficiency note, PRD C8/D7 review).
+        # Single record lookup reused by the capability gate below and the Table
+        # B and declared-pin gates further down. queue.get() reads from disk,
+        # so identity-mapped callers previously paid for two reads per resolve
+        # (once for the ceiling check, again for Table B); one fetch is now
+        # shared by the gates (efficiency note, PRD C8/D7 review). `rec` is a
+        # read-only GATING snapshot: no write uses it, because every write goes
+        # through a queue method that re-reads under `escalation_id_lock`.
         rec = queue.get(escalation_id)
         if rec is None:
             return {'error': f'Escalation {escalation_id} not found'}
@@ -2612,10 +2638,8 @@ def create_server(
         # capability header AND an illegal action) sees 'bad_capability_header'
         # / 'level_forbidden', not 'illegal_transition'. Neither gate mutates
         # the record, so this is an error-reporting precedence only — see the
-        # "Gate precedence" note in the resolve_issue docstring. `rec` was
-        # already fetched above (shared with the capability gate); nothing
-        # mutates the record between that fetch and here, so it is reused
-        # rather than re-read from disk.
+        # "Gate precedence" note in the resolve_issue docstring. `rec` is the
+        # gating snapshot fetched above (shared with the capability gate).
         effect = effect_for(action, rec.level, rec.category)
         if effect is None:
             return {
@@ -2633,7 +2657,7 @@ def create_server(
             # Version-a: park keeps the escalation open at L2.
             # queue.park() handles all stamping (level=2, resolution_action='park',
             # resolution text) and fires the resolve callback for teardown WITHOUT
-            # archiving the record.  No pre-stamp needed — park() owns the full write.
+            # archiving the record.  park() owns the full write, as resolve() does.
             esc = queue.park(
                 escalation_id, resolution,
                 resolved_by=resolved_by, resolution_turns=resolution_turns,
@@ -2647,9 +2671,8 @@ def create_server(
         # AFTER the `park` early-return above, so park is structurally exempt
         # with no `action != 'park'` condition that a later edit could get wrong
         # — park keeps the record OPEN and never archives it, so it cannot spend
-        # a pin.  And it sits BEFORE the resolution_action pre-stamp below, so a
-        # refusal persists nothing (INV-1), exactly as the capability and Table B
-        # gates do.
+        # a pin.  And it sits BEFORE queue.resolve, so a refusal persists
+        # nothing (INV-1), exactly as the capability and Table B gates do.
         #
         # Classifies the TARGET plus EVERY member of an L2 cluster, because the
         # BULK CLOSE of a homogeneous cluster is precisely the operation that
@@ -2706,27 +2729,14 @@ def create_server(
                 ],
             }
 
-        # Pre-stamp resolution_action on the pending record so resolve()'s
-        # read-modify-write carries it into the archived JSON (C1 persistence).
-        # Guard: only rewrite pending records — archived records must not be resurrected.
-        # Reuses `rec` fetched at the top of the gate sequence above (shared by
-        # the capability and Table B gates) instead of re-reading from disk:
-        # queue.get() is a pure read and nothing mutates the record between
-        # that fetch and here (the park branch above already returned), so
-        # `rec` is still current and a further queue.get() would be redundant.
-        if rec.status == 'pending':
-            rec.resolution_action = action
-            queue._rewrite(escalation_id, rec)
         dismiss = action in _DISMISS_ACTIONS
-        resolve_outcome: ResolveOutcome = {
-            'applied': False, 'prior_status': None, 'prior_resolved_by': None,
-            'late_resolution_captured': False, 'resolution_class_corrected': None,
-        }
+        resolve_outcome = blank_resolve_outcome()
         esc = queue.resolve(
             escalation_id, resolution, dismiss=dismiss,
             resolved_by=resolved_by, resolution_turns=resolution_turns,
             resolution_class=resolution_class,
             granted_files=granted_files,
+            resolution_action=action,
             outcome=resolve_outcome,
         )
         if esc is None:
@@ -3415,9 +3425,10 @@ def create_server(
 
         **Sentinel-bound members** (task 4541): when at least one member
         resolves and EVERY resolved member was filed under a role in
-        ``escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES`` (today the
-        recovery-veto-streak alarm and the offline lane's escalations), a new
-        L2 must be minted under one of those members' own task ids.  Any other *task_id* is refused with
+        ``escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES`` (the
+        sentinel-filed orchestrator alarms; that frozenset is the list), a new
+        L2 must be minted under one of those members' own task ids.  Any other
+        *task_id* is refused with
         ``code: 'sentinel_task_id_required'`` and ``required_task_ids`` —
         re-issue with one of them — and nothing is minted, for header-less
         callers too.  Why: see

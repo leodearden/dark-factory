@@ -4,9 +4,10 @@
 #
 # TWO TIERS, and the split is deliberate:
 #
-#   UNIVERSAL (every branch) -- the merge-lane ratchet audit below. It is
-#     scoped to what this commit STAGES, so an ordinary commit costs one
-#     `git diff --cached` and spawns nothing.
+#   UNIVERSAL (every branch) -- the merge-lane ratchet audit and the
+#     code-quality render check below. Each is scoped to what this commit
+#     STAGES, so an ordinary commit costs one `git diff --cached` per check
+#     and spawns nothing.
 #   MAIN ONLY -- ruff, the three staged-file style checks, and pyright.
 #     These sweep whole packages and cost seconds, which is the wrong price
 #     to pay on every commit of every task branch.
@@ -104,6 +105,31 @@ if [ -n "$staged_ratchet" ]; then
         exit 1
     elif [ "$ratchet_rc" -ne 0 ]; then
         echo "pre-commit: merge-lane ratchet audit REFUSED this commit (rc=$ratchet_rc); see above."
+        exit 1
+    fi
+fi
+
+# ── code-quality render check (ALL BRANCHES, staged-scoped) ──────────
+#
+# roles.py renders the packaged code-quality doc at import through
+# code_quality.py::render, and a docs-only commit straight to main never meets
+# the merge gate's test of it. So whenever this commit stages either file, the
+# STAGED doc is rendered with the STAGED renderer. NO `|| true` on the filter,
+# for the same reason as the ratchet filter above.
+code_quality_inputs=(
+    orchestrator/src/orchestrator/agents/code_quality.md
+    orchestrator/src/orchestrator/agents/code_quality.py
+)
+staged_code_quality="$(cd "$ROOT" && git diff --cached --no-renames --name-only -- \
+    "${code_quality_inputs[@]}")" || {
+    echo "pre-commit: could not list staged code-quality inputs (git rc=$?);"
+    echo "  refusing the commit rather than skipping the render check."
+    exit 1
+}
+if [ -n "$staged_code_quality" ]; then
+    echo "pre-commit: code-quality render check (staged)..."
+    if ! (cd "$ROOT" && python3 scripts/check_staged_code_quality_render.py); then
+        echo "pre-commit: code-quality render check REFUSED this commit; its named cause is above."
         exit 1
     fi
 fi

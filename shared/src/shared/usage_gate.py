@@ -56,6 +56,7 @@ from shared.invocation_outcome import (
 # guard that keeps a fabricating fork from being re-introduced here.
 from shared.invocation_outcome import _parse_resets_at as _parse_resets_at_strict
 from shared.proc_group import terminate_process_group
+from shared.secret_env import agent_subprocess_env
 
 if TYPE_CHECKING:
     from collections.abc import Collection
@@ -2707,7 +2708,7 @@ class UsageGate:
             'Say ok',
         ]
 
-        env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+        env = agent_subprocess_env(os.environ)
         if acct.token is not None:
             env['CLAUDE_CODE_OAUTH_TOKEN'] = acct.token
         env['CLAUDE_CONFIG_DIR'] = str(config_dir.path)

@@ -4023,9 +4023,10 @@ class TaskKnowledgeSync(BaseStage):
             )
 
         # Done-Task Completion-Memory Audit — enumerate EVERY task that
-        # transitioned to `done` since the prior successful cycle boundary
-        # (watermark.last_full_run_completed) via an updatedAt-window scan over
-        # the UNCAPPED filtered.all_done_tasks.  This supersedes reliance on the
+        # transitioned to `done` inside the task-change window, which starts when
+        # the previous full run STARTED (why not its completion:
+        # tests/reconciliation/test_recon_window_anchor.py), via an updatedAt scan
+        # over the UNCAPPED filtered.all_done_tasks.  This supersedes reliance on the
         # 5-item Proactive Task Sample for done-task completion-memory coverage,
         # which systematically missed done tasks as throughput grew (the sample
         # sorts done tasks last, so they rarely survive the top-5 cut).  Gated on
@@ -4033,7 +4034,7 @@ class TaskKnowledgeSync(BaseStage):
         # (remediation is a focused second pass, not general sync).
         done_audit_section = ''
         if not self.remediation_mode:
-            boundary = watermark.last_full_run_completed
+            boundary = watermark.last_task_change_timestamp
             audit_tasks = select_done_since_boundary(filtered.all_done_tasks, boundary)
             total_audit = len(audit_tasks)
             boundary_label = (
@@ -4060,7 +4061,7 @@ class TaskKnowledgeSync(BaseStage):
             done_audit_section = (
                 f'\n### Done-Task Completion-Memory Audit '
                 f'({total_audit} since last cycle)\n'
-                f'Boundary (last full-run completed): {boundary_label}\n'
+                f'Boundary (previous full run started): {boundary_label}\n'
                 f'{audit_body}'
             )
 
@@ -4074,7 +4075,7 @@ class TaskKnowledgeSync(BaseStage):
             )
 
         # Inference-bearing sections (see REQUIRED_SECTIONS), bound here so their probes run first.
-        required_sections = await self._render_required_sections(filtered)
+        required_sections = await self._render_required_sections(filtered, tree_read_at)
 
         # Call render_active_section once to get both the visible-task list (for
         # hint-attention slice-then-filter below) and the fully assembled Active
@@ -4479,17 +4480,25 @@ For cross-project routing see "Known Projects" above.
             lines.append(f'- {pid:<{width}}  → {root}{marker}')
         return '\n### Known Projects (for cross-project routing)\n' + '\n'.join(lines) + '\n'
 
-    async def _build_live_workflow_section(self, filtered: FilteredTaskTree) -> str:
+    async def _build_live_workflow_section(
+        self, filtered: FilteredTaskTree, tree_read_at: datetime,
+    ) -> str:
         """Return the Live-Workflow Signals section for *filtered*, or ``''``.
 
         Takes the payload's RESOLVED tree — harness-injected or self-fetched by
-        :meth:`assemble_payload` — which is why it is not a zero-arg reader of
-        ``self.filtered_task_tree`` like Stage 1's same-named renderer. An empty
-        active list renders ``''`` with no I/O.
+        :meth:`assemble_payload` — and the instant it was read, which is why it
+        is not a zero-arg reader of ``self.filtered_task_tree`` like Stage 1's
+        same-named renderer. Claimant heartbeats are aged at *tree_read_at*,
+        not at render time (task 6027). An empty active list renders ``''``
+        with no I/O.
         """
-        return await render_live_workflow_section(filtered.active_tasks, self.scope.project_root)
+        return await render_live_workflow_section(
+            filtered.active_tasks, self.scope.project_root, claims_read_at=tree_read_at,
+        )
 
-    async def _render_required_sections(self, filtered: FilteredTaskTree) -> str:
+    async def _render_required_sections(
+        self, filtered: FilteredTaskTree, tree_read_at: datetime,
+    ) -> str:
         """Render every inference-bearing payload section for *filtered*, in registry order.
 
         Every Stage-2 payload builder MUST interpolate this — enforced
@@ -4497,15 +4506,19 @@ For cross-project routing see "Known Projects" above.
         ``tests/reconciliation/test_stage2_payload_section_parity.py``. See
         :attr:`REQUIRED_SECTIONS` for which sections qualify.
 
-        Renderers receive the payload's resolved *filtered* tree, because
-        :meth:`assemble_payload` may self-fetch it rather than use the
-        harness-injected attribute. Each renderer keeps its own
-        conditional-empty contract, so ``''`` is a normal result and no
-        separator is added. The sections render on remediation passes too: the
-        harness sets the tree there as well.
+        Renderers receive the payload's resolved *filtered* tree AND
+        *tree_read_at*, the instant it was read (harness-injected, or stamped
+        after the self-fetch), because :meth:`assemble_payload` may self-fetch
+        the tree rather than use the harness-injected attribute. Each renderer
+        keeps its own conditional-empty contract, so ``''`` is a normal result
+        and no separator is added. The sections render on remediation passes
+        too: the harness sets the tree there as well.
         """
         return ''.join(
-            [await getattr(self, section.renderer)(filtered) for section in self.REQUIRED_SECTIONS]
+            [
+                await getattr(self, section.renderer)(filtered, tree_read_at)
+                for section in self.REQUIRED_SECTIONS
+            ]
         )
 
     @staticmethod

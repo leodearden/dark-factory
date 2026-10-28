@@ -304,44 +304,6 @@ def reconciliation_db(tmp_path):
         ),
     )
 
-    # Journal entries for run-001
-    conn.execute(
-        """INSERT INTO journal_entries
-           (id, run_id, stage, timestamp, operation, target_system,
-            before_state, after_state, reasoning, evidence)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            'je-001',
-            'run-001',
-            'memory_consolidation',
-            (now - timedelta(hours=1, minutes=55)).isoformat(),
-            'consolidate',
-            'mem0',
-            '{"count": 5}',
-            '{"count": 3}',
-            'Merged duplicate memories',
-            '[{"source": "mem0", "id": "m-1"}]',
-        ),
-    )
-    conn.execute(
-        """INSERT INTO journal_entries
-           (id, run_id, stage, timestamp, operation, target_system,
-            before_state, after_state, reasoning, evidence)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            'je-002',
-            'run-001',
-            'task_knowledge_sync',
-            (now - timedelta(hours=1, minutes=50)).isoformat(),
-            'sync',
-            'graphiti',
-            None,
-            '{"entities": 2}',
-            '',
-            '[]',
-        ),
-    )
-
     # Judge verdict
     conn.execute(
         """INSERT INTO judge_verdicts (run_id, reviewed_at, severity, findings, action_taken)

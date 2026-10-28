@@ -2201,7 +2201,8 @@ class TestBuildMergeVerifySpec:
         )
         assert spec_from_json(spec_to_json(spec)) == spec
 
-    def test_effective_verify_env_propagated_to_spec(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_effective_verify_env_propagated_to_spec(self):
         """spec.verify_env carries the merged sccache backend from effective_verify_env.
 
         Uses a real OrchestratorConfig (not MagicMock) so that effective_verify_env
@@ -2210,9 +2211,6 @@ class TestBuildMergeVerifySpec:
         """
         from orchestrator.config import OrchestratorConfig, SccacheConfig
         from orchestrator.verify_runner import build_merge_verify_spec
-
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
 
         config = OrchestratorConfig(
             verify_env={'RUSTC_WRAPPER': 'sccache'},

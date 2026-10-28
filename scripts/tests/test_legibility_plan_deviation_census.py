@@ -18,6 +18,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -962,7 +963,9 @@ def _never_invoked(prompt, model):
     raise AssertionError('the coder must not be reached on a red night')
 
 
-def _run_red_night(tmp_path: Path, *, pass_kind: nightly.PassKind) -> nightly.NightlyResult:
+def _run_red_night(
+    tmp_path: Path, *, pass_kind: nightly.PassKind, **seams: Any,
+) -> nightly.NightlyResult:
     projects_root = tmp_path / 'projects'
     projects_root.mkdir()
     posted: list[tuple[str, dict]] = []
@@ -975,6 +978,7 @@ def _run_red_night(tmp_path: Path, *, pass_kind: nightly.PassKind) -> nightly.Ni
         status_fetcher=lambda: {'statuses': {}},
         poster=lambda url, envelope: posted.append((url, envelope)),
         pass_kind=pass_kind,
+        **seams,
     )
 
 
@@ -982,35 +986,35 @@ def _crashed_extractor(selected, **kwargs):
     return [], [('session-1', 'boom')]
 
 
-def test_nightly_red_night_early_return_still_runs_the_census(tmp_path, monkeypatch, caplog):
+def test_nightly_red_night_early_return_still_runs_the_census(tmp_path, caplog):
     caplog.set_level(logging.INFO, logger=_LOGGER)
-    monkeypatch.setattr(nightly, 'build_digests', _crashed_extractor)
 
-    result = _run_red_night(tmp_path, pass_kind=nightly.PassKind.MANUAL)
+    result = _run_red_night(
+        tmp_path, pass_kind=nightly.PassKind.MANUAL, digest_builder=_crashed_extractor,
+    )
 
     assert result.exit_code == 1
     assert len(_census_records(caplog)) == 1
 
 
-def test_nightly_unexpected_raise_still_runs_the_census(tmp_path, monkeypatch, caplog):
+def test_nightly_unexpected_raise_still_runs_the_census(tmp_path, caplog):
     caplog.set_level(logging.INFO, logger=_LOGGER)
 
     def _raise(*args, **kwargs):
         raise RuntimeError('sampler exploded')
 
-    monkeypatch.setattr(nightly, 'select_digest_sessions', _raise)
-
-    result = _run_red_night(tmp_path, pass_kind=nightly.PassKind.MANUAL)
+    result = _run_red_night(tmp_path, pass_kind=nightly.PassKind.MANUAL, selector=_raise)
 
     assert result.exit_code == 1
     assert len(_census_records(caplog)) == 1
 
 
-def test_nightly_retry_pass_does_not_run_the_census(tmp_path, monkeypatch, caplog):
+def test_nightly_retry_pass_does_not_run_the_census(tmp_path, caplog):
     caplog.set_level(logging.INFO, logger=_LOGGER)
-    monkeypatch.setattr(nightly, 'build_digests', _crashed_extractor)
 
-    result = _run_red_night(tmp_path, pass_kind=nightly.PassKind.RETRY)
+    result = _run_red_night(
+        tmp_path, pass_kind=nightly.PassKind.RETRY, digest_builder=_crashed_extractor,
+    )
 
     assert result.exit_code == 1
     assert _census_records(caplog) == []

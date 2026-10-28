@@ -370,7 +370,9 @@ async def _gate(
         max_timeouts=3,
         max_enospc=max_enospc,
         merge_sha=rebased.rebased_sha if merge_sha is None else merge_sha,
-        run_post_merge_verify=functools.partial(_run_post_merge_verify, verifier=verifier),
+        run_post_merge_verify=functools.partial(
+            _run_post_merge_verify, verifier=verifier, event_store=scene.store,
+        ),
         event_store=scene.store,
     )
 

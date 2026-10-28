@@ -53,14 +53,13 @@ claude --strict-mcp-config --mcp-config "$DARK_FACTORY_ROOT/recon-watch/mcp.json
   "/recon-escalation-watcher"
 ```
 
-**Default lane: tmux.** This is a long-running loop session (PRD
-`plans/fleet-cockpit-prd.md` §3 fork 1) — run it in the crash-survivable, reattachable tmux lane
-by default: wrap the invocation above via `skills/spawn/spawn-claude.sh` with
-`CLAUDE_SPAWN_BACKEND=tmux` (see that script's header) so the session gets a `display.kind=tmux`
-session-registry record and a `tmux attach`-reattachable window. A killed watcher is reattachable
-with `tmux attach`, and its record persists across the crash. Interactive one-offs are unaffected
-— this watcher never spawns interactive sessions of its own (see the table above: no `/unblock`,
-no worktree).
+**Lane.** This is a long-running loop session (PRD `plans/fleet-cockpit-prd.md` §3 fork 1). The
+operator runs it as a **T3 Code thread** (hosted; no `CLAUDE_SPAWN_BACKEND` needed). Launched from a
+plain terminal, run it in the crash-survivable, reattachable tmux lane: wrap the invocation above via
+`skills/spawn/spawn-claude.sh` with `CLAUDE_SPAWN_BACKEND=tmux` (see that script's header) so the
+session gets a `display.kind=tmux` session-registry record and a `tmux attach`-reattachable window
+that persists across a crash. This watcher never spawns interactive sessions of its own (see the
+table above: no `/unblock`, no worktree).
 
 `recon-watch/mcp.json` (created by the setup; both servers required):
 
@@ -1014,7 +1013,11 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   its lease-token shape is not a session-registry key. The cockpit's Enter-to-focus follows
   `record_slug`, your session record's key, which `write-decision` stamps itself from `$CLAUDE_PID`;
   there is no shell token to add. If it cannot be resolved the decision is still filed, just
-  unlinked.
+  unlinked, and the verb says so with a line on stderr that starts `write-decision --id <your id>`,
+  names `$CLAUDE_PID` and says `BLANK record_slug` (it carries no `WARNING` prefix). That line alone
+  is not a failed filing: an id on stdout still means the filing landed, and the row is only
+  unfocusable in the cockpit. Re-filing from the same session resolves the same way, so it does not
+  repair the link and is not called for.
 - **`--severity`**: pass through the parked escalation's own severity (`esc.severity` —
   `info`/`blocking`/`critical`/`urgent`). This now weights the cockpit decision-queue rank, so a
   freshly-filed `critical`/`urgent` park surfaces at the top of the queue instead of being buried

@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 import pytest
 import yaml
+from _code_default_hatch import require_code_default_config
 from _orch_helpers import _init_harness_state_for_test
 from escalation.categories import EscalationCategory
 from escalation.models import BORN_AT_L2_SEVERITIES
@@ -32,11 +33,10 @@ from orchestrator.config import (
 from orchestrator.harness import Harness
 
 
-def _make_harness(tmp_path, monkeypatch, census, queue):
+def _make_harness(tmp_path, census, queue):
     """Bare Harness (Harness.__new__ + _init_harness_state_for_test) with a real
     config whose unknown_key_census is set directly and the given queue."""
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-    monkeypatch.chdir(tmp_path)
+    require_code_default_config()
     h = Harness.__new__(Harness)
     _init_harness_state_for_test(h)
     config = OrchestratorConfig(project_root=tmp_path)
@@ -56,11 +56,12 @@ def _pending_config_l2s(queue):
     ]
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
-async def test_files_born_at_l2_for_unknown_keys(tmp_path: Path, monkeypatch):
+async def test_files_born_at_l2_for_unknown_keys(tmp_path: Path):
     queue = EscalationQueue(tmp_path / 'esc')
     census = [ConfigUnknownKey('spare_warm_lanes', 'git.spare_warm_lanes')]
-    h = _make_harness(tmp_path, monkeypatch, census, queue)
+    h = _make_harness(tmp_path, census, queue)
 
     await h._file_config_unknown_keys_escalation()
 
@@ -78,11 +79,12 @@ async def test_files_born_at_l2_for_unknown_keys(tmp_path: Path, monkeypatch):
     assert 'git.spare_warm_lanes' in esc.detail
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
-async def test_same_key_set_dedups_to_one(tmp_path: Path, monkeypatch):
+async def test_same_key_set_dedups_to_one(tmp_path: Path):
     queue = EscalationQueue(tmp_path / 'esc')
     census = [ConfigUnknownKey('spare_warm_lanes', 'git.spare_warm_lanes')]
-    h = _make_harness(tmp_path, monkeypatch, census, queue)
+    h = _make_harness(tmp_path, census, queue)
 
     await h._file_config_unknown_keys_escalation()
     await h._file_config_unknown_keys_escalation()
@@ -90,11 +92,12 @@ async def test_same_key_set_dedups_to_one(tmp_path: Path, monkeypatch):
     assert len(_pending_config_l2s(queue)) == 1, 'identical key-set must file exactly one L2'
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
-async def test_changed_key_set_files_second_distinct_l2(tmp_path: Path, monkeypatch):
+async def test_changed_key_set_files_second_distinct_l2(tmp_path: Path):
     queue = EscalationQueue(tmp_path / 'esc')
     h = _make_harness(
-        tmp_path, monkeypatch,
+        tmp_path,
         [ConfigUnknownKey('spare_warm_lanes', 'git.spare_warm_lanes')],
         queue,
     )
@@ -109,11 +112,12 @@ async def test_changed_key_set_files_second_distinct_l2(tmp_path: Path, monkeypa
     assert len({e.root_cause for e in l2s}) == 2
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
-async def test_empty_census_self_heals_pending_l2(tmp_path: Path, monkeypatch):
+async def test_empty_census_self_heals_pending_l2(tmp_path: Path):
     queue = EscalationQueue(tmp_path / 'esc')
     h = _make_harness(
-        tmp_path, monkeypatch,
+        tmp_path,
         [ConfigUnknownKey('spare_warm_lanes', 'git.spare_warm_lanes')],
         queue,
     )
@@ -132,20 +136,22 @@ async def test_empty_census_self_heals_pending_l2(tmp_path: Path, monkeypatch):
     assert resolved.status == 'resolved'
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
-async def test_empty_census_no_pending_files_nothing(tmp_path: Path, monkeypatch):
+async def test_empty_census_no_pending_files_nothing(tmp_path: Path):
     queue = EscalationQueue(tmp_path / 'esc')
-    h = _make_harness(tmp_path, monkeypatch, [], queue)
+    h = _make_harness(tmp_path, [], queue)
 
     await h._file_config_unknown_keys_escalation()
 
     assert queue.get_pending() == []
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
-async def test_none_queue_is_noop(tmp_path: Path, monkeypatch):
+async def test_none_queue_is_noop(tmp_path: Path):
     h = _make_harness(
-        tmp_path, monkeypatch,
+        tmp_path,
         [ConfigUnknownKey('spare_warm_lanes', 'git.spare_warm_lanes')],
         None,
     )
@@ -166,10 +172,9 @@ def _reload_harness(tmp_path):
     return h
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_reload_config_surfaces_unknown_keys(tmp_path: Path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
     h = _reload_harness(tmp_path)
 
     fresh = OrchestratorConfig(project_root=tmp_path)
@@ -189,10 +194,9 @@ async def test_reload_config_surfaces_unknown_keys(tmp_path: Path, monkeypatch):
     )
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_reload_config_clean_yields_empty_unknown_keys(tmp_path: Path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
     h = _reload_harness(tmp_path)
 
     fresh = OrchestratorConfig(project_root=tmp_path)  # census sentinel None → []
@@ -272,7 +276,7 @@ _REIFY_ALLOWLIST = {
 }
 
 
-def _census_harness(tmp_path, monkeypatch, data, queue, name='orchestrator.yaml'):
+def _census_harness(tmp_path, data, queue, name='orchestrator.yaml'):
     """Harness whose config carries a census computed from a REAL YAML file.
 
     Unlike _make_harness (which injects a hand-built census), this drives the
@@ -282,18 +286,19 @@ def _census_harness(tmp_path, monkeypatch, data, queue, name='orchestrator.yaml'
     p = tmp_path / name
     p.write_text(yaml.dump(data))
     census = census_config_keys(p)
-    h = _make_harness(tmp_path, monkeypatch, census.unknown, queue)
+    h = _make_harness(tmp_path, census.unknown, queue)
     h.config._ignored_key_census = census.ignored
     return h
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
-async def test_escape_hatched_only_config_files_nothing(tmp_path: Path, monkeypatch):
+async def test_escape_hatched_only_config_files_nothing(tmp_path: Path):
     """(a) NO FALSE L2 — the reviewer's finding.  A project whose only non-model
     keys are deliberate, allowlisted knobs must not be escalated at all."""
     queue = EscalationQueue(tmp_path / 'esc')
     h = _census_harness(
-        tmp_path, monkeypatch, {**_REIFY_ALLOWLIST, **_REIFY_HATCHED}, queue
+        tmp_path, {**_REIFY_ALLOWLIST, **_REIFY_HATCHED}, queue
     )
     assert h.config.unknown_key_census == [], 'fixture precondition: census is clean'
 
@@ -302,8 +307,9 @@ async def test_escape_hatched_only_config_files_nothing(tmp_path: Path, monkeypa
     assert queue.get_pending() == []
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
-async def test_allowlist_resolves_a_previously_permanent_l2(tmp_path: Path, monkeypatch):
+async def test_allowlist_resolves_a_previously_permanent_l2(tmp_path: Path):
     """(b) RESOLVABILITY — the defect was that the L2 could never be cleared.
 
     File it from the pre-hatch census (those keys ARE unknown), then apply the
@@ -312,7 +318,7 @@ async def test_allowlist_resolves_a_previously_permanent_l2(tmp_path: Path, monk
     """
     queue = EscalationQueue(tmp_path / 'esc')
     # Before: no allowlist → the reify-owned keys are genuinely unknown.
-    h = _census_harness(tmp_path, monkeypatch, dict(_REIFY_HATCHED), queue)
+    h = _census_harness(tmp_path, dict(_REIFY_HATCHED), queue)
     assert len(h.config.unknown_key_census) == 3, h.config.unknown_key_census
     await h._file_config_unknown_keys_escalation()
     pending = _pending_config_l2s(queue)
@@ -338,8 +344,9 @@ def _write_census_yaml(tmp_path: Path, data: dict, name: str) -> Path:
     return p
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
-async def test_genuine_signal_survives_the_hatch(tmp_path: Path, monkeypatch):
+async def test_genuine_signal_survives_the_hatch(tmp_path: Path):
     """(c) SIGNAL PRESERVED — the hatch must not blind the census.
 
     A real unknown key alongside the allowlist still files exactly one born-at-L2,
@@ -348,7 +355,7 @@ async def test_genuine_signal_survives_the_hatch(tmp_path: Path, monkeypatch):
     """
     queue = EscalationQueue(tmp_path / 'esc')
     h = _census_harness(
-        tmp_path, monkeypatch,
+        tmp_path,
         {**_REIFY_ALLOWLIST, **_REIFY_HATCHED, 'warm_lane_pool': 6},
         queue,
     )
@@ -367,13 +374,14 @@ async def test_genuine_signal_survives_the_hatch(tmp_path: Path, monkeypatch):
         assert hatched not in esc.detail, f'excused key {hatched} must not be escalated'
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
-async def test_l2_detail_documents_the_escape_hatch(tmp_path: Path, monkeypatch):
+async def test_l2_detail_documents_the_escape_hatch(tmp_path: Path):
     """The L2 must be self-describing: an operator hitting it needs the opt-out
     written down, else it still dead-ends them."""
     queue = EscalationQueue(tmp_path / 'esc')
     h = _make_harness(
-        tmp_path, monkeypatch,
+        tmp_path,
         [ConfigUnknownKey('some_project_knob', None)],
         queue,
     )

@@ -1623,7 +1623,7 @@ def _merged_value(base: Any, ours: Any, theirs: Any) -> Any:
 
     Each side's own move stands, up or down, and a deletion stands unless the
     other side moved the entry (a modify/delete keeps the modification). Where
-    both sides moved one measure, the higher side bounds it.
+    both sides moved one measure, :func:`_both_moved_bound` bounds it.
     """
     if ours == base:
         return theirs
@@ -1633,7 +1633,25 @@ def _merged_value(base: Any, ours: Any, theirs: Any) -> Any:
         return theirs if ours is None else ours
     if isinstance(ours, dict) and isinstance(theirs, dict):
         return _merged_mapping(base if isinstance(base, dict) else {}, ours, theirs)
-    return max(ours, theirs, key=_magnitude)
+    return _both_moved_bound(base, ours, theirs)
+
+
+def _both_moved_bound(base: Any, ours: Any, theirs: Any) -> Any:
+    """The most a measure both sides moved can honestly hold.
+
+    That is the higher side, or both sides' moves composed over *base* where
+    that is higher: ``ours + theirs - base``, or for a name list the 3-way set
+    merge, whose absent *base* is the empty list. A count with no *base* has
+    nothing to compose over.
+    """
+    if isinstance(ours, list):
+        before, mine, other = set(base or ()), set(ours), set(theirs)
+        composed = sorted((mine & other) | (mine - before) | (other - before))
+    elif base is None:
+        return max(ours, theirs, key=_magnitude)
+    else:
+        composed = ours + theirs - base
+    return max(ours, theirs, composed, key=_magnitude)
 
 
 def _merged_mapping(base: dict, ours: dict, theirs: dict) -> dict:
@@ -1662,9 +1680,9 @@ def compare_merged_baseline_files(
 
     The bound is what git does to the file text, applied per measure against the
     merge *base*: a measure only one side moved stands at that side's value, up
-    or down, and one both sides moved is bounded by the higher side. An absent
-    *base* is the empty image git merges unrelated histories against, and an
-    absent parent moved nothing, so it stands in as the base.
+    or down, and one both sides moved is bounded by :func:`_both_moved_bound`.
+    An absent *base* is the empty image git merges unrelated histories against,
+    and an absent parent moved nothing, so it stands in as the base.
 
     NOT "clean against either parent": that admits keeping one side's stale
     value over the other side's lowering, which is an unrecorded widening on

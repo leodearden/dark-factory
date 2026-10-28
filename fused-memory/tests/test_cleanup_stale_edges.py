@@ -8,7 +8,12 @@ from _fm_helpers import extract_params, pydantic_spec
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
 from fused_memory.config.schema import FusedMemoryConfig
-from fused_memory.maintenance.cleanup_stale_edges import CleanupManager, CleanupResult, run_cleanup
+from fused_memory.maintenance.cleanup_stale_edges import (
+    CleanupManager,
+    CleanupResult,
+    EdgeOutsideWindowError,
+    run_cleanup,
+)
 
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.query_edges_by_time_range
@@ -254,6 +259,79 @@ class TestCleanupManager:
         assert result.edges_found == 0
         assert result.edges_deleted == 0
         backend.bulk_remove_edges.assert_not_called()
+
+
+_START = '2026-03-22T17:50:00'
+_END = '2026-03-22T18:15:00'
+
+
+def _edge(edge_uuid: str, valid_at: str | None) -> dict:
+    return {'uuid': edge_uuid, 'fact': 'f', 'name': 'n', 'valid_at': valid_at, 'invalid_at': None}
+
+
+def _manager_over(backend, edges: list[dict]) -> CleanupManager:
+    backend.query_edges_by_time_range = AsyncMock(return_value=edges)
+    backend.bulk_remove_edges = AsyncMock(return_value=len(edges))
+    return CleanupManager(backend, group_id='test')
+
+
+class TestCleanupRefusesEdgesOutsideTheWindow:
+    """Every returned uuid is deleted, so a read that strays outside the window is refused (task 7543)."""
+
+    @pytest.mark.asyncio
+    async def test_cleanup_deletes_nothing_when_the_read_returns_an_edge_after_the_window(
+        self, mock_config, make_backend,
+    ):
+        backend = make_backend(mock_config)
+        manager = _manager_over(backend, [
+            _edge('u1', '2026-03-22T17:51:00'),
+            _edge('u9', '2026-03-22T19:00:00'),
+        ])
+
+        with pytest.raises(EdgeOutsideWindowError) as excinfo:
+            await manager.cleanup(start=_START, end=_END)
+
+        backend.bulk_remove_edges.assert_not_awaited()
+        message = str(excinfo.value)
+        for expected in ('u9', '2026-03-22T19:00:00', _START, _END, 'test'):
+            assert expected in message
+
+    @pytest.mark.asyncio
+    async def test_dry_run_refuses_too(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+        manager = _manager_over(backend, [
+            _edge('u1', '2026-03-22T17:51:00'),
+            _edge('u9', '2026-03-22T19:00:00'),
+        ])
+
+        with pytest.raises(EdgeOutsideWindowError):
+            await manager.cleanup(start=_START, end=_END, dry_run=True)
+
+    @pytest.mark.parametrize('valid_at', ['2026-03-22T17:49:59', None])
+    @pytest.mark.asyncio
+    async def test_an_edge_before_start_or_without_valid_at_is_refused(
+        self, valid_at, mock_config, make_backend,
+    ):
+        backend = make_backend(mock_config)
+        manager = _manager_over(backend, [
+            _edge('u1', '2026-03-22T17:51:00'),
+            _edge('u0', valid_at),
+        ])
+
+        with pytest.raises(EdgeOutsideWindowError):
+            await manager.cleanup(start=_START, end=_END)
+
+        backend.bulk_remove_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_edges_on_either_bound_are_deleted(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+        manager = _manager_over(backend, [_edge('u-start', _START), _edge('u-end', _END)])
+
+        result = await manager.cleanup(start=_START, end=_END)
+
+        backend.bulk_remove_edges.assert_awaited_once_with(['u-start', 'u-end'], group_id='test')
+        assert result.edges_deleted == 2
 
 
 # ---------------------------------------------------------------------------

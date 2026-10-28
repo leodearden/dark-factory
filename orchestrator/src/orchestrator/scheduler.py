@@ -55,6 +55,7 @@ from orchestrator.config import (
     PsiAdmissionConfig,
     coerce_tier,
 )
+from orchestrator.delivered_check_owner import derive_check_owner
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.dependency_verdict import DepKind, DepState, deps_verdict, task_external_deps
 from orchestrator.event_store import EventStore, EventType
@@ -256,14 +257,34 @@ class SetTaskStatusRejected(Exception):
     the silent-WARNING-and-return behaviour must now wrap the call.
     """
 
-    def __init__(self, task_id: str, error_code: str, raw: str, message: str | None = None):
+    def __init__(
+        self,
+        task_id: str,
+        error_code: str,
+        raw: str,
+        message: str | None = None,
+        *,
+        old_status: str | None = None,
+        target_status: str | None = None,
+    ):
         self.task_id = task_id
         self.error_code = error_code
         self.raw = raw
+        self.old_status = old_status
+        self.target_status = target_status
         super().__init__(
             message
             or f'set_task_status({task_id!r}) rejected: {error_code} — {raw}'
         )
+
+    @property
+    def attempted_transition(self) -> str:
+        return f"{self.old_status or 'unknown'} -> {self.target_status or 'unknown'}"
+
+    @property
+    def row_already_terminal(self) -> bool:
+        """The refusal reports the row already terminal: the write lost a race, not a stuck row."""
+        return self.old_status in TERMINAL_STATUSES
 
 
 class TerminalExitRejection(SetTaskStatusRejected):
@@ -279,8 +300,6 @@ class TerminalExitRejection(SetTaskStatusRejected):
     """
 
     def __init__(self, task_id: str, old_status: str, target_status: str, raw: str):
-        self.old_status = old_status
-        self.target_status = target_status
         super().__init__(
             task_id=task_id,
             error_code='terminal_exit_rejected',
@@ -289,6 +308,8 @@ class TerminalExitRejection(SetTaskStatusRejected):
                 f'set_task_status({task_id!r}, {target_status!r}) refused: '
                 f'task is currently {old_status!r} (terminal-exit gate)'
             ),
+            old_status=old_status,
+            target_status=target_status,
         )
 
 
@@ -311,6 +332,7 @@ class DoneGateRejection(SetTaskStatusRejected):
                 f'set_task_status({task_id!r}, "done") refused: '
                 f'phantom-done gate — missing files: {missing_files!r}'
             ),
+            target_status='done',
         )
 
 
@@ -331,6 +353,7 @@ class ProvenanceValidationRejection(SetTaskStatusRejected):
                 f'set_task_status({task_id!r}, "done") refused: '
                 f'{error_code} — {raw}'
             ),
+            target_status='done',
         )
 
 
@@ -374,6 +397,7 @@ class StaleEvidenceRejection(SetTaskStatusRejected):
                 f'done_evidence_stale — evidence {evidence_commit!r} '
                 f'({evidence_committed_at}) predates reopen_at {reopen_at!r}'
             ),
+            target_status='done',
         )
 
 
@@ -769,6 +793,10 @@ def _build_delivered_check_escalation(
     field comes from ``shared.capability_manifest.CHECK_SUBJECT_FIELD``,
     so a new check kind never renders a field its descriptor lacks.
 
+    Renders the failure only. The check's owner, declaration sites, remedy and
+    re-pend line are appended at filing time by
+    ``orchestrator/delivered_check_owner.py::render_check_owner``.
+
     Pure rendering — no side effects, no scheduler state.
     """
     name = check.get('name')
@@ -795,10 +823,6 @@ def _build_delivered_check_escalation(
     lines.append(f'paths: {check.get("paths", [])}')
     lines.append(f'expect: {check.get("expect")}')
     lines.append('observed: FAILED')
-    lines.append(
-        f'Blocked dependents are NOT auto-re-pended — set task {task_id} back '
-        f'to pending after the capability lands on main.'
-    )
     detail = '\n'.join(lines)
     return summary, detail
 
@@ -3399,6 +3423,11 @@ class Scheduler:
                     if isinstance(structured, dict)
                     else ''
                 )
+                from_status = (
+                    str(structured['from_status'])
+                    if isinstance(structured, dict) and structured.get('from_status')
+                    else None
+                )
                 if error_code == 'terminal_exit_rejected':
                     # Terminal classification reuses the shared TERMINAL_STATUSES
                     # set (imported above) rather than a separate local copy.
@@ -3410,8 +3439,7 @@ class Scheduler:
                         return
                     raise TerminalExitRejection(
                         task_id=task_id,
-                        old_status=str(structured.get('from_status', ''))
-                        if isinstance(structured, dict) else '',
+                        old_status=from_status or '',
                         target_status=status,
                         raw=rejection,
                     )
@@ -3464,6 +3492,8 @@ class Scheduler:
                     task_id=task_id,
                     error_code=error_code or 'unknown',
                     raw=rejection,
+                    old_status=from_status,
+                    target_status=status,
                 )
             logger.info(
                 'set_task_status(%s, %s) transient rejection '
@@ -4532,6 +4562,15 @@ class Scheduler:
         if check is None:
             check = {'name': check_name, 'kind': detail.get('kind')}
         dep_status = status_map.get(dep_id, 'unknown')
+        owner = (
+            derive_check_owner(
+                dep_id=dep_id,
+                dep_metadata=dep_task.get('metadata') or {},
+                check_name=check_name,
+            )
+            if isinstance(check_name, str) and check_name
+            else None
+        )
         summary, esc_detail = _build_delivered_check_escalation(
             task_id=task_id,
             dep_id=dep_id,
@@ -4546,6 +4585,8 @@ class Scheduler:
                     summary=summary,
                     detail=esc_detail,
                     category='dependency_capability',
+                    check=check,
+                    owner=owner,
                 )
             except Exception:
                 logger.warning(

@@ -957,6 +957,9 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.middleware.candidate_key_escalation import (  # noqa: PLC0415
         _ANCHOR_TASK_ID as CANDIDATE_KEY_ANCHOR,
     )
+    from fused_memory.middleware.curator_escalator import (
+        _ANCHOR_TASK_ID as CURATOR_ANCHOR,
+    )
     from fused_memory.middleware.entity_mint_storm_escalator import (  # noqa: PLC0415
         _ANCHOR_TASK_ID as ENTITY_MINT_ANCHOR,
     )
@@ -974,6 +977,9 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     )
     from fused_memory.middleware.scope_violation_escalator import (
         _OVERRIDE_ANCHOR_TASK_ID as SCOPE_OVERRIDE_ANCHOR,
+    )
+    from fused_memory.middleware.ticket_janitor import (
+        _ANCHOR_TASK_ID as TICKET_JANITOR_ANCHOR,
     )
     from fused_memory.middleware.ticket_janitor import (
         curation_backlog_anchor,
@@ -1051,17 +1057,26 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         'scope_violation_escalator': SCOPE_VIOLATION_ANCHOR,
         'scope_violation_escalator override': SCOPE_OVERRIDE_ANCHOR,
         'scope_violation_escalator budget-misconfig': SCOPE_BUDGET_ANCHOR,
+        # -- the curator-subsystem filers. Plain `queue.submit`, and a SUBJECT
+        #    anchor (the curator bucket) rather than a dedupe anchor. --------
+        'curator_escalator': CURATOR_ANCHOR,
+        'ticket_janitor curator-bucket': TICKET_JANITOR_ANCHOR,
     }
 
 
-#: The ONE pair that is deliberately the same value, asserted equal rather than
+#: The pairs that are deliberately the same value, asserted equal rather than
 #: excluded silently. `markup_guard` hands its residue records to
 #: `markup_tripwire.emit_markup_residue_escalation`, so both spell the SAME
-#: anchor for the SAME record kind. Two homes for one value is a lockstep
-#: hazard in the other direction — renaming one would split the series in half
-#: without any test noticing — so the pair is pinned EQUAL below.
+#: anchor for the SAME record kind. The curator pair is one SUBJECT anchor,
+#: 'task-curator': the curator-subsystem bucket operators query by task id.
+#: Neither of those filers dedupes on a pending anchor, so sharing cannot
+#: suppress either one. Two homes for one value is a lockstep hazard in the
+#: other direction — renaming one would split the series (or the curator
+#: history) in half without any test noticing — so each pair is pinned EQUAL
+#: below.
 _DELIBERATE_ALIASES: tuple[tuple[str, str], ...] = (
     ('markup_tripwire residue', 'markup_guard residue'),
+    ('curator_escalator', 'ticket_janitor curator-bucket'),
 )
 
 
@@ -1138,12 +1153,14 @@ class TestNoTwoFilersShareAnAnchor:
             'link_heal misfile-share',
             'link_heal corrects-share',
             'link_heal adjudicator',
+            'curator_escalator',
+            'ticket_janitor curator-bucket',
         ):
             assert required in anchors, (
                 f'{required!r} files into the same queue but is absent from '
                 'the anchor sweep'
             )
-        assert len(anchors) >= 20, (
+        assert len(anchors) >= 25, (
             f'the sweep shrank to {len(anchors)} entries; a filer was dropped '
             'rather than renamed'
         )

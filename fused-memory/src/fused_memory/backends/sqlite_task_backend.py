@@ -33,6 +33,7 @@ from shared.defects import (
     DeclareEvent,
     OutcomeEvent,
 )
+from shared.elision import elide_at_word
 from shared.project_id import normalize_project_id
 from shared.project_layout import tasks_db
 from shared.sqlite_column_migration import add_column_if_missing
@@ -171,6 +172,8 @@ CREATE TABLE IF NOT EXISTS id_counters (
 """
 
 DEFAULT_TAG = 'master'
+
+_PROMPT_TITLE_MAX = 200
 
 # Sentinel distinguishing "leave the claimant column untouched" (default) from
 # "clear it to NULL" (explicit None). Module-level and private — never
@@ -3174,14 +3177,11 @@ class SqliteTaskBackend:
                 f'{sorted(s.value for s in _VALID_STATUSES)}.',
             )
 
-        # SqliteTaskBackend has no LLM — derive title/description from prompt
-        # when the caller only supplied a prompt. The first non-empty line is
-        # the title; the full text is the description.
         if not title and prompt:
             for line in prompt.splitlines():
                 stripped = line.strip()
                 if stripped:
-                    title = stripped[:200]
+                    title = elide_at_word(stripped, _PROMPT_TITLE_MAX)
                     break
             description = description or prompt
         if not title:

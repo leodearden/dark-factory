@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 from shared.cli_invoke import _SubprocessResult
 from shared.invocation_outcome import CapHit, Failure, classify_invocation
+from shared.process_cost import ProcessCostBasis
 
 from orchestrator.agents.invoke import (
     _estimate_cost,
@@ -80,6 +81,7 @@ class TestParseGeminiValidStats:
         # gemini-3-flash: input=0.075/1M, output=0.30/1M
         # cost = (100 * 0.075 + 50 * 0.30) / 1_000_000 = 0.0000225
         assert agent_result.cost_usd > 0.0
+        assert agent_result.cost_basis is ProcessCostBasis.USAGE_ESTIMATE
 
 
 class TestParseCodexNullUsage:
@@ -136,6 +138,7 @@ class TestParseCodexValidUsage:
         # o4-mini: input=1.10/1M, output=4.40/1M
         # cost = (200 * 1.10 + 100 * 4.40) / 1_000_000 = 0.00066
         assert agent_result.cost_usd > 0.0
+        assert agent_result.cost_basis is ProcessCostBasis.USAGE_ESTIMATE
 
 
 class TestParseCodexOutputConfigPrices:
@@ -790,6 +793,7 @@ class TestParsePiCostFallback:
         )
         assert agent_result.success is True
         assert agent_result.cost_usd == pytest.approx((400 * 100.0 + 200 * 100.0) / 1_000_000)
+        assert agent_result.cost_basis is ProcessCostBasis.USAGE_ESTIMATE
 
     def test_zero_native_cost_falls_back_to_price_table(self):
         """`cost.total`==0.0 (present but zero) is treated the same as
@@ -801,6 +805,7 @@ class TestParsePiCostFallback:
             prices={'o4-mini': {'input_per_1m': 100.0, 'output_per_1m': 100.0}},
         )
         assert agent_result.cost_usd == pytest.approx((400 * 100.0 + 200 * 100.0) / 1_000_000)
+        assert agent_result.cost_basis is ProcessCostBasis.USAGE_ESTIMATE
 
     def test_nonzero_native_cost_wins_over_price_table(self):
         """`cost.total` present and >0 -> the native value is used verbatim;
@@ -813,6 +818,7 @@ class TestParsePiCostFallback:
             prices={'o4-mini': {'input_per_1m': 100.0, 'output_per_1m': 100.0}},
         )
         assert agent_result.cost_usd == pytest.approx(0.01234)
+        assert agent_result.cost_basis is ProcessCostBasis.REPORTED
 
 
 class TestWritePiMcpConfig:

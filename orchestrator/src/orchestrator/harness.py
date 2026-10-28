@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import contextlib
 import errno
@@ -12,7 +11,6 @@ import itertools
 import json
 import logging
 import os
-import re
 import time
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -23,6 +21,8 @@ from typing import IO, TYPE_CHECKING, Any, ClassVar, cast
 
 from escalation.categories import EscalationCategory
 from escalation.classify import is_done_step_commit_orphan
+from escalation.disposition import ExitKind
+from escalation.models import DeliveredCheckOwner, Escalation
 from escalation.pins import classify_pins
 from shared import delivered_check_polarity
 from shared.asyncio_tasks import abandon_task
@@ -33,6 +33,7 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
+from shared.elision import elide_at_word
 from shared.eval_lane import eval_lane_provenance
 from shared.loop_stall import LoopStallMonitor
 from shared.mcp_envelope import resolver_failed
@@ -57,8 +58,8 @@ from shared.transcript_archive import (
     set_archival_failure_hook,
 )
 
+from orchestrator import delivered_check_owner, recovery_pins, recut_ruling
 from orchestrator import digest as digest_mod
-from orchestrator import recovery_pins, recut_ruling
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
@@ -95,6 +96,7 @@ from orchestrator.deterministic_runner import (
     DeterministicRunner,
     build_milestone_gate_escalation_fields,
 )
+from orchestrator.escalation_router import InfoL0Sweep, RouterPorts, read_hold, router_owns
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.flake_debt_drain import DRAIN_INTERVAL_SECS, run_drain_pass
 from orchestrator.flake_ledger import ledger_db_path
@@ -162,7 +164,6 @@ from orchestrator.scheduler import (
     SchedulerCallbacks,
     SetTaskStatusRejected,
     StaleEvidenceRejection,
-    TerminalExitRejection,
 )
 from orchestrator.service_restart import (
     FLEET_DEPLOY_CLOCK_RELPATH,
@@ -228,8 +229,6 @@ from orchestrator.zero_progress_requeue import (
 )
 
 if TYPE_CHECKING:
-    from escalation.models import Escalation
-
     from orchestrator.merge_lane.worker import (
         BreakerTrip,
         SpeculativeMergeWorker,
@@ -416,6 +415,8 @@ _AUTO_EVAL_EXCLUDED_BLOCK_CATEGORIES: frozenset[str] = frozenset(
     {'wip_conflict', 'infra_issue', 'branch_reset'},
 )
 
+_REDO_TITLE_MAX = 200
+
 # Grace period added to the watcher rotation timeout on top of
 # watcher_rotation_hours*3600.  Gives the agent time to emit its digest and
 # exit cleanly before the supervisor kills it with a SIGTERM timeout.
@@ -521,7 +522,8 @@ _IDLE_POLL_LOG_SECS: float = 180.0
 # Allowed and disallowed tools for the escalation-watcher-auto rotation.
 # Scoped to what escalation triage actually needs: file reads, foreground
 # escalation.watcher subprocess, safe git reads, and the MCP tools for
-# autonomous dispatch (update_task, add_dependency, resolve_issue).
+# autonomous dispatch (update_task, add_dependency, resolve_issue), plus the
+# submit_task/resolve_ticket filing pair.
 # Defence-in-depth mirrors the unblock-auto precedent (dry_run_unblock.py).
 #
 # NOTE — this allowlist is ADVISORY, not the durable enforcement boundary.
@@ -569,12 +571,16 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     # pending L1/L2 it assessed (task 2555) so future rotations can skip
     # re-deriving the same disposition every rotation.
     'mcp__escalation__stamp_triage',
-    # Fused-memory MCP: read + autonomous dispatch (scope_violation/dependency/cleanup)
+    # Fused-memory MCP: read + autonomous dispatch (scope_violation/dependency/cleanup) + filing
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
     'mcp__fused-memory__search',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__add_dependency',
+    # Convert-to-tracked-work filing (task 3726): submit_task files the
+    # candidate; resolve_ticket waits for the task id the resolution cites.
+    'mcp__fused-memory__submit_task',
+    'mcp__fused-memory__resolve_ticket',
 ]
 # Connection-capability headers for the escalation-watcher-auto rotation's
 # escalation MCP connection (plans/escalation-connection-capability-guard-prd.md
@@ -5759,19 +5765,16 @@ class Harness:
                     tid, status, mid_run=mid_run, tally=tally,
                 )
             except SetTaskStatusRejected as exc:
-                # Persistence layer refused our write — escalate directly
-                # (task 2243, W10-θ2 step-14: the per-tid strike counter and
-                # its MAX_RECONCILE_FAILURES threshold gate are retired; a
-                # persistent rejection is now surfaced loudly on the sweep
-                # it occurs, not tallied toward a threshold first).  Honest
-                # log so future operators can see *why* the task is still
-                # stranded instead of the old "marked done" misnomer.
-                # Other (unexpected) exception types intentionally propagate
-                # so bugs in the sweep surface rather than being silently
-                # skipped.
+                # Persistence layer refused a recovery write (mark-done or the
+                # pending revert) — escalate directly (task 2243, W10-θ2
+                # step-14: the per-tid strike counter is retired).  The log
+                # names the transition the refused write attempted.  Other
+                # (unexpected) exception types intentionally propagate so bugs
+                # in the sweep surface rather than being silently skipped.
                 logger.error(
-                    '%s: failed to mark task %s done — %s: %s',
-                    log_prefix, tid, exc.error_code, exc.raw,
+                    '%s: reconcile write refused for task %s (%s) — %s: %s',
+                    log_prefix, tid, exc.attempted_transition,
+                    exc.error_code, exc.raw,
                 )
                 if self._escalation_queue:
                     self._escalate_reconcile_failure(tid, exc)
@@ -7085,10 +7088,9 @@ class Harness:
         """Revert a stranded in-progress task to pending (REVERT_TO_PENDING applier).
 
         Returns ``'reverted'`` (status flipped to pending) or ``None`` (left
-        intact — the sole remaining early-return is the infra-held
-        non-degenerate branch guard below; task 2763 removed the
-        unreadable-lock fail-closed early-return along with the worktree
-        plan.lock read that produced it).
+        intact: the infra-held non-degenerate branch guard below, or the row
+        was already terminal at the live status re-read just before the write,
+        or by the time the write reached the server).
 
         Callers only reach this on the REVERT_TO_PENDING action:
         ``TaskGroundTruth.recovery_for``'s ``live_claimant`` resolution has
@@ -7244,7 +7246,25 @@ class Harness:
         # exist; the suppress + missing_ok keep it a harmless no-op then.
         with contextlib.suppress(OSError):
             lock_path.unlink(missing_ok=True)
-        await self.scheduler.clear_claim_then_set_status(tid, 'pending')
+        live_status = await self.scheduler.get_status(tid)
+        if live_status in TERMINAL_STATUSES:
+            logger.info(
+                'Reconcile: task %s is already %s — skipping the stale pending '
+                'revert (status snapshot predates it)',
+                tid, live_status,
+            )
+            return None
+        try:
+            await self.scheduler.clear_claim_then_set_status(tid, 'pending')
+        except SetTaskStatusRejected as exc:
+            if not exc.row_already_terminal:
+                raise
+            logger.info(
+                'Reconcile: task %s went terminal between the live re-read and '
+                'the write — pending revert refused (%s); nothing to recover',
+                tid, exc.attempted_transition,
+            )
+            return None
         logger.info(
             'Reconcile: reverted task %s to pending', tid
         )
@@ -7407,12 +7427,13 @@ class Harness:
     ) -> None:
         """Submit an L1 escalation for a persistent reconcile failure.
 
-        Fired directly on every ``mark_done`` rejection the reconcile sweep
-        observes for *tid* (task 2243, W10-θ2 step-14 — the per-tid strike
-        counter and its ``MAX_RECONCILE_FAILURES`` threshold gate are
-        retired): the persistence layer contradicts a branch-on-main
-        observation, which is L1-worthy on its own without waiting for a
-        run of consecutive sweeps to confirm it.
+        Fired directly on every recovery-write rejection the reconcile sweep
+        observes for *tid* — a mark-done on landing evidence or the pending
+        revert of a stranded task (task 2243, W10-θ2 step-14 — the per-tid
+        strike counter and its ``MAX_RECONCILE_FAILURES`` threshold gate are
+        retired): the persistence layer refusing the sweep's recovery is
+        L1-worthy on its own without waiting for a run of consecutive sweeps
+        to confirm it.
         """
         if not self._escalation_queue:
             return
@@ -7424,17 +7445,20 @@ class Harness:
             agent_role='harness-reconcile',
             severity='blocking',
             category='reconcile_persistent_rejection',
-            summary=f'Reconcile sweep failed to mark task {tid} done'[:200],
+            summary=(
+                f'Reconcile sweep write refused for task {tid}: '
+                f'{exc.attempted_transition}'
+            )[:200],
             detail=(
-                f'set_task_status(done) rejected by fused-memory for task '
-                f'{tid}.\n\n'
+                f'Reconcile sweep write for task {tid} was refused by '
+                f'fused-memory.\n\n'
+                f'attempted transition: {exc.attempted_transition}\n'
                 f'error_code: {exc.error_code}\n'
                 f'raw: {exc.raw}\n\n'
-                f'The branch was observed on main (or a merge marker was '
-                f'found) but the persistence layer refuses the transition. '
-                f'Manual investigation required — the row may carry stale '
-                f'metadata.files or the done_provenance ancestor check may '
-                f'be failing.'
+                f"The sweep's recovery write (mark-done on landing evidence, "
+                f'or revert-to-pending of a stranded task) was refused by the '
+                f'persistence layer; the error_code and raw rejection above '
+                f'name the gate that refused it. Manual investigation required.'
             ),
             suggested_action='investigate_persistence_layer_rejection',
             filing_claimant_run_id=self._filing_claimant_run_id,
@@ -7468,8 +7492,8 @@ class Harness:
         NON-transient rejections, so an exception reaching this caller is by
         construction post-retry and a caller-level re-retry would be dead code.
 
-        Carve-out: a :class:`TerminalExitRejection` whose ``old_status`` is
-        terminal is a legitimately-finished row, not a hold.  Nothing is stuck
+        Carve-out: a rejection whose ``row_already_terminal`` holds is a
+        legitimately-finished row, not a hold.  Nothing is stuck
         and nobody needs to investigate, so it is logged at INFO and NOT filed —
         filing there would be pure noise on a common, benign race.
 
@@ -7487,7 +7511,7 @@ class Harness:
         fire-and-forget, so an exception escaping here would surface only as an
         unretrieved-task-exception at GC time — i.e. be lost.
         """
-        if isinstance(exc, TerminalExitRejection) and exc.old_status in TERMINAL_STATUSES:
+        if isinstance(exc, SetTaskStatusRejected) and exc.row_already_terminal:
             logger.info(
                 'cascade-unblock: resume of task %s to %r refused because the row '
                 'is already %s — legitimately finished out of band, not a hold; '
@@ -8405,58 +8429,8 @@ class Harness:
 
     # ── task 3500: authoring-defect diagnosis for a failed delivered check ──
 
-    #: Recovers the failed check's descriptor from the detail
-    #: ``scheduler._build_delivered_check_escalation`` renders. Parsing a
-    #: rendered string is not the shape anyone would choose — the descriptor
-    #: exists as a dict three frames up — but the ``on_delivered_check_block``
-    #: callback's signature is ``(task_id, *, summary, detail, category)`` and
-    #: widening it means editing ``scheduler.py``, which is outside task 3500's
-    #: lock scope. The coupling is filed as a follow-up; until then this is
-    #: deliberately total-or-nothing (any shape it does not recognise yields
-    #: None -> no diagnosis), and its only consumer is best-effort, so a format
-    #: drift costs the enhancement and never the escalation.
-    _DELIVERED_CHECK_DETAIL_RE = re.compile(
-        r"^Delivered check '(?P<name>[^']*)' \(kind=(?P<kind>[^)]*)\)", re.MULTILINE
-    )
-    _DELIVERED_CHECK_FIELD_RE = re.compile(
-        r'^(?P<key>pattern|paths|expect): (?P<value>.*)$', re.MULTILINE
-    )
-
-    @classmethod
-    def _parse_delivered_check_detail(cls, detail: str) -> dict | None:
-        """Recover ``{name, kind, pattern, expect, paths}`` from *detail*.
-
-        Returns None for anything it does not fully recognise — a grep check
-        without a pattern cannot be linted, and guessing at a half-parsed
-        descriptor would produce a diagnosis about a check nobody authored.
-        """
-        head = cls._DELIVERED_CHECK_DETAIL_RE.search(detail or '')
-        if head is None:
-            return None
-        fields = {
-            m.group('key'): m.group('value')
-            for m in cls._DELIVERED_CHECK_FIELD_RE.finditer(detail)
-        }
-        pattern = fields.get('pattern')
-        if not pattern or pattern == 'None':
-            return None
-        try:
-            # `paths` is rendered as a Python list repr by the escalation
-            # builder; literal_eval, never eval — this string reaches us from
-            # task metadata an agent authored.
-            paths = ast.literal_eval(fields.get('paths') or '[]')
-        except (ValueError, SyntaxError):
-            paths = []
-        return {
-            'name': head.group('name'),
-            'kind': head.group('kind'),
-            'pattern': pattern,
-            'expect': fields.get('expect'),
-            'paths': list(paths) if isinstance(paths, list) else [],
-        }
-
-    def _diagnose_delivered_check_authoring(self, detail: str) -> str | None:
-        """An ``AUTHORING DIAGNOSIS`` block for *detail*, or None if clean.
+    def _diagnose_delivered_check_authoring(self, check: dict[str, Any]) -> str | None:
+        """An ``AUTHORING DIAGNOSIS`` block for the failed *check*, or None if clean.
 
         THE POINT OF TASK 3500. ``DEP_CAPABILITY_NOT_DELIVERED`` reads
         identically whether the check is mis-authored or the capability
@@ -8466,7 +8440,8 @@ class Harness:
         actually reads the record.
 
         ONLY ``severity='reject'`` findings are surfaced, which in practice
-        means ``filename_shaped``. The exclusions are deliberate:
+        means ``filename_shaped``, ``removed_path`` and
+        ``shim_path``. The exclusions are deliberate:
 
         * The ``vacuous_*`` codes are unreachable on this path by
           construction — they fire on a check that PASSES, and we are here
@@ -8478,13 +8453,10 @@ class Harness:
           confident-sounding diagnosis built on data we do not have is worse
           than none, because the reader cannot tell it is unfounded.
         """
-        parsed = self._parse_delivered_check_detail(detail)
-        if parsed is None:
-            return None
         findings = [
             f
             for f in delivered_check_polarity.lint_delivered_checks(
-                [parsed],
+                [check],
                 files=None,
                 repo_root=self.config.project_root,
                 # The same tree the gate itself evaluated against, so the
@@ -8511,6 +8483,8 @@ class Harness:
         summary: str,
         detail: str,
         category: str,
+        check: dict[str, Any] | None = None,
+        owner: DeliveredCheckOwner | None = None,
     ) -> None:
         """Block a task and file a BORN-AT-L2 escalation for a delivered
         check that has FAILED for ``delivered_checks.grace_cycles``
@@ -8590,22 +8564,46 @@ class Harness:
         # nothing else. Runs AFTER the dedupe read so it can neither trigger a
         # second file nor change what the existing one matches on, and in a
         # worker thread because the lint shells out to git.
-        try:
-            diagnosis = await asyncio.to_thread(
-                self._diagnose_delivered_check_authoring, detail
-            )
-        except Exception:
-            logger.warning(
-                'Delivered-check block for task %s — authoring diagnosis '
-                'failed; filing the escalation undiagnosed',
-                task_id,
-                exc_info=True,
-            )
-            diagnosis = None
-        if diagnosis:
-            detail = f'{detail}\n{diagnosis}'
+        diagnosis = None
+        if check is not None:
+            try:
+                diagnosis = await asyncio.to_thread(
+                    self._diagnose_delivered_check_authoring, check
+                )
+            except Exception:
+                logger.warning(
+                    'Delivered-check block for task %s — authoring diagnosis '
+                    'failed; filing the escalation undiagnosed',
+                    task_id,
+                    exc_info=True,
+                )
 
-        from escalation.models import Escalation
+        # Task 7514: resolve whether the owner's sidecar declares the check on
+        # main. Best-effort in the same way, and keeping the derived owner on
+        # failure so `task_id` is always present.
+        if owner is not None:
+            try:
+                owner = await asyncio.to_thread(
+                    delivered_check_owner.verify_check_owner,
+                    owner,
+                    project_root=self.config.project_root,
+                )
+            except Exception:
+                logger.warning(
+                    'Delivered-check block for task %s — owner sidecar '
+                    'verification failed; filing with the derived owner',
+                    task_id,
+                    exc_info=True,
+                )
+        detail = '\n'.join(
+            part
+            for part in (
+                detail,
+                diagnosis,
+                delivered_check_owner.render_check_owner(owner, dependent_id=task_id),
+            )
+            if part
+        )
 
         esc = Escalation(
             id=self._escalation_queue.make_id(task_id),
@@ -8615,12 +8613,13 @@ class Harness:
             category=category,
             # `summary` is deliberately UNTOUCHED: it is truncated to 200
             # chars and existing e2e tests assert its contents, so the
-            # diagnosis is additive to `detail` alone.
+            # diagnosis and the owner block are additive to `detail` alone.
             summary=summary[:200],
             detail=detail,
             suggested_action='manual_intervention',
             level=2,
             filing_claimant_run_id=self._filing_claimant_run_id,
+            delivered_check_owner=owner,
         )
         self._escalation_queue.submit(esc)
         logger.warning(
@@ -11249,14 +11248,14 @@ class Harness:
             'files': sanitize_files_for_persist(task_metadata.get('files') or []),
         }
 
-        title = (
-            f'[auto-eval redo] {assignment.task.get("title", "")}'
-        )[:200]
+        original_title = str(assignment.task.get('title') or '')
+        title = elide_at_word(f'[auto-eval redo] {original_title}', _REDO_TITLE_MAX)
         description = (
             f'Automated full-architect redo of task {original_id} '
             f'(blocked at phase={report.block_phase} via optimistic path '
             f'{optimistic_path!r}). Original branch+worktree are renamed to '
             f'{new_branch} for forensic comparison once this redo is released.'
+            f'\n\nOriginal title: {original_title}'
         )
 
         outcome = await self.scheduler.submit_task({
@@ -11400,46 +11399,6 @@ class Harness:
             len(cancellable_redo_ids), cancellable_redo_ids,
         )
 
-    async def _trailing_24h_fetch_one(
-        self,
-        sql: str,
-        leading_params: tuple = (),
-        *,
-        label: str,
-    ) -> tuple | None:
-        """Execute an arbitrary trailing-24h aggregate query and return the first row.
-
-        ``sql`` must be a full SELECT ending with ``... completed_at >= ?`` (the
-        cutoff is appended internally as the LAST parameter).  ``leading_params``
-        are passed in front of the cutoff in the same order.
-
-        Fail-open: returns None when ``cost_store is None`` or when any
-        exception is raised by ``_require_conn()`` / cursor execute / fetchone.
-        Callers MUST treat None as "skip / assume zero" — dispatch must
-        never be blocked by a transient cost-DB error.  The ``label`` is used
-        only in the warning log.
-        """
-        if not sql.rstrip().endswith('completed_at >= ?'):
-            raise ValueError(
-                '_trailing_24h_fetch_one: sql must end with "completed_at >= ?" '
-                f'(got {sql[:80]!r})'
-            )
-        if self.cost_store is None:
-            return None
-        cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
-        try:
-            conn = self.cost_store._require_conn()  # type: ignore[attr-defined]
-            cur = await conn.execute(sql, (*leading_params, cutoff))
-            row = await cur.fetchone()
-            await cur.close()
-            return tuple(row) if row is not None else None
-        except Exception as exc:  # noqa: BLE001 — never block dispatch on this
-            logger.warning(
-                '%s: trailing-24h cost query failed (%s) — fail-open',
-                label, exc,
-            )
-            return None
-
     async def _auto_eval_budget_used_24h(self) -> float:
         """Sum cost_usd from invocations table for known auto-eval redo
         task_ids in the trailing 24h.
@@ -11448,16 +11407,21 @@ class Harness:
         because auto-eval is rollout instrumentation that will be sunset
         once metrics stabilise.
         """
-        if not self._auto_eval_redo_task_ids:
+        if not self._auto_eval_redo_task_ids or self.cost_store is None:
             return 0.0
-        placeholders = ','.join('?' for _ in self._auto_eval_redo_task_ids)
-        row = await self._trailing_24h_fetch_one(
-            f'SELECT COALESCE(SUM(cost_usd), 0.0) FROM invocations '
-            f'WHERE task_id IN ({placeholders}) AND completed_at >= ?',
-            tuple(self._auto_eval_redo_task_ids),
-            label='auto_eval_budget_used_24h',
-        )
-        return float(row[0]) if row and row[0] is not None else 0.0
+        since = datetime.now(UTC) - timedelta(hours=24)
+        try:
+            return await self.cost_store.tasks_invocation_cost(
+                self.config.fused_memory.project_id,
+                frozenset(self._auto_eval_redo_task_ids),
+                since=since,
+            )
+        except Exception as exc:  # noqa: BLE001 — never block dispatch on this
+            logger.warning(
+                '_auto_eval_budget_used_24h: trailing-24h cost query failed (%s) — fail-open',
+                exc,
+            )
+            return 0.0
 
     async def _enforce_cost_ceilings(self) -> None:
         """Check daily cost ceilings and pause the scheduler on breach.
@@ -13169,9 +13133,16 @@ class Harness:
         L0 with a parked workflow can never age out there.  The origin strand
         esc-5189-7 sat pending 20h58m for exactly that reason — a workflow WAS
         attending it — and then this sweep closed it as ordinary restart noise.
+
+        Info notes the info-L0 router owns are routed first, never dismissed
+        unread (plans/info-l0-disposition-router-prd.md boundary #16): a held
+        or still-unrouted one survives the sweep for the orphan reaper, and
+        none is counted as a strand.
         """
         if self._escalation_queue is None:
             return
+
+        await self._route_info_l0s_across_restart(self._escalation_queue)
 
         threshold = self.config.orphan_l0_timeout_secs
         strands = self._snapshot_stale_l0_strands(threshold)
@@ -13180,7 +13151,7 @@ class Harness:
             'Auto-dismissed: orchestrator restarted — stale from prior run'
         )
         count = self._escalation_queue.dismiss_all_pending(
-            resolution, strand_age_secs=threshold
+            resolution, strand_age_secs=threshold, keep=self._router_owns,
         )
         if count:
             logger.info(
@@ -13194,6 +13165,34 @@ class Harness:
             self._report_stale_l0_strands(strands)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning(f'Failed to report stale L0 strand telemetry: {e}')
+
+    async def _route_info_l0s_across_restart(self, queue: EscalationQueue) -> None:
+        """One startup-amnesty router pass: finish held notes, route the rest.
+
+        A router failure never aborts startup; the notes it left pending are
+        kept by the sweep for the orphan reaper.
+        """
+        try:
+            sweep = InfoL0Sweep(
+                self._router_ports(queue), by='startup-amnesty',
+                max_conversions=self.config.info_l0_router_max_conversions_per_sweep,
+            )
+            now = datetime.now(UTC)
+            for esc in queue.get_pending():
+                if not self._router_owns(esc):
+                    continue
+                hold = read_hold(esc)
+                if hold is None:
+                    await sweep.route(esc, exit_kind=ExitKind.RESTART)
+                else:
+                    await sweep.finish_hold(
+                        esc, hold, now=now,
+                        timeout_secs=self.config.info_l0_router_ticket_timeout_secs,
+                        exit_kind=ExitKind.RESTART,
+                    )
+            sweep.close()
+        except Exception:
+            logger.exception('info-l0-router: the startup amnesty pass failed')
 
     def _snapshot_stale_l0_strands(self, threshold_secs: float) -> list[dict[str, Any]]:
         """Per-record detail for the L0s about to be swept as strands.
@@ -13220,7 +13219,7 @@ class Harness:
         try:
             now = datetime.now(UTC)
             for esc in self._escalation_queue.get_pending():
-                if esc.level != 0:
+                if esc.level != 0 or self._router_owns(esc):
                     continue
                 # fallback=datetime.max — same sentinel direction as the queue
                 # side, so an unparseable timestamp is never mistaken for a
@@ -14162,6 +14161,20 @@ class Harness:
             self._escalation_task = None
             logger.info('Escalation server stopped')
 
+    def _router_ports(self, queue: EscalationQueue) -> RouterPorts:
+        """The I/O the info-L0 router may touch from the harness."""
+        return RouterPorts(
+            queue=queue,
+            event_store=self.event_store,
+            dispatch_tool=self.scheduler.dispatch_tool,
+            project_root=str(self.config.project_root),
+            filing_claimant_run_id=self._filing_claimant_run_id,
+        )
+
+    def _router_owns(self, esc: Escalation) -> bool:
+        """True when the info-L0 router is *esc*'s consumer under the live config."""
+        return router_owns(esc, enabled=self.config.info_l0_router_enabled)
+
     #: "not read yet", distinguishable from a genuine ``get_task`` -> ``None``
     #: (no such row).  Scoped to :meth:`_reap_orphan_l0_escalations`'s per-record
     #: memo, whose whole point is that ONE record costs at most ONE task read.
@@ -14196,6 +14209,10 @@ class Harness:
         timeout = self.config.orphan_l0_timeout_secs
         now = datetime.now(UTC)
         promoted = 0
+        router = InfoL0Sweep(
+            self._router_ports(self._escalation_queue), by='orphan-reaper',
+            max_conversions=self.config.info_l0_router_max_conversions_per_sweep,
+        )
 
         for esc in self._escalation_queue.get_pending():
             if esc.level != 0:
@@ -14222,6 +14239,18 @@ class Harness:
                 logger.info(
                     'Orphan L0 reaper: dismissed eval-lane orphan for task_id=%s (%s)',
                     esc.task_id, eval_lane_reason,
+                )
+                continue
+
+            # A router hold (PRD D9) is owned by this reaper alone, so it is
+            # finished ahead of the liveness arm: a live newer incarnation
+            # never consumes it.
+            routed_here = self._router_owns(esc)
+            hold = read_hold(esc) if routed_here else None
+            if hold is not None:
+                await router.finish_hold(
+                    esc, hold, now=now,
+                    timeout_secs=self.config.info_l0_router_ticket_timeout_secs,
                 )
                 continue
 
@@ -14293,23 +14322,22 @@ class Harness:
                     f'current claimant is {live_run_id}'
                 )
 
+            if routed_here:
+                row = await _task_row()
+                await router.route(
+                    esc, exit_kind=ExitKind.ORPHAN, task_status=(row or {}).get('status'),
+                )
+                continue
+
             # Defense-in-depth: never double-escalate a task a human is
             # already looking at.  B1 (commit 1a1eca9a67) stopped the main
             # orphan source by skipping L0 creation on escalate_to_human
             # paths, but other L0 sources remain (agent escalate_info,
             # deep-reviewer L0s, steward-chained L0s) and an /unblock can be
-            # in flight.  If an L1 is already open for this task, dismiss the
-            # orphan L0 rather than promoting it to a duplicate "echo" L1.
-            if self._escalation_queue.has_open_l1(esc.task_id):
-                self._escalation_queue.resolve(
-                    esc.id,
-                    (
-                        'Dismissed by orphan reaper — open L1 already covers '
-                        f'this task (task_id={esc.task_id})'
-                    ),
-                    dismiss=True,
-                    resolved_by='harness-orphan-reaper',
-                )
+            # in flight.  If an L1 about the same category is already open for
+            # this task, dismiss the orphan L0 rather than promoting it to a
+            # duplicate "echo" L1.
+            if self._escalation_queue.dismiss_if_covered(esc, resolver='harness-orphan-reaper'):
                 continue
 
             # Live lock-free-stage race (task 2931): defer — don't promote —
@@ -14449,6 +14477,7 @@ class Harness:
             )
             promoted += 1
 
+        router.close()
         if promoted:
             logger.warning(
                 'Orphan L0 reaper: promoted %d escalation(s) to L1', promoted,

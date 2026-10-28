@@ -10,6 +10,7 @@ from shared.prompt_artifact import PromptSpec
 from orchestrator.agents.bash_cwd_guidance import BASH_CWD_ANCHOR_GUIDANCE
 from orchestrator.agents.chained_command_guidance import CHAINED_COMMAND_STATUS_GUIDANCE
 from orchestrator.agents.code_quality import guidance
+from orchestrator.agents.deviation_doctrine import render_deviation_doctrine
 from orchestrator.agents.file_lookup_guidance import FILE_LOOKUP_GUIDANCE
 from orchestrator.agents.grep_pattern_guidance import GREP_PATTERN_ESCAPING_GUIDANCE
 from orchestrator.agents.partial_failure_guidance import MULTI_PATH_PARTIAL_FAILURE_GUIDANCE
@@ -140,12 +141,11 @@ _READ_ONLY_TOOLS = ['Read', 'Glob', 'Grep', 'Bash(git:*)']
 _JCODEMUNCH_TOOLS = ['mcp__jcodemunch__*']
 
 # --- Escalation tools available to roles that can escalate ---
-_ESCALATION_TOOLS = [
-    'mcp__escalation__escalate_info',
-    'mcp__escalation__escalate_blocker',
-]
+ESCALATE_INFO_TOOL = 'mcp__escalation__escalate_info'
+ESCALATE_BLOCKER_TOOL = 'mcp__escalation__escalate_blocker'
+_ESCALATION_TOOLS = [ESCALATE_INFO_TOOL, ESCALATE_BLOCKER_TOOL]
 
-# Spliced into ESCALATION_LADDER_CORE so every escalating role, steward included, reads it.
+# Spliced into ESCALATION_LADDER_CORE so every blocker-holding role, steward included, reads it.
 RESERVED_BOUND_ROUTING_RULE = """
 **A bound reserved to a human makes the ruling blocking, even when the finding is not.**
 If your remedy must cross a bound whose own text reserves the change to a human
@@ -156,9 +156,68 @@ something later promotes it, and promotion is not retroactive: it can land after
 branch has already merged.
 """
 
+# The one statement of the escalate_info contract (plans/plan-deviation-recording-prd.md
+# D3; INV-5 no-lockstep-duplication). It is rendered once into each escalation section
+# (ESCALATION_LADDER_CORE and INFO_ONLY_ESCALATION_INSTRUCTIONS); every other site that
+# mentions escalate_info points at "## Escalation" instead of restating it. The decision
+# sentence lives in ESCALATE_BLOCKER_DECISION_ROUTE because it names a tool only
+# blocker-holding roles have (task 6010). The reviewer/router disposition is
+# plans/info-l0-disposition-router-prd.md.
+ESCALATE_INFO_CONTRACT = """
+### What `escalate_info` files
+
+`escalate_info` files a non-blocking observation.
+
+- With `note_to_file=True` it is a record that requests nothing and is archived
+  unrouted: no reviewer, steward or watcher will read it.
+- Without it, it is an observation the reviewer dispositions in its verdict, or
+  the router closes at workflow exit.
+
+A work item is `submit_task`.
+"""
+
+ESCALATE_BLOCKER_DECISION_ROUTE = """A decision you need before continuing is `escalate_blocker`.
+"""
+
+_ESCALATION_SECTION_OPENING = """
+## Escalation
+
+If you encounter a problem you cannot solve at your scope, you can escalate:
+
+- **`escalate_info(...)`** — Report it and continue working. What it files is stated below.
+"""
+
+_ESCALATION_CATEGORIES = """
+Categories: scope_violation, design_concern, cleanup_needed, dependency_discovered,
+risk_identified, infra_issue.
+"""
+
+_OBSERVATIONS_VS_HYPOTHESES = """
+### Observations vs. hypotheses
+
+State OBSERVATIONS as fact; state causal diagnoses as clearly-marked hypotheses.
+The `summary`/`detail` and every structured `evidence` entry must record what you
+actually measured — a HEAD SHA, a rerun result, a raw exit code — never an
+unverified guess at the cause. Put any causal claim on a separate line prefixed
+`Hypothesis:` so a reviewer never reads a guess as fact. A single observation is
+never sufficient to recommend a destructive intervention (a ref move / rewind):
+re-run or re-measure first, and never name a "last-known-good" ref you have not
+re-verified is actually good right now (it may have failed too, or the tip may
+have moved since you measured).
+
+Beside any commit SHA you cite, also cite `task/<id>` and the commit's subject:
+rebasing a task branch onto main rewrites its SHAs, so the cited object may not
+be the one that landed.
+
+Each escalation tool you hold accepts an optional structured
+`evidence` list — each item a `{observation, measured_at, ref}` raw-observation
+entry (e.g. `{"observation": "main red, exit 134", "measured_at": "HEAD=abc123",
+"ref": "rerun#2"}`). Prefer it over prose when you have concrete measurements.
+"""
+
 # Split (task 4169): the original single `_ESCALATION_INSTRUCTIONS` literal
 # ended with a paragraph telling every escalating role that `level=1` is "the
-# STEWARD's route, not yours" -- correct for the six non-steward escalating
+# STEWARD's route, not yours" -- correct for the non-steward blocker-holding
 # roles below, but wrong for STEWARD itself, whose own body mandates
 # `escalate_blocker(..., level=1)` re-escalation in four places (Rule 2
 # be-conservative, Rule 6 merge-halt categories, MAX_TURNS,
@@ -168,12 +227,14 @@ branch has already merged.
 #
 # ESCALATION_LADDER_CORE carries the mechanics (what escalate_info /
 # escalate_blocker do, severity policy, the level=0-vs-1 ladder) and goes to
-# EVERY escalating role, steward included -- it is what the steward's own
+# EVERY blocker-holding role, steward included -- it is what the steward's own
 # level=1 mandates depend on. NON_STEWARD_LEVEL_GATE carries the "level=1 is
-# not yours" framing and goes to every escalating role EXCEPT steward.
+# not yours" framing and goes to every blocker-holding role EXCEPT steward.
+# deep_reviewer, which holds escalate_info only, reads neither: it reads
+# INFO_ONLY_ESCALATION_INSTRUCTIONS (task 6010).
 #
 # `_ESCALATION_INSTRUCTIONS` (the pre-split name) is kept alive as their
-# concatenation rather than renamed: (1) it keeps the six non-steward splice
+# concatenation rather than renamed: (1) it keeps the non-steward splice
 # sites below byte-identical to before the split, and (2)
 # escalation/src/escalation/server.py cites `_ESCALATION_INSTRUCTIONS` BY
 # NAME in the docstring of its level-1 observability warning. Plain `+`
@@ -191,12 +252,7 @@ branch has already merged.
 # f-string, so the copy below must be updated with it, and
 # test_roles_escalation_ladder.py catches the drift after the fact rather than
 # preventing it structurally (task 5368).
-ESCALATION_LADDER_CORE = """
-## Escalation
-
-If you encounter a problem you cannot solve at your scope, you can escalate:
-
-- **`escalate_info(...)`** — Non-blocking observation. Report it and continue working.
+ESCALATION_LADDER_CORE = _ESCALATION_SECTION_OPENING + """\
 - **`escalate_blocker(...)`** — Blocking problem. Report it, then read the `action` key
   of the response and do what it says.
   - `terminate_cleanly` (every normal branch) — commit any in-progress work, log your
@@ -213,33 +269,13 @@ If you encounter a problem you cannot solve at your scope, you can escalate:
     `critical`/`urgent` filing bypasses dedupe entirely — so on every other path each
     repeat mints a NEW record, and on that one a NEW page to the human. One retry
     buys a second chance at durability; a retry every iteration is a storm.
-""" + RESERVED_BOUND_ROUTING_RULE + """
-Categories: scope_violation, design_concern, cleanup_needed, dependency_discovered,
-risk_identified, infra_issue.
-
+""" + RESERVED_BOUND_ROUTING_RULE + _ESCALATION_CATEGORIES + """
 Use escalation when:
 - You need write access to files outside your module scope
 - A test failure's root cause is in code you can't modify
 - A design decision requires broader context than this task provides
 - The verify/debug loop won't converge due to an external dependency
-
-### Observations vs. hypotheses
-
-State OBSERVATIONS as fact; state causal diagnoses as clearly-marked hypotheses.
-The `summary`/`detail` and every structured `evidence` entry must record what you
-actually measured — a HEAD SHA, a rerun result, a raw exit code — never an
-unverified guess at the cause. Put any causal claim on a separate line prefixed
-`Hypothesis:` so a reviewer never reads a guess as fact. A single observation is
-never sufficient to recommend a destructive intervention (a ref move / rewind):
-re-run or re-measure first, and never name a "last-known-good" ref you have not
-re-verified is actually good right now (it may have failed too, or the tip may
-have moved since you measured).
-
-Both `escalate_info` and `escalate_blocker` accept an optional structured
-`evidence` list — each item a `{observation, measured_at, ref}` raw-observation
-entry (e.g. `{"observation": "main red, exit 134", "measured_at": "HEAD=abc123",
-"ref": "rerun#2"}`). Prefer it over prose when you have concrete measurements.
-
+""" + ESCALATE_INFO_CONTRACT + ESCALATE_BLOCKER_DECISION_ROUTE + _OBSERVATIONS_VS_HYPOTHESES + """
 ### Severity policy
 
 `escalate_blocker` defaults to severity `blocking` — the correct level for agent-filed
@@ -260,7 +296,7 @@ default) or `level=1` — anything else is rejected with an `{'error': ...}`
 response and nothing is filed.
 """
 
-# The "level=1 is not yours" framing. Correct for every escalating role
+# The "level=1 is not yours" framing. Correct for every blocker-holding role
 # EXCEPT steward -- see the comment above ESCALATION_LADDER_CORE. Splice
 # order is always core-then-gate; the two never appear reordered or split
 # across roles (test_roles_escalation_ladder.py::test_composite_is_core_plus_gate).
@@ -276,6 +312,13 @@ faster resolution, only an audit trail showing you bypassed your handler.
 """
 
 _ESCALATION_INSTRUCTIONS = ESCALATION_LADDER_CORE + NON_STEWARD_LEVEL_GATE
+
+# Each escalating role reads the section matching its filer grants: this one for a
+# role granted `escalate_info` only, the ladder above for one also granted
+# `escalate_blocker`. Enforced by orchestrator/tests/test_roles_escalation_ladder.py.
+INFO_ONLY_ESCALATION_INSTRUCTIONS = _ESCALATION_SECTION_OPENING + """
+You hold `escalate_info` only, so nothing you file blocks work or waits on a decision.
+""" + _ESCALATION_CATEGORIES + ESCALATE_INFO_CONTRACT + _OBSERVATIONS_VS_HYPOTHESES
 
 _MEMORY_TOOLS = [
     'mcp__fused-memory__add_memory',
@@ -343,6 +386,14 @@ _PLAN_CREATOR_TOOLS = [
 
 _PLAN_STATUS_TOOLS = [
     'mcp__plan-tools__mark_step_done',
+]
+
+# Separate from _PLAN_STATUS_TOOLS because SIMPLE_TASK holds that list too and
+# has no frozen plan and no doctrine (plans/plan-deviation-recording-prd.md D14).
+# The bare name is held once: the doctrine prompt names it, the grant qualifies it.
+_RECORD_STEP_DEVIATION = 'record_step_deviation'
+_PLAN_DEVIATION_TOOLS = [
+    'mcp__plan-tools__' + _RECORD_STEP_DEVIATION,
 ]
 
 # The writer-facing metadata vocabulary spliced onto the tail of
@@ -1660,6 +1711,7 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
 2. **Verify premises before planning.** For any file or symbol the task description claims already exists (files to MODIFY, functions to extend, types to reuse), confirm it is actually present on the base branch:
    - Files: `Read` them or run `git ls-files -- <path>` in the worktree.
    - Symbols/functions: use `mcp__jcodemunch__search_symbols` or grep.
+   - Load-bearing symbols: for every existing symbol a step routes through, calls or extends — not only those the task names — read its signature and confirm the step's other requirements are expressible through it. A step that must pass something through a function with no parameter for it rests on a false premise, however present the function is.
 
    Based on what you find, choose ONE of the following exits. Do NOT call `create_plan` if any of the rejection paths apply.
 
@@ -1688,6 +1740,7 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
 8. **Small steps.** Each step should be a single, atomic change that can be committed independently.
 9. **File listing.** List ALL files (or directory paths) this task will create or modify in the `files` parameter of `create_plan`. Use paths relative to the worktree root. Be exhaustive — this is used to derive concurrency locks and the phantom-done gate. Include test files.
 10. **Design decisions.** Document non-obvious choices with `add_design_decision`.
+11. **No suite forecasts.** Step text states what changes and which test it greens. It does not forecast suite outcomes — exact test counts, the error type a red run will show, or that some tests "must stay green" — because nothing consumes those forecasts and they are the step text most often found false.
 
 ## Validate RED-test premises before writing them
 
@@ -1727,7 +1780,7 @@ Then stop.  The orchestrator files a level-1 design_concern escalation; the auto
 
 ## Important
 
-- The plan structure is IMMUTABLE after creation. Only `status` and `commit` fields change during execution.
+- After creation, only an architect pass may change a plan's structure, and never on a `done` step: `remove_plan_step` and `replace_plan_step` refuse one. The implementer's immutability is its tool allowlist, which holds no plan-authoring tool.
 - The top-level key for your plan steps MUST be `"steps"` — aliases like `"tdd_steps"` are NOT a plain string and will be rejected.
 - Prerequisites (setup tasks) MUST be dicts — NOT a plain string. Each prerequisite must be a dict with `id`, `description`, and `status` fields.
 - You MUST use the plan-tools MCP tools — do not write .task/plan.json directly.
@@ -1740,6 +1793,10 @@ Then stop.  The orchestrator files a level-1 design_concern escalation; the auto
     default_max_turns=50,
     mcp_families=frozenset({'orchestrator', 'plan_tools'}),
 )
+
+
+# The doctrine's text lives in orchestrator/src/orchestrator/agents/deviation_doctrine.py.
+IMPLEMENTER_DEVIATION_DOCTRINE = render_deviation_doctrine(_RECORD_STEP_DEVIATION)
 
 
 IMPLEMENTER = AgentRole(
@@ -1756,7 +1813,7 @@ You are a TDD implementer. You execute a structured plan by writing code, step b
 
 ## Rules
 
-1. **Follow the plan exactly.** Do not deviate from the plan structure. Do not add steps or skip steps.
+1. **Keep to the plan's structure.** Do not add, skip or reorder steps. When a step's text proves wrong, the plan-deviation section below governs.
 2. **TDD discipline.** For `test` steps: write the test, run it, confirm it fails. For `impl` steps: write implementation, run tests, confirm they pass.
 3. **Commit each step.** After completing a step, stage ONLY your code changes (not `.task/` files) and commit. Then call `mark_step_done(step_id, commit_sha)` to record the step as complete.
 4. **Stop at logical boundaries.** Don't exhaust your context trying to complete everything. Complete a logical chunk of steps, commit, mark done, and stop. The next iteration will continue from where you left off.
@@ -1793,10 +1850,9 @@ The workflow for each step is:
 ## Important
 
 - Run tests frequently to verify your work.
-- If you encounter an unexpected issue that the plan doesn't account for, note it and stop. Do NOT modify the plan.
 - Prefer minimal, targeted changes. Don't refactor surrounding code.
-""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS],
+""" + IMPLEMENTER_DEVIATION_DOCTRINE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=10.0,
@@ -1851,7 +1907,7 @@ still ends up staged.
 - Read the failing test/code carefully before making changes.
 - If the failure reveals a fundamental design issue, note it and stop rather than applying band-aids.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=5.0,
@@ -2428,10 +2484,12 @@ reaper to maybe recover:
         "name this task's id, the escalation id if one exists, the concrete file\n"
         "paths, and the rationale verbatim. `escalation_id` and `suggestion_hash`\n"
         "(the R4 idempotency keys) MUST be present so a re-filed candidate dedupes.\n"
-        "A pure observation with no work item goes to `escalate_info` instead; when\n"
-        "something is BOTH an observation and a work item, do both. One-time\n"
-        "operational asks (run a script after X lands, a service needs a restart) do\n"
-        "NOT go here — those route through the deterministic task mechanism."
+        'An observation that is not a work item is not filed here: see "## Escalation".\n'
+        "A one-time operational ask that no agent can carry out (restart a service,\n"
+        "run a script after X lands) IS filed here too: add\n"
+        '"execution_class": "operational" to `metadata` and the submit boundary\n'
+        "turns it into a deterministic human gate (docs/task-authoring.md §4-5).\n"
+        "Docs, code and test edits are agent work — never mark them operational."
     ),
 )
 
@@ -2901,7 +2959,7 @@ For each finding, classify and act:
 | Classification | Criteria | Action |
 |---|---|---|
 | **create_task** | Unambiguous bug, missing wiring, unfilled stub, clear fix path | Call `submit_task` (single step) — see Creating tasks below |
-| **escalate** | Ambiguous, multiple valid approaches, architectural implications, design questions | Call `escalate_info` with category and summary |
+| **escalate** | Ambiguous, multiple valid approaches, architectural implications, design questions | Call `escalate_info` with category `design_concern` (architectural question) or `risk_identified` (potential issue) and a summary naming the options; its contract is under "## Escalation". The note gates nothing, reaches no steward, and may be closed without a human ever seeing it |
 | **dismiss** | Known gap in briefing, noise, style preference, intentionally incomplete | Skip |
 
 ### Creating tasks
@@ -2930,12 +2988,6 @@ or expired tickets as a follow-up escalation):
     ),
 ) + """
 
-### Escalating ambiguous findings
-
-Use the `escalate_info` MCP tool for findings that need human judgment:
-- `category`: "design_concern" for architectural questions, "risk_identified" for potential issues
-- `summary`: clear description of the finding, why it's ambiguous, and what the options are
-
 ## Rules
 
 1. **Read before judging.** Understand the code's intent before flagging issues.
@@ -2943,11 +2995,11 @@ Use the `escalate_info` MCP tool for findings that need human judgment:
 3. **Be specific.** Every finding must have a file location and concrete description.
 4. **Don't flag cosmetics.** Formatting and layout preferences are noise. Naming and comments are NOT cosmetics: judge them under the code-quality heuristics below, which govern here.
 5. **Focus on the boundary.** The highest-value findings are at module boundaries where per-task reviews can't see.
-""" + CODE_QUALITY_GUIDANCE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + CODE_QUALITY_GUIDANCE + INFO_ONLY_ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=[
         'Read', 'Glob', 'Grep', 'Bash',
         *_DEEP_REVIEW_TOOLS,
-        'mcp__escalation__escalate_info',
+        ESCALATE_INFO_TOOL,
         *_JCODEMUNCH_TOOLS,
     ],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],

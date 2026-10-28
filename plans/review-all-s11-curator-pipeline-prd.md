@@ -267,7 +267,8 @@ def is_combine_eligible_status(status) -> bool
 ```
 
 Invariants:
-- Imports only the stdlib and `shared.task_statuses`.
+- Imports only the stdlib and the first-party layer declared at
+  `fused-memory/tests/test_curator_types_leaf.py::ALLOWED_FIRST_PARTY`.
 - No module in `fused_memory.middleware` imports a name listed above from `task_curator`.
 - `candidate_key.normalize_title` is the only title normaliser.
 

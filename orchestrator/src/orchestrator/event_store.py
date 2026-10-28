@@ -14,7 +14,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import Enum, StrEnum
+from enum import Enum, StrEnum, unique
 from pathlib import Path
 
 from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
@@ -200,6 +200,9 @@ class EventType(StrEnum):
     #                Measured by _deep_chain_placement, not by build_chain, so
     #                it covers the FULL stall: lane acquisition, the sequential
     #                merges, and the asyncio.timeout wrapper's overhead.
+    # PLUS three always-present, nullable keys (task 5651): plan_hash,
+    # cache_mode and units, defined by
+    # orchestrator/src/orchestrator/verify_evidence.py::verify_event_fields.
     merge_verify = 'merge_verify'
     # A merge-role scoped-verify red that the isolated-rerun-confirm gate
     # (verify.apply_merge_flake_suppression, PRD task α) demonstrated was a
@@ -224,8 +227,17 @@ class EventType(StrEnum):
     # The branch's OWN pre-merge verify verdict, recorded by the orchestrator
     # workflow VERIFY phase (branch-vs-its-merge-base) — distinct from
     # merge_verify, which is the merge worker's POST-rebase verify (branch
-    # already merged onto CURRENT main).  task_id-keyed; data carries at least
-    # {passed: bool, base_sha: str, branch: str}.  Consumed by the merge-skew
+    # already merged onto CURRENT main).  task_id-keyed; the workflow's rows
+    # (TaskWorkflow._emit_workflow_verify, task 5651) carry {passed, tip_sha,
+    # base_sha, branch, site, duration_ms, slot_wait_secs, plan_hash,
+    # cache_mode, units}, site per verify_evidence.py::VerifySite and the
+    # last three per verify_evidence.py::verify_event_fields.  duration_ms is
+    # the verify run's own wall
+    # (VerifyResult.duration_secs), excluding the admission queueing that
+    # slot_wait_secs records.  Escalation-side vouch rows carry only
+    # {passed, base_sha, branch} until task 5409.  A 2752 checkpoint hit emits
+    # phase_skipped(verify, reason='durable_verified_green') INSTEAD of this
+    # row.  Consumed by the merge-skew
     # attribution classifier's I5 branch-green fact (merge_disposition.
     # _branch_pre_merge_verify_green).  Task 2381 α adds this member + the
     # reader; task 2383 β emits it at the workflow VERIFY-pass site.  Its
@@ -1076,6 +1088,38 @@ class EventType(StrEnum):
     #   (INV-4). Age surfacing only; nothing times out. Payload:
     #   {waiter: {task_id, module, role, plan_id, wait_secs}, aged_count, alarm_secs}
     verify_admission_wait_aged = 'verify_admission_wait_aged'
+
+    # Shadow eval (plans/live-shadow-eval-prd.md C2). task_id is the PRODUCTION
+    # task the cell shadows; shadow_cell_skipped's data.reason is a
+    # ShadowSkipReason value. The payloads are owned by the coordinator (ε1).
+    # shadow_cell_settled marks a cell whose settled_at was written (settled |
+    # expired); shadow_cell_ended marks one that ended without it (failed | cap_excluded).
+    shadow_cell_opened = 'shadow_cell_opened'
+    shadow_cell_skipped = 'shadow_cell_skipped'
+    shadow_cell_settled = 'shadow_cell_settled'
+    shadow_cell_ended = 'shadow_cell_ended'
+
+
+@unique
+class ShadowSkipReason(StrEnum):
+    """The closed vocabulary of why a shadow trigger opened no cell (INV-11).
+
+    CREDITS_EXHAUSTED is also the reason that settles a running Coding Plan cell
+    cap_excluded (PRD decision 16).
+    """
+
+    SAMPLED_OUT = 'sampled_out'
+    NO_CREDENTIALS = 'no_credentials'
+    ISOLATION_UNAVAILABLE = 'isolation_unavailable'
+    BUDGET_EXHAUSTED = 'budget_exhausted'
+    CREDITS_EXHAUSTED = 'credits_exhausted'
+    CONCURRENCY_FULL = 'concurrency_full'
+    HOST_SATURATED = 'host_saturated'
+    SHAPE_DISABLED = 'shape_disabled'
+    ALREADY_OPEN = 'already_open'
+    PAUSED = 'paused'
+    UNKNOWN_CANDIDATE = 'unknown_candidate'
+    NO_BASE_SHA = 'no_base_sha'
 
 
 _MERGE_FINALIZED_ROWS = f"event_type = '{EventType.merge_finalized.value}'"

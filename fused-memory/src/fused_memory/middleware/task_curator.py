@@ -48,6 +48,7 @@ import uuid as uuid_mod
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
 
@@ -70,6 +71,8 @@ from shared.config_dir import (
 from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_artifacts_root
+from shared.streak import KeyedStreaks
+from shared.transcript_archive import ArchiveBeforeDelete, archive_before_delete
 
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
@@ -116,6 +119,8 @@ from fused_memory.middleware.recon_code_fix_premise_guard import (
 from fused_memory.middleware.recon_code_fix_premise_guard import (
     match_candidate as match_refuted_premise,
 )
+from fused_memory.middleware.zero_output_breaker import ZeroOutputBreaker
+from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
 from fused_memory.reconciliation.context_assembler import estimate_tokens
 from fused_memory.utils.task_dependency_ids import task_dependency_ids as _task_dependencies
 
@@ -154,8 +159,48 @@ _CURATOR_CAP_WAIT_SANITY_SECS = 120.0
 _CONFIG_DIR_TASK_PREFIX = 'fm-curator-'
 
 
-def _sweep_stale_curator_config_dirs_once(base_dir: Path | None) -> None:
-    """Reclaim curator config dirs whose owning process is dead. Never raises."""
+def _archive_curator_config_dir(config_dir: Path, archive_root: Path) -> ArchiveBeforeDelete:
+    """Archive a curator config dir's transcripts, then remove the dir. Never raises.
+
+    The archive key is the dir's TaskConfigDir task_id, ``fm-curator-<pid>``.
+    """
+    outcome = archive_before_delete(
+        config_dir, config_dir.name.removeprefix(CONFIG_DIR_PREFIX), archive_root=archive_root,
+    )
+    if outcome.archived or outcome.held:
+        logger.info(
+            'TaskCurator config dir %s archival: archived=%d already_current=%d held=%d '
+            'removed=%s archive_root=%s',
+            config_dir.name,
+            outcome.archived,
+            outcome.already_current,
+            len(outcome.held),
+            outcome.config_dir_removed,
+            archive_root,
+        )
+    return outcome
+
+
+def _reclaim_by_archiving(path: Path, *, archive_root: Path) -> None:
+    """The dead-PID sweep's reclaim step, honouring ``shutil.rmtree``'s contract.
+
+    A dir left holding unarchivable transcripts keeps its dead-PID name, so the
+    next process's sweep retries it.
+    """
+    outcome = _archive_curator_config_dir(path, archive_root)
+    if outcome.config_dir_removed:
+        return
+    if not path.exists():
+        raise FileNotFoundError(path)
+    if outcome.held:
+        raise OSError(f'{len(outcome.held)} transcript(s) held, not archivable, in {path}')
+    raise OSError(f'transcripts archived, but the dir could not be removed: {path}')
+
+
+def _sweep_stale_curator_config_dirs_once(
+    base_dir: Path | None, archive_root: Path | None,
+) -> None:
+    """Archive, then reclaim, curator config dirs whose owning process is dead. Never raises."""
     prefix = CONFIG_DIR_PREFIX + _CONFIG_DIR_TASK_PREFIX
     sweep_stale_pid_dirs_once(
         prefix,
@@ -169,6 +214,9 @@ def _sweep_stale_curator_config_dirs_once(base_dir: Path | None) -> None:
             prefix, exc_info=True,
         ),
         base_dir=base_dir,
+        reclaim=None if archive_root is None else partial(
+            _reclaim_by_archiving, archive_root=archive_root,
+        ),
     )
 
 
@@ -702,19 +750,6 @@ def _render_batch_prompt(
     return '\n'.join([*sections, instruction])
 
 
-@dataclass
-class _DegradedStreak:
-    """One project's run of consecutive degraded curations.
-
-    ``alarm_fired`` latches so a streak escalates once, not once per curation
-    past the threshold; the whole record is discarded on that project's next
-    usable decision.
-    """
-
-    count: int = 0
-    alarm_fired: bool = False
-
-
 class _LazyRegistry:
     """One-shot, off-loop lazy load of a YAML registry file.
 
@@ -884,53 +919,21 @@ class TaskCurator:
         self._operational_registry = _LazyRegistry(
             config_key='operational_ask_registry_path', label='operational-ask',
         )
-        # Consecutive-ZOT circuit breaker (task 1743).
-        # Counts zero-output/full-timeout curator LLM failures since the
-        # last real LLM success; a non-ZOT failure neither increments nor
-        # resets it.
-        self._consecutive_zero_output_timeouts: int = 0
-        # monotonic() time until which the breaker is open (None = closed).
-        self._zero_output_breaker_open_until: float | None = None
+        # Consecutive-ZOT circuit breaker (task 1743): counts only ZOTs; a
+        # non-ZOT failure neither increments nor resets it.
+        self._zero_output_breaker = ZeroOutputBreaker(
+            threshold=config.curator.zero_output_breaker_threshold,
+            cooldown_seconds=config.curator.zero_output_breaker_cooldown_seconds,
+        )
         # Degraded-curation streaks by project_id (task 4448). Distinct from
-        # the ZOT counter above: that one counts hung calls in order to stop
+        # the ZOT breaker above: that one counts hung calls in order to stop
         # paying for them; these count degraded decisions of every cause, in
         # order to make a sustained outage visible. Keyed by project because
         # one curator serves every project, so a shared count would let one
         # project's healthy curations mask another's outage.
-        self._degraded_streaks: dict[str, _DegradedStreak] = {}
-
-    # ------------------------------------------------------------------
-    # Zero-output-timeout circuit breaker (task 1743)
-    # ------------------------------------------------------------------
-
-    def _zero_output_breaker_open(self, now: float) -> bool:
-        """Return True while the breaker is tripped and the cooldown has not elapsed."""
-        return (
-            self._zero_output_breaker_open_until is not None
-            and now < self._zero_output_breaker_open_until
+        self._degraded_streaks: KeyedStreaks[str] = KeyedStreaks(
+            threshold=config.curator.degraded_streak_threshold,
         )
-
-    def _record_zero_output_timeout(self, now: float) -> None:
-        """Increment the consecutive-ZOT counter; open the breaker when threshold is reached."""
-        self._consecutive_zero_output_timeouts += 1
-        if (
-            self._consecutive_zero_output_timeouts
-            >= self._config.curator.zero_output_breaker_threshold
-        ):
-            self._zero_output_breaker_open_until = (
-                now + self._config.curator.zero_output_breaker_cooldown_seconds
-            )
-            logger.warning(
-                'task_curator: zero-output-breaker OPEN after %d consecutive ZOTs; '
-                'short-circuiting curator LLM calls for %.0fs',
-                self._consecutive_zero_output_timeouts,
-                self._config.curator.zero_output_breaker_cooldown_seconds,
-            )
-
-    def _reset_zero_output_breaker(self) -> None:
-        """Reset the breaker on any real LLM success."""
-        self._consecutive_zero_output_timeouts = 0
-        self._zero_output_breaker_open_until = None
 
     # ------------------------------------------------------------------
     # Lazy init (mirrors task_dedup.py pattern)
@@ -1571,10 +1574,6 @@ class TaskCurator:
     # Class-agnostic degraded-streak alarm (task 4448)
     # ------------------------------------------------------------------
 
-    def _reset_degraded_streak(self, project_id: str) -> None:
-        """Clear *project_id*'s streak and re-arm its alarm, on a usable decision."""
-        self._degraded_streaks.pop(project_id, None)
-
     async def _degraded_create(
         self,
         *,
@@ -1628,24 +1627,22 @@ class TaskCurator:
         nonetheless failed to decide).  The alarm is class-agnostic by construction: it
         takes only the fact that a curation degraded, never the reason.
         """
-        streak = self._degraded_streaks.setdefault(project_id, _DegradedStreak())
-        streak.count += 1
-        threshold = self._config.curator.degraded_streak_threshold
-        if streak.count < threshold or streak.alarm_fired:
+        step = self._degraded_streaks.failure(project_id)
+        if not step.fired:
             return
 
-        streak.alarm_fired = True
+        threshold = self._config.curator.degraded_streak_threshold
         logger.error(
             'task_curator: %d consecutive degraded curations for project %s '
             '(threshold %d) — every candidate in that run was filed without '
             'dedupe. Last: %s',
-            streak.count, project_id, threshold, justification,
+            step.count, project_id, threshold, justification,
         )
         if self._escalator is not None:
             await self._escalator.report_consecutive_degraded(
                 project_root=project_root,
                 project_id=project_id,
-                streak=streak.count,
+                streak=step.count,
                 threshold=threshold,
                 last_justification=justification,
                 candidate_title=candidate_title,
@@ -1741,12 +1738,12 @@ class TaskCurator:
         # Only the 180s LLM call (and the corpus build that precedes it) is the
         # cost the breaker exists to avoid; cheap cache checks above run always.
         now = time.monotonic()
-        if self._zero_output_breaker_open(now):
+        if self._zero_output_breaker.is_open(now):
             logger.warning(
                 'task_curator: zero-output-breaker open — deferring curation '
                 'for candidate %r (consecutive ZOTs=%d)',
                 candidate.title,
-                self._consecutive_zero_output_timeouts,
+                self._zero_output_breaker.consecutive_timeouts,
             )
             return CuratorDecision.deferred(
                 DeferReason.ZERO_OUTPUT_BREAKER_OPEN,
@@ -1782,9 +1779,9 @@ class TaskCurator:
                 agent_result, pool_sizes=pool_sizes,
                 latency_ms=int((time.monotonic() - start) * 1000), pool=pool,
             )
-            # Success: reset the consecutive-ZOT counter so a single hung call
-            # that was followed by a healthy one doesn't accumulate toward open.
-            self._reset_zero_output_breaker()
+            # Success: close the ZOT breaker so a single hung call that was
+            # followed by a healthy one doesn't accumulate toward open.
+            self._zero_output_breaker.close()
             # A completed call can still carry no usable decision (the parser
             # fails open without raising), so the streak keys on the decision.
             if decision.degraded:
@@ -1795,7 +1792,7 @@ class TaskCurator:
                     candidate_title=candidate.title,
                 )
             else:
-                self._reset_degraded_streak(project_id)
+                self._degraded_streaks.success(project_id)
         except POOL_UNAVAILABLE_ERRORS as exc:
             decision = CuratorDecision.deferred(
                 pool_defer_reason(exc),
@@ -1833,7 +1830,13 @@ class TaskCurator:
                 # Capture a fresh timestamp so the cooldown window is measured
                 # from when the failure was observed, not from before the
                 # (potentially 180s) hung LLM call started.
-                self._record_zero_output_timeout(time.monotonic())
+                if self._zero_output_breaker.record_timeout(time.monotonic()):
+                    logger.warning(
+                        'task_curator: zero-output-breaker OPEN after %d consecutive ZOTs; '
+                        'short-circuiting curator LLM calls for %.0fs',
+                        self._zero_output_breaker.consecutive_timeouts,
+                        self._zero_output_breaker.cooldown_seconds,
+                    )
                 decision = await self._degraded_create(
                     justification='llm-error-escalated',
                     pool_sizes=pool_sizes,
@@ -2181,22 +2184,22 @@ class TaskCurator:
         # Batch ZOT counting: each size-1 curate() that bisects out of a batch
         # ZOT records the failure independently via its own except block.
         # A single batch outage of M LLM-bound candidates may therefore
-        # increment _consecutive_zero_output_timeouts up to M times, opening
+        # count up to M consecutive ZOTs on the breaker, opening
         # the breaker faster than a single count per event would.  That is
         # intentional — opening sooner is harmless and simpler than trying to
         # normalise concurrent increments.  curate_batch_prepared need not
         # record separately; it relies on the per-size-1 accumulation.
-        # Conversely, a successful batch call resets the counter itself
+        # Conversely, a successful batch call closes the breaker itself
         # (see _decisions_from_batch_result, task 4143), so
         # "consecutive" is measured across every real LLM success — batch
         # and size-1 alike — not just the size-1 successes handled by
         # curate().
-        if llm_k_list and self._zero_output_breaker_open(time.monotonic()):
+        if llm_k_list and self._zero_output_breaker.is_open(time.monotonic()):
             logger.warning(
                 'curate_batch: zero-output-breaker open — deferring curation of %d '
                 'LLM-bound candidate(s) (consecutive ZOTs=%d)',
                 len(llm_k_list),
-                self._consecutive_zero_output_timeouts,
+                self._zero_output_breaker.consecutive_timeouts,
             )
             for _k in llm_k_list:
                 decided_without_llm[_k] = CuratorDecision.deferred(
@@ -2643,6 +2646,25 @@ class TaskCurator:
             return PruneResult(skipped=True, reason='error', live=len(live))
 
     async def close(self) -> None:
+        """Archive and remove this process's config dir, then release the clients.
+
+        Archival goes first, so a hanging client close cannot starve it. The
+        thread hop holds the delete as well as the archival, so a cancelled
+        await cannot skip one and keep the other, which is the hazard
+        ``archive_before_delete``'s no-``to_thread`` note guards against. A
+        cancellation landing on that await still releases the clients.
+        """
+        config_dir, self._config_dir = self._config_dir, None
+        archive_root = self._transcript_archive_root()
+        try:
+            if config_dir is not None and archive_root is not None:
+                await asyncio.to_thread(
+                    _archive_curator_config_dir, config_dir.path, archive_root,
+                )
+        finally:
+            await self._close_clients()
+
+    async def _close_clients(self) -> None:
         if self._qdrant_client is not None:
             import contextlib as _ctx
 
@@ -2990,18 +3012,26 @@ class TaskCurator:
         The dead-PID sweep runs on a worker thread and is not awaited: it
         reclaims other processes' leftovers, so no call depends on it, and a
         readdir of a large system tempdir must stall neither the server's event
-        loop nor this call (task 7335).
+        loop nor this call (task 7335). It archives each dead dir's transcripts
+        before removing the dir.
         """
         if self._usage_gate is None:
             return None
         if self._config_dir is None:
             asyncio.get_running_loop().run_in_executor(
-                None, _sweep_stale_curator_config_dirs_once, self._config_dir_base,
+                None,
+                _sweep_stale_curator_config_dirs_once,
+                self._config_dir_base,
+                self._transcript_archive_root(),
             )
             self._config_dir = TaskConfigDir(
                 f'{_CONFIG_DIR_TASK_PREFIX}{os.getpid()}', base_dir=self._config_dir_base,
             )
         return self._config_dir
+
+    def _transcript_archive_root(self) -> Path | None:
+        """Where curator transcripts are archived: recon's root, under recon's kill switch."""
+        return recon_archive_root(self._config.reconciliation)
 
     def _ledger_kwargs(self, role: str) -> dict[str, Any]:
         """The ``invoke_with_cap_retry`` kwargs that land a call in the invocations ledger.
@@ -3140,9 +3170,9 @@ class TaskCurator:
         project_root: str,
     ) -> list[CuratorDecision]:
         """Parse a successful batch call into one decision per candidate, and account for it."""
-        # A real LLM round-trip completed, so the service is not wedged — reset
-        # the consecutive-ZOT counter exactly as TaskCurator.curate does for a
-        # single call. Without this, size-1 bisect ZOTs accumulate across
+        # A real LLM round-trip completed, so the service is not wedged — close
+        # the ZOT breaker exactly as TaskCurator.curate does for a single call.
+        # Without this, size-1 bisect ZOTs accumulate across
         # arbitrarily many healthy BATCH calls in a batch-dominant deployment
         # until threshold (default 2) trips the breaker and disables dedupe for
         # the cooldown (default 600s) on a healthy service (task 4143).
@@ -3157,7 +3187,7 @@ class TaskCurator:
         # flight. Closing that cooldown early is deliberate (task 4143's plan
         # design decision 3; pinned by
         # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker).
-        self._reset_zero_output_breaker()
+        self._zero_output_breaker.close()
 
         decisions = _parse_batch_decisions(
             agent_result,
@@ -3171,7 +3201,7 @@ class TaskCurator:
         # action='create' without raising. One usable decision suffices — the
         # other items' degradation is then the designed per-item fail-open.
         if any(not d.degraded for d in decisions):
-            self._reset_degraded_streak(project_id)
+            self._degraded_streaks.success(project_id)
         else:
             for candidate, decision in zip(candidates, decisions, strict=True):
                 await self._count_degraded(

@@ -448,7 +448,7 @@ class TestScenario2WorktreeBase:
 
         # Create α branch off main with one commit so it has a non-main tip.
         wt_a, alpha_sha = await make_stacked_member(
-            git_ops, "alpha", (await git_ops._freshen_main())[0],
+            git_ops, "alpha", await git_ops._freshen_main(),
             lambda wt: (wt / "alpha.txt").write_text("alpha\n"),
         )
 
