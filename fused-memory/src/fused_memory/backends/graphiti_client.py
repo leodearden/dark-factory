@@ -60,6 +60,7 @@ from fused_memory.backends.llm_token_usage import (
     TokenMeasurement,
     measure_llm_tokens,
 )
+from fused_memory.backends.recent_episodes import read_recent_group_episodes
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.backends.timeout_budget import await_within
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
@@ -1117,46 +1118,6 @@ async def _paged_ro_query(
     )
 
 
-async def _read_all_group_episodes(
-    driver: GraphDriver,
-    group_ids: list[str],
-    *,
-    page_size: int = _DEFAULT_READ_PAGE_SIZE,
-    max_pages: int = _MAX_READ_PAGES,
-) -> list[EpisodicNode]:
-    """Read every episode in ``group_ids``, past the server's row cap.
-
-    A different mechanism from ``_paged_ro_query`` because this read goes
-    through graphiti-core, not ``ro_query``.  ``EpisodicNode.get_by_group_ids``'
-    own ``uuid_cursor`` is KEYSET paging (``uuid < cursor ORDER BY uuid DESC``),
-    and keyset pages never shift under concurrent insert.  Only an EMPTY page
-    ends the read, never a short one, so a server cap below ``page_size``
-    cannot truncate it — which is why neither ``_paged_ro_query``'s refusal
-    guard nor a census is needed.  See plans/falkordb-resultset-cap-audit.md.
-
-    Raises:
-        IncompleteEnumerationError: ``max_pages`` ran out on a non-empty page.
-    """
-    episodes: list[EpisodicNode] = []
-    cursor: str | None = None
-    for _ in range(max_pages):
-        page = await EpisodicNode.get_by_group_ids(
-            driver, group_ids, limit=page_size, uuid_cursor=cursor
-        )
-        if not page:
-            return episodes
-        episodes.extend(page)
-        cursor = min(ep.uuid for ep in page)
-    raise IncompleteEnumerationError(
-        f'_read_all_group_episodes(group_ids={group_ids!r}): the enumeration '
-        f'was structurally incomplete (incomplete_kind={INCOMPLETE_PAGE_CAP!r}): '
-        f'max_pages={max_pages} exhausted at page_size={page_size} with '
-        f'episodes_seen={len(episodes)} and the last page non-empty, so the '
-        f'episodes read are a uuid-ordered prefix and sorting them by '
-        f'created_at would select the wrong most-recent episodes'
-    )
-
-
 def apply_incompleteness_policy(
     paged: PagedRead,
     *,
@@ -1336,15 +1297,12 @@ def _embedding_dim(raw) -> int:
     return len(str(raw).strip('<>').split(', '))
 
 
-def _as_sortable_utc(created_at: datetime | None) -> datetime:
+def _as_sortable_utc(created_at: datetime) -> datetime:
     """Coerce an episode's created_at to a tz-aware UTC datetime for sorting.
 
     Naive (tzinfo-less) datetimes are assumed to already be UTC rather than
-    raising on naive-vs-aware comparison; None sorts as the minimum possible
-    value (oldest/unknown), landing last in a descending sort.
+    raising on naive-vs-aware comparison.
     """
-    if created_at is None:
-        return datetime.min.replace(tzinfo=UTC)
     if created_at.tzinfo is None:
         return created_at.replace(tzinfo=UTC)
     return created_at.astimezone(UTC)
@@ -2113,44 +2071,34 @@ class GraphitiBackend:
         last_n: int = 10,
         reference_time: datetime | None = None,
     ) -> list[Any]:
-        """Retrieve recent episodes by group, ordered by created_at (most recent first) and truncated to last_n.
-
-        EpisodicNode.get_by_group_ids truncates via ``ORDER BY uuid DESC LIMIT``,
-        which is unrelated to recency, so we read the group's full episode set
-        in keyset pages (``_read_all_group_episodes``, task 4869) and
-        sort/truncate by created_at ourselves.
+        """Return the group's last_n most recent episodes, newest created_at first, ties by uuid descending.
 
         Raises:
-            IncompleteEnumerationError: The keyset read ran out of page budget.
+            ValueError: last_n is outside 1 <= last_n < ``_RESULTSET_SIZE``.
             TimeoutError: The read overran its budget (class TIMEOUT POSTURE).
                 MemoryConsolidator then marks 'episodes' a degraded fetch
                 source, and get_episodes answers an error, not an empty list.
+
+        Why the read is neither keyset-paged nor a full scan:
+        plans/falkordb-resultset-cap-audit.md, the ``retrieve_episodes`` entry.
         """
-        driver = self._driver_for(group_ids[0]) if group_ids else self._require_driver()
-        # The full set is still read, now in keyset pages, because the
-        # created_at sort must see every episode: a cap-truncated set would
-        # silently select the wrong episodes, not merely fewer of them. The
-        # cheaper bounded read (ORDER BY created_at ... LIMIT last_n) was
-        # declined; its cost and reasons are in
-        # plans/falkordb-resultset-cap-audit.md.
+        if not 1 <= last_n < _RESULTSET_SIZE:
+            raise ValueError(
+                f'retrieve_episodes: last_n={last_n} must satisfy 1 <= last_n < '
+                f'{_RESULTSET_SIZE} (the assumed FalkorDB RESULTSET_SIZE); at or '
+                f'above it the server truncates this unpaged read silently'
+            )
+        if not group_ids:
+            return []
         episodes = await self._timed_read(
-            _read_all_group_episodes(driver, group_ids), 'retrieve_episodes',
+            read_recent_group_episodes(self._graph_for(group_ids[0]), group_ids, last_n),
+            'retrieve_episodes',
         )
-        episodes = sorted(
-            episodes or [],
-            # Secondary key (uuid) makes this a total order: get_by_group_ids
-            # truncates via ORDER BY uuid DESC, so without a tie-breaker,
-            # episodes sharing created_at (batch/rapid co-ingestion, or
-            # reduced-precision storage) fall back to that upstream order,
-            # which is not guaranteed reproducible across executions and can
-            # read as non-monotonic to a strict-descending observer.
-            key=lambda ep: (
-                _as_sortable_utc(getattr(ep, 'created_at', None)),
-                getattr(ep, 'uuid', None) or '',
-            ),
+        return sorted(
+            episodes,
+            key=lambda ep: (_as_sortable_utc(ep.created_at), ep.uuid),
             reverse=True,
         )
-        return episodes[:last_n]
 
     @_canonicalize_group_args
     async def get_episode_by_uuid(self, episode_uuid: str, *, group_id: str) -> EpisodicNode | None:

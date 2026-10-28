@@ -631,9 +631,7 @@ def make_graph_mock():
     carries the stateful query log the truncation tests need — because two
     doubles that both claim to stand in for the same server drift, and the
     drift shows up as a test that passes against a fake nothing else agrees
-    with.  A test that needs the cap should use that one (or, for episode
-    reads through graphiti-core, its API-level counterpart
-    ``FakeCappedEpisodeStore`` in the same module).
+    with.  A test that needs the cap should use that one.
     """
     skip_limit_re = re.compile(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', re.IGNORECASE)
     # Deliberately NARROW: only a query whose entire projection is a bare row
