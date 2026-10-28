@@ -280,8 +280,13 @@ def _ancestry(dag: Mapping[str, tuple[str, ...]], start: str) -> frozenset[str]:
 
 
 def contained_siblings(snapshot: _Snapshot, branch: str) -> tuple[str, ...]:
-    """Other unlanded task branches whose tip *branch* contains, sorted."""
-    reachable = _ancestry(snapshot.dag, snapshot.tips[branch])
+    """Other unlanded task branches whose tip is a strict ancestor of *branch*'s, sorted.
+
+    A sibling at the very same commit is no evidence either way: neither
+    branch has a commit the other lacks.
+    """
+    own_tip = snapshot.tips[branch]
+    reachable = _ancestry(snapshot.dag, own_tip) - {own_tip}
     return tuple(sorted(
         name for name, tip in snapshot.tips.items() if name != branch and tip in reachable
     ))

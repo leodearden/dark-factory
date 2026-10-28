@@ -268,6 +268,18 @@ async def test_a_contained_sibling_without_a_reflog_stacking_event_is_unadjudica
     assert 'task/S' in finding.detail
 
 
+async def test_a_sibling_at_the_same_commit_is_not_contained(repo: Path) -> None:
+    add_member(repo, 'P', 'main', {'p.txt': 'p\n'})
+    p_tip = rev(repo, 'task/P')
+    git(repo, 'branch', 'task/C', p_tip)
+
+    findings = findings_of(await census_of(repo))
+
+    assert 'task/P' not in findings
+    assert findings['task/C'].contained_siblings == ()
+    assert findings['task/C'].verdict is census.Verdict.CONFIRMED
+    assert findings['task/C'].base == p_tip
+
 async def test_a_branch_with_a_stack_base_record_is_recorded(repo: Path) -> None:
     stacked_on_p(repo)
     p_tip = rev(repo, 'task/P')
