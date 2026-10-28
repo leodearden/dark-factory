@@ -449,7 +449,7 @@ def test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark(request
     for (module, name), (n_scaled, func_node) in sorted(swept.items()):
         arg = _timeout_mark_argument(func_node)
         effective, offence = _timeout_mark_budget(arg, inherited)
-        if offence is not None:
+        if arg is not None and offence is not None:
             banned_marks.append(
                 f'{module}::{name}: @pytest.mark.timeout({ast.unparse(arg)}) {offence}'
             )
