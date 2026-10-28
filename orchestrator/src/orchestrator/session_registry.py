@@ -3943,6 +3943,9 @@ class HolderRecordState(StrEnum):
 class LeaseHolder:
     """Serialized identity of a lease's current holder -- the exact ``.lease`` file body.
 
+    Every field is type-checked at construction, so a mistyped body is
+    unreadable rather than a holder.
+
     session_slug: a CLAIMANT-CHOSEN ownership token, NOT a session-registry
         record key. The skills prescribe ``<lease-role>-<project>-<pid>``
         (escalation-watcher's and recon-escalation-watcher's "Claiming the
@@ -3970,9 +3973,8 @@ class LeaseHolder:
         Its ONLY two roles are (i) the ownership comparison in
         ``_check_lease_ownership`` and (ii) naming the holder in a
         human-readable contention/refusal message.
-    pid: the holder process's pid; liveness is checked via _pid_alive. Any int (0 is
-        resolve_session_pid's degraded provably-dead value); a non-int, bool included, is
-        rejected at construction, so such a body reads as unreadable to every lease reader.
+    pid: the holder process's pid; liveness is checked via _pid_alive. Any int, bool
+        excluded (0 is resolve_session_pid's degraded provably-dead value).
     start_ts: ISO-8601 timestamp of when this holder claimed the lease.
     record_slug: the holder's session-registry record key, resolved at claim
         time from *pid*'s pointer (``resolve_session_slug_for_pid``). '' when
@@ -3988,6 +3990,10 @@ class LeaseHolder:
     def __post_init__(self) -> None:
         if not _is_json_integer(self.pid):
             raise TypeError(f'LeaseHolder.pid must be an int (not a bool), got {self.pid!r}')
+        for name in ('session_slug', 'start_ts', 'record_slug'):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                raise TypeError(f'LeaseHolder.{name} must be a str, got {value!r}')
 
     def to_dict(self) -> dict[str, Any]:
         return {
