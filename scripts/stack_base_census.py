@@ -119,6 +119,16 @@ class BranchFinding:
     events: tuple[StackingEvent, ...]
     detail: str
 
+    def __post_init__(self) -> None:
+        if self.verdict in _VERDICTS_WITH_A_BASE and self.base is None:
+            raise ValueError(f'{self.verdict} finding for {self.branch} needs a base')
+        if self.verdict in _VERDICTS_WITH_A_CUT and self.cut is None:
+            raise ValueError(f'{self.verdict} finding for {self.branch} needs a cut')
+
+
+_VERDICTS_WITH_A_CUT = frozenset({Verdict.STRANDED_BASE, Verdict.CONFIRMED})
+_VERDICTS_WITH_A_BASE = _VERDICTS_WITH_A_CUT | {Verdict.ALREADY_CLEAN}
+
 
 @dataclass(frozen=True)
 class CensusReport:
@@ -541,6 +551,51 @@ async def run_census(
         unlanded_branches=len(snapshot.tips),
         findings=tuple(finding for finding in found if finding is not None),
         elapsed_secs=time.monotonic() - started,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Adoption: the census's only write
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AdoptOutcome:
+    branch: str
+    base: str
+    written: bool
+    detail: str
+
+
+async def adopt_confirmed(repo_root: Path, report: CensusReport) -> tuple[AdoptOutcome, ...]:
+    """Record a 5618 stack-base ref for every CONFIRMED finding, in branch order.
+
+    Every other verdict is skipped.  ``StackBaseLedger.record`` logs and
+    swallows its own failure, so each record is read back, and ``written``
+    reports only what the ref says afterwards.
+    """
+    ledger = StackBaseLedger(repo_root, _git)
+    confirmed = sorted(
+        (finding.branch, finding.base) for finding in report.findings
+        if finding.verdict is Verdict.CONFIRMED and finding.base is not None
+    )
+    return tuple([await _adopt(ledger, branch, base) for branch, base in confirmed])
+
+
+async def _adopt(ledger: StackBaseLedger, branch: str, base: str) -> AdoptOutcome:
+    await ledger.record(branch, base)
+    found = await ledger.base_of(branch)
+    if found == base:
+        return AdoptOutcome(
+            branch=branch, base=base, written=True,
+            detail=f'recorded {ledger.ref_for(branch)} -> {base}',
+        )
+    return AdoptOutcome(
+        branch=branch, base=base, written=False,
+        detail=(
+            f'the record of {branch} at {base} did not read back: '
+            f'{ledger.ref_for(branch)} reads {found or "nothing"}'
+        ),
     )
 
 
