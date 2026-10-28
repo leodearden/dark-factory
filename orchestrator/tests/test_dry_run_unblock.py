@@ -3131,6 +3131,7 @@ class TestContentlessTaskRecordIsAlsoDegraded:
         self, tmp_path, caplog,
     ):
         scheduler = _TaskDocScheduler(task_doc=_CONTENTLESS_TASK_DOC)
+        _init_git_repo(tmp_path)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'):
             await _run_with_scheduler(tmp_path, scheduler)

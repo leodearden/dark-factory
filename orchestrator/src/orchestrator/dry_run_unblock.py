@@ -30,7 +30,7 @@ from shared.cli_invoke import (
     is_zero_output_timeout,
 )
 from shared.config_dir import TaskConfigDir
-from shared.git_async import run_git
+from shared.git_async import GitResult, run_git
 from shared.transcript_archive import archive_task_transcripts
 
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
@@ -371,13 +371,20 @@ _EMPTY_BRANCH_PATCH_ID = '0' * 40
 """The branch_patch_id of a branch that carries no change relative to main."""
 
 
-async def _capture_branch_patch_id(worktree: str) -> str | None:
+def _git_failure(step: str, result: GitResult) -> RuntimeError:
+    timed_out = ' (timed out)' if result.timed_out else ''
+    return RuntimeError(
+        f'{step} exited {result.returncode}{timed_out}: {result.stderr.strip()}',
+    )
+
+
+async def _capture_branch_patch_id(worktree: str, *, task_id: str) -> str | None:
     """Rebase-stable identity of the branch's committed change set relative to main.
 
     ``git patch-id --stable`` ignores line numbers and whitespace, so a clean
-    rebase onto an advanced main keeps it. Fully defensive, like
-    :func:`_capture_worktree_shas`: any git failure, a non-repo worktree
-    included, yields None.
+    rebase onto an advanced main keeps it. Any failure, a non-repo worktree or
+    a missing ``main`` ref included, yields None and is logged at WARNING,
+    because None turns coverage dedup off for the run.
     """
     try:
         diff = await run_git([
@@ -385,17 +392,24 @@ async def _capture_branch_patch_id(worktree: str) -> str | None:
             '--no-ext-diff', '--no-textconv', 'main...HEAD',
         ])
         if not diff.ok:
-            return None
+            raise _git_failure('git diff main...HEAD', diff)
         if not diff.stdout:
             return _EMPTY_BRANCH_PATCH_ID
         patch_id = await run_git(
             ['git', '-C', worktree, 'patch-id', '--stable'], input_text=diff.stdout,
         )
         if not patch_id.ok:
-            return None
+            raise _git_failure('git patch-id --stable', patch_id)
         tokens = patch_id.stdout.split()
-        return tokens[0] if tokens else None
-    except Exception:
+        if not tokens:
+            raise RuntimeError('git patch-id produced no output')
+        return tokens[0]
+    except Exception as exc:
+        logger.warning(
+            'dry_run_unblock: branch patch-id unavailable for task %s '
+            '(worktree %s); coverage dedup is off for this run: %s',
+            task_id, worktree, exc,
+        )
         return None
 
 
@@ -503,7 +517,7 @@ async def run_dry_run_unblock(
     # Capture worktree SHAs before invoke_agent so both the success and
     # exception paths can stamp the same anchor values.
     head_sha, main_sha = await _capture_worktree_shas(worktree)
-    branch_patch_id = await _capture_branch_patch_id(worktree)
+    branch_patch_id = await _capture_branch_patch_id(worktree, task_id=task_id)
 
     config_dir: TaskConfigDir | None = None
     preserve_config_dir = False
