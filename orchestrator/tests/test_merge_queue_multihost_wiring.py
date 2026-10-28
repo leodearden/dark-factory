@@ -84,11 +84,11 @@ def _make_runner_cfg(
 
 
 class TestBuildRemoteRunners:
-    """Tests for _build_remote_runners(config, cwd, *, deployed_sha, quarantine=None) -> list[RemoteRunner]."""
+    """Tests for build_remote_runners(config, cwd, *, deployed_sha, quarantine=None) -> list[RemoteRunner]."""
 
     def _call(self, config, cwd='/repo', *, quarantine=None):
-        from orchestrator.merge_lane.worker import _build_remote_runners
-        return _build_remote_runners(
+        from orchestrator.verify_hosts import build_remote_runners
+        return build_remote_runners(
             config, cwd, deployed_sha=TEST_DEPLOYED_SHA, quarantine=quarantine,
         )
 
@@ -197,7 +197,7 @@ class TestBuildRemoteRunners:
 
 
 class TestBuildRemoteRunnersGatePaths:
-    """Each RemoteRunner built by _build_remote_runners gets its gate layout.
+    """Each RemoteRunner built by build_remote_runners gets its gate layout.
 
     - df_remote_checkout / gate root == its VerifyRunnerConfig.gate_paths();
     - deployed_sha == the one passed in, on every runner;
@@ -206,8 +206,8 @@ class TestBuildRemoteRunnersGatePaths:
     """
 
     def _call(self, config, cwd='/repo', *, quarantine=None):
-        from orchestrator.merge_lane.worker import _build_remote_runners
-        return _build_remote_runners(
+        from orchestrator.verify_hosts import build_remote_runners
+        return build_remote_runners(
             config, cwd, deployed_sha=TEST_DEPLOYED_SHA, quarantine=quarantine,
         )
 

@@ -142,7 +142,9 @@ class ClockPort(Protocol):
 
     async def sleep(self, secs: float) -> None: ...
 
-    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+    async def wait_for_any(
+        self, aws: Collection[asyncio.Future[Any]], timeout: float,
+    ) -> set[asyncio.Future[Any]]:
         """Wait up to *timeout* for any of *aws* to finish; the DONE set, never a raise.
 
         A lane wait belongs on this port iff it sits in a REPEATING loop
@@ -238,7 +240,9 @@ class ProductionClock:
     async def sleep(self, secs: float) -> None:
         await asyncio.sleep(secs)
 
-    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+    async def wait_for_any(
+        self, aws: Collection[asyncio.Future[Any]], timeout: float,
+    ) -> set[asyncio.Future[Any]]:
         done, _ = await asyncio.wait(aws, timeout=timeout)
         return done
 

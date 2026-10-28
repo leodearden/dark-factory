@@ -92,21 +92,6 @@ class TestIndexSessions:
         assert not index.available
 
 
-class TestParseResultOutcome:
-    @pytest.mark.parametrize(('text', 'expected'), [
-        ('outcome: done\nchanged: x\n', 'done'),
-        ('---\noutcome: handed-off\nchanged: task/5140\naction_needed: poll\n---\nprose', 'handed-off'),
-        ('outcome: blocked', 'blocked'),
-        ('outcome: abandoned\n', 'abandoned'),
-        ('outcome: maybe\n', None),
-        ('', None),
-        ('I finished the work.\n', None),
-        ('---\nchanged: x\n---\noutcome: done\n', None),
-    ])
-    def test_header_outcome_or_none(self, text, expected):
-        assert mod.parse_result_outcome(text) == expected
-
-
 class TestSpawnedSessionProbe:
     def test_in_flight_session_owns(self, sessions_root):
         _session(sessions_root, 'unblock-df-4797-7', status=Status.RUNNING, role='unblock', project='dark_factory',
@@ -135,6 +120,24 @@ class TestSpawnedSessionProbe:
 
         assert result.status == 'mentions'
         assert 'unblock-df-4797-9' in result.evidence
+
+    def test_in_flight_session_with_a_checkpoint_outcome_still_owns(self, sessions_root):
+        _session(sessions_root, 'unblock-df-4797-10', status=Status.RUNNING, result='outcome: in-progress\n',
+                 project='dark_factory', escalation_id='esc-4797-15')
+
+        result = _probe(_sweep(_item(), sessions_root=sessions_root), 'spawned_session')
+
+        assert result.status == 'owns'
+        assert result.owner == 'session unblock-df-4797-10 (in flight)'
+
+    def test_exited_session_at_a_checkpoint_is_only_a_mention_naming_the_checkpoint(self, sessions_root):
+        _session(sessions_root, 'unblock-df-4797-11', status=Status.EXITED, result='---\noutcome: in-progress\n---\n',
+                 project='dark_factory', escalation_id='esc-4797-15')
+
+        result = _probe(_sweep(_item(), sessions_root=sessions_root), 'spawned_session')
+
+        assert result.status == 'mentions'
+        assert 'outcome=in-progress' in result.evidence
 
     def test_same_id_in_another_project_does_not_match(self, sessions_root):
         _session(sessions_root, 'unblock-reify-4797-1', status=Status.RUNNING, project='reify',

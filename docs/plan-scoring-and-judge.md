@@ -1013,7 +1013,7 @@ tainted. The ladder, in order:
   refusal.
 
 The runner adds the causes no `AgentResult` can show: `timeout`,
-`cap_exhausted` (every account stayed capped past the eval's cap-wait patience),
+`cap_exhausted` (every account stayed capped past the shared cap-wait patience),
 and `harness_error` (our own crash: worktree, config, briefing or artifact read
 raised). The plan judge adds `raised` and `unparseable` (a non-JSON, null or
 non-finite answer).
@@ -1169,7 +1169,7 @@ a reader who tests presence directly; no consumer has to.
 
 The five decline kinds (`metrics.py::DECLINE_KINDS`) are single-sourced against
 the `artifacts.TaskArtifacts.read_*` readers that produce them via
-`metrics.py::_DECLINE_READERS`, so the vocabulary cannot drift away from the
+`metrics.py::DECLINE_READERS`, so the vocabulary cannot drift away from the
 artifacts it names.
 
 **A DECLINE IS NOT A FAILURE.** It is the architect reading the fixture and
@@ -1238,11 +1238,297 @@ explicit, server-accepted decline calls — none silent, none capped — made af
 a median of 41–98 assistant turns of real investigation. Establishing that took
 manual forensics over `~/.claude/projects/*run-<id>/` transcripts, because the
 decline artifacts themselves were already gone: `snapshots.py::cleanup_eval_worktree`
-`rmtree`s the relocated meta root from `runner.py::run_architect_eval`'s
-`finally`. The runner therefore reads the decline artifacts **inside that
-`finally`, immediately before the cleanup call** — the one site reached by all
-four exits (success, timeout, cap exhaustion, harness error) and the last moment
-the artifacts exist.
+`rmtree`s the relocated meta root once the architect invoke ends. The cell
+therefore reads the decline artifacts **immediately before the cleanup call**
+(`architect_eval.py::invoke_architect`, below) — a site reached by all four
+exits (success, timeout, cap exhaustion, harness error) and the last moment the
+artifacts exist.
+
+### The architect cell: invoke, classify, assemble (task 6737)
+
+Code: `orchestrator/src/orchestrator/evals/architect_eval.py`, composed by
+`runner.py::run_architect_eval`.
+
+`run_architect_eval` runs one architect cell as a short composition. The
+architect is invoked and its attempt recorded as a frozen `ArchitectAttempt`:
+outcome, plan, declines, usage, resolved architect cost and, when something
+went wrong, one architect `Unmeasured`. The reference diff is read
+(`read_reference_diff`). `classify_attempt` decides how the plan is scored.
+The plan judge is asked (`judge_plan`) only when that decision is `JUDGE`.
+`assemble_metrics` builds the persisted `EvalMetrics`, and
+`log_architect_cell` writes the route's warning and the completion line.
+`classify_attempt` and `assemble_metrics` are pure. Every effect boundary of a
+cell (worktree, artifacts, briefing, invoke, judge, reference-diff read, gate
+factory, cap-retry wrapper, store) is a field of `ArchitectEvalDeps`, whose
+defaults are the production collaborators, so a test injects fakes rather than
+patching module paths. The orchestrator config the cell runs under is an
+input, not a boundary: `invoke_architect` takes it as `build_orch_config`,
+because the runner derives it from the base config and the candidate.
+
+**The invoke step (`invoke_architect`).** It is the only step with effects on
+the architect, and it drives only the architect: the worktree at the fixture's
+`pre_task_commit`, `TaskArtifacts.init` at the relocated `.task-meta/<name>/`
+root, the replay-framed architect prompt (docs/eval-replay-frame.md), one gated
+`invoke_with_cap_retry` with this candidate's model, backend, effort and
+`env_overrides`, then `read_plan`. Every downstream role is frozen. The
+architect reaches plan-tools and no other MCP server
+(`architect_eval_mcp_scope`): plan-tools is wired through the same seam real
+dispatch uses, so the server writes `plan.json` where the artifacts read it,
+and the strict flag drops the worktree's ambient `.mcp.json` with its live
+escalation and fused-memory servers. The cell's address (`CellName`) is built
+right after the worktree exists, before anything spends, so an unaddressable
+cell fails without a run.
+
+Each way the invoke can end is one row:
+
+| Exit | `outcome` | Architect `Unmeasured` | Plan | Usage |
+|---|---|---|---|---|
+| Answered | `done`, or `blocked` when not `success` | the transport refusal, if `classify_unmeasured` finds one | `read_plan()` | the last attempt's |
+| Answered, then `read_plan` raised | `blocked` | the refusal if any, else `harness_error` | `{}` | the last attempt's |
+| `TimeoutError` | `timeout` | `timeout` | not read | zeros |
+| `AllAccountsCappedException` | `blocked` | `cap_exhausted` | re-read, `{}` if that raises | zeros |
+| Any other exception (config, artifacts, briefing, invoke) | `blocked` | `harness_error` | `{}` | zeros |
+
+Every marker carries the spend banked so far. A classifier that raises leaves
+the cell unmarked rather than losing it.
+
+- The operator's `--timeout` bounds each attempt, never the cap-retry loop.
+  Around the loop, a cap wait longer than the timeout would surface as
+  `outcome='timeout'`, which is candidate-attributable and so not tainted: a
+  cap-starved cell would be scored on a fabricated 0.0 and included in the
+  mean, the differential-exclusion bias φ exists to remove. Per attempt, the
+  two clocks keep their meanings: slowness is a timeout and scores on content,
+  cap starvation is cap exhaustion and taints. A capped attempt is near-instant
+  and free, so the attempt that burns the whole timeout is never the one being
+  retried.
+- Spend is banked per attempt, as each attempt returns.
+  `invoke_with_cap_retry` returns only the last `AgentResult`, so a cap landing
+  mid-run, after the architect spent real money, would otherwise vanish. That
+  matters because the cell is now included: under-reported cost biases the
+  cost comparison the same way exclusion biased quality. Duration is the
+  winning attempt's alone, because cap waits and abandoned attempts are infra
+  time, not candidate latency.
+- Cap exhaustion re-reads the plan. The exception is raised at the invoke, so
+  the ordinary `read_plan` never ran, and a plan written through plan-tools
+  before the pool ran dry would be discarded, turning a scorable cell into an
+  exclusion. The re-read makes exhaustion follow the same taint row an inline
+  mid-run 429 follows. It is caught ahead of the generic handler so it is not
+  labelled our own crash.
+- A transport refusal outranks a later harness error: when `read_plan` raises
+  after a classified refusal, the refusal is the more specific statement of
+  why the cell is not measured.
+- The decline artifacts are read once the call has ended, on every exit and
+  before `cleanup_worktree`, which removes the meta root they live under: it
+  is the last moment they exist. The call turns every `Exception` into an exit
+  row, so the read is reached on each one; the artifacts it reads travel on
+  that exit, with the prices and the banked spend. A read that raises costs
+  the declines, never the cell.
+
+The architect component's cost is resolved per Invariant P5 through
+`metrics.resolve_cost_usd`, the seam `collect_metrics` uses. Its model is
+`config.model`, the model the invoke was handed; `orch_config.models.architect`
+is pinned to the frozen `opus` default for every architect eval and would
+price a fable or vLLM candidate as opus. Its prices come from the built orch
+config, which seeds `claude_endpoint_price_table()` for a proxied candidate
+(task 2820), and its proxy flag is `is_proxied_endpoint(config.env_overrides)`,
+the predicate that seeding keys on. A cell that spent nothing (no tokens, $0.00
+banked) skips resolution and reads `(0.0, 'cli')`: there is no provenance to
+resolve, and resolving would fire the unpriced-proxy warning for spend that
+never happened. The judge's spend keeps its CLI figure (the judge is always a
+native opus call) and the two are composed by `compose_cost_source`.
+
+**The taint table (`classify_attempt`).** "Never asked" means the attempt
+carries an architect `Unmeasured` whose cause is not candidate-attributable;
+`CANDIDATE_ATTRIBUTABLE_CAUSES` holds `timeout` alone. "Scorable" is
+`plan_predicates.is_scorable_plan`, the same predicate the floor and the
+judge's own refusal consult.
+
+| Never asked | Scorable plan | Scoring | `plan_quality` |
+|---|---|---|---|
+| yes | no | `TAINTED` | `None`, `cap_tainted=True` |
+| yes | yes | `FLOORED` | `score_plan_structure(plan)` |
+| no | no | `FLOORED` | `score_plan_structure(plan)`, i.e. `0.0` |
+| no | yes | `JUDGE` | the judge's score, or the floor when the judge is unmeasured |
+
+Per row, and why the line falls there (the general recorded-vs-tainted
+argument is in "Unmeasured cells: typed causes" above):
+
+- A transport refusal (cap hit, auth failure, model not found, body-less 429,
+  5xx, zero-output wedge), cap exhaustion or a harness error, with no scorable
+  plan, is tainted. The candidate was never asked, and charging a schedule,
+  a configuration or our own crash to it would be a fabricated score. "No
+  scorable plan" covers an absent artifact and the header-only stub
+  `create_plan` writes.
+- The same failures after a plan with steps landed (a cap landing mid-run,
+  after the architect wrote real steps through plan-tools) are floored, not
+  tainted: model content exists, so the structural floor is a genuine content
+  measurement. The judge is skipped, because inside the same cap window it
+  would 429 too.
+- A healthy architect with no scorable plan is floored to `0.0` and not marked
+  at all: that is a real reliability signal. The judge is skipped, so the
+  score is never the judge's opinion of an artifact with nothing to judge, and
+  the judge refuses such an artifact itself as well (task 3303).
+- A timeout is marked but is candidate-attributable, so it keeps scoring on
+  content: floored without a plan, judged with one.
+- A failure of the judge alone is recorded (stage `judge`) and never taints:
+  the cell falls back to the floor of a real plan.
+
+The table is today's ladder exactly. Deriving "never asked" from the cause,
+instead of carrying a second flag on the attempt, keeps one fact in one place,
+and a test sweeps every `UnmeasuredCause` so a new cause lands on a row
+deliberately.
+
+**The reference diff and the two warnings.** The reference diff is read on
+every route, so the fixture-level warning ("fixture carries no
+`reference.post_task_commit`") fires once per cell even when the cell is
+tainted and never reaches the judge. That warning states only the fixture-level
+fact. The claim that a score was judged blind is made separately, by
+`judge_plan`, exactly where the judge is invoked with an empty diff.
+`judged_without_reference` is set only where the judge's own number is kept
+(`Scored`), for the reasons in "The validity bound" above: every other path
+persists the structural floor, which never consults a reference.
+
+**Judge spend and calls.** `judge_invocations` is 1 whenever the judge was
+called, even for a $0.00 refusal or an unparseable answer. A judge that raised
+is recorded as `raised` with `cost_usd=0.0` and credits no call, because
+whether the judge was ever reached is unknowable from the caller; its record
+keeps the cell from reading as judge-free. `judge_plan` states that on the
+judgement itself (`PlanJudgement.reached` is false only on that raise), and
+crediting routes on it rather than re-deriving it from the cause.
+`judge_cost_usd` is a subset of the cell's `cost_usd`, as "Spend" above
+states.
+
+**`tests_pass` is `None`.** No test signal exists for a plan-only cell:
+implementer, debugger, reviewer and verify are frozen, so verification never
+runs. `None` is the documented "unknown" value. The dataclass default `False`
+would read as "the tests failed" and hard-gate `blend_composite` to `0.0`,
+collapsing every architect row's composite and leaving `select_survivors`'
+alphabetical tie-break as the whole selection mechanism. `True` is wrong too:
+`build_composite_report` draws each fixture's cost and latency floor from
+passing trials, and `ofat_candidates()` mixes architect, implementer and judge
+candidates over the same fixtures, so a cheap plan-only cell marked passing
+would become the floor for full-workflow cells, and it would fabricate a 100%
+`tests_pass_rate` for a cell that never ran a test.
+
+### Eval usage-gate lifecycle (task 6737)
+
+Code: `orchestrator/src/orchestrator/evals/eval_gate.py`
+(`build_eval_usage_gate`, `owned_usage_gate`, `campaign_usage_gate`,
+`GATE_UNSET`, `InjectedGate`). Consumers:
+`runner.py`'s three executors and stage fan-outs, `cli.py::_run_single_eval`
+and `reviewer_trial/__main__.py::campaign`.
+
+**Why an eval invoke is gated at all (eval-revival φ).** Ungated, a capped
+account refuses the architect outright and the cell is recorded `cap_tainted`,
+so it is excluded from the reported mean. The 2026-07-28 architect wave lost
+about 40% of its cells that way (37 blocked). Exclusion is not neutral: the
+costlier candidate runs longer, is more cap-exposed, and so loses more cells
+than its cheaper rival. The surviving cells are then a biased sample, and the
+comparison the campaign exists to make is silently wrong. Failing over to a
+healthy account measures the candidate instead of the schedule.
+
+**One builder.** `build_eval_usage_gate` is the single construction every eval
+entry point uses. It replaced three byte-identical copies, the shape that
+drifts: the zero-account degrade below would otherwise have had to be
+remembered in three places. It comes back ungated (`None`) three ways, all
+warn-and-degrade rather than raise. Losing failover costs cells, but raising
+costs the whole campaign, for a reason that has nothing to do with the
+candidate under test.
+
+1. `usage_cap.enabled=False`. This is a real production configuration: a
+   deployment that opted out of the account pool must not pay for probe dirs
+   and account state it never asked for.
+2. The constructor raised.
+3. The gate constructed but resolved zero accounts. `_init_accounts` logs "No
+   accounts configured and no default credential found" and returns `[]`, so
+   construction succeeds and the failure is deferred to the first
+   `before_invoke`, which raises `RuntimeError('No OAuth accounts available
+   ...')`. That lands in the caller's harness-error handler, so the cell is
+   tainted and excluded. With `usage_cap.enabled=True` but no `CLAUDE_OAUTH_*`
+   exported and no `~/.claude/.credentials.json` (an ordinary CI shell), every
+   architect cell would be lost, where the same campaign ran fine ungated on
+   ambient credentials before φ. An empty pool has nothing to fail over to, so
+   degrading forfeits nothing. The discarded gate is still shut down
+   (best-effort): even with no accounts the constructor allocated a fallback
+   probe `TaskConfigDir` and installed a SIGHUP handler, and this runs once
+   per cell.
+
+**The three readings of a `usage_gate=` argument (`InjectedGate`, task 4427).**
+A `UsageGate` is a live gate a campaign owner handed down. `None` is a campaign
+owner that is deliberately ungated: run without failover and do not build one.
+`GATE_UNSET`, the default, means nobody supplied anything: build a gate and own
+it. A plain `None` default cannot express this, because `build_eval_usage_gate`
+legitimately returns `None` three ways. A campaign whose gate degraded would
+hand `None` to every cell, and each cell would read that as "nothing was
+supplied" and build its own, silently restoring the per-cell construction the
+campaign gate exists to remove (and re-paying a probe-dir allocation plus a
+SIGHUP-handler steal per cell on the zero-account path). `GATE_UNSET` is an
+instance of a private class so the annotation and the `isinstance` check are
+pyright-clean.
+
+**Whoever built the gate tears it down, and nobody else.** `owned_usage_gate`
+is that contract, stated once for all three executors. Given `GATE_UNSET` it
+builds through its factory, yields, and shuts the gate down on exit, whether
+the body returned or raised. Given a gate or `None` it yields the argument and
+touches nothing.
+
+- An owned gate must come down. A campaign loops fixtures × candidates ×
+  trials in one process, so a gate left running leaks a live account-resume
+  probe loop firing real CLI probes for the rest of the campaign, and each new
+  gate steals the SIGHUP handler from predecessors kept alive by exactly those
+  background tasks.
+- A borrowed gate must not. It carries the one cap-state view every sibling
+  cell shares, so cell N+1 no longer re-leases the account cell N proved
+  capped. Shutting it down would take failover from every sibling still to
+  run, including ones already in flight.
+- Teardown is best-effort everywhere: the cell (or the campaign) is already
+  complete by then, so a failing `shutdown()` logs and never turns a finished
+  result into a raise.
+
+In the architect cell the owned gate wraps only the `invoke_with_cap_retry`
+call, the one call that uses it. A harness error before the invoke therefore
+builds no gate at all.
+
+**One gate per campaign (`campaign_usage_gate`).** A campaign is any loop that
+runs several cells in one process. It builds through `owned_usage_gate`, so
+build, yield and teardown have one implementation. It builds from
+`base_config`, which is right because the builder reads exactly one leaf,
+`usage_cap`, and every cell's orch config is
+`apply_eval_profile(base_config).model_copy(update=...)` with neither
+`EVAL_PROFILE` nor the update dict mentioning `usage_cap`. The leaf is
+inherited verbatim and the campaign gate is identical to the one each cell
+would have built. That equivalence is emergent across two files, so
+`test_eval_architect.py::TestCampaignGatePremise` pins it as a tripwire. A
+`None` base config yields `None` without building: there is nothing to build
+from, and every stage function defaults it. A `None` yield, from that or from
+a degraded build, must be threaded to cells as an explicit `usage_gate=None`,
+never dropped, for the reason in the readings above.
+
+Sharing one gate across concurrent cells is the production shape, not a new
+one: `orchestrator.harness.Harness` builds one `UsageGate` per orchestrator
+process, shares it across every concurrently running workflow, and tears it
+down once. Account leasing exists to arbitrate concurrent consumers, and
+sharing is what makes cap state mean anything: a cell that proves an account
+capped must inform its in-flight siblings, not merely its successors.
+
+Sharing also makes the gate's runtime state campaign-scoped, including
+`UsageGate._cumulative_cost`. `before_invoke` raises `SessionBudgetExhausted`
+once that tally reaches `usage_cap.session_budget_usd`, and nothing resets it
+between cells, so one gate means one session ceiling for the whole campaign
+where a per-cell gate gave each cell a fresh budget. With the ceiling set, a
+long campaign would trip partway through and every remaining cell would block
+or be stamped `harness_error`, losses the report would attribute to the
+candidate. This is latent, not live: `session_budget_usd` defaults to `None`
+and no config in this repo sets it. A campaign that wants per-cell budgeting
+should build from a `usage_cap` copy with `session_budget_usd=None` and let
+each invocation's `max_budget_usd` bound it instead.
+
+**Cap-wait patience: the shared default.** The architect call passes no
+`cap_wait_sanity_secs` and no `max_cap_retries`, so it takes the shared default
+(`shared/src/shared/cli_invoke.py::_DEFAULT_CAP_WAIT_SANITY_SECS`; esc-4002-1,
+task 7320). Waiting is about free, because `--resume` carries banked spend
+across the account switch, while tainting re-spends it. A fixed retry count
+would give a bigger pool less patience.
 
 ---
 

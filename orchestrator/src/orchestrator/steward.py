@@ -56,6 +56,7 @@ from shared.cli_invoke import (
     is_timed_out_with_progress,
 )
 from shared.proc_group import terminate_process_group
+from shared.process_cost import next_resume_prior
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import STEWARD
@@ -160,6 +161,7 @@ class TaskSteward:
         self.cost_store = cost_store
 
         self._session_id: str | None = None
+        self._session_reported_total_usd: float | None = None
         self._stopped = False
         self._task: asyncio.Task | None = None
         # The four guards below are restart-durable and TTL-bounded (task
@@ -692,6 +694,8 @@ class TaskSteward:
                     # denominator.
                     'ended_awaiting_background': result.ended_awaiting_background,
                     'retry_aborted': result.retry_aborted,
+                    'cost_basis': result.cost_basis.value,
+                    'cost_delta_clamped': result.cost_delta_clamped,
                 },
             )
 
@@ -730,7 +734,7 @@ class TaskSteward:
             # session id so the next attempt rebuilds a fresh initial prompt at the
             # current cwd instead of repeating the same instant failure.
             cleared = self._session_id is not None
-            self._session_id = None
+            self._drop_session()
             logger.warning(
                 f'Steward for task {self.task_id}: invocation produced no output '
                 f'(empty stdout) — retry_count NOT incremented '
@@ -892,6 +896,8 @@ class TaskSteward:
         )
         if self._session_id is not None:
             kwargs['resume_session_id'] = self._session_id
+            if self._session_reported_total_usd is not None:
+                kwargs['resume_prior_total_cost_usd'] = self._session_reported_total_usd
 
         # `backend` below reaches invoke_agent: invoke_with_cap_retry forwards
         # it into invoke_kwargs only when a custom invoke_fn is supplied, and
@@ -925,10 +931,26 @@ class TaskSteward:
             **kwargs,
         )
 
-        if result.session_id:
-            self._session_id = result.session_id
+        self._adopt_session(result)
 
         return result
+
+    def _adopt_session(self, result) -> None:
+        """Resume *result*'s session next time, carrying its reported total as the prior."""
+        if not result.session_id:
+            return
+        self._session_reported_total_usd = next_resume_prior(
+            armed_session_id=self._session_id,
+            armed_prior_usd=self._session_reported_total_usd,
+            result_session_id=result.session_id,
+            result_reported_total_usd=result.reported_total_cost_usd,
+        )
+        self._session_id = result.session_id
+
+    def _drop_session(self) -> None:
+        """Start the next invocation fresh: forget the session and its prior total together."""
+        self._session_id = None
+        self._session_reported_total_usd = None
 
     # ------------------------------------------------------------------
     # Pre-triage for large suggestion sets

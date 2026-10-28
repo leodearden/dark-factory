@@ -86,7 +86,7 @@ def _finalize(
     *,
     request_id: str,
     state: str,
-    branch: str = _BRANCH,
+    branch: str = _TASK,
     task_id: str = _TASK,
     **extra: Any,
 ) -> None:
@@ -100,7 +100,7 @@ def _finalize(
 def _journal_entry(
     request_id: str,
     *,
-    branch: str = _BRANCH,
+    branch: str = _TASK,
     task_id: str = _TASK,
     enqueued_at: float = 1_700_000_000.0,
 ) -> dict[str, Any]:
@@ -140,7 +140,7 @@ def _live_entry(
 ) -> dict[str, Any]:
     return {
         'request_id': request_id,
-        'branch': _BRANCH,
+        'branch': _TASK,
         'task_id': _TASK,
         'state': state,
         'position': 0,
@@ -433,11 +433,11 @@ class TestAliasResolution:
     ) -> None:
         prior, current = _event_stores(tmp_path)
         _finalize(
-            prior, request_id='mr-a', state='superseded', branch='task/1', task_id='1',
+            prior, request_id='mr-a', state='superseded', branch='1', task_id='1',
             superseded_by='coalesce-x-1',
         )
         _finalize(
-            prior, request_id='mr-b', state='superseded', branch='task/2', task_id='2',
+            prior, request_id='mr-b', state='superseded', branch='2', task_id='2',
             superseded_by='coalesce-x-1',
         )
 
@@ -450,7 +450,7 @@ class TestAliasResolution:
         assert last['state'] == 'superseded'
         assert last['superseded_by'] == 'coalesce-x-1'
         assert last['request_id'] == 'mr-b'
-        assert last['branch'] == 'task/2'
+        assert last['branch'] == '2'
 
     async def test_b7_a_prior_run_absorbed_loser_resolves_to_its_primary(
         self, tmp_path: Path
@@ -483,6 +483,52 @@ class TestAliasResolution:
         assert response['source'] == 'event_store'
         assert response['request_id'] == 'mr-primary'
         assert response['last_outcome']['request_id'] == 'mr-primary'
+
+
+@pytest.mark.parametrize('branch', [_TASK, _BRANCH], ids=['bare', 'full_ref'])
+class TestBranchKeySpelling:
+    """Each non-git tier answers a branch poll whether or not it carries the prefix."""
+
+    async def test_the_live_tier(self, tmp_path: Path, branch: str) -> None:
+        _, current = _event_stores(tmp_path)
+        server = _server(tmp_path, current, worker=_live_worker(_live_entry('mr-live')))
+
+        response = await _poll(server, branch=branch)
+
+        assert response['state'] == 'queued'
+        assert response['source'] == 'live'
+        assert response['request_id'] == 'mr-live'
+
+    async def test_the_current_run_tier(self, tmp_path: Path, branch: str) -> None:
+        _, current = _event_stores(tmp_path)
+        _finalize(current, request_id='mr-1', state='blocked')
+
+        response = await _poll(_server(tmp_path, current), branch=branch)
+
+        assert response['state'] is MergeState.blocked
+        assert response['source'] == 'event_store'
+        assert response['request_id'] == 'mr-1'
+
+    async def test_the_journal_tier(self, tmp_path: Path, branch: str) -> None:
+        _, current = _event_stores(tmp_path)
+        journal = _journal(tmp_path, _journal_entry('mr-j'))
+
+        response = await _poll(_server(tmp_path, current, journal=journal), branch=branch)
+
+        assert response['state'] is MergeState.journaled
+        assert response['source'] == 'journal'
+        assert response['request_id'] == 'mr-j'
+
+    async def test_the_prior_run_tier(self, tmp_path: Path, branch: str) -> None:
+        prior, current = _event_stores(tmp_path)
+        _finalize(prior, request_id='mr-old', state='conflict')
+
+        response = await _poll(_server(tmp_path, current), branch=branch)
+
+        assert response['state'] is MergeState.stale_record
+        assert response['reason'] == MergeReason.prior_run_terminal
+        assert response['source'] == 'event_store_cross_run'
+        assert response['last_outcome']['request_id'] == 'mr-old'
 
 
 class TestMergeCancelDurableResolution:

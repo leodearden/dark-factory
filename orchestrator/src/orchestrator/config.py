@@ -12,7 +12,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 from types import UnionType
-from typing import Any, Literal, NamedTuple, Union, get_args, get_origin
+from typing import Annotated, Any, Literal, NamedTuple, Union, get_args, get_origin
 
 import yaml
 from pydantic import (
@@ -50,6 +50,7 @@ from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for t
     parse_census_ignore_entries,
 )
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
+from orchestrator.shadow_types import ShadowShape
 from orchestrator.verify_admission_gate import AdmissionOrder
 
 logger = logging.getLogger(__name__)
@@ -3295,10 +3296,10 @@ _DEFAULT_PRICES: dict[str, dict[str, float]] = {
     # config is threaded in. Kept in lockstep with defaults.yaml's `prices:`
     # block by test_config.py's test_default_price_table_matches_defaults_yaml.
     'gpt-5.4': {'input_per_1m': 2.50, 'output_per_1m': 10.00},
-    # Codex sticker rates; codex reports no cached-input split, so these price
-    # every input token at the uncached rate (an upper bound on the true
-    # spend). gpt-5.6-sol's rate is promotional through at least 2026-11-21.
-    'gpt-6-astra': {'input_per_1m': 10.00, 'output_per_1m': 50.00},
+    # Codex sticker rates. codex reports cached_input_tokens inside input_tokens and astra prices
+    # that split; sol and terra have no cached rate yet, so theirs is an uncached upper bound.
+    # gpt-5.6-sol's rate is promotional through at least 2026-11-21.
+    'gpt-6-astra': {'input_per_1m': 10.00, 'output_per_1m': 50.00, 'cached_input_per_1m': 1.00},
     'gpt-5.6-sol': {'input_per_1m': 4.00, 'output_per_1m': 20.00},
     'gpt-5.6-terra': {'input_per_1m': 2.00, 'output_per_1m': 12.00},
     'o4-mini': {'input_per_1m': 1.10, 'output_per_1m': 4.40},
@@ -3316,6 +3317,11 @@ class PriceEntry(BaseModel):
 
     input_per_1m: float = Field(ge=0, description='USD per 1M input tokens.')
     output_per_1m: float = Field(ge=0, description='USD per 1M output tokens.')
+    cached_input_per_1m: float | None = Field(
+        default=None,
+        ge=0,
+        description='USD per 1M cached input tokens; None prices them at input_per_1m.',
+    )
 
 
 def default_price_table() -> dict[str, dict[str, float]]:
@@ -3470,6 +3476,83 @@ class ConfigKeyCensusConfig(BaseModel):
             'tooling already greps for.'
         ),
     )
+
+
+_SampleRate = Annotated[float, Field(ge=0.0, le=1.0)]
+_CandidateName = Annotated[str, Field(min_length=1)]
+
+
+class ShadowEvalConfig(BaseModel):
+    """Live paired shadow eval (plans/live-shadow-eval-prd.md C6), under ``shadow_eval:``.
+
+    Assumption (Leo, 2026-09-11): the GLM Coding Plan is used only for eval, so
+    shadow cells contend with nothing for its credit allowance; no credit-budget
+    knob or quota-contention model exists. Revisit if the plan starts serving
+    other work.
+    """
+
+    enabled: bool = Field(default=False, description='Master switch; off opens no cell.')
+    sample_rate: _SampleRate = Field(
+        default=0.0, description='Probability a matching trigger opens a cell.',
+    )
+    candidate_sample_rates: dict[str, _SampleRate] = Field(
+        default_factory=dict,
+        description='Per-candidate sample_rate overrides; keys must be listed in candidates.',
+    )
+    shapes: list[ShadowShape] = Field(
+        default_factory=list, description='The enabled cell shapes.',
+    )
+    candidates: list[_CandidateName] = Field(
+        default_factory=list,
+        description='EvalConfig names, optionally <name>@<variant>.',
+    )
+    end_to_end_candidates: list[_CandidateName] = Field(
+        default_factory=list,
+        description='The candidates that also run end-to-end cells; each must be in candidates.',
+    )
+    max_concurrent: int = Field(default=1, ge=1, description='Cells running at once.')
+    daily_budget_usd: float = Field(
+        default=50.0,
+        ge=0.0,
+        description=(
+            'auto_eval_redo_budget_usd semantics: a trailing-24h USD sum of shadow '
+            'invocation cost, above which no cell opens.'
+        ),
+    )
+    settle_deadline_hours: float = Field(
+        default=168.0, gt=0.0,
+        description='How long an awaiting cell waits for its production reference.',
+    )
+    failure_streak_pause: int = Field(
+        default=5, ge=1, description='Consecutive failed cells that pause shadow eval.',
+    )
+    cost_ratio_ceiling: float = Field(
+        default=3.0, gt=0.0,
+        description='Candidate-to-incumbent cost ratio above which shadow eval pauses.',
+    )
+    n_min: int = Field(
+        default=12, ge=1,
+        description='Pairs below which a report line is UNDERPOWERED (provisional, PRD open question 2).',
+    )
+    seed: int = Field(default=0, description='Seed of the sampling RNG.')
+
+    @model_validator(mode='after')
+    def _listed_candidates_only(self) -> 'ShadowEvalConfig':
+        listed = set(self.candidates)
+        unlisted = {
+            'end_to_end_candidates': [c for c in self.end_to_end_candidates if c not in listed],
+            'candidate_sample_rates': sorted(set(self.candidate_sample_rates) - listed),
+        }
+        for field_name, names in unlisted.items():
+            if names:
+                raise ValueError(
+                    f'shadow_eval.{field_name} names {names} absent from '
+                    f'shadow_eval.candidates; such an entry would never fire'
+                )
+        return self
+
+    def sample_rate_for(self, candidate: str) -> float:
+        return self.candidate_sample_rates.get(candidate, self.sample_rate)
 
 
 # --- Top-level ---
@@ -3978,15 +4061,24 @@ class OrchestratorConfig(BaseSettings):
     # restarting the fleet is not a kill switch (the argument already written
     # for ``config_key_census.*`` and ``merge_deep.chain_cap``).
     merge_disjoint_skip_requires_verified_drift: bool = Field(default=True)
-    # The project's merge gate verdict is a function of the tree alone: no
-    # leg reads git history (ancestry of HEAD, a merge-base, a log).  Only
-    # then may ``merge_lane/gates.py::_reverify_rebased_tree`` skip the
-    # re-verify of a rebased tree byte-identical to the one that just passed
-    # (task 6647).  False (the default) re-verifies it.  GREEN TIER for the
-    # reason given for ``merge_disjoint_skip_requires_verified_drift``
-    # above: read fresh off ``req.config`` at each gate evaluation, and it
-    # only ever decides whether one more verify runs before an advance.
+    # The project's merge gate verdict is a function of the tree alone: every
+    # gate leg judges the tree, except the tests
+    # ``merge_gate_history_test_command`` selects, which read git history
+    # (ancestry of HEAD, a merge-base, a log) and so re-run on the same tree.
+    # Only then may ``merge_lane/gates.py::_reverify_rebased_tree`` forgo the
+    # full re-verify of a rebased tree byte-identical to the one that just
+    # passed (tasks 6647, 7248).  False (the default) re-verifies it.  GREEN
+    # TIER for the reason given for
+    # ``merge_disjoint_skip_requires_verified_drift`` above: read fresh off
+    # ``req.config`` at each gate evaluation, and it only ever decides
+    # whether one more verify runs before an advance.
     merge_gate_history_pure: bool = Field(default=False)
+    # The shell command, run from the merge worktree root, that runs exactly
+    # the merge gate's history-reading tests (task 7248).  Consulted only
+    # when ``merge_gate_history_pure`` is True, on a same-tree rebase, where
+    # it runs instead of skipping.  None (the default) declares no history
+    # leg, so that rebase skips.
+    merge_gate_history_test_command: str | None = Field(default=None)
     # Fix (b), task 2822 — per-land cross-check of a REMOTE merge-verify green.
     # When True (default), after a remote two-host verify returns a real-suite
     # PASS that would DECIDE a land, the merge worker re-runs the LOCAL
@@ -4213,6 +4305,7 @@ class OrchestratorConfig(BaseSettings):
             '_AUTO_EVAL_EXCLUDED_BLOCK_CATEGORIES whatever their phase.'
         ),
     )
+    shadow_eval: ShadowEvalConfig = Field(default_factory=ShadowEvalConfig)
 
     # Worktree identity guard (Fix C) — on crash-recovery / worktree reuse,
     # compare the worktree's stored title against the live DB task's title and
@@ -6420,6 +6513,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # and the 8h fleet-redeploy cadence, clearing a false-positive L2 without a
     # restart is materially better.
     _submodel_leaf_paths('config_key_census', ConfigKeyCensusConfig),
+    # Live shadow eval (task 5382, plans/live-shadow-eval-prd.md C6): green tier on
+    # purpose, NOT auto_eval_redo_budget_usd's restart tier (PRD S2).
+    _submodel_leaf_paths('shadow_eval', ShadowEvalConfig),
     {
         # Steward grace
         'steward_completion_timeout',
@@ -6547,6 +6643,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # Same-tree gate skip precondition (task 6647) — green-tier for the
         # reason given directly above.
         'merge_gate_history_pure',
+        # Same-tree history leg (task 7248) — read fresh off req.config at each
+        # gate evaluation, and it only decides what one gate run executes.
+        'merge_gate_history_test_command',
         # Task-text amendment gate on the Lever-B skip (task 4031) — read off
         # self.config at each revalidation decision and never captured, so a
         # flip affects only the next decision.

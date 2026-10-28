@@ -392,6 +392,10 @@ reconciliation:
   # instead of resuming silently. Restart-tier (read each cycle; not hot-reloadable).
   auto_unhalt_after_cooldown: true
   explore_codebase_root: "${PROJECT_ROOT:.}"
+  # Recon CLI transcripts are archived into the orchestrator's archive root (relative to explore_codebase_root), which the legibility miner already walks.
+  # TaskCurator's per-process config-dir transcripts are archived there too, under the same kill switch (task 6008).
+  transcript_archive_enabled: true
+  transcript_archive_root: "data/orchestrator/agent-transcripts"
   # Escalation
   escalation_port: ${RECON_ESCALATION_PORT:8103}
   escalation_host: "127.0.0.1"

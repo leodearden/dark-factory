@@ -1975,6 +1975,7 @@ _DEPENDENCY_FREE_MODULES = {
         'tab_escalations.jsx',
         'tab_escalation_analytics.jsx',
     ),
+    'tab_render_failure.js': ('app.jsx',),
 }
 _DEPENDENCY_FREE_CONSUMER_CASES = [
     (module, consumer)
@@ -2121,6 +2122,7 @@ def redux_base_state() -> ReduxBaseState | None:
     return resolve_redux_base_state(REPO_ROOT)
 
 
+@pytest.mark.reads_git_history
 def test_redux_cache_buster_is_newer_than_merge_base(
     index_html_body: str,
     redux_base_state: ReduxBaseState | None,

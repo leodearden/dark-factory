@@ -772,6 +772,7 @@ EXPECTED_GUARDED_SCRIPTS: frozenset[str] = frozenset({
     'normalize_topic_slugs.py',
     'prune_recon_cycle_summaries.py',
     'purge_knowlive_namespace.py',
+    'replay_failed_mem0_intents.py',
     'retro_stamp_topics.py',
     'sweep_orphan_flag_markers.py',
     'sweep_toolcall_xml_leak.py',
@@ -802,6 +803,109 @@ class TestGuardedScriptCensus:
             '4293 and 4848. Unlike EXPECTED_EXEMPT_SCRIPTS this list is expected '
             'to GROW: a newly-guarded script is the good outcome, and growth is '
             'fine as long as BOTH homes move together in the same edit.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# No hand-rolled refusal record (task 6014)
+# ---------------------------------------------------------------------------
+#
+# The guard emits the operator-facing refusal record itself, through the
+# logger its caller passes. Seventeen scripts used to wrap it in an
+# `except StoreMutationUnavailable: logger.error(...)` arm instead, and the
+# hand-copied prose drifted (dashes, a dropped mechanism clause, a dropped
+# --apply tail). This keeps a new arm from bringing that back.
+# ---------------------------------------------------------------------------
+
+#: The guard's refusal type, as it is spelled in a handler.
+REFUSAL_TYPE = 'StoreMutationUnavailable'
+
+#: The logger methods a hand-rolled refusal record would be emitted through.
+LOGGING_METHODS: frozenset[str] = frozenset({
+    'error', 'exception', 'critical', 'warning', 'info', 'debug', 'log',
+})
+
+
+def _handler_names_the_refusal(handler_type: ast.expr | None) -> bool:
+    if isinstance(handler_type, ast.Tuple):
+        return any(_handler_names_the_refusal(elt) for elt in handler_type.elts)
+    if isinstance(handler_type, ast.Name):
+        return handler_type.id == REFUSAL_TYPE
+    if isinstance(handler_type, ast.Attribute):
+        return handler_type.attr == REFUSAL_TYPE
+    return False
+
+
+def hand_rolled_refusal_records(tree: ast.Module) -> list[int]:
+    """Line numbers of logging calls inside an ``except StoreMutationUnavailable``."""
+    return sorted(
+        node.lineno
+        for handler in ast.walk(tree)
+        if isinstance(handler, ast.ExceptHandler)
+        and _handler_names_the_refusal(handler.type)
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in LOGGING_METHODS
+    )
+
+
+class TestHandRolledRefusalRecordDetector:
+    """The detector on synthetic sources, so it cannot rot unseen once the live
+    tree holds no offender."""
+
+    @pytest.mark.parametrize(
+        'handler_type',
+        ['StoreMutationUnavailable', 'preflight.StoreMutationUnavailable',
+         '(OSError, StoreMutationUnavailable)'],
+    )
+    def test_a_logging_call_in_a_refusal_handler_is_flagged(self, tmp_path, handler_type):
+        source = tmp_path / 'script.py'
+        source.write_text(
+            'try:\n'
+            "    assert_store_mutation_allowed(operation='x --apply')\n"
+            f'except {handler_type}:\n'
+            "    logger.error('refused')\n"
+            '    raise\n'
+        )
+
+        assert hand_rolled_refusal_records(parse_python_module(source)) == [4]
+
+    def test_a_print_and_exit_handler_is_not_flagged(self, tmp_path):
+        source = tmp_path / 'script.py'
+        source.write_text(
+            'try:\n'
+            "    assert_store_mutation_allowed(operation='x')\n"
+            'except StoreMutationUnavailable as error:\n'
+            "    print(f'error: {error}', file=sys.stderr)\n"
+            '    return 2\n'
+        )
+
+        assert hand_rolled_refusal_records(parse_python_module(source)) == []
+
+    def test_logging_in_an_unrelated_handler_is_not_flagged(self, tmp_path):
+        source = tmp_path / 'script.py'
+        source.write_text(
+            'try:\n'
+            '    work()\n'
+            'except Exception:\n'
+            "    logger.error('fatal error during sweep')\n"
+        )
+
+        assert hand_rolled_refusal_records(parse_python_module(source)) == []
+
+
+@pytest.mark.parametrize('path', GUARDED_SCRIPTS, ids=lambda p: p.name)
+class TestNoGuardedScriptHandRollsTheRefusalRecord:
+    def test_no_refusal_handler_logs(self, path):
+        offenders = hand_rolled_refusal_records(parse_python_module(path))
+        assert offenders == [], (
+            '; '.join(f'scripts/{path.name}:{lineno}' for lineno in offenders)
+            + f' -- logs from inside an `except {REFUSAL_TYPE}` handler. The '
+            f'guard composes the refusal record itself: pass logger=<this '
+            f"script's logger> and extra_detail=<this script's mechanism and "
+            f"its 'nothing was X'd' clause> to {GUARD_CALLABLE}, and never "
+            f'hand-roll the record.'
         )
 
 

@@ -22,13 +22,12 @@ from shared.async_sqlite_base import (
 # circular import.  The rule lives in shared precisely so this module and the
 # dashboard can both reach it; judge.py delegates to the same primitives.
 from shared.phantom_verdict import UNPARSEABLE_VERDICT_CODE, is_phantom_verdict_json
+from shared.sqlite_column_migration import add_column_if_missing
 
 from fused_memory.models.reconciliation import (
-    JournalEntry,
     JudgeVerdict,
     ReconciliationRun,
     RunStatus,
-    StageId,
     StageReport,
     Watermark,
 )
@@ -109,20 +108,6 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
-
-CREATE TABLE IF NOT EXISTS journal_entries (
-    id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL,
-    stage TEXT,
-    timestamp TEXT NOT NULL,
-    operation TEXT NOT NULL,
-    target_system TEXT NOT NULL,
-    before_state TEXT,
-    after_state TEXT,
-    reasoning TEXT DEFAULT '',
-    evidence TEXT DEFAULT '[]'
-);
-CREATE INDEX IF NOT EXISTS idx_journal_run ON journal_entries(run_id);
 
 CREATE TABLE IF NOT EXISTS judge_verdicts (
     run_id TEXT PRIMARY KEY,
@@ -294,49 +279,29 @@ class ReconciliationJournal:
         async with self._access.write() as db:
             await db.executescript(SCHEMA_SQL)
 
-        # Safe migration: add triggered_by column to existing DBs
-        await self._add_column('ALTER TABLE runs ADD COLUMN triggered_by TEXT')
+        async with self._access.write() as db:
+            # Safe migration: add triggered_by column to existing DBs
+            await add_column_if_missing(db, 'runs', 'triggered_by', 'TEXT')
 
-        # Safe migration: add instance_id column to existing DBs.  Lets the
-        # stale-run reaper distinguish runs owned by the current process from
-        # runs orphaned by a prior process whose lock has since been re-acquired
-        # by a fresh instance — see _recover_stale_runs.
-        await self._add_column('ALTER TABLE runs ADD COLUMN instance_id TEXT')
+            # Safe migration: add instance_id column to existing DBs.  Lets the
+            # stale-run reaper distinguish runs owned by the current process from
+            # runs orphaned by a prior process whose lock has since been re-acquired
+            # by a fresh instance — see _recover_stale_runs.
+            await add_column_if_missing(db, 'runs', 'instance_id', 'TEXT')
 
-        # Safe migration: add session-capture columns to existing DBs (task 2744).
-        # session_id / stage_cursor snapshot the in-flight stage subprocess's CLI
-        # session (cleared between stages); attempt is a monotonic count of
-        # stage-subprocess launches, the substrate task σ's resume gate consumes.
-        await self._add_column('ALTER TABLE runs ADD COLUMN session_id TEXT')
-        await self._add_column('ALTER TABLE runs ADD COLUMN stage_cursor TEXT')
-        await self._add_column('ALTER TABLE runs ADD COLUMN attempt INTEGER DEFAULT 0')
+            # Safe migration: add session-capture columns to existing DBs (task 2744).
+            # session_id / stage_cursor snapshot the in-flight stage subprocess's CLI
+            # session (cleared between stages); attempt is a monotonic count of
+            # stage-subprocess launches, the substrate task σ's resume gate consumes.
+            await add_column_if_missing(db, 'runs', 'session_id', 'TEXT')
+            await add_column_if_missing(db, 'runs', 'stage_cursor', 'TEXT')
+            await add_column_if_missing(db, 'runs', 'attempt', 'INTEGER DEFAULT 0')
+
+            # Retired mutation-audit ledger (task 5890), dropped from DBs created
+            # before its DDL was removed; its idx_journal_run index goes with it.
+            await db.execute('DROP TABLE IF EXISTS journal_entries')
 
         logger.info(f'Reconciliation journal initialized at {db_path}')
-
-    async def _add_column(self, ddl: str) -> None:
-        """Run one ALTER migration, tolerating a DB that already has the column.
-
-        Each ALTER is its OWN write unit: a column that already exists must roll
-        back only its own statement, never a sibling migration that just
-        succeeded.
-
-        "duplicate column name" is the ONLY tolerated failure, and the catch is
-        narrowed to it (loud-over-silent) exactly as ``EventBuffer._migrate`` and
-        ``ReconLedgerStore.initialize`` narrow theirs.  SQLite's ALTER TABLE has
-        no IF NOT EXISTS, so re-running these against an already-migrated DB is
-        expected; a locked or partially-created DB or a disk error is NOT, and
-        swallowing it here would let initialize() log success and leave the
-        failure to re-surface much later as a confusing "no such column" from the
-        first statement that needs the column.
-        """
-        access = self._require_access()
-        try:
-            async with access.write() as db:
-                await db.execute(ddl)
-        except Exception as exc:
-            # The write unit has already rolled itself back.
-            if 'duplicate column name' not in str(exc).lower():
-                raise  # Not the benign "column already exists" case — surface it.
 
     async def close(self) -> None:
         if self._access is not None:
@@ -467,6 +432,15 @@ class ReconciliationJournal:
             )
             applied = cursor.rowcount == 1
         return applied
+
+    async def is_run_completed(self, run_id: str) -> bool:
+        """The one definition of 'durably completed', consulted by both the
+        drained-event restore policy and ``run_full_cycle``'s failure arms:
+        durable completion is final."""
+        row = await self._require_access().read_one(
+            'SELECT status FROM runs WHERE id = ?', (run_id,)
+        )
+        return row is not None and row['status'] == RunStatus.completed.value
 
     async def update_run_stage_reports(
         self, run_id: str, stage_reports: dict[str, StageReport | dict]
@@ -787,56 +761,6 @@ class ReconciliationJournal:
             (project_id,),
         )
         return row is not None
-
-    # ── Journal entries ────────────────────────────────────────────────
-
-    async def add_entry(self, entry: JournalEntry) -> None:
-        async with self._require_access().write() as db:
-            await db.execute(
-                """INSERT INTO journal_entries
-                   (id, run_id, stage, timestamp, operation, target_system,
-                    before_state, after_state, reasoning, evidence)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    entry.id,
-                    entry.run_id,
-                    entry.stage.value if entry.stage else None,
-                    entry.timestamp.isoformat(),
-                    entry.operation,
-                    entry.target_system,
-                    json.dumps(entry.before_state) if entry.before_state is not None else None,
-                    json.dumps(entry.after_state) if entry.after_state is not None else None,
-                    entry.reasoning,
-                    json.dumps(entry.evidence),
-                ),
-            )
-
-    async def get_entries(self, run_id: str) -> list[JournalEntry]:
-        rows = await self._require_access().read_all(
-            'SELECT * FROM journal_entries WHERE run_id = ? ORDER BY timestamp',
-            (run_id,),
-        )
-        entries = []
-        for row in rows:
-            entries.append(
-                JournalEntry(
-                    id=row['id'],
-                    run_id=row['run_id'],
-                    stage=StageId(row['stage']) if row['stage'] else None,
-                    timestamp=datetime.fromisoformat(row['timestamp']),
-                    operation=row['operation'],
-                    target_system=row['target_system'],
-                    before_state=json.loads(row['before_state'])
-                    if row['before_state']
-                    else None,
-                    after_state=json.loads(row['after_state'])
-                    if row['after_state']
-                    else None,
-                    reasoning=row['reasoning'],
-                    evidence=json.loads(row['evidence']),
-                )
-            )
-        return entries
 
     # ── Judge verdicts ─────────────────────────────────────────────────
 

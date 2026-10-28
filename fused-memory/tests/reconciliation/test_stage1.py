@@ -55,7 +55,6 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
-from fused_memory.models.scope import ProjectScope
 from fused_memory.reconciliation import live_workflow_section as section_module
 from fused_memory.reconciliation.curator_gate_resolution_sweep import (
     GATE_RESOLUTION_FLAG_TYPE,
@@ -84,19 +83,7 @@ from fused_memory.services.live_workflow_detector import WorkflowLiveness
 # callable, and bound the guard to a private name this file was free to rename.
 # Add a new shared consolidator fixture there, not here.
 from reconciliation.consolidator_fixtures import make_consolidator, make_scope
-
-
-def _rescope(stages, scope: ProjectScope) -> list:
-    """Re-scope each pinned stage instance in *stages* to *scope*, in place.
-
-    Local mirror of test_harness.py's `_rescope` — lets this file's single
-    `_make_stages` monkeypatch shim (below) honor whatever scope production
-    code passes in.
-    """
-    for s in stages:
-        s.scope = scope
-    return stages
-
+from reconciliation.harness_fixtures import make_harness, make_harness_config
 
 # ---------------------------------------------------------------------------
 # project_root in legacy (time-windowed) assemble_payload
@@ -472,23 +459,13 @@ def _make_dedup_harness(tmp_path: Path, queue_subdir: str = 'recon_esc'):
     """
     from escalation.queue import EscalationQueue
 
-    from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
-    from fused_memory.reconciliation.harness import ReconciliationHarness
-
-    config = FusedMemoryConfig(
-        reconciliation=ReconciliationConfig(
-            enabled=True,
-            judge_enabled=False,  # no Judge; avoids needing real journal for Judge.init
-            agent_llm_provider='anthropic',
-            agent_llm_model='claude-sonnet-4-20250514',
-        )
-    )
-    harness = ReconciliationHarness(
-        memory_service=AsyncMock(),
-        taskmaster=None,
+    harness = make_harness(
         journal=MagicMock(),
         event_buffer=MagicMock(),
-        config=config,
+        memory_service=AsyncMock(),
+        taskmaster=None,
+        # No Judge: it would need a real journal to initialise.
+        config=make_harness_config(judge_enabled=False),
         known_projects={},
     )
     queue_dir = tmp_path / queue_subdir
@@ -3968,17 +3945,17 @@ class TestCrossProjectSuppressedFlagIsNotAcknowledged:
         Mirrors tests/test_flag_dedup.py::_seed_marker: dedup identity is
         (project_id, 'stage1_flag_marker', task_id, flag_type, run_id='') —
         the originating run_id rides in payload_json, not the PK.  The
-        identity's task component is the flag's SIGNATURE component, not its
-        top-level task_id: compute_flag_signature unions the top-level id with
-        every cited_tasks id, so this flag keys on '3839,598'.  Derived from
-        compute_flag_signature rather than hardcoded so a future change to the
-        union rule cannot silently turn this seed into a MISS (which would
-        make the whole test pass vacuously — the gate is HIT-only).
+        identity's task component is the flag's MARKER signature, not its
+        top-level task_id: compute_marker_signature unions the top-level id
+        with every cited_tasks id, project-qualifying the foreign fix task.
+        Derived rather than hardcoded so a future change to the union rule
+        cannot silently turn this seed into a MISS (which would make the whole
+        test pass vacuously — the gate is HIT-only).
         """
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+        from fused_memory.reconciliation.flag_dedup import compute_marker_signature
         from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
 
-        signature = compute_flag_signature(self._suppressed_flag())
+        signature = compute_marker_signature(self._suppressed_flag(), project_id=self.PROJECT_ID)
         assert signature is not None, 'the suppressed flag must have a signature'
         sig_task_id, sig_flag_type = signature
 
@@ -4090,7 +4067,10 @@ class TestCrossProjectSuppressedFlagIsNotAcknowledged:
 
     @pytest.mark.asyncio
     async def test_cross_project_drop_is_excluded_from_acknowledge(self, ledger_store):
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_flag_signature,
+            compute_marker_signature,
+        )
 
         await self._seed_prior_marker(ledger_store)
 
@@ -4126,9 +4106,12 @@ class TestCrossProjectSuppressedFlagIsNotAcknowledged:
 
         # Ledger-level restatement: the marker row itself survives the cycle,
         # re-upserted active by dedup_flags BEFORE the gate ran.
-        assert suppressed_sig is not None
+        marker_sig = compute_marker_signature(
+            self._suppressed_flag(), project_id=self.PROJECT_ID,
+        )
+        assert marker_sig is not None
         marker = await ledger_store.get_by_identity(
-            self.PROJECT_ID, 'stage1_flag_marker', suppressed_sig[0], suppressed_sig[1], '',
+            self.PROJECT_ID, 'stage1_flag_marker', marker_sig[0], marker_sig[1], '',
         )
         assert marker is not None and marker.state == 'active', (
             'the suppressed flag\'s marker must survive un-reclaimed; '
@@ -5826,8 +5809,9 @@ class TestGateOwnedActionPhrasingWiring:
 
 class TestStage1LiveStateFreshnessSection:
     """The Stage-1 live-state freshness section (task 5271) renders its benign
-    deleter list from recon_self_model.MEM0_TOMBSTONE_DELETERS, the tuple the
-    code-side sweep_deletion_guard reads, so the two cannot drift apart."""
+    deleter list as the shared recon_self_model.format_mem0_tombstone_deleters()
+    list, built from the tuple the code-side sweep_deletion_guard reads, so the
+    two cannot drift apart."""
 
     def _section(self) -> str:
         from fused_memory.reconciliation.prompts.stage1 import (
@@ -5847,13 +5831,12 @@ class TestStage1LiveStateFreshnessSection:
 
         assert STAGE1_SYSTEM_PROMPT.count(LIVE_STATE_FRESHNESS_HEADING) == 1
 
-    def test_every_documented_deleter_is_rendered_in_the_section(self):
-        from fused_memory.reconciliation.recon_self_model import MEM0_TOMBSTONE_DELETERS
+    def test_section_renders_the_shared_deleter_list(self):
+        from fused_memory.reconciliation.recon_self_model import format_mem0_tombstone_deleters
 
-        section = self._section()
-        missing = [d for d in MEM0_TOMBSTONE_DELETERS if d not in section]
-        assert not missing, (
-            f'the section must name every documented sweep deleter; missing {missing!r}'
+        deleters = format_mem0_tombstone_deleters()
+        assert deleters in self._section(), (
+            f'the section must render the shared deleter list {deleters!r}'
         )
 
 

@@ -58,7 +58,7 @@ import time
 from collections.abc import Collection
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, assert_type
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -75,8 +75,6 @@ from _orch_helpers import PYPROJECT_DEFAULT_TIMEOUT, wait_responsive
 from test_merge_queue_concurrent_verify import (
     _inject_two_host_allocator,
     _make_branch_with_file,
-    _timeout_mark_offenders,
-    _worst_per_method_wait_budget,
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -88,6 +86,7 @@ from orchestrator.merge_lane.liveness import (
     check_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
 )
+from orchestrator.merge_lane.ports import ClockPort
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import PRODUCTION_CLOCK, MergeRequest
 from orchestrator.verify import VerifyResult
@@ -1177,7 +1176,7 @@ _LANE_STOP_TIMEOUT = 30.0
 
 #: Per-test ceiling for the host capstone, whose methods settle a real-git lane
 #: through several ``wait_responsive`` waits and a reprobe sweep.  Sized above
-#: the budget ``TestTimeoutMarkCoverage`` recomputes from this module's own
+#: the budget test_wait_budget_coverage_guard.py recomputes from this module's
 #: source rather than from any figure written here, and never below
 #: ``PYPROJECT_DEFAULT_TIMEOUT``.  Why a mark at all: pytest-timeout's thread
 #: method ``os._exit()``s the xdist worker on expiry, and ``--max-worker-restart=0``
@@ -1346,7 +1345,7 @@ class _ShortSleepClock:
     honestly -- only the cadence is compressed.
     """
 
-    _CAP_SECS = 0.02
+    CAP_SECS = 0.02
 
     def now(self) -> float:
         return time.time()
@@ -1358,15 +1357,42 @@ class _ShortSleepClock:
         return None
 
     async def sleep(self, secs: float) -> None:
-        await asyncio.sleep(min(secs, self._CAP_SECS))
+        await asyncio.sleep(min(secs, self.CAP_SECS))
 
-    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+    async def wait_for_any(
+        self, aws: Collection[asyncio.Future[Any]], timeout: float,
+    ) -> set[asyncio.Future[Any]]:
         # UNCAPPED, unlike the sleep above: capping it would re-check the
         # lane's halt and abandonment branches ~500x more often and reorder
         # the halt-vs-verify interleaving this file's capstone measures. So
         # this one method wants production semantics exactly, and delegates
         # rather than restating them.
         return await PRODUCTION_CLOCK.wait_for_any(aws, timeout)
+
+
+_SHORT_SLEEP_CLOCK_IS_A_CLOCK_PORT: ClockPort = _ShortSleepClock()
+
+
+class TestShortSleepClockWaitsForAny:
+    """``wait_for_any`` keeps the whole timeout that ``sleep`` caps.
+
+    The ``assert_type`` pins the precise signature, which the conformance pin
+    above cannot: an ``Any``-typed method still satisfies the Protocol.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_unfinished_wait_runs_its_whole_timeout_not_the_sleep_cap(self) -> None:
+        cap = _ShortSleepClock.CAP_SECS
+        forever = asyncio.create_task(asyncio.Event().wait())
+        try:
+            started = time.monotonic()
+            done = await _ShortSleepClock().wait_for_any({forever}, timeout=10 * cap)
+            assert_type(done, set[asyncio.Future[Any]])
+            assert done == set()
+            assert time.monotonic() - started > 5 * cap
+        finally:
+            forever.cancel()
+            await asyncio.gather(forever, return_exceptions=True)
 
 
 class _HostEscalationQueue:
@@ -2944,71 +2970,11 @@ class TestIndeterminateLocalLegDoesNotVeto:
         assert es.events_of(EventType.verify_cross_check_mismatch)
 
 
-# ===========================================================================
-# Task 5030 amendment: the timeout-mark guard, generalised to THIS module.
-# ===========================================================================
-
-
-class TestTimeoutMarkCoverage:
-    """Enforced invariant: every class in THIS module must have its computed
-    worst-case per-method wait budget cleared by the timeout it actually
-    runs under -- its own ``@pytest.mark.timeout`` mark if it has one, else
-    the ambient budget (see ``_timeout_mark_offenders``).
-
-    Task 3492 built this guard, and task 5030 gave test_merge_speculation.py
-    its own copy -- but both resolve ``Path(__file__)`` against their own
-    source, so neither reaches this module.  That mattered here the moment
-    γ7 replaced this file's mock-driven host tests with real-git lane-settling
-    polls: ``TestUnreachableHostCapstone`` went from trivially fast to a
-    computed budget above the ambient default, with no mark anywhere in the
-    file.
-
-    The helpers are IMPORTED from test_merge_queue_concurrent_verify rather
-    than reimplemented: they are deliberately pure (source text in, offender
-    list out, class resolver injected as ``globals().get``) precisely so they
-    can be driven with foreign input, and a third copy would be free to drift
-    from the marks it audits.
-
-    The computed budget is a conservative FLOOR over call SHAPES: it bills
-    ``wait_responsive`` / ``asyncio.wait_for`` / ``_await_outcome`` sites and
-    nothing else, so this module's ``_until(...)`` polls -- which do bound
-    their own budget, through ``wait_responsive`` one frame down -- are not
-    counted. An unrecognised shape can only under-count, never fabricate a
-    wait, so a class this guard passes may still deserve a wider mark than the
-    floor demands; a class it fails is genuinely under-marked.
-    """
-
-    def test_heavy_wait_classes_carry_adequate_timeout_mark(self) -> None:
-        """Every Test* class's computed worst-case per-method wait budget
-        must be cleared by the timeout it actually runs under (its own mark
-        if it has one, else the ambient budget).
-
-        Recomputes every class's budget from source on each run -- the
-        single source of those figures, so none is restated beside a mark.
-        """
-        source = Path(__file__).read_text()
-        budgets = _worst_per_method_wait_budget(source)
-        offenders = _timeout_mark_offenders(budgets, globals().get)
-
-        assert not offenders, (
-            'The following classes have a computed worst-case per-method '
-            'wait budget that the timeout they actually run under (their '
-            'own mark if they have one, else the ambient budget) does not '
-            'clear:\n'
-            + '\n'.join(f'  - {offender}' for offender in offenders)
-            + '\n\nConsequence: pytest-timeout\'s thread method os._exit()s '
-            'the xdist worker under --max-worker-restart=0, so a '
-            'slow-but-correct run reports as a worker death instead of a '
-            'clean per-test failure -- strictly worse than the flake being '
-            'fixed. Add @pytest.mark.timeout(HOST_CAPSTONE_TEST_TIMEOUT) '
-            'directly above each offending class.'
-        )
-
-
 class TestHostCapstoneTimeoutConstant:
     """HOST_CAPSTONE_TEST_TIMEOUT is a literal held up by the never-narrow floor.
 
-    The per-class WAIT floor is TestTimeoutMarkCoverage's job, not this one's.
+    Whether each marked test's waits fit under it is checked per item by
+    test_wait_budget_coverage_guard.py, not here.
     """
 
     def test_never_narrows_the_ini_default(self) -> None:

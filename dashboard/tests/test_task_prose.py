@@ -1,7 +1,7 @@
 """The per-task prose read behind the Tasks tab's Task Detail pane (task 5815).
 
-The ACTIVE_TASKS list no longer carries a task's description/details; the pane
-fetches them for the ONE selected task. That read is addressed by the row's own
+The task rows (``TASKS_SNAPSHOT[p].rows``) carry no description/details; the
+pane fetches them for the ONE selected task. That read is addressed by the row's own
 uid, so the label resolution and the uid format below are the seam the list
 rows and the prose route share.
 """

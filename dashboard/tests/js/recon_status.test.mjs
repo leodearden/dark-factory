@@ -10,7 +10,7 @@
 // statically detect named exports assigned from a variable, so
 // `import { reconRunCounts } from '...'` would come back undefined. We
 // therefore default-import the module and destructure instead (mirrors
-// task_status_counts.test.mjs / prd_grouping.test.mjs).
+// graph_layout.test.mjs / task_vocab.test.mjs).
 //
 // The JSX WIRING half of this module's coverage — that app.jsx and
 // tabs.jsx actually consume these functions rather than restating the

@@ -59,7 +59,7 @@ The script is idempotent (safe to re-run) and self-reports each step with
 3. **`uv sync`** across the Python subprojects (`shared`, `escalation`, `fused-memory`, `orchestrator`, `dashboard`), in dependency order.
 4. **fused-memory systemd unit** — renders `scripts/fused-memory.service.template` into `~/.config/systemd/user/fused-memory.service` (substituting your real repo path and `uv` binary path), enables it, and starts it only if `fused-memory/.env` already exists (see §4 — you'll usually run this once before secrets exist, then `systemctl --user restart fused-memory` after writing them).
 5. **Orchestrator systemd units + watchdog** — see the **Known gap** callout immediately below; this step is the one you must edit for your own project set.
-6. **jCodeMunch** — optional personal productivity tooling (AST-based code retrieval) the repo's original maintainer uses. Safe to let run; skip/ignore if you don't want it — nothing else in this repo depends on it. Step 6 also installs the version-pinned `jcodemunch-mcp` launcher with `uv tool install` (the pin lives in `shared/src/shared/jcodemunch_launch.py`) and registers it in your user-level Claude config, so uv's tool bin dir (`uv tool dir --bin`) must be on your PATH.
+6. **jCodeMunch** — optional personal productivity tooling (AST-based code retrieval) the repo's original maintainer uses. Safe to let run; skip/ignore if you don't want it, but note that orchestrator agents and reconciliation stages are always given the `jcodemunch` MCP server (launched as `jcodemunch-mcp` from your PATH). If that launcher is missing the server fails to start, and those sessions run without the `mcp__jcodemunch__*` tools rather than failing. Step 6 also installs the version-pinned `jcodemunch-mcp` launcher with `uv tool install` (the pin lives in `shared/src/shared/jcodemunch_launch.py`) and registers it in your user-level Claude config, so uv's tool bin dir (`uv tool dir --bin`) must be on your PATH.
 7. **Dashboard systemd units** — renders and enables `dark-factory-dashboard` + its watchdog timer (installed, not started — see §7).
 8. **Claude Code skill symlinks** — wires the in-repo `skills/` into your Claude Code install. Covered in full in §8 below.
 9. **Git hooks** — runs `hooks/setup.sh`, which points `core.hooksPath` at `hooks/` (pre-commit, pre-merge-commit), then `python3 scripts/merge_lane_ratchet_merge.py install`, which writes dark-factory's own merge driver for the ratchet baseline (`merge.ratchet-baseline.driver`, named by `.gitattributes`) into the repo's `.git/config`. Without the driver a merge of two branches that both moved the baseline conflicts instead of composing.
@@ -69,13 +69,14 @@ The script is idempotent (safe to re-run) and self-reports each step with
 ### Known gap: step 5 hardcodes the maintainer's other projects
 
 `scripts/setup-host.sh`'s orchestrator-units step unconditionally installs
-and enables systemd units for **six projects that are not part of this
+and enables systemd units for **seven projects that are not part of this
 repo and won't exist on your machine**: `orchestrator-reify.service`,
 `orchestrator-autopilot-video.service`,
 `orchestrator-my-solar-challenge.service`,
 `orchestrator-solar-challenge-platform.service`,
-`orchestrator-know-live.service`, and
-`orchestrator-pump-web-ui.service`. Each `ExecStart` points at
+`orchestrator-know-live.service`,
+`orchestrator-pump-web-ui.service`, and
+`orchestrator-stream-touch.service`. Each `ExecStart` points at
 a `dark-factory-orchestrator.yaml` in a sibling repo that doesn't exist for
 you, so once `default.target` restarts them (next login/boot), they'll
 crash-loop until `StartLimitBurst` is exhausted. `orchestrator-dark-factory.service`
@@ -93,7 +94,8 @@ systemctl --user disable --now \
   orchestrator-my-solar-challenge.service \
   orchestrator-solar-challenge-platform.service \
   orchestrator-know-live.service \
-  orchestrator-pump-web-ui.service
+  orchestrator-pump-web-ui.service \
+  orchestrator-stream-touch.service
 ```
 
 Keep `orchestrator-watchdog.timer` enabled — it skips disabled units, so

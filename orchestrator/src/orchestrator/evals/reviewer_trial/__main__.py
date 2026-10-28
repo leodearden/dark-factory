@@ -9,7 +9,8 @@ Commands:
     calibrate      Run scorer on 3 diffs for human inspection (step 3)
     corpus-sanity  Run baseline on all 15 diffs and score (step 4)
     campaign       Run arms x fixtures x N trials and reduce them; ``--briefing
-                   diff-only,d2`` adds a context-complete arm per variant
+                   diff-only,d2`` adds a context-complete arm per variant,
+                   ``--briefing d2`` runs only the context-complete arms
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from shared import project_layout
 
 from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.main_checkout_defaults import cli_default
+from orchestrator.review_payload import Verdict, normalize_review
 
 if TYPE_CHECKING:
     from .corpus import CorpusManifest
@@ -217,6 +219,7 @@ def smoke(diff_id: str, stagger: float) -> None:
 
         result = await _load_or_run_panel(VARIANT_BASELINE, diff, stagger_secs=stagger)
         click.echo()
+        payloads = {name: normalize_review(rev) for name, rev in result.reviews.items()}
 
         checks_passed = 0
         total_checks = 5
@@ -240,20 +243,13 @@ def smoke(diff_id: str, stagger: float) -> None:
             checks_passed += 1
 
         # Check C: No ERROR verdicts
-        error_count = sum(1 for rev in result.reviews.values() if rev.get('verdict') == 'ERROR')
+        error_count = sum(1 for p in payloads.values() if p.verdict is Verdict.ERROR)
         if _print_check(error_count == 0, f'{error_count} ERROR verdicts'):
             checks_passed += 1
 
         # Check D: At least 1 blocking issue found
-        blocking_count = sum(
-            1 for rev in result.reviews.values()
-            for issue in rev.get('issues', [])
-            if issue.get('severity') == 'blocking'
-        )
-        reviewers_with_blocking = sum(
-            1 for rev in result.reviews.values()
-            if any(i.get('severity') == 'blocking' for i in rev.get('issues', []))
-        )
+        blocking_count = sum(len(p.blocking_issues) for p in payloads.values())
+        reviewers_with_blocking = sum(1 for p in payloads.values() if p.blocking_issues)
         if _print_check(blocking_count > 0, f'{reviewers_with_blocking}/{expected} reviewers found blocking issues ({blocking_count} total)'):
             checks_passed += 1
 
@@ -266,11 +262,11 @@ def smoke(diff_id: str, stagger: float) -> None:
         # Reviewer summary
         click.echo()
         click.echo(click.style('Reviewer Summary:', bold=True))
-        for name, rev in sorted(result.reviews.items()):
-            verdict = rev.get('verdict', '?')
-            issues = rev.get('issues', [])
-            blocking = sum(1 for i in issues if i.get('severity') == 'blocking')
-            click.echo(f'  {name:25s} {verdict:15s} ({len(issues)} issues, {blocking} blocking)')
+        for name, p in sorted(payloads.items()):
+            click.echo(
+                f'  {name:25s} {p.verdict:15s} '
+                f'({len(p.issues)} issues, {len(p.blocking_issues)} blocking)'
+            )
 
         if result.errors:
             click.echo()
@@ -1155,10 +1151,12 @@ def refresh_trial(max_parallel: int, stagger: float, report_dir: Path | None) ->
 def _parse_briefings(
     _ctx: click.Context, _param: click.Parameter, value: str,
 ) -> list[ReviewBriefing]:
-    """The generations to run, each once; the diff-only incumbent leads whenever d2 is measured.
+    """The generations to run, each once; diff-only, when listed, leads.
 
-    Every arm is paired against the first arm's first generation, so a repeat
-    would collide on its result paths and a leading d2 would pair d2 against itself.
+    Every arm is paired against the first arm's first generation, so ``d2``
+    alone pairs every d2 arm against the first arm's d2 arm, while d2 listed
+    before diff-only would invert the gate. A repeat would collide on its
+    result paths.
     """
     valid = [b.value for b in ReviewBriefing]
     names = [name.strip() for name in value.split(',') if name.strip()]
@@ -1171,9 +1169,9 @@ def _parse_briefings(
     if repeated:
         raise click.BadParameter(f'each generation runs once; repeated: {", ".join(repeated)}')
     briefings = [ReviewBriefing(name) for name in names]
-    if ReviewBriefing.CONTEXT_COMPLETE in briefings and briefings[0] is not ReviewBriefing.DIFF_ONLY:
+    if ReviewBriefing.DIFF_ONLY in briefings and briefings[0] is not ReviewBriefing.DIFF_ONLY:
         raise click.BadParameter(
-            f'{ReviewBriefing.DIFF_ONLY.value} must come first: it is the incumbent '
+            f'{ReviewBriefing.DIFF_ONLY.value} must come first when listed: it is the incumbent '
             f'{ReviewBriefing.CONTEXT_COMPLETE.value} is paired against',
         )
     return briefings
@@ -1187,7 +1185,8 @@ def _parse_briefings(
 @click.option('--arms', default=None, help='Comma-separated variant names (default: FABLE_EVIDENCE_VARIANTS)')
 @click.option('--briefing', 'briefings', default=ReviewBriefing.DIFF_ONLY.value, callback=_parse_briefings,
               help='Comma-separated reviewer briefing generations, each run once for every arm '
-                   '(diff-only | d2; default: diff-only; diff-only first whenever d2 is listed)')
+                   '(diff-only | d2; default: diff-only; diff-only first when both are listed; '
+                   "d2 alone pairs every arm against the first arm's d2 arm)")
 @click.option('--diff-cap', default=None, type=int,
               help='Diff truncation in chars (default: runner.DIFF_CAP_CHARS; 0 lifts the cap)')
 @click.option('--max-parallel', default=3, type=int, help='Max concurrent panel runs')
@@ -1214,7 +1213,7 @@ def campaign(
     config_path = config_path or cli_default('--config', lambda root: root / PROJECT_CONFIG_FILENAME)
 
     async def _run() -> int:
-        from orchestrator.evals.runner import campaign_usage_gate
+        from orchestrator.evals.eval_gate import campaign_usage_gate
 
         from . import campaign as reduce
         from .runner import DIFF_CAP_CHARS, run_trial

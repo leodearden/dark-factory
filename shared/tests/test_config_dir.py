@@ -437,6 +437,63 @@ class TestSweepStalePidDirsBounding:
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
+class TestSweepStalePidDirsReclaim:
+    """An injected *reclaim* replaces the delete; selection is unchanged (task 6008)."""
+
+    def test_reclaim_replaces_the_delete_for_each_eligible_dir(self, tmp_path):
+        dead = find_dead_pid()
+        eligible = plant(tmp_path, f'{PROBE_PREFIX}work-{dead}')
+        plant(tmp_path, f'{PROBE_PREFIX}live-{os.getpid()}')
+        plant(tmp_path, f'{PROBE_PREFIX}fresh-{dead}', aged=False)
+        plant(tmp_path, f'{PROBE_PREFIX}nopid')
+        reclaimed: list[Path] = []
+
+        removed = sweep_stale_pid_dirs(
+            PROBE_PREFIX, base_dir=tmp_path, reclaim=reclaimed.append,
+        )
+
+        assert reclaimed == [eligible]
+        assert eligible.exists(), 'with reclaim given, the sweep must not delete on its own'
+        assert removed == 1
+
+    def test_a_reclaim_that_raises_oserror_is_loud_and_uncounted(self, tmp_path, caplog):
+        dead = find_dead_pid()
+        failing = plant(tmp_path, f'{PROBE_PREFIX}failing-{dead}')
+        succeeding = plant(tmp_path, f'{PROBE_PREFIX}succeeding-{dead}')
+        reclaimed: list[Path] = []
+
+        def reclaim(path: Path) -> None:
+            if path.name == failing.name:
+                raise OSError('simulated held transcript')
+            reclaimed.append(path)
+
+        with caplog.at_level(logging.WARNING, logger='shared.config_dir'):
+            removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path, reclaim=reclaim)
+
+        assert reclaimed == [succeeding]
+        assert removed == 1
+        assert any(
+            'failed to reclaim' in r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        )
+
+    def test_a_reclaim_that_finds_the_dir_already_gone_is_quietly_skipped(
+        self, tmp_path, caplog,
+    ):
+        dead = find_dead_pid()
+        plant(tmp_path, f'{PROBE_PREFIX}raced-{dead}')
+
+        def reclaim(path: Path) -> None:
+            raise FileNotFoundError(path)
+
+        with caplog.at_level(logging.WARNING, logger='shared.config_dir'):
+            removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path, reclaim=reclaim)
+
+        assert removed == 0
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
 # ---------------------------------------------------------------------------
 # The once-per-process wrapper around the sweep, hoisted out of its two callers
 # (shared.usage_gate and shared/tests/startup_completion_probe.py), which held

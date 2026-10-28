@@ -54,9 +54,9 @@ runtime, 20.8s -> 30.7s over the seven scanned dirs).  Note what this ruling doe
 say: it is not "put every future check here".  It applies because Rule C is another
 AST pass over exactly the same file set with exactly the same stdlib-only budget.
 A guard needing runtime import, pytest marks or a non-stdlib dependency does not
-qualify and stays where it is — which is why
-``orchestrator/tests/test_merge_speculation.py::TestTimeoutMarkCoverage`` was
-deliberately left file-local by task 4246 rather than moved here.
+qualify and stays where it is — which is why the runtime-mark timeout-coverage
+guard, ``orchestrator/tests/test_wait_budget_coverage_guard.py``, is a pytest
+module rather than a rule here.
 
 ---------------------------------------------------------------------------
 Rule A — ``bare-magicmock``
@@ -303,10 +303,13 @@ _DATACLASS_SHAPES: tuple[_DataclassShape, ...] = (
             'failing_test_ids_by_module',
             'skipped_test_ids',
             'failing_leg_categories',
+            'run_all_failed_members',
             'trivial',
             'duration_secs',
             'flake_suppression',
             'admission_legs',
+            'units',
+            'cache_mode',
             'test_leg_failed',
         }),
         anchors=frozenset({'passed'}),

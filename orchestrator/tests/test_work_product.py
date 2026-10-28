@@ -13,7 +13,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import pytest
-from _call_recorder import ThreadRecordingCall
+from _call_recorder import BlockingCall, ThreadRecordingCall
 from _git_fixtures import README_SEED, _git, build_repo
 
 from orchestrator.sentinel_l1 import SentinelL1
@@ -314,29 +314,34 @@ class TestWorkProductProbe:
         assert load.threads and load.threads[0] != threading.get_ident()
 
     async def test_poll_never_waits_and_never_overlaps_refreshes(self):
-        rig, counting = _Rig(), _counting_load()
-        release = threading.Event()
-
-        def blocked_load() -> WorkProductSnapshot:
-            release.wait(timeout=30)
-            return FRESH
+        rig, counting, load = _Rig(), _counting_load(), BlockingCall(FRESH)
 
         try:
             started_at = time.monotonic()
-            rig.probe.poll(blocked_load)
+            rig.probe.poll(load)
             assert time.monotonic() - started_at < 1.0
-            await asyncio.sleep(0.05)
+            await load.entered()
             assert rig.probe.snapshot is WorkProductSnapshot.EMPTY
 
             rig.clock[0] = TTL + 1
             rig.probe.poll(counting)
-            assert counting.calls == 0
+            assert load.blocked
         finally:
-            release.set()
+            load.release()
         await rig.probe.join()
 
         assert rig.probe.snapshot is FRESH
         assert counting.calls == 0
+
+    async def test_the_next_window_refreshes_as_soon_as_the_last_refresh_has_published(self):
+        rig, load = _Rig(), _counting_load()
+        rig.probe.poll(load)
+        while rig.probe.snapshot is not FRESH:
+            await asyncio.sleep(0)
+
+        await rig.refresh_next_window(load)
+
+        assert load.calls == 2
 
     async def test_a_failed_refresh_withdraws_all_credit(self):
         rig = _Rig()
@@ -407,21 +412,41 @@ class TestWorkProductProbe:
 @pytest.mark.asyncio
 class TestWorkProductProbeClose:
     async def test_close_cancels_an_in_flight_refresh_without_waiting_for_git(self):
-        rig, release = _Rig(), threading.Event()
-
-        def blocked_load() -> WorkProductSnapshot:
-            release.wait(timeout=30)
-            return FRESH
+        rig, load = _Rig(), BlockingCall(FRESH)
 
         try:
-            rig.probe.poll(blocked_load)
+            rig.probe.poll(load)
+            await load.entered()
             await asyncio.wait_for(rig.probe.aclose(), timeout=5)
-            assert not release.is_set()
+            assert load.blocked
         finally:
-            release.set()
+            load.release()
 
         assert rig.probe.snapshot is WorkProductSnapshot.EMPTY
         assert rig.filed == []
+
+    async def test_closing_before_the_refresh_first_runs_leaves_nothing_to_join(self):
+        rig, load = _Rig(), _counting_load()
+        rig.probe.poll(load)
+
+        await rig.probe.aclose()
+        await rig.probe.join()
+
+        assert load.calls == 0
+
+    async def test_a_refresh_cancelled_before_it_first_runs_does_not_wedge_the_next_window(self):
+        rig, load = _Rig(), _counting_load()
+        rig.probe.poll(load)
+        current = asyncio.current_task()
+        stragglers = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+        assert stragglers, 'poll started no refresh for the sweep to cancel'
+
+        for straggler in stragglers:
+            straggler.cancel()
+        await asyncio.wait(stragglers)
+        await rig.refresh_next_window(load)
+
+        assert load.calls == 1
 
     async def test_a_closed_probe_starts_no_further_refresh(self):
         rig, load = _Rig(), _counting_load()

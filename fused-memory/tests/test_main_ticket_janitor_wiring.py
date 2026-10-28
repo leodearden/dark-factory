@@ -17,12 +17,12 @@ from shared.project_layout import escalation_queue_dir
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig, TicketJanitorConfig
 from fused_memory.middleware.curation_deferral import DeferReason
-from fused_memory.middleware.task_curator import (
+from fused_memory.middleware.curator_types import (
     CandidateTask,
     CuratorDecision,
     PreparedCandidate,
-    TaskCurator,
 )
+from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_janitor import curation_backlog_anchor
 from fused_memory.middleware.ticket_store import AWAITING_CURATION, TicketStore

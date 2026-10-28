@@ -398,14 +398,11 @@ class TestS4MixedDispositionCompleteness:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestS5HybridRollbackLock:
     """PRD boundary scenario 5: a synthetic-allowlist hybrid invariant break rolls back (I5)."""
 
-    def test_hybrid_invariant_violation_rolls_back_synchronously(
-        self, monkeypatch, tmp_path,
-    ) -> None:
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_hybrid_invariant_violation_rolls_back_synchronously(self) -> None:
         # live is valid on its own: 1800 >= 900.
         live = OrchestratorConfig(
             timeouts=TimeoutsConfig(steward=1800.0),

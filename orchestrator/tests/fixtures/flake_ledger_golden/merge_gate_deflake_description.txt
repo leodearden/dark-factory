@@ -1,0 +1,15 @@
+The flake ledger recorded a `passes_in_isolation` observation for this test and SUPPRESSED the red it produced, so a merge landed on a gate that had gone red:
+
+  test:        $test_id
+  project:     $project_id
+  opened_at:   $opened_at
+  open_count:  $open_count
+
+What that verdict means, precisely: the test failed under load in the merge verify and then PASSED on an isolated, serial re-run. Read that as evidence about the SYSTEM, not as a verdict on the test — a test that passes alone and fails under load has repeatedly turned out to be a real production defect here (task 1836 -> 1841: a widened timeout masked a genuine SIGHUP bug for a day; esc-3650-2 was a real SIGPIPE-under-pipefail bug, task 3552). Diagnose before you conclude the test is at fault.
+
+$responsibility_fix_root_defect.
+$responsibility_remove_from_ledger.
+
+$never_widen_a_timeout
+
+Auto-filed by the flake ledger when the debt row was opened (PRD plans/flake-ledger-prd.md §5.9). The merge already landed, so this is visible, owned debt rather than an incident.

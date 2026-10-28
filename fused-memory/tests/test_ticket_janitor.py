@@ -27,7 +27,11 @@ from _fm_helpers import LoopFreedomProbe
 from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import ticket_janitor
-from fused_memory.middleware.curation_deferral import CurationRetryPolicy, DeferReason
+from fused_memory.middleware.curation_deferral import (
+    CurationRetryPolicy,
+    DeferReason,
+    backlog_remediation,
+)
 from fused_memory.middleware.ticket_janitor import (
     CURATION_BACKLOG_ANCHOR,
     TicketJanitor,
@@ -305,7 +309,7 @@ async def test_bad_candidate_json_falls_back_to_unparseable_group(store, tmp_pat
         assert len(files) == 1
         body = json.loads(files[0].read_text())
         # Falls back to the curator-bucket task_id rather than a real task id.
-        assert body['task_id'] == 'task-curator'
+        assert body['task_id'] == ticket_janitor._ANCHOR_TASK_ID
         assert 'unparseable' in body['summary']
         # Row stamped so it doesn't re-escalate.
         row = await store.get(a)
@@ -348,7 +352,8 @@ async def test_worker_dead_marks_pending_tickets_failed_worker_dead(store, tmp_p
     """When a project's curator worker is dead (no live asyncio.Task and no
     ``_worker_intent`` placeholder), pending tickets for that project must be
     terminalised as ``failed/worker_dead`` and surface as a single
-    ``ticket_failure`` escalation grouped by ``(project_id, 'task-curator', _no_escalation_)``.
+    ``ticket_failure`` escalation grouped by
+    ``(project_id, ticket_janitor._ANCHOR_TASK_ID, _no_escalation_)``.
     """
     handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
     try:
@@ -379,7 +384,7 @@ async def test_worker_dead_marks_pending_tickets_failed_worker_dead(store, tmp_p
         assert len(files) == 1, [f.name for f in files]
         body = json.loads(files[0].read_text())
         assert body['category'] == 'ticket_failure'
-        assert body['task_id'] == 'task-curator'
+        assert body['task_id'] == ticket_janitor._ANCHOR_TASK_ID
     finally:
         handle.close()
 
@@ -1082,7 +1087,11 @@ class TestDedupOutageDetector:
         body = escalations[0]
         assert body['category'] == 'infra_issue'
         assert body['agent_role'] == 'fused-memory/ticket-janitor'
-        assert body['task_id'] == 'task-curator'
+        assert body['task_id'] == 'task-curator', (
+            "OPERATIONS.md §'Is the curator deduping, or just creating?' tells "
+            'operators this record files under task id task-curator; changing '
+            'the curator bucket id is a contract change, not a rename'
+        )
         assert body['level'] == 1
         assert body['severity'] == 'blocking'
         assert pid in body['summary']
@@ -1513,6 +1522,32 @@ class TestCurationBacklogEscalation:
             'accounts-auth-failed', 'blocking', 1,
         )
         assert [t['ticket_id'] for t in auth_detail['tickets']] == [auth_failed]
+
+    @pytest.mark.asyncio
+    async def test_each_record_names_its_own_reasons_remediation(self, store, tmp_path, pid):
+        await _park(store, pid, title='corpus', reason=DeferReason.CORPUS_FAILED, deferrals=2)
+        await _park(store, pid, title='capped', reason=DeferReason.ALL_ACCOUNTS_CAPPED, deferrals=2)
+
+        await self._janitor(store, tmp_path, pid).tick()
+
+        [corpus_record] = self._pending(tmp_path, DeferReason.CORPUS_FAILED)
+        [capped_record] = self._pending(tmp_path, DeferReason.ALL_ACCOUNTS_CAPPED)
+        assert corpus_record.severity == 'blocking'
+        assert backlog_remediation(DeferReason.CORPUS_FAILED) in corpus_record.suggested_action
+        assert backlog_remediation(DeferReason.ALL_ACCOUNTS_CAPPED) not in corpus_record.suggested_action
+        assert backlog_remediation(DeferReason.ALL_ACCOUNTS_CAPPED) in capped_record.suggested_action
+
+    @pytest.mark.asyncio
+    async def test_a_possibly_transient_blocking_record_does_not_claim_it_never_clears(
+        self, store, tmp_path, pid,
+    ):
+        await _park(store, pid, title='corpus', reason=DeferReason.CORPUS_FAILED, deferrals=2)
+
+        await self._janitor(store, tmp_path, pid).tick()
+
+        [record] = self._pending(tmp_path, DeferReason.CORPUS_FAILED)
+        assert record.severity == 'blocking'
+        assert 'will not clear by itself' not in record.suggested_action
 
     @pytest.mark.asyncio
     async def test_the_detail_lists_at_most_twenty_tickets(self, store, tmp_path, pid):

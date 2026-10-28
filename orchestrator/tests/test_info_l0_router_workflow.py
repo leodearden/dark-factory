@@ -127,6 +127,8 @@ async def _blocked_fall_through(workflow: TaskWorkflow, queue: EscalationQueue, 
 
 
 async def _skip_escalation_sweep(workflow: TaskWorkflow, queue: EscalationQueue, tmp_path: Path) -> None:
+    """``skip_escalation`` presumes the caller filed the covering handoff (task 7096)."""
+    _submit(queue, severity='blocking', level=1)
     await workflow._mark_blocked('synthetic failure', skip_escalation=True)
 
 

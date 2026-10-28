@@ -134,10 +134,9 @@ RECON_RUN_REVIEW_HEADINGS: tuple[str, ...] = (
     '## reconciliation run review', '### run metadata', '### stage reports',
 )
 """Injected reconciliation run-review PROMPT heading literals
-(fused_memory/reconciliation/judge.py:411 ``ReconciliationJudge.
-_build_review_prompt`` emits '## Reconciliation Run Review', '### Run
-Metadata', '### Stage Reports', '### MCP Actions (N total)' and '###
-Journal Entries (N total)' as a single f-string). The three
+(``fused_memory/reconciliation/judge.py::Judge._build_review_prompt``
+emits '## Reconciliation Run Review', '### Run Metadata', '### Stage
+Reports' and '### MCP Actions (N total)' as a single f-string). The three
 parenthesis-free headings are used so the marker is an exact line match;
 all must co-occur as line-anchored headings (all(), not any() -- the same
 false-positive guard as HARNESS_BRIEFING_HEADINGS).
@@ -196,11 +195,19 @@ extended to the other members: it was justified by forensics on the
 briefing shape specifically, and a newly-sighted injector earns one only
 on its own evidence."""
 
+TRICKLE_CODER_PROMPT_OPENER: str = 'you are the trickle coder for the dark-factory agent-confusion codebook'
+"""The lowercase opening of scripts/legibility/coder.py::build_prompt,
+restated rather than imported for the same layering reason as
+:data:`CODER_JUDGMENT_KEYS`."""
+
 HARNESS_PROMPT_MARKERS: tuple[str, ...] = (
-    'you are the trickle coder for the dark-factory agent-confusion codebook',
+    TRICKLE_CODER_PROMPT_OPENER,
     'your previous run was interrupted by a usage limit',
     'you were interrupted by an orchestrator restart',
     'handle this escalation, then call `resolve_issue` with a summary',
+    'you are adjudicating whether each current review suggestion merely re-flags',
+    'you are running as an autonomous escalation watcher',
+    'the implementation was reviewed and blocking issues were found',
 )
 """Harness-authored PROSE literals, matched as plain case-insensitive
 substrings (unlike the line-anchored heading markers above): the trickle
@@ -208,13 +215,22 @@ coder's system prompt (scripts/legibility/coder.py:174 ``build_prompt``),
 the harness's two resume prompts --
 ``shared.cli_invoke.CAP_HIT_RESUME_PROMPT`` (cap-hit) and
 ``shared.cli_invoke.CRASH_RECOVERY_RESUME_PROMPT`` (orchestrator restart)
--- and the steward's resume prompt for a new escalation,
-``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler.build_steward_continuation_prompt``.
-All three resume prompts are one defect class -- harness-injected
-continuation boilerplate typed into the transcript as an ordinary user
-turn, the steward's with no origin stamp -- even though cli_invoke
-deliberately keeps its two strings separate because their causes differ (a
-usage-cap interrupt vs. an orchestrator restart).
+-- the steward's resume prompt for a new escalation,
+``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler.build_steward_continuation_prompt``,
+the prior-round adjudicator,
+``orchestrator/src/orchestrator/review_suggestions/prior_round.py::build_resettled_adjudicator_prompt``,
+the escalation-watcher rotation prompt,
+``orchestrator/src/orchestrator/harness.py::Harness._run_watcher_rotation``,
+and the pre-task-5356 replan prompt. Every one is one defect class --
+harness prose typed into the transcript as an ordinary user turn, most
+with no origin stamp -- even though cli_invoke deliberately keeps its two
+strings separate because their causes differ (a usage-cap interrupt vs. an
+orchestrator restart).
+
+The replan marker is a RETIRED shape kept for the archived corpus and must
+not be pruned, for the reason HARNESS_BRIEFING_SUBHEADINGS keeps its
+retired spellings: today's ``BriefingAssembler.build_replan_prompt`` opens
+with the task preamble and is classified by the briefing rule.
 
 Each marker is deliberately a stable, interpolation-free sentence of its
 constant, not the whole string -- the FIRST sentence wherever the first one
@@ -225,14 +241,18 @@ heading interpolates the task.
 
 Held in lockstep with the canonical sources by
 ``TestHarnessInjectedTurnFilter.test_resume_prompt_is_excluded_lockstep``
-(the two constants) and
+(the two constants),
 ``TestHarnessInjectedTurnFilter.test_steward_continuation_prompt_is_excluded_lockstep``
-(the prompt built by the real builder), both in
+and ``test_prior_round_adjudicator_prompt_is_excluded_lockstep`` (prompts
+built by the real builders), all in
 scripts/tests/test_legibility_reingestion.py, which assert
 ``is_harness_injected_turn(<prompt>) is True`` rather than restating the
 literal -- a harness rewording turns them red instead of silently
-regressing coverage. Extend with future harness prompt literals as
-one-line additions."""
+regressing coverage. The watcher and replan markers are held by
+``test_watcher_rotation_prompt_is_excluded`` and
+``test_pre_5356_replan_prompt_is_excluded`` over restated shapes: the
+harness builds the watcher prompt inline, and the replan prompt is retired.
+Extend with future harness prompt literals as one-line additions."""
 
 HARNESS_CONTEXT_BLOCK_MARKERS: tuple[str, ...] = (
     '_this context was recalled from the ',

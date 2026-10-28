@@ -16,6 +16,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import _async_mock_orphans
 import pytest
 import pytest_asyncio
 
@@ -63,13 +64,11 @@ from _orch_helpers import (  # noqa: E402
     CLAIMANT_TTL_SECS,
     ExitContractViolationCollector,
     ample_disk_usage,
-    drain_async_mock_coroutines,
     idle_psi_sample,
     pydantic_spec,
     reap_leaked_aiosqlite_connections,
     reap_leaked_claimant_heartbeats,
     stamp_stock_routing_config,
-    track_async_mock_coroutines,
 )
 from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
@@ -98,7 +97,7 @@ from orchestrator.merge_lane import worker  # noqa: E402
 # module-level _DEBUG_ASSERTS seed at False.
 worker._DEBUG_ASSERTS = True
 
-track_async_mock_coroutines()
+_async_mock_orphans.track_async_mock_coroutines()
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -898,18 +897,17 @@ def _neutralize_verify_admission(monkeypatch, request):
 
 @pytest.fixture(autouse=True)
 def _drain_async_mock_coroutines():
-    """Close this test's un-awaited AsyncMock call coroutines before the next test starts.
+    """Fail this test if it called an AsyncMock without awaiting it, closing the orphan first.
 
-    Task 1714 / esc-1702-13; rationale in ``_orch_helpers.py::drain_async_mock_coroutines``.
-    ``track_async_mock_coroutines()`` runs when this conftest is imported, so
-    mocks called during collection are covered too.
+    Tasks 1714 / 5669; rationale in ``_async_mock_orphans.py``.
+    ``track_async_mock_coroutines()`` runs at conftest import, so collection-time mocks are covered.
 
     KNOWN LIMITATION: an orphan created in the teardown of a fixture set up
-    BEFORE this one (module- or session-scoped) is created after this drain has
-    run, so it is closed at the next test's boundary rather than this one's.
+    BEFORE this one (module- or session-scoped) is created after this check has
+    run, so the NEXT test fails instead; the message names where it was created.
     """
     yield
-    drain_async_mock_coroutines()
+    _async_mock_orphans.fail_on_orphaned_async_mock_calls()
 
 
 @pytest.fixture

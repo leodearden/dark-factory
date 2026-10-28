@@ -462,7 +462,7 @@ Investigate this claim against the codebase and report your findings.
             cwd=codebase_root,
         )
 
-        result, _ = await agent.run(prompt)
+        result = await agent.run(prompt)
 
         verdict = extract_agent_verdict(
             result,

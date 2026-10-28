@@ -10,7 +10,7 @@
 // statically detect named exports assigned from a variable, so
 // `import { staleNoticesForTab } from '...'` would come back undefined. We
 // therefore default-import the module and destructure instead (mirrors
-// tasks_offline_banner.test.mjs / task_status_counts.test.mjs). A plain
+// tasks_offline_banner.test.mjs / graph_layout.test.mjs). A plain
 // static ESM import is SAFE here — unlike data.js, this module touches no
 // browser global at load; its `window.DF_ENDPOINT_STALENESS` assignment is
 // guarded by `typeof window !== 'undefined'`.

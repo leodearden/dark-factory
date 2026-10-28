@@ -22,14 +22,19 @@ idiom keeps exercising the real (now-shared) helper logic.
 from __future__ import annotations
 
 import json
+import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
+from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
+from orchestrator.config import GitConfig
 from orchestrator.delivered_checks import DeliveredCheckResult
-from orchestrator.git_ops import CommitEffectProbe
+from orchestrator.git_ops import CommitEffectProbe, GitOps
 from orchestrator.merge_lane.landing_evidence import (
     LANDING_TALLY,
     LandingEvidenceVerdict,
@@ -54,6 +59,8 @@ def _git_ops(
     fork_point=None,
     reported_commit_files=None,
     reported_commit_diff_error=None,
+    content_in_main: bool = False,
+    equivalent: str | None = None,
 ) -> MagicMock:
     """Build a bare MagicMock git_ops with the three sub-methods the helper calls.
 
@@ -80,6 +87,10 @@ def _git_ops(
     stub ``get_merge_commit_diff_files`` — the reported commit's OWN diff,
     which the reported-claim mode intersects with the task's declared files.
     Stubbed only when either is given, so every earlier test keeps its shape.
+
+    ``content_in_main`` / ``equivalent`` (task 4862) ALWAYS stub
+    ``branch_content_in_main`` and ``find_equivalent_commit``, the citation-miss
+    fallback's gate and anchor, so a default ``no_citation`` miss declines cleanly.
     """
     git_ops = MagicMock()
     git_ops.config = SimpleNamespace(
@@ -106,6 +117,9 @@ def _git_ops(
         git_ops.get_merge_commit_diff_files = AsyncMock(
             return_value=(list(reported_commit_files or []), reported_commit_diff_error),
         )
+    git_ops.branch_content_in_main = AsyncMock(return_value=content_in_main)
+    git_ops.find_equivalent_commit = AsyncMock(return_value=equivalent)
+    git_ops.project_root = '/repo'
     return git_ops
 
 
@@ -2869,3 +2883,338 @@ class TestReportedClaimEscalation:
 
         (esc,) = queue.get_by_task('42', status='pending')
         assert esc.filing_claimant_run_id is None
+
+
+# ---------------------------------------------------------------------------
+# task 4862 — the content-equivalence fallback on DISCOVERY's citation miss.
+#
+# Upgrade-only: it may turn a `no_citation` reject into an accept anchored on
+# the branch tip's patch-id twin on main, and every way it declines reproduces
+# the pre-task `no_citation` verdict with the reason in probe['content_fallback'].
+# ---------------------------------------------------------------------------
+
+_TIP = 'f' * 40
+_FORK = 'b' * 40
+_TWIN = 'e' * 40
+
+
+def _uncited_git_ops(**kwargs: Any) -> MagicMock:
+    return _git_ops(citation=None, is_ancestor_map={}, effect_present=True, **kwargs)
+
+
+async def _discover(git_ops: MagicMock, *, branch_tip_sha: str | None = _TIP) -> LandingVerdict:
+    return await validate_landing_evidence(
+        git_ops, '42', 'task/42', branch_tip_sha=branch_tip_sha,
+    )
+
+
+@pytest.mark.asyncio
+class TestContentEquivalenceFallbackContract:
+    async def test_content_equivalent_branch_with_patch_id_twin_is_accepted(self) -> None:
+        git_ops = _uncited_git_ops(content_in_main=True, fork_point=_FORK, equivalent=_TWIN)
+
+        verdict = await _discover(git_ops)
+
+        assert verdict.accepted is True
+        assert verdict.reason == 'ok'
+        assert verdict.method is LandingMethod.content_equivalence
+        assert verdict.evidence_sha == _TWIN
+        assert verdict.probe['citation'] is None
+        assert verdict.probe['content_fallback'] == 'attributed'
+        assert verdict.probe['evidence_source'] == 'patch_id_equivalent'
+        assert verdict.probe['method'] == LandingMethod.content_equivalence
+        # Content and anchor are judged on ONE tip (the task-3103 TOCTOU hazard).
+        git_ops.branch_content_in_main.assert_awaited_once_with(_TIP)
+        git_ops.find_equivalent_commit.assert_awaited_once_with(
+            '/repo', _FORK, _TIP, patch_id_only=True,
+        )
+
+    async def test_content_equivalent_branch_without_twin_still_rejects_no_citation(
+        self,
+    ) -> None:
+        git_ops = _uncited_git_ops(content_in_main=True, fork_point=_FORK, equivalent=None)
+
+        verdict = await _discover(git_ops)
+
+        assert verdict.accepted is False
+        assert verdict.reason == 'no_citation'
+        assert verdict.evidence_sha is None
+        assert verdict.probe['content_fallback'] == 'unanchored'
+        assert verdict.probe['citation'] is None
+        assert verdict.method is LandingMethod.citation
+
+    async def test_a_non_sha_anchor_is_never_accepted(self) -> None:
+        """An accepted evidence_sha becomes done_provenance, so it must be 40-hex."""
+        git_ops = _uncited_git_ops(
+            content_in_main=True, fork_point=_FORK, equivalent='not-a-sha',
+        )
+
+        verdict = await _discover(git_ops)
+
+        assert verdict.reason == 'no_citation'
+        assert verdict.evidence_sha is None
+        assert verdict.probe['content_fallback'] == 'unanchored'
+
+    async def test_unresolved_fork_point_declines_unanchored(self) -> None:
+        git_ops = _uncited_git_ops(content_in_main=True)
+        git_ops.merge_base_with_main = AsyncMock(return_value=None)
+
+        verdict = await _discover(git_ops)
+
+        assert verdict.reason == 'no_citation'
+        assert verdict.evidence_sha is None
+        assert verdict.probe['content_fallback'] == 'unanchored'
+        assert verdict.probe['evidence_source'] == 'merge_base_unresolved'
+        git_ops.find_equivalent_commit.assert_not_awaited()
+
+    async def test_content_not_equivalent_rejects_no_citation(self) -> None:
+        git_ops = _uncited_git_ops()
+
+        verdict = await _discover(git_ops)
+
+        assert verdict.reason == 'no_citation'
+        assert verdict.probe['content_fallback'] == 'not_content_equivalent'
+        git_ops.find_equivalent_commit.assert_not_awaited()
+
+    async def test_no_branch_tip_declines_without_git_work(self) -> None:
+        git_ops = _uncited_git_ops(content_in_main=True)
+
+        verdict = await _discover(git_ops, branch_tip_sha=None)
+
+        assert verdict.reason == 'no_citation'
+        assert verdict.probe['content_fallback'] == 'no_branch_tip'
+        git_ops.branch_content_in_main.assert_not_awaited()
+
+    async def test_fallback_failure_is_contained_as_no_citation(self, caplog) -> None:
+        git_ops = _uncited_git_ops()
+        git_ops.branch_content_in_main = AsyncMock(side_effect=RuntimeError('boom'))
+
+        with caplog.at_level('WARNING'):
+            verdict = await _discover(git_ops)
+
+        assert verdict.reason == 'no_citation'
+        assert verdict.probe['content_fallback'] == 'error'
+        assert 'boom' in verdict.probe['content_fallback_error']
+        assert any(
+            record.name == 'orchestrator.merge_lane'
+            and record.levelname == 'WARNING'
+            for record in caplog.records
+        )
+
+    async def test_a_cited_landing_never_consults_the_fallback(self) -> None:
+        branch, citation = 'task/42', 'a' * 40
+        git_ops = _git_ops(
+            citation=citation,
+            is_ancestor_map={(citation, branch): True},
+            effect_present=True,
+            content_in_main=True,
+        )
+
+        verdict = await _discover(git_ops)
+
+        assert verdict.accepted is True
+        assert verdict.method is LandingMethod.citation
+        git_ops.branch_content_in_main.assert_not_awaited()
+
+    async def test_candidate_mode_never_consults_the_fallback(self) -> None:
+        git_ops = _uncited_git_ops(content_in_main=True)
+
+        await validate_landing_evidence(
+            git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha='c' * 40,
+        )
+
+        git_ops.branch_content_in_main.assert_not_awaited()
+
+    async def test_declined_fallback_reason_reaches_the_escalation_detail(self) -> None:
+        verdict = await _discover(
+            _uncited_git_ops(content_in_main=True, fork_point=_FORK, equivalent=None),
+        )
+
+        _summary, detail = format_unattributed_landing_detail('42', 'task/42', verdict)
+
+        assert detail.startswith('validate_landing_evidence')
+        assert "'content_fallback': 'unanchored'" in detail
+
+
+def _numbered(prefix: str, count: int) -> str:
+    """Unique lines: patch-ids are computed over line content."""
+    return ''.join(f'{prefix}_{i:04d} = {i * 7919}\n' for i in range(count))
+
+
+class _Repo:
+    """A synthetic repository whose every git call carries both isolation guards."""
+
+    def __init__(self, root: Path) -> None:
+        assert_isolated_git_repo(root)
+        self.root = root
+
+    def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
+        assert_isolated_git_repo(self.root)
+        return subprocess.run(
+            ['git', *args], cwd=str(self.root), capture_output=True,
+            env=git_env_with_ceiling(self.root), text=True, check=False,
+        )
+
+    def git(self, *args: str) -> str:
+        proc = self._run(*args)
+        assert proc.returncode == 0, f'git {" ".join(args)} failed: {proc.stderr.strip()}'
+        return proc.stdout.strip()
+
+    def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        return self._run('merge-base', '--is-ancestor', ancestor, descendant).returncode == 0
+
+    def commit(self, message: str, files: dict[str, str], body: str | None = None) -> str:
+        for rel, content in files.items():
+            target = self.root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        self.git('add', '-A')
+        self.git('commit', '-m', message, *(['-m', body] if body is not None else []))
+        return self.sha('HEAD')
+
+    def sha(self, ref: str) -> str:
+        return self.git('rev-parse', ref)
+
+
+@pytest.fixture
+def real_git_repo(tmp_path: Path) -> Path:
+    return seed_repo(tmp_path / 'repo')
+
+
+@pytest.fixture
+def real_git_ops(real_git_repo: Path) -> GitOps:
+    config = GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+    )
+    return GitOps(config, real_git_repo)
+
+
+_UNCITED_TIP_SUBJECT = 'test(dashboard/tests): RED — pin the client seam'
+
+
+def _build_uncited_branch(repo: _Repo) -> str:
+    """``task/4881`` off main: two commits, no task id in either SUBJECT."""
+    repo.git('checkout', '-b', 'task/4881', 'main')
+    repo.commit(
+        'refactor(dashboard/tests): extract the canned client',
+        {'pkg/a.py': _numbered('client', 30)},
+    )
+    tip = repo.commit(
+        _UNCITED_TIP_SUBJECT,
+        {'pkg/b.py': _numbered('seam', 30)},
+        body='Task 4881 final step.',
+    )
+    repo.git('checkout', 'main')
+    return tip
+
+
+def _build_carried_landing(repo: _Repo) -> tuple[str, str]:
+    """The esc-4881-8 shape: 4881's work lands only as cherry-picks carried by 4775.
+
+    Returns ``(tip, twin)``: 4881's branch tip and its patch-id twin on main.
+    """
+    tip = _build_uncited_branch(repo)
+    repo.commit('chore: unrelated main work', {'CHANGELOG.md': _numbered('log', 5)})
+    repo.git('checkout', '-b', 'task/4775', 'main')
+    repo.commit('feat(4775): carrier work', {'pkg/c.py': _numbered('carrier', 30)})
+    repo.git('cherry-pick', 'task/4881~1')
+    repo.git('cherry-pick', 'task/4881')
+    twin = repo.sha('HEAD')
+    repo.git('checkout', 'main')
+    repo.git('merge', '--no-ff', 'task/4775', '-m', 'Merge task/4775 into main')
+    repo.commit('chore: more unrelated main work', {'NOTES.md': _numbered('note', 5)})
+    return tip, twin
+
+
+@pytest.mark.asyncio
+class TestContentEquivalenceFallbackRealGit:
+    async def test_carried_landing_without_citation_is_accepted(
+        self, real_git_ops: GitOps, real_git_repo: Path,
+    ) -> None:
+        repo = _Repo(real_git_repo)
+        tip, twin = _build_carried_landing(repo)
+        assert not repo.is_ancestor('task/4881', 'main')
+        assert await real_git_ops.find_task_citation_commit('4881') is None
+        assert await real_git_ops.branch_content_in_main('task/4881') is True
+
+        verdict = await validate_landing_evidence(
+            real_git_ops, '4881', 'task/4881', branch_tip_sha=tip,
+        )
+
+        assert verdict.accepted is True
+        assert verdict.reason == 'ok'
+        assert verdict.method is LandingMethod.content_equivalence
+        assert verdict.evidence_sha == twin
+        assert repo.is_ancestor(twin, 'main')
+        assert twin not in (tip, repo.sha('main'))
+        assert verdict.probe['citation'] is None
+
+    async def test_content_differs_on_main_still_rejects(
+        self, real_git_ops: GitOps, real_git_repo: Path,
+    ) -> None:
+        repo = _Repo(real_git_repo)
+        tip, _twin = _build_carried_landing(repo)
+        repo.commit(
+            'fix: extend the client',
+            {'pkg/a.py': _numbered('client', 30) + 'client_extra = 1\n'},
+        )
+
+        verdict = await validate_landing_evidence(
+            real_git_ops, '4881', 'task/4881', branch_tip_sha=tip,
+        )
+
+        assert verdict.reason == 'no_citation'
+        assert verdict.evidence_sha is None
+        assert verdict.probe['content_fallback'] == 'not_content_equivalent'
+
+    async def test_ancestor_of_main_tip_declines_before_any_anchor_search(
+        self, real_git_ops: GitOps, real_git_repo: Path,
+    ) -> None:
+        """The is_ancestor-gated DISCOVERY callers rely on this decline."""
+        repo = _Repo(real_git_repo)
+        tip = _build_uncited_branch(repo)
+        repo.git('merge', '--ff-only', 'task/4881')
+        repo.commit('chore: unrelated main work', {'CHANGELOG.md': _numbered('log', 5)})
+        assert repo.is_ancestor(tip, 'main')
+
+        verdict = await validate_landing_evidence(
+            real_git_ops, '4881', 'task/4881', branch_tip_sha=tip,
+        )
+
+        assert verdict.reason == 'no_citation'
+        assert verdict.evidence_sha is None
+        assert verdict.probe['content_fallback'] == 'not_content_equivalent'
+
+    @pytest.mark.parametrize(
+        'squash_subject',
+        [
+            pytest.param('chore: squash import', id='distinct-subject'),
+            pytest.param(_UNCITED_TIP_SUBJECT, id='tip-subject-on-a-different-diff'),
+        ],
+    )
+    async def test_squash_landing_refuses_to_guess_an_anchor(
+        self, real_git_ops: GitOps, real_git_repo: Path, squash_subject: str,
+    ) -> None:
+        """Byte-identical content but no patch-id twin: never anchor on main HEAD or the tip.
+
+        A unique main commit sharing the tip's subject is no twin either: its
+        diff is not the tip's, so it cannot carry the task's provenance.
+        """
+        repo = _Repo(real_git_repo)
+        tip = _build_uncited_branch(repo)
+        repo.git('merge', '--squash', 'task/4881')
+        repo.git('commit', '-m', squash_subject)
+        repo.commit('chore: unrelated main work', {'CHANGELOG.md': _numbered('log', 5)})
+
+        verdict = await validate_landing_evidence(
+            real_git_ops, '4881', 'task/4881', branch_tip_sha=tip,
+        )
+
+        assert verdict.reason == 'no_citation'
+        assert verdict.probe['content_fallback'] == 'unanchored'
+        assert verdict.probe['evidence_source'] == 'no_equivalent_on_main'
+        assert verdict.evidence_sha is None

@@ -13,11 +13,13 @@ verdict is adoptable only from a gate that answered the dispatcher's identity.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import fcntl
 import json
 import os
 import shlex
+import signal
 import subprocess
 import time
 from collections.abc import Awaitable, Callable
@@ -28,6 +30,13 @@ from typing import Any, ClassVar
 import pytest
 from _gate_fixtures import without_push_ssh_config
 from click.testing import CliRunner
+from df_pytest_isolation import read_leaked_pid
+from shared.proc_group import (
+    pid_running,
+    process_group_members,
+    process_group_terminated,
+    read_stat_fields,
+)
 
 from orchestrator.deployed_sha import DeployedSha
 from orchestrator.event_store import EventType
@@ -52,6 +61,7 @@ from orchestrator.verify_runner import (
     REMOTE_TOOL_PATH_PRELUDE,
     DriftDetector,
     DriftVerdict,
+    HostAllocator,
     MergeVerifySpec,
     RemoteRunner,
     RunnerUnavailable,
@@ -75,7 +85,7 @@ def test_wire_fingerprint_is_pinned_for_todays_wire_classes():
     a field change must update it too (folding the two is a follow-up).
     """
     assert wire_fingerprint(wire_classes()) == (
-        'f0b4dcde23f390891bfb1d7f71f097039f7ce022f94066c01feaedbf0cedfb10'
+        'b4945038372961f4d31413928768fb5387e8d3276de6fa1d43c61e25b6acf833'
     )
 
 
@@ -714,6 +724,7 @@ class _Scripted:
             'delete': (0, '', ''),
             'verify': (0, result_to_json(_VERDICT), ''),
             'cancel': (0, '', ''),
+            'probe': (1, '', ''),
             'reap': (0, '', ''),
             'other': (0, '', ''),
             **replies,
@@ -732,6 +743,8 @@ class _Scripted:
                 return 'ensure'
             if ' reap-gates ' in argv[-1]:
                 return 'reap'
+            if 'pgrep' in argv[-1]:
+                return 'probe'
             return 'cancel' if 'cancel-verify' in argv[-1] else 'verify'
         return 'other'
 
@@ -891,49 +904,191 @@ async def test_a_push_that_never_returns_is_gate(monkeypatch, role):
     assert 'verify' not in transport.roles()
 
 
-def _process_gone(pid: int) -> bool:
-    try:
-        stat = Path(f'/proc/{pid}/stat').read_text()
-    except FileNotFoundError:
-        return True
-    return stat.rsplit(')', 1)[1].split()[0] == 'Z'
+@dataclass(frozen=True)
+class _HungPushScene:
+    runner: RemoteRunner
+    sha: str
+    ssh_pidfile: Path
+
+    @property
+    def git_marker(self) -> str:
+        """A string only the publish push's git command line carries."""
+        return f'refs/gate/{self.sha}'
 
 
-@pytest.mark.asyncio
-async def test_a_timed_out_push_leaves_no_git_or_ssh_behind(tmp_path: Path, monkeypatch):
-    """The default transport kills the push's whole process group when the bound fires."""
+def _hung_push_scene(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _HungPushScene:
+    """A RemoteRunner on the default transport whose publish push hangs in a fake ssh.
+
+    The fake ssh records its own pid atomically and never answers git.
+    """
     checkout = tmp_path / 'checkout'
     checkout.mkdir()
     _git(checkout, 'init', '-q')
     sha = _commit(checkout, 'deployed')
     fakebin = tmp_path / 'bin'
     fakebin.mkdir()
-    pids = tmp_path / 'pids'
+    pidfile = tmp_path / 'ssh.pid'
     ssh = fakebin / 'ssh'
-    ssh.write_text(f'#!/usr/bin/env bash\necho "$PPID $$" > {pids}\nexec sleep 120\n')
+    ssh.write_text(
+        f'#!/usr/bin/env bash\necho $$ > {pidfile}.tmp && mv {pidfile}.tmp {pidfile}\n'
+        'exec sleep 120\n'
+    )
     ssh.chmod(0o755)
     monkeypatch.setenv('PATH', f'{fakebin}:{os.environ["PATH"]}')
-    monkeypatch.setattr('orchestrator.verify_runner.ENSURE_CLIENT_TIMEOUT_SECS', 3.0)
     runner = RemoteRunner(
         'laptop', 'gate-host', 'gate-host', str(checkout),
         df_remote_checkout='/laptop/dark-factory', gate_checkouts_path='/gates',
         deployed_sha=DeployedSha(sha, indeterminate=False, dirty_wire_path=False),
         code_checkout=str(checkout),
     )
+    return _HungPushScene(runner=runner, sha=sha, ssh_pidfile=pidfile)
 
-    started = time.monotonic()
-    with pytest.raises(RunnerUnavailable) as excinfo:
-        await runner.publish_sha()
 
-    assert time.monotonic() - started < 30, 'the bound waited for the hung push instead of killing it'
-    assert excinfo.value.kind == 'gate'
-    git_pid, ssh_pid = (int(pid) for pid in pids.read_text().split())
-    for _ in range(100):
-        if _process_gone(git_pid) and _process_gone(ssh_pid):
-            break
-        await asyncio.sleep(0.05)
-    assert _process_gone(git_pid), 'the timed-out git push is still running'
-    assert _process_gone(ssh_pid), "the timed-out push's ssh is still running"
+def _child_of_this_process(marker: str) -> int | None:
+    """The pid of this process's direct child whose cmdline contains *marker*, if any."""
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        fields = read_stat_fields(entry, skip_malformed=True)
+        if fields is None or fields.ppid != os.getpid():
+            continue
+        with contextlib.suppress(OSError):
+            if marker in (entry / 'cmdline').read_bytes().decode('utf-8', 'replace'):
+                return int(entry.name)
+    return None
+
+
+def _holds_within(predicate: Callable[[], bool], ceiling: float) -> bool:
+    """Poll until *predicate* holds (True) or *ceiling* seconds pass (False).
+
+    Blocking: call it through ``asyncio.to_thread``.  A one-shot read would
+    misjudge a SIGKILLed process, which is not yet a zombie at the instant its
+    pipes close.
+    """
+    deadline = time.monotonic() + ceiling
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+async def _kill_push_group(push: asyncio.Future, git_pid: int | None) -> None:
+    """Test cleanup: stop the push and SIGKILL whatever of its group survived."""
+    push.cancel()
+    if git_pid is not None:
+        for member in process_group_members(git_pid):
+            if not member.terminated:
+                with contextlib.suppress(OSError):
+                    os.kill(member.pid, signal.SIGKILL)
+    await asyncio.wait({push}, timeout=30)
+
+
+# Each push test below judges the ssh while the push is still in flight and
+# only then awaits it: a surviving group member holds the push's pipes open, so
+# awaiting first would hang rather than fail.
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_push_leaves_no_git_or_ssh_behind(tmp_path: Path, monkeypatch):
+    """The bound's expiry is a cancellation of the awaiting task.
+
+    The test delivers it only once the push is hung in ssh, so no wall clock
+    races the spawn chain (task 7304).  The 'gate' class of a timed-out push
+    is test_a_push_that_never_returns_is_gate's.
+    """
+    scene = _hung_push_scene(tmp_path, monkeypatch)
+    push = asyncio.ensure_future(scene.runner.publish_sha())
+    git_pid = None
+    try:
+        ssh_pid = await asyncio.to_thread(read_leaked_pid, scene.ssh_pidfile, timeout=60.0)
+        git_pid = _child_of_this_process(scene.git_marker)
+        assert git_pid is not None, 'the push hung in ssh, yet no git push is a child of this process'
+        push.cancel()
+
+        assert await asyncio.to_thread(_holds_within, lambda: not pid_running(ssh_pid), 30.0), (
+            "the cancelled push's ssh is still running"
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await push
+        assert await asyncio.to_thread(
+            _holds_within, lambda: process_group_terminated(git_pid), 30.0,
+        ), 'a git push process is still running'
+    finally:
+        await _kill_push_group(push, git_pid)
+
+
+@pytest.mark.asyncio
+async def test_a_push_cancelled_mid_spawn_leaves_no_ssh_behind(tmp_path: Path, monkeypatch):
+    """A cancel landing after git's fork but before create_subprocess_exec
+    returns must still reach the push's whole group."""
+    scene = _hung_push_scene(tmp_path, monkeypatch)
+    real_spawn = asyncio.create_subprocess_exec
+    spawned: list[asyncio.subprocess.Process] = []
+
+    async def _recording_spawn(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+        spawned.append(await real_spawn(*args, **kwargs))
+        return spawned[-1]
+
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', _recording_spawn)
+    push = asyncio.ensure_future(scene.runner.publish_sha())
+    git_pid = None
+    try:
+        deadline = time.monotonic() + 30.0
+        while (git_pid := _child_of_this_process(scene.git_marker)) is None:
+            if time.monotonic() >= deadline:
+                pytest.fail(
+                    'the git push never forked within 30.0s; the harness is broken, '
+                    'which says nothing either way about process-group containment.',
+                    pytrace=False,
+                )
+            await asyncio.sleep(0)
+        # Held on the loop thread, not to_thread: this freezes the push inside
+        # create_subprocess_exec's post-fork pipe connect, as load does.
+        ssh_pid = read_leaked_pid(scene.ssh_pidfile, timeout=60.0)
+        assert not spawned, (
+            'create_subprocess_exec returned before the cancel: asyncio connected '
+            "git's pipes ahead of this poll, so the test no longer reaches the "
+            'mid-spawn window'
+        )
+        push.cancel()
+
+        assert await asyncio.to_thread(_holds_within, lambda: not pid_running(ssh_pid), 30.0), (
+            'ssh survived a push cancelled mid-spawn'
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await push
+        assert await asyncio.to_thread(
+            _holds_within, lambda: process_group_terminated(git_pid), 30.0,
+        ), 'a git push process is still running'
+    finally:
+        await _kill_push_group(push, git_pid)
+
+
+@pytest.mark.asyncio
+async def test_the_default_transport_hands_ssh_the_dispatchers_own_locale(
+    tmp_path: Path, monkeypatch,
+):
+    """ssh forwards LANG/LC_* to the verify host (SendEnv), so the transport
+    must not pin them: a pinned locale would skew every remote env probe."""
+    fakebin = tmp_path / 'bin'
+    fakebin.mkdir()
+    ssh = fakebin / 'ssh'
+    ssh.write_text('#!/usr/bin/env bash\nprintf \'%s|%s\' "${LC_ALL-unset}" "${LANG-unset}"\n')
+    ssh.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{fakebin}:{os.environ["PATH"]}')
+    monkeypatch.setenv('LANG', 'en_GB.UTF-8')
+    monkeypatch.delenv('LC_ALL', raising=False)
+    runner = RemoteRunner(
+        'laptop', 'gate-host', 'gate-host', str(tmp_path),
+        df_remote_checkout='/laptop/dark-factory', gate_checkouts_path='/gates',
+        deployed_sha=DeployedSha('d' * 40, indeterminate=False, dirty_wire_path=False),
+        code_checkout=str(tmp_path),
+    )
+
+    rc, stdout, _ = await (await runner.env_probe_run())(['true'])
+
+    assert (rc, stdout) == (0, 'unset|en_GB.UTF-8')
 
 
 @pytest.mark.asyncio
@@ -986,6 +1141,76 @@ async def test_cancel_verify_runs_through_the_gate_binary():
     ]
     # Killed by this dispatcher's own cancel: says nothing about the host.
     assert excinfo.value.kind == 'transport'
+
+
+# What leo-laptop's host shim answers a cancel sent through a gate not yet built.
+_UNBUILT_GATE_CANCEL = (127, '', f'/usr/local/bin/orchestrator: line 50: {_GATE_BIN}: No such file or directory')
+
+# The awaits a dispatch makes after claiming its request and before its verify ssh.
+_PRE_VERIFY_ROLES = ('publish', 'ensure', 'verify_push')
+
+
+def _hold(transport: _Scripted, role: str) -> tuple[asyncio.Event, asyncio.Event]:
+    """Hold *role*'s reply until release is set; entered is set once the role is reached."""
+    entered, release = asyncio.Event(), asyncio.Event()
+    reply = transport.replies[role]
+    assert isinstance(reply, tuple)
+
+    async def held() -> tuple[int, str, str]:
+        entered.set()
+        await release.wait()
+        return reply
+
+    transport.replies[role] = held
+    return entered, release
+
+
+async def _no_sleep(_: float) -> None:
+    return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('held_role', _PRE_VERIFY_ROLES)
+async def test_a_cancel_before_the_verify_ssh_frees_the_slot_without_parking(held_role):
+    transport = _Scripted(cancel=_UNBUILT_GATE_CANCEL)
+    entered, release = _hold(transport, held_role)
+    allocator = HostAllocator([_scripted_runner(transport)])
+    lease = allocator.acquire_remote()
+    assert lease is not None
+    assert lease.name == 'laptop'
+    dispatch = asyncio.create_task(lease.runner.run_merge_verify('mergesha', _spec()))
+    await entered.wait()
+
+    freed = await allocator.cancel_and_release(lease, sleep=_no_sleep)
+
+    assert freed is True
+    assert not allocator.is_parked('laptop')
+    assert not allocator.is_busy('laptop')
+    release.set()
+    with pytest.raises(RunnerUnavailable):
+        await dispatch
+    assert 'verify' not in transport.roles()
+    assert 'cancel' not in transport.roles()
+    assert 'probe' not in transport.roles()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('held_role', _PRE_VERIFY_ROLES)
+async def test_a_dispatch_cancelled_before_its_verify_ssh_never_starts_it(held_role):
+    transport = _Scripted(cancel=_UNBUILT_GATE_CANCEL)
+    entered, release = _hold(transport, held_role)
+    runner = _scripted_runner(transport)
+    dispatch = asyncio.create_task(runner.run_merge_verify('mergesha', _spec()))
+    await entered.wait()
+
+    assert await runner.cancel_verify() == 0
+    release.set()
+    with pytest.raises(RunnerUnavailable) as excinfo:
+        await dispatch
+
+    assert excinfo.value.kind == 'transport'
+    assert 'verify' not in transport.roles()
+    assert 'cancel' not in transport.roles()
 
 
 @pytest.mark.asyncio

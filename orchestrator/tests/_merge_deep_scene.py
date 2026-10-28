@@ -591,11 +591,6 @@ def _canary_predicate_items_per(
     correct if the per-walk contributions SUM to the number of items the walk
     landed.  Emitting the chain size k on every one of k items would yield
     k²/n_deep; emitting 1-indexed positions would yield k(k+1)/2.
-
-    The shipped predicate carries a ``dur`` alongside each event's parsed
-    ``data`` (for its unrelated p90 statistic); this helper takes the ``data``
-    dicts alone, because durations play no part in the ``items_per`` arithmetic
-    reproduced here.
     """
     # A "deep" verify is one whose verified tree carried >= 2 chained items.
     deep = [

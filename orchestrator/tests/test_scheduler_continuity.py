@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
-from _call_recorder import ThreadRecordingCall
+from _call_recorder import BlockingCall, ThreadRecordingCall
 from _git_fixtures import README_SEED, _git, build_repo
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -127,45 +127,33 @@ class TestBoundedProbeOccupancy:
         assert reader.threads and reader.threads[0] != threading.get_ident()
 
     async def test_the_tick_never_waits_on_git(self, store, clock):
-        release = threading.Event()
-        blocked: list[int] = []
-
-        def blocked_reader() -> dict[str, BranchWork]:
-            blocked.append(threading.get_ident())
-            release.wait(timeout=30)
-            return {}
-
-        scheduler = _scheduler(blocked_reader, event_store=store, clock=clock)
+        reader = BlockingCall[dict[str, BranchWork]]({})
+        scheduler = _scheduler(reader, event_store=store, clock=clock)
         scheduler.get_tasks = AsyncMock(return_value=_tasks(3))
         try:
             assignment = await asyncio.wait_for(scheduler.acquire_next(), timeout=5)
             assert isinstance(assignment, TaskAssignment)
-            assert not release.is_set()
+            await reader.entered()
+            assert reader.blocked
         finally:
-            release.set()
+            reader.release()
         await scheduler.work_product.join()
-        assert len(blocked) == 1
+        assert reader.calls == 1
 
     async def test_closing_the_scheduler_abandons_a_slow_refresh_and_stops_probing(self, store, clock):
-        release = threading.Event()
-        reads: list[int] = []
-
-        def blocked_reader() -> dict[str, BranchWork]:
-            reads.append(threading.get_ident())
-            release.wait(timeout=30)
-            return {}
-
-        scheduler = _scheduler(blocked_reader, event_store=store, clock=clock)
+        reader = BlockingCall[dict[str, BranchWork]]({})
+        scheduler = _scheduler(reader, event_store=store, clock=clock)
         try:
             await _tick(scheduler, _tasks(3))
+            await reader.entered()
             await asyncio.wait_for(scheduler.aclose(), timeout=5)
-            assert not release.is_set()
+            assert reader.blocked
         finally:
-            release.set()
+            reader.release()
 
         clock[0] += 10 * TTL
         await _tick_and_settle(scheduler, _tasks(3))
-        assert len(reads) == 1
+        assert reader.calls == 1
 
     async def test_nothing_is_probed_without_an_event_store(self, clock):
         reader = _reader()

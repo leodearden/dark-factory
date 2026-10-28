@@ -24,6 +24,7 @@ import signal
 
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_cmd import ToolKind
+from orchestrator.verify_event_channel import VerifyEventChannel
 
 # ---------------------------------------------------------------------------
 # EXTERNAL termination signals (task 3173). ``_run_cmd`` returns
@@ -231,6 +232,8 @@ _LINKER_SIGNAL_RE = re.compile(r'signal:?\s*7\b|SIGBUS|Bus error', re.IGNORECASE
 # task 3679: LINE-ANCHORED, producer-grounded slot-timeout markers — the
 # POSITIVE detector for the SEMAPHORE_TIMEOUT arm, replacing the whole-output
 # token co-occurrence above (deleted in the follow-up step).
+# Task 6856: these text arms are consulted only when the verify's event
+# channel is absent (`_reports_fatal_slot_timeout`, C3 rules 2 and 4).
 #
 # ANCHORING CONTRACT: `^` + re.MULTILINE, tolerating LEADING HORIZONTAL
 # WHITESPACE ONLY — deliberately NOT an arbitrary leading log/harness prefix.
@@ -735,11 +738,42 @@ _VERIFY_WORKTREE_COLLATERAL_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r'^=== INTERRUPTED \(worktree removed\) ===', re.MULTILINE),
 ]
 
+# verify.py::_run_cmd's `systemd-run --user --scope` could not start the leg's
+# scope (task 7258). Grounded samples, each the leg's ENTIRE output at rc=1:
+#   'Failed to start transient scope unit: Transport endpoint is not connected'
+#     (task 7217's cockpit test/lint/type legs, 2026-10-20)
+#   'Failed to connect to bus: No such file or directory'
+#     (systemd 255.4, user bus unreachable, measured 2026-10-22)
+# Matched against the WHOLE output, never per line: systemd-run fails before
+# exec'ing the leg, so its refusal is all the leg can print, and any other
+# output means the command ran and its own verdict stands. Only systemd-run
+# prints the scope-unit line, so any reason after it means the scope never
+# started. `systemctl --user` and `busctl --user` print the bus-connect line
+# verbatim too (measured), so only its observed reasons match; a leg whose own
+# systemctl prints exactly that line still reads as infra until task 7339 tags
+# the spawn path structurally. Add a reason only on a newly observed sample
+# (the _CARGO_CLI_ERROR_RE discipline).
+_SCOPE_SPAWN_FAILURE_RE = re.compile(
+    r'Failed to start transient scope unit: [^\n]+'
+    r'|Failed to connect to bus: No such file or directory'
+)
 
-def _classify_environmental(output: str) -> FailureCategory | None:
+
+def _reports_fatal_slot_timeout(
+    scoped: str, event_channel: VerifyEventChannel | None,
+) -> bool:
+    if event_channel is not None and event_channel.present:
+        return event_channel.fatal_slot_timeouts > 0
+    return bool(_has_fatal_slot_timeout_sentinel(scoped) or _SLOT_ACQUIRE_DEADLINE_RE.search(scoped))
+
+
+def _classify_environmental(
+    output: str, event_channel: VerifyEventChannel | None = None,
+) -> FailureCategory | None:
     """Tool-blind host-infrastructure guard: DISK_FULL / ENV_TRANSIENT (broken
     ``_merge-verify`` worktree, incl. restart collateral; mis-resolved pyright
-    interpreter) / SEMAPHORE_TIMEOUT.
+    interpreter; a verify scope systemd-run could not start) /
+    SEMAPHORE_TIMEOUT.
 
     Checked in ``classify_failure`` immediately after the ``timed_out`` ->
     ``INFRA_TIMEOUT`` guard and before any per-tool dispatch — these
@@ -983,6 +1017,13 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     per-tool table duplication (Invariant C1 intact — C1 forbids duplicating
     the same pattern across per-tool tables, not a category being reachable
     from more than one guard).
+
+    ENV_TRANSIENT — verify scope never started (task 7258): when
+    ``verify.py::_run_cmd``'s ``systemd-run --user --scope`` cannot reach the
+    user bus it exits before exec'ing the leg, so the leg's entire output is
+    systemd-run's one-line refusal (``_SCOPE_SPAWN_FAILURE_RE``). It is matched
+    only as the WHOLE scoped output, so it cannot tie with any other arm and
+    its position among them is not load-bearing.
     """
     # task 4492 — every POSITIVE detector below reads `scoped`, the output
     # with each PASSED suite's interior blanked; the one NEGATIVE/veto
@@ -1005,8 +1046,8 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     #      removed) ===` marker a test could legitimately replay. Scoping one
     #      arm would leave the class alive under a different label — the
     #      shape-N+1 treadmill (2748 -> 2821 -> 3679 -> 4212) this exists to end.
-    #   3. ORDERING IS UNCHANGED (DISK_FULL, the three ENV_TRANSIENT
-    #      branches, then SEMAPHORE_TIMEOUT last). The ORDERING note above
+    #   3. ORDERING IS UNCHANGED (DISK_FULL, the ENV_TRANSIENT branches,
+    #      then SEMAPHORE_TIMEOUT last). The ORDERING note above
     #      stays load-bearing; scoping changes WHICH TEXT each arm reads,
     #      never the order they are tried in.
     scoped = _redact_passed_suite_blocks(output)
@@ -1024,15 +1065,20 @@ def _classify_environmental(output: str) -> FailureCategory | None:
         return FailureCategory.ENV_TRANSIENT
     if is_interpreter_missing_workspace_packages(scoped):
         return FailureCategory.ENV_TRANSIENT
+    if _SCOPE_SPAWN_FAILURE_RE.fullmatch(scoped.rstrip('\n')):
+        return FailureCategory.ENV_TRANSIENT
     # task 4212: sentinel half is gated on disposition
     # (`_has_fatal_slot_timeout_sentinel` above has the full grounding);
     # basename half stays ungated — its emitters carry no `disposition` field.
-    if _has_fatal_slot_timeout_sentinel(scoped) or _SLOT_ACQUIRE_DEADLINE_RE.search(scoped):
+    if _reports_fatal_slot_timeout(scoped, event_channel):
         return FailureCategory.SEMAPHORE_TIMEOUT
     return None
 
 
-def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> FailureCategory:
+def classify_failure(
+    tool: ToolKind, rc: int, output: str, timed_out: bool, *,
+    event_channel: VerifyEventChannel | None = None,
+) -> FailureCategory:
     """Classify a command failure into a ``FailureCategory``, dispatched by tool.
 
     Guards (checked before any per-tool dispatch, identically for every
@@ -1055,9 +1101,10 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
        see ``_EXTERNAL_KILL_SIGNALS``.
     3. ``_classify_environmental(output)`` -> ``FailureCategory.DISK_FULL``,
        ``FailureCategory.SEMAPHORE_TIMEOUT``, or ``FailureCategory.ENV_TRANSIENT``
-       (broken ``_merge-verify`` worktree; or a mis-resolved pyright
+       (broken ``_merge-verify`` worktree; a mis-resolved pyright
        interpreter holding none of the workspace's third-party packages —
-       task 3367) when grounded in *output* (wins over any per-tool output
+       task 3367; or a verify scope systemd-run could not start — task 7258)
+       when grounded in *output* (wins over any per-tool output
        pattern for the same "root cause is the environment, not the command
        output" reason as guard 2 — a host condition like a full disk, a
        lock/semaphore-slot timeout, an unreadable worktree lockfile, or an
@@ -1068,7 +1115,8 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
        reported zero failures is no longer evidence about the failure being
        classified; its one veto still reads the full *output*, which keeps
        the change able to move a classification only AWAY from a guard-3
-       category, never toward one.
+       category, never toward one. Task 6856: a PRESENT *event_channel*
+       alone decides SEMAPHORE_TIMEOUT (its fatal slot_timeout records).
 
     SCOPING BOUNDARY — a RECORDED CHOICE, not an oversight (review amendment
     #5). Guard 3 is the ONLY consumer of the scoped text. Guards 1/2/2.5 and
@@ -1136,7 +1184,7 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
         return FailureCategory.INFRA_TIMEOUT
     if is_external_kill_rc(rc):
         return FailureCategory.INFRA_KILL
-    environmental_category = _classify_environmental(output)
+    environmental_category = _classify_environmental(output, event_channel)
     if environmental_category is not None:
         return environmental_category
 

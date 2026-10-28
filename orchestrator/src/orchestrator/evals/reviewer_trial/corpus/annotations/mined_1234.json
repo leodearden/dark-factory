@@ -32,6 +32,38 @@
       "severity": "suggestion",
       "description": "test_static_index_html_serves_200 depends on a `client` fixture (presumably from conftest) while the module fixture independently builds its own TestClient(app). If the `client` fixture is not defined, this test errors rather than exercising the intended path; the two clients also risk diverging in app configuration.",
       "mutation_type": "api_misuse"
+    },
+    {
+      "id": "mined_1234_pool_01",
+      "location": "dashboard/tests/test_index_html.py:96-116",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "test_cdn_script_has_sri_integrity checks that the marked/DOMPurify tags carry an integrity attribute but not `crossorigin`. A cross-origin script with integrity but no crossorigin is fetched no-cors, the SRI check fails on the opaque response and the browser blocks it, producing the silent plain-text fallback this module says it guards against, while the test still passes.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1234_pool_02",
+      "location": "dashboard/tests/test_index_html.py:19",
+      "category": "weak_assertion",
+      "severity": "suggestion",
+      "description": "_SRI_HASH_RE accepts any base64 run of 20+ characters for every algorithm, so a truncated or corrupted hash passes (sha384 should be exactly 64 base64 characters), and the 'https://unpkg.com/marked@' / 'dompurify@' prefixes do not require a pinned version. The finding's claim that mixed multi-hash values pass is wrong: the anchored regex rejects whitespace.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1234_pool_03",
+      "location": "dashboard/tests/test_index_html.py:36-52",
+      "category": "comments_stance",
+      "severity": "suggestion",
+      "description": "The `_find_cdn_script_attrs` docstring defends HTMLParser against a rejected regex alternative (reviewer-facing rationale for the commit message), and the tab_tasks.jsx/MarkdownText dependency is restated in the module docstring, both consumer_note strings and the test docstring, which will drift if the component moves.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1234_pool_04",
+      "location": "dashboard/tests/test_index_html.py:74-93",
+      "category": "duplicated_case_identity",
+      "severity": "suggestion",
+      "description": "Each library's identity is stated twice: `lib_name` inside the positional `_CDN_SCRIPT_CASES` tuples and again in the separate, order-dependent `ids=['marked', 'dompurify']` list, so adding or reordering a case requires lockstep edits.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+from os.path import commonprefix
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from escalation.queue import EscalationQueue
+from shared.elision import elision_marker
 from shared.task_submit import SubmitFailed, SubmittedTask
 from test_merge_queue_main_health import (
     COMPILE_ERROR_RESULT,
@@ -30,8 +32,10 @@ from orchestrator.main_health_actions import MainHealthNextAction
 from orchestrator.main_health_fix_owner import (
     REPRODUCE_FIRST,
     SIGNATURE_KEY,
+    FixSpawnContext,
     MainBreak,
     MainFixTaskFiler,
+    build_main_fix_task_arguments,
     ensure_main_fix_owner,
 )
 from orchestrator.merge_lane.worker import (
@@ -151,6 +155,40 @@ def _ensure(store: FakeTaskStore, brk: MainBreak, filer: MainFixTaskFiler | None
 
 
 TEST_BREAK = MainBreak('test_failure', 'tests/test_foo.py::test_bar', 'main red')
+
+
+def _fix_arguments(brk: MainBreak) -> dict:
+    return build_main_fix_task_arguments(brk, project_root='/p', spawn_context=FixSpawnContext.FILED)
+
+
+class TestFixMainTaskArguments:
+    """The fix-main task carries the whole failure report, and a long cause is clipped visibly."""
+
+    def test_the_whole_failure_report_rides_in_details(self) -> None:
+        reason = 'FAILED tests/test_foo.py::test_bar\n' + 'E   assert widget == gadget\n' * 300
+
+        args = _fix_arguments(MainBreak('test_failure', 'tests/test_foo.py::test_bar', reason))
+
+        assert args['details'] == reason.strip()
+
+    def test_a_long_cause_clips_the_title_at_a_word_with_a_counted_marker(self) -> None:
+        cause = ' '.join(f'tests/test_mod_{i}.py::test_case' for i in range(10))
+        full = f'fix main: {cause}'
+
+        args = _fix_arguments(MainBreak('test_failure', cause, 'main red'))
+
+        title = args['title']
+        head = commonprefix([title, full])
+        assert len(title) <= 100
+        assert title == head + elision_marker(len(full) - len(head))
+        assert full[len(head)].isspace()
+        assert f'Cause: {cause}' in args['description']
+
+    def test_a_short_cause_titles_the_task_verbatim(self) -> None:
+        assert _fix_arguments(TEST_BREAK)['title'] == 'fix main: tests/test_foo.py::test_bar'
+
+    def test_an_empty_reason_files_no_details(self) -> None:
+        assert 'details' not in _fix_arguments(MainBreak('compile_error', 'hint', ''))
 
 
 class TestMainFixTaskFiler:

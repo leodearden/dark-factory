@@ -1,6 +1,6 @@
 """Live-corpus pins for repaired capability-manifest delivered_check descriptors.
 
-Two populations are pinned. Task 6036 re-anchored descriptors on BOTH sides: the
+Three populations are pinned. Task 6036 re-anchored descriptors on BOTH sides: the
 producer task's ``metadata.delivered_checks`` entry in tasks.db AND the sidecar
 the stamper copies it from. Task 5256 resynced sidecars, sidecar-only, to task
 records that had already been repaired. CI can never see the tasks.db half, so
@@ -8,7 +8,10 @@ either way these pins guard the SIDECAR half: a stale sidecar would be
 re-stamped over the repaired record by the next re-decompose. Every resynced
 producer is done, so the resynced rows are also evaluated at HEAD through the
 runtime grep primitive. They read only tracked files in this checkout and open
-no database.
+no database. Task 6047 re-pointed a FOREIGN descriptor, warm-lane κ, whose
+task-record half lives in reify's store; reify's tree is not this checkout, so
+its non-vacuity is checked behaviourally against committed fixture trees rather
+than at HEAD.
 
 MAINTENANCE CONTRACT: an exact pin also fires on a legitimate later both-sides
 re-repair. In that case, update the row here in the same change and re-run
@@ -22,9 +25,14 @@ from pathlib import Path
 
 import pytest
 from audit_delivered_checks import load_manifest_checks, structural_findings
+from committed_git_repo import committed_repo
 from git_checkout_root import checkout_root_or_skip
 from shared.capability_manifest import load_capability_manifest
-from shared.delivered_check_polarity import CheckOutcome, evaluate_grep_at_tree
+from shared.delivered_check_polarity import (
+    CheckOutcome,
+    evaluate_grep_at_tree,
+    evaluate_path_at_tree,
+)
 
 # Task 6036: re-anchored on both sides.
 _REANCHORED = [
@@ -104,6 +112,24 @@ _RETIRED_TO_MANUAL = [
     ),
 ]
 
+# Task 6047: re-pointed foreign descriptor (producer reify:5616).
+_KAPPA = (
+    "plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
+    "κ", "reify-scripts-reduced-to-contract-primitives",
+)
+# plans/warm-lane-infra-repatriation-prd.md §κ: "Remove the seven relocated scripts".
+_RELOCATED_WARM_LANE_SCRIPTS = (
+    "scripts/warm-lane-gc.sh",
+    "scripts/warm-lane-gc-sweep.sh",
+    "scripts/thin-warm-lane.sh",
+    "scripts/warm-lane-disk-guard.sh",
+    "scripts/warm-lane-audit.sh",
+    "scripts/warm-lane-degenerate-ref-check.sh",
+    "scripts/provision-warm-lane-fs.sh",
+)
+# PRD §5: κ keeps the project's one primitive and its base-advance counterpart.
+_CONTRACT_PRIMITIVES = ("scripts/seed-warm-lane.sh", "scripts/refresh-warm-base.sh")
+
 
 def _the_one_capability(root: str, relpath: str, label: str, capability: str):
     tracked = subprocess.run(
@@ -122,6 +148,24 @@ def _the_one_capability(root: str, relpath: str, label: str, capability: str):
         f"in {relpath}, found {len(matches)}"
     )
     return matches[0]
+
+
+def _kappa_check():
+    relpath, label, capability = _KAPPA
+    check = _the_one_capability(
+        checkout_root_or_skip(), relpath, label, capability).delivered_check
+
+    assert check is not None
+    assert check.kind == "path" and check.expect == "absent", (
+        f"{relpath} label {label} capability {capability} is kind={check.kind!r} "
+        f"expect={check.expect!r}, not path/absent: either the vacuous "
+        f"scripts/verify-pipeline-paths.txt grep is back or the check changed kind."
+    )
+    return check
+
+
+def _reify_tree_holding(tmp_path: Path, scripts) -> str:
+    return committed_repo(tmp_path / "reify", dict.fromkeys(scripts, "#!/bin/sh\n"))
 
 
 @pytest.mark.parametrize(
@@ -205,3 +249,34 @@ def test_audit_structural_section_names_no_reanchored_grep_capability():
     flagged = {(s.row.task_id, s.row.name, s.code)
                for s in structural_findings(rows, repo_root=root, ref="HEAD")}
     assert flagged == set()
+
+
+@pytest.mark.parametrize(
+    "survivor", _RELOCATED_WARM_LANE_SCRIPTS, ids=lambda path: Path(path).name,
+)
+def test_kappa_gate_holds_while_any_relocated_script_survives(tmp_path, survivor):
+    """Every one of κ's seven deletions is gated, so the gate cannot pass early."""
+    check = _kappa_check()
+    repo = _reify_tree_holding(tmp_path, [*_CONTRACT_PRIMITIVES, survivor])
+
+    outcome = evaluate_path_at_tree(
+        list(check.paths), expect=check.expect, repo_root=repo, ref="HEAD",
+    )
+    assert outcome is CheckOutcome.FAIL, (
+        f"κ's delivered_check evaluates {outcome.value} on a tree that still holds "
+        f"{survivor}; it must gate every relocated script's deletion."
+    )
+
+
+def test_kappa_gate_opens_once_only_the_contract_primitives_remain(tmp_path):
+    """No retained contract primitive is in the gate, so κ can actually finish."""
+    check = _kappa_check()
+    repo = _reify_tree_holding(tmp_path, _CONTRACT_PRIMITIVES)
+
+    outcome = evaluate_path_at_tree(
+        list(check.paths), expect=check.expect, repo_root=repo, ref="HEAD",
+    )
+    assert outcome is CheckOutcome.PASS, (
+        f"κ's delivered_check evaluates {outcome.value} on a tree holding only "
+        f"{_CONTRACT_PRIMITIVES}; a retained primitive must not be in the gate."
+    )

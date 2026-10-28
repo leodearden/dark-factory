@@ -682,12 +682,16 @@ class TaskStatusConfig(BaseModel):
 # --- Reconciliation ---
 
 class ProceduralTopicCluster(BaseModel):
-    """One known-contradictory procedural_knowledge topic for the write-time topic guard.
+    """One known-contradictory topic for the write-time topic guard.
 
-    A cluster is matched deterministically: an incoming ``procedural_knowledge``
-    add_memory write is soft-blocked when its (lowercased) content contains
-    EITHER at least ``min_phrase_hits`` DISTINCT ``phrases``, OR any single
-    phrase listed in ``sufficient_phrases``. A blocked write routes the writer
+    A cluster is matched deterministically: an incoming add_memory write whose
+    explicit ``category`` is in ``_TOPIC_GUARD_GATED_CATEGORIES``
+    (``server/tools.py::create_mcp_server``) is soft-blocked when its (lowercased)
+    content contains EITHER at least ``min_phrase_hits`` DISTINCT ``phrases``,
+    OR any single phrase listed in ``sufficient_phrases``. The cosine
+    near-duplicate guard that this topic guard complements (see
+    ``procedural_knowledge_near_dup_guard_enabled`` on ``ReconciliationConfig``)
+    remains ``procedural_knowledge``-only. A blocked write routes the writer
     to consolidate/update the existing entries or add context to the human gate
     task named in ``hint`` -- instead of accumulating another paraphrased,
     below-cosine-threshold restatement the semantic near-dup guard cannot catch
@@ -1610,6 +1614,30 @@ class ReconciliationConfig(BaseModel):
     sandbox_recon_agents: bool = Field(default=True)
     sandbox_recon_writable_extras: list[str] = Field(default_factory=list)
 
+    transcript_archive_enabled: bool = Field(
+        default=True,
+        description=(
+            'Archive each recon stage CLI transcript before its per-run config '
+            'dir is destroyed (task 3972). The operator kill switch, and the '
+            'only remedy if the archive root breaks: fused-memory installs no '
+            'archival-failure storm consumer. Green-tier for that reason; both '
+            'archive leaves are read live per stage and per GC through '
+            'reconciliation/cli_stage_runner.py::recon_archive_root. It also '
+            "governs TaskCurator's per-process config-dir archival (task 6008): "
+            'off, the dead-PID sweep removes curator config dirs unarchived.'
+        ),
+    )
+    transcript_archive_root: str = Field(
+        default='data/orchestrator/agent-transcripts',
+        description=(
+            'Archive root, resolved against explore_codebase_root (NOT data_dir). '
+            "The default deliberately equals the orchestrator's archive root, "
+            "which docs/legibility/legibility.yaml's agent_transcript_roots "
+            'already mines. TaskCurator archives its config-dir transcripts '
+            'here too, keyed fm-curator-<pid> (task 6008).'
+        ),
+    )
+
     # Quiescence / burst detection
     conditional_trigger_ratio: float = Field(default=0.33)
     burst_window_seconds: float = Field(default=30.0)
@@ -1730,7 +1758,6 @@ class ReconciliationConfig(BaseModel):
         return self
 
     # Safety
-    max_mutations_per_stage: int = Field(default=50)
     halt_on_judge_serious: bool = Field(default=True)
 
     # Done-provenance gate — when True, set_task_status(done) rejects calls
@@ -2001,8 +2028,11 @@ class ReconciliationConfig(BaseModel):
         ),
     )
 
-    # Write-time TOPIC-keyed cluster guard for procedural_knowledge add_memory writes
-    # (task 2845). Complements the cosine near-dup guard above: paraphrased same-topic
+    # Write-time TOPIC-keyed cluster guard for add_memory writes (task 2845), gated
+    # since task 3430 on category in _TOPIC_GUARD_GATED_CATEGORIES
+    # (server/tools.py::create_mcp_server) rather than procedural_knowledge alone.
+    # Complements the cosine near-dup guard above, which remains
+    # procedural_knowledge-only: paraphrased same-topic
     # entries score BELOW any cosine threshold that is also safe for unrelated writes,
     # so a recurring known-contradictory topic (e.g. "pytest-xdist -n0 serial override")
     # kept accumulating contradictory entries the cosine guard
@@ -2017,21 +2047,33 @@ class ReconciliationConfig(BaseModel):
     # Machine-derived clusters from server/topic_cluster_store.py merge AFTER this
     # list at read time and, unlike it, ARE project-scoped
     # (server/near_duplicate_guard.py::resolve_topic_guard_clusters).
+    # NOTE: the field keeps its historical `procedural_knowledge_` prefix although the
+    # gate covers more categories. Do not rename it: ReconciliationConfig leaves
+    # pydantic's extra='ignore' in force, so a rename would silently drop any operator
+    # override still written under the old key unless a rejecting validator like
+    # _reject_legacy_bulk_reset_threshold were added. Keep the ProceduralTopicCluster
+    # class name and the ProceduralKnowledgeKnownTopicClusterWriteRejected error_type
+    # too; writers and skills match on that error_type string.
     procedural_knowledge_topic_guard_clusters: list[ProceduralTopicCluster] = Field(
         default_factory=_default_topic_guard_clusters,
         description=(
-            'Known-contradictory procedural_knowledge topic clusters. An add_memory '
-            "write whose content contains >= a cluster's min_phrase_hits distinct "
-            "phrases -- OR any single one of that cluster's sufficient_phrases, for "
-            'phrases distinctive enough to qualify alone -- is soft-blocked '
+            'Known-contradictory topic clusters for the write-time topic guard. An '
+            'add_memory write whose explicit category is gated (procedural_knowledge or '
+            'preferences_and_norms; source of truth: _TOPIC_GUARD_GATED_CATEGORIES in '
+            "server/tools.py) and whose content contains >= a cluster's min_phrase_hits "
+            "distinct phrases -- OR any single one of that cluster's sufficient_phrases, "
+            'for phrases distinctive enough to qualify alone -- is soft-blocked '
             '(error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected) BEFORE '
-            'the cosine near-dup search. Seeded with five clusters (pytest-xdist, '
+            'the cosine near-dup search. The cosine near-dup guard remains '
+            'procedural_knowledge-only. Seeded with five clusters (pytest-xdist, '
             'the two architect families, ruff-format, and npx-pyright-EACCES); '
             'the two eval-worktree '
             'clusters that were seeded originally are RETIRED -- both their human '
             'gates (2841/2844) are done -- and must not be reinstated without '
             'reading the retirement notes on _default_topic_guard_clusters. An '
             'empty list disables the topic guard. '
+            'The procedural_knowledge_ name prefix is historical: the guard covers '
+            'more than procedural_knowledge. '
             'A sufficient_phrases entry absent from that cluster\'s phrases is '
             'rejected at load/reload rather than silently matching nothing. Green-tier '
             'hot-reloadable via the reload_config MCP tool (read live per add_memory '
@@ -2276,7 +2318,7 @@ class CuratorConfig(BaseModel):
     #
     # These four are deliberately NOT re-tuned by task 5364. Nothing measured
     # how often they bind; the ``pool_truncated`` census that task installs
-    # (``task_curator.py::PoolWithheld``) IS that instrument, and tuning waits
+    # (``curator_types.py::PoolWithheld``) IS that instrument, and tuning waits
     # on what it reports rather than repeating the 2026-04 guess.
     pool_module_cap: int = Field(default=15)
     pool_embedding_cap: int = Field(default=10)
@@ -2307,7 +2349,7 @@ class CuratorConfig(BaseModel):
     idempotency_ttl_seconds: float = Field(default=600.0)
 
     # Entry payload limits, applied per pool entry AND to the candidate block
-    # (both sides route through ``task_curator.py::clip_for_prompt``, which
+    # (both sides route through ``curator_types.py::clip_for_prompt``, which
     # marks what it elided).
     #
     # Derived from the live task corpus, measured 2026-09-18 (n=5574 rows;
@@ -2342,8 +2384,8 @@ class CuratorConfig(BaseModel):
     # (get_tasks over the whole tree + an embedder call + a qdrant query).
     # That path now hands the prepared bundle to ``curate``, so a smaller
     # batch no longer costs a rebuild.
-    entry_description_chars: int = Field(default=2000)
-    entry_details_chars: int = Field(default=1500)
+    entry_description_chars: int = Field(default=2000, ge=1)
+    entry_details_chars: int = Field(default=1500, ge=1)
 
     # Batch-curator knobs — the worker drains up to batch_max tickets per
     # round-trip; timeout, turns, and budget scale linearly with N and are
@@ -2411,13 +2453,13 @@ class CuratorConfig(BaseModel):
     # degrade-to-create contract.
     # Open after this many CONSECUTIVE ZOT curator LLM failures (reset on
     # any successful LLM call; a non-ZOT failure neither increments nor
-    # resets it — see task_curator.py::TaskCurator._consecutive_zero_output_timeouts).
+    # resets it — see middleware/zero_output_breaker.py::ZeroOutputBreaker).
     zero_output_breaker_threshold: int = Field(default=2, ge=1)
     # How long the breaker stays open / short-circuits to action='create'
     # before allowing a half-open probe; a successful LLM call (including a
     # concurrent batch round-trip) closes the breaker early rather than
     # waiting out the cooldown — see
-    # task_curator.py::TaskCurator._reset_zero_output_breaker and
+    # middleware/zero_output_breaker.py::ZeroOutputBreaker.close and
     # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker.
     zero_output_breaker_cooldown_seconds: float = Field(default=600.0, gt=0)
     # Post-ZOT duplicate sweep (fused_memory/middleware/curator_zot_duplicate_sweep.py).
@@ -2434,10 +2476,11 @@ class CuratorConfig(BaseModel):
     # which counts only hung calls and short-circuits them; this only reports.
     degraded_streak_threshold: int = Field(default=5, ge=1)
 
-    # A submission the account pool could not serve parks awaiting_curation and
-    # is retried on this backoff until an attempt yields a verdict; the max is
-    # the retry-interval cap, not a bound on how long a ticket stays parked
-    # (fused_memory/middleware/curation_deferral.py).
+    # A submission the curator could not judge (for a reason in
+    # fused-memory/src/fused_memory/middleware/curation_deferral.py::DeferReason)
+    # parks awaiting_curation and is retried on this backoff until an attempt
+    # yields a verdict; the max is the retry-interval cap, not a bound on how
+    # long a ticket stays parked.
     deferral_backoff_base_seconds: float = Field(default=60.0, gt=0)
     deferral_backoff_max_seconds: float = Field(default=1800.0, gt=0)
 
@@ -3526,6 +3569,27 @@ class LinkHealConfig(BaseModel):
     )
 
 
+class OverreachGuardConfig(BaseModel):
+    """The ruling-overreach guard's Stage S shadow (design.md §6.1, task 6137)."""
+
+    shadow_enabled: bool = Field(
+        default=True,
+        description=(
+            'Kill switch for the record-only overreach shadow judge. Read live per '
+            'job by services/overreach_shadow.py, so a hot reload takes effect on '
+            'the next decisions_and_rationale write.'
+        ),
+    )
+    judge_timeout_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        description=(
+            'Bound on one shadow judge call; a slower call is recorded as failed. '
+            'Read live per job by services/overreach_shadow.py.'
+        ),
+    )
+
+
 class FusedMemoryConfig(BaseSettings):
     """Fused Memory configuration with YAML and environment support."""
 
@@ -3571,6 +3635,9 @@ class FusedMemoryConfig(BaseSettings):
     )
     # Bare submodel for the same per-leaf-reload reason as write_triage above.
     mem0_update: Mem0UpdateConfig = Field(default_factory=Mem0UpdateConfig)
+    # Bare submodel for the same per-leaf-reload reason as write_triage above;
+    # shadow_enabled is a kill switch, and a restart-only kill switch is none.
+    overreach_guard: OverreachGuardConfig = Field(default_factory=OverreachGuardConfig)
     # Bare submodel for the same per-leaf-reload reason as write_triage above.
     # Here nullability would additionally cost the KILL SWITCH its green tier,
     # and a restart-only kill switch is no kill switch.

@@ -20,6 +20,7 @@ from shared.project_layout import (
     ESCALATION_QUEUE_RELPATH,
     KNOWN_PROJECT_ROOTS_ENV,
     CheckoutRootError,
+    agent_transcripts_dir,
     default_project_root,
     escalation_queue_dir,
     known_project_roots,
@@ -54,6 +55,9 @@ class TestStoreLocators:
 
     def test_orchestrator_data_dir(self, root: str | Path) -> None:
         assert orchestrator_data_dir(root) == Path(root) / 'data' / 'orchestrator'
+
+    def test_agent_transcripts_dir(self, root: str | Path) -> None:
+        assert agent_transcripts_dir(root) == Path(root) / 'data' / 'orchestrator' / 'agent-transcripts'
 
     @pytest.mark.parametrize(('locator', 'name'), _ORCHESTRATOR_STORES)
     def test_orchestrator_store(self, root: str | Path, locator, name: str) -> None:

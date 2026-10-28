@@ -41,32 +41,27 @@ def _write_yaml(tmp_path: Path, data, name: str = 'orchestrator.yaml') -> Path:
     return p
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestVerifyHostPolicyDefault:
     """The default preserves today's dispatch order byte-for-byte: local is
     taken first when free, remotes take overflow.  Flipping the knob is an
     opt-in act by an operator, never a silent change under an upgrade.
     """
 
-    def test_default_is_prefer_local(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        monkeypatch.delenv('ORCH_VERIFY_HOST_POLICY', raising=False)
+    def test_default_is_prefer_local(self):
         cfg = OrchestratorConfig()
         assert cfg.verify_host_policy == 'prefer_local'
 
-    def test_prefer_remote_is_accepted(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_prefer_remote_is_accepted(self):
         cfg = OrchestratorConfig(verify_host_policy='prefer_remote')
         assert cfg.verify_host_policy == 'prefer_remote'
 
-    def test_prefer_local_is_accepted_explicitly(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_prefer_local_is_accepted_explicitly(self):
         cfg = OrchestratorConfig(verify_host_policy='prefer_local')
         assert cfg.verify_host_policy == 'prefer_local'
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestVerifyHostPolicyValidation:
     """The Literal is the guard, not a free string: a typo'd or empty policy is
     rejected at construction rather than falling through to the prefer_local
@@ -78,9 +73,7 @@ class TestVerifyHostPolicyValidation:
         'bad_value',
         ['prefer_laptop', '', None, 'PREFER_REMOTE', 'remote', 0],
     )
-    def test_bogus_policy_rejected(self, bad_value, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_bogus_policy_rejected(self, bad_value):
         with pytest.raises(ValidationError):
             OrchestratorConfig(verify_host_policy=bad_value)
 
@@ -95,9 +88,7 @@ class TestVerifyHostPolicyCheckConfigCensus:
     excuse for it.
     """
 
-    def test_key_is_known_to_the_census(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_key_is_known_to_the_census(self, tmp_path):
         p = _write_yaml(tmp_path, {'verify_host_policy': 'prefer_remote'})
 
         census = census_config_keys(p)
@@ -106,9 +97,7 @@ class TestVerifyHostPolicyCheckConfigCensus:
         assert [uk.path for uk in census.unknown] == []
         assert 'verify_host_policy' not in [ik.path for ik in census.ignored]
 
-    def test_key_is_known_beside_its_lever_c_siblings(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_key_is_known_beside_its_lever_c_siblings(self, tmp_path):
         p = _write_yaml(
             tmp_path,
             {
@@ -143,11 +132,8 @@ class TestVerifyHostPolicyReloadDisposition:
             'is missing from RELOADABLE_FIELDS'
         )
 
-    def test_edit_lands_in_applied_candidates_not_restart_required(
-        self, monkeypatch, tmp_path
-    ):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_edit_lands_in_applied_candidates_not_restart_required(self):
         live = OrchestratorConfig(verify_host_policy='prefer_local')
         fresh = OrchestratorConfig(verify_host_policy='prefer_remote')
 
@@ -156,9 +142,8 @@ class TestVerifyHostPolicyReloadDisposition:
         assert 'verify_host_policy' in diff.applied_candidates
         assert 'verify_host_policy' not in diff.restart_required
 
-    def test_apply_reload_applies_in_place(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_apply_reload_applies_in_place(self):
         live = OrchestratorConfig(verify_host_policy='prefer_local')
         fresh = OrchestratorConfig(verify_host_policy='prefer_remote')
 
@@ -173,13 +158,12 @@ class TestVerifyHostPolicyReloadDisposition:
         # reaches the next dispatch through MergeRequest(config=...)'s reference.
         assert live.verify_host_policy == 'prefer_remote'
 
-    def test_rollback_is_one_reload_too(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_rollback_is_one_reload_too(self):
         """The flip and its rollback are symmetric: an operator who flips to
         prefer_remote and regrets it gets back with a second reload_config, not
         a restart.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig(verify_host_policy='prefer_local')
 
         apply_reload(live, OrchestratorConfig(verify_host_policy='prefer_remote'))

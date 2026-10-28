@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -70,7 +70,6 @@ class TestHarnessKFromConfig:
              patch('orchestrator.merge_lane.liveness.enforce_persistent_worktree_serial_lane') as mock_serial:
 
             mock_smw = MagicMock()
-            mock_smw.run = AsyncMock(return_value=None)
             mock_smw_cls.return_value = mock_smw
 
             await h._start_merge_worker()
