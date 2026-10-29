@@ -15,6 +15,7 @@ from _qdrant_responses import missing_collection_404
 from qdrant_client.http.exceptions import UnexpectedResponse
 from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, escalation_queue_dir
 
+from fused_memory.backends.falkor_server_settings import FalkorServerSettings
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware import mem0_update_storm_escalator as storm_mod
 from fused_memory.models.enums import MemoryCategory, SourceStore
@@ -51,6 +52,11 @@ DEFAULT_POINT_PAYLOAD = {
 }
 
 
+_MATCHING_SERVER_SETTINGS = FalkorServerSettings(
+    expected_graph_timeout_ms=30000, graph_timeout_ms=30000, appendonly='yes',
+)
+
+
 @pytest.fixture
 def service(mock_config):
     """MemoryService with mocked backends (no real DB needed)."""
@@ -82,6 +88,7 @@ def _mocked_service(config) -> MemoryService:
     svc.graphiti._require_client = MagicMock()
     svc.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
     svc.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+    svc.graphiti.read_server_settings = AsyncMock(return_value=_MATCHING_SERVER_SETTINGS)
     install_identity_mocks(svc.graphiti)
 
     svc.mem0 = MagicMock()
@@ -8172,6 +8179,33 @@ class TestGetStatusScoping:
             f'queue section should equal get_stats output; got {result["queue"]}'
         )
 
+
+class TestGetStatusSurfacesFalkorServerSettings:
+    """`get_status()['graphiti']['server_settings']` carries the live FalkorDB settings (task 6848)."""
+
+    @pytest.mark.asyncio
+    async def test_a_reset_timeout_is_visible_in_get_status(self, service):
+        service.graphiti.list_graphs = AsyncMock(return_value=[])
+        service.mem0.list_projects = AsyncMock(return_value=[])
+        reset = FalkorServerSettings(
+            expected_graph_timeout_ms=30000, graph_timeout_ms=1000, appendonly='no',
+        )
+        service.graphiti.read_server_settings = AsyncMock(return_value=reset)
+
+        result = await service.get_status()
+
+        assert result['graphiti']['server_settings'] == reset.to_status()
+        assert result['graphiti']['server_settings']['ok'] is False
+
+    @pytest.mark.asyncio
+    async def test_server_settings_are_reported_even_when_graph_listing_fails(self, service):
+        service.graphiti.list_graphs = AsyncMock(side_effect=ConnectionError('down'))
+        service.mem0.list_projects = AsyncMock(return_value=[])
+
+        result = await service.get_status()
+
+        assert result['graphiti']['connected'] is False
+        assert result['graphiti']['server_settings'] == _MATCHING_SERVER_SETTINGS.to_status()
 
 class TestGetStatusSurfacesDeadByOperation:
     """`get_status()['queue']` must carry the per-operation dead breakdown.

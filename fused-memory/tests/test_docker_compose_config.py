@@ -5,13 +5,21 @@ The falkordb image entrypoint (/var/lib/falkordb/bin/run.sh) runs
 file, so the compose file is the only durable home for redis options.
 """
 
+import re
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-COMPOSE_FILE = Path(__file__).resolve().parent.parent / "docker" / "docker-compose.yml"
+FUSED_MEMORY_DIR = Path(__file__).resolve().parent.parent
+COMPOSE_FILE = FUSED_MEMORY_DIR / "docker" / "docker-compose.yml"
+CONFIG_FILE = FUSED_MEMORY_DIR / "config" / "config.yaml"
 FALKORDB_DATA_DIR = "/var/lib/falkordb/data"
+EXPECTED_FALKORDB_MODULE_ARGS = {
+    "MAX_QUEUED_QUERIES": "25",
+    "TIMEOUT": "30000",
+    "RESULTSET_SIZE": "10000",
+}
 
 
 def _falkordb_service() -> dict[str, Any]:
@@ -37,6 +45,12 @@ def _redis_options(redis_args: str) -> dict[str, str]:
     )
     assert well_formed, f"REDIS_ARGS must be '--option value' pairs; got {redis_args!r}"
     return {name.removeprefix("--"): value for name, value in zip(names, values, strict=True)}
+
+
+def _falkordb_module_args(falkordb_args: str) -> dict[str, str]:
+    tokens = falkordb_args.split()
+    assert len(tokens) % 2 == 0, f"FALKORDB_ARGS must be 'NAME value' pairs; got {falkordb_args!r}"
+    return dict(zip(tokens[0::2], tokens[1::2], strict=True))
 
 
 def _mounted_container_paths(service: dict[str, Any]) -> set[str]:
@@ -78,4 +92,39 @@ def test_falkordb_data_dir_is_host_mounted() -> None:
         f"run.sh passes --dir {FALKORDB_DATA_DIR}, so the AOF and RDB land there; "
         "without a mount of that path they die with the container. "
         f"volumes = {service.get('volumes')!r}"
+    )
+
+
+def test_falkordb_args_pin_the_legacy_read_timeout_and_keep_the_image_defaults() -> None:
+    env = _service_env(_falkordb_service())
+    assert "FALKORDB_ARGS" in env, (
+        "falkordb sets no FALKORDB_ARGS, so it runs with the image default TIMEOUT 1000, "
+        "and a runtime GRAPH.CONFIG SET TIMEOUT is lost on every restart (task 6848). "
+        f"environment = {env!r}"
+    )
+    module_args = _falkordb_module_args(env["FALKORDB_ARGS"])
+    assert module_args == EXPECTED_FALKORDB_MODULE_ARGS, (
+        "FALKORDB_ARGS replaces the image default wholesale, so it must restate "
+        "MAX_QUEUED_QUERIES 25 and RESULTSET_SIZE 10000 and raise only TIMEOUT. It must "
+        "not use TIMEOUT_DEFAULT/TIMEOUT_MAX: those also time out writes and roll them "
+        f"back. parsed = {module_args!r}"
+    )
+
+
+def test_falkordb_image_is_pinned_by_digest() -> None:
+    image = str(_falkordb_service().get("image"))
+    assert re.fullmatch(r"falkordb/falkordb@sha256:[0-9a-f]{64}", image), (
+        "a recreate must not silently upgrade FalkorDB, so the image is pinned by repo "
+        f"digest, not a tag; image = {image!r}"
+    )
+
+
+def test_compose_timeout_is_the_timeout_fused_memory_expects() -> None:
+    module_args = _falkordb_module_args(_service_env(_falkordb_service())["FALKORDB_ARGS"])
+    config = yaml.safe_load(CONFIG_FILE.read_text(encoding="utf-8"))
+    expected = config["graphiti"]["falkordb"]["expected_graph_timeout_ms"]
+    assert int(module_args["TIMEOUT"]) == int(expected), (
+        "the compose TIMEOUT and config.yaml graphiti.falkordb.expected_graph_timeout_ms "
+        "must agree, or fused-memory warns about a server that is configured as intended; "
+        f"compose TIMEOUT = {module_args['TIMEOUT']!r}, expected = {expected!r}"
     )
