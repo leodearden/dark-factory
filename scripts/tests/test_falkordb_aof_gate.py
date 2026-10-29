@@ -81,7 +81,7 @@ class FakeDocker:
             if self.ps_fails:
                 return CommandResult(1, "", "Cannot connect to the Docker daemon")
             return CommandResult(0, f"{CONTAINER}\n" if self.status else "", "")
-        if command[4:] == ("config", "--format", "json"):
+        if command[4:] == ("config", "--no-env-resolution", "--format", "json"):
             volume = {"type": "bind", "source": str(self.data_dir), "target": "/var/lib/falkordb/data"}
             return CommandResult(0, json.dumps({"services": {"falkordb": {"volumes": [volume]}}}), "")
         if command[:2] == ("docker", "inspect"):
@@ -250,3 +250,15 @@ def test_under_systemd_a_refusal_is_logged_at_error_priority(data_dir, capsys, m
 
     refusal = [line for line in capsys.readouterr().err.splitlines() if "REFUSED" in line]
     assert refusal and all(line.startswith("<3>") for line in refusal)
+
+
+def test_the_unit_template_brings_the_stores_up_only_through_the_gate():
+    template = Path(__file__).resolve().parents[1] / "fused-memory.service.template"
+    exec_start_pre = [
+        line for line in template.read_text().splitlines() if line.startswith("ExecStartPre=")
+    ]
+
+    assert any("scripts/falkordb_aof_gate.py --compose-file" in line for line in exec_start_pre), exec_start_pre
+    assert not any("docker compose" in line for line in exec_start_pre), (
+        "a bare compose-up would recreate falkordb without the AOF gate"
+    )

@@ -35,7 +35,10 @@ WorkingDirectory=__REPO_ROOT__
 # missing AND recreates any whose config drifted (e.g. healthcheck edits).
 # Lets compose-file changes go live on the next restart without manual
 # `docker compose up -d`. Named services only — don't auto-start fused-mcp.
-ExecStartPre=/usr/bin/docker compose -f __REPO_ROOT__/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+# falkordb is recreated only onto a current AOF (task 6330, Leo 2026-10-07);
+# on refusal the gate leaves it running, still brings qdrant up, and logs the
+# remedy at error priority, so fused-memory starts against the live container.
+ExecStartPre=/usr/bin/python3 __REPO_ROOT__/scripts/falkordb_aof_gate.py --compose-file __REPO_ROOT__/fused-memory/docker/docker-compose.yml
 # Step 2: poll their published ports so our FIRST start stops losing the boot
 # race — the failure mode that cancelled the dependent orchestrators (which
 # had a hard Requires= on us) on 2026-05-27. Budget 280s < TimeoutStartSec=300.
