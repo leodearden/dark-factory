@@ -72,6 +72,13 @@ ALLOWED_UNCONDITIONALLY = {
         'names the retired wiring is data, not a live reference; editing it '
         'would break the pinned sha and falsify what the raters see'
     ),
+    'fused-memory/calibration/write_triage_eval_set_v2_live_slates.jsonl': (
+        'FROZEN measurement artifact — task 7160\'s rebuilt live slates, quoting '
+        'historical Mem0 memory texts verbatim from a store snapshot and pinned '
+        'by sha256 in the eval set\'s summary. A quoted memory that names the '
+        'retired wiring is data, not a live reference; editing it would break '
+        'the pinned sha and falsify what the raters saw'
+    ),
 }
 
 # A second allowlist, merged into the same exclusion set as the dict above:
