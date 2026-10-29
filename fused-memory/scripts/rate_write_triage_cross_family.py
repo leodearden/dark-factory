@@ -340,7 +340,7 @@ def render_markdown(report_: Mapping[str, Any]) -> str:
     """*report_* as Markdown tables; the same report always renders to the same text."""
     coverage = report_['coverage']
     summary = '\n'.join([
-        '# Cross-family re-rate of the write-triage eval set (rubric v2.1)', '',
+        '# Cross-family re-rate of the write-triage eval set', '',
         f'- Raters: {", ".join(report_["raters"]) or "—"}; calls {report_["calls"]};'
         f' spend {report_["spend_usd"]:.2f} USD at list price.',
         f'- Discordant pairs: {coverage[SELECTION_DISCORDANT]["selected"]} selected,'
