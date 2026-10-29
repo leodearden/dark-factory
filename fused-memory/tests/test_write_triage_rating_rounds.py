@@ -350,31 +350,42 @@ def _decided() -> Any:
 
 class TestThirdRoundBlockers:
     def test_names_each_pair_a_tie_or_an_open_follow_up_alone_blocks(self) -> None:
-        derivations = {
-            'tied': _incomplete(_gap('p1', 'conflict', 'tied')),
-            'open': _incomplete(_gap('p2', 'loss', 'open')),
-            'both': _incomplete(_gap('p3', 'home', 'tied'), _gap('p3', 'loss', 'open')),
-            'decided': _decided(),
-            'unclear': _rubric().Unclear(binaries=(('p4', _rubric().Binary.HOME),)),
-        }
+        derivations = [
+            ('tied', _incomplete(_gap('p1', 'conflict', 'tied'))),
+            ('open', _incomplete(_gap('p2', 'loss', 'open'))),
+            ('both', _incomplete(_gap('p3', 'home', 'tied'), _gap('p3', 'loss', 'open'))),
+            ('decided', _decided()),
+            ('unclear', _rubric().Unclear(binaries=(('p4', _rubric().Binary.HOME),))),
+        ]
         assert _mod().third_round_blockers(derivations) == [
             ('both', 'p3'), ('open', 'p2'), ('tied', 'p1'),
         ]
 
     def test_a_multi_target_derivation_blocks_only_its_gap_targets(self) -> None:
-        derivations = {'stored': _incomplete(_gap('t2', 'home', 'tied'), _gap('t5', 'conflict', 'tied'))}
+        derivations = [('stored', _incomplete(_gap('t2', 'home', 'tied'), _gap('t5', 'conflict', 'tied')))]
         assert _mod().third_round_blockers(derivations) == [('stored', 't2'), ('stored', 't5')]
 
+    def test_one_entry_may_come_once_per_pair(self) -> None:
+        derivations = [('w', _incomplete(_gap('t1', 'home', 'tied'))), ('w', _decided()),
+                       ('w', _incomplete(_gap('t3', 'loss', 'open')))]
+        assert _mod().third_round_blockers(derivations) == [('w', 't1'), ('w', 't3')]
+
     def test_an_unrated_decisive_binary_is_refused_naming_the_entry_and_binaries(self) -> None:
-        derivations = {
-            'fine': _incomplete(_gap('p1', 'conflict', 'tied')),
-            'unrated-entry': _incomplete(_gap('p1', 'home', 'tied'), _gap('p1', 'conflict', 'unrated')),
-        }
+        derivations = [
+            ('fine', _incomplete(_gap('p1', 'conflict', 'tied'))),
+            ('unrated-entry', _incomplete(_gap('p1', 'home', 'tied'), _gap('p1', 'conflict', 'unrated'))),
+        ]
         with pytest.raises(ValueError, match=r"'unrated-entry'.*\['conflict'\]"):
             _mod().third_round_blockers(derivations)
 
+    def test_an_unrated_gap_after_a_tie_on_one_pair_is_refused(self) -> None:
+        derivation = _incomplete(_gap('p1', 'conflict', 'tied'), _gap('p1', 'loss', 'unrated'))
+        assert [str(gap.kind) for gap in derivation.missing] == ['tied', 'unrated']
+        with pytest.raises(ValueError, match=r"'w'.*\['loss'\]"):
+            _mod().third_round_blockers([('w', derivation)])
+
     def test_nothing_blocked_is_an_empty_list(self) -> None:
-        assert _mod().third_round_blockers({'decided': _decided()}) == []
+        assert _mod().third_round_blockers([('decided', _decided())]) == []
 
 
 class TestLossConsumingPairs:
