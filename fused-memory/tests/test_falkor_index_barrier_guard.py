@@ -98,6 +98,10 @@ _LIVE_GRAPH_CALL = 'select_graph'
 VERIFIED_LIVE_INDEX_MODULES = {
     'test_falkor_fulltext_integration.py',
     'test_list_indices_integration.py',
+    # Task 6210 builds these two modules' graphs only through
+    # _falkor_index_live.scratch_graphs, so they prove discovery follows it.
+    'test_ensure_indices_integration.py',
+    'test_index_provisioning_wiring_integration.py',
 }
 
 
@@ -115,14 +119,14 @@ def _has_index_creating_literal(tree: ast.Module) -> bool:
     )
 
 
-def _discover_live_index_modules() -> list[pathlib.Path]:
-    """Every test module that creates an index on a live async FalkorDB graph.
+def _discover_live_index_modules(root: pathlib.Path = TESTS_ROOT) -> list[pathlib.Path]:
+    """Every test module under *root* that creates an index on a live async FalkorDB graph.
 
     Derived rather than hand-listed so a newly-added live-index module is
     covered automatically — see the module docstring.
     """
     found: list[pathlib.Path] = []
-    for path in sorted(TESTS_ROOT.glob('**/test_*.py')):
+    for path in sorted(root.glob('**/test_*.py')):
         if path.resolve() == SELF:
             # This guard names the tokens in prose; it drives no graph.
             continue
@@ -160,6 +164,28 @@ class TestDiscoveryItself:
             f'criteria; do NOT shrink the floor, or this guard silently checks '
             f'nothing.'
         )
+
+    def test_discovery_follows_graphs_made_through_the_shared_scratch_helper(self, tmp_path):
+        (tmp_path / 'test_helper_route.py').write_text(
+            'from _falkor_index_live import scratch_graphs\n'
+            '\n'
+            '\n'
+            'async def build():\n'
+            "    async with scratch_graphs('x') as make:\n"
+            "        name, graph = make('y')\n"
+            "        await graph.query('CREATE INDEX FOR (n:E) ON (n.f)')\n"
+        )
+        assert [p.name for p in _discover_live_index_modules(tmp_path)] == [
+            'test_helper_route.py'
+        ]
+
+    def test_a_module_only_mentioning_the_scratch_helper_is_not_discovered(self, tmp_path):
+        (tmp_path / 'test_helper_mention.py').write_text(
+            '"""Graphs here would come from scratch_graphs, but none is made."""\n'
+            '\n'
+            "STATEMENT = 'CREATE INDEX FOR (n:E) ON (n.f)'\n"
+        )
+        assert _discover_live_index_modules(tmp_path) == []
 
 
 @pytest.mark.parametrize('path', LIVE_INDEX_MODULES, ids=lambda p: p.name)
