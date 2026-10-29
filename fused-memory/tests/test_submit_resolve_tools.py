@@ -646,7 +646,7 @@ async def test_gitignored_deliverable_operational_class_is_exempt(
 
 
 # ------------------------------------------------------------------
-# lock-charter guard γ — gitignored-store rejection names the
+# lock-charter guard γ — unrecognised-extension rejection names the
 # deterministic routing (task 6199)
 # ------------------------------------------------------------------
 
@@ -660,7 +660,7 @@ async def test_gitignored_deliverable_operational_class_is_exempt(
     ],
     ids=['normal', 'deterministic'],
 )
-async def test_lock_charter_rejection_of_gitignored_store_names_deterministic_routing(
+async def test_lock_charter_rejection_of_unrecognised_extension_path_names_deterministic_routing(
     mcp_server, task_interceptor, ignored_project, filing,
 ):
     result = await mcp_server._tool_manager.call_tool(
@@ -686,7 +686,7 @@ async def test_lock_charter_rejection_of_genuine_directory_keeps_directory_messa
         'submit_task',
         {
             'project_root': str(ignored_project),
-            'title': 'Edit the task store',
+            'title': 'Edit the source tree',
             'metadata': {'files': ['src']},
         },
     )
