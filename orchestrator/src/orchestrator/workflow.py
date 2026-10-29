@@ -9814,7 +9814,8 @@ class TaskWorkflow:
 
         Best-effort and defensive, identical posture to
         :meth:`_detect_tip_wip_commits`: no-ops on any missing collaborator
-        (``worktree``/``git_ops``/``artifacts``), unset ``base_commit``, or
+        (``worktree``/``git_ops``/``artifacts``), unset ``base_commit``, an
+        unreadable HEAD (``_get_head_commit`` returned ``''``), or
         git error — a false negative here just reverts to today's baseline
         (the documented manual `git show <wip-sha>` verification), never
         sinks the iteration loop.
@@ -9845,6 +9846,8 @@ class TaskWorkflow:
             return
         try:
             head = await self._get_head_commit()
+            if not head:
+                return
             commits = await self.git_ops.get_commit_subjects(self.worktree, base)
             wip_run: list[tuple[str, str]] = []
             for sha, subject in commits:
