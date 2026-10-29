@@ -102,7 +102,7 @@ class TestReaderAgreement:
             conn.close()
 
         result = subprocess.run(
-            ['bash', str(_PREDICATE), '--runs-db', str(db)],
+            ['bash', str(_PREDICATE), '--runs-db', str(db), '--min-deep-verifies', '1'],
             capture_output=True, text=True, timeout=_PREDICATE_TIMEOUT,
         )
 

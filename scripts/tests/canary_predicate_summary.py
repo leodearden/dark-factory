@@ -5,7 +5,9 @@ stdout is several lines, in this order:
 - one ``store <path as given>: n_deep=<k> ...`` line per ``--runs-db`` store;
 - a ``populations: <name>=<value> ...`` line carrying the pooled populations
   and raw values behind the legs;
-- the verdict line, always LAST, e.g. ``merge-deep-canary window_days=7
+- the final line, always LAST: either ``insufficient_signal n_deep_verifies=<n>
+  (< <minimum>)`` when the pooled deep-verify count is below the minimum, or the
+  verdict line, e.g. ``merge-deep-canary window_days=7
   n_deep_verifies=2: deep_fail_rate=0.5(FAIL <= 0.35) items_per_verify=2.0(ok
   >= 1.3) verify_p90_secs=n/a(FAIL <= 5400) -> HOLD``.
 
@@ -44,3 +46,10 @@ def store_n_deep(stdout: str) -> dict[str, int]:
         match.group(1): int(match.group(2))
         for match in re.finditer(r'^store (.+?): n_deep=(\d+)', stdout, re.MULTILINE)
     }
+
+
+def insufficient_signal(stdout: str) -> tuple[int, int] | None:
+    """``(n, minimum)`` from a final ``insufficient_signal`` line, or None when the final line is a verdict."""
+    lines = stdout.splitlines()
+    match = re.fullmatch(r'insufficient_signal n_deep_verifies=(\d+) \(< (\d+)\)', lines[-1]) if lines else None
+    return (int(match.group(1)), int(match.group(2))) if match else None

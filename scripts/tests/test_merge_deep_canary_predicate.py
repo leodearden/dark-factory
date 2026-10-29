@@ -12,7 +12,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from canary_predicate_summary import metric, n_deep_verifies, store_n_deep, verdict
+from canary_predicate_summary import (
+    insufficient_signal,
+    metric,
+    n_deep_verifies,
+    store_n_deep,
+    verdict,
+)
 from cli_subprocess_timeout import cli_timeout_from_env
 from orchestrator.event_store import EventStore, EventType
 
@@ -145,7 +151,7 @@ class TestVerifyP90ReadsThePayloadDuration:
             _seed_verify(runs_db, _recent(i), passed=True, duration_ms=duration_ms)
             _seed_finalized(runs_db, _recent(i), landed_via_chain=2)
 
-        result = _run(runs_db_path)
+        result = _run(runs_db_path, '--min-deep-verifies', '2')
 
         assert result.returncode == 1, f'{result.stdout=} {result.stderr=}'
         assert metric(result.stdout, 'verify_p90_secs') == 7000.0
@@ -158,7 +164,7 @@ class TestVerifyP90ReadsThePayloadDuration:
             _seed_verify(runs_db, _recent(i), passed=True, duration_ms=duration_ms)
             _seed_finalized(runs_db, _recent(i), landed_via_chain=2)
 
-        result = _run(runs_db_path)
+        result = _run(runs_db_path, '--min-deep-verifies', '1')
 
         assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
         assert metric(result.stdout, 'verify_p90_secs') == 300.0
@@ -169,7 +175,7 @@ class TestWindowEdges:
         _seed_inside(runs_db, _CUTOFF + timedelta(hours=2))
         _seed_intruder(runs_db, _CUTOFF - timedelta(hours=2))
 
-        result = _run(runs_db_path, *_NOW_ARGS)
+        result = _run(runs_db_path, *_NOW_ARGS, '--min-deep-verifies', '1')
 
         assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
         assert n_deep_verifies(result.stdout) == 1
@@ -181,7 +187,7 @@ class TestWindowEdges:
         _seed_intruder(runs_db, _CUTOFF, finalized_ts=_CUTOFF)
         _seed_inside(runs_db, _AS_OF, finalized_ts=_AS_OF)
 
-        result = _run(runs_db_path, *_NOW_ARGS)
+        result = _run(runs_db_path, *_NOW_ARGS, '--min-deep-verifies', '1')
 
         assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
         assert n_deep_verifies(result.stdout) == 1
@@ -190,7 +196,7 @@ class TestWindowEdges:
         _seed_inside(runs_db, _AS_OF - timedelta(hours=1))
         _seed_intruder(runs_db, _AS_OF + timedelta(hours=1))
 
-        result = _run(runs_db_path, *_NOW_ARGS)
+        result = _run(runs_db_path, *_NOW_ARGS, '--min-deep-verifies', '1')
 
         assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
         assert n_deep_verifies(result.stdout) == 1
@@ -200,7 +206,7 @@ class TestWindowEdges:
         _seed_inside(runs_db, now - timedelta(days=6))
         _seed_intruder(runs_db, now - timedelta(days=8))
 
-        result = _run(runs_db_path, '--window-days', '7')
+        result = _run(runs_db_path, '--window-days', '7', '--min-deep-verifies', '1')
 
         assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
         assert n_deep_verifies(result.stdout) == 1
@@ -251,6 +257,10 @@ class TestUsageFaultsExitTwo:
         ('--deep-fail-rate-max', 'loose'),
         ('--items-per-verify-min', 'x'),
         ('--verify-p90-max-secs', 'nan'),
+        ('--min-deep-verifies', '0'),
+        ('--min-deep-verifies', '-1'),
+        ('--min-deep-verifies', 'eight'),
+        ('--min-deep-verifies', '2.5'),
     ])
     def test_malformed_numeric_flag_is_a_usage_fault(self, runs_db_path, flag, value):
         result = _run(runs_db_path, flag, value)
@@ -306,3 +316,58 @@ class TestPooledStores:
 
         assert result.returncode == 2, f'{result.stdout=} {result.stderr=}'
         assert str(bare) in result.stderr
+
+
+class TestMinimumSample:
+    @pytest.mark.parametrize(('reify_rounds', 'df_rounds'), [
+        pytest.param(4, 3, id='7-pooled'),
+        pytest.param(4, 4, id='8-pooled'),
+        pytest.param(8, 0, id='8-in-one-store'),
+    ])
+    def test_pooled_n_below_the_minimum_is_insufficient_signal(self, make_runs_db, reify_rounds, df_rounds):
+        reify = make_runs_db(_healthy_rounds(reify_rounds), name='reify.db')
+        df = make_runs_db(_healthy_rounds(df_rounds), name='df.db')
+        pooled = reify_rounds + df_rounds
+
+        result = _run_stores([reify, df], *_NOW_ARGS)
+
+        assert store_n_deep(result.stdout) == {str(reify): reify_rounds, str(df): df_rounds}
+        if pooled < 8:
+            assert result.returncode == 1, f'{result.stdout=} {result.stderr=}'
+            assert result.stdout.splitlines()[-1] == f'insufficient_signal n_deep_verifies={pooled} (< 8)'
+            assert '-> PASS' not in result.stdout and '-> HOLD' not in result.stdout
+            assert '(ok ' not in result.stdout and '(FAIL ' not in result.stdout
+        else:
+            assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
+            assert '-> PASS' in result.stdout
+            assert insufficient_signal(result.stdout) is None
+
+    def test_an_explicit_minimum_lowers_the_bar(self, make_runs_db):
+        reify = make_runs_db(_healthy_rounds(3), name='reify.db')
+
+        result = _run(reify, *_NOW_ARGS, '--min-deep-verifies', '3')
+
+        assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
+        assert result.stdout.splitlines()[-1].endswith('-> PASS')
+
+    def test_no_deep_verifies_is_insufficient_signal(self, runs_db_path):
+        result = _run(runs_db_path, *_NOW_ARGS)
+
+        assert result.returncode == 1, f'{result.stdout=} {result.stderr=}'
+        assert result.stdout.splitlines()[-1] == 'insufficient_signal n_deep_verifies=0 (< 8)'
+        assert insufficient_signal(result.stdout) == (0, 8)
+
+    def test_p90_is_reported_only_when_the_timed_population_reaches_the_minimum(self, make_runs_db):
+        untimed_at = _AS_OF - timedelta(days=1)
+        untimed_round = [
+            _verify_event(untimed_at, passed=True, duration_ms=_ABSENT),
+            _finalized_event(untimed_at + timedelta(minutes=1), landed_via_chain=2),
+        ]
+        reify = make_runs_db([*_healthy_rounds(7), *untimed_round], name='reify.db')
+
+        result = _run(reify, *_NOW_ARGS)
+
+        assert result.returncode == 1, f'{result.stdout=} {result.stderr=}'
+        assert n_deep_verifies(result.stdout) == 8
+        assert metric(result.stdout, 'verify_p90_secs') is None
+        assert verdict(result.stdout, 'verify_p90_secs') == 'FAIL'
