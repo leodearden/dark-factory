@@ -40,6 +40,8 @@ from shared.testing_streams import (
     closed_pipe_stdout,
 )
 
+from fused_memory.backends.falkor_read_only import NonReadOnlyCommandError, open_graph
+
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'local_memory_models_eval' / 'build_corpus.py'
 )
@@ -800,13 +802,23 @@ class _UnreachableDouble(_FalkorDouble):
         raise self.exc
 
 
+class _GuardFiringDouble(_FalkorDouble):
+    """A graph handle on which the shared read-only guard fires, refusing GRAPH.QUERY.
+
+    Subclasses ``_FalkorDouble`` so every write-path tripwire stays armed.
+    """
+
+    async def ro_query(self, cypher, *args, **kwargs):
+        self.ro_queries.append(cypher)
+        raise NonReadOnlyCommandError('GRAPH.QUERY')
+
+
 def _redis_connection_error(message: str) -> BaseException:
     """The exception a down FalkorDB actually surfaces, imported at call time.
 
-    Local rather than a top-level import so this module keeps build_corpus.py's
-    own property — importing it drags in no client — and so collection never
-    depends on what is only a transitive dependency
-    (graphiti-core[falkordb] -> falkordb -> redis).
+    Local rather than a top-level import so collection never depends on what
+    is only a transitive dependency (graphiti-core[falkordb] -> falkordb ->
+    redis).
     """
     from redis.exceptions import ConnectionError as RedisConnectionError  # noqa: PLC0415
 
@@ -939,14 +951,13 @@ class TestReaderIsReadOnly:
     def test_reader_rejects_a_non_ro_command_client_side(self):
         """A client-side guard on top of the server-side one.
 
-        GRAPH.RO_QUERY is refused server-side, but the guard makes the
-        violation a typed CorpusBuildError at the seam rather than a redis
-        error surfacing from three layers down.
+        A write is refused server-side anyway, but the shared guard firing on
+        the real read path reaches the caller as a typed CorpusBuildError
+        rather than a redis error surfacing from three layers down.
         """
         with pytest.raises(_mod.CorpusBuildError) as exc:
-            _mod.EpisodeReader.assert_read_only_command('GRAPH.QUERY')
+            _fetch(_GuardFiringDouble([_row('u1')]))
         assert 'GRAPH.RO_QUERY' in str(exc.value)
-        _mod.EpisodeReader.assert_read_only_command('GRAPH.RO_QUERY')
 
 
 class TestNoGraphitiDriverIsConstructed:
@@ -2669,6 +2680,19 @@ class TestAnUnreachableStoreIsATypedErrorNotATraceback:
         assert _mod.EXIT_RUN_FAILED not in set(_mod.EXIT_CODES.values())
 
 
+class TestARefusedCommandIsATypedErrorNotATraceback:
+    def test_the_guard_firing_exits_run_failed_with_an_error_line(self, monkeypatch, capsys):
+        capsys.readouterr()
+        code, _ = _run_cli(
+            monkeypatch, '--n', '20', '--seed', 's', '--dry-run', double=_GuardFiringDouble()
+        )
+        assert code == _mod.EXIT_RUN_FAILED
+        err = capsys.readouterr().err
+        assert err.startswith('error: ')
+        assert 'GRAPH.RO_QUERY' in err
+        assert 'Traceback' not in err
+
+
 class TestAWriteFailureIsNotBlamedOnTheStore:
     """A bad ``--out`` is an ordinary operator typo — do not name the store for it.
 
@@ -3560,14 +3584,14 @@ def test_live_dark_factory_population_smoke(monkeypatch):
     recorders: list[_RecordingLiveGraph] = []
 
     async def _run() -> list:
-        reader = _mod.EpisodeReader(graph_name=_mod.DEFAULT_GRAPH)
-        # Resolve through the reader's OWN lazy client construction, so the
-        # host/port env wiring is exercised live rather than bypassed by an
-        # injected handle; then wrap it to record the command path.
-        live: Any = reader._resolve_graph()
+        # The probe reader resolves FALKOR_HOST/FALKOR_PORT, so the env wiring
+        # is exercised live; the handle it addresses is wrapped to record the
+        # command path.
+        probe = _mod.EpisodeReader(graph_name=_mod.DEFAULT_GRAPH)
+        live: Any = open_graph(probe.graph_name, host=probe.host, port=probe.port)
         recorder = _RecordingLiveGraph(live)
         recorders.append(recorder)
-        reader._graph = recorder
+        reader = _mod.EpisodeReader(graph=recorder, graph_name=probe.graph_name)
         try:
             return await reader.fetch_population()
         finally:
