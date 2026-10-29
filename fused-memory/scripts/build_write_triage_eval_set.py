@@ -212,13 +212,8 @@ def pair_derivations(
 
 def _third_round_pairs(derivations: Mapping[Pair, _rubric.Derivation]) -> list[Pair]:
     """The pairs only a third rater can unblock; an unrated decisive binary is refused."""
-    missing: defaultdict[str, list[_rubric.Gap]] = defaultdict(list)
-    for (entry_id, _), derivation in derivations.items():
-        if isinstance(derivation, _rubric.Incomplete):
-            missing[entry_id] += derivation.missing
-    return _rounds.third_round_blockers({
-        entry_id: _rubric.Incomplete(tuple(sorted(gaps))) for entry_id, gaps in missing.items()
-    })
+    return _rounds.third_round_blockers(
+        (entry_id, derivation) for (entry_id, _), derivation in derivations.items())
 
 
 def _refuse_incomplete(derivations: Mapping[Pair, _rubric.Derivation]) -> None:

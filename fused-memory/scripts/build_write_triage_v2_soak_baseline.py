@@ -307,9 +307,8 @@ def third_round_pairs(
     blocked by an unrated decisive binary is refused.
     """
     judgements = _rubric.resolve_judgements(verdicts)
-    return _rounds.third_round_blockers({
-        item['entry_id']: _current_derivation(item, judgements) for item in items
-    })
+    return _rounds.third_round_blockers(
+        (item['entry_id'], _current_derivation(item, judgements)) for item in items)
 
 
 def extend_sample(

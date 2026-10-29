@@ -230,15 +230,18 @@ _THIRD_ROUND_GAPS = frozenset({_rubric.GapKind.TIED, _rubric.GapKind.OPEN})
 """The gaps a third rater answering the whole item can fill: a tie, or an open follow-up."""
 
 
-def third_round_blockers(derivations: Mapping[str, _rubric.Derivation]) -> list[tuple[str, str]]:
+def third_round_blockers(
+    derivations: Iterable[tuple[str, _rubric.Derivation]],
+) -> list[tuple[str, str]]:
     """The sorted (entry, target) pairs whose derivation only a third rater can unblock.
 
-    *derivations* maps each entry to its derivation. An Incomplete one blocks
-    on the target of each of its gaps, provided every gap is a decisive tie or
-    an open follow-up; an unrated gap is refused, naming the entry.
+    *derivations* gives (entry, derivation) pairs; an entry may come once per
+    item, or once per pair of a write. An Incomplete derivation blocks on the
+    target of each of its gaps, provided every gap is a decisive tie or an open
+    follow-up; an unrated gap is refused, naming the entry.
     """
     blocked: set[tuple[str, str]] = set()
-    for entry_id, derivation in derivations.items():
+    for entry_id, derivation in derivations:
         if not isinstance(derivation, _rubric.Incomplete):
             continue
         unrated = [str(gap.binary) for gap in derivation.missing if gap.kind not in _THIRD_ROUND_GAPS]
