@@ -1541,6 +1541,15 @@ class TestWallClockLoadBearingTarget:
 _NON_DEBT_FILE = 'orchestrator/tests/test_brand_new.py'
 
 
+def _rule_b(source: str, filename: str = _NON_DEBT_FILE) -> list:
+    """Return only the Rule B violations find_violations reports for *source*."""
+    return [
+        v
+        for v in find_violations(source, filename)
+        if 'bare-dataclass-double' in v.message
+    ]
+
+
 def _rule_c(source: str, filename: str = _NON_DEBT_FILE) -> list:
     """Return only the Rule C violations find_violations reports for *source*."""
     return [
@@ -2544,12 +2553,7 @@ class TestRuleBCoversMergeSpeculation:
         This is what the deleted _BARE_DOUBLE_EXEMPT_SCOPES frozenset used to do,
         now carried per-site by `# noqa: bare-dataclass-double` instead.
         """
-        source = _merge_speculation_source()
-        violations = [
-            v
-            for v in find_violations(source, _MERGE_SPECULATION)
-            if 'fake_verify_result' in v.message
-        ]
+        violations = _rule_b(_merge_speculation_source(), _MERGE_SPECULATION)
         assert violations == [], (
             'test_merge_speculation.py must be Rule-B clean. Offenders:\n  '
             + '\n  '.join(f'{v.lineno}: {v.message}' for v in violations)
@@ -2558,11 +2562,7 @@ class TestRuleBCoversMergeSpeculation:
     def test_the_counter_example_flags_under_that_exact_filename(self):
         """(b) The module is IN SCOPE — and Rule B has no baseline to grandfather it."""
         source = _merge_speculation_source() + _RULE_B_COUNTER_EXAMPLE
-        violations = [
-            v
-            for v in find_violations(source, _MERGE_SPECULATION)
-            if 'fake_verify_result' in v.message
-        ]
+        violations = _rule_b(source, _MERGE_SPECULATION)
         assert len(violations) == 1, (
             'a new bare VerifyResult-shaped double must flag under '
             f'{_MERGE_SPECULATION}; got {violations!r}. If this is empty, the module '
@@ -2586,11 +2586,7 @@ class TestRuleBCoversMergeSpeculation:
         if respelled:
             source = re.sub(r'(noqa: bare-dataclass-double) —', r'\1 -', original)
             assert source != original, 'the respelling must actually change the pragma'
-        still_clean = [
-            v
-            for v in find_violations(source, _MERGE_SPECULATION)
-            if 'fake_verify_result' in v.message
-        ]
+        still_clean = _rule_b(source, _MERGE_SPECULATION)
         assert still_clean == [], (
             f'the respelled pragma must still exempt the site; got {still_clean!r}'
         )
@@ -2599,11 +2595,7 @@ class TestRuleBCoversMergeSpeculation:
             "no line matched the checker's own `bare-dataclass-double` exemption "
             'regex, so there was no pragma to strip and this proof means nothing'
         )
-        violations = [
-            v
-            for v in find_violations(stripped, _MERGE_SPECULATION)
-            if 'fake_verify_result' in v.message
-        ]
+        violations = _rule_b(stripped, _MERGE_SPECULATION)
         assert len(violations) == 1, (
             'with its pragma removed, the deliberate mutation site must flag — that '
             f'is what proves Rule B sees it at all; got {violations!r}'
