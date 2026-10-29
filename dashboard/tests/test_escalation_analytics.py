@@ -624,7 +624,9 @@ class TestAggregateProjectLifespan:
         lifespan = entry['lifespan']
 
         promo = lifespan['l1_to_l2_promotion']
-        assert promo == {'count': 0, 'p50_secs': None, 'p90_secs': None}
+        assert promo == {
+            'count': 0, 'p50_secs': None, 'p90_secs': None, 'fold_time_unknown': 0,
+        }
 
         open_by_id = {item['id']: item for item in lifespan['open_items']}
         assert open_by_id['esc-201-1']['breach_6h'] is False
