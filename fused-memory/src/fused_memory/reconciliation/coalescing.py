@@ -9,6 +9,11 @@ Dependency operations never fold.  Each ``add_dependency`` / ``remove_dependency
 event's ``depends_on`` is a distinct fact: on 2026-10-19, 113 live such events
 covered 111 distinct edges.
 
+A transition into done is a fold barrier: it never folds and is never a fold
+target, because ``unlanded_path_check.select_done_transitions`` reads each one's
+own ``done_provenance``.  A future reader of a per-transition payload key adds
+its transition to ``_FOLD_BARRIER_STATUSES``, the single home of that rule.
+
 The key is a pure function of the event, so it is stored even when coalescing is
 switched off; turning it back on then folds into rows written meanwhile.
 Rationale and sizing: ``plans/recon-throughput-capacity.md`` (Lever 3).
@@ -20,6 +25,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+
+from shared.task_statuses import TaskStatus
 
 from fused_memory.models.reconciliation import EventType, ReconciliationEvent
 
@@ -38,6 +45,7 @@ __all__ = [
 ]
 
 _COALESCIBLE_TASK_MODIFIED_OPERATIONS = frozenset({'update_task'})
+_FOLD_BARRIER_STATUSES = frozenset({TaskStatus.DONE})
 
 # Bookkeeping keys a fold writes into the merged payload.  Every other key is a
 # producer key, owned by whichever constituent event is newest.
@@ -72,11 +80,16 @@ def task_id_key(value: object) -> str | None:
 
 
 def coalesce_key(event: ReconciliationEvent) -> str | None:
-    """The key ``event`` folds under in the buffer, or None when it never folds."""
+    """The key ``event`` folds under in the buffer, or None when it never folds.
+
+    None for a transition into a ``_FOLD_BARRIER_STATUSES`` status.
+    """
     task_id = task_id_key(event.payload.get('task_id'))
     if task_id is None:
         return None
     if event.type is EventType.task_status_changed:
+        if event.payload.get('new_status') in _FOLD_BARRIER_STATUSES:
+            return None
         return f'{event.type.value}:{task_id}'
     operation = event.payload.get('operation')
     if (
