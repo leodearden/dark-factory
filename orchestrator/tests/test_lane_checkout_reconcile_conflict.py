@@ -23,13 +23,15 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from unittest.mock import AsyncMock
+from typing import cast
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _workflow_helpers import _build_harness, _init_git_repo
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, WorktreeConflictError, _run
+from orchestrator.harness import Harness
 
 _BARE_ID = '3965'
 _TASK_BRANCH = f'task/{_BARE_ID}'
@@ -179,5 +181,73 @@ class TestReconcileLaneCheckoutsConflictedLane:
         )
         assert any(
             'FAILED to detach' in record.getMessage() for record in caplog.records
+            if record.name == 'orchestrator.harness' and record.levelno == logging.WARNING
+        ), caplog.text
+
+
+@pytest.fixture
+def startup_harness(tmp_path: Path, mock_orch_config: MagicMock) -> Harness:
+    """A Harness whose run() exercises only the startup block, then stops at acquire_next."""
+    mock_orch_config.max_concurrent_tasks = 2
+    mock_orch_config.fused_memory.project_id = 'test'
+
+    with patch('orchestrator.harness.McpLifecycle') as mock_mcp_cls, \
+         patch('orchestrator.harness.Scheduler'), \
+         patch('orchestrator.harness.BriefingAssembler'):
+        h = Harness(mock_orch_config)
+
+    mock_mcp = mock_mcp_cls.return_value
+    mock_mcp.start = AsyncMock()
+    mock_mcp.stop = AsyncMock()
+
+    h.git_ops = MagicMock()
+    h.git_ops.has_dirty_working_tree = AsyncMock(return_value=None)
+    h.git_ops.worktree_base = tmp_path / '.worktrees'
+    h.git_ops.disable_shared_repo_auto_maintenance = AsyncMock()
+
+    h._start_escalation_server = AsyncMock()
+    h._start_merge_worker = AsyncMock()
+    h._dismiss_stale_escalations = AsyncMock()
+    h._tag_task_modules = AsyncMock()
+    h._recover_crashed_tasks = AsyncMock()
+    h._reconcile_lane_checkouts = AsyncMock()
+    h._reconcile_stranded_in_progress = AsyncMock()
+    h._tag_prd_metadata = AsyncMock()
+
+    h.scheduler = MagicMock()
+    h.scheduler.get_tasks = AsyncMock(return_value=[{'id': '99', 'status': 'pending'}])
+    h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
+    h.scheduler.set_task_status = AsyncMock()
+    h.scheduler.acquire_next = AsyncMock(
+        side_effect=RuntimeError('__loop_reached_sentinel__'),
+    )
+    return h
+
+
+class TestStartupSurvivesLaneCheckoutReconcileFailure:
+    """Startup step 2c2 is non-fatal: whatever escapes the sweep, startup carries on."""
+
+    @pytest.mark.asyncio
+    async def test_escaping_sweep_error_is_logged_and_startup_continues(
+        self,
+        startup_harness: Harness,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        h = startup_harness
+        reconcile = AsyncMock(
+            side_effect=WorktreeConflictError(tmp_path / '_lane-5', ['README.md']),
+        )
+        h._reconcile_lane_checkouts = reconcile
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'), \
+             pytest.raises(RuntimeError, match='__loop_reached_sentinel__'):
+            await h.run(prd_path=None)
+
+        reconcile.assert_awaited_once()
+        cast(AsyncMock, h._reconcile_stranded_in_progress).assert_awaited()
+        assert any(
+            'lane checkouts' in record.getMessage() and 'README.md' in record.getMessage()
+            for record in caplog.records
             if record.name == 'orchestrator.harness' and record.levelno == logging.WARNING
         ), caplog.text
