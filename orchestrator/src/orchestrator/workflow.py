@@ -15531,13 +15531,27 @@ class TaskWorkflow:
         return '\n'.join(resolutions)
 
     async def _get_head_commit(self) -> str:
-        """Return the HEAD commit SHA for the current worktree."""
+        """Return the worktree's HEAD sha, or ``''`` when git exits non-zero.
+
+        Stdout is not trusted on failure: for an unborn branch git echoes
+        ``HEAD`` with rc=128. Callers treat ``''`` as "HEAD unknown" and fail
+        closed; ``verify_checkpoint.py``'s module docstring relies on this.
+        """
         proc = await asyncio.create_subprocess_exec(
             'git', 'rev-parse', 'HEAD',
             cwd=str(self.worktree),
             stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await proc.communicate()
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.warning(
+                'Task %s: git rev-parse HEAD failed in %s (rc=%s); returning '
+                'empty HEAD. stderr=%s',
+                self.task_id, self.worktree, proc.returncode,
+                stderr.decode(errors='replace').strip()[:200] or '<empty>',
+            )
+            return ''
         return stdout.decode().strip()
 
     async def _iteration_commit_provenance(self, pre_head: str) -> dict:
