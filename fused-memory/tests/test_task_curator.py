@@ -3440,17 +3440,25 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
 
     @pytest.mark.asyncio
     async def test_total_cap_drops_are_counted_when_the_trim_does_fire(self):
+        """A total cap no larger than the module stream runs the trim through every stream it may cut."""
         config = _make_config()
-        config.curator.pool_total_cap = 20
+        cur = config.curator
+        cur.pool_total_cap = cur.pool_module_cap
         curator, candidate, neighbor_ids = self._every_stream_overflowing(config)
 
-        pool, _sizes, withheld = await self._corpus(
+        pool, sizes, withheld = await self._corpus(
             curator, candidate, neighbor_ids=neighbor_ids,
         )
 
-        assert len(pool) == 20
-        assert withheld.by_source['total_cap'] == self._full_stream_pool(config.curator) - 20
-        assert withheld.caps['total_cap'] == 20
+        assert len(pool) == cur.pool_total_cap
+        assert sizes == {
+            'anchor': 1,
+            'module': cur.pool_total_cap - 1,
+            'dependency': 0,
+            'embedding': 0,
+        }
+        assert withheld.by_source['total_cap'] == self._full_stream_pool(cur) - cur.pool_total_cap
+        assert withheld.caps['total_cap'] == cur.pool_total_cap
 
     @pytest.mark.asyncio
     async def test_an_untruncated_pool_yields_a_quiet_census(self):

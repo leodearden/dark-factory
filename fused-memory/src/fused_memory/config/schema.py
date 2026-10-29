@@ -2337,10 +2337,11 @@ class CuratorConfig(BaseModel):
     # The re-tune moves slots instead of adding them: pool_module_cap 15 -> 20,
     # and pool_total_cap 30 -> 29, the old reachable maximum, so ``_trim_pool``
     # is the live control. With the module stream full, the trim takes
-    # dependency entries first, then the embedding tail, leaving at least
-    # 29 - 1 - 20 = 8 embedding entries; ranks 1-8 held 41 of its 42 targets.
-    # A pool whose module stream fits the old cap of 15 keeps every stream at
-    # its cap.
+    # dependency entries first, then the embedding tail, leaving
+    # 29 - 1 - 20 = 8 embedding entries. The floor is 5: ranks 1-5 held 41 of
+    # the embedding stream's 42 targets, so a module cap leaving fewer than 5
+    # would cut measured targets. A pool whose module stream fits the old cap
+    # of 15 keeps every stream at its cap.
     #
     # The trade: the worst-case pool is unchanged, so cost and batch fan-in at
     # the maximum are unchanged too. Input is ~4.7K + ~930 tokens per entry; a

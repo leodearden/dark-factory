@@ -1794,10 +1794,9 @@ class TestCuratorPoolCaps:
         embedding_left = cfg.pool_total_cap - 1 - cfg.pool_module_cap
         assert embedding_left >= 5, (
             f'A full module stream plus the anchor leaves {embedding_left} '
-            f'embedding slots. The embedding stream is the only '
-            f'relevance-ordered stream, and its ranks 1-5 held 41 of its 42 '
-            f'measured drop/combine targets; the trim must not cut it below '
-            f'that.'
+            f'embedding slots, below the floor of 5. The embedding stream is '
+            f'the only relevance-ordered stream; see the pool-cap block in '
+            f'config/schema.py::CuratorConfig for why its head must survive.'
         )
 
 
