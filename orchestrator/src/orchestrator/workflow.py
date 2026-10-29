@@ -98,6 +98,7 @@ from orchestrator.artifacts import (
     TaskArtifacts,
     iteration_entry_written_by_orchestrator,
 )
+from orchestrator.branch_mergeability import Mergeability, read_branch_state
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.curator_submit import SubmitBatchResult, submit_task_batch
 from orchestrator.delivered_checks import (
@@ -144,6 +145,7 @@ from orchestrator.merge_lane.landing_evidence import (
     validate_landing_evidence,
     validate_reported_landing,
 )
+from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.recut_ruling import ruling_to_enforce
@@ -2330,10 +2332,9 @@ class TaskWorkflow:
     async def _finalise_without_merge_sha(self) -> WorkflowOutcome:
         """Resolve a merge-phase SUCCESS that carries no ``_merge_sha`` (task 3113).
 
-        Known routes here: the merge queue answering ``already_merged`` (a
+        Known route here: the merge queue answering ``already_merged`` (a
         coalesced duplicate submission, reify 5367/5602, or a restart-replayed
-        orphan) and the branch observed on main after a steward resolution in
-        :meth:`_run_merge_phase`.  Eval mode skips the merge by design and
+        orphan).  Eval mode skips the merge by design and
         keeps its DONE-without-row exit.  Otherwise the shared ladder
         (:meth:`_recover_landed_branch`) stamps an honest provenance — a
         journalled landing as ``merged``, an attributable one as
@@ -4128,6 +4129,11 @@ class TaskWorkflow:
             ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
         )
         main_sha = await self.git_ops.get_main_sha()
+        settled = await self._settle_unmergeable_branch(
+            branch_name, branch_head.strip(), main_sha, guard='pre-MERGE',
+        )
+        if settled is not None:
+            return settled
         _r = await self._recover_before_merge(branch_head.strip(), main_sha)
         if _r is not None:
             return _r
@@ -4237,17 +4243,20 @@ class TaskWorkflow:
                 if thrash_outcome is not None:
                     return thrash_outcome
 
-            # Steward resolved — check if branch landed on main
+            # Steward resolved — settle a branch it left with nothing to land
             _, bh, _ = await _run(
                 ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
             )
             main_sha = await self.git_ops.get_main_sha()
-            if await self.git_ops.is_ancestor(bh.strip(), main_sha):
-                logger.info(
-                    'Task %s: branch on main after steward '
-                    'resolution', self.task_id,
-                )
-                break
+            settled = await self._settle_unmergeable_branch(
+                branch_name, bh.strip(), main_sha, guard='post-steward',
+            )
+            if settled == WorkflowOutcome.DONE:
+                await self._clear_merge_retry_pending()
+                await self._clear_merge_phase_entered()
+                return settled
+            if settled is not None:
+                return settled
             # Retry merge
             logger.info(
                 'Task %s: retrying merge (attempt %d/%d)',
@@ -16306,13 +16315,55 @@ class TaskWorkflow:
             files=branch_files,
         )
 
+    async def _settle_unmergeable_branch(
+        self, branch_name: str, worktree_head: str, main_sha: str, *, guard: str,
+    ) -> WorkflowOutcome | None:
+        """Refuse a merge whose branch gives the queue nothing honest to land (task 7516).
+
+        Returns ``None`` for a mergeable or unreadable branch, and the merge
+        proceeds. A clean branch with no commits beyond main runs the shared
+        landing ladder on the branch TIP and returns its outcome when it
+        stamps one. Every other case (an empty branch whose worktree holds
+        uncommitted work, a ladder miss, a worktree HEAD on main while the
+        branch is ahead) blocks behind an L1 with
+        ``root_cause='merge-refused:<kind>'``.
+        """
+        assert self.worktree is not None
+        state = await read_branch_state(
+            self.git_ops, self.worktree,
+            QueuedBranch.parse(branch_name, self.config.git.branch_prefix),
+            worktree_head=worktree_head, main_sha=main_sha,
+        )
+        kind = state.mergeability
+        if kind in (Mergeability.MERGEABLE, Mergeability.UNREADABLE):
+            return None
+        verdict: str | None = None
+        if kind is Mergeability.BRANCH_EMPTY and not state.worktree_dirty:
+            landed = await self._recover_landed_branch(
+                state.merge_source, main_sha, guard=guard,
+            )
+            if isinstance(landed, WorkflowOutcome):
+                return landed
+            verdict = landed.value
+        return await self._mark_blocked(
+            state.refusal_summary(),
+            detail=state.refusal_detail(
+                task_id=self.task_id, worktree=self.worktree, landing_verdict=verdict,
+            ),
+            escalate_to_human=True,
+            root_cause=f'merge-refused:{kind.value}',
+        )
+
     async def _recover_before_merge(
         self, branch_head: str, main_sha: str,
     ) -> WorkflowOutcome | None:
         """Ghost-loop early exit inside the merge phase (Guard 3, PRD α, MP-1/MP-2).
 
-        Runs at the top of :meth:`_run_merge_phase`, immediately after the
-        caller computes ``branch_head``/``main_sha`` — prevents infinite
+        Runs at the top of :meth:`_run_merge_phase`, once
+        :meth:`_settle_unmergeable_branch` has let the branch through (it
+        refuses or settles every branch whose merge source has no commits
+        beyond main, so this guard's journal-first rung is what recovers a
+        branch that is still ahead) — prevents infinite
         merge retry when the code was already merged (e.g. by an external
         actor, or by a prior run of this same workflow).
 
