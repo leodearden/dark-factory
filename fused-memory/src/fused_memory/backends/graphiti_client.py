@@ -36,6 +36,7 @@ from graphiti_core.nodes import EpisodeType, EpisodicNode
 from fused_memory.backends.exact_episode_window import ExactEpisodeWindowGraphiti
 from fused_memory.backends.falkor_edge_search import FalkorEdgeSearch
 from fused_memory.backends.falkor_fulltext import build_query
+from fused_memory.backends.falkor_graph_operations import FalkorGraphOperations
 from fused_memory.backends.falkor_indices import (
     IndexCatalogUnsettledError,
     IndexHeaderShapeError,
@@ -1355,9 +1356,15 @@ class _MultiTenantFalkorDriver(FalkorDriver):
     Cypher FalkorDB can plan over the provisioned indices; see
     :mod:`fused_memory.backends.falkor_edge_search`.  It is a class attribute, so
     every ``clone()`` carries it on both the read and the write path.
+
+    ``graph_operations_interface`` is set (task 7714) so graphiti's edge
+    get-by-uuid(s) runs Cypher FalkorDB can plan; see
+    :mod:`fused_memory.backends.falkor_graph_operations`.  It is a class
+    attribute, so every ``clone()`` carries it.
     """
 
     search_interface = FalkorEdgeSearch()
+    graph_operations_interface = FalkorGraphOperations()
 
     async def build_indices_and_constraints(self, delete_existing=False):
         pass
