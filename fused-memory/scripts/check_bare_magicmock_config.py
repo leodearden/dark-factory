@@ -657,7 +657,6 @@ _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     'fused-memory/tests/test_e2e_durable_queue.py': 2,
     'fused-memory/tests/test_journaling_integration.py': 2,
     'fused-memory/tests/test_recon_claim_verification_wiring.py': 2,
-    'fused-memory/tests/test_ticket_worker.py': 2,
     # shared/tests
     'shared/tests/test_uuid_prefix_guard.py': 2,
     'shared/tests/test_async_sqlite_base.py': 1,

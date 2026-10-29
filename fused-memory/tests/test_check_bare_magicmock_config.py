@@ -1977,7 +1977,6 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'fused-memory/tests/test_e2e_durable_queue.py',
     'fused-memory/tests/test_journaling_integration.py',
     'fused-memory/tests/test_recon_claim_verification_wiring.py',
-    'fused-memory/tests/test_ticket_worker.py',
     'shared/tests/test_uuid_prefix_guard.py',
     'shared/tests/test_async_sqlite_base.py',
     'shared/tests/test_cli_invoke.py',
