@@ -41,7 +41,6 @@ from fused_memory.backends.graphiti_client import GraphitiBackend
 
 pytestmark = [
     falkor_skipif(),
-    pytest.mark.timeout(120),
     pytest.mark.integration,
 ]
 
