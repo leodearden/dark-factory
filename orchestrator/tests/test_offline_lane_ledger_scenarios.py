@@ -137,6 +137,15 @@ async def _numeric(lane: Lane, outcome: Confirmed | Unconfirmable, failing: tupl
     return effect
 
 
+async def _outage(lane: Lane) -> PassEffect:
+    observation = lane.written_pass(HEAD1, None, _run('detect', HEAD1, lane.clock(), failing=(A,)), None)
+    return await lane.engine.observe(replace(observation, lane_command=PROBED, outcome=Outage(OUTAGE), probe=OUTAGE))
+
+
+def _unwritable_save(store: EpisodeStore, record: object) -> None:
+    raise OSError('episode file unwritable')
+
+
 # --- scenario 25: every non-outage red pass is recorded at call site offline_lane ---------
 
 
@@ -227,9 +236,8 @@ async def test_a_green_pass_and_an_outage_pass_write_no_row(tmp_path: Path):
     lane = Lane(tmp_path)
     await lane.green()
     lane.clock.advance(minutes=30)
-    observation = lane.written_pass(HEAD1, None, _run('detect', HEAD1, lane.clock(), failing=(A,)), None)
 
-    await lane.engine.observe(replace(observation, lane_command=PROBED, outcome=Outage(OUTAGE), probe=OUTAGE))
+    await _outage(lane)
 
     assert _rows(lane) == []
 
@@ -278,15 +286,7 @@ async def test_an_unknowable_host_pressure_is_recorded_as_none_and_changes_no_ef
 async def test_the_lanes_rows_leave_the_merge_gates_report_counters_unchanged(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(flake_recorder, '_merge_flake_suppression_streak', 0)
     lane = Lane(tmp_path)
-    merge_gate = FlakeSuppression(
-        verdict=FlakeVerdict.passes_in_isolation,
-        test_ids=(C,),
-        observed_at=(T0 - timedelta(minutes=1)).isoformat(),
-        call_site=FlakeCallSite.merge_gate,
-        runner='local',
-        psi_cpu_some10=1.0,
-        unconfirmable_reason=None,
-    )
+    merge_gate = replace(_merge_gate_clear(0), test_ids=(C,), observed_at=(T0 - timedelta(minutes=1)).isoformat())
     await flake_recorder.record_flake_observation(
         merge_gate, project_root=tmp_path, project_id=lane.project_id, merge_sha=HEAD0, task_id='42',
     )
@@ -450,10 +450,7 @@ async def test_the_ledger_is_written_before_the_episodes_new_state(tmp_path: Pat
     await lane.red()
     lane.clock.advance(minutes=30)
 
-    def unwritable(self, record):
-        raise OSError('episode file unwritable')
-
-    monkeypatch.setattr(EpisodeStore, 'save', unwritable)
+    monkeypatch.setattr(EpisodeStore, 'save', _unwritable_save)
     with pytest.raises(OSError):
         await lane.red(reproduced=(), cleared=(A,))
     monkeypatch.undo()
@@ -517,11 +514,6 @@ async def test_scenario_40_a_clear_enqueued_before_the_fix_is_dropped_once_its_o
 
 
 # --- a recovered test owes debt at the head of its evidence ------------------------------
-
-
-async def _outage(lane: Lane) -> PassEffect:
-    observation = lane.written_pass(HEAD1, None, _run('detect', HEAD1, lane.clock(), failing=(A,)), None)
-    return await lane.engine.observe(replace(observation, lane_command=PROBED, outcome=Outage(OUTAGE), probe=OUTAGE))
 
 
 @pytest.mark.asyncio
@@ -666,10 +658,7 @@ async def test_scenario_34_a_restart_between_the_recorder_and_the_store_files_on
     await lane.red()
     lane.clock.advance(minutes=10)
 
-    def unwritable(self, record):
-        raise OSError('episode file unwritable')
-
-    monkeypatch.setattr(EpisodeStore, 'save', unwritable)
+    monkeypatch.setattr(EpisodeStore, 'save', _unwritable_save)
     with pytest.raises(OSError):
         await lane.green()
     monkeypatch.undo()
