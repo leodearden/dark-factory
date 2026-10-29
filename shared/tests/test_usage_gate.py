@@ -842,6 +842,26 @@ class TestUsageGateProbeRequiresServedResult:
         gate, acct = probing_gate
         assert await self._probe(gate, acct, 1, MEASURED_ORG_DISABLED_403) is False
 
+    async def test_exit_0_with_a_schema_salvaged_result_is_not_served(
+        self, probing_gate: tuple[UsageGate, AccountState]
+    ) -> None:
+        gate, acct = probing_gate
+        stdout = json.dumps({
+            'type': 'result',
+            'subtype': 'success',
+            'is_error': True,
+            'structured_output': {'x': 1},
+            'result': 'err',
+        }).encode()
+        assert await self._probe(gate, acct, 0, stdout) is False
+
+    @pytest.mark.parametrize('stdout', [b'42', b'[1]', b'null', b'"ok"'])
+    async def test_exit_0_with_non_object_json_is_not_served(
+        self, probing_gate: tuple[UsageGate, AccountState], stdout: bytes,
+    ) -> None:
+        gate, acct = probing_gate
+        assert await self._probe(gate, acct, 0, stdout) is False
+
     async def test_not_served_warning_names_the_api_error_status(
         self,
         probing_gate: tuple[UsageGate, AccountState],
@@ -878,6 +898,54 @@ class TestUsageGateProbeRequiresServedResult:
             await gate._reprobe_account(acct)
 
         assert acct.phase == AccountPhase.AUTH_FAILED
+
+
+@pytest.mark.asyncio
+class TestUsageGateProbeReadsParsedResult:
+    """_run_probe classifies the parsed CLI result, not the raw stdout text."""
+
+    async def test_cap_reason_is_the_decoded_result_text(
+        self, probing_gate: tuple[UsageGate, AccountState]
+    ) -> None:
+        gate, acct = probing_gate
+        acct.phase = AccountPhase.AUTH_FAILED
+        acct.auth_failed_at = datetime.now(UTC)
+        cap_text = "You're out of extra usage · resets in 2h"
+        stdout = json.dumps({
+            'type': 'result',
+            'subtype': 'success',
+            'is_error': True,
+            'api_error_status': 429,
+            'result': cap_text,
+        }).encode()
+        proc = _fake_probe_proc(1, stdout)
+
+        with patch('shared.usage_gate.asyncio.create_subprocess_exec',
+                   return_value=proc):
+            served = await gate._run_probe(acct)
+
+        assert served is False
+        assert acct.phase == AccountPhase.CAPPED
+        assert gate.paused_reason == cap_text
+        await _drain_task(acct.resume_task)
+
+    async def test_not_served_warning_names_the_classified_outcome(
+        self,
+        probing_gate: tuple[UsageGate, AccountState],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        gate, acct = probing_gate
+        caplog.set_level(logging.WARNING, logger='shared.usage_gate')
+        proc = _fake_probe_proc(1, MEASURED_ORG_DISABLED_403)
+
+        with patch('shared.usage_gate.asyncio.create_subprocess_exec',
+                   return_value=proc):
+            await gate._run_probe(acct)
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert any('probe-acct' in msg and 'AuthFailed' in msg for msg in warnings), warnings
 
 
 # ---------------------------------------------------------------------------
