@@ -484,7 +484,8 @@ async def test_routing_intent_enforce_mode_rejects_a_stamped_submission(
 # (the probe is not monkeypatched) with the interceptor mocked. The declared
 # path is .taskmaster/tasks/tasks.json rather than tasks.db: '.db' is not on
 # the lock-charter extension allowlist, so lock-charter guard γ refuses
-# tasks.db as a "directory" before this guard is reached.
+# tasks.db as a "directory" before this guard is reached. That γ rejection is
+# pinned by the task-6199 tests at the end of this file.
 # ------------------------------------------------------------------
 
 _IGNORED_DELIVERABLE = '.taskmaster/tasks/tasks.json'
