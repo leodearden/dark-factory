@@ -144,9 +144,12 @@ def _parsed(text: str, entry: _rounds.ShardEntry, *, rater: str, batch: str,
         return None, ['the reply is not JSON']
     if not isinstance(answer, dict):
         return None, ['the reply is not a JSON object']
-    row = {**{key: value for key, value in answer.items() if key != 'id'},
-           'entry_id': entry.entry_id, 'target_id': entry.target_id, 'basis': entry.basis,
-           'rater': rater, 'role': str(Role.CROSS_FAMILY), 'batch': batch}
+    identity = {'entry_id': entry.entry_id, 'target_id': entry.target_id, 'basis': entry.basis,
+                'rater': rater, 'role': str(Role.CROSS_FAMILY), 'batch': batch}
+    try:
+        row = _rounds.rater_row(identity, {key: value for key, value in answer.items() if key != 'id'})
+    except ValueError as refusal:
+        return None, [str(refusal)]
     problems = _rounds.rating_problems(row, entry.child_text, entry.parent_text)
     return (None, problems) if problems else (row, [])
 

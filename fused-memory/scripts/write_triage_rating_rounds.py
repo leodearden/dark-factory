@@ -190,6 +190,18 @@ def rating_problems(row: Mapping[str, Any], child_text: str, parent_text: str) -
     return validate_rating(row, child_text, parent_text)
 
 
+IDENTITY_KEYS = ('entry_id', 'target_id', 'basis', 'rater', 'role', 'batch')
+"""The keys of a rater row that say whose answer it is and on what; never the rater's to give."""
+
+
+def rater_row(identity: Mapping[str, Any], answer: Mapping[str, Any]) -> dict[str, Any]:
+    """*answer* under *identity*; refused, naming the keys, when *answer* carries an identity key."""
+    claimed = sorted(key for key in IDENTITY_KEYS if key in answer)
+    if claimed:
+        raise ValueError(f'the answer carries identity keys {claimed}; only the key assigns them')
+    return {**answer, **identity}
+
+
 def effective_ratings(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Each rater's highest-``round`` line on each pair and basis, without its ``round``.
 
@@ -466,8 +478,11 @@ class RatingScratch:
             if item_id not in spec['items']:
                 raise ValueError(f'{path}:{number}: id {item_id!r} is not an item of shard {name}')
             seen[item_id] += 1
-            row = {**items[item_id], 'rater': spec['rater'], 'role': spec['role'], 'batch': name,
-                   **answer}
+            identity = {**items[item_id], 'rater': spec['rater'], 'role': spec['role'], 'batch': name}
+            try:
+                row = rater_row(identity, answer)
+            except ValueError as refusal:
+                raise ValueError(f'{path}:{number}: {refusal}') from refusal
             rows.append({**row, 'round': spec['round']})
         wrong = sorted(item for item in spec['items'] if seen[item] != 1)
         if wrong:
