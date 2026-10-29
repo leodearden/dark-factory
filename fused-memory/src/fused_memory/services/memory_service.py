@@ -11568,6 +11568,7 @@ class MemoryService:
 
         # Graphiti connectivity + project discovery
         graphiti_counts: dict[str, int] = {}
+        graphiti_status: dict[str, Any]
         try:
             graphs = await self.graphiti.list_graphs()
             for graph_name in graphs:
@@ -11575,9 +11576,11 @@ class MemoryService:
                     graphiti_counts[graph_name] = await self.graphiti.node_count(graph_name)
                 except Exception:
                     graphiti_counts[graph_name] = -1
-            status['graphiti'] = {'connected': True}
+            graphiti_status = {'connected': True}
         except Exception as e:
-            status['graphiti'] = {'connected': False, 'error': str(e)}
+            graphiti_status = {'connected': False, 'error': str(e)}
+        graphiti_status['server_settings'] = (await self.graphiti.read_server_settings()).to_status()
+        status['graphiti'] = graphiti_status
 
         # Mem0 connectivity + project discovery
         mem0_counts: dict[str, int] = {}

@@ -50,6 +50,11 @@ from fused_memory.backends.falkor_indices import (
     vector_drop_statement,
     vector_index_properties,
 )
+from fused_memory.backends.falkor_server_settings import (
+    FalkorServerSettings,
+    read_falkor_server_settings,
+    warn_on_shortfalls,
+)
 from fused_memory.backends.falkor_string_bounds import exact_string_upper_bound
 from fused_memory.backends.llm_clients import (
     ForceJsonObjectOpenAIGenericClient,
@@ -569,9 +574,10 @@ _RESULTSET_SIZE = 10000
 """FalkorDB's server-wide result-set ceiling: every query returns at most this
 many rows, silently truncated — no error, no marker.
 
-This is an ASSUMPTION about server configuration, not a fact this repo
-controls: nothing here sets ``RESULTSET_SIZE``, and a grep finds no override
-anywhere.  Measured 2026-08-17 against localhost:6379::
+This is an ASSUMPTION about server configuration, not a fact this module
+controls: fused-memory/docker/docker-compose.yml pins ``RESULTSET_SIZE`` in
+FALKORDB_ARGS (task 6848), but a server started any other way may differ.
+Measured 2026-08-17 against localhost:6379::
 
     GRAPH.CONFIG GET RESULTSET_SIZE  ->  10000
 
@@ -1743,6 +1749,14 @@ class GraphitiBackend:
         driver = self._require_driver()
         return cast(Any, driver).client
 
+    async def read_server_settings(self) -> FalkorServerSettings:
+        """Read the live TIMEOUT and appendonly settings; read-only, and a failed read is reported, not raised."""
+        client = getattr(self._driver, 'client', None)
+        return await read_falkor_server_settings(
+            client,
+            expected_graph_timeout_ms=self.config.graphiti.falkordb.expected_graph_timeout_ms,
+        )
+
     async def _ensure_indices(self, group_id: str) -> None:
         """Provision *group_id*'s indices if it is registered and not yet cached.
 
@@ -1904,6 +1918,8 @@ class GraphitiBackend:
             cross_encoder=self._cross_encoder,
             max_coroutines=cfg.queue.graphiti_max_coroutines,
         )
+
+        warn_on_shortfalls(await self.read_server_settings())
 
         # Provision the registered project graphs that already exist (PRD D6).
         if not skip_maintenance:
