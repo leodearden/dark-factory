@@ -13852,6 +13852,34 @@ class TestCanonicalClaimChangeOnTheUpdatePath:
         filters = call.kwargs.get('filters', call.args[1] if len(call.args) > 1 else None)
         assert filters == {'topic': 'other-topic', 'canonical': True}
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('held', [1, 1.0, 'true'])
+    async def test_a_non_bool_canonical_pre_image_is_not_a_held_claim(
+        self, service, held
+    ):
+        """A pre-image whose canonical is not the bool True does not hold the
+        claim under the strict meaning, so patching it to True ACQUIRES the
+        claim and must be probed.
+
+        Guard 3's tuple equality `(1, t) == (True, t)` let int and float
+        pre-images skip the probe; 'true' is the companion row.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        self._stage(service, {'topic': self._TOPIC, 'canonical': held})
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation) as excinfo:
+            await service.update_memory(
+                memory_id=self._POINT, project_id='dark_factory',
+                metadata_patch={'canonical': True},
+            )
+
+        assert excinfo.value.incumbent_id == self._INCUMBENT
+        service.mem0.count_by_metadata.assert_awaited_once()
+        service.mem0.set_payload.assert_not_called()
+
 
 class TestParentIdLivenessAtSeam:
     """Write-time `metadata.parent_id` LIVENESS (task 3197, leaf δ).
