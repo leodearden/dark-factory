@@ -187,6 +187,13 @@ class TestRating:
         assert 'conflict_quote.child' in failed['failure']
         assert ask.asked().count('w2') == 3
 
+    def test_a_reply_naming_its_own_pair_is_asked_again(self, tmp_path: Path) -> None:
+        out = tmp_path / 'cf.jsonl'
+        ask = _Ask({'w1': [_reply(**KEPT, entry_id='w2'), HONEST]})
+        _rate(out, ask, selection=SELECTION[:1])
+        record = _records(out)['w1', 't1']
+        assert (record['attempts'], record['row']['entry_id']) == (2, 'w1')
+
     def test_a_rerun_skips_every_pair_already_recorded(self, tmp_path: Path) -> None:
         out = tmp_path / 'cf.jsonl'
         _rate(out, _Ask(), selection=SELECTION[:1])

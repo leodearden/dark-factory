@@ -477,6 +477,21 @@ class TestPlanShards:
         assert dict(_mod().RATER_MODELS) == {'primary': 'opus', 'second': 'opus', 'third': 'opus'}
 
 
+IDENTITY = {'entry_id': 'e1', 'target_id': 'p1', 'basis': 'current', 'rater': 'opus-primary',
+            'role': 'primary', 'batch': 'primary_00'}
+
+
+class TestRaterRow:
+    def test_is_the_answer_under_its_identity(self) -> None:
+        answer = {'home': 'NO', 'conflict': 'NO', 'reason': 'r'}
+        assert _mod().rater_row(IDENTITY, answer) == {**answer, **IDENTITY}
+
+    @pytest.mark.parametrize('key', sorted(IDENTITY))
+    def test_an_answer_carrying_an_identity_key_is_refused_naming_it(self, key: str) -> None:
+        with pytest.raises(ValueError, match=rf"\['{key}'\]"):
+            _mod().rater_row(IDENTITY, {'home': 'NO', key: 'x'})
+
+
 class TestRatingVolume:
     def test_counts_distinct_pairs_per_basis_and_role(self) -> None:
         def item(entry: str, basis: str = 'current') -> dict[str, str]:
@@ -653,6 +668,16 @@ class TestRatingScratch:
         assert 'lacks loss' in reasks[broken, 'primary'].problems[0]
         assert 'conflict_quote.child' in reasks[unfound, 'second'].problems[0]
         assert reasks[broken, 'primary'].item_id in str(reasks[broken, 'primary'])
+
+    def test_a_rating_line_carrying_an_identity_key_is_refused_naming_it(
+        self, rounds: _Rounds,
+    ) -> None:
+        rounds.rate()
+        path = rounds.root / 'ratings' / 'primary_00.jsonl'
+        first, *rest = path.read_text().splitlines()
+        path.write_text('\n'.join([json.dumps({**json.loads(first), 'role': 'second'}), *rest]) + '\n')
+        with pytest.raises(ValueError, match=r"primary_00\.jsonl:1.*\['role'\]"):
+            rounds.scratch.ratings(rounds.key(), rounds.entries())
 
     def test_a_shard_without_ratings_is_refused(self, rounds: _Rounds) -> None:
         rounds.rate()
