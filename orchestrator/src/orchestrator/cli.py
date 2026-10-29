@@ -18,11 +18,12 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import click
 from dotenv import load_dotenv
-from shared.project_layout import tasks_db
+from shared.project_layout import runs_db, tasks_db
 
 from orchestrator.config import ConfigRequiredError, OrchestratorConfig, load_config
 from orchestrator.config_census_ignore import audit_census_ignore_entries
 from orchestrator.main_checkout_defaults import cli_default
+from orchestrator.shadow_types import ShadowShape
 from orchestrator.verify_cancel import (
     WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
     WATCHDOG_KILL_GRACE_SECS,
@@ -1966,6 +1967,59 @@ def eval_confirm_cmd(config_path, arch, impl, tasks_dir, trials, max_parallel, t
         base_config, arch=arch, impl=impl, tasks_dir=tasks_dir,
         max_parallel=max_parallel, trials=trials, timeout=timeout,
     )
+
+
+@main.group('eval-shadow')
+def eval_shadow():
+    """Live paired shadow evaluation (plans/live-shadow-eval-prd.md)."""
+
+
+@eval_shadow.command('report')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to orchestrator config YAML (REQUIRED unless '
+                   'ORCH_CONFIG_PATH is set).')
+@click.option('--shape', type=click.Choice([s.value for s in ShadowShape]),
+              default=ShadowShape.IMPLEMENTER.value, show_default=True,
+              help='Cell shape to report.')
+@click.option('--candidate', default=None, help='Report only this candidate.')
+@click.option('--json', 'as_json', is_flag=True, help='Emit the report as JSON.')
+def eval_shadow_report_cmd(config_path, shape, candidate, as_json):
+    """C5 report of one project's shadow cells: one paired line per candidate.
+
+    Exits 1 when a settled cell's result is missing, in either form, so a
+    short table never reads as a complete measurement.
+    """
+    try:
+        config = load_config(config_path)
+    except ConfigRequiredError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+    from orchestrator.evals.shadow_report import (
+        RunsDbMissingError,
+        read_shadow_report,
+        render_text,
+    )
+    try:
+        report = asyncio.run(read_shadow_report(
+            runs_db(config.project_root),
+            project_id=config.fused_memory.project_id,
+            shape=ShadowShape(shape),
+            candidate=candidate,
+            n_min=config.shadow_eval.n_min,
+        ))
+    except RunsDbMissingError as e:
+        click.echo(f'Error: {e}. Does --config name the intended project?', err=True)
+        sys.exit(1)
+    except ValueError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+    if as_json:
+        click.echo(json.dumps(report.to_dict(), indent=2))
+    else:
+        click.echo(render_text(report), nl=False)
+    if not report.complete:
+        sys.exit(1)
 
 
 def _run_judge_cmd(max_rounds: int = 50, reset: bool = False):
