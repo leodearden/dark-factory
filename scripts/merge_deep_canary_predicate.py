@@ -92,9 +92,10 @@ the done-provenance note.
 EXIT CODES. The DeterministicRunner decides by exit code only:
   0  canary healthy          -> task done (promote 6->32 proceeds)
   1  unhealthy OR no signal  -> born-at-L2 milestone_check_failed (hold)
-  2  fault                   -> never masquerades as a health verdict: a
-                                usage or infra fault, or an internal error,
-                                whose traceback goes to stderr
+  2  usage, infra or         -> the same block as 1, but the escalation's
+     internal fault             ``(rc=2)`` names a fault, never a health
+                                verdict; an internal error's traceback goes
+                                to stderr
 """
 from __future__ import annotations
 
