@@ -7,7 +7,9 @@ success then surfaced as the misleading "no merge_sha" L1 from
 ``workflow.py::TaskWorkflow._finalise_without_merge_sha``. These cases drive
 ``_merge_and_finalise`` over a real repository and worktree, with only the
 merge-queue submission stubbed (its side effect plays the steward), and check
-that each shape is refused by name and that a genuine landing still closes.
+that each shape is refused by name, that a genuine landing still closes, and
+that a worktree HEAD carrying new work past a ref that already landed still
+merges (the pre-enqueue rebind makes the queue land HEAD, not the stale ref).
 
 This file imports no merge-lane module, so ``scripts/merge_lane_metrics.py``
 does not measure its private reads (see
@@ -103,6 +105,14 @@ class _Scene:
     def land_branch_on_main(self) -> None:
         _git(self.repo, 'merge', '--no-ff', '-m', f'Merge {BRANCH} into main', BRANCH)
 
+    def advance_detached_head_past_a_landed_ref(self) -> None:
+        """Land the ref's commit on main, then commit new work on a detached HEAD."""
+        self.land_branch_on_main()
+        _git(self.wt, 'checkout', '--detach')
+        (self.wt / 'more.py').write_text('y = 2\n')
+        _git(self.wt, 'add', 'more.py')
+        _git(self.wt, 'commit', '-m', 'add more')
+
     async def merge(self) -> WorkflowOutcome:
         return await self.wf._merge_and_finalise(BRANCH)
 
@@ -169,3 +179,21 @@ async def test_a_genuine_landing_after_a_steward_resolution_still_closes(
     scene.fixture.mark_done.assert_awaited_once()
     assert scene.fixture.mark_done.await_args.kwargs['kind'] == 'found_on_main'
     assert scene.pending_root_causes() == []
+
+
+@pytest.mark.asyncio
+async def test_new_work_on_head_past_a_landed_ref_is_merged_not_stamped_landed(
+    scene: _Scene,
+) -> None:
+    scene.advance_detached_head_past_a_landed_ref()
+    scene.submit.return_value = WorkflowOutcome.BLOCKED
+
+    outcome = await scene.merge()
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    assert scene.submit.await_count == 1
+    scene.fixture.mark_done.assert_not_awaited()
+    assert not [
+        cause for cause in scene.pending_root_causes()
+        if cause.startswith('merge-refused:')
+    ]
