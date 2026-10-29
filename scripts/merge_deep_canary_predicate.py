@@ -7,7 +7,7 @@ the entry point gate 3190 runs; it execs this module with every argument.
 Usage:
     merge-deep-canary-predicate.sh --runs-db PATH [--runs-db PATH ...]
         [--window-days N] [--deep-fail-rate-max R] [--items-per-verify-min R]
-        [--verify-p90-max-secs S] [--now EPOCH_SECS]
+        [--verify-p90-max-secs S] [--min-deep-verifies N] [--now EPOCH_SECS]
 
 STORES. Each ``--runs-db`` names one orchestrator runs.db, the append-only
 sqlite event store. Every store is opened read-only (a ``mode=ro`` URI) and
@@ -24,6 +24,13 @@ events.timestamp is exact.
 DEEP VERIFY. A merge_verify whose payload ``chain_items`` is an int >= 2: the
 verified tree carried two or more chained items.
 
+MINIMUM SAMPLE. When the pooled deep-verify count is below
+``--min-deep-verifies`` (default 8, an integer >= 1), no leg is evaluated:
+the store lines are followed by the final line
+``insufficient_signal n_deep_verifies=<n> (< <N>)`` and the exit is 1. Too
+little signal never promotes, and is labelled as what it is rather than as a
+failed leg.
+
 LEGS. Provisional thresholds, all overridable; task theta (the week-after
 aggressiveness assessment) retunes them against real canary telemetry.
   deep_fail_rate   <= 0.35  failed deep verifies / deep verifies. The replay
@@ -34,11 +41,14 @@ aggressiveness assessment) retunes them against real canary telemetry.
   verify_p90_secs  <= 5400  nearest-rank p90 of the deep verifies' payload
                             ``duration_ms`` (75% of the 7200 s verify timeout);
                             the events.duration_ms column is NULL for this
-                            event type.
-A leg with no value (no deep verify, no duration) FAILs: a canary that never
-exercised chains must not silently promote.
+                            event type. Reported only when the TIMED deep
+                            verifies (those carrying a finite duration) reach
+                            the minimum sample.
+A leg with no value FAILs: a canary that never exercised chains must not
+silently promote.
 
-STDOUT. The store lines, then the verdict line LAST:
+STDOUT. The store lines, then either the insufficient_signal line or the
+verdict line, always LAST:
 ``merge-deep-canary window_days=7 n_deep_verifies=N: <leg>=<value>(ok|FAIL
 <bound>) ... -> PASS|HOLD``. DeterministicRunner keeps only that final line as
 the done-provenance note.
@@ -80,6 +90,7 @@ class Settings:
     deep_fail_rate_max: float
     items_per_verify_min: float
     verify_p90_max_secs: float
+    min_deep_verifies: int
 
 
 @dataclass(frozen=True)
@@ -139,6 +150,16 @@ def _finite(flag: str, raw: str) -> float:
     return value
 
 
+def _positive_int(flag: str, raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise PredicateFault(f'{flag} must be an integer >= 1; got {raw!r}')
+    return value
+
+
 def _window(raw_days: str, raw_now: str | None) -> Window:
     days = _finite('--window-days', raw_days)
     if days <= 0:
@@ -177,6 +198,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--deep-fail-rate-max', default='0.35')
     parser.add_argument('--items-per-verify-min', default='1.3')
     parser.add_argument('--verify-p90-max-secs', default='5400')
+    parser.add_argument('--min-deep-verifies', default='8')
     parser.add_argument('--now', default=None, metavar='EPOCH_SECS')
     return parser
 
@@ -186,6 +208,7 @@ def _settings(argv: Sequence[str]) -> Settings:
     deep_fail_rate_max = _finite('--deep-fail-rate-max', args.deep_fail_rate_max)
     items_per_verify_min = _finite('--items-per-verify-min', args.items_per_verify_min)
     verify_p90_max_secs = _finite('--verify-p90-max-secs', args.verify_p90_max_secs)
+    min_deep_verifies = _positive_int('--min-deep-verifies', args.min_deep_verifies)
     window = _window(args.window_days, args.now)
     return Settings(
         stores=_stores(args.runs_db),
@@ -193,6 +216,7 @@ def _settings(argv: Sequence[str]) -> Settings:
         deep_fail_rate_max=deep_fail_rate_max,
         items_per_verify_min=items_per_verify_min,
         verify_p90_max_secs=verify_p90_max_secs,
+        min_deep_verifies=min_deep_verifies,
     )
 
 
@@ -280,15 +304,20 @@ def _ratio(numerator: float, denominator: int) -> float | None:
     return numerator / denominator if denominator else None
 
 
+def _sampled_p90(xs: Sequence[float], minimum: int) -> float | None:
+    return pct(xs, 0.90) if len(xs) >= minimum else None
+
+
 def _legs(samples: Sequence[StoreSample], settings: Settings) -> list[Leg]:
     deep = [row for sample in samples for row in sample.deep]
     failures = sum(1 for row in deep if not row.passed)
     landed = sum(sample.landed_via_chain for sample in samples)
     durations = [row.duration_secs for row in deep if row.duration_secs is not None]
+    p90 = _sampled_p90(durations, settings.min_deep_verifies)
     return [
         Leg('deep_fail_rate', _ratio(failures, len(deep)), settings.deep_fail_rate_max, at_most=True),
         Leg('items_per_verify', _ratio(landed, len(deep)), settings.items_per_verify_min, at_most=False),
-        Leg('verify_p90_secs', pct(durations, 0.90), settings.verify_p90_max_secs, at_most=True),
+        Leg('verify_p90_secs', p90, settings.verify_p90_max_secs, at_most=True),
     ]
 
 
@@ -296,8 +325,7 @@ def _store_line(sample: StoreSample) -> str:
     return f'store {sample.path}: n_deep={len(sample.deep)}'
 
 
-def _verdict_line(samples: Sequence[StoreSample], legs: Sequence[Leg], window: Window) -> str:
-    n_deep = sum(len(sample.deep) for sample in samples)
+def _verdict_line(n_deep: int, legs: Sequence[Leg], window: Window) -> str:
     summary = ' '.join(leg.render() for leg in legs)
     outcome = 'PASS' if all(leg.passed for leg in legs) else 'HOLD'
     return f'merge-deep-canary window_days={window.days:g} n_deep_verifies={n_deep}: {summary} -> {outcome}'
@@ -310,10 +338,14 @@ def main(argv: Sequence[str]) -> int:
     except PredicateFault as fault:
         print(f'predicate: {fault}', file=sys.stderr)
         return 2
-    legs = _legs(samples, settings)
     for sample in samples:
         print(_store_line(sample))
-    print(_verdict_line(samples, legs, settings.window))
+    n_deep = sum(len(sample.deep) for sample in samples)
+    if n_deep < settings.min_deep_verifies:
+        print(f'insufficient_signal n_deep_verifies={n_deep} (< {settings.min_deep_verifies})')
+        return 1
+    legs = _legs(samples, settings)
+    print(_verdict_line(n_deep, legs, settings.window))
     return 0 if all(leg.passed for leg in legs) else 1
 
 
