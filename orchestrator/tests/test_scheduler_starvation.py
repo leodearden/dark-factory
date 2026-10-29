@@ -17,6 +17,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _orch_helpers import HermeticMcpSession
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.psi import PsiSample
@@ -32,6 +33,8 @@ T0 = datetime(2026, 10, 1, tzinfo=UTC)
 FLOOR = 259200.0
 _IDLE_PSI = PsiSample(cpu_some10=0.0, mem_some10=0.0, mem_full10=0.0, io_some10=0.0, read_ok=True)
 _SATURATED_PSI = PsiSample(cpu_some10=99.0, mem_some10=0.0, mem_full10=0.0, io_some10=0.0, read_ok=True)
+
+pytestmark = pytest.mark.usefixtures('forbid_live_mcp')
 
 
 def _task(tid: str, priority: str, *files: str, **metadata: Any) -> dict:
@@ -164,6 +167,7 @@ def _rig(
         wall_time_source=lambda: wall[0],
         override_store=overrides,
         eligibility_clock_store=EligibilityClockStore(tmp_path / 'scheduler_eligibility.db'),
+        mcp_session=HermeticMcpSession(),
     )
     scheduler._read_psi_sample = lambda: _IDLE_PSI
 
