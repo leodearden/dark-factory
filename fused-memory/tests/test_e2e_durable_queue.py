@@ -52,8 +52,10 @@ async def integrated_service(mock_config):
 
     # Real initialize — creates DurableWriteQueue with real SQLite
     await svc.initialize()
+    queue = svc.durable_queue
+    assert queue is not None, 'MemoryService.initialize() built no DurableWriteQueue'
     # Rationale: test_integrated_service_queue_commits_do_not_wait_on_the_disk
-    async with svc.durable_queue._require_access().write() as db:
+    async with queue._require_access().write() as db:
         await db.execute('PRAGMA synchronous=OFF')
 
     yield svc
