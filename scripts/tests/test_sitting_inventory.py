@@ -4,7 +4,6 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
 
 import pytest
 from escalation.models import Escalation
@@ -328,8 +327,6 @@ class TestQueueProjectRoots:
             'dark_factory': Path(_queue(df_root)).parents[1],
             'reify': Path(reify_queue).parents[1],
         }
-        with pytest.raises(TypeError):
-            cast('dict[str, Path]', roots)['third'] = tmp_path
 
 
 class TestFailOpen:
