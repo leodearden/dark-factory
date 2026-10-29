@@ -1,4 +1,8 @@
 {
+  "inputs": {
+    "live_slates_sha256": "fa5c20f6eb8461d2f7dfdd5b9a2ef3e48fe3853e26945b9e3d53ebdf4728930c",
+    "snapshot_sha256": "55398cd73c9a355d05f9454a2e1cca9e7da760bd89df141b2f6b5b8f28293e38"
+  },
   "items": {
     "primary_00-000": {
       "basis": "current",
