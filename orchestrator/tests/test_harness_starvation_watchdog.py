@@ -227,12 +227,12 @@ class TestHarnessStarvationWatchdogWiring:
         """
         harness, queue = _make_harness_with_queue(tmp_path)
 
-        assert harness.scheduler._callbacks.on_starvation_warn is not None, (
+        assert harness.scheduler.callbacks.on_starvation_warn is not None, (
             'Harness must wire scheduler._on_starvation_warn after construction'
         )
 
         # Invoke the callback directly — simulating what the scheduler does.
-        await harness.scheduler._callbacks.on_starvation_warn(
+        await harness.scheduler.callbacks.on_starvation_warn(
             'T_wire',
             summary='STARVATION_WATCHDOG: T_wire skipped 55×',
             detail='idle 1900s',
@@ -255,19 +255,19 @@ class TestHarnessStarvationWatchdogWiring:
         """
         harness, queue = _make_harness_with_queue(tmp_path)
 
-        assert harness.scheduler._callbacks.on_starvation_resolve is not None, (
+        assert harness.scheduler.callbacks.on_starvation_resolve is not None, (
             'Harness must wire scheduler._on_starvation_resolve after construction'
         )
-        assert harness.scheduler._callbacks.on_starvation_warn is not None, (
+        assert harness.scheduler.callbacks.on_starvation_warn is not None, (
             'Harness must wire scheduler._on_starvation_warn after construction'
         )
 
-        await harness.scheduler._callbacks.on_starvation_warn(
+        await harness.scheduler.callbacks.on_starvation_warn(
             'T_wire',
             summary='STARVATION_WATCHDOG: T_wire',
             detail='detail',
         )
-        await harness.scheduler._callbacks.on_starvation_resolve('T_wire')
+        await harness.scheduler.callbacks.on_starvation_resolve('T_wire')
 
         pending = queue.get_by_task('T_wire', status='pending')
         assert len(pending) == 0, (
@@ -318,8 +318,6 @@ class TestFleetScaleKnownAnswer:
         harness = Harness(config)
         queue = EscalationQueue(tmp_path / 'esc')
         harness._escalation_queue = queue
-        harness._run_store = MagicMock(spec=RunStore)
-        harness._run_id = 'run-fleet-scale'
         scheduler = harness.scheduler
         scheduler.escalation_queue = queue
 
@@ -329,7 +327,6 @@ class TestFleetScaleKnownAnswer:
         async def get_statuses(ids=None):
             return {t['id']: t['status'] for t in tasks if ids is None or t['id'] in ids}, None
 
-        scheduler._mcp_session = MagicMock()
         # The Harness-wired already-landed gate forks git per candidate: ~9s a
         # tick at this scale against a tmp_path that is no repository.
         scheduler._already_landed_gate = None
@@ -400,7 +397,7 @@ class TestParkBlockedFilesAnL1:
         self, tmp_path: Path,
     ) -> None:
         harness, queue = _make_harness_with_queue(tmp_path)
-        callbacks = harness.scheduler._callbacks
+        callbacks = harness.scheduler.callbacks
         assert callbacks.on_starvation_warn is not None
         assert callbacks.on_starvation_resolve is not None
 
@@ -426,7 +423,7 @@ class TestInfoL0RouterKnowsTheWatchdogRole:
     @pytest.mark.asyncio
     async def test_a_filed_watchdog_l0_routes_to_status_info(self, tmp_path: Path) -> None:
         harness, queue = _make_harness_with_queue(tmp_path)
-        callbacks = harness.scheduler._callbacks
+        callbacks = harness.scheduler.callbacks
         assert callbacks.on_starvation_warn is not None
 
         await callbacks.on_starvation_warn(

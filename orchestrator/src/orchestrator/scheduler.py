@@ -2926,6 +2926,11 @@ class Scheduler:
         # enough — callers are time-throttled by _write_snapshot_best_effort.
         self._override_store_warned: bool = False
 
+    @property
+    def callbacks(self) -> SchedulerCallbacks:
+        """The immutable Harness callback bundle this scheduler was built with."""
+        return self._callbacks
+
     # --- Park-and-stop pause API (task 1322) ---
 
     @property
