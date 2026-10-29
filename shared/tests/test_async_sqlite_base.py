@@ -664,12 +664,17 @@ class TestAsyncSqliteBaseCloseExceptionSafety:
 # ---------------------------------------------------------------------------
 
 
+def _worker_thread(conn: aiosqlite.Connection) -> threading.Thread:
+    """The connection's aiosqlite worker thread: this file's one ``._thread`` access."""
+    return conn._thread
+
+
 def _assert_daemon_thread(conn: aiosqlite.Connection, label: str = '') -> None:
     """Assert that an aiosqlite connection's worker thread is alive and daemon-marked.
 
-    Centralises the ``._thread`` access pattern so that a future aiosqlite
-    rename is caught in one place rather than in every daemon-related test
-    method.  The fused-memory counterpart lives in
+    Centralises the ``._thread`` access pattern (through :func:`_worker_thread`)
+    so that a future aiosqlite rename is caught in one place rather than in
+    every daemon-related test method.  The fused-memory counterpart lives in
     ``fused-memory/tests/test_daemon_connect_consolidation.py``.
 
     Args:
@@ -677,7 +682,7 @@ def _assert_daemon_thread(conn: aiosqlite.Connection, label: str = '') -> None:
         label: Optional label prepended to assertion failure messages.
     """
     prefix = f'{label}: ' if label else ''
-    thread = conn._thread
+    thread = _worker_thread(conn)
     assert thread.is_alive(), f'{prefix}worker thread should be alive while connection is open'
     assert thread.daemon is True, (
         f'{prefix}aiosqlite worker thread must be daemon so a leaked '
@@ -910,6 +915,8 @@ class _ScanGate:
     It runs on the connection's worker thread in the middle of
     ``sqlite3_step``, so the read's snapshot stays pinned while it is parked.
     Every call comes from that one thread, so ``_has_parked`` needs no lock.
+    Registered with ``set_trace_callback`` instead, it parks the first traced
+    statement.
     """
 
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -1461,3 +1468,32 @@ class TestAtomicConnectionClose:
             row = await cur.fetchone()
         assert row is not None
         assert row['v'] == '1'
+
+    @staticmethod
+    async def _cancel_close_in_its_checkpoint(access: AtomicConnection, gate: _ScanGate) -> None:
+        closing = asyncio.create_task(access.close())
+        await asyncio.wait_for(gate.parked.wait(), timeout=_GATE_HANG_GUARD_SECS)
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+
+    async def test_a_close_cancelled_in_its_checkpoint_still_closes_the_connection(
+        self, tmp_path, open_conn
+    ):
+        """A caller's close budget (MemoryService._safe_close) that runs out during
+        the WAL checkpoint must not leak the connection; task 7712."""
+        conn = await open_conn(tmp_path / 'cut.db')
+        access = AtomicConnection(conn)
+        worker = _worker_thread(conn)
+        gate = _ScanGate(asyncio.get_running_loop())
+        await conn.set_trace_callback(gate)
+
+        try:
+            await self._cancel_close_in_its_checkpoint(access, gate)
+        finally:
+            gate.release()
+
+        with pytest.raises(ValueError):
+            await conn.execute('SELECT 1')
+        await asyncio.to_thread(worker.join, _GATE_HANG_GUARD_SECS)
+        assert not worker.is_alive()
