@@ -33,7 +33,15 @@ from pathlib import Path
 import pytest
 
 from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES, Escalation
-from escalation.pins import PinClass, PinRecord, PinReport, classify_pins, is_queue_handoff
+from escalation.pins import (
+    ClusterPinRecord,
+    PinClass,
+    PinRecord,
+    PinReport,
+    classify_pins,
+    is_queue_handoff,
+    pinned_only_by_human_parked,
+)
 
 # ---------------------------------------------------------------------------
 # step-3 — pure type-surface contract
@@ -107,8 +115,6 @@ class TestPinRecordProtocol:
 
     def test_escalation_satisfies_cluster_pin_record_statically(self) -> None:
         """The members-carrying sub-protocol accepts the server-side record too."""
-        from escalation.pins import ClusterPinRecord
-
         esc = Escalation(
             id='esc-42-2', task_id='42', agent_role='escalation-watcher-auto',
             severity='blocking', category='infra_issue', summary='s', level=2,
@@ -830,8 +836,6 @@ class TestPinnedOnlyByHumanParked:
         live_claimant: bool = False,
         live_claimant_id: str | None = None,
     ) -> bool:
-        from escalation.pins import pinned_only_by_human_parked
-
         report = classify_pins(
             '42', records, live_claimant=live_claimant, live_claimant_id=live_claimant_id,
         )
@@ -915,8 +919,6 @@ class TestPinnedOnlyByHumanParked:
 
     def test_a_handoff_id_the_records_do_not_carry_is_not(self) -> None:
         """A report and records that disagree prove nothing about who holds the task."""
-        from escalation.pins import pinned_only_by_human_parked
-
         report = classify_pins('42', [_rec(id='esc-42-1', level=2)], live_claimant=False)
 
         assert pinned_only_by_human_parked(report, [_rec(id='esc-42-2', level=2)]) is False
@@ -984,8 +986,6 @@ class TestPinnedOnlyByHumanParked:
         assert self._parked(records) is False
 
     def test_an_unreadable_store_is_not_even_with_a_held_l1(self) -> None:
-        from escalation.pins import pinned_only_by_human_parked
-
         records = [
             _rec(id='esc-42-1', level=1),
             _rec(id='esc-42-2', level=2, members=('esc-42-1',)),
