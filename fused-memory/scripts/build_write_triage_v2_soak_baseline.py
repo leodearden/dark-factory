@@ -574,7 +574,7 @@ def _projects(soak: Iterable[_SoakItem]) -> dict[str, str]:
 
 def _shards_command(args: argparse.Namespace) -> dict[str, Any]:
     bundle = _SoakBundle.read(args.bundle)
-    scratch = _rounds.RatingScratch(args.scratch)
+    scratch = _rounds.RatingScratch(args.scratch, brief=args.brief)
     key = _soak_key(scratch)
     totals = {OUTCOME_RESTATED: args.restated_total, OUTCOME_AMENDED: args.amended_total}
     extension, unrecoverable = _draw_extension(bundle, totals, args.seed, args.journal_db)
@@ -588,7 +588,7 @@ def _shards_command(args: argparse.Namespace) -> dict[str, Any]:
     added = scratch.add_shards(key, entries, seed=args.seed)
     scratch.save_key(key)
     scratch.save_texts(entries)
-    (args.scratch / 'rater_prompt.md').write_text(_rounds.rater_prompt())
+    (args.scratch / 'rater_prompt.md').write_text(_rounds.rater_prompt(args.brief))
     return {
         'items': len(soak),
         'extension': Counter(record['outcome'] for record in extension.values()),
@@ -615,7 +615,7 @@ class _Corpus:
 def _corpus(args: argparse.Namespace) -> _Corpus:
     """The assembled corpus, refused while any line awaits a re-ask or any pair lacks a rater."""
     bundle = _SoakBundle.read(args.bundle)
-    scratch = _rounds.RatingScratch(args.scratch)
+    scratch = _rounds.RatingScratch(args.scratch, brief=args.brief)
     key = _soak_key(scratch)
     soak = bundle.keyed_items(key)
     entries = scratch.entries(_projects(soak))
@@ -629,7 +629,7 @@ def _corpus(args: argparse.Namespace) -> _Corpus:
 
 
 def _reask_command(args: argparse.Namespace) -> dict[str, Any]:
-    scratch = _rounds.RatingScratch(args.scratch)
+    scratch = _rounds.RatingScratch(args.scratch, brief=args.brief)
     key = _soak_key(scratch)
     entries = scratch.entries(_projects(_SoakBundle.read(args.bundle).keyed_items(key)))
     return _rounds.reask_round(scratch, key, entries)
@@ -695,6 +695,9 @@ def _build_parser() -> argparse.ArgumentParser:
         command.add_argument('--bundle', type=Path, required=True, metavar='DIR',
                              help="the soak bundle's correctness/ directory (read-only)")
         command.add_argument('--scratch', type=Path, required=True, metavar='DIR')
+        command.add_argument('--brief', type=Path, default=_rounds.BRIEF_PATH, metavar='PATH',
+                             help='the rater brief new shards are rendered for and record;'
+                                  ' default the committed brief (v2.1 is commit c7b682bcb9)')
     shards = commands.choices['shards']
     shards.add_argument('--history-db', type=Path, required=True, metavar='PATH',
                         help="mem0's history.db (read-only)")

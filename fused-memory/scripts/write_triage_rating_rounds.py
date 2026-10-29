@@ -14,9 +14,10 @@ goes to a new third rater.
 
 A :class:`RatingScratch` directory holds the rounds:
 
-- ``key.json``: each shard's role, rater, round and item ids, and each item
-  id's pair and basis. It is the only map from an item back to its pair. Its
-  ``rerates`` list records each re-rate (see :func:`rerate_round`).
+- ``key.json``: each shard's role, rater, round, item ids and the sha256 of
+  the brief its rater was given, and each item id's pair and basis. It is the
+  only map from an item back to its pair. Its ``rerates`` list records each
+  re-rate (see :func:`rerate_round`).
 - ``texts.json``: each pair and basis as its raters saw it.
 - ``shards/<name>.txt``: what a rater reads, re-renderable from the key and the texts.
 - ``ratings/<name>.jsonl``: the rater's answers, one line per item.
@@ -360,11 +361,15 @@ class Rated:
 
 
 class RatingScratch:
-    """The scratch directory of one set of rating rounds; see the module docstring for its layout."""
+    """The scratch directory of one set of rating rounds; see the module docstring for its layout.
 
-    def __init__(self, root: Path) -> None:
+    Every shard it writes is rendered for, and records the sha256 of, *brief*.
+    """
+
+    def __init__(self, root: Path, brief: Path = BRIEF_PATH) -> None:
         self.root = root
         self.key_path = root / 'key.json'
+        self.brief = brief
 
     def load_key(self) -> dict[str, Any]:
         if not self.key_path.exists():
@@ -403,7 +408,7 @@ class RatingScratch:
         self._shard_path(name).parent.mkdir(parents=True, exist_ok=True)
         self._shard_path(name).write_text(rendered.text)
         key['shards'][name] = {'role': role, 'rater': rater, 'round': round,
-                               'items': sorted(rendered.key)}
+                               'items': sorted(rendered.key), 'brief_sha256': brief_sha256(self.brief)}
         key['items'].update({item_id: dict(pair) for item_id, pair in rendered.key.items()})
 
     def render_missing(self, key: Mapping[str, Any], entries: Mapping[Triple, ShardEntry]) -> list[str]:
@@ -437,16 +442,27 @@ class RatingScratch:
             for record in json.loads((self.root / 'texts.json').read_text())
         }
 
-    def ratings(self, key: Mapping[str, Any], entries: Mapping[Triple, ShardEntry]) -> Rated:
-        """Every rater's effective lines, each checked by :func:`rating_problems`.
+    def effective_lines(self, key: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Every rater's effective lines, read from the key and the ratings alone.
 
-        A third rater a re-rate retires has no line on that re-rate's pairs.
+        A third rater a re-rate retires has no line on that re-rate's pairs. A
+        line is refused unless its shard was rated under the round-0 brief or
+        under the brief of a re-rate covering its pair (:func:`refuse_foreign_briefs`).
         """
+        return effective_ratings(self._lines(key))
+
+    def _lines(self, key: Mapping[str, Any]) -> list[dict[str, Any]]:
         retired = _retired_votes(key)
         lines: list[dict[str, Any]] = []
         for name, spec in sorted(key['shards'].items()):
             lines += [line for line in self._shard_ratings(name, spec, key['items'])
                       if (line['rater'], line['entry_id'], line['target_id']) not in retired]
+        refuse_foreign_briefs(key, effective_ratings(lines))
+        return lines
+
+    def ratings(self, key: Mapping[str, Any], entries: Mapping[Triple, ShardEntry]) -> Rated:
+        """:meth:`effective_lines`, each checked by :func:`rating_problems` against its texts."""
+        lines = self._lines(key)
         rows = effective_ratings(lines)
         rerated = {name for rerate in key.get('rerates', ()) for name in rerate['shards']}
         item_ids = {
@@ -538,22 +554,52 @@ def third_round(
     return {'pairs': len(members), 'shards': names}
 
 
-def brief_sha256() -> str:
-    """The sha256 of the brief every rater is given, as it now reads."""
-    return hashlib.sha256(BRIEF_PATH.read_bytes()).hexdigest()
+def brief_sha256(brief: Path = BRIEF_PATH) -> str:
+    """The sha256 of *brief* as it now reads."""
+    return hashlib.sha256(brief.read_bytes()).hexdigest()
 
 
-def keyed_rerate(key: Mapping[str, Any], version: str) -> Mapping[str, Any] | None:
+def refuse_foreign_briefs(key: Mapping[str, Any], rows: Iterable[Mapping[str, Any]]) -> None:
+    """Refuse a line whose shard was rated under neither the round-0 brief nor a covering re-rate's.
+
+    The round-0 double shards must record one brief between them. A shard that
+    records no brief is refused by name.
+    """
+    shards = key['shards']
+    unrecorded = sorted(name for name, spec in shards.items() if 'brief_sha256' not in spec)
+    if unrecorded:
+        raise ValueError(f'shards record no brief_sha256: {unrecorded}')
+    base = {spec['brief_sha256'] for spec in shards.values()
+            if spec['round'] == 0 and spec['role'] in DOUBLE_RATED}
+    if len(base) != 1:
+        raise ValueError(f'the round-0 primary and second shards record {len(base)} briefs,'
+                         f' not one: {sorted(base)}')
+    covering: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+    for rerate in key.get('rerates', ()):
+        for entry_id, target_id in rerate['pairs']:
+            covering[entry_id, target_id].add(rerate['brief_sha256'])
+    foreign = [
+        f'{row["batch"]} {row["entry_id"]} {row["target_id"]}: {shards[row["batch"]]["brief_sha256"]}'
+        for row in rows
+        if shards[row['batch']]['brief_sha256'] not in base | covering[row['entry_id'], row['target_id']]
+    ]
+    if foreign:
+        raise ValueError('rater lines rated under a brief that is neither the round-0 brief'
+                         f' {base.pop()} nor that of a re-rate covering their pair:\n'
+                         + '\n'.join(sorted(foreign)))
+
+
+def keyed_rerate(key: Mapping[str, Any], version: str, brief: Path = BRIEF_PATH) -> Mapping[str, Any] | None:
     """The re-rate *key* records under brief *version*; None if none.
 
-    Refused when the brief no longer reads as it did when that re-rate was keyed.
+    Refused when *brief* does not read as it did when that re-rate was keyed.
     """
     for rerate in key.get('rerates', ()):
         if rerate['version'] == version:
-            if rerate['brief_sha256'] != brief_sha256():
+            if rerate['brief_sha256'] != brief_sha256(brief):
                 raise ValueError(
                     f'rerate {version} was keyed under brief sha256 {rerate["brief_sha256"]},'
-                    f' but {BRIEF_PATH} now has sha256 {brief_sha256()}')
+                    f' but {brief} now has sha256 {brief_sha256(brief)}')
             return rerate
     return None
 
@@ -570,7 +616,7 @@ def rerate_round(
     the shards, and every third rater keyed so far, whose lines on those pairs
     are retired. Saves the key; returns the record.
     """
-    if keyed_rerate(key, version) is not None:
+    if keyed_rerate(key, version, scratch.brief) is not None:
         raise ValueError(f'a rerate under brief {version} is already keyed')
     selected = sorted(set(pairs))
     if not selected:
@@ -584,7 +630,7 @@ def rerate_round(
             scratch.write_shard(key, name, dealt, role=role, rater=_double_rater(role), round=round_)
             names.append(name)
     rerate = {
-        'version': version, 'round': round_, 'brief_sha256': brief_sha256(),
+        'version': version, 'round': round_, 'brief_sha256': brief_sha256(scratch.brief),
         'pairs': [list(pair) for pair in selected], 'shards': sorted(names),
         'retires_third_raters': sorted({spec['rater'] for spec in key['shards'].values()
                                         if spec['role'] == Role.THIRD}),
@@ -626,12 +672,12 @@ def refuse_unfinished(rated: Rated, entries: Iterable[Triple]) -> None:
         raise ValueError(f'pairs and bases without an effective primary or second line: {lacking}')
 
 
-def answer_contract() -> str:
-    """The brief verbatim and the answer it asks for: what every rater, file or API, is given."""
+def answer_contract(brief: Path = BRIEF_PATH) -> str:
+    """*brief* verbatim and the answer it asks for: what every rater, file or API, is given."""
     return '\n'.join([
         '## The rubric (verbatim, fused-memory/calibration/write_triage_rater_brief_v2.md)',
         '',
-        BRIEF_PATH.read_text(),
+        brief.read_text(),
         '## Output',
         '',
         'Each item starts with `=== ITEM id=<id> | project=<project> | basis=<basis>`'
@@ -654,8 +700,8 @@ def answer_contract() -> str:
     ])
 
 
-def rater_prompt() -> str:
-    """The prompt a blind rater agent gets for one shard file and one output file."""
+def rater_prompt(brief: Path = BRIEF_PATH) -> str:
+    """The prompt a blind rater agent gets for one shard file and one output file, under *brief*."""
     return '\n'.join([
         '# Rater task (read one shard file, write one JSONL file)',
         '',
@@ -663,7 +709,7 @@ def rater_prompt() -> str:
         ' output file you are given. Do not open any other file (no key file, no repository'
         ' file, no store), and do not call any memory or task tool.',
         '',
-        answer_contract(),
+        answer_contract(brief),
         '## Writing the output file',
         '',
         'Write one JSON object per line, in item order, to the output file you are given.'

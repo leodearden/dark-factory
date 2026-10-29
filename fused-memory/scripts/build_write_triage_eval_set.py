@@ -256,7 +256,7 @@ def _summary(
                      'pairs': len(rerate['pairs']), 'brief_sha256': rerate['brief_sha256']}
                     for rerate in key.get('rerates', ())],
         'shards': {name: {'rater': spec['rater'], 'role': spec['role'], 'round': spec['round'],
-                          'items': len(spec['items'])}
+                          'items': len(spec['items']), 'brief_sha256': spec['brief_sha256']}
                    for name, spec in sorted(key['shards'].items())},
         'strata': inputs.strata,
         'inputs': {'snapshot_sha256': inputs.snapshot_sha256,
@@ -308,7 +308,7 @@ class _Rounds:
 
     @classmethod
     def read(cls, args: argparse.Namespace) -> _Rounds:
-        scratch = _rounds.RatingScratch(args.scratch)
+        scratch = _rounds.RatingScratch(args.scratch, brief=args.brief)
         return cls(_Inputs.read(args.snapshot, args.live_slates), scratch, scratch.load_key())
 
     def finished(self) -> _rounds.Rated:
@@ -333,7 +333,7 @@ def _shards_command(args: argparse.Namespace) -> dict[str, Any]:
     rounds.scratch.save_key(rounds.key)
     rounds.scratch.save_texts(entries.values())
     rendered = rounds.scratch.render_missing(rounds.key, entries)
-    (args.scratch / 'rater_prompt.md').write_text(_rounds.rater_prompt())
+    (args.scratch / 'rater_prompt.md').write_text(_rounds.rater_prompt(args.brief))
     (args.scratch / '.gitignore').write_text(''.join(f'{name}\n' for name in _SCRATCH_IGNORED))
     return {
         'pairs': dict(Counter(write.row['source'] for write in rounds.inputs.writes
@@ -358,7 +358,7 @@ def _third_command(args: argparse.Namespace) -> dict[str, Any]:
 def _rerate_command(args: argparse.Namespace) -> dict[str, Any]:
     rounds = _Rounds.read(args)
     entries = rounds.inputs.entries()
-    rerate = _rounds.keyed_rerate(rounds.key, args.brief_version)
+    rerate = _rounds.keyed_rerate(rounds.key, args.brief_version, args.brief)
     new_shards: dict[str, dict[str, int]] = {}
     if rerate is None:
         selected = _rounds.loss_consuming_pairs(rounds.finished().rows)
@@ -368,7 +368,7 @@ def _rerate_command(args: argparse.Namespace) -> dict[str, Any]:
             spec = rounds.key['shards'][name]
             new_shards.setdefault(spec['role'], {})[name] = len(spec['items'])
     rendered = rounds.scratch.render_missing(rounds.key, entries)
-    (args.scratch / 'rater_prompt.md').write_text(_rounds.rater_prompt())
+    (args.scratch / 'rater_prompt.md').write_text(_rounds.rater_prompt(args.brief))
     return {
         'version': rerate['version'], 'round': rerate['round'], 'pairs': len(rerate['pairs']),
         'retires_third_raters': rerate['retires_third_raters'],
@@ -555,6 +555,9 @@ def _build_parser() -> argparse.ArgumentParser:
         command.add_argument('--live-slates', type=Path, default=DEFAULT_LIVE_SLATES,
                              metavar='PATH')
         command.add_argument('--scratch', type=Path, default=DEFAULT_SCRATCH, metavar='DIR')
+        command.add_argument('--brief', type=Path, default=_rounds.BRIEF_PATH, metavar='PATH',
+                             help='the rater brief new shards are rendered for and record;'
+                                  ' default the committed brief')
     commands.choices['shards'].add_argument('--seed', type=int, default=7160)
     commands.choices['rerate'].add_argument(
         '--brief-version', required=True, metavar='LABEL',
