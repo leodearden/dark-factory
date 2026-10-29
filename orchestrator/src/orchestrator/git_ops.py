@@ -8727,9 +8727,9 @@ class GitOps:
             True on success.  False (and logs at ERROR) if ``git checkout
             --detach`` fails, or if the WIP snapshot is refused — an
             unmerged index (:class:`WorktreeConflictError`) or a failed
-            ``git commit`` — in which case the lane is left attached,
-            untouched.  On False the caller must NOT treat the branch as
-            freed.
+            ``git commit``, which may leave the WIP staged.  Either way the
+            checkout stays attached with its working tree preserved.  On
+            False the caller must NOT treat the branch as freed.
         """
         # commit() returns None when the tree is already clean — fine.
         try:
