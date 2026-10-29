@@ -5113,6 +5113,16 @@ def _task_ids_by_host(rows: Iterable[LeaseRow]) -> dict[str, list[str]]:
     return by_host
 
 
+def _verifying_by_host(rows: Iterable[LeaseRow]) -> dict[str, list[str]]:
+    """``occupancy.verifying_by_host``: :func:`_task_ids_by_host` of the rows that count verifying."""
+    return _task_ids_by_host(row for row in rows if row.counts_verifying)
+
+
+def _ssh_targets_by_runner(config: OrchestratorConfig) -> Mapping[str, str]:
+    """``{runner name: ssh_host}`` of *config*'s enabled verify runners."""
+    return {r.name: r.ssh_host for r in config.enabled_verify_runners}
+
+
 def _lease_part(row: LeaseRow) -> str:
     """``host=task_id``, annotated ``(activity[,quarantined])`` unless it counts verifying."""
     occupant = f'{row.host}={row.task_id}'
@@ -5125,15 +5135,14 @@ def _lease_part(row: LeaseRow) -> str:
 def _occupancy_suffix(rows: Sequence[LeaseRow], *, hosts_total: int) -> str:
     """The heartbeat's `` | verifying N/M hosts: ...`` segment; '' with no lease held.
 
-    N counts the hosts with a lease that :attr:`LeaseRow.counts_verifying`,
-    the keys of ``occupancy.verifying_by_host``, and every lease is named, so a
-    held lease with nothing running on its host reads ``laptop=5300(finished)``.
+    N counts the hosts of :func:`_verifying_by_host`, and every lease is named,
+    so a held lease with nothing running on its host reads
+    ``laptop=5300(finished)``.
     """
     if not rows:
         return ''
-    verifying_hosts = {row.host for row in rows if row.counts_verifying}
     parts = ' '.join(_lease_part(row) for row in rows)
-    return f' | verifying {len(verifying_hosts)}/{hosts_total} hosts: {parts}'
+    return f' | verifying {len(_verifying_by_host(rows))}/{hosts_total} hosts: {parts}'
 
 
 class _DuplicateRenderLog:
@@ -10985,7 +10994,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 config.verify_host_unreachable_escalate_after_secs
             )
             self._reprobe_interval_s = config.verify_host_reprobe_interval_s
-            self._runner_ssh_targets = {r.name: r.ssh_host for r in config.enabled_verify_runners}
+            self._runner_ssh_targets = _ssh_targets_by_runner(config)
             return self._host_allocator
         # project_root unavailable: return a transient empty-remote allocator
         # without caching so a subsequent call with project_root set builds the
@@ -14276,7 +14285,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             'inflight_by_host': inflight_by_host,
             'inflight_total': len(rows),
             'leases': [row.to_wire() for row in rows],
-            'verifying_by_host': _task_ids_by_host(row for row in rows if row.counts_verifying),
+            'verifying_by_host': _verifying_by_host(rows),
         }
 
     def snapshot(self) -> dict:
