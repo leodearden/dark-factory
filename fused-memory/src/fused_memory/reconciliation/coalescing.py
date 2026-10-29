@@ -145,8 +145,10 @@ def merge_coalesced_payload(
     against the row's span: OLDER than the row, NEWER than the newest folded
     constituent, or in the MIDDLE.  That makes ``old_status`` (earliest
     constituent), ``new_status`` and every producer key (newest constituent)
-    and the count independent of arrival order.  The status path is
-    best-effort: a middle arrival only bumps the count.
+    and the count independent of arrival order.  The status path stays
+    continuous across a status event held in another row, such as a done
+    barrier (``coalesce_key``), and is best-effort for a middle arrival, which
+    only bumps the count.
     """
     if existing.get(COALESCED_LAST_ID_KEY) == incoming_id:
         return None
@@ -211,7 +213,8 @@ def _merge_newer(
     if tracks_status:
         if 'old_status' in existing:
             merged['old_status'] = existing['old_status']
-        merged.update(_grown_path(existing, incoming.get('new_status'), at_start=False))
+        step = _unjoined_step(existing, incoming, at_start=False)
+        merged.update(_grown_path(existing, step, at_start=False))
     return merged
 
 
@@ -230,18 +233,40 @@ def _merge_older(
     if tracks_status:
         if 'old_status' in incoming:
             merged['old_status'] = incoming['old_status']
-        merged.update(_grown_path(existing, incoming.get('old_status'), at_start=True))
+        step = _unjoined_step(existing, incoming, at_start=True)
+        merged.update(_grown_path(existing, step, at_start=True))
     return merged
 
 
-def _grown_path(existing: Mapping[str, Any], entry: Any, *, at_start: bool) -> dict[str, Any]:
-    """The status-path keys after adding ``entry`` at one end, within the cap."""
+def _unjoined_step(
+    existing: Mapping[str, Any], incoming: Mapping[str, Any], *, at_start: bool,
+) -> list[Any]:
+    """Incoming's ``[old_status, new_status]`` less the end that meets the path.
+
+    That end (new_status at the start, old_status at the end) is dropped when
+    absent or already the path's end, so a contiguous step adds one entry and
+    a step across a status held in another row adds two.
+    """
+    path = _status_path(existing)
+    joint_key, far_key = ('new_status', 'old_status') if at_start else ('old_status', 'new_status')
+    meets = path[:1] if at_start else path[-1:]
+    joint = [incoming[joint_key]] if joint_key in incoming else []
+    if joint == meets:
+        joint = []
+    far = [incoming.get(far_key)]
+    return [*far, *joint] if at_start else [*joint, *far]
+
+
+def _grown_path(
+    existing: Mapping[str, Any], entries: list[Any], *, at_start: bool,
+) -> dict[str, Any]:
+    """The status-path keys after adding all of ``entries`` at one end, or none past the cap."""
     path = _status_path(existing)
     truncated = existing.get(COALESCED_STATUS_PATH_TRUNCATED_KEY) is True
-    if len(path) >= MAX_COALESCED_STATUS_PATH:
+    if len(path) + len(entries) > MAX_COALESCED_STATUS_PATH:
         truncated = True
     else:
-        path = [entry, *path] if at_start else [*path, entry]
+        path = [*entries, *path] if at_start else [*path, *entries]
     grown: dict[str, Any] = {COALESCED_STATUS_PATH_KEY: path}
     if truncated:
         grown[COALESCED_STATUS_PATH_TRUNCATED_KEY] = True
