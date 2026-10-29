@@ -4057,6 +4057,18 @@ def _parse_claude_output(
     )
 
 
+def parse_claude_cli_output(*, stdout: str, stderr: str, returncode: int) -> AgentResult:
+    """Parse one finished, non-resumed ``claude --print --output-format json`` run.
+
+    The one reader of the CLI result for callers outside this module that ran
+    the CLI themselves (``shared.usage_gate.UsageGate._run_probe``). Never
+    raises, whatever *stdout* holds.
+    """
+    return _parse_claude_output(
+        _SubprocessResult(stdout=stdout, stderr=stderr, returncode=returncode, duration_ms=0)
+    )
+
+
 def _cpu_govern_prefix(env: dict[str, str]) -> list[str]:
     """Return a cgroup-governance prefix list if DF_AGENT_CPU_GOVERN is set to an executable.
 
