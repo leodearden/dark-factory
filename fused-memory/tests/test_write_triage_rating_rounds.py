@@ -264,6 +264,11 @@ class TestRatingProblems:
         assert len(problems) == 1
         assert 'conflict_quote.child' in problems[0]
 
+    def test_a_cross_family_line_is_checked_against_the_same_contract(self) -> None:
+        line = {**_rated('e1', home='YES', conflict='NO'), 'role': 'cross_family'}
+        assert ['lacks loss' in problem for problem in self._problems(line)] == [True]
+        assert self._problems({**line, 'loss': 'NO'}) == []
+
     def test_a_contract_violation_hides_the_unfound_evidence_beside_it(self) -> None:
         problems = self._problems(_quoting(
             _rated('e1', home='YES', conflict='NO'), loss_spans=['not in the child'],

@@ -849,9 +849,18 @@ class TestTheCrossFamilyRole:
     def test_its_rows_keep_the_evidence_contract(self) -> None:
         row = _row(role='cross_family', conflict='YES')
         del row['conflict_quote']
-        with pytest.raises(ValueError, match='conflict_quote'):
-            _mod().resolve_judgements([row])
+        assert 'conflict_quote' in (_mod().row_violation(row) or '')
 
     def test_its_rows_keep_the_skipped_follow_up_contract(self) -> None:
-        with pytest.raises(ValueError, match='lacks loss'):
-            _mod().resolve_judgements([_row(role='cross_family', home='YES', conflict='NO')])
+        violation = _mod().row_violation(_row(role='cross_family', home='YES', conflict='NO'))
+        assert 'lacks loss' in (violation or '')
+
+    def test_a_valid_row_has_no_violation(self) -> None:
+        assert _mod().row_violation(_row(role='cross_family', home='NO', conflict='NO')) is None
+
+    def test_a_corpus_refuses_its_rows_because_they_never_vote(self) -> None:
+        rows = [_row(rater='r1', role='primary', home='YES', conflict='NO', loss='NO'),
+                _row(rater='r2', role='second', home='NO', conflict='NO'),
+                _row(rater='gpt:high', role='cross_family', home='YES', conflict='NO', loss='NO')]
+        with pytest.raises(ValueError, match='verdict row 2.*cross_family never votes'):
+            _mod().resolve_judgements(rows)
