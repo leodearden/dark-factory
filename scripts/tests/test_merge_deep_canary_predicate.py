@@ -390,6 +390,7 @@ class TestItemsPerPassedDeepRound:
             dict(merge_sha='tip-b', attempt=0, passed=False),
             dict(merge_sha='tip-c', attempt=0, passed=True),
             dict(merge_sha='tip-c', attempt=0, passed=True),
+            dict(merge_sha='tip-d', attempt=1, passed=True),
             dict(merge_sha=_ABSENT, attempt=0, passed=True),
         ]
         events = []
@@ -532,6 +533,17 @@ class TestSameRunnerP90Ratio:
         assert result.returncode == 1, f'{result.stdout=} {result.stderr=}'
         assert metric(result.stdout, 'verify_p90_ratio') == 2.0
         assert verdict(result.stdout, 'verify_p90_ratio') == 'FAIL'
+
+    def test_a_zero_same_runner_baseline_gives_no_ratio(self, make_runs_db):
+        store = make_runs_db(_healthy_rounds(8, baseline_ms=0), name='reify.db')
+
+        result = _run(store, *_NOW_ARGS)
+
+        assert result.returncode == 1, f'{result.stdout=} {result.stderr=}'
+        assert population(result.stdout, 'ratio_deep_verifies') == 0
+        assert metric(result.stdout, 'verify_p90_ratio') is None
+        assert verdict(result.stdout, 'verify_p90_ratio') == 'FAIL'
+        assert metric(result.stdout, 'verify_p90_secs') == 600.0
 
     def test_a_deep_verify_without_a_same_runner_baseline_has_no_ratio(self, make_runs_db):
         first = _AS_OF - timedelta(days=3)
