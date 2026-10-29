@@ -1474,9 +1474,9 @@ class TestDeadInflightVerifyAborts:
         """SEED PIN, split out from the negative twin above so each test pins one invariant (the twin's
         abort assertions hold via evidence B alone, independent of this one).
 
-        Proves `_last_content_mtime` is seeded unconditionally at verify-task creation — immediately
-        after verify_task is created, before the poll loop's first `await` — rather than lazily on
-        the first probe. Otherwise the `_last_content_mtime is None` arm would hand a genuinely
+        Proves the progress watch's content-mtime sample is seeded unconditionally at verify-task
+        creation — immediately after verify_task is created, before the poll loop's first `await`
+        — rather than lazily on the first probe. Otherwise an unseeded sample would hand a genuinely
         coasting remote lease one free budget window the first time it probes.
 
         `newest_content_mtime` is wrapped in a recorder that still delegates to the real
@@ -1520,7 +1520,7 @@ class TestDeadInflightVerifyAborts:
         )
 
         assert seed_probes_at_dispatch_start and seed_probes_at_dispatch_start[0] >= 1, (
-            f'_last_content_mtime must be seeded unconditionally at verify-task creation, '
+            f'the content-mtime sample must be seeded unconditionally at verify-task creation, '
             f'strictly before run_merge_verify gets its first turn on the event loop — '
             f'otherwise a remote lease is left with a None seed until the first probe, handing '
             f'a genuinely coasting lease one free budget window; observed '

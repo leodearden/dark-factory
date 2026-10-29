@@ -19497,10 +19497,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # 4579: guard against INFLIGHT_VERIFY_PROGRESS_PROBE_SECS not
             # being comfortably smaller than INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS.
             # If the probe interval were >= the budget, the very first
-            # eligible content probe would land at/after the budget deadline,
+            # eligible progress probe would land at/after the budget deadline,
             # so the abort would trip before a single progress probe ever
             # ran — false-aborting every verify regardless of health. The
-            # probe interval now drives the content-mtime arm for BOTH lease
+            # probe interval gates the progress probes for BOTH lease
             # kinds (task 4579: it used to be LOCAL-only), so a misconfigured
             # or hot-reloaded PROBE >= BUDGET pair would false-abort every
             # REMOTE verify for the identical reason it would false-abort

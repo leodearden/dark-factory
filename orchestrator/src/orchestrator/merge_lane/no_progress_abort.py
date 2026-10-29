@@ -2,9 +2,10 @@
 
 Abort trigger 3 of the merge worker's in-flight verify fires when no progress
 signal (a live remote dispatch, a change in the verify process tree's CPU time,
-or new content under the merge worktree) was seen for a whole budget. ``NoProgressAbort`` records what was observed at that
-firing; ``event_data`` renders it as the ``merge_verify_progress_abort`` event
-payload and ``terminal_reason`` as the blocked reason of a cap-out. Both state
+or new content under the merge worktree) was seen for a whole budget.
+``NoProgressAbort`` records what was observed at that firing; ``event_data``
+renders it as the ``merge_verify_progress_abort`` event payload and
+``terminal_reason`` as the blocked reason of a cap-out. Both state
 observations only: nothing here can tell a dead verify from a slow one, so
 neither rendering claims to.
 
