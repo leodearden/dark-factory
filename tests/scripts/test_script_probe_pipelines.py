@@ -38,6 +38,7 @@ the unfixed text and the fixed text.
 
 from __future__ import annotations
 
+import os
 import pathlib
 
 from shell_sections import (
@@ -743,3 +744,57 @@ def test_verify_sees_the_container_on_a_clean_listing(tmp_path):
     combined = result.stdout + result.stderr
     assert _CONTAINER_RUNNING in combined, combined
     assert _CONTAINER_NOT_FOUND not in combined, combined
+
+
+# --- import-data.sh section 7: no start onto an AOF older than dump.rdb (task 6330) ---
+# A new falkordb container boots with appendonly yes and loads ONLY the AOF, so
+# an imported dump.rdb with no AOF manifest, or one newer than the manifest,
+# would come up stale or empty. The slice runs from the refusal through the
+# compose-up it guards.
+_IMPORT_AOF_CHECK_START = 'FALKOR_AOF_MANIFEST="$FALKOR_DATA/appendonlydir/appendonly.aof.manifest"'
+_IMPORT_AOF_CHECK_END = 'docker compose -f "$COMPOSE_FILE" up -d falkordb qdrant'
+_BOOTSTRAP_PROCEDURE = "Bootstrapping FalkorDB's AOF from dump.rdb"
+
+
+def _run_import_aof_check(tmp_path, *, dump_mtime=None, manifest_mtime=None):
+    falkor = tmp_path / "fused-memory" / "data" / "falkordb"
+    (falkor / "appendonlydir").mkdir(parents=True)
+    for name, mtime in (("dump.rdb", dump_mtime), ("appendonlydir/appendonly.aof.manifest", manifest_mtime)):
+        if mtime is not None:
+            (falkor / name).write_text("x")
+            os.utime(falkor / name, (mtime, mtime))
+    section = (
+        'FALKOR_DATA="$REPO_ROOT/fused-memory/data/falkordb"\n'
+        + slice_section(IMPORT_DATA_PATH, _IMPORT_AOF_CHECK_START, _IMPORT_AOF_CHECK_END)
+        + 'echo "STARTED"\n'
+    )
+    return _run_probe(tmp_path, section, docker_body=dispatch_stub_body(()))
+
+
+def test_import_refuses_a_dump_rdb_with_no_aof_manifest(tmp_path):
+    result = _run_import_aof_check(tmp_path, dump_mtime=2_000_000_000)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1, combined
+    assert "FAIL" in combined and _BOOTSTRAP_PROCEDURE in combined
+    assert "STARTED" not in combined
+
+
+def test_import_refuses_a_dump_rdb_newer_than_the_aof_manifest(tmp_path):
+    result = _run_import_aof_check(tmp_path, dump_mtime=2_000_000_100, manifest_mtime=2_000_000_000)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1, combined
+    assert _BOOTSTRAP_PROCEDURE in combined
+
+
+def test_import_starts_when_the_aof_manifest_is_as_new_as_dump_rdb(tmp_path):
+    result = _run_import_aof_check(tmp_path, dump_mtime=2_000_000_000, manifest_mtime=2_000_000_000)
+
+    assert result.returncode == 0 and "STARTED" in result.stdout, result.stdout + result.stderr
+
+
+def test_import_starts_when_there_is_no_dump_rdb(tmp_path):
+    result = _run_import_aof_check(tmp_path)
+
+    assert result.returncode == 0 and "STARTED" in result.stdout, result.stdout + result.stderr

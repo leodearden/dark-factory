@@ -41,7 +41,7 @@ from shell_sections import (
 # Both anchors are CODE (not comment prose), are unique in the file, and
 # survive the fix, which matters because the same anchors must slice the
 # unfixed text and the fixed text.
-_SECTION_2_START = 'docker compose -f "$COMPOSE_FILE" up -d falkordb qdrant'
+_SECTION_2_START = 'scripts/falkordb_aof_gate.py" --compose-file "$COMPOSE_FILE"'
 _SECTION_2_END = "\ndone\n"
 
 
@@ -116,14 +116,29 @@ def _falkordb_probe(start, end):
 
 
 def _run_section_2(tmp_path, exec_body):
-    """Slice the section-2 wait loop and run it against a scripted docker."""
+    """Slice the section-2 wait loop and run it against a scripted docker.
+
+    `python3` and `docker` record their argv: section 2 brings the stores up
+    through scripts/falkordb_aof_gate.py, which has its own suite.
+    """
+    write_stub(stub_bin_dir(tmp_path), "python3", f'printf "%s\\n" "$*" >> "{tmp_path}/python3.argv"\n')
     return _run_probe(
         tmp_path,
         _falkordb_probe(_SECTION_2_START, _SECTION_2_END),
         stub_name="docker",
-        stub_body=_docker_stub_body(exec_body),
+        stub_body=f'printf "%s\\n" "$*" >> "{tmp_path}/docker.argv"\n' + _docker_stub_body(exec_body),
         env_extra=_compose_env(tmp_path),
     )
+
+
+def test_section_2_brings_the_stores_up_only_through_the_aof_gate(tmp_path):
+    _run_section_2(tmp_path, clean_match("PONG"))
+
+    gate_calls = (tmp_path / "python3.argv").read_text().splitlines()
+    assert len(gate_calls) == 1
+    assert gate_calls[0].endswith(f"scripts/falkordb_aof_gate.py --compose-file {tmp_path / 'docker-compose.yml'}")
+    docker_calls = (tmp_path / "docker.argv").read_text().splitlines()
+    assert not [call for call in docker_calls if " up " in f" {call} "], docker_calls
 
 
 def test_section_2_reports_healthy_when_the_producer_exits_nonzero_after_the_reply(
