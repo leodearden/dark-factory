@@ -90,6 +90,7 @@ def scene(tmp_path: Path) -> _Scene:
     return _Scene(tmp_path)
 
 
+@pytest.mark.asyncio
 async def test_a_clean_branch_with_work_beyond_main_is_mergeable(scene: _Scene) -> None:
     state = await scene.read()
 
@@ -99,6 +100,7 @@ async def test_a_clean_branch_with_work_beyond_main_is_mergeable(scene: _Scene) 
     assert state.worktree_dirty is False
 
 
+@pytest.mark.asyncio
 async def test_a_branch_reset_to_main_with_the_work_staged_is_empty(scene: _Scene) -> None:
     scene.wt.git('reset', '--soft', 'main')
 
@@ -110,6 +112,7 @@ async def test_a_branch_reset_to_main_with_the_work_staged_is_empty(scene: _Scen
     assert state.merge_source == scene.main_sha
 
 
+@pytest.mark.asyncio
 async def test_a_worktree_moved_onto_main_while_the_branch_is_ahead_is_off_branch(
     scene: _Scene,
 ) -> None:
@@ -124,6 +127,7 @@ async def test_a_worktree_moved_onto_main_while_the_branch_is_ahead_is_off_branc
     assert state.worktree_head == scene.main_sha
 
 
+@pytest.mark.asyncio
 async def test_a_detached_head_carrying_newer_work_than_a_stale_ref_is_mergeable(
     scene: _Scene,
 ) -> None:
@@ -137,6 +141,7 @@ async def test_a_detached_head_carrying_newer_work_than_a_stale_ref_is_mergeable
     assert state.branch_tip == scene.task_commit
 
 
+@pytest.mark.asyncio
 async def test_an_absent_ref_falls_back_to_the_worktree_head(scene: _Scene) -> None:
     scene.wt.git('checkout', '--detach')
     scene.repo.git('branch', '-D', BRANCH.full_name)
