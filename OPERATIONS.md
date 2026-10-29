@@ -633,7 +633,7 @@ install -D -m 0600 client-feed/examples/dark-factory.yaml ~/.config/client-feed/
 
 For a client project, install it under the project's name, then edit
 `project_id`, `project_root`, `out_dir`, `in_dir` and `visible_globs`. The
-publisher refuses to start on a file that does not parse or validate, on a
+publisher refuses to start on a file it cannot read, parse or validate, on a
 `project_root` that is not the top of a git work tree, and on an `out_dir` that
 is missing, a symlink, or not the running user's
 (`client-feed/src/client_feed/policy.py::PolicyProblem`).
