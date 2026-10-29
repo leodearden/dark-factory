@@ -474,16 +474,18 @@ LOSS_CONSUMING = sorted([THIRD_DECIDED_LOSS, ('o1', 'd'), ('o2', 'P'), ('l1', 'f
                          ('l2', 'Q'), ('l2', 'h')])
 
 
-def _rated_through_a_third_round(evalset: _EvalSet) -> None:
+def _rated_through_a_third_round(evalset: _EvalSet, *third_args: str) -> None:
     """Every shard rated: ('o1', 'a') reads CONFLICT YES, ('o1', 'b') HOME NO, and the two
-    third-decided pairs tie first; every other pair reads HOME YES and CONFLICT NO."""
+    third-decided pairs tie first; every other pair reads HOME YES and CONFLICT NO.
+
+    *third_args* go to the ``third`` command."""
     evalset.rate({('primary', ('o1', 'a')): _conflict_yes, ('second', ('o1', 'a')): _conflict_yes,
                   ('primary', ('o1', 'b')): _home_no, ('second', ('o1', 'b')): _home_no,
                   ('primary', THIRD_DECIDED_LOSS): _conflict_yes,
                   ('second', THIRD_DECIDED_LOSS): _conflict_no,
                   ('primary', THIRD_DECIDED_CONFLICT): _conflict_yes,
                   ('second', THIRD_DECIDED_CONFLICT): _kept})
-    assert evalset.run('third') == 0
+    assert evalset.run('third', *third_args) == 0
     evalset.rate({('third', THIRD_DECIDED_LOSS): _conflict_no,
                   ('third', THIRD_DECIDED_CONFLICT): _conflict_yes})
 
@@ -820,13 +822,45 @@ class TestTheSplitCommand:
         assert json.loads(path.read_text()) == frozen
 
 
+class TestTheBrief:
+    @pytest.fixture
+    def old_brief(self, tmp_path: Path) -> Path:
+        path = tmp_path / 'brief_v2_1.md'
+        path.write_text('# Rater brief v2.1\n\nThe older LOSS wording.\n')
+        return path
+
+    def test_shards_renders_and_records_the_brief_it_is_given(
+        self, tmp_path: Path, old_brief: Path,
+    ) -> None:
+        built = _EvalSet(tmp_path)
+        assert built.run('shards', '--brief', str(old_brief)) == 0
+        assert {spec['brief_sha256'] for spec in built.key()['shards'].values()} == {
+            _sha256(old_brief)}
+        assert (built.scratch / 'rater_prompt.md').read_text() == _rounds().rater_prompt(old_brief)
+
+    def test_a_rerate_under_the_new_brief_lands_its_lines_and_the_summary_names_each_shards_brief(
+        self, tmp_path: Path, old_brief: Path,
+    ) -> None:
+        built = _EvalSet(tmp_path)
+        assert built.run('shards', '--brief', str(old_brief)) == 0
+        _rated_through_a_third_round(built, '--brief', str(old_brief))
+        assert built.run('rerate', '--brief-version', 'v2.2') == 0
+        built.rate()
+        assert built.assemble() == 0
+        key, shards = built.key(), built.summary()['shards']
+        rerated = set(key['rerates'][0]['shards'])
+        assert {name: spec['brief_sha256'] for name, spec in shards.items()} == {
+            name: _sha256(_rounds().BRIEF_PATH if name in rerated else old_brief) for name in key['shards']}
+
+
 class TestTheOpusCorpusIsOpusOnly:
     def test_assemble_refuses_a_cross_family_row_naming_it(self, evalset: _EvalSet) -> None:
         evalset.rate()
         key = evalset.key()
         [item] = key['shards']['primary_00']['items'][:1]
         key['shards']['cross_00'] = {'role': 'cross_family', 'rater': 'gpt-6.1-sol:high',
-                                     'round': 0, 'items': [item]}
+                                     'round': 0, 'items': [item],
+                                     'brief_sha256': _sha256(_rounds().BRIEF_PATH)}
         (evalset.scratch / 'key.json').write_text(json.dumps(key))
         (evalset.scratch / 'ratings' / 'cross_00.jsonl').write_text(
             json.dumps({'id': item, **KEPT, 'reason': 'r'}) + '\n')

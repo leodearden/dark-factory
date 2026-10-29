@@ -9,6 +9,7 @@ rating-round tests here drive it end to end through the soak CLI.
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import sqlite3
 import types
@@ -592,11 +593,11 @@ class _Bundle:
         connection.close()
         return path
 
-    def shards(self, *, restated: int = 3, amended: int = 3) -> int:
+    def shards(self, *extra: str, restated: int = 3, amended: int = 3) -> int:
         return _mod().main([
             'shards', '--bundle', str(self.dir), '--history-db', str(self.history),
             '--journal-db', str(self.journal), '--scratch', str(self.scratch), '--seed', '7',
-            '--restated-total', str(restated), '--amended-total', str(amended),
+            '--restated-total', str(restated), '--amended-total', str(amended), *extra,
         ])
 
     def key(self) -> dict[str, Any]:
@@ -712,6 +713,15 @@ class TestTheShardsCommand:
         with pytest.raises(ValueError, match='extension'):
             bundle.shards(amended=2)
         assert (bundle.scratch / 'key.json').read_bytes() == key_bytes
+
+    def test_shards_renders_and_records_the_brief_it_is_given(self, tmp_path: Path) -> None:
+        old_brief = tmp_path / 'brief_v2_1.md'
+        old_brief.write_text('# Rater brief v2.1\n\nThe older LOSS wording.\n')
+        built = _Bundle(tmp_path)
+        assert built.shards('--brief', str(old_brief)) == 0
+        sha = hashlib.sha256(old_brief.read_bytes()).hexdigest()
+        assert {spec['brief_sha256'] for spec in built.key()['shards'].values()} == {sha}
+        assert (built.scratch / 'rater_prompt.md').read_text() == _rounds().rater_prompt(old_brief)
 
     def test_the_rater_prompt_asks_for_evidence_and_not_digest(self, bundle: _Bundle) -> None:
         prompt = (bundle.scratch / 'rater_prompt.md').read_text()

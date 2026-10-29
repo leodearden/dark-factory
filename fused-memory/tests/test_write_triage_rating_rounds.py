@@ -6,6 +6,7 @@ Synthetic rows and a tmp scratch only. The module is loaded by path
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import sqlite3
 import types
@@ -624,7 +625,7 @@ class TestRatingScratch:
             assert attach == [triple[2] == 'attach_time'] * 2, triple
         for name, spec in key['shards'].items():
             assert spec == {'role': spec['role'], 'rater': f'opus-{spec["role"]}', 'round': 0,
-                            'items': spec['items']}
+                            'items': spec['items'], 'brief_sha256': _sha(_mod().BRIEF_PATH)}
             assert (rounds.root / 'shards' / f'{name}.txt').exists()
         assert sorted(rounds.added) == sorted(key['shards'])
 
@@ -754,6 +755,7 @@ class TestRatingScratch:
         key = rounds.key()
         assert {**key['shards']['third_00'], 'items': len(key['shards']['third_00']['items'])} == {
             'role': 'third', 'rater': 'opus-third-00', 'round': 0, 'items': 1,
+            'brief_sha256': _sha(_mod().BRIEF_PATH),
         }
         assert rounds.holding(('e0', 'p1', 'current'))[-1] == 'third_00'
         assert 'third_00' not in rounds.holding(('e0', 'p1', 'attach_time'))
@@ -768,6 +770,75 @@ class TestRatingScratch:
             'pairs': 0, 'shards': [],
         }
         assert (rounds.root / 'key.json').read_bytes() == key_bytes
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@pytest.fixture
+def old_brief(tmp_path: Path) -> Path:
+    path = tmp_path / 'brief_v2_1.md'
+    path.write_text('# Rater brief v2.1: an older wording\n\nAnswer LOSS the old way.\n')
+    return path
+
+
+class TestTheBrief:
+    def test_the_contract_and_the_prompt_render_the_brief_they_are_given(
+        self, old_brief: Path,
+    ) -> None:
+        rounds = _mod()
+        contract = rounds.answer_contract(old_brief)
+        assert old_brief.read_text() in contract
+        assert rounds.BRIEF_PATH.read_text() not in contract
+        assert contract in rounds.rater_prompt(old_brief)
+        assert rounds.answer_contract() == rounds.answer_contract(rounds.BRIEF_PATH)
+        assert rounds.brief_sha256(old_brief) == _sha(old_brief)
+
+    def test_every_shard_records_the_sha256_of_its_scratchs_brief(
+        self, tmp_path: Path, old_brief: Path,
+    ) -> None:
+        scratch = _mod().RatingScratch(tmp_path / 'scratch', brief=old_brief)
+        key = scratch.load_key()
+        scratch.add_shards(key, _scratch_entries(), seed=7)
+        assert {spec['brief_sha256'] for spec in key['shards'].values()} == {_sha(old_brief)}
+
+    def test_a_line_under_a_brief_neither_round_0s_nor_a_covering_rerates_is_refused(
+        self, tmp_path: Path, old_brief: Path,
+    ) -> None:
+        rounds = _Rounds(tmp_path)
+        rounds.rate()
+        other = _mod().RatingScratch(rounds.root, brief=old_brief)
+        _mod().third_round(other, rounds.key(), rounds.entries(), {('e0', 'p1')})
+        rounds.rate()
+        with pytest.raises(ValueError, match=r'third_00 e0 p1'):
+            rounds.scratch.effective_lines(rounds.key())
+        with pytest.raises(ValueError, match=r'third_00 e0 p1'):
+            rounds.scratch.ratings(rounds.key(), rounds.entries())
+
+    def test_a_shard_recording_no_brief_is_refused_naming_it(self, tmp_path: Path) -> None:
+        rounds = _Rounds(tmp_path)
+        rounds.rate()
+        key = rounds.key()
+        del key['shards']['second_00']['brief_sha256']
+        with pytest.raises(ValueError, match='second_00'):
+            rounds.scratch.effective_lines(key)
+
+    def test_round_0_must_record_one_brief(self, tmp_path: Path) -> None:
+        rounds = _Rounds(tmp_path)
+        rounds.rate()
+        key = rounds.key()
+        key['shards']['second_00']['brief_sha256'] = '0' * 64
+        with pytest.raises(ValueError, match='round-0'):
+            rounds.scratch.effective_lines(key)
+
+    def test_the_effective_lines_need_no_texts(self, tmp_path: Path) -> None:
+        rounds = _Rounds(tmp_path)
+        rounds.rate()
+        (rounds.root / 'texts.json').unlink()
+        lines = rounds.scratch.effective_lines(rounds.key())
+        assert sorted((_triple(row), row['role']) for row in lines) == sorted(
+            (triple, role) for triple in ALL_TRIPLES for role in ('primary', 'second'))
 
 
 class TestTheRaterContract:
