@@ -3,7 +3,8 @@
 This document defines the metrics that judge write triage by what a later
 reader of the corpus meets, and the procedure that measures them for task
 3131's release. Raters answer the questions in
-`write_triage_rater_brief_v2.md` (rater brief v2.1). `fused-memory/scripts/write_triage_reader_rubric.py`
+`write_triage_rater_brief_v2.md` (rater brief v2.2 since task 7160; v2.1 is commit
+`c7b682bcb9`). `fused-memory/scripts/write_triage_reader_rubric.py`
 turns their answers into cells, and `fused-memory/scripts/score_write_triage_reader.py`
 turns cells into the figures below. The scorer reports and never gates: every
 gate on this page is applied by a person reading its report.
@@ -133,6 +134,15 @@ left out.
   its `unreached_follow_ups`). A follow-up the raters' own answers leave open
   is not UNCLEAR: it goes to a third round. An item whose deciding binary is
   UNCLEAR is left out of every rate and counted.
+- The brief is v2.2 from task 7160 (task 7703, commit `169dcb2ef0`). Only the
+  LOSS question and anchors 5 to 8 changed from v2.1, whose text is commit
+  `c7b682bcb9`. When a brief revision changes a question, every pair whose
+  derivation reads that question is re-rated by fresh primary and second
+  raters, and earlier third votes on those pairs are retired
+  (`fused-memory/scripts/write_triage_rating_rounds.py::rerate_round`).
+  `write_triage_eval_set_v2.md` §6 records why v2.2 was written and what it
+  moved. Verdict rows do not record the brief, so the scorer takes the label
+  from its caller (`score_write_triage_reader.py --rubric`).
 
 ## 5. Reconstructing write-time state
 
@@ -216,7 +226,7 @@ record marked). The window opens when the last of them is live, runs at least
 4. Rate per §4: two blind Opus raters on every item. Validate every line, and
    re-ask each rater whose line breaks the row contract or whose evidence is
    not found until none is left. Then check kappa over consumed answers.
-5. Score with `score_write_triage_reader.py --strata`. For the gaps a refusal
+5. Score with `score_write_triage_reader.py --strata --rubric <brief label>`. For the gaps a refusal
    names, run a third round with a new rater, and repeat until the scorer
    accepts the corpus.
 6. Read the release condition off the report and the window's logs.
@@ -234,8 +244,21 @@ record marked). The window opens when the last of them is live, runs at least
 **Report-only:** M2 per outcome, M4 against 0.20, M5, M6, and harm per write
 under the provisional weights.
 
+**Which brief: open, for Leo.** This release condition was ratified under
+brief v2.1. M1 <= 0.15, and M3 population <= 0.35 (esc-7301-1, recorded on
+task 3131), were set against the v2.1 soak baseline (§8). v2.2 narrows LOSS,
+which can only lower the figures that rest on it (§8). The post-fix
+measurement must therefore do one of two things. It can render its rater
+prompt from the v2.1 brief text (`git show
+c7b682bcb9:fused-memory/calibration/write_triage_rater_brief_v2.md`) and
+score with `--rubric v2.1`. Or it can wait for Leo to re-confirm the bounds
+against a v2.2 re-rate of the soak's LOSS-consuming pairs. It must not
+silently pick up v2.2 from the file. This is a choice for Leo; nothing here
+makes it.
+
 **After the embedder cutover (6807)** re-run the whole measurement: the band
 edges and every cosine-derived threshold move with the embedder.
+The labelled pair set for it is `write_triage_eval_set_v2.md`.
 
 ## 8. Soak baseline
 
@@ -251,6 +274,13 @@ otherwise. Rates and kappas are quoted to four places as the JSON gives them.
 Every floor binary meets the kappa floor, and no v1 row that failed the
 derivation check fixes an answer (both below), so this baseline meets §4's
 conditions for scoring.
+
+These figures are rated under brief v2.1 (commit `c7b682bcb9`), not the v2.2
+the brief file now holds. M1 hidden, M1 as amended, M2 restated, and the
+hidden_detail and duplicate_clutter harm all rest partly on LOSS. v2.2
+narrowed LOSS to needed detail (`write_triage_eval_set_v2.md` §6), so these
+figures do not compare with a v2.2-rated measurement until the soak's
+LOSS-consuming pairs are re-rated under v2.2.
 
 ### Provenance
 
