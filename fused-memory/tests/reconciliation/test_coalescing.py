@@ -13,6 +13,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from shared.task_statuses import TaskStatus
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -31,6 +32,7 @@ from fused_memory.reconciliation.coalescing import (
     merge_coalesced_payload,
     task_id_key,
 )
+from fused_memory.reconciliation.unlanded_path_check import select_done_transitions
 
 
 def _event(event_type: EventType, payload: dict) -> ReconciliationEvent:
@@ -103,6 +105,40 @@ def test_status_change_without_a_task_id_never_folds(payload):
     assert coalesce_key(_event(EventType.task_status_changed, payload)) is None
 
 
+_MERGED = {'kind': 'merged', 'commit': 'abc'}
+
+
+@pytest.mark.parametrize('task_id', ['5', 5], ids=['str', 'int'])
+@pytest.mark.parametrize('new_status', list(TaskStatus), ids=lambda s: s.value)
+def test_only_a_transition_into_done_is_a_fold_barrier(new_status, task_id):
+    payloads = [{'task_id': task_id, 'old_status': 'pending', 'new_status': new_status.value}]
+    if new_status is TaskStatus.DONE:
+        payloads.append({**payloads[0], 'done_provenance': _MERGED})
+    expected = None if new_status is TaskStatus.DONE else 'task_status_changed:5'
+    for payload in payloads:
+        assert coalesce_key(_event(EventType.task_status_changed, payload)) == expected
+
+
+def _done_reader_cases() -> list[ReconciliationEvent]:
+    statuses = [
+        _event(EventType.task_status_changed, {
+            'task_id': task_id, 'new_status': status.value, 'done_provenance': _MERGED})
+        for status in TaskStatus
+        for task_id in ('5', 5)
+    ]
+    memory = _event(EventType.memory_added, {'task_id': '5', 'new_status': 'done'})
+    return [*statuses, memory]
+
+
+@pytest.mark.parametrize(
+    'event', _done_reader_cases(),
+    ids=lambda e: f"{e.type.value}-{e.payload['new_status']}-{type(e.payload['task_id']).__name__}",
+)
+def test_every_transition_the_unlanded_path_check_reads_survives_folding(event):
+    if select_done_transitions([event]):
+        assert coalesce_key(event) is None
+
+
 #: The key every EventType gets for a payload that carries everything a fold
 #: key could read.  Listing EVERY member (the coverage test below enforces it)
 #: forces whoever adds an EventType to decide whether it folds.
@@ -161,40 +197,40 @@ def _fold_status(
 def test_newer_status_fold_rewinds_old_status_and_advances_new_status():
     incoming_ts = _at(5)
     fold = merge_coalesced_payload(
-        _status('pending', 'in-progress'), _status('in-progress', 'done'),
+        _status('pending', 'in-progress'), _status('in-progress', 'review'),
         event_type=EventType.task_status_changed,
         incoming_id='evt-b', incoming_ts=incoming_ts, row_ts=_T0,
     )
     assert fold is not None
     assert fold.payload['old_status'] == 'pending'
-    assert fold.payload['new_status'] == 'done'
+    assert fold.payload['new_status'] == 'review'
     assert fold.payload[COALESCED_COUNT_KEY] == 2
     assert fold.payload[COALESCED_LAST_ID_KEY] == 'evt-b'
     assert fold.payload[COALESCED_LAST_TIMESTAMP_KEY] == incoming_ts.isoformat()
-    assert fold.payload[COALESCED_STATUS_PATH_KEY] == ['pending', 'in-progress', 'done']
+    assert fold.payload[COALESCED_STATUS_PATH_KEY] == ['pending', 'in-progress', 'review']
     assert fold.row_timestamp == _T0
     assert fold.folded_timestamp == incoming_ts
 
 
 def test_a_third_newer_fold_appends_one_path_entry():
     second = _fold_status(
-        _status('pending', 'in-progress'), _status('in-progress', 'done'),
+        _status('pending', 'in-progress'), _status('in-progress', 'review'),
         incoming_ts=_at(5),
     )
-    third = _fold_status(second.payload, _status('done', 'review'), incoming_ts=_at(9))
+    third = _fold_status(second.payload, _status('review', 'blocked'), incoming_ts=_at(9))
     assert third.payload[COALESCED_COUNT_KEY] == 3
     assert third.payload[COALESCED_STATUS_PATH_KEY] == [
-        'pending', 'in-progress', 'done', 'review']
-    assert third.payload['new_status'] == 'review'
+        'pending', 'in-progress', 'review', 'blocked']
+    assert third.payload['new_status'] == 'blocked'
 
 
 def test_redelivery_of_the_last_folded_event_is_not_a_fold():
     folded = _fold_status(
-        _status('pending', 'in-progress'), _status('in-progress', 'done'),
+        _status('pending', 'in-progress'), _status('in-progress', 'review'),
         incoming_ts=_at(5), incoming_id='evt-b',
     )
     assert merge_coalesced_payload(
-        folded.payload, _status('in-progress', 'done'),
+        folded.payload, _status('in-progress', 'review'),
         event_type=EventType.task_status_changed,
         incoming_id='evt-b', incoming_ts=_at(5), row_ts=_T0,
     ) is None
@@ -203,16 +239,16 @@ def test_redelivery_of_the_last_folded_event_is_not_a_fold():
 def test_late_older_arrival_takes_old_status_and_moves_the_row_earlier():
     row_ts = _at(10)
     older_ts = _at(2)
-    existing = _status('in-progress', 'done', done_provenance={'kind': 'merged'})
+    existing = _status('in-progress', 'deferred', deferral={'until': '2026-11-01'})
     fold = _fold_status(
         existing, _status('pending', 'in-progress', _project_root='/older'),
         incoming_ts=older_ts, row_ts=row_ts,
     )
     assert fold.payload['old_status'] == 'pending'
-    assert fold.payload['new_status'] == 'done'
-    assert fold.payload['done_provenance'] == {'kind': 'merged'}
+    assert fold.payload['new_status'] == 'deferred'
+    assert fold.payload['deferral'] == {'until': '2026-11-01'}
     assert fold.payload['_project_root'] == '/p'
-    assert fold.payload[COALESCED_STATUS_PATH_KEY] == ['pending', 'in-progress', 'done']
+    assert fold.payload[COALESCED_STATUS_PATH_KEY] == ['pending', 'in-progress', 'deferred']
     assert fold.payload[COALESCED_COUNT_KEY] == 2
     assert fold.row_timestamp == older_ts
     assert fold.folded_timestamp == row_ts
@@ -220,7 +256,7 @@ def test_late_older_arrival_takes_old_status_and_moves_the_row_earlier():
 
 def test_middle_arrival_only_bumps_the_count():
     two = _fold_status(
-        _status('pending', 'in-progress'), _status('blocked', 'done'),
+        _status('pending', 'in-progress'), _status('blocked', 'review'),
         incoming_ts=_at(10), incoming_id='evt-newest',
     )
     middle_ts = _at(4)
@@ -247,22 +283,13 @@ def test_status_path_is_capped_and_flagged_but_new_status_stays_newest():
 
 def test_an_uncapped_path_carries_no_truncation_flag():
     fold = _fold_status(
-        _status('pending', 'in-progress'), _status('in-progress', 'done'),
+        _status('pending', 'in-progress'), _status('in-progress', 'review'),
         incoming_ts=_at(5),
     )
     assert COALESCED_STATUS_PATH_TRUNCATED_KEY not in fold.payload
 
 
 def test_producer_keys_come_from_the_newest_constituent_only():
-    reopened = _fold_status(
-        _status('pending', 'done', done_provenance={'kind': 'merged'}),
-        _status('done', 'pending', reopen_reason='regressed', reopen_from='done'),
-        incoming_ts=_at(5),
-    )
-    assert reopened.payload['reopen_reason'] == 'regressed'
-    assert reopened.payload['reopen_from'] == 'done'
-    assert 'done_provenance' not in reopened.payload
-
     undeferred = _fold_status(
         _status('pending', 'deferred', deferral={'until': '2026-11-01'}),
         _status('deferred', 'pending', deferral_cleared={'by': 'gate'}),
@@ -289,10 +316,10 @@ def test_task_update_fold_takes_newest_producer_keys_and_records_no_path():
 
 def test_merge_does_not_mutate_the_existing_payload():
     existing = _fold_status(
-        _status('pending', 'in-progress'), _status('in-progress', 'done'),
+        _status('pending', 'in-progress'), _status('in-progress', 'review'),
         incoming_ts=_at(5),
     ).payload
     before = copy.deepcopy(existing)
-    _fold_status(existing, _status('done', 'review'), incoming_ts=_at(9))
+    _fold_status(existing, _status('review', 'blocked'), incoming_ts=_at(9))
     _fold_status(existing, _status('draft', 'pending'), incoming_ts=_at(-5))
     assert existing == before

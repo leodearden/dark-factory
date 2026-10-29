@@ -28,6 +28,10 @@ from fused_memory.reconciliation.coalescing import (
     COALESCED_STATUS_PATH_KEY,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
+from fused_memory.reconciliation.unlanded_path_check import (
+    DoneTransition,
+    select_done_transitions,
+)
 
 _PROJECT = 'dark_factory'
 # In the past, so cleanup_drained(max_age_seconds=0) can sweep these rows.
@@ -268,29 +272,18 @@ async def _only_row(buf: EventBuffer) -> ReconciliationEvent:
 @pytest.mark.asyncio
 async def test_a_status_chain_folds_to_its_start_and_end(buf):
     await buf.push(_transition('pending', 'in-progress', _at(0)))
-    await buf.push(_transition('in-progress', 'done', _at(1)))
+    await buf.push(_transition('in-progress', 'review', _at(1)))
 
     payload = (await _only_row(buf)).payload
     assert payload['old_status'] == 'pending'
-    assert payload['new_status'] == 'done'
-    assert payload[COALESCED_STATUS_PATH_KEY] == ['pending', 'in-progress', 'done']
+    assert payload['new_status'] == 'review'
+    assert payload[COALESCED_STATUS_PATH_KEY] == ['pending', 'in-progress', 'review']
     assert payload[COALESCED_COUNT_KEY] == 2
 
-    await buf.push(_transition('done', 'review', _at(2)))
+    await buf.push(_transition('review', 'blocked', _at(2)))
     payload = (await _only_row(buf)).payload
-    assert payload['new_status'] == 'review'
-    assert payload[COALESCED_STATUS_PATH_KEY] == ['pending', 'in-progress', 'done', 'review']
-
-
-@pytest.mark.asyncio
-async def test_a_drained_fold_carries_only_the_newest_transitions_keys(buf):
-    await buf.push(_transition('pending', 'done', _at(0), done_provenance={'kind': 'merged'}))
-    await buf.push(_transition(
-        'done', 'pending', _at(1), reopen_reason='regressed', reopen_from='done'))
-    [drained] = await buf.drain(_PROJECT, run_id='r1')
-    assert drained.payload['reopen_reason'] == 'regressed'
-    assert drained.payload['reopen_from'] == 'done'
-    assert 'done_provenance' not in drained.payload
+    assert payload['new_status'] == 'blocked'
+    assert payload[COALESCED_STATUS_PATH_KEY] == ['pending', 'in-progress', 'review', 'blocked']
 
 
 @pytest.mark.asyncio
@@ -304,21 +297,21 @@ async def test_a_drained_fold_does_not_carry_a_stale_deferral_entry(buf):
 
 @pytest.mark.asyncio
 async def test_an_older_transition_arriving_late_does_not_revert_the_status(buf):
-    newer = _transition('in-progress', 'done', _at(2))
+    newer = _transition('in-progress', 'review', _at(2))
     older = _transition('pending', 'in-progress', _at(1))
     await buf.push(newer)
     await buf.push(older)
 
     row = await _only_row(buf)
     assert row.payload['old_status'] == 'pending'
-    assert row.payload['new_status'] == 'done'
+    assert row.payload['new_status'] == 'review'
     assert row.timestamp == older.timestamp
 
 
 @pytest.mark.asyncio
 async def test_redelivering_a_folded_away_event_changes_nothing(buf, db_path):
     first = _transition('pending', 'in-progress', _at(0))
-    second = _transition('in-progress', 'done', _at(1))
+    second = _transition('in-progress', 'review', _at(1))
     await buf.push(first)
     await buf.push(second)
     await buf.push(second)
@@ -326,6 +319,91 @@ async def test_redelivering_a_folded_away_event_changes_nothing(buf, db_path):
     row = await _only_row(buf)
     assert row.payload[COALESCED_COUNT_KEY] == 2
     assert len(_raw(db_path, 'SELECT id FROM event_buffer')) == 1
+
+
+# ── a transition into done is a fold barrier ───────────────────────────
+
+_MERGED = {'kind': 'merged', 'commit': 'abc'}
+
+
+def _merged_done(ts: datetime) -> ReconciliationEvent:
+    return _transition('in-progress', 'done', ts, done_provenance=_MERGED)
+
+
+def _reopened(ts: datetime) -> ReconciliationEvent:
+    return _transition('done', 'pending', ts, reopen_reason='regressed', reopen_from='done')
+
+
+def _done_then_reopened() -> list[ReconciliationEvent]:
+    return [_merged_done(_at(0)), _reopened(_at(1))]
+
+
+def _done_lands_inside_a_fold() -> list[ReconciliationEvent]:
+    return [
+        _transition('pending', 'in-progress', _at(0)),
+        _transition('in-progress', 'review', _at(2)),
+        _merged_done(_at(1)),
+    ]
+
+
+async def _push_all(buf: EventBuffer, events: list[ReconciliationEvent]) -> None:
+    for event in events:
+        await buf.push(event)
+
+
+@pytest.mark.asyncio
+async def test_a_reopen_does_not_absorb_the_done_transition_it_follows(buf, db_path):
+    done, reopened = _done_then_reopened()
+    await _push_all(buf, [done, reopened])
+
+    drained = await buf.drain(_PROJECT, run_id='r1')
+    assert len(drained) == 2
+    assert select_done_transitions(drained) == (DoneTransition('644', 'abc'),)
+    [done_row] = [event for event in drained if event.id == done.id]
+    assert done_row.payload == done.payload
+    [stored] = _raw(db_path, 'SELECT coalesce_key FROM event_buffer WHERE id = ?', (done.id,))
+    assert stored['coalesce_key'] is None
+
+
+@pytest.mark.asyncio
+async def test_a_done_arriving_inside_a_folded_span_keeps_its_own_row(buf):
+    await _push_all(buf, _done_lands_inside_a_fold())
+
+    assert await buf.count_buffered(_PROJECT) == 2
+    drained = await buf.drain(_PROJECT, run_id='r1')
+    assert [event.payload['new_status'] for event in drained] == ['review', 'done']
+    assert select_done_transitions(drained) == (DoneTransition('644', 'abc'),)
+
+
+@pytest.mark.asyncio
+async def test_a_done_row_is_never_a_fold_target(buf):
+    done = _merged_done(_at(0))
+    await _push_all(buf, [done, _reopened(_at(1)), _transition('pending', 'in-progress', _at(2))])
+
+    rows = await buf.peek_buffered(_PROJECT, limit=10)
+    assert len(rows) == 2
+    [done_row] = [row for row in rows if row.id == done.id]
+    assert done_row.payload == done.payload
+    [after_done] = [row for row in rows if row.id != done.id]
+    assert after_done.payload[COALESCED_COUNT_KEY] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'sequence', [_done_then_reopened, _done_lands_inside_a_fold],
+    ids=['done_then_reopened', 'done_inside_a_fold'],
+)
+async def test_coalescing_never_changes_what_the_unlanded_path_check_sees(tmp_path, sequence):
+    seen = {}
+    for coalesce in (True, False):
+        b = EventBuffer(db_path=tmp_path / f'{coalesce}.db', coalesce_task_events=coalesce)
+        await b.initialize()
+        try:
+            await _push_all(b, sequence())
+            seen[coalesce] = select_done_transitions(await b.drain(_PROJECT, run_id='r1'))
+        finally:
+            await b.close()
+    assert seen[True] == seen[False] == (DoneTransition('644', 'abc'),)
 
 
 # ── the drain lifecycle keeps its invariants ───────────────────────────
