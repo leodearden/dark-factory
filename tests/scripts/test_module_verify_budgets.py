@@ -57,10 +57,11 @@ see drift between. This file now imports ``min_budget``,
 ``FAMILY_PUBLISHER_PATHS``, ``FAMILY_READER_PATH`` and ``published_pairs`` from
 ``module_budget_family`` — a non-test sibling, on the ``setup_host_sections`` /
 ``systemd_unit_invariants`` precedent already established in this directory —
-imports ``BudgetCensus`` and ``ORCHESTRATOR_BUDGET_CENSUS`` from the non-test
-``verify_budget_census_records`` (task 6172), and takes its setup from the ``root_config`` / ``discover_module_configs`` /
-``executed_for_touched`` fixtures in ``tests/scripts/conftest.py``. Every guard
-in the family still fails entirely on its own.
+reads ``BudgetCensus`` and ``ORCHESTRATOR_BUDGET_CENSUS`` from the non-test
+``verify_budget_census_records`` (task 6172), and takes its setup from the
+``root_config`` / ``discover_module_configs`` / ``executed_for_touched``
+fixtures in ``tests/scripts/conftest.py``. Every guard in the family still
+fails entirely on its own.
 
 The SECOND half named the wrong remedy for a real hazard. The
 ``ORCH_CONFIG_PATH`` anchor IS load-bearing exactly as described, and its
@@ -111,6 +112,7 @@ import textwrap
 from collections.abc import Callable
 
 import pytest
+import verify_budget_census_records as census_records
 import yaml
 from module_budget_family import (
     FAMILY_PUBLISHER_PATHS,
@@ -120,7 +122,6 @@ from module_budget_family import (
     published_pairs,
 )
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from verify_budget_census_records import ORCHESTRATOR_BUDGET_CENSUS, BudgetCensus
 
 from orchestrator import verify
 
@@ -396,8 +397,8 @@ CENSUS_FLOOR_REFUSAL_CEILING = 7200
 # parametrized branch below stays total rather than special-casing one name.
 # Each record is IMPORTED from tests/scripts/verify_budget_census_records.py,
 # its single home, which test_fallback_verify_config.py reads too.
-RULED_BUDGET_CENSUS: dict[str, BudgetCensus] = {
-    'orchestrator': ORCHESTRATOR_BUDGET_CENSUS,
+RULED_BUDGET_CENSUS: dict[str, census_records.BudgetCensus] = {
+    'orchestrator': census_records.ORCHESTRATOR_BUDGET_CENSUS,
 }
 
 
@@ -1779,8 +1780,6 @@ def test_the_ruled_census_is_the_shared_record_the_fleet_table_reads() -> None:
     a re-introduced local copy carrying equal values today is exactly the drift
     a single home exists to prevent, and equality would pass it.
     """
-    import verify_budget_census_records as census_records
-
     assert RULED_BUDGET_CENSUS['orchestrator'] is census_records.ORCHESTRATOR_BUDGET_CENSUS, (
         "RULED_BUDGET_CENSUS['orchestrator'] is not the record at "
         'tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS '
