@@ -607,6 +607,124 @@ your shell profile — it will silently redirect an unrelated invocation at
 the wrong project. Prefer a per-project `.envrc` (direnv) instead, and note
 that direnv isn't installed by default on a fresh host.
 
+### Client feed
+
+#### What the publisher is
+
+One long-running `client-feed publish --config <policy>` per client project,
+run as `client-feed@<name>.service`. Every pass writes that project's
+client-safe evidence to its `out/` (`feed.jsonl`, `state.json`,
+`cursor.json`) and reads its `in/` (`inbox.jsonl`, `engagement.json`), which
+the client portal writes. `scripts/setup-host.sh` renders the unit from
+`scripts/client-feed.service.template` and never enables it. The design is
+`plans/client-feed-prd.md`; what the publisher may open and write is its
+isolation invariant, §8.
+
+#### The policy file
+
+Each instance reads `~/.config/client-feed/<name>.yaml` (PRD §7.6). The schema
+and every default live in `client-feed/src/client_feed/policy.py::Policy`. The
+worked example for this repository is `client-feed/examples/dark-factory.yaml`.
+From the checkout root:
+
+```bash
+install -D -m 0600 client-feed/examples/dark-factory.yaml ~/.config/client-feed/dark-factory.yaml
+```
+
+For a client project, install it under the project's name, then edit
+`project_id`, `project_root`, `out_dir`, `in_dir` and `visible_globs`. The
+publisher refuses to start on a file that does not parse or validate, on a
+`project_root` that is not the top of a git work tree, and on an `out_dir` that
+is missing, a symlink, or not the running user's
+(`client-feed/src/client_feed/policy.py::PolicyProblem`).
+
+#### The two directories
+
+| Directory | Owner:group | Mode | Written by |
+|---|---|---|---|
+| `<root>/<name>/out` | `leo:scoping-intake` | 2750, setgid | the publisher; its files are 0640 (`client-feed/src/client_feed/feed_io.py::FILE_MODE`) |
+| `<root>/<name>/in` | `scoping-intake:scoping-intake` | 2750, setgid | the portal; Leo reads it through the group |
+
+`<root>` is `/var/lib/scoping-intake-feeds` unless moved, and `scoping-intake`
+is the portal account's group. The portal repository creates both directories
+(`sudo ~leo/src/scoping-intake/deploy/install.sh feed <name>`), and the portal
+PRD owns them. The authoritative layout is that repository's
+`deploy/README.md` §"Feeds". If the root moves, point the policy's `out_dir`
+and `in_dir` at the new paths and restart the instance.
+
+`install.sh` adds Leo to the group (`usermod -aG scoping-intake leo`). The
+publisher's user units see the new membership only once Leo's user manager
+restarts. A reboot restarts it; with linger on, logging out does not.
+`sudo systemctl restart user@$(id -u).service` also restarts it, but that
+stops every user unit, the orchestrators and fused-memory included, so treat
+it as a fleet restart and drain first (§8). To check, and to keep the units
+running without a login:
+
+```bash
+systemd-run --user --pipe --wait id -nG   # must list scoping-intake
+loginctl enable-linger leo
+```
+
+#### Enabling an instance
+
+From the checkout root:
+
+```bash
+bash scripts/setup-host.sh       # renders client-feed@.service; enables nothing
+# install the policy (above), then publish one pass; a refusal prints on stderr and exits 1:
+uv run --no-sync --project client-feed client-feed snapshot --config ~/.config/client-feed/<name>.yaml
+systemctl --user enable --now client-feed@<name>.service
+systemctl --user cat client-feed@<name>.service                # the template, repo root and uv path substituted
+systemctl --user show -p ExecStart client-feed@<name>.service  # --config resolved to ~/.config/client-feed/<name>.yaml
+journalctl --user -u client-feed@<name>.service
+```
+
+The unit runs `uv run --no-sync`, so the shared `.venv` must already hold
+`client-feed`. setup-host's sync installs it, and so does
+`scripts/sync-orchestrator-env.sh`. After a template change, re-run setup-host
+and restart the instance. A clean stop exits 0. A refusal exits 1, and systemd
+retries it with a 5s→60s backoff until the cause is fixed.
+
+#### Reading the heartbeat's degraded list
+
+```bash
+uv run --no-sync --project client-feed client-feed dump-state --out-dir <out>
+```
+
+prints the fold of the feed. Its `degraded` is the last heartbeat's list of
+`{source, reason}`, and its `as_of` is that heartbeat's time. An empty list is
+healthy; an `as_of` older than a few intervals means the publisher is not
+running. The sources are `client-feed/src/client_feed/contract.py::Source`.
+What a degraded source holds back is stated in `plans/client-feed-prd.md`
+§12:
+
+- `engagement`: reveals are disabled for the pass (δ entry (d)).
+- `inbox`: the inbox offset is held (δ entry (e)).
+- `git`: a merge commit git cannot read holds the landing batch (γ entry (f)).
+  Unparseable git output and a timed-out `git cat-file --batch` read degrade
+  `git` too (task 7484 entry (c)).
+- `archive`: only that run's archived details are lost (γ entry (f)).
+- `tasks`, `events`: rows that cannot be projected are counted as
+  `skipped N rows: …` (γ entry (f)).
+
+The same failures are WARNING lines in the unit's journal.
+
+#### The isolation check
+
+The isolation gate is ζ's `client-feed/tests/test_isolation.py` (task 6973;
+PRD §10 row ζ, B1, B2, B15 and B22). It lands with ζ and was not yet on main
+on 2026-10-29. The deployment canary is the portal repository's
+`deploy/README.md` §"Check": step 4 (the portal account cannot list
+`/home/leo`) and step 7 (the canary feed).
+
+#### What evidence exists
+
+- Test and criteria evidence exists for pytest projects only: junit
+  injection is pytest-only (PRD §2).
+- Per-test results for merge runs exist only when the client project's
+  `dark-factory-orchestrator.yaml` sets `merge_verify_breadth: full`.
+  Otherwise only task legs carry `test_results`.
+
 ---
 
 ## 4. Watching a run

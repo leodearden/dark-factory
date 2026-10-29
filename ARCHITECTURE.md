@@ -190,6 +190,12 @@ for the whole fleet. Entry: `fused-memory/src/fused_memory/server/main.py`
   load-sampler unit. Discovers orchestrator instances by reading each
   registered project's `dark-factory-orchestrator.yaml` (`escalation.port`);
   reads fused-memory and its own SQLite DBs read-only.
+- **Client feed publisher** — `client-feed@<name>.service`, one instance per
+  client project; setup-host renders the template and enables none. It reads that project's `tasks.db` and
+  `runs.db` read-only, its verify archive, its git objects and its `in/`
+  directory, and writes only its `out/`. Invariant and contract:
+  `plans/client-feed-prd.md` §8 and §7. Operating it:
+  [OPERATIONS.md](OPERATIONS.md) §"Client feed".
 - **`scripts/orchestrator-watchdog.py`** — a systemd-timer oneshot
   (`OnBootSec=30`, `OnUnitActiveSec=60`). Its liveness pass TCP-probes each
   orchestrator's escalation port and revives a wedged unit immediately; its
