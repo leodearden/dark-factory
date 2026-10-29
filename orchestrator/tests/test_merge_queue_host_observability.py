@@ -765,6 +765,27 @@ def _hb_message(caplog) -> str:
     return records[-1].message
 
 
+# The task-5290 tests reach the worker's in-flight deque, heartbeat and reprobe
+# sweep only through these three.
+
+
+def _seat(worker: SpeculativeMergeWorker, *entries: InflightEntry) -> None:
+    """Put *entries* in flight on *worker*, head first."""
+    worker._inflight.extend(entries)
+
+
+def _logged_heartbeat(worker: SpeculativeMergeWorker, caplog) -> str:
+    """Fire *worker*'s heartbeat now and return the line it logged."""
+    with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
+        assert worker._maybe_log_queue_heartbeat(time.time()) is True
+    return _hb_message(caplog)
+
+
+async def _reprobe(worker: SpeculativeMergeWorker) -> None:
+    """Run one reprobe sweep of *worker*'s benched hosts now."""
+    await worker._reprobe_quarantined_hosts(time.time())
+
+
 def _worker_with_events(
     git_ops: GitOps,
     tmp_path: Path,
@@ -989,19 +1010,19 @@ class TestRecoveryIgnoresOccupancy:
         verify_task = asyncio.create_task(asyncio.Event().wait())
         lease = HostLease(name='laptop', runner=MagicMock(), is_local=False)
         req = _make_req('occ-phantom', 'task/occ-phantom', config, git_repo)
-        worker._inflight.append(_make_entry(req, lease, verify_task=verify_task))
+        _seat(worker, _make_entry(req, lease, verify_task=verify_task))
         try:
             assert worker.snapshot()['occupancy']['by_host'] == {'laptop': 'occ-phantom'}
 
             runners['laptop'].health.return_value = False
-            await worker._reprobe_quarantined_hosts(time.time())
+            await _reprobe(worker)
 
             assert [esc.id for esc in queue.get_pending()] == [l1.id]
             assert queue.get_by_task(l1.task_id, status='resolved') == []
             assert _by_name(worker.snapshot())['laptop']['quarantined'] is True
 
             runners['laptop'].health.return_value = True
-            await worker._reprobe_quarantined_hosts(time.time())
+            await _reprobe(worker)
 
             assert queue.get_pending() == []
             [resolved] = queue.get_by_task(l1.task_id, status='resolved')
@@ -1113,6 +1134,7 @@ def _lease_wire(
     }
 
 
+
 @pytest.mark.asyncio
 class TestOccupancyLeaseFidelity:
     """occupancy.leases / verifying_by_host: what each held lease is doing.
@@ -1131,15 +1153,13 @@ class TestOccupancyLeaseFidelity:
         req_local = _make_req('occ-run', 'task/occ-run', config, git_repo)
         req_laptop = _make_req('occ-done', 'task/occ-done', config, git_repo)
         async with _VerifyTasks() as tasks:
-            worker._inflight.append(
+            _seat(
+                worker,
                 _make_entry(req_local, _local_lease(), verify_task=tasks.running()),
-            )
-            worker._inflight.append(
                 _make_entry(req_laptop, _remote_lease(), verify_task=await tasks.finished()),
             )
             occ = worker.snapshot()['occupancy']
-            with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
-                assert worker._maybe_log_queue_heartbeat(time.time()) is True
+            msg = _logged_heartbeat(worker, caplog)
 
         assert occ['leases'] == [
             _lease_wire(req_local, 'local', 'verifying'),
@@ -1150,7 +1170,6 @@ class TestOccupancyLeaseFidelity:
         assert occ['inflight_by_host'] == {'local': ['occ-run'], 'laptop': ['occ-done']}
         assert occ['hosts_busy'] == 2
         assert occ['inflight_total'] == 2
-        msg = _hb_message(caplog)
         assert msg.endswith(' | verifying 1/2 hosts: local=occ-run laptop=occ-done(finished)'), msg
 
     @pytest.mark.parametrize(
@@ -1174,15 +1193,13 @@ class TestOccupancyLeaseFidelity:
         req = _make_req('occ-tail', 'task/occ-tail', config, git_repo)
         async with _VerifyTasks() as tasks:
             lease = _remote_lease(dispatch_in_flight=dispatch_in_flight)
-            worker._inflight.append(_make_entry(req, lease, verify_task=tasks.running()))
+            _seat(worker, _make_entry(req, lease, verify_task=tasks.running()))
             occ = worker.snapshot()['occupancy']
-            with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
-                assert worker._maybe_log_queue_heartbeat(time.time()) is True
+            msg = _logged_heartbeat(worker, caplog)
 
         assert occ['leases'] == [_lease_wire(req, 'laptop', activity)]
         assert occ['verifying_by_host'] == verifying_by_host
         assert occ['by_host'] == {'laptop': 'occ-tail'}
-        msg = _hb_message(caplog)
         assert msg.endswith(segment), msg
 
     @pytest.mark.parametrize(
@@ -1205,7 +1222,7 @@ class TestOccupancyLeaseFidelity:
         async with _VerifyTasks() as tasks:
             entry = _make_entry(req, lease, verify_task=await tasks.finished())
             entry.gate = _parked_gate(req, tasks.running(), git_repo)
-            worker._inflight.append(entry)
+            _seat(worker, entry)
             occ = worker.snapshot()['occupancy']
 
         assert occ['leases'] == [_lease_wire(req, lease.name, activity)]
@@ -1221,22 +1238,19 @@ class TestOccupancyLeaseFidelity:
         req_local = _make_req('occ-ql', 'task/occ-ql', config, git_repo)
         req_laptop = _make_req('occ-q', 'task/occ-q', config, git_repo)
         async with _VerifyTasks() as tasks:
-            worker._inflight.append(
+            _seat(
+                worker,
                 _make_entry(req_local, _local_lease(), verify_task=tasks.running()),
-            )
-            worker._inflight.append(
                 _make_entry(req_laptop, _remote_lease(), verify_task=tasks.running()),
             )
             occ = worker.snapshot()['occupancy']
-            with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
-                assert worker._maybe_log_queue_heartbeat(time.time()) is True
+            msg = _logged_heartbeat(worker, caplog)
 
         assert occ['leases'] == [
             _lease_wire(req_local, 'local', 'verifying'),
             _lease_wire(req_laptop, 'laptop', 'verifying', host_quarantined=True),
         ]
         assert occ['verifying_by_host'] == {'local': ['occ-ql']}
-        msg = _hb_message(caplog)
         assert (
             ' | verifying 1/2 hosts: local=occ-ql laptop=occ-q(verifying,quarantined) | DEGRADED'
         ) in msg, msg
@@ -1251,25 +1265,23 @@ class TestOccupancyLeaseFidelity:
         """
         worker, _alloc, _runner, _db = _worker_with_events(git_ops, tmp_path, 'disp')
         req = _make_req('occ-disp', 'task/occ-disp', config, git_repo)
-        worker._inflight.append(_make_entry(req, _remote_lease()))
+        _seat(worker, _make_entry(req, _remote_lease()))
         occ = worker.snapshot()['occupancy']
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
-            assert worker._maybe_log_queue_heartbeat(time.time()) is True
+        msg = _logged_heartbeat(worker, caplog)
 
         assert occ['leases'] == [_lease_wire(req, 'laptop', 'dispatching')]
         assert occ['verifying_by_host'] == {'laptop': ['occ-disp']}
-        msg = _hb_message(caplog)
         assert msg.endswith(' | verifying 1/2 hosts: laptop=occ-disp'), msg
 
     async def test_heartbeat_event_carries_leases(
-        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path,
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
     ) -> None:
         """The persisted merge_heartbeat event carries the activity view too."""
         worker, _alloc, _runner, db_path = _worker_with_events(git_ops, tmp_path, 'evt')
         req = _make_req('occ-evt', 'task/occ-evt', config, git_repo)
         async with _VerifyTasks() as tasks:
-            worker._inflight.append(_make_entry(req, _local_lease(), verify_task=tasks.running()))
-            assert worker._maybe_log_queue_heartbeat(time.time()) is True
+            _seat(worker, _make_entry(req, _local_lease(), verify_task=tasks.running()))
+            _logged_heartbeat(worker, caplog)
 
         [(raw,)] = _read_heartbeat_key(db_path, 'occupancy')
         occ = _json.loads(raw)
