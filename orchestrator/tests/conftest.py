@@ -75,8 +75,8 @@ from df_pytest_isolation import (  # noqa: E402
     _df_fleet_dir_redirect,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
-    _df_no_leaked_drain_processes,  # noqa: F401  — the binding IS the wiring
     _df_no_synthetic_heartbeats_in_live_fleet,  # noqa: F401  — the binding IS the wiring
+    arm_leaked_drain_process_guard,
     reject_unsafe_basetemp,
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
@@ -549,7 +549,7 @@ def df_warm_lane_script_dir(monkeypatch, tmp_path: Path):
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Refuse an unsafe ``--basetemp``, then register ``real_psi_reader`` (task 2418).
+    """Refuse an unsafe ``--basetemp``, arm the drain-leak guard, register ``real_psi_reader``.
 
     The ``reject_unsafe_basetemp`` call comes FIRST and is unrelated to the
     marker below: it aborts collection when ``--basetemp`` points inside a live
@@ -567,6 +567,7 @@ def pytest_configure(config: pytest.Config) -> None:
     load-bearing yet.
     """
     reject_unsafe_basetemp(config)
+    arm_leaked_drain_process_guard(config)
     config.addinivalue_line(
         'markers',
         'real_psi_reader: opt a test OUT of the autouse `_hermetic_psi_reader` '

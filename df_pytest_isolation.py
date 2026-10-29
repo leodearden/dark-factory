@@ -195,14 +195,15 @@ do not "fix" it back into line with the others.
 
 WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO.  Ten conftests
 import from this module; the git ceiling and the deploy-clock guard are in
-all ten.  ``_df_no_leaked_drain_processes`` is bound in nine: the ROOT
-conftest (covering ``tests/``) and ``scripts/tests/conftest.py`` — the two
-rootdirs that spawn the drain script — plus the seven subproject rootdirs
-(``cockpit``, ``dashboard``, ``escalation``, ``fused-memory``,
-``orchestrator``, ``sampler``, ``shared``), each of which runs as its own
-pytest session and so stamps its own token.  In those nine a green run means
-the teardown sweep ran; see ``_df_no_leaked_drain_processes`` for its
-detection window.  The tenth, ``client-feed``, does not bind the guard, so no
+all ten.  ``_df_no_leaked_drain_processes`` is armed in nine: bound by
+import in the ROOT conftest (covering ``tests/``) and
+``scripts/tests/conftest.py`` — the two rootdirs that spawn the drain
+script — and armed by :func:`arm_leaked_drain_process_guard` in the seven
+subproject rootdirs (``cockpit``, ``dashboard``, ``escalation``,
+``fused-memory``, ``orchestrator``, ``sampler``, ``shared``), each of which
+runs as its own pytest session and so stamps its own token.  In those nine a
+green run means the teardown sweep ran; see ``_df_no_leaked_drain_processes``
+for its detection window.  The tenth, ``client-feed``, arms no guard, so no
 sweep runs there and a green ``client-feed`` run is unmeasured.
 
 Task 3799's ``_df_fleet_dir_redirect`` / ``_df_no_synthetic_heartbeats_in_live_fleet``
@@ -2242,6 +2243,33 @@ def _df_no_leaked_drain_processes():
                 with contextlib.suppress(OSError):
                     os.kill(pid, signal.SIGKILL)
             pytest.fail(reason, pytrace=False)
+
+
+LEAKED_DRAIN_GUARD_PLUGIN = 'df-leaked-drain-process-guard'
+
+
+class _LeakedDrainProcessGuardPlugin:
+    """The plugin :func:`arm_leaked_drain_process_guard` registers: that guard alone."""
+
+    _df_no_leaked_drain_processes = _df_no_leaked_drain_processes
+
+
+def arm_leaked_drain_process_guard(config: pytest.Config) -> None:
+    """Arm :func:`_df_no_leaked_drain_processes` for this session, from ``pytest_configure``.
+
+    The other way to arm it, binding the fixture into a conftest by import, costs
+    an unowned ``# noqa: F401``, and INV-12's ratchet keys those by line text, so
+    the identical binding repeated across conftests overruns the baseline
+    (esc-3932-9).  ``pytest_plugins = ('df_pytest_isolation',)`` needs no
+    suppression, but it arms EVERY autouse fixture in this module and pytest
+    refuses it in a conftest discovered mid-collection.  A plugin holding only
+    this guard has neither cost.
+
+    Idempotent, because a session that collects several test roots runs each
+    root's ``pytest_configure``.
+    """
+    if not config.pluginmanager.has_plugin(LEAKED_DRAIN_GUARD_PLUGIN):
+        config.pluginmanager.register(_LeakedDrainProcessGuardPlugin, LEAKED_DRAIN_GUARD_PLUGIN)
 
 
 # ---------------------------------------------------------------------------

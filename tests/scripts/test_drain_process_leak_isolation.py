@@ -1345,3 +1345,69 @@ class TestTheGuardFailsTheRunEndToEnd:
             f'stdout={result.stdout!r} stderr={result.stderr!r}'
         )
         assert 'LEAKED' not in result.stdout
+
+
+def _arming_conftest() -> str:
+    """Source for a nested conftest, one directory below the root, that arms the guard.
+
+    It reaches the guard through :func:`df_pytest_isolation.arm_leaked_drain_process_guard`
+    from ``pytest_configure``, the way the subproject conftests do, and binds no
+    fixture by import.
+    """
+    return (
+        'import sys\n'
+        'from pathlib import Path\n'
+        '\n'
+        'sys.path.insert(0, str(Path(__file__).resolve().parents[1]))\n'
+        '\n'
+        'from df_pytest_isolation import arm_leaked_drain_process_guard\n'
+        '\n'
+        '\n'
+        'def pytest_configure(config):\n'
+        '    arm_leaked_drain_process_guard(config)\n'
+    )
+
+
+def _armed_suite(suite: str, *, leaks: bool) -> dict[str, str]:
+    """One test root, *suite*, armed by :func:`_arming_conftest`.
+
+    *suite* must not start with ``test``: pytest loads such a directory's
+    conftest with the initial conftests, and this tree exists to have it
+    discovered mid-collection instead.  It also names the test module, since
+    two suites' modules may not share a basename.
+    """
+    return {
+        f'{suite}/conftest.py': _arming_conftest(),
+        f'{suite}/{_LEAKER_NAME}': _NESTED_LEAKER,
+        f'{suite}/test_forgetful_{suite}.py': _nested_test_source(leaks=leaks),
+    }
+
+
+class TestArmLeakedDrainProcessGuard:
+    """The subproject conftests' wiring arms the guard with no conftest binding.
+
+    Each tree is collected whole from the nested root, so every suite's conftest
+    is discovered mid-collection. That is where ``pytest_plugins`` is refused,
+    and the case the helper exists to handle.
+    """
+
+    def test_a_leak_under_an_armed_suite_fails_the_run(self, tmp_path: Path) -> None:
+        root = tmp_path / 'armed'
+        pidfile = root / 'suite_a' / _LEAKED_PIDFILE_NAME
+        try:
+            result = run_nested_pytest(root, _armed_suite('suite_a', leaks=True))
+            _assert_the_leak_failed_the_run(result, pidfile)
+        finally:
+            _reap_leaker(_read_pid_file(pidfile))
+
+    def test_two_suites_arming_in_one_session_run_clean(self, tmp_path: Path) -> None:
+        """Arming twice is a no-op, not pytest's duplicate-plugin error."""
+        result = run_nested_pytest(tmp_path / 'two-roots', {
+            **_armed_suite('suite_a', leaks=False),
+            **_armed_suite('suite_b', leaks=False),
+        })
+
+        assert result.returncode == 0, (
+            f'stdout={result.stdout!r} stderr={result.stderr!r}'
+        )
+        assert '2 passed' in result.stdout, result.stdout
