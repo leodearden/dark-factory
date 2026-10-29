@@ -330,7 +330,7 @@ class TestMain:
         assert record['redacted'] == []
         assert record['escalation_error'] is None
 
-    @pytest.mark.parametrize('endpoint_suffix', ['/mcp', '/mcp/'])
+    @pytest.mark.parametrize('endpoint_suffix', ['/mcp', '/mcp/'])  # mcp-url-sweep: allow input the code under test must normalise; the stub asserts it reached /mcp
     def test_a_sweep_that_redacts_files_one_escalation_on_the_configured_server(
         self, secretless_environ, monkeypatch, tmp_path, capsys, endpoint_suffix
     ):

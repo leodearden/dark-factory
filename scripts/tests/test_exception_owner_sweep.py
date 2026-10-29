@@ -1233,7 +1233,7 @@ def _served_tool_calls(server: StubMcpServer) -> list[tuple[str, object]]:
     ]
 
 
-@pytest.mark.parametrize('endpoint_suffix', ['/mcp', '/mcp/'])
+@pytest.mark.parametrize('endpoint_suffix', ['/mcp', '/mcp/'])  # mcp-url-sweep: allow input the code under test must normalise; the stub asserts it reached /mcp
 def test_build_ports_reach_fused_memory_at_its_base_and_escalation_at_its_endpoint(
     tmp_path: Path, endpoint_suffix: str
 ):
