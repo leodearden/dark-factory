@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from _git_fixtures import seed_repo
+from _unreadable_head import make_head_unreadable
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -43,12 +44,6 @@ def workflow(repo: Path) -> TaskWorkflow:
     return workflow
 
 
-async def _make_head_unreadable(repo: Path) -> None:
-    """Point HEAD at an unborn branch, so ``git rev-parse HEAD`` exits 128."""
-    rc, _, err = await _run(['git', 'symbolic-ref', 'HEAD', 'refs/heads/unborn-head'], cwd=repo)
-    assert rc == 0, err
-
-
 @pytest.mark.asyncio
 class TestGetHeadCommit:
     async def test_readable_head_returns_the_sha(self, repo, workflow):
@@ -57,14 +52,14 @@ class TestGetHeadCommit:
         assert await workflow._get_head_commit() == expected.strip()
 
     async def test_unreadable_head_returns_empty_string(self, repo, workflow):
-        await _make_head_unreadable(repo)
+        await make_head_unreadable(repo)
 
         assert await workflow._get_head_commit() == ''
 
     async def test_unreadable_head_logs_a_warning_with_the_exit_code(
         self, repo, workflow, caplog,
     ):
-        await _make_head_unreadable(repo)
+        await make_head_unreadable(repo)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
             await workflow._get_head_commit()

@@ -25,6 +25,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _unreadable_head import make_head_unreadable
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -383,7 +384,7 @@ class TestRederiveStepStatusDefensive:
         artifacts.append_iteration_log({
             'agent': 'implementer', 'steps_completed': ['step-1'], 'commit': step_commit,
         })
-        await _run(['git', 'symbolic-ref', 'HEAD', 'refs/heads/unborn-head'], cwd=wt)
+        await make_head_unreadable(wt)
 
         result = await workflow._rederive_step_status_from_branch_state()
 

@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _unreadable_head import make_head_unreadable
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
@@ -377,7 +378,7 @@ class TestReconcileDoneStepCommits:
         assert step_commit, 'Setup: expected a real commit to be made'
 
         workflow.plan = _write_done_step_plan(artifacts, 'step-1', step_commit)
-        await _run(['git', 'symbolic-ref', 'HEAD', 'refs/heads/unborn-head'], cwd=wt)
+        await make_head_unreadable(wt)
 
         await workflow._reconcile_done_step_commits()
 
