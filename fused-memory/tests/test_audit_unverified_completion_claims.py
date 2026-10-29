@@ -726,7 +726,8 @@ class TestReadOnlyByConstruction:
         test_reader_constructs_no_graphiti_driver went AST-based. Pinning
         source text also punished a second legitimate mention of a constant.
         The behavioural guarantee lives in _FakeGraph (which raises if the
-        writable ``query`` is ever issued) and in assert_read_only_command;
+        writable ``query`` is ever issued) and in
+        ``fused_memory/backends/falkor_read_only.py::ReadOnlyGraphProxy``;
         this test is the structural backstop for a mutator that never runs
         under test.
         """

@@ -34,13 +34,14 @@ from typing import Any
 
 import pytest
 from _fm_helpers import falkor_skipif, load_script_module
+from redis.exceptions import ConnectionError as RedisConnectionError
 from shared.testing_streams import (
     StdoutWithAFailingFlush,
     StdoutWithAFailingWrite,
     closed_pipe_stdout,
 )
 
-from fused_memory.backends.falkor_read_only import NonReadOnlyCommandError, open_graph
+from fused_memory.backends.falkor_read_only import ReadOnlyGraphProxy, open_graph
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'local_memory_models_eval' / 'build_corpus.py'
@@ -803,26 +804,17 @@ class _UnreachableDouble(_FalkorDouble):
 
 
 class _GuardFiringDouble(_FalkorDouble):
-    """A graph handle on which the shared read-only guard fires, refusing GRAPH.QUERY.
+    """A handle whose read drifts onto the writable ``query``, resolved through the real shared guard.
 
-    Subclasses ``_FalkorDouble`` so every write-path tripwire stays armed.
+    The builder's read resolves only ``ro_query``, which the guard forwards, so
+    the guard cannot fire on it today; this double stands in for a read path
+    that regressed. Subclasses ``_FalkorDouble`` so every write-path tripwire
+    stays armed.
     """
 
     async def ro_query(self, cypher, *args, **kwargs):
         self.ro_queries.append(cypher)
-        raise NonReadOnlyCommandError('GRAPH.QUERY')
-
-
-def _redis_connection_error(message: str) -> BaseException:
-    """The exception a down FalkorDB actually surfaces, imported at call time.
-
-    Local rather than a top-level import so collection never depends on what
-    is only a transitive dependency (graphiti-core[falkordb] -> falkordb ->
-    redis).
-    """
-    from redis.exceptions import ConnectionError as RedisConnectionError  # noqa: PLC0415
-
-    return RedisConnectionError(message)
+        return await ReadOnlyGraphProxy(self).query(cypher, *args, **kwargs)
 
 
 def _row(uuid: str, month: str = '2026-05', kind: str = 'temporal_facts') -> list[object]:
@@ -948,16 +940,19 @@ class TestReaderIsReadOnly:
             asyncio.run(double.execute_command('GRAPH.QUERY', 'g', 'CREATE (n:Junk)'))
         assert double.violations == ['execute_command:GRAPH.QUERY']
 
-    def test_reader_rejects_a_non_ro_command_client_side(self):
+    def test_a_guard_refusal_on_the_read_path_is_a_corpus_build_error(self):
         """A client-side guard on top of the server-side one.
 
-        A write is refused server-side anyway, but the shared guard firing on
-        the real read path reaches the caller as a typed CorpusBuildError
-        rather than a redis error surfacing from three layers down.
+        A write is refused server-side anyway, but should the shared guard ever
+        fire on the builder's read, the refusal reaches the caller as a typed
+        CorpusBuildError rather than a redis error surfacing from three layers
+        down, and the writable primitive is never called.
         """
+        double = _GuardFiringDouble([_row('u1')])
         with pytest.raises(_mod.CorpusBuildError) as exc:
-            _fetch(_GuardFiringDouble([_row('u1')]))
+            _fetch(double)
         assert 'GRAPH.RO_QUERY' in str(exc.value)
+        assert double.violations == []
 
 
 class TestNoGraphitiDriverIsConstructed:
@@ -2586,13 +2581,11 @@ class TestAnUnreachableStoreIsATypedErrorNotATraceback:
         FalkorDB case escape as a traceback. Pinned as a premise so the reason
         for the second exception type cannot be lost to a later tidy-up.
         """
-        from redis.exceptions import ConnectionError as RedisConnectionError  # noqa: PLC0415
-
         assert not issubclass(RedisConnectionError, OSError)
 
     @pytest.mark.parametrize(
         'make_exc',
-        [_redis_connection_error, OSError],
+        [RedisConnectionError, OSError],
         ids=['redis-connection-error', 'oserror'],
     )
     def test_an_unreachable_store_exits_run_failed_under_verify(
@@ -2611,7 +2604,7 @@ class TestAnUnreachableStoreIsATypedErrorNotATraceback:
 
     @pytest.mark.parametrize(
         'make_exc',
-        [_redis_connection_error, OSError],
+        [RedisConnectionError, OSError],
         ids=['redis-connection-error', 'oserror'],
     )
     def test_an_unreachable_store_exits_run_failed_under_build(
@@ -2646,7 +2639,7 @@ class TestAnUnreachableStoreIsATypedErrorNotATraceback:
             's',
             '--out',
             str(out),
-            double=_UnreachableDouble(_redis_connection_error('falkordb is down')),
+            double=_UnreachableDouble(RedisConnectionError('falkordb is down')),
         )
         err = capsys.readouterr().err
         assert err.startswith('error: ')
@@ -2790,7 +2783,7 @@ class TestAWriteFailureIsNotBlamedOnTheStore:
             's',
             '--out',
             str(out),
-            double=_UnreachableDouble(_redis_connection_error('falkordb is down')),
+            double=_UnreachableDouble(RedisConnectionError('falkordb is down')),
         )
         err = capsys.readouterr().err
         assert code == _mod.EXIT_RUN_FAILED

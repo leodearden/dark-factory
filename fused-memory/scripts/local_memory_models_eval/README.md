@@ -175,9 +175,11 @@ guarantee.
 The builder issues exactly one `GRAPH.RO_QUERY`. Read-only here is
 **server-enforced**, not a client-side promise: a `CREATE` issued through that
 command path is refused by FalkorDB and materializes nothing. A client-side
-guard sits on top of it so a violation surfaces as a typed `CorpusBuildError`
-at the seam that owns the guarantee, rather than as a redis error three layers
-down. Both the guard and the client opener live in
+guard sits on top of it: the graph handle the builder reads through forwards
+only the read primitive, so no write primitive can even be resolved on it.
+Should that guard ever fire on the builder's read, the refusal surfaces as a
+typed `CorpusBuildError` rather than as a redis error three layers down. Both
+the guard and the client opener live in
 `fused-memory/src/fused_memory/backends/falkor_read_only.py`, the read-only
 seam every audit and corpus script shares.
 

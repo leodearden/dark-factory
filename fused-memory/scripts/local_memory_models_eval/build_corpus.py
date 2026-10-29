@@ -781,9 +781,11 @@ class EpisodeReader:
         denominator. Content is the replay experiment's independent variable,
         so an unusable one is exactly the condition that must be loud.
 
-        The shared guard refusing a non-``GRAPH.RO_QUERY`` command surfaces as
-        a :class:`CorpusBuildError` too, so it reaches the CLI as an
-        ``error:`` line and exit 1 rather than a traceback.
+        Should the shared guard ever refuse a primitive on this read, the
+        refusal surfaces as a :class:`CorpusBuildError` too, so it reaches the
+        CLI as an ``error:`` line and exit 1 rather than a traceback. It cannot
+        fire today: the read resolves only ``ro_query``, which the guard
+        forwards.
         """
         try:
             rows = await self._reader.read_unpaged(POPULATION_CYPHER)
