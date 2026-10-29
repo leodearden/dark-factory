@@ -203,8 +203,8 @@ subproject rootdirs (``cockpit``, ``dashboard``, ``escalation``,
 ``fused-memory``, ``orchestrator``, ``sampler``, ``shared``), each of which
 runs as its own pytest session and so stamps its own token.  In those nine a
 green run means the teardown sweep ran; see ``_df_no_leaked_drain_processes``
-for its detection window.  The tenth, ``client-feed``, arms no guard, so no
-sweep runs there and a green ``client-feed`` run is unmeasured.
+for its detection window.  The tenth, ``client-feed``, does not arm this
+guard, so no sweep runs there and a green ``client-feed`` run is unmeasured.
 
 Task 3799's ``_df_fleet_dir_redirect`` / ``_df_no_synthetic_heartbeats_in_live_fleet``
 pair is a SEPARATE defence, bound in three rootdirs: root ``tests/``,
@@ -2245,7 +2245,7 @@ def _df_no_leaked_drain_processes():
             pytest.fail(reason, pytrace=False)
 
 
-LEAKED_DRAIN_GUARD_PLUGIN = 'df-leaked-drain-process-guard'
+_LEAKED_DRAIN_GUARD_PLUGIN = 'df-leaked-drain-process-guard'
 
 
 class _LeakedDrainProcessGuardPlugin:
@@ -2257,19 +2257,11 @@ class _LeakedDrainProcessGuardPlugin:
 def arm_leaked_drain_process_guard(config: pytest.Config) -> None:
     """Arm :func:`_df_no_leaked_drain_processes` for this session, from ``pytest_configure``.
 
-    The other way to arm it, binding the fixture into a conftest by import, costs
-    an unowned ``# noqa: F401``, and INV-12's ratchet keys those by line text, so
-    the identical binding repeated across conftests overruns the baseline
-    (esc-3932-9).  ``pytest_plugins = ('df_pytest_isolation',)`` needs no
-    suppression, but it arms EVERY autouse fixture in this module and pytest
-    refuses it in a conftest discovered mid-collection.  A plugin holding only
-    this guard has neither cost.
-
     Idempotent, because a session that collects several test roots runs each
     root's ``pytest_configure``.
     """
-    if not config.pluginmanager.has_plugin(LEAKED_DRAIN_GUARD_PLUGIN):
-        config.pluginmanager.register(_LeakedDrainProcessGuardPlugin, LEAKED_DRAIN_GUARD_PLUGIN)
+    if not config.pluginmanager.has_plugin(_LEAKED_DRAIN_GUARD_PLUGIN):
+        config.pluginmanager.register(_LeakedDrainProcessGuardPlugin, _LEAKED_DRAIN_GUARD_PLUGIN)
 
 
 # ---------------------------------------------------------------------------

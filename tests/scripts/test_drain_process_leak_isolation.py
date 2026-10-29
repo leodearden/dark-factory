@@ -1386,16 +1386,24 @@ def _armed_suite(suite: str, *, leaks: bool) -> dict[str, str]:
 class TestArmLeakedDrainProcessGuard:
     """The subproject conftests' wiring arms the guard with no conftest binding.
 
-    Each tree is collected whole from the nested root, so every suite's conftest
-    is discovered mid-collection. That is where ``pytest_plugins`` is refused,
-    and the case the helper exists to handle.
+    A suite named on the command line loads its conftest before configure, as a
+    subproject's own ``pytest tests/`` does. A tree collected whole from the
+    nested root discovers it mid-collection instead, where ``pytest_plugins``
+    is refused.
     """
 
-    def test_a_leak_under_an_armed_suite_fails_the_run(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        'targets', [('suite_a',), ()], ids=['loaded-at-startup', 'found-mid-collection'],
+    )
+    def test_a_leak_under_an_armed_suite_fails_the_run(
+        self, tmp_path: Path, targets: tuple[str, ...],
+    ) -> None:
         root = tmp_path / 'armed'
         pidfile = root / 'suite_a' / _LEAKED_PIDFILE_NAME
         try:
-            result = run_nested_pytest(root, _armed_suite('suite_a', leaks=True))
+            result = run_nested_pytest(
+                root, _armed_suite('suite_a', leaks=True), targets=targets,
+            )
             _assert_the_leak_failed_the_run(result, pidfile)
         finally:
             _reap_leaker(_read_pid_file(pidfile))
