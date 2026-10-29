@@ -1766,16 +1766,17 @@ class LeaseActivity(StrEnum):
     """What an in-flight entry's held host lease is doing (task 5290).
 
     DISPATCHING and VERIFYING are the live members: work is about to run, or
-    runs, on the leased host.  POST_DISPATCH is a remote lease with no live
-    ssh dispatch while work still runs on THIS host: the dispatch returned
-    (task 2822's cross-check, a task-6155 gate re-verify) or, briefly, has
-    not yet claimed (the main-mirror push before it).  FINISHED holds the
-    lease until finalize with nothing left to run.
+    runs, on the leased host.  NO_LIVE_DISPATCH is a remote lease with no
+    live ssh dispatch while its verify task still runs on THIS host, either
+    before the dispatch claims its request (the main-mirror push, which can
+    hang on an ssh connect) or after it returned (task 2822's cross-check, a
+    task-6155 gate re-verify); the runner does not tell the two apart.
+    FINISHED holds the lease until finalize with nothing left to run.
     """
 
     DISPATCHING = 'dispatching'
     VERIFYING = 'verifying'
-    POST_DISPATCH = 'post_dispatch'
+    NO_LIVE_DISPATCH = 'no_live_dispatch'
     FINISHED = 'finished'
 
     @property
@@ -1786,10 +1787,54 @@ class LeaseActivity(StrEnum):
 def remote_dispatch_live(lease: HostLease) -> bool:
     """THE "an ssh dispatch is live on this remote lease" predicate (task 5290).
 
-    Shared by Abort trigger 3 and :attr:`InflightEntry.lease_activity`.  A
-    runner without ``dispatch_in_flight`` reads live, trigger 3's fail-safe.
+    Shared by Abort trigger 3 and :func:`lease_activity`.  A runner without
+    ``dispatch_in_flight`` reads live, trigger 3's fail-safe.
     """
     return not lease.is_local and bool(getattr(lease.runner, 'dispatch_in_flight', True))
+
+
+def lease_activity(lease: HostLease, pending_task: asyncio.Task[object] | None) -> LeaseActivity:
+    """What *lease* is doing while finalize waits on *pending_task* (task 5290).
+
+    *pending_task* is :attr:`InflightEntry.pending_task`, so a parked gate
+    re-verify reads as running.
+    """
+    if pending_task is None:
+        return LeaseActivity.DISPATCHING
+    if pending_task.done():
+        return LeaseActivity.FINISHED
+    if lease.is_local or remote_dispatch_live(lease):
+        return LeaseActivity.VERIFYING
+    return LeaseActivity.NO_LIVE_DISPATCH
+
+
+@dataclass(frozen=True)
+class LeaseRow:
+    """One held host lease: who holds it and what it is doing (task 5290).
+
+    The typed row behind ``snapshot()``'s ``occupancy.leases`` (:meth:`to_wire`)
+    and the heartbeat's ``verifying N/M hosts`` segment.
+    """
+
+    host: str
+    task_id: str
+    request_id: str
+    activity: LeaseActivity
+    host_quarantined: bool
+
+    @property
+    def counts_verifying(self) -> bool:
+        """Whether it counts toward ``verifying_by_host``: live, on a host not quarantined."""
+        return self.activity.is_live and not self.host_quarantined
+
+    def to_wire(self) -> dict[str, str | bool]:
+        return {
+            'host': self.host,
+            'task_id': self.task_id,
+            'request_id': self.request_id,
+            'activity': self.activity.value,
+            'host_quarantined': self.host_quarantined,
+        }
 
 
 @dataclass
@@ -1901,20 +1946,6 @@ class InflightEntry:
     def pending_task(self) -> asyncio.Task[object] | None:
         """The task finalize waits for: the parked gate's, else the verify's."""
         return self.gate.task if self.gate is not None else self.verify_task
-
-    @property
-    def lease_activity(self) -> LeaseActivity | None:
-        """What this entry's lease is doing, read off :attr:`pending_task`; None without one."""
-        if self.lease is None:
-            return None
-        task = self.pending_task
-        if task is None:
-            return LeaseActivity.DISPATCHING
-        if task.done():
-            return LeaseActivity.FINISHED
-        if self.lease.is_local or remote_dispatch_live(self.lease):
-            return LeaseActivity.VERIFYING
-        return LeaseActivity.POST_DISPATCH
 
     @property
     def in_verify_frontier(self) -> bool:

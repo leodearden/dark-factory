@@ -136,9 +136,12 @@ occupant when two entries share a host. All four are **lease** occupancy, and a
 lease is never evidence that its host is reachable: a finished verify holds its
 lease until finalize, and a lease can sit on a host benched since it was taken.
 Whether a verify really runs on a host is `leases[].activity` (`dispatching`,
-`verifying`, `post_dispatch`, `finished`) with `leases[].host_quarantined`, and
+`verifying`, `no_live_dispatch`, `finished`) with `leases[].host_quarantined`, and
 `verifying_by_host`, which counts the live leases on unquarantined hosts and is
 the `N` of the heartbeat's `verifying N/M hosts` line (task 5290).
+`no_live_dispatch` is a remote lease whose verify task runs on THIS host with no
+ssh dispatch live: either before the dispatch claims (the main-mirror push, which
+can hang on an ssh connect) or after it returned (a cross-check or gate re-verify).
 
 ---
 

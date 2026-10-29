@@ -1129,12 +1129,12 @@ class TestOccupancyLeaseFidelity:
     @pytest.mark.parametrize(
         ('dispatch_in_flight', 'activity', 'verifying_by_host', 'segment'),
         [
-            (False, 'post_dispatch', {}, ' | verifying 0/2 hosts: laptop=occ-tail(post_dispatch)'),
+            (False, 'no_live_dispatch', {}, ' | verifying 0/2 hosts: laptop=occ-tail(no_live_dispatch)'),
             (True, 'verifying', {'laptop': ['occ-tail']}, ' | verifying 1/2 hosts: laptop=occ-tail'),
         ],
         ids=['dispatch-returned', 'dispatch-live'],
     )
-    async def test_remote_lease_after_dispatch_returned_is_post_dispatch(
+    async def test_remote_lease_after_dispatch_returned_has_no_live_dispatch(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
         dispatch_in_flight: bool, activity: str, verifying_by_host: dict, segment: str,
     ) -> None:
@@ -1160,7 +1160,7 @@ class TestOccupancyLeaseFidelity:
 
     @pytest.mark.parametrize(
         ('is_local', 'activity'),
-        [(True, 'verifying'), (False, 'post_dispatch')],
+        [(True, 'verifying'), (False, 'no_live_dispatch')],
         ids=['local', 'remote-dispatch-returned'],
     )
     async def test_parked_gate_reverify_counts_as_running(
@@ -1170,7 +1170,7 @@ class TestOccupancyLeaseFidelity:
         """A head parked on its gate: the verify is done, the gate re-verify runs.
 
         The gate re-verify runs on this host, so a remote lease whose dispatch
-        returned reads post_dispatch rather than finished.
+        returned reads no_live_dispatch rather than finished.
         """
         worker, _alloc, _ = _real_worker(git_ops)
         req = _make_req('occ-gate', 'task/occ-gate', config, git_repo)
