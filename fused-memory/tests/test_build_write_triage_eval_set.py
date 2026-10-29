@@ -590,6 +590,30 @@ class TestTheRerate:
             evalset.run('rerate', '--brief-version', 'v2.2')
         assert 'rerates' not in evalset.key()
 
+    def test_refuses_while_a_reask_is_pending(self, evalset: _EvalSet) -> None:
+        evalset.rate({('second', ('l1', 'f')): _unfound_quote})
+        with pytest.raises(ValueError, match='reask'):
+            evalset.run('rerate', '--brief-version', 'v2.2')
+        assert 'rerates' not in evalset.key()
+
+    def test_refuses_while_a_pair_awaits_a_third_rater(self, evalset: _EvalSet) -> None:
+        evalset.rate({('primary', THIRD_DECIDED_LOSS): _conflict_yes,
+                      ('second', THIRD_DECIDED_LOSS): _conflict_no})
+        with pytest.raises(ValueError, match=r"run third.*\('o1', 'c'\)"):
+            evalset.run('rerate', '--brief-version', 'v2.2')
+        assert 'rerates' not in evalset.key()
+
+    def test_assemble_refuses_a_pair_reading_loss_outside_the_latest_rerate(
+        self, rerated: _EvalSet,
+    ) -> None:
+        rerated.rate()
+        key = rerated.key()
+        key['rerates'][0]['pairs'].remove(['l1', 'g'])
+        (rerated.scratch / 'key.json').write_text(json.dumps(key))
+        with pytest.raises(ValueError, match=r'latest re-rate.*l1 g'):
+            rerated.assemble()
+        assert not rerated.out.exists()
+
     def test_refuses_a_brief_changed_since_its_rerate_was_keyed(self, rerated: _EvalSet) -> None:
         key = rerated.key()
         key['rerates'][0]['brief_sha256'] = '0' * 64
