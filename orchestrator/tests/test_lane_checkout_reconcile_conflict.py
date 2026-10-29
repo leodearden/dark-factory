@@ -23,9 +23,10 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
-from _workflow_helpers import _init_git_repo
+from _workflow_helpers import _build_harness, _init_git_repo
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -130,3 +131,53 @@ class TestDetachLaneCheckoutRefusedSnapshot:
             if record.name == 'orchestrator.git_ops' and record.levelno >= logging.WARNING
         ]
         assert any(str(lane) in message and detail in message for message in warnings), warnings
+
+
+class TestReconcileLaneCheckoutsConflictedLane:
+    """The startup sweep absorbs a conflicted lane at each of its three detach sites."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('statuses', 'trusted_pin_name'),
+        [
+            pytest.param({_BARE_ID: 'done'}, None, id='terminal'),
+            pytest.param({'999': 'pending'}, None, id='deleted_id'),
+            pytest.param({_BARE_ID: 'in-progress'}, '_lane-2', id='dup_checkout'),
+        ],
+    )
+    async def test_sweep_completes_and_keeps_the_conflicted_lane_pinned(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        statuses: dict[str, str],
+        trusted_pin_name: str | None,
+    ):
+        config, git_ops, lane = await _pool_with_lane(tmp_path)
+        await _make_index_conflicted(git_ops.project_root, lane)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        checkouts = await git_ops.lane_branch_checkouts()
+        assert checkouts is not None
+        conflicted_lane = checkouts[_BARE_ID]
+
+        harness = _build_harness(config)
+        harness.git_ops = git_ops
+        harness.scheduler.get_statuses = AsyncMock(return_value=(statuses, None))
+        if trusted_pin_name is None:
+            expected_pin = conflicted_lane
+        else:
+            expected_pin = git_ops.worktree_base / trusted_pin_name
+            pool.restore_assignment(_BARE_ID, expected_pin)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            await harness._reconcile_lane_checkouts()
+
+        assert await _git(lane, 'symbolic-ref', '-q', 'HEAD') == f'refs/heads/{_TASK_BRANCH}'
+        assert pool.assignment_for(_BARE_ID) == expected_pin, (
+            'the conflicted lane must stay pinned (or the trusted pin stay put), '
+            'never handed to a fresh dispatch'
+        )
+        assert any(
+            'FAILED to detach' in record.getMessage() for record in caplog.records
+            if record.name == 'orchestrator.harness' and record.levelno == logging.WARNING
+        ), caplog.text
