@@ -69,17 +69,10 @@ async def test_integrated_service_queue_commits_do_not_wait_on_the_disk(
 ):
     """integrated_service's queue runs with PRAGMA synchronous=OFF.
 
-    Tests on this fixture run a wall-clock-bounded drain, and every queued
-    item costs four serialized write units on the queue's one connection:
-    enqueue, claim, mark_executed and mark_completed. Under synchronous=FULL
-    each of those units' commits is an fsync, whose latency is set by every
-    other process on the host disk, not by the code under test. Task 7711
-    measured it: under a 32-process fsync storm, mean unit hold rose from
-    about 4ms to 14-25ms with FULL but stayed at about 4ms with OFF. That
-    coupling is what failed TestConcurrencyStress::test_multi_project_concurrent
-    at 28.4s on a merge gate.
-
-    No test on this fixture kills the process, so it needs no power-loss
+    Tests on this fixture bound their drains by wall clock. Under
+    synchronous=FULL every queue commit is an fsync, whose latency is set by
+    whatever else is writing to the host disk, not by the code under test.
+    No test on this fixture kills the process, so none needs power-loss
     durability.
     """
     rows = await integrated_service.durable_queue._require_access().read_all(
