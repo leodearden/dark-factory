@@ -813,9 +813,36 @@ class TestDataclassShapeRegistry:
         for shape in _checker._DATACLASS_SHAPES:
             assert shape.module, f'{shape.name}: module must be set (message provenance)'
             assert shape.factory, f'{shape.name}: factory must name the canonical remedy'
+            assert shape.factory_home, (
+                f'{shape.name}: factory_home must name the file defining {shape.factory}'
+            )
         verify_result = _checker._DATACLASS_SHAPES[0]
         assert verify_result.module == 'orchestrator.verify'
-        assert verify_result.factory == '_fake_verify_result'
+        assert verify_result.factory == 'fake_verify_result'
+        assert verify_result.factory_home == 'orchestrator/tests/_verify_result_doubles.py'
+
+    def test_the_registered_factory_is_defined_at_its_registered_home(self):
+        """The printed remedy names a helper that really exists where it says.
+
+        Parsed, never imported: the home is an orchestrator test helper, and this
+        guard must not depend on that package's import path.
+        """
+        for shape in _checker._DATACLASS_SHAPES:
+            home = _REPO_ROOT / shape.factory_home
+            assert home.is_file(), (
+                f'{shape.name}: factory_home {shape.factory_home!r} is not a file; '
+                'update `_DATACLASS_SHAPES` in '
+                'fused-memory/scripts/check_bare_magicmock_config.py'
+            )
+            module = ast.parse(home.read_text(encoding='utf-8'))
+            top_level_functions = {
+                node.name for node in module.body if isinstance(node, ast.FunctionDef)
+            }
+            assert shape.factory in top_level_functions, (
+                f'{shape.name}: factory {shape.factory!r} is not a top-level function '
+                f'of {shape.factory_home!r}; update `_DATACLASS_SHAPES` in '
+                'fused-memory/scripts/check_bare_magicmock_config.py'
+            )
 
 
 class TestDataclassDoublePositionBlindness:
@@ -880,7 +907,7 @@ class TestDataclassDoublePositionBlindness:
         message = violations[0].message
         assert message != _checker._VIOLATION_MSG, (
             "Rule B must not reuse Rule A's message — the remedies are unrelated "
-            '(mock_orch_config/pydantic_spec vs _fake_verify_result/spec=VerifyResult)'
+            '(mock_orch_config/pydantic_spec vs fake_verify_result/spec=VerifyResult)'
         )
         assert 'bare-dataclass-double' in message, (
             f"Rule B's message must name its own noqa code; got {message!r}"
@@ -1026,7 +1053,8 @@ class TestDataclassDoubleMessage:
         message = find_violations(_TASK_3980_SHAPE, 'test_3980.py')[0].message
         for needle in (
             'VerifyResult',
-            '_fake_verify_result',
+            'fake_verify_result',
+            'orchestrator/tests/_verify_result_doubles.py',
             'spec=VerifyResult',
             'dataclasses.fields',
             '3477',
@@ -1095,7 +1123,7 @@ class TestDataclassDoubleMessage:
         for needle in (
             str(bad_file),
             'VerifyResult',
-            '_fake_verify_result',
+            'fake_verify_result',
             'verify_skipped',
             'bare-dataclass-double',
         ):
@@ -1235,7 +1263,7 @@ class TestRuleBIsUnconditional:
             f'{path} must report every Rule B site in full — {why}; got {violations}'
         )
         for violation in violations:
-            assert '_fake_verify_result' in violation.message, (
+            assert 'fake_verify_result' in violation.message, (
                 f'{path} must report a PLAIN Rule B hit carrying the migration remedy; '
                 f'got {violation.message!r}'
             )
@@ -1379,7 +1407,7 @@ class TestAllScannedTestDirsClean:
             'Any non-zero exit here means at least one package lint_command is RED.\n'
             'Remedy depends on the rule:\n'
             '  bare-magicmock        → mock_orch_config / MagicMock(spec_set=pydantic_spec(...))\n'
-            '  bare-dataclass-double → _fake_verify_result(...) / MagicMock(spec=VerifyResult)\n'
+            '  bare-dataclass-double → fake_verify_result(...) / MagicMock(spec=VerifyResult)\n'
             '  wall-clock-deadline   → wait_responsive(...) with a label= / bound derived from MERGE_RESULT_TIMEOUT\n'
             f'Scanned: {present}\n'
             f'Violations:\n{result.stdout}\n'
@@ -1766,13 +1794,13 @@ class TestWallClockDeadlineMessage:
         """Rule A's and Rule B's remedies are unusable here and must not appear.
 
         mock_orch_config / pydantic_spec read pydantic model_fields;
-        _fake_verify_result / spec=VerifyResult spec a stdlib dataclass.  Neither
+        fake_verify_result / spec=VerifyResult spec a stdlib dataclass.  Neither
         has anything to say about a wall-clock deadline on a future.
         """
         foreign = (
             'mock_orch_config',
             'pydantic_spec',
-            '_fake_verify_result',
+            'fake_verify_result',
             'spec=VerifyResult',
             'bare-magicmock',
             'bare-dataclass-double',
@@ -1796,7 +1824,7 @@ class TestWallClockDeadlineExemption:
     rather than re-parsed, so an author learns the em-dash-or-hyphen,
     mandatory-reason, preceding-line-only, no-inline-trailing rules once and they
     hold for all three codes.  What is NOT shared is the code itself: Rule A's
-    remedy is mock_orch_config/pydantic_spec, Rule B's is _fake_verify_result, and
+    remedy is mock_orch_config/pydantic_spec, Rule B's is fake_verify_result, and
     Rule C's is wait_responsive/MERGE_RESULT_TIMEOUT — so a pragma written for one
     is never informed consent for another.
     """
@@ -1861,7 +1889,7 @@ class TestWallClockDeadlineCrossCodeIsolation:
         """# noqa: bare-dataclass-double must NOT suppress a Rule C violation."""
         source = '# noqa: bare-dataclass-double — a reason\n' + _RULE_C_SOURCE
         assert len(_rule_c(source)) == 2, (
-            "Rule B's noqa code must not suppress Rule C — _fake_verify_result has "
+            "Rule B's noqa code must not suppress Rule C — fake_verify_result has "
             'nothing to say about a wall-clock deadline'
         )
 
@@ -2198,7 +2226,7 @@ class TestWallClockDeadlineDebtBaseline:
             )
 
     def test_overrun_message_carries_rule_c_remedies_not_rule_b_ones(self):
-        """A Rule C overrun must never prescribe _fake_verify_result.
+        """A Rule C overrun must never prescribe fake_verify_result.
 
         Driven end to end through find_violations against a LIVE baseline entry, so
         it also proves find_violations looks the filename up in the real baseline,
@@ -2221,7 +2249,7 @@ class TestWallClockDeadlineDebtBaseline:
             assert needle in message, (
                 f'the Rule C overrun message must carry {needle!r}; got {message!r}'
             )
-        for foreign in ('_fake_verify_result', 'spec=VerifyResult', 'bare-dataclass-double'):
+        for foreign in ('fake_verify_result', 'spec=VerifyResult', 'bare-dataclass-double'):
             assert foreign not in message, (
                 f'Rule C overrun message must not offer {foreign!r}: {message!r}'
             )
@@ -2520,7 +2548,7 @@ class TestRuleBCoversMergeSpeculation:
         violations = [
             v
             for v in find_violations(source, _MERGE_SPECULATION)
-            if '_fake_verify_result' in v.message
+            if 'fake_verify_result' in v.message
         ]
         assert violations == [], (
             'test_merge_speculation.py must be Rule-B clean. Offenders:\n  '
@@ -2533,7 +2561,7 @@ class TestRuleBCoversMergeSpeculation:
         violations = [
             v
             for v in find_violations(source, _MERGE_SPECULATION)
-            if '_fake_verify_result' in v.message
+            if 'fake_verify_result' in v.message
         ]
         assert len(violations) == 1, (
             'a new bare VerifyResult-shaped double must flag under '
@@ -2561,7 +2589,7 @@ class TestRuleBCoversMergeSpeculation:
         still_clean = [
             v
             for v in find_violations(source, _MERGE_SPECULATION)
-            if '_fake_verify_result' in v.message
+            if 'fake_verify_result' in v.message
         ]
         assert still_clean == [], (
             f'the respelled pragma must still exempt the site; got {still_clean!r}'
@@ -2574,7 +2602,7 @@ class TestRuleBCoversMergeSpeculation:
         violations = [
             v
             for v in find_violations(stripped, _MERGE_SPECULATION)
-            if '_fake_verify_result' in v.message
+            if 'fake_verify_result' in v.message
         ]
         assert len(violations) == 1, (
             'with its pragma removed, the deliberate mutation site must flag — that '
