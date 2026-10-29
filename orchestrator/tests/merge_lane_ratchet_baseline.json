@@ -1106,6 +1106,7 @@
     "orchestrator/tests/test_atomic_train_merge.py": {"patch_targets": ["gates._check_post_merge_equivalence", "worker.run_scoped_verification", "worker.shutil.disk_usage"], "private_reads": 19},
     "orchestrator/tests/test_b3_gate.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_block_disposition.py": {"patch_targets": [], "private_reads": 10},
+    "orchestrator/tests/test_branch_mergeability.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_branch_stack.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_branch_work_landed.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_citation_gate_positive_arm.py": {"patch_targets": [], "private_reads": 0},
