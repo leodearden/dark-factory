@@ -20,7 +20,6 @@ import copy
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -28,11 +27,11 @@ from _falkor_index_live import injected_driver, live_backends, scratch_graphs
 from _falkor_plans import explain, scan_operators, spy_on_queries
 from _fm_helpers import await_index_operational, falkor_skipif
 from _query_recorder import IssuedQuery, recording_driver
+from _unused_embedder import UnusedEmbedder
 from falkordb.asyncio.graph import AsyncGraph
 from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.edges import EntityEdge
-from graphiti_core.embedder import EmbedderClient
 from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.nodes import EntityNode
 from graphiti_core.utils import bulk_utils
@@ -60,13 +59,6 @@ SEED_OFF_LABEL_CYPHER = (
     "episodes: ['ep'], created_at: $created_at}]->"
     "(:CanaryEndpoint {uuid: 'canary-target', name: 'canary-target', group_id: $group_id})"
 )
-
-
-class UnusedEmbedder(EmbedderClient):
-    """Every seeded embedding is preset, so graphiti must never embed."""
-
-    async def create(self, input_data: Any) -> list[float]:
-        raise AssertionError('embeddings are preset; graphiti must not call the embedder')
 
 
 def ring_nodes(group_id: str, count: int) -> list[EntityNode]:

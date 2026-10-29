@@ -25,11 +25,11 @@ import graphiti_core
 import pytest
 from _ast_guard import parse_python_module
 from _query_recorder import IssuedQuery, recording_driver
+from _unused_embedder import UnusedEmbedder
 from graphiti_core.driver.driver import GraphDriver, GraphDriverSession
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.driver.graph_operations.graph_operations import GraphOperationsInterface
 from graphiti_core.edges import EntityEdge, EpisodicEdge
-from graphiti_core.embedder import EmbedderClient
 from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
 from graphiti_core.search import search_utils
@@ -159,13 +159,6 @@ class RecordingTransaction(GraphDriverSession):
         return await func(self, *args, **kwargs)
 
 
-class UnusedEmbedder(EmbedderClient):
-    """Every model's embedding is preset, so graphiti must never embed."""
-
-    async def create(self, input_data: Any) -> list[float]:
-        raise AssertionError('embeddings are preset; graphiti must not call the embedder')
-
-
 BulkModels = tuple[list[EpisodicNode], list[EpisodicEdge], list[EntityNode], list[EntityEdge]]
 
 
@@ -284,12 +277,35 @@ def unguarded_dispatches(node: ast.AST, guarded: bool = False) -> set[str]:
     return found
 
 
-def graphiti_unguarded_dispatches() -> set[str]:
+def unrecognised_interface_reads(tree: ast.AST) -> list[int]:
+    """Lines reading ``graph_operations_interface`` in a shape ``unguarded_dispatches`` cannot see.
+
+    The census sees two shapes: an ``if`` whose whole test is the attribute,
+    and a method call made directly on it.  An alias, a ``getattr`` or a
+    hand-off could dispatch out of its sight, so any other read is reported.
+    """
+    recognised: set[int] = set()
+    reads: list[ast.expr] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If):
+            recognised.add(id(node.test))
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            recognised.add(id(node.func.value))
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == 'graph_operations_interface'
+            and isinstance(node.ctx, ast.Load)
+        ) or (isinstance(node, ast.Constant) and node.value == 'graph_operations_interface'):
+            reads.append(node)
+    return sorted(read.lineno for read in reads if id(read) not in recognised)
+
+
+def graphiti_modules() -> dict[str, ast.Module]:
     graphiti_root = pathlib.Path(graphiti_core.__file__).parent
-    found: set[str] = set()
-    for path in sorted(graphiti_root.rglob('*.py')):
-        found |= unguarded_dispatches(parse_python_module(path))
-    return found
+    return {
+        str(path.relative_to(graphiti_root)): parse_python_module(path)
+        for path in sorted(graphiti_root.rglob('*.py'))
+    }
 
 
 def test_every_unguarded_dispatch_is_overridden() -> None:
@@ -297,10 +313,50 @@ def test_every_unguarded_dispatch_is_overridden() -> None:
 
     graphiti-core has no upper version bound, so a new one must fail here, not in production.
     """
-    unguarded = graphiti_unguarded_dispatches()
+    unguarded: set[str] = set()
+    for tree in graphiti_modules().values():
+        unguarded |= unguarded_dispatches(tree)
 
     assert unguarded, 'the scan found no dispatch at all; it can no longer see graphiti'
     assert unguarded <= set(OVERRIDDEN_OPERATIONS), sorted(unguarded - set(OVERRIDDEN_OPERATIONS))
+
+
+def test_graphiti_reads_the_interface_only_in_shapes_the_census_sees() -> None:
+    """A dispatch through an alias would escape the census above; review it, then teach the scan."""
+    unrecognised = {
+        module: lines
+        for module, tree in graphiti_modules().items()
+        if (lines := unrecognised_interface_reads(tree))
+    }
+
+    assert unrecognised == {}
+
+
+@pytest.mark.parametrize(
+    ('source', 'unrecognised_lines'),
+    [
+        ('if driver.graph_operations_interface:\n    pass', []),
+        ('driver.graph_operations_interface.node_save_bulk()', []),
+        ('self.graph_operations_interface = FalkorGraphOperations()', []),
+        ('graph_operations_interface: GraphOperationsInterface | None = None', []),
+        ('ops = driver.graph_operations_interface\nops.node_save_bulk()', [1]),
+        ('if driver.graph_operations_interface is not None:\n    pass', [1]),
+        ("getattr(driver, 'graph_operations_interface').node_save_bulk()", [1]),
+    ],
+    ids=[
+        'if-test',
+        'direct-dispatch',
+        'assignment',
+        'class-declaration',
+        'alias',
+        'compound-test',
+        'getattr',
+    ],
+)
+def test_unrecognised_interface_reads_flags_every_other_shape(
+    source: str, unrecognised_lines: list[int]
+) -> None:
+    assert unrecognised_interface_reads(ast.parse(source)) == unrecognised_lines
 
 
 @pytest.mark.parametrize('method', OVERRIDDEN_OPERATIONS)
