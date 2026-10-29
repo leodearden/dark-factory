@@ -2241,7 +2241,7 @@ class TestTheCensusAndTheGuardShareOneDerivation:
         its name: a moved record would leave a name-only check passing on a
         stale path (task 6172).
         """
-        import verify_budget_census_records  # noqa: PLC0415
+        import verify_budget_census_records
 
         report = self._report(tmp_path, capsys, _leg(duration_secs=4626.0))
 

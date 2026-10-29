@@ -1779,7 +1779,7 @@ def test_the_ruled_census_is_the_shared_record_the_fleet_table_reads() -> None:
     a re-introduced local copy carrying equal values today is exactly the drift
     a single home exists to prevent, and equality would pass it.
     """
-    import verify_budget_census_records as census_records  # noqa: PLC0415
+    import verify_budget_census_records as census_records
 
     assert RULED_BUDGET_CENSUS['orchestrator'] is census_records.ORCHESTRATOR_BUDGET_CENSUS, (
         "RULED_BUDGET_CENSUS['orchestrator'] is not the record at "
