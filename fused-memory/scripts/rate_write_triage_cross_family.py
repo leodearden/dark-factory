@@ -395,7 +395,10 @@ def openai_ask(model: str, effort: str, *, timeout: float = 600.0,
                sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep) -> Ask:
     """The real port: one Responses call per ask, client built and closed per call.
 
-    Transport failures are retried with doubling backoff, as the arms runner does.
+    The answer contract goes in as a developer input message, not ``instructions``:
+    the API refuses a ``json_object`` format unless an input message says "json",
+    and the item text, rendered as the Opus raters saw it, need not. Transport
+    failures are retried with doubling backoff, as the arms runner does.
     """
     import openai  # the network dependency stays out of the report path
 
@@ -409,7 +412,8 @@ def openai_ask(model: str, effort: str, *, timeout: float = 600.0,
             try:
                 async with openai.AsyncOpenAI() as client:
                     response = await asyncio.wait_for(client.responses.create(
-                        model=model, instructions=instructions, input=item,
+                        model=model, input=[{'role': 'developer', 'content': instructions},
+                                            {'role': 'user', 'content': item}],
                         text={'format': {'type': 'json_object'}}, **sampling,
                     ), timeout=timeout)
             except transient:

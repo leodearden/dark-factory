@@ -298,3 +298,47 @@ class TestTheReportCommand:
         written = json.loads(out.with_suffix('.json').read_text())
         assert written == json.loads(json.dumps(_report()))
         assert out.with_suffix('.md').read_text() == _mod().render_markdown(written)
+
+
+class _FakeResponses:
+    def __init__(self, calls: list[dict[str, Any]]) -> None:
+        self.calls = calls
+
+    async def create(self, **request: Any) -> Any:
+        self.calls.append(request)
+        usage = types.SimpleNamespace(input_tokens=10, output_tokens=2)
+        return types.SimpleNamespace(output_text='{}', usage=usage)
+
+
+class _FakeClient:
+    calls: list[dict[str, Any]] = []
+
+    def __init__(self) -> None:
+        self.responses = _FakeResponses(_FakeClient.calls)
+
+    async def __aenter__(self) -> _FakeClient:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        return None
+
+
+class TestTheOpenAIPort:
+    def test_a_json_object_request_names_json_in_its_input_messages(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The Responses API refuses a json_object format unless an input message says 'json'."""
+        import openai
+        _FakeClient.calls = []
+        monkeypatch.setattr(openai, 'AsyncOpenAI', _FakeClient)
+        ask = _mod().openai_ask('gpt-6.1-sol', 'high')
+        reply = asyncio.run(ask(_rounds().answer_contract(), 'ITEM WITHOUT THE WORD'))
+        [request] = _FakeClient.calls
+        assert reply.usage == {'input_tokens': 10, 'output_tokens': 2}
+        assert request['text'] == {'format': {'type': 'json_object'}}
+        assert request['reasoning'] == {'effort': 'high'}
+        messages = request['input']
+        assert [message['role'] for message in messages] == ['developer', 'user']
+        assert messages[0]['content'] == _rounds().answer_contract()
+        assert messages[1]['content'] == 'ITEM WITHOUT THE WORD'
+        assert any('json' in message['content'].lower() for message in messages)
