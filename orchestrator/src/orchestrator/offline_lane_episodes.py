@@ -155,6 +155,7 @@ UNKNOWN_MODE = 'unknown'
 UNKNOWN_STATUS = 'unknown'
 CLOSED_ESCALATION_STATES = frozenset({'resolved', 'dismissed'})
 DEFERRED_STATUS = 'deferred'
+_NO_TASK_CLIENT = 'no task client'
 _OPEN_STATUSES = tuple(sorted(s.value for s in TaskStatus if owner_liveness(s) is OwnerLiveness.OPEN))
 
 
@@ -806,10 +807,16 @@ class LaneEngine:
         return PassReads(verdicts, covering.terminal_task_ids, previous), statuses
 
     async def _covering_statuses(self, record: CommandRecord) -> CoveringStatuses:
-        """The pass's one batched status read of every bound covering task."""
+        """The pass's one batched status read of every bound covering task.
+
+        A lane run with no task client reads nothing and logs nothing here: it was configured
+        that way, and each decision that rests on the read reports it.
+        """
         bound = sorted({e.covering_task_id for e in record.episodes.values() if e.covering_task_id is not None})
         if not bound:
             return CoveringStatuses({})
+        if self._tasks is None:
+            return CoveringStatuses({}, _NO_TASK_CLIENT)
         statuses, error = await self._read_statuses(bound)
         if error is not None:
             logger.error(
@@ -822,7 +829,7 @@ class LaneEngine:
     async def _read_statuses(self, task_ids: list[str]) -> tuple[Mapping[str, str], str | None]:
         """One batched status read; the statuses, or why they could not be read."""
         if self._tasks is None:
-            return {}, 'no task client'
+            return {}, _NO_TASK_CLIENT
         try:
             statuses, error = await self._tasks.get_statuses(task_ids)
         except Exception as exc:
@@ -831,7 +838,7 @@ class LaneEngine:
 
     async def _read_task(self, task_id: str) -> _TaskRead:
         if self._tasks is None:
-            return _TaskRead(None, 'no task client')
+            return _TaskRead(None, _NO_TASK_CLIENT)
         try:
             task, error = await self._tasks.get_task(task_id)
         except Exception as exc:
@@ -994,7 +1001,7 @@ class LaneEngine:
     async def _open_lane_tasks(self) -> _OpenLaneTasks:
         """The project's open lane fix tasks, read live, in lookup order; or why they could not be read."""
         if self._tasks is None:
-            return {}, 'no task client'
+            return {}, _NO_TASK_CLIENT
         try:
             rows, error = await self._tasks.find_tasks_by_metadata(SPAWN_CONTEXT_KEY, SPAWN_CONTEXT, _OPEN_STATUSES)
         except Exception as exc:

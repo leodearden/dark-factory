@@ -371,7 +371,10 @@ class Lane:
         self._read_psi = _reader(psi)
         self.engine = self.restarted()
 
-    def restarted(self) -> LaneEngine:
+    def restarted(self, *, client: bool | None = None) -> LaneEngine:
+        """A fresh engine over the same stores; *client* given, it is the new engine's task-client wiring."""
+        if client is not None:
+            self._with_client = client
         self.engine = LaneEngine(
             self.config,
             self.ancestry,

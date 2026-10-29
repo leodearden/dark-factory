@@ -425,6 +425,26 @@ async def test_an_unreadable_covering_status_leaves_the_clear_undecided_and_visi
 
 
 @pytest.mark.asyncio
+async def test_a_lane_run_without_a_task_client_logs_no_pass_error_yet_leaves_a_bound_clear_undecided(
+    tmp_path: Path, caplog,
+):
+    lane = Lane(tmp_path)
+    await _fix_filed(lane)
+    lane.restarted(client=False)
+    lane.clock.advance(minutes=30)
+
+    with caplog.at_level(logging.ERROR):
+        await lane.red((B,))
+
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+    undecided = await _clear(lane)
+
+    assert (undecided.debts_offered, undecided.debts_undecided) == ((), (A,))
+    assert _due(lane) == []
+
+
+@pytest.mark.asyncio
 async def test_the_ledger_is_written_before_the_episodes_new_state(tmp_path: Path, monkeypatch):
     lane = Lane(tmp_path)
     await lane.red()
