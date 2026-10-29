@@ -29,6 +29,7 @@ import dataclasses
 import logging
 import math
 import os
+import shlex
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -45,6 +46,7 @@ from orchestrator.merge_lane.types import (
     _HostUnavailability,
 )
 from orchestrator.remote_gate import SHIM_REMEDY, shim_suspected
+from orchestrator.verify_runner import _SSH_BASE_OPTS
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
@@ -574,6 +576,17 @@ def _verify_host_skew_sentinel(host: str) -> str:
     return f'{_VERIFY_HOST_SKEW_SENTINEL_PREFIX}{host}'
 
 
+def ssh_health_probe_command(ssh_target: str) -> str:
+    """The shell line of the probe ``RemoteRunner.health`` runs against *ssh_target*."""
+    return shlex.join(['ssh', *_SSH_BASE_OPTS, ssh_target, 'true'])
+
+
+def _health_probe_lines(host: str, ssh_target: str | None) -> str:
+    if ssh_target is None:
+        return f'SSH target: unknown ({host!r} is not in the verify_runners config)\n'
+    return f'SSH target: {ssh_target}\nHealth probe: {ssh_health_probe_command(ssh_target)}\n'
+
+
 def _alarm_verify_host_unreachable(
     escalation_queue: Any,
     host: str,
@@ -581,6 +594,7 @@ def _alarm_verify_host_unreachable(
     *,
     streak: int,
     duration_s: float,
+    ssh_target: str | None,
     event_store: Any = None,
 ) -> None:
     """Submit a dedup'd L1 escalation when a remote verify host is persistently unreachable.
@@ -590,6 +604,11 @@ def _alarm_verify_host_unreachable(
     bench is ``alarm_due``, so a resolve issued while the host is still down
     is re-opened; recovery resolves it via
     :func:`_clear_verify_host_unreachable` (task 5290).
+
+    The detail names *ssh_target*, the configured ``ssh_host`` the runner
+    dials, which can differ from the runner name *host*, and the exact
+    health-probe command the reprobe runs against it, so a reader can repeat
+    the orchestrator's own recovery check.
 
     The escalation is:
 
@@ -606,10 +625,13 @@ def _alarm_verify_host_unreachable(
 
     Args:
         escalation_queue: Live escalation queue or ``None``.
-        host: Remote runner name (e.g. ``'leo-laptop'``).
+        host: Remote runner name (e.g. ``'laptop'``).
         reason: ``str(exc)`` from the most-recent ``RunnerUnavailable`` exception.
         streak: Consecutive RunnerUnavailable failure count for this episode.
         duration_s: Seconds since the first failure in this episode.
+        ssh_target: The runner's configured ``ssh_host``, or ``None`` when
+            *host* is not in the verify_runners config; the detail then says
+            so rather than guessing.
         event_store: Optional event store; when provided a
             ``EventType.verify_host_unreachable`` event is emitted.
     """
@@ -629,6 +651,7 @@ def _alarm_verify_host_unreachable(
     )
     detail = (
         f'Host: {host}\n'
+        f'{_health_probe_lines(host, ssh_target)}'
         f'Reason: {reason}\n'
         f'Consecutive failures: {streak}\n'
         f'Duration since first failure: {duration_str}\n'
@@ -638,13 +661,13 @@ def _alarm_verify_host_unreachable(
         'The orchestrator is falling back to serial-local verification; '
         'throughput is degraded but correctness is preserved.\n'
         '\n'
-        'Auto-reprobe is active: every reprobe sweep runs the ssh health probe '
-        '`ssh -o BatchMode=yes -o ConnectTimeout=10 <host> true`; a pass '
-        're-admits the host and resolves this alarm without a restart.  While '
-        'the probe still fails, every sweep re-asserts this alarm, so resolving '
-        'it while the host is still down re-opens it.  Recovery is decided by '
-        'that probe, never by get_merge_queue occupancy (by_host is lease '
-        'bookkeeping, not host health).'
+        'Auto-reprobe is active: every reprobe sweep runs the runner\'s ssh '
+        'health probe, the Health probe command above, against its SSH target '
+        '(not the runner name); a pass re-admits the host and resolves this '
+        'alarm without a restart.  While the probe still fails, every sweep '
+        're-asserts this alarm, so resolving it while the host is still down '
+        're-opens it.  Recovery is decided by that probe, never by '
+        'get_merge_queue occupancy (by_host is lease bookkeeping, not host health).'
     )
 
     esc = Escalation(
@@ -657,10 +680,10 @@ def _alarm_verify_host_unreachable(
         summary=summary,
         detail=detail,
         suggested_action=(
-            f'Check SSH connectivity to {host!r}.  '
-            'The reprobe sweep resolves this alarm once the host answers `ssh -o '
-            'BatchMode=yes -o ConnectTimeout=10 <host> true`; do not resolve it '
-            'while the host is still down, since the next sweep re-opens it.  '
+            f'Check SSH connectivity from the orchestrator host to the SSH target of {host!r} '
+            'named in the detail.  The reprobe sweep resolves this alarm once its '
+            'Health probe command exits 0; do not resolve it while the host is '
+            'still down, since the next sweep re-opens it.  '
             f'To lift the bench now, call clear_verify_host_quarantine(host={host!r}); '
             'to retire a host that is gone for good, remove it from the '
             'verify_runners config.'
@@ -671,7 +694,10 @@ def _alarm_verify_host_unreachable(
     if event_store is not None:
         event_store.emit(
             EventType.verify_host_unreachable,
-            data={'host': host, 'reason': reason, 'streak': streak, 'duration_s': duration_s},
+            data={
+                'host': host, 'ssh_target': ssh_target, 'reason': reason,
+                'streak': streak, 'duration_s': duration_s,
+            },
         )
 
 

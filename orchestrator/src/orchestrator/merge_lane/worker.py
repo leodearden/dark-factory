@@ -9982,6 +9982,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._unreachable_escalate_after_n: int = 3
         self._unreachable_escalate_after_secs: float = 600.0
         self._reprobe_interval_s: float = 120.0
+        # {runner name: configured ssh_host}, the target the unreachability
+        # alarm names (task 5290); set alongside the knobs above.
+        self._runner_ssh_targets: Mapping[str, str] = {}
         # Rate-limit state for the reprobe sweep's "still unreachable" record
         # (task 3043 amend).  {host: (last_info_at, last_streak, sweeps_seen)}.
         # A host that
@@ -10982,6 +10985,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 config.verify_host_unreachable_escalate_after_secs
             )
             self._reprobe_interval_s = config.verify_host_reprobe_interval_s
+            self._runner_ssh_targets = {r.name: r.ssh_host for r in config.enabled_verify_runners}
             return self._host_allocator
         # project_root unavailable: return a transient empty-remote allocator
         # without caching so a subsequent call with project_root set builds the
@@ -11189,6 +11193,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             entry.reason,
             streak=entry.streak,
             duration_s=duration_s,
+            ssh_target=self._runner_ssh_targets.get(host),
             event_store=self._event_store,
         )
 

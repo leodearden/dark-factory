@@ -2224,7 +2224,7 @@ Infrastructure problems — database connectivity, MCP failures, service outages
 
 **Recovery is only one of these:**
 - the orchestrator's own resolve (`resolved_by` `orchestrator-verify-host-monitor`), reported by a `verify_host_recovered` event whose `evidence` is `ssh_health_probe`, `ensure_gate` or `operator_clear`;
-- for `verify_host_unreachable` only, a passing ssh health probe: `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> true` exits 0. A skew host answers ssh by definition, so the probe says nothing about `verify_host_skew`.
+- for `verify_host_unreachable` only, a passing ssh health probe: the detail's `Health probe:` command, run verbatim, exits 0. It is the exact argv the orchestrator's reprobe runs, and it dials the `SSH target:` line, the runner's configured `ssh_host`, which can differ from the runner name in `Host:` (`laptop` dials `leo-laptop`). Never substitute the runner name; a record with no `Health probe:` line (`SSH target: unknown`, or filed before the line existed) gives no probe to run faithfully. A skew host answers ssh by definition, so the probe says nothing about `verify_host_skew`.
 
 `get_merge_queue` occupancy (`by_host`, `inflight_by_host`, `hosts_busy`) is lease bookkeeping and is **never** recovery evidence: the 2026-07-24 false resolve read a phantom `laptop:5300` lease four seconds before an ssh connect timeout. For host health, read the snapshot's `hosts[]` (`quarantined`, `quarantine_class`, `sticky`) and `occupancy.leases[]` (`activity`, `host_quarantined`).
 

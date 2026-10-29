@@ -38,9 +38,10 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _gate_fixtures import TEST_DEPLOYED_SHA
 from escalation.queue import EscalationQueue
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_lane.types import (
@@ -1009,6 +1010,32 @@ class TestRecoveryIgnoresOccupancy:
             verify_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await verify_task
+
+
+class TestUnreachableAlarmNamesTheProbeTarget:
+    """The unreachability L1 names the ssh target the runner dials, not only its name."""
+
+    def test_the_configured_ssh_host_reaches_the_alarm(
+        self, git_ops: GitOps, git_repo: Path, git_config: GitConfig,
+    ) -> None:
+        escalations = _FakeEscalationQueue()
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(), escalation_queue=escalations, deployed_sha=TEST_DEPLOYED_SHA,
+        )
+        worker._ensure_host_allocator(OrchestratorConfig(
+            project_root=git_repo, git=git_config,
+            verify_runners=[VerifyRunnerConfig(
+                name='laptop', ssh_host='leo-laptop', git_remote='laptop',
+                df_checkout_path='/remote/dark-factory',
+            )],
+        ))
+        for _ in range(3):
+            worker.bench_unavailable_runner('laptop', RunnerUnavailable('ssh: connect timed out'))
+
+        [l1] = escalations.submitted
+        assert l1.category == 'verify_host_unreachable'
+        assert 'Host: laptop\nSSH target: leo-laptop\nHealth probe: ssh ' in l1.detail
+        assert l1.detail.splitlines()[2].endswith(' leo-laptop true')
 
 
 # ── 5290: occupancy says what each lease is doing, not only that it is held ───
