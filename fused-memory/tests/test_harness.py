@@ -15479,7 +15479,7 @@ async def test_get_prior_s3_findings_drops_a_superseded_finding(
     stricter instruction than the Stage-2 channel's, and one that reads as a
     live to-do.
     """
-    from fused_memory.reconciliation.stages.memory_consolidator import _format_findings
+    from fused_memory.reconciliation.stage1_payload_format import format_findings
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     superseded = _make_superseded_finding()
@@ -15495,8 +15495,8 @@ async def test_get_prior_s3_findings_drops_a_superseded_finding(
     # the renderer emits description/severity/category/suggested_action plus the
     # typed citation lists, and nothing else — so a retirement that survives
     # this far is invisible by the time an agent reads it.
-    assert _SUPERSEDER_FID not in _format_findings([superseded])
-    assert 'superseded_by' not in _format_findings([superseded])
+    assert _SUPERSEDER_FID not in format_findings([superseded])
+    assert 'superseded_by' not in format_findings([superseded])
 
 
 @pytest.mark.asyncio
