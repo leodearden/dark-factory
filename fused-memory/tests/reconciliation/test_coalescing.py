@@ -254,6 +254,42 @@ def test_late_older_arrival_takes_old_status_and_moves_the_row_earlier():
     assert fold.folded_timestamp == row_ts
 
 
+_ACROSS_A_DONE_ROW = ['pending', 'in-progress', 'done', 'pending']
+
+
+def test_a_newer_fold_across_a_gap_records_both_ends_of_the_incoming_step():
+    fold = _fold_status(
+        _status('pending', 'in-progress'), _status('done', 'pending'), incoming_ts=_at(5),
+    )
+    assert fold.payload[COALESCED_STATUS_PATH_KEY] == _ACROSS_A_DONE_ROW
+    assert fold.payload['old_status'] == 'pending'
+    assert fold.payload['new_status'] == 'pending'
+    assert fold.payload[COALESCED_COUNT_KEY] == 2
+
+
+def test_an_older_fold_across_a_gap_records_both_ends_of_the_incoming_step():
+    fold = _fold_status(
+        _status('done', 'pending'), _status('pending', 'in-progress'),
+        incoming_ts=_at(2), row_ts=_at(10),
+    )
+    assert fold.payload[COALESCED_STATUS_PATH_KEY] == _ACROSS_A_DONE_ROW
+    assert fold.payload['old_status'] == 'pending'
+    assert fold.payload['new_status'] == 'pending'
+
+
+def test_a_gap_fold_that_does_not_fit_leaves_the_path_within_the_cap():
+    payload = _status('s0', 's1')
+    for n in range(1, MAX_COALESCED_STATUS_PATH - 2):
+        payload = _fold_status(payload, _status(f's{n}', f's{n + 1}'),
+                               incoming_ts=_at(n)).payload
+    assert len(payload[COALESCED_STATUS_PATH_KEY]) == MAX_COALESCED_STATUS_PATH - 1
+
+    gapped = _fold_status(payload, _status('x', 'y'), incoming_ts=_at(100)).payload
+    assert len(gapped[COALESCED_STATUS_PATH_KEY]) <= MAX_COALESCED_STATUS_PATH
+    assert gapped.get(COALESCED_STATUS_PATH_TRUNCATED_KEY) is True
+    assert gapped['new_status'] == 'y'
+
+
 def test_middle_arrival_only_bumps_the_count():
     two = _fold_status(
         _status('pending', 'in-progress'), _status('blocked', 'review'),

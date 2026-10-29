@@ -389,6 +389,22 @@ async def test_a_done_row_is_never_a_fold_target(buf):
 
 
 @pytest.mark.asyncio
+async def test_a_fold_spanning_a_done_row_keeps_a_continuous_status_path(buf):
+    done = _transition('in-progress', 'done', _at(1))
+    await _push_all(buf, [
+        _transition('pending', 'in-progress', _at(0)), done, _transition('done', 'pending', _at(2)),
+    ])
+
+    rows = await buf.peek_buffered(_PROJECT, limit=10)
+    assert len(rows) == 2
+    [done_row] = [row for row in rows if row.id == done.id]
+    assert done_row.payload == done.payload
+    [folded] = [row for row in rows if row.id != done.id]
+    assert folded.payload[COALESCED_STATUS_PATH_KEY] == [
+        'pending', 'in-progress', 'done', 'pending']
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     'sequence', [_done_then_reopened, _done_lands_inside_a_fold],
     ids=['done_then_reopened', 'done_inside_a_fold'],
