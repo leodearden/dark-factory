@@ -129,6 +129,13 @@ ESCALATIONS_FILED = 5
 ESCALATIONS_ARCHIVED = 3
 """Pending L1 records filed through the real queue, and how many then sit in its archive."""
 
+CHECK_OWNER: Mapping[str, Any] = {
+    'task_id': '4',
+    'check_name': 'boundary-capability',
+    'sidecar': {'path': 'plans/boundary.capabilities.yaml', 'on_main': 'declares'},
+}
+"""The delivered_check_owner of the one dependency_capability record the check-owner scenario files."""
+
 CORPUS_TTL_GENERATIONS: Mapping[str, float] = {'a': escalation_corpus.CORPUS_TTL_SECONDS, 'b': 3600.0}
 """Each corpus generation's TTL; the counts must not depend on it."""
 
@@ -529,6 +536,39 @@ def _corpus_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     return bodies
 
 
+def _check_owner_family(client: TestClient, workdir: Path) -> dict[str, Any]:
+    """An /escalations body whose one row carries a delivered_check_owner (task 7725).
+
+    The record is filed as orchestrator/src/orchestrator/harness.py files a
+    failing delivered check, through the real queue, so the render tests'
+    owner-carrying row is checked against a shape the route really serves.
+    """
+    with _canned_roots(client, workdir / 'check_owner', {'dark-factory': _substrate(REIFY_COUNTS)}):
+        _clear_corpus()
+        config = app.state.config
+        queue = EscalationQueue(config.escalations_dir)
+        queue.submit(Escalation(
+            id=queue.make_id('3'),
+            task_id='3',
+            agent_role='orchestrator-scheduler',
+            severity='critical',
+            category='dependency_capability',
+            summary='delivered check boundary-capability fails on main',
+            detail='the owner block the harness renders',
+            suggested_action='manual_intervention',
+            timestamp=T0.isoformat(),
+            status='pending',
+            level=2,
+            delivered_check_owner=dict(CHECK_OWNER),
+        ))
+        config.reconciliation_escalations_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with patch('dashboard.api.escalations.resolve_now', new=lambda _now: T0):
+                return {'escalations_check_owner': _get(client, ESCALATIONS)}
+        finally:
+            _clear_corpus()
+
+
 def ragged_store_rows(workdir: Path) -> list[dict[str, Any]]:
     """Every row the real sampler wrote in the ragged scenario, oldest first.
 
@@ -552,4 +592,5 @@ def build_all(workdir: Path) -> dict[str, Any]:
             **_burndown_family(client, workdir),
             **_window_family(client, workdir),
             **_corpus_family(client, workdir),
+            **_check_owner_family(client, workdir),
         }

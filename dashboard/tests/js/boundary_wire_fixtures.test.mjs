@@ -11,6 +11,8 @@ import { loadClient, payload } from './_boundary_client.mjs';
 import {
   burndownBlock,
   escalationAnalytics,
+  escalationRow,
+  escalationsPayload,
   mergeQueueBlock,
   openEscalationItem,
   taskCensus,
@@ -84,4 +86,17 @@ test('a MERGE_QUEUE block is built only with keys /merge-queue serves', () => {
   const served = payload('merge_7d').MERGE_QUEUE['dark-factory'];
 
   assertBuiltKeysServed(mergeQueueBlock({ bucketMinutes: 60 }), served, 'MERGE_QUEUE[project]');
+});
+
+test('an /escalations payload, a check-owner row included, is built only with keys /escalations serves', () => {
+  const served = payload('escalations_check_owner').ESCALATIONS;
+  const row = escalationRow({
+    id: 'esc-3-1',
+    taskId: '3',
+    summary: 's',
+    project: 'dark-factory',
+    deliveredCheckOwner: { task_id: '4', check_name: 'c', sidecar: { path: 'p', on_main: 'declares' } },
+  });
+
+  assertBuiltKeysServed(escalationsPayload([{ project: 'dark-factory', rows: [row] }]), served, 'ESCALATIONS');
 });
