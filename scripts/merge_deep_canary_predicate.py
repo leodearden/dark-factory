@@ -105,7 +105,7 @@ import sqlite3
 import sys
 import time
 import traceback
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -170,45 +170,15 @@ class Baseline:
 
 @dataclass(frozen=True)
 class StoreSample:
+    """One store's window, reduced once to the populations its store line and the pool read."""
+
     path: str
-    verifies: tuple[VerifyRow, ...]
+    deep: tuple[VerifyRow, ...]
+    passed_deep_rounds: int
+    baselines: Mapping[str, Baseline]
+    ratios: tuple[float, ...]
     landed_via_chain: int
     item_attributed_failures: int
-
-    @property
-    def deep(self) -> tuple[VerifyRow, ...]:
-        return tuple(row for row in self.verifies if row.is_deep)
-
-    @property
-    def passed_deep_rounds(self) -> int:
-        return len({
-            row.merge_sha for row in self.deep
-            if row.merge_sha is not None and row.attempt == 0 and row.passed
-        })
-
-    @property
-    def baselines(self) -> dict[str, Baseline]:
-        """Each runner's non-chain verify p90 in this store, sorted by runner."""
-        by_runner: dict[str, list[float]] = {}
-        for row in self.verifies:
-            if row.chain_items == 1 and row.runner is not None and row.duration_secs is not None:
-                by_runner.setdefault(row.runner, []).append(row.duration_secs)
-        return {
-            runner: Baseline(p90_secs=p90, n=len(durations))
-            for runner, durations in sorted(by_runner.items())
-            if (p90 := pct(durations, 0.90)) is not None
-        }
-
-    @property
-    def ratios(self) -> tuple[float, ...]:
-        """Each timed deep verify's duration over its runner's baseline p90, when it has one."""
-        baselines = self.baselines
-        ratios = []
-        for row in self.deep:
-            baseline = baselines.get(row.runner) if row.runner is not None else None
-            if row.duration_secs is not None and baseline is not None and baseline.p90_secs > 0:
-                ratios.append(row.duration_secs / baseline.p90_secs)
-        return tuple(ratios)
 
 
 @dataclass(frozen=True)
@@ -400,6 +370,47 @@ def _item_attributed_failures(verifies: Sequence[VerifyRow], as_of: datetime) ->
     return sum(1 for tip in failed_tips if _is_item_attributed(tip, solo_failures, as_of))
 
 
+def _passed_deep_rounds(deep: Sequence[VerifyRow]) -> int:
+    return len({row.merge_sha for row in deep if row.merge_sha is not None and row.attempt == 0 and row.passed})
+
+
+def _baselines(verifies: Sequence[VerifyRow]) -> dict[str, Baseline]:
+    """Each runner's non-chain verify p90 in one store, sorted by runner."""
+    by_runner: dict[str, list[float]] = {}
+    for row in verifies:
+        if row.chain_items == 1 and row.runner is not None and row.duration_secs is not None:
+            by_runner.setdefault(row.runner, []).append(row.duration_secs)
+    return {
+        runner: Baseline(p90_secs=p90, n=len(durations))
+        for runner, durations in sorted(by_runner.items())
+        if (p90 := pct(durations, 0.90)) is not None
+    }
+
+
+def _ratios(deep: Sequence[VerifyRow], baselines: Mapping[str, Baseline]) -> tuple[float, ...]:
+    """Each timed deep verify's duration over its runner's baseline p90, when that baseline is non-zero."""
+    ratios = []
+    for row in deep:
+        baseline = baselines.get(row.runner) if row.runner is not None else None
+        if row.duration_secs is not None and baseline is not None and baseline.p90_secs > 0:
+            ratios.append(row.duration_secs / baseline.p90_secs)
+    return tuple(ratios)
+
+
+def _sample(path: str, verifies: Sequence[VerifyRow], landed_via_chain: int, as_of: datetime) -> StoreSample:
+    deep = tuple(row for row in verifies if row.is_deep)
+    baselines = _baselines(verifies)
+    return StoreSample(
+        path=path,
+        deep=deep,
+        passed_deep_rounds=_passed_deep_rounds(deep),
+        baselines=baselines,
+        ratios=_ratios(deep, baselines),
+        landed_via_chain=landed_via_chain,
+        item_attributed_failures=_item_attributed_failures(verifies, as_of),
+    )
+
+
 def _window_rows(conn: sqlite3.Connection, event_type: str, window: Window) -> list[tuple[object, ...]]:
     return conn.execute(
         'SELECT timestamp, task_id, data FROM events '
@@ -419,12 +430,11 @@ def _load_store(path: str, window: Window) -> StoreSample:
             conn.close()
     except sqlite3.Error as exc:
         raise PredicateFault(f'cannot read runs.db {path}: {exc}') from exc
-    verify_rows = tuple(_verify_row(path, ts, task_id, data) for ts, task_id, data in verify_events)
-    return StoreSample(
-        path=path,
-        verifies=verify_rows,
+    return _sample(
+        path,
+        [_verify_row(path, ts, task_id, data) for ts, task_id, data in verify_events],
         landed_via_chain=sum(_landed_via_chain(data) for _, _, data in finalized),
-        item_attributed_failures=_item_attributed_failures(verify_rows, window.as_of),
+        as_of=window.as_of,
     )
 
 
