@@ -10228,7 +10228,8 @@ class TaskWorkflow:
         Best-effort and defensive, identical posture to
         :meth:`_detect_tip_wip_commits` / :meth:`_reconcile_done_step_commits`:
         returns ``[]`` on any missing collaborator (``worktree``/``git_ops``/
-        ``artifacts``), unset ``base_commit``, or internal error — a false
+        ``artifacts``), unset ``base_commit``, an unreadable HEAD
+        (``_get_head_commit`` returned ``''``), or internal error — a false
         negative here just reverts to today's (buggy) baseline rather than
         sinking the iteration loop.
 
@@ -10241,6 +10242,8 @@ class TaskWorkflow:
             return []
         try:
             head = await self._get_head_commit()
+            if not head:
+                return []
             status = self._has_prior_implementation(wt_head=head)
             if not status.has_work:
                 return []
