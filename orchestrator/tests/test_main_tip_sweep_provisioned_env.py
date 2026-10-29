@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _git_fixtures import seed_repo
 from _seed_script_stubs import (
     CURRENT_LOCKING_SEED_SCRIPT,
     commit_seed_script,
@@ -21,7 +22,7 @@ from _seed_script_stubs import (
 )
 
 from orchestrator import verify as verify_module
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.main_tip_sweep_cadence import SweepSeedMode
 from orchestrator.verify import VerifyResult
@@ -32,6 +33,18 @@ PROVISION = f'touch {PROVISIONED}'
 
 PASSING_RESULT = VerifyResult(
     passed=True, test_output='', lint_output='', type_output='', summary='ok',
+)
+
+NODE_ID = 'pkg/tests/test_env.py::test_needs_toolchain'
+
+FAILING_RESULT = VerifyResult(
+    passed=False,
+    test_output=f'FAILED {NODE_ID}',
+    lint_output='',
+    type_output='',
+    summary='test_failure',
+    cause_hint=f'FAILED {NODE_ID}',
+    category='test_failure',
 )
 
 
@@ -105,3 +118,66 @@ class TestMainTipSweepProvisionedEnv:
             and 'exit 3' in r.getMessage()
             for r in caplog.records
         ), caplog.text
+
+
+def _confirm_repo(tmp_path: Path) -> Path:
+    """A repo whose committed subproject owns NODE_ID, so the gate can re-run it."""
+    repo = seed_repo(tmp_path / 'repo')
+    (repo / 'pkg' / 'tests').mkdir(parents=True)
+    (repo / 'pkg' / 'orchestrator.yaml').write_text(
+        'test_command: "uv run --project pkg --directory pkg pytest tests/ --tb=short -q"\n',
+    )
+    (repo / 'pkg' / 'tests' / 'test_env.py').write_text(
+        'def test_needs_toolchain():\n    pass\n',
+    )
+    identity = ['git', '-c', 'user.name=t', '-c', 'user.email=t@example.invalid']
+    subprocess.run([*identity, 'add', '-A'], cwd=repo, check=True)
+    subprocess.run([*identity, 'commit', '-qm', 'pkg'], cwd=repo, check=True)
+    return repo
+
+
+async def _confirm(tmp_path: Path, *, passes_when_provisioned: bool) -> tuple[bool, list[bool]]:
+    """Run the confirm gate on FAILING_RESULT; return (verdict, provisioned per re-run)."""
+    repo = _confirm_repo(tmp_path)
+    config = OrchestratorConfig(
+        project_root=repo,
+        git=GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False,
+        ),
+        verify_cold_preprovision_command=PROVISION,
+    )
+    git_ops = GitOps(config.git, repo)
+    seen: list[bool] = []
+
+    async def _fake_run_verification(worktree: Path, cfg, module_config=None, **kwargs):
+        provisioned = (worktree / PROVISIONED).exists()
+        seen.append(provisioned)
+        return PASSING_RESULT if provisioned and passes_when_provisioned else FAILING_RESULT
+
+    with patch.object(verify_module, 'run_verification', side_effect=_fake_run_verification):
+        verdict = await verify_module.confirm_main_tip_failure_is_real(
+            config, git_ops, FAILING_RESULT, main_sha=_head(repo),
+        )
+    return verdict, seen
+
+
+@pytest.mark.asyncio
+class TestConfirmGateProvisionedEnv:
+    async def test_an_environment_only_failure_is_suppressed_once_the_confirm_tree_is_provisioned(
+        self, tmp_path: Path,
+    ):
+        verdict, seen = await _confirm(tmp_path, passes_when_provisioned=True)
+
+        assert verdict is False
+        assert seen == [True]
+
+    async def test_a_failure_that_survives_provisioning_still_files_the_alarm(
+        self, tmp_path: Path,
+    ):
+        verdict, seen = await _confirm(tmp_path, passes_when_provisioned=False)
+
+        assert verdict is True, 'the confirm gate must never mask a real red'
+        assert seen and all(seen), (
+            'every isolated re-run must see the provisioned tree'
+        )
