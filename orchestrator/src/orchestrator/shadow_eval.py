@@ -1324,8 +1324,9 @@ class ShadowCoordinator:
         cell inserted by a drive cancelled mid-open, such as consequence leg 2,
         gets no drive, and the closing sweep fails it from ``sampled``; so
         does a drive cancelled before its first step, which never wrote its
-        own successor. An insert that lands after the sweep is left to the
-        next start's ``reconcile_on_start``.
+        own successor. An insert that lands after the sweep, such as one from
+        an ``on_phase`` arriving once closing has begun, is left to the next
+        start's ``reconcile_on_start``; task 7674 makes that open refuse.
         """
         self._closing = True
         drives = list(self._drives)
