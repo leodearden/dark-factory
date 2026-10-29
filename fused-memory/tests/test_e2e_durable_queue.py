@@ -1,6 +1,9 @@
 """E2E + concurrency stress tests — MemoryService wired to a real DurableWriteQueue.
 
 Only Graphiti/Mem0 backends are mocked; the queue uses real SQLite via tmp_path.
+integrated_service's queue commits skip fsync (synchronous=OFF), so its drains
+are not bounded by host-disk latency; see
+test_integrated_service_queue_commits_do_not_wait_on_the_disk.
 """
 
 from __future__ import annotations
@@ -49,6 +52,9 @@ async def integrated_service(mock_config):
 
     # Real initialize — creates DurableWriteQueue with real SQLite
     await svc.initialize()
+    # Rationale: test_integrated_service_queue_commits_do_not_wait_on_the_disk
+    async with svc.durable_queue._require_access().write() as db:
+        await db.execute('PRAGMA synchronous=OFF')
 
     yield svc
 
