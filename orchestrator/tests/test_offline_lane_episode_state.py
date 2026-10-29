@@ -50,6 +50,7 @@ from orchestrator.offline_lane_episode_state import (
     CommandRecord,
     CoveringStatuses,
     CoveringVerdict,
+    EndedEpisode,
     Episode,
     EpisodeStore,
     LanePolicy,
@@ -263,6 +264,71 @@ def test_the_pass_effect_names_the_debts_it_offered_and_left_undecided():
         {'node': B, 'trigger': 'recovered', 'head': HEAD0},
     ]
     assert payload['debts_undecided'] == [C]
+
+
+def _full_effect() -> PassEffect:
+    return PassEffect(
+        tests_counted=(A, B),
+        episodes_started=(B,),
+        episodes_extended=(A,),
+        episodes_ended=(
+            EndedEpisode(node=C, reason='cleared', counted_passes=1, reproduced_heads=(HEAD0,)),
+            EndedEpisode(node='d', reason='passed', counted_passes=3, reproduced_heads=(HEAD0, HEAD1)),
+        ),
+        threshold_reached=(A,),
+        stale_heads=('e',),
+        no_decision=('f',),
+        tasks_filed=('9001',),
+        escalations_raised=('esc-1', 'esc-2'),
+        debts_offered=(OfferedDebt(C, DebtTrigger.cleared, HEAD1), OfferedDebt('d', DebtTrigger.recovered, HEAD2)),
+        debts_undecided=('g',),
+    )
+
+
+def test_a_pass_effect_reads_back_from_its_json():
+    effect = _full_effect()
+
+    assert PassEffect.from_json(effect.to_json()) == effect
+    assert PassEffect.from_json(json.loads(json.dumps(effect.to_json()))) == effect
+
+
+def test_an_effect_written_before_the_debt_fields_reads_with_none_offered_or_undecided():
+    payload = _full_effect().to_json()
+    del payload['debts_offered'], payload['debts_undecided']
+
+    effect = PassEffect.from_json(payload)
+
+    assert (effect.debts_offered, effect.debts_undecided) == ((), ())
+    assert effect.tasks_filed == ('9001',)
+
+
+def _without_tasks_filed(payload: dict) -> object:
+    del payload['tasks_filed']
+    return payload
+
+
+def _threshold_not_strings(payload: dict) -> object:
+    return {**payload, 'threshold_reached': [A, 7]}
+
+
+def _bool_counted_passes(payload: dict) -> object:
+    return {**payload, 'episodes_ended': [{**payload['episodes_ended'][0], 'counted_passes': True}]}
+
+
+def _unknown_trigger(payload: dict) -> object:
+    return {**payload, 'debts_offered': [{**payload['debts_offered'][0], 'trigger': 'vanished'}]}
+
+
+def _not_an_object(payload: dict) -> object:
+    return [payload]
+
+
+@pytest.mark.parametrize(
+    'malform', [_without_tasks_filed, _threshold_not_strings, _bool_counted_passes, _unknown_trigger, _not_an_object],
+)
+def test_a_malformed_effect_is_refused(malform):
+    with pytest.raises(ValueError):
+        PassEffect.from_json(malform(_full_effect().to_json()))
 
 
 # --- D5: what one pass does to a held test's episode -------------------------------
