@@ -14,8 +14,6 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
-from shared.task_statuses import OwnerLiveness, owner_liveness
-
 from orchestrator.flake_ledger import (
     DEBT_CONTEXT_EVIDENCE_LIMIT,
     UNKNOWN_TEST_ID,
@@ -41,6 +39,7 @@ from orchestrator.offline_lane_episode_state import (
     EndReason,
     Episode,
     PassObservation,
+    is_live_owner,
     reproduce_for,
     unconfirmable_node,
 )
@@ -194,9 +193,6 @@ class DebtDecision(StrEnum):
     NEVER = 'never'
 
 
-_COVERING_LIVENESS = frozenset({OwnerLiveness.OPEN, OwnerLiveness.DEFERRED})
-
-
 def debt_decision(
     node: str, command: str, episode: Episode | None, covering: CoveringStatuses,
 ) -> DebtDecision:
@@ -208,7 +204,7 @@ def debt_decision(
         return DebtDecision.ELIGIBLE
     if covering.error is not None:
         return DebtDecision.UNDECIDED
-    if owner_liveness(covering.statuses.get(task_id)) in _COVERING_LIVENESS:
+    if is_live_owner(covering.statuses.get(task_id)):
         return DebtDecision.COVERED
     return DebtDecision.ELIGIBLE
 

@@ -57,6 +57,7 @@ from orchestrator.offline_lane_episode_state import (
     PassEffect,
     PassObservation,
     apply_outage,
+    is_live_owner,
     recheck_due,
     unconfirmable_node,
     with_recorded_history,
@@ -223,6 +224,17 @@ def test_covering_statuses_name_the_done_and_closed_tasks_terminal():
 
 def test_unreadable_covering_statuses_name_no_task_terminal():
     assert CoveringStatuses({'5': 'done'}, 'task store unreachable').terminal_task_ids == frozenset()
+
+
+@pytest.mark.parametrize(
+    ('status', 'live'),
+    [
+        ('pending', True), ('in-progress', True), ('blocked', True), ('deferred', True),
+        ('done', False), ('cancelled', False), ('', False), (None, False),
+    ],
+)
+def test_an_owner_is_live_while_open_or_deferred(status: str | None, live: bool):
+    assert is_live_owner(status) is live
 
 
 def _effect(**debts) -> PassEffect:

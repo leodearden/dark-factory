@@ -416,7 +416,12 @@ class PassReads:
     previous_detect: RunRecord | None
 
 
-_TERMINAL_LIVENESS = frozenset({OwnerLiveness.DONE, OwnerLiveness.CLOSED})
+_LIVE_LIVENESS = frozenset({OwnerLiveness.OPEN, OwnerLiveness.DEFERRED})
+
+
+def is_live_owner(status: str | None) -> bool:
+    """Whether a task with *status* still owns its work: open or deferred, not done, cancelled or unknown."""
+    return owner_liveness(status) in _LIVE_LIVENESS
 
 
 @dataclass(frozen=True)
@@ -430,9 +435,7 @@ class CoveringStatuses:
     def terminal_task_ids(self) -> frozenset[str]:
         if self.error is not None:
             return frozenset()
-        return frozenset(
-            task_id for task_id, status in self.statuses.items() if owner_liveness(status) in _TERMINAL_LIVENESS
-        )
+        return frozenset(task_id for task_id, status in self.statuses.items() if not is_live_owner(status))
 
 
 class EndReason(StrEnum):

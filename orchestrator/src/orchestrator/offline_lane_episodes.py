@@ -92,6 +92,7 @@ from orchestrator.offline_lane_episode_state import (
     PassReads,
     apply_outage,
     apply_pass,
+    is_live_owner,
     recheck_due,
     reproduce_for,
     reproduced_nodes,
@@ -1092,7 +1093,7 @@ class LaneEngine:
             return {node: f'{owner} (status unreadable: {error})' for node, owner in owed.items()}
         return {
             node: owner for node, owner in owed.items()
-            if owner_liveness(statuses.get(owner)) in (OwnerLiveness.OPEN, OwnerLiveness.DEFERRED)
+            if is_live_owner(statuses.get(owner))
         }
 
     async def _counted_evidence(
