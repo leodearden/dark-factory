@@ -2493,6 +2493,12 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # human-gate-owned, so the deterministic gate-owned
             # suggested_action normalizer rewrites nothing.
             'gate_owned_suggested_actions_normalized': 0,
+            # Always present (task 5626), pre-initialised before the
+            # remediation early-return; 0 here because no task completed.
+            'unlanded_path_check_checked': 0,
+            'unlanded_path_check_skipped': 0,
+            'unlanded_path_check_errors': 0,
+            'unlanded_path_check_flags_emitted': 0,
             # The auto-consolidation post-step's keys (task 5240). This bare
             # AsyncMock memory's enabled_projects contains nothing, so the
             # post-step stops at its project gate.
@@ -2709,6 +2715,12 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # human-gate-owned, so the deterministic gate-owned
             # suggested_action normalizer rewrites nothing.
             'gate_owned_suggested_actions_normalized': 0,
+            # Always present (task 5626), pre-initialised before the
+            # remediation early-return; 0 here because no task completed.
+            'unlanded_path_check_checked': 0,
+            'unlanded_path_check_skipped': 0,
+            'unlanded_path_check_errors': 0,
+            'unlanded_path_check_flags_emitted': 0,
             # The auto-consolidation post-step's keys (task 5240). This bare
             # AsyncMock memory's enabled_projects contains nothing, so the
             # post-step stops at its project gate.
