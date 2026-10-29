@@ -249,14 +249,8 @@ class EventBuffer:
             # keep NULL and are never fold targets.  The index lives here, not
             # in _BUFFER_SCHEMA_SQL, because that script runs first and would
             # name a column a pre-existing table does not have yet.
-            if 'coalesce_key' not in eb_columns:
-                try:
-                    await db.execute('ALTER TABLE event_buffer ADD COLUMN coalesce_key TEXT')
-                    logger.info('EventBuffer: migrated event_buffer — added coalesce_key column')
-                except Exception as exc:
-                    if 'duplicate column name' not in str(exc).lower():
-                        raise
-                    logger.debug('EventBuffer: coalesce_key already exists (concurrent init)')
+            if await add_column_if_missing(db, 'event_buffer', 'coalesce_key', 'TEXT'):
+                logger.info('EventBuffer: migrated event_buffer — added coalesce_key column')
             await db.execute(
                 'CREATE INDEX IF NOT EXISTS idx_eb_coalesce'
                 ' ON event_buffer(project_id, coalesce_key, status)'
