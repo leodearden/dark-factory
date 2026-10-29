@@ -1,6 +1,6 @@
-"""Importing chronic_flake must not load the HTTP lifecycle module (task 6216).
+"""Importing chronic_flake must not load orchestrator.mcp_lifecycle (task 6216).
 
-That module is orchestrator.mcp_lifecycle. The probe runs in a FRESH interpreter: this pytest process has already
+The probe runs in a FRESH interpreter: this pytest process has already
 imported mcp_lifecycle through sibling test modules, so an in-process
 ``sys.modules`` check would pass vacuously.
 """
