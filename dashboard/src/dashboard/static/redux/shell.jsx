@@ -496,4 +496,30 @@ function Segmented({ options, value, onChange }) {
   );
 }
 
-window.DF_SHELL = { Glyph, StatStrip, ChipGroup, ProjectChips, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Pip, DatumReading, Segmented, timeago, fmtUptime, fmtDateTime, scrubIsos, taskId };
+// ── Render-failure boundary ──
+// A render throw anywhere below would otherwise unmount the whole page. React
+// accepts only a class as an error boundary. `describe(thrown)` decides the
+// notice and must be total (render_failure.js); this class never reads the
+// thrown value itself. It never resets: a parent that wants a retry remounts
+// it with a new key.
+class RenderFailureBoundary extends React.Component {
+  state = { failed: false, thrown: undefined };
+
+  static getDerivedStateFromError(thrown) {
+    return { failed: true, thrown };
+  }
+
+  render() {
+    if (!this.state.failed) return this.props.children;
+    const { describe, testId, className, style } = this.props;
+    const notice = describe(this.state.thrown);
+    return (
+      <div className={className} data-testid={testId} role="alert" style={style}>
+        <div>{notice.text}</div>
+        <div>{notice.detail}</div>
+      </div>
+    );
+  }
+}
+
+window.DF_SHELL = { Glyph, StatStrip, ChipGroup, ProjectChips, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Pip, DatumReading, Segmented, RenderFailureBoundary, timeago, fmtUptime, fmtDateTime, scrubIsos, taskId };
