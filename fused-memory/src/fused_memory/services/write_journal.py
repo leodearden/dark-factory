@@ -19,10 +19,12 @@ import json
 import logging
 import time
 import uuid as uuid_mod
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 
 import aiosqlite
 from shared.async_sqlite_base import (
@@ -31,8 +33,14 @@ from shared.async_sqlite_base import (
     apply_full_durability_pragmas,
     connect_daemon,
 )
+from shared.sqlite_column_migration import add_column_if_missing
 
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
+from fused_memory.services.read_rollup import (
+    COUNT_READ_SQL,
+    READ_OP_COUNTS_SCHEMA_SQL,
+    keeps_read_row,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +51,7 @@ logger = logging.getLogger(__name__)
 _monotonic = time.monotonic
 
 SCHEMA_SQL = """
+-- The read rollup table read_op_counts (task 5405) is created beside these; its DDL lives in services/read_rollup.py.
 CREATE TABLE IF NOT EXISTS write_ops (
     id TEXT PRIMARY KEY,
     causation_id TEXT,
@@ -150,8 +159,8 @@ CREATE TABLE IF NOT EXISTS write_ops (
 CREATE INDEX IF NOT EXISTS idx_wo_causation ON write_ops(causation_id);
 CREATE INDEX IF NOT EXISTS idx_wo_project_time ON write_ops(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_wo_operation ON write_ops(operation);
--- idx_wo_created (task 3304): the dashboard filters a BARE `WHERE created_at >= ?`
--- in get_memory_timeseries / get_operations_breakdown / get_agent_breakdown
+-- idx_wo_created (task 3304): the dashboard range-filters `created_at` alone
+-- in get_memory_ops
 -- (dashboard/src/dashboard/data/write_journal.py — cited by function name, not
 -- line number, so the reference survives edits to that file). Every other
 -- write_ops index has created_at in SECOND position, so none of them can
@@ -218,6 +227,8 @@ CREATE INDEX IF NOT EXISTS idx_bo_created ON backend_ops(created_at);
 -- mem0 write (the happy path logs 'pending' then stamps 'completed'), so
 -- terminal completed/failed rows are aged out by WriteJournal.prune_mem0_intents
 -- (run at startup after recovery); 'dead' rows are preserved for manual replay.
+-- 'retrying' rows (task 7397: a transient provider failure, re-issued at
+-- next_attempt_at) keep resolved_at NULL and so are never pruned.
 CREATE TABLE IF NOT EXISTS mem0_intents (
     id TEXT PRIMARY KEY,
     write_op_id TEXT,
@@ -232,7 +243,9 @@ CREATE TABLE IF NOT EXISTS mem0_intents (
     status TEXT NOT NULL DEFAULT 'pending',
     reason TEXT,
     created_at TEXT NOT NULL,
-    resolved_at TEXT
+    resolved_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_mi_status ON mem0_intents(status);
 CREATE INDEX IF NOT EXISTS idx_mi_write_op ON mem0_intents(write_op_id);
@@ -290,6 +303,27 @@ CREATE TABLE IF NOT EXISTS referent_findings (
 CREATE INDEX IF NOT EXISTS idx_rf_group_time ON referent_findings(group_id, created_at);
 """
 
+
+def _prune_batch_sql(horizon_rows: str) -> str:
+    return (
+        'DELETE FROM write_ops WHERE id IN ('
+        'SELECT id FROM write_ops INDEXED BY idx_wo_kind_time '
+        f'WHERE {horizon_rows} AND created_at >= ? AND created_at < ? '
+        'ORDER BY created_at LIMIT ?) RETURNING created_at'
+    )
+
+
+#: One batch of ``WriteJournal.prune_write_ops`` per retention horizon, in the
+#: order it drains them: delete the oldest ``LIMIT`` rows of the horizon created
+#: in ``[resume_from, cutoff)`` and return their ``created_at``. Parameters:
+#: ``(resume_from, cutoff, limit)``. Each range-seeks idx_wo_kind_time, and
+#: INDEXED BY pins it, so a missing index errors instead of scanning.
+WRITE_OPS_PRUNE_BATCH_SQL: Mapping[str, str] = MappingProxyType({
+    'read': _prune_batch_sql("kind = 'read' AND operation <> 'search'"),
+    'search': _prune_batch_sql("kind = 'read' AND operation = 'search'"),
+    'write': _prune_batch_sql("kind = 'write'"),
+})
+
 #: Parameters: ``(since_iso_timestamp, limit)``.
 OPERATOR_TELEMETRY_QUERY = """
 SELECT
@@ -345,12 +379,51 @@ class JournalGrowthSample:
     since: datetime
 
 
+_UPSERT_WRITE_OP_SQL = """INSERT INTO write_ops
+   (id, causation_id, source, provenance, operation,
+    project_id, agent_id, session_id, kind,
+    params, result_summary, success, error, created_at)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   ON CONFLICT(id) DO UPDATE SET
+       causation_id = excluded.causation_id,
+       source = excluded.source,
+       provenance = excluded.provenance,
+       operation = excluded.operation,
+       project_id = excluded.project_id,
+       agent_id = excluded.agent_id,
+       session_id = excluded.session_id,
+       kind = excluded.kind,
+       params = excluded.params,
+       result_summary = excluded.result_summary,
+       success = excluded.success,
+       error = excluded.error,
+       created_at = excluded.created_at"""
+
+
 async def _read_int(access: AtomicConnection, sql: str) -> int:
     """The single integer *sql* selects, or a RuntimeError naming *sql*."""
     row = await access.read_one(sql)
     if row is None or row[0] is None:
         raise RuntimeError(f'write_journal growth sample: {sql!r} returned no value')
     return row[0]
+
+
+class Mem0IntentStatus(StrEnum):
+    """The ``mem0_intents.status`` vocabulary.
+
+    ``RETRYING`` is a write whose Mem0 leg failed on a transient provider error
+    and is re-issued at ``next_attempt_at`` (``services/mem0_write_retry.py``).
+    """
+
+    PENDING = 'pending'
+    RETRYING = 'retrying'
+    COMPLETED = 'completed'
+    FAILED = 'failed'
+    DEAD = 'dead'
+
+
+def _schedule_timestamp(moment: datetime) -> str:
+    return moment.isoformat(timespec='microseconds')
 
 
 class WriteJournal:
@@ -360,6 +433,7 @@ class WriteJournal:
         self.data_dir = Path(data_dir)
         self._access: AtomicConnection | None = None
         self._dropped: collections.Counter[str] = collections.Counter()
+        self._pruned_below: dict[str, str] = {}
 
     @property
     def db_path(self) -> Path:
@@ -374,6 +448,7 @@ class WriteJournal:
         self._access = AtomicConnection(conn)
         async with self._access.write() as db:
             await db.executescript(SCHEMA_SQL)
+            await db.executescript(READ_OP_COUNTS_SCHEMA_SQL)
         await self._migrate()
         logger.info(f'Write journal initialized at {db_path}')
 
@@ -437,21 +512,13 @@ class WriteJournal:
 
     async def _migrate(self) -> None:
         """Add columns introduced after initial schema (idempotent)."""
-        access = self._require_access()
-        existing = {row[1] for row in await access.read_all('PRAGMA table_info(write_ops)')}
-        existing_backend_ops = {
-            row[1] for row in await access.read_all('PRAGMA table_info(backend_ops)')
-        }
-
-        async with access.write() as db:
-            if 'session_id' not in existing:
-                await db.execute('ALTER TABLE write_ops ADD COLUMN session_id TEXT')
+        async with self._require_access().write() as db:
+            if await add_column_if_missing(db, 'write_ops', 'session_id', 'TEXT'):
                 logger.info('Migration: added session_id column to write_ops')
 
-            if 'kind' not in existing:
-                await db.execute(
-                    "ALTER TABLE write_ops ADD COLUMN kind TEXT NOT NULL DEFAULT 'write'"
-                )
+            if await add_column_if_missing(
+                db, 'write_ops', 'kind', "TEXT NOT NULL DEFAULT 'write'"
+            ):
                 await db.execute(
                     "UPDATE write_ops SET kind = 'read' WHERE operation = 'search'"
                 )
@@ -465,23 +532,27 @@ class WriteJournal:
             # Deliberately NOT backfilled (unlike `kind`): a pre-change row's
             # terminal outcome is genuinely unknown and must stay NULL rather
             # than be guessed.
-            if 'terminal_status' not in existing:
-                await db.execute('ALTER TABLE write_ops ADD COLUMN terminal_status TEXT')
+            if await add_column_if_missing(db, 'write_ops', 'terminal_status', 'TEXT'):
                 logger.info('Migration: added terminal_status column to write_ops')
 
-            if 'terminal_at' not in existing:
-                await db.execute('ALTER TABLE write_ops ADD COLUMN terminal_at TEXT')
+            if await add_column_if_missing(db, 'write_ops', 'terminal_at', 'TEXT'):
                 logger.info('Migration: added terminal_at column to write_ops')
 
-            if 'terminal_error' not in existing:
-                await db.execute('ALTER TABLE write_ops ADD COLUMN terminal_error TEXT')
+            if await add_column_if_missing(db, 'write_ops', 'terminal_error', 'TEXT'):
                 logger.info('Migration: added terminal_error column to write_ops')
 
             # Same O(1), no-backfill stance as terminal_* above: a historical
             # row's duration is unknown, so it stays NULL.
-            if 'duration_ms' not in existing_backend_ops:
-                await db.execute('ALTER TABLE backend_ops ADD COLUMN duration_ms REAL')
+            if await add_column_if_missing(db, 'backend_ops', 'duration_ms', 'REAL'):
                 logger.info('Migration: added duration_ms column to backend_ops')
+
+            if await add_column_if_missing(
+                db, 'mem0_intents', 'attempts', 'INTEGER NOT NULL DEFAULT 0'
+            ):
+                logger.info('Migration: added attempts column to mem0_intents')
+
+            if await add_column_if_missing(db, 'mem0_intents', 'next_attempt_at', 'TEXT'):
+                logger.info('Migration: added next_attempt_at column to mem0_intents')
 
             # Indexes on new columns (safe after migration ensures columns exist)
             await db.execute(
@@ -510,6 +581,11 @@ class WriteJournal:
     ) -> None:
         """Log a Layer 1 operation. Fire-and-forget — never raises.
 
+        A successful read with no per-row consumer (``read_rollup.keeps_read_row``
+        is False) is COUNTED into ``read_op_counts`` and never stored (task 5405).
+        Each read therefore lands in exactly one of the two tables, which is what
+        lets the dashboard add them.
+
         An UPSERT rather than a plain INSERT (task 3582): the durable queue's
         terminal write-back can legitimately reach this ``write_op_id`` before
         its producer gets here — ``add_memory`` enqueues the Graphiti leg and
@@ -530,46 +606,46 @@ class WriteJournal:
         that is really just the writer. Such a row also carries
         ``params['done_provenance_kind']`` and lands for a REFUSED write too,
         with ``success=0`` and the refusal in ``error``.
+
+        A ``search`` IS ALWAYS STORED AS ``kind='read'``, because the search
+        retention horizon of :meth:`prune_write_ops` selects on that pair; any
+        other ``kind`` passed with it is logged and overridden.
         """
+        if operation == 'search' and kind != 'read':
+            logger.warning(
+                "write_op %s: operation='search' journalled with kind=%r; stored as "
+                "kind='read', the kind the search retention horizon selects",
+                write_op_id, kind,
+            )
+            kind = 'read'
+        created_at = datetime.now(UTC).isoformat()
+        counted = kind == 'read' and not keeps_read_row(operation=operation, success=success)
         try:
             async with self._require_access().write() as db:
-                await db.execute(
-                    """INSERT INTO write_ops
-                       (id, causation_id, source, provenance, operation,
-                        project_id, agent_id, session_id, kind,
-                        params, result_summary, success, error, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(id) DO UPDATE SET
-                           causation_id = excluded.causation_id,
-                           source = excluded.source,
-                           provenance = excluded.provenance,
-                           operation = excluded.operation,
-                           project_id = excluded.project_id,
-                           agent_id = excluded.agent_id,
-                           session_id = excluded.session_id,
-                           kind = excluded.kind,
-                           params = excluded.params,
-                           result_summary = excluded.result_summary,
-                           success = excluded.success,
-                           error = excluded.error,
-                           created_at = excluded.created_at""",
-                    (
-                        write_op_id,
-                        causation_id,
-                        source,
-                        provenance,
-                        operation,
-                        project_id,
-                        agent_id,
-                        session_id,
-                        kind,
-                        json.dumps(params) if params else '{}',
-                        json.dumps(result_summary) if isinstance(result_summary, dict) else result_summary,
-                        1 if success else 0,
-                        error,
-                        datetime.now(UTC).isoformat(),
-                    ),
-                )
+                if counted:
+                    await db.execute(
+                        COUNT_READ_SQL, (created_at, project_id, agent_id, operation, 1)
+                    )
+                else:
+                    await db.execute(
+                        _UPSERT_WRITE_OP_SQL,
+                        (
+                            write_op_id,
+                            causation_id,
+                            source,
+                            provenance,
+                            operation,
+                            project_id,
+                            agent_id,
+                            session_id,
+                            kind,
+                            json.dumps(params) if params else '{}',
+                            json.dumps(result_summary) if isinstance(result_summary, dict) else result_summary,
+                            1 if success else 0,
+                            error,
+                            created_at,
+                        ),
+                    )
         except Exception as e:
             self._dropped[operation] += 1
             logger.warning(f'Failed to log write_op: {e}')
@@ -776,10 +852,15 @@ class WriteJournal:
         results.sort(key=lambda r: r.get('created_at', ''))
         return results
 
-    async def get_ops_since(
+    async def get_stored_ops_since(
         self, since: str, limit: int = 100, kind: str | None = None
     ) -> list[dict]:
-        """Return write_ops since a timestamp, optionally filtered by kind."""
+        """Return the ``write_ops`` rows STORED since a timestamp, optionally by kind.
+
+        Successful reads without a per-row consumer are counted into
+        ``read_op_counts`` and never stored (``read_rollup.py``), so this is not
+        an activity count: ``kind='read'`` yields searches and failed reads only.
+        """
         if kind:
             sql = 'SELECT * FROM write_ops WHERE created_at >= ? AND kind = ? ORDER BY created_at LIMIT ?'
             params = (since, kind, limit)
@@ -958,23 +1039,93 @@ class WriteJournal:
             logger.error(f'Failed to log mem0_intent {intent_id}: {e}')
 
     async def resolve_mem0_intent(
-        self, intent_id: str, status: str, reason: str | None = None
-    ) -> None:
+        self,
+        intent_id: str,
+        status: str,
+        reason: str | None = None,
+        *,
+        expected_status: str | None = None,
+    ) -> bool:
         """Stamp a mem0_intent terminal (``completed``|``failed``|``dead``).
 
-        Fire-and-forget — logs loudly on failure but never raises.
+        With ``expected_status`` the stamp is a compare-and-set: it applies only
+        to a row currently in that status. Returns whether a row was updated.
+
+        Fire-and-forget — logs loudly on failure and returns ``False``, never
+        raises.
         """
+        sql = 'UPDATE mem0_intents SET status = ?, reason = ?, resolved_at = ? WHERE id = ?'
+        params: tuple[str | None, ...] = (
+            status,
+            reason,
+            datetime.now(UTC).isoformat(),
+            intent_id,
+        )
+        if expected_status is not None:
+            sql += ' AND status = ?'
+            params = (*params, expected_status)
         try:
             async with self._require_access().write() as db:
-                await db.execute(
-                    'UPDATE mem0_intents SET status = ?, reason = ?, resolved_at = ? '
-                    'WHERE id = ?',
-                    (status, reason, datetime.now(UTC).isoformat(), intent_id),
-                )
+                cursor = await db.execute(sql, params)
+                return cursor.rowcount == 1
         except Exception as e:
             logger.error(
                 f'Failed to resolve mem0_intent {intent_id} -> {status}: {e}'
             )
+            return False
+
+    async def schedule_mem0_retry(
+        self, intent_id: str, *, reason: str, retry_at: datetime
+    ) -> bool:
+        """Move a ``pending`` or ``retrying`` intent to ``retrying`` at ``retry_at``.
+
+        Increments ``attempts``. A compare-and-set: an unknown id or a terminal
+        row is left unchanged and ``False`` is returned. ``resolved_at`` stays
+        NULL, which is what keeps :meth:`prune_mem0_intents` off the row.
+
+        Fire-and-forget — logs loudly on failure and returns ``False``, never
+        raises.
+        """
+        try:
+            async with self._require_access().write() as db:
+                cursor = await db.execute(
+                    'UPDATE mem0_intents SET status = ?, attempts = attempts + 1, '
+                    'next_attempt_at = ?, reason = ? '
+                    'WHERE id = ? AND status IN (?, ?)',
+                    (
+                        Mem0IntentStatus.RETRYING,
+                        _schedule_timestamp(retry_at),
+                        reason,
+                        intent_id,
+                        Mem0IntentStatus.PENDING,
+                        Mem0IntentStatus.RETRYING,
+                    ),
+                )
+                return cursor.rowcount == 1
+        except Exception as e:
+            logger.error(f'Failed to schedule retry of mem0_intent {intent_id}: {e}')
+            return False
+
+    async def get_due_mem0_retries(self, *, now: datetime, limit: int) -> list[dict]:
+        """Return up to ``limit`` ``retrying`` intents due by ``now``, soonest first."""
+        rows = await self._require_access().read_all(
+            'SELECT * FROM mem0_intents WHERE status = ? AND next_attempt_at <= ? '
+            'ORDER BY next_attempt_at LIMIT ?',
+            (Mem0IntentStatus.RETRYING, _schedule_timestamp(now), limit),
+        )
+        return [dict(row) for row in rows]
+
+    async def count_mem0_intents_by_status(self, *, since: datetime) -> dict[str, int]:
+        """Count intents created at or after ``since``, keyed by status in sorted order.
+
+        Raises on a read error: the caller chooses the fallback.
+        """
+        rows = await self._require_access().read_all(
+            'SELECT status, COUNT(*) FROM mem0_intents WHERE created_at >= ? '
+            'GROUP BY status ORDER BY status',
+            (_schedule_timestamp(since),),
+        )
+        return {row[0]: row[1] for row in rows}
 
     async def record_terminal_outcome(
         self,
@@ -1097,6 +1248,9 @@ class WriteJournal:
         and is an operator-visible signal, so it must not be silently aged
         out. Override ``statuses`` to include it explicitly.
 
+        ``retrying`` rows are excluded whatever ``statuses`` says: they are not
+        terminal and keep ``resolved_at`` NULL until their retry resolves them.
+
         Fire-and-forget — logs loudly on failure but never raises, so a prune
         hiccup cannot crash startup.
         """
@@ -1141,19 +1295,20 @@ class WriteJournal:
 
         Same fire-and-forget contract as ``prune_mem0_intents`` — logs loudly,
         never raises, returns the count deleted, returns 0 when uninitialised.
-        Intended to run once at startup.
+        Runs at startup and every ``prune_interval_seconds``
+        (``services/write_ops_retention.py``).
 
         EVERY BOUND IS REQUIRED, with no default here. The six numbers have a
         single home — ``config/schema.py::WriteJournalConfig`` — and the sole
-        production caller (``server/main.py``) already passes all six from it.
-        A second copy as signature defaults would be a copy nothing reads, kept
-        equal to the first only by a drift-guard test; requiring the arguments
-        deletes the copy instead of policing it.
+        production caller, ``services/write_ops_retention.py::prune_write_ops_pass``,
+        passes all six from it. A second copy as signature defaults would be a
+        copy nothing reads, kept equal to the first only by a drift-guard test;
+        requiring the arguments deletes the copy instead of policing it.
 
         THREE HORIZONS, because the rows are not interchangeable. Measured
         2026-09-11 over a never-pruned 157-day span: non-search READS are
         34,669,782 rows (97.9% of the table — ``get_task``, ``get_tasks``,
-        ``get_statuses``, ``get_external_statuses``, ~220,800/day) and have no
+        ``get_statuses``, ``get_external_statuses``) and have no
         downstream consumer, so 30 days is generous incident-forensics headroom.
         SEARCH reads are the opposite in both directions: only 481,447 rows
         (1.36%, ~3,066/day), and they are the SOLE data source for leaf eta's
@@ -1162,7 +1317,9 @@ class WriteJournal:
         short horizon would silently starve the metric, and a long one is nearly
         free (365 days is ~1.1M rows). WRITES are the durable audit trail joined
         by ``causation_id`` in ``reconciliation/stats_verifier.py`` and are 0.73%
-        of volume, so 730 days costs essentially nothing.
+        of volume, so 730 days costs essentially nothing. Since task 5405 the
+        'read' horizon governs less than it did: see the ``write_journal`` block
+        of ``fused-memory/config/config.yaml``.
 
         BATCHED AND DOUBLY BOUNDED, unlike this file's two sibling prunes, whose
         tables are small enough for a single unbounded DELETE. This one runs
@@ -1175,30 +1332,37 @@ class WriteJournal:
         errors. A multi-minute startup DELETE would therefore corrupt the very
         telemetry it is pruning. Each batch is its own ``write()`` unit, so both
         the per-connection lock and SQLite's write lock are released between
-        batches and serving writes interleave, and the sweep stops on
-        whichever bound comes first. ``max_rows`` is only a PROXY for the risk;
-        ``max_seconds`` bounds it directly, because rows-per-second is not
-        knowable in advance — it depends on page-cache warmth and on six index
-        b-trees per delete. The deadline is checked BETWEEN batches, never
-        mid-batch.
+        batches and serving writes interleave. That matters most for the
+        periodic pass, which runs while serving: a journalled tool call waits on
+        the connection lock for at most one batch, never a whole pass, and
+        ``batch_size`` is sized for that wait in ``fused-memory/config/config.yaml``.
+        The sweep stops on whichever bound comes first. ``max_rows`` is only a
+        PROXY for the risk; ``max_seconds`` bounds it directly, because
+        rows-per-second is not knowable in advance — it depends on page-cache
+        warmth and on six index b-trees per delete. The deadline is checked
+        BETWEEN batches, never mid-batch.
 
-        WHAT "DRAINS OVER SUCCESSIVE RESTARTS" REQUIRES, stated so the claim is
-        checkable rather than hopeful. Non-search reads accrue at ~220,800/day,
-        so a sweep only makes net progress if it removes more than
-        220,800/(redeploys per day) rows — at an ASSUMED 1-3 fleet redeploys per
-        day that is ~74,000-220,800 rows per run, i.e. ~2,500-7,400 rows/sec
-        against the stock 30 s deadline. The accrual rate is measured; the
-        redeploy cadence is an estimate, not a pinned figure (see OPERATIONS.md
-        §"Fleet redeploy & watchdog"), so treat the required rate as an order of
-        magnitude and the LOGGED rate below as the real answer. Below that the backlog never clears
-        while the WARNING fires forever and reads as normal, so the achieved
-        rate is MEASURED and logged (rows and rows/sec) on every partial sweep
-        rather than assumed. If the first production run comes in under it, the
-        two ways out are raising ``prune_max_seconds`` (a config leaf, restart
-        to apply) for the drain phase, or a one-off operator-run bulk delete
-        against a stopped server, where no startup grace applies. A first run
-        against the current backlog legitimately needs many restarts either way,
-        which the WARNING discloses rather than hides.
+        EACH HORIZON RESUMES WHERE ITS LAST BATCH STOPPED. ``operation`` is not
+        in idx_wo_kind_time, so the read horizon tests ``operation <> 'search'``
+        with a table-row lookup per index entry, and its range holds every kept
+        search row older than the oldest expired read. A batch started from the
+        bottom walks all of them before deleting anything: measured 2026-10-12 on
+        the live journal, 430,040 rows took 9.4 s cold and 0.4-0.6 s warm in one
+        statement the deadline cannot interrupt, against 2 ms from a resume
+        point. ``_pruned_below`` keeps, per horizon, the ``created_at`` below
+        which every matching row is already deleted. It stays true because every
+        ``write_ops`` writer stamps ``created_at`` with the current time, so no
+        row lands behind it. It lives as long as the process, so only the first
+        batch after a start pays the walk, and that runs before READY.
+
+        WHAT NET PROGRESS REQUIRES, stated so the claim is checkable rather than
+        hopeful: rows removed per day (passes per day x rows per pass) must
+        exceed the non-search reads inserted per day. Below that the backlog
+        never clears while the WARNING fires on every pass and reads as normal.
+        The dated measurement of both sides, and the interval chosen from it,
+        live in the ``write_journal`` block of ``fused-memory/config/config.yaml``
+        (2026-10-11); the rows and rows/sec logged on every partial pass are the
+        live answer.
 
         ``terminal_status='dead'`` rows are NOT exempted, unlike the dead-letters
         ``prune_mem0_intents`` deliberately preserves: a dead ``write_ops`` row
@@ -1206,37 +1370,19 @@ class WriteJournal:
         age is the only thing that should decide its fate.
 
         THIS BOUNDS GROWTH; IT DOES NOT RECLAIM DISK. Measured on the live
-        journal: ``PRAGMA auto_vacuum`` is 0 (NONE) and ``freelist_count`` is 0.
-        With auto-vacuum off a DELETE returns pages to SQLite's freelist for
-        REUSE by later inserts; it does not return them to the filesystem, so
-        ``ls -lh`` still reports ~16 GB after a fully successful prune — and the
-        freed pages are exactly what absorbs the new per-result search detail in
-        place. Reclaiming the space needs an offline ``VACUUM``, a full-file
-        rewrite requiring another ~16 GB of scratch, which is categorically not
-        a startup operation.
+        journal: ``PRAGMA auto_vacuum`` is 0 (NONE). With auto-vacuum off a
+        DELETE returns pages to SQLite's freelist for REUSE by later inserts; it
+        does not return them to the filesystem, so ``ls -lh`` reports the same
+        size after a fully successful prune — and the freed pages are exactly
+        what absorbs the new per-result search detail in place. Reclaiming the
+        space needs an offline ``VACUUM``, a full-file rewrite requiring as much
+        scratch again, which is categorically not a startup operation.
         """
-        horizons = (
-            # Cheapest first, and each written against an index that already
-            # exists — no new DDL, because building one on this table would
-            # reintroduce the startup stall the batching exists to avoid.
-            #
-            # The two kind-scoped horizons range-seek idx_wo_kind_time
-            # (kind, created_at), so the cutoff bounds the scan. The search
-            # horizon does NOT: idx_wo_operation is on (operation) alone, so it
-            # seeks the operation='search' partition and applies created_at as
-            # a residual filter — a scan of that whole partition (~481k rows
-            # measured) on every startup, even once the horizon is drained.
-            # Correct, and cheap relative to the read horizon, but it is a
-            # partition scan and not a seek. Only widen the index to
-            # (operation, created_at) if that scan ever shows up in startup
-            # timings: the DDL cost above is the reason it is not there today.
-            ('read', "kind = 'read' AND operation <> 'search' AND created_at < ?",
-             read_older_than_days),       # idx_wo_kind_time — seek
-            ('search', "operation = 'search' AND created_at < ?",
-             search_older_than_days),     # idx_wo_operation — partition scan
-            ('write', "kind = 'write' AND created_at < ?",
-             write_older_than_days),      # idx_wo_kind_time — seek
-        )
+        older_than_days = {
+            'read': read_older_than_days,
+            'search': search_older_than_days,
+            'write': write_older_than_days,
+        }
         try:
             deadline = _monotonic() + max_seconds
             total = 0
@@ -1244,30 +1390,33 @@ class WriteJournal:
             halted = ''
             backlog: list[str] = []
 
-            for label, predicate, older_than_days in horizons:
+            for label, batch_sql in WRITE_OPS_PRUNE_BATCH_SQL.items():
                 if halted:
                     # Never attempted under this run's bounds — unknown, so
                     # reported as a backlog rather than assumed drained.
                     backlog.append(label)
                     continue
-                cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+                cutoff = (
+                    datetime.now(UTC) - timedelta(days=older_than_days[label])
+                ).isoformat()
                 while True:
                     limit = min(batch_size, max_rows - total)
                     if limit <= 0:
                         halted = 'row budget'
                         backlog.append(label)
                         break
+                    resume_from = self._pruned_below.get(label, '')
                     async with self._require_access().write() as db:
-                        cursor = await db.execute(
-                            f'DELETE FROM write_ops WHERE id IN '
-                            f'(SELECT id FROM write_ops WHERE {predicate} LIMIT ?)',
-                            (cutoff, limit),
-                        )
-                        removed = max(cursor.rowcount, 0)
+                        deleted = list(await db.execute_fetchall(
+                            batch_sql, (resume_from, cutoff, limit)
+                        ))
+                    removed = len(deleted)
                     total += removed
                     by_horizon[label] = by_horizon.get(label, 0) + removed
                     if removed < limit:
+                        self._pruned_below[label] = cutoff
                         break  # a short batch means this horizon is drained
+                    self._pruned_below[label] = max(row[0] for row in deleted)
                     if total >= max_rows:
                         halted = 'row budget'
                         backlog.append(label)
@@ -1287,83 +1436,17 @@ class WriteJournal:
                     write_older_than_days, by_horizon.get('write', 0),
                 )
             if halted:
-                # The achieved rate is the ONLY thing that says whether "drains
-                # over successive restarts" is true on this disk: reads accrue
-                # at ~220,800/day, so a sweep sustaining less than
-                # ~2,500-7,400 rows/sec (at 1-3 redeploys/day) never catches up
-                # and this WARNING would otherwise repeat forever looking normal.
+                # The achieved rate is the ONLY thing that says whether the
+                # passes keep up on this disk; see the net-progress rule above.
                 elapsed = max(_monotonic() - (deadline - max_seconds), 1e-9)
                 logger.warning(
                     'write_ops prune stopped early on the %s after %d rows in %.1fs '
-                    '(%.0f rows/sec; ~2500-7400 rows/sec is needed to beat the '
-                    '~220,800 reads/day accrual at 1-3 redeploys/day); horizons '
-                    'still holding a backlog: %s. The table drains over successive '
-                    'restarts only while that rate holds.',
+                    '(%.0f rows/sec); horizons still holding a backlog: %s. Compare '
+                    'that rate with the sizing basis in the write_journal block of '
+                    'fused-memory/config/config.yaml.',
                     halted, total, elapsed, total / elapsed, ', '.join(backlog),
                 )
             return total
         except Exception as e:
             logger.error(f'Failed to prune write_ops: {e}')
             return 0
-
-    async def get_usage_stats(
-        self, since: str, project_id: str | None = None
-    ) -> dict:
-        """Aggregate read/write stats since a timestamp.
-
-        Returns {reads, writes, by_operation, by_agent}.
-        """
-        access = self._require_access()
-        where = 'WHERE created_at >= ?'
-        params: list = [since]
-        if project_id:
-            where += ' AND project_id = ?'
-            params.append(project_id)
-
-        kind_counts = {
-            row[0]: row[1]
-            for row in await access.read_all(
-                f'SELECT kind, COUNT(*) FROM write_ops {where} GROUP BY kind', params
-            )
-        }
-        by_operation = {
-            row[0]: row[1]
-            for row in await access.read_all(
-                f'SELECT operation, COUNT(*) FROM write_ops {where} GROUP BY operation',
-                params,
-            )
-        }
-        by_agent: dict[str, dict[str, int]] = {}
-        for row in await access.read_all(
-            f'SELECT agent_id, kind, COUNT(*) FROM write_ops {where} GROUP BY agent_id, kind',
-            params,
-        ):
-            aid = row[0] or '_unknown'
-            if aid not in by_agent:
-                by_agent[aid] = {'read': 0, 'write': 0}
-            by_agent[aid][row[1]] = row[2]
-
-        return {
-            'reads': kind_counts.get('read', 0),
-            'writes': kind_counts.get('write', 0),
-            'by_operation': by_operation,
-            'by_agent': by_agent,
-        }
-
-    async def get_session_ops(
-        self, agent_id: str, since: str | None = None, limit: int = 100
-    ) -> list[dict]:
-        """Return ops for a specific agent, most recent first."""
-        if since:
-            sql = (
-                'SELECT * FROM write_ops WHERE agent_id = ? AND created_at >= ? '
-                'ORDER BY created_at DESC LIMIT ?'
-            )
-            params = (agent_id, since, limit)
-        else:
-            sql = (
-                'SELECT * FROM write_ops WHERE agent_id = ? '
-                'ORDER BY created_at DESC LIMIT ?'
-            )
-            params = (agent_id, limit)
-        return [dict(row) for row in await self._require_access().read_all(sql, params)]

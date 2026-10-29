@@ -631,9 +631,7 @@ def make_graph_mock():
     carries the stateful query log the truncation tests need — because two
     doubles that both claim to stand in for the same server drift, and the
     drift shows up as a test that passes against a fake nothing else agrees
-    with.  A test that needs the cap should use that one (or, for episode
-    reads through graphiti-core, its API-level counterpart
-    ``FakeCappedEpisodeStore`` in the same module).
+    with.  A test that needs the cap should use that one.
     """
     skip_limit_re = re.compile(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', re.IGNORECASE)
     # Deliberately NARROW: only a query whose entire projection is a bare row
@@ -745,6 +743,9 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
     off: the tracked YAML ships it on (task 3169), and with it on every
     Mem0-primary ``add_memory`` in a unit test would reach the real judge
     client.  A test of the triage path opts in on its own config.
+    ``overreach_guard.shadow_enabled`` is pinned off for the same reason: with
+    it on, every decision write in a unit test would reach the real overreach
+    judge; a test of the shadow opts in on its own config.
     """
     config = FusedMemoryConfig(
         llm=LLMConfig(
@@ -776,6 +777,7 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
         ),
     )
     config.write_triage.enabled = False
+    config.overreach_guard.shadow_enabled = False
     return config
 
 

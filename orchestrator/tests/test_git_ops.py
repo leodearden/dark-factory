@@ -314,16 +314,6 @@ async def _build_cold_orphan_branch(
 
 @pytest.mark.asyncio
 class TestWorktreeLifecycle:
-    async def test_worktree_info_stale_commits_field(self, git_ops: GitOps):
-        """WorktreeInfo.stale_commits defaults to None and can be set explicitly."""
-        info_default = WorktreeInfo(path=git_ops.project_root, base_commit='a' * 40)
-        assert info_default.stale_commits is None
-
-        info_explicit = WorktreeInfo(
-            path=git_ops.project_root, base_commit='a' * 40, stale_commits=5,
-        )
-        assert info_explicit.stale_commits == 5
-
     async def test_worktree_info_reify_debug_port_field(self, git_ops: GitOps):
         """WorktreeInfo.reify_debug_port defaults to None and can be set explicitly."""
         info_default = WorktreeInfo(path=git_ops.project_root, base_commit='a' * 40)
@@ -1410,34 +1400,31 @@ class TestWorktreeLifecycle:
 @pytest.mark.asyncio
 class TestFreshenMain:
     async def test_freshen_main_no_remote(self, git_ops: GitOps):
-        """Without a remote, _freshen_main returns (main_branch, None)."""
-        ref, stale = await git_ops._freshen_main()
+        """Without a remote, _freshen_main returns main_branch."""
+        ref = await git_ops._freshen_main()
         assert ref == git_ops.config.main_branch
-        assert stale is None
 
     async def test_freshen_main_remote_ahead(
         self, git_ops_with_remote: tuple[GitOps, Path],
     ):
-        """When origin/main is 3 commits ahead, returns ('origin/main', 3)."""
+        """When origin/main is 3 commits ahead, returns 'origin/main'."""
         git_ops, origin = git_ops_with_remote
         await _push_n_commits_to_origin(origin, 3)
-        ref, stale = await git_ops._freshen_main()
+        ref = await git_ops._freshen_main()
         assert ref == f'{git_ops.config.remote}/{git_ops.config.main_branch}'
-        assert stale == 3
 
     async def test_freshen_main_already_current(
         self, git_ops_with_remote: tuple[GitOps, Path],
     ):
-        """When local main == origin/main (no new commits), returns (main_branch, 0)."""
+        """When local main == origin/main (no new commits), returns main_branch."""
         git_ops, _origin = git_ops_with_remote
-        ref, stale = await git_ops._freshen_main()
+        ref = await git_ops._freshen_main()
         assert ref == git_ops.config.main_branch
-        assert stale == 0
 
     async def test_freshen_main_diverged(
-        self, git_ops_with_remote: tuple[GitOps, Path],
+        self, git_ops_with_remote: tuple[GitOps, Path], caplog,
     ):
-        """When local and remote have diverged, returns (main_branch, N) with N behind count."""
+        """When local and remote have diverged, returns main_branch and logs a divergence warning."""
         git_ops, origin = git_ops_with_remote
         local = git_ops.project_root
         # Add a local-only commit (not pushed to origin)
@@ -1446,15 +1433,21 @@ class TestFreshenMain:
         await _run(['git', 'commit', '-m', 'Local only commit'], cwd=local)
         # Add a different commit to origin (creates divergence)
         await _push_n_commits_to_origin(origin, 1, prefix='remote_div')
-        ref, stale = await git_ops._freshen_main()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            ref = await git_ops._freshen_main()
         # Diverged: use local ref to avoid losing advance_main commits
         assert ref == git_ops.config.main_branch
-        assert stale == 1
+        assert any(
+            r.levelno == logging.WARNING
+            and r.name == 'orchestrator.git_ops'
+            and 'diverged' in r.getMessage()
+            for r in caplog.records
+        )
 
     async def test_freshen_main_behind_rev_list_fails(
         self, git_ops_with_remote: tuple[GitOps, Path],
     ):
-        """When behind rev-list exits non-zero, _freshen_main returns (main_branch, None)."""
+        """When behind rev-list exits non-zero, _freshen_main returns main_branch."""
         git_ops, _origin = git_ops_with_remote
 
         async def fake_run(cmd, cwd=None):
@@ -1463,15 +1456,14 @@ class TestFreshenMain:
             return (128, '', 'fatal: bad revision')   # rev-list fails
 
         with patch('orchestrator.git_ops._run', side_effect=fake_run):
-            ref, stale = await git_ops._freshen_main()
+            ref = await git_ops._freshen_main()
 
         assert ref == git_ops.config.main_branch
-        assert stale is None
 
     async def test_freshen_main_behind_count_value_error(
         self, git_ops_with_remote: tuple[GitOps, Path],
     ):
-        """When behind rev-list returns non-numeric stdout, _freshen_main returns (main_branch, None)."""
+        """When behind rev-list returns non-numeric stdout, _freshen_main returns main_branch."""
         git_ops, _origin = git_ops_with_remote
 
         async def fake_run(cmd, cwd=None):
@@ -1480,15 +1472,14 @@ class TestFreshenMain:
             return (0, 'not-a-number', '')   # rev-list returns garbage
 
         with patch('orchestrator.git_ops._run', side_effect=fake_run):
-            ref, stale = await git_ops._freshen_main()
+            ref = await git_ops._freshen_main()
 
         assert ref == git_ops.config.main_branch
-        assert stale is None
 
     async def test_freshen_main_ahead_count_value_error(
         self, git_ops_with_remote: tuple[GitOps, Path],
     ):
-        """When ahead rev-list returns non-numeric stdout, falls back to (main_branch, behind)."""
+        """When ahead rev-list returns non-numeric stdout, falls back to main_branch."""
         git_ops, _origin = git_ops_with_remote
 
         remote_ref = f'{git_ops.config.remote}/'
@@ -1507,16 +1498,15 @@ class TestFreshenMain:
             return (0, '', '')
 
         with patch('orchestrator.git_ops._run', side_effect=fake_run):
-            ref, stale = await git_ops._freshen_main()
+            ref = await git_ops._freshen_main()
 
-        # Falls back to local main; reports behind count as-is
+        # Falls back to local main
         assert ref == git_ops.config.main_branch
-        assert stale == 3
 
     async def test_freshen_main_ahead_rev_list_fails(
         self, git_ops_with_remote: tuple[GitOps, Path], caplog,
     ):
-        """When ahead rev-list exits non-zero, _freshen_main returns (main_branch, behind) and logs a warning."""
+        """When ahead rev-list exits non-zero, _freshen_main returns main_branch and logs a warning."""
         git_ops, _origin = git_ops_with_remote
 
         call_count = 0
@@ -1532,10 +1522,9 @@ class TestFreshenMain:
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
              patch('orchestrator.git_ops._run', side_effect=fake_run):
-            ref, stale = await git_ops._freshen_main()
+            ref = await git_ops._freshen_main()
 
         assert ref == git_ops.config.main_branch
-        assert stale == 3
         assert any('rev-list (ahead) failed' in r.message for r in caplog.records)
 
 
@@ -1549,30 +1538,12 @@ class TestCreateWorktreeFreshening:
         await _push_n_commits_to_origin(origin, 1, prefix='fresh')
         worktree_info = await git_ops.create_worktree('freshen-test')
         assert (worktree_info.path / 'fresh_0.txt').exists()
-        # Exactly 1 commit was pushed, so stale_commits must reflect that.
-        assert worktree_info.stale_commits == 1
         # base_commit must match origin/main SHA captured after create_worktree
         # (which internally fetched, so origin/main is now up-to-date in the local repo).
         _, expected_sha, _ = await _run(
             ['git', 'rev-parse', 'origin/main'], cwd=git_ops.project_root,
         )
         assert worktree_info.base_commit == expected_sha
-
-    async def test_create_worktree_stale_commits_populated(
-        self, git_ops_with_remote: tuple[GitOps, Path],
-    ):
-        """stale_commits == 2 when origin is 2 commits ahead at create_worktree time."""
-        git_ops, origin = git_ops_with_remote
-        await _push_n_commits_to_origin(origin, 2)
-        worktree_info = await git_ops.create_worktree('stale-commits-test')
-        assert worktree_info.stale_commits == 2
-
-    async def test_create_worktree_stale_commits_none_without_remote(
-        self, git_ops: GitOps,
-    ):
-        """stale_commits is None when no remote is configured (graceful degradation)."""
-        worktree_info = await git_ops.create_worktree('no-remote-test')
-        assert worktree_info.stale_commits is None
 
     async def test_create_worktree_revparse_fallback(self, git_ops: GitOps):
         """When rev-parse of start_ref fails, create_worktree falls back to local main.
@@ -1589,14 +1560,13 @@ class TestCreateWorktreeFreshening:
         local_main_sha = local_main_sha.strip()
 
         with patch.object(
-            git_ops, '_freshen_main', return_value=('origin/nonexistent-ref', 3),
+            git_ops, '_freshen_main', return_value='origin/nonexistent-ref',
         ):
             worktree_info = await git_ops.create_worktree('revparse-fallback-test')
 
         assert (worktree_info.path / 'README.md').exists()
         assert len(worktree_info.base_commit) == 40
         assert worktree_info.base_commit == local_main_sha
-        assert worktree_info.stale_commits == 3  # persists through fallback
 
 
 @pytest.mark.asyncio
@@ -4085,6 +4055,66 @@ class TestResolveBranchSha:
         """
         result = await git_ops.resolve_branch_sha(bad_ref)
         assert result is None
+
+
+@pytest.mark.asyncio
+class TestListLocalBranches:
+    async def test_fresh_repo_lists_main(self, git_ops: GitOps):
+        branches = await git_ops.list_local_branches()
+
+        assert isinstance(branches, frozenset)
+        assert 'main' in branches
+
+    async def test_lists_a_created_task_branch_by_its_full_name(
+        self, git_ops: GitOps,
+    ):
+        await git_ops.create_worktree('lb-1')
+
+        branches = await git_ops.list_local_branches()
+
+        assert branches is not None
+        assert 'task/lb-1' in branches
+
+    async def test_a_deleted_branch_is_no_longer_listed(self, git_ops: GitOps):
+        wt_info = await git_ops.create_worktree('lb-1')
+        assert wt_info is not None
+        await git_ops.cleanup_worktree(wt_info.path, 'lb-1')
+
+        branches = await git_ops.list_local_branches()
+
+        assert branches is not None
+        assert 'task/lb-1' not in branches
+
+    async def test_agrees_with_resolve_branch_sha(self, git_ops: GitOps):
+        await git_ops.create_worktree('lb-2')
+
+        branches = await git_ops.list_local_branches()
+
+        assert branches is not None
+        for name in branches:
+            assert await git_ops.resolve_branch_sha(name) is not None, name
+        assert 'task/lb-absent' not in branches
+        assert await git_ops.resolve_branch_sha('task/lb-absent') is None
+
+    async def test_returns_none_outside_a_git_repository(
+        self, git_config: GitConfig, tmp_path: Path,
+    ):
+        not_a_repo = tmp_path / 'not-a-repo'
+        not_a_repo.mkdir()
+
+        assert await GitOps(git_config, not_a_repo).list_local_branches() is None
+
+    async def test_a_branch_sharing_its_name_with_a_tag_keeps_its_exact_name(
+        self, git_ops: GitOps,
+    ):
+        for cmd in (['git', 'tag', 'dup'], ['git', 'branch', 'dup']):
+            rc, _, stderr = await _run(cmd, cwd=git_ops.project_root)
+            assert rc == 0, stderr
+
+        branches = await git_ops.list_local_branches()
+
+        assert branches is not None
+        assert 'dup' in branches
 
 
 @pytest.mark.asyncio
@@ -7497,7 +7527,6 @@ class TestCreateWorktreeTrain:
         info = await git_ops.create_worktree('feature-notrain', train=None)
 
         assert info.base_commit == main_sha
-        assert info.stale_commits is None  # no remote in git_repo fixture
 
     async def test_train_order_zero_degenerate(self, git_ops: GitOps):
         """order=0 is degenerate — must branch from main, same as train=None."""
@@ -7536,17 +7565,14 @@ class TestCreateWorktreeTrain:
         # (1) WorktreeInfo.base_commit == α's branch tip SHA
         assert beta_info.base_commit == alpha_tip
 
-        # (2) stale_commits is None for train-based worktrees
-        assert beta_info.stale_commits is None
-
-        # (3) git merge-base task/beta task/alpha == α's tip (β forks from α)
+        # (2) git merge-base task/beta task/alpha == α's tip (β forks from α)
         _, mb, _ = await _run(
             ['git', 'merge-base', 'task/beta', 'task/alpha'],
             cwd=git_ops.project_root,
         )
         assert mb.strip() == alpha_tip
 
-        # (4) git log task/beta..task/alpha is empty (β already has all of α's commits)
+        # (3) git log task/beta..task/alpha is empty (β already has all of α's commits)
         _, log_out, _ = await _run(
             ['git', 'log', 'task/beta..task/alpha', '--oneline'],
             cwd=git_ops.project_root,
@@ -10699,12 +10725,20 @@ class TestCreateWorktreeRequeueAndRecycledId:
         await git_ops.cleanup_worktree(lane, 'A')
         assert plan_file.exists(), 'prereq: plan.json must still exist after cleanup'
 
+        # Seed the lane→task routing key so the disk backstop MATCHES and the
+        # identity guard this test exists to prove is genuinely reached.
+        meta_root = TaskArtifacts.meta_root_for(lane.parent, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text(
+            '{"task_id": "A", "title": "Old Task"}'
+        )
+
         # NEW task with recycled id 'A' but DIFFERENT title — should NOT inherit plan
         info2 = await git_ops.create_worktree('A', expected_title='New Task')
         assert info2.path == lane  # same pool lane
 
-        # TODAY: disk backstop reuses (task_id 'A' == 'A') → plan.json inherited → FAIL
-        # AFTER step-26: identity mismatch ('Old Task' != 'New Task') → fresh reset → plan gone
+        # Without the guard: disk backstop reuses (task_id 'A' == 'A') → plan inherited
+        # With it: identity mismatch ('Old Task' != 'New Task') → fresh reset → plan gone
         assert not plan_file.exists(), (
             'Recycled-id task MUST NOT inherit the prior task\'s plan.json '
             '(identity guard should route to fresh reset)'
@@ -10922,6 +10956,44 @@ class TestGetFilesTouchedInBranchWarning:
             'get_files_touched_in_branch' in t.lower()
             for t in warning_texts
         ), f'Expected WARNING to mention get_files_touched_in_branch; got: {warning_texts}'
+
+
+@pytest.mark.asyncio
+class TestGetChangedFilesWarning:
+    """Task 3493: get_changed_files keeps its fail-open ``[]`` on a git diff
+    error but no longer swallows the failure silently: it WARNs.
+    """
+
+    async def test_nonexistent_sha_returns_empty_and_warns(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        unresolvable = 'deadbeef' * 5
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops.get_changed_files(unresolvable, 'HEAD')
+
+        assert result == [], f'Expected [] on git error; got {result!r}'
+        warning_texts = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any('get_changed_files' in t for t in warning_texts), (
+            f'Expected a WARNING naming get_changed_files; got: {warning_texts}'
+        )
+
+    async def test_success_lists_changed_files_without_warning(
+        self, git_ops: GitOps, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        (git_repo / 'base.py').write_text('# base\n')
+        base_sha = await _commit_all(git_repo, 'base')
+        (git_repo / 'alpha.py').write_text('# alpha\n')
+        (git_repo / 'beta.py').write_text('# beta\n')
+        head_sha = await _commit_all(git_repo, 'add alpha and beta')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            files = await git_ops.get_changed_files(base_sha, head_sha)
+
+        assert sorted(files) == ['alpha.py', 'beta.py']
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 # ---------------------------------------------------------------------------
@@ -12181,7 +12253,7 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
         task/D must be RETAINED by α (not deleted as 0-beyond-main).
 
         Sequence:
-        1. Acquire lane on 'D', write .task/plan.json, commit WIP commit
+        1. Acquire lane on 'D', seed the meta root's metadata.json, commit WIP
         2. Advance main
         3. release_warm_lane('D') → detach + retain task/D (WIP > 0) + FREE
         4. acquire_warm_lane('D', main_HEAD) → disk-backstop route (route 2)
@@ -12198,15 +12270,16 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
 
         git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
 
-        # Step 1: Acquire lane on 'D', write plan.json, commit WIP
+        # Step 1: Acquire lane on 'D', seed metadata.json, commit WIP
         info = await git_ops.acquire_warm_lane('D', start_ref)
         assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
         lane = info.path
 
-        # Write .task/plan.json with task_id='D' (forces disk-backstop route on re-acquire)
-        task_dir = lane / '.task'
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'plan.json').write_text(_json.dumps({'task_id': 'D'}))
+        # metadata.json with task_id='D' is the lane→task routing key that
+        # forces the disk-backstop route on re-acquire.
+        meta_root = TaskArtifacts.meta_root_for(lane.parent, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text(_json.dumps({'task_id': 'D'}))
 
         # Commit WIP so task/D has commits beyond main
         (lane / 'wip_d.txt').write_text('work for task D\n')
@@ -12224,7 +12297,7 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
         # Step 3: release_warm_lane → detach + retain + FREE
         await git_ops.release_warm_lane(lane, 'D')
 
-        # Verify: detached, task/D retained, plan.json intact
+        # Verify: detached, task/D retained, metadata.json intact
         _, abbrev_raw, _ = await _run(
             ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
         )
@@ -12235,12 +12308,13 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
             ['git', 'rev-parse', '--verify', 'task/D'], cwd=git_repo,
         )
         assert rc_verify == 0, 'task/D must be RETAINED after first release (α)'
-        assert (task_dir / 'plan.json').exists(), (
-            'plan.json must survive release_warm_lane (used by disk-backstop re-acquire)'
+        assert (meta_root / 'metadata.json').exists(), (
+            'metadata.json must survive release_warm_lane '
+            '(it is the disk-backstop re-acquire routing key)'
         )
 
         # Step 4: re-acquire via disk-backstop route
-        # (pool sees lane as FREE+registered with plan.json task_id=='D' → route 2)
+        # (pool sees lane as FREE+registered, metadata.json task_id=='D' → route 2)
         info2 = await git_ops.acquire_warm_lane('D', main_head)
 
         # Step 5: assertions on re-acquire result

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from shared import safe_io
+from shared.project_layout import escalation_queue_dir, tasks_db
 from shared.safe_io import load_json_or_warn
 
 from orchestrator.stop_instruction import detect_stop_instruction
@@ -36,7 +37,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-STATE_REL_PATH = 'data/escalations/b3-state.json'
+STATE_FILENAME = 'b3-state.json'
 B3_CATEGORIES: frozenset[str] = frozenset({'task_failure', 'review_issues'})
 
 FRESH = 'fresh'
@@ -77,7 +78,9 @@ DEFAULT_TAG = 'master'
 DEFAULT_CAP = 6
 _LAUNCH_RETENTION_DAYS = 30  # prune launches older than this many days (bound state-file growth)
 
-_FAILURE_REPORT_CAPTURED_HEADINGS = ('Test Failures', 'Lint Issues', 'Type Errors')
+_FAILURE_REPORT_CAPTURED_HEADINGS = (
+    'Test Failures', 'Test Output', 'Lint Issues', 'Type Errors', 'Type Check Output',
+)
 _CAPTURED_OUTPUT_RE = re.compile(
     r'^(## (?:' + '|'.join(map(re.escape, _FAILURE_REPORT_CAPTURED_HEADINGS)) + r')\n\n)'
     r'```\n.*?^```[ \t]*$',
@@ -90,7 +93,7 @@ _CAPTURED_OUTPUT_RE = re.compile(
 
 def _state_path(project_root: str | Path) -> Path:
     """Return the canonical state-file path for a given project root."""
-    return Path(project_root) / STATE_REL_PATH
+    return escalation_queue_dir(project_root) / STATE_FILENAME
 
 
 # ---------------------------------------------------------------------------
@@ -621,7 +624,7 @@ def _read_latest_proposal(
     try:
         owns_conn = conn is None
         if owns_conn:
-            db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+            db_path = tasks_db(project_root)
             if not db_path.exists():
                 return None
             # Open read-only via URI
@@ -691,7 +694,7 @@ def _read_task_description(
     try:
         owns_conn = conn is None
         if owns_conn:
-            db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+            db_path = tasks_db(project_root)
             if not db_path.exists():
                 return None
             uri = f'file:{db_path}?mode=ro'
@@ -789,7 +792,7 @@ def run_check(args: argparse.Namespace) -> None:
     # tasks.db twice per invocation, once per reader). Falls back to each
     # reader's own independent open (and its existing fail-closed-to-None
     # behavior) when this shared connection can't be established.
-    db_path = Path(args.project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    db_path = tasks_db(args.project_root)
     shared_conn: sqlite3.Connection | None = None
     if db_path.exists():
         try:
@@ -888,7 +891,7 @@ def _build_parser() -> argparse.ArgumentParser:
             sp_parser.add_argument('--worktree', required=True,
                                    help='path to the blocked task\'s worktree')
         sp_parser.add_argument('--project-root', required=True,
-                               help='project root dir (contains data/escalations/)')
+                               help='project root dir (holds the escalation queue)')
         sp_parser.add_argument('--config', default=None,
                                help='optional path to orchestrator config YAML')
         sp_parser.add_argument('--now', default=None,

@@ -616,6 +616,34 @@ class TestUsageGateProbeProcessGroup:
         mock_tpg.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_usage_gate_probe_child_env_carries_only_the_probed_credential(
+    probing_gate: tuple[UsageGate, AccountState], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe child sees its own account's token and config dir, never the pool."""
+    gate, acct = probing_gate
+    monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', 'pool-a-' + 'A' * 41)
+    monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_B', 'pool-b-' + 'B' * 41)
+    monkeypatch.setenv('OPENAI_API_KEY', 'openai-' + 'o' * 41)
+    captured_envs: list[dict] = []
+
+    async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+        env = kwargs.get('env')
+        assert isinstance(env, dict)
+        captured_envs.append(env)
+        return _fake_probe_proc(0, b'{"ok": true}')
+
+    with patch('shared.usage_gate.asyncio.create_subprocess_exec', side_effect=fake_exec):
+        await gate._run_probe(acct)
+
+    (env,) = captured_envs
+    assert [k for k in env if k.startswith('CLAUDE_OAUTH_TOKEN_')] == []
+    assert 'OPENAI_API_KEY' not in env
+    assert 'ANTHROPIC_API_KEY' not in env
+    assert env['CLAUDE_CODE_OAUTH_TOKEN'] == acct.token
+    assert env['CLAUDE_CONFIG_DIR'] == str(gate._config_dir_for(acct).path)
+
+
 # ---------------------------------------------------------------------------
 # _run_probe exit-code classification — distinguish local budget cap
 # (API accepted the request) from real Anthropic-side failures.

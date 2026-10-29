@@ -11,6 +11,7 @@ import { loadClient, payload } from './_boundary_client.mjs';
 import {
   burndownBlock,
   escalationAnalytics,
+  mergeQueueBlock,
   openEscalationItem,
   taskCensus,
   tasksSnapshotEntry,
@@ -77,4 +78,10 @@ test('the escalation-analytics payload is built only with keys /escalation-analy
   const servedItem = served.per_project[0].lifespan.open_items[0];
   assert.ok(!('pins_recovery' in servedItem), 'this check expects the served item to carry no pins annotation');
   assertSameKeys(item, servedItem, 'an open item with no pins annotation');
+});
+
+test('a MERGE_QUEUE block is built only with keys /merge-queue serves', () => {
+  const served = payload('merge_7d').MERGE_QUEUE['dark-factory'];
+
+  assertBuiltKeysServed(mergeQueueBlock({ bucketMinutes: 60 }), served, 'MERGE_QUEUE[project]');
 });

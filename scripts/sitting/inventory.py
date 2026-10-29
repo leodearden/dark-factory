@@ -39,8 +39,8 @@ from orchestrator.session_registry import (
     decisions_dir,
     list_decisions,
     normalize_escalations_dir,
-    normalize_project_token,
 )
+from shared.project_id import fold_project_token
 from shared.project_layout import ESCALATION_QUEUE_RELPATH
 
 QUEUE_TAGS: Mapping[Path, str] = MappingProxyType({
@@ -183,7 +183,7 @@ def queue_tag(queue_dir: str) -> str:
 
 def queue_project(queue_dir: str) -> str:
     root = queue_project_root(queue_dir)
-    return normalize_project_token(root.name) if root is not None else ''
+    return fold_project_token(root.name) if root is not None else ''
 
 
 def escalation_queue_dirs(
@@ -216,7 +216,7 @@ def collect_open_items(
 
     *decisions_root* is the fleet root holding ``decisions/`` (see
     ``session_registry.fleet_root``). *project*, when given, is folded through
-    ``normalize_project_token`` and keeps only that project's items.
+    ``fold_project_token`` and keeps only that project's items.
     """
     if now.tzinfo is None:
         raise ValueError('now must be timezone-aware')
@@ -243,7 +243,7 @@ def collect_open_items(
         host = items.get(host_key) if host_key is not None else None
         if host_key is not None and host is not None and host.decision_id is None:
             items[host_key] = replace(
-                host, decision_id=record.id, decision_project=normalize_project_token(record.project)
+                host, decision_id=record.id, decision_project=fold_project_token(record.project)
             )
         else:
             item = _decision_item(record, queue_dir, now)
@@ -251,7 +251,7 @@ def collect_open_items(
 
     selected = items.values()
     if project is not None:
-        wanted = normalize_project_token(project)
+        wanted = fold_project_token(project)
         selected = [item for item in selected if item.project == wanted]
     return Inventory(
         items=tuple(sorted(selected, key=_oldest_first)),
@@ -406,10 +406,10 @@ def _decision_item(record: DecisionRecord, queue_dir: str, now: datetime) -> Ope
     return OpenItem(
         key=decision_key(record.id),
         decision_id=record.id,
-        decision_project=normalize_project_token(record.project),
+        decision_project=fold_project_token(record.project),
         escalation_id=record.escalation_id,
         queue_dir=queue_dir,
-        project=normalize_project_token(record.project),
+        project=fold_project_token(record.project),
         task_id=record.task_id,
         severity=record.severity,
         text=record.text,

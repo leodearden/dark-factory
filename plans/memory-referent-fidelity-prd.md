@@ -185,7 +185,14 @@ out-of-scope triple-write path would need.)
 8. **Scanner is precision-over-recall, with an explicit blind list.** It will not see
    bare-digit node names (`1251`), title-only references, or Greek-letter aliases
    (`Task θ2=2184`) — all measured as present. The signal is scoped accordingly; we do
-   not claim completeness.
+   not claim completeness. Spellings found live and added to the list: list
+   continuations (`tasks 3659 and 3500`, `Tasks 5949/5849` see only the first number),
+   non-task vocabulary (`gate 184`, `carrier 6033`) and the bare hash `#4262`. Hyphen
+   slugs (`task-173-foo`) and branch names (`task/173`) were blind too, until task 6059
+   taught the scanner both. Consequence: the conflict rule treats the scanner's silence
+   as uninformative PER REFERENT. A declared referent conflicts only on positive
+   evidence: a near-miss number when the declared number is written nowhere in the
+   content, or the same number under another project.
 
 ## Pre-conditions for activating
 
@@ -302,6 +309,9 @@ Postconditions:
 | Mode (ii): correct node present, LLM picks sibling | both `Task 1030` and `Task 1031` exist; fact is about 1031 | edge repointed to `Task 1031`; `reassigned_from_node_uuid` stamped; both summaries refreshed |
 | Mode (iii): both nodes in referent set | one episode mints `Task 3074` + `Task 3075`; fact cites 3075, lands on 3074 | set-membership passes; **per-edge pairing** fires; edge repointed to `Task 3075` |
 | Declared/prose conflict | content cites `Task 3127`; caller declares `task:3129` | `add_memory` returns a structured error naming both; **no write occurs** |
+| Declared referent the scanner cannot see, beside an unrelated scannable task | content `Merged task-173-fillet-fix after task 170 landed.`; caller declares `task:173` | write succeeds; no conflict |
+| Near-miss typo | content cites `Task 3127`; caller declares `task:3129`, written nowhere in the content | rejected, naming both |
+| Mem0-primary write with a conflicting declaration | explicit `observations_and_summaries`, `dual_write=False`; declaration contradicts the content | write succeeds; the declaration is shape-checked and discarded |
 | Undeclared, derivable | content cites `Task 3127`; `entities` omitted | write succeeds; `source='derived'`; declaration-rate counter increments the undeclared bucket |
 | Undeclared, underivable | content says "the merge-lane hardening task" | write succeeds; `source='none'`; no repair attempted; counted |
 | Ambiguous scan | same number appears both bare and project-qualified | ref routed to `.ambiguous`; treated as undeclared; recorded, not guessed |

@@ -8,6 +8,8 @@ test_config_verify_admission_reload.py).
 
 from __future__ import annotations
 
+import pytest
+
 from orchestrator.config import (
     RELOADABLE_FIELDS,
     OrchestratorConfig,
@@ -17,12 +19,11 @@ from orchestrator.config import (
 )
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestTranscriptArchiveDefaults:
     """The block is fully-formed from Pydantic field defaults (no defaults.yaml)."""
 
-    def test_defaults(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_defaults(self):
         cfg = OrchestratorConfig()
         ta = cfg.transcript_archive
         assert ta.enabled is True
@@ -53,9 +54,8 @@ class TestTranscriptArchiveReloadable:
         assert 'transcript_archive.storm_threshold' in RELOADABLE_FIELDS
         assert 'transcript_archive.storm_window_secs' in RELOADABLE_FIELDS
 
-    def test_enabled_flip_hot_applies(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_enabled_flip_hot_applies(self):
         live = OrchestratorConfig()
         fresh = OrchestratorConfig(
             transcript_archive=TranscriptArchiveConfig(enabled=False)
@@ -69,9 +69,8 @@ class TestTranscriptArchiveReloadable:
         }
         assert live.transcript_archive.enabled is False
 
-    def test_retention_edit_hot_applies_as_whole_submodel_swap(
-        self, monkeypatch, tmp_path
-    ):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_retention_edit_hot_applies_as_whole_submodel_swap(self):
         """A retention.* edit reloads as the claimed atomic whole-retention swap.
 
         _iter_leaves descends exactly one level, so transcript_archive.retention
@@ -80,8 +79,6 @@ class TestTranscriptArchiveReloadable:
         sibling (max_task_dirs) along. Guards against a regression in
         _iter_leaves/_set_leaf descent depth for this nested submodel.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig()
         assert live.transcript_archive.retention.max_age_days == 90
         fresh = OrchestratorConfig(

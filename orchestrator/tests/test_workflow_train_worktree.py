@@ -67,7 +67,7 @@ async def test_train_metadata_forwarded_to_create_worktree(tmp_path: Path):
     base_sha = 'a' * 40
 
     wf.git_ops.create_worktree = AsyncMock(
-        return_value=WorktreeInfo(path=tmp_path, base_commit=base_sha, stale_commits=None)
+        return_value=WorktreeInfo(path=tmp_path, base_commit=base_sha)
     )
     wf._sync_worktree_venvs = AsyncMock()
 
@@ -86,7 +86,7 @@ async def test_no_train_metadata_passes_none(tmp_path: Path):
     base_sha = 'b' * 40
 
     wf.git_ops.create_worktree = AsyncMock(
-        return_value=WorktreeInfo(path=tmp_path, base_commit=base_sha, stale_commits=None)
+        return_value=WorktreeInfo(path=tmp_path, base_commit=base_sha)
     )
     wf._sync_worktree_venvs = AsyncMock()
 
@@ -105,7 +105,7 @@ async def test_no_metadata_key_at_all_passes_none(tmp_path: Path):
     base_sha = 'c' * 40
 
     wf.git_ops.create_worktree = AsyncMock(
-        return_value=WorktreeInfo(path=tmp_path, base_commit=base_sha, stale_commits=None)
+        return_value=WorktreeInfo(path=tmp_path, base_commit=base_sha)
     )
     wf._sync_worktree_venvs = AsyncMock()
 

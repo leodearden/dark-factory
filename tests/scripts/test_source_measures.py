@@ -544,6 +544,74 @@ class TestPatchCalls:
             (None, 'mod', '_two'),
         ]
 
+    def test_a_name_argument_resolves_through_the_given_constants(self) -> None:
+        tree = ast.parse('patch(_T)\nmonkeypatch.setattr(_T, v)\npatch.object(mod, _A)\n')
+        calls = source_measures.patch_calls_in_tree(
+            tree, constants={'_T': 'a.b._c', '_A': '_x'}
+        )
+        assert [_shape(call) for call in calls] == [
+            ('a.b._c', None, None),
+            ('a.b._c', None, None),
+            (None, 'mod', '_x'),
+        ]
+
+    def test_without_constants_a_name_argument_is_not_found(self) -> None:
+        assert _patch_calls('patch(_T)\n') == ()
+
+
+class TestStringConstants:
+    @pytest.mark.parametrize(
+        ('source', 'name', 'value'),
+        [
+            pytest.param("_T = 'a.b'\n", '_T', 'a.b', id='module-literal'),
+            pytest.param("_T: str = 'a.b'\n", '_T', 'a.b', id='annotated'),
+            pytest.param("_A = _B = 'x'\n", '_A', 'x', id='chained-first'),
+            pytest.param("_A = _B = 'x'\n", '_B', 'x', id='chained-second'),
+            pytest.param("_M = 'pkg'\n_T = f'{_M}.x'\n", '_T', 'pkg.x', id='f-string'),
+            pytest.param("_M = 'pkg'\n_T = _M + '.x'\n", '_T', 'pkg.x', id='concatenation'),
+            pytest.param(
+                "def f():\n    t = f'{_M}.x'\n_M = 'pkg'\n", 't', 'pkg.x', id='defined-later'
+            ),
+        ],
+    )
+    def test_a_name_bound_once_to_a_static_string_resolves(
+        self, source: str, name: str, value: str
+    ) -> None:
+        assert source_measures.string_constants_in_tree(ast.parse(source))[name] == value
+
+    @pytest.mark.parametrize(
+        ('source', 'name'),
+        [
+            pytest.param("_T = 'a'\n_T = 'b'\n", '_T', id='bound-twice'),
+            pytest.param("_T = 'a'\n_T += '.b'\n", '_T', id='aug-assign'),
+            pytest.param("_T = 'a'\ndef f(_T): pass\n", '_T', id='also-a-parameter'),
+            pytest.param("_T = 'a'\ndef _T(): pass\n", '_T', id='also-a-def'),
+            pytest.param("_T = 'a'\nasync def _T(): pass\n", '_T', id='also-an-async-def'),
+            pytest.param("_T = 'a'\nclass _T: pass\n", '_T', id='also-a-class'),
+            pytest.param("_T = 'a'\ntry: pass\nexcept E as _T: pass\n", '_T', id='also-except-as'),
+            pytest.param("_T = 'a'\nfor _T in x: pass\n", '_T', id='also-a-for-target'),
+            pytest.param("_T = 'a'\n[_T for _T in x]\n", '_T', id='also-a-comprehension-var'),
+            pytest.param("_T = 'a'\nwith x as _T: pass\n", '_T', id='also-with-as'),
+            pytest.param("_T = 'a'\n(_T := 'b')\n", '_T', id='also-a-walrus-target'),
+            pytest.param(
+                "_T = 'a'\ndef f():\n    global _T\n    _T = 'b'\n", '_T', id='global-reassigned'
+            ),
+            pytest.param("_T = 'a'\nmatch x:\n    case _T: pass\n", '_T', id='also-a-match-capture'),
+            pytest.param("_T = 'a'\nmatch x:\n    case [*_T]: pass\n", '_T', id='also-a-match-star'),
+            pytest.param("_T = 'a'\nimport h as _T\n", '_T', id='also-an-import-alias'),
+            pytest.param('from h import _T\n', '_T', id='imported'),
+            pytest.param('_N = 1\n', '_N', id='non-string'),
+            pytest.param("_A, _B = 'x', 'y'\n", '_A', id='tuple-unpacking'),
+            pytest.param("_M = 'pkg'\n_T = f'{_M!r}'\n", '_T', id='f-string-conversion'),
+            pytest.param("_M = 'pkg'\n_T = f'{_M:>5}'\n", '_T', id='f-string-format-spec'),
+            pytest.param("_T = f'{__name__}._run'\n", '_T', id='unresolvable-placeholder'),
+        ],
+    )
+    def test_an_ambiguous_or_non_static_binding_does_not_resolve(
+        self, source: str, name: str
+    ) -> None:
+        assert name not in source_measures.string_constants_in_tree(ast.parse(source))
+
 
 # ---------------------------------------------------------------------------
 # Patch targets: (module, leaf) pairs patched through a module in a given set.
@@ -635,6 +703,22 @@ class TestPatchTargets:
             '\n'
             'p = patch.object(mod, NAME, 1)\n'
         )
+        assert source_measures.patch_targets(source, MODULES) == set()
+
+    def test_a_string_path_parked_in_a_module_constant_is_detected(self) -> None:
+        source = "_T = 'pkg.mod.foo'\npatch(_T, x)\n"
+        assert source_measures.patch_targets(source, MODULES) == {('pkg.mod', 'foo')}
+
+    def test_an_f_string_over_a_module_constant_is_detected(self) -> None:
+        source = "_M = 'pkg.mod'\npatch(f'{_M}.foo', x)\n"
+        assert source_measures.patch_targets(source, MODULES) == {('pkg.mod', 'foo')}
+
+    def test_a_constant_attribute_name_for_patch_object_is_detected(self) -> None:
+        source = "from pkg import mod\n_A = 'x'\npatch.object(mod, _A, 1)\n"
+        assert source_measures.patch_targets(source, MODULES) == {('pkg.mod', 'x')}
+
+    def test_an_ambiguously_bound_name_is_not_resolved(self) -> None:
+        source = "_T = 'pkg.mod.foo'\n_T = 'pkg.mod.bar'\npatch(_T, x)\n"
         assert source_measures.patch_targets(source, MODULES) == set()
 
     def test_unparseable_source_raises_naming_the_path(self) -> None:

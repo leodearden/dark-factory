@@ -18,6 +18,7 @@ class EventType(StrEnum):
     task_created = 'task_created'
     task_modified = 'task_modified'
     task_deleted = 'task_deleted'
+    deferral_restamped = 'deferral_restamped'
 
 
 class EventSource(StrEnum):
@@ -95,23 +96,17 @@ class AssembledPayload:
     context_items: dict[str, ContextItem] = field(default_factory=dict)
     total_tokens: int = 0
     events_remaining: int = 0  # > 0 exactly when token_budget stopped the assembly
-    effective_watermark: datetime | None = None
     token_budget: int = 0
 
-
-class JournalEntry(BaseModel):
-    """One per reconciliation operation — full audit trail."""
-
-    id: str
-    run_id: str = ''
-    stage: StageId | None = None
-    timestamp: datetime
-    operation: str
-    target_system: str  # 'graphiti', 'mem0', 'taskmaster'
-    before_state: dict | None = None
-    after_state: dict | None = None
-    reasoning: str = ''
-    evidence: list[dict] = Field(default_factory=list)
+    def budget_report(self) -> dict[str, int]:
+        """How much of token_budget this chunk spent, and on how many events and context items."""
+        return {
+            'estimated_tokens': self.total_tokens,
+            'token_budget': self.token_budget,
+            'events': len(self.events),
+            'context_items': len(self.context_items),
+            'events_deferred': self.events_remaining,
+        }
 
 
 class StageReport(BaseModel):
@@ -258,7 +253,12 @@ def _normalize_project_id(v: object, *, allow_empty: bool = False) -> object:
 
 
 class Watermark(BaseModel):
-    """Tracks what's been processed per project."""
+    """Tracks what's been processed per project.
+
+    The three ``*_timestamp`` fields are the lower bounds of the next cycle's data
+    windows, anchored at run start (why: tests/reconciliation/test_recon_window_anchor.py);
+    ``last_full_run_completed`` is the completion instant.
+    """
 
     project_id: str
     last_full_run_id: str | None = None

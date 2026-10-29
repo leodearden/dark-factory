@@ -15,7 +15,6 @@ import httpx
 
 from dashboard.config import DashboardConfig
 from dashboard.data import escalation_corpus
-from dashboard.data.active_tasks import project_roots_for_label
 from dashboard.data.db import DbPool
 from dashboard.data.escalation_corpus import QueueKind, corpus_queues
 from dashboard.data.metrics import fan_out_list_tickets
@@ -143,12 +142,17 @@ class TestEveryConsumerWalksTheOneEnumerator:
         )
         assert queues[-1].kind is QueueKind.RECONCILIATION
 
-    def test_project_roots_for_label(self, tmp_path):
+    def test_project_labels(self, tmp_path):
         primary, x_proj, y_proj = _dirs(tmp_path, 'primary', 'x/proj', 'y/proj')
         config = _ReversedRoots(project_root=primary, known_project_roots=[x_proj, y_proj])
-        expected = [r for r in config.all_project_roots if r.name == 'proj']
-        assert project_roots_for_label(config, 'proj') == expected, (
-            'active_tasks.project_roots_for_label walks its own roster'
+        assert config.project_labels.roots == config.all_project_roots, (
+            'DashboardConfig.project_labels walks its own roster'
+        )
+        assert config.project_labels.root_for('x/proj') == x_proj.resolve()
+
+        without_last = _WithoutLastRoot(project_root=primary, known_project_roots=[x_proj, y_proj])
+        assert without_last.project_labels.root_for('y/proj') is None, (
+            'a root the roster omits is not configured'
         )
 
     async def test_fan_out_list_tickets(self, tmp_path):

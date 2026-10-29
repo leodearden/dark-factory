@@ -257,6 +257,16 @@ class TestMem0TombstoneDeleters:
         assert set(m.MEM0_TOMBSTONE_DELETERS) == expected
 
 
+class TestFormatMem0TombstoneDeleters:
+    """format_mem0_tombstone_deleters() is the one prompt rendering of
+    MEM0_TOMBSTONE_DELETERS that every recon prompt site interpolates."""
+
+    def test_renders_each_deleter_backticked_in_declared_order(self):
+        assert m.format_mem0_tombstone_deleters().split(', ') == [
+            f'`{deleter}`' for deleter in m.MEM0_TOMBSTONE_DELETERS
+        ]
+
+
 class _OneTombstoneReader:
     """A memory service holding exactly one tombstone."""
 
@@ -452,23 +462,11 @@ class TestRenderCycleSummarySection:
         assert m.STAGE2_CYCLE_SUMMARY_RECON_POOL == 'stage2_cycle_summary'
 
     def test_tombstone_claim_names_its_deleters(self):
-        """The scoped claim is single-sourced from MEM0_TOMBSTONE_DELETERS.
-
-        Deliberately stronger than a per-element `deleter in text` loop:
-        that form is satisfied by ANY ordering, duplication, or scattering
-        of the tags, so it can only fail if the f-string interpolation is
-        deleted outright — it carries almost no regression signal. Asserting
-        the exact backtick-wrapped, comma-joined, in-declared-order
-        substring instead also catches a reordering, a gap opened up by an
-        unrelated edit landing mid-list, or the render switching away from
-        MEM0_TOMBSTONE_DELETERS as its source, while still failing closed if
-        the interpolation is deleted entirely.
-        """
-        text = m.render_cycle_summary_section()
-        expected_deleters_str = ', '.join(f'`{deleter}`' for deleter in m.MEM0_TOMBSTONE_DELETERS)
-        assert expected_deleters_str in text, (
-            f'Expected the exact ordered, comma-joined deleter list '
-            f'{expected_deleters_str!r} in render_cycle_summary_section()'
+        """The rendered section contains the shared deleter list exactly, so a
+        reorder, a gap or a switch away from the shared source fails."""
+        deleters = m.format_mem0_tombstone_deleters()
+        assert deleters in m.render_cycle_summary_section(), (
+            f'Expected the shared deleter list {deleters!r} in render_cycle_summary_section()'
         )
 
 

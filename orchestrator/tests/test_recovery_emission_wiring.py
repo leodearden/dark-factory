@@ -26,7 +26,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import wire_clear_claim_then_set_status, wire_scheduler_liveness_mock
+from _orch_helpers import (
+    wire_clear_claim_then_set_status,
+    wire_live_status_from_get_task,
+    wire_scheduler_liveness_mock,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.deploy_state import DeployPhase
@@ -35,7 +39,7 @@ from shared.task_statuses import TaskStatus
 from orchestrator.config import RecoveryEmissionConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
-from orchestrator.landed_outbox import MergeProvenance
+from orchestrator.merge_lane.landed_outbox import MergeProvenance
 from orchestrator.recovery_emission import (
     RECOVERY_VETO_STREAK_SENTINEL_PREFIX,
     RecoveryVetoStreakTracker,
@@ -240,6 +244,7 @@ def harness(tmp_path: Path, mock_orch_config):
     h.scheduler = MagicMock()
     wire_scheduler_liveness_mock(h.scheduler)
     wire_clear_claim_then_set_status(h.scheduler)
+    wire_live_status_from_get_task(h.scheduler)
     h.scheduler.get_tasks = AsyncMock(return_value=[])
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
     h.scheduler.set_task_status = AsyncMock()

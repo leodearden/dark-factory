@@ -227,10 +227,7 @@ from fused_memory.reconciliation.task_filter import (
     POINT_IN_TIME_CHECK_RE,
     TASK_REF_RE,
 )
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('audit_duplicate_memories')
 
@@ -3059,23 +3056,19 @@ async def _run(args: argparse.Namespace) -> int:
     # half-completed, unrecoverable store mutation. Raising keeps it
     # un-maskable by, and un-confusable with, that report-shaped refusal.
     #
-    # ``logging.basicConfig`` already ran above, so this error is emitted.
+    # ``logging.basicConfig`` already ran above, so the guard's refusal record
+    # is emitted.
     if args.apply:
-        try:
-            assert_store_mutation_allowed(operation='audit_duplicate_memories --apply')
-        except StoreMutationUnavailable:
-            logger.error(
-                'audit_duplicate_memories: --apply NOT started (fail-closed) -- this '
-                "process cannot write mem0's history directory, so each deletion "
-                'would remove a Qdrant point and then fail to write its history, '
-                'irreversibly destroying the non-survivors of every cluster. '
-                'Nothing was scanned and nothing was mutated, and no client was '
-                'opened. Route the deletions through the fused-memory MCP server '
-                '(the unsandboxed owner of the store), or re-run from an '
-                'unsandboxed operator shell. To obtain the audit report safely from '
-                'anywhere, re-run without --apply.'
-            )
-            raise
+        assert_store_mutation_allowed(
+            operation='audit_duplicate_memories --apply',
+            logger=logger,
+            extra_detail=(
+                'each deletion would remove a Qdrant point and then fail to write '
+                'its history, irreversibly destroying the non-survivors of every '
+                'cluster. Nothing was scanned and nothing was mutated, and no '
+                'client was opened.'
+            ),
+        )
 
     # De-duplicate while preserving the caller's order. A repeated
     # --categories value would otherwise ingest the same Qdrant points twice

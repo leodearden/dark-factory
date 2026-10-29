@@ -12,10 +12,10 @@ omitted `--uv-bin` spawned `uv run --project orchestrator` against the MAIN
 checkout, ~20 more read the real /home/leo/src/reify config, and the suite
 took 37 s to say so.
 
-Nothing here imports `sampler`: this suite
-runs under `--project shared`, where a probe showed sibling workspace members
-can be absent from the venv, and the script under test must itself run under
-the system python3 where none of them exist.
+The script binds this checkout through scripts/_checkout.py and imports
+sampler.metrics, never sampler.store. This suite imports sampler.store through
+the same bootstrap, so every corpus it builds has the schema the real store
+writes.
 """
 from __future__ import annotations
 
@@ -29,39 +29,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import _checkout as _checkout
 import pytest
+from sampler.metrics import ARM_METRICS, TICK_CLOCK, MetricSpec, SampleKey
+from sampler.store import SCHEMA, LoadSampleStore
 
-REPO_ROOT = Path(__file__).parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / 'scripts' / 'load-threshold-calibration.py'
-
-# A copy of sampler.store.SCHEMA, because this suite cannot import `sampler`
-# (see the module docstring). It lives until task 6773 has these tests import
-# SCHEMA through scripts/_checkout.py.
-#
-# NOTHING IN THIS SUITE RECONCILES THIS COPY, and it cannot: reconciling means
-# importing the writer. Every test below reads a DB built from this fixture, so
-# if sampler.store's schema moved, all of them would stay green against a shape
-# the store no longer writes.
-#
-# The reconciler is therefore in the SAMPLER suite, which can import both sides:
-# sampler/tests/test_load_metrics.py::TestCalibrationScriptArmTableLockstep
-# ::test_the_script_reads_a_corpus_THIS_STORE_wrote drives THIS script's
-# read_series over a DB the real store wrote. It guards from the writer's side
-# rather than comparing two DDL strings, so a reformatted CREATE TABLE does not
-# trip it and a column the store never had does not slip past.
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS samples (
-    ts INTEGER NOT NULL,
-    metric TEXT NOT NULL,
-    value REAL NOT NULL,
-    window_mean REAL,
-    window_max REAL,
-    leaf TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_samples_metric_ts_leaf ON samples (metric, ts, leaf);
-CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
-"""
-
 
 # The script's two defaults that reach OUTSIDE this worktree: the peer
 # project's committed config, and the uv that fetches the orchestrator's code
@@ -78,11 +52,8 @@ REAL_PEER_CONFIG = Path('/home/leo/src/reify/dark-factory-orchestrator.yaml')
 def load_script(*, real_host_defaults: bool = False):
     """Load the hyphen-named script as a module, hermetic by default.
 
-    This must work under a STDLIB-ONLY module body: at ε1/ε2 time the
-    `#!/usr/bin/env python3` shebang resolves to /usr/bin/python3, which has
-    neither `shared` nor `sampler` nor `orchestrator`. A top-level first-party
-    import would crash the gate on import fourteen days after this lands, in a
-    born-at-L2 escalation path, with no earlier signal.
+    The script's ``import _checkout`` resolves because scripts/ is on sys.path
+    (scripts/tests/conftest.py), as it is for every other bound script.
 
     The two host-reaching argparse defaults are redirected at absent paths
     unless *real_host_defaults* asks for the shipped ones. Without that, a
@@ -120,7 +91,7 @@ def seed_db(path: Path, series: Mapping[str | tuple[str, str], list[float]], *,
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     try:
-        conn.executescript(_SCHEMA)
+        conn.executescript(SCHEMA)
         for key, values in series.items():
             metric, leaf = (key, None) if isinstance(key, str) else key
             conn.executemany(
@@ -187,7 +158,7 @@ def series_keys(payload: dict, section: str) -> set[tuple[str, str | None]]:
     return {(entry['metric'], entry['leaf']) for entry in _entries(payload, section)}
 
 
-# ── the module body is stdlib-only ──────────────────────────────────────────
+# ── the gate shape: a bare interpreter with only the _checkout binding ──────
 
 
 def test_script_is_executable():
@@ -199,67 +170,110 @@ def test_script_is_executable():
         f'Expected {SCRIPT} to be executable (os.X_OK); run: chmod +x {SCRIPT}')
 
 
-def test_module_body_imports_no_yaml_and_no_first_party_package():
-    """Loading the module must not execute a yaml or first-party import.
-
-    yaml is imported LAZILY inside the drift check so a missing PyYAML becomes
-    a named degradation in the report instead of an import crash, and so any
-    test in any subproject can load this module by path.
-    """
-    module = load_script()
-
-    assert not hasattr(module, 'yaml'), (
-        'yaml must be imported lazily inside the drift check, not at module level')
-    for name in ('shared', 'sampler', 'orchestrator'):
-        assert not hasattr(module, name), (
-            f'{name} must not be imported: at gate time this script runs under '
-            'the system python3, which does not have it')
+# No site-packages (-S, -s) and no PYTHON* environment (-E): the gate's
+# /usr/bin/python3 has no venv, so this checkout's _checkout binding is all the
+# script may rely on. Not -I, which implies -P and so drops the script's own
+# directory, which the gate's shebang run prepends.
+_BARE = (sys.executable, '-E', '-s', '-S')
 
 
-_LOAD_UNDER_AN_IMPORT_BLOCKER = '''
-import importlib.util, sys
+def _bare_env() -> dict[str, str]:
+    import os
 
-FORBIDDEN = {'shared', 'sampler', 'orchestrator', 'yaml'}
-
-
-class Blocker:
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname.split('.')[0] in FORBIDDEN:
-            raise AssertionError('module-level import of ' + fullname)
-        return None
+    dropped = {'PYTHONPATH', 'PYTHONSAFEPATH', 'VIRTUAL_ENV'}
+    env = {key: value for key, value in os.environ.items() if key not in dropped}
+    env['PYTHONNOUSERSITE'] = '1'
+    return env
 
 
-sys.meta_path.insert(0, Blocker())
-spec = importlib.util.spec_from_file_location('calibration_under_test', sys.argv[1])
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-print('loaded')
-'''
+def _gate_argv(tmp_path: Path) -> list[str]:
+    db = seed_db(tmp_path / 'db.sqlite', {
+        'runqueue_ratio': [1.0, 2.0, 3.0],
+        'runqueue_read_ok': [1.0, 1.0, 1.0],
+    })
+    return hermetic([
+        '--arm', 'runqueue_ratio', '--db', str(db), '--no-report',
+        '--config', str(tmp_path / 'absent' / 'local.yaml'),
+    ])
 
 
-def test_loading_the_script_executes_no_first_party_or_yaml_import():
-    """The gate-time property, EXECUTED rather than grepped off the source.
-
-    At gate time the shebang resolves to the system python3, which has yaml
-    but none of `shared`, `sampler`, `orchestrator`. A top-level first-party
-    import would crash ε1/ε2 on import, fourteen days after this lands, in a
-    born-at-L2 path with no earlier signal.
-
-    This replaces a rescan of the source text for lines beginning `import x` /
-    `from x`, which was strictly weaker in both directions: it missed indented
-    and `__import__` forms, and it could only ever report what the source LOOKS
-    like. Loading the module behind a meta-path finder that raises reports what
-    the module DOES, in every form an import can take. It also closes the hole
-    the scan existed for — `from shared.psi import _ARMS` binds `_ARMS`, not
-    `shared`, so the hasattr check above cannot see it.
-    """
+def test_a_bare_interpreter_runs_the_gate_shape_to_exit_zero(tmp_path: Path):
+    """PRD boundary row 7: no venv on sys.path, only the _checkout binding."""
     result = subprocess.run(
-        [sys.executable, '-c', _LOAD_UNDER_AN_IMPORT_BLOCKER, str(SCRIPT)],
-        capture_output=True, text=True, check=False,
+        [*_BARE, str(SCRIPT), *_gate_argv(tmp_path)],
+        capture_output=True, text=True, timeout=120, env=_bare_env(), check=False,
     )
 
     assert result.returncode == 0, result.stderr
-    assert 'loaded' in result.stdout, result.stdout
+    payload = trailing_json(result.stdout)
+    assert ('runqueue_ratio', None) in series_keys(payload, 'percentiles'), payload
+
+
+_PROBE = """
+import json, runpy, sys
+
+namespace = runpy.run_path(sys.argv[1], run_name='calibration')
+rc = namespace['main'](sys.argv[2:])
+
+import sampler.metrics
+
+print(json.dumps({
+    'rc': rc,
+    'metrics_file': sampler.metrics.__file__,
+    'loaded': sorted(m for m in ('psutil', 'sampler.store', 'aiosqlite') if m in sys.modules),
+    'selectors': {arm: spec.selector for arm, spec in namespace['ARM_METRIC_SELECTORS'].items()},
+    'arm_metrics': {arm: spec.name for arm, spec in sampler.metrics.ARM_METRICS.items()},
+}))
+"""
+
+
+def test_a_bare_interpreter_imports_the_checkouts_metrics_and_nothing_heavier(
+    tmp_path: Path,
+):
+    """The selectors are read from this checkout's table, not from a second spelling."""
+    result = subprocess.run(
+        [*_BARE, '-c', _PROBE, str(SCRIPT), *_gate_argv(tmp_path)],
+        capture_output=True, text=True, timeout=120, env=_bare_env(),
+        cwd=REPO_ROOT / 'scripts', check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    probe = trailing_json(result.stdout)
+    assert probe['rc'] == 0
+    metrics_file = Path(probe['metrics_file']).resolve()
+    assert metrics_file.is_relative_to(REPO_ROOT / 'sampler' / 'src'), metrics_file
+    assert probe['loaded'] == [], probe['loaded']
+    assert probe['selectors'] == probe['arm_metrics']
+
+
+def load_script_against(monkeypatch, arm_metrics: Mapping[str, MetricSpec]):
+    """The script, loaded while sampler.metrics.ARM_METRICS is *arm_metrics*."""
+    monkeypatch.setattr('sampler.metrics.ARM_METRICS', arm_metrics)
+    return load_script()
+
+
+def test_reordering_the_tables_arms_leaves_the_report_order_unchanged(monkeypatch):
+    shipped = list(load_script().ARM_METRIC_SELECTORS)
+    reversed_table = dict(reversed(list(ARM_METRICS.items())))
+
+    reordered = list(load_script_against(monkeypatch, reversed_table).ARM_METRIC_SELECTORS)
+
+    assert reordered == shipped
+
+
+def test_an_arm_the_table_records_and_the_script_cannot_scale_fails_at_load(monkeypatch):
+    widened = {**ARM_METRICS, 'fixture_unscaled_arm': TICK_CLOCK}
+
+    with pytest.raises(ValueError, match='fixture_unscaled_arm'):
+        load_script_against(monkeypatch, widened)
+
+
+def test_an_arm_the_script_scales_and_the_table_does_not_record_fails_at_load(monkeypatch):
+    dropped = next(iter(ARM_METRICS))
+    narrowed = {arm: spec for arm, spec in ARM_METRICS.items() if arm != dropped}
+
+    with pytest.raises(ValueError, match=dropped):
+        load_script_against(monkeypatch, narrowed)
 
 
 # ── the argument surface ────────────────────────────────────────────────────
@@ -691,6 +705,73 @@ def test_read_series_counts_the_tick_clock_rather_than_loading_it(tmp_path: Path
     # The evidence the arm DID ask for is still fetched, both halves of it.
     assert len(read.readability[('own_read_ok', 'leaf.service')]) == 100
     assert len(read.series[('own_cpu_some10', 'leaf.service')]) == 100
+
+
+def test_read_series_over_a_corpus_the_real_store_wrote(tmp_path: Path, capsys):
+    """PRD boundary row 5: the script reads what LoadSampleStore.write_tick writes.
+
+    Guarded from the WRITER's side rather than by comparing two DDL strings,
+    so it fails on the drift that matters (a column the store never had) and
+    on nothing else (a reformatted CREATE TABLE).
+
+    The same corpus reconciles the TICK CLOCK, which ``read_series`` counts
+    with its own SQL, against the ticks ``write_tick`` actually wrote, and the
+    LEAF: each value series is paired with the readability series of the same
+    leaf, including a leaf that never read and so wrote no value row at all.
+    """
+    module = load_script()
+    db_path = tmp_path / 'corpus.db'
+    store = LoadSampleStore(db_path)
+    for i in range(3):
+        store.write_tick(
+            1_000_000 + i * 5,
+            unwindowed={SampleKey('psi_cpu_some_avg10'): 10.0 + i},
+            windowed={
+                SampleKey('runqueue_ratio'): 1.0 + i,
+                SampleKey('runqueue_read_ok'): 1.0,
+                SampleKey('own_cpu_some10', 'orchestrator-a.service'): 10.0 + i,
+                SampleKey('own_read_ok', 'orchestrator-a.service'): 1.0,
+                SampleKey('own_read_ok', 'orchestrator-b.service'): 0.0,
+            },
+        )
+
+    read = module.read_series(db_path, None)
+
+    assert read.degradations == [], read.degradations
+    assert [v for _, v in read.series[('runqueue_ratio', None)]] == [1.0, 2.0, 3.0]
+    assert [v for _, v in read.series[('psi_cpu_some_avg10', None)]] == [
+        10.0, 11.0, 12.0]
+    assert [k for k in read.series if k[0] == 'own_cpu_some10'] == [
+        ('own_cpu_some10', 'orchestrator-a.service')]
+    assert [v for _, v in read.series[
+        ('own_cpu_some10', 'orchestrator-a.service')]] == [10.0, 11.0, 12.0]
+    assert [v for _, v in read.readability[('runqueue_read_ok', None)]] == [
+        1.0, 1.0, 1.0]
+    assert [v for _, v in read.readability[
+        ('own_read_ok', 'orchestrator-a.service')]] == [1.0, 1.0, 1.0]
+    assert [v for _, v in read.readability[
+        ('own_read_ok', 'orchestrator-b.service')]] == [0.0, 0.0, 0.0]
+    assert read.ticks_in_corpus == 3, (
+        'the script counted a different number of ticks than write_tick '
+        f'wrote: {read.ticks_in_corpus} against 3'
+    )
+
+    coverage = module.coverage_table(
+        read.series, read.readability,
+        list(module.ARM_METRIC_SELECTORS.values()), ticks_in_corpus=3,
+    )
+    dark = coverage[('own_cpu_some10', 'orchestrator-b.service')]
+    assert dark is not None
+    assert (dark['ticks_with_a_row'], dark['readable']) == (3, 0), dark
+
+    absent = tmp_path / 'absent'
+    module.main([
+        '--db', str(db_path), '--arm', 'own_cpu_some_avg10', '--no-report',
+        '--config', str(absent / 'local.yaml'),
+        '--peer-config', str(absent / 'peer.yaml'),
+        '--uv-bin', str(absent / 'uv'),
+    ])
+    assert '### `own_cpu_some10:orchestrator-a.service` —' in capsys.readouterr().out
 
 
 

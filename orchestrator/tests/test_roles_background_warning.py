@@ -19,7 +19,8 @@ guard.  Each assertion is a one-line existence check, not a prose pin.
 
 from __future__ import annotations
 
-from orchestrator.agents.roles import BACKGROUND_TASK_WARNING, ROLES
+from orchestrator.agents.harness_guidance import BACKGROUND_TASK_WARNING
+from orchestrator.agents.roles import ROLES
 
 
 def test_background_warning_is_nonempty() -> None:

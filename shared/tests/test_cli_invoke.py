@@ -20,9 +20,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 from shared.cli_invoke import (
     _CAP_HIT_COOLDOWN_SECS,
     _MAX_CAP_COOLDOWN_SECS,
+    BUDGET_EXHAUSTED_SUBTYPE,
     CAP_HIT_RESUME_PROMPT,
     AgentFailureKind,
     AgentResult,
@@ -78,6 +80,15 @@ def _make_result(**overrides: Any) -> AgentResult:
     }
     defaults.update(overrides)
     return AgentResult(**defaults)
+
+
+def _make_cap_result(**overrides: Any) -> AgentResult:
+    """A genuine cap: the CLI reports it as a failed turn carrying the banner."""
+    defaults: dict[str, Any] = {
+        'success': False, 'output': REAL_CLI_CAP_HIT_MESSAGES[0],
+    }
+    defaults.update(overrides)
+    return _make_result(**defaults)
 
 
 class TestAgentResultAccountNameField:
@@ -166,7 +177,7 @@ class TestAccountNameThreading:
             patch(
                 'shared.cli_invoke.invoke_claude_agent',
                 new_callable=AsyncMock,
-                return_value=result,
+                side_effect=[_make_cap_result(), result],
             ),
             patch('shared.cli_invoke.asyncio') as mock_asyncio,
         ):
@@ -211,7 +222,7 @@ class TestCapHitBackoff:
             patch(
                 'shared.cli_invoke.invoke_claude_agent',
                 new_callable=AsyncMock,
-                return_value=result,
+                side_effect=[_make_cap_result(), result],
             ) as mock_invoke,
             patch('shared.cli_invoke.asyncio') as mock_asyncio,
         ):
@@ -262,7 +273,7 @@ class TestCapHitBackoff:
             patch(
                 'shared.cli_invoke.invoke_claude_agent',
                 new_callable=AsyncMock,
-                return_value=result,
+                side_effect=[_make_cap_result()] * 2 + [result],
             ),
             patch('shared.cli_invoke.asyncio') as mock_asyncio,
         ):
@@ -291,7 +302,7 @@ class TestCapHitBackoff:
             patch(
                 'shared.cli_invoke.invoke_claude_agent',
                 new_callable=AsyncMock,
-                return_value=result,
+                side_effect=[_make_cap_result()] * 3 + [result],
             ),
             patch('shared.cli_invoke.asyncio') as mock_asyncio,
         ):
@@ -324,7 +335,7 @@ class TestCapHitBackoff:
             patch(
                 'shared.cli_invoke.invoke_claude_agent',
                 new_callable=AsyncMock,
-                return_value=result,
+                side_effect=[_make_cap_result()] * num_hits + [result],
             ),
             patch('shared.cli_invoke.asyncio') as mock_asyncio,
         ):
@@ -476,7 +487,7 @@ class TestCapHitResume:
             active_account_name='acct-b',
         )
 
-        capped_result = _make_result(session_id='sess-123')
+        capped_result = _make_cap_result(session_id='sess-123')
         ok_result = _make_result()
 
         with (
@@ -504,7 +515,7 @@ class TestCapHitResume:
             active_account_name='acct-b',
         )
 
-        capped_result = _make_result(session_id='')
+        capped_result = _make_cap_result(session_id='')
         ok_result = _make_result()
 
         with (
@@ -531,7 +542,7 @@ class TestCapHitResume:
             active_account_name='acct-b',
         )
 
-        capped_result = _make_result(session_id='sess-123')
+        capped_result = _make_cap_result(session_id='sess-123')
         failed_resume = _make_result(success=False, output='resume error')
         ok_result = _make_result()
 
@@ -565,8 +576,8 @@ class TestCapHitResume:
             active_account_name='next',
         )
 
-        r1 = _make_result(session_id='sess-1')
-        r2 = _make_result(session_id='sess-2')
+        r1 = _make_cap_result(session_id='sess-1')
+        r2 = _make_cap_result(session_id='sess-2')
         r3 = _make_result()
 
         with (
@@ -726,7 +737,7 @@ class TestResumeFallbackCounter:
             active_account_name='acct-b',
         )
         failed_resume_1 = _make_result(success=False, output='resume error')
-        capped = _make_result(session_id='sess-capped')
+        capped = _make_cap_result(session_id='sess-capped')
         failed_resume_2 = _make_result(success=False, output='resume error')
         ok_result = _make_result()
 
@@ -3008,6 +3019,71 @@ class TestClassifyAgentFailureOutcomeProjection:
         assert cls.kind is AgentFailureKind.TIMED_OUT
 
 
+class TestBudgetExhaustedSubtype:
+    """The CLI wire value every package compares a budget abort against."""
+
+    def test_is_the_claude_cli_wire_value(self):
+        assert BUDGET_EXHAUSTED_SUBTYPE == 'error_max_budget_usd'
+
+
+class TestClassifyAgentFailureBudget:
+    """A run ended by the CLI's own ``--max-budget-usd`` ceiling classifies
+    BUDGET, ranked like MAX_TURNS: below the wall-clock rule, above every
+    status heuristic, because a budget abort proves the API accepted the
+    request and billed real tokens."""
+
+    def test_kind_value_is_the_census_token(self):
+        assert AgentFailureKind.BUDGET == 'budget'
+
+    def test_budget_abort_classifies_budget(self):
+        result = AgentResult(
+            success=False, output='', subtype=BUDGET_EXHAUSTED_SUBTYPE,
+            turns=40, cost_usd=5.01,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.BUDGET
+        assert '5.01' in cls.summary
+        assert '40' in cls.summary
+        assert not cls.summary.startswith('agent API error: HTTP')
+        assert 'no specific failure signal' not in cls.summary
+
+    def test_success_still_short_circuits(self):
+        result = AgentResult(
+            success=True, output='done', subtype=BUDGET_EXHAUSTED_SUBTYPE,
+            turns=40, cost_usd=5.01,
+        )
+        assert classify_agent_failure(result).kind is AgentFailureKind.SUCCESS
+
+    def test_timed_out_outranks_budget(self):
+        result = AgentResult(
+            success=False, output='', subtype=BUDGET_EXHAUSTED_SUBTYPE,
+            timed_out=True, duration_ms=600_000, transcript_turns=0,
+        )
+        assert classify_agent_failure(result).kind is AgentFailureKind.TIMED_OUT
+
+    def test_budget_outranks_404_model_not_found(self):
+        result = AgentResult(
+            success=False, output='', subtype=BUDGET_EXHAUSTED_SUBTYPE,
+            cost_usd=1.0, api_error_status=404,
+        )
+        assert classify_agent_failure(result).kind is AgentFailureKind.BUDGET
+
+    @pytest.mark.parametrize('status', [401, 429])
+    def test_budget_outranks_non_5xx_api_error_status(self, status):
+        result = AgentResult(
+            success=False, output='', subtype=BUDGET_EXHAUSTED_SUBTYPE,
+            cost_usd=1.0, api_error_status=status,
+        )
+        assert classify_agent_failure(result).kind is AgentFailureKind.BUDGET
+
+    def test_agrees_with_classify_cap_kill(self):
+        result = AgentResult(
+            success=False, output='', subtype=BUDGET_EXHAUSTED_SUBTYPE, cost_usd=1.0,
+        )
+        assert classify_cap_kill(result, budget_usd=None, max_turns=None) is CapReason.BUDGET
+        assert classify_agent_failure(result).kind is AgentFailureKind.BUDGET
+
+
 class TestBuildFailureMessage:
     """Tests for the build_failure_message formatting helper."""
 
@@ -3061,7 +3137,7 @@ class TestCapWaitPeriodicLog:
         gate = self._exact_hit_gate(hits=1)
 
         with (
-            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[_make_cap_result()] + [_make_result()]),
             patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
             patch('shared.cli_invoke.time.monotonic', return_value=0.0),
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
@@ -3083,7 +3159,7 @@ class TestCapWaitPeriodicLog:
         label = 'task-99-architect'
 
         with (
-            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[_make_cap_result()] + [_make_result()]),
             patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
             patch('shared.cli_invoke.time.monotonic', return_value=0.0),
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
@@ -3100,7 +3176,7 @@ class TestCapWaitPeriodicLog:
         gate = self._exact_hit_gate(hits=1, soonest_resets_at=reset_dt)
 
         with (
-            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[_make_cap_result()] + [_make_result()]),
             patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
             patch('shared.cli_invoke.time.monotonic', return_value=0.0),
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
@@ -3116,7 +3192,7 @@ class TestCapWaitPeriodicLog:
         gate = self._exact_hit_gate(hits=1, soonest_resets_at=None)
 
         with (
-            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[_make_cap_result()] + [_make_result()]),
             patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
             patch('shared.cli_invoke.time.monotonic', return_value=0.0),
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
@@ -3132,7 +3208,7 @@ class TestCapWaitPeriodicLog:
         gate = self._exact_hit_gate(hits=3)
 
         with (
-            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[_make_cap_result()] * 3 + [_make_result()]),
             patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
             # All monotonic calls return 0.0 — time never advances, throttle stays active
             patch('shared.cli_invoke.time.monotonic', return_value=0.0),
@@ -3160,7 +3236,7 @@ class TestCapWaitPeriodicLog:
         )
 
         with (
-            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[_make_cap_result()] * 3 + [_make_result()]),
             patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
             patch('shared.cli_invoke.time.monotonic', side_effect=monotonic_vals),
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
@@ -4379,6 +4455,24 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
 
         return _side_effect
 
+    @staticmethod
+    def _kill_decision_clock():
+        """snapshot_process_group side_effect recording time.monotonic() per call.
+
+        _run_subprocess calls snapshot_process_group as the first statement of
+        its TimeoutError handler, right after the watchdog decides to kill, so
+        each recorded time is a kill decision and excludes post-kill teardown.
+        """
+        import time as _time
+
+        decided_at: list[float] = []
+
+        def _side_effect(pgid):
+            decided_at.append(_time.monotonic())
+            return f'snapshot_process_group({pgid}): stubbed'
+
+        return _side_effect, decided_at
+
     async def test_productive_run_survives_ceiling_and_completes_normally(self, tmp_path):
         """(a) PRODUCTIVE-SURVIVES-CEILING: transcript turns keep growing across the
         old timeout_seconds ceiling; the process eventually completes normally with
@@ -4546,6 +4640,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
 
         proc, _ = self._make_hanging_proc()
         terminate_pg_mock = AsyncMock()
+        snapshot_side_effect, decided_at = self._kill_decision_clock()
 
         async def fake_exec(*args, **kwargs):
             return proc
@@ -4553,6 +4648,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.snapshot_process_group', side_effect=snapshot_side_effect),
             patch('shared.cli_invoke.count_transcript_turns', side_effect=self._always_growing_turns()),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
             patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.02),
@@ -4564,23 +4660,18 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
                 session_id=sid, config_dir=cfg_dir,
                 working_idle_secs=10.0, absolute_cap_secs=0.3,
             )
-            wall = _time.monotonic() - t0
 
         assert result.timed_out is True
         terminate_pg_mock.assert_called_once()
+        assert len(decided_at) == 1, f'Expected exactly one kill decision, got {len(decided_at)}'
         # absolute_cap_secs=0.3 « idle_bound=max(10.0, 0.05)=10.0 — only the cap can fire.
-        assert wall >= 0.2, f'Expected cap-kill at ~0.3s, killed too early at {wall:.3f}s'
-        # Discriminates the correct ~0.3s cap-kill from the WRONG 10.0s idle bound. The
-        # cap-kill itself fires at ~0.3s (see the "Working-regime absolute cap reached"
-        # log); wall additionally captures the post-kill teardown (an UNMOCKED
-        # snapshot_process_group /proc walk + comm_task cancellation + event-loop
-        # scheduling), which under parallel verify/host load has been observed to drift
-        # to ~2.0s (task 2723). 4.0s keeps full discriminating power against the 10.0s
-        # wrong ceiling while tolerating that teardown latency — mirrors the same
-        # load-drift de-flake applied to the sibling UNREADABLE-DEGRADE test (e) below
-        # (commit fda97df621af), widened further here since 2.0s of observed drift
-        # already ate the old idle_bound=2.0s/wall<1.5s margin outright.
-        assert wall < 4.0, f'Expected cap-kill at ~0.3s, not at the 10.0s idle bound ({wall:.3f}s)'
+        # The bounds time the kill decision, not the teardown after it, so 4.0s
+        # separates the ~0.3s cap from the wrong 10.0s idle bound under any load.
+        decision = decided_at[0] - t0
+        assert decision >= 0.2, f'Expected cap-kill at ~0.3s, killed too early at {decision:.3f}s'
+        assert decision < 4.0, (
+            f'Expected cap-kill at ~0.3s, not at the 10.0s idle bound ({decision:.3f}s)'
+        )
 
     async def test_unreadable_transcript_degrades_to_old_ceiling_even_with_extension_params_set(self, tmp_path):
         """(e) UNREADABLE-DEGRADE: count_transcript_turns always returns None (B7
@@ -4598,6 +4689,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
 
         proc, _ = self._make_hanging_proc()
         terminate_pg_mock = AsyncMock()
+        snapshot_side_effect, decided_at = self._kill_decision_clock()
 
         async def fake_exec(*args, **kwargs):
             return proc
@@ -4605,6 +4697,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.snapshot_process_group', side_effect=snapshot_side_effect),
             patch('shared.cli_invoke.count_transcript_turns', return_value=None),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
         ):
@@ -4615,21 +4708,21 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
                 session_id=sid, config_dir=cfg_dir,
                 working_idle_secs=5.0, absolute_cap_secs=10.0,
             )
-            wall = _time.monotonic() - t0
 
         assert result.timed_out is True
         assert result.transcript_turns is None
         terminate_pg_mock.assert_called_once()
-        # Discriminates the correct ~0.2s ceiling from the WRONG extended ceilings
-        # (working_idle_secs=5.0 / absolute_cap_secs=10.0). The kill itself fires at
-        # 0.2s (see the "Absolute ceiling reached after 0.2s — killing" log); the only
-        # thing wall measures beyond that is real-ish subprocess teardown + event-loop
-        # scheduling, which under parallel verify load can drift to ~1.3s. The bound
-        # only needs to sit comfortably below the nearest wrong ceiling (5.0s), so 3.0s
-        # keeps full discriminating power while tolerating teardown latency under load.
-        assert wall < 3.0, (
+        assert len(decided_at) == 1, f'Expected exactly one kill decision, got {len(decided_at)}'
+        # The bounds time the kill decision, not the teardown after it, so 3.0s
+        # separates the 0.2s ceiling from the wrong extended ceilings (5.0s idle /
+        # 10.0s cap) under any load.
+        decision = decided_at[0] - t0
+        assert decision >= 0.2, (
+            f'Expected kill at the old 0.2s ceiling, killed too early at {decision:.3f}s'
+        )
+        assert decision < 3.0, (
             f'Expected kill at the old ~0.2s ceiling (extension never engages on an '
-            f'unreadable transcript), got {wall:.3f}s — looks like the huge idle/cap '
+            f'unreadable transcript), got {decision:.3f}s — looks like the huge idle/cap '
             f'params (5.0s idle / 10.0s cap) leaked into the degrade path'
         )
 

@@ -29,7 +29,7 @@ from fused_memory.models.reconciliation import EventSource, EventType, Reconcili
 from fused_memory.reconciliation.cli_stage_runner import FINDING_ITEM_SCHEMA
 from fused_memory.reconciliation.flag_dedup import (
     ABSENCE_FLAG_TYPES,
-    STALE_METADATA_FLAG_TYPES,
+    STALE_METADATA_FAMILY,
     compute_flag_signature,
 )
 from fused_memory.reconciliation.unlanded_path_check import (
@@ -210,7 +210,7 @@ class TestBuildUnlandedPathFlag:
         assert 'dismiss' in action
 
     def test_flag_type_survives_the_done_task_filters(self):
-        assert UNLANDED_PATH_FLAG_TYPE not in STALE_METADATA_FLAG_TYPES
+        assert not STALE_METADATA_FAMILY.matches(UNLANDED_PATH_FLAG_TYPE)
         assert UNLANDED_PATH_FLAG_TYPE not in ABSENCE_FLAG_TYPES
 
 

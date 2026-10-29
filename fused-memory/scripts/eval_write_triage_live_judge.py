@@ -16,8 +16,6 @@ the only eval module that reaches an LLM.
 from __future__ import annotations
 
 import asyncio
-import importlib.util
-import sys
 import types
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -27,30 +25,13 @@ from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.write_triage import OUTCOME_JUDGE, BandDecision, JudgeUsage
 from fused_memory.server.write_triage_judge import (
-    _elide,
+    judge_prompt_elisions,
     judge_write,
     resolve_judge_field_chars,
 )
+from fused_memory.utils.script_loader import load_script
 
 _SCRIPTS = Path(__file__).resolve().parent
-
-
-def _load_script(path: Path, mod_name: str) -> types.ModuleType:
-    """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
 
 
 # Pyright cannot follow the by-path loader, so it alone resolves `_scoring` through
@@ -58,7 +39,7 @@ def _load_script(path: Path, mod_name: str) -> types.ModuleType:
 if TYPE_CHECKING:
     import eval_write_triage_scoring as _scoring
 else:
-    _scoring = _load_script(
+    _scoring = load_script(
         _SCRIPTS / 'eval_write_triage_scoring.py', 'eval_write_triage_scoring',
     )
 
@@ -80,20 +61,6 @@ _SYNTHETIC_SCORE_STEP = 0.01
 #: C1 forbids repo or task context from reaching the judge, and
 #: ``build_judge_prompt`` interpolates no metadata whatsoever.
 _EVAL_PROJECT_ID = 'dark_factory'
-
-
-def _elision_flags(
-    content: str, slate: Sequence[Any], field_chars: int,
-) -> tuple[bool, dict[str, bool]]:
-    """Which rendered fields the judge's own ``_elide`` cut at *field_chars*.
-
-    Asked of the shipped function rather than re-derived from a length
-    comparison here, so the flags cannot disagree with the prompt.
-    """
-    return (
-        _elide(content, field_chars) != content,
-        {c.id: _elide(c.content, field_chars) != c.content for c in slate},
-    )
 
 
 def _usage_row(usage: JudgeUsage | None) -> dict[str, int] | None:
@@ -137,8 +104,8 @@ def _ask_judge(
     if outcome != OUTCOME_JUDGE:
         return _scoring.JudgeAnswer(outcome=outcome)
 
-    entry_elided, candidates_elided = _elision_flags(
-        content, slate, resolve_judge_field_chars(service),
+    elisions = judge_prompt_elisions(
+        content, slate, field_chars=resolve_judge_field_chars(service),
     )
     verdict = asyncio.run(judge_write(
         memory_service=service,
@@ -156,8 +123,8 @@ def _ask_judge(
     return _scoring.JudgeAnswer(
         outcome=verdict.outcome,
         verdict=verdict.outcome,
-        entry_elided=entry_elided,
-        candidates_elided=candidates_elided,
+        entry_elided=elisions.entry,
+        candidates_elided=elisions.candidates,
         usage=_usage_row(verdict.usage),
         candidate_id=verdict.candidate_id,
     )

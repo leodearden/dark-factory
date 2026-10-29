@@ -4,11 +4,14 @@ Guards against:
   * Silent removal of the marked / DOMPurify CDN script tags (the MarkdownText
     component falls back to plain text when these are missing — works "well
     enough" that the regression can ship unnoticed).
+  * A silent reversion of the React CDN tags to the development build (every
+    tab still renders, just several times slower per re-render).
 """
 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -36,7 +39,7 @@ def test_static_index_html_serves_200(client):
     )
 
 
-_CDN_SCRIPT_CASES = [
+_MARKDOWN_CDN_CASES = [
     (
         'https://unpkg.com/marked@',
         'marked',
@@ -51,26 +54,53 @@ _CDN_SCRIPT_CASES = [
     ),
 ]
 
+_REACT_PREFIX = 'https://unpkg.com/react@'
+_REACT_DOM_PREFIX = 'https://unpkg.com/react-dom@'
+
+_CDN_SCRIPT_CASES = [
+    *_MARKDOWN_CDN_CASES,
+    (
+        _REACT_PREFIX,
+        'React',
+        'Every .jsx reads the global `React` — a missing or wrong integrity '
+        'either runs unverified CDN bytes or, on a hash mismatch, blocks the '
+        'whole dashboard.',
+    ),
+    (
+        _REACT_DOM_PREFIX,
+        'ReactDOM',
+        'app.jsx mounts the app through the global `ReactDOM.createRoot` — a '
+        'missing or wrong integrity either runs unverified CDN bytes or, on a '
+        'hash mismatch, leaves the page blank.',
+    ),
+]
+
+
+def _script_attrs(
+    index_html_body: str, src_prefix: str, consumer_note: str = ''
+) -> dict[str, str | None]:
+    result = find_script_position(index_html_body, src_prefix)
+    assert result is not None, (
+        f'No <script src="{src_prefix}..."> tag found in index.html. {consumer_note}'
+    ).rstrip()
+    return result[1]
+
 
 @pytest.mark.parametrize(
     'src_prefix, lib_name, consumer_note',
     _CDN_SCRIPT_CASES,
-    ids=['marked', 'dompurify'],
+    ids=['marked', 'dompurify', 'react', 'react-dom'],
 )
 def test_cdn_script_has_sri_integrity(
     index_html_body: str, src_prefix: str, lib_name: str, consumer_note: str
 ) -> None:
     """Each CDN <script> tag is present with a well-formed SRI integrity hash.
 
-    Parametrised over marked and DOMPurify — both are required by the
-    MarkdownText component in tab_tasks.jsx.
+    Parametrised over every CDN library the redux bundle needs except Babel,
+    whose pin the node suite's
+    dashboard/tests/js/_served_bundle.mjs::loadVendoredBabel already holds.
     """
-    result = find_script_position(index_html_body, src_prefix)
-    attrs = result[1] if result is not None else None
-    assert attrs is not None, (
-        f'No <script src="{src_prefix}..."> tag found in index.html. '
-        f'{consumer_note}'
-    )
+    attrs = _script_attrs(index_html_body, src_prefix, consumer_note)
     integrity = (attrs.get('integrity') or '').strip()
     assert integrity, (
         f'{lib_name} CDN tag has missing or empty integrity= attribute. '
@@ -79,6 +109,62 @@ def test_cdn_script_has_sri_integrity(
     assert _SRI_HASH_RE.match(integrity), (
         f'{lib_name} CDN tag integrity= is not a valid SRI hash '
         f'(expected sha256/384/512-<base64>): {integrity!r}'
+    )
+
+
+@dataclass(frozen=True)
+class UnpkgUmdTag:
+    package: str
+    version: str
+    build: str
+
+
+_UNPKG_UMD_SRC_RE = re.compile(
+    r'^https://unpkg\.com/(?P<package>react|react-dom)@(?P<version>[^/]+)'
+    r'/umd/(?P=package)\.(?P<build>[a-z.]+)\.js$'
+)
+
+
+def _parse_unpkg_umd_src(src: str) -> UnpkgUmdTag:
+    match = _UNPKG_UMD_SRC_RE.match(src)
+    assert match is not None, (
+        f'React CDN src {src!r} is not the expected shape '
+        'https://unpkg.com/<react|react-dom>@<version>/umd/<package>.<build>.js'
+    )
+    return UnpkgUmdTag(match['package'], match['version'], match['build'])
+
+
+def _react_umd_tag(index_html_body: str, src_prefix: str) -> UnpkgUmdTag:
+    return _parse_unpkg_umd_src(_script_attrs(index_html_body, src_prefix).get('src') or '')
+
+
+def test_react_cdn_tags_load_one_version_of_the_production_build(index_html_body: str) -> None:
+    """React and ReactDOM load the production UMD build, at one shared version.
+
+    The development build re-validates every element on every render; the page
+    still works, so a reversion would ship unnoticed while every poll-driven
+    re-render pays for it.
+
+    The production build is silent about missing keys and prop or hook misuse,
+    and reports render errors as "Minified React error #N". To get those
+    diagnostics back while debugging a .jsx change locally, point both tags at
+    umd/<package>.development.js and drop or re-derive their integrity= (SRI
+    blocks a mismatched hash). Do not commit that swap; this test fails on it.
+    dashboard/tests/js/dom_harness.mjs renders the tabs on the development build
+    of the same package, so jsx_render.test.mjs still fails on those warnings.
+    """
+    react = _react_umd_tag(index_html_body, _REACT_PREFIX)
+    react_dom = _react_umd_tag(index_html_body, _REACT_DOM_PREFIX)
+    for tag in (react, react_dom):
+        assert tag.build == 'production.min', (
+            f'{tag.package}@{tag.version} loads umd/{tag.package}.{tag.build}.js; '
+            f'expected umd/{tag.package}.production.min.js. The development build '
+            're-validates every element on every render, and task 5828 measured it '
+            '2-5x slower per dashboard re-render.'
+        )
+    assert react.version == react_dom.version, (
+        f'react@{react.version} and react-dom@{react_dom.version} differ; a '
+        'React/ReactDOM version mismatch breaks the app at runtime.'
     )
 
 
@@ -136,7 +222,7 @@ _TAB_TASKS_PREFIX = '/static/redux/tab_tasks.jsx'
 
 @pytest.mark.parametrize(
     'src_prefix, lib_name, consumer_note',
-    _CDN_SCRIPT_CASES,
+    _MARKDOWN_CDN_CASES,
     ids=['marked', 'dompurify'],
 )
 def test_cdn_script_loads_before_tab_tasks_jsx(
@@ -1889,6 +1975,7 @@ _DEPENDENCY_FREE_MODULES = {
         'tab_escalations.jsx',
         'tab_escalation_analytics.jsx',
     ),
+    'tab_render_failure.js': ('app.jsx',),
 }
 _DEPENDENCY_FREE_CONSUMER_CASES = [
     (module, consumer)
@@ -2035,6 +2122,7 @@ def redux_base_state() -> ReduxBaseState | None:
     return resolve_redux_base_state(REPO_ROOT)
 
 
+@pytest.mark.reads_git_history
 def test_redux_cache_buster_is_newer_than_merge_base(
     index_html_body: str,
     redux_base_state: ReduxBaseState | None,

@@ -1,10 +1,10 @@
 """Role-prompt guidance: locate a file by name through git's index, not a tree walk.
 
-`orchestrator/src/orchestrator/agents/roles.py::_BASH_CAPABLE_ROLE_PREAMBLE`
+`orchestrator/src/orchestrator/agents/harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE`
 and `orchestrator/src/orchestrator/agents/roles.py::JUDGE` splice
 `FILE_LOOKUP_GUIDANCE` into every role with a literal system prompt. It is a
-leaf module, imported downward by roles.py, only so that already oversized file
-does not grow further. Provenance: reify #7936 via task 5975; reify codebook
+leaf module, imported downward by harness_guidance.py, and by roles.py for
+JUDGE's chain. Provenance: reify #7936 via task 5975; reify codebook
 entry-cand-20260827-17.
 
 `orchestrator/src/orchestrator/agents/path_not_found_guidance.py::PATH_NOT_FOUND_GUIDANCE`

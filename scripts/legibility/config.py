@@ -20,9 +20,10 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Annotated
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 LOG_LEVEL_ENV_VAR = 'LEGIBILITY_LOG_LEVEL'
 LOG_FORMAT = '%(asctime)s %(levelname)s %(name)s: %(message)s'
@@ -87,10 +88,42 @@ class TrickleCensusCaps(BaseModel):
     max_verify_clusters: int | None = Field(default=150, ge=1, strict=True)
 
 
+class Adjudication(BaseModel):
+    """``census.adjudication`` — the census similarity stage
+    (plans/census-incremental-prd.md D3, D4, T1): the cosine at which a novel
+    cluster or a pending candidate attaches to an entry, the cosine at which
+    pending candidates cluster into one queue item, the most queue clusters
+    one run verifies, and the embedding model. Both thresholds are
+    provisional: no signal asserts their precision, so every attach is
+    audited in the report. ``embedding_model`` has its one home here; the
+    vector cache key and the report read it from this block.
+    """
+
+    model_config = ConfigDict(extra='allow', frozen=True)
+
+    attach_min_similarity: float = Field(default=0.90, ge=0.0, le=1.0)
+    cluster_min_similarity: float = Field(default=0.85, ge=0.0, le=1.0)
+    max_clusters_per_run: int = Field(default=10, ge=0, strict=True)
+    embedding_model: str = 'text-embedding-3-small'
+
+
+class LandingGate(BaseModel):
+    """``census.landing_gate`` — the command run in the project's checkout
+    before a census output lands (scripts/legibility/landing_gate.py). Only
+    exit 0 lands; an omitted block means ungated."""
+
+    model_config = ConfigDict(extra='allow', frozen=True)
+
+    argv: tuple[Annotated[str, StringConstraints(min_length=1)], ...] = Field(min_length=1)
+    timeout_secs: int = Field(default=900, ge=1, strict=True)
+
+
 class Census(BaseModel):
     """``census`` block — census-trigger (ζ), saturation tuning (PRD §5.2
-    points 6-7), the nightly trickle's census launch caps, and the length of
-    the census mining window (which is also the session ledger's retention)."""
+    points 6-7), the nightly trickle's census launch caps, the similarity
+    stage, the length of the census mining window (which is also the
+    session ledger's retention), and the landing gate a census output must
+    pass before it lands."""
 
     model_config = ConfigDict(extra='allow')
 
@@ -102,6 +135,8 @@ class Census(BaseModel):
     floor_days: int = 5
     saturation: Saturation = Field(default_factory=Saturation)
     trickle_caps: TrickleCensusCaps = Field(default_factory=TrickleCensusCaps)
+    adjudication: Adjudication = Field(default_factory=Adjudication)
+    landing_gate: LandingGate | None = None
 
 
 class Models(BaseModel):
@@ -143,6 +178,24 @@ class Timeouts(BaseModel):
     census_synthesis_secs: int = 1800
 
 
+class PlanDeviationCensus(BaseModel):
+    """``plan_deviation_census`` block — the plan-deviation census's defaults
+    and the settings type it evaluates with. Validated not by pydantic but by
+    ``scripts/legibility/plan_deviation_census.py::settings_from_mapping``;
+    rationale: plans/plan-deviation-recording-prd.md D8."""
+
+    model_config = ConfigDict(extra='allow', frozen=True)
+
+    enabled: bool = True
+    rate_rise_factor: float = 2.0
+    min_records: int = 10
+    pattern_share: float = 0.5
+    prose_only_min: int = 3
+    cooldown_days: int = 7
+    horizon_days: int = 28
+    meta_roots: tuple[str, ...] = ('.worktrees/.task-meta',)
+
+
 def _require_absolute(value: str, *, field_name: str, detail: str) -> str:
     """Raise ``ValueError`` naming *field_name* when *value* isn't absolute.
 
@@ -171,7 +224,9 @@ class LegibilityConfig(BaseModel):
     list of additional archive roots the miner enumerates alongside
     ``~/.claude/projects`` (the ``shared.transcript_archive`` fleet-transcript
     tree); it defaults to ``[]`` — the byte-parity baseline in which only
-    ``~/.claude/projects`` is read.
+    ``~/.claude/projects`` is read. ``plan_deviation_census`` is kept RAW so a
+    bad value never fails ``load_config``; it is validated by
+    ``plan_deviation_census.py::settings_from_mapping``.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -186,6 +241,7 @@ class LegibilityConfig(BaseModel):
     census: Census = Field(default_factory=Census)
     models: Models = Field(default_factory=Models)
     timeouts: Timeouts = Field(default_factory=Timeouts)
+    plan_deviation_census: object = None
 
     @field_validator('project_root')
     @classmethod

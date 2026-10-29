@@ -17,8 +17,8 @@ from orchestrator.session_registry import (
     SessionRecord,
     Status,
     normalize_escalations_dir,
-    normalize_project_token,
 )
+from shared.project_id import fold_project_token
 from sitting import ledger as ledger_mod
 from sitting import preparation as prep_mod
 from sitting import prepare_sitting as mod
@@ -305,7 +305,7 @@ class TestRecommendOnly:
         assert close['tool'] == 'cli:session_registry'
         argv = close['args'][-1]
         assert argv[argv.index('close-decision') + 1:argv.index('close-decision') + 5] == [
-            '--id', f'{normalize_project_token(env.df.name)}-esc-400-1', '--state', 'answered',
+            '--id', f'{fold_project_token(env.df.name)}-esc-400-1', '--state', 'answered',
         ]
         assert argv[argv.index('--project') + 1] == closeable['esc-400-1']['project']
         assert argv[argv.index('--escalations-dir') + 1] == normalize_escalations_dir(env.queue)
@@ -352,7 +352,7 @@ class TestCloseCollision:
     def test_a_bare_id_collision_leaves_the_other_record_and_files_under_the_derived_id(self, env, capsys):
         self._seed_other_project(env, 'esc-400-1')
         before = self._decision_files(env)
-        project = normalize_project_token(env.df.name)
+        project = fold_project_token(env.df.name)
         derived = f'{project}-esc-400-1'
 
         runs = self._apply_the_close(env, capsys)
@@ -367,7 +367,7 @@ class TestCloseCollision:
         assert (closed.project, closed.escalations_dir) == (project, normalize_escalations_dir(env.queue))
 
     def test_a_forced_derived_id_collision_is_refused_loudly(self, env, capsys):
-        other = self._seed_other_project(env, f'{normalize_project_token(env.df.name)}-esc-400-1')
+        other = self._seed_other_project(env, f'{fold_project_token(env.df.name)}-esc-400-1')
         before = self._decision_files(env)
 
         write, close = self._apply_the_close(env, capsys)

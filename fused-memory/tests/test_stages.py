@@ -24,7 +24,9 @@ from _fused_memory_tool_surface import (
     registered_fused_memory_tools,
 )
 from _tool_surface_classification import assert_tool_surface_classified
+from reconciliation.harness_fixtures import make_harness
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 
 import fused_memory.reconciliation.stages.base as base_module
 from fused_memory.config.schema import ReconciliationConfig
@@ -42,6 +44,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
     DISALLOW_CONSOLIDATION_OP,
     DISALLOW_CONSOLIDATION_PROPOSALS,
+    DISALLOW_ESCALATION_MERGE_LANE_CONTROL,
     DISALLOW_ESCALATION_READS,
     DISALLOW_ESCALATION_WRITES,
     DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES,
@@ -56,6 +59,9 @@ from fused_memory.reconciliation.cli_stage_runner import (
     _extract_report,
     _normalize_report,
     run_stage_via_cli,
+)
+from fused_memory.reconciliation.consolidation_auto_executor import (
+    auto_consolidation_initial_stats,
 )
 from fused_memory.reconciliation.live_workflow_section import NO_PER_TASK_SIGNAL_TOKEN
 from fused_memory.reconciliation.prompts import (
@@ -78,13 +84,14 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _format_flagged,
     _git_show_name_only,
     _needs_hint_attention,
-    _queue_briefing_refresh_tasks,
     _render_done_provenance_section,
     _run_briefing_known_gaps_script,
     _select_proactive_sample,
     _suppress_same_run_human_operator_dups,
     _sweep_stale_mem0_flag_for_stage2_markers,
+    queue_briefing_refresh_tasks,
     retire_flag_markers_for_terminal_task,
+    select_tasks_needing_hint_attention,
 )
 from fused_memory.reconciliation.standing_decision_constants import (
     CATEGORY_STANDING_DECISION_STORM,
@@ -206,7 +213,7 @@ class TestMockTypesConstant:
 #     record the caller holds and has just mutated, in the queue it is connected
 #     to — never an arbitrary per-task query, so it answers no existence
 #     question either.
-#   - merge_* / *_scheduler / *_merge_queue / *_warm_worktree / release_workflow /
+#   - merge_* (except merge_relane, denied by DISALLOW_ESCALATION_MERGE_LANE_CONTROL) / *_scheduler / *_merge_queue / *_warm_worktree / release_workflow /
 #     reload_config / get_task_runtime_state — orchestrator control-plane and
 #     merge-lane surface, unrelated to the escalation-record question.
 #
@@ -220,6 +227,9 @@ _REVIEWED_STAGE_SAFE = {
     # queue it can only ever answer "not found" — never a categorical [].
     'mcp__escalation__amend_escalation',
     'mcp__escalation__claim_warm_worktree',
+    # clear_verify_host_quarantine (task 6565) is merge-lane control plane: it
+    # re-admits a benched verify host and reads no per-task escalation state.
+    'mcp__escalation__clear_verify_host_quarantine',
     # declare_pin (task 4377) is stamp_triage's structural twin: a
     # restrictive-only write that marks a record as load-bearing.  Against the
     # reconciliation queue it can only ever answer "not found" — it reads no
@@ -463,14 +473,19 @@ class TestDisallowedToolLists:
         ``..._the_three_read_tools`` when the fourth member landed, and a name
         that promises a count forces a rename on every accession (and reads as a
         lie in between — see the RETIRED ASSERTION note above).
+
+        ``resolve_escalation_shas`` joined it in task 5751: a by-id record read,
+        denied for the same reason as ``get_escalation`` (against the
+        reconciliation queue it can only answer not-found).
         """
         assert set(DISALLOW_ESCALATION_READS) == {
             'mcp__escalation__get_pending_escalations',
             'mcp__escalation__get_escalation',
             'mcp__escalation__get_task_escalations',
             'mcp__escalation__get_task_escalation_history',
+            'mcp__escalation__resolve_escalation_shas',
         }
-        assert len(DISALLOW_ESCALATION_READS) == 4, 'no duplicate entries'
+        assert len(DISALLOW_ESCALATION_READS) == 5, 'no duplicate entries'
 
     def test_every_escalation_server_tool_is_classified(self):
         """Every tool the SHARED escalation server registers is denied or reviewed.
@@ -512,6 +527,7 @@ class TestDisallowedToolLists:
             {
                 'DISALLOW_ESCALATION_READS': DISALLOW_ESCALATION_READS,
                 'DISALLOW_ESCALATION_WRITES': DISALLOW_ESCALATION_WRITES,
+                'DISALLOW_ESCALATION_MERGE_LANE_CONTROL': DISALLOW_ESCALATION_MERGE_LANE_CONTROL,
                 '_REVIEWED_STAGE_SAFE': _REVIEWED_STAGE_SAFE,
             },
             remedy=(
@@ -635,6 +651,20 @@ class TestDisallowedToolLists:
             assert set(DISALLOW_ESCALATION_WRITES).issubset(set(stage_list)), (
                 f'{name} must deny the escalation filing tools'
             )
+
+    def test_merge_relane_is_denied_in_every_stage(self):
+        """Operator merge-lane control: no reconciliation stage may re-prioritise merges."""
+        deps = _mock_stage_deps()
+        assert DISALLOW_ESCALATION_MERGE_LANE_CONTROL == ['mcp__escalation__merge_relane']
+        for stage_list in (STAGE1_DISALLOWED, STAGE2_DISALLOWED, STAGE3_DISALLOWED):
+            assert set(DISALLOW_ESCALATION_MERGE_LANE_CONTROL).issubset(set(stage_list))
+        for cls, stage_id in (
+            (MemoryConsolidator, StageId.memory_consolidator),
+            (TaskKnowledgeSync, StageId.task_knowledge_sync),
+            (IntegrityCheck, StageId.integrity_check),
+        ):
+            hook = set(cls(stage_id, **deps).get_disallowed_tools())
+            assert set(DISALLOW_ESCALATION_MERGE_LANE_CONTROL).issubset(hook)
 
     def test_escalate_blocker_stays_allowed_in_stage2_only(self):
         """Stage 2 keeps both filing tools for FIX D; Stages 1 and 3 deny escalate_blocker."""
@@ -1302,7 +1332,7 @@ class TestTaskKnowledgeSyncDoneAuditSection:
     """assemble_payload renders a since-boundary Done-Task Completion-Memory Audit (step-5).
 
     The audit enumerates every done task updated at/after the watermark's
-    ``last_full_run_completed`` boundary (not a fixed 5-item sample), so
+    ``last_task_change_timestamp`` boundary (not a fixed 5-item sample), so
     completion-memory gaps outside the small Proactive Task Sample are no longer
     systematically missed as done-task throughput grows.
     """
@@ -1341,7 +1371,7 @@ class TestTaskKnowledgeSyncDoneAuditSection:
             ],
         }
 
-        wm = Watermark(project_id='p', last_full_run_completed=boundary)
+        wm = Watermark(project_id='p', last_task_change_timestamp=boundary)
         payload = await stage.assemble_payload([], wm, [])
 
         assert '### Done-Task Completion-Memory Audit' in payload, (
@@ -1354,6 +1384,47 @@ class TestTaskKnowledgeSyncDoneAuditSection:
             'a done task updated before the boundary must be excluded from the audit section'
         )
         assert '[8900]' not in section, 'an active task must never appear in the done-task audit'
+
+    @pytest.mark.asyncio
+    async def test_audit_window_starts_at_task_change_timestamp_not_completion(
+        self, mock_deps, tmp_path
+    ):
+        """The audit starts at the previous run's start, so a task done mid-run is audited.
+
+        This is the Stage 2 half of the done-audit invariant. The harness half, that
+        the persisted ``last_task_change_timestamp`` is the run's start, is
+        tests/reconciliation/test_recon_window_anchor.py::test_task_done_mid_cycle_is_inside_next_cycles_task_change_window.
+        """
+        previous_run_started = datetime(2026, 7, 14, 12, 0, 0, tzinfo=UTC)
+        previous_run_completed = datetime(2026, 7, 14, 12, 30, 0, tzinfo=UTC)
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='p', project_root=str(tmp_path)
+        )
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                {'id': 8811, 'status': 'done', 'title': 'Done mid-previous-run',
+                 'updatedAt': '2026-07-14T12:10:00.000Z'},
+                {'id': 8812, 'status': 'done', 'title': 'Done before the previous run',
+                 'updatedAt': '2026-07-14T11:00:00.000Z'},
+                {'id': 8813, 'status': 'done', 'title': 'Done after the previous run',
+                 'updatedAt': '2026-07-14T13:00:00.000Z'},
+            ],
+        }
+
+        wm = Watermark(
+            project_id='p',
+            last_task_change_timestamp=previous_run_started,
+            last_full_run_completed=previous_run_completed,
+        )
+        payload = await stage.assemble_payload([], wm, [])
+
+        section = _extract_section(payload, '### Done-Task Completion-Memory Audit')
+        assert '[8811]' in section
+        assert '[8813]' in section
+        assert '[8812]' not in section
+        boundary_line = next(ln for ln in section.splitlines() if ln.startswith('Boundary'))
+        assert previous_run_started.isoformat() in boundary_line
+        assert previous_run_completed.isoformat() not in boundary_line
 
     @pytest.mark.asyncio
     async def test_audit_section_render_cap_drops_oldest_with_overflow_note(
@@ -1392,7 +1463,7 @@ class TestTaskKnowledgeSyncDoneAuditSection:
         ]
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': tasks}
 
-        wm = Watermark(project_id='p', last_full_run_completed=boundary)
+        wm = Watermark(project_id='p', last_task_change_timestamp=boundary)
         payload = await stage.assemble_payload([], wm, [])
 
         section = _extract_section(payload, '### Done-Task Completion-Memory Audit')
@@ -1443,7 +1514,7 @@ class TestTaskKnowledgeSyncDoneAuditSection:
             ],
         }
 
-        wm = Watermark(project_id='p', last_full_run_completed=boundary)
+        wm = Watermark(project_id='p', last_task_change_timestamp=boundary)
         payload = await stage.assemble_payload([], wm, [])
 
         assert '### Done-Task Completion-Memory Audit' not in payload, (
@@ -2399,6 +2470,8 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # filters — the only place that increments this counter — never run,
             # leaving it at its __init__/reset value of 0.
             'stage1_undatable_freshness_records': 0,
+            # Always present (task 5499): None because no backlog payload was assembled.
+            'stage1_assembled_budget': None,
             # Always present (task 3052), zeroed in the same block as the
             # task-3084 curator-gate trio above and for the same reason: they
             # are set BEFORE the remediation early-return, so a caller reading
@@ -2426,6 +2499,11 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'unlanded_path_check_skipped': 0,
             'unlanded_path_check_errors': 0,
             'unlanded_path_check_flags_emitted': 0,
+            # The auto-consolidation post-step's keys (task 5240). This bare
+            # AsyncMock memory's enabled_projects contains nothing, so the
+            # post-step stops at its project gate.
+            **auto_consolidation_initial_stats(),
+            'auto_consolidations_skipped_project': 1,
             # THIRTEEN keys from the two stale-edge sweeps, not the four this
             # task added (task 4386).  The count is what needs explaining: the
             # consolidator's per-sweep `else:` branch copies out the WHOLE key
@@ -2614,6 +2692,8 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # filters — the only place that increments this counter — never run,
             # leaving it at its __init__/reset value of 0.
             'stage1_undatable_freshness_records': 0,
+            # Always present (task 5499): None because no backlog payload was assembled.
+            'stage1_assembled_budget': None,
             # Always present (task 3052), zeroed in the same block as the
             # task-3084 curator-gate trio above and for the same reason: they
             # are set BEFORE the remediation early-return, so a caller reading
@@ -2641,6 +2721,11 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'unlanded_path_check_skipped': 0,
             'unlanded_path_check_errors': 0,
             'unlanded_path_check_flags_emitted': 0,
+            # The auto-consolidation post-step's keys (task 5240). This bare
+            # AsyncMock memory's enabled_projects contains nothing, so the
+            # post-step stops at its project gate.
+            **auto_consolidation_initial_stats(),
+            'auto_consolidations_skipped_project': 1,
             # THIRTEEN keys from the two stale-edge sweeps, not the four this
             # task added (task 4386).  The count is what needs explaining: the
             # consolidator's per-sweep `else:` branch copies out the WHOLE key
@@ -3159,6 +3244,91 @@ class TestNeedsHintAttention:
         """Task with metadata as a string returns True (defensive: non-dict metadata treated as no hints)."""
         task = {'id': 1, 'title': 'T', 'status': 'pending', 'metadata': 'not-a-dict'}
         assert _needs_hint_attention(task) is True
+
+
+class TestSelectTasksNeedingHintAttention:
+    """select_tasks_needing_hint_attention: hint-attention candidates minus live-claimed tasks.
+
+    A claim is live when it carries a non-blank claimant_run_id whose heartbeat_at
+    is within DEFAULT_CLAIMANT_HEARTBEAT_TTL of ``claims_read_at`` (task 5093).
+    READ_AT lies far in the past, so every live-claim exclusion below also shows
+    that freshness is judged at ``claims_read_at``, not at wall clock.
+    """
+
+    READ_AT = datetime(2026, 1, 1, tzinfo=UTC)
+    CLAIMANT = 'orch-run/sess/pid=1'
+    _UNSET = object()
+
+    @classmethod
+    def _task(cls, tid: int = 1, *, claimant=_UNSET, heartbeat_at=_UNSET, metadata=None) -> dict:
+        task: dict = {'id': tid, 'title': f'T{tid}', 'status': 'pending', 'metadata': metadata or {}}
+        if claimant is not cls._UNSET:
+            task['claimant_run_id'] = claimant
+        if heartbeat_at is not cls._UNSET:
+            task['heartbeat_at'] = (
+                heartbeat_at.isoformat() if isinstance(heartbeat_at, datetime) else heartbeat_at
+            )
+        return task
+
+    @classmethod
+    def _claimed(cls, tid: int = 1, *, heartbeat_age: timedelta, metadata=None) -> dict:
+        return cls._task(
+            tid,
+            claimant=cls.CLAIMANT,
+            heartbeat_at=cls.READ_AT - heartbeat_age,
+            metadata=metadata,
+        )
+
+    def _select(self, tasks: list[dict]) -> list[dict]:
+        return select_tasks_needing_hint_attention(tasks, claims_read_at=self.READ_AT)
+
+    def test_live_claimed_hintless_task_is_excluded(self):
+        assert self._select([self._claimed(heartbeat_age=timedelta(minutes=1))]) == []
+
+    def test_unclaimed_hintless_task_is_included(self):
+        absent = self._task(1)
+        none_claimant = self._task(2, claimant=None)
+        assert self._select([absent, none_claimant]) == [absent, none_claimant]
+
+    def test_claim_just_past_the_shared_ttl_is_stale_and_included(self):
+        task = self._claimed(heartbeat_age=DEFAULT_CLAIMANT_HEARTBEAT_TTL + timedelta(minutes=1))
+        assert self._select([task]) == [task]
+
+    def test_claim_just_inside_the_shared_ttl_is_live_and_excluded(self):
+        task = self._claimed(heartbeat_age=DEFAULT_CLAIMANT_HEARTBEAT_TTL - timedelta(minutes=1))
+        assert self._select([task]) == []
+
+    @pytest.mark.parametrize('heartbeat_at', [None, 'not-a-timestamp'])
+    def test_claim_without_a_readable_heartbeat_is_included(self, heartbeat_at):
+        task = self._task(claimant=self.CLAIMANT, heartbeat_at=heartbeat_at)
+        assert self._select([task]) == [task]
+
+    def test_blank_claimant_with_fresh_heartbeat_is_included(self):
+        task = self._task(claimant='   ', heartbeat_at=self.READ_AT - timedelta(minutes=1))
+        assert self._select([task]) == [task]
+
+    def test_live_claimed_legacy_list_hints_task_is_excluded(self):
+        task = self._claimed(
+            heartbeat_age=timedelta(minutes=1),
+            metadata={'memory_hints': [{'entity': 'X', 'query': 'q'}]},
+        )
+        assert self._select([task]) == []
+
+    def test_unclaimed_task_with_valid_hints_is_excluded(self):
+        task = self._task(metadata={'memory_hints': {'entities': ['E'], 'queries': ['q']}})
+        assert self._select([task]) == []
+
+    def test_mixed_input_keeps_survivors_in_order_and_is_not_mutated(self):
+        tasks = [
+            self._task(1),
+            self._claimed(2, heartbeat_age=timedelta(minutes=1)),
+            self._task(3, metadata={'memory_hints': {'entities': ['E'], 'queries': ['q']}}),
+            self._claimed(4, heartbeat_age=DEFAULT_CLAIMANT_HEARTBEAT_TTL * 3),
+            self._task(5),
+        ]
+        snapshot = [dict(t) for t in tasks]
+        assert [t['id'] for t in self._select(tasks)] == [1, 4, 5]
+        assert tasks == snapshot
 
 
 class TestRunIdValidation(BaseStageValidationTest):
@@ -5187,7 +5357,7 @@ class TestStage2HandoffShortfallWarning:
 
 
 class TestBriefingKnownGapsRefresh:
-    """Tests for _run_briefing_known_gaps_script and _queue_briefing_refresh_tasks helpers."""
+    """Tests for _run_briefing_known_gaps_script and queue_briefing_refresh_tasks helpers."""
 
     @pytest.fixture
     def mock_deps(self, tmp_path):
@@ -5305,7 +5475,7 @@ class TestBriefingKnownGapsRefresh:
         assert getattr(warning_records[0], 'returncode', None) == 2
 
     # ------------------------------------------------------------------ #
-    # _queue_briefing_refresh_tasks                                         #
+    # queue_briefing_refresh_tasks                                          #
     # ------------------------------------------------------------------ #
 
     @pytest.mark.asyncio
@@ -5320,7 +5490,7 @@ class TestBriefingKnownGapsRefresh:
             {'task_id': '1820', 'title': 'Other', 'subproject': 'orchestrator', 'what': 'Other gap'},
         ]
 
-        await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+        await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert taskmaster.add_task.call_count == 2
 
@@ -5346,7 +5516,7 @@ class TestBriefingKnownGapsRefresh:
 
         mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
 
-        result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+        result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         taskmaster.add_task.assert_not_called()
         assert '1751' in result['skipped']
@@ -5366,7 +5536,7 @@ class TestBriefingKnownGapsRefresh:
 
         mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
 
-        result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+        result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         taskmaster.add_task.assert_called_once()
         assert '1751' not in result['skipped']
@@ -5394,7 +5564,7 @@ class TestBriefingKnownGapsRefresh:
 
         mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
 
-        result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+        result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         # Neither near-miss deduped → add_task must be called exactly once
         taskmaster.add_task.assert_called_once()
@@ -5685,7 +5855,7 @@ class TestBriefingKnownGapsRefresh:
         assert isinstance(getattr(warning_records[0], 'error', None), str)
 
     # ------------------------------------------------------------------ #
-    # _queue_briefing_refresh_tasks — exception path                        #
+    # queue_briefing_refresh_tasks — exception path                         #
     # ------------------------------------------------------------------ #
 
     @pytest.mark.asyncio
@@ -5701,7 +5871,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger=_TKS_LOGGER,
         ):
-            result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+            result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert result['failed'] == ['1751']
         assert result['created'] == []
@@ -5716,7 +5886,7 @@ class TestBriefingKnownGapsRefresh:
         assert getattr(warning_records[0], 'task_id', None) == '1751'
 
     # ------------------------------------------------------------------ #
-    # _queue_briefing_refresh_tasks — candidate_key dedup (task 2402)       #
+    # queue_briefing_refresh_tasks — candidate_key dedup (task 2402)        #
     # ------------------------------------------------------------------ #
 
     @pytest.mark.asyncio
@@ -5745,7 +5915,7 @@ class TestBriefingKnownGapsRefresh:
             logging.INFO,
             logger=_TKS_LOGGER,
         ):
-            result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+            result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert result['skipped'] == ['1751'], (
             f"expected the collision folded into skipped, got {result['skipped']!r}"
@@ -5777,7 +5947,7 @@ class TestBriefingKnownGapsRefresh:
         assert getattr(dedup_records[0], 'existing_id', None) == 42
 
     # ------------------------------------------------------------------ #
-    # _queue_briefing_refresh_tasks — unexpected-shape (contract-drift)     #
+    # queue_briefing_refresh_tasks — unexpected-shape (contract-drift)      #
     # ------------------------------------------------------------------ #
 
     @pytest.mark.asyncio
@@ -5820,7 +5990,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger=_TKS_LOGGER,
         ):
-            result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+            result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert result['created'] == [], (
             f'created should be [] when add_task returns {bogus_result!r}, got {result["created"]!r}'
@@ -5839,7 +6009,7 @@ class TestBriefingKnownGapsRefresh:
         assert getattr(warning_records[0], 'task_id', None) == '1751'
 
     # ------------------------------------------------------------------ #
-    # _queue_briefing_refresh_tasks — mixed success/failure in one call    #
+    # queue_briefing_refresh_tasks — mixed success/failure in one call     #
     # ------------------------------------------------------------------ #
 
     @pytest.mark.asyncio
@@ -5869,7 +6039,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger=_TKS_LOGGER,
         ):
-            result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+            result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert result['created'] == ['100', '300'], (
             f'expected created=[100, 300], got {result["created"]!r}'
@@ -12926,21 +13096,14 @@ class TestBaseStageEscalationQueueAttribute:
 def minimal_harness():
     """Construct a minimal ReconciliationHarness with all deps mocked."""
     from fused_memory.config.schema import FusedMemoryConfig
-    from fused_memory.reconciliation.harness import ReconciliationHarness
 
-    config = FusedMemoryConfig()
-    memory_service = AsyncMock()
-    taskmaster = AsyncMock()
-    journal = AsyncMock()
-    event_buffer = AsyncMock()
-    harness = ReconciliationHarness(
-        memory_service=memory_service,
-        taskmaster=taskmaster,
-        journal=journal,
-        event_buffer=event_buffer,
-        config=config,
+    return make_harness(
+        journal=AsyncMock(),
+        event_buffer=AsyncMock(),
+        memory_service=AsyncMock(),
+        taskmaster=AsyncMock(),
+        config=FusedMemoryConfig(),
     )
-    return harness
 
 
 class TestHarnessWiresEscalationQueueOntoStages:
@@ -13114,6 +13277,14 @@ class TestStage2HintAttentionDetection:
         ``_make_task_no_metadata``.
         """
         return {'id': tid, 'title': f'Task {tid}', 'status': status, 'dependencies': [], 'metadata': {}}
+
+    def _make_claimed_task_no_hints(self, tid: int, status: str, *, heartbeat_at: datetime) -> dict:
+        """A hintless task claimed by an orchestrator run that heartbeated at *heartbeat_at*."""
+        return {
+            **self._make_task_no_hints(tid, status),
+            'claimant_run_id': 'orch-run/sess/pid=1',
+            'heartbeat_at': heartbeat_at.isoformat(),
+        }
 
     def _make_task_no_metadata(self, tid: int, status: str) -> dict:
         """Build a task dict with no ``metadata`` key at all.
@@ -13454,6 +13625,121 @@ class TestStage2HintAttentionDetection:
             f'Hint section references task IDs absent from the Active Task Tree: {sorted(orphaned)}\n'
             f'hint_ids={sorted(hint_ids)}, active_tree_ids={sorted(active_tree_ids)}'
         )
+
+    # ------------------------------------------------- live-claimed exclusion (task 5093)
+
+    _READ_INSTANT_MISSING_EVENT = 'reconciliation.task_tree_read_instant_missing'
+
+    def _stage(self, mock_deps) -> TaskKnowledgeSync:
+        return make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='test_project', project_root='/tmp/test_project'
+        )
+
+    def _read_instant_missing_warnings(self, caplog) -> list[logging.LogRecord]:
+        return [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and self._READ_INSTANT_MISSING_EVENT in r.getMessage()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_live_claimed_task_left_out_of_hint_section_only(self, mock_deps, watermark):
+        fetched_at = datetime.now(UTC)
+        stage = self._stage(mock_deps)
+        stage.filtered_task_tree = self._make_tree([
+            self._make_claimed_task_no_hints(70, 'pending', heartbeat_at=fetched_at - timedelta(minutes=1)),
+            self._make_task_no_hints(71, 'pending'),
+            self._make_claimed_task_no_hints(72, 'pending', heartbeat_at=fetched_at - timedelta(minutes=30)),
+        ])
+        stage.filtered_task_tree_fetched_at = fetched_at
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        section = _extract_section(payload, self._SECTION_HEADER)
+        assert '[70]' not in section, section
+        assert '[71]' in section, section
+        assert '[72]' in section, section
+        assert '[70]' in _extract_section(payload, '### Active Task Tree')
+
+    @pytest.mark.asyncio
+    async def test_section_omitted_when_every_candidate_is_live_claimed(self, mock_deps, watermark):
+        fetched_at = datetime.now(UTC)
+        fresh = fetched_at - timedelta(minutes=1)
+        stage = self._stage(mock_deps)
+        stage.filtered_task_tree = self._make_tree([
+            self._make_claimed_task_no_hints(70, 'pending', heartbeat_at=fresh),
+            self._make_claimed_task_no_hints(71, 'in-progress', heartbeat_at=fresh),
+        ])
+        stage.filtered_task_tree_fetched_at = fetched_at
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert self._SECTION_HEADER not in payload
+
+    @pytest.mark.asyncio
+    async def test_claims_are_aged_at_the_tree_read_instant_not_wall_clock(
+        self, mock_deps, watermark
+    ):
+        read_at = datetime(2026, 1, 1, tzinfo=UTC)
+        stage = self._stage(mock_deps)
+        stage.filtered_task_tree = self._make_tree([
+            self._make_claimed_task_no_hints(73, 'pending', heartbeat_at=read_at - timedelta(minutes=1)),
+            self._make_task_no_hints(74, 'pending'),
+        ])
+        stage.filtered_task_tree_fetched_at = read_at
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        section = _extract_section(payload, self._SECTION_HEADER)
+        assert '[73]' not in section, section
+        assert '[74]' in section, section
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('read_instant', 'reason'),
+        [(None, 'not_supplied'), (datetime(2026, 1, 1), 'naive_datetime')],
+        ids=['missing', 'naive'],
+    )
+    async def test_injected_tree_without_usable_read_instant_warns_and_ages_at_wall_clock(
+        self, mock_deps, watermark, caplog, read_instant, reason
+    ):
+        stage = self._stage(mock_deps)
+        stage.filtered_task_tree = self._make_tree([
+            self._make_claimed_task_no_hints(
+                75, 'pending', heartbeat_at=datetime.now(UTC) - timedelta(minutes=1)
+            ),
+        ])
+        stage.filtered_task_tree_fetched_at = read_instant
+
+        with caplog.at_level(logging.WARNING):
+            payload = await stage.assemble_payload([], watermark, [])
+
+        assert '[75]' not in _extract_section(payload, self._SECTION_HEADER)
+        assert [r.__dict__['reason'] for r in self._read_instant_missing_warnings(caplog)] == [
+            reason
+        ]
+
+    @pytest.mark.asyncio
+    async def test_self_fetched_tree_excludes_live_claimed_task_without_warning(
+        self, mock_deps, watermark, caplog
+    ):
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_claimed_task_no_hints(
+                    76, 'pending', heartbeat_at=datetime.now(UTC) - timedelta(minutes=1)
+                ),
+                self._make_task_no_hints(77, 'pending'),
+            ]
+        }
+        stage = self._stage(mock_deps)
+
+        with caplog.at_level(logging.WARNING):
+            payload = await stage.assemble_payload([], watermark, [])
+
+        section = _extract_section(payload, self._SECTION_HEADER)
+        assert '[76]' not in section, section
+        assert '[77]' in section, section
+        assert not self._read_instant_missing_warnings(caplog)
 
 
 # ── Regression: cycle 8df8bdcd — Stage 2 Recently-Completed/Done-Provenance
@@ -14056,16 +14342,18 @@ class TestAssemblePayloadRequiredSections:
     def watermark(self):
         return Watermark(project_id='dark_factory')
 
-    def _install_stub_registry(self, stage, monkeypatch) -> dict[str, FilteredTaskTree]:
-        """Swap in STUB_REGISTRY; return the tree each stub renderer received, by stub."""
-        received: dict[str, FilteredTaskTree] = {}
+    def _install_stub_registry(
+        self, stage, monkeypatch
+    ) -> dict[str, tuple[FilteredTaskTree, datetime]]:
+        """Swap in STUB_REGISTRY; return the (tree, read instant) each stub received, by stub."""
+        received: dict[str, tuple[FilteredTaskTree, datetime]] = {}
 
-        async def stub_alpha(filtered: FilteredTaskTree) -> str:
-            received['alpha'] = filtered
+        async def stub_alpha(filtered: FilteredTaskTree, tree_read_at: datetime) -> str:
+            received['alpha'] = (filtered, tree_read_at)
             return '\n### Alpha\nfirst\n'
 
-        async def stub_beta(filtered: FilteredTaskTree) -> str:
-            received['beta'] = filtered
+        async def stub_beta(filtered: FilteredTaskTree, tree_read_at: datetime) -> str:
+            received['beta'] = (filtered, tree_read_at)
             return '\n### Beta\nsecond\n'
 
         monkeypatch.setattr(stage, 'stub_alpha', stub_alpha, raising=False)
@@ -14094,8 +14382,8 @@ class TestAssemblePayloadRequiredSections:
             'concatenated in REGISTRY ORDER, with no separator and no '
             f'post-processing; expected {self.EXPECTED_SECTIONS!r} in:\n{payload!r}'
         )
-        assert received.get('alpha') is stage.filtered_task_tree
-        assert received.get('beta') is stage.filtered_task_tree
+        assert received['alpha'][0] is stage.filtered_task_tree
+        assert received['beta'][0] is stage.filtered_task_tree
 
     @pytest.mark.asyncio
     async def test_self_fetched_tree_reaches_every_registry_renderer(
@@ -14104,25 +14392,37 @@ class TestAssemblePayloadRequiredSections:
         """With no harness-injected tree, renderers get the tree assemble_payload fetched.
 
         Pins Stage 2's contract over Stage 1's zero-arg aggregator: a renderer
-        reading self.filtered_task_tree would see None on this path.
+        reading self.filtered_task_tree would see None on this path.  The tree
+        travels with the instant it was read, stamped once the fetch returned.
         """
-        mock_deps['taskmaster'].get_tasks.return_value = {
-            'tasks': [{'id': 7, 'title': 'Fetched task', 'status': 'pending'}]
-        }
+        fetch_returned_by: list[datetime] = []
+
+        async def get_tasks(**_kwargs):
+            fetch_returned_by.append(datetime.now(UTC))
+            return {'tasks': [{'id': 7, 'title': 'Fetched task', 'status': 'pending'}]}
+
+        mock_deps['taskmaster'].get_tasks.side_effect = get_tasks
         stage = make_configured_task_knowledge_sync_stage(
             mock_deps, project_id='dark_factory', project_root='/project'
         )
         received = self._install_stub_registry(stage, monkeypatch)
 
         payload = await stage.assemble_payload([], watermark, [])
+        assembled_by = datetime.now(UTC)
 
         assert self.EXPECTED_SECTIONS in payload
         assert stage.filtered_task_tree is None
-        assert received['alpha'] is received['beta'], (
+        tree, tree_read_at = received['alpha']
+        assert received['beta'][0] is tree and received['beta'][1] == tree_read_at, (
             'Every Stage-2 registry renderer must receive the SAME resolved '
-            f'FilteredTaskTree; received {received!r}'
+            f'FilteredTaskTree and read instant; received {received!r}'
         )
-        assert [task['id'] for task in received['alpha'].active_tasks] == [7]
+        assert [task['id'] for task in tree.active_tasks] == [7]
+        assert tree_read_at.tzinfo is not None
+        assert fetch_returned_by[0] <= tree_read_at <= assembled_by, (
+            'A self-fetched tree is read when the fetch returns; got '
+            f'{tree_read_at!r}, fetch returned by {fetch_returned_by[0]!r}'
+        )
 
 
 class TestRenderLiveWorkflowSectionEmptyTasksNoOp:

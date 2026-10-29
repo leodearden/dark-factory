@@ -224,6 +224,7 @@ test('receipts: a successful refresh records servedAt from the body and received
     servedAt: '2026-09-20T12:00:00+00:00',
     receivedAt: 555,
     window: null,
+    pacingHoldMs: 0,
   });
 });
 
@@ -239,6 +240,7 @@ test('receipts: a windowed body\'s WINDOW echo is recorded verbatim beside serve
     servedAt: 'S',
     receivedAt: 555,
     window: { requested: '90d', served: '30d', days: 30 },
+    pacingHoldMs: 0,
   });
 });
 
@@ -250,7 +252,7 @@ test('receipts: a body with no served_at records null, never undefined', async (
 
   await api.refreshOne(CURATOR_PATH, {}, api.createPollState(), deps);
 
-  assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], { servedAt: null, receivedAt: 42, window: null });
+  assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], { servedAt: null, receivedAt: 42, window: null, pacingHoldMs: 0 });
 });
 
 test('receipts: a FAILED refresh leaves the receipt alone, so the tiles keep ageing', async () => {

@@ -39,12 +39,12 @@ from _boundary_payloads import (
     ragged_b,
     ragged_day,
 )
+from _dashboard_helpers import node_path
 from _lock_chip_matrix import (
     CELL_MATRIX,
     heatmap_cell_and_chip,
     heatmap_module,
     heatmap_row,
-    node_path,
 )
 from shared.task_statuses import TaskStatus
 
@@ -266,6 +266,19 @@ def test_sketch_9_the_two_windows_hold_different_merges(served_bodies):
 
     assert week['recent_total']['value'] != day['recent_total']['value']
     assert len(week['recent']) != len(day['recent'])
+
+
+@pytest.mark.parametrize('window, bucket_minutes', [('24h', 15), ('7d', 60)])
+def test_the_served_depth_names_the_width_its_labels_are_spaced_at(served_bodies, window, bucket_minutes):
+    depth = served_bodies[f'merge_{window}']['MERGE_QUEUE']['dark-factory']['depth']
+    starts = [datetime.fromisoformat(label) for label in depth['labels']]
+
+    assert depth['bucket_minutes'] == bucket_minutes
+    assert len(starts) >= 2, (
+        "the fixture's merges at 20h and 70h before T0 leave at least two buckets after the leading-zero trim"
+    )
+    gaps = {later - earlier for earlier, later in zip(starts, starts[1:], strict=False)}
+    assert gaps == {timedelta(minutes=bucket_minutes)}
 
 
 @pytest.mark.parametrize('generation', sorted(CORPUS_TTL_GENERATIONS))

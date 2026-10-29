@@ -34,7 +34,6 @@ from dashboard.data.mcp_fanout import (
     describe_exc,
     fanout_label,
     first_success,
-    project_label,
 )
 from dashboard.data.memory import (
     get_curator_state,
@@ -100,6 +99,7 @@ async def fan_out_list_tickets(
     # takes effect without needing to pass an explicit kwarg.
     effective_limit = limit if limit is not None else _LIST_TICKETS_LIMIT
     all_roots = [str(root) for root in config.all_project_roots]
+    labels = config.project_labels
 
     async def _fan_out_one_root(root_str: str) -> tuple[int, list[dict]]:
         """Query list_tickets for *root_str* across all configured URLs.
@@ -195,7 +195,7 @@ async def fan_out_list_tickets(
         return await first_success(
             config.fused_memory_urls,
             _call,
-            log_label=fanout_label('list_tickets', root_str),
+            log_label=fanout_label('list_tickets', root_str, labels),
             offline_result=lambda errs: (0, []),
         )
 
@@ -635,8 +635,9 @@ async def collect_metrics_snapshot(
     # dashboard-one-datum-one-path, decisions 5 and 11).
     try:
         live_map = await fetch_live_merge_queues(http_client, config.escalation_urls)
+        labels = config.project_labels
         for pid, _db in merge_dbs:
-            live = live_map.get(project_label(pid))
+            live = live_map.get(labels.of(pid))
             if live is None or not live.get('reachable'):
                 logger.debug(
                     'merge sampler: no live queue reading for %s: %s',

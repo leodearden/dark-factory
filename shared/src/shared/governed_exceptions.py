@@ -71,6 +71,7 @@ __all__ = [
     'UndisposedException',
     'disposition_record',
     'governed_exceptions',
+    'owner_from_record',
     'owner_record',
     'parse_disposition_marker',
 ]
@@ -320,6 +321,25 @@ def owner_record(ref: TaskRef | TicketRef) -> dict[str, object]:
         return {'type': 'ticket', 'id': ref.id}
     raise MalformedDisposition(
         f'owner_record: {ref!r} is not a TaskRef or a TicketRef.', value=ref
+    )
+
+
+def owner_from_record(record: object) -> TaskRef | TicketRef:
+    """The reader twin of :func:`owner_record`, consumed by the owner sweep.
+
+    Raises:
+        MalformedDisposition: *record* is not a ``{'type': 'task'|'ticket', 'id'}``
+            mapping, or its id fails the ref constructor's own operand check.
+    """
+    if isinstance(record, Mapping) and 'id' in record:
+        if record.get('type') == 'task':
+            return TaskRef(record['id'])
+        if record.get('type') == 'ticket':
+            return TicketRef(record['id'])
+    raise MalformedDisposition(
+        f"owner_from_record: {record!r} is not an owner record — expected "
+        f"{{'type': 'task' | 'ticket', 'id': <id>}}.",
+        value=record,
     )
 
 

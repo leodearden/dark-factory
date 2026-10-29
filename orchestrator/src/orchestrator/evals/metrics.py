@@ -8,6 +8,7 @@ import re
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 # Cost primitives (the USD/1M fallback rate + the PriceEntry-or-dict accessor)
@@ -18,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 # cycle back to evals (it reaches only config/fm_retry/shared.*), so a
 # module-level import is safe.
 from orchestrator.agents.invoke import _FALLBACK_PRICE, _rate
+from orchestrator.shadow_types import ReferenceKind
 
 from .measurement import UnmeasuredRecord
 from .plan_predicates import is_scorable_plan
@@ -39,7 +41,7 @@ logger = logging.getLogger(__name__)
 # Terminal outcome vocabulary (task 4760) — what the architect's LAST statement
 # about the task actually was.
 #
-# ``_DECLINE_READERS`` single-sources the kind <-> artifact correspondence: each
+# ``DECLINE_READERS`` single-sources the kind <-> artifact correspondence: each
 # key is a member of DECLINE_KINDS, each value the ``TaskArtifacts`` reader that
 # answers "did the architect take that exit?".  It is the ONE place the two
 # vocabularies below and :func:`read_decline_artifacts` all derive from, so a
@@ -48,18 +50,19 @@ logger = logging.getLogger(__name__)
 # pins every value against the real class, so a rename there fails the suite
 # instead of silently degrading that kind to ``'none'``.
 # ---------------------------------------------------------------------------
-_DECLINE_READERS: dict[str, str] = {
+DECLINE_READERS: Mapping[str, str] = MappingProxyType({
     'already_done': 'read_already_done',
     'blocking_dependency': 'read_blocking_dependency',
     'false_premise': 'read_false_premise',
     'unactionable': 'read_unactionable_task',
     'ready_to_merge': 'read_ready_to_merge',
-}
+})
+_DECLINE_READERS = DECLINE_READERS
 
 # The five EXPLICIT plan-tools decline exits (plan_tools._report_* →
 # artifacts.TaskArtifacts.write_*), in the fixed order that breaks a
 # same-timestamp tie in :func:`resolve_terminal_kind`.
-DECLINE_KINDS: tuple[str, ...] = tuple(_DECLINE_READERS)
+DECLINE_KINDS: tuple[str, ...] = tuple(DECLINE_READERS)
 
 # The CLOSED terminal vocabulary: a scorable plan, the five declines, or
 # neither.  :func:`resolve_terminal_kind` always returns a member of this tuple.
@@ -278,6 +281,16 @@ class EvalMetrics:
     # The key is written unconditionally; see docs/eval-replay-frame.md.
     replay_frame: str | None = None
 
+    # Live shadow eval (plans/live-shadow-eval-prd.md C1/C4): the shadow_cells row
+    # is the record's home and this is its pointer. None on every non-shadow cell
+    # and on every result persisted before these fields existed.
+    shadow_cell_id: str | None = None
+    reference_kind: ReferenceKind | None = None
+
+    def __post_init__(self) -> None:
+        if self.reference_kind is not None:
+            self.reference_kind = ReferenceKind(self.reference_kind)
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -420,10 +433,11 @@ def read_decline_artifacts(
     logs — the raise, the missing reader, and a file whose JSON parses but is
     not an OBJECT (``[]``, ``"x"``, ``3``), which no ``except`` would catch.
     Only a kind the architect never reported goes quiet, because that ``None``
-    is a measurement, not a degradation. This matters because the SOLE caller
-    is inside ``run_architect_eval``'s ``finally`` block — the only place the
-    artifacts still exist, since the next statement ``rmtree``s the meta root
-    — where a raise would turn an already-scored cell into a lost run.
+    is a measurement, not a degradation. This matters because the SOLE caller,
+    ``architect_eval.invoke_architect``, reads immediately before
+    ``cleanup_worktree`` ``rmtree``s the meta root — the last moment the
+    artifacts exist — where a raise would turn an already-scored cell into a
+    lost run.
 
     ``artifacts is None`` (the harness-error path, where it was never
     constructed) and an object missing a reader (a legacy or monkeypatched
@@ -432,7 +446,7 @@ def read_decline_artifacts(
     out: dict[str, dict | None] = dict.fromkeys(DECLINE_KINDS)
     if artifacts is None:
         return out
-    for kind, reader_name in _DECLINE_READERS.items():
+    for kind, reader_name in DECLINE_READERS.items():
         reader = getattr(artifacts, reader_name, None)
         if not callable(reader):
             logger.warning(
@@ -623,8 +637,9 @@ def is_proxied_endpoint(env_overrides: dict[str, str] | None) -> bool:
     apart from a native-cloud one, and THREE sites key on it: ``runner
     .build_eval_orch_config`` (which seeds :func:`claude_endpoint_price_table`
     into ``config.prices`` for a proxied candidate, task 2820),
-    :func:`collect_metrics` and ``runner.run_architect_eval`` (both of which
-    pass it to :func:`resolve_cost_usd` as the do-not-trust-the-CLI-cost flag).
+    :func:`collect_metrics` and ``architect_eval.invoke_architect`` (both of
+    which pass it to :func:`resolve_cost_usd` as the do-not-trust-the-CLI-cost
+    flag).
     Those three MUST agree — a seeded price table beside a "native, trust the
     CLI figure" flag would resolve one candidate's cost two different ways — so
     the predicate gets ONE home rather than three copies a future change to the

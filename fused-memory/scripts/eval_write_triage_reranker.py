@@ -40,11 +40,9 @@ import argparse
 import asyncio
 import contextlib
 import importlib.metadata
-import importlib.util
 import json
 import logging
 import os
-import sys
 import time
 import types
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -53,44 +51,28 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from fused_memory.utils.script_loader import load_script
+
 logger = logging.getLogger(__name__)
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 _SCRIPTS = _PACKAGE_ROOT / 'scripts'
 
 
-def _load_script(path: Path, mod_name: str) -> types.ModuleType:
-    """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_calibrate = _load_script(_SCRIPTS / 'calibrate_write_triage.py', 'calibrate_write_triage')
+_calibrate = load_script(_SCRIPTS / 'calibrate_write_triage.py', 'calibrate_write_triage')
 # Pyright cannot follow the by-path loader, so it alone resolves `_arms` through
 # the scripts/ extraPath; at runtime the module is always the by-path load.
 if TYPE_CHECKING:
     import eval_write_triage_reranker_arms as _arms
 else:
-    _arms = _load_script(
+    _arms = load_script(
         _SCRIPTS / 'eval_write_triage_reranker_arms.py', 'eval_write_triage_reranker_arms',
     )
 
 
 def load_retrieval() -> types.ModuleType:
     """The live-store edge, loaded on first use: it pulls in the server stack."""
-    return _load_script(_SCRIPTS / 'eval_write_triage_retrieval.py', 'eval_write_triage_retrieval')
+    return load_script(_SCRIPTS / 'eval_write_triage_retrieval.py', 'eval_write_triage_retrieval')
 
 
 LABEL_CANONICAL = _calibrate.LABEL_CANONICAL

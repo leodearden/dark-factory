@@ -15,27 +15,30 @@ Two call shapes reach the CLI through a built-in tool REGISTRY filter
   ``--tools <list>``, which names the built-in tools that exist and says
   nothing about MCP (task 4344).
 
-In both cases MCP tools stay reachable — and the CLI
-ambient-merges whatever ``.mcp.json`` sits at ``cwd``.  This repo's root holds a
-live one (servers ``escalation``, ``fused-memory``), and the wildcard callers
+In both cases MCP tools stay reachable — the CLI ambient-merges whatever
+``.mcp.json`` sits at ``cwd``, and account-scoped claude.ai connectors connect
+wherever ``cwd`` is.  This repo's root holds a live ``.mcp.json`` (servers
+``escalation``, ``fused-memory``), and the wildcard callers
 run at ``permission_mode='bypassPermissions'``, so the result is unreviewed MCP
 **write** access: ``halt_scheduler`` and ``delete_memory`` are in the blast
 radius.  A registry-filter caller's permission mode is no substitute for
 closing MCP either: the mode can change at the call, and this gate reads only
 what closes the hole.
 
-A caller closes the hole in one of exactly two ways, and this scanner
-recognises both:
+A caller closes the hole one way, and it is the only one this scanner
+recognises: ``mcp_config=no_mcp_servers_config()`` together with
+``strict_mcp_config=True``.  See
+``shared/src/shared/cli_invoke.py::no_mcp_servers_config``: it returns
+``{'mcpServers': {}}``, a TRUTHY zero-server config, and the truthiness is
+load-bearing — ``--strict-mcp-config`` is emitted inside
+``build_claude_argv``'s ``if mcp_config:`` block, so a bare ``{}`` silently
+emits NEITHER flag and reinstates the hole while looking correct.
 
-(a) ``mcp_config=no_mcp_servers_config()`` together with
-    ``strict_mcp_config=True``.  See
-    ``shared/src/shared/cli_invoke.py::no_mcp_servers_config``: it returns
-    ``{'mcpServers': {}}``, a TRUTHY zero-server config, and the truthiness is
-    load-bearing — ``--strict-mcp-config`` is emitted inside
-    ``build_claude_argv``'s ``if mcp_config:`` block, so a bare ``{}`` silently
-    emits NEITHER flag and reinstates the hole while looking correct.
-(b) run at ``shared/src/shared/neutral_cwd.py::neutral_cli_cwd()`` — an empty
-    scratch directory, so there is no ambient ``.mcp.json`` to merge.
+Running at ``shared/src/shared/neutral_cwd.py::neutral_cli_cwd()`` removes only
+the ambient project ``.mcp.json``.  It does not close MCP: an account-scoped
+claude.ai connector still connected at an empty neutral cwd and exposed write
+tools (CLI 2.1.283 system/init inventory, task 3995), so this scanner does not
+accept it.
 
 Tasks 4145 and 4242 each found and hand-fixed one instance of this.  Two
 hand-fixes of one shape is the point at which a guard is cheaper than a third,
@@ -71,6 +74,16 @@ Design
   the call: an unresolvable argument must never be a blessing, and a name the
   scanner cannot see through may hold ``{}`` at runtime — the very footgun
   being guarded.
+* **A call through a bound name is the same call.**  A callee counts when its
+  bare name is a target, or when the module binds that name to a target: a
+  parameter defaulting to one (``invoke=invoke_with_cap_retry``), the attribute
+  assigned from such a parameter (``self._invoke = invoke``), or a class-body
+  field defaulting to one (the dataclass form).  A constructor-injected invoker
+  is therefore still a site, matched by its binding rather than its spelling.
+  The alias set is module-wide; that is acceptable because a site still needs
+  the literal wildcard or registry kwargs, and it keeps
+  :func:`records_worth_scanning` sound because every binding spells a target
+  name.
 """
 
 from __future__ import annotations
@@ -79,7 +92,6 @@ import ast
 from collections.abc import Iterable
 from typing import NamedTuple
 
-from loop_blocking_scan import _shallow_nodes
 from silent_fallthrough_scan import (
     ParsedFile,
     _build_parent_map,
@@ -99,32 +111,23 @@ TARGET_CALLEES: frozenset[str] = frozenset({
     'invoke_claude_agent',
 })
 
-#: ``shared/src/shared/neutral_cwd.py::neutral_cli_cwd`` — matched on the bare
-#: name, so the ``neutral_cwd.neutral_cli_cwd()`` attribute spelling counts too.
-NEUTRAL_CWD_CALLEE = 'neutral_cli_cwd'
-
-#: ``shared/src/shared/cli_invoke.py::no_mcp_servers_config`` — matched the same
-#: way, so ``cli_invoke.no_mcp_servers_config()`` counts too.
+#: ``shared/src/shared/cli_invoke.py::no_mcp_servers_config`` — matched on the
+#: bare name, so the ``cli_invoke.no_mcp_servers_config()`` spelling counts too.
 NO_MCP_SERVERS_CALLEE = 'no_mcp_servers_config'
 
 #: How a site is protected.  Named constants rather than bare literals at the
 #: comparison sites, so a typo is an ImportError instead of a silent miss.
 EXEMPT_STRICT_MCP = 'strict_mcp_config'
-EXEMPT_NEUTRAL_CWD = 'neutral_cwd'
 NOT_EXEMPT = ''
 
 _VIOLATION_MESSAGE = (
     "a registry filter (available_tools, or a wildcard deny + output_schema, which "
-    "becomes --tools '') does not filter MCP, so MCP tools stay reachable and the "
-    'ambient .mcp.json at cwd is merged'
+    "becomes --tools '') does not filter MCP, so the ambient .mcp.json at cwd and "
+    'account-scoped connectors stay reachable'
 )
 _STRICT_MCP_MESSAGE = (
     'MCP closed explicitly: a truthy mcp_config with strict_mcp_config=True '
     'scopes the run to only those servers'
-)
-_NEUTRAL_CWD_MESSAGE = (
-    f'runs at {NEUTRAL_CWD_CALLEE}(), an empty scratch dir, so there is no '
-    f'ambient .mcp.json for the CLI to merge'
 )
 
 
@@ -138,8 +141,8 @@ class WildcardMcpScopingSite(NamedTuple):
     """
 
     filename: str        # repo-relative posix path, the caller's spelling
-    qualname: str        # enclosing def, e.g. 'TaskCurator._call_llm'
-    callee: str          # the target name as written
+    qualname: str        # enclosing def, e.g. 'TaskCurator._invoke_curator'
+    callee: str          # the callee as written: a target or a name bound to one
     lineno: int          # display only -- drifts on any edit above the site
     exemption: str       # how it is protected, or NOT_EXEMPT when it is not
     message: str         # one-line human explanation
@@ -235,6 +238,83 @@ def _is_true_literal(node: ast.expr | None) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Injected-invoker bindings
+# --------------------------------------------------------------------------- #
+
+
+def _bare_name(node: ast.expr | None) -> str | None:
+    """``Name.id`` or ``Attribute.attr`` of a reference, else None."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _is_target_reference(node: ast.expr | None) -> bool:
+    return _bare_name(node) in TARGET_CALLEES
+
+
+def _target_defaulted_params(args: ast.arguments) -> set[str]:
+    """Parameters whose default is a target callee."""
+    positional = [*args.posonlyargs, *args.args]
+    first_defaulted = len(positional) - len(args.defaults)
+    defaulted = list(zip(positional[first_defaulted:], args.defaults, strict=True))
+    defaulted += [
+        (arg, default)
+        for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True)
+        if default is not None
+    ]
+    return {arg.arg for arg, default in defaulted if _is_target_reference(default)}
+
+
+def _attributes_assigned_from(
+    func: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda, params: set[str],
+) -> set[str]:
+    """Attributes *func* assigns one of *params* to, e.g. ``self._invoke = invoke``."""
+    attrs: set[str] = set()
+    for node in ast.walk(func):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if not (isinstance(value, ast.Name) and value.id in params):
+            continue
+        attrs.update(target.attr for target in targets if isinstance(target, ast.Attribute))
+    return attrs
+
+
+def _target_class_fields(cls: ast.ClassDef) -> set[str]:
+    """Class-body fields whose default is a target callee (the dataclass form)."""
+    fields: set[str] = set()
+    for stmt in cls.body:
+        if isinstance(stmt, ast.AnnAssign):
+            targets, value = [stmt.target], stmt.value
+        elif isinstance(stmt, ast.Assign):
+            targets, value = stmt.targets, stmt.value
+        else:
+            continue
+        if _is_target_reference(value):
+            fields.update(target.id for target in targets if isinstance(target, ast.Name))
+    return fields
+
+
+def _injected_invoker_names(tree: ast.Module) -> frozenset[str]:
+    """The names *tree* binds to a target callee, so a call through one is a call to it."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            params = _target_defaulted_params(node.args)
+            if params:
+                names |= params | _attributes_assigned_from(node, params)
+        elif isinstance(node, ast.ClassDef):
+            names |= _target_class_fields(node)
+    return frozenset(names)
+
+
+# --------------------------------------------------------------------------- #
 # Scanner
 # --------------------------------------------------------------------------- #
 
@@ -266,8 +346,9 @@ def find_wildcard_mcp_scoping_sites(
     """Report every call in *tree* that reaches the CLI through a registry
     filter that does not filter MCP.
 
-    A call is a site when its callee's bare name is in :data:`TARGET_CALLEES`
-    AND either trigger holds:
+    A call is a site when its callee's bare name is in :data:`TARGET_CALLEES`,
+    or is a name the module binds to one (a defaulted parameter, the attribute
+    assigned from it, or a class-field default), AND either trigger holds:
 
     * WILDCARD — ``disallowed_tools`` is a list/tuple display containing
       ``'*'`` AND ``output_schema`` is passed and is not a falsy literal; or
@@ -297,22 +378,38 @@ def find_wildcard_mcp_scoping_sites(
             _parent_map = _build_parent_map(tree)
         return _parent_map
 
+    _aliases: frozenset[str] | None = None
+
+    def calls_a_target(callee: str) -> bool:
+        """The injected-invoker bindings are read LAZILY, at most once, and only
+        for a file holding a triggering call to a non-target name, for the same
+        reason as :func:`parent_map`.
+        """
+        nonlocal _aliases
+        if callee in TARGET_CALLEES:
+            return True
+        if _aliases is None:
+            _aliases = _injected_invoker_names(tree)
+        return callee in _aliases
+
     sites: list[WildcardMcpScopingSite] = []
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         callee = _callee_name(node)
-        if callee not in TARGET_CALLEES:
+        if callee is None:
             continue
         wildcard = _denies_everything(
             _keyword(node, 'disallowed_tools')
         ) and not _is_falsy_literal(_keyword(node, 'output_schema'))
         if not (wildcard or _sets_registry_filter(_keyword(node, 'available_tools'))):
             continue
+        if not calls_a_target(callee):
+            continue
 
         pmap = parent_map()
-        exemption, message = _classify(node, pmap)
+        exemption, message = _classify(node)
         sites.append(WildcardMcpScopingSite(
             filename=filename,
             qualname=_compute_qualname(node, pmap),
@@ -325,103 +422,9 @@ def find_wildcard_mcp_scoping_sites(
     return sites
 
 
-def _enclosing_function(
-    node: ast.AST,
-    parent_map: dict[int, ast.AST],
-) -> ast.AST | None:
-    """Return the NEAREST enclosing ``def``/``async def``, or None at module scope."""
-    current = parent_map.get(id(node))
-    while current is not None:
-        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            return current
-        current = parent_map.get(id(current))
-    return None
-
-
-def _neutral_cwd_locals(func: ast.AST) -> set[str]:
-    """Local names *func*'s OWN body binds to a ``neutral_cli_cwd()`` call.
-
-    ``_shallow_nodes`` (borrowed from ``loop_blocking_scan``, which in turn
-    mirrors ``silent_fallthrough_scan``) stops descent at nested ``def`` /
-    ``class`` / ``lambda``, so an assignment made inside a nested helper cannot
-    launder the exemption up to its enclosing function.
-
-    Both assignment spellings are read: ``ast.Assign`` — including the chained
-    ``a = b = neutral_cli_cwd()`` form, which binds every ``Name`` target — and
-    ``ast.AnnAssign`` carrying a value. A tuple-unpacking target binds no single
-    name to the call's result and is skipped.
-    """
-    bound: set[str] = set()
-    for node in _shallow_nodes(func):
-        if isinstance(node, ast.Assign):
-            targets: list[ast.expr] = list(node.targets)
-            value = node.value
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            targets = [node.target]
-            value = node.value
-        else:
-            continue
-        if _callee_name(value) == NEUTRAL_CWD_CALLEE:
-            bound.update(t.id for t in targets if isinstance(t, ast.Name))
-    return bound
-
-
-def _resolves_to_neutral_cwd(
-    call: ast.Call,
-    parent_map: dict[int, ast.AST],
-) -> bool:
-    """True when *call*'s ``cwd=`` argument is a ``neutral_cli_cwd()`` result.
-
-    Two spellings resolve, and they are the two that actually occur:
-
-    (i)  DIRECT — ``cwd=neutral_cli_cwd()``, bare or attribute-qualified.
-    (ii) VIA A LOCAL NAME — ``cwd=<name>`` where the enclosing function's own
-         body assigns ``<name> = neutral_cli_cwd()``. This is the spelling ALL
-         THREE real neutral-cwd sites use.
-
-    The scope limits below are the guard's PRECISION BOUNDARY, each deliberate:
-
-    * ONE level of indirection, no transitive chains. No real site needs a
-      second hop, and each hop widens the ways a non-neutral value could be
-      laundered past the guard.
-    * FUNCTION-LOCAL ONLY — never a module global, never an attribute such as
-      ``self._cwd``. A guard that accepted ``cwd=self._cwd`` would pass ANY
-      instance attribute whatsoever, which is precisely the silent-exposure
-      shape being guarded against.
-    * LAST-ASSIGNMENT-WINS IS NOT MODELLED: any matching assignment anywhere in
-      the function exempts. A function that assigns ``cwd`` from
-      ``neutral_cli_cwd()`` and then reassigns it to a project root is not a
-      shape that occurs, and a false RED costs more here than this miss.
-
-    This resolution is deliberately used INSTEAD of listing the three real
-    sites in an allowlist. They are COMPLIANT, not exempt; an allowlist entry
-    would freeze that judgement, so a later edit changing
-    ``cwd = neutral_cli_cwd()`` to ``cwd = self._project_root`` would leave the
-    blessing in place and the guard silent exactly where it matters. Tied to
-    the property that makes the call safe, the exemption evaporates the moment
-    the property does.
-    """
-    cwd = _keyword(call, 'cwd')
-    if cwd is None:
-        return False
-    if _callee_name(cwd) == NEUTRAL_CWD_CALLEE:
-        return True
-    if not isinstance(cwd, ast.Name):
-        return False
-    func = _enclosing_function(call, parent_map)
-    return func is not None and cwd.id in _neutral_cwd_locals(func)
-
-
-def _classify(call: ast.Call, parent_map: dict[int, ast.AST]) -> tuple[str, str]:
-    """Return the ``(exemption, message)`` pair describing how *call* is (un)safe.
-
-    Explicit scoping is reported ahead of neutral-cwd when a call carries both,
-    so the exemption named is the one the call states rather than the one it
-    inherits from where it happens to run.
-    """
+def _classify(call: ast.Call) -> tuple[str, str]:
+    """Return the ``(exemption, message)`` pair describing how *call* is (un)safe."""
     strict = _is_true_literal(_keyword(call, 'strict_mcp_config'))
     if strict and _is_known_truthy_config(_keyword(call, 'mcp_config')):
         return EXEMPT_STRICT_MCP, _STRICT_MCP_MESSAGE
-    if _resolves_to_neutral_cwd(call, parent_map):
-        return EXEMPT_NEUTRAL_CWD, _NEUTRAL_CWD_MESSAGE
     return NOT_EXEMPT, _VIOLATION_MESSAGE

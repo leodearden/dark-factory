@@ -21,6 +21,7 @@ import pytest
 from _workflow_helpers import _build_harness, _init_git_repo
 from escalation.queue import EscalationQueue
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
@@ -165,6 +166,7 @@ def _make_runner(name: str) -> VerifyRunnerConfig:
         name=name,
         ssh_host=f'{name}.example.com',
         git_remote=f'remote-{name}',
+        df_checkout_path='/df',
     )
 
 
@@ -278,7 +280,7 @@ class TestCancelledWorkflowLaneRelease:
         # ── Setup: minimal git repo ─────────────────────────────────────────
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         # ── GitOps with warm lane pool ──────────────────────────────────────
         config = OrchestratorConfig(
@@ -429,7 +431,7 @@ class TestB1InFlightHardCancelSkipsRelease:
         # ── Setup: minimal git repo ─────────────────────────────────────────
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -549,7 +551,7 @@ class TestHardCancelLaneRelease:
         # ── Setup: real git repo ────────────────────────────────────────────
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         # Create task/99 branch with an unmerged commit so rev-list main..task/99 > 0.
         # The harness safety net makes no release call on this path, so the
@@ -657,7 +659,7 @@ class TestHardCancelLaneRelease:
         # ── Setup: repo + harness with pool ────────────────────────────────
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -736,7 +738,7 @@ class TestTrainCallbackLaneRelease:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -783,7 +785,7 @@ class TestTrainCallbackLaneRelease:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -834,7 +836,7 @@ class TestTrainCallbackLaneRelease:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -902,7 +904,7 @@ class TestMarkInProgressDoneLaneRelease:
         # ── Setup: minimal git repo ─────────────────────────────────────────
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -925,10 +927,13 @@ class TestMarkInProgressDoneLaneRelease:
         pool._assignments.clear()
         assert pool.assignment_for(tid) is None, 'setup: assignment map must be empty'
 
-        # Write on-disk plan.json backstop so the primitive can still find the lane
-        task_dir = lane / '.task'
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'plan.json').write_text('{"task_id": "3459"}')
+        # Seed the lane's meta root with the on-disk backstop key so the
+        # primitive can still find the lane. The lane dir itself must exist:
+        # the scan only considers dirs found under worktree_base.
+        lane.mkdir(parents=True, exist_ok=True)
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text('{"task_id": "3459"}')
 
         # ── Build Harness with real git_ops ─────────────────────────────────
         harness = _build_harness(config)
@@ -953,7 +958,7 @@ class TestMarkInProgressDoneLaneRelease:
         assert pool.assignment_for(tid) is None, (
             '_mark_in_progress_done must release the lane after mark_done '
             '(the in-memory map was lost post-restart; the primitive uses the '
-            'on-disk plan.json backstop to locate and free the lane)'
+            'on-disk metadata.json backstop to locate and free the lane)'
         )
         assert pool.state(lane) == LaneState.FREE, (
             f'Lane must be FREE after found-on-main mark_done, got {pool.state(lane)!r}'
@@ -977,13 +982,13 @@ class TestTerminalLaneReconciler:
     RED: _reconcile_terminal_lanes does not exist yet; calls raise AttributeError.
     """
 
-    async def _make_harness_with_pool(
+    def _make_harness_with_pool(
         self, tmp_path: Path, pool_size: int = 1
     ):
         """Build a harness backed by a real GitOps warm lane pool."""
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
         config = OrchestratorConfig(
             project_root=repo,
             max_concurrent_tasks=pool_size,
@@ -1002,7 +1007,7 @@ class TestTerminalLaneReconciler:
         from orchestrator.event_store import EventType
         from orchestrator.warm_lane_pool import LaneState
 
-        harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+        harness, _git_ops, pool = self._make_harness_with_pool(tmp_path)
         assert pool is not None
 
         tid = '3459'
@@ -1042,7 +1047,7 @@ class TestTerminalLaneReconciler:
 
         from orchestrator.warm_lane_pool import LaneState
 
-        harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+        harness, _git_ops, pool = self._make_harness_with_pool(tmp_path)
         assert pool is not None
 
         tid = '7777'
@@ -1065,7 +1070,7 @@ class TestTerminalLaneReconciler:
 
         from orchestrator.warm_lane_pool import LaneState
 
-        harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+        harness, _git_ops, pool = self._make_harness_with_pool(tmp_path)
         assert pool is not None
 
         tid = '8888'
@@ -1089,7 +1094,7 @@ class TestTerminalLaneReconciler:
 
         from orchestrator.warm_lane_pool import LaneState
 
-        harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+        harness, _git_ops, pool = self._make_harness_with_pool(tmp_path)
         assert pool is not None
 
         tid = '9999'
@@ -1121,7 +1126,7 @@ class TestTerminalLaneReconciler:
 
         from orchestrator.warm_lane_pool import LaneState
 
-        harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+        harness, _git_ops, pool = self._make_harness_with_pool(tmp_path)
         assert pool is not None
 
         tid = '1111'
@@ -1160,7 +1165,7 @@ class TestRecoveryTerminalTaskLaneRelease:
     is called regardless of task status).
     """
 
-    async def _make_recovery_setup(
+    def _make_recovery_setup(
         self, tmp_path: Path, *, task_id: str = '3459'
     ):
         """Build harness with real git repo, GitOps pool, and a lane dir with
@@ -1180,7 +1185,7 @@ class TestRecoveryTerminalTaskLaneRelease:
         """
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
         config = OrchestratorConfig(
             project_root=repo,
             max_concurrent_tasks=1,
@@ -1250,7 +1255,7 @@ class TestRecoveryTerminalTaskLaneRelease:
         afterward then hits an illegal RELEASED -> RELEASED edge and raises
         out of the recovery loop.
         """
-        harness, git_ops, pool, lane_entry = await self._make_recovery_setup(tmp_path)
+        harness, git_ops, pool, lane_entry = self._make_recovery_setup(tmp_path)
 
         harness.scheduler.get_status = AsyncMock(return_value='done')
 
@@ -1279,7 +1284,7 @@ class TestRecoveryTerminalTaskLaneRelease:
     async def test_recovery_restores_non_terminal_task_lane(self, tmp_path: Path):
         """(22) Non-terminal task (in-progress): restore_assignment IS called;
         plan IS stored for resumption (regression guard — existing behavior preserved)."""
-        harness, git_ops, pool, lane_entry = await self._make_recovery_setup(tmp_path)
+        harness, git_ops, pool, lane_entry = self._make_recovery_setup(tmp_path)
 
         harness.scheduler.get_status = AsyncMock(return_value='in-progress')
 
@@ -1300,7 +1305,7 @@ class TestRecoveryTerminalTaskLaneRelease:
         Safe default: layer A (_reconcile_terminal_lanes) self-heals any
         genuinely-terminal lane on the next reconcile interval.
         """
-        harness, git_ops, pool, lane_entry = await self._make_recovery_setup(tmp_path)
+        harness, git_ops, pool, lane_entry = self._make_recovery_setup(tmp_path)
 
         # Transient failure: get_status returns None (not in ('done','cancelled'))
         harness.scheduler.get_status = AsyncMock(return_value=None)
@@ -1330,7 +1335,7 @@ class TestRecoveryTerminalTaskLaneRelease:
         invariant with mock-based fixtures; keep both in sync if this
         invariant ever changes.
         """
-        harness, git_ops, pool, lane_entry = await self._make_recovery_setup(tmp_path)
+        harness, git_ops, pool, lane_entry = self._make_recovery_setup(tmp_path)
 
         git_ops._is_registered_worktree = AsyncMock(return_value=False)
         harness.scheduler.get_status = AsyncMock(return_value='in-progress')
@@ -1388,7 +1393,7 @@ class TestMarkInProgressDoneDiskBackstopWiring:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -1626,11 +1631,17 @@ class TestReclaimOnExhaustionKnobWiring:
             '(1933 reclaim-on-exhaustion safety valve on by default fleet-wide)'
         )
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_warm_lane_reclaim_on_exhaustion_default_true(self):
         """Stock OrchestratorConfig().git.warm_lane_reclaim_on_exhaustion is
         True (full config-load default resolution; proves defaults.yaml does
         not shadow the Field default — the knob is deliberately absent from
-        defaults.yaml, per PRD W4 decision 6)."""
+        defaults.yaml, per PRD W4 decision 6).
+
+        task 4481: hatched, because "stock" is precisely what it claims —
+        the project layer must not participate, or an operator declaring the
+        knob would make this assert their value rather than the shipped one.
+        """
         assert OrchestratorConfig().git.warm_lane_reclaim_on_exhaustion is True, (
             'OrchestratorConfig().git.warm_lane_reclaim_on_exhaustion must '
             'default to True (1933 valve on by default fleet-wide, PRD W4)'
@@ -1966,7 +1977,7 @@ class TestLaneBranchCheckouts:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -2009,7 +2020,7 @@ class TestLaneBranchCheckouts:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -2027,7 +2038,7 @@ class TestLaneBranchCheckouts:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -2064,7 +2075,7 @@ class TestDetachLaneCheckout:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -2117,7 +2128,7 @@ class TestDetachLaneCheckout:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -2172,7 +2183,7 @@ class TestReconcileLaneCheckouts:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         # Pre-create the default warm-lane CoW seed base so the pre-acquire
         # base-health gate sees WarmBaseHealth.OK (mirrors wl_git_repo in
@@ -2485,7 +2496,7 @@ class TestMidRunRecycleLeak:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         # Pre-create the default warm-lane CoW seed base so the pre-acquire
         # base-health gate sees WarmBaseHealth.OK — it runs BEFORE the (here
@@ -2586,14 +2597,14 @@ def _neutralise_prewarm_startup(harness: Harness) -> None:
     harness._reconcile_terminal_lanes = AsyncMock()
 
 
-async def _build_prewarm_harness(
+def _build_prewarm_harness(
     tmp_path: Path, *, warm_lane_pool: bool, warm_lane_prewarm: bool,
 ) -> Harness:
     """Real Harness over a real git repo with the given warm-lane knobs, with
     heavyweight startup neutralised and git_ops.prewarm_pool spied."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    await _init_git_repo(repo)
+    _init_git_repo(repo)
     config = OrchestratorConfig(
         project_root=repo,
         max_concurrent_tasks=3,
@@ -2633,7 +2644,7 @@ class TestHarnessPrewarmWiring:
     async def test_prewarm_called_once_when_both_knobs_on(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
-        harness = await _build_prewarm_harness(
+        harness = _build_prewarm_harness(
             tmp_path, warm_lane_pool=True, warm_lane_prewarm=True,
         )
         assert harness.git_ops.warm_lane_pool is not None
@@ -2647,7 +2658,7 @@ class TestHarnessPrewarmWiring:
     ) -> None:
         """Default (warm_lane_prewarm=False) with pool ON → never prewarms
         (byte-identical to today)."""
-        harness = await _build_prewarm_harness(
+        harness = _build_prewarm_harness(
             tmp_path, warm_lane_pool=True, warm_lane_prewarm=False,
         )
         assert harness.git_ops.warm_lane_pool is not None
@@ -2660,7 +2671,7 @@ class TestHarnessPrewarmWiring:
         self, tmp_path: Path, monkeypatch,
     ) -> None:
         """Pool OFF → never prewarms regardless of the prewarm knob."""
-        harness = await _build_prewarm_harness(
+        harness = _build_prewarm_harness(
             tmp_path, warm_lane_pool=False, warm_lane_prewarm=True,
         )
         assert harness.git_ops.warm_lane_pool is None

@@ -153,15 +153,16 @@ SCRIPT_COVERAGE = {
 #: by construction: against the pre-port inline predicate the same block reports
 #: ``75 passed, 6 failed`` (K1/K5/K6, two asserts each).
 ASSERT_FLOORS = {
-    'test_warm_lane_disk_guard.sh': 62,
-    'test_warm_lane_degenerate_ref.sh': 81,  # 70 + 11 (K1-K6: the conventional-commit citation arm)
+    'test_warm_lane_disk_guard.sh': 89,  # 79 + 10 (A10, task 5940)
+    'test_warm_lane_degenerate_ref.sh': 84,  # 70 + 11 (K1-K6: the conventional-commit citation arm)
+                                             # + 3 (U8, task 5940)
     'test_thin_warm_lane.sh': 45,
-    'test_warm_lane_gc.sh': 278,  # 214 + 64 (S-pressure 17 + S-age 16 + S-age-degrade 14
-                                 #           + A11 12 + A11-boundary 5)
-    'test_warm_lane_gc_sweep.sh': 90,  # 86 + 4 (Block Y: bridge-cost seam contract)
-    'test_warm_lane_audit.sh': 225,  # 228 measured − 3 (L9, root-guarded)
+    'test_warm_lane_gc.sh': 280,  # 214 + 64 (S-pressure 17 + S-age 16 + S-age-degrade 14
+                                 #           + A11 12 + A11-boundary 5) + 2 (A11m/A11n, task 5940)
+    'test_warm_lane_gc_sweep.sh': 102,  # 99 + 3 (G6g, task 5940)
+    'test_warm_lane_audit.sh': 229,  # 232 measured − 3 (L9, root-guarded)
     'test_warm_lane_sizing_lifecycle.sh': 65,
-    'test_provision_warm_lane_fs.sh': 106,  # 111 measured − 5 (Block I, xfsprogs)
+    'test_provision_warm_lane_fs.sh': 110,  # 115 measured − 5 (Block I, xfsprogs)
 }
 
 #: ``test_helpers.sh::test_summary``'s pass/fail protocol line, verbatim.
@@ -454,7 +455,8 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
             # stale the moment the kernel may recycle that pid.  So dispatch no
             # signal at all once the process has been reaped, mirroring
             # `shared.proc_group.terminate_process_group` step 1 and
-            # `deterministic_runner._terminate_process_tree`.
+            # `shared.proc_group.sigkill_process_group`'s reaped-leader
+            # short-circuit.
             #
             # `Popen.communicate(timeout=...)` deliberately does NOT reap on
             # timeout, so `returncode` is normally None here and the kill still
@@ -467,9 +469,9 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
             # pipe open times out with the leader an unreaped zombie whose pid
             # the kernel cannot recycle — so the frozen pgid is still valid and
             # the group must be killed, or the helper holds a lane flock for
-            # minutes and turns one timeout into a cascade.  This spelling is a
-            # literal mirror of `deterministic_runner._terminate_process_tree`,
-            # so both sites this task closed enforce the same two-part rule the
+            # minutes and turns one timeout into a cascade.  This spelling
+            # mirrors `shared.proc_group.sigkill_process_group`'s reaped-leader
+            # short-circuit, so both sites enforce the same two-part rule the
             # killpg guard's failure message states.
             if proc.returncode is None:
                 try:

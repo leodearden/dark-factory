@@ -26,7 +26,7 @@ transport window to absorb network jitter and response-serialization overhead; i
 values like 90 s or 110 s would leave too little margin to reliably surface the failure as a
 retryable timeout.  See the [`timeout`](#timeout) failure section.
 
-`resolve["status"]` is one of `"created"`, `"combined"`, `"refused"`, or `"failed"`.
+`resolve["status"]` is one of `"created"`, `"combined"`, `"refused"`, `"awaiting_curation"`, or `"failed"`.
 When `"failed"`, `resolve["reason"]` names the failure class.
 
 A `refused` ticket is a **success**, not a failure: a deterministic guard
@@ -36,6 +36,22 @@ candidate because its premise is dead.  **No task was created and there is no
 same guard), do NOT record a task id for it, and do NOT route it through any of
 the failure policies below.  `resolve["reason"]` carries the justification;
 record that verbatim wherever you would have recorded the created task id.
+
+---
+
+## `awaiting_curation`
+
+`awaiting_curation` is **non-terminal**, and neither a failure nor a creation.
+The curator could not judge the submission yet (the ticket's `reason` says
+why), so the ticket is durably parked and the ticket janitor retries it until
+the curator reaches a verdict: it is later created, combined or refused.
+**There is no `task_id` yet.**
+
+Record the ticket id where you would have recorded the task id, and do NOT
+re-submit (a second `submit_task` files a duplicate ticket).  Do not count it as
+created and do not route it through the failure policies above.  Call
+`resolve_ticket` at most once more within the cap if the caller needs the
+outcome; otherwise move on, since the verdict lands without further action.
 
 ---
 

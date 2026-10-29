@@ -16,6 +16,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import _async_mock_orphans
 import pytest
 import pytest_asyncio
 
@@ -54,7 +55,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 # Suite-wide single-writer debug asserts (task 1999 / MQ-invariants ξ, I7).
-# Must be set BEFORE any `orchestrator.merge_queue` import so the module-level
+# Must be set BEFORE any `orchestrator.merge_lane.worker` import so the module-level
 # `_DEBUG_ASSERTS = os.environ.get(...)` seed picks it up.
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
@@ -63,13 +64,11 @@ from _orch_helpers import (  # noqa: E402
     CLAIMANT_TTL_SECS,
     ExitContractViolationCollector,
     ample_disk_usage,
-    drain_async_mock_coroutines,
     idle_psi_sample,
     pydantic_spec,
     reap_leaked_aiosqlite_connections,
     reap_leaked_claimant_heartbeats,
     stamp_stock_routing_config,
-    track_async_mock_coroutines,
 )
 from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
@@ -90,16 +89,15 @@ from orchestrator.config import (  # noqa: E402
     ReviewConfig,
     SandboxConfig,
 )
-from orchestrator.landed_outbox import LandedOutbox, MergeProvenance  # noqa: E402
 from orchestrator.merge_lane import worker  # noqa: E402
 
 # Belt-and-braces direct assignment: defeats any import-order race where
-# orchestrator.merge_queue was imported (by another conftest/plugin) before
+# orchestrator.merge_lane.worker was imported (by another conftest/plugin) before
 # the os.environ.setdefault above took effect, which would have frozen its
 # module-level _DEBUG_ASSERTS seed at False.
 worker._DEBUG_ASSERTS = True
 
-track_async_mock_coroutines()
+_async_mock_orphans.track_async_mock_coroutines()
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -661,23 +659,23 @@ def forbid_live_mcp(monkeypatch):
     through to the LIVE ``mcp_call(...)`` HTTP branch, which — because the
     module-global ``mcp_lifecycle._session`` is ``None`` in unit tests —
     constructs a one-shot ``McpSession`` and calls ``initialize()`` /
-    ``_raw_call()`` against the real ``http://localhost:8002``.  Under
+    ``call()`` against the real ``http://localhost:8002``.  Under
     ``pytest -n auto`` that shared server saturates under load (observed
     ~100x latency), and these multi-call paths can exceed the suite's 60s
     per-test timeout — which (``timeout_method='thread'``) ``os._exit()``s
     the xdist worker rather than just failing the one test.
 
-    Patches the ``McpSession`` CLASS in ``orchestrator.mcp_lifecycle`` —
+    Patches the ``McpSession`` CLASS (``shared.mcp_session``) —
     NOT ``orchestrator.scheduler.mcp_call`` — because ``scheduler.py`` binds
     ``mcp_call`` via ``from ... import``, a distinct binding from the
     canonical ``orchestrator.mcp_lifecycle.mcp_call`` (and
     ``orchestrator.agents.memory_recall.mcp_call``).  Every alias, however,
     ultimately constructs/uses an ``McpSession`` and issues its first
-    network I/O through ``McpSession.initialize`` -> ``_raw_call`` (the
-    one-shot fallback path inside ``mcp_call``, since the module-global
-    ``_session`` is ``None`` in unit tests) — patching the class methods is
-    the single binding-independent network chokepoint every alias funnels
-    through.
+    network I/O through ``McpSession.initialize`` -> ``call`` (``call_tool``
+    delegates to ``call``; the one-shot fallback inside ``mcp_call`` applies,
+    as the module-global ``_session`` is ``None`` in unit tests) — patching
+    the class methods is the single binding-independent network chokepoint
+    every alias funnels through.
 
     RECORDS each attempt into the yielded list (rather than only raising)
     because the two dominant live seams here swallow exceptions:
@@ -705,7 +703,7 @@ def forbid_live_mcp(monkeypatch):
             'Scheduler under test (see _orch_helpers.HermeticMcpSession)'
         )
 
-    async def _fake_raw_call(self, method: str, params=None, timeout: float = 30) -> dict:
+    async def _fake_call(self, method: str, params=None, *, timeout: float = 30) -> dict:
         recorder.append((self.base_url, method))
         raise AssertionError(
             f'live fused-memory MCP round-trip attempted: {method!r} at '
@@ -713,8 +711,8 @@ def forbid_live_mcp(monkeypatch):
             'Scheduler under test (see _orch_helpers.HermeticMcpSession)'
         )
 
-    monkeypatch.setattr('orchestrator.mcp_lifecycle.McpSession.initialize', _fake_initialize)
-    monkeypatch.setattr('orchestrator.mcp_lifecycle.McpSession._raw_call', _fake_raw_call)
+    monkeypatch.setattr('shared.mcp_session.McpSession.initialize', _fake_initialize)
+    monkeypatch.setattr('shared.mcp_session.McpSession.call', _fake_call)
 
     yield recorder
 
@@ -808,6 +806,7 @@ def _isolated_merge_provenance(tmp_path_factory):
     lookup in the same worker (task 5034). The file is never created unless
     something records through the facade.
     """
+    from orchestrator.merge_lane.landed_outbox import LandedOutbox, MergeProvenance
     basetemp = tmp_path_factory.getbasetemp()
     MergeProvenance.bind(LandedOutbox(basetemp / f'landed-outbox-{uuid.uuid4().hex}.json'))
 
@@ -817,7 +816,7 @@ def _mock_merge_queue_verification(monkeypatch, request):
     """Patch merge_queue's run_scoped_verification to return passed=True by default.
 
     A lane on the production verifier (``ports.py::ProductionVerifier``) resolves
-    orchestrator.merge_queue.run_scoped_verification on every call; tests that run
+    orchestrator.merge_lane.worker.run_scoped_verification on every call; tests that run
     one need it patched or pytest/ruff/pyright cause BLOCKED outcomes.
     Tests that need specific merge-verification behaviour override this with their
     own monkeypatch.setattr call in the test body.
@@ -836,7 +835,7 @@ def _mock_merge_queue_verification(monkeypatch, request):
     which use the marker as the SOLE restore mechanism (no in-body patch):
       - test_train_integration.py::TestTrainIntegrationB2::test_lower_member_break_blocks_train
       - test_atomic_train_merge.py::TestScenario5GroupMergeVerify::test_group_merge_workspace_verify_red
-    Do NOT add a redundant in-body ``patch('orchestrator.merge_queue.run_scoped_verification',
+    Do NOT add a redundant in-body ``patch('orchestrator.merge_lane.worker.run_scoped_verification',
     ...)`` to these tests — the marker is sufficient and is the authoritative mechanism
     (pinned by test_merge_verify_mock_autouse.py).
     Every other test that drives the real merge path either overrides
@@ -851,7 +850,7 @@ def _mock_merge_queue_verification(monkeypatch, request):
 
     from orchestrator.verify import VerifyResult
     monkeypatch.setattr(
-        'orchestrator.merge_queue.run_scoped_verification',
+        'orchestrator.merge_lane.worker.run_scoped_verification',
         AsyncMock(return_value=VerifyResult(
             passed=True, test_output='', lint_output='',
             type_output='', summary='mocked merge verify',
@@ -898,18 +897,17 @@ def _neutralize_verify_admission(monkeypatch, request):
 
 @pytest.fixture(autouse=True)
 def _drain_async_mock_coroutines():
-    """Close this test's un-awaited AsyncMock call coroutines before the next test starts.
+    """Fail this test if it called an AsyncMock without awaiting it, closing the orphan first.
 
-    Task 1714 / esc-1702-13; rationale in ``_orch_helpers.py::drain_async_mock_coroutines``.
-    ``track_async_mock_coroutines()`` runs when this conftest is imported, so
-    mocks called during collection are covered too.
+    Tasks 1714 / 5669; rationale in ``_async_mock_orphans.py``.
+    ``track_async_mock_coroutines()`` runs at conftest import, so collection-time mocks are covered.
 
     KNOWN LIMITATION: an orphan created in the teardown of a fixture set up
-    BEFORE this one (module- or session-scoped) is created after this drain has
-    run, so it is closed at the next test's boundary rather than this one's.
+    BEFORE this one (module- or session-scoped) is created after this check has
+    run, so the NEXT test fails instead; the message names where it was created.
     """
     yield
-    drain_async_mock_coroutines()
+    _async_mock_orphans.fail_on_orphaned_async_mock_calls()
 
 
 @pytest.fixture

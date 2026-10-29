@@ -40,22 +40,32 @@ the born-at-L2 human gates (the design_concern / milestone_gate /
 milestone_check_failed / curator_adjudication_missing categories, and the
 ``orchestrator-deterministic`` sentinel role) are never auto-closable even
 when a class predicate would otherwise match. That guarantee belongs to the
-MCP ``resolve_issue`` path. One direct-queue path also auto-closes L2s, gated
-by MEMBERSHIP rather than by class, so the category denylist does not bind it:
-``orchestrator/src/orchestrator/recovery_emission.py::resolve_recovery_veto_streak_escalation``
-resolves an L2 of ANY category whose every member is an already-resolved
-recovery-veto-streak alarm and which carries no blocking declared pin. Such
-a wrapper holds nothing the detector has not itself stood down.
+MCP ``resolve_issue`` path. Direct-queue paths also auto-close L2s, gated by
+MEMBERSHIP rather than by class, so the category denylist does not bind them:
+
+- ``orchestrator/src/orchestrator/sentinel_alarm_wrappers.py::discharge_sentinel_wrappers``,
+  called by ``recovery_emission.py::resolve_recovery_veto_streak_escalation``
+  and ``zero_progress_requeue.py::resolve_zero_progress_requeue_alert``,
+  resolves an L2 of ANY category whose every member is an already-resolved
+  alarm of the resolving detector's own class;
+- ``orchestrator/src/orchestrator/offline_lane_escalations.py::release_lane_record``
+  resolves an L2 whose only member is the lane's own released record.
+
+Such a wrapper holds nothing the detector has not itself stood down.
 
 Task 4541 adds ``PROMOTE_SENTINEL_BOUND_ROLES``, keyed on the agent_role of
 the records being PROMOTED rather than on the caller's identity, so unlike
-the tables above it binds header-less callers too.
+the tables above it binds header-less callers too. Tasks 6861 and 5880 bind
+the offline lane's records and the zero-progress requeue alarm by the same
+rule.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+
+from escalation.categories import EscalationCategory
 
 # Must equal orchestrator.harness._WATCHER_ESCALATION_HEADERS['X-Escalation-Identity'].
 # Duplicated (not imported) to preserve the escalation -> orchestrator layer
@@ -81,15 +91,17 @@ PROMOTE_ALLOWED: frozenset[str] = frozenset({_WATCHER_AUTO_IDENTITY})
 # under a caller-chosen REAL id, it becomes a record every veto predicate reads
 # on that task, so the alarm about a hold becomes part of the hold
 # (esc-5469-11).
-# Must equal orchestrator.recovery_emission.RECOVERY_VETO_STREAK_ROLE and
-# orchestrator.offline_lane_escalations.LANE_ESCALATION_ROLE; the full WHY is at
-# orchestrator/src/orchestrator/recovery_emission.py::
+# Must equal orchestrator.recovery_emission.RECOVERY_VETO_STREAK_ROLE,
+# orchestrator.offline_lane_escalations.LANE_ESCALATION_ROLE and
+# orchestrator.zero_progress_requeue.ZERO_PROGRESS_REQUEUE_ROLE; the full WHY is
+# at orchestrator/src/orchestrator/recovery_emission.py::
 # RECOVERY_VETO_STREAK_SENTINEL_PREFIX. Duplicated (not imported) to preserve
-# the escalation -> orchestrator layer direction; pinned in lockstep by
-# tests/test_authority.py.
+# the escalation -> orchestrator layer direction; each member is pinned in
+# lockstep by its own test in tests/test_authority.py.
 PROMOTE_SENTINEL_BOUND_ROLES: frozenset[str] = frozenset({
     'orchestrator-recovery-veto-streak',
     'orchestrator-offline-lane',
+    'orchestrator-zero-progress-requeue',
 })
 
 
@@ -118,24 +130,19 @@ L2_AUTO_CLOSE_ACTION: str = 'close_only'
 # (it files under agent_role='orchestrator-deterministic'), and is listed here
 # for that same defense-in-depth reason.
 #
-# CROSS-LAYER PIN (reviewer amendment). The three RUNNER-FILED members below —
-# 'milestone_gate', 'milestone_check_failed', 'curator_adjudication_missing' —
-# are each duplicated from a named constant in
-# ``orchestrator.deterministic_runner`` (MILESTONE_GATE_CATEGORY /
-# MILESTONE_CHECK_FAILED_CATEGORY / CURATOR_ADJUDICATION_MISSING_CATEGORY) and
-# held in lockstep by the function-local orchestrator imports in
-# ``tests/test_authority.py``, per the layer-direction rule in this module's
-# docstring. 'design_concern' is NOT pinned that way, deliberately: it has no
-# single owning constant to import. It is filed as a bare literal from several
-# orchestrator call sites (twice in ``orchestrator.workflow``, once in
-# ``orchestrator.harness``) AND is a member of ``escalation.server``'s
-# operator-facing CATEGORIES vocabulary — a SHARED term, not one module's
-# duplicate, so there is no upstream definition a lockstep test could bind to.
+# Every member is spelled through the registry, so a misspelling fails at
+# import instead of silently ending the denial. The three RUNNER-FILED members
+# are additionally held in lockstep with their named constants in
+# ``orchestrator.deterministic_runner`` by the function-local orchestrator
+# imports in ``tests/test_authority.py``, per the layer-direction rule in this
+# module's docstring.
 # Checked BEFORE the allowlist (denylist-first).
-L2_AUTO_CLOSE_DENY_CATEGORIES: frozenset[str] = frozenset(
-    {'design_concern', 'milestone_gate', 'milestone_check_failed',
-     'curator_adjudication_missing'}
-)
+L2_AUTO_CLOSE_DENY_CATEGORIES: frozenset[str] = frozenset({
+    EscalationCategory.DESIGN_CONCERN,
+    EscalationCategory.MILESTONE_GATE,
+    EscalationCategory.MILESTONE_CHECK_FAILED,
+    EscalationCategory.CURATOR_ADJUDICATION_MISSING,
+})
 
 # Agent roles that are NEVER auto-closable regardless of category/evidence —
 # the born-at-L2 human-gate sentinel role (deterministic always_escalates /

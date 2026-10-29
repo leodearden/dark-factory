@@ -2,14 +2,15 @@
 
 import asyncio
 import json
+import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
 
 from fused_memory.models.reconciliation import (
-    JournalEntry,
     JudgeVerdict,
     ReconciliationRun,
     RunStatus,
@@ -25,6 +26,33 @@ from fused_memory.reconciliation.journal import (
     ReconciliationJournal,
 )
 from fused_memory.services.memory_service import MemoryService
+
+_LEGACY_JOURNAL_ENTRIES_DDL = """
+CREATE TABLE journal_entries (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    stage TEXT,
+    timestamp TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    target_system TEXT NOT NULL,
+    before_state TEXT,
+    after_state TEXT,
+    reasoning TEXT DEFAULT '',
+    evidence TEXT DEFAULT '[]'
+);
+CREATE INDEX idx_journal_run ON journal_entries(run_id);
+"""
+
+
+def _schema_names(db_path: Path, kind: str) -> set[str]:
+    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    try:
+        rows = conn.execute(
+            'SELECT name FROM sqlite_master WHERE type = ?', (kind,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {name for (name,) in rows}
 
 
 @pytest_asyncio.fixture
@@ -90,27 +118,54 @@ async def test_run_lifecycle(journal):
 
 
 @pytest.mark.asyncio
-async def test_journal_entries(journal):
-    run_id = str(uuid.uuid4())
-    entry = JournalEntry(
-        id=str(uuid.uuid4()),
-        run_id=run_id,
-        stage=StageId.memory_consolidator,
-        timestamp=datetime.now(UTC),
-        operation='delete_memory',
-        target_system='mem0',
-        before_state={'id': '123', 'content': 'old'},
-        after_state=None,
-        reasoning='Duplicate found',
-        evidence=[{'query': 'test', 'match': True}],
-    )
-    await journal.add_entry(entry)
+async def test_fresh_schema_creates_exactly_this_table_set(journal):
+    """The tables ReconciliationJournal.initialize() creates, read from the DB file.
 
-    entries = await journal.get_entries(run_id)
-    assert len(entries) == 1
-    assert entries[0].operation == 'delete_memory'
-    assert entries[0].before_state == {'id': '123', 'content': 'old'}
-    assert entries[0].evidence == [{'query': 'test', 'match': True}]
+    A tripwire on schema drift: the dashboard, a separate process, reads
+    these tables directly, so adding or dropping one must show up here.
+    The set cannot show that each table has a live producer (INV-13); whoever
+    adds a table owes that check.  recon_ledger shares the file but is
+    created by ReconLedgerStore, not by the journal.
+    """
+    db_path = journal.data_dir / 'reconciliation.db'
+
+    assert _schema_names(db_path, 'table') == {
+        'watermarks',
+        'runs',
+        'judge_verdicts',
+        'event_buffer',
+        'reconciliation_locks',
+        'burst_state',
+        'chunk_boundaries',
+        'run_actions',
+        'halt_state',
+        'judge_pending',
+    }
+
+
+@pytest.mark.asyncio
+async def test_initialize_drops_the_retired_journal_entries_table(journal, tmp_path):
+    """A reconciliation.db created before task 5890 loses the retired journal_entries table, and its index, on initialize."""
+    legacy_dir = tmp_path / 'legacy_recon'
+    legacy_dir.mkdir()
+    legacy_db = legacy_dir / 'reconciliation.db'
+    conn = sqlite3.connect(legacy_db)
+    try:
+        conn.executescript(_LEGACY_JOURNAL_ENTRIES_DDL)
+    finally:
+        conn.close()
+
+    legacy = ReconciliationJournal(legacy_dir)
+    try:
+        await legacy.initialize()
+    finally:
+        await legacy.close()
+
+    assert 'journal_entries' not in _schema_names(legacy_db, 'table')
+    assert 'idx_journal_run' not in _schema_names(legacy_db, 'index')
+    assert _schema_names(legacy_db, 'table') == _schema_names(
+        journal.data_dir / 'reconciliation.db', 'table',
+    )
 
 
 @pytest.mark.asyncio
@@ -1272,6 +1327,29 @@ class TestCompleteRunIfStatus:
         assert after_text == before_text
         assert after.status == before.status
         assert after.completed_at == before.completed_at
+
+
+class TestIsRunCompleted:
+    """The journal's one answer to whether a run durably completed."""
+
+    @pytest.mark.asyncio
+    async def test_a_run_journaled_completed_answers_true(self, journal):
+        run_id = await TestCompleteRunIfStatus._seed(journal, RunStatus.completed)
+
+        assert await journal.is_run_completed(run_id) is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'status', [RunStatus.running, RunStatus.failed, RunStatus.interrupted]
+    )
+    async def test_a_run_in_any_other_status_answers_false(self, journal, status):
+        run_id = await TestCompleteRunIfStatus._seed(journal, status)
+
+        assert await journal.is_run_completed(run_id) is False
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_run_id_answers_false_without_raising(self, journal):
+        assert await journal.is_run_completed('nonexistent-id') is False
 
 
 class TestUpdateRunStageReportsPreservesCitationRepairs:

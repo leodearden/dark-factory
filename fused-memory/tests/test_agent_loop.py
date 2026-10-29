@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _sdk_client_stubs import sdk_client_double
 from shared.cli_invoke import AgentResult
 from shared.testing import make_gate_mock
 
@@ -13,7 +14,6 @@ from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.reconciliation.agent_loop import (
     CLI_WARNING_ORIGINS,
     AgentLoop,
-    CircuitBreakerError,
     ToolDefinition,
     _OpenAIResponseAdapter,
     _TextBlock,
@@ -25,7 +25,6 @@ def _make_config(**overrides) -> ReconciliationConfig:
     defaults = {
         'agent_max_steps': 10,
         'agent_max_tokens': 4096,
-        'max_mutations_per_stage': 5,
         'agent_llm_provider': 'anthropic',
         'agent_llm_model': 'claude-sonnet-4-20250514',
     }
@@ -162,7 +161,7 @@ async def test_openai_content_block_dispatch():
     mock_completions.create = fake_create
     mock_chat = MagicMock()
     mock_chat.completions = mock_completions
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.chat = mock_chat
 
     with patch('openai.AsyncOpenAI', return_value=mock_client):
@@ -242,120 +241,9 @@ async def test_terminal_tool_ends_loop():
 
     agent._call_llm = mock_llm
 
-    result, entries = await agent.run('test payload')
+    result = await agent.run('test payload')
 
     assert result == {'report': {'stats': {'tested': True}}}
-    assert len(entries) == 0
-
-
-@pytest.mark.asyncio
-async def test_mutation_is_journaled():
-    """Mutation tools produce journal entries."""
-    config = _make_config()
-
-    call_count = 0
-
-    async def mutating_tool(content: str = ''):
-        nonlocal call_count
-        call_count += 1
-        return {'id': f'mem_{call_count}'}
-
-    tools = {
-        'add_memory': ToolDefinition(
-            name='add_memory',
-            description='Write memory',
-            parameters={'type': 'object', 'properties': {'content': {'type': 'string'}}},
-            function=mutating_tool,
-            is_mutation=True,
-            target_system='mem0',
-        ),
-        'stage_complete': ToolDefinition(
-            name='stage_complete',
-            description='Complete',
-            parameters={'type': 'object', 'properties': {'report': {'type': 'object'}}},
-            function=lambda **kw: kw,
-        ),
-    }
-
-    agent = AgentLoop(
-        config=config,
-        system_prompt='Test',
-        tools=tools,
-        terminal_tool='stage_complete',
-    )
-
-    # Step 1: call add_memory
-    response1 = FakeResponse(
-        content=[FakeToolUse(id='call_1', name='add_memory', input={'content': 'test'})],
-    )
-
-    # Step 2: call stage_complete
-    response2 = FakeResponse(
-        content=[FakeToolUse(id='call_2', name='stage_complete', input={'report': {}})],
-    )
-
-    call_idx = 0
-    responses = [response1, response2]
-
-    async def mock_llm(messages, tool_schemas):
-        nonlocal call_idx
-        resp = responses[call_idx]
-        call_idx += 1
-        return resp
-
-    agent._call_llm = mock_llm
-
-    result, entries = await agent.run('test')
-    assert len(entries) == 1
-    assert entries[0].operation == 'add_memory'
-    assert entries[0].target_system == 'mem0'
-
-
-@pytest.mark.asyncio
-async def test_circuit_breaker():
-    """Exceeding max mutations raises CircuitBreakerError."""
-    config = _make_config(max_mutations_per_stage=2)
-
-    async def mutating_tool(**kwargs):
-        return {'ok': True}
-
-    tools = {
-        'mutate': ToolDefinition(
-            name='mutate',
-            description='Mutate',
-            parameters={'type': 'object', 'properties': {}},
-            function=mutating_tool,
-            is_mutation=True,
-            target_system='test',
-        ),
-        'stage_complete': ToolDefinition(
-            name='stage_complete',
-            description='Complete',
-            parameters={'type': 'object', 'properties': {}},
-            function=lambda **kw: kw,
-        ),
-    }
-
-    agent = AgentLoop(
-        config=config,
-        system_prompt='Test',
-        tools=tools,
-        terminal_tool='stage_complete',
-    )
-
-    call_idx = 0
-
-    async def mock_llm(messages, tool_schemas):
-        nonlocal call_idx
-        call_idx += 1
-        return FakeResponse(
-            content=[FakeToolUse(id=f'call_{call_idx}', name='mutate', input={})],
-        )
-
-    agent._call_llm = mock_llm
-
-    with pytest.raises(CircuitBreakerError):
-        await agent.run('test')
 
 
 @pytest.mark.asyncio
@@ -399,7 +287,7 @@ async def test_max_steps_reached():
 
     agent._call_llm = mock_llm
 
-    result, entries = await agent.run('test')
+    result = await agent.run('test')
     assert result.get('warning') == 'max_steps_reached'
 
 
@@ -429,7 +317,7 @@ async def test_no_tool_calls_ends_loop():
 
     agent._call_llm = mock_llm
 
-    result, entries = await agent.run('test')
+    result = await agent.run('test')
     assert result.get('warning') == 'no_tool_calls'
     assert 'I am done thinking.' in result.get('text', '')
 
@@ -649,11 +537,11 @@ async def test_openai_tool_schema_conversion():
     mock_chat = MagicMock()
     mock_chat.completions = mock_completions
 
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.chat = mock_chat
 
     with patch('openai.AsyncOpenAI', return_value=mock_client):
-        result, entries = await agent.run('initial payload')
+        result = await agent.run('initial payload')
 
     assert result == {'report': {}}
 
@@ -747,7 +635,7 @@ async def test_openai_message_conversion():
     mock_completions.create = fake_create
     mock_chat = MagicMock()
     mock_chat.completions = mock_completions
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.chat = mock_chat
 
     with patch('openai.AsyncOpenAI', return_value=mock_client):
@@ -816,7 +704,7 @@ async def test_openai_tools_omitted_when_empty():
     mock_completions.create = fake_create
     mock_chat = MagicMock()
     mock_chat.completions = mock_completions
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.chat = mock_chat
 
     with patch('openai.AsyncOpenAI', return_value=mock_client):
@@ -928,15 +816,14 @@ async def test_openai_round_trip_two_turns():
     mock_completions.create = fake_create
     mock_chat = MagicMock()
     mock_chat.completions = mock_completions
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.chat = mock_chat
 
     with patch('openai.AsyncOpenAI', return_value=mock_client):
-        result, entries = await agent.run('run the test')
+        result = await agent.run('run the test')
 
     # Agent returned terminal tool input
     assert result == {'report': {'doubled': 14}}
-    assert len(entries) == 0  # my_tool is not a mutation
 
     # Tool was actually executed
     assert executed_calls == [7]
@@ -952,6 +839,59 @@ async def test_openai_round_trip_two_turns():
     assert tool_result_msgs[0]['tool_call_id'] == 'call_tool_1'
     result_content = json.loads(tool_result_msgs[0]['content'])
     assert result_content['doubled'] == 14
+
+
+def _sdk_arm_agent(provider: str, model: str) -> AgentLoop:
+    return AgentLoop(
+        config=_make_config(agent_llm_provider=provider, agent_llm_model=model),
+        system_prompt='Release test agent.',
+        tools={},
+        terminal_tool='stage_complete',
+    )
+
+
+class TestAgentLoopReleasesSdkClient:
+    @pytest.mark.asyncio
+    async def test_the_anthropic_client_is_released(self):
+        agent = _sdk_arm_agent('anthropic', 'claude-sonnet-4-20250514')
+        client = sdk_client_double()
+        client.messages.create = AsyncMock(return_value=FakeResponse(
+            content=[FakeText(text='ok')], usage=FakeUsage(input_tokens=7, output_tokens=3),
+        ))
+
+        with patch('anthropic.AsyncAnthropic', return_value=client):
+            await agent._call_llm([{'role': 'user', 'content': 'hi'}], [])
+
+        client.__aexit__.assert_awaited_once()
+        assert agent.llm_call_count == 1
+        assert agent.token_count == 10
+
+    @pytest.mark.asyncio
+    async def test_the_openai_client_is_released(self):
+        agent = _sdk_arm_agent('openai', 'gpt-4o')
+        client = sdk_client_double()
+        client.chat.completions.create = AsyncMock(return_value=FakeOpenAIResponse(
+            choices=[FakeOpenAIChoice(message=FakeOpenAIMessage(content='ok'))],
+        ))
+
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await agent._call_openai([{'role': 'user', 'content': 'hi'}], [])
+
+        client.__aexit__.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_openai_client_is_released_when_the_call_fails(self):
+        agent = _sdk_arm_agent('openai', 'gpt-4o')
+        client = sdk_client_double()
+        client.chat.completions.create = AsyncMock(side_effect=RuntimeError('boom'))
+
+        with (
+            patch('openai.AsyncOpenAI', return_value=client),
+            pytest.raises(RuntimeError, match='boom'),
+        ):
+            await agent._call_openai([{'role': 'user', 'content': 'hi'}], [])
+
+        client.__aexit__.assert_awaited_once()
 
 
 # --- Claude CLI provider tests ---
@@ -985,7 +925,6 @@ def _make_cli_config(**overrides) -> ReconciliationConfig:
     defaults = {
         'agent_max_steps': 10,
         'agent_max_tokens': 4096,
-        'max_mutations_per_stage': 5,
         'agent_llm_provider': 'claude_cli',
         'agent_llm_model': 'sonnet',
     }
@@ -1052,12 +991,11 @@ async def test_cli_run_is_one_invocation_returning_the_terminal_payload():
 
     config = _make_cli_config()
     agent = _cli_agent(config=config)
-    (payload, journal), mock_invoke = await _run_cli(
+    payload, mock_invoke = await _run_cli(
         agent, _verdict_result(input_tokens=30, output_tokens=12),
     )
 
     assert payload == {'verdict': 'confirmed', 'summary': 's'}
-    assert journal == []
     mock_invoke.assert_called_once()
     kwargs = mock_invoke.call_args.kwargs
     assert kwargs['prompt'] == 'payload'
@@ -1197,11 +1135,10 @@ async def test_cli_failures_end_the_run_with_a_closed_origin(result, origin, cap
     writes an agent_failed row rather than a prose-only error row.
     """
     with caplog.at_level(logging.WARNING):
-        (payload, journal), _mock = await _run_cli(_cli_agent(), result)
+        payload, _mock = await _run_cli(_cli_agent(), result)
 
     assert payload['warning'] == 'no_tool_calls'
     assert payload['warning_origin'] == origin
-    assert journal == []
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any(origin in m for m in warnings), f'no WARNING naming {origin}: {warnings}'
     if origin == 'api_refusal':
@@ -1216,7 +1153,7 @@ async def test_cli_warning_origins_is_exactly_what_the_cli_path_emits():
     """
     emitted = set()
     for _case_id, result, _origin in _CLI_FAILURES:
-        (payload, _journal), _mock = await _run_cli(_cli_agent(), result)
+        payload, _mock = await _run_cli(_cli_agent(), result)
         emitted.add(payload['warning_origin'])
     assert emitted == set(CLI_WARNING_ORIGINS)
 
@@ -1228,7 +1165,7 @@ async def test_cli_max_turns_is_distinct_from_refusal_and_crash():
     Both calls reached the model, so both are counted.
     """
     agent = _cli_agent()
-    (payload, _journal), _mock = await _run_cli(
+    payload, _mock = await _run_cli(
         agent, AgentResult(success=False, output='', subtype='error_max_turns'),
     )
     assert payload['warning_origin'] == 'cli_max_turns'
@@ -1250,7 +1187,7 @@ async def test_cli_max_turns_is_distinct_from_refusal_and_crash():
 
 @pytest.mark.asyncio
 async def test_cli_structured_output_json_string_is_parsed():
-    (payload, _journal), _mock = await _run_cli(
+    payload, _mock = await _run_cli(
         _cli_agent(),
         _verdict_result(structured_output='{"verdict": "confirmed", "summary": "s"}'),
     )

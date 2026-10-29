@@ -25,8 +25,8 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_disposition import MergeFailureDisposition
-from orchestrator.merge_queue import MergeOutcome
+from orchestrator.merge_lane.disposition import MergeFailureDisposition
+from orchestrator.merge_lane.worker import MergeOutcome
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 
@@ -93,6 +93,13 @@ class TestWorkflowVerifyProducerEmit:
             'tip_sha': 'cafef00d',
             'base_sha': 'deadbeef',
             'branch': f'{wf.config.git.branch_prefix}{wf.task_id}',
+            # task 5651: this workflow holds no VerifyResult, so every verdict fact is None.
+            'site': 'implement',
+            'duration_ms': None,
+            'slot_wait_secs': None,
+            'plan_hash': None,
+            'cache_mode': None,
+            'units': None,
         }
 
     def test_verify_checkpoint_hit_suppresses_workflow_verify_emit(self, tmp_path: Path):
@@ -243,7 +250,7 @@ class TestSubmitToMergeQueueIntegrationSkewRouting:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
         ):
             result = asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=True)
@@ -300,7 +307,7 @@ class TestSubmitToMergeQueueIntegrationSkewRouting:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
         ):
             result = asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=False)

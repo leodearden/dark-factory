@@ -26,6 +26,7 @@ git_ops.py/warm_lane_pool.py only if end-to-end composition surfaces a defect.
 from __future__ import annotations
 
 import asyncio
+import shutil
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -42,7 +43,7 @@ from orchestrator.git_ops import (
 )
 from orchestrator.harness import Harness, TaskReport
 from orchestrator.lane_lifecycle import LANE_STATE_DIRNAME
-from orchestrator.merge_queue import _classify_branch_presence
+from orchestrator.merge_lane.worker import _classify_branch_presence
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.warm_lane_pool import LaneState
 from orchestrator.workflow import WorkflowOutcome
@@ -449,6 +450,49 @@ class TestThinRecycle:
         assert not cold_b.exists(), (
             f'Cold worktree_base/B must NOT be created when pool is enabled; '
             f'found {cold_b}'
+        )
+
+    async def test_recycle_runs_no_rmtree_on_the_event_loop_thread(
+        self, ig_git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A recycle deletes its prior target/ without blocking the loop (task 7366)."""
+        await _add_all_warm_lane_scripts(ig_git_repo)
+        config = _make_config()
+        git_ops = GitOps(config, ig_git_repo, warm_lane_pool_size=1)
+
+        info_a = await git_ops.create_worktree('A')
+        assert isinstance(info_a, WorktreeInfo)
+        lane_path = info_a.path
+        bloat = lane_path / 'target' / 'bloat.bin'
+        deps = lane_path / 'target' / 'deps'
+        deps.mkdir(parents=True, exist_ok=True)
+        bloat.write_bytes(b'\xde\xad\xbe\xef' * 64)
+        for index in range(5):
+            (deps / f'lib{index}.rlib').write_bytes(b'\x00' * 32)
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(lane_path)
+
+        real_rmtree = shutil.rmtree
+        on_loop: list[Path] = []
+
+        def recorder(path: Any, *args: Any, **kwargs: Any) -> None:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                on_loop.append(Path(path))
+            real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(shutil, 'rmtree', recorder)
+        info_b = await git_ops.create_worktree('B')
+
+        assert isinstance(info_b, WorktreeInfo)
+        assert info_b.path == lane_path
+        assert not bloat.exists()
+        assert on_loop == [], (
+            'the event loop thread ran a recursive delete during a warm-lane '
+            f'recycle (task 7366): {[str(p) for p in on_loop]}'
         )
 
 

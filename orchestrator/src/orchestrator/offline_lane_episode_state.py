@@ -2,7 +2,8 @@
 
 PRD ``plans/offline-lane-red-path-prd.md`` D5, D10, D12 and section 5.3: one record per
 lane command, its per-test episodes, the store that keeps it, and the pure rules over
-it (:func:`apply_pass` for a pass, :func:`recheck_due` for an idle tick).  The I/O
+it (:func:`apply_pass` for a pass, :func:`apply_outage` for an outage pass,
+:func:`with_probe` for a probe's answer, :func:`recheck_due` for an idle tick).  The I/O
 around them is ``orchestrator/src/orchestrator/offline_lane_episodes.py::LaneEngine``.
 """
 
@@ -11,16 +12,16 @@ from __future__ import annotations
 import logging
 import shlex
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from orchestrator.guard_state import PersistentMap, guard_path
-from orchestrator.offline_lane_confirm import Confirmed, Unconfirmable, reproduce_line
+from orchestrator.offline_lane_confirm import Confirmed, Outage, Unconfirmable, reproduce_line
 from orchestrator.offline_lane_filing import EvidenceNote
-from orchestrator.offline_lane_records import Leg, RunRecord
+from orchestrator.offline_lane_records import Leg, PassRecord, ProbeKind, ProbeResult, RunRecord
 from orchestrator.offline_lane_runs import (
     INFRA_SCOPE,
     RUN_ALL_INFRA_SCRIPT,
@@ -43,6 +44,7 @@ _LEGACY_REPRODUCE = {
 }
 
 _T = TypeVar('_T')
+_REQUIRED: Any = object()
 
 
 def unconfirmable_node(command: str) -> str:
@@ -52,8 +54,8 @@ def unconfirmable_node(command: str) -> str:
 @dataclass(frozen=True)
 class LanePolicy:
     persist_passes: int = 2
-    recheck_secs: int = 1800
-    red_unlanded_hours: int = 24
+    recheck_secs: float = 1800.0
+    red_unlanded_hours: float = 24.0
 
     @property
     def recheck(self) -> timedelta:
@@ -66,7 +68,7 @@ class LanePolicy:
 
 
 class _Fields:
-    """Typed reads of one JSON object; every miss is a ``ValueError``."""
+    """Typed reads of one JSON object; every miss is a ``ValueError`` unless the read names its *absent* value."""
 
     def __init__(self, payload: object, what: str) -> None:
         if not isinstance(payload, Mapping):
@@ -74,19 +76,21 @@ class _Fields:
         self._payload: Mapping[str, Any] = payload
         self._what = what
 
-    def raw(self, key: str) -> Any:
+    def raw(self, key: str, *, absent: Any = _REQUIRED) -> Any:
         if key not in self._payload:
+            if absent is not _REQUIRED:
+                return absent
             raise ValueError(f'{self._what}: missing {key!r}')
         return self._payload[key]
 
-    def typed(self, key: str, expected: type[_T]) -> _T:
-        value = self.raw(key)
+    def typed(self, key: str, expected: type[_T], *, absent: Any = _REQUIRED) -> _T:
+        value = self.raw(key, absent=absent)
         if not isinstance(value, expected) or (expected is not bool and isinstance(value, bool)):
             raise ValueError(f'{self._what}: {key!r} must be {expected.__name__}, got {value!r}')
         return value
 
-    def optional(self, key: str, expected: type[_T]) -> _T | None:
-        return None if self.raw(key) is None else self.typed(key, expected)
+    def optional(self, key: str, expected: type[_T], *, absent: Any = _REQUIRED) -> _T | None:
+        return None if self.raw(key, absent=absent) is None else self.typed(key, expected)
 
     def instant(self, key: str) -> datetime:
         try:
@@ -97,8 +101,8 @@ class _Fields:
             raise ValueError(f'{self._what}: {key!r} must carry a UTC offset')
         return instant
 
-    def optional_instant(self, key: str) -> datetime | None:
-        return None if self.raw(key) is None else self.instant(key)
+    def optional_instant(self, key: str, *, absent: Any = _REQUIRED) -> datetime | None:
+        return None if self.raw(key, absent=absent) is None else self.instant(key)
 
     def strings(self, key: str) -> tuple[str, ...]:
         values = self.typed(key, list)
@@ -212,24 +216,52 @@ class Episode:
 
 @dataclass(frozen=True)
 class CommandRecord:
-    """Everything the lane remembers about one command; ``leg`` and ``fix_task_priority`` are None until its first pass."""
+    """Everything the lane remembers about one command; ``leg`` and ``fix_task_priority`` are None until its first pass.
+
+    ``probe_record_behind`` is true while an escalation write for the latest probe
+    answer has failed, so the lane's open probe record does not yet state it.
+    """
 
     command: str
     leg: str | None
     episodes: Mapping[str, Episode]
     rechecks: Mapping[str, int]
     outage_escalation_id: str | None
-    last_probe_result: Any | None
+    last_probe_result: ProbeResult | None
     last_pass_started_at: datetime | None
     last_pass_head: str | None
     last_pass_id: str | None
     last_green_head: str | None
     stuck_filing_escalation_id: str | None
     fix_task_priority: str | None
+    probe_broken_escalation_id: str | None
+    last_probe_at: datetime | None
+    probe_record_behind: bool
 
     @classmethod
     def empty(cls, command: str) -> CommandRecord:
-        return cls(command, None, {}, {}, None, None, None, None, None, None, None, None)
+        return cls(
+            command=command,
+            leg=None,
+            episodes={},
+            rechecks={},
+            outage_escalation_id=None,
+            last_probe_result=None,
+            last_pass_started_at=None,
+            last_pass_head=None,
+            last_pass_id=None,
+            last_green_head=None,
+            stuck_filing_escalation_id=None,
+            fix_task_priority=None,
+            probe_broken_escalation_id=None,
+            last_probe_at=None,
+            probe_record_behind=False,
+        )
+
+    @property
+    def in_outage(self) -> bool:
+        """D12's hold: the command's last probe answered an outage."""
+        return self.last_probe_result is not None and self.last_probe_result.result == ProbeKind.OUTAGE
 
     def filing_identity(self) -> tuple[str, str]:
         """``(leg, fix_task_priority)``; a filing exists only after a pass set both."""
@@ -244,17 +276,21 @@ class CommandRecord:
             'episodes': [episode.to_json() for episode in self.episodes.values()],
             'rechecks': dict(self.rechecks),
             'outage_escalation_id': self.outage_escalation_id,
-            'last_probe_result': self.last_probe_result,
+            'last_probe_result': None if self.last_probe_result is None else asdict(self.last_probe_result),
             'last_pass_started_at': _iso(self.last_pass_started_at),
             'last_pass_head': self.last_pass_head,
             'last_pass_id': self.last_pass_id,
             'last_green_head': self.last_green_head,
             'stuck_filing_escalation_id': self.stuck_filing_escalation_id,
             'fix_task_priority': self.fix_task_priority,
+            'probe_broken_escalation_id': self.probe_broken_escalation_id,
+            'last_probe_at': _iso(self.last_probe_at),
+            'probe_record_behind': self.probe_record_behind,
         }
 
     @classmethod
     def from_json(cls, payload: object) -> CommandRecord:
+        """Strict on every key but the three task 6863 added, which a record written before it lacks."""
         fields = _Fields(payload, 'command record')
         episodes = [Episode.from_json(item) for item in fields.objects('episodes')]
         rechecks = fields.typed('rechecks', dict)
@@ -263,19 +299,23 @@ class CommandRecord:
             for head, count in rechecks.items()
         ):
             raise ValueError("command record: 'rechecks' must map heads to counts")
+        probe = fields.optional('last_probe_result', dict)
         return cls(
             command=fields.typed('command', str),
             leg=fields.optional('leg', str),
             episodes={episode.node: episode for episode in episodes},
             rechecks=rechecks,
             outage_escalation_id=fields.optional('outage_escalation_id', str),
-            last_probe_result=fields.raw('last_probe_result'),
+            last_probe_result=None if probe is None else ProbeResult.from_json(probe),
             last_pass_started_at=fields.optional_instant('last_pass_started_at'),
             last_pass_head=fields.optional('last_pass_head', str),
             last_pass_id=fields.optional('last_pass_id', str),
             last_green_head=fields.optional('last_green_head', str),
             stuck_filing_escalation_id=fields.optional('stuck_filing_escalation_id', str),
             fix_task_priority=fields.optional('fix_task_priority', str),
+            probe_broken_escalation_id=fields.optional('probe_broken_escalation_id', str, absent=None),
+            last_probe_at=fields.optional_instant('last_probe_at', absent=None),
+            probe_record_behind=fields.typed('probe_record_behind', bool, absent=False),
         )
 
 
@@ -335,7 +375,10 @@ _UNLANDED = _BINDING_KEPT | {CoveringVerdict.CLOSED}
 
 @dataclass(frozen=True)
 class PassObservation:
-    """One pass of one command; ``lane_command`` is the generic command's config, None on the legacy legs."""
+    """One pass of one command; ``lane_command`` is the generic command's config, None on the legacy legs.
+
+    ``probe`` is the outage probe this pass ran, None when it ran none.
+    """
 
     command: str
     leg: str
@@ -344,14 +387,20 @@ class PassObservation:
     started_at: datetime
     detect: RunRecord | None
     confirm: RunRecord | None
-    outcome: Confirmed | Unconfirmable | None
+    outcome: Confirmed | Unconfirmable | Outage | None
     fix_task_priority: str
     notes: tuple[EvidenceNote, ...]
     lane_command: LaneCommand | None
+    probe: ProbeResult | None = None
 
     def __post_init__(self) -> None:
-        if (Leg(self.leg) is Leg.GENERIC) != (self.lane_command is not None):
+        generic = Leg(self.leg) is Leg.GENERIC
+        if generic != (self.lane_command is not None):
             raise ValueError(f'a {self.leg} pass carries a lane command exactly when it is generic')
+        if self.probe is not None and not generic:
+            raise ValueError(f'a {self.leg} pass runs no outage probe')
+        if isinstance(self.outcome, Outage) and self.outcome.probe != self.probe:
+            raise ValueError(f'{self.command}: an outage pass carries the probe that answered it')
 
 
 @dataclass(frozen=True)
@@ -428,6 +477,10 @@ class _Shows(StrEnum):
     CLEARED = 'cleared'
     PASSED = 'passed'
     NOTHING = 'nothing'
+
+
+def _detect_green(detect: RunRecord | None) -> bool:
+    return detect is not None and detect.returncode == 0
 
 
 def _passed(detect: RunRecord | None, node: str) -> bool:
@@ -681,7 +734,6 @@ class _PassApplier:
 
     def command_fields(self, episodes: Mapping[str, Episode]) -> CommandRecord:
         obs = self.obs
-        detect_green = obs.detect is not None and obs.detect.returncode == 0
         return replace(
             self.record,
             leg=obs.leg,
@@ -690,7 +742,7 @@ class _PassApplier:
             last_pass_started_at=obs.started_at,
             last_pass_head=obs.head,
             last_pass_id=obs.pass_id,
-            last_green_head=obs.head if detect_green else self.record.last_green_head,
+            last_green_head=obs.head if _detect_green(obs.detect) else self.record.last_green_head,
             fix_task_priority=obs.fix_task_priority,
         )
 
@@ -703,6 +755,8 @@ def apply_pass(
     now: datetime,
 ) -> Applied:
     """The effect of one pass on one command's record: D5, D10, expiry, notes, refresh.  Pure."""
+    if isinstance(observation.outcome, Outage):
+        raise ValueError(f'{observation.command}: an outage pass goes through apply_outage, not apply_pass')
     applier = _PassApplier(record, observation, reads, policy, now)
     ended: list[EndedEpisode] = []
     episodes: dict[str, Episode] = {}
@@ -747,6 +801,35 @@ def apply_pass(
     return Applied(applier.command_fields(kept), effect, (to_file,) if to_file else (), tuple(unlanded))
 
 
+def apply_outage(record: CommandRecord, observation: PassObservation) -> CommandRecord:
+    """D5's outage row: every live episode is marked as having seen an outage pass, and nothing else in it changes.
+
+    The pass fields stay at the last non-outage pass, and ``leg`` and
+    ``fix_task_priority`` are set, being the command's identity rather than evidence.
+    """
+    if not isinstance(observation.outcome, Outage):
+        raise ValueError(f'{observation.command}: apply_outage takes an outage pass only')
+    episodes = {
+        node: replace(episode, had_outage_pass=True) if episode.live else episode
+        for node, episode in record.episodes.items()
+    }
+    return replace(record, leg=observation.leg, episodes=episodes, fix_task_priority=observation.fix_task_priority)
+
+
+def with_recorded_history(record: CommandRecord, recorded: Sequence[PassRecord]) -> CommandRecord:
+    """R14: a record that has observed no pass takes its last pass id and last green head
+    from *recorded*, the command's run records before the pass, oldest first."""
+    if record.last_pass_id is not None or not recorded:
+        return record
+    green_head = next((earlier.head for earlier in reversed(recorded) if _detect_green(earlier.detect)), None)
+    return replace(record, last_pass_id=recorded[-1].pass_id, last_green_head=green_head)
+
+
+def with_probe(record: CommandRecord, probe: ProbeResult, at: datetime) -> CommandRecord:
+    """The record after a probe answered *probe* at *at*, in a pass or on a tick."""
+    return replace(record, last_probe_result=probe, last_probe_at=at)
+
+
 def _recheck_fell_due(episode: Episode, record: CommandRecord, policy: LanePolicy, now: datetime) -> bool:
     last = episode.last_counted_started_at
     if not episode.live or last is None or len(episode.counted_passes) >= policy.persist_passes:
@@ -758,7 +841,9 @@ def _recheck_fell_due(episode: Episode, record: CommandRecord, policy: LanePolic
 
 
 def recheck_due(record: CommandRecord, head: str, policy: LanePolicy, now: datetime) -> CommandRecord | None:
-    """D12: the record with this head's recheck counted, or None when no recheck is due."""
+    """D12: the record with this head's recheck counted, or None when no recheck is due or the command is in an outage."""
+    if record.in_outage:
+        return None
     done = record.rechecks.get(head, 0)
     if record.leg != Leg.GENERIC.value or done >= policy.persist_passes - 1:
         return None

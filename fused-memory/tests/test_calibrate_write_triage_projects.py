@@ -2,7 +2,7 @@
 
 A project other than reify is calibrated on its OWN curator-labelled fixture
 and its cutoffs are written to their own config section, never pooled with
-reify's. This module pins the dark_factory fixture's contract (the R1
+reify's. This module pins every live-store fixture's contract (the R1
 provenance mapping and the R2 label rule), the project-config writer and
 its CLI flag, and the committed artifacts that bind config <-> report <->
 fixture.
@@ -26,15 +26,18 @@ import pytest
 import yaml
 from _fm_helpers import load_script_module
 from _jsonl_fixture import parse_jsonl_fixture
+from _write_triage_calibration_fixtures import (
+    CALIBRATION_FIXTURES,
+    DARK_FACTORY_ADMITTED_CATEGORIES,
+    DARK_FACTORY_FIXTURE_PATH,
+    LIVE_STORE_FIXTURES,
+    PACKAGE_ROOT,
+    LiveStoreFixture,
+)
 
 from fused_memory.config.schema import FusedMemoryConfig, WriteTriageProjectCalibration
 
-SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'calibrate_write_triage.py'
-FIXTURES_DIR = Path(__file__).parent / 'fixtures'
-REIFY_FIXTURE_PATH = FIXTURES_DIR / 'write_triage_calibration.jsonl'
-DARK_FACTORY_FIXTURE_PATH = FIXTURES_DIR / 'write_triage_calibration_dark_factory.jsonl'
-
-TARGET_CATEGORIES = frozenset({'preferences_and_norms', 'observations_and_summaries'})
+SCRIPT_PATH = PACKAGE_ROOT / 'scripts' / 'calibrate_write_triage.py'
 LIVE_STORE_SOURCE = 'live_store_topic_scroll'
 
 
@@ -48,12 +51,22 @@ def dark_factory_records() -> list[dict]:
     return parse_jsonl_fixture(DARK_FACTORY_FIXTURE_PATH)
 
 
+@pytest.fixture(scope='module', params=LIVE_STORE_FIXTURES, ids=lambda f: f.project_id)
+def live_store(request: pytest.FixtureRequest) -> LiveStoreFixture:
+    return request.param
+
+
+@pytest.fixture(scope='module')
+def live_records(live_store: LiveStoreFixture) -> list[dict]:
+    return parse_jsonl_fixture(live_store.path)
+
+
 def _canonicals_by_cluster(records: list[dict]) -> dict[str, dict]:
     return {r['cluster_id']: r for r in records if r['label'] == 'canonical'}
 
 
-class TestDarkFactoryFixtureContract:
-    """The dark_factory corpus is read from the live store's retain-and-tag topics.
+class TestLiveStoreFixtureContract:
+    """Each per-project corpus is read from its live store's retain-and-tag topics.
 
     R1: there is no transcript — the store record IS the artifact — and the
     adjudicating sitting is the canonical's author. R2: a label is read off
@@ -61,11 +74,11 @@ class TestDarkFactoryFixtureContract:
     """
 
     def test_every_record_was_read_from_the_live_store_with_no_transcript(
-        self, dark_factory_records: list[dict],
+        self, live_records: list[dict],
     ) -> None:
         bad = {
             r['memory_id']: (r['provenance'].get('source'), r['provenance'].get('transcript_line'))
-            for r in dark_factory_records
+            for r in live_records
             if r['provenance'].get('source') != LIVE_STORE_SOURCE
             or r['provenance'].get('transcript_line') is not None
         }
@@ -75,10 +88,10 @@ class TestDarkFactoryFixtureContract:
         )
 
     def test_every_record_names_its_topic_and_a_cluster_shares_one(
-        self, dark_factory_records: list[dict],
+        self, live_records: list[dict],
     ) -> None:
         topics: dict[str, set] = defaultdict(set)
-        for r in dark_factory_records:
+        for r in live_records:
             topic = r['provenance'].get('topic')
             assert isinstance(topic, str) and topic.strip(), (
                 f'{r["memory_id"]}: provenance.topic must be a non-empty str'
@@ -88,21 +101,21 @@ class TestDarkFactoryFixtureContract:
         assert not split, f'a cluster is one topic; these span several: {split}'
 
     def test_gate_id_is_the_adjudicating_sittings_agent_id(
-        self, dark_factory_records: list[dict],
+        self, live_records: list[dict],
     ) -> None:
-        canonicals = _canonicals_by_cluster(dark_factory_records)
+        canonicals = _canonicals_by_cluster(live_records)
         bad = {
             r['memory_id']: (r['provenance'].get('gate_id'), canonicals[r['cluster_id']]['agent_id'])
-            for r in dark_factory_records
+            for r in live_records
             if r['provenance'].get('gate_id') != canonicals[r['cluster_id']]['agent_id']
         }
         assert not bad, f'provenance.gate_id must equal the canonical agent_id; got {bad}'
 
     def test_every_peer_carries_the_ruling_that_decided_its_label(
-        self, dark_factory_records: list[dict],
+        self, live_records: list[dict],
     ) -> None:
         bad = [
-            r['memory_id'] for r in dark_factory_records
+            r['memory_id'] for r in live_records
             if r['label'] != 'canonical'
             and not (isinstance(r['provenance'].get('ruling'), str)
                      and r['provenance']['ruling'].strip())
@@ -110,32 +123,37 @@ class TestDarkFactoryFixtureContract:
         assert not bad, f'a non-canonical record must quote its ruling verbatim; got {bad}'
 
     def test_labels_are_only_those_the_r2_rule_can_produce(
-        self, dark_factory_records: list[dict],
+        self, live_records: list[dict],
     ) -> None:
-        labels = {r['label'] for r in dark_factory_records}
+        labels = {r['label'] for r in live_records}
         assert labels <= {'canonical', 'duplicate', 'distinct'}, (
             'R2 rules only duplicate vs distinct; pseudo_contradiction has no rule '
             f'in this corpus. Got {sorted(labels)}'
         )
 
-    def test_every_record_is_in_a_target_category(
-        self, dark_factory_records: list[dict],
+    def test_every_record_is_in_an_admitted_category(
+        self, live_store: LiveStoreFixture, live_records: list[dict],
     ) -> None:
-        off = {r['memory_id']: r['category'] for r in dark_factory_records
-               if r['category'] not in TARGET_CATEGORIES}
+        off = {r['memory_id']: r['category'] for r in live_records
+               if r['category'] not in live_store.admitted_categories}
         assert not off, f'off-category members are excluded and tallied; got {off}'
 
+    def test_the_corpus_shares_no_memory_with_any_other_calibration_fixture(
+        self, live_store: LiveStoreFixture, live_records: list[dict],
+    ) -> None:
+        own_ids = {r['memory_id'] for r in live_records}
+        shared = {
+            project: sorted(own_ids & {r['memory_id'] for r in parse_jsonl_fixture(other)})
+            for project, other in CALIBRATION_FIXTURES.items() if other != live_store.path
+        }
+        assert not any(shared.values()), f'calibration corpora must be disjoint (R3); shared: {shared}'
+
+
+class TestDarkFactoryFixtureScope:
     def test_both_target_categories_are_present(
         self, dark_factory_records: list[dict],
     ) -> None:
-        assert {r['category'] for r in dark_factory_records} == TARGET_CATEGORIES
-
-    def test_the_corpus_shares_no_memory_with_the_reify_fixture(
-        self, dark_factory_records: list[dict],
-    ) -> None:
-        reify_ids = {r['memory_id'] for r in parse_jsonl_fixture(REIFY_FIXTURE_PATH)}
-        shared = sorted(reify_ids & {r['memory_id'] for r in dark_factory_records})
-        assert not shared, f'the two corpora must be disjoint (R3); shared: {shared}'
+        assert {r['category'] for r in dark_factory_records} == DARK_FACTORY_ADMITTED_CATEGORIES
 
 
 # ---------------------------------------------------------------------------
@@ -461,16 +479,14 @@ class TestWriteProjectConfigHelper:
 # The committed artifacts: config <-> report <-> fixture, no network
 # ---------------------------------------------------------------------------
 
-PACKAGE_ROOT = Path(__file__).parent.parent
 CONFIG_PATH = PACKAGE_ROOT / 'config' / 'config.yaml'
-DF_REPORT_PATH = PACKAGE_ROOT / 'calibration' / 'write_triage_calibration_report_dark_factory.json'
-DF_FIXTURE_REL = 'tests/fixtures/write_triage_calibration_dark_factory.jsonl'
 
 
 @functools.cache
-def _df_report() -> dict:
-    assert DF_REPORT_PATH.exists(), f'report missing: {DF_REPORT_PATH}'
-    return json.loads(DF_REPORT_PATH.read_text())
+def _committed_report(project_id: str) -> dict:
+    path = next(f.report_path for f in LIVE_STORE_FIXTURES if f.project_id == project_id)
+    assert path.exists(), f'report missing: {path}'
+    return json.loads(path.read_text())
 
 
 @functools.cache
@@ -494,61 +510,83 @@ def _max_negative(entry: dict) -> float:
     return max(measured)
 
 
-class TestCommittedDarkFactoryCalibration:
-    def test_the_report_pair_is_committed(self) -> None:
-        assert DF_REPORT_PATH.exists()
-        assert DF_REPORT_PATH.with_suffix('.md').exists()
+def _category_outcome_defect(entry: dict) -> str | None:
+    """Why *entry* is neither a separating cutoff nor a measured refusal, else None."""
+    if entry['t_high'] is not None:
+        if not 0.0 <= entry['t_high'] <= 1.0:
+            return f't_high {entry["t_high"]} is not a cosine'
+        if entry['t_high'] <= _max_negative(entry):
+            return 'a derived cutoff must admit no in-category negative'
+        return None
+    if entry['t_low'] is not None:
+        return 'a refused category must leave t_low None too'
+    code, _, detail = str(entry['reason']).partition(':')
+    refusals = {
+        _mod().REASON_EMPTY_CLASS, _mod().REASON_NOT_SEPARABLE, _mod().REASON_INSUFFICIENT_PAIRS,
+    }
+    if code not in refusals:
+        return f'unknown refusal {entry["reason"]!r}'
+    if not detail.strip():
+        return 'a refusal must state what was measured'
+    return None
 
-    def test_provenance_names_the_dark_factory_corpus(self) -> None:
-        provenance = _df_report()['provenance']
-        assert provenance['project_id'] == 'dark_factory'
-        assert provenance['fixture_path'] == DF_FIXTURE_REL
+
+def _pair_counts_by_category(records: list[dict]) -> dict[str, dict[str, int]]:
+    buckets = _mod().partition_pairs_by_category(records)['by_category']
+    return {
+        category: {cls.removesuffix('_pairs'): len(pairs) for cls, pairs in bucket.items()}
+        for category, bucket in buckets.items()
+    }
+
+
+class TestCommittedLiveStoreCalibration:
+    def test_the_report_pair_is_committed(self, live_store: LiveStoreFixture) -> None:
+        assert live_store.report_path.exists()
+        assert live_store.report_path.with_suffix('.md').exists()
+
+    def test_provenance_names_the_projects_own_corpus(self, live_store: LiveStoreFixture) -> None:
+        provenance = _committed_report(live_store.project_id)['provenance']
+        assert provenance['project_id'] == live_store.project_id
+        assert provenance['fixture_path'] == live_store.package_relative_path
         assert provenance['retrieval_mode'] == 'production'
 
     def test_the_record_count_is_the_committed_fixtures(
-        self, dark_factory_records: list[dict],
+        self, live_store: LiveStoreFixture, live_records: list[dict],
     ) -> None:
-        assert _df_report()['provenance']['record_count'] == len(dark_factory_records)
+        report = _committed_report(live_store.project_id)
+        assert report['provenance']['record_count'] == len(live_records)
 
     def test_the_pair_counts_are_recomputed_from_the_committed_fixture(
-        self, dark_factory_records: list[dict],
+        self, live_store: LiveStoreFixture, live_records: list[dict],
     ) -> None:
         """A fixture edit without a re-run fails here."""
-        buckets = _mod().partition_pairs_by_category(dark_factory_records)['by_category']
-        recomputed = {
-            category: {cls.removesuffix('_pairs'): len(pairs) for cls, pairs in bucket.items()}
-            for category, bucket in buckets.items()
-        }
-        assert _df_report()['provenance']['per_category_pair_counts'] == recomputed
+        report = _committed_report(live_store.project_id)
+        assert report['provenance']['per_category_pair_counts'] == _pair_counts_by_category(
+            live_records,
+        )
 
-    def test_both_target_categories_have_an_outcome(self) -> None:
-        assert set(_df_report()['per_category']) >= TARGET_CATEGORIES
-
-    @pytest.mark.parametrize('category', sorted(TARGET_CATEGORIES))
-    def test_a_category_derives_a_separating_cutoff_or_states_a_measured_refusal(
-        self, category: str,
+    def test_every_admitted_category_that_forms_pairs_has_a_measured_outcome(
+        self, live_store: LiveStoreFixture, live_records: list[dict],
     ) -> None:
-        entry = _df_report()['per_category'][category]
-        if entry['t_high'] is not None:
-            assert 0.0 <= entry['t_high'] <= 1.0
-            assert entry['t_high'] > _max_negative(entry), (
-                'a derived cutoff admits no in-category negative'
-            )
-            return
-        assert entry['t_low'] is None
-        code, _, detail = str(entry['reason']).partition(':')
-        assert code in {
-            _mod().REASON_EMPTY_CLASS, _mod().REASON_NOT_SEPARABLE,
-            _mod().REASON_INSUFFICIENT_PAIRS,
-        }, entry['reason']
-        assert detail.strip(), 'a refusal must state what was measured'
+        per_category = _committed_report(live_store.project_id)['per_category']
+        forming = {
+            category for category, counts in _pair_counts_by_category(live_records).items()
+            if category in live_store.admitted_categories and any(counts.values())
+        }
+        assert forming, 'a fixture that forms no pair calibrates nothing'
+        missing = sorted(forming - set(per_category))
+        assert not missing, f'categories with pairs but no outcome: {missing}'
+        defects = {c: _category_outcome_defect(per_category[c]) for c in sorted(forming)}
+        assert not any(defects.values()), defects
 
-    def test_the_corpus_is_isolated_from_the_pooled_report_of_record(self) -> None:
+    def test_the_corpus_is_isolated_from_the_pooled_report_of_record(
+        self, live_store: LiveStoreFixture,
+    ) -> None:
         pooled_named = _shipped_config()['write_triage']['calibration_report_path']
-        assert (PACKAGE_ROOT / pooled_named).resolve() != DF_REPORT_PATH.resolve()
+        assert (PACKAGE_ROOT / pooled_named).resolve() != live_store.report_path.resolve()
         pooled = _pooled_report()['provenance']
         assert pooled['project_id'] == 'reify'
-        assert pooled['fixture_path'] != _df_report()['provenance']['fixture_path']
+        assert pooled['fixture_path'] != live_store.package_relative_path
 
 
 class TestCommittedProjectCalibrationsAreTraceable:
@@ -575,16 +613,18 @@ class TestCommittedProjectCalibrationsAreTraceable:
     def test_no_entry_shadows_the_pooled_corpus_of_record(self) -> None:
         assert _pooled_report()['provenance']['project_id'] not in _project_entries()
 
-    def test_the_dark_factory_entry_exists_exactly_when_a_cutoff_was_derived(self) -> None:
-        derived = _mod().derived_category_cutoffs(_df_report())
-        assert ('dark_factory' in _project_entries()) == bool(derived)
+    def test_a_project_entry_exists_exactly_when_a_cutoff_was_derived(
+        self, live_store: LiveStoreFixture,
+    ) -> None:
+        derived = _mod().derived_category_cutoffs(_committed_report(live_store.project_id))
+        assert (live_store.project_id in _project_entries()) == bool(derived)
 
-    def test_rewriting_the_shipped_entry_is_a_byte_for_byte_no_op(self) -> None:
-        entry = _project_entries().get('dark_factory')
-        if entry is None:
-            pytest.skip('no dark_factory entry: both categories refused')
+    def test_rewriting_every_shipped_entry_is_a_byte_for_byte_no_op(self) -> None:
         shipped = CONFIG_PATH.read_text()
-        assert _mod().write_project_calibration_block(
-            shipped, 'dark_factory', entry['calibration_report_path'],
-            entry['t_high_by_category'],
-        ) == shipped
+        changed = [
+            project for project, entry in _project_entries().items()
+            if _mod().write_project_calibration_block(
+                shipped, project, entry['calibration_report_path'], entry['t_high_by_category'],
+            ) != shipped
+        ]
+        assert not changed, f'a rewrite of these shipped entries changes config.yaml: {changed}'

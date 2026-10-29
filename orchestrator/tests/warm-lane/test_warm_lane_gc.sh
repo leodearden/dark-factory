@@ -559,6 +559,15 @@ run_helper reclaim \
 assert "A11k: an OVERFLOWING --max-record-age-days exits 2 (a wrap would silently disable the valve)" \
     test "$RC" -eq 2
 
+# grep's line-oriented `^…$` accepted a value whose first line is valid.
+run_helper reclaim \
+    --worktrees-dir "$A7_WORKTREES" \
+    --base-target "$A7_BASE/target" \
+    --max-record-age-days $'14\nx'
+assert "A11m: a multi-line --max-record-age-days exits 2" test "$RC" -eq 2
+assert "A11n: ...and stderr names the flag, with NO raw bash arithmetic diagnostic" \
+    bash -c 'grep -qF -- "--max-record-age-days" <<<"$1" && ! grep -qF -- "syntax error" <<<"$1"' _ "$ERR_OUT"
+
 # NON-VACUITY. Without this the block would pass a guard that rejected
 # everything, and A11's reader cannot see Block S-age's accepting cases from
 # here (heuristic 13 — a block makes internal sense in isolation).

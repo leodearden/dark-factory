@@ -35,13 +35,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
 
 import click
+from shared import project_layout
 
 from orchestrator.evals.prompt_opt.canary import (
     CanaryThresholds,
@@ -49,6 +49,7 @@ from orchestrator.evals.prompt_opt.canary import (
     deploy_at_from_provenance,
     run_canary,
 )
+from orchestrator.main_checkout_defaults import cli_default
 
 LOG_FORMAT = '%(asctime)s %(levelname)-8s [%(name)s] %(message)s'
 
@@ -56,13 +57,6 @@ _PKG_DIR = Path(__file__).parent
 _CURATOR_CORPUS_DIR = _PKG_DIR / 'curator_replay_corpus'
 _CURATOR_MANIFEST_PATH = _CURATOR_CORPUS_DIR / 'manifest.json'
 
-# Overridable via env var for portability across checkouts -- tickets.db is
-# offline, gitignored operational data that lives in the MAIN repo, not a
-# task worktree (mirrors reviewer_trial's REVIEWER_TRIAL_RUNS_DB pattern;
-# see corpus/README.md's "Regenerating / extending the corpus").
-_DEFAULT_TICKETS_DB = Path(os.environ.get(
-    'CURATOR_TICKETS_DB', '/home/leo/src/dark-factory/data/reconciliation/tickets.db',
-))
 # ~100 labeled decisions matches D-6's "make a 2:1:7 split meaningful"
 # floor for the reviewer corpus (target ~100, >=~50 minimum); curator
 # labels are cheaper per-item (one frontier call, no diff text to read) so
@@ -87,12 +81,11 @@ _AUDIT_CHECKS = (
     ('spot_check_subset_empty', 'a non-empty documented spot-check subset exists'),
 )
 
-# Overridable via env var for portability across checkouts -- runs.db is
-# offline, gitignored data that lives in the MAIN repo, not a task worktree
-# (mirrors reviewer_trial.__main__'s REVIEWER_TRIAL_RUNS_DB idiom).
-_CANARY_DEFAULT_DB = Path(os.environ.get(
-    'PROMPT_OPT_RUNS_DB', '/home/leo/src/dark-factory/data/orchestrator/runs.db',
-))
+
+def _fused_memory_default_tickets_db(root: Path) -> Path:
+    """Under fused-memory's default reconciliation.data_dir, a location shared.project_layout does not own."""
+    return root / 'data' / 'reconciliation' / 'tickets.db'
+
 
 # Documented PRD §9 calibration STARTING points -- both the window lengths
 # below and the per-metric threshold defaults sourced from CanaryThresholds()
@@ -165,8 +158,9 @@ def cli(ctx: click.Context, verbose: bool) -> None:
 
 
 @cli.command('build-curator-corpus')
-@click.option('--db-path', default=str(_DEFAULT_TICKETS_DB), type=click.Path(path_type=Path),
-              help='Path to the offline tickets.db (env: CURATOR_TICKETS_DB)')
+@click.option('--db-path', default=None, type=click.Path(path_type=Path),
+              help='Path to the offline tickets.db (env: CURATOR_TICKETS_DB; '
+                   "default: the main checkout's data/reconciliation/tickets.db)")
 @click.option('--n', default=_DEFAULT_N, type=int,
               help='Max labeled decisions to sample (stratified by recorded action)')
 @click.option('--seed', default=_DEFAULT_SEED, type=int, help='Deterministic sampling/split seed')
@@ -175,7 +169,9 @@ def cli(ctx: click.Context, verbose: bool) -> None:
 @click.option('--out', default=str(_CURATOR_MANIFEST_PATH), type=click.Path(path_type=Path),
               help="Where to write manifest.json ('annotations/' and adjudication_log.jsonl "
                    'are written alongside it)')
-def build_curator_corpus_cmd(db_path: Path, n: int, seed: int, spot_check_size: int, out: Path) -> None:
+def build_curator_corpus_cmd(
+    db_path: Path | None, n: int, seed: int, spot_check_size: int, out: Path,
+) -> None:
     """Build the T5 curator replay corpus from tickets.db (task 2496 / PRD D-6).
 
     Thin wiring over already-tested machinery (curator_corpus.py): reads
@@ -188,6 +184,10 @@ def build_curator_corpus_cmd(db_path: Path, n: int, seed: int, spot_check_size: 
     adjudication_log.jsonl under *out*'s directory. Prints an
     audit_curator_corpus PASS/FAIL summary and exits non-zero on FAIL.
     """
+    db_path = db_path or cli_default(
+        '--db-path', _fused_memory_default_tickets_db, env_var='CURATOR_TICKETS_DB',
+    )
+
     from .curator_corpus import (
         FrontierLabel,
         audit_curator_corpus,
@@ -261,8 +261,9 @@ def build_curator_corpus_cmd(db_path: Path, n: int, seed: int, spot_check_size: 
 
 
 @cli.command('canary')
-@click.option('--runs-db', default=str(_CANARY_DEFAULT_DB), type=click.Path(path_type=Path),
-              help='Path to the offline orchestrator runs.db (env: PROMPT_OPT_RUNS_DB)')
+@click.option('--runs-db', default=None, type=click.Path(path_type=Path),
+              help='Path to the offline orchestrator runs.db (env: PROMPT_OPT_RUNS_DB; '
+                   "default: the main checkout's runs.db)")
 @click.option('--deploy-at', default=None,
               help='ISO-8601 deploy timestamp. Required unless --prompt-id/--executor-model/'
                    '--harness-version are all given (resolves it from T1 provenance instead)')
@@ -298,7 +299,7 @@ def build_curator_corpus_cmd(db_path: Path, n: int, seed: int, spot_check_size: 
 @click.option('--min-samples', type=int, default=_DEFAULT_THRESHOLDS.min_samples,
               help="Minimum rows required in EACH window, else verdict='insufficient_data'")
 def canary(
-    runs_db: Path,
+    runs_db: Path | None,
     deploy_at: str | None,
     prompt_id: str | None,
     executor_model: str | None,
@@ -327,6 +328,8 @@ def canary(
     feeds: pin -> watch this command -> unpin (T1
     PromptArtifactStore.unpin) on regress.
     """
+    runs_db = runs_db or cli_default('--runs-db', project_layout.runs_db, env_var='PROMPT_OPT_RUNS_DB')
+
     if deploy_at is None:
         if not (prompt_id and executor_model and harness_version):
             click.echo(
@@ -362,9 +365,9 @@ def canary(
     if not runs_db.is_file():
         click.echo(
             f'runs.db not found at {runs_db}\n'
-            '  This reads the gitignored orchestrator run history '
-            '(data/orchestrator/runs.db in the MAIN repo checkout, not a task '
-            'worktree). Pass --runs-db, or set PROMPT_OPT_RUNS_DB.',
+            '  This reads the gitignored orchestrator run history, which lives in '
+            'the MAIN repo checkout, not a task worktree. Pass --runs-db, or set '
+            'PROMPT_OPT_RUNS_DB.',
             err=True,
         )
         sys.exit(_USAGE_ERROR_EXIT_CODE)

@@ -77,8 +77,6 @@ from test_merge_queue_concurrent_verify import (  # noqa: F401
     _make_branch_with_file,
     _make_request,
     _stop_worker,
-    _timeout_mark_offenders,
-    _worst_per_method_wait_budget,
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig  # noqa: F401
@@ -90,14 +88,14 @@ from orchestrator.git_ops import (  # noqa: F401
     WorktreeInfo,
     _run,
 )
-from orchestrator.landed_outbox import LandedOutbox  # noqa: F401
-from orchestrator.merge_disposition import (  # noqa: F401
+from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane.disposition import (
     ClassificationResult,
     classify_merge_failure_disposition,
 )
-from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane.landed_outbox import LandedOutbox
 from orchestrator.merge_lane.shadow import _submit_shadow_divergence_escalation  # noqa: F401
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     MergeRequest,
     _acquire_warm_verify_worktree,
 )
@@ -1298,7 +1296,7 @@ class TestSpecLaneShadowSafetyValve:
 # VERIFY PORT, NOT THE AMBIENT PATCH
 # ----------------------------------
 # The conftest autouse _mock_merge_queue_verification fixture leaves the
-# module-level orchestrator.merge_queue.run_scoped_verification returning
+# module-level orchestrator.merge_lane.worker.run_scoped_verification returning
 # passed=True for anything that still resolves it.  These tests do not rely on
 # it and do not displace it: each builds a _SequencedVerifier and passes it as
 # MergeLane(..., verifier=...), so the lane asks its OWN collaborator, for its
@@ -1406,7 +1404,7 @@ def _make_late_arrival_lane(
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # checked by test_wait_budget_coverage_guard.py
 class TestLateArrivalAttaches:
     """Step-1 RED — late arrival B attaches to in-flight predecessor A's merge commit.
 
@@ -1438,7 +1436,7 @@ class TestLateArrivalAttaches:
           - ``speculative_merge`` event for B carries the same ``base_sha``
         """
         # Capture DEBUG-level logs so we can assert the ATTACH code path fired.
-        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_queue')
+        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_lane')
 
         git_config = _make_late_arrival_git_config()
         git_ops = GitOps(git_config, spec_git_repo)
@@ -1621,7 +1619,7 @@ class TestLateArrivalAttaches:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # checked by test_wait_budget_coverage_guard.py
 class TestLateArrivalCleanCAS:
     """Step-3 RED→GREEN — after A lands, B advances via clean CAS (DONE-WHEN 3).
 
@@ -1648,7 +1646,7 @@ class TestLateArrivalCleanCAS:
         GREEN (step-2): B.base_sha == A's merge commit == main-after-A → 'advanced'.
         """
         # Capture DEBUG-level logs so we can assert the ATTACH code path fired.
-        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_queue')
+        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_lane')
 
         git_config = _make_late_arrival_git_config()
         git_ops = GitOps(git_config, spec_git_repo)
@@ -1800,7 +1798,7 @@ class TestLateArrivalCleanCAS:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # checked by test_wait_budget_coverage_guard.py
 class TestLateArrivalFailCascade:
     """Step-5 RED→GREEN — predecessor failing invalidates the late arrival (DONE-WHEN 4).
 
@@ -2038,7 +2036,7 @@ class TestLateArrivalFailCascade:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # checked by test_wait_budget_coverage_guard.py
 class TestLateArrivalGuards:
     """Step-7 guards — fallback + permit accounting + depth-K + skip_verify + K=1 sanity.
 
@@ -2562,7 +2560,7 @@ class TestLateArrivalGuards:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # checked by test_wait_budget_coverage_guard.py
 class TestLateArrivalSubmissionOrderCAS:
     """Step-8 guard — main advances in strict submission order on the late-arrival path.
 
@@ -2603,7 +2601,7 @@ class TestLateArrivalSubmissionOrderCAS:
           (c) Both A and B resolve 'done' (clean CAS, no rebase).
         """
         # Capture DEBUG-level logs so we can assert the ATTACH code path fired.
-        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_queue')
+        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_lane')
 
         git_config = _make_late_arrival_git_config()
         git_ops = GitOps(git_config, spec_git_repo)
@@ -2796,7 +2794,7 @@ class TestJournalLandedThenAdvanceHelper:
 
     async def test_records_before_advance(self, tmp_path: Path) -> None:
         """The row must already be visible from inside advance_main's own call."""
-        from orchestrator.merge_queue import _journal_landed_then_advance
+        from orchestrator.merge_lane.worker import _journal_landed_then_advance
 
         outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
         merge_wt = tmp_path / '_merge-wt'
@@ -2838,7 +2836,7 @@ class TestJournalLandedThenAdvanceHelper:
 
     async def test_none_outbox_does_not_crash(self, tmp_path: Path) -> None:
         """outbox=None (no project_root) must no-op the record, not raise."""
-        from orchestrator.merge_queue import _journal_landed_then_advance
+        from orchestrator.merge_lane.worker import _journal_landed_then_advance
 
         merge_wt = tmp_path / '_merge-wt2'
         git_ops = MagicMock()
@@ -2861,95 +2859,6 @@ class TestJournalLandedThenAdvanceHelper:
         git_ops.advance_main.assert_awaited_once_with(
             'mergesha2', merge_wt,
             branch='task/2', max_attempts=3, expected_main='base2',
-        )
-
-
-# ---------------------------------------------------------------------------
-# task 3980: enforced timeout-mark coverage over THIS module's own source
-# ---------------------------------------------------------------------------
-#
-# POLICY (task 4246): this guard deliberately STAYS file-local, and is the one
-# guard in this module that did NOT move into
-# fused-memory/scripts/check_bare_magicmock_config.py alongside
-# `wall-clock-deadline` and `bare-dataclass-double`. Two independent reasons,
-# both hard:
-#
-#   1. It is not an AST-only guard. `_timeout_mark_offenders` resolves each
-#      class through a RUNTIME resolver (`globals().get` below) and reads the
-#      live `cls.pytestmark` marks, and the mark's argument is a Name
-#      (`@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)`), not a literal a
-#      static pass could evaluate. Its budget engine likewise depends on
-#      RESPONSIVE_WAIT_STRETCH / RESPONSIVE_WAIT_WALL_CAP imported from
-#      orchestrator's test helpers. The checker script holds a hard
-#      stdlib-only contract — hooks/project-checks runs it under a bare
-#      `python3` with no uv env resolution — so importing this module's
-#      dependencies there is not an option, and re-deriving the constants
-#      would recreate exactly the drift the imports exist to prevent.
-#
-#   2. It is ALREADY shared, by cross-module import rather than by copy: the
-#      helpers come from test_merge_queue_concurrent_verify (see the imports
-#      at the head of this file), which is why moving it would not remove a
-#      duplicate. It is not the one-copy-per-test-module multiplication that
-#      motivated task 4246; the two guards that WERE that multiplication are
-#      the ones that moved.
-#
-# So the (a)/(b)/(c) choice this task weighed resolved to option (c) — leave it
-# file-local — for this guard alone, and to option (a) — widen the shared
-# checker — for the other two. Do not "finish the job" by moving this one too.
-
-
-class TestTimeoutMarkCoverage:
-    """Enforced invariant: every class in THIS module must have its computed
-    worst-case per-method wait budget cleared by the timeout it actually
-    runs under -- its own ``@pytest.mark.timeout`` mark if it has one, else
-    the ambient budget (see ``_timeout_mark_offenders``).
-
-    Task 3492 built this guard and applied it to
-    test_merge_queue_concurrent_verify.py, but hard-scoped it to that file's
-    own ``Path(__file__)`` -- so THIS module was never covered, despite
-    carrying five classes over the 60s pyproject default with ZERO
-    ``@pytest.mark.timeout`` marks anywhere in the file.
-
-    The helpers are IMPORTED from test_merge_queue_concurrent_verify rather
-    than reimplemented: they are deliberately pure (source text in, offender
-    list out, class resolver injected as ``globals().get``) precisely so they
-    can be driven with foreign input, and a second copy would be free to
-    drift from the marks it audits.
-
-    ``_call_wait_budget`` bills a ``wait_responsive(...)`` site its stretched
-    worst case, ``min(RESPONSIVE_WAIT_STRETCH * timeout,
-    RESPONSIVE_WAIT_WALL_CAP)``.  The helper computes its own default cap from
-    that SAME formula, which is what makes the bill an EXACT upper bound on
-    real wall clock rather than an under-count.  That
-    stretch is why this guard must exist BEFORE any wait in this file is
-    migrated: a stretched wait under an inadequate mark is strictly worse than
-    the flake it fixes.
-    """
-
-    def test_heavy_wait_classes_carry_adequate_timeout_mark(self) -> None:
-        """Every Test* class's computed worst-case per-method wait budget
-        must be cleared by the timeout it actually runs under (its own mark
-        if it has one, else the ambient budget).
-
-        Recomputes every class's budget from source on each run -- the
-        single source of those figures, so none is restated beside a mark.
-        """
-        source = Path(__file__).read_text()
-        budgets = _worst_per_method_wait_budget(source)
-        offenders = _timeout_mark_offenders(budgets, globals().get)
-
-        assert not offenders, (
-            'The following classes have a computed worst-case per-method '
-            'wait budget that the timeout they actually run under (their '
-            'own mark if they have one, else the ambient budget) does not '
-            'clear:\n'
-            + '\n'.join(f'  - {offender}' for offender in offenders)
-            + '\n\nConsequence: pytest-timeout\'s thread method os._exit()s '
-            'the xdist worker under --max-worker-restart=0, so a '
-            'slow-but-correct run reports as a worker death instead of a '
-            'clean per-test failure -- strictly worse than the flake being '
-            'fixed. Add @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT) '
-            'directly above each offending class.'
         )
 
 

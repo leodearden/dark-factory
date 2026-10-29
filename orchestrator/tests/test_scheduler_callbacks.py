@@ -5,8 +5,8 @@ Replaces the post-construction ``scheduler._on_*`` monkey-patches with a
 single frozen dataclass passed to ``Scheduler.__init__``.
 
 Covers:
-  (a) ``SchedulerCallbacks`` shape — frozen dataclass, 10 fields, all default
-      ``None``.
+  (a) ``SchedulerCallbacks`` shape — frozen dataclass, exact field set, all
+      default ``None``.
   (b) ``Scheduler(config, callbacks=...)`` construction, with and without an
       explicit ``callbacks=`` argument (omitting it must collapse to an
       all-``None`` ``SchedulerCallbacks`` so bare-Scheduler unit tests are
@@ -31,7 +31,7 @@ from orchestrator.scheduler import Scheduler, SchedulerCallbacks
 
 
 class TestSchedulerCallbacksDataclass:
-    """(a) SchedulerCallbacks: frozen dataclass, 10 fields, all default None."""
+    """(a) SchedulerCallbacks: frozen dataclass, exact field set, all default None."""
 
     def test_all_fields_default_none(self):
         callbacks = SchedulerCallbacks()
@@ -45,8 +45,9 @@ class TestSchedulerCallbacksDataclass:
         assert callbacks.on_warm_base_promote_l2 is None
         assert callbacks.on_warm_base_resolve is None
         assert callbacks.suppress_blocked_write is None
+        assert callbacks.read_already_landed_tick_view is None
 
-    def test_field_count_is_exactly_ten(self):
+    def test_field_set_is_exact(self):
         field_names = {f.name for f in dataclasses.fields(SchedulerCallbacks)}
         assert field_names == {
             'on_park_stop_trip',
@@ -59,6 +60,7 @@ class TestSchedulerCallbacksDataclass:
             'on_warm_base_promote_l2',
             'on_warm_base_resolve',
             'suppress_blocked_write',
+            'read_already_landed_tick_view',
         }
 
     def test_is_frozen(self):
@@ -93,6 +95,13 @@ class TestConstructorInjectedHooksFire:
         spy = AsyncMock()
         config = OrchestratorConfig(
             max_per_module=1,
+            # task 4481: pin the trip ON rather than inheriting it.  This test
+            # is about the CALLBACK firing, not about park_stop_enabled's
+            # default; an operator setting park_stop_enabled=false in
+            # dark-factory-orchestrator.yaml disarms the trip and the spy is
+            # never called.  The threshold/window beside it are already pinned
+            # for the same reason.
+            park_stop_enabled=True,
             park_stop_parked_threshold=1,
             park_stop_parked_window_hours=1.0,
         )

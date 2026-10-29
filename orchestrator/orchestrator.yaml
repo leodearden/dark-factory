@@ -11,11 +11,21 @@ type_check_command: "uv run --directory orchestrator pyright src/ tests/ scripts
 # unstuck 2026-09-11 option C), recorded on task 3353 and split out as task
 # 5422 because 3353 could not dispatch.
 #
-# INTERIM, AND NOT YET D-DERIVED (Leo's ruling D16', 2026-09-08). 7200 is an
-# operator estimate, not a measured distribution — task 3353's own scope D (a
-# distribution measured under load: p50/p90/max, with PSI and runqueue
-# recorded alongside) is what refines it later. No later reader should
-# mistake this for a measured budget.
+# CENSUS-DERIVED SINCE Leo's ruling D17 (2026-09-14, task 3353 scope D'). 7200
+# is a RULED figure held at or above a census-derived floor: the excepted
+# branch of tests/scripts/test_module_verify_budgets.py::
+# RULED_INTERIM_BUDGET_EXCEPTIONS asserts it is at least
+# max(census_budget_floor(ORCHESTRATOR_BUDGET_CENSUS.max_secs), fleet ceiling)
+# (see tests/scripts/module_budget_family.py::census_budget_floor). The
+# census figures, and the command that repeats the census, live at
+# tests/scripts/test_module_verify_budgets.py::ORCHESTRATOR_BUDGET_CENSUS and
+# are not copied here: they change on every re-measure.
+#
+# HISTORY: Leo's ruling D16' (2026-09-08) first set 7200 INTERIM, as an
+# operator estimate rather than a measured distribution (~1.6x headroom over
+# a ~4400s loaded extrapolation from task 4176's contended run), pending task
+# 3353's scope D — a distribution measured under load. D17 delivered that
+# scope.
 #
 # DELIBERATELY NOT NARROWER than the repo-root whole-fleet ceiling — the
 # opposite of every other module's per-module budget, which narrows below
@@ -39,9 +49,6 @@ type_check_command: "uv run --directory orchestrator pyright src/ tests/ scripts
 # "at least ~2x worst measured" and the "strictly below the fleet ceiling"
 # checks — lives in tests/scripts/test_module_verify_budgets.py::
 # RULED_INTERIM_BUDGET_EXCEPTIONS.
-#
-# BASIS FOR 7200: ~1.6x headroom over the ~4400s loaded extrapolation from
-# task 4176's contended run.
 #
 # THE TASK/BACKGROUND COLD LANE IS NOW CLOSED HERE — see
 # verify_cold_command_timeout_secs at the bottom of this block. It was

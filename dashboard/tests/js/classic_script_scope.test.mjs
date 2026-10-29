@@ -79,6 +79,8 @@ const EXPECTED_WINDOW_GLOBALS = {
   'spend_readings.js': 'DF_SPEND_READINGS',
   'persisted_state.js': 'DF_PERSISTED_STATE',
   'invariant_chip.js': 'DF_INVARIANT_CHIP',
+  'deferral_cell.js': 'DF_DEFERRAL_CELL',
+  'tab_render_failure.js': 'DF_TAB_RENDER_FAILURE',
 };
 
 // NOTE — no `document` shim, and that omission is load-bearing rather than an

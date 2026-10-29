@@ -163,7 +163,7 @@ test('on-demand: flow-control and staleness are recorded under the request\'s OW
   assert.equal(state.get(TASKS_PATH), undefined, 'the on-demand request took over the POLLED tasks entry');
   assert.ok(win.DF_DATA.__stale[TERMINAL_STATE_KEY], 'the on-demand request published no staleness of its own');
   assert.equal(win.DF_DATA.__stale[TASKS_PATH], undefined, "the on-demand request wrote the polled endpoint's __stale");
-  assert.deepEqual(win.DF_DATA.__receipt[TERMINAL_STATE_KEY], { servedAt: '2026-09-20T09:00:01+00:00', receivedAt: 77, window: null });
+  assert.deepEqual(win.DF_DATA.__receipt[TERMINAL_STATE_KEY], { servedAt: '2026-09-20T09:00:01+00:00', receivedAt: 77, window: null, pacingHoldMs: 0 });
   assert.equal(win.DF_DATA.__receipt[TASKS_PATH], undefined, "the on-demand receipt landed on the polled endpoint's path");
 });
 

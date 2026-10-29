@@ -21,6 +21,7 @@ from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 
 import pytest
+from _gate_fixtures import gate_argv, gated_remote_runner
 from _xdist_crash_fixtures import XDIST_SESSION_ABORTED_OUTPUT
 
 from orchestrator import verify
@@ -118,6 +119,7 @@ class _FakeTransport:
         ssh_rc: int = 0,
         ssh_stderr: str = '',
         push_rc: int = 0,
+        push_stderr: str = 'push rejected',
         push_error: OSError | None = None,
         ssh_error: OSError | None = None,
         hold_ssh: bool = False,
@@ -127,6 +129,7 @@ class _FakeTransport:
         self.ssh_rc = ssh_rc
         self.ssh_stderr = ssh_stderr
         self.push_rc = push_rc
+        self.push_stderr = push_stderr
         self.push_error = push_error
         self.ssh_error = ssh_error
         self.hold_ssh = hold_ssh
@@ -140,7 +143,7 @@ class _FakeTransport:
                 return 0, '', ''
             if self.push_error is not None:
                 raise self.push_error
-            return self.push_rc, '', 'push rejected' if self.push_rc else ''
+            return self.push_rc, '', self.push_stderr if self.push_rc else ''
         if self.ssh_error is not None:
             raise self.ssh_error
         if self.hold_ssh:
@@ -173,7 +176,7 @@ def _remote_runner(
     main_branch: str | None = None,
     config_path: str | None = None,
 ) -> RemoteRunner:
-    return RemoteRunner(
+    return gated_remote_runner(
         name='laptop',
         ssh_host='laptop.local',
         git_remote='origin',
@@ -215,7 +218,7 @@ class TestRunnerUnavailableKind:
     def test_bare_construction_is_transport(self):
         assert RunnerUnavailable().kind == 'transport'
 
-    @pytest.mark.parametrize('kind', ['transport', 'unparseable', 'no_verdict', 'wire_shape'])
+    @pytest.mark.parametrize('kind', ['transport', 'gate', 'unparseable', 'no_verdict', 'wire_shape'])
     def test_every_vocabulary_kind_is_accepted(self, kind: RunnerUnavailableKind):
         assert RunnerUnavailable('x', kind=kind).kind == kind
 
@@ -235,11 +238,22 @@ class TestDispatchFailureKinds:
         return excinfo.value.kind
 
     @pytest.mark.asyncio
-    async def test_push_rejection_is_transport_and_no_ssh_is_issued(self):
+    async def test_push_rejection_is_gate_and_no_verify_ssh_is_issued(self):
+        """A host that refuses the verify ref is reached: 'gate' (task 6565, Q1 ruling)."""
         transport = _FakeTransport(push_rc=1)
 
-        assert await self._kind_of(transport) == 'transport'
+        assert await self._kind_of(transport) == 'gate'
         assert transport.ssh_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_push_connect_failure_is_transport(self):
+        transport = _FakeTransport(
+            push_rc=128,
+            push_stderr='ssh: connect to host laptop.local port 22: Connection timed out\n'
+                        'fatal: Could not read from remote repository.',
+        )
+
+        assert await self._kind_of(transport) == 'transport'
 
     @pytest.mark.asyncio
     async def test_push_spawn_failure_is_transport(self):
@@ -248,6 +262,11 @@ class TestDispatchFailureKinds:
     @pytest.mark.asyncio
     async def test_ssh_exit_255_is_transport(self):
         assert await self._kind_of(_FakeTransport(ssh_rc=255, ssh_stderr='refused')) == 'transport'
+
+    @pytest.mark.asyncio
+    async def test_ssh_exit_other_than_255_is_gate(self):
+        """The host was reached and the verify command failed there (design D5)."""
+        assert await self._kind_of(_FakeTransport(ssh_rc=1, ssh_stderr='Error: x')) == 'gate'
 
     @pytest.mark.asyncio
     async def test_ssh_spawn_failure_is_transport(self):
@@ -374,14 +393,14 @@ class TestRunTaskVerifyTransport:
         )
         [ssh_argv] = transport.ssh_calls()
         assert ssh_argv[-2] == 'laptop.local'
-        parsed = shlex.split(ssh_argv[-1])
+        parsed = gate_argv(ssh_argv[-1])
         assert parsed == [
-            'orchestrator', 'verify-task', '--sha', _TIP,
+            'verify-task', '--sha', _TIP,
             '--spec', task_spec_to_json(spec),
             '--config', '/etc/orch.yaml',
             '--request-id', 'fixed-id',
         ]
-        assert task_spec_from_json(parsed[5]) == spec
+        assert task_spec_from_json(parsed[4]) == spec
         assert transport.deleted_refs() == ['refs/merge-verify/fixed-id']
 
     @pytest.mark.asyncio
@@ -422,11 +441,22 @@ class TestRunTaskVerifyTransport:
         assert await self._kind_of(_FakeTransport(ssh_rc=255, ssh_stderr='refused')) == 'transport'
 
     @pytest.mark.asyncio
-    async def test_push_rejection_is_transport_and_no_ssh_is_issued(self):
+    async def test_push_rejection_is_gate_and_no_verify_ssh_is_issued(self):
+        """A host that refuses the verify ref is reached: 'gate' (task 6565, Q1 ruling)."""
         transport = _FakeTransport(push_rc=1)
 
-        assert await self._kind_of(transport) == 'transport'
+        assert await self._kind_of(transport) == 'gate'
         assert transport.ssh_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_push_connect_failure_is_transport(self):
+        transport = _FakeTransport(
+            push_rc=128,
+            push_stderr='ssh: connect to host laptop.local port 22: Connection timed out\n'
+                        'fatal: Could not read from remote repository.',
+        )
+
+        assert await self._kind_of(transport) == 'transport'
 
     @pytest.mark.asyncio
     async def test_non_json_stdout_is_unparseable(self):

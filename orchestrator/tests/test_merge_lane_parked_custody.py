@@ -30,8 +30,8 @@ from orchestrator.merge_lane import (
     MemberRedriveOutcome,
     MergeOutcome,
     QueuedBranch,
-    SpeculativeMergeWorker,
 )
+from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
 _CUSTODY_WAIT_S = 5.0
 
