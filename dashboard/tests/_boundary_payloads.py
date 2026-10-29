@@ -23,7 +23,7 @@ import httpx
 from _canned_mcp import CannedMCP, _raw_row
 from _dt_helpers import make_fixed_datetime_cls
 from escalation.archive import archive_dir_for_date
-from escalation.models import Escalation
+from escalation.models import DeliveredCheckOwner, Escalation
 from escalation.queue import EscalationQueue
 from fastapi.testclient import TestClient
 from shared.locking import files_to_modules
@@ -129,7 +129,7 @@ ESCALATIONS_FILED = 5
 ESCALATIONS_ARCHIVED = 3
 """Pending L1 records filed through the real queue, and how many then sit in its archive."""
 
-CHECK_OWNER: Mapping[str, Any] = {
+CHECK_OWNER: DeliveredCheckOwner = {
     'task_id': '4',
     'check_name': 'boundary-capability',
     'sidecar': {'path': 'plans/boundary.capabilities.yaml', 'on_main': 'declares'},
@@ -559,7 +559,7 @@ def _check_owner_family(client: TestClient, workdir: Path) -> dict[str, Any]:
             timestamp=T0.isoformat(),
             status='pending',
             level=2,
-            delivered_check_owner=dict(CHECK_OWNER),
+            delivered_check_owner=CHECK_OWNER,
         ))
         config.reconciliation_escalations_dir.mkdir(parents=True, exist_ok=True)
         try:
