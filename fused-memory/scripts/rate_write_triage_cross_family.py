@@ -397,7 +397,7 @@ def openai_ask(model: str, effort: str, *, timeout: float = 600.0,
 
     Transport failures are retried with doubling backoff, as the arms runner does.
     """
-    import openai  # noqa: PLC0415 — the network dependency stays out of the report path
+    import openai  # the network dependency stays out of the report path
 
     transient = (TimeoutError, openai.APIConnectionError, openai.RateLimitError,
                  openai.InternalServerError)
