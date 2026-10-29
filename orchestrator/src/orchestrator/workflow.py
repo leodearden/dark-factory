@@ -104,7 +104,11 @@ from orchestrator.delivered_checks import (
     DeliveredChecksBlock,
     gate_mark_done_on_delivered_checks,
 )
-from orchestrator.dry_run_unblock import run_dry_run_unblock
+from orchestrator.dry_run_unblock import (
+    investigation_in_flight,
+    investigation_task_name,
+    run_dry_run_unblock,
+)
 from orchestrator.escalation_router import InfoL0Sweep, RouterPorts, exit_kind_for, router_owns
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.exit_contract import (
@@ -196,6 +200,7 @@ from orchestrator.verify_evidence import VerifySite, verify_event_fields
 from orchestrator.workflow_types import (  # noqa: F401  re-export shim
     BlockDisposition,
     CancellationScope,
+    DryRunSpawn,
     IllegalTransition,
     OnTerminalEntry,
     RequeueKind,
@@ -8185,6 +8190,8 @@ class TaskWorkflow:
         Then short-circuits to ``_mark_blocked(escalate_to_human=True)``,
         which submits an L1 directly without invoking the steward — the
         steward consumes only L0 escalations and cannot fix a broken spec.
+        No dry-run is spawned: the architect's report is itself the
+        investigation.
         """
         assert self.artifacts is not None
         report = self.artifacts.read_unactionable_task()
@@ -8206,6 +8213,7 @@ class TaskWorkflow:
                 detail=json.dumps(report, indent=2)[:2000],
                 escalate_to_human=True,
                 merge_phase=merge_phase,
+                dry_run_spawn=DryRunSpawn.NEVER,
             )
 
         return await self._mark_blocked(
@@ -8213,6 +8221,7 @@ class TaskWorkflow:
             detail=f'reason: {reason}\nevidence: {evidence}'[:2000],
             escalate_to_human=True,
             merge_phase=merge_phase,
+            dry_run_spawn=DryRunSpawn.NEVER,
         )
 
     async def _handle_false_premise_report(
@@ -8231,6 +8240,8 @@ class TaskWorkflow:
         category='design_concern')``, which submits a level-1 design_concern
         escalation directly without invoking the steward — only a human/curator
         can re-spec a test premise or relocate a signal to a different task.
+        No dry-run is spawned: the architect's report is itself the
+        investigation.
         """
         assert self.artifacts is not None
         report = self.artifacts.read_false_premise()
@@ -8253,6 +8264,7 @@ class TaskWorkflow:
                 escalate_to_human=True,
                 category='design_concern',
                 merge_phase=merge_phase,
+                dry_run_spawn=DryRunSpawn.NEVER,
             )
         else:
             result = await self._mark_blocked(
@@ -8265,6 +8277,7 @@ class TaskWorkflow:
                 escalate_to_human=True,
                 category='design_concern',
                 merge_phase=merge_phase,
+                dry_run_spawn=DryRunSpawn.NEVER,
             )
         # Clear only after the L1 escalation has been successfully submitted —
         # if _mark_blocked raises, the artifact survives for the next retry.
@@ -12371,10 +12384,11 @@ class TaskWorkflow:
         # Post-merge unscoped type-check short-circuit: a union break caught
         # after the merge landed is also a human-judgement fix-forward case;
         # same L1-not-steward routing so the steward cannot mask the signal.
-        # spawn_dry_run=True captures a sha-anchored dry-run proposal for the
-        # B3 low-risk auto-unblock gate: advance_main has already moved
-        # refs/heads/main to advanced_sha before this path runs, so
-        # _capture_worktree_shas reflects post-merge reality at spawn time.
+        # DryRunSpawn.POST_MERGE_RED_MAIN captures a sha-anchored dry-run
+        # proposal for the B3 low-risk auto-unblock gate: advance_main has
+        # already moved refs/heads/main to advanced_sha before this path
+        # runs, so _capture_worktree_shas reflects post-merge reality at
+        # spawn time.
         if result.reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX):
             self._write_merge_failure_review(
                 'post_merge_pyright_broken', result.reason,
@@ -12383,7 +12397,7 @@ class TaskWorkflow:
                 result.reason,
                 merge_phase=merge_phase,
                 escalate_to_human=True,
-                spawn_dry_run=True,
+                dry_run_spawn=DryRunSpawn.POST_MERGE_RED_MAIN,
             )
         # Transient-infra short-circuit: the merge worker already pruned stale
         # merge worktrees and retried the verify, and it still hit ENOSPC.  Go
@@ -17121,7 +17135,7 @@ class TaskWorkflow:
         suggested_action: str = 'investigate_and_retry',
         category: str = 'task_failure',
         dedupe_fingerprint: str | None = None,
-        spawn_dry_run: bool = False,
+        dry_run_spawn: DryRunSpawn = DryRunSpawn.OUTSIDE_MERGE_PHASE,
         root_cause: str = '',
         disposition: BlockDisposition | None = None,
     ) -> WorkflowOutcome:
@@ -17180,15 +17194,19 @@ class TaskWorkflow:
         submission through submit_or_dedupe so N tasks seeing the same
         inherited-from-main break collapse to a single parent escalation.
         All existing callers (no fingerprint) keep the raw-submit path.
-        *spawn_dry_run* opts in to run_dry_run_unblock even when
-        *merge_phase* is True.  Use ONLY for the post-merge red-main class
+        *dry_run_spawn* decides whether run_dry_run_unblock is spawned.
+        ``OUTSIDE_MERGE_PHASE`` (the default) spawns only when *merge_phase*
+        is False.  ``POST_MERGE_RED_MAIN`` also spawns when *merge_phase* is
+        True; use it ONLY for the post-merge red-main class
         (POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX): main is already advanced
         before this path runs, so _capture_worktree_shas naturally reflects
         post-merge reality and the B3 gate can act on the resulting proposal.
         All other merge_phase=True escalation paths (dropped_plan_targets,
         post_merge_equivalence, transient_infra, plan_files_not_touched) are
-        human-judgement/infra cases and must NOT receive a proposal — leave
-        their callers with spawn_dry_run=False (the default).
+        human-judgement/infra cases and must NOT receive a proposal, so they
+        keep the default.  ``NEVER`` spawns nothing; the architect's
+        report_unactionable_task and report_false_premise handlers pass it
+        because the architect's report is already the investigation.
         """
         if escalate_to_human and skip_escalation:
             raise ValueError(
@@ -17271,11 +17289,12 @@ class TaskWorkflow:
                     '(best-effort, continuing): %s',
                     self.task_id, exc,
                 )
-            self._spawn_dry_run_unblock(
-                reason, detail or reason,
-                block_class=(disposition.block_class if disposition is not None else None),
-            )
-        elif spawn_dry_run:
+            if dry_run_spawn is not DryRunSpawn.NEVER:
+                self._spawn_dry_run_unblock(
+                    reason, detail or reason,
+                    block_class=(disposition.block_class if disposition is not None else None),
+                )
+        elif dry_run_spawn is DryRunSpawn.POST_MERGE_RED_MAIN:
             # Post-merge red-main class: merge_phase suppressed the status
             # transition and the spawn above, but this IS the mechanically
             # auto-unblockable class.  _spawn_dry_run_unblock is idempotent
@@ -17284,7 +17303,7 @@ class TaskWorkflow:
             # has already moved refs/heads/main to advanced_sha, so the
             # proposal reflects post-merge reality for b3_gate.check_proposal.
             #
-            # ORDERING INVARIANT: spawn_dry_run=True is only valid when
+            # ORDERING INVARIANT: DryRunSpawn.POST_MERGE_RED_MAIN is only valid when
             # advance_main has already committed main.  The only reason prefix
             # in this category is POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX —
             # _check_post_merge_pyright is invoked exclusively from
@@ -17300,7 +17319,8 @@ class TaskWorkflow:
             )
             if not reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX):
                 raise AssertionError(
-                    f'spawn_dry_run=True requires advance_main to have already '
+                    f'dry_run_spawn=DryRunSpawn.POST_MERGE_RED_MAIN requires '
+                    f'advance_main to have already '
                     f'moved refs/heads/main (post-merge red-main class only). '
                     f'Reason prefix {reason[:80]!r} does not match '
                     f'POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX; this path may '
@@ -17908,9 +17928,10 @@ class TaskWorkflow:
             return
         # Skip if an investigation for this task is already running (e.g. rapid
         # re-blocks during steward retries).  Duplicate proposals are unhelpful
-        # and would multiply budget spend up to 600 s × N re-blocks.
-        _task_name = f'unblock-auto-{self.task_id}'
-        if any(t.get_name() == _task_name and not t.done() for t in self._background_tasks):
+        # and would multiply budget spend up to 600 s × N re-blocks.  The check
+        # covers the whole event loop, so it spans re-dispatched workflow
+        # instances and the merge lane.
+        if investigation_in_flight(self.task_id):
             logger.debug(
                 'Task %s: dry-run investigation already in progress, skipping duplicate spawn',
                 self.task_id,
@@ -17933,7 +17954,7 @@ class TaskWorkflow:
                     cost_store=self.cost_store,
                     block_class=block_class,
                 ),
-                name=_task_name,
+                name=investigation_task_name(self.task_id),
             )
             self._background_tasks.add(_task)
             _task.add_done_callback(self._background_tasks.discard)
