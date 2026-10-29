@@ -5,13 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
-    ContextItem,
     ReconciliationEvent,
     StageReport,
     Watermark,
@@ -27,7 +26,6 @@ from fused_memory.reconciliation.curator_gate_resolution_sweep import (
     extract_open_gate_task_ids,
     sweep_resolved_curator_gates,
 )
-from fused_memory.reconciliation.dangling_citation import render_dangling_citation_line
 from fused_memory.reconciliation.degenerate_task_node_sweep import (
     extract_terminal_task_ids,
     sweep_degenerate_task_nodes,
@@ -71,6 +69,17 @@ from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.recon_pool_map import (
     STAGE1_CYCLE_SUMMARY_RECON_POOL as _STAGE1_CYCLE_SUMMARY_RECON_POOL,
 )
+from fused_memory.reconciliation.stage1_payload_format import (
+    append_note,
+    format_context_items,
+    format_episodes,
+    format_events,
+    format_findings,
+    format_memories,
+    format_watermark,
+    parse_instant,
+    to_utc,
+)
 from fused_memory.reconciliation.stage1_stall_detector import (
     compute_stalled_task_ids,
     extract_human_operator_task_ids,
@@ -108,15 +117,13 @@ from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     detect_census_inconsistency,
     format_filtered_task_tree,
-    strip_snapshot_lines,
 )
 from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
 from fused_memory.reconciliation.unlanded_path_check import (
     UnlandedPathCheckResult,
     check_unlanded_path_claims,
 )
-from fused_memory.server.grouped_read import PARENT_ID_KEY, _parent_id_in_meta
-from fused_memory.utils.clip_disclosure import clip_note, elide_text, fetch_cap_note
+from fused_memory.utils.clip_disclosure import clip_note, fetch_cap_note
 
 if TYPE_CHECKING:
     from fused_memory.services.memory_service import MemoryService
@@ -132,7 +139,6 @@ logger = logging.getLogger(__name__)
 # enforce_summary_pool_cap call trims the pool to at most this many members by
 # deleting the OLDEST entries — deterministically via Qdrant scroll, NOT semantic search.
 STAGE1_CYCLE_SUMMARY_POOL_CAP: int = 2
-_RECORD_BODY_CHARS = 2_000  # basis: plans/recon-evidence-caps-measurement-2026-10.md
 _STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
 
 
@@ -1520,12 +1526,12 @@ class MemoryConsolidator(BaseStage):
     ) -> list[dict]:
         """Return the subset of *records* strictly newer than *watermark*.
 
-        Parses each record's raw timestamp exactly once via ``_parse_instant``
+        Parses each record's raw timestamp exactly once via ``parse_instant``
         and compares it against *watermark* normalized to UTC exactly once per
         call (hoisted out of the loop as ``wm_utc``) — the same two steps
-        ``_is_newer_than_watermark`` (task 4574) performs per call, inlined
+        ``is_newer_than_watermark`` (task 4574) performs per call, inlined
         here so a record's timestamp is never parsed twice and the watermark
-        is never re-normalized per record. ``_is_newer_than_watermark`` stays
+        is never re-normalized per record. ``is_newer_than_watermark`` stays
         the public, independently unit-tested predicate for external callers;
         this method does not call it.
 
@@ -1548,11 +1554,11 @@ class MemoryConsolidator(BaseStage):
         lets the caller apply the mem0-only ``created_at`` -> ``updated_at``
         fallback without duplicating this method per record shape.
         """
-        wm_utc = _to_utc(watermark)
+        wm_utc = to_utc(watermark)
         new_records = []
         for record in records:
             raw_ts = get_raw_ts(record)
-            ts = _parse_instant(raw_ts)
+            ts = parse_instant(raw_ts)
             if ts is None:
                 self._undatable_freshness_records += 1
                 logger.warning(
@@ -1612,7 +1618,7 @@ class MemoryConsolidator(BaseStage):
             self._fetch_degraded_sources.append('episodes')
         new_episodes = episodes
         if watermark.last_episode_timestamp:
-            # WHY _is_newer_than_watermark and not `str(watermark...) > str(...)`:
+            # WHY is_newer_than_watermark and not `str(watermark...) > str(...)`:
             # str(datetime) renders with a space separator
             # ('2026-08-20 12:00:00+00:00'), while e['created_at'] here comes
             # from services/memory_service.py::_created_at_to_utc_iso as
@@ -1674,7 +1680,7 @@ class MemoryConsolidator(BaseStage):
         status = await self._fetch_status()
 
         # 4. Events summary
-        event_summary = _format_events(events)
+        event_summary = format_events(events)
 
         # 5. Prior S3 findings (backstop from last completed run)
         prior_s3_section = ''
@@ -1683,7 +1689,7 @@ class MemoryConsolidator(BaseStage):
                 f'\n### Prior Stage 3 Findings ({len(self.prior_s3_findings)})\n'
                 f'These issues were found in the last integrity check and should be addressed '
                 f'during this consolidation pass if possible.\n'
-                f'{_format_findings(self.prior_s3_findings)}\n'
+                f'{format_findings(self.prior_s3_findings)}\n'
             )
 
         # 6. Cycle fence section
@@ -1707,17 +1713,17 @@ class MemoryConsolidator(BaseStage):
         overreach_flags_section = render_overreach_flags_section(self.overreach_flags)
 
         # 8. Format
-        episodes_str, ep_n = _format_episodes(new_episodes)
-        memories_str, mem_n = _format_memories(new_memories)
+        episodes_str, ep_n = format_episodes(new_episodes)
+        memories_str, mem_n = format_memories(new_memories)
         self._entity_summary_snapshot_lines_stripped = ep_n + mem_n
         # Episodes arrive newest-first (undatable last), so one the watermark filter
         # dropped proves nothing newer lay past the cap. mem0's get_all scrolls in
         # point-id order, which proves nothing, so its note rests on the count alone.
         if len(new_episodes) == len(episodes):
-            episodes_str = _append_note(episodes_str, fetch_cap_note(
+            episodes_str = append_note(episodes_str, fetch_cap_note(
                 fetched=len(episodes), noun='episode(s)', cap_name='episode_limit', cap=self.episode_limit,
             ))
-        memories_str = _append_note(memories_str, fetch_cap_note(
+        memories_str = append_note(memories_str, fetch_cap_note(
             fetched=len(mem0_memories), noun='memory record(s)', cap_name='memory_limit',
             cap=self.memory_limit,
         ))
@@ -1738,7 +1744,7 @@ class MemoryConsolidator(BaseStage):
 {json.dumps(status, indent=2, default=str)}
 
 ### Previous Reconciliation
-{_format_watermark(watermark, include_freshness_cutoffs=True)}
+{format_watermark(watermark, include_freshness_cutoffs=True)}
 {prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{overreach_flags_section}{await self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
@@ -1783,7 +1789,7 @@ Review the above data and perform memory consolidation:
         # leak hazard as _fetch_degraded_sources above).
         self._undatable_freshness_records = 0
 
-        event_summary = _format_events(ap.events)
+        event_summary = format_events(ap.events)
         deferred_events_note = clip_note(
             omitted=ap.events_remaining,
             omitted_noun='buffered event(s)',
@@ -1791,7 +1797,7 @@ Review the above data and perform memory consolidation:
             cap=ap.token_budget,
             dropped_first='the newest events (still buffered for a later chunk)',
         )
-        event_summary = _append_note(event_summary, deferred_events_note)
+        event_summary = append_note(event_summary, deferred_events_note)
 
         # Store status (cheap fetch, always useful)
         status = await self._fetch_status()
@@ -1803,7 +1809,7 @@ Review the above data and perform memory consolidation:
                 f'\n### Prior Stage 3 Findings ({len(self.prior_s3_findings)})\n'
                 f'These issues were found in the last integrity check and should be addressed '
                 f'during this consolidation pass if possible.\n'
-                f'{_format_findings(self.prior_s3_findings)}\n'
+                f'{format_findings(self.prior_s3_findings)}\n'
             )
 
         # Cycle fence
@@ -1826,7 +1832,7 @@ Review the above data and perform memory consolidation:
         # Overreach shadow flags (design.md §6.1 O4, task 6137)
         overreach_flags_section = render_overreach_flags_section(self.overreach_flags)
 
-        ctx_str, ctx_n = _format_context_items(ap.context_items)
+        ctx_str, ctx_n = format_context_items(ap.context_items)
         self._entity_summary_snapshot_lines_stripped = ctx_n
 
         return f"""## Reconciliation Run — Stage 1: Memory Consolidation
@@ -1842,7 +1848,7 @@ Review the above data and perform memory consolidation:
 {json.dumps(status, indent=2, default=str)}
 
 ### Previous Reconciliation
-{_format_watermark(watermark)}
+{format_watermark(watermark)}
 {prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{overreach_flags_section}{await self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
@@ -1981,7 +1987,7 @@ Review the above data and perform memory consolidation:
 ## Project: {self.project_id}
 
 ### Actionable Findings to Remediate ({len(findings)})
-{_format_findings(findings)}{await self._render_required_sections()}
+{format_findings(findings)}{await self._render_required_sections()}
 
 ## Your Task
 This is a focused remediation run. Address ONLY the specific findings listed above:
@@ -2003,284 +2009,3 @@ def _marker_signatures(
         sig for f in flags
         if (sig := compute_marker_signature(f, project_id=project_id)) is not None
     }
-
-
-def _to_utc(dt: datetime) -> datetime:
-    """Coerce *dt* to a tz-aware UTC datetime, assuming UTC when naive.
-
-    Shared normalization step for both sides of ``_is_newer_than_watermark``'s
-    comparison, mirroring ``backends/graphiti_client.py::_as_sortable_utc``'s
-    "naive means UTC" convention for its sort key.
-    """
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(UTC)
-
-
-def _parse_instant(raw_ts: str | None) -> datetime | None:
-    """Parse *raw_ts* into a tz-aware UTC datetime, or None if it is
-    missing, empty, or unparseable ("undatable" — see
-    ``_is_newer_than_watermark`` and ``MemoryConsolidator._filter_records_newer_than_watermark``,
-    which count and log this case rather than silently dropping it).
-
-    Catches both ``ValueError`` (malformed ISO-8601 text) and ``TypeError``
-    (a non-str, non-None value such as a ``datetime``, an int epoch, or a
-    dict — ``datetime.fromisoformat`` raises ``TypeError`` rather than
-    ``ValueError`` for these) so one malformed record is classified as
-    undatable rather than raising out of the caller's filter loop.
-    """
-    if not raw_ts:
-        return None
-    try:
-        ts = datetime.fromisoformat(raw_ts)
-    except (TypeError, ValueError):
-        return None
-    return _to_utc(ts)
-
-
-def _is_newer_than_watermark(raw_ts: str | None, watermark: datetime) -> bool:
-    """True iff *raw_ts* is a parseable instant STRICTLY after *watermark*.
-
-    Both sides are compared as instants, never as strings: *raw_ts* is
-    parsed with ``datetime.fromisoformat`` and *watermark* is taken as
-    given, then each is coerced to a tz-aware UTC datetime — naive
-    (tzinfo-less) values on EITHER side are assumed to already be UTC
-    rather than raising on naive-vs-aware comparison, mirroring
-    ``backends/graphiti_client.py::_as_sortable_utc`` — before comparing
-    with ``>`` (strictly after, not ``>=``, so an instant exactly equal to
-    *watermark* is not re-surfaced). A non-UTC offset is therefore compared
-    correctly by its true instant, not by its printed digits.
-
-    Comparing these values as STRINGS is wrong: ``str(datetime)`` renders
-    with a space separator (``'2026-08-20 12:00:00+00:00'``) while
-    ``created_at`` values produced by
-    ``services/memory_service.py::_created_at_to_utc_iso`` use ``T``
-    (``'2026-08-20T01:52:27+00:00'``) — a lexical ``>`` then short-circuits
-    at the separator and degenerates to date-granularity (task 4574).
-
-    *raw_ts* that is missing, empty, or unparseable returns False — an
-    undatable record cannot be shown to be newer than the watermark, so it
-    is treated as not-newer rather than raising.
-    """
-    ts = _parse_instant(raw_ts)
-    if ts is None:
-        return False
-    return ts > _to_utc(watermark)
-
-
-def _format_events(events: list[ReconciliationEvent]) -> str:
-    if not events:
-        return 'No events.'
-    lines = []
-    for e in events:
-        lines.append(f'- [{e.type.value}] {e.timestamp.isoformat()}: {json.dumps(e.payload)}')
-    return '\n'.join(lines)
-
-
-def _append_note(body: str, note: str) -> str:
-    return f'{body}\n\n{note}' if note else body
-
-
-def _format_episodes(episodes: list[dict]) -> tuple[str, int]:
-    if not episodes:
-        return 'No new episodes.', 0
-    lines = []
-    total_stripped = 0
-    for ep in episodes:
-        raw = ep.get('content') or ''
-        cleaned, n = strip_snapshot_lines(raw)
-        total_stripped += n
-        content = elide_text(cleaned, _RECORD_BODY_CHARS, field='content').text
-        lines.append(f'- [{ep.get("uuid", "?")}] {ep.get("created_at", "?")}: {content}')
-    return '\n'.join(lines), total_stripped
-
-
-def _parent_link(meta: Mapping[str, Any]) -> str:
-    """Render a child's parent link for prompts/stage1.py::CHILD_MEMORY_AUTHORITY_RULE."""
-    parent_id = _parent_id_in_meta(meta)
-    if parent_id is None:
-        return ''
-    return f' {PARENT_ID_KEY}={parent_id} kind={meta["kind"]}'
-
-
-def _format_memories(memories: list[dict]) -> tuple[str, int]:
-    if not memories:
-        return 'No memories.', 0
-    lines = []
-    total_stripped = 0
-    for m in memories:
-        raw = m.get('memory') or ''
-        cleaned, n = strip_snapshot_lines(raw)
-        total_stripped += n
-        content = elide_text(cleaned, _RECORD_BODY_CHARS, field='content').text
-        meta = m.get('metadata', {}) or {}
-        cat = meta.get('category', '?')
-        lines.append(f'- [{m.get("id", "?")}]{_parent_link(meta)} ({cat}): {content}')
-    return '\n'.join(lines), total_stripped
-
-
-def _format_context_items(items: dict[str, ContextItem]) -> tuple[str, int]:
-    """Format context items grouped by source, stripping count-snapshot lines."""
-    if not items:
-        return 'No related context.', 0
-    by_source: dict[str, list[ContextItem]] = {}
-    for item in items.values():
-        by_source.setdefault(item.source, []).append(item)
-    sections = []
-    total_stripped = 0
-    for source, source_items in sorted(by_source.items()):
-        sections.append(f'**{source}** ({len(source_items)})')
-        for item in source_items:
-            cleaned, n = strip_snapshot_lines(item.formatted)
-            total_stripped += n
-            sections.append(cleaned)
-    return '\n'.join(sections), total_stripped
-
-
-def _format_findings(findings: list[dict]) -> str:
-    """Render a list of finding dicts as a human-readable string.
-
-    Each finding is formatted with its header fields (description, severity,
-    category, suggested_action) followed by the four typed citation lists
-    (cited_entities, cited_edges, cited_tasks, cited_memories) from PRD §9.3,
-    then the dangling-citation line naming the repair ids when the finding
-    carries that handoff record (task 5749).
-    Empty citation lists are omitted from output.
-
-    Rendering limits (reviewer finding incomplete_rendering):
-    - Each citation list is capped at 5 entries (``... +N more`` appended).
-    - ``fact_text_snapshot`` is truncated at 120 characters to avoid inflating
-      payload size when feeding findings into the next reconciliation context.
-    - cited_tasks includes the task title so downstream consumers can read
-      findings without re-fetching tasks.
-    """
-    _CITE_CAP = 5
-    _SNAPSHOT_CAP = 120
-    # Caps for LLM-controlled free-text fields (reviewer finding incomplete_rendering):
-    # without a cap, verbose descriptions from a handful of findings can dominate
-    # the downstream stage payload and swamp per-citation limits.
-    _DESC_CAP = 500
-    _ACTION_CAP = 500
-
-    if not findings:
-        return 'No findings.'
-    lines = []
-    for i, f in enumerate(findings, 1):
-        desc = f.get('description', '?')
-        severity = f.get('severity', '?')
-        category = f.get('category', '?')
-        action = f.get('suggested_action', '?')
-
-        if len(desc) > _DESC_CAP:
-            desc = desc[:_DESC_CAP] + '...'
-        if len(action) > _ACTION_CAP:
-            action = action[:_ACTION_CAP] + '...'
-
-        parts = [
-            f'{i}. [{severity}/{category}] {desc}',
-            f'   Suggested action: {action}',
-        ]
-
-        cited_entities = f.get('cited_entities') or []
-        if cited_entities:
-            shown = cited_entities[:_CITE_CAP]
-            entity_strs = ', '.join(
-                f"{e.get('canonical_name', '?')} ({e.get('entity_uuid', '?')})"
-                for e in shown
-            )
-            extra = len(cited_entities) - len(shown)
-            if extra:
-                entity_strs += f', ... +{extra} more'
-                logger.debug('_format_findings: finding %d cited_entities truncated (%d dropped)', i, extra)
-            parts.append(f'   Cited entities: {entity_strs}')
-
-        cited_edges = f.get('cited_edges') or []
-        if cited_edges:
-            shown = cited_edges[:_CITE_CAP]
-            edge_parts = []
-            for e in shown:
-                snapshot = e.get('fact_text_snapshot', '?')
-                if len(snapshot) > _SNAPSHOT_CAP:
-                    snapshot = snapshot[:_SNAPSHOT_CAP] + '...'
-                edge_parts.append(f"{e.get('edge_uuid', '?')}: {snapshot}")
-            edge_strs = ', '.join(edge_parts)
-            extra = len(cited_edges) - len(shown)
-            if extra:
-                edge_strs += f', ... +{extra} more'
-                logger.debug('_format_findings: finding %d cited_edges truncated (%d dropped)', i, extra)
-            parts.append(f'   Cited edges: {edge_strs}')
-
-        cited_tasks = f.get('cited_tasks') or []
-        if cited_tasks:
-            shown = cited_tasks[:_CITE_CAP]
-            task_strs = ', '.join(
-                f"{t.get('project_id', '?')}/{t.get('task_id', '?')} ({t.get('title', '?')})"
-                for t in shown
-            )
-            extra = len(cited_tasks) - len(shown)
-            if extra:
-                task_strs += f', ... +{extra} more'
-                logger.debug('_format_findings: finding %d cited_tasks truncated (%d dropped)', i, extra)
-            parts.append(f'   Cited tasks: {task_strs}')
-
-        cited_memories = f.get('cited_memories') or []
-        if cited_memories:
-            shown = cited_memories[:_CITE_CAP]
-            memory_strs = ', '.join(
-                f"{m.get('memory_id', '?')} ({m.get('store', '?')})"
-                for m in shown
-            )
-            extra = len(cited_memories) - len(shown)
-            if extra:
-                memory_strs += f', ... +{extra} more'
-                logger.debug('_format_findings: finding %d cited_memories truncated (%d dropped)', i, extra)
-            parts.append(f'   Cited memories: {memory_strs}')
-
-        line = render_dangling_citation_line(f)
-        if line is not None:
-            parts.append(f'   {line}')
-
-        lines.append('\n'.join(parts))
-    return '\n'.join(lines)
-
-
-def _format_watermark(watermark: Watermark, *, include_freshness_cutoffs: bool = False) -> str:
-    """Render the "Previous Reconciliation" section.
-
-    *include_freshness_cutoffs* must be True ONLY from the caller that
-    actually ran the episode/mem0 "new since last reconciliation" filters
-    against these cutoffs — today that is exclusively the time-windowed
-    ``assemble_payload`` path. ``_format_assembled_payload`` (the
-    ContextAssembler/token-budget path) does no freshness filtering at all
-    and formats ``### Related Context`` instead of a filtered episode/mem0
-    count, so it leaves this False (the default): showing the cutoffs there
-    would claim a relationship to the displayed items that does not exist
-    (task 4574 review amendment).
-    """
-    if watermark.last_full_run_completed is None:
-        return 'First run — no previous reconciliation.'
-    lines = [
-        f'Last full run: {watermark.last_full_run_id} '
-        f'at {watermark.last_full_run_completed.isoformat()}'
-    ]
-    if include_freshness_cutoffs:
-        # Disclose the freshness cutoffs the episode/mem0 "new since last
-        # reconciliation" filters above actually compared against (task 4574).
-        # Previously invisible here — the payload showed a filtered COUNT
-        # ("New Episodes Since Last Reconciliation (N)") with no way to see
-        # what cursor N was computed against, which is why the 894fbe90
-        # incident survived three full cycles of re-investigation undiagnosed.
-        # Rendered via .isoformat() (never str(datetime), which uses a space
-        # separator — see _is_newer_than_watermark) and omitted entirely
-        # (rather than printed as the literal 'None') when unset, e.g. on a
-        # watermark that has a completed full run but has not yet recorded an
-        # episode or memory cutoff.
-        if watermark.last_episode_timestamp is not None:
-            lines.append(
-                f'Episode freshness cutoff: {watermark.last_episode_timestamp.isoformat()}'
-            )
-        if watermark.last_memory_timestamp is not None:
-            lines.append(
-                f'Mem0 memory freshness cutoff: {watermark.last_memory_timestamp.isoformat()}'
-            )
-    return '\n'.join(lines)
