@@ -2218,6 +2218,20 @@ Infrastructure problems — database connectivity, MCP failures, service outages
 5. Wait for human instructions
 6. Append `<esc-id>` to the wrapper-owned exclude-file (see "Starting the watcher" above) while this item is pending
 
+### `verify_host_unreachable` / `verify_host_skew` (blocking, L1/L2)
+
+`orchestrator-verify-host-monitor` files one of these on a per-host sentinel `task_id` when the merge worker benches a remote verify host: `verify_host_unreachable` when ssh fails, `verify_host_skew` when it reached the host but could not run its gate there. Neither halts the lane; it falls back to serial-local verify.
+
+**Recovery is only one of these:**
+- the orchestrator's own resolve (`resolved_by` `orchestrator-verify-host-monitor`), reported by a `verify_host_recovered` event whose `evidence` is `ssh_health_probe`, `ensure_gate` or `operator_clear`;
+- for `verify_host_unreachable` only, a passing ssh health probe: `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> true` exits 0. A skew host answers ssh by definition, so the probe says nothing about `verify_host_skew`.
+
+`get_merge_queue` occupancy (`by_host`, `inflight_by_host`, `hosts_busy`) is lease bookkeeping and is **never** recovery evidence: the 2026-07-24 false resolve read a phantom `laptop:5300` lease four seconds before an ssh connect timeout. For host health, read the snapshot's `hosts[]` (`quarantined`, `quarantine_class`, `sticky`) and `occupancy.leases[]` (`activity`, `host_quarantined`).
+
+**Do not resolve while the host is still benched.** Every reprobe sweep (~120s) re-asserts the alarm, so the resolve re-opens. To bring a host back now (cause fixed, or a `sticky` skew bench, which never re-admits on its own), call `mcp__escalation__clear_verify_host_quarantine(host=...)`: it does not probe first, and it resolves the alarm with evidence `operator_clear`. To retire a host that is gone for good, remove it from the project's `verify_runners` config and restart (restart-only, `OPERATIONS.md` §"Config reload vs restart").
+
+The orchestrator no longer files a per-recovery info escalation; recovery is recorded as events only.
+
 ### `recon_*` categories
 
 `recon_failure`, `recon_backlog_overflow`, `recon_stale_run`, `recon_integrity_issue` — these are all fused-memory reconciliation problems.

@@ -352,11 +352,10 @@ test or config patches later.
 | `PersistentWorktreeConfigError` | merge_lane/liveness.py | Raised by `enforce_persistent_worktree_serial_lane` when per-host in-flight count would exceed 1 |
 | `_safety_valve_due()` | merge_lane/liveness.py | Periodic cold-verify safety-valve gate (every Nth verifying attempt, PRD §10 invariant 6) |
 | `_VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX` | merge_lane/liveness.py | Per-host dedup sentinel prefix for unreachability alarms (task 1795) |
-| `_VERIFY_HOST_RECOVERED_SENTINEL_PREFIX` | merge_lane/liveness.py | Per-host sentinel prefix for recovery info escalations, distinct from the unreachable prefix |
 | `_MERGE_WORKER_LOOP_DIED_SENTINEL` | merge_lane/liveness.py | Sentinel task_id base for the merge-worker supervisor loop-death escalation |
 | `_verify_host_unreachable_sentinel()` | merge_lane/liveness.py | Per-host dedup sentinel task_id for unreachability alarms |
 | `_alarm_verify_host_unreachable()` | merge_lane/liveness.py | Dedup'd L1 escalation when a remote verify host is persistently unreachable |
-| `_clear_verify_host_unreachable()` | merge_lane/liveness.py | Resolve any open unreachability alarm and emit a recovery event on reprobe success |
+| `_clear_verify_host_unreachable()` | merge_lane/liveness.py | Resolve every pending record on the host's sentinel on named `RecoveryEvidence`, then emit `verify_host_recovered` |
 | `_acquire_warm_verify_worktree()` | merge_lane/liveness.py | Swap the ephemeral merge worktree for the persistent warm worktree (or the `_spec-` warm lane) |
 | `enforce_persistent_worktree_serial_lane()` | merge_lane/liveness.py | Fail-closed startup guard: per-host in-flight verify count must not exceed 1 |
 | `TOUCH_MISS_TOLERANCE` | merge_lane/liveness.py | Consecutive heartbeat ticks a live worker's `_merge-*` worktrees may miss before mtime ages into the reaper window (= 20); moved out of the worker, task 5036 |
