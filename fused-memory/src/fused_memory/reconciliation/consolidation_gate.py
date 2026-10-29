@@ -72,6 +72,7 @@ from shared.task_metadata import HUMAN_CURATOR_ADJUDICATED_AT_KEY, HUMAN_CURATOR
 
 from fused_memory.memory_metadata import (
     EXPERIMENTAL_KEY_PREFIX,
+    is_canonical,
     is_valid_topic_slug,
     normalize_supersedes,
 )
@@ -297,7 +298,7 @@ def _sole_canonical_claim(members: Sequence[Any]) -> list[Any]:
     because there is no single claim to trust.  Normalized through the shared
     :func:`normalize_supersedes` (INV-5), never a second parser.
     """
-    canonicals = [p for p in members if _payload_meta(p).get('canonical') is True]
+    canonicals = [p for p in members if is_canonical(_payload_meta(p))]
     if len(canonicals) != 1:
         return []
     return normalize_supersedes(_payload_meta(canonicals[0]).get('supersedes'))
@@ -625,11 +626,8 @@ def evaluate_closure(
     It therefore refuses ONLY on cluster malformedness:
 
     * ``no_canonical`` / ``multiple_canonicals`` — the canonical count is not
-      exactly one.  Canonical is ``meta.get('canonical') is True``, a strict
-      IDENTITY check, single-sourcing the meaning with
-      ``services/topic_anchor.py::select_canonical_payload``; truthiness would
-      admit an int ``1`` (``1 == True`` in Python) and let the read path and
-      this predicate disagree about what canonical means.
+      exactly one.  Canonical is ``fused_memory/canonical_marker.py::is_canonical``,
+      the strict predicate every reader shares.
 
     Every offender is collected rather than short-circuited on the first,
     matching ``server/consolidation.py::validate_consolidate_args``' convention,
@@ -683,9 +681,7 @@ def evaluate_closure(
         )
 
     # --- canonical invariant: exactly one strictly-canonical member -------- #
-    canonical_ids = [
-        _payload_id(p) for p in members if _payload_meta(p).get('canonical') is True
-    ]
+    canonical_ids = [_payload_id(p) for p in members if is_canonical(_payload_meta(p))]
     if not canonical_ids and not scroll_truncated:
         # ABSENCE-based, so it is only sound on a COMPLETE view: a canonical
         # sitting past the scroll cap is indistinguishable from no canonical at
