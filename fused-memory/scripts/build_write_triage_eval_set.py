@@ -25,8 +25,14 @@ the main checkout's frozen population), ``--live-slates`` and ``--scratch``:
   evidence not in the texts shown; the later round supersedes it.
 - ``third``: shard the pairs a decisive tie or an open follow-up blocks, for a
   new third rater.
+- ``rerate --brief-version LABEL``: once every keyed shard is rated, key a new
+  round of both raters over every pair whose derivation reads LOSS, under the
+  brief as it now reads, retiring the earlier third votes on those pairs; then
+  re-render any missing shard text and ``rater_prompt.md``. A rerun under a
+  keyed label keys nothing new.
 - ``assemble``: write ``write_triage_eval_set_v2_{writes.jsonl,verdicts.jsonl,summary.json}``
-  into ``--out-dir``, refusing while any pair is not fully labelled.
+  into ``--out-dir``, refusing while any pair is not fully labelled. The summary
+  records each re-rate, so it says which pairs rest on which brief.
 
 ``split --eval-dir DIR`` freezes the assembled set's held-out split
 (:func:`freeze_split`) into ``write_triage_eval_set_v2_split.json`` beside it,
@@ -251,6 +257,9 @@ def _summary(
         'kappa': _score.kappa_over_consumed(consumed, _rubric.resolve_judgements(verdicts)),
         'rating_volume': _rounds.rating_volume(key),
         'reasked': rated.reasked,
+        'rerates': [{'version': rerate['version'], 'round': rerate['round'],
+                     'pairs': len(rerate['pairs']), 'brief_sha256': rerate['brief_sha256']}
+                    for rerate in key.get('rerates', ())],
         'shards': {name: {'rater': spec['rater'], 'role': spec['role'], 'round': spec['round'],
                           'items': len(spec['items'])}
                    for name, spec in sorted(key['shards'].items())},
@@ -349,6 +358,27 @@ def _third_command(args: argparse.Namespace) -> dict[str, Any]:
     derivations = pair_derivations(rounds.inputs.rows(), rounds.finished().rows)
     return _rounds.third_round(rounds.scratch, rounds.key, rounds.inputs.entries(),
                                _third_round_pairs(derivations))
+
+
+def _rerate_command(args: argparse.Namespace) -> dict[str, Any]:
+    rounds = _Rounds.read(args)
+    entries = rounds.inputs.entries()
+    rerate = _rounds.keyed_rerate(rounds.key, args.brief_version)
+    new_shards: dict[str, dict[str, int]] = {}
+    if rerate is None:
+        selected = _rounds.loss_consuming_pairs(rounds.finished().rows)
+        rerate = _rounds.rerate_round(rounds.scratch, rounds.key, entries, selected,
+                                      version=args.brief_version)
+        for name in rerate['shards']:
+            spec = rounds.key['shards'][name]
+            new_shards.setdefault(spec['role'], {})[name] = len(spec['items'])
+    rendered = rounds.scratch.render_missing(rounds.key, entries)
+    (args.scratch / 'rater_prompt.md').write_text(_rounds.rater_prompt())
+    return {
+        'version': rerate['version'], 'round': rerate['round'], 'pairs': len(rerate['pairs']),
+        'retires_third_raters': rerate['retires_third_raters'],
+        'new_shards': new_shards, 'rendered_again': rendered,
+    }
 
 
 def _assemble_command(args: argparse.Namespace) -> dict[str, Any]:
@@ -515,9 +545,9 @@ def _refuse_inside_read_only(parser: argparse.ArgumentParser, args: argparse.Nam
 
 _COMMANDS: Mapping[str, Callable[[argparse.Namespace], dict[str, Any]]] = {
     'shards': _shards_command, 'reask': _reask_command, 'third': _third_command,
-    'assemble': _assemble_command, 'split': _split_command,
+    'rerate': _rerate_command, 'assemble': _assemble_command, 'split': _split_command,
 }
-_ROUND_COMMANDS = ('shards', 'reask', 'third', 'assemble')
+_ROUND_COMMANDS = ('shards', 'reask', 'third', 'rerate', 'assemble')
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -531,6 +561,9 @@ def _build_parser() -> argparse.ArgumentParser:
                              metavar='PATH')
         command.add_argument('--scratch', type=Path, default=DEFAULT_SCRATCH, metavar='DIR')
     commands.choices['shards'].add_argument('--seed', type=int, default=7160)
+    commands.choices['rerate'].add_argument(
+        '--brief-version', required=True, metavar='LABEL',
+        help="the brief's version label (e.g. v2.2), recorded in the key and the summary")
     commands.choices['assemble'].add_argument('--out-dir', type=Path, default=_CALIBRATION,
                                               metavar='DIR')
     split = commands.add_parser('split')

@@ -7,12 +7,16 @@ shard of opaque item ids, and each shard is read by a blind Opus rater given
 the brief verbatim. A line that breaks the rubric's row contract, or quotes
 evidence not in the texts its rater saw, is asked again in a later round,
 which supersedes it. A pair that a decisive tie or an open follow-up blocks
-goes to a third round, under a new rater.
+goes to a third round, under a new rater. A re-rate under a revised brief
+asks both raters again on chosen pairs in a new round, and retires every
+earlier third rater's line on those pairs, so a tie under the revised brief
+goes to a new third rater.
 
 A :class:`RatingScratch` directory holds the rounds:
 
 - ``key.json``: each shard's role, rater, round and item ids, and each item
-  id's pair and basis. It is the only map from an item back to its pair.
+  id's pair and basis. It is the only map from an item back to its pair. Its
+  ``rerates`` list records each re-rate (see :func:`rerate_round`).
 - ``texts.json``: each pair and basis as its raters saw it.
 - ``shards/<name>.txt``: what a rater reads, re-renderable from the key and the texts.
 - ``ratings/<name>.jsonl``: the rater's answers, one line per item.
@@ -22,6 +26,7 @@ module imports only the rubric.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
@@ -57,6 +62,11 @@ RATER_MODELS: Mapping[str, str] = MappingProxyType({
     Role.PRIMARY: 'opus', Role.SECOND: 'opus', Role.THIRD: 'opus',
 })
 DOUBLE_RATED = (Role.PRIMARY, Role.SECOND)
+
+
+def _double_rater(role: str) -> str:
+    """The one rater of a double-rating *role*, in every round."""
+    return f'{RATER_MODELS[role]}-{role}'
 
 Triple = tuple[str, str, str]
 """A pair and basis: (entry id, target id, basis)."""
@@ -238,6 +248,18 @@ def third_round_blockers(derivations: Mapping[str, _rubric.Derivation]) -> list[
     return sorted(blocked)
 
 
+def loss_consuming_pairs(rows: Iterable[Mapping[str, Any]]) -> list[tuple[str, str]]:
+    """The sorted (entry, target) pairs whose current-basis *rows* resolve to the answers LOSS
+    is asked after, so a derivation reads LOSS on them."""
+    needs = _rubric.FOLLOW_UPS[Binary.LOSS]
+    return sorted(
+        (pair.entry_id, pair.target_id)
+        for pair, judgement in _rubric.resolve_judgements(rows).items()
+        if pair.basis == Basis.CURRENT
+        and all(judgement.answer(binary) == needed for binary, needed in needs.items())
+    )
+
+
 def rating_volume(key: Mapping[str, Any]) -> dict[str, dict[str, int]]:
     """The distinct (entry, target) pairs the scratch *key*'s shards put before each role, by basis."""
     pairs: defaultdict[str, defaultdict[str, set[tuple[str, str]]]] = defaultdict(
@@ -324,7 +346,7 @@ class Reask:
 
 @dataclass(frozen=True)
 class Rated:
-    """The effective rater lines, how many earlier-round lines they superseded, and those to ask again."""
+    """The effective rater lines, how many earlier lines a re-ask superseded, and those to ask again."""
 
     rows: list[dict[str, Any]]
     reasked: int
@@ -363,8 +385,8 @@ class RatingScratch:
                 first = sum(name.startswith(f'{prefix}{role}_') for name in key['shards'])
                 for name, members in plan_shards(pending, role=role, prefix=prefix, seed=seed,
                                                  first_index=first):
-                    self.write_shard(key, name, members, role=role,
-                                     rater=f'{RATER_MODELS[role]}-{role}', round=0)
+                    self.write_shard(key, name, members, role=role, rater=_double_rater(role),
+                                     round=0)
                     added.append(name)
         return added
 
@@ -410,11 +432,17 @@ class RatingScratch:
         }
 
     def ratings(self, key: Mapping[str, Any], entries: Mapping[Triple, ShardEntry]) -> Rated:
-        """Every rater's effective lines, each checked by :func:`rating_problems`."""
+        """Every rater's effective lines, each checked by :func:`rating_problems`.
+
+        A third rater a re-rate retires has no line on that re-rate's pairs.
+        """
+        retired = _retired_votes(key)
         lines: list[dict[str, Any]] = []
         for name, spec in sorted(key['shards'].items()):
-            lines += self._shard_ratings(name, spec, key['items'])
+            lines += [line for line in self._shard_ratings(name, spec, key['items'])
+                      if (line['rater'], line['entry_id'], line['target_id']) not in retired]
         rows = effective_ratings(lines)
+        rerated = {name for rerate in key.get('rerates', ()) for name in rerate['shards']}
         item_ids = {
             (name, *_keyed_order(key['items'][item_id])): item_id
             for name, spec in key['shards'].items() for item_id in spec['items']
@@ -425,7 +453,9 @@ class RatingScratch:
             if problems := rating_problems(row, entry.child_text, entry.parent_text):
                 item_id = item_ids[row['batch'], *_keyed_order(row)]
                 reask.append(Reask(row, item_id, tuple(problems)))
-        return Rated(rows=rows, reasked=len(lines) - len(rows), reask=reask)
+        superseded = len(lines) - len(rows)
+        return Rated(rows=rows, reasked=superseded - sum(line['batch'] in rerated for line in lines),
+                     reask=reask)
 
     def _shard_path(self, name: str) -> Path:
         return self.root / 'shards' / f'{name}.txt'
@@ -497,6 +527,71 @@ def third_round(
     if names:
         scratch.save_key(key)
     return {'pairs': len(members), 'shards': names}
+
+
+def brief_sha256() -> str:
+    """The sha256 of the brief every rater is given, as it now reads."""
+    return hashlib.sha256(BRIEF_PATH.read_bytes()).hexdigest()
+
+
+def keyed_rerate(key: Mapping[str, Any], version: str) -> Mapping[str, Any] | None:
+    """The re-rate *key* records under brief *version*; None if none.
+
+    Refused when the brief no longer reads as it did when that re-rate was keyed.
+    """
+    for rerate in key.get('rerates', ()):
+        if rerate['version'] == version:
+            if rerate['brief_sha256'] != brief_sha256():
+                raise ValueError(
+                    f'rerate {version} was keyed under brief sha256 {rerate["brief_sha256"]},'
+                    f' but {BRIEF_PATH} now has sha256 {brief_sha256()}')
+            return rerate
+    return None
+
+
+def rerate_round(
+    scratch: RatingScratch, key: dict[str, Any], entries: Mapping[Triple, ShardEntry],
+    pairs: Iterable[tuple[str, str]], *, version: str,
+) -> Mapping[str, Any]:
+    """Shard the current-basis texts of *pairs* for both double raters in one new round.
+
+    Each rater reads the pairs in an order seeded by *version*, and its new
+    lines supersede its earlier ones on them. The key's ``rerates`` list gains
+    the record: the brief's *version* label and sha256, the round, the pairs,
+    the shards, and every third rater keyed so far, whose lines on those pairs
+    are retired. Saves the key; returns the record.
+    """
+    if keyed_rerate(key, version) is not None:
+        raise ValueError(f'a rerate under brief {version} is already keyed')
+    selected = sorted(set(pairs))
+    if not selected:
+        raise ValueError(f'no pair to re-rate under brief {version}')
+    round_ = max(spec['round'] for spec in key['shards'].values()) + 1
+    members = [entries[(entry_id, target_id, Basis.CURRENT)] for entry_id, target_id in selected]
+    names = []
+    for role in DOUBLE_RATED:
+        for name, dealt in plan_shards(members, role=role, prefix=f'rerate_{round_:02d}_',
+                                       seed=version, first_index=0):
+            scratch.write_shard(key, name, dealt, role=role, rater=_double_rater(role), round=round_)
+            names.append(name)
+    rerate = {
+        'version': version, 'round': round_, 'brief_sha256': brief_sha256(),
+        'pairs': [list(pair) for pair in selected], 'shards': sorted(names),
+        'retires_third_raters': sorted({spec['rater'] for spec in key['shards'].values()
+                                        if spec['role'] == Role.THIRD}),
+    }
+    key.setdefault('rerates', []).append(rerate)
+    scratch.save_key(key)
+    return rerate
+
+
+def _retired_votes(key: Mapping[str, Any]) -> frozenset[tuple[str, str, str]]:
+    """Each (rater, entry, target) whose line a re-rate retired."""
+    return frozenset(
+        (rater, entry_id, target_id)
+        for rerate in key.get('rerates', ())
+        for rater in rerate['retires_third_raters'] for entry_id, target_id in rerate['pairs']
+    )
 
 
 def _dealt(members: Sequence[ShardEntry], name: str) -> list[tuple[str, list[ShardEntry]]]:
