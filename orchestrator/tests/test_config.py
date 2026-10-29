@@ -1057,6 +1057,12 @@ class TestPathResolution:
         config = OrchestratorConfig(project_root=tmp_path)
         assert config.overrides_db_path == tmp_path / 'data' / 'orchestrator' / 'scheduler_overrides.db'
 
+    def test_eligibility_clock_db_path_default(self, tmp_path: Path) -> None:
+        from shared.project_layout import scheduler_eligibility_db
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        assert config.eligibility_clock_db_path == scheduler_eligibility_db(tmp_path)
+
 
 @pytest.mark.usefixtures("code_default_config")
 class TestStewardTimeoutInvariant:
@@ -2349,6 +2355,45 @@ class TestStarvationWatchdogConfig:
             "'starvation_watchdog.idle_only_secs' must be in RELOADABLE_FIELDS "
             '(green-tier hot-reloadable, alongside the other starvation leaves)'
         )
+
+    @pytest.mark.usefixtures("code_default_config")
+    def test_consequence_knob_defaults(self):
+        """The task-3821 consequence knobs: park_blocked floor, pin cap, pin TTL."""
+        cfg = OrchestratorConfig().starvation_watchdog
+        assert cfg.park_blocked_age_secs == 14400.0
+        assert cfg.auto_pin_max_concurrent == 3
+        assert cfg.auto_pin_ttl_secs == 86400.0
+
+    @pytest.mark.parametrize(('field', 'bad'), [
+        ('park_blocked_age_secs', 0.0),
+        ('auto_pin_max_concurrent', -1),
+        ('auto_pin_ttl_secs', 0.0),
+    ])
+    def test_consequence_knobs_reject_out_of_range(self, field: str, bad: float):
+        from orchestrator.config import StarvationWatchdogConfig
+        with pytest.raises(ValidationError, match=field):
+            StarvationWatchdogConfig.model_validate({field: bad})
+
+    def test_auto_pin_cap_zero_is_allowed(self):
+        """A cap of 0 turns auto-pinning off while keeping events and the cap L1."""
+        from orchestrator.config import StarvationWatchdogConfig
+        assert StarvationWatchdogConfig(auto_pin_max_concurrent=0).auto_pin_max_concurrent == 0
+
+    @pytest.mark.parametrize('leaf', [
+        'park_blocked_age_secs', 'auto_pin_max_concurrent', 'auto_pin_ttl_secs',
+    ])
+    def test_consequence_knobs_are_green_tier(self, leaf: str):
+        assert f'starvation_watchdog.{leaf}' in RELOADABLE_FIELDS
+
+    def test_packaged_defaults_keep_thresholds_and_add_knobs(self):
+        """The retune is the predicate, not the numbers: both age floors stay 72h."""
+        block = _load_package_defaults()['starvation_watchdog']
+        assert block['idle_secs'] == 259200.0
+        assert block['idle_only_secs'] == 259200.0
+        assert block['skip_threshold'] == 50
+        assert block['park_blocked_age_secs'] == 14400.0
+        assert block['auto_pin_max_concurrent'] == 3
+        assert block['auto_pin_ttl_secs'] == 86400.0
 
 
 class TestParkBackfillConfig:

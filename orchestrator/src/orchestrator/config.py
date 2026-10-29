@@ -33,6 +33,7 @@ from shared.project_id import project_id_for_root
 from shared.project_layout import (
     ESCALATION_QUEUE_RELPATH,
     park_eviction_requests_db,
+    scheduler_eligibility_db,
     scheduler_overrides_db,
 )
 from shared.task_metadata import KNOWN_ROLE_NAMES
@@ -710,28 +711,35 @@ class ScoringConfig(BaseModel):
 class StarvationWatchdogConfig(BaseModel):
     """Scheduler starvation watchdog configuration.
 
-    When a ``pending`` task is dispatch-eligible (all local + external deps
-    satisfied, no live claimant) yet keeps being skipped as the TOP-scored
-    candidate past both ``skip_threshold`` and ``idle_secs``, the scheduler
-    files exactly ONE INFO-level escalation so an AFK operator is notified.
-    The escalation auto-resolves when the task finally dispatches.
+    The predicate (``orchestrator/src/orchestrator/starvation_watchdog.py``):
+    every gate needs BOTH a durable eligibility-age floor AND a stuck signal
+    observed while the task was a dispatch candidate, so age alone, which
+    every task in a deep backlog has, never fires (esc-4851-3).
 
-    The escalation fires when EITHER gate is crossed (OR, not AND):
-    - the dual gate — ``skip_threshold`` AND ``idle_secs`` both crossed; or
-    - the idle-only backstop — ``idle_only_secs`` crossed regardless of
-      skip_count (catches never-top-scored tasks that accrue zero skips and so
-      can never cross the dual gate — reify-5166 RCA, task 2755).
+    - ``dual`` — at least ``skip_threshold`` top-candidate skips AND an
+      eligibility age of at least ``idle_secs``.
+    - ``lock_refused`` — at least ``skip_threshold`` scans in which the task
+      was refused its locks while a LOWER-ranked candidate dispatched, AND an
+      eligibility age of at least ``idle_only_secs``.  A task the scan never
+      reaches accrues no refusals.  This gate replaces the age-only
+      ``idle_only`` backstop of task 2755.
+    - ``park_blocked`` — the task owns a live park, one of whose modules is
+      held by another task, for at least ``park_blocked_age_secs``.  It takes
+      precedence over the other two and never pins.
 
-    Dual-gate components:
-    - ``skip_threshold`` — minimum consecutive top-skips (reuses ``_skip_count``).
-    - ``idle_secs`` — minimum wall-clock seconds of continuous dispatch-eligibility
-      (anchored on the first tick the task appears as a candidate; resets if it
-      leaves the candidate pool for any tick).
+    The eligibility age is measured from a durable wall-clock anchor stamped
+    the first tick the task is a dispatch candidate
+    (``data/orchestrator/scheduler_eligibility.db``).  It survives restarts and
+    transient candidacy gaps, so a restart cannot stamp an alarm cohort.
 
-    Default 50 skips is well above the fairness per-tier park thresholds (0–9,
-    polish 9999) so the watchdog only fires on genuine multi-day starvation (e.g.
-    the live reify-3465 case: 475× skipped).  Default 259200 s (72h) provides the
-    independent wall-clock backstop required by PROPERTY 3.
+    Consequence: a ``dual`` or ``lock_refused`` firing on a task with no
+    overrides row auto-pins it (``source='starvation_watchdog'``, TTL
+    ``auto_pin_ttl_secs``), at most ``auto_pin_max_concurrent`` at a time, with
+    an INFO trail; firings beyond the cap file no per-task escalation, only one
+    shared level-1 escalation naming the capped cohort.  A ``park_blocked``
+    firing files a level-1 INFO escalation naming the blocking holder.  Every
+    firing emits a ``starvation_detected`` event.  Escalations auto-resolve
+    when the task dispatches.
 
     Owner decision (Leo 2026-07-15), backed by archive analysis of all 209
     STARVATION_WATCHDOG escalations filed since 06-17: 94% closed benign/no-action,
@@ -740,6 +748,7 @@ class StarvationWatchdogConfig(BaseModel):
     72h threshold, while sibling-project reify tasks legitimately wait ~48h on
     locks.  The watchdog remains the multi-day true-wedge tripwire; it is not being
     removed, only re-tuned so it no longer fires on ordinary lock contention.
+    Task 3821 retuned the predicate, not those numbers (esc-4851-3, option c).
 
     Set ``enabled: false`` in orchestrator.yaml to silence the watchdog entirely.
     """
@@ -752,41 +761,66 @@ class StarvationWatchdogConfig(BaseModel):
         default=50,
         ge=1,
         description=(
-            'Minimum consecutive top-candidate skips before filing an INFO escalation. '
-            'Must be >= 1.  Well above the fairness park thresholds (0–9 / polish 9999) '
-            'so it only fires on genuine multi-day starvation.  Secondary signal only: '
-            'crossing this threshold alone never files an escalation — idle_secs must '
-            'also be crossed.'
+            'Count threshold of the stuck signal, for BOTH gates that count: '
+            'top-candidate skips (dual gate) and rank-relative lock refusals '
+            '(lock_refused gate).  Must be >= 1.  Well above the fairness park '
+            'thresholds (0–9 / polish 9999).  Crossing it alone never fires: '
+            'the gate\'s eligibility-age floor must also be crossed.'
         ),
     )
     idle_secs: float = Field(
         default=259200.0,
         gt=0,
         description=(
-            'Minimum wall-clock seconds of continuous dispatch-eligibility before '
-            'filing.  Anchored on the first tick the task enters the candidate pool; '
-            'reset if the task leaves the pool for any tick.  Must be > 0.  Default '
-            '259200s (72h): archive analysis of 209 prior firings showed max starving '
-            'duration was 5.8h and sibling-project reify tasks legitimately wait ~48h '
-            'on locks, so 72h isolates genuine multi-day wedges without false-positive '
-            'noise.'
+            'Eligibility-age floor of the dual gate, in wall-clock seconds since '
+            'the task first became a dispatch candidate (a durable anchor that '
+            'survives restarts and transient candidacy gaps).  Must be > 0.  '
+            'Default 259200s (72h): archive analysis of 209 prior firings showed '
+            'max starving duration was 5.8h and sibling-project reify tasks '
+            'legitimately wait ~48h on locks, so 72h isolates genuine multi-day '
+            'wedges without false-positive noise.'
         ),
     )
     idle_only_secs: float = Field(
         default=259200.0,
         gt=0,
         description=(
-            'Never-top-scored starvation backstop.  A task continuously '
-            'dispatch-eligible for this many wall-clock seconds files the '
-            'escalation on idle ALONE — the skip-gate is waived (OR, not AND). '
-            'This catches the structural blind spot where a low-priority task can '
-            'never outscore a medium/high candidate, is never the top-scored '
-            'candidate, accrues ZERO skips, and so can never cross the '
-            'skip_threshold+idle_secs dual gate (reify-5166 RCA, task 2755).  Must '
-            'be > 0 and >= idle_secs (enforced by a model_validator).  Default '
-            '259200s (72h) == idle_secs default, so it never fires on ordinary '
-            'contention (all 209 prior firings starved < 6h); raise it above '
-            'idle_secs to restore a two-tier fast-skip / slow-idle scheme.'
+            'Eligibility-age floor of the lock_refused gate.  The name is kept '
+            'for config compatibility: the gate it once controlled fired on age '
+            'ALONE and so fired on every low/medium task in a deep backlog '
+            '(esc-4851-3).  It now also needs skip_threshold scans in which the '
+            'task was refused its locks while a lower-ranked candidate '
+            'dispatched.  Must be > 0 and >= idle_secs (enforced by a '
+            'model_validator).  Default 259200s (72h) == idle_secs default.'
+        ),
+    )
+    park_blocked_age_secs: float = Field(
+        default=14400.0,
+        gt=0,
+        description=(
+            'Minimum age, in seconds, of a live park one of whose modules is '
+            'held by another task before the park_blocked gate fires.  That gate '
+            'files a level-1 INFO escalation naming the blocking holder and '
+            'module, and never pins.  Must be > 0.  Default 14400s (4h).'
+        ),
+    )
+    auto_pin_max_concurrent: int = Field(
+        default=3,
+        ge=0,
+        description=(
+            'Maximum number of watchdog-owned pins at once.  Pin-gate firings '
+            'beyond it are not pinned and file no per-task escalation; one '
+            'shared level-1 escalation names the capped cohort instead.  0 turns '
+            'auto-pinning off.  Must be >= 0.'
+        ),
+    )
+    auto_pin_ttl_secs: float = Field(
+        default=86400.0,
+        gt=0,
+        description=(
+            'Lifetime, in seconds, of a watchdog-owned pin; the overrides TTL '
+            'sweep removes it after that even if the task never dispatches.  '
+            'Must be > 0.  Default 86400s (24h).'
         ),
     )
 
@@ -5990,6 +6024,15 @@ class OrchestratorConfig(BaseSettings):
         """
         return park_eviction_requests_db(self.project_root)
 
+    @property
+    def eligibility_clock_db_path(self) -> Path:
+        """Path to the starvation watchdog's durable eligibility-clock database.
+
+        One wall-clock anchor per dispatch candidate, kept across restarts so
+        a restart cannot re-stamp the whole backlog into one alarm cohort.
+        """
+        return scheduler_eligibility_db(self.project_root)
+
     model_config = SettingsConfigDict(
         env_prefix='ORCH_',
         env_nested_delimiter='__',
@@ -6585,6 +6628,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'starvation_watchdog.skip_threshold',
         'starvation_watchdog.idle_secs',
         'starvation_watchdog.idle_only_secs',
+        'starvation_watchdog.park_blocked_age_secs',
+        'starvation_watchdog.auto_pin_max_concurrent',
+        'starvation_watchdog.auto_pin_ttl_secs',
         'warm_base_hard_down.enabled',
         'warm_base_hard_down.l2_window_secs',
         # Loop-pass thresholds (+ the two crashloop-window params read live

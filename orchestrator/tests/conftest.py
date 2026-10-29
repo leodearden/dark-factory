@@ -1154,6 +1154,7 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
       - ``escalation`` = pre-created sub-section mock (no default value)
       - ``overrides_db_path`` = ``tmp_path / 'overrides.db'``
       - ``park_eviction_requests_db_path`` = ``tmp_path / 'park_eviction_requests.db'``
+      - ``eligibility_clock_db_path`` = ``tmp_path / 'scheduler_eligibility.db'``
 
     The top-level mock and each sub-section (usage_cap, review, sandbox,
     fused_memory, escalation) are spec_set'd against their pydantic model's
@@ -1262,6 +1263,9 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # Same failure mode as overrides_db_path above (tasks 1313/1339); this
     # instance of it is task 2045.
     config.park_eviction_requests_db_path = tmp_path / 'park_eviction_requests.db'
+    # Real Path for EligibilityClockStore.from_config(config), which Harness
+    # wires at construction (task 3821); same stray-file failure mode as above.
+    config.eligibility_clock_db_path = tmp_path / 'scheduler_eligibility.db'
     # Production default (task 4757). Unassigned, TaskWorkflow._invoke would
     # read a truthy Mock and run every mock-config workflow test strictly scoped.
     config.strict_mcp_config = False

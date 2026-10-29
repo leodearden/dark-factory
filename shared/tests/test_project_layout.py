@@ -28,6 +28,7 @@ from shared.project_layout import (
     orchestrator_data_dir,
     park_eviction_requests_db,
     runs_db,
+    scheduler_eligibility_db,
     scheduler_overrides_db,
     scheduler_state_json,
     tasks_db,
@@ -38,6 +39,7 @@ _ORCHESTRATOR_STORES = (
     (scheduler_state_json, 'scheduler_state.json'),
     (scheduler_overrides_db, 'scheduler_overrides.db'),
     (park_eviction_requests_db, 'park_eviction_requests.db'),
+    (scheduler_eligibility_db, 'scheduler_eligibility.db'),
 )
 
 
@@ -62,6 +64,9 @@ class TestStoreLocators:
     @pytest.mark.parametrize(('locator', 'name'), _ORCHESTRATOR_STORES)
     def test_orchestrator_store(self, root: str | Path, locator, name: str) -> None:
         assert locator(root) == Path(root) / 'data' / 'orchestrator' / name
+
+    def test_scheduler_eligibility_db_is_exported(self) -> None:
+        assert 'scheduler_eligibility_db' in shared.project_layout.__all__
 
     def test_tasks_db_is_the_real_store_not_the_decoy(self, root: str | Path) -> None:
         assert tasks_db(root) == Path(root) / '.taskmaster' / 'tasks' / 'tasks.db'
