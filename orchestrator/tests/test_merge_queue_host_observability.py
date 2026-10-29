@@ -27,6 +27,7 @@ Steps covered:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json as _json
 import logging
 import sqlite3
@@ -131,7 +132,7 @@ def _make_entry(
     lease: HostLease | None,
     started_at: float | None = None,
     *,
-    verify_task: asyncio.Future[Any] | None = None,
+    verify_task: asyncio.Task[Any] | None = None,
 ) -> InflightEntry:
     return InflightEntry(
         item=_make_item(req),
@@ -971,7 +972,7 @@ class TestRecoveryIgnoresOccupancy:
             worker.bench_unavailable_runner('laptop', RunnerUnavailable('ssh: connect timed out'))
         [l1] = [esc for esc in queue.get_pending() if esc.level == 1]
 
-        verify_task: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        verify_task = asyncio.create_task(asyncio.Event().wait())
         lease = HostLease(name='laptop', runner=MagicMock(), is_local=False)
         req = _make_req('occ-phantom', 'task/occ-phantom', config, git_repo)
         worker._inflight.append(_make_entry(req, lease, verify_task=verify_task))
@@ -993,3 +994,5 @@ class TestRecoveryIgnoresOccupancy:
             assert 'ssh_health_probe' in (resolved.resolution or '')
         finally:
             verify_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await verify_task

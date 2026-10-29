@@ -34,7 +34,12 @@ from escalation.models import Escalation
 
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps
-from orchestrator.merge_lane.types import MergeRequest, _HostUnavailability
+from orchestrator.merge_lane.types import (
+    MergeRequest,
+    QuarantineClass,
+    RecoveryEvidence,
+    _HostUnavailability,
+)
 from orchestrator.remote_gate import SHIM_REMEDY, shim_suspected
 
 if TYPE_CHECKING:
@@ -469,14 +474,6 @@ def _safety_valve_due(attempt_count: int, every_n: int) -> bool:
 _VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX = '__verify_host_unreachable__'
 
 
-# Distinct prefix for recovery info sentinels — kept separate from the
-# unreachable-alarm prefix so a host literally named ``'recovered__X'``
-# cannot alias the unreachable sentinel for host ``'X'``
-# (``'__verify_host_unreachable__recovered__X'`` vs
-#  ``'__verify_host_recovered__X'`` — no collision).
-_VERIFY_HOST_RECOVERED_SENTINEL_PREFIX = '__verify_host_recovered__'
-
-
 # Prefix for per-host gate-skew escalation sentinels (task 6565):
 # ``__verify_host_skew__<host>``; the deployed sha is in the detail.  Separate
 # from the unreachability namespace so an open "unreachable" L1 never hides a
@@ -549,8 +546,7 @@ def _alarm_verify_host_unreachable(
     if escalation_queue.has_open_l1(sentinel):
         return
 
-    minutes = duration_s / 60.0
-    duration_str = f'{minutes:.1f} min' if duration_s < 3600 else f'{duration_s / 3600:.1f} h'
+    duration_str = _duration_text(duration_s)
     summary = (
         f'Remote verify host {host!r} unreachable for {duration_str} '
         f'({streak} consecutive RunnerUnavailable failures): {reason}'
@@ -596,6 +592,47 @@ def _alarm_verify_host_unreachable(
             EventType.verify_host_unreachable,
             data={'host': host, 'reason': reason, 'streak': streak, 'duration_s': duration_s},
         )
+
+
+def _duration_text(seconds: float) -> str:
+    return f'{seconds / 60.0:.1f} min' if seconds < 3600 else f'{seconds / 3600:.1f} h'
+
+
+def _resolve_pending_alarm(escalation_queue: Any, sentinel: str, resolution: str) -> tuple[str, ...]:
+    """Resolve every pending record on *sentinel*, at any level, and return their ids.
+
+    This one read is both the set resolved and the "an alarm was open" guard,
+    so the two cannot disagree: a promoted L2 carries the sentinel too, and
+    is closed and reported with its L1 (task 5290).
+    """
+    pending = escalation_queue.get_by_task(sentinel, status='pending')
+    for esc in pending:
+        escalation_queue.resolve(esc.id, resolution, resolved_by='orchestrator-verify-host-monitor')
+    return tuple(esc.id for esc in pending)
+
+
+def _close_bench_alarm(
+    escalation_queue: Any,
+    event_store: Any,
+    host: str,
+    *,
+    sentinel: str,
+    bench_class: QuarantineClass,
+    resolution: str,
+    downtime_s: float,
+    evidence: RecoveryEvidence,
+) -> None:
+    """Resolve *host*'s pending alarm on *sentinel* and report each record closed by event."""
+    resolved = _resolve_pending_alarm(escalation_queue, sentinel, resolution)
+    if not resolved or event_store is None:
+        return
+    event_store.emit(EventType.verify_host_recovered, data={
+        'host': host,
+        'downtime_s': downtime_s,
+        'quarantine_class': bench_class,
+        'evidence': evidence.value,
+        'resolved_escalation_ids': list(resolved),
+    })
 
 
 def _first_line(text: str, limit: int = 300) -> str:
@@ -690,17 +727,10 @@ def _alarm_verify_host_skew(
 
 
 def _resolve_verify_host_skew(escalation_queue: Any, host: str, resolution: str) -> bool:
-    """Resolve *host*'s pending skew L1s with *resolution*; return whether one was open."""
+    """Resolve *host*'s pending skew records with *resolution*; return whether one was open."""
     if escalation_queue is None:
         return False
-    sentinel = _verify_host_skew_sentinel(host)
-    if not escalation_queue.has_open_l1(sentinel):
-        return False
-    for esc in escalation_queue.get_by_task(sentinel, status='pending'):
-        escalation_queue.resolve(
-            esc.id, resolution, resolved_by='orchestrator-verify-host-monitor',
-        )
-    return True
+    return bool(_resolve_pending_alarm(escalation_queue, _verify_host_skew_sentinel(host), resolution))
 
 
 def _clear_verify_host_skew(
@@ -709,22 +739,25 @@ def _clear_verify_host_skew(
     host: str,
     *,
     downtime_s: float,
+    evidence: RecoveryEvidence,
 ) -> None:
-    """Resolve an open skew alarm for *host* on readmit.
+    """Resolve *host*'s skew alarm on readmit, on *evidence*: the skew twin of the unreachable clear.
 
-    Emits ``verify_host_recovered`` only when an alarm was open, mirroring
-    :func:`_clear_verify_host_unreachable`.  None-safe on *escalation_queue*.
+    None-safe on *escalation_queue*.
     """
-    resolution = (
-        f'Host {host!r} re-admitted after {downtime_s / 60.0:.1f} min benched for gate skew.'
-    )
-    if not _resolve_verify_host_skew(escalation_queue, host, resolution):
+    if escalation_queue is None:
         return
-    if event_store is not None:
-        event_store.emit(
-            EventType.verify_host_recovered,
-            data={'host': host, 'downtime_s': downtime_s, 'quarantine_class': 'skew'},
-        )
+    _close_bench_alarm(
+        escalation_queue, event_store, host,
+        sentinel=_verify_host_skew_sentinel(host),
+        bench_class='skew',
+        resolution=(
+            f'Host {host!r} re-admitted after {_duration_text(downtime_s)} benched for '
+            f'gate skew, on {evidence.describe()}.'
+        ),
+        downtime_s=downtime_s,
+        evidence=evidence,
+    )
 
 
 def _clear_verify_host_skew_of_an_earlier_process(
@@ -751,98 +784,30 @@ def _clear_verify_host_unreachable(
     host: str,
     *,
     downtime_s: float,
+    evidence: RecoveryEvidence,
 ) -> None:
-    """Resolve any open unreachability alarm and emit a recovery event.
+    """Resolve *host*'s unreachability alarm on readmit, on *evidence*.
 
-    Called from :meth:`_reprobe_quarantined_hosts` when a previously unreachable
-    remote verify host responds to an SSH health check again.  Performs three
-    actions:
-
-    1. **Resolve open L1**: looks up all pending escalations for the per-host
-       sentinel (via ``get_by_task(sentinel, status='pending')``) and resolves
-       each one with a recovery message.
-    2. **Emit recovery event** *(conditional)*: emits
-       ``EventType.verify_host_recovered`` when an event store is provided,
-       **only if an alarm was actually open for this host**.
-    3. **Submit info escalation** *(conditional)*: submits a ``severity='info'``,
-       ``level=0`` informational escalation naming the host and the downtime
-       duration, **only if an alarm was actually open for this host**.
-
-    Steps 2 and 3 are gated on whether the escalation queue reports an open L1
-    for the per-host sentinel (checked via ``has_open_l1`` before resolving).
-    This suppresses spurious recovery noise for sub-threshold blips — a host
-    that flapped briefly without ever crossing *escalate_after_n* or
-    *escalate_after_secs* never filed an alarm, so no recovery record is needed.
-
-    None-safe: returns immediately when *escalation_queue* is None.
-
-    Args:
-        escalation_queue: Live escalation queue or ``None``.
-        event_store: Optional event store; when provided a
-            ``EventType.verify_host_recovered`` event is emitted.
-        host: Remote runner name (e.g. ``'leo-laptop'``).
-        downtime_s: Seconds the host was unreachable (``now - first_unavailable_at``).
+    Every pending record on the host's sentinel, at any level, is resolved
+    with a resolution naming *evidence* and the downtime; the same read is
+    the "an alarm was open" guard, so a sub-threshold blip that never filed
+    one stays silent.  Recovery is reported by one ``verify_host_recovered``
+    event and files no escalation (task 5290).  None-safe on
+    *escalation_queue*; *event_store* None skips the event only.
     """
     if escalation_queue is None:
         return
-
-    sentinel = _verify_host_unreachable_sentinel(host)
-
-    # Check whether an alarm was actually open before resolving — we read this
-    # BEFORE calling resolve(), which clears the open-L1 flag in many impls.
-    alarm_was_open = escalation_queue.has_open_l1(sentinel)
-
-    # Resolve any pending L1 escalations for this host.
-    pending = escalation_queue.get_by_task(sentinel, status='pending')
-    for esc in pending:
-        resolution = (
-            f'Host {host!r} recovered automatically via SSH reprobe after '
-            f'{downtime_s / 60.0:.1f} min of unavailability.'
-        )
-        escalation_queue.resolve(esc.id, resolution, resolved_by='orchestrator-verify-host-monitor')
-
-    # Only emit recovery signal when an alarm was actually open for this host.
-    # Sub-threshold blips (host flapped briefly without crossing either
-    # escalate_after_n or escalate_after_secs) never filed an alarm, so no
-    # recovery record is needed — emitting one would be spurious audit noise.
-    if not alarm_was_open:
-        return
-
-    # Emit recovery event.
-    if event_store is not None:
-        event_store.emit(
-            EventType.verify_host_recovered,
-            data={'host': host, 'downtime_s': downtime_s},
-        )
-
-    # Submit an info-level recovery escalation for audit trail visibility.
-
-    minutes = downtime_s / 60.0
-    duration_str = f'{minutes:.1f} min' if downtime_s < 3600 else f'{downtime_s / 3600:.1f} h'
-    summary = (
-        f'Remote verify host {host!r} recovered after {duration_str} of unavailability'
+    _close_bench_alarm(
+        escalation_queue, event_store, host,
+        sentinel=_verify_host_unreachable_sentinel(host),
+        bench_class='ru',
+        resolution=(
+            f'Host {host!r} re-admitted after {_duration_text(downtime_s)} unreachable, '
+            f'on {evidence.describe()}.'
+        ),
+        downtime_s=downtime_s,
+        evidence=evidence,
     )
-    detail = (
-        f'Host: {host}\n'
-        f'Downtime: {duration_str}\n'
-        '\n'
-        f'The remote verify runner {host!r} responded to the SSH health check.  '
-        'Quarantine cleared, host re-entered the live pool, and any open '
-        'unreachability alarm resolved.  No restart required.'
-    )
-
-    recovery_sentinel = f'{_VERIFY_HOST_RECOVERED_SENTINEL_PREFIX}{host}'
-    esc = Escalation(
-        id=escalation_queue.make_id(recovery_sentinel),
-        task_id=recovery_sentinel,
-        agent_role='orchestrator-verify-host-monitor',
-        severity='info',
-        level=0,
-        category='verify_host_unreachable',
-        summary=summary,
-        detail=detail,
-    )
-    escalation_queue.submit(esc)
 
 
 async def _acquire_warm_verify_worktree(

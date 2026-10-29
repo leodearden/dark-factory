@@ -185,6 +185,7 @@ from orchestrator.merge_lane.types import (
     PendingGate,
     QueuedBranch,
     RealMergeItem,
+    RecoveryEvidence,
     RelaneOutcome,
     SoloVerifyResult,
     SpeculativeItem,
@@ -11368,7 +11369,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
            ``allocator.readmit`` — which un-quarantines *and* un-PARKs; plain
            ``clear_quarantine`` cannot recover a PARKED slot, since
            ``acquire_remote`` additionally requires ``_SLOT_FREE`` — then
-           :meth:`readmit_host` resets the tracker and resolves the open L1s.
+           :meth:`readmit_host` resets the tracker and resolves the alarms on
+           the evidence the probe named.
         3. **On failure** (host still unreachable): if
            ``self._unreachable_escalate_after_secs > 0`` **and**
            ``now - entry.first_unavailable_at >= self._unreachable_escalate_after_secs``
@@ -11473,8 +11475,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # Probe first so a host that recovers in the same cycle it would
                 # have tripped the time-based threshold goes directly to the
                 # recovery path, avoiding a spurious open→immediate-resolve L1.
-                if await self.probe_host(name, runner):
-                    await self._readmit_probed_host(name, runner, now)
+                evidence = await self.probe_host(name, runner)
+                if evidence is not None:
+                    await self._readmit_benched_host(name, runner, now, evidence=evidence)
                 else:
                     self._note_host_still_out(name, entry, now)
             except Exception:
@@ -11483,30 +11486,37 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     name,
                 )
 
-    async def probe_host(self, name: str, runner: Any) -> bool:
-        """Whether tracked host *name* has recovered, probed as its bench class needs (design D6).
+    async def probe_host(self, name: str, runner: Any) -> RecoveryEvidence | None:
+        """The evidence that tracked host *name* has recovered, or None (design D6, task 5290).
 
-        An 'ru' bench answers ``runner.health()`` (``ssh true``).  A 'skew'
-        bench answers ``runner.ensure_gate()`` — publish, build or reuse the
-        gate, handshake — so a host only comes back once it can run this
-        dispatcher's gate.  A sticky bench is never probed: it waits for an
-        operator clear or a restart.
+        An 'ru' bench answers ``runner.health()`` (``ssh true``), giving
+        ``SSH_HEALTH_PROBE``.  A 'skew' bench answers ``runner.ensure_gate()``
+        — publish, build or reuse the gate, handshake — giving ``ENSURE_GATE``,
+        so a host only comes back once it can run this dispatcher's gate.  A
+        sticky bench is never probed: it waits for an operator clear or a
+        restart.
         """
         entry = self._runner_unavailable[name]
         if entry.sticky:
-            return False
+            return None
         if quarantine_class(entry.kind) == 'ru':
-            return await runner.health()
+            return await self._ssh_health_evidence(runner)
         try:
             await runner.ensure_gate(event_store=self._event_store)
         except RunnerUnavailable as exc:
             logger.info('reprobe: ensure-gate for skew-benched host %r failed (%s): %s',
                         name, exc.kind, exc)
-            return False
-        return True
+            return None
+        return RecoveryEvidence.ENSURE_GATE
 
-    async def _readmit_probed_host(self, name: str, runner: Any, now: float) -> bool:
-        """Re-admit *name*, whose probe passed, unless its PARKED slot is not yet clean.
+    @staticmethod
+    async def _ssh_health_evidence(runner: Any) -> RecoveryEvidence | None:
+        return RecoveryEvidence.SSH_HEALTH_PROBE if await runner.health() else None
+
+    async def _readmit_benched_host(
+        self, name: str, runner: Any, now: float, *, evidence: RecoveryEvidence,
+    ) -> bool:
+        """Re-admit *name* on *evidence* unless its PARKED slot is not yet clean.
 
         PARK means "the cancel RPC failed, so a stale verify may still be
         running there", so a PARKED slot is freed only on a clean
@@ -11521,7 +11531,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         downtime_s = now - entry.first_unavailable_at if entry is not None else 0.0
         if _was_parked and not await self._parked_slot_is_clean(name, runner, downtime_s):
             return False
-        if not self.readmit_host(name, now=now, expect_epoch=_probed_epoch):
+        if not self.readmit_host(name, now=now, evidence=evidence, expect_epoch=_probed_epoch):
             return False
         logger.info(
             'reprobe: host %r recovered after %.0fs down — re-admitted to '
@@ -11596,12 +11606,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if 0 < self._unreachable_escalate_after_secs <= downtime_s:
             self._alarm_host(name, entry, downtime_s)
 
-    def readmit_host(self, name: str, *, now: float, expect_epoch: int | None = None) -> bool:
+    def readmit_host(
+        self, name: str, *, now: float, evidence: RecoveryEvidence,
+        expect_epoch: int | None = None,
+    ) -> bool:
         """Return remote *name* to the verify pool and close its bench: THE readmit.
 
         Un-quarantines and un-PARKs it (``allocator.readmit``, refused when the
         park episode moved past *expect_epoch*), drops its tracker entry, and
-        resolves its open unreachability and skew L1s.  The reprobe sweep calls
+        resolves its pending unreachability and skew alarms on the named
+        *evidence* (task 5290).  The reprobe sweep calls
         it after a passing :meth:`probe_host`, and keeps the per-(host, sha)
         skew count that makes the next skew bench sticky;
         :meth:`clear_host_quarantine` (the operator clear) calls it without a
@@ -11619,10 +11633,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         downtime_s = now - entry.first_unavailable_at if entry is not None else 0.0
         self._record_runner_recovered(name)
         _clear_verify_host_unreachable(
-            self._escalation_queue, self._event_store, name, downtime_s=downtime_s,
+            self._escalation_queue, self._event_store, name,
+            downtime_s=downtime_s, evidence=evidence,
         )
         _clear_verify_host_skew(
-            self._escalation_queue, self._event_store, name, downtime_s=downtime_s,
+            self._escalation_queue, self._event_store, name,
+            downtime_s=downtime_s, evidence=evidence,
         )
         return True
 
@@ -11657,7 +11673,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return {**result, 'reason': f'{name!r} is not a remote verify host of this worker'}
         if entry is None and not quarantined:
             return {**result, 'reason': f'{name!r} is not benched'}
-        if not await self._readmit_probed_host(name, runner, self._clock.now()):
+        if not await self._readmit_benched_host(
+            name, runner, self._clock.now(), evidence=RecoveryEvidence.OPERATOR_CLEAR,
+        ):
             return {
                 **result,
                 'reason': 'its slot is PARKED and a stale verify may still be running there',
