@@ -7,7 +7,9 @@ restart by swapping in a smaller ``WarmLanePool`` over the same on-disk
 worktrees and durable records, and drive the REAL production seams:
 ``GitOps.lane_branch_checkouts``, ``Harness._recover_crashed_tasks``,
 ``Harness._reconcile_lane_checkouts``, ``GitOps.acquire_warm_lane`` and
-``GitOps.cleanup_worktree``.
+``GitOps.cleanup_worktree``.  The acquire cases construct a NEW, smaller
+``GitOps`` to stand in for the post-shrink process, and pin how an acquire
+settles a task branch that is already checked out in some worktree.
 
 Module-local fixtures only (copied from test_lane_lifecycle_integration.py):
 a conftest edit trips verify.py's has_conftest full-suite fallback.
@@ -25,8 +27,9 @@ import pytest
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import WorktreeInfo, _run
+from orchestrator.git_ops import GitOps, WorktreeInfo, _run
 from orchestrator.harness import Harness
+from orchestrator.lane_branch_holder import BranchCheckedOutElsewhere, BranchHolderAction
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool, WarmLanePoolShrink
 
@@ -71,18 +74,20 @@ async def _add_warm_lane_scripts(repo: Path, port: int = 39411) -> None:
     await _run(['git', 'commit', '-m', 'add warm-lane scripts'], cwd=repo)
 
 
+def _git_config() -> GitConfig:
+    return GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+        warm_lane_pool=True,
+    )
+
+
 def _make_orch_config(repo: Path, *, max_concurrent_tasks: int) -> OrchestratorConfig:
     return OrchestratorConfig(
-        project_root=repo,
-        max_concurrent_tasks=max_concurrent_tasks,
-        git=GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-            push_after_advance=False,
-            warm_lane_pool=True,
-        ),
+        project_root=repo, max_concurrent_tasks=max_concurrent_tasks, git=_git_config(),
     )
 
 
@@ -157,22 +162,16 @@ class _ShrunkHost:
         return pool
 
 
-async def _shrunk_host(repo: Path, *, statuses: dict[str, str] | None = None) -> _ShrunkHost:
-    """Three live lanes acquired at N=3, then a restart at N=1.
+async def _acquire_three_live_lanes(git_ops: GitOps) -> str:
+    """Acquire '41' -> _lane-0, '42' -> _lane-1, '43' -> _lane-2 and return the start ref.
 
-    '41' -> _lane-0, '42' -> _lane-1, '43' -> _lane-2; '43' carries a plan
-    with completed steps and a WIP commit (``wip43.txt``) on task/43.
+    '43' carries a plan with completed steps and a WIP commit (``wip43.txt``)
+    on task/43.
     """
-    await _add_warm_lane_scripts(repo)
-    harness = _build_harness(_make_orch_config(repo, max_concurrent_tasks=3))
-    _wire_recovery_scheduler(harness, statuses or {})
-    head = await _git(repo, 'rev-parse', 'HEAD')
-    base = harness.git_ops.worktree_base
-
+    head = await _git(git_ops.project_root, 'rev-parse', 'HEAD')
+    base = git_ops.worktree_base
     for task_id in ('41', '42', '43'):
-        wt = await harness.git_ops.acquire_warm_lane(
-            task_id, head, expected_title=_title(task_id),
-        )
+        wt = await git_ops.acquire_warm_lane(task_id, head, expected_title=_title(task_id))
         assert isinstance(wt, WorktreeInfo), f'acquire for {task_id} failed: {wt!r}'
 
     lane2 = base / '_lane-2'
@@ -182,7 +181,16 @@ async def _shrunk_host(repo: Path, *, statuses: dict[str, str] | None = None) ->
     (lane2 / 'wip43.txt').write_text('task 43 work in progress\n')
     await _git(lane2, 'add', 'wip43.txt')
     await _git(lane2, 'commit', '-m', 'wip: task 43')
+    return head
 
+
+async def _shrunk_host(repo: Path, *, statuses: dict[str, str] | None = None) -> _ShrunkHost:
+    """Three live lanes acquired at N=3, then a restart at N=1."""
+    await _add_warm_lane_scripts(repo)
+    harness = _build_harness(_make_orch_config(repo, max_concurrent_tasks=3))
+    _wire_recovery_scheduler(harness, statuses or {})
+    head = await _acquire_three_live_lanes(harness.git_ops)
+    base = harness.git_ops.worktree_base
     harness.git_ops.warm_lane_pool = WarmLanePool(worktree_base=base, size=1)
     return _ShrunkHost(harness=harness, head=head, base=base)
 
@@ -336,3 +344,164 @@ async def test_reconcile_repins_live_over_cap_checkout_without_record(ig_git_rep
     assert pool is not None
     assert pool.capacity == 1
     assert pool.assignment_for('77') == lane4
+
+
+# ── Acquire settles a task branch already checked out somewhere ─────────
+
+
+def _collision_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == 'orchestrator.git_ops' and 'already used by worktree' in r.getMessage()
+    ]
+
+
+async def _checked_out_branch(worktree: Path) -> str | None:
+    rc, out, _ = await _run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=worktree)
+    return out.strip() if rc == 0 else None
+
+
+async def _raw_task_checkout(repo: Path, worktree: Path, bare_id: str) -> None:
+    """``git worktree add <worktree> -b task/<bare_id> main`` plus one WIP commit."""
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    await _git(repo, 'worktree', 'add', str(worktree), '-b', f'task/{bare_id}', 'main')
+    (worktree / f'wip{bare_id}.txt').write_text(f'task {bare_id} work\n')
+    await _git(worktree, 'add', f'wip{bare_id}.txt')
+    await _git(worktree, 'commit', '-m', f'wip: task {bare_id}')
+
+
+async def _make_index_conflicted(repo: Path, lane: Path) -> None:
+    """Leave *lane* mid-merge with README.md unmerged (``UU``)."""
+    (lane / 'README.md').write_text('lane side\n')
+    await _git(lane, 'commit', '-am', 'lane side of README')
+    await _git(repo, 'checkout', '-b', 'other', 'main')
+    (repo / 'README.md').write_text('other side\n')
+    await _git(repo, 'commit', '-am', 'other side of README')
+    await _git(repo, 'checkout', 'main')
+    rc, _, _ = await _run(['git', 'merge', 'other'], cwd=lane)
+    assert rc != 0, 'the merge was expected to conflict'
+    assert 'UU README.md' in await _git(lane, 'status', '--porcelain')
+
+
+@pytest.mark.asyncio
+async def test_acquire_reuses_own_over_cap_lane_after_shrink(
+    ig_git_repo: Path, caplog: pytest.LogCaptureFixture,
+):
+    await _add_warm_lane_scripts(ig_git_repo)
+    head = await _acquire_three_live_lanes(
+        GitOps(_git_config(), ig_git_repo, warm_lane_pool_size=3),
+    )
+    shrunk = GitOps(_git_config(), ig_git_repo, warm_lane_pool_size=1)
+    lane2 = shrunk.worktree_base / '_lane-2'
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+        wt = await shrunk.acquire_warm_lane('43', head)
+
+    assert isinstance(wt, WorktreeInfo), wt
+    assert wt.path == lane2
+    assert shrunk.warm_lane_pool is not None
+    assert shrunk.warm_lane_pool.assignment_for('43') == lane2
+    assert await _wip_survives_on_task_43(ig_git_repo)
+    assert not _collision_warnings(caplog)
+
+
+@pytest.mark.asyncio
+async def test_acquire_reuses_own_in_range_lane_left_free_in_memory(ig_git_repo: Path):
+    await _add_warm_lane_scripts(ig_git_repo)
+    head = await _acquire_three_live_lanes(
+        GitOps(_git_config(), ig_git_repo, warm_lane_pool_size=3),
+    )
+    restarted = GitOps(_git_config(), ig_git_repo, warm_lane_pool_size=3)
+
+    wt = await restarted.acquire_warm_lane('42', head)
+
+    assert isinstance(wt, WorktreeInfo), wt
+    assert wt.path == restarted.worktree_base / '_lane-1'
+
+
+@pytest.mark.asyncio
+async def test_acquire_detaches_ownerless_over_cap_lane_and_lands_in_range(
+    ig_git_repo: Path,
+):
+    await _add_warm_lane_scripts(ig_git_repo)
+    git_ops = GitOps(_git_config(), ig_git_repo, warm_lane_pool_size=1)
+    pool = git_ops.warm_lane_pool
+    assert pool is not None
+    lane3 = git_ops.worktree_base / '_lane-3'
+    await _raw_task_checkout(ig_git_repo, lane3, '77')
+    head = await _git(ig_git_repo, 'rev-parse', 'main')
+
+    wt = await git_ops.acquire_warm_lane('77', head)
+
+    assert isinstance(wt, WorktreeInfo), wt
+    assert wt.path == git_ops.worktree_base / '_lane-0'
+    assert await _checked_out_branch(wt.path) == 'refs/heads/task/77'
+    rc, out, _ = await _run(['git', 'show', 'task/77:wip77.txt'], cwd=ig_git_repo)
+    assert rc == 0 and 'task 77 work' in out
+    assert lane3.is_dir()
+    assert await _head_is_detached(lane3)
+    assert pool.state(lane3) is None
+
+
+@pytest.mark.asyncio
+async def test_acquire_refuses_branch_checked_out_in_foreign_worktree(
+    ig_git_repo: Path, tmp_path: Path,
+):
+    await _add_warm_lane_scripts(ig_git_repo)
+    git_ops = GitOps(_git_config(), ig_git_repo, warm_lane_pool_size=2)
+    pool = git_ops.warm_lane_pool
+    assert pool is not None
+    side = tmp_path / 'side'
+    await _git(ig_git_repo, 'worktree', 'add', str(side), '-b', 'task/88', 'main')
+    head = await _git(ig_git_repo, 'rev-parse', 'main')
+
+    with pytest.raises(BranchCheckedOutElsewhere) as refused:
+        await git_ops.acquire_warm_lane('88', head)
+
+    assert refused.value.holder.resolve() == side.resolve()
+    assert refused.value.action is BranchHolderAction.REFUSE_FOREIGN_WORKTREE
+    assert pool.assignment_for('88') is None
+    assert all(pool.state(lane) is LaneState.FREE for lane in pool.lane_paths())
+
+    with pytest.raises(BranchCheckedOutElsewhere):
+        await git_ops.create_worktree('88')
+
+
+@pytest.mark.asyncio
+async def test_acquire_refuses_branch_checked_out_in_lane_the_pool_holds(ig_git_repo: Path):
+    await _add_warm_lane_scripts(ig_git_repo)
+    git_ops = GitOps(_git_config(), ig_git_repo, warm_lane_pool_size=3)
+    pool = git_ops.warm_lane_pool
+    assert pool is not None
+    lane1 = git_ops.worktree_base / '_lane-1'
+    await _git(ig_git_repo, 'worktree', 'add', str(lane1), '-b', 'task/99', 'main')
+    pool.restore_assignment('55', lane1)
+    head = await _git(ig_git_repo, 'rev-parse', 'main')
+
+    with pytest.raises(BranchCheckedOutElsewhere) as refused:
+        await git_ops.acquire_warm_lane('99', head)
+
+    assert refused.value.action is BranchHolderAction.REFUSE_HELD_LANE
+    assert pool.assignment_for('55') == lane1
+
+
+@pytest.mark.asyncio
+async def test_acquire_keeps_ownerless_lane_pinned_when_its_detach_is_refused(
+    ig_git_repo: Path,
+):
+    await _add_warm_lane_scripts(ig_git_repo)
+    git_ops = GitOps(_git_config(), ig_git_repo, warm_lane_pool_size=3)
+    pool = git_ops.warm_lane_pool
+    assert pool is not None
+    lane2 = git_ops.worktree_base / '_lane-2'
+    lane2.parent.mkdir(parents=True, exist_ok=True)
+    await _git(ig_git_repo, 'worktree', 'add', str(lane2), '-b', 'task/66', 'main')
+    await _make_index_conflicted(ig_git_repo, lane2)
+    head = await _git(ig_git_repo, 'rev-parse', 'main')
+
+    with pytest.raises(BranchCheckedOutElsewhere) as refused:
+        await git_ops.acquire_warm_lane('66', head)
+
+    assert refused.value.action is BranchHolderAction.DETACH_OWNERLESS_LANE
+    assert pool.assignment_for('66') == lane2
+    assert 'UU README.md' in await _git(lane2, 'status', '--porcelain')
