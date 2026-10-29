@@ -31,10 +31,25 @@ the store lines are followed by the final line
 little signal never promotes, and is labelled as what it is rather than as a
 failed leg.
 
+ITEM-ATTRIBUTED FAILURE. A failed deep verify (tip at T) whose own item was
+broken says nothing about chain safety. It is item-attributed when a
+merge_verify in the SAME store with the same events.task_id, ``chain_items``
+1 and ``passed`` not true is stamped in (T, min(T + 6h, now)]. No event
+records a chain's members, so the only known member is the dispatching item:
+VerifyRunnerPool.dispatch stamps events.task_id with the task that dispatched
+the chain (item #1). Task 7259's planned chain_truncated_reason /
+chain_truncated_at name the first item NOT in the chain, so they would not
+add membership either. Dispatcher-only attribution can only under-attribute,
+which keeps a failure in the gated rate.
+
 LEGS. Provisional thresholds, all overridable; task theta (the week-after
 aggressiveness assessment) retunes them against real canary telemetry.
-  deep_fail_rate   <= 0.35  failed deep verifies / deep verifies. The replay
-                            study saw 2/59 ~= 0.034, so this is a loose gate.
+  deep_fail_rate   <= 0.35  (failed deep verifies - item-attributed ones) /
+                            (deep verifies - item-attributed ones): an
+                            attributed tip leaves the numerator AND the
+                            population. The raw failed / deep rate is printed
+                            as deep_fail_rate_raw. The replay study saw
+                            2/59 ~= 0.034, so this is a loose gate.
   items_per_verify >= 1.3   the merge_finalized ``landed_via_chain`` sum (items
                             a chain landed) / passed deep ROUNDS: a chain must
                             land materially more than one item per round. A
@@ -77,6 +92,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+ITEM_ATTRIBUTION_HORIZON = timedelta(hours=6)
+
 
 class PredicateFault(Exception):
     """A usage or infra fault: reported on stderr, exit 2, never a verdict."""
@@ -85,6 +102,7 @@ class PredicateFault(Exception):
 @dataclass(frozen=True)
 class Window:
     days: float
+    as_of: datetime
     lo: str
     hi: str
 
@@ -102,7 +120,7 @@ class Settings:
 @dataclass(frozen=True)
 class VerifyRow:
     store: str
-    timestamp: str
+    stamped_at: datetime | None
     task_id: str | None
     runner: str | None
     merge_sha: str | None
@@ -121,6 +139,7 @@ class StoreSample:
     path: str
     verifies: tuple[VerifyRow, ...]
     landed_via_chain: int
+    item_attributed_failures: int
 
     @property
     def deep(self) -> tuple[VerifyRow, ...]:
@@ -140,9 +159,14 @@ class Pool:
 
     n_deep: int
     failures: int
+    item_attributed_failures: int
     landed_via_chain: int
     passed_deep_rounds: int
     durations: tuple[float, ...]
+
+
+def _rendered(value: float | None) -> str:
+    return 'n/a' if value is None else str(round(value, 4))
 
 
 @dataclass(frozen=True)
@@ -159,9 +183,8 @@ class Leg:
         return self.value <= self.bound if self.at_most else self.value >= self.bound
 
     def render(self) -> str:
-        shown = 'n/a' if self.value is None else round(self.value, 4)
         relation = '<=' if self.at_most else '>='
-        return f"{self.name}={shown}({'ok' if self.passed else 'FAIL'} {relation} {self.bound})"
+        return f"{self.name}={_rendered(self.value)}({'ok' if self.passed else 'FAIL'} {relation} {self.bound})"
 
 
 def _finite(flag: str, raw: str) -> float:
@@ -195,7 +218,7 @@ def _window(raw_days: str, raw_now: str | None) -> Window:
         hi = as_of.isoformat(timespec='microseconds')
     except (OverflowError, OSError, ValueError) as exc:
         raise PredicateFault(f'--now/--window-days put the window out of range: {exc}') from exc
-    return Window(days=days, lo=lo, hi=hi)
+    return Window(days=days, as_of=as_of, lo=lo, hi=hi)
 
 
 def _stores(paths: Sequence[str]) -> tuple[str, ...]:
@@ -269,11 +292,20 @@ def _payload_secs(data: dict[str, object]) -> float | None:
     return ms / 1000.0
 
 
-def _verify_row(store: str, timestamp: str, task_id: object, raw: object) -> VerifyRow:
+def _instant(timestamp: object) -> datetime | None:
+    """An events.timestamp as an aware datetime; None when it is not one."""
+    try:
+        parsed = datetime.fromisoformat(timestamp) if isinstance(timestamp, str) else None
+    except ValueError:
+        return None
+    return parsed if parsed is not None and parsed.tzinfo is not None else None
+
+
+def _verify_row(store: str, timestamp: object, task_id: object, raw: object) -> VerifyRow:
     data = _payload(raw)
     return VerifyRow(
         store=store,
-        timestamp=timestamp,
+        stamped_at=_instant(timestamp),
         task_id=None if task_id is None else str(task_id),
         runner=_str_field(data, 'runner'),
         merge_sha=_str_field(data, 'merge_sha'),
@@ -289,6 +321,23 @@ def _landed_via_chain(raw: object) -> int:
     return landed if landed is not None and landed >= 1 else 0
 
 
+def _is_item_attributed(tip: VerifyRow, solo_failures: Sequence[VerifyRow], as_of: datetime) -> bool:
+    if tip.task_id is None or tip.stamped_at is None:
+        return False
+    horizon_end = min(tip.stamped_at + ITEM_ATTRIBUTION_HORIZON, as_of)
+    return any(
+        solo.task_id == tip.task_id and solo.stamped_at is not None
+        and tip.stamped_at < solo.stamped_at <= horizon_end
+        for solo in solo_failures
+    )
+
+
+def _item_attributed_failures(verifies: Sequence[VerifyRow], as_of: datetime) -> int:
+    solo_failures = [row for row in verifies if row.chain_items == 1 and not row.passed]
+    failed_tips = [row for row in verifies if row.is_deep and not row.passed]
+    return sum(1 for tip in failed_tips if _is_item_attributed(tip, solo_failures, as_of))
+
+
 def _window_rows(conn: sqlite3.Connection, event_type: str, window: Window) -> list[tuple[object, ...]]:
     return conn.execute(
         'SELECT timestamp, task_id, data FROM events '
@@ -302,16 +351,18 @@ def _load_store(path: str, window: Window) -> StoreSample:
     try:
         conn = sqlite3.connect(uri, uri=True)
         try:
-            verifies = _window_rows(conn, 'merge_verify', window)
+            verify_events = _window_rows(conn, 'merge_verify', window)
             finalized = _window_rows(conn, 'merge_finalized', window)
         finally:
             conn.close()
     except sqlite3.Error as exc:
         raise PredicateFault(f'cannot read runs.db {path}: {exc}') from exc
+    verify_rows = tuple(_verify_row(path, ts, task_id, data) for ts, task_id, data in verify_events)
     return StoreSample(
         path=path,
-        verifies=tuple(_verify_row(path, str(ts), task_id, data) for ts, task_id, data in verifies),
+        verifies=verify_rows,
         landed_via_chain=sum(_landed_via_chain(data) for _, _, data in finalized),
+        item_attributed_failures=_item_attributed_failures(verify_rows, window.as_of),
     )
 
 
@@ -337,6 +388,7 @@ def _pool(samples: Sequence[StoreSample]) -> Pool:
     return Pool(
         n_deep=len(deep),
         failures=sum(1 for row in deep if not row.passed),
+        item_attributed_failures=sum(sample.item_attributed_failures for sample in samples),
         landed_via_chain=sum(sample.landed_via_chain for sample in samples),
         passed_deep_rounds=sum(sample.passed_deep_rounds for sample in samples),
         durations=tuple(row.duration_secs for row in deep if row.duration_secs is not None),
@@ -344,7 +396,8 @@ def _pool(samples: Sequence[StoreSample]) -> Pool:
 
 
 def _legs(pool: Pool, settings: Settings) -> list[Leg]:
-    fail_rate = _ratio(pool.failures, pool.n_deep)
+    attributed = pool.item_attributed_failures
+    fail_rate = _ratio(pool.failures - attributed, pool.n_deep - attributed)
     items = _ratio(pool.landed_via_chain, pool.passed_deep_rounds)
     p90 = _sampled_p90(pool.durations, settings.min_deep_verifies)
     return [
@@ -355,11 +408,18 @@ def _legs(pool: Pool, settings: Settings) -> list[Leg]:
 
 
 def _store_line(sample: StoreSample) -> str:
-    return f'store {sample.path}: n_deep={len(sample.deep)} passed_deep_rounds={sample.passed_deep_rounds}'
+    return (
+        f'store {sample.path}: n_deep={len(sample.deep)} passed_deep_rounds={sample.passed_deep_rounds} '
+        f'item_attributed_failures={sample.item_attributed_failures}'
+    )
 
 
 def _populations_line(pool: Pool) -> str:
-    return f'populations: landed_via_chain={pool.landed_via_chain} passed_deep_rounds={pool.passed_deep_rounds}'
+    return (
+        f'populations: deep_fail_rate_raw={_rendered(_ratio(pool.failures, pool.n_deep))} '
+        f'deep_failures={pool.failures} item_attributed_failures={pool.item_attributed_failures} '
+        f'landed_via_chain={pool.landed_via_chain} passed_deep_rounds={pool.passed_deep_rounds}'
+    )
 
 
 def _verdict_line(n_deep: int, legs: Sequence[Leg], window: Window) -> str:
