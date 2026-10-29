@@ -260,13 +260,16 @@ def score_reader(
     items: Iterable[Mapping[str, Any]],
     verdicts: Iterable[Mapping[str, Any]],
     *,
+    rubric: str,
     strata: Mapping[str, int] | None = None,
     harm_weights: Mapping[str, float] = PROVISIONAL_HARM_WEIGHTS,
 ) -> dict[str, Any]:
     """Score every item against the verdict corpus; refuse an incomplete one.
 
-    The report carries no timestamps, so scoring the same inputs twice gives
-    the same report.
+    *rubric* labels the rater brief the verdicts were rated under (``v2.1``,
+    ``v2.2``); verdict rows do not say, so the caller must, and the report
+    records it. The report carries no timestamps, so scoring the same inputs
+    twice gives the same report.
     """
     weights = _validated_weights(harm_weights)
     reader_items = _reader_items(items)
@@ -275,7 +278,7 @@ def score_reader(
     scored = [_score(item, judgements) for item in reader_items]
     _refuse_incomplete(scored)
     return {
-        'rubric': 'v2.1',
+        'rubric': rubric,
         'cell_rules': {str(cell): rule for cell, rule in _rubric.CELL_RULES.items()},
         'harm_weights': {str(cell): weight for cell, weight in weights.items()},
         'harm_weights_status': (
@@ -891,7 +894,7 @@ def _read_json_object(path: Path) -> dict[str, Any]:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            'Score write-triage outcomes by what a reader meets (rubric v2.1): metrics M1-M6,'
+            'Score write-triage outcomes by what a reader meets (rubric v2): metrics M1-M6,'
             ' rater agreement and harm per write against storing every write flat.'
             ' Definitions: fused-memory/calibration/write_triage_reader_metrics.md.'
         ),
@@ -903,6 +906,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--verdicts', type=Path, nargs='+', required=True, metavar='PATH',
         help='JSONL verdict files, read together as one corpus',
+    )
+    parser.add_argument(
+        '--rubric', required=True, metavar='LABEL',
+        help='the rater brief version the verdicts were rated under, e.g. v2.1; recorded in the report',
     )
     parser.add_argument(
         '--strata', type=Path, metavar='PATH',
@@ -925,6 +932,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         report = score_reader(
             _read_jsonl(args.items),
             _read_jsonl(args.verdicts),
+            rubric=args.rubric,
             strata=None if args.strata is None else _read_json_object(args.strata),
             harm_weights=(
                 PROVISIONAL_HARM_WEIGHTS if args.harm_weights is None

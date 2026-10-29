@@ -815,7 +815,7 @@ def _score(out: Path) -> int:
     paths = {name: out / f'write_triage_v2_soak_{name}' for name in CORPUS_FILES}
     return score.main([
         '--items', str(paths['items.jsonl']), '--verdicts', str(paths['verdicts.jsonl']),
-        '--strata', str(paths['strata.json']),
+        '--strata', str(paths['strata.json']), '--rubric', 'v2.1',
     ])
 
 

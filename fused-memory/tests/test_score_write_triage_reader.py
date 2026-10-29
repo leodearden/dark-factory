@@ -134,18 +134,24 @@ def _corpus() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
 
 
 _STRATA = {'r': 40, 'a': 20, 'c': 5, 's': 30}
+SOAK_RUBRIC = 'v2.1'
+"""The rater brief the synthetic corpus and the committed soak baseline were rated under."""
+
+
+def _score_reader(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    return _mod().score_reader(*args, rubric=SOAK_RUBRIC, **kwargs)
 
 
 @functools.cache
 def _report() -> dict[str, Any]:
     items, verdicts = _corpus()
-    return _mod().score_reader(items, verdicts)
+    return _score_reader(items, verdicts)
 
 
 @functools.cache
 def _weighted_report() -> dict[str, Any]:
     items, verdicts = _corpus()
-    return _mod().score_reader(items, verdicts, strata=_STRATA)
+    return _score_reader(items, verdicts, strata=_STRATA)
 
 
 def _block(hits: int, n: int, *, unclear: int = 0) -> dict[str, Any]:
@@ -154,6 +160,31 @@ def _block(hits: int, n: int, *, unclear: int = 0) -> dict[str, Any]:
         'wilson95': _stats().wilson95(hits, n), 'unclear': unclear,
         'population_rate': None, 'population_interval95': None,
     }
+
+
+class TestTheRubricLabel:
+    """The caller names the brief its verdicts were rated under; the scorer cannot tell."""
+
+    def test_the_report_records_the_label_it_is_given(self) -> None:
+        items, verdicts = _corpus()
+        report = _mod().score_reader(items, verdicts, rubric='v2.2')
+        assert report['rubric'] == 'v2.2'
+        assert _mod().render_markdown(report).startswith('# Write-triage reader report (rubric v2.2)')
+
+    def test_no_label_is_assumed(self) -> None:
+        items, verdicts = _corpus()
+        with pytest.raises(TypeError, match='rubric'):
+            _mod().score_reader(items, verdicts)
+
+    def test_the_cli_requires_the_label(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        items = _write_jsonl(tmp_path / 'items.jsonl', [_item('X', 'contested', 'P')])
+        verdicts = _write_jsonl(tmp_path / 'verdicts.jsonl', [_vote('X', 'P', conflict='YES')])
+        with pytest.raises(SystemExit) as exited:
+            _mod().main(['--items', str(items), '--verdicts', str(verdicts)])
+        assert exited.value.code == 2
+        assert '--rubric' in capsys.readouterr().err
 
 
 class TestTheItemRowContract:
@@ -170,18 +201,18 @@ class TestTheItemRowContract:
         self, row: dict[str, Any], match: str,
     ) -> None:
         with pytest.raises(ValueError, match=match):
-            _mod().score_reader([row], [])
+            _score_reader([row], [])
 
     def test_a_duplicate_entry_is_refused(self) -> None:
         rows = [_item('X', 'contested', 'P1'), _item('X', 'contested', 'P2')]
         with pytest.raises(ValueError, match="row 1.*'X'"):
-            _mod().score_reader(rows, [_vote('X', 'P1', conflict='YES')])
+            _score_reader(rows, [_vote('X', 'P1', conflict='YES')])
 
 
 class TestTheReport:
     def test_states_its_rubric_rules_and_weights(self) -> None:
         report = _report()
-        assert report['rubric'] == 'v2.1'
+        assert report['rubric'] == SOAK_RUBRIC
         assert set(report['cell_rules']) == {
             'hidden_detail', 'hidden_conflict', 'digest_conflict', 'wrong_home',
             'false_conflict', 'duplicate_clutter', 'orphaned_conflict', 'attached_supersession',
@@ -293,13 +324,13 @@ class TestTheReport:
 
     def test_a_rerun_gives_the_same_report(self) -> None:
         items, verdicts = _corpus()
-        assert _mod().score_reader(items, verdicts) == _report()
+        assert _score_reader(items, verdicts) == _report()
 
 
 class TestHarmWeights:
     def test_a_custom_map_changes_the_totals(self) -> None:
         items, verdicts = _corpus()
-        report = _mod().score_reader(items, verdicts, harm_weights={'wrong_home': 10})
+        report = _score_reader(items, verdicts, harm_weights={'wrong_home': 10})
         assert report['harm_weights'] == {'wrong_home': 10}
         assert report['harm_weights_status'] == 'custom'
         assert report['harm']['per_write'] == {'triage': round(30 / 13, 4), 'status_quo': 0.0}
@@ -314,7 +345,7 @@ class TestHarmWeights:
     def test_a_bad_weight_is_refused_listing_the_cells(self, weights: dict[str, Any]) -> None:
         items, verdicts = _corpus()
         with pytest.raises(ValueError, match='wrong_home.*hidden_conflict|hidden_detail'):
-            _mod().score_reader(items, verdicts, harm_weights=weights)
+            _score_reader(items, verdicts, harm_weights=weights)
 
 
 class TestStrata:
@@ -345,7 +376,7 @@ class TestStrata:
         verdicts = [_vote('R1', 'P1', **conflict), _vote('R2', 'P2', **conflict),
                     _vote('R3', 'P3', **_FLAT), _vote('R4', 'P4', **_FLAT)]
         verdicts += [_vote(f'C{n}', f'Q{n}', **conflict) for n in range(1, 5)]
-        m3 = _mod().score_reader(items, verdicts, strata={'r': 40, 'c': 4})['metrics']['m3']
+        m3 = _score_reader(items, verdicts, strata={'r': 40, 'c': 4})['metrics']['m3']
         assert (m3['n'], m3['hits']) == (6, 2)
         assert m3['population_rate'] == round(20 / 24, 4)
         low, high = m3['population_interval95']
@@ -357,12 +388,12 @@ class TestStrata:
     def test_an_item_outside_every_stratum_is_refused(self) -> None:
         items, verdicts = _corpus()
         with pytest.raises(ValueError, match="'s'"):
-            _mod().score_reader(items, verdicts, strata={'r': 40, 'a': 20, 'c': 5})
+            _score_reader(items, verdicts, strata={'r': 40, 'a': 20, 'c': 5})
 
     def test_a_stratum_smaller_than_its_sample_is_refused(self) -> None:
         items, verdicts = _corpus()
         with pytest.raises(ValueError, match="'c'.*5"):
-            _mod().score_reader(items, verdicts, strata={**_STRATA, 'c': 4})
+            _score_reader(items, verdicts, strata={**_STRATA, 'c': 4})
 
 
 def _rated(
@@ -377,7 +408,7 @@ def _rated(
 def _by_binary(*rated: tuple[dict[str, Any], list[dict[str, Any]]]) -> dict[str, Any]:
     items = [item for item, _ in rated]
     verdicts = [vote for _, votes in rated for vote in votes]
-    return _mod().score_reader(items, verdicts)['kappa']['by_binary']
+    return _score_reader(items, verdicts)['kappa']['by_binary']
 
 
 def _agreement(n: int, kappa: float | None, floor_met: bool = False) -> dict[str, Any]:
@@ -626,7 +657,7 @@ class TestRefusal:
         verdicts = [_vote('X2', 'P2', home='YES'),
                     _vote('X2', 'P2', rater='sonnet', role='second', conflict='NO')]
         with pytest.raises(_mod().IncompleteJudgementError) as refusal:
-            _mod().score_reader(items, verdicts)
+            _score_reader(items, verdicts)
         assert refusal.value.gaps == (
             ('X1', 'P1', 'conflict', 'unrated'), ('X2', 'P2', 'loss', 'open'),
         )
@@ -640,25 +671,25 @@ class TestRefusal:
                     _vote('X', 'P', rater='sonnet', role='second', conflict='NO', home='YES',
                           loss='NO')]
         with pytest.raises(_mod().IncompleteJudgementError) as refusal:
-            _mod().score_reader([_item('X', 'contested', 'P')], verdicts)
+            _score_reader([_item('X', 'contested', 'P')], verdicts)
         assert refusal.value.gaps == (('X', 'P', 'conflict', 'tied'),)
 
     def test_a_non_decisive_tie_is_accepted(self) -> None:
         verdicts = [_vote('X', 'P', conflict='YES', home='YES'),
                     _vote('X', 'P', rater='sonnet', role='second', conflict='YES', home='NO')]
-        report = _mod().score_reader([_item('X', 'contested', 'P')], verdicts)
+        report = _score_reader([_item('X', 'contested', 'P')], verdicts)
         assert report['metrics']['m5']['hits'] == 1
 
     def test_a_missing_attach_time_judgement_never_refuses(self) -> None:
         item = _item('X', 'contested', 'P', parent_edited_after_attach=True)
-        report = _mod().score_reader([item], [_vote('X', 'P', conflict='YES')])
+        report = _score_reader([item], [_vote('X', 'P', conflict='YES')])
         assert report['metrics']['m6']['attach_time_unrated'] == 1
 
     def test_an_undecided_attach_time_judgement_is_counted_not_refused(self) -> None:
         item = _item('X', 'contested', 'P', parent_edited_after_attach=True)
         verdicts = [_vote('X', 'P', conflict='YES'),
                     _vote('X', 'P', basis='attach_time', home='YES')]
-        report = _mod().score_reader([item], verdicts)
+        report = _score_reader([item], verdicts)
         assert report['metrics']['m6']['attach_time_undecided'] == 1
         assert report['metrics']['m6']['attach_time_rated'] == 0
 
@@ -677,7 +708,7 @@ class TestTheCli:
             '--items', str(_write_jsonl(tmp_path / 'items.jsonl', items)),
             '--verdicts', str(_write_jsonl(tmp_path / 'v1.jsonl', verdicts[:5])),
             str(_write_jsonl(tmp_path / 'v2.jsonl', verdicts[5:])),
-            '--strata', str(strata),
+            '--strata', str(strata), '--rubric', SOAK_RUBRIC,
         ]
 
     def test_prints_the_report_and_writes_both_files(
@@ -711,7 +742,7 @@ class TestTheCli:
         verdicts = _write_jsonl(tmp_path / 'verdicts.jsonl', [_vote('X0', 'P0', home='YES')])
         out, markdown = tmp_path / 'report.json', tmp_path / 'report.md'
         code = _mod().main([
-            '--items', str(items), '--verdicts', str(verdicts),
+            '--items', str(items), '--verdicts', str(verdicts), '--rubric', SOAK_RUBRIC,
             '--out', str(out), '--markdown', str(markdown),
         ])
         assert code == 1
@@ -727,7 +758,8 @@ class TestTheCli:
         items.write_text(json.dumps(_item('X', 'contested', 'P')) + '\n{not json\n')
         verdicts = _write_jsonl(tmp_path / 'verdicts.jsonl', [_vote('X', 'P', conflict='YES')])
         with pytest.raises(ValueError, match=f'{items}:2'):
-            _mod().main(['--items', str(items), '--verdicts', str(verdicts)])
+            _mod().main(['--items', str(items), '--verdicts', str(verdicts),
+                         '--rubric', SOAK_RUBRIC])
 
 
 def _table_rows(markdown: str) -> dict[str, list[str]]:
@@ -903,7 +935,7 @@ def _committed_inputs() -> tuple[list[dict[str, Any]], list[dict[str, Any]], dic
 @functools.cache
 def _rescored_baseline() -> dict[str, Any]:
     items, verdicts, strata = _committed_inputs()
-    return _mod().score_reader(items, verdicts, strata=strata)
+    return _score_reader(items, verdicts, strata=strata)
 
 
 @functools.cache
