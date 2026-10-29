@@ -28,7 +28,8 @@ WAIT = "wait until"
 FIX_DISK = "disk"
 USE_MAIN_COMPOSE = "main checkout"
 BY_HAND = "by hand"
-BOOTSTRAP = "Bootstrapping FalkorDB's AOF from dump.rdb"
+BOOTSTRAP = "decide which copy is newest"
+MAIN_GIT_DIRS = ("/repo/.git", "/repo/.git")
 SETTLE = "settle"
 
 
@@ -78,6 +79,7 @@ class FakeDocker:
         exec_raises: Exception | None = None,
         ps_fails: bool = False,
         action_rc: int = 0,
+        git_dirs: tuple[str, str] | int = MAIN_GIT_DIRS,
     ):
         self.data_dir = data_dir
         self.status = status
@@ -90,6 +92,7 @@ class FakeDocker:
         self.exec_raises = exec_raises
         self.ps_fails = ps_fails
         self.action_rc = action_rc
+        self.git_dirs = git_dirs
         self.commands: list[tuple[str, ...]] = []
 
     @property
@@ -110,6 +113,8 @@ class FakeDocker:
             return CommandResult(0, json.dumps({"services": {"falkordb": {"volumes": [volume]}}}), "")
         if command[:2] == ("docker", "inspect"):
             return CommandResult(0, json.dumps([self._inspect()]), "")
+        if command[:1] == ("git",):
+            return self._git(command)
         if command[:3] == ("docker", "exec", CONTAINER):
             if self.exec_raises is not None:
                 raise self.exec_raises
@@ -126,6 +131,15 @@ class FakeDocker:
             "Mounts": [{"Type": "bind", "Source": str(self.data_dir), "Destination": target}],
             "Config": {"Env": env},
         }
+
+    def _git(self, command: tuple[str, ...]) -> CommandResult:
+        assert command == (
+            "git", "-C", str(Path(COMPOSE).parent),
+            "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir",
+        ), command
+        if isinstance(self.git_dirs, int):
+            return CommandResult(self.git_dirs, "", "fatal: not a git repository")
+        return CommandResult(0, "\n".join(self.git_dirs) + "\n", "")
 
     def _redis_cli(self, args: tuple[str, ...]) -> CommandResult:
         if self.redis_cli_fails:
@@ -271,6 +285,26 @@ def test_an_unsettled_container_is_left_alone(data_dir, capsys, status):
 
 def test_no_container_and_no_persisted_data_creates_it(data_dir):
     docker = FakeDocker(data_dir, status=None)
+
+    assert _gate(docker) == 0
+    assert docker.actions == [UP_ALL]
+
+
+def test_no_container_is_never_created_from_a_linked_worktrees_compose_file(data_dir, capsys):
+    docker = FakeDocker(
+        data_dir, status=None, git_dirs=("/repo/.git/worktrees/carry", "/repo/.git"),
+    )
+
+    assert _gate(docker) == 0
+
+    assert docker.actions == [UP_QDRANT]
+    err = capsys.readouterr().err
+    assert "create REFUSED" in err and USE_MAIN_COMPOSE in err
+
+
+@pytest.mark.parametrize("git_rc", [128, 127], ids=["outside-any-repo", "git-missing"])
+def test_no_container_outside_a_git_worktree_is_created(data_dir, git_rc):
+    docker = FakeDocker(data_dir, status=None, git_dirs=git_rc)
 
     assert _gate(docker) == 0
     assert docker.actions == [UP_ALL]

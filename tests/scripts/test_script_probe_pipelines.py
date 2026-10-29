@@ -746,55 +746,79 @@ def test_verify_sees_the_container_on_a_clean_listing(tmp_path):
     assert _CONTAINER_NOT_FOUND not in combined, combined
 
 
-# --- import-data.sh section 7: no start onto an AOF older than dump.rdb (task 6330) ---
+# --- import-data.sh section 3: no import of a dump.rdb newer than its AOF (task 6330) ---
 # A new falkordb container boots with appendonly yes and loads ONLY the AOF, so
-# an imported dump.rdb with no AOF manifest, or one newer than the manifest,
-# would come up stale or empty. The slice runs from the refusal through the
-# compose-up it guards.
-_IMPORT_AOF_CHECK_START = 'FALKOR_AOF_MANIFEST="$FALKOR_DATA/appendonlydir/appendonly.aof.manifest"'
-_IMPORT_AOF_CHECK_END = 'docker compose -f "$COMPOSE_FILE" up -d falkordb qdrant'
-_BOOTSTRAP_PROCEDURE = "Bootstrapping FalkorDB's AOF from dump.rdb"
+# an exported dump.rdb with no AOF manifest, or one older than it, would come
+# up stale or empty. The rule is judged on the EXPORT, before the overlay copy:
+# judged on the destination, the destination's own newer manifest survives
+# `cp -a` and accepts an RDB-only export whose graph is then silently ignored.
+_IMPORT_RESTORE_START = 'FALKOR_EXPORT="$EXPORT_DIR/fused-memory-data/falkordb"'
+_IMPORT_RESTORE_END_AFTER = 'warn "No FalkorDB data in export"'
+_IMPORT_RESTORE_END = "\nfi\n"
+_DECIDE_NEWEST = "Deciding which FalkorDB copy is newest"
+_OLD, _NEW = 2_000_000_000, 2_000_000_100
 
 
-def _run_import_aof_check(tmp_path, *, dump_mtime=None, manifest_mtime=None):
-    falkor = tmp_path / "fused-memory" / "data" / "falkordb"
-    (falkor / "appendonlydir").mkdir(parents=True)
+def _falkordb_files(root, *, dump_mtime=None, manifest_mtime=None):
+    (root / "appendonlydir").mkdir(parents=True)
     for name, mtime in (("dump.rdb", dump_mtime), ("appendonlydir/appendonly.aof.manifest", manifest_mtime)):
         if mtime is not None:
-            (falkor / name).write_text("x")
-            os.utime(falkor / name, (mtime, mtime))
+            (root / name).write_text(f"{name}@{mtime}")
+            os.utime(root / name, (mtime, mtime))
+
+
+def _run_import_restore(tmp_path, *, export=None, dest=None):
+    export_dir = tmp_path / "export"
+    falkor_export = export_dir / "fused-memory-data" / "falkordb"
+    falkor_dest = tmp_path / "fused-memory" / "data" / "falkordb"
+    _falkordb_files(falkor_export, **(export or {}))
+    if dest is not None:
+        _falkordb_files(falkor_dest, **dest)
     section = (
-        'FALKOR_DATA="$REPO_ROOT/fused-memory/data/falkordb"\n'
-        + slice_section(IMPORT_DATA_PATH, _IMPORT_AOF_CHECK_START, _IMPORT_AOF_CHECK_END)
-        + 'echo "STARTED"\n'
+        f'EXPORT_DIR="{export_dir}"\n'
+        + slice_section(
+            IMPORT_DATA_PATH, _IMPORT_RESTORE_START, _IMPORT_RESTORE_END,
+            end_after=_IMPORT_RESTORE_END_AFTER,
+        )
+        + 'echo "IMPORTED"\n'
     )
-    return _run_probe(tmp_path, section, docker_body=dispatch_stub_body(()))
+    return _run_probe(tmp_path, section, docker_body=dispatch_stub_body(())), falkor_dest
 
 
-def test_import_refuses_a_dump_rdb_with_no_aof_manifest(tmp_path):
-    result = _run_import_aof_check(tmp_path, dump_mtime=2_000_000_000)
-
-    combined = result.stdout + result.stderr
-    assert result.returncode == 1, combined
-    assert "FAIL" in combined and _BOOTSTRAP_PROCEDURE in combined
-    assert "STARTED" not in combined
-
-
-def test_import_refuses_a_dump_rdb_newer_than_the_aof_manifest(tmp_path):
-    result = _run_import_aof_check(tmp_path, dump_mtime=2_000_000_100, manifest_mtime=2_000_000_000)
+def test_import_refuses_an_exported_dump_rdb_with_no_aof_manifest(tmp_path):
+    result, dest = _run_import_restore(tmp_path, export={"dump_mtime": _OLD})
 
     combined = result.stdout + result.stderr
     assert result.returncode == 1, combined
-    assert _BOOTSTRAP_PROCEDURE in combined
+    assert "FAIL" in combined and _DECIDE_NEWEST in combined
+    assert "IMPORTED" not in combined and not (dest / "dump.rdb").exists()
 
 
-def test_import_starts_when_the_aof_manifest_is_as_new_as_dump_rdb(tmp_path):
-    result = _run_import_aof_check(tmp_path, dump_mtime=2_000_000_000, manifest_mtime=2_000_000_000)
+def test_import_refuses_an_exported_dump_rdb_newer_than_its_aof_manifest(tmp_path):
+    result, _ = _run_import_restore(tmp_path, export={"dump_mtime": _NEW, "manifest_mtime": _OLD})
 
-    assert result.returncode == 0 and "STARTED" in result.stdout, result.stdout + result.stderr
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert _DECIDE_NEWEST in result.stdout + result.stderr
 
 
-def test_import_starts_when_there_is_no_dump_rdb(tmp_path):
-    result = _run_import_aof_check(tmp_path)
+def test_import_judges_the_export_not_a_destination_with_its_own_newer_manifest(tmp_path):
+    result, dest = _run_import_restore(
+        tmp_path, export={"dump_mtime": _OLD}, dest={"dump_mtime": _OLD + 50, "manifest_mtime": _NEW},
+    )
 
-    assert result.returncode == 0 and "STARTED" in result.stdout, result.stdout + result.stderr
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert (dest / "dump.rdb").read_text() == f"dump.rdb@{_OLD + 50}"
+    assert "IMPORTED" not in result.stdout
+
+
+def test_import_copies_an_export_whose_aof_manifest_is_as_new_as_dump_rdb(tmp_path):
+    result, dest = _run_import_restore(tmp_path, export={"dump_mtime": _OLD, "manifest_mtime": _OLD})
+
+    assert result.returncode == 0 and "IMPORTED" in result.stdout, result.stdout + result.stderr
+    assert (dest / "dump.rdb").exists() and (dest / "appendonlydir" / "appendonly.aof.manifest").exists()
+
+
+def test_import_copies_an_export_with_no_dump_rdb(tmp_path):
+    result, _ = _run_import_restore(tmp_path, export={"manifest_mtime": _OLD})
+
+    assert result.returncode == 0 and "IMPORTED" in result.stdout, result.stdout + result.stderr
