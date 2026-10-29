@@ -1114,6 +1114,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 7a. Client-feed publisher unit template (rendered, never enabled)
+# ---------------------------------------------------------------------------
+info "Installing the client-feed publisher unit template"
+
+# One instance per client project is enabled by hand: OPERATIONS.md §"Client feed".
+_cf_render_script="$REPO_ROOT/scripts/render_systemd_unit.py"
+if python3 "$_cf_render_script" \
+     --unit      client-feed \
+     --template  "$REPO_ROOT/scripts/client-feed.service.template" \
+     --repo-root "$REPO_ROOT" \
+     --uv-path   "$UV_PATH" \
+     --output    "$UNIT_DIR/client-feed@.service"; then
+  systemctl --user daemon-reload
+  ok "client-feed@.service installed; no instance enabled (one per client project, by hand: OPERATIONS.md §\"Client feed\")"
+else
+  fail "client-feed@.service render FAILED — see the [client_feed_unit_render] report above."
+  fail "  Any installed $UNIT_DIR/client-feed@.service was left untouched."
+fi
+
+# ---------------------------------------------------------------------------
 # 8. Claude Code skill symlinks
 # ---------------------------------------------------------------------------
 info "Creating Claude Code skill symlinks"
