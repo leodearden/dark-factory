@@ -1076,9 +1076,9 @@ def select_done_since_boundary(
 
     Enumerates the FULL set of done tasks whose ``updatedAt`` is at or after
     *boundary* (the prior successful reconciliation cycle boundary — typically
-    ``Watermark.last_full_run_completed``), so the Stage-2 completion-memory
-    audit covers every task that reached ``done`` since the last cycle instead
-    of a small fixed sample.  Intended to consume the uncapped
+    ``Watermark.last_task_change_timestamp``, the previous full run's start), so
+    the Stage-2 completion-memory audit covers every task that reached ``done``
+    since the last cycle instead of a small fixed sample.  Intended to consume the uncapped
     ``FilteredTaskTree.all_done_tasks`` (not the 30-capped ``done_tasks``) so
     the coverage does not silently shrink as task throughput grows.
 

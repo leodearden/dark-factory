@@ -128,13 +128,13 @@ rather than stripping to the end of the field.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
 from dataclasses import dataclass
 from typing import Any
 
+from fused_memory.middleware.metadata_dict import raw_metadata_dict
 from fused_memory.reconciliation.recon_self_model import EXECUTION_CLASSES
 
 logger = logging.getLogger(__name__)
@@ -289,28 +289,6 @@ class RoutingIntentFinding:
     fields: tuple[str, ...]
 
 
-def _parse_metadata(metadata: Any) -> dict:
-    """Return *metadata* as a dict (best-effort; unknown shapes -> {}).
-
-    Mirrors ``execution_class_guard._parse_metadata``: None -> {}; empty
-    string -> {}; dict -> returned as-is; JSON string -> parsed dict (or {}
-    on parse failure / non-dict result); anything else -> {}.
-    """
-    if metadata is None:
-        return {}
-    if isinstance(metadata, dict):
-        return metadata
-    if isinstance(metadata, str):
-        if not metadata:
-            return {}
-        try:
-            parsed = json.loads(metadata)
-        except json.JSONDecodeError:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
-
-
 def routing_intent_finding(
     title: str | None,
     description: str | None,
@@ -334,7 +312,8 @@ def routing_intent_finding(
     if task_kind != 'normal':
         return None
 
-    if _parse_metadata(metadata).get('execution_class') in _EXEMPT_EXECUTION_CLASSES:
+    execution_class = raw_metadata_dict(metadata, source='routing_intent_guard').get('execution_class')
+    if execution_class in _EXEMPT_EXECUTION_CLASSES:
         return None
 
     fields: dict[str, str] = {

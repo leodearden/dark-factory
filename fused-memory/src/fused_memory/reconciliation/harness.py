@@ -53,6 +53,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     recon_archive_root,
     run_config_dir_path,
 )
+from fused_memory.reconciliation.dangling_citation import dangling_citation_identity
 from fused_memory.reconciliation.drained_event_restore import (
     restore_unless_completed_best_effort,
 )
@@ -71,6 +72,10 @@ from fused_memory.reconciliation.index_health import summarize_index_health
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.judge import Judge
 from fused_memory.reconciliation.mem0_dedup import find_prior_memory
+from fused_memory.reconciliation.overreach_flags import (
+    acknowledge_overreach_flags,
+    fetch_overreach_flags,
+)
 from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
 from fused_memory.reconciliation.scope_freshness import (
@@ -123,6 +128,7 @@ from fused_memory.services.orchestrator_detector import (
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
+    from fused_memory.services.overreach_shadow import OverreachFlagPage
 
 try:
     from escalation.dedupe import (  # type: ignore[import-untyped]
@@ -377,9 +383,13 @@ def _derive_affected_ids(finding: dict) -> list[str]:
     recurrence counting still works against pre-cutover journal rows that carry
     the old shape.
 
+    A Stage-3 dangling-citation finding cites nothing, so its
+    ``dangling_citation`` handoff record supplies its identity
+    (``dangling_citation.py::dangling_citation_identity``, task 5749).
+
     The top-level ``add_finding`` ``task_id`` is deliberately NOT an identity
-    source: only the legacy ``affected_ids`` and the typed ``cited_*`` lists
-    are.  Guarded by
+    source: only the legacy ``affected_ids``, the typed ``cited_*`` lists and
+    the ``dangling_citation`` record are.  Guarded by
     ``tests/reconciliation/test_derive_affected_ids.py::TestDeriveAffectedIds``
     (task-4772 section).
     """
@@ -404,6 +414,7 @@ def _derive_affected_ids(finding: dict) -> list[str]:
         mid = c.get('memory_id') if isinstance(c, dict) else None
         if mid:
             ids.append(str(mid))
+    ids.extend(dangling_citation_identity(finding))
     return ids
 
 
@@ -1303,20 +1314,26 @@ class ReconciliationHarness:
         assembled_payload: AssembledPayload | None = None,
         remediation_findings: list[dict] | None = None,
         filtered_task_tree: FilteredTaskTree | None = None,
+        filtered_task_tree_fetched_at: datetime | None = None,
         task_count_verification: dict | None = None,
         graphiti_queue_health: dict | None = None,
         index_health: dict | None = None,
         status_correction_reconciliation: dict | None = None,
+        overreach_flags: OverreachFlagPage | None = None,
     ) -> None:
         """Apply tier limits and mode-specific attributes to MemoryConsolidator.
 
         Shared between run_full_cycle and _run_remediation_pass to prevent
         attribute-configuration divergence.
 
-        Note: filtered_task_tree here applies only to Stage 1 (MemoryConsolidator).
-        Stage 2 (TaskKnowledgeSync) wiring is handled by the symmetric
-        _configure_task_sync helper.
+        Note: filtered_task_tree and filtered_task_tree_fetched_at here apply
+        only to Stage 1 (MemoryConsolidator). Stage 2 (TaskKnowledgeSync)
+        wiring is handled by the symmetric _configure_task_sync helper.
 
+        filtered_task_tree_fetched_at: the instant filtered_task_tree was read,
+            against which Stage 1's Live-Workflow section ages claimant
+            heartbeats (task 6027). Set unconditionally with the tree, so a
+            call without one never leaves a previous tree's instant behind.
         task_count_verification: cross_verify_task_counts record (available only
             in full-cycle passes; None in remediation passes).
         graphiti_queue_health: summarize_graphiti_queue_health record (available only
@@ -1326,6 +1343,8 @@ class ReconciliationHarness:
         status_correction_reconciliation: _reconcile_status_correction record
             (task 1938; available only in full-cycle passes; None in
             remediation passes).
+        overreach_flags: fetch_overreach_flags page (task 6137; available only
+            in full-cycle passes; None in remediation passes).
         """
         stage.episode_limit = tier.episode_limit
         stage.memory_limit = tier.memory_limit
@@ -1334,10 +1353,12 @@ class ReconciliationHarness:
         stage.assembled_payload = assembled_payload
         stage.remediation_findings = remediation_findings
         stage.filtered_task_tree = filtered_task_tree
+        stage.filtered_task_tree_fetched_at = filtered_task_tree_fetched_at
         stage.task_count_verification = task_count_verification
         stage.graphiti_queue_health = graphiti_queue_health
         stage.index_health = index_health
         stage.status_correction_reconciliation = status_correction_reconciliation
+        stage.overreach_flags = overreach_flags
 
     @staticmethod
     def _configure_task_sync(
@@ -1351,9 +1372,9 @@ class ReconciliationHarness:
 
         Mirrors _configure_consolidator for Stage 1 — both full-cycle and
         remediation paths use this helper to keep attribute wiring symmetric
-        and discoverable. Stage-2-specific attributes (filtered_task_tree,
-        filtered_task_tree_fetched_at, remediation_mode) are set here; Stage-1
-        wiring is handled by _configure_consolidator.
+        and discoverable. Stage 2's attributes (filtered_task_tree,
+        filtered_task_tree_fetched_at, remediation_mode) are set here; Stage 1's,
+        including its own tree and read instant, by _configure_consolidator.
         """
         stage.filtered_task_tree = filtered_task_tree
         stage.filtered_task_tree_fetched_at = filtered_task_tree_fetched_at
@@ -3757,8 +3778,9 @@ class ReconciliationHarness:
         # e.g. at the _maybe_remediate call below — because the S1->S3 stage
         # loop that follows is minutes of LLM work and the claimant heartbeat
         # TTL is only 10 minutes (task 2964). Threaded to Stage 2's
-        # hint-attention selector (task 5093) and through _maybe_remediate ->
-        # _run_remediation_pass to the live-workflow gate, so both age a task's
+        # hint-attention selector (task 5093), to both stages' Live-Workflow
+        # Signals sections (task 6027), and through _maybe_remediate ->
+        # _run_remediation_pass to the live-workflow gate, so each ages a task's
         # heartbeat against the actual read, not a fresh clock taken well after it.
         filtered_task_tree_fetched_at = datetime.now(UTC)
 
@@ -3812,6 +3834,7 @@ class ReconciliationHarness:
             index_health = None
 
         current_stage_name: str | None = None
+        stage_1_overreach_flags: OverreachFlagPage | None = None
         cycle_start_time = datetime.now(UTC)
         stages = self._make_stages(scope)
         with self._active_runs.track(
@@ -3882,16 +3905,21 @@ class ReconciliationHarness:
 
                     # Apply tier limits, prior S3 findings, cycle fence, and task tree to Stage 1
                     if isinstance(stage, MemoryConsolidator):
+                        stage_1_overreach_flags = await fetch_overreach_flags(
+                            self.memory.overreach_shadow, scope.project_id,
+                        )
                         self._configure_consolidator(
                             stage, tier,
                             prior_s3_findings=prior_s3_findings,
                             cycle_fence_time=cycle_start_time,
                             assembled_payload=assembled_payload,
                             filtered_task_tree=filtered_task_tree,
+                            filtered_task_tree_fetched_at=filtered_task_tree_fetched_at,
                             task_count_verification=task_count_verification,
                             graphiti_queue_health=graphiti_queue_health,
                             index_health=index_health,
                             status_correction_reconciliation=status_correction_reconciliation,
+                            overreach_flags=stage_1_overreach_flags,
                         )
 
                     # Wire harness-fetched task tree into Stage 2 via symmetric helper (ref: task 455)
@@ -3940,7 +3968,7 @@ class ReconciliationHarness:
                     # tests/reconciliation/test_recon_window_anchor.py
                     'last_episode_timestamp': run.started_at,
                     'last_memory_timestamp': run.started_at,
-                    'last_task_change_timestamp': completed_at,
+                    'last_task_change_timestamp': run.started_at,
                 })
                 await self.journal.update_watermark(watermark)
 
@@ -3958,6 +3986,9 @@ class ReconciliationHarness:
                 raise
             else:
                 # Durably completed: the handlers above can no longer relabel it.
+                await acknowledge_overreach_flags(
+                    self.memory.overreach_shadow, stage_1_overreach_flags,
+                )
                 await self._finish_durably_completed_cycle(
                     project_id, run_id, run, tier,
                     scope=scope,
@@ -5920,6 +5951,7 @@ class ReconciliationHarness:
                 stage1, tier,
                 remediation_findings=findings,
                 filtered_task_tree=remediation_tree,
+                filtered_task_tree_fetched_at=_tasks_snapshot_at,
             )
             self._configure_task_sync(
                 stage2,
@@ -6515,12 +6547,14 @@ class BacklogIterator:
         buffer: EventBuffer,
         harness: ReconciliationHarness,
         time_provider: Callable[[], float] = time.monotonic,
+        iteration_deadline: Callable[[float], asyncio.Timeout] = asyncio.timeout,
     ):
         self.config = config
         self.journal = journal
         self.buffer = buffer
         self.harness = harness
         self.time_provider = time_provider
+        self._iteration_deadline = iteration_deadline
 
     async def should_iterate(self, project_id: str) -> bool:
         """Buffer count > 150% of trigger threshold.
@@ -6543,9 +6577,10 @@ class BacklogIterator:
         token-budgeted payload via ContextAssembler, then drains only the
         events that fit.  Stops when no events remain before the cutoff.
 
-        The whole invocation is bounded by cycle_timeout_seconds (task 2040).
-        On that deadline the in-flight run's events are restored unless it
-        completed, and TimeoutError propagates to the caller's log (task 6453).
+        The whole invocation is bounded by cycle_timeout_seconds under the
+        injected ``iteration_deadline`` (task 2040).  On that deadline the
+        in-flight run's events are restored unless it completed, and
+        TimeoutError propagates to the caller's log (task 6453).
         """
         from fused_memory.reconciliation.context_assembler import ContextAssembler
 
@@ -6570,7 +6605,7 @@ class BacklogIterator:
 
         in_flight_run_id: str | None = None
         try:
-            async with asyncio.timeout(self.config.cycle_timeout_seconds):
+            async with self._iteration_deadline(self.config.cycle_timeout_seconds):
                 watermark = await self.journal.get_watermark(project_id)
 
                 chunk_num = 0

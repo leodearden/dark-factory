@@ -44,6 +44,7 @@ __all__ = [
     "STATE_TO_STATUS",
     "BlockDisposition",
     "CancellationScope",
+    "DryRunSpawn",
     "IllegalTransition",
     "RequeueKind",
     "StewardBudgetExhausted",
@@ -174,6 +175,22 @@ class RequeueKind(enum.Enum):
     REQUEUE = 'requeue'
     BLOCK = 'block'
     CANCEL = 'cancel'
+
+
+class DryRunSpawn(enum.Enum):
+    """When ``TaskWorkflow._mark_blocked`` spawns an unblock_auto dry-run."""
+
+    OUTSIDE_MERGE_PHASE = 'outside_merge_phase'
+    """Spawn only on the ``merge_phase=False`` path. The default."""
+
+    POST_MERGE_RED_MAIN = 'post_merge_red_main'
+    """Also spawn when ``merge_phase=True``. Valid only for a reason starting
+    with ``POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX``, whose main has already
+    advanced, so the proposal is anchored to post-merge SHAs."""
+
+    NEVER = 'never'
+    """The caller's own agent already reached the verdict an investigation
+    would only re-derive."""
 
 
 @dataclass(frozen=True)

@@ -99,7 +99,7 @@ def _make_workflow(
 async def _setup(wf: TaskWorkflow, base_sha: str = 'a' * 40) -> None:
     """Drive the create_worktree path of _setup_worktree_and_artifacts."""
     wf.git_ops.create_worktree = AsyncMock(
-        return_value=WorktreeInfo(path=wf.config.project_root, base_commit=base_sha, stale_commits=0)
+        return_value=WorktreeInfo(path=wf.config.project_root, base_commit=base_sha)
     )
     wf._sync_worktree_venvs = AsyncMock()
     with patch('orchestrator.workflow._run', new=AsyncMock(return_value=(0, '', ''))):

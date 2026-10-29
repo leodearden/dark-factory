@@ -36,6 +36,21 @@ async def test_fake_scheduler_smoke() -> None:
     assert sched.statuses == {'x': ['pending', 'done']}
 
 
+@pytest.mark.asyncio
+async def test_fake_scheduler_submit_task_through_the_chronic_flake_adapter_files_nothing() -> None:
+    """The chronic-flake adapter submits through FakeScheduler, which records the call and files nothing."""
+    from _workflow_helpers import FakeScheduler
+    from shared.task_submit import SubmitFailed
+
+    from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+
+    sched = FakeScheduler()
+    outcome = await SchedulerChronicFlakeTaskClient(sched, '/proj').submit_task({'title': 't'})
+
+    assert outcome == SubmitFailed('FakeScheduler files nothing')
+    assert sched.submit_task_calls == [({'title': 't', 'project_root': '/proj'}, 30)]
+
+
 def test_fake_mcp_smoke() -> None:
     """FakeMcp returns the expected URL and empty MCP config."""
     from _workflow_helpers import FakeMcp  # noqa: PLC0415
@@ -145,12 +160,11 @@ def test_warmlane_workflow_factory_smoke(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_init_git_repo_factory_smoke(tmp_path) -> None:
+def test_init_git_repo_factory_smoke(tmp_path) -> None:
     """_init_git_repo seeds a real git repo with an initial README commit."""
     from _workflow_helpers import _init_git_repo  # noqa: PLC0415
 
-    await _init_git_repo(tmp_path)
+    _init_git_repo(tmp_path)
     assert (tmp_path / '.git').is_dir()
     assert (tmp_path / 'README.md').exists()
 
@@ -160,8 +174,7 @@ async def test_init_git_repo_factory_smoke(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_e2e_factories_smoke(tmp_path) -> None:
+def test_e2e_factories_smoke(tmp_path) -> None:
     """Behavioral smoke: PLAN/_make_review/AgentStub/_init_repo real invocation checks."""
     from _workflow_helpers import PLAN, AgentStub, _init_repo, _make_review  # noqa: PLC0415
 
@@ -174,7 +187,7 @@ async def test_e2e_factories_smoke(tmp_path) -> None:
     assert AgentStub()._detect_role('You are a TDD architect') == 'architect'
     assert AgentStub()._detect_role('You are the completion judge') == 'judge'
 
-    await _init_repo(tmp_path)
+    _init_repo(tmp_path)
     assert (tmp_path / 'lib.py').exists()
     assert (tmp_path / '.git').is_dir()
 
@@ -269,7 +282,7 @@ async def test_init_transcript_repo_smoke(tmp_path) -> None:
 
     from orchestrator.git_ops import _run  # noqa: PLC0415
 
-    await _init_transcript_repo(tmp_path)
+    _init_transcript_repo(tmp_path)
 
     assert (tmp_path / '.git').is_dir()
     assert (tmp_path / 'lib.py').exists()

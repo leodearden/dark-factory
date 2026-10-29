@@ -111,6 +111,10 @@ _PROBE_DEFECT = '_probe_defect_'
 # Cooldown-key sentinel for dedup-outage escalations, in the same style.
 _DEDUP_OUTAGE = '_dedup_outage_'
 
+# The curator-bucket SUBJECT pseudo-task id, shared deliberately with curator_escalator;
+# pinned equal by tests/test_folded_escalation.py::_DELIBERATE_ALIASES.
+_ANCHOR_TASK_ID: str = 'task-curator'
+
 _CURATION_BACKLOG = '_curation_backlog_'
 CURATION_BACKLOG_ANCHOR: Final = 'curation-backlog'
 _CURATION_BACKLOG_DETAIL_TICKETS: Final = 20
@@ -250,7 +254,7 @@ class TicketJanitor:
             kwargs = blob.get('kwargs') or {}
             # ``task_id`` is the canonical key per the plan; fall back to
             # ``spawned_from`` (steward's convention) before defaulting.
-            task_id = metadata.get('task_id') or metadata.get('spawned_from') or 'task-curator'
+            task_id = metadata.get('task_id') or metadata.get('spawned_from') or _ANCHOR_TASK_ID
             return {
                 'task_id': str(task_id),
                 'escalation_id': metadata.get('escalation_id') or _NO_ESCALATION,
@@ -318,7 +322,7 @@ class TicketJanitor:
         queue = self._queue_for(project_root)
         escalation = Escalation(
             id=queue.make_id('ticket-janitor'),
-            task_id='task-curator',
+            task_id=_ANCHOR_TASK_ID,
             agent_role='fused-memory/ticket-janitor',
             severity=severity,
             category='infra_issue',
@@ -691,7 +695,7 @@ class TicketJanitor:
                 })
             escalation = Escalation(
                 id=queue.make_id('ticket-janitor'),
-                task_id=task_id if task_id and task_id != '_unparseable_' else 'task-curator',
+                task_id=task_id if task_id and task_id != '_unparseable_' else _ANCHOR_TASK_ID,
                 agent_role='fused-memory/ticket-janitor',
                 severity='info',
                 category='ticket_failure',

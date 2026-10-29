@@ -13,6 +13,7 @@ from typing import Any
 from shared.briefing_queries import BriefingScope
 from shared.task_text_fingerprint import TaskTextDrift
 
+from orchestrator.agents.harness_guidance import WAIT_PATTERN_REMINDER
 from orchestrator.agents.memory_recall import MemoryRecall
 from orchestrator.agents.review_briefing import (
     ReviewSubject,
@@ -20,7 +21,6 @@ from orchestrator.agents.review_briefing import (
     render_context_complete_review,
     review_action_section,
 )
-from orchestrator.agents.roles import WAIT_PATTERN_REMINDER
 from orchestrator.config import OrchestratorConfig
 
 logger = logging.getLogger(__name__)

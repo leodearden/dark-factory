@@ -32,6 +32,12 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 from fused_memory.memory_metadata import (
     EXPERIMENTAL_KEY_PREFIX,
@@ -49,7 +55,12 @@ from fused_memory.reconciliation.standing_decision_writer import (
     EVIDENCE_TYPE_OPERATOR_AUTHORIZATION,
     LedgerUnavailable,
 )
-from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+)
+from fused_memory.utils.store_mutation_preflight import (
+    assert_store_mutation_allowed as _real_guard,
+)
 from fused_memory.utils.validation import is_full_uuid
 
 SCRIPT_PATH = (
@@ -57,6 +68,16 @@ SCRIPT_PATH = (
 )
 
 _mod = load_script_module(SCRIPT_PATH, mod_name='backfill_entity_standing_decision')
+
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``main(['--apply'])`` runs the preflight once, before it builds the
+    config or the MemoryService (task 2900 eta). This suite is MOCK-unit:
+    ``_LiveHarness`` fakes the config and the service and keeps a REAL
+    ``ReconLedgerStore`` on ``tmp_path``. Its ``_probe`` records each call and
+    then delegates to the real guard, and ``denied=True`` makes that guard
+    refuse through ``deny``.""",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1121,22 +1142,29 @@ class _LiveHarness:
         self.services.append(service)
         return service
 
-    def run(self, monkeypatch, argv: list[str], *, probe_error=None) -> int:
-        """Install the fakes and drive the real ``main(argv)``."""
-        def _probe(*, operation: str) -> None:
-            self.trace.append('probe')
-            self.operations.append(operation)
-            if probe_error is not None:
-                raise probe_error
+    def run(self, monkeypatch, argv: list[str], *, denied: bool = False) -> int:
+        """Install the fakes and drive the real ``main(argv)``.
 
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _probe)
-        monkeypatch.setattr(
-            'fused_memory.config.schema.FusedMemoryConfig', self._make_config
-        )
-        monkeypatch.setattr(
-            'fused_memory.services.memory_service.MemoryService', self._make_service
-        )
-        return _mod.main(argv)
+        The fakes are undone when the run ends, so a later run on the same
+        *monkeypatch* starts from the real guard again.
+        """
+        def _probe(**kwargs) -> None:
+            self.trace.append('probe')
+            self.operations.append(kwargs['operation'])
+            _real_guard(**kwargs)
+
+        with monkeypatch.context() as patch:
+            if denied:
+                deny(_mod, patch)
+            patch.setattr(_mod, 'assert_store_mutation_allowed', _probe)
+            patch.setattr(
+                'fused_memory.config.schema.FusedMemoryConfig', self._make_config
+            )
+            patch.setattr(
+                'fused_memory.services.memory_service.MemoryService',
+                self._make_service,
+            )
+            return _mod.main(argv)
 
     def report(self, capsys) -> dict:
         """The JSON artifact ``main`` printed."""
@@ -1192,15 +1220,34 @@ class TestMainStoreMutationPreflight:
     ) -> None:
         harness = _LiveHarness(tmp_path)
         with pytest.raises(StoreMutationUnavailable):
-            harness.run(
-                monkeypatch,
-                ['--apply'],
-                probe_error=StoreMutationUnavailable('denied'),
-            )
+            harness.run(monkeypatch, ['--apply'], denied=True)
         assert harness.trace == ['probe']
         assert harness.services == []
         assert harness.stamps == []
         assert harness.rows() == []
+
+    def test_a_refused_probe_logs_exactly_one_fail_closed_diagnosis(
+        self, tmp_path, monkeypatch, caplog
+    ) -> None:
+        harness = _LiveHarness(tmp_path)
+        with caplog.at_level(logging.ERROR), pytest.raises(StoreMutationUnavailable):
+            harness.run(monkeypatch, ['--apply'], denied=True)
+        (record,) = fail_closed_records(caplog, 'backfill_entity_standing_decision')
+        assert SENTINEL in record.getMessage()
+
+    def test_a_second_run_on_one_harness_probes_once_and_can_still_be_refused(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """Each ``run`` is self-contained: a later run on the same harness and
+        monkeypatch neither re-records an earlier run's probe nor finds it
+        bound in place of the real guard."""
+        harness = _LiveHarness(tmp_path)
+        assert harness.run(monkeypatch, ['--apply']) == 0
+        capsys.readouterr()
+        with pytest.raises(StoreMutationUnavailable):
+            harness.run(monkeypatch, ['--apply'], denied=True)
+        assert harness.trace.count('probe') == 2
+        assert len(harness.operations) == 2
 
     def test_the_probed_operation_names_this_script_and_the_flag(
         self, tmp_path, monkeypatch, capsys
@@ -1254,11 +1301,7 @@ class TestMainRefusesADeadLedgerTarget:
         all should hear that, not a complaint about which file it aimed at."""
         harness = _LiveHarness(tmp_path, target=_mod.LedgerTargetState.MISSING)
         with pytest.raises(StoreMutationUnavailable):
-            harness.run(
-                monkeypatch,
-                ['--apply'],
-                probe_error=StoreMutationUnavailable('denied'),
-            )
+            harness.run(monkeypatch, ['--apply'], denied=True)
         assert harness.trace == ['probe']
 
     def test_a_dry_run_is_never_gated_on_the_target(

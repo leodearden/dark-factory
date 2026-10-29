@@ -80,6 +80,7 @@ const EXPECTED_WINDOW_GLOBALS = {
   'persisted_state.js': 'DF_PERSISTED_STATE',
   'invariant_chip.js': 'DF_INVARIANT_CHIP',
   'deferral_cell.js': 'DF_DEFERRAL_CELL',
+  'render_failure.js': 'DF_RENDER_FAILURE',
 };
 
 // NOTE — no `document` shim, and that omission is load-bearing rather than an

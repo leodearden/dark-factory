@@ -213,11 +213,11 @@ After the last phase run:
 
 ```
 add_memory(
-  content="Review {run_id} for {scope} at {as_of_sha:10}: {n} findings ({high} high), {filed} filed, {structural} for deliberation, {fixed} fixed since {since:10}. Key concerns: {list}.",
+  content="Review {run_id} for {scope} at {as_of_sha:10}: {n} findings ({high} high), {filed} filed, {structural} for deliberation, {fixed} fixed since {since:10}. Key concerns: {list}. Next run gated by task 3127.",
   category="observations_and_summaries",
   project_id="<project_id>",
   agent_id="claude-review",
-  entities=[]
+  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the human gate of the chain this run filed (contract §11), here and in content; if it filed none, as under --findings-only, use [] and drop the gate sentence from content
 )
 ```
 

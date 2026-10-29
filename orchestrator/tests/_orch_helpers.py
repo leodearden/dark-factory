@@ -164,6 +164,20 @@ def wire_clear_claim_then_set_status(scheduler_mock: MagicMock) -> None:
     )
 
 
+def wire_live_status_from_get_task(scheduler_mock: MagicMock) -> None:
+    """Answer ``get_status`` on a MagicMock Scheduler from its own ``get_task`` row.
+
+    Mirrors the real Scheduler, where both read the same fused-memory row;
+    ``get_task`` is looked up per call, so a test that reassigns it later flows through.
+    """
+
+    async def _live_status(tid: str) -> str | None:
+        row = await scheduler_mock.get_task(tid)
+        return (row or {}).get('status')
+
+    scheduler_mock.get_status = AsyncMock(side_effect=_live_status)
+
+
 # task 3492/4215: the pyproject-configured default per-test timeout ceiling
 # that every heavy test in this suite must clear.  MIRROR of
 # `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml -- see
@@ -812,10 +826,9 @@ MERGE_RESULT_TIMEOUT = 45
 # task 3980: how far `wait_responsive` below may stretch a wait's REAL wall
 # clock past its nominal, loop-responsive budget.  SINGLE SOURCE of the ratio:
 # the helper's per-call default cap is
-# `min(RESPONSIVE_WAIT_STRETCH * timeout, RESPONSIVE_WAIT_WALL_CAP)`, and
-# test_merge_queue_concurrent_verify.py's AST wait-budget auditor
-# (`_call_wait_budget`) bills a `wait_responsive` site by IMPORTING this same
-# constant.  One definition is what makes the auditor's number an exact upper
+# `min(RESPONSIVE_WAIT_STRETCH * timeout, RESPONSIVE_WAIT_WALL_CAP)`, and the
+# AST wait-budget auditor (`_wait_budget_audit.py::_call_wait_budget`) bills a
+# `wait_responsive` site by IMPORTING this same constant.  One definition is what makes the auditor's number an exact upper
 # bound on the helper rather than an estimate free to drift below it.
 RESPONSIVE_WAIT_STRETCH = 2.0
 
@@ -824,9 +837,8 @@ RESPONSIVE_WAIT_STRETCH = 2.0
 # reviewer can check the arithmetic instead of trusting a number.  It bounds
 # the scaled per-call cap above whatever nominal a call site passes.  Whether
 # the waits a test stacks on it fit that test's timeout mark is checked, not
-# restated here: each guarded module's TestTimeoutMarkCoverage recomputes
-# every class's budget from source
-# (test_merge_queue_concurrent_verify.py::_worst_per_method_wait_budget).
+# restated here: test_wait_budget_coverage_guard.py recomputes every test's
+# budget from source (`_wait_budget_audit.py::item_wait_budgets`).
 # Never-narrow.
 RESPONSIVE_WAIT_WALL_CAP = int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT)  # 90s
 
@@ -852,6 +864,10 @@ RESPONSIVE_WAIT_WALL_CAP = int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT)  
 # If a gate-barrier flake is ever measured, the fix is to make child-process
 # progress observable to the accounting, not to grow this number.  Never-narrow.
 MERGE_GATE_BARRIER_TIMEOUT = MERGE_RESULT_TIMEOUT // 3  # 15s
+
+# Default worker-task join of test_merge_queue_concurrent_verify.py::_stop_worker,
+# which `_wait_budget_audit.py::_call_wait_budget` bills for a bare call.
+STOP_WORKER_JOIN_TIMEOUT = 5.0
 
 # task 3307: generous synchronization-barrier ceiling for the workflow
 # CancellationScope tests (test_workflow_cancellation.py).  These barriers
@@ -996,8 +1012,8 @@ async def wait_responsive(
 
     The default ``cap`` SCALES WITH THE NOMINAL rather than defaulting flat to
     the 90s ceiling, and that is what makes the paired marks checkable:
-    ``_wait_responsive_budget``'s ``min(nominal * RESPONSIVE_WAIT_STRETCH,
-    RESPONSIVE_WAIT_WALL_CAP)`` is then an EXACT upper bound on this helper,
+    ``_wait_budget_audit.py::_wait_responsive_budget``'s
+    ``min(nominal * RESPONSIVE_WAIT_STRETCH, RESPONSIVE_WAIT_WALL_CAP)`` is then an EXACT upper bound on this helper,
     not an under-count.  With a flat default a ``timeout=15`` site the auditor
     billed at 30s could consume 90s, and TestLateArrivalCleanCAS's true worst
     case would overrun its ``HEAVY_BARRIER_TEST_TIMEOUT`` mark.
@@ -1009,8 +1025,8 @@ async def wait_responsive(
     guard rejects the site rather than under-billing it.
 
     The kwarg is named literally ``timeout`` so task 3492's AST wait-budget
-    scanner (``_call_wait_budget`` in test_merge_queue_concurrent_verify.py)
-    can resolve call sites without a special case.
+    scanner (``_wait_budget_audit.py::_call_wait_budget``) can resolve call
+    sites without a special case.
 
     Accepts a Future, a Task or a coroutine.  When a coroutine is wrapped, the
     wrapper task is cancelled on give-up so nothing leaks into pytest-asyncio

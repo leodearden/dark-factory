@@ -173,8 +173,11 @@ own checkout (`shared.project_layout.default_project_root` is banned in `client_
 12. **Reveal budget** (design note §5): counted set = visible production files not matching free,
     never-reveal or generated globs (`linguist-generated` honoured); lines = non-blank lines, a line
     over `max_line_bytes` counting as ⌈bytes/max⌉; budget = `reveal_proportion × counted lines added or
-    changed since delivered_commit` (all counted lines when null); each reveal costs
-    `max(file_lines, reveal_floor_lines)`; granted when `spent + cost ≤ budget`. Reveal identity is
+    changed since delivered_commit` (all counted lines when null); a path in the counted set costs
+    `max(its chargeable lines, reveal_floor_lines)` and a path outside it costs 0; a request that adds
+    nothing to `spent` (a path outside the counted set, or one already revealed) is granted whatever
+    `spent` is, and any other is granted when `spent + cost ≤ budget` (where this is implemented:
+    §12, the 2026-10-22 δ entry (b) and the 2026-10-25 entry (a)). Reveal identity is
     the path until a delete event; a recreated path needs a new reveal; renames follow git's default
     detection; a deleted file emits a final `file_revealed {deleted: true}` and stops counting.
 13. **Hostile requests are refused with typed reasons.** A requested path must appear in
@@ -268,8 +271,9 @@ whole `criteria_declared` map. Rewritten atomically after every pass that append
 
 ### 7.4 `in/inbox.jsonl` (portal → publisher)
 
-`{seq, at, type: "reveal_requested", path}`. Answered with `file_revealed` or `reveal_refused`. A second line
-type, `defect_reported`, is added by §14.3.
+`{seq, at, type: "reveal_requested", path}`. Answered with `file_revealed` or `reveal_refused`. A request
+for a path already revealed and still revealable appends nothing, because the feed already holds its
+content at head (§12, 2026-10-25 entry (b)). A second line type, `defect_reported`, is added by §14.3.
 
 ### 7.5 `in/engagement.json` (portal → publisher)
 
@@ -596,6 +600,28 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     `f5cea40d8354190c9fa0cce260b2e69adc79ea3a`. Its `delivered_commit` is a fixture sha that no test
     repository holds, so read as vendored it disables reveals. A test that needs a usable engagement
     sets it to null after reading the vendored file (`client-feed/tests/test_in_v1_fixture.py`).
+
+- 2026-10-25, from task 7484. These bind ζ (6973) and the portal:
+  - (a) A request that adds nothing to `spent_lines` is granted whatever `spent_lines` is: a path
+    outside the counted set, or one already revealed. Any other request must fit what is left of
+    the budget (`client-feed/src/client_feed/budget.py::CountedSet.grantable`). Follow-head never
+    refuses for budget (δ entry (f)), so `spent_lines` can exceed `budget_lines`. A free file is
+    still granted then, and B14's `spent_lines` is unchanged by its grant.
+  - (b) A granted request for a path already in the revealed set emits no event, so a portal retry
+    or a double-click appends nothing. Within a pass, follow-head runs before the inbox is answered,
+    and it has already re-emitted at head every revealed file whose blob changed
+    (`client-feed/src/client_feed/reveals.py::_follow_events`). The feed therefore already holds
+    head's content for every revealed path. The request is still judged first, so a refusal is
+    emitted exactly as before (`client-feed/src/client_feed/reveals.py::_answer`). A consumer that
+    tracks pending requests therefore settles one when its path is in `state.revealed` or a
+    `reveal_refused` answers it, and never waits for a `file_revealed` per request. An explicit
+    `already_revealed` acknowledgement would need a contract revision.
+  - (c) git output that does not parse is a `GitError` of the command that wrote it, and it
+    degrades `git` like any other git failure
+    (`client-feed/src/client_feed/sources/git.py::_parsing`). Every `git cat-file --batch` read is
+    bounded by `GIT_TIMEOUT_SECS`, as every one-shot git call is. The bound applies per read, so the
+    caller's work between reads never counts against it. A read that outlasts it kills the session
+    and fails as `timed out` (`client-feed/src/client_feed/sources/git.py::blob_reader`).
 
 ## 13. Open questions (tactical)
 

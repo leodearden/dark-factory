@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 
 from graphiti_core.nodes import EpisodeType
 from shared.storm_counter import KeyedStormCounters
+from shared.streak import KeyedStreaks
 
 from fused_memory.backends.graphiti_client import (
     ActiveEdgesError,
@@ -107,16 +108,30 @@ from fused_memory.reconciliation.standing_decision_writer import (
 )
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
+from fused_memory.services import mem0_write_retry, overreach_guard
 from fused_memory.services.classification_fallback_alarm import (
     ClassificationFallbackAlarm,
     journal_params,
 )
 from fused_memory.services.completion_claim_gate import UNVERIFIED_CLAIM_TAG
 from fused_memory.services.durable_queue import DeadLetterEvent, DurableWriteQueue
+from fused_memory.services.mem0_write_retry import (
+    DEFAULT_MEM0_RETRY_POLICY,
+    Mem0RetryPassSummary,
+    Mem0RetryPolicy,
+    classify_transient_provider_failure,
+    mem0_write_op_landed,
+    retry_reason,
+)
 from fused_memory.services.memory_metadata_census import (
     UnknownKeyStormDetector,
     emit_schema_warnings,
     file_unknown_key_storm_escalation,
+)
+from fused_memory.services.overreach_shadow import (
+    OverreachShadow,
+    open_overreach_shadow,
+    shadow_job_from_write,
 )
 from fused_memory.services.read_telemetry import (
     fallback_search_summary,
@@ -130,6 +145,7 @@ from fused_memory.services.topic_anchor import (
     resolve_topic_anchor_enabled,
     select_canonical_payload,
 )
+from fused_memory.services.write_journal import Mem0IntentStatus
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
 from fused_memory.utils.canonical_labels import Referent, parse_node_name, scan_content
 from fused_memory.utils.referent_resolution import (
@@ -185,6 +201,9 @@ _SUBCLOSE_TIMEOUT = 3.0
 # SDK connection-pool releases (classifier, router) only close local idle sockets: httpx opens its TLS streams with standard_compatible=False, so no close waits on the peer.
 # They run after every durable-flush close and lose nothing if cut short.
 _POOL_RELEASE_TIMEOUT = 0.5
+
+# The overreach shadow's close cancels its judge jobs rather than draining them, so it needs no SQLite-flush budget.
+_SHADOW_CLOSE_TIMEOUT = 0.5
 
 # The durable-queue group_id prefix that distinguishes a project's Mem0 writes
 # from its Graphiti ones, whose group_id is the bare project_id
@@ -2319,8 +2338,14 @@ def _elapsed_ms_since(started: float) -> float:
 class MemoryService:
     """Central orchestration — fused read/write across Graphiti + Mem0."""
 
-    def __init__(self, config: FusedMemoryConfig):
+    def __init__(
+        self,
+        config: FusedMemoryConfig,
+        *,
+        mem0_retry_policy: Mem0RetryPolicy = DEFAULT_MEM0_RETRY_POLICY,
+    ):
         self.config = config
+        self._mem0_retry_policy = mem0_retry_policy
         self.graphiti = GraphitiBackend(config)
         self.mem0 = Mem0Backend(config)
         self.classifier = WriteClassifier(config)
@@ -2330,6 +2355,8 @@ class MemoryService:
         self._write_journal: WriteJournal | None = None
         self.taskmaster: TaskBackendProtocol | None = None
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
+        # Public: recon's O4 handoff reads flags through it (task 6137).
+        self.overreach_shadow: OverreachShadow | None = None
         self.recon_ledger: ReconLedgerStore | None = None
         self.recon_journal: ReconciliationJournal | None = None
         # {project_id: project_root}, seeded below from DASHBOARD_KNOWN_PROJECT_ROOTS
@@ -2416,8 +2443,9 @@ class MemoryService:
         # the degraded configuration where a repair storm is least likely to be
         # noticed any other way.
         #
-        # `_referent_repair_streaks` maps group_id -> CONSECUTIVE episodes whose
-        # repair pass moved at least one endpoint. Per group_id because the
+        # `_referent_repair_streaks` holds, per group_id, the live run of
+        # CONSECUTIVE episodes whose repair pass moved at least one endpoint.
+        # Per group_id because the
         # escalation queue is per-project: a regression in one project's graph
         # must not be masked by another project's clean writes, which is exactly
         # what a single global streak would do (any interleaved clean project
@@ -2426,7 +2454,11 @@ class MemoryService:
         # Bounded by the LIVE PROJECT SET — `group_id == project_id`, of which
         # there are a handful — so unlike the per-agent mem0 storm counters
         # above it needs no pruning; there is no unbounded key space to leak.
-        self._referent_repair_streaks: dict[str, int] = {}
+        #
+        # Only the counts are read: the storm gate pages on EVERY breach and
+        # reads `_REFERENT_REPAIR_STREAK_THRESHOLD` at use time, so `fired`
+        # and the threshold given here gate nothing.
+        self._referent_repair_streaks: KeyedStreaks[str] = KeyedStreaks(threshold=1)
         # Process-lifetime totals, monotonic and never reset, keyed by a closed
         # five-member vocabulary so a reader never distinguishes "zero" from
         # "absent". Deliberately SEPARATE from the streaks: the streak is a live
@@ -2601,6 +2633,13 @@ class MemoryService:
             self.planned_episode_registry = PlannedEpisodeRegistry(data_dir=qcfg.data_dir)
             await self.planned_episode_registry.initialize()
 
+        try:
+            self.overreach_shadow = await open_overreach_shadow(
+                self.config, read_edges=self.graphiti.get_edges_by_uuids,
+            )
+        except Exception:
+            logger.warning('overreach shadow failed to open; running without it', exc_info=True)
+
         self.durable_queue = DurableWriteQueue(
             data_dir=qcfg.data_dir,
             execute_write=self._execute_durable_write,
@@ -2698,6 +2737,7 @@ class MemoryService:
         """Each sub-close close() runs, in order, with its time budget."""
         return (
             ('durable_queue', self.durable_queue, _SUBCLOSE_TIMEOUT),
+            ('overreach_shadow', self.overreach_shadow, _SHADOW_CLOSE_TIMEOUT),
             ('graphiti', self.graphiti, _SUBCLOSE_TIMEOUT),
             ('mem0', self.mem0, _SUBCLOSE_TIMEOUT),
             ('write_journal', self._write_journal, _SUBCLOSE_TIMEOUT),
@@ -4782,9 +4822,9 @@ class MemoryService:
           evidence either way: resetting on it would let a FalkorDB blip
           mid-storm disarm the alarm, and incrementing on it would let an
           outage page as a scanner regression.
-        * zero repairs but ``endpoints_checked > 0`` -> ``0``. THE POSITIVE
-          HEALTH SIGNAL: we looked at this episode's edge endpoints and none
-          needed moving.
+        * zero repairs but ``endpoints_checked > 0`` -> ends the run. THE
+          POSITIVE HEALTH SIGNAL: we looked at this episode's edge endpoints and
+          none needed moving.
         * zero repairs and ``endpoints_checked == 0`` -> UNCHANGED, and the key
           is not even created.
 
@@ -4812,7 +4852,7 @@ class MemoryService:
             The group's streak AFTER the increment, when this pass incremented
             it — i.e. the reading the storm gate thresholds. ``None`` on the
             other three arms. Returning the value rather than having the caller
-            re-read the dict is what keeps the gate from firing on a pass that
+            re-read the streak is what keeps the gate from firing on a pass that
             merely LEFT a breached streak in place: an episode that checked
             nothing performs no repair, so it must not re-page an alarm it
             produced no evidence for.
@@ -4826,13 +4866,11 @@ class MemoryService:
         self._referent_repair_counts['nodes_deleted'] += repair_stats.nodes_deleted
 
         if repair_stats.repaired:
-            streak = self._referent_repair_streaks.get(group_id, 0) + 1
-            self._referent_repair_streaks[group_id] = streak
-            return streak
+            return self._referent_repair_streaks.failure(group_id).count
         if repair_stats.failed:
             return None
         if stats.endpoints_checked:
-            self._referent_repair_streaks[group_id] = 0
+            self._referent_repair_streaks.success(group_id)
         return None
 
     async def _escalate_referent_repair_storm(
@@ -5478,7 +5516,7 @@ class MemoryService:
             # above would record `outcome='failed'` with `moved` never set —
             # a committed repair booked as an infrastructure failure that did
             # nothing. That would un-count it in `ReferentRepairStats.repaired`,
-            # suppress its `_referent_repair_streaks` increment, and drop the
+            # suppress its streak increment, and drop the
             # emptied node from `_cleanup_emptied_nodes` candidacy: the exact
             # "report zero repairs for an episode that performed one" shape
             # that `_backstop_endpoint_summaries` and the cleanup's own
@@ -5968,17 +6006,33 @@ class MemoryService:
         whose repairs the backend thwarted clears nothing). It is the
         value the storm gate thresholds, exposed so an operator can see how
         close a project is to the alarm rather than only learning at the breach.
-        A group appears only once a pass has produced evidence about it, so an
-        absent key means "no repair pass has drawn a conclusion here yet" —
-        distinct from a present ``0``, which means "checked, clean".
+        A group appears only while it is in a live run; absent means no live
+        run.
 
         Returns a COPY at BOTH levels — the nested streaks dict included — so a
         caller cannot mutate the escape hatch's own state. A read-only escape
         hatch a consumer can write through is not an escape hatch.
         """
         counts: dict[str, Any] = dict(self._referent_repair_counts)
-        counts['streaks'] = dict(self._referent_repair_streaks)
+        streaks = self._referent_repair_streaks
+        counts['streaks'] = {g: streaks.count(g) for g in streaks.tracked_keys}
         return counts
+
+    def _submit_overreach_shadow(
+        self, result: Any, payload: dict[str, Any], category: MemoryCategory | None,
+    ) -> None:
+        """Hand a landed class write to the overreach shadow; a failure never fails the write."""
+        if self.overreach_shadow is None or not overreach_guard.is_guarded_category(category):
+            return
+        try:
+            job = shadow_job_from_write(
+                result, group_id=payload['group_id'], content=payload['content'], category=category,
+            )
+            if job is not None:
+                self.overreach_shadow.submit(job)
+        except Exception:
+            logger.warning('overreach shadow: submit failed for group_id=%r',
+                           payload.get('group_id'), exc_info=True)
 
     async def _execute_graphiti_write(
         self, operation: str, payload: dict[str, Any]
@@ -6034,6 +6088,8 @@ class MemoryService:
         # the tag reaches the persisted episodic node (and, via
         # _dual_write_callback, every fact derived from it).
         unverified_claim = bool(payload.pop('unverified_claim', False))
+        # task 6137: the overreach shadow's class key, on the same channel.
+        memory_category = overreach_guard.category_of(payload.pop('memory_category', None))
         # task 3561: rows enqueued BEFORE the fix still carry the fatal 'uuid'
         # key, and the durable queue outlives the deploy that removed it — so
         # the defect would survive its own fix for as long as the backlog does
@@ -6166,6 +6222,11 @@ class MemoryService:
                 'Reconciled episode identity for group_id=%r: %r',
                 payload['group_id'], reconcile_stats,
             )
+
+        # After the lock: the judge needs no identity lock, and an LLM round trip
+        # inside it would serialize every decision write for the group
+        # (design.md §6 'Lock placement').
+        self._submit_overreach_shadow(result, payload, memory_category)
 
         # Register planning episodes so they can be filtered from search results.
         #
@@ -6802,6 +6863,7 @@ class MemoryService:
 
         memory_ids: list[str] = []
         stores_written: list[SourceStore] = []
+        stores_pending_retry: list[SourceStore] = []
         meta['category'] = resolved_category.value
         _stamp_unverified_claim(meta, unverified_claim)
 
@@ -6861,6 +6923,7 @@ class MemoryService:
 
         _graphiti_error = None
         _mem0_error = None
+        _mem0_pending = None
 
         # Graphiti: enqueue via durable queue (async, but durably persisted)
         if write_graphiti:
@@ -6905,6 +6968,8 @@ class MemoryService:
                         'source': 'text',
                         'group_id': scope.graphiti_group_id,
                         'source_description': f'add_memory:{resolved_category.value}',
+                        # Popped by _execute_graphiti_write for the overreach shadow.
+                        'memory_category': resolved_category.value,
                         '_causation_id': causation_id,
                         '_write_op_id': write_op_id,
                         # Popped and decoded by _execute_graphiti_write.
@@ -6977,7 +7042,7 @@ class MemoryService:
                 # In-request call resolved without raising → stamp terminal.
                 if self._write_journal and intent_id:
                     await self._write_journal.resolve_mem0_intent(
-                        intent_id, 'completed'
+                        intent_id, Mem0IntentStatus.COMPLETED
                     )
                 if not mem0_ids and _MEM0_ADD_INFER_PINNED_FALSE:
                     # mem0.add() did not raise but returned no results — a silent
@@ -6995,15 +7060,21 @@ class MemoryService:
                         },
                     )
             except Exception as e:
-                logger.error(f'Mem0 write failed: {e}')
-                _mem0_error = str(e)
-                # add() provably raised → mem0 did NOT persist. Stamp the
-                # intent 'failed' (the reconciler treats a failed-only
-                # backend_op as safe to re-issue).
-                if self._write_journal and intent_id:
-                    await self._write_journal.resolve_mem0_intent(
-                        intent_id, 'failed', reason=str(e)
-                    )
+                _mem0_pending = await self._defer_mem0_write_for_retry(
+                    e, intent_id=intent_id, write_op_id=write_op_id
+                )
+                if _mem0_pending is not None:
+                    stores_pending_retry.append(SourceStore.mem0)
+                else:
+                    logger.error(f'Mem0 write failed: {e}')
+                    _mem0_error = str(e)
+                    # add() provably raised → mem0 did NOT persist. Stamp the
+                    # intent 'failed' (the reconciler treats a failed-only
+                    # backend_op as safe to re-issue).
+                    if self._write_journal and intent_id:
+                        await self._write_journal.resolve_mem0_intent(
+                            intent_id, Mem0IntentStatus.FAILED, reason=str(e)
+                        )
 
         # Layer 1 journal entry
         if self._write_journal:
@@ -7023,6 +7094,7 @@ class MemoryService:
                 result_summary={
                     'memory_ids': memory_ids,
                     'stores': [s.value for s in stores_written],
+                    'stores_pending': [s.value for s in stores_pending_retry],
                 },
                 success=not (_graphiti_error or _mem0_error),
                 error=_graphiti_error or _mem0_error,
@@ -7047,15 +7119,78 @@ class MemoryService:
             msg += f' [graphiti_error: {_graphiti_error}]'
         if _mem0_error:
             msg += f' [mem0_error: {_mem0_error}]'
+        if _mem0_pending:
+            msg += f' [mem0_pending_retry: {_mem0_pending}]'
         if classification_fallback is not None:
             msg += f' [classification_fallback: {classification_fallback.value}]'
 
         return AddMemoryResponse(
             memory_ids=memory_ids,
             stores_written=stores_written,
+            stores_pending_retry=stores_pending_retry,
             category=resolved_category,
             message=msg,
             classification_fallback=classification_fallback,
+        )
+
+    async def _defer_mem0_write_for_retry(
+        self, error: Exception, *, intent_id: str | None, write_op_id: str
+    ) -> str | None:
+        """Queue a transiently failed Mem0 leg for server-side retry; return why, or None.
+
+        ``None`` means the write was NOT deferred: the error is not transient,
+        or no durable ``retrying`` intent row could be made, so the caller
+        reports the leg failed.
+        """
+        failure = classify_transient_provider_failure(error)
+        if failure is None or self._write_journal is None or intent_id is None:
+            return None
+        reason = retry_reason(failure, error)
+        deferred = await self._write_journal.schedule_mem0_retry(
+            intent_id,
+            reason=reason,
+            retry_at=self._mem0_retry_policy.retry_at(attempts=1, now=datetime.now(UTC)),
+        )
+        if not deferred:
+            return None
+        logger.warning(
+            'Mem0 write deferred for server-side retry '
+            '(intent_id=%s, write_op_id=%s, failure=%s)',
+            intent_id,
+            write_op_id,
+            failure.value,
+        )
+        return reason
+
+    async def reissue_mem0_intent(self, intent: Mapping[str, Any]) -> Any:
+        """Re-issue a journaled Mem0 write intent under its original write_op_id."""
+        content = intent.get('content') or ''
+        scope = Scope(
+            project_id=intent.get('project_id') or 'main',
+            agent_id=intent.get('agent_id'),
+            session_id=intent.get('session_id'),
+        )
+        metadata = json.loads(intent.get('metadata') or '{}')
+        return await self._journaled_backend_call(
+            write_op_id=intent['write_op_id'],
+            causation_id=intent.get('causation_id'),
+            backend='mem0',
+            operation='add',
+            payload={'content': content[:200]},
+            coro=self.mem0.add(content=content, scope=scope, metadata=metadata),
+        )
+
+    async def retry_due_mem0_intents(
+        self, *, now: datetime | None = None
+    ) -> Mem0RetryPassSummary:
+        """Run one server-side retry pass over the Mem0 writes deferred for retry."""
+        if self._write_journal is None:
+            return Mem0RetryPassSummary()
+        return await mem0_write_retry.retry_due_mem0_intents(
+            self._write_journal,
+            self.reissue_mem0_intent,
+            policy=self._mem0_retry_policy,
+            now=now or datetime.now(UTC),
         )
 
     # ------------------------------------------------------------------
@@ -7076,8 +7211,9 @@ class MemoryService:
           re-issue.
         - only FAILED mem0 backend_op(s) → ``add()`` raised. In the common
           (clean, pre-persist) failure mem0 did not land, so re-issue is safe
-          (0 prior writes + 1 = 1): rebuild ``Scope`` + metadata and call
-          ``mem0.add``; ``completed`` on success, ``dead`` on error. Crash
+          (0 prior writes + 1 = 1): ``reissue_mem0_intent``; ``completed`` on
+          success, ``retrying`` on a transient provider error (the periodic
+          retry pass takes it over), ``dead`` on any other error. Crash
           after re-issue: ``fused-memory/tests/test_mem0_intent_recovery.py::TestRecoverMem0Intents::test_crash_after_successful_reissue_is_reconciled_not_reissued_again``.
           RESIDUAL DUPLICATE RISK (accepted, documented): a failure raised
           AFTER mem0 committed but at/near the response (e.g. a read-timeout
@@ -7097,7 +7233,13 @@ class MemoryService:
         plus a loud log line. Idempotent — no pending intents ⇒ zeroed
         summary — so it is safe to run on every startup.
         """
-        summary = {'scanned': 0, 'reconciled': 0, 'reissued': 0, 'dead_lettered': 0}
+        summary = {
+            'scanned': 0,
+            'reconciled': 0,
+            'reissued': 0,
+            'deferred': 0,
+            'dead_lettered': 0,
+        }
         if self._write_journal is None:
             return summary
 
@@ -7112,13 +7254,12 @@ class MemoryService:
                 write_op_id
             )
             mem0_beops = [b for b in beops if b.get('backend') == 'mem0']
-            any_success = any(b.get('success') for b in mem0_beops)
 
-            if any_success:
+            if mem0_write_op_landed(beops):
                 # Write landed; only the completion stamp was lost.
                 await self._write_journal.resolve_mem0_intent(
                     intent_id,
-                    'completed',
+                    Mem0IntentStatus.COMPLETED,
                     reason='reconciled: mem0 backend_op confirms write landed',
                 )
                 summary['reconciled'] += 1
@@ -7134,26 +7275,10 @@ class MemoryService:
                 # note in this method's docstring for the narrow
                 # post-commit-failure case where this can mint a duplicate twin.
                 try:
-                    scope = Scope(
-                        project_id=intent.get('project_id') or 'main',
-                        agent_id=intent.get('agent_id'),
-                        session_id=intent.get('session_id'),
-                    )
-                    metadata = json.loads(intent.get('metadata') or '{}')
-                    content = intent.get('content') or ''
-                    await self._journaled_backend_call(
-                        write_op_id=write_op_id,
-                        causation_id=intent.get('causation_id'),
-                        backend='mem0',
-                        operation='add',
-                        payload={'content': content[:200]},
-                        coro=self.mem0.add(
-                            content=content, scope=scope, metadata=metadata
-                        ),
-                    )
+                    await self.reissue_mem0_intent(intent)
                     await self._write_journal.resolve_mem0_intent(
                         intent_id,
-                        'completed',
+                        Mem0IntentStatus.COMPLETED,
                         reason='reconciled: re-issued after failed-only mem0 backend_op',
                     )
                     summary['reissued'] += 1
@@ -7164,20 +7289,25 @@ class MemoryService:
                         write_op_id,
                     )
                 except Exception as e:
-                    reason = (
-                        f're-issue failed: {type(e).__name__}: {e} '
-                        f'(write_op_id={write_op_id}, payload_digest={payload_digest})'
-                    )
-                    await self._write_journal.resolve_mem0_intent(
-                        intent_id, 'dead', reason=reason
-                    )
-                    summary['dead_lettered'] += 1
-                    logger.error(
-                        'recover_mem0_intents: intent %s dead-lettered — re-issue '
-                        'raised: %s',
-                        intent_id,
-                        e,
-                    )
+                    if await self._defer_mem0_write_for_retry(
+                        e, intent_id=intent_id, write_op_id=write_op_id
+                    ):
+                        summary['deferred'] += 1
+                    else:
+                        reason = (
+                            f're-issue failed: {type(e).__name__}: {e} '
+                            f'(write_op_id={write_op_id}, payload_digest={payload_digest})'
+                        )
+                        await self._write_journal.resolve_mem0_intent(
+                            intent_id, Mem0IntentStatus.DEAD, reason=reason
+                        )
+                        summary['dead_lettered'] += 1
+                        logger.error(
+                            'recover_mem0_intents: intent %s dead-lettered — re-issue '
+                            'raised: %s',
+                            intent_id,
+                            e,
+                        )
             else:
                 # No backend_op → UNKNOWN outcome → dead-letter (never silent).
                 reason = (
@@ -7192,7 +7322,7 @@ class MemoryService:
                     'would risk a duplicate twin; manual replay available.'
                 )
                 await self._write_journal.resolve_mem0_intent(
-                    intent_id, 'dead', reason=reason
+                    intent_id, Mem0IntentStatus.DEAD, reason=reason
                 )
                 summary['dead_lettered'] += 1
                 logger.warning(

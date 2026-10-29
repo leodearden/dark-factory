@@ -95,6 +95,13 @@ class TestConstructorInjectedHooksFire:
         spy = AsyncMock()
         config = OrchestratorConfig(
             max_per_module=1,
+            # task 4481: pin the trip ON rather than inheriting it.  This test
+            # is about the CALLBACK firing, not about park_stop_enabled's
+            # default; an operator setting park_stop_enabled=false in
+            # dark-factory-orchestrator.yaml disarms the trip and the spy is
+            # never called.  The threshold/window beside it are already pinned
+            # for the same reason.
+            park_stop_enabled=True,
             park_stop_parked_threshold=1,
             park_stop_parked_window_hours=1.0,
         )

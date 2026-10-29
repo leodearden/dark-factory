@@ -68,18 +68,22 @@ from escalation.models import (
     AGENT_FILABLE_LEVELS,
     BORN_AT_L2_SEVERITIES,
     KNOWN_SEVERITIES,
+    NOTE_TO_FILE_CLASS,
     RESOLUTION_CLASSES,
     STATUS_ACCEPTED_UNPERSISTED,
     Escalation,
     EvidenceEntry,
     max_severity,
+    note_to_file_class_conflict,
 )
+from escalation.note_to_file import file_note_to_file, note_to_file_refusal
 from escalation.pins import classify_pins
 from escalation.project_root_guard import ProjectRootGuard
-from escalation.queue import AmendmentOutcome, EscalationQueue, ResolveOutcome
+from escalation.queue import AmendmentOutcome, EscalationQueue, blank_resolve_outcome
 from escalation.queue import observed_submit_response as _observed_submit_response
 from escalation.related_pending import related_pending
 from escalation.server_instructions import ESCALATION_SERVER_INSTRUCTIONS
+from escalation.sha_citations import resolve_cited_shas
 from escalation.store_identity import StoreIdentity
 from escalation.tool_description_block import AppendToEveryToolDescription
 
@@ -721,6 +725,30 @@ _COMPACT_ESCALATION_FIELDS = (
     # and giving absence a second, different meaning on a neighbouring key would
     # be exactly the legibility trap that contract exists to prevent.
     'pin_declared_by',
+    # project_id (task 4951) is DELIBERATELY NOT PROJECTED — decided in task 5776
+    # (won't-fix), so do not re-file it as an oversight.
+    #
+    # THE GAP IS REAL BUT NARROW: the reconciliation queue is shared across
+    # projects, so a compact row there cannot name its subject project.  An
+    # orchestrator queue is per-project (each endpoint serves one project), so
+    # for those the answer is already the endpoint itself.
+    #
+    # WHY IT IS NOT WORTH A KEY ON EVERY ROW: (1) the in-repo consumers
+    # (orphaned_recon_escalation_sweep.py::escalation_project_id and
+    # derive_orphaned_recon_escalations.py) read FULL records, so nothing needs
+    # it; (2) `None` means UNSTAMPED, and `attach_dedupe_child` never backfills a
+    # folded parent, so a parent filed before 4951 never gains it — a compact
+    # reader would see `null`, could not tell "legacy" from "no project", and
+    # would STILL need a get_escalation round-trip for exactly the records it
+    # cares about; (3) it costs ~20 bytes (`"project_id":null`) on
+    # EVERY compact row, including the dashboard's fetch_pins_recovery poll that
+    # reads nothing but `pins_recovery`, for a value that is null on the
+    # overwhelming majority.
+    #
+    # IF A PROJECT-SCOPED COMPACT DRAIN EVER EXISTS: add a server-side
+    # `project_id` filter to get_pending_escalations (one filtered value per
+    # call, no per-row cost) rather than widening this tuple — and note that no
+    # such filter exists today.
 )
 
 # get_pending_escalations(compact=True) additionally keeps its computed
@@ -1757,6 +1785,8 @@ def create_server(
                with resolution_action='close_only' via submit_resolved before
                ANY other gate or lookup, so no argument can mint it pending or
                at L2
+          (claimant stamp, then) esc.note_to_file → file_note_to_file: resolved
+               note-to-file, archived; no downgrade, gate 1-4 or dedupe runs
           1. terminal_state_is_the_bug=True  → bypass (submit normally)
           2. category == 'review_suggestions' → bypass (A4b owns this category)
           3. task_status_lookup is None       → bypass (chokepoint disabled)
@@ -1782,7 +1812,7 @@ def create_server(
                 'production signal, the eval measurement is scored from the '
                 'cell result artifacts',
                 resolved_by='escalation-eval-lane-containment',
-                resolution_class='benign',
+                resolution_class=NOTE_TO_FILE_CLASS if esc.note_to_file else 'benign',
             )
             return {
                 'id': contained.id,
@@ -1825,6 +1855,9 @@ def create_server(
                 # Normalise blank/whitespace-only to None so an empty string
                 # never reaches pins._norm_id as a pseudo-value.
                 esc.filing_claimant_run_id = (_claimant or '').strip() or None
+
+        if esc.note_to_file:
+            return file_note_to_file(queue, esc)
 
         # C4/D3: Agent-role severity downgrade — runs FIRST, before the born-at-L2
         # stamp, so the existing level=2 gate and the _submit_or_dedupe L2-bypass
@@ -1942,6 +1975,7 @@ def create_server(
         evidence: list[dict[str, Any]] | None = None,
         terminal_state_is_the_bug: bool = False,
         project_root: str | None = None,
+        note_to_file: bool = False,
     ) -> dict[str, Any]:
         """Report a non-blocking observation. The agent continues working after this call.
 
@@ -1977,7 +2011,16 @@ def create_server(
         fact.  A single observation is not sufficient to recommend a destructive
         intervention (a ref move / rewind) — re-run or re-measure first.
 
+        *note_to_file* — set True for a record that requests nothing: a note
+        kept for the archive.  Info severity only; any other severity is
+        refused with ``code='note_to_file_requires_info'`` and nothing is
+        written.  The note is filed resolved (``resolution_class:
+        note-to-file``) and archived at filing, so no reviewer, steward or
+        watcher reads it, and the task is untouched.
+
         Response shape (``level`` is present on every branch):
+        - Note to file:           ``{id, status, resolution_class, level}``
+          where status='resolved' and resolution_class='note-to-file'
         - Queued (task alive):    ``{id, status, level}``  where status='queued'
         - Deduped (folded):       ``{id, status, parent_id, child_id, level}``
           (L2 escalations are never deduped — they always produce 'queued')
@@ -2009,6 +2052,8 @@ def create_server(
             require_registered_category(category)
         except UnregisteredEscalationCategory as exc:
             return {'error': str(exc)}
+        if note_to_file and (refusal := note_to_file_refusal(severity)) is not None:
+            return refusal
         esc_id = await asyncio.to_thread(queue.make_id, task_id)
         esc = Escalation(
             id=esc_id,
@@ -2022,6 +2067,7 @@ def create_server(
             worktree=worktree,
             workflow_state=workflow_state,
             evidence=cast(list[EvidenceEntry], evidence or []),
+            note_to_file=note_to_file,
         )
         # Returns {id, status} or resolved record.
         # No 'action' key — that is only on the blocker path.
@@ -2302,9 +2348,11 @@ def create_server(
         against ``escalation.models.RESOLUTION_CLASSES`` before any gate runs
         or the record is touched; an unrecognised value returns
         ``{'error': ..., 'code': 'invalid_resolution_class'}`` with NO record
-        change. Written only at resolution — never author-supplied
-        otherwise. Not forwarded to the ``park`` action (the record stays
-        open at L2, unclassified until eventually resolved).
+        change. A class that conflicts with the record's ``note_to_file``
+        flag (``escalation.models.note_to_file_class_conflict``) returns the
+        same code, also with no record change. Written only at resolution —
+        never author-supplied otherwise. Not forwarded to the ``park`` action
+        (the record stays open at L2, unclassified until eventually resolved).
 
         **A resolve on an ALREADY-AUTO-DISMISSED record does NOT take effect**
         (task 4495).  ``queue.resolve``'s status check is an atomic
@@ -2509,14 +2557,20 @@ def create_server(
                 }
         identity = headers.get(_IDENTITY_HEADER)
 
-        # Single record lookup reused by the capability gate below, the Table B
-        # gate further down, and the pre-stamp write after it. queue.get() reads
-        # from disk, so identity-mapped callers previously paid for two reads
-        # per resolve (once for the ceiling check, again for Table B); one
-        # fetch is now shared by both gates (efficiency note, PRD C8/D7 review).
+        # Single record lookup reused by the capability gate below and the Table
+        # B and declared-pin gates further down. queue.get() reads from disk,
+        # so identity-mapped callers previously paid for two reads per resolve
+        # (once for the ceiling check, again for Table B); one fetch is now
+        # shared by the gates (efficiency note, PRD C8/D7 review). `rec` is a
+        # read-only GATING snapshot: no write uses it, because every write goes
+        # through a queue method that re-reads under `escalation_id_lock`.
         rec = queue.get(escalation_id)
         if rec is None:
             return {'error': f'Escalation {escalation_id} not found'}
+        if resolution_class is not None and (
+            conflict := note_to_file_class_conflict(rec, resolution_class)
+        ):
+            return {'error': conflict, 'code': 'invalid_resolution_class'}
 
         # D7 effective ceiling: an identity mapped in ROLE_LEVEL_ALLOWLIST is
         # AUTHORITATIVE — a present X-Escalation-Levels header may only
@@ -2584,10 +2638,8 @@ def create_server(
         # capability header AND an illegal action) sees 'bad_capability_header'
         # / 'level_forbidden', not 'illegal_transition'. Neither gate mutates
         # the record, so this is an error-reporting precedence only — see the
-        # "Gate precedence" note in the resolve_issue docstring. `rec` was
-        # already fetched above (shared with the capability gate); nothing
-        # mutates the record between that fetch and here, so it is reused
-        # rather than re-read from disk.
+        # "Gate precedence" note in the resolve_issue docstring. `rec` is the
+        # gating snapshot fetched above (shared with the capability gate).
         effect = effect_for(action, rec.level, rec.category)
         if effect is None:
             return {
@@ -2605,7 +2657,7 @@ def create_server(
             # Version-a: park keeps the escalation open at L2.
             # queue.park() handles all stamping (level=2, resolution_action='park',
             # resolution text) and fires the resolve callback for teardown WITHOUT
-            # archiving the record.  No pre-stamp needed — park() owns the full write.
+            # archiving the record.  park() owns the full write, as resolve() does.
             esc = queue.park(
                 escalation_id, resolution,
                 resolved_by=resolved_by, resolution_turns=resolution_turns,
@@ -2619,9 +2671,8 @@ def create_server(
         # AFTER the `park` early-return above, so park is structurally exempt
         # with no `action != 'park'` condition that a later edit could get wrong
         # — park keeps the record OPEN and never archives it, so it cannot spend
-        # a pin.  And it sits BEFORE the resolution_action pre-stamp below, so a
-        # refusal persists nothing (INV-1), exactly as the capability and Table B
-        # gates do.
+        # a pin.  And it sits BEFORE queue.resolve, so a refusal persists
+        # nothing (INV-1), exactly as the capability and Table B gates do.
         #
         # Classifies the TARGET plus EVERY member of an L2 cluster, because the
         # BULK CLOSE of a homogeneous cluster is precisely the operation that
@@ -2678,27 +2729,14 @@ def create_server(
                 ],
             }
 
-        # Pre-stamp resolution_action on the pending record so resolve()'s
-        # read-modify-write carries it into the archived JSON (C1 persistence).
-        # Guard: only rewrite pending records — archived records must not be resurrected.
-        # Reuses `rec` fetched at the top of the gate sequence above (shared by
-        # the capability and Table B gates) instead of re-reading from disk:
-        # queue.get() is a pure read and nothing mutates the record between
-        # that fetch and here (the park branch above already returned), so
-        # `rec` is still current and a further queue.get() would be redundant.
-        if rec.status == 'pending':
-            rec.resolution_action = action
-            queue._rewrite(escalation_id, rec)
         dismiss = action in _DISMISS_ACTIONS
-        resolve_outcome: ResolveOutcome = {
-            'applied': False, 'prior_status': None, 'prior_resolved_by': None,
-            'late_resolution_captured': False, 'resolution_class_corrected': None,
-        }
+        resolve_outcome = blank_resolve_outcome()
         esc = queue.resolve(
             escalation_id, resolution, dismiss=dismiss,
             resolved_by=resolved_by, resolution_turns=resolution_turns,
             resolution_class=resolution_class,
             granted_files=granted_files,
+            resolution_action=action,
             outcome=resolve_outcome,
         )
         if esc is None:
@@ -3387,9 +3425,10 @@ def create_server(
 
         **Sentinel-bound members** (task 4541): when at least one member
         resolves and EVERY resolved member was filed under a role in
-        ``escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES`` (today the
-        recovery-veto-streak alarm and the offline lane's escalations), a new
-        L2 must be minted under one of those members' own task ids.  Any other *task_id* is refused with
+        ``escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES`` (the
+        sentinel-filed orchestrator alarms; that frozenset is the list), a new
+        L2 must be minted under one of those members' own task ids.  Any other
+        *task_id* is refused with
         ``code: 'sentinel_task_id_required'`` and ``required_task_ids`` —
         re-issue with one of them — and nothing is minted, for header-less
         callers too.  Why: see
@@ -4967,6 +5006,41 @@ def create_server(
                 'error': 'escalation server running standalone — no harness wired',
             }
         return await harness.reload_config()
+
+    # --- Cited-SHA resolution (task 5751) ---
+
+    @mcp.tool()
+    async def resolve_escalation_shas(escalation_id: str) -> dict[str, Any]:
+        """Resolve the commit SHAs an escalation cites to the commits they landed as on main.
+
+        Scans the record's ``summary``, ``detail`` and each ``evidence``
+        entry's ``observation`` for 7-40 hex SHA tokens and maps each one a
+        rebase orphaned to its landed twin on main (patch-id first, then a
+        unique exact subject; never a guess).  Returns ``{escalation_id,
+        resolved_shas: [{cited, landed, subject, method}], skipped_shas}``,
+        both in cited order.  Only the first
+        ``escalation.sha_citations.MAX_CITED_SHAS_RESOLVED`` distinct tokens
+        are looked up; ``skipped_shas`` lists the rest, unresolved.  A looked-up token absent from ``resolved_shas`` is
+        already on main, is not a commit, or has no twin.
+
+        Read-only: the record is never rewritten, and ``get_escalation`` /
+        ``get_task_escalations`` are unchanged — they still show the SHAs as
+        filed.  An unknown id returns ``{error}`` naming it; a standalone
+        server (no harness wired) returns ``{'error': 'no git authority
+        wired'}``.
+        """
+        git_ops = getattr(harness, 'git_ops', None)
+        if git_ops is None:
+            return {'error': 'no git authority wired'}
+        esc = await asyncio.to_thread(queue.get, escalation_id)
+        if esc is None:
+            return {'error': f'Escalation {escalation_id} not found'}
+        citations = await resolve_cited_shas(esc, git_ops)
+        return {
+            'escalation_id': esc.id,
+            'resolved_shas': list(citations.resolved),
+            'skipped_shas': list(citations.skipped),
+        }
 
     # --- Interactive warm-worktree tools (PRD β / task 2011) ---
 

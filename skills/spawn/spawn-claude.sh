@@ -31,16 +31,31 @@
 # a session can never re-serve its own launch parameters to a session IT
 # spawns. Set them explicitly on each spawn; they do not propagate onward.
 #
-# Backend selection:
-#   $CLAUDE_SPAWN_BACKEND=tmux — bypass terminal-emulator discovery entirely
+# Parent: with no $CLAUDE_SPAWN_SESSION_ID, on every lane, the child's parent
+#   comes from this spawner's own record (spawn_t3_lane.py `self-record`), so a
+#   hand-launched spawner's children get a parent_session_id too, and sibling
+#   mode uses that record's parent rather than an inherited
+#   $CLAUDE_SPAWN_PARENT_ID.
+#
+# Backend selection -- $CLAUDE_SPAWN_BACKEND names where the session lives:
+#   auto (or unset) — t3 when this script runs inside a T3 Code-hosted
+#     session (spawn_t3_lane.py `detect`), else wm.
+#   t3 — a T3 Code thread in the project whose root is <cwd>; no terminal.
+#     The lane refuses (exit 145) skip_permissions=false and any
+#     $CLAUDE_SPAWN_CLAUDE_ARGS; $CLAUDE_SPAWN_MODEL becomes the thread's
+#     model. Child mode joins on the thread's result.md or archive and exits
+#     with spawn_t3_lane.py `wait`'s code. The started-grace defaults to 300s.
+#   tmux — bypass terminal-emulator discovery entirely
 #     and launch in a crash-survivable, reattachable tmux window instead
 #     (Fleet Cockpit C6). Per-project session `fleet-<project>` (project from
 #     $CLAUDE_SPAWN_PROJECT, else basename(cwd), else "fleet"), one window
 #     per runner; override the session name via $CLAUDE_SPAWN_TMUX_SESSION.
 #     Reattach with `tmux attach -t <session>`. Requires `tmux` on $PATH —
 #     see exit code 126 below.
+#   wm — terminal-emulator discovery, below.
+#   Any other value is bad usage (exit 2).
 #
-# Emulator discovery order (when $CLAUDE_SPAWN_BACKEND != tmux):
+# Emulator discovery order (the wm backend):
 #   1. $CLAUDE_TERMINAL_CMD             (preferred env override)
 #   2. $ESCALATION_TERMINAL_CMD         (legacy fallback)
 #   3. gnome-terminal / kitty / konsole / xterm in $PATH
@@ -48,12 +63,22 @@
 #   5. exit 126 — caller must prompt user and set $CLAUDE_TERMINAL_CMD
 #
 # Exit codes:
-#   0..125 — claude's own exit code (recovered from sentinel)
-#   126    — no usable launcher (no terminal emulator found / tmux missing in tmux mode)
+#   0..125 — claude's own exit code (recovered from sentinel); on the t3 lane,
+#            spawn_t3_lane.py `wait`'s code: 0 (final result.md, or thread
+#            archived) or 1 (the thread's last run ended without one)
+#   126    — no usable launcher (no terminal emulator found / tmux missing in tmux mode /
+#            t3, python3 or T3's server-runtime.json missing on the t3 lane); on the
+#            t3 lane also `wait`'s "T3 server unreachable beyond its grace" (a deleted
+#            thread ends the same way: its `thread show` fails)
 #   127    — launcher itself failed (emulator exited before writing the sentinel,
-#            or the sentinel never settled to a numeric exit code within the launch grace)
+#            or the sentinel never settled to a numeric exit code within the launch grace;
+#            on the t3 lane, the thread launch failed or spawn_t3_lane.py faulted). On the
+#            t3 lane also `wait`'s "show reported no thread", and "join lost": `wait` faulted
+#            while the thread may still be running (stderr names the thread and record)
 #   129    — terminal window closed while the session was alive (SIGHUP)
+#   143    — the session's payload shell was sent SIGTERM
 #   144    — Claude never started within the started-grace window (registry marked failed-to-start)
+#   145    — the selected lane cannot honour an input (t3 lane only, today)
 #   2      — bad usage
 
 set -u
@@ -63,6 +88,8 @@ set -u
 # free (0-125 claude, 126 no-emulator, 127 launcher-fail, 129 window-closed,
 # 143 SIGTERM, 2 usage), so this is additive and backward-compatible.
 EXIT_FAILED_TO_START=144
+# "This lane cannot honour that input" -- a different invariant from bad usage.
+EXIT_LANE_REFUSED=145
 
 # Absolute path to the repo root, computed from this script's own location
 # (skills/spawn/spawn-claude.sh -> skills/spawn -> skills -> repo root) so the
@@ -70,6 +97,7 @@ EXIT_FAILED_TO_START=144
 # venv, PYTHONPATH, or install required.
 REPO_ROOT="$(cd "$(dirname "$(dirname "$(dirname "${BASH_SOURCE[0]}")")")" && pwd)"
 SESSION_REGISTRY_PY="$REPO_ROOT/orchestrator/src/orchestrator/session_registry.py"
+SPAWN_T3_LANE_PY="$REPO_ROOT/orchestrator/src/orchestrator/spawn_t3_lane.py"
 
 if [ $# -eq 4 ] && [ "$4" != "--prompt-file" ]; then
   prompt="$4"
@@ -106,6 +134,92 @@ spawn_mode="${CLAUDE_SPAWN_MODE:-child}"
 self_exit=""
 [ "${CLAUDE_SPAWN_SELF_EXIT:-}" = "1" ] && self_exit=1
 
+# Runs a spawn_t3_lane.py verb under the same import contract as the hooks
+# (skills/spawn/hooks/session-start.sh). Every verb prints one verdict line:
+# a status word, then `key=value` tokens.
+t3_lane_module() {
+  PYTHONPATH="$REPO_ROOT/orchestrator/src${PYTHONPATH:+:$PYTHONPATH}" python3 "$SPAWN_T3_LANE_PY" "$@"
+}
+
+verdict_status() {
+  local status rest
+  read -r status rest <<<"$1"
+  printf '%s' "$status"
+}
+
+# $1 verdict line, $2 key; prints the key's value, or nothing.
+verdict_field() {
+  local -a words=()
+  local w
+  read -r -a words <<<"$1"
+  for w in ${words[@]+"${words[@]}"}; do
+    case "$w" in "$2="*) printf '%s' "${w#"$2="}"; return 0 ;; esac
+  done
+  return 1
+}
+
+t3_host_detected() {
+  local verdict rc
+  command -v python3 >/dev/null 2>&1 || return 1
+  verdict=$(t3_lane_module detect)
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "spawn-claude.sh: T3 host detection faulted (rc $rc); using terminal-emulator discovery" >&2
+    return 1
+  fi
+  [ "$verdict" = "t3" ]
+}
+
+# Sets spawn_backend to t3|tmux|wm and, for t3, t3_lane_origin (how the lane
+# was chosen, for refusal messages).
+resolve_spawn_backend() {
+  t3_lane_origin="explicitly (CLAUDE_SPAWN_BACKEND=t3)"
+  case "${CLAUDE_SPAWN_BACKEND:-auto}" in
+    auto)
+      spawn_backend="wm"
+      if t3_host_detected; then
+        spawn_backend="t3"
+        t3_lane_origin="by auto-selection (CLAUDE_SPAWN_BACKEND=${CLAUDE_SPAWN_BACKEND:-unset}; this spawner is T3-hosted)"
+      fi
+      ;;
+    t3|tmux|wm) spawn_backend="$CLAUDE_SPAWN_BACKEND" ;;
+    *)
+      echo "spawn-claude.sh: unknown CLAUDE_SPAWN_BACKEND='$CLAUDE_SPAWN_BACKEND' (expected auto|t3|tmux|wm)" >&2
+      exit 2
+      ;;
+  esac
+}
+
+# $1 the input refused, $2 what the caller can do instead.
+t3_lane_refuse() {
+  echo "spawn-claude.sh: the t3 lane, selected $t3_lane_origin, cannot honour $1 -- $2" >&2
+  exit "$EXIT_LANE_REFUSED"
+}
+
+refuse_inputs_the_t3_lane_cannot_honour() {
+  if [ "$skip_perms" != "true" ]; then
+    t3_lane_refuse "skip_permissions=$skip_perms" \
+      "a T3 thread runs in its project's runtime mode; pass true, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
+  fi
+  if [ -n "${CLAUDE_SPAWN_CLAUDE_ARGS:-}" ]; then
+    t3_lane_refuse "CLAUDE_SPAWN_CLAUDE_ARGS='$CLAUDE_SPAWN_CLAUDE_ARGS'" \
+      "a T3 thread takes no claude CLI arguments; unset it, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
+  fi
+}
+
+require_python3_for_the_t3_lane() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "spawn-claude.sh: the t3 lane, selected $t3_lane_origin, needs python3 on PATH" >&2
+    exit 126
+  fi
+}
+
+resolve_spawn_backend
+if [ "$spawn_backend" = "t3" ]; then
+  refuse_inputs_the_t3_lane_cannot_honour
+  require_python3_for_the_t3_lane
+fi
+
 # Started-verification watchdog (Attention Rail T4) state: a spawn-time
 # reference marker (mtime = spawn start, used by the step-4 transcript-
 # appearance probe to distinguish a fresh transcript from a stale one), a
@@ -117,7 +231,9 @@ self_exit=""
 # trip the new code.
 spawn_ref="$(mktemp -t spawn-claude-ref-XXXXXX)"
 fts_marker="$(mktemp -u -t spawn-claude-XXXXXX.fts)"
-SPAWN_STARTED_GRACE_SECS="${SPAWN_STARTED_GRACE_SECS:-90}"
+started_grace_default=90
+[ "$spawn_backend" = "t3" ] && started_grace_default=300
+SPAWN_STARTED_GRACE_SECS="${SPAWN_STARTED_GRACE_SECS:-$started_grace_default}"
 CLAUDE_PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
 
 # Kill the started-watchdog on EVERY exit path -- MANDATORY. A backgrounded
@@ -136,7 +252,7 @@ CLAUDE_PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
 # spawn_ref to be removed prematurely.
 _cleanup() {
   [ -n "${watchdog_pid:-}" ] && kill "$watchdog_pid" 2>/dev/null
-  rm -f "$spawn_ref" "$fts_marker"
+  rm -f "$spawn_ref" "$fts_marker" ${t3_prompt_file:+"$t3_prompt_file"}
 }
 trap _cleanup EXIT
 
@@ -293,6 +409,20 @@ fi
 #     set: --resume/--continue make a brand-new nested process report it too,
 #     so honouring it would let an inheritor rebind THIS spawn's record to
 #     itself.
+# A spawner with no CLAUDE_SPAWN_SESSION_ID (hand-launched, or T3-hosted)
+# finds its own record through its claude pid; child mode parents at that
+# record, sibling mode at that record's parent. Fail-soft: no record, no parent.
+parent_from_own_record() {
+  local verdict own
+  verdict=$(t3_lane_module self-record) || return 0
+  if [ "$spawn_mode" = "sibling" ]; then
+    own=$(verdict_field "$verdict" parent)
+  else
+    own=$(verdict_field "$verdict" slug)
+  fi
+  [ "$own" = "none" ] || printf '%s' "$own"
+}
+
 spawn_id_export=""
 parent_id_export=""
 if [ -n "$SESSION_RECORD_DIR" ]; then
@@ -300,10 +430,12 @@ if [ -n "$SESSION_RECORD_DIR" ]; then
   q_child=$(printf %q "$child_session_id")
   spawn_id_export="export CLAUDE_SPAWN_SESSION_ID=$q_child; "
 
-  if [ "$spawn_mode" = "sibling" ]; then
+  if [ -z "${CLAUDE_SPAWN_SESSION_ID:-}" ]; then
+    parent_of_child=$(parent_from_own_record)
+  elif [ "$spawn_mode" = "sibling" ]; then
     parent_of_child="${CLAUDE_SPAWN_PARENT_ID:-}"
   else
-    parent_of_child="${CLAUDE_SPAWN_SESSION_ID:-}"
+    parent_of_child="$CLAUDE_SPAWN_SESSION_ID"
   fi
   if [ -n "$parent_of_child" ]; then
     q_parent=$(printf %q "$parent_of_child")
@@ -371,10 +503,17 @@ If you write it before your work is done, set outcome: in-progress and
 rewrite it with a final outcome before you end. Run /reflect before you
 end this session."
   if [ "$self_exit" = 1 ]; then
-    self_exit_trailer='This session was spawned with self-exit on. When all work, result.md and
+    if [ "$spawn_backend" = "t3" ]; then
+      self_exit_trailer='This session was spawned with self-exit on. When all work, result.md and
+/reflect are complete and no background task of yours is still running,
+call the t3_thread_organize MCP tool with action "archive" on your own
+thread as your final action (best-effort; skip it if it fails).'
+    else
+      self_exit_trailer='This session was spawned with self-exit on. When all work, result.md and
 /reflect are complete and no background task of yours is still running,
 run this as your final action (best-effort; skip it if it fails):
 printf '\''%s'\'' "$CLAUDE_CODE_SESSION_ID" > "$(dirname "$CLAUDE_SPAWN_RESULT_FILE")/exit-requested"'
+    fi
     prompt="${prompt}
 
 ${self_exit_trailer}"
@@ -818,6 +957,12 @@ _started_evidence() {
 # way to retract the flag once the caller has observed it. Callers on slow or
 # loaded hosts should raise SPAWN_STARTED_GRACE_SECS accordingly; see
 # SKILL.md's Verification section for the caller-facing note.
+mark_record_failed_to_start() {
+  if [ -n "$SESSION_RECORD_DIR" ] && command -v python3 >/dev/null 2>&1; then
+    python3 "$SESSION_REGISTRY_PY" refresh --record "$SESSION_RECORD_DIR" --status failed-to-start || true
+  fi
+}
+
 _started_watchdog() {
   # Clear inherited traps in this backgrounded copy -- without this, the
   # child would run the parent's _cleanup on its own return, which would be
@@ -851,9 +996,7 @@ _started_watchdog() {
   # deadline boundary.
   [ -f "$sentinel" ] && return 0
 
-  if [ -n "$SESSION_RECORD_DIR" ] && command -v python3 >/dev/null 2>&1; then
-    python3 "$SESSION_REGISTRY_PY" refresh --record "$SESSION_RECORD_DIR" --status failed-to-start || true
-  fi
+  mark_record_failed_to_start
   # Deliberately do NOT assert a specific final exit code here: resolve_foreground
   # and resolve_detached's launch_rc!=0 branch both prefer the more specific,
   # pre-existing 127 launcher-failure verdict over this flag when both fire for
@@ -1003,9 +1146,98 @@ _detach() {
   fi
 }
 
+# --- t3 lane ---------------------------------------------------------------
+# A T3 Code thread hosts the session, so the payload $inner, the sentinel and
+# the started-watchdog play no part: spawn_t3_lane.py launches the thread,
+# awaits its start (binding its transcript to the record) and, in child mode,
+# joins on its result.md. Any fault or unknown verdict is a launcher failure.
+
+t3_lane_call() {
+  local rc
+  t3_verdict=$(t3_lane_module "$@")
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$(verdict_status "$t3_verdict")" ]; then
+    echo "spawn-claude.sh: t3 lane: spawn_t3_lane.py $1 faulted (rc $rc); treating it as a launcher failure" >&2
+    exit 127
+  fi
+}
+
+t3_lane_unexpected() {
+  echo "spawn-claude.sh: t3 lane: spawn_t3_lane.py $1 answered '$t3_verdict'; treating it as a launcher failure" >&2
+  exit 127
+}
+
+launch_t3_thread() {
+  local thread_title="${title:-${SESSION_RECORD_DIR##*/}}"
+  [ -n "$thread_title" ] || thread_title="spawned claude session"
+  t3_prompt_file=$(mktemp -t spawn-claude-t3-prompt-XXXXXX)
+  printf '%s' "$prompt" > "$t3_prompt_file"
+  local -a args=(launch --cwd "$cwd" --title "$thread_title" --prompt-file "$t3_prompt_file" --record "$SESSION_RECORD_DIR")
+  [ -n "${CLAUDE_SPAWN_MODEL:-}" ] && args+=(--model "$CLAUDE_SPAWN_MODEL")
+  [ -n "${parent_of_child:-}" ] && args+=(--parent "$parent_of_child")
+  t3_launch_epoch=$(date +%s)
+  t3_lane_call "${args[@]}"
+  case "$(verdict_status "$t3_verdict")" in
+    started)
+      t3_thread_id=$(verdict_field "$t3_verdict" thread_id)
+      [ -n "$t3_thread_id" ] || t3_lane_unexpected launch
+      ;;
+    no-launcher)
+      echo "spawn-claude.sh: the t3 lane, selected $t3_lane_origin, has no launcher ($(verdict_field "$t3_verdict" reason)) -- install t3 / start T3 Code, or set CLAUDE_SPAWN_BACKEND=tmux or wm" >&2
+      exit 126
+      ;;
+    refused)
+      t3_lane_refuse "cwd=$cwd ($(verdict_field "$t3_verdict" reason); project root $(verdict_field "$t3_verdict" detail))" \
+        "a T3 thread always runs in its project's root; pass that root as cwd, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
+      ;;
+    launch-failed)
+      echo "spawn-claude.sh: t3 lane: t3 thread start failed and no thread titled '$thread_title' appeared" >&2
+      exit 127
+      ;;
+    *) t3_lane_unexpected launch ;;
+  esac
+}
+
+await_t3_thread_started() {
+  local status
+  t3_lane_call await-started --thread-id "$t3_thread_id" --cwd "$cwd" --record "$SESSION_RECORD_DIR" \
+    --timeout "$SPAWN_STARTED_GRACE_SECS" --since "$t3_launch_epoch"
+  status=$(verdict_status "$t3_verdict")
+  case "$status" in
+    started) ;;
+    failed-to-start|timeout)
+      mark_record_failed_to_start
+      echo "spawn-claude.sh: FAILED-TO-START — T3 thread $t3_thread_id did not start ($status) within ${SPAWN_STARTED_GRACE_SECS}s; registry marked failed-to-start." >&2
+      exit "$EXIT_FAILED_TO_START"
+      ;;
+    *) t3_lane_unexpected await-started ;;
+  esac
+}
+
+# Exit 127 (the table is liveness-only), but say what it means here: the
+# thread was started and may still be running.
+t3_lane_join_lost() {
+  echo "spawn-claude.sh: t3 lane: JOIN LOST — $1; T3 thread $t3_thread_id may still be running (record: ${SESSION_RECORD_DIR:-none}); check it before spawning again" >&2
+  exit 127
+}
+
+join_t3_thread() {
+  local code rc
+  t3_verdict=$(t3_lane_module wait --thread-id "$t3_thread_id" --cwd "$cwd" --record "$SESSION_RECORD_DIR")
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ "$(verdict_status "$t3_verdict")" != "finished" ]; then
+    t3_lane_join_lost "spawn_t3_lane.py wait exited $rc with verdict '$t3_verdict'"
+  fi
+  code=$(verdict_field "$t3_verdict" code)
+  case "$code" in ''|*[!0-9]*) t3_lane_join_lost "spawn_t3_lane.py wait answered '$t3_verdict'" ;; esac
+  exit "$code"
+}
+
 # --- emulator selection ----------------------------------------------------
 
-if [ "${CLAUDE_SPAWN_BACKEND:-}" = "tmux" ]; then
+if [ "$spawn_backend" = "t3" ]; then
+  first_word="t3-lane"
+elif [ "$spawn_backend" = "tmux" ]; then
   # Fleet Cockpit C6: the tmux lane is crash-survivable/reattachable and
   # needs no terminal emulator at all -- bypass discovery entirely.
   # first_word drives the case dispatch further down exactly like a
@@ -1047,13 +1279,16 @@ fi
 # _cleanup + trap installed earlier (right after the mktemp calls near the
 # top of the script), so spawn_ref can never leak -- including on the
 # `exit 126` (no emulator found) path just above. Only the fork itself
-# happens here, immediately before the emulator case dispatch. Forked
-# unconditionally, including for spawn_mode=sibling -- see resolve_sibling's
-# KNOWN LIMITATION comment above for why this watchdog can never actually
-# flag failed-to-start on that path.
+# happens here, immediately before the emulator case dispatch. Forked for
+# every lane except t3 (which has no sentinel or terminal transcript race;
+# its start is spawn_t3_lane.py `await-started`), including for
+# spawn_mode=sibling -- see resolve_sibling's KNOWN LIMITATION comment above
+# for why this watchdog can never actually flag failed-to-start on that path.
 watchdog_pid=""
-_started_watchdog &
-watchdog_pid=$!
+if [ "$first_word" != "t3-lane" ]; then
+  _started_watchdog &
+  watchdog_pid=$!
+fi
 
 case "$first_word" in
   gnome-terminal)
@@ -1169,6 +1404,15 @@ case "$first_word" in
         finish_failed_to_start
       fi
       finish
+    fi
+    ;;
+  t3-lane)
+    launch_t3_thread
+    await_t3_thread_started
+    if [ "$spawn_mode" = "sibling" ]; then
+      resolve_sibling
+    else
+      join_t3_thread
     fi
     ;;
   tmux-lane)

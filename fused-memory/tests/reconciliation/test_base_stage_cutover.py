@@ -18,6 +18,7 @@ from fused_memory.reconciliation.cli_stage_runner import STAGE_REPORT_SCHEMA, St
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from reconciliation.consolidator_fixtures import make_consolidator
+from reconciliation.harness_fixtures import make_harness
 
 
 class _StubStage(BaseStage):
@@ -350,22 +351,14 @@ class TestHarnessForwardsReconState:
     """ReconciliationHarness must accept recon_report_state and forward it to all stages."""
 
     def _make_harness(self, state):
-        from unittest.mock import MagicMock
-
         from fused_memory.config.schema import FusedMemoryConfig
-        from fused_memory.reconciliation.harness import ReconciliationHarness
 
-        config = FusedMemoryConfig()
-        memory_mock = AsyncMock()
-        journal_mock = AsyncMock()
-        event_buffer_mock = MagicMock()
-
-        harness = ReconciliationHarness(
-            memory_service=memory_mock,
+        harness = make_harness(
+            journal=AsyncMock(),
+            event_buffer=MagicMock(),
+            memory_service=AsyncMock(),
             taskmaster=None,
-            journal=journal_mock,
-            event_buffer=event_buffer_mock,
-            config=config,
+            config=FusedMemoryConfig(),
             recon_report_state=state,
         )
         # Task 2146 β: the harness no longer pre-builds a long-lived `self.stages`
@@ -422,17 +415,16 @@ class TestMainWiringReconState:
     def test_harness_preserves_state_identity(self):
         """ReconciliationHarness preserves the exact state object passed at construction."""
         from fused_memory.config.schema import FusedMemoryConfig, ServerConfig
-        from fused_memory.reconciliation.harness import ReconciliationHarness
         from fused_memory.server.main import _build_recon_report_components
 
         config = FusedMemoryConfig(server=ServerConfig(recon_report_port=8099))
         state, _, _ = _build_recon_report_components(config)
 
-        harness = ReconciliationHarness(
-            memory_service=AsyncMock(),
-            taskmaster=None,
+        harness = make_harness(
             journal=AsyncMock(),
             event_buffer=MagicMock(),
+            memory_service=AsyncMock(),
+            taskmaster=None,
             config=config,
             recon_report_state=state,
         )

@@ -2,7 +2,8 @@
 // jsdom window and loads index.html's local scripts into it the way the
 // browser does, on the browser's exact Babel build and the development build
 // of the exact React package the browser loads. Render tests mount one real
-// tab into it and query the DOM it produces.
+// tab into it with mount(), or the whole page app.jsx bootstraps with
+// mountPage(), and query the DOM it produces.
 //
 // A helper module, not a test: the `*.test.mjs` glob skips it.
 // dom_harness.test.mjs holds its contract.
@@ -35,8 +36,9 @@ const REACT_DEVELOPMENT_BUILDS = Object.freeze({
 export const REACT_BUILDS = Object.keys(REACT_DEVELOPMENT_BUILDS);
 
 // app.jsx is the page bootstrap: at load it mounts the whole <App/> into
-// #root, which would bring every tab's effects into every window. Render tests
-// mount one tab each instead.
+// #root, which would bring every tab's effects into every window. So it is
+// excluded from the LOAD, and run only on demand by mountPage(); most render
+// tests mount one tab each instead.
 const EXCLUDED_SCRIPTS = ['app.jsx'];
 
 function npmCiRemedy(root) {
@@ -168,6 +170,8 @@ function capturedConsoleErrors(VirtualConsole) {
 // served file. Returns the window and what was loaded, plus:
 //   consoleErrors — everything the window wrote to console.error, live;
 //   mount(Component, props) — renders into a fresh container under act();
+//   mountPage() — runs the excluded scripts into a fresh #root under act(),
+//     as index.html does, at most once per window; returns that #root;
 //   close() — unmounts every root, then closes the window and its timers.
 // Any script that fails to evaluate fails the build.
 export function buildDashboardWindow({ readSource = readServedSource } = {}) {
@@ -225,6 +229,26 @@ export function buildDashboardWindow({ readSource = readServedSource } = {}) {
     return handle;
   }
 
+  let pageRoot = null;
+
+  // app.jsx owns the createRoot it renders into, so no handle is tracked:
+  // window.close() is what stops the page's timers.
+  function mountPage() {
+    if (pageRoot) throw new Error(`mountPage() already ran ${excluded.join(', ')} into this window's #root`);
+    const { React, document } = window;
+    pageRoot = document.createElement('div');
+    pageRoot.id = 'root';
+    document.body.appendChild(pageRoot);
+    const context = dom.getInternalVMContext();
+    for (const src of excluded) {
+      const script = servedScript(src, readSource(src), compileAsScriptTag);
+      React.act(() => {
+        script.runInContext(context);
+      });
+    }
+    return pageRoot;
+  }
+
   let closed = false;
 
   function close() {
@@ -237,7 +261,7 @@ export function buildDashboardWindow({ readSource = readServedSource } = {}) {
     }
   }
 
-  return { window, loaded: scripts.map(({ src }) => src), excluded, consoleErrors, mount, close };
+  return { window, loaded: scripts.map(({ src }) => src), excluded, consoleErrors, mount, mountPage, close };
 }
 
 // Lands `patch` in the window's DF_DATA as a poll would. Its `__receipt`

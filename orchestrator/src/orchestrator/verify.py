@@ -35,7 +35,7 @@ from shared.proc_group import terminate_process_group
 from shared.psi import read_psi_sample
 from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
 
-from orchestrator import verify_plan
+from orchestrator import verify_evidence, verify_plan
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 
@@ -99,6 +99,7 @@ from orchestrator.verify_cmd import (
     with_junitxml,
     with_pytest_timeout,
 )
+from orchestrator.verify_event_channel import VerifyEventChannel, allocate_verify_event_log
 
 logger = logging.getLogger(__name__)
 
@@ -2161,33 +2162,25 @@ def _serial_pytest_str(cmd: str | None, *, invocation_dir: Path | None) -> str |
     a PYTEST ToolKind (e.g. a ``cargo test --workspace`` command — covers
     OPAQUE too, P1).
 
-    **Why the refusal branch logs (task 4121).** There is a third way to
-    reach ``rewritten is parsed``: ``verify_cmd``'s raw-chain appender
-    REFUSES outright rather than splice the flags into an unclosed quote
-    (the rule and its measurements live in
-    ``verify_cmd._unspliceable_pytest_spans``). Refusing is correct, but a
-    SILENT refusal is its own defect — the ENV_TRANSIENT retry re-runs the
+    **Why an unchanged raw chain logs (task 4121).** A raw-retained PYTEST
+    chain comes back unchanged for any reason on
+    ``verify_cmd.py::serial_pytest``'s raw no-op list; the quoted chain
+    operator (``-k 'a && b'``) this was written for is now recovered. A
+    SILENT no-op is its own defect — the ENV_TRANSIENT retry re-runs the
     ORIGINAL command and fails for its own reason, and an operator reading
     that log cannot tell "recovery ran without its flags" from "recovery
     ran". One WARNING makes the difference legible, the same reasoning
     ``_with_junitxml_str`` records for its own suppressed injection (task
     3218). This is the single string-level wrapper behind every
-    serial-recovery call site, so one record here covers them all. The
-    record names the OFFENDING SPAN — ``_unspliceable_pytest_spans`` returns
-    the spans, not a bare bool — so a long multi-segment ``test_command``
-    does not leave the operator re-deriving the segmentation by hand, and so
-    the message states what was measured instead of asserting a cause.
+    serial-recovery call site, so one record here covers them all. When
+    ``_unspliceable_pytest_spans`` finds an offending span the record names
+    it, so the message states what was measured instead of asserting a
+    cause.
 
     The gate is STRUCTURAL (``parsed.tool is ToolKind.PYTEST and parsed.raw
-    is not None``) rather than "does the command contain an unspliceable
-    span", and that is exact: a structured PYTEST command always gains
-    ``base_flags``, so it never reaches ``rewritten is parsed`` at all — and
-    a command like ``pytest -k 'a && pytest b' tests/`` parses with ``raw is
-    None`` (measured) and IS successfully mutated, so a span-content gate
-    would warn about a command that lost nothing. A non-PYTEST or OPAQUE
-    command is an expected, benign no-op. That leaves exactly one thing a
-    raw-retained PYTEST chain returning unchanged can be: the appender's
-    refusal.
+    is not None``): a structured PYTEST command always gains ``base_flags``,
+    so it never reaches ``rewritten is parsed`` at all, and a non-PYTEST or
+    OPAQUE command is an expected, benign no-op.
     """
     if cmd is None:
         return None
@@ -2199,10 +2192,9 @@ def _serial_pytest_str(cmd: str | None, *, invocation_dir: Path | None) -> str |
             refused = _unspliceable_pytest_spans(parsed.raw)
             reason = (
                 f'the matched pytest span {refused[0]!r} ends inside an unclosed '
-                "quote (commonly a -k 'a && b' expression, where the quote-blind "
-                'span scanner stops at the && INSIDE the quotes), so nowhere in it '
-                'could take -p no:xdist -o addopts= without landing inside a live '
-                'quoted argument and silently running the wrong tests'
+                'quote, so nowhere in it could take -p no:xdist -o addopts= without '
+                'landing inside a live quoted argument and silently running the '
+                'wrong tests'
                 if refused
                 else 'no pytest invocation could be located outside a quoted '
                 'argument, so there was nowhere to put -p no:xdist -o addopts='
@@ -2261,18 +2253,19 @@ def _with_pytest_numprocesses_str(cmd: str | None, n: str) -> str | None:
     configures a numeric cap), and an already-serial-forced command (``-p
     no:xdist`` — injecting ``-n`` there would fail the run with
     ``unrecognized arguments: -n`` and defeat the serial-recovery safety
-    net). Task 4121 adds a fourth: the raw-chain appender REFUSES rather than
-    splice ``-n`` into an unclosed quote, returning the command untouched
-    (see ``verify_cmd._unspliceable_pytest_spans``).
+    net). Task 4121 adds a fourth, now defence in depth: the raw-chain
+    appender REFUSES rather than splice ``-n`` into an unclosed quote,
+    returning the command untouched (see
+    ``verify_cmd._unspliceable_pytest_spans``).
 
     Unlike ``_with_junitxml_str`` — and unlike ``_serial_pytest_str``, which
-    task 4121 gave a WARNING for exactly that refusal — this does NOT log any
-    of its no-ops. A suppressed junit injection means an expected report will
-    not be written, and suppressed serial-recovery flags mean a recovery
-    attempt runs without the thing that makes it a recovery; both degrade
-    named capabilities. A suppressed ``-n`` just leaves the command at its
+    logs a raw chain it hands back unchanged — this does NOT log any of its
+    no-ops. A suppressed junit injection means an expected report will not
+    be written, and suppressed serial-recovery flags mean a recovery attempt
+    runs without the thing that makes it a recovery; both degrade named
+    capabilities. A suppressed ``-n`` just leaves the command at its
     configured worker count, which is the pre-cap status quo and not a lost
-    capability — the refusal case included.
+    capability.
 
     Task 3478 extracted this so the cap has ONE rewrite site with two
     callers — ``_run_or_skip_timed``'s non-segmented branch and the
@@ -2511,15 +2504,17 @@ def _red_gate_category(slot: LegSlot) -> FailureCategory:
 
 
 def classify_leg(
-    slot: LegSlot, rc: int, output: str, timed_out: bool, cmd: str | None,
+    slot: LegSlot, rc: int, output: str, timed_out: bool, cmd: str | None, *,
+    event_channel: VerifyEventChannel | None = None,
 ) -> FailureCategory:
     """The ONE per-leg classifier. ``classify_failure`` answers what the tool's
-    OUTPUT says; this adds what only verify knows: the leg's slot, and that
-    verify interposed the shell. It rewrites only the UNKNOWN_TEST_FAILURE
-    fall-through, so every more specific diagnosis survives.
+    OUTPUT says (and the leg's *event_channel*, when present); this adds what
+    only verify knows: the leg's slot, and that verify interposed the shell.
+    It rewrites only the UNKNOWN_TEST_FAILURE fall-through, so every more
+    specific diagnosis survives.
     """
     tool = _tool_for_cmd(cmd)
-    category = classify_failure(tool, rc, output, timed_out)
+    category = classify_failure(tool, rc, output, timed_out, event_channel=event_channel)
     if category != FailureCategory.UNKNOWN_TEST_FAILURE:
         return category
     if tool is ToolKind.PYTEST and _pytest_session_aborted_without_verdict(rc, output):
@@ -2528,7 +2523,7 @@ def classify_leg(
 
 
 def _classify_failing_legs(
-    legs: Iterable[tuple[LegSlot, int, str, bool, str | None]],
+    legs: Iterable[tuple[LegSlot, int, str, bool, str | None, VerifyEventChannel | None]],
 ) -> dict[LegSlot, FailureCategory]:
     """Each failing leg's own category, keyed by slot, in *legs* order.
 
@@ -2537,22 +2532,26 @@ def _classify_failing_legs(
     provisioned venv is ENV_TRANSIENT, not TYPE_ERROR.
     """
     by_slot = {leg[0]: leg for leg in legs}
-    _, test_rc, _, _, test_cmd = by_slot[LegSlot.TEST]
+    _, test_rc, _, _, test_cmd, _ = by_slot[LegSlot.TEST]
     categories: dict[LegSlot, FailureCategory] = {}
-    for slot, rc, output, timed_out, cmd in by_slot.values():
+    for slot, rc, output, timed_out, cmd, event_channel in by_slot.values():
         if rc == 0:
             continue
         if slot is LegSlot.TYPE and _type_leg_read_partially_provisioned_venv(
             rc, output, timed_out, cmd, test_rc=test_rc, test_cmd=test_cmd,
+            event_channel=event_channel,
         ):
             categories[slot] = FailureCategory.ENV_TRANSIENT
         else:
-            categories[slot] = classify_leg(slot, rc, output, timed_out, cmd)
+            categories[slot] = classify_leg(
+                slot, rc, output, timed_out, cmd, event_channel=event_channel,
+            )
     return categories
 
 
 def _type_leg_read_partially_provisioned_venv(
     rc: int, out: str, timed_out: bool, cmd: str | None, *, test_rc: int, test_cmd: str | None,
+    event_channel: VerifyEventChannel | None = None,
 ) -> bool:
     """True when task 6127's cross-leg refinement decides the TYPE leg.
 
@@ -2565,7 +2564,9 @@ def _type_leg_read_partially_provisioned_venv(
     ``_warn_if_type_leg_read_partially_provisioned_venv`` both ask this one
     question, so the log never disagrees with the category.
     """
-    category = classify_failure(_tool_for_cmd(cmd), rc, out, timed_out)
+    category = classify_failure(
+        _tool_for_cmd(cmd), rc, out, timed_out, event_channel=event_channel,
+    )
     return category == FailureCategory.UNKNOWN_TEST_FAILURE and (
         is_partially_provisioned_venv_type_failure(
             out, test_tool=_tool_for_cmd(test_cmd), test_leg_passed=test_rc == 0,
@@ -2577,7 +2578,7 @@ def _warn_if_type_leg_read_partially_provisioned_venv(attempt: 'VerifyAttempt') 
     type_leg, test_leg = attempt.type, attempt.test
     if not _type_leg_read_partially_provisioned_venv(
         type_leg.rc, type_leg.output, type_leg.timed_out, type_leg.cmd,
-        test_rc=test_leg.rc, test_cmd=test_leg.cmd,
+        test_rc=test_leg.rc, test_cmd=test_leg.cmd, event_channel=type_leg.event_channel,
     ):
         return
     logger.warning(
@@ -2681,13 +2682,13 @@ def _summarize_checks(
         return True, 'passed', '', 'All checks passed', []
 
     legs = (
-        (LegSlot.TEST, test_rc, test_out, test_timed_out, test_cmd),
-        (LegSlot.LINT, lint_rc, lint_out, lint_timed_out, lint_cmd),
-        (LegSlot.TYPE, type_rc, type_out, type_timed_out, type_cmd),
+        (LegSlot.TEST, test_rc, test_out, test_timed_out, test_cmd, None),
+        (LegSlot.LINT, lint_rc, lint_out, lint_timed_out, lint_cmd, None),
+        (LegSlot.TYPE, type_rc, type_out, type_timed_out, type_cmd, None),
     )
     if leg_categories is None:
         leg_categories = _classify_failing_legs(legs)
-    hints = (_extract_cause_hint(out) for _, rc, out, _, _ in legs if rc != 0)
+    hints = (_extract_cause_hint(out) for _, rc, out, *_ in legs if rc != 0)
     cause_hint = ' | '.join(hint for hint in hints if hint)
     per_check_categories: list[str] = [*leg_categories.values()]
     category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
@@ -2768,6 +2769,12 @@ def _build_summary_payload(
     role-less. It is a required keyword so no writer can emit a record
     without it.
 
+    ``carried_over`` (task 5624) marks a leg whose started_at/duration_secs
+    come from the attempt's first pass, not this one; a reader computing
+    attempt timing must exclude it, never difference or sum across it. It is
+    read with ``.get`` like ``segments``, so a hand-built remote run reads
+    None: not recorded.
+
     A NEGATIVE rc is not a quiet outcome — it is asyncio reporting that the
     process was terminated by signal ``-rc`` and never got to exit at all, so
     it is the LOUDEST possible outcome and sorts above every non-negative rc
@@ -2793,6 +2800,7 @@ def _build_summary_payload(
         'cmd': worst['cmd'],
         'started_at': worst['started_at'],
         'duration_secs': worst['duration_secs'],
+        'carried_over': worst.get('carried_over'),
         'commands': [
             {
                 'label': r['label'],
@@ -2804,6 +2812,7 @@ def _build_summary_payload(
                 'segments': r.get('segments'),
                 'load': r.get('load'),
                 'slot_wait_secs': r.get('slot_wait_secs'),
+                'carried_over': r.get('carried_over'),
             }
             for r in active_runs
         ],
@@ -3707,6 +3716,7 @@ def _trivial_pass(reason: str) -> 'VerifyResult':
         timed_out=False,
         cause_hint='',
         trivial=True,
+        units=(),
     )
 
 
@@ -3756,6 +3766,7 @@ def _merge_no_evidence_fail(reason: str) -> 'VerifyResult':
         cause_hint=f'{_MERGE_NO_EVIDENCE_CATEGORY}:{reason}',
         category=_MERGE_NO_EVIDENCE_CATEGORY,
         trivial=False,
+        units=(),
     )
 
 
@@ -4333,21 +4344,6 @@ def _build_fallback_config(
     )
 
 
-def _verify_duration_secs(runs: list[dict]) -> float:
-    """Sum per-command ``duration_secs`` values from a verification runs list.
-
-    Each entry is expected to have a ``duration_secs`` key (float); entries
-    that are missing the key contribute 0.0.  Returns 0.0 for an empty list.
-
-    This is the correct wall-clock measure when commands were run **serially**
-    (sum of sequential durations).  For the **concurrent** branch (asyncio.gather
-    of test/lint/type) the caller should use ``max(...)`` of the individual
-    durations — mirroring the multi-module logic in ``_aggregate_results`` — to
-    avoid overstating wall-clock by ~3×.
-    """
-    return sum(r.get('duration_secs', 0.0) for r in runs)
-
-
 @dataclass
 class CheckRun:
     """The execution outcome of a single check (test/lint/type).
@@ -4405,6 +4401,20 @@ class CheckRun:
     # when it competed for no slot, on the terms ``slot_wait_secs`` states.
     # LAST field, as above.
     admission: 'AdmissionLeg | None' = None
+    # This leg invocation's parsed REIFY_VERIFY_EVENT_LOG (task 6856); None =
+    # no command ran. LAST field, as above, and kept out of ``to_dict``.
+    event_channel: 'VerifyEventChannel | None' = None
+    # True when this leg was not re-run in the attempt holding it, so its
+    # result, started_at and duration_secs are that attempt's first pass's
+    # (the env-recovery retry, task 5624). LAST field, as above.
+    carried_over: bool = False
+
+    def __post_init__(self) -> None:
+        if self.carried_over and self.cmd is None:
+            raise ValueError(
+                f'CheckRun {str(self.label)!r}: a check that never ran (cmd=None) '
+                'cannot be carried over'
+            )
 
     @classmethod
     def skipped(cls, label: str) -> 'CheckRun':
@@ -4421,10 +4431,11 @@ class CheckRun:
 
     def to_dict(self) -> dict:
         """Serialise to the runs-dict schema consumed by ``_persist_attempt_logs``/
-        ``_build_summary_payload``/``_verify_duration_secs``/``_archive_merge_verify_logs``
-        (all take ``list[dict]``) — the exact 11-key shape (label/cmd/rc/output/
-        timed_out/started_at/duration_secs/segments/load/slot_wait_secs/admission),
-        7 of which were previously hand-built inline in ``run_verification``.
+        ``_build_summary_payload``/``_archive_merge_verify_logs``
+        (all take ``list[dict]``) — the exact 12-key shape (label/cmd/rc/output/
+        timed_out/started_at/duration_secs/segments/load/slot_wait_secs/admission/
+        carried_over), 7 of which were previously hand-built inline in
+        ``run_verification``.
 
         ``started_at`` is normalised via ``or ''``: a skipped check's
         ``None`` serialises as ``''``, matching the pre-refactor
@@ -4446,6 +4457,9 @@ class CheckRun:
         ``slot_wait_secs`` (task 5671) and ``admission`` (task 5628) are
         emitted unconditionally too: absent means the run predates them,
         ``None`` means it queued for no slot.
+
+        ``carried_over`` (task 5624) is emitted unconditionally as well: True
+        marks a leg whose timing belongs to the attempt's first pass.
         """
         return {
             'label': self.label,
@@ -4459,6 +4473,7 @@ class CheckRun:
             'load': self.load,
             'slot_wait_secs': self.slot_wait_secs,
             'admission': None if self.admission is None else self.admission.to_dict(),
+            'carried_over': self.carried_over,
         }
 
 
@@ -4477,6 +4492,8 @@ class VerifyAttempt:
     ``timed_out=False`` while ``category`` flipped to ``infra_timeout``.
     With a single property definition read from every call site, first-pass
     and env-recovery are now structurally incapable of disagreeing.
+
+    A re-run attempt is built only through :meth:`with_rerun`.
     """
 
     checks: list[CheckRun]
@@ -4507,11 +4524,11 @@ class VerifyAttempt:
             and all(c.rc == 0 or c.timed_out for c in self.checks)
         )
 
-    def _by_label(self, slot: LegSlot) -> CheckRun:
-        found = next((c for c in self.checks if c.label == slot), None)
+    def _by_label(self, label: str) -> CheckRun:
+        found = next((c for c in self.checks if c.label == label), None)
         if found is None:
             raise KeyError(
-                f'no check labeled {slot.value!r} in {[str(c.label) for c in self.checks]}'
+                f'no check labeled {str(label)!r} in {[str(c.label) for c in self.checks]}'
             )
         return found
 
@@ -4531,11 +4548,30 @@ class VerifyAttempt:
         # (LegSlot) used throughout verify.py.
         return self._by_label(LegSlot.TYPE)
 
+    def with_rerun(self, run: CheckRun) -> 'VerifyAttempt':
+        """This attempt with *run* replacing its same-label check and every
+        other check that ran carried over; skipped checks stay skipped.
+
+        Raises ``KeyError`` when this attempt holds no check labeled
+        ``run.label``.
+        """
+        replaced = self._by_label(run.label)
+        return VerifyAttempt([
+            run if c is replaced
+            else (replace(c, carried_over=True) if c.cmd is not None else c)
+            for c in self.checks
+        ])
+
+    def wall_secs(self, *, concurrent: bool) -> float:
+        """Wall time of the legs this attempt ran itself."""
+        own = [c.duration_secs for c in self.checks if not c.carried_over]
+        return max(own, default=0.0) if concurrent else sum(own)
+
     def classify_failing_legs(self) -> dict[LegSlot, FailureCategory]:
         """Each failing check's own category (``classify_leg``), keyed by slot."""
         checks = ((slot, self._by_label(slot)) for slot in LegSlot)
         return _classify_failing_legs(
-            (slot, check.rc, check.output, check.timed_out, check.cmd)
+            (slot, check.rc, check.output, check.timed_out, check.cmd, check.event_channel)
             for slot, check in checks
         )
 
@@ -4656,6 +4692,10 @@ class VerifyResult:
     # UNSCOPED_TYPECHECK_* sentinel results, and any hand-constructed result.
     # `[]` = "no failing legs" (a pass), which is likewise not a licence.
     failing_leg_categories: list[str] | None = None
+    # Task 6856: the TEST leg channel's C3 rule-3 failed run_all members. None =
+    # the channel is absent or no run_all reported into it, so the text parse
+    # governs; [] = the channel cannot vouch for a complete set, i.e. the full suite.
+    run_all_failed_members: list[str] | None = None
     # Task 5357: True iff the TEST leg ran and exited non-zero. `lint_output` and
     # `type_output` are blanked on a passing leg at construction but
     # `test_output` is not (chronic_flake reads it on passes), so
@@ -4722,6 +4762,11 @@ class VerifyResult:
     # no gated leg ran. compare=False because the stamps are wall clock, as for
     # ``duration_secs``.
     admission_legs: tuple[AdmissionLeg, ...] | None = field(default=None, compare=False)
+    # Task 5651: one unit per leg that ran (verify_evidence.py::VerifyUnit). None =
+    # not recorded (an older remote, hand-built results, sentinels); () = nothing ran.
+    units: tuple[verify_evidence.VerifyUnit, ...] | None = None
+    # Task 5651: a plan-level fact like `plan`, stamped where `plan` is stamped.
+    cache_mode: verify_evidence.CacheMode = verify_evidence.CacheMode.OFF
 
     def __post_init__(self) -> None:
         mismatch = _module_attribution_mismatch(
@@ -4734,6 +4779,21 @@ class VerifyResult:
             )
         if self.admission_legs is not None:
             self.admission_legs = legs_from_wire(self.admission_legs)
+        if self.units is not None:
+            self.units = verify_evidence.units_from_wire(self.units)
+        self.cache_mode = verify_evidence.CacheMode(self.cache_mode)
+
+    @property
+    def plan_hash(self) -> str | None:
+        """Identity of the plan this verdict ran (verify_evidence.py::plan_hash)."""
+        return verify_evidence.plan_hash(self.plan)
+
+    @property
+    def slot_wait_secs(self) -> float | None:
+        """The admission queueing ``duration_secs`` excludes: each gated leg's turn wait plus flock wait."""
+        if self.admission_legs is None:
+            return None
+        return sum(leg.waited_secs + leg.flock_wait_secs for leg in self.admission_legs)
 
     def failure_report(self) -> str:
         """Format all failures into a single report for the debugger."""
@@ -6987,6 +7047,21 @@ async def _preprovision_shared_venv(
         _prune_preprovision_guard()
 
 
+def _log_event_channel(label: str, channel: VerifyEventChannel) -> None:
+    if channel.skipped_lines:
+        logger.warning(
+            'Verification %s leg: event channel had %d unparseable line(s), skipped',
+            label, channel.skipped_lines,
+        )
+    if channel.run_starts or channel.fatal_slot_timeouts or channel.soft_slot_timeouts:
+        logger.info(
+            'Verification %s leg: event channel run_starts=%d run_finishes=%d '
+            'fatal_slot_timeouts=%d soft_slot_timeouts=%d',
+            label, channel.run_starts, len(channel.run_finishes),
+            channel.fatal_slot_timeouts, channel.soft_slot_timeouts,
+        )
+
+
 async def run_verification(
     worktree: Path,
     config: OrchestratorConfig,
@@ -7189,19 +7264,18 @@ async def run_verification(
             infix = ''
         return verify_dir / f'attempt-{current_attempt}{infix}.{label}.log'
 
-    async def _run_or_skip_timed(
-        cmd: str | None,
+    async def _run_leg_command(
+        leg_cmd: str,
         *,
         label: LegSlot,
         current_attempt: int,
+        leg_env: dict[str, str],
     ) -> CheckRun:
         """Like _run_cmd but returns a CheckRun capturing (rc, output, timed_out,
-        started_at, duration_secs) for this check.
-
-        When *cmd* is None (skipped check), returns ``CheckRun.skipped(label)``.
+        started_at, duration_secs) for this check, every spawn under *leg_env*.
         """
-        if cmd is None:
-            return CheckRun.skipped(label)
+        # Optional because the `_*_str` rewrites below return `str | None`.
+        cmd: str | None = leg_cmd
         # Capture the un-governed config command before _govern_cpu_str/the
         # nice-wrap below reassign the local `cmd` — CheckRun.cmd must reflect
         # what the caller configured, not the governed/wrapped string handed
@@ -7453,7 +7527,7 @@ async def run_verification(
                         governed,
                         segment_cwd,
                         segment_timeout,
-                        env=verify_env or None,
+                        env=leg_env or None,
                         log_path=_stream_log_path(
                             f'{label}.{segment_label}', current_attempt,
                         ),
@@ -7481,7 +7555,7 @@ async def run_verification(
                     cmd,
                     worktree,
                     timeout,
-                    env=verify_env or None,
+                    env=leg_env or None,
                     log_path=_stream_log_path(label, current_attempt),
                     **_scope_kw,
                     **_clock_kw,
@@ -7606,6 +7680,27 @@ async def run_verification(
             ),
         )
 
+    async def _run_or_skip_timed(
+        cmd: str | None,
+        *,
+        label: LegSlot,
+        current_attempt: int,
+    ) -> CheckRun:
+        """One leg invocation under its own fresh REIFY_VERIFY_EVENT_LOG channel,
+        read back onto ``CheckRun.event_channel``; ``CheckRun.skipped`` when
+        *cmd* is None.
+        """
+        if cmd is None:
+            return CheckRun.skipped(label)
+        with allocate_verify_event_log(role=role) as event_log:
+            run = await _run_leg_command(
+                cmd, label=label, current_attempt=current_attempt,
+                leg_env=event_log.export_into(verify_env),
+            )
+            channel = event_log.read()
+        _log_event_channel(label, channel)
+        return replace(run, event_channel=channel)
+
     # Cold-verify shared-venv pre-provision (task 2997, esc-2913-3): populate
     # the shared .venv ONCE, synchronously, before the concurrent test/lint/type
     # gather below, so the full-repo-scope root LINT/TYPE commands don't race the
@@ -7719,20 +7814,13 @@ async def run_verification(
         )
         test_runs.append(new_test)
 
-        # Recompute pure-timeout consistency for the recovery run via a fresh
-        # VerifyAttempt: lint/type are unchanged from the first pass (only
-        # the test leg was re-run), so this reads the SAME
-        # VerifyAttempt.pure_timeout_failure property the loop above used —
-        # not a second hand-copied formula.  Without this, a recovery run
-        # that itself hits the wall-clock timeout would leave the stale
-        # timed_out=False from the first pass while category flips to
-        # 'infra_timeout' — an inconsistent VerifyResult that both wrongly
-        # marks the worktree warm (the "not result.timed_out" check below)
-        # and hides the timeout from callers that special-case
-        # result.timed_out (merge_queue.py, workflow.py).
-        attempt = VerifyAttempt([new_test, attempt.lint, attempt.type])
+        # Only the test leg was re-run, so lint/type are carried over; the same
+        # VerifyAttempt properties the loop above read recompute timed_out, so
+        # the 6-clause consistency holds for the recovery run too.
+        attempt = attempt.with_rerun(new_test)
         timed_out = (not attempt.passed) and attempt.pure_timeout_failure
 
+        leg_categories = attempt.classify_failing_legs()
         passed, category, cause_hint, summary, failing_leg_categories = _summarize_checks(
             attempt.test.rc, attempt.test.output, attempt.test.timed_out, attempt.test.cmd,
             attempt.lint.rc, attempt.lint.output, attempt.lint.timed_out, attempt.lint.cmd,
@@ -7740,6 +7828,7 @@ async def run_verification(
             test_duration=attempt.test.duration_secs,
             lint_duration=attempt.lint.duration_secs,
             type_duration=attempt.type.duration_secs,
+            leg_categories=leg_categories,
         )
         if timed_out:
             # Distinct wording from the first-pass timeout summary: this
@@ -7894,13 +7983,8 @@ async def run_verification(
             ),
         )
 
-    # When the three verify commands ran concurrently (asyncio.gather) the
-    # true wall-clock cost is the longest single command, not their sum.
-    # Serial mode is rare (legacy / explicit opt-out) and sums correctly.
-    if concurrent:
-        _wall_secs = max(c.duration_secs for c in attempt.checks)
-    else:
-        _wall_secs = _verify_duration_secs(runs)
+    # Max for concurrent legs, sum for serial, carried-over legs excluded.
+    _wall_secs = attempt.wall_secs(concurrent=concurrent)
 
     # Task μ: parse the junit report written (if any) by the injection above.
     # None when the report does not attribute failures (not a full-breadth
@@ -7947,7 +8031,15 @@ async def run_verification(
         skipped_test_ids=skipped_test_ids,
         failing_test_ids_by_module=failing_test_ids_by_module,
         failing_leg_categories=failing_leg_categories,
+        run_all_failed_members=(
+            attempt.test.event_channel.failed_run_all_members()
+            if attempt.test.event_channel is not None else None
+        ),
         admission_legs=tuple(run.admission for run in test_runs if run.admission is not None) or None,
+        units=tuple(
+            verify_evidence.module_leg_unit(module_prefix, check.label, check.rc)
+            for check in attempt.checks if check.cmd is not None
+        ),
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),
@@ -7999,6 +8091,21 @@ def _aggregate_failing_ids_by_module(
         for prefix, ids in r.failing_test_ids_by_module.items():
             merged.setdefault(prefix, set()).update(ids)
     return {prefix: sorted(ids) for prefix, ids in merged.items()}
+
+
+def _aggregate_run_all_failed_members(results: list[VerifyResult]) -> list[str] | None:
+    # Two channels cannot be unioned: [] conflates "none failed" with "refused to narrow".
+    carried = [r.run_all_failed_members for r in results if r.run_all_failed_members is not None]
+    if not carried:
+        return None
+    return list(carried[0]) if len(carried) == 1 else []
+
+
+def _aggregate_units(results: list[VerifyResult]) -> tuple[verify_evidence.VerifyUnit, ...] | None:
+    # Fail closed: a partial list would read as a module whose legs never ran.
+    if any(r.units is None for r in results):
+        return None
+    return tuple(unit for r in results for unit in r.units or ())
 
 
 def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
@@ -8128,8 +8235,10 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         skipped_test_ids=skipped_test_ids,
         failing_test_ids_by_module=failing_test_ids_by_module,
         failing_leg_categories=failing_leg_categories,
+        run_all_failed_members=_aggregate_run_all_failed_members(results),
         test_leg_failed=any(r.test_leg_failed for r in results),
         admission_legs=tuple(leg for r in results for leg in (r.admission_legs or ())) or None,
+        units=_aggregate_units(results),
     )
 
 
@@ -8377,10 +8486,9 @@ def _executed_module_configs_from_plan(
 ) -> list[ModuleConfig]:
     """Build the ModuleConfig(s) *plan* prescribes running, for the module-config branch.
 
-    The plan->execution bridge (task κ, verify-scope-inversion-prd.md):
-    groups *plan*.runs by module_prefix and, for each *mc* in
-    *module_configs*, rebuilds its three commands from the corresponding
-    PlannedRun's scope_kind:
+    The plan->execution bridge (task κ, verify-scope-inversion-prd.md): for
+    each *mc* in *module_configs* that *plan* executes, rebuilds its three
+    commands from the corresponding PlannedRun's scope_kind:
 
     - SKIPPED -> ``None`` (that check does not run).
     - FULL_SUITE -> *mc*'s OWN verbatim command (preserves e.g.
@@ -8390,42 +8498,17 @@ def _executed_module_configs_from_plan(
     - FILE_SCOPED -> ``render(run.cmd)`` (identical to ``_scope_to_keyword``'s
       output, which itself renders a VerifyCmd — see ``verify_cmd.render``).
 
-    A module whose ONLY run is the "no files under prefix" SKIPPED emitted by
-    ``verify_plan._derive_module_runs`` (a single-element runs list — the
-    normal 3-run-per-module shape never collapses to one) is dropped from the
-    returned list entirely, mirroring ``scope_module_config`` returning
-    ``None`` for a subproject with zero matching files: the caller must skip
-    that subproject rather than run its full unscoped suite.
+    Which modules execute is ``verify_plan.py::executed_module_prefixes``'s rule.
 
     Copies *mc* via ``dataclasses.replace`` so all non-command fields survive.
-
-    Guard: a TRIVIAL *plan* (``derive_verify_plan``'s top-level "no
-    .py/.rs file at all" short-circuit — a single run with
-    ``module_prefix=''``, which matches no real ``mc.prefix``) means every
-    module has zero matching ``.py`` files by construction, so this returns
-    ``[]`` immediately rather than mis-reading the absent per-module lookup
-    as "no commands configured" and emitting a vacuous ModuleConfig per
-    module (``scope_module_config`` returns ``None`` — excluded — for every
-    *mc* in this case too).
     """
-    if len(plan.runs) == 1 and plan.runs[0].scope_kind is verify_plan.ScopeKind.TRIVIAL:
-        return []
-
-    runs_by_prefix: dict[str, list[verify_plan.PlannedRun]] = {}
-    for run in plan.runs:
-        runs_by_prefix.setdefault(run.module_prefix, []).append(run)
-
+    executed_prefixes = verify_plan.executed_module_prefixes(plan)
     executed: list[ModuleConfig] = []
     for mc in module_configs:
-        runs = runs_by_prefix.get(mc.prefix, [])
-        only_run = runs[0] if len(runs) == 1 else None
-        if (
-            only_run is not None
-            and only_run.cmd is None
-            and only_run.scope_kind is verify_plan.ScopeKind.SKIPPED
-        ):
+        if mc.prefix not in executed_prefixes:
             continue
 
+        runs = [run for run in plan.runs if run.module_prefix == mc.prefix]
         commands: dict[str, str | None] = {}
         for run in runs:
             if run.cmd is None:

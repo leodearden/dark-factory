@@ -24,6 +24,7 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 from importlib import resources as pkg_resources
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -73,9 +74,8 @@ class TestChronicFlakeConfigDefaults:
         field_info = ChronicFlakeConfig.model_fields['ledger_relpath']
         assert field_info.default == 'data/verify-logs/flaky-ledger.jsonl'
 
-    def test_reachable_as_orchestrator_config_attribute(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_reachable_as_orchestrator_config_attribute(self):
         config = OrchestratorConfig()
         assert config.chronic_flake.enabled is False
         assert config.chronic_flake.threshold == 3
@@ -83,13 +83,12 @@ class TestChronicFlakeConfigDefaults:
         assert config.chronic_flake.rate_limit_days == 7
         assert config.chronic_flake.ledger_relpath == 'data/verify-logs/flaky-ledger.jsonl'
 
-    def test_defaults_yaml_block_round_trips(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_defaults_yaml_block_round_trips(self):
         """The shipped defaults.yaml declares the same chronic_flake: block
         explicitly (including enabled: false) so the feature is discoverable
         and retunable in orchestrator.yaml without guessing at Pydantic
         defaults, mirroring the git:/psi_admission: precedent."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         defaults = _load_package_defaults()
         assert 'chronic_flake' in defaults
@@ -781,10 +780,10 @@ _FILED = SubmittedTask('fix-7', 'deferred')
 
 
 class _StubScheduler:
-    """Stub scheduler exposing ``dispatch_tool`` and ``submit_task`` — the surface
-    ``SchedulerChronicFlakeTaskClient`` depends on (duck-typed; no import of
-    the real ``Scheduler``, mirroring the module's cross-project scope
-    boundary).  ``submit_task`` answers with a canned outcome: parsing the response
+    """Stub scheduler exposing ``dispatch_tool`` and ``submit_task`` — the
+    ``SchedulerTaskStore`` surface ``SchedulerChronicFlakeTaskClient`` depends on
+    (no import of the real ``Scheduler``, mirroring the module's cross-project
+    scope boundary).  ``submit_task`` answers with a canned outcome: parsing the response
     is ``Scheduler.submit_task``'s job, driven for real in
     :class:`TestSubmitTaskThroughTheRealScheduler`."""
 
@@ -801,7 +800,7 @@ class _StubScheduler:
         self.calls: list[tuple[str, dict, float | None]] = []
         self.submit_calls: list[tuple[dict, float]] = []
 
-    async def dispatch_tool(self, name, arguments, *, timeout=15):
+    async def dispatch_tool(self, name: str, arguments: dict, *, timeout: float = 15) -> Any:
         self.calls.append((name, arguments, timeout))
         if self.raises is not None:
             raise self.raises
@@ -1509,7 +1508,7 @@ class _PagingScheduler(_StubScheduler):
         super().__init__()
         self.pages = list(pages)
 
-    async def dispatch_tool(self, name, arguments, *, timeout=15):
+    async def dispatch_tool(self, name: str, arguments: dict, *, timeout: float = 15) -> Any:
         self.calls.append((name, arguments, timeout))
         return self.pages.pop(0)
 

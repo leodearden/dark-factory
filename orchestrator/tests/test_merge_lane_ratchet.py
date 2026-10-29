@@ -640,6 +640,17 @@ class TestLanePatchTargets:
                 [],
                 id='unrelated-attribute-sharing-the-leaf-not-counted',
             ),
+            pytest.param(
+                "_GATE = 'orchestrator.merge_lane.worker.gate_mark_done_on_delivered_checks'\n"
+                'patch(_GATE, x)\n',
+                ['worker.gate_mark_done_on_delivered_checks'],
+                id='module-constant-indirection',
+            ),
+            pytest.param(
+                "_WORKER = 'orchestrator.merge_lane.worker'\npatch(f'{_WORKER}.spin', x)\n",
+                ['worker.spin'],
+                id='f-string-over-module-constant',
+            ),
         ],
     )
     def test_the_lane_binding(self, body: str, expected: list[str]) -> None:

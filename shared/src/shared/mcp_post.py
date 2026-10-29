@@ -59,15 +59,9 @@ The ingredients stay public — :data:`MCP_POST_HEADERS`,
 non-``tools/call`` request or a hand-built envelope.
 
 ``shared.mcp_session``'s ``McpSession`` and ``SyncMcpSession`` (the
-session-handshake transports) consume :data:`MCP_POST_HEADERS`,
-:func:`mcp_endpoint_url` and :func:`decode_mcp_response_body`, so neither
-holds a copy of them.
-
-ONE TWIN REMAINS.  ``dashboard/src/dashboard/data/memory.py`` still carries
-its own ``MCP_HEADERS``, ``_parse_mcp_response`` and ``_parse_sse_response``.
-The dependency direction already allows it to import this module instead;
-that file was simply outside task 4819's module locks.  Until it is migrated,
-a change to the headers or the decoder here must be mirrored there.
+session-handshake transports) and ``dashboard.data.memory``'s ``McpSession``
+consume :data:`MCP_POST_HEADERS`, :func:`mcp_endpoint_url` and
+:func:`decode_mcp_response_body`, so none of them holds a copy.
 
 Public API::
 

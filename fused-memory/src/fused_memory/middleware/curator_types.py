@@ -14,6 +14,7 @@ from typing import Any, Final, Literal
 from shared.task_statuses import TaskStatus
 
 from fused_memory.middleware.curation_deferral import DeferReason, deferral_justification
+from fused_memory.utils.clip_disclosure import elide_text
 
 
 class CuratorFailureError(RuntimeError):
@@ -29,9 +30,10 @@ class CuratorFailureError(RuntimeError):
     so the bisecting fallback in
     :meth:`TaskCurator._call_llm_batch_with_fallback` can branch on the
     failure subtype without leaking the underlying ``AgentResult`` outside
-    :meth:`TaskCurator._call_llm` / :meth:`TaskCurator._call_llm_batch`.
+    :meth:`TaskCurator._invoke_curator`, whose failures
+    ``task_curator.py::_failure_error`` maps to this one error.
     Defaults make the attributes safe to read even when the failure
-    originates outside those call sites.
+    originates outside that call.
 
     ``schema_tool_denied`` is the CLI-2.1.168 regression signal: the synthetic
     ``StructuredOutput`` schema tool was permission-denied (a systemic deny-list
@@ -153,7 +155,7 @@ class CandidateTask:
         h.update((self.execution_class or '').encode())
         # 16-char sha256-hex shape — canonical owner: orchestrator.agents.triage.sha256_16.
         # Any change to length or algorithm must be mirrored there and at the
-        # task_curator.py mirror sites (_intra_batch_key, _normalize_key).
+        # other mirror site, candidate_key.py::compute_candidate_key.
         return h.hexdigest()[:16]
 
     @classmethod
@@ -404,24 +406,24 @@ def embedding_text(title: str, description: str, files_to_modify: list[str]) -> 
 
 
 def clip_for_prompt(text: str, cap: int) -> str:
-    """Clip *text* to *cap* characters, marking how much was elided.
+    """Clip *text* to *cap* characters for the curator prompt, marking how much was elided.
 
-    The single owner of truncate-and-mark for the curator prompt. Both sides
-    of that prompt route through it — the POOL side (:meth:`PoolEntry.render`)
-    and the CANDIDATE side (:meth:`TaskCurator._build_user_prompt` and
-    :meth:`TaskCurator._build_batch_section`) — so the two cannot drift apart
-    (INV-5 ``no-lockstep-duplication``). They previously did: the pool side
-    appended a bare ``…`` while the candidate side clipped silently, so the
-    reading LLM could not tell a short description from a truncated one.
+    The counted marker is owned by ``utils/clip_disclosure.py::elide_text``;
+    this is the curator prompt's single route to it. Both sides of that prompt
+    route through here — the POOL side (:meth:`PoolEntry.render`) and the
+    CANDIDATE side (``task_curator.py::_render_candidate_section``, which both
+    the single and batch prompts use) — so the two cannot drift apart (INV-5
+    ``no-lockstep-duplication``). They previously did: the pool side appended a
+    bare ``…`` while the candidate side clipped silently, so the reading LLM
+    could not tell a short description from a truncated one. Text longer than
+    a non-positive *cap* raises ``ValueError`` rather than rendering a marker.
 
     The elided COUNT is part of the marker because the size of the loss is
     what decides whether it mattered: "2 characters trimmed" and "1827
     characters of concrete file references gone" are not the same event, and
     1827 was the measured mean elision at the pre-2026-09-18 cap.
     """
-    if len(text) <= cap:
-        return text
-    return f'{text[:cap]}…[+{len(text) - cap} chars elided]'
+    return elide_text(text, cap, field='curator_prompt').text
 
 
 def is_combine_eligible_status(status: str) -> bool:

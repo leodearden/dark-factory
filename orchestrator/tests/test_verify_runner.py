@@ -2201,7 +2201,8 @@ class TestBuildMergeVerifySpec:
         )
         assert spec_from_json(spec_to_json(spec)) == spec
 
-    def test_effective_verify_env_propagated_to_spec(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_effective_verify_env_propagated_to_spec(self):
         """spec.verify_env carries the merged sccache backend from effective_verify_env.
 
         Uses a real OrchestratorConfig (not MagicMock) so that effective_verify_env
@@ -2210,9 +2211,6 @@ class TestBuildMergeVerifySpec:
         """
         from orchestrator.config import OrchestratorConfig, SccacheConfig
         from orchestrator.verify_runner import build_merge_verify_spec
-
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
 
         config = OrchestratorConfig(
             verify_env={'RUSTC_WRAPPER': 'sccache'},
@@ -4094,10 +4092,10 @@ class TestCaptureEnvFingerprintMissingBinary:
 class TestCaptureEnvFingerprintIncludeToolchain:
     """The three hardcoded Rust probes are skippable when nothing compares them.
 
-    On the remote side each probe is a SEPARATE ssh invocation (_SSH_BASE_OPTS
-    sets up no ControlMaster/ControlPersist), so issuing rustc/cargo/sccache
-    for a comparison scoped to extra_probes costs three extra TCP+auth
-    handshakes per host, serially, over a possibly-WAN link.
+    On the remote side each probe is a SEPARATE ssh round trip over the probe
+    master, so issuing rustc/cargo/sccache for a comparison scoped to
+    extra_probes costs three extra round trips per host, serially, over a
+    possibly-WAN link.
     """
 
     def _make_run(self):
@@ -4163,7 +4161,7 @@ class TestCheckEnvSkipsUnreadToolchainProbes:
 
         expected = [list(argv) for _, argv in _ENV_PROBE_SPECS]
         assert local_run.issued == expected
-        assert remote_fake.env_probe_run().issued == expected
+        assert remote_fake.probe_run.issued == expected
 
     async def test_a_toolchain_scope_still_probes_rustc(self):
         """Derived, not hardcoded off: asking for toolchain must MEASURE it.
@@ -5869,6 +5867,7 @@ def _make_env_drift_pool(*, local_output=None, remote_output=None, remote_raises
 
         def __init__(self):
             self.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+            self.probe_run = remote_run
 
         async def health(self) -> bool:
             # Present to satisfy the VerifyRunner Protocol (pyright over tests/
@@ -5877,8 +5876,8 @@ def _make_env_drift_pool(*, local_output=None, remote_output=None, remote_raises
             # health, and check_env only calls env_probe_run.
             return True
 
-        def env_probe_run(self):
-            return remote_run
+        async def env_probe_run(self):
+            return self.probe_run
 
     remote_fake = _FakeRemote()
 
@@ -6241,6 +6240,8 @@ class TestEnvProbeSshTimeout:
 
     def _hanging_runner(self):
         async def fake_run(argv, *, cwd=None):
+            if argv[-1] == 'true':
+                return (0, '', '')
             await asyncio.sleep(60)
             return (0, '', '')
 
@@ -6256,7 +6257,7 @@ class TestEnvProbeSshTimeout:
         """Transport failure, NOT a recorded rc: a wedged link is not a finding."""
         from orchestrator import verify_runner as vr
         monkeypatch.setattr(vr, '_SSH_PROBE_TIMEOUT_SECS', 0.05)
-        adapter = self._hanging_runner().env_probe_run()
+        adapter = await self._hanging_runner().env_probe_run()
         with pytest.raises(vr.RunnerUnavailable) as excinfo:
             await adapter(['uv', '--version'])
         assert 'laptop.local' in str(excinfo.value)
@@ -6376,7 +6377,7 @@ class TestDriftDetectorCheckEnvBadDimensions:
         with pytest.raises(ValueError):
             await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run, dimensions=())
         assert local_run.issued == []
-        assert remote_fake.env_probe_run().issued == []
+        assert remote_fake.probe_run.issued == []
 
 
 # ---------------------------------------------------------------------------
@@ -6413,7 +6414,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
         await detector.check_env([], local_run=local_run)
         assert local_run.issued == []
-        assert remote_fake.env_probe_run().issued == []
+        assert remote_fake.probe_run.issued == []
 
     async def test_no_eligible_remote_is_inconclusive(self):
         """Lever C off, or the remote already quarantined by the verdict path."""
@@ -6676,6 +6677,7 @@ class TestDriftDetectorCheckEnvUnreachableRemote:
         """
         from orchestrator.verify_runner import DriftVerdict
         ssh_run = _make_ssh_seam({
+            'true': (0, '', ''),
             'npx pyright --version': (127, '', 'npx: command not found'),
             'uv --version': (0, 'uv 0.11.6\n', ''),
             'rustc --version': (127, '', 'rustc: command not found'),
@@ -7397,7 +7399,7 @@ class TestRemoteRunnerRequestId:
 class TestRemoteRunnerCancelVerify:
     """cancel_verify() issues ssh cancel-verify; probe_clean() issues ssh pgrep."""
 
-    def _make_runner_and_calls(self, *, config_path=None, cancel_rc=0, probe_rc=1):
+    def _make_runner_and_calls(self, *, probe_rc=1):
         """Return (runner, calls_list) where calls_list records each run() argv."""
         calls = []
 
@@ -7406,8 +7408,37 @@ class TestRemoteRunnerCancelVerify:
             if argv[0] == 'ssh':
                 if 'pgrep' in argv[-1]:
                     return (probe_rc, '', '')
-                return (cancel_rc, '', '')
+                return (0, '', '')
             return (0, '', '')
+
+        runner = gated_remote_runner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'req-42',
+        )
+        return runner, calls
+
+    async def _cancel_mid_verify(self, *, config_path=None, cancel_rc=0):
+        """Cancel a real dispatch while its verify ssh is held; return (cancel rc, recorded argvs)."""
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        calls: list[list[str]] = []
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append(argv[:])
+            if argv[0] == 'git':
+                return (0, '', '')
+            if 'cancel-verify' in argv[-1]:
+                return (cancel_rc, '', '')
+            if 'pgrep' in argv[-1]:
+                return (1, '', '')
+            entered.set()
+            await release.wait()
+            return (137, '', 'Killed')
 
         runner = gated_remote_runner(
             name='laptop',
@@ -7418,10 +7449,20 @@ class TestRemoteRunnerCancelVerify:
             run=fake_run,
             id_factory=lambda: 'req-42',
         )
-        return runner, calls
+        dispatch = asyncio.create_task(runner.run_merge_verify('abc123', _make_spec()))
+        await entered.wait()
+        rc = await runner.cancel_verify()
+        release.set()
+        with pytest.raises(RunnerUnavailable):
+            await dispatch
+        return rc, calls
+
+    @staticmethod
+    def _cancel_ssh_calls(calls):
+        return [c for c in calls if c[0] == 'ssh' and 'cancel-verify' in c[-1]]
 
     async def test_cancel_verify_no_inflight_returns_zero_no_ssh(self):
-        """cancel_verify() with _inflight_request_id=None returns 0 without issuing ssh."""
+        """cancel_verify() with no dispatch in flight returns 0 without issuing ssh."""
         runner, calls = self._make_runner_and_calls()
         rc = await runner.cancel_verify()
         assert rc == 0
@@ -7431,11 +7472,9 @@ class TestRemoteRunnerCancelVerify:
     async def test_cancel_verify_issues_correct_argv(self):
         """cancel_verify() issues ssh BatchMode/ConnectTimeout cancel-verify --request-id."""
 
-        runner, calls = self._make_runner_and_calls(cancel_rc=0)
-        runner._inflight_request_id = 'req-42'
-        await runner.cancel_verify()
+        _, calls = await self._cancel_mid_verify(cancel_rc=0)
 
-        ssh_calls = [c for c in calls if c[0] == 'ssh']
+        ssh_calls = self._cancel_ssh_calls(calls)
         assert len(ssh_calls) == 1
         argv = ssh_calls[0]
 
@@ -7451,11 +7490,9 @@ class TestRemoteRunnerCancelVerify:
     async def test_cancel_verify_appends_config_when_set(self):
         """cancel_verify() appends --config <path> when config_path is set."""
 
-        runner, calls = self._make_runner_and_calls(config_path='/etc/orch.yaml', cancel_rc=0)
-        runner._inflight_request_id = 'req-42'
-        await runner.cancel_verify()
+        _, calls = await self._cancel_mid_verify(config_path='/etc/orch.yaml', cancel_rc=0)
 
-        ssh_calls = [c for c in calls if c[0] == 'ssh']
+        ssh_calls = self._cancel_ssh_calls(calls)
         remote_cmd = ssh_calls[0][-1]
         parsed = gate_argv(remote_cmd)
         cfg_idx = parsed.index('--config')
@@ -7463,9 +7500,7 @@ class TestRemoteRunnerCancelVerify:
 
     async def test_cancel_verify_returns_ssh_rc(self):
         """cancel_verify() returns the ssh return code."""
-        runner, calls = self._make_runner_and_calls(cancel_rc=1)
-        runner._inflight_request_id = 'req-42'
-        rc = await runner.cancel_verify()
+        rc, _ = await self._cancel_mid_verify(cancel_rc=1)
         assert rc == 1
 
     async def test_probe_clean_true_when_pgrep_rc_is_1(self):
@@ -7513,19 +7548,36 @@ class TestRemoteRunnerCancelVerify:
 # ---------------------------------------------------------------------------
 
 
+async def _open_reaches_nothing():
+    return (255, '', 'ssh: connect to host laptop.local port 22: No route to host')
+
+
+async def _open_cannot_spawn_ssh():
+    raise FileNotFoundError(2, 'No such file or directory', 'ssh')
+
+
+async def _open_hangs():
+    await asyncio.sleep(60)
+    return (0, '', '')
+
+
 @pytest.mark.asyncio
 class TestRemoteRunnerEnvProbeRun:
-    """env_probe_run() returns a capture_env_fingerprint-compatible adapter
-    that dispatches each probe argv over ssh through the plain self._run seam,
-    behind REMOTE_TOOL_PATH_PRELUDE (task 7097) so the non-login ssh shell
-    finds ~/.local/bin tools the way RemoteRunner's own `uv sync` does."""
+    """``await env_probe_run()`` opens (or reuses) a multiplexed ssh master,
+    then returns a capture_env_fingerprint-compatible adapter whose probes
+    ride that master through the plain self._run seam, behind
+    REMOTE_TOOL_PATH_PRELUDE (task 7097) so the non-login ssh shell finds
+    ~/.local/bin tools the way RemoteRunner's own `uv sync` does."""
 
-    def _make_runner(self, *, responses=None):
+    def _make_runner(self, *, responses=None, delay=0.0, open_reply=None):
         calls = []
         queue = list(responses or [])
 
         async def fake_run(argv, *, cwd=None):
             calls.append(argv[:])
+            await asyncio.sleep(delay)
+            if argv[-1] == 'true':
+                return await open_reply() if open_reply is not None else (0, '', '')
             if queue:
                 return queue.pop(0)
             return (0, 'ok\n', '')
@@ -7539,18 +7591,78 @@ class TestRemoteRunnerEnvProbeRun:
         )
         return runner, calls
 
-    async def test_issues_exact_ssh_argv_with_shared_base_opts(self):
-        """The adapter reuses _SSH_BASE_OPTS verbatim rather than re-spelling flags."""
-        from orchestrator.verify_runner import _SSH_BASE_OPTS, REMOTE_TOOL_PATH_PRELUDE
+    @staticmethod
+    def _probe_opts():
+        from orchestrator.verify_runner import _SSH_BASE_OPTS
+        return [
+            *_SSH_BASE_OPTS,
+            '-o', 'ControlMaster=auto',
+            '-o', 'ControlPersist=30',
+            '-o', 'ControlPath=~/.df-env-probe-%C',
+        ]
 
+    async def test_opens_the_probe_master_then_probes_over_it(self):
+        """The probe-only option set is spelled literally; the open is a bare `true`."""
+        from orchestrator import verify_runner as vr
+
+        opts = self._probe_opts()
         runner, calls = self._make_runner()
-        adapter = runner.env_probe_run()
+        adapter = await runner.env_probe_run()
         await adapter(['uv', '--version'])
 
-        assert calls == [[
-            'ssh', *_SSH_BASE_OPTS, 'laptop.local',
-            f'{REMOTE_TOOL_PATH_PRELUDE} uv --version',
-        ]]
+        assert calls == [
+            ['ssh', *opts, 'laptop.local', 'true'],
+            ['ssh', *opts, 'laptop.local', f'{vr.REMOTE_TOOL_PATH_PRELUDE} uv --version'],
+        ]
+
+    async def test_one_open_serves_every_probe_of_an_adapter(self):
+        runner, calls = self._make_runner()
+        adapter = await runner.env_probe_run()
+        for argv in (['uv', '--version'], ['npx', 'pyright', '--version'], ['rustc', '--version']):
+            await adapter(argv)
+
+        remote_cmds = [argv[-1] for argv in calls]
+        assert remote_cmds.count('true') == 1
+        assert remote_cmds[0] == 'true'
+        assert len(remote_cmds) == 4
+
+    async def test_master_establishment_does_not_eat_the_first_probes_budget(self, monkeypatch):
+        """Open and first probe are bounded separately: 0.6s + 0.6s under a 1.0s bound
+        each passes, where one shared budget would have timed the probe out.  A sleep
+        never ends early, so only the 0.4s per-call headroom is load-sensitive."""
+        from orchestrator import verify_runner as vr
+        monkeypatch.setattr(vr, '_SSH_PROBE_TIMEOUT_SECS', 1.0)
+
+        runner, _ = self._make_runner(responses=[(0, 'uv 0.11.6\n', '')], delay=0.6)
+        adapter = await runner.env_probe_run()
+
+        assert await adapter(['uv', '--version']) == (0, 'uv 0.11.6\n', '')
+
+    async def test_a_hung_open_raises_runner_unavailable_and_issues_no_probe(self, monkeypatch):
+        from orchestrator import verify_runner as vr
+        monkeypatch.setattr(vr, '_SSH_PROBE_TIMEOUT_SECS', 0.05)
+
+        runner, calls = self._make_runner(open_reply=_open_hangs)
+        with pytest.raises(vr.RunnerUnavailable) as excinfo:
+            await runner.env_probe_run()
+
+        assert 'laptop.local' in str(excinfo.value)
+        assert calls == [['ssh', *self._probe_opts(), 'laptop.local', 'true']]
+
+    @pytest.mark.parametrize(
+        'open_reply',
+        [
+            pytest.param(_open_reaches_nothing, id='ssh_rc_255'),
+            pytest.param(_open_cannot_spawn_ssh, id='ssh_spawn_oserror'),
+        ],
+    )
+    async def test_open_transport_failures_are_runner_unavailable(self, open_reply):
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        runner, calls = self._make_runner(open_reply=open_reply)
+        with pytest.raises(RunnerUnavailable):
+            await runner.env_probe_run()
+        assert len(calls) == 1
 
     async def test_remote_command_leads_with_the_unquoted_path_prelude(self):
         """Task 7097: a non-login ssh shell lacks ~/.local/bin, so a bare
@@ -7561,10 +7673,10 @@ class TestRemoteRunnerEnvProbeRun:
         from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE
 
         runner, calls = self._make_runner()
-        adapter = runner.env_probe_run()
+        adapter = await runner.env_probe_run()
         await adapter(['sh', '-c', 'echo a b'])
 
-        remote_cmd = calls[0][-1]
+        remote_cmd = calls[-1][-1]
         assert remote_cmd.startswith(f'{REMOTE_TOOL_PATH_PRELUDE} ')
         assert '$HOME/.local/bin' in remote_cmd
         assert remote_cmd.removeprefix(f'{REMOTE_TOOL_PATH_PRELUDE} ') == "sh -c 'echo a b'"
@@ -7572,23 +7684,22 @@ class TestRemoteRunnerEnvProbeRun:
     async def test_returns_run_result_tuple_unchanged(self):
         """(rc, stdout, stderr) passes through — satisfies capture's run contract."""
         runner, _ = self._make_runner(responses=[(0, 'uv 0.10.6\n', 'warn')])
-        adapter = runner.env_probe_run()
+        adapter = await runner.env_probe_run()
         assert await adapter(['uv', '--version']) == (0, 'uv 0.10.6\n', 'warn')
 
     async def test_argv_elements_are_shlex_quoted(self):
         """An argv element needing quoting is quoted into the remote command string."""
-        runner, calls = self._make_runner()
-        adapter = runner.env_probe_run()
-        await adapter(['sh', '-c', 'echo a b'])
-
         from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE
 
-        remote_cmd = calls[0][-1]
-        assert remote_cmd == f"{REMOTE_TOOL_PATH_PRELUDE} sh -c 'echo a b'"
+        runner, calls = self._make_runner()
+        adapter = await runner.env_probe_run()
+        await adapter(['sh', '-c', 'echo a b'])
+
+        assert calls[-1][-1] == f"{REMOTE_TOOL_PATH_PRELUDE} sh -c 'echo a b'"
 
     async def test_capture_env_fingerprint_drives_probes_over_ssh(self):
         """End-to-end: capture_env_fingerprint(adapter) populates extra_probes."""
-        from orchestrator.verify_runner import capture_env_fingerprint
+        from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE, capture_env_fingerprint
 
         runner, calls = self._make_runner(responses=[
             (127, '', 'rustc: command not found'),   # rustc
@@ -7597,7 +7708,7 @@ class TestRemoteRunnerEnvProbeRun:
             (0, '1.1.377\n', ''),                    # pyright probe
             (0, 'uv 0.10.6\n', ''),                  # uv probe
         ])
-        adapter = runner.env_probe_run()
+        adapter = await runner.env_probe_run()
         fp = await capture_env_fingerprint(adapter, extra_probe_specs=[
             ('pyright', ['npx', 'pyright', '--version']),
             ('uv', ['uv', '--version']),
@@ -7606,9 +7717,58 @@ class TestRemoteRunnerEnvProbeRun:
         assert dict(fp.extra_probes) == {'pyright': '1.1.377', 'uv': 'uv 0.10.6'}
         # every probe went over ssh to the configured host
         assert all(c[0] == 'ssh' and 'laptop.local' in c for c in calls)
-        from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE
         assert calls[-2][-1] == f'{REMOTE_TOOL_PATH_PRELUDE} npx pyright --version'
         assert calls[-1][-1] == f'{REMOTE_TOOL_PATH_PRELUDE} uv --version'
+
+    async def test_check_env_opens_one_master_then_one_ssh_per_declared_probe(self):
+        """Through DriftDetector.check_env and a REAL RemoteRunner: the remote
+        side costs one handshake, not one per probe."""
+        from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE, DriftDetector, DriftVerdict
+
+        ssh_run = _make_ssh_seam({
+            'true': (0, '', ''),
+            'npx pyright --version': (0, 'pyright 1.1.377\n', ''),
+            'uv --version': (0, 'uv 0.11.6\n', ''),
+        })
+        pool, _ = _make_real_remote_pool(ssh_run)
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
+
+        result = await detector.check_env(_ENV_PROBE_SPECS, local_run=_make_probe_run(_MATCHING_PROBE_OUTPUT))
+
+        assert result.verdict == DriftVerdict.AGREE
+        assert [argv[-1] for argv in ssh_run.issued] == [
+            'true',
+            *(f'{REMOTE_TOOL_PATH_PRELUDE} {" ".join(argv)}' for _, argv in _ENV_PROBE_SPECS),
+        ]
+        prefix = ['ssh', *self._probe_opts()]
+        assert all(argv[:len(prefix)] == prefix for argv in ssh_run.issued), ssh_run.issued
+
+
+_REAL_SSHD_HOST = os.environ.get('DF_ENV_PROBE_SSH_HOST', '')
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not _REAL_SSHD_HOST,
+    reason='opt-in: set DF_ENV_PROBE_SSH_HOST to a host this user reaches by BatchMode ssh',
+)
+async def test_env_probe_master_against_a_real_sshd():
+    """Run before arming Lever C, from the account the orchestrator runs as.
+
+    The open must come back inside _SSH_PROBE_TIMEOUT_SECS even though ControlPersist keeps
+    the backgrounded master for longer, the ControlPath under ~ must bind, and the probes
+    must ride that master with the remote shell's own exit codes."""
+    runner = gated_remote_runner('real-sshd', _REAL_SSHD_HOST, 'origin', '/')
+    probe = await runner.env_probe_run()
+
+    check = await asyncio.create_subprocess_exec(
+        'ssh', '-o', 'ControlPath=~/.df-env-probe-%C', '-O', 'check', _REAL_SSHD_HOST,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+    )
+    _, check_stderr = await check.communicate()
+    assert check.returncode == 0, check_stderr
+    assert (await probe(['uname', '-s']))[0] == 0
+    assert (await probe(['df-env-probe-absent-tool', '--version']))[0] == 127
 
 
 # ---------------------------------------------------------------------------
@@ -7622,7 +7782,7 @@ class TestRemoteRunnerSshKeepalive:
     probe_clean) must carry the ServerAlive keepalive options, and must stay
     identical across sites (shared const, task 2362 / incident 5111)."""
 
-    def _make_runner(self, expected_result):
+    def _make_runner(self, expected_result, *, verify_entered, verify_release):
         calls = []
 
         async def fake_run(argv, *, cwd=None):
@@ -7634,7 +7794,11 @@ class TestRemoteRunnerSshKeepalive:
                     return (1, '', '')
                 if 'cancel-verify' in argv[-1]:
                     return (0, '', '')
-                # ssh dispatch / health probe
+                if 'verify-merge' in argv[-1]:
+                    verify_entered.set()
+                    await verify_release.wait()
+                    return (137, '', 'Killed')
+                # health probe
                 return (0, result_to_json(expected_result), '')
             return (0, '', '')
 
@@ -7664,18 +7828,25 @@ class TestRemoteRunnerSshKeepalive:
             _SSH_BASE_OPTS,
             SSH_SERVER_ALIVE_COUNT_MAX,
             SSH_SERVER_ALIVE_INTERVAL,
+            RunnerUnavailable,
         )
 
         expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
-        runner, calls = self._make_runner(expected)
+        verify_entered, verify_release = asyncio.Event(), asyncio.Event()
+        runner, calls = self._make_runner(
+            expected, verify_entered=verify_entered, verify_release=verify_release,
+        )
 
         # Site 1: health()
         await runner.health()
-        # Site 2: run_merge_verify() dispatch
-        await runner.run_merge_verify('abc123', _make_spec())
-        # Site 3: cancel_verify()
-        runner._inflight_request_id = 'req-42'
+        # Site 2: run_merge_verify() dispatch, its verify ssh held
+        dispatch = asyncio.create_task(runner.run_merge_verify('abc123', _make_spec()))
+        await verify_entered.wait()
+        # Site 3: cancel_verify() of that in-flight verify
         await runner.cancel_verify()
+        verify_release.set()
+        with pytest.raises(RunnerUnavailable):
+            await dispatch
         # Site 4: probe_clean()
         await runner.probe_clean()
 
@@ -7698,6 +7869,50 @@ class TestRemoteRunnerSshKeepalive:
             # shared option block, followed by <host> <remote_cmd_or_literal>.
             assert argv[:len(expected_prefix)] == expected_prefix, argv
             assert argv[len(expected_prefix)] == 'laptop.local'
+
+    async def test_non_probe_ssh_sites_carry_the_unmultiplexed_option_block(self):
+        """Only env probes multiplex: the dispatch sites and git's push transport
+        keep the plain option block byte for byte.
+
+        The verify-merge dispatch's ssh child owns the heartbeat connection-death
+        protocol (``_default_ssh_heartbeat_run``); a shared ControlMaster would put
+        that child's liveness behind another process's socket.  The block is spelled
+        literally, because comparing against ``_SSH_BASE_OPTS`` would be tautological.
+        """
+        from orchestrator.verify_runner import (
+            GIT_PUSH_SSH_CONFIG,
+            SSH_SERVER_ALIVE_COUNT_MAX,
+            SSH_SERVER_ALIVE_INTERVAL,
+            RunnerUnavailable,
+        )
+
+        block = [
+            '-o', 'BatchMode=yes',
+            '-o', 'ConnectTimeout=10',
+            '-o', f'ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL}',
+            '-o', f'ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}',
+        ]
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        verify_entered, verify_release = asyncio.Event(), asyncio.Event()
+        runner, calls = self._make_runner(
+            expected, verify_entered=verify_entered, verify_release=verify_release,
+        )
+
+        await runner.health()
+        dispatch = asyncio.create_task(runner.run_merge_verify('abc123', _make_spec()))
+        await verify_entered.wait()
+        await runner.cancel_verify()
+        verify_release.set()
+        with pytest.raises(RunnerUnavailable):
+            await dispatch
+        await runner.probe_clean()
+
+        ssh_calls = [c for c in calls if c[0] == 'ssh']
+        assert len(ssh_calls) == 4
+        for argv in ssh_calls:
+            assert argv == ['ssh', *block, 'laptop.local', argv[-1]], argv
+            assert not any('Control' in element for element in argv), argv
+        assert ('-c', 'core.sshCommand=ssh ' + ' '.join(block)) == GIT_PUSH_SSH_CONFIG
 
 
 # ---------------------------------------------------------------------------
@@ -8618,7 +8833,7 @@ class TestRemoteRunnerPassSummaryArchival:
 # deadline and lets the CHILD return the verdict.
 #
 # The bound needs a basis, because the flake class it must avoid is measured:
-# test_laptop_warm_verify_boundary.py's HeartbeatWriter comment records an
+# the ROW_WATCHDOG banner of _verify_boundary_ceilings.py records an
 # Event.wait-driven writer showing inter-write gaps of p999 0.386s / MAX 0.845s
 # at loadavg 113-178, with the overshoot largely ADDITIVE scheduling delay
 # rather than multiplicative.  Five beats at 0.05s is 0.25s nominal; even a
@@ -8659,7 +8874,7 @@ HEARTBEAT_STOP_JOIN_CEILING_SECS = HEARTBEAT_STOP_JOIN_SECS
 #: — so any positive floor detects it and a low one cannot be flaky.  Two, in a
 #: window of HEARTBEAT_STOP_JOIN_SECS: even if every tick cost the ~0.85s worst
 #: single-gap scheduling delay measured at loadavg 113-178
-#: (test_laptop_warm_verify_boundary.py's HeartbeatWriter comment) rather than
+#: (the ROW_WATCHDOG banner of _verify_boundary_ceilings.py) rather than
 #: this cadence, that window still fits five.
 LOOP_TICK_SECS = 0.05
 LOOP_TICKS_REQUIRED_DURING_TEARDOWN = 2

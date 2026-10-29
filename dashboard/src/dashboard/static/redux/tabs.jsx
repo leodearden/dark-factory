@@ -30,7 +30,7 @@ const { projectCensus, censusOver, projectRows, viewRows, terminalSelectingProje
 // Windowed headers are labelled from the payload's served-window echo — window_chip.js.
 const { windowEcho, windowLabel, recentMergesCaption } = window.DF_WINDOW_CHIP;
 const {
-  projectInQueue, inQueueOver, inQueueHistory, latencyCaption,
+  projectInQueue, inQueueOver, inQueueHistory, latencyCaption, depthBucketCaption,
   queuedSince, projectSpeculative, speculativeOver, hitRateText, recentTotal,
 } = window.DF_MERGE_QUEUE;
 const { writeQueue, queueHint, newestHourOps, opsTotals, opsCaption, opsTotalText } = window.DF_MEMORY_READINGS;
@@ -831,7 +831,7 @@ function ReconTab({ projectFilter, search }) {
         </div>
         <div className="panel-body flush">
           <table className="tbl">
-            <thead><tr><th>Run</th><th>Project</th><th>Trigger</th><th>Type</th><th>Status</th><th className="num">Events</th><th className="num">Duration</th><th>When</th><th className="num">Journal</th></tr></thead>
+            <thead><tr><th>Run</th><th>Project</th><th>Trigger</th><th>Type</th><th>Status</th><th className="num">Events</th><th className="num">Duration</th><th>When</th></tr></thead>
             <tbody>
               {runs.map(rn => (
                 <tr key={rn.id}>
@@ -843,7 +843,6 @@ function ReconTab({ projectFilter, search }) {
                   <td className="num">{rn.events_processed ?? rn.events ?? 0}</td>
                   <td className="num">{rn.duration_seconds != null ? `${rn.duration_seconds.toFixed(1)}s` : '—'}</td>
                   <td style={{ color: 'var(--fg-3)' }}>{window.DF_SHELL.timeago(rn.started_at)}</td>
-                  <td className="num"><span className="badge accent">{rn.journal_entry_count ?? 0}</span></td>
                 </tr>
               ))}
             </tbody>
@@ -936,7 +935,7 @@ function MergeTab({ projectFilter }) {
             <ProjectGroup id={pid} label={pid} open={openMap[pid]} onToggle={() => toggle(pid)} summary={summary}>
               <div className="grid cols-12" style={{ gap: 12 }}>
                 <div className="col-span-7 panel">
-                  <div className="panel-head"><span className="title">Merge attempts · 15-min buckets</span></div>
+                  <div className="panel-head"><span className="title">Merge attempts · {depthBucketCaption(d.depth)}</span></div>
                   <div className="panel-body"><LC labels={d.depth.labels.map(String)} series={[{ values: d.depth.values, color: CP.accent }]} height={180} formatY={formatCountTick} snapMax={niceCountMax} formatX={window.DF_SHELL.fmtDateTime} /></div>
                 </div>
 

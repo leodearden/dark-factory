@@ -911,9 +911,9 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
     clean file-level merge while the resolver made no choice about the ratchet
     files at all. Against HEAD alone each read as new; against either parent,
     keeping one side's stale value would re-absorb the other side's lowering.
-    The bound is git's own rule per measure: a measure one side moved stands at
-    that side's value, and where both moved, the higher side bounds it. Only
-    entries the merge ITSELF appends cover anything above it.
+    The bound is git's own rule per measure, as
+    scripts/merge_lane_metrics.py::compare_merged_baseline_files defines it.
+    Only entries the merge ITSELF appends cover anything above it.
     """
 
     @staticmethod
@@ -1010,13 +1010,8 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
 
         assert result.returncode == 0, result.stdout + result.stderr
 
-    def test_two_recorded_raises_of_one_measure_need_the_merges_own_entry(
-        self, tmp_path: Path
-    ) -> None:
-        # Each side RECORDED its raise of a.py, and the honest merge holds both:
-        # 128. The bound is the higher side, not the sum -- a sum would refuse
-        # two sides that removed overlapping code -- so the excess is the
-        # merge's own raise, and only its own `--authorize-raise` covers it.
+    def test_two_recorded_raises_of_one_measure_compose(self, tmp_path: Path) -> None:
+        # Each side RECORDED its raise of a.py, and the honest merge holds both.
         repo = _Repo.mid_merge(
             tmp_path,
             ours=_with_a_py('cognitive', 125),
@@ -1027,12 +1022,19 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
         repo.write_baseline(_with_a_py('cognitive', 128))
         repo.stage(metrics.BASELINE_RELPATH)
 
+        composed = repo.gate()
+
+        assert composed.returncode == 0, composed.stdout + composed.stderr
+
+        repo.write_baseline(_with_a_py('cognitive', 129))
+        repo.stage(metrics.BASELINE_RELPATH)
+
         refused = repo.gate()
 
         assert refused.returncode == 1, refused.stdout + refused.stderr
-        assert 'rose 125 -> 128' in refused.stderr
+        assert 'rose 128 -> 129' in refused.stderr
 
-        repo.write_entry(_a_py_cognitive_raise(125, 128, '5792'))
+        repo.write_entry(_a_py_cognitive_raise(128, 129, '5792'))
         repo.stage(metrics.LEDGER_DIR_RELPATH)
 
         authorized = repo.gate()
@@ -1042,10 +1044,9 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
     def test_the_refusal_names_the_workaround_and_the_workaround_passes(
         self, tmp_path: Path
     ) -> None:
-        # Both sides raised a.py; the composed 128 (what the ratchet-baseline
-        # driver writes) is above the higher side. The write gate records
-        # nothing over a file already holding 128, so the recipe the refusal
-        # prints is: take ours back, then authorize the rise from it.
+        # Both sides raised a.py and the resolver's 129 exceeds even the composed
+        # 128. The recipe the refusal prints is: take ours back, then authorize
+        # the rise from it.
         repo = _Repo.mid_merge(
             tmp_path,
             ours=_with_a_py('cognitive', 125),
@@ -1053,7 +1054,7 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
             ours_entries=(_a_py_cognitive_raise(120, 125, '5722'),),
             theirs_entries=(_a_py_cognitive_raise(120, 123, '3620'),),
         )
-        repo.write_baseline(_with_a_py('cognitive', 128))
+        repo.write_baseline(_with_a_py('cognitive', 129))
         repo.stage(metrics.BASELINE_RELPATH)
 
         refused = repo.gate()
@@ -1064,8 +1065,8 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
         repo.git('checkout', 'HEAD', '--', metrics.BASELINE_RELPATH)
         written = metrics.write_baseline(
             repo.root / metrics.BASELINE_RELPATH,
-            _with_a_py('cognitive', 128),
-            authorization=metrics.RaiseAuthorization(task_id='5792', reason='both sides'),
+            _with_a_py('cognitive', 129),
+            authorization=metrics.RaiseAuthorization(task_id='5792', reason='beyond both sides'),
             ledger=repo.root / metrics.LEDGER_DIR_RELPATH,
         )
         assert written.record is not None

@@ -44,7 +44,7 @@ const { projectRows, viewRows, unrequestedTerminalRows } = snapshot;
 const { snapshotRowsOver, EVERY_VIEW, terminalWindowProjects, terminalWindowEntrants } = snapshot;
 const { terminalSelectingProjects, createTerminalWindowHooks } = snapshot;
 const { sameDatum } = snapshot;
-const { isDatum, datumView, displayedAgeMs, EM_DASH } = loadedWindow.DF_DATUM;
+const { isDatum, datumView, displayedAgeMs, EM_DASH, servedDatum } = loadedWindow.DF_DATUM;
 const { MEMBERS, VIEWS, SUB_VIEWS } = loadedWindow.DF_TASK_VOCAB;
 
 const EXPECTED_FUNCTION_NAMES = [
@@ -215,6 +215,24 @@ test('projectCensus: an unknown served census stays unknown with the producer\'s
   assert.equal(census.reason, 'status map read failed');
 });
 
+const UNAGEABLE_TASKS_RECEIPTS = [{ servedAt: SERVED_AT }, { servedAt: SERVED_AT, receivedAt: 'not a clock' }];
+
+test("projectCensus and projectRows: a receipt that cannot age a Datum is no receipt — servedDatum's own verdict", () => {
+  for (const receipt of UNAGEABLE_TASKS_RECEIPTS) {
+    const data = sketchData({ __receipt: { [TASKS_ENDPOINT]: receipt } });
+    for (const [reader, wireKey] of [[projectCensus, 'census'], [projectRows, 'rows']]) {
+      const label = `${reader.name} under ${JSON.stringify(receipt)}`;
+      const served = data.TASKS_SNAPSHOT['dark-factory'][wireKey];
+
+      assert.deepEqual(
+        reader(data, 'dark-factory'),
+        servedDatum(served, TASKS_ENDPOINT, 'unused', data.__receipt),
+        label,
+      );
+    }
+  }
+});
+
 // ── censusOver: one project, or a member-wise total over several ────────────
 
 test('censusOver: a single project in scope is that project\'s census', () => {
@@ -290,6 +308,22 @@ test('censusOver: the total renders the placeholder, never a 0, when nothing is 
     },
   });
   assert.equal(view.text, EM_DASH);
+});
+
+test('censusOver: a receipt that cannot age a Datum makes a hole of the total, never a throw', () => {
+  const data = sketchData({ __receipt: { [TASKS_ENDPOINT]: { servedAt: SERVED_AT } } });
+  for (const scope of [null, ['dark-factory']]) {
+    const label = `scope ${JSON.stringify(scope)}`;
+    let fleet;
+    assert.doesNotThrow(() => {
+      fleet = censusOver(data, scope);
+    }, label);
+
+    assert.equal(isDatum(fleet), true, label);
+    assert.equal(fleet.state, 'unknown', label);
+    assert.equal(fleet.value, null, label);
+    assert.match(fleet.reason, /not yet fetched/, label);
+  }
 });
 
 // ── The named readings ──────────────────────────────────────────────────────

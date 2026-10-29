@@ -61,6 +61,7 @@ from orchestrator.verify_runner import (
     REMOTE_TOOL_PATH_PRELUDE,
     DriftDetector,
     DriftVerdict,
+    HostAllocator,
     MergeVerifySpec,
     RemoteRunner,
     RunnerUnavailable,
@@ -84,7 +85,7 @@ def test_wire_fingerprint_is_pinned_for_todays_wire_classes():
     a field change must update it too (folding the two is a follow-up).
     """
     assert wire_fingerprint(wire_classes()) == (
-        'a1d128e7f274c216c5c8f2570853fa4a0f25fe791a58f74d80f88e9cd1dac637'
+        'b4945038372961f4d31413928768fb5387e8d3276de6fa1d43c61e25b6acf833'
     )
 
 
@@ -723,6 +724,7 @@ class _Scripted:
             'delete': (0, '', ''),
             'verify': (0, result_to_json(_VERDICT), ''),
             'cancel': (0, '', ''),
+            'probe': (1, '', ''),
             'reap': (0, '', ''),
             'other': (0, '', ''),
             **replies,
@@ -741,6 +743,8 @@ class _Scripted:
                 return 'ensure'
             if ' reap-gates ' in argv[-1]:
                 return 'reap'
+            if 'pgrep' in argv[-1]:
+                return 'probe'
             return 'cancel' if 'cancel-verify' in argv[-1] else 'verify'
         return 'other'
 
@@ -1082,7 +1086,7 @@ async def test_the_default_transport_hands_ssh_the_dispatchers_own_locale(
         code_checkout=str(tmp_path),
     )
 
-    rc, stdout, _ = await runner.env_probe_run()(['true'])
+    rc, stdout, _ = await (await runner.env_probe_run())(['true'])
 
     assert (rc, stdout) == (0, 'unset|en_GB.UTF-8')
 
@@ -1137,6 +1141,76 @@ async def test_cancel_verify_runs_through_the_gate_binary():
     ]
     # Killed by this dispatcher's own cancel: says nothing about the host.
     assert excinfo.value.kind == 'transport'
+
+
+# What leo-laptop's host shim answers a cancel sent through a gate not yet built.
+_UNBUILT_GATE_CANCEL = (127, '', f'/usr/local/bin/orchestrator: line 50: {_GATE_BIN}: No such file or directory')
+
+# The awaits a dispatch makes after claiming its request and before its verify ssh.
+_PRE_VERIFY_ROLES = ('publish', 'ensure', 'verify_push')
+
+
+def _hold(transport: _Scripted, role: str) -> tuple[asyncio.Event, asyncio.Event]:
+    """Hold *role*'s reply until release is set; entered is set once the role is reached."""
+    entered, release = asyncio.Event(), asyncio.Event()
+    reply = transport.replies[role]
+    assert isinstance(reply, tuple)
+
+    async def held() -> tuple[int, str, str]:
+        entered.set()
+        await release.wait()
+        return reply
+
+    transport.replies[role] = held
+    return entered, release
+
+
+async def _no_sleep(_: float) -> None:
+    return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('held_role', _PRE_VERIFY_ROLES)
+async def test_a_cancel_before_the_verify_ssh_frees_the_slot_without_parking(held_role):
+    transport = _Scripted(cancel=_UNBUILT_GATE_CANCEL)
+    entered, release = _hold(transport, held_role)
+    allocator = HostAllocator([_scripted_runner(transport)])
+    lease = allocator.acquire_remote()
+    assert lease is not None
+    assert lease.name == 'laptop'
+    dispatch = asyncio.create_task(lease.runner.run_merge_verify('mergesha', _spec()))
+    await entered.wait()
+
+    freed = await allocator.cancel_and_release(lease, sleep=_no_sleep)
+
+    assert freed is True
+    assert not allocator.is_parked('laptop')
+    assert not allocator.is_busy('laptop')
+    release.set()
+    with pytest.raises(RunnerUnavailable):
+        await dispatch
+    assert 'verify' not in transport.roles()
+    assert 'cancel' not in transport.roles()
+    assert 'probe' not in transport.roles()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('held_role', _PRE_VERIFY_ROLES)
+async def test_a_dispatch_cancelled_before_its_verify_ssh_never_starts_it(held_role):
+    transport = _Scripted(cancel=_UNBUILT_GATE_CANCEL)
+    entered, release = _hold(transport, held_role)
+    runner = _scripted_runner(transport)
+    dispatch = asyncio.create_task(runner.run_merge_verify('mergesha', _spec()))
+    await entered.wait()
+
+    assert await runner.cancel_verify() == 0
+    release.set()
+    with pytest.raises(RunnerUnavailable) as excinfo:
+        await dispatch
+
+    assert excinfo.value.kind == 'transport'
+    assert 'verify' not in transport.roles()
+    assert 'cancel' not in transport.roles()
 
 
 @pytest.mark.asyncio

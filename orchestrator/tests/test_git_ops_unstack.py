@@ -2,8 +2,10 @@
 
 stack_train_branches records the base each member was stacked onto, and
 GitOps.unstack_from_unlanded_base strips a never-landed base's commits from a
-member so the member carries only its own delta.  stack_train_branches also
-reports each member's tip from just before stacking, and
+member so the member carries only its own delta.  The train's anchor is
+un-stacked too, before anything is stacked onto it (task 6133).
+stack_train_branches also reports each member's tip from just before
+stacking, and
 GitOps.restore_pre_stack_tip puts a member back on it (task 4953).
 
 Real temp git repositories throughout.  Members live at
@@ -243,6 +245,65 @@ class TestStackRecordsBase:
         assert second.survivors == ['P2', 'M']
         assert await _diff_vs_main(repo.root, 'task/M') == {'p2.txt', 'm.txt'}
         assert await repo.ledger.base_of('task/M') == await repo.sha('task/P2')
+
+
+# ---------------------------------------------------------------------------
+# stack_train_branches un-stacks the anchor too (task 6133)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStackUnstacksTheAnchor:
+    async def test_anchor_stacked_on_an_unlanded_base_is_stacked_from_its_own_delta(
+        self, repo: Repo,
+    ) -> None:
+        await _stack_p_and_m(repo)
+        await _add_member(repo.git_ops, 'X', 'main', {'x.txt': 'x\n'})
+
+        result = await repo.git_ops.stack_train_branches(['M', 'X'])
+
+        assert result.survivors == ['M', 'X']
+        assert await _diff_vs_main(repo.root, 'task/M') == {'m.txt'}
+        assert await _diff_vs_main(repo.root, 'task/X') == {'m.txt', 'x.txt'}
+        assert await repo.ledger.base_of('task/M') is None
+        assert await repo.ledger.base_of('task/X') == await repo.sha('task/M')
+
+    async def test_anchor_that_cannot_be_unstacked_abandons_the_train(
+        self, repo: Repo,
+    ) -> None:
+        await _stack_p_and_m(repo)
+        await _add_member(repo.git_ops, 'X', 'main', {'x.txt': 'x\n'})
+        (repo.wt('M') / 'm.txt').write_text('uncommitted edit\n')
+        m_before = await repo.sha('task/M')
+        x_before = await repo.sha('task/X')
+
+        result = await repo.git_ops.stack_train_branches(['M', 'X'])
+
+        assert (result.survivors, result.ejected, result.pre_stack_tips) == (
+            [], ['M'], (),
+        )
+        assert await repo.sha('task/X') == x_before
+        assert await repo.sha('task/M') == m_before
+        assert await repo.ledger.base_of('task/X') is None
+        assert await repo.ledger.base_of('task/M') == await repo.sha('task/P')
+        assert (repo.wt('M') / 'm.txt').read_text() == 'uncommitted edit\n'
+
+    async def test_anchor_whose_own_delta_conflicts_abandons_the_train(
+        self, repo: Repo,
+    ) -> None:
+        await _stack_p_and_m(repo, m_writes={'m.txt': 'm\n', 'other.txt': 'm\n'})
+        await repo.advance_main({'shared.txt': 'main\n', 'other.txt': 'main\n'})
+        await _add_member(repo.git_ops, 'X', 'main', {'x.txt': 'x\n'})
+        m_before = await repo.sha('task/M')
+        x_before = await repo.sha('task/X')
+
+        result = await repo.git_ops.stack_train_branches(['M', 'X'])
+
+        assert (result.survivors, result.ejected) == ([], ['M'])
+        assert await repo.sha('task/X') == x_before
+        assert await repo.sha('task/M') == m_before
+        assert await repo.ledger.base_of('task/X') is None
+        assert await repo.ledger.base_of('task/M') == await repo.sha('task/P')
 
 
 # ---------------------------------------------------------------------------

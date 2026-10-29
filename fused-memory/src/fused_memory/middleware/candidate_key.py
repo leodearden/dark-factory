@@ -48,6 +48,6 @@ def compute_candidate_key(
     h.update(normalized_files.encode())
     # 16-char sha256-hex shape — canonical owner: orchestrator.agents.triage.sha256_16.
     # Any change to length or algorithm must be mirrored there and at the
-    # mirror sites curator_types.py::CandidateTask.payload_hash and
-    # task_curator.py::TaskCurator._intra_batch_key / _normalize_key.
+    # other mirror site, curator_types.py::CandidateTask.payload_hash.
+    # TaskCurator._normalize_key delegates here and is not a mirror.
     return h.hexdigest()[:16]

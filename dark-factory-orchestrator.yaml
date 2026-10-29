@@ -450,9 +450,9 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #   scripts/tests/test_design_invariants_consistency.py — reads
 #       skills/prd/references/gates.md live; its enumeration and citation
 #       scans walk the repo with no skills/ prune (task 4941).
-#   fused-memory/tests/test_referent_declaration_examples.py — reads
-#       skills/reflect/SKILL.md to execute its `entities=` examples against
-#       the live entities_gate (task 3675).
+#   fused-memory/tests/test_referent_declaration_examples.py — reads the
+#       skills/ docs named in its _GUARDED_DOCS to execute their `entities=`
+#       examples against the live entities_gate (tasks 3675, 5555, 5866).
 #   tests/scripts/test_merge_marker_search_snippets.py — EXECUTES every
 #       merge-marker search in skills/**/*.md against a shadowed fixture history (task 5774).
 # So the union includes orchestrator/tests/ — the fleet's largest suite —
@@ -1786,3 +1786,15 @@ psi_admission:            # PRD plans/load-throttle-harmonisation-prd.md §6.2 (
 # Runbook: plans/d2-context-complete-reviewer-gate.md (watch section 3, kill rule section 4).
 review:
   reviewer_briefing: d2
+
+# Task 5057 (deep-chain canary; plans/deep-merge-ahead-prd.md), Leo's ruling B of
+# 2026-10-20: carry the flip (carrier 7619) one week after reify's canary 3189.
+# Reify's week was neutral: 122 merge verifies, 95 landings (66 the week before),
+# 2 deep verifies, 1 chain landing, 0 chain-attributed red.
+# STOP RULE: back to 0 if gates per landed item exceed 1.0, or on any
+# chain-attributed red main or rebase-conflict cluster. Green tier: reload_config
+# applies a change without a restart; this carry issues none, so 6 goes live at
+# the next restart. The coalesce test this flip once redded pins chain_cap=0
+# since task 7279 (merge 58a69de6a5).
+merge_deep:
+  chain_cap: 6

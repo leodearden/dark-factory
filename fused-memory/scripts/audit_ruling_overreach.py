@@ -62,10 +62,12 @@ from fused_memory.reconciliation.task_filter import (
     is_batch_plan_framing,
     is_proposed_resolution_framing,
 )
+from fused_memory.services import overreach_guard
 from fused_memory.services.completion_claim_gate import (
     UNVERIFIED_CLAIM_TAG,
     extract_completion_claims,
 )
+from fused_memory.services.overreach_guard import EPISODE_CLASSIFIERS, LABELS
 
 # --------------------------------------------------------------------------- #
 # Records
@@ -189,48 +191,19 @@ def attribute_edges(edges: Iterable[Edge]) -> Attribution:
 # --------------------------------------------------------------------------- #
 # Candidate ruling-shape classifiers, under evaluation
 # --------------------------------------------------------------------------- #
-# They live here, not in fused_memory src, until design.md picks one; the
-# build promotes the winner and this script imports it (one copy, SPOT).
-
-HEAD_CHARS = 200
-DECISIONS_CATEGORY = 'decisions_and_rationale'
-_RULING_LEXEME = re.compile(r'\b(ruling|ruled)\b', re.IGNORECASE)
-_DECISION_LEXEME = re.compile(r'\b(ruling|ruled|decision|decisions|decided)\b', re.IGNORECASE)
-_DECISION_ANCHOR = re.compile(r'\besc-\d+-\d+\b|\([^)]*\b\d{4}-\d{2}-\d{2}')
-_RULING_HEADER = re.compile(r'\s*RULING\b', re.IGNORECASE)
+# The vocabulary lives in fused_memory.services.overreach_guard (one copy,
+# SPOT); this script evaluates it over Episode records.
 
 
-def _head(episode: Episode) -> str:
-    return (episode.content or '')[:HEAD_CHARS]
-
-
-def _category_decisions(episode: Episode) -> bool:
-    return episode.source.category == DECISIONS_CATEGORY
-
-
-def _header_ruling_paren(episode: Episode) -> bool:
-    return (episode.content or '').lstrip().startswith('RULING (')
-
-
-def _header_ruling(episode: Episode) -> bool:
-    return _RULING_HEADER.match(episode.content or '') is not None
-
-
-def _ruling_lexeme_head(episode: Episode) -> bool:
-    return _RULING_LEXEME.search(_head(episode)) is not None
-
-
-def _decision_anchor_head(episode: Episode) -> bool:
-    head = _head(episode)
-    return bool(_DECISION_LEXEME.search(head) and _DECISION_ANCHOR.search(head))
+def _episode_adapter(name: str) -> Callable[[Episode], bool]:
+    holds = EPISODE_CLASSIFIERS[name]
+    return lambda episode: holds(
+        overreach_guard.category_of(episode.source.category), episode.content or '',
+    )
 
 
 CLASSIFIERS: Mapping[str, Callable[[Episode], bool]] = MappingProxyType({
-    'category_decisions': _category_decisions,
-    'header_ruling_paren': _header_ruling_paren,
-    'header_ruling': _header_ruling,
-    'ruling_lexeme_head': _ruling_lexeme_head,
-    'decision_anchor_head': _decision_anchor_head,
+    name: _episode_adapter(name) for name in EPISODE_CLASSIFIERS
 })
 
 STRATA: tuple[str, ...] = ('ruling_lexeme', 'decision_anchor', 'other_decisions')
@@ -238,17 +211,19 @@ STRATA: tuple[str, ...] = ('ruling_lexeme', 'decision_anchor', 'other_decisions'
 
 def stratum_of(episode: Episode) -> str | None:
     """The first stratum in ``STRATA`` order whose classifiers hold."""
-    if _header_ruling(episode) or _ruling_lexeme_head(episode):
+    if CLASSIFIERS['header_ruling'](episode) or CLASSIFIERS['ruling_lexeme_head'](episode):
         return 'ruling_lexeme'
-    if _decision_anchor_head(episode):
+    if CLASSIFIERS['decision_anchor_head'](episode):
         return 'decision_anchor'
-    if _category_decisions(episode):
+    if CLASSIFIERS['category_decisions'](episode):
         return 'other_decisions'
     return None
 
 
 def matching_classifiers(episode: Episode) -> tuple[str, ...]:
-    return tuple(name for name, holds in CLASSIFIERS.items() if holds(episode))
+    return overreach_guard.matching_classifiers(
+        overreach_guard.category_of(episode.source.category), episode.content or '',
+    )
 
 
 @dataclass(frozen=True)
@@ -474,11 +449,6 @@ def worksheet_rows(
 # --------------------------------------------------------------------------- #
 # The adjudicated verdict file, validated fail-closed
 # --------------------------------------------------------------------------- #
-
-LABELS: tuple[str, ...] = (
-    'holding', 'bookkeeping', 'context', 'overreach', 'misbound', 'unjudgeable',
-)
-"""The pre-registered vocabulary; definitions in design.md §2."""
 
 EdgeKey = tuple[str, str]
 """``(graph, edge_uuid)``."""

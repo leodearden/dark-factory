@@ -52,6 +52,7 @@ from orchestrator.evals.reviewer_trial.variants import (
     with_briefing,
 )
 from orchestrator.review_inputs import gather_review_subject
+from orchestrator.review_payload import Verdict, normalize_review
 
 
 @pytest.fixture
@@ -245,8 +246,8 @@ class TestRunSingleReviewerLiveTransport:
 
         assert name == 'r1'
         assert review is not None
-        assert review['verdict'] in {'PASS', 'ISSUES_FOUND'}
-        assert review['reviewer'] == 'reviewer_r1'
+        assert review.verdict is Verdict.PASS
+        assert review.reviewer == 'reviewer_r1'
         assert cost == 0.50
         # The verdict path is directly observable at the injected meta_root.
         assert (tmp_path / 'verdicts' / 'reviewer_r1.json').exists()
@@ -266,7 +267,7 @@ class TestRunSingleReviewerLiveTransport:
             _name, review, _cost = await _run_single_reviewer(spec, diff, meta_root=tmp_path)
 
         assert review is not None
-        assert review['verdict'] == 'ISSUES_FOUND'
+        assert review.verdict is Verdict.ISSUES_FOUND
 
     @pytest.mark.asyncio
     async def test_missing_verdict_yields_error_disposition(self, tmp_path) -> None:
@@ -288,7 +289,9 @@ class TestRunSingleReviewerLiveTransport:
 
         assert name == 'r1'
         assert review is not None
-        assert review['verdict'] == 'ERROR'
+        assert review.verdict is Verdict.ERROR
+        assert review.issues == ()
+        assert review.reviewer == 'reviewer_r1'
 
     @pytest.mark.asyncio
     async def test_unsuccessful_result_yields_error_even_if_verdict_written(self, tmp_path) -> None:
@@ -309,7 +312,29 @@ class TestRunSingleReviewerLiveTransport:
             _name, review, _cost = await _run_single_reviewer(spec, diff, max_retries=1, meta_root=tmp_path)
 
         assert review is not None
-        assert review['verdict'] == 'ERROR'
+        assert review.verdict is Verdict.ERROR
+        assert review.issues == ()
+        assert review.reviewer == 'reviewer_r1'
+
+    @pytest.mark.asyncio
+    async def test_an_off_contract_inner_verdict_is_no_verdict(self, tmp_path) -> None:
+        spec = ReviewerSpec(name='r1', model='sonnet', specialization='Testing.')
+        diff = CorpusDiff(
+            diff_id='d1', language='python', source='synthetic',
+            diff_text='diff', description='Test', ground_truth=[],
+        )
+
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_make_verdict_writing_invoke(verdict='NEEDS_CHANGES'),
+        ):
+            name, review, _cost = await _run_single_reviewer(spec, diff, max_retries=1, meta_root=tmp_path)
+
+        assert name == 'r1'
+        assert review is not None
+        assert review.verdict is Verdict.ERROR
+        assert review.issues == ()
+        assert review.reviewer == 'reviewer_r1'
 
     @pytest.mark.asyncio
     async def test_defaults_to_fresh_meta_root_when_uninjected(self) -> None:
@@ -330,7 +355,7 @@ class TestRunSingleReviewerLiveTransport:
 
         assert name == 'r1'
         assert review is not None
-        assert review['verdict'] == 'PASS'
+        assert review.verdict is Verdict.PASS
 
     @pytest.mark.asyncio
     async def test_cost_accumulates_across_retries(self, tmp_path) -> None:
@@ -355,7 +380,7 @@ class TestRunSingleReviewerLiveTransport:
 
         assert name == 'r1'
         assert review is not None
-        assert review['verdict'] == 'PASS'
+        assert review.verdict is Verdict.PASS
         # attempt 1 (no verdict → retried) + attempt 2 (valid) each cost 0.50;
         # the returned cost must sum BOTH, not report only the final 0.50.
         assert cost == pytest.approx(1.0)
@@ -383,6 +408,7 @@ class TestRunPanel:
         assert result.diff_id == 'd1'
         assert 'r1' in result.reviews
         assert result.reviews['r1']['verdict'] == 'PASS'
+        assert result.reviews['r1'] == normalize_review(result.reviews['r1']).to_record()
         assert result.total_cost_usd == 0.50
         assert result.errors == []
 
@@ -452,6 +478,7 @@ class TestRunPanel:
 
         assert 'r1' in result.reviews
         assert result.reviews['r1']['verdict'] == 'ERROR'
+        assert result.reviews['r1'] == normalize_review(result.reviews['r1']).to_record()
         assert result.errors == []
 
 

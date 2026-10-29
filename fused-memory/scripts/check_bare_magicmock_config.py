@@ -54,9 +54,9 @@ runtime, 20.8s -> 30.7s over the seven scanned dirs).  Note what this ruling doe
 say: it is not "put every future check here".  It applies because Rule C is another
 AST pass over exactly the same file set with exactly the same stdlib-only budget.
 A guard needing runtime import, pytest marks or a non-stdlib dependency does not
-qualify and stays where it is — which is why
-``orchestrator/tests/test_merge_speculation.py::TestTimeoutMarkCoverage`` was
-deliberately left file-local by task 4246 rather than moved here.
+qualify and stays where it is — which is why the runtime-mark timeout-coverage
+guard, ``orchestrator/tests/test_wait_budget_coverage_guard.py``, is a pytest
+module rather than a rule here.
 
 ---------------------------------------------------------------------------
 Rule A — ``bare-magicmock``
@@ -303,10 +303,13 @@ _DATACLASS_SHAPES: tuple[_DataclassShape, ...] = (
             'failing_test_ids_by_module',
             'skipped_test_ids',
             'failing_leg_categories',
+            'run_all_failed_members',
             'trivial',
             'duration_secs',
             'flake_suppression',
             'admission_legs',
+            'units',
+            'cache_mode',
             'test_leg_failed',
         }),
         anchors=frozenset({'passed'}),
@@ -614,11 +617,7 @@ def _dataclass_double_violation(
 # on trailing path COMPONENTS, so the package directory keeps them distinct.
 _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     # orchestrator/tests
-    'orchestrator/tests/test_merge_queue_concurrent_verify.py': 85,
-    'orchestrator/tests/test_concurrent_verify_boundary.py': 44,
-    'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 30,
-    'orchestrator/tests/test_merge_queue_permit_conservation.py': 27,
-    'orchestrator/tests/test_merge_queue_resolve_release.py': 25,
+    'orchestrator/tests/test_merge_queue_concurrent_verify.py': 64,
     'orchestrator/tests/test_coalesce_integration_gate.py': 12,
     'orchestrator/tests/test_merge_queue_request_liveness.py': 10,
     'orchestrator/tests/test_offline_lane.py': 10,
@@ -658,7 +657,6 @@ _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     'fused-memory/tests/test_e2e_durable_queue.py': 2,
     'fused-memory/tests/test_journaling_integration.py': 2,
     'fused-memory/tests/test_recon_claim_verification_wiring.py': 2,
-    'fused-memory/tests/test_ticket_worker.py': 2,
     # shared/tests
     'shared/tests/test_uuid_prefix_guard.py': 2,
     'shared/tests/test_async_sqlite_base.py': 1,

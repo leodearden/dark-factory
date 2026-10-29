@@ -91,6 +91,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'orchestrator/tests/test_merge_gates_plan_files_rename.py': (
         'a predicate over recorded argv; the probe it intercepts runs in the tmp git_repo fixture'
     ),
+    'orchestrator/tests/test_merge_gates_rename_family.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_merge_lane_ratchet_commit_gate.py': (
         '_Repo.seeded builds its repo under tmp_path'
     ),
@@ -110,6 +111,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
         'create_subprocess_exec is faked; the git argv is a recorded-call literal'
     ),
     'orchestrator/tests/test_train_moved_main.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_verify_events_units.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_verify_phase_rebase.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_warm_lane_abort_teardown.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_warm_lane_integration_gate.py': _SEEDS_ITS_OWN_REPO,

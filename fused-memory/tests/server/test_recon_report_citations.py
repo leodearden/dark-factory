@@ -2735,6 +2735,51 @@ class TestCiteTaskFoldPurgeRecordPersistence(_FoldPurgeRecordHarness):
             'existing_finding_id': anchor_id,
         }
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('fold', ['project_scoped', 'entity_scoped'])
+    async def test_folding_an_evicted_stages_last_finding_is_not_resurrected_by_a_restart(
+        self, store, fold
+    ):
+        state, t = self._make_state(store, ttl_seconds=10)
+        state.start_report(run_id='run-1', stage='s1', project_id='dark_factory')
+        loser_id = self._file_null_task_finding(
+            state, 'LOSER content',
+            flag_type=None if fold == 'project_scoped' else 'cross_project',
+        )
+        state.complete('run-1', 's1 done')
+        state.start_report(run_id='run-1', stage='s2', project_id='dark_factory')
+        t[0] = 11.0
+        assert state.tick() == 1
+
+        if fold == 'project_scoped':
+            anchor_id = self._file_null_task_finding(state, 'anchor filed by s2')
+            assert 'error' not in await state.cite_task(
+                'run-1', anchor_id, 'dark_factory', '2405'
+            )
+        else:
+            anchor_id = state.add_finding(
+                run_id='run-1', severity='minor', category='memory_stale',
+                description='entity survivor', suggested_action='a',
+                task_id='2405', flag_type='cross_project',
+            )['finding_id']
+
+        folded = await state.cite_task('run-1', loser_id, 'dark_factory', '2405')
+
+        assert folded.get('existing_finding_id') == anchor_id, folded
+        rows = _persisted_purge_record_rows(store, 'run-1')
+        assert [f['finding_id'] for f in rows['s1']['findings']] == []
+        assert [
+            (r['owning_stage'], r['finding']['finding_id'])
+            for r in rows['s2']['purged_findings']
+        ] == [('s1', loser_id)]
+
+        state_b, _ = self._make_state(store)
+        state_b.hydrate_from_store()
+        assert self._flagged_ids(state_b, 's1') == []
+        assert anchor_id in self._flagged_ids(state_b, 's2')
+        refolded = await state_b.cite_task('run-1', loser_id, 'dark_factory', '2405')
+        assert refolded.get('error') == 'finding_unknown', refolded
+
 # ---------------------------------------------------------------------------
 # task-2425 step-3: TestCiteTaskFoldKeyClearedOnDelete — RED until step-4
 # routes delete_finding through the shared _purge_finding helper

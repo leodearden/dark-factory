@@ -24,6 +24,7 @@ from _fused_memory_tool_surface import (
     registered_fused_memory_tools,
 )
 from _tool_surface_classification import assert_tool_surface_classified
+from reconciliation.harness_fixtures import make_harness
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 
@@ -472,14 +473,19 @@ class TestDisallowedToolLists:
         ``..._the_three_read_tools`` when the fourth member landed, and a name
         that promises a count forces a rename on every accession (and reads as a
         lie in between — see the RETIRED ASSERTION note above).
+
+        ``resolve_escalation_shas`` joined it in task 5751: a by-id record read,
+        denied for the same reason as ``get_escalation`` (against the
+        reconciliation queue it can only answer not-found).
         """
         assert set(DISALLOW_ESCALATION_READS) == {
             'mcp__escalation__get_pending_escalations',
             'mcp__escalation__get_escalation',
             'mcp__escalation__get_task_escalations',
             'mcp__escalation__get_task_escalation_history',
+            'mcp__escalation__resolve_escalation_shas',
         }
-        assert len(DISALLOW_ESCALATION_READS) == 4, 'no duplicate entries'
+        assert len(DISALLOW_ESCALATION_READS) == 5, 'no duplicate entries'
 
     def test_every_escalation_server_tool_is_classified(self):
         """Every tool the SHARED escalation server registers is denied or reviewed.
@@ -1326,7 +1332,7 @@ class TestTaskKnowledgeSyncDoneAuditSection:
     """assemble_payload renders a since-boundary Done-Task Completion-Memory Audit (step-5).
 
     The audit enumerates every done task updated at/after the watermark's
-    ``last_full_run_completed`` boundary (not a fixed 5-item sample), so
+    ``last_task_change_timestamp`` boundary (not a fixed 5-item sample), so
     completion-memory gaps outside the small Proactive Task Sample are no longer
     systematically missed as done-task throughput grows.
     """
@@ -1365,7 +1371,7 @@ class TestTaskKnowledgeSyncDoneAuditSection:
             ],
         }
 
-        wm = Watermark(project_id='p', last_full_run_completed=boundary)
+        wm = Watermark(project_id='p', last_task_change_timestamp=boundary)
         payload = await stage.assemble_payload([], wm, [])
 
         assert '### Done-Task Completion-Memory Audit' in payload, (
@@ -1378,6 +1384,47 @@ class TestTaskKnowledgeSyncDoneAuditSection:
             'a done task updated before the boundary must be excluded from the audit section'
         )
         assert '[8900]' not in section, 'an active task must never appear in the done-task audit'
+
+    @pytest.mark.asyncio
+    async def test_audit_window_starts_at_task_change_timestamp_not_completion(
+        self, mock_deps, tmp_path
+    ):
+        """The audit starts at the previous run's start, so a task done mid-run is audited.
+
+        This is the Stage 2 half of the done-audit invariant. The harness half, that
+        the persisted ``last_task_change_timestamp`` is the run's start, is
+        tests/reconciliation/test_recon_window_anchor.py::test_task_done_mid_cycle_is_inside_next_cycles_task_change_window.
+        """
+        previous_run_started = datetime(2026, 7, 14, 12, 0, 0, tzinfo=UTC)
+        previous_run_completed = datetime(2026, 7, 14, 12, 30, 0, tzinfo=UTC)
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='p', project_root=str(tmp_path)
+        )
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                {'id': 8811, 'status': 'done', 'title': 'Done mid-previous-run',
+                 'updatedAt': '2026-07-14T12:10:00.000Z'},
+                {'id': 8812, 'status': 'done', 'title': 'Done before the previous run',
+                 'updatedAt': '2026-07-14T11:00:00.000Z'},
+                {'id': 8813, 'status': 'done', 'title': 'Done after the previous run',
+                 'updatedAt': '2026-07-14T13:00:00.000Z'},
+            ],
+        }
+
+        wm = Watermark(
+            project_id='p',
+            last_task_change_timestamp=previous_run_started,
+            last_full_run_completed=previous_run_completed,
+        )
+        payload = await stage.assemble_payload([], wm, [])
+
+        section = _extract_section(payload, '### Done-Task Completion-Memory Audit')
+        assert '[8811]' in section
+        assert '[8813]' in section
+        assert '[8812]' not in section
+        boundary_line = next(ln for ln in section.splitlines() if ln.startswith('Boundary'))
+        assert previous_run_started.isoformat() in boundary_line
+        assert previous_run_completed.isoformat() not in boundary_line
 
     @pytest.mark.asyncio
     async def test_audit_section_render_cap_drops_oldest_with_overflow_note(
@@ -1416,7 +1463,7 @@ class TestTaskKnowledgeSyncDoneAuditSection:
         ]
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': tasks}
 
-        wm = Watermark(project_id='p', last_full_run_completed=boundary)
+        wm = Watermark(project_id='p', last_task_change_timestamp=boundary)
         payload = await stage.assemble_payload([], wm, [])
 
         section = _extract_section(payload, '### Done-Task Completion-Memory Audit')
@@ -1467,7 +1514,7 @@ class TestTaskKnowledgeSyncDoneAuditSection:
             ],
         }
 
-        wm = Watermark(project_id='p', last_full_run_completed=boundary)
+        wm = Watermark(project_id='p', last_task_change_timestamp=boundary)
         payload = await stage.assemble_payload([], wm, [])
 
         assert '### Done-Task Completion-Memory Audit' not in payload, (
@@ -2423,6 +2470,8 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # filters — the only place that increments this counter — never run,
             # leaving it at its __init__/reset value of 0.
             'stage1_undatable_freshness_records': 0,
+            # Always present (task 5499): None because no backlog payload was assembled.
+            'stage1_assembled_budget': None,
             # Always present (task 3052), zeroed in the same block as the
             # task-3084 curator-gate trio above and for the same reason: they
             # are set BEFORE the remediation early-return, so a caller reading
@@ -2444,6 +2493,12 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # human-gate-owned, so the deterministic gate-owned
             # suggested_action normalizer rewrites nothing.
             'gate_owned_suggested_actions_normalized': 0,
+            # Always present (task 5626), pre-initialised before the
+            # remediation early-return; 0 here because no task completed.
+            'unlanded_path_check_checked': 0,
+            'unlanded_path_check_skipped': 0,
+            'unlanded_path_check_errors': 0,
+            'unlanded_path_check_flags_emitted': 0,
             # The auto-consolidation post-step's keys (task 5240). This bare
             # AsyncMock memory's enabled_projects contains nothing, so the
             # post-step stops at its project gate.
@@ -2637,6 +2692,8 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # filters — the only place that increments this counter — never run,
             # leaving it at its __init__/reset value of 0.
             'stage1_undatable_freshness_records': 0,
+            # Always present (task 5499): None because no backlog payload was assembled.
+            'stage1_assembled_budget': None,
             # Always present (task 3052), zeroed in the same block as the
             # task-3084 curator-gate trio above and for the same reason: they
             # are set BEFORE the remediation early-return, so a caller reading
@@ -2658,6 +2715,12 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # human-gate-owned, so the deterministic gate-owned
             # suggested_action normalizer rewrites nothing.
             'gate_owned_suggested_actions_normalized': 0,
+            # Always present (task 5626), pre-initialised before the
+            # remediation early-return; 0 here because no task completed.
+            'unlanded_path_check_checked': 0,
+            'unlanded_path_check_skipped': 0,
+            'unlanded_path_check_errors': 0,
+            'unlanded_path_check_flags_emitted': 0,
             # The auto-consolidation post-step's keys (task 5240). This bare
             # AsyncMock memory's enabled_projects contains nothing, so the
             # post-step stops at its project gate.
@@ -13033,21 +13096,14 @@ class TestBaseStageEscalationQueueAttribute:
 def minimal_harness():
     """Construct a minimal ReconciliationHarness with all deps mocked."""
     from fused_memory.config.schema import FusedMemoryConfig
-    from fused_memory.reconciliation.harness import ReconciliationHarness
 
-    config = FusedMemoryConfig()
-    memory_service = AsyncMock()
-    taskmaster = AsyncMock()
-    journal = AsyncMock()
-    event_buffer = AsyncMock()
-    harness = ReconciliationHarness(
-        memory_service=memory_service,
-        taskmaster=taskmaster,
-        journal=journal,
-        event_buffer=event_buffer,
-        config=config,
+    return make_harness(
+        journal=AsyncMock(),
+        event_buffer=AsyncMock(),
+        memory_service=AsyncMock(),
+        taskmaster=AsyncMock(),
+        config=FusedMemoryConfig(),
     )
-    return harness
 
 
 class TestHarnessWiresEscalationQueueOntoStages:
@@ -14286,16 +14342,18 @@ class TestAssemblePayloadRequiredSections:
     def watermark(self):
         return Watermark(project_id='dark_factory')
 
-    def _install_stub_registry(self, stage, monkeypatch) -> dict[str, FilteredTaskTree]:
-        """Swap in STUB_REGISTRY; return the tree each stub renderer received, by stub."""
-        received: dict[str, FilteredTaskTree] = {}
+    def _install_stub_registry(
+        self, stage, monkeypatch
+    ) -> dict[str, tuple[FilteredTaskTree, datetime]]:
+        """Swap in STUB_REGISTRY; return the (tree, read instant) each stub received, by stub."""
+        received: dict[str, tuple[FilteredTaskTree, datetime]] = {}
 
-        async def stub_alpha(filtered: FilteredTaskTree) -> str:
-            received['alpha'] = filtered
+        async def stub_alpha(filtered: FilteredTaskTree, tree_read_at: datetime) -> str:
+            received['alpha'] = (filtered, tree_read_at)
             return '\n### Alpha\nfirst\n'
 
-        async def stub_beta(filtered: FilteredTaskTree) -> str:
-            received['beta'] = filtered
+        async def stub_beta(filtered: FilteredTaskTree, tree_read_at: datetime) -> str:
+            received['beta'] = (filtered, tree_read_at)
             return '\n### Beta\nsecond\n'
 
         monkeypatch.setattr(stage, 'stub_alpha', stub_alpha, raising=False)
@@ -14324,8 +14382,8 @@ class TestAssemblePayloadRequiredSections:
             'concatenated in REGISTRY ORDER, with no separator and no '
             f'post-processing; expected {self.EXPECTED_SECTIONS!r} in:\n{payload!r}'
         )
-        assert received.get('alpha') is stage.filtered_task_tree
-        assert received.get('beta') is stage.filtered_task_tree
+        assert received['alpha'][0] is stage.filtered_task_tree
+        assert received['beta'][0] is stage.filtered_task_tree
 
     @pytest.mark.asyncio
     async def test_self_fetched_tree_reaches_every_registry_renderer(
@@ -14334,25 +14392,37 @@ class TestAssemblePayloadRequiredSections:
         """With no harness-injected tree, renderers get the tree assemble_payload fetched.
 
         Pins Stage 2's contract over Stage 1's zero-arg aggregator: a renderer
-        reading self.filtered_task_tree would see None on this path.
+        reading self.filtered_task_tree would see None on this path.  The tree
+        travels with the instant it was read, stamped once the fetch returned.
         """
-        mock_deps['taskmaster'].get_tasks.return_value = {
-            'tasks': [{'id': 7, 'title': 'Fetched task', 'status': 'pending'}]
-        }
+        fetch_returned_by: list[datetime] = []
+
+        async def get_tasks(**_kwargs):
+            fetch_returned_by.append(datetime.now(UTC))
+            return {'tasks': [{'id': 7, 'title': 'Fetched task', 'status': 'pending'}]}
+
+        mock_deps['taskmaster'].get_tasks.side_effect = get_tasks
         stage = make_configured_task_knowledge_sync_stage(
             mock_deps, project_id='dark_factory', project_root='/project'
         )
         received = self._install_stub_registry(stage, monkeypatch)
 
         payload = await stage.assemble_payload([], watermark, [])
+        assembled_by = datetime.now(UTC)
 
         assert self.EXPECTED_SECTIONS in payload
         assert stage.filtered_task_tree is None
-        assert received['alpha'] is received['beta'], (
+        tree, tree_read_at = received['alpha']
+        assert received['beta'][0] is tree and received['beta'][1] == tree_read_at, (
             'Every Stage-2 registry renderer must receive the SAME resolved '
-            f'FilteredTaskTree; received {received!r}'
+            f'FilteredTaskTree and read instant; received {received!r}'
         )
-        assert [task['id'] for task in received['alpha'].active_tasks] == [7]
+        assert [task['id'] for task in tree.active_tasks] == [7]
+        assert tree_read_at.tzinfo is not None
+        assert fetch_returned_by[0] <= tree_read_at <= assembled_by, (
+            'A self-fetched tree is read when the fetch returns; got '
+            f'{tree_read_at!r}, fetch returned by {fetch_returned_by[0]!r}'
+        )
 
 
 class TestRenderLiveWorkflowSectionEmptyTasksNoOp:

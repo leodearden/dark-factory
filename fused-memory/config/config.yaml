@@ -393,6 +393,7 @@ reconciliation:
   auto_unhalt_after_cooldown: true
   explore_codebase_root: "${PROJECT_ROOT:.}"
   # Recon CLI transcripts are archived into the orchestrator's archive root (relative to explore_codebase_root), which the legibility miner already walks.
+  # TaskCurator's per-process config-dir transcripts are archived there too, under the same kill switch (task 6008).
   transcript_archive_enabled: true
   transcript_archive_root: "data/orchestrator/agent-transcripts"
   # Escalation
@@ -443,7 +444,8 @@ reconciliation:
   opus_episode_limit: 500
   opus_memory_limit: 1000
   # Token-budget context assembly
-  token_budget: 65000
+  # Sized with context_assembler's per-item caps: plans/recon-evidence-caps-measurement-2026-10.md
+  token_budget: 130000
   context_search_limit: 5
   context_fetch_batch_size: 10
   # Caller bar for `deterministic-*` done provenance (task 5237, PRD C5).
@@ -796,8 +798,9 @@ write_triage:
   # included regardless of this cap.
   judge_candidate_count: 5
   # judge_field_chars: the per-field character cap on the entry and on every
-  # candidate the judge reads, cut fields marked `…[elided]`. Why 4000 and
-  # not the old 1200: calibration/write_triage_judge_field_chars_report.md.
+  # candidate the judge reads, cut fields marked with how many characters
+  # were elided. Why 4000 and not the old 1200:
+  # calibration/write_triage_judge_field_chars_report.md.
   judge_field_chars: 4000
   # judge_accuracy_report_path: traceability from the judge shipped here back
   # to the run that MEASURED it against leaf alpha's curator-labelled fixture,
