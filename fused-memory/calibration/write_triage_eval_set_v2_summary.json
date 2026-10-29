@@ -1,0 +1,1527 @@
+{
+  "full_label_outcome": "restated",
+  "inputs": {
+    "live_slates_sha256": "fa5c20f6eb8461d2f7dfdd5b9a2ef3e48fe3853e26945b9e3d53ebdf4728930c",
+    "snapshot_sha256": "55398cd73c9a355d05f9454a2e1cca9e7da760bd89df141b2f6b5b8f28293e38"
+  },
+  "kappa": {
+    "by_binary": {
+      "action_changing": {
+        "floor_met": false,
+        "kappa": null,
+        "n_consumed": 0
+      },
+      "conflict": {
+        "floor_met": true,
+        "kappa": 0.8684,
+        "n_consumed": 4254
+      },
+      "digest": {
+        "floor_met": false,
+        "kappa": null,
+        "n_consumed": 0
+      },
+      "home": {
+        "floor_met": true,
+        "kappa": 0.9119,
+        "n_consumed": 4254
+      },
+      "loss": {
+        "floor_met": true,
+        "kappa": 0.803,
+        "n_consumed": 270
+      },
+      "scope": {
+        "floor_met": false,
+        "kappa": null,
+        "n_consumed": 0
+      }
+    },
+    "floor": 0.7,
+    "floor_binaries": [
+      "home",
+      "conflict",
+      "loss"
+    ],
+    "min_pairs": 60
+  },
+  "labels": {
+    "decided": 4254,
+    "unclear": 2
+  },
+  "pairs": {
+    "live": 1846,
+    "offline": 2410
+  },
+  "rating_volume": {
+    "current": {
+      "primary": 4256,
+      "second": 4256,
+      "third": 264
+    }
+  },
+  "reasked": 0,
+  "rerates": [
+    {
+      "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
+      "pairs": 290,
+      "round": 1,
+      "version": "v2.2"
+    }
+  ],
+  "shards": {
+    "primary_00": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_01": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_02": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_03": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_04": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_05": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_06": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_07": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_08": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_09": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_10": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_100": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_101": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_102": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_103": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_104": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_105": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_106": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_11": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_12": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_13": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_14": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_15": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_16": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_17": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_18": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_19": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_20": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_21": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_22": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_23": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_24": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_25": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_26": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_27": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_28": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_29": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_30": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_31": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_32": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_33": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_34": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_35": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_36": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_37": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_38": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_39": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_40": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_41": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_42": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_43": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_44": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_45": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_46": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_47": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_48": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_49": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_50": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_51": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_52": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_53": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_54": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_55": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_56": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_57": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_58": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_59": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_60": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_61": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_62": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_63": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_64": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_65": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_66": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_67": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_68": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_69": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_70": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_71": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_72": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_73": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_74": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_75": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_76": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_77": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_78": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_79": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_80": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_81": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_82": {
+      "items": 40,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_83": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_84": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_85": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_86": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_87": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_88": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_89": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_90": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_91": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_92": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_93": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_94": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_95": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_96": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_97": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_98": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "primary_99": {
+      "items": 39,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 0
+    },
+    "rerate_01_primary_00": {
+      "items": 37,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 1
+    },
+    "rerate_01_primary_01": {
+      "items": 37,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 1
+    },
+    "rerate_01_primary_02": {
+      "items": 36,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 1
+    },
+    "rerate_01_primary_03": {
+      "items": 36,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 1
+    },
+    "rerate_01_primary_04": {
+      "items": 36,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 1
+    },
+    "rerate_01_primary_05": {
+      "items": 36,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 1
+    },
+    "rerate_01_primary_06": {
+      "items": 36,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 1
+    },
+    "rerate_01_primary_07": {
+      "items": 36,
+      "rater": "opus-primary",
+      "role": "primary",
+      "round": 1
+    },
+    "rerate_01_second_00": {
+      "items": 37,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 1
+    },
+    "rerate_01_second_01": {
+      "items": 37,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 1
+    },
+    "rerate_01_second_02": {
+      "items": 36,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 1
+    },
+    "rerate_01_second_03": {
+      "items": 36,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 1
+    },
+    "rerate_01_second_04": {
+      "items": 36,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 1
+    },
+    "rerate_01_second_05": {
+      "items": 36,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 1
+    },
+    "rerate_01_second_06": {
+      "items": 36,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 1
+    },
+    "rerate_01_second_07": {
+      "items": 36,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 1
+    },
+    "second_00": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_01": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_02": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_03": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_04": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_05": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_06": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_07": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_08": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_09": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_10": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_100": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_101": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_102": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_103": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_104": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_105": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_106": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_11": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_12": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_13": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_14": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_15": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_16": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_17": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_18": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_19": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_20": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_21": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_22": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_23": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_24": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_25": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_26": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_27": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_28": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_29": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_30": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_31": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_32": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_33": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_34": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_35": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_36": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_37": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_38": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_39": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_40": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_41": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_42": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_43": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_44": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_45": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_46": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_47": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_48": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_49": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_50": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_51": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_52": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_53": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_54": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_55": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_56": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_57": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_58": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_59": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_60": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_61": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_62": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_63": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_64": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_65": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_66": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_67": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_68": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_69": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_70": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_71": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_72": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_73": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_74": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_75": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_76": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_77": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_78": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_79": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_80": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_81": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_82": {
+      "items": 40,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_83": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_84": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_85": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_86": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_87": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_88": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_89": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_90": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_91": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_92": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_93": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_94": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_95": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_96": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_97": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_98": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "second_99": {
+      "items": 39,
+      "rater": "opus-second",
+      "role": "second",
+      "round": 0
+    },
+    "third_00_00": {
+      "items": 40,
+      "rater": "opus-third-00",
+      "role": "third",
+      "round": 0
+    },
+    "third_00_01": {
+      "items": 40,
+      "rater": "opus-third-00",
+      "role": "third",
+      "round": 0
+    },
+    "third_00_02": {
+      "items": 39,
+      "rater": "opus-third-00",
+      "role": "third",
+      "round": 0
+    },
+    "third_00_03": {
+      "items": 39,
+      "rater": "opus-third-00",
+      "role": "third",
+      "round": 0
+    },
+    "third_00_04": {
+      "items": 39,
+      "rater": "opus-third-00",
+      "role": "third",
+      "round": 0
+    },
+    "third_00_05": {
+      "items": 39,
+      "rater": "opus-third-00",
+      "role": "third",
+      "round": 0
+    },
+    "third_01": {
+      "items": 38,
+      "rater": "opus-third-01",
+      "role": "third",
+      "round": 0
+    },
+    "third_02": {
+      "items": 1,
+      "rater": "opus-third-02",
+      "role": "third",
+      "round": 0
+    }
+  },
+  "strata": {
+    "live-dark_factory": 732,
+    "live-reify": 666,
+    "live-scoping_intake": 48,
+    "live-solar_challenge": 760,
+    "live-solar_challenge_platform": 553,
+    "offline-write-time": 1102
+  },
+  "unclear_pairs": [
+    {
+      "binaries": [
+        "loss"
+      ],
+      "entry_id": "0e6bd429-4b0a-423b-99d5-e0cae764b108",
+      "target_id": "6fb4a744-7cf3-4ced-8907-240710aadf27"
+    },
+    {
+      "binaries": [
+        "loss"
+      ],
+      "entry_id": "7e9aac4e-64ee-43cb-a797-6dedc8fe96b5",
+      "target_id": "e0a41fcd-0745-426b-bf71-45466e6d34e0"
+    }
+  ],
+  "width": 5
+}
