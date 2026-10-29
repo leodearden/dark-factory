@@ -24,10 +24,7 @@ from orchestrator.cli import main
 
 
 @pytest.fixture
-def project(tmp_path, monkeypatch) -> SeededProject:
-    # The suite pins ORCH_PROJECT_ROOT to tmp_path, which outranks the YAML; here
-    # the YAML's project_root is the selector under test.
-    monkeypatch.delenv('ORCH_PROJECT_ROOT', raising=False)
+def project(tmp_path) -> SeededProject:
     return make_project(tmp_path)
 
 
@@ -110,16 +107,12 @@ def test_a_candidate_filter_limits_both_forms_to_that_candidate(project, tmp_pat
     assert [line['candidate'] for line in json.loads(as_json.stdout)['lines']] == [_OTHER]
 
 
-def test_a_project_that_has_no_runs_db_is_refused_and_left_without_one(tmp_path, monkeypatch):
-    monkeypatch.delenv('ORCH_PROJECT_ROOT', raising=False)
-    never_ran = tmp_path / 'never-ran'
-    never_ran.mkdir()
-
-    result = _report('--config', str(write_config(tmp_path, never_ran, 3)))
+def test_a_project_that_has_no_runs_db_is_refused_and_left_without_one(tmp_path):
+    result = _report('--config', str(write_config(tmp_path, tmp_path, 3)))
 
     assert result.exit_code == 1
-    assert str(runs_db(never_ran)) in result.output
-    assert not runs_db(never_ran).exists()
+    assert str(runs_db(tmp_path)) in result.output
+    assert not runs_db(tmp_path).exists()
 
 
 def test_a_shape_without_a_report_rule_is_refused_naming_the_supported_shapes(project, tmp_path):
@@ -138,10 +131,11 @@ def test_the_group_and_its_report_command_are_listed():
     assert 'report' in group.output
 
 
-def test_no_config_is_refused_as_every_sibling_refuses_it(monkeypatch):
-    monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+def test_no_usable_config_is_refused_as_every_sibling_refuses_it(tmp_path, monkeypatch):
+    absent = tmp_path / 'absent.yaml'
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(absent))
 
     result = _report()
 
     assert result.exit_code == 1
-    assert '--config is required' in result.output
+    assert f'Config file not found: {absent}' in result.output

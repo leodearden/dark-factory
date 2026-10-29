@@ -44,7 +44,12 @@ _ids = itertools.count(1)
 
 @dataclass(frozen=True)
 class SeededProject:
-    """A project root laid out as the orchestrator lays one out, with an open run store."""
+    """A project root laid out as the orchestrator lays one out, with an open run store.
+
+    The root is ``tmp_path`` itself, the value conftest's autouse
+    ``_isolate_orch_config`` pins ``ORCH_PROJECT_ROOT`` to, so a written YAML
+    and the environment agree on it.
+    """
 
     project_root: Path
     db_path: Path
@@ -53,9 +58,8 @@ class SeededProject:
 
 
 def make_project(tmp_path: Path) -> SeededProject:
-    project_root = tmp_path / 'project'
-    db_path = runs_db(project_root)
-    return SeededProject(project_root, db_path, tmp_path / 'results', RunStore(db_path))
+    db_path = runs_db(tmp_path)
+    return SeededProject(tmp_path, db_path, tmp_path / 'results', RunStore(db_path))
 
 
 def build_cell(**overrides: Any) -> ShadowCell:
@@ -142,7 +146,7 @@ async def seed_production_cost(
 
 
 def write_config(tmp_path: Path, project_root: Path, n_min: int) -> Path:
-    path = tmp_path / 'orchestrator.yaml'
+    path = tmp_path / 'dark-factory-orchestrator.yaml'
     path.write_text(yaml.safe_dump({
         'project_root': str(project_root),
         'fused_memory': {'project_id': PROJECT_ID},
