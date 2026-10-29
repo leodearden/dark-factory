@@ -1320,6 +1320,7 @@
     "orchestrator/tests/test_verify_phase_rebase.py": {"patch_targets": [], "private_reads": 15},
     "orchestrator/tests/test_verify_plan_integration.py": {"patch_targets": ["worker.verify_failure_is_preexisting_on_main"], "private_reads": 1},
     "orchestrator/tests/test_verify_preexisting_main_break.py": {"patch_targets": [], "private_reads": 23},
+    "orchestrator/tests/test_verify_result_doubles.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_verify_runner.py": {"patch_targets": [], "private_reads": 4},
     "orchestrator/tests/test_verify_scope_inversion_boundary.py": {"patch_targets": ["worker.run_scoped_verification", "worker.verify_failure_is_preexisting_on_main"], "private_reads": 7},
     "orchestrator/tests/test_verify_scope_spawn_failure.py": {"patch_targets": [], "private_reads": 0},
