@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from canary_predicate_summary import metric, n_deep_verifies, verdict
+from canary_predicate_summary import metric, n_deep_verifies, store_n_deep, verdict
 from cli_subprocess_timeout import cli_timeout_from_env
 from orchestrator.event_store import EventStore, EventType
 
@@ -26,11 +26,16 @@ _NOW_ARGS = ('--now', str(_AS_OF.timestamp()), '--window-days', '7')
 _CUTOFF = _AS_OF - timedelta(days=7)
 
 
-def _run(db_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _run_stores(db_paths: list[Path], *args: str) -> subprocess.CompletedProcess[str]:
+    store_args = [arg for db_path in db_paths for arg in ('--runs-db', str(db_path))]
     return subprocess.run(
-        ['bash', str(_PREDICATE), '--runs-db', str(db_path), *args],
+        ['bash', str(_PREDICATE), *store_args, *args],
         capture_output=True, text=True, timeout=_PREDICATE_TIMEOUT,
     )
+
+
+def _run(db_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return _run_stores([db_path], *args)
 
 
 _FRESH_SHA = object()
@@ -105,6 +110,15 @@ def _recent(i: int) -> datetime:
 def _seed_inside(conn, verify_ts: datetime, finalized_ts: datetime | None = None):
     for event in _healthy_round_events(verify_ts, finalized_ts=finalized_ts):
         conn.seed_event(**event)
+
+
+def _healthy_rounds(count: int, *, first: datetime = _AS_OF - timedelta(days=3), **round_fields):
+    """*count* healthy rounds an hour apart from *first*, flattened into one event list."""
+    return [
+        event
+        for k in range(count)
+        for event in _healthy_round_events(first + timedelta(hours=k), **round_fields)
+    ]
 
 
 def _seed_intruder(conn, verify_ts: datetime, finalized_ts: datetime | None = None):
@@ -243,3 +257,52 @@ class TestUsageFaultsExitTwo:
 
         assert result.returncode == 2, f'{result.stdout=} {result.stderr=}'
         assert flag in result.stderr
+
+
+class TestPooledStores:
+    def test_metrics_pool_across_repeated_runs_db(self, make_runs_db):
+        failed_tip = _verify_event(_AS_OF - timedelta(days=1), passed=False, task_id='9001')
+        reify = make_runs_db([*_healthy_rounds(4), failed_tip], name='reify.db')
+        df = make_runs_db(_healthy_rounds(4), name='df.db')
+
+        result = _run_stores([reify, df], *_NOW_ARGS)
+
+        assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
+        assert n_deep_verifies(result.stdout) == 9
+        assert metric(result.stdout, 'deep_fail_rate') == 0.1111
+        assert store_n_deep(result.stdout) == {str(reify): 5, str(df): 4}
+
+    @pytest.mark.parametrize('respell', [
+        pytest.param(lambda path: path, id='verbatim'),
+        pytest.param(lambda path: path.parent / '.' / path.name, id='respelled'),
+    ])
+    def test_a_store_named_twice_is_a_usage_fault(self, make_runs_db, respell):
+        reify = make_runs_db(_healthy_rounds(8), name='reify.db')
+
+        result = _run_stores([reify, respell(reify)], *_NOW_ARGS)
+
+        assert result.returncode == 2, f'{result.stdout=} {result.stderr=}'
+        assert '--runs-db' in result.stderr
+
+    @pytest.mark.parametrize('missing_first', [False, True], ids=['missing-second', 'missing-first'])
+    def test_a_missing_store_is_a_usage_fault(self, make_runs_db, tmp_path, missing_first):
+        reify = make_runs_db(_healthy_rounds(8), name='reify.db')
+        missing = tmp_path / 'absent.db'
+        stores = [missing, reify] if missing_first else [reify, missing]
+
+        result = _run_stores(stores, *_NOW_ARGS)
+
+        assert result.returncode == 2, f'{result.stdout=} {result.stderr=}'
+        assert str(missing) in result.stderr
+
+    @pytest.mark.parametrize('bare_first', [False, True], ids=['bare-second', 'bare-first'])
+    def test_a_store_without_an_events_table_is_an_infra_fault(self, make_runs_db, tmp_path, bare_first):
+        reify = make_runs_db(_healthy_rounds(8), name='reify.db')
+        bare = tmp_path / 'bare.db'
+        sqlite3.connect(bare).close()
+        stores = [bare, reify] if bare_first else [reify, bare]
+
+        result = _run_stores(stores, *_NOW_ARGS)
+
+        assert result.returncode == 2, f'{result.stdout=} {result.stderr=}'
+        assert str(bare) in result.stderr
