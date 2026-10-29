@@ -3,12 +3,16 @@
 A variable is secret-bearing when its name starts with the OAuth pool prefix or
 ends in ``_API_KEY`` or ``_TOKEN``; the rule reads names only, never values. An
 agent child inherits no secret-bearing variable except its own session
-credential, ``CLAUDE_CODE_OAUTH_TOKEN``. Operator view: ``OPERATIONS.md``.
+credential, ``CLAUDE_CODE_OAUTH_TOKEN``. An agent child also inherits no
+Python-environment selection (``shared.python_env``). Operator view:
+``OPERATIONS.md``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+
+from shared.python_env import without_python_env_selection
 
 __all__ = [
     'AGENT_CREDENTIAL_VAR',
@@ -31,7 +35,7 @@ def is_secret_env_name(name: str) -> bool:
 def agent_subprocess_env(environ: Mapping[str, str]) -> dict[str, str]:
     return {
         name: value
-        for name, value in environ.items()
+        for name, value in without_python_env_selection(environ).items()
         if name == AGENT_CREDENTIAL_VAR or not is_secret_env_name(name)
     }
 

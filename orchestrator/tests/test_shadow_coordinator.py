@@ -694,5 +694,6 @@ async def test_shutdown_during_the_leg_two_open_still_fails_leg_two(tmp_path, co
         let_announce_finish.set()
 
     [leg_two] = _of_shape(rig, ShadowShape.ARCHITECT_CONSEQUENCE)
+    assert [request.cell.shape for request in rig.runner.prepared] == [ShadowShape.ARCHITECT]
     assert (leg_two.state, leg_two.reason) == (_S.FAILED, 'cancelled_at_shutdown')
     assert not any(cell.state.held_by_run for cell in _cells(rig))

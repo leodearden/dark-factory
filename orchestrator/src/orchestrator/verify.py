@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 
 from shared.proc_group import terminate_process_group
 from shared.psi import read_psi_sample
+from shared.python_env import without_python_env_selection
 from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
 
 from orchestrator import verify_evidence, verify_plan
@@ -2769,6 +2770,12 @@ def _build_summary_payload(
     role-less. It is a required keyword so no writer can emit a record
     without it.
 
+    ``carried_over`` (task 5624) marks a leg whose started_at/duration_secs
+    come from the attempt's first pass, not this one; a reader computing
+    attempt timing must exclude it, never difference or sum across it. It is
+    read with ``.get`` like ``segments``, so a hand-built remote run reads
+    None: not recorded.
+
     A NEGATIVE rc is not a quiet outcome — it is asyncio reporting that the
     process was terminated by signal ``-rc`` and never got to exit at all, so
     it is the LOUDEST possible outcome and sorts above every non-negative rc
@@ -2794,6 +2801,7 @@ def _build_summary_payload(
         'cmd': worst['cmd'],
         'started_at': worst['started_at'],
         'duration_secs': worst['duration_secs'],
+        'carried_over': worst.get('carried_over'),
         'commands': [
             {
                 'label': r['label'],
@@ -2805,6 +2813,7 @@ def _build_summary_payload(
                 'segments': r.get('segments'),
                 'load': r.get('load'),
                 'slot_wait_secs': r.get('slot_wait_secs'),
+                'carried_over': r.get('carried_over'),
             }
             for r in active_runs
         ],
@@ -4336,21 +4345,6 @@ def _build_fallback_config(
     )
 
 
-def _verify_duration_secs(runs: list[dict]) -> float:
-    """Sum per-command ``duration_secs`` values from a verification runs list.
-
-    Each entry is expected to have a ``duration_secs`` key (float); entries
-    that are missing the key contribute 0.0.  Returns 0.0 for an empty list.
-
-    This is the correct wall-clock measure when commands were run **serially**
-    (sum of sequential durations).  For the **concurrent** branch (asyncio.gather
-    of test/lint/type) the caller should use ``max(...)`` of the individual
-    durations — mirroring the multi-module logic in ``_aggregate_results`` — to
-    avoid overstating wall-clock by ~3×.
-    """
-    return sum(r.get('duration_secs', 0.0) for r in runs)
-
-
 @dataclass
 class CheckRun:
     """The execution outcome of a single check (test/lint/type).
@@ -4411,6 +4405,17 @@ class CheckRun:
     # This leg invocation's parsed REIFY_VERIFY_EVENT_LOG (task 6856); None =
     # no command ran. LAST field, as above, and kept out of ``to_dict``.
     event_channel: 'VerifyEventChannel | None' = None
+    # True when this leg was not re-run in the attempt holding it, so its
+    # result, started_at and duration_secs are that attempt's first pass's
+    # (the env-recovery retry, task 5624). LAST field, as above.
+    carried_over: bool = False
+
+    def __post_init__(self) -> None:
+        if self.carried_over and self.cmd is None:
+            raise ValueError(
+                f'CheckRun {str(self.label)!r}: a check that never ran (cmd=None) '
+                'cannot be carried over'
+            )
 
     @classmethod
     def skipped(cls, label: str) -> 'CheckRun':
@@ -4427,10 +4432,11 @@ class CheckRun:
 
     def to_dict(self) -> dict:
         """Serialise to the runs-dict schema consumed by ``_persist_attempt_logs``/
-        ``_build_summary_payload``/``_verify_duration_secs``/``_archive_merge_verify_logs``
-        (all take ``list[dict]``) — the exact 11-key shape (label/cmd/rc/output/
-        timed_out/started_at/duration_secs/segments/load/slot_wait_secs/admission),
-        7 of which were previously hand-built inline in ``run_verification``.
+        ``_build_summary_payload``/``_archive_merge_verify_logs``
+        (all take ``list[dict]``) — the exact 12-key shape (label/cmd/rc/output/
+        timed_out/started_at/duration_secs/segments/load/slot_wait_secs/admission/
+        carried_over), 7 of which were previously hand-built inline in
+        ``run_verification``.
 
         ``started_at`` is normalised via ``or ''``: a skipped check's
         ``None`` serialises as ``''``, matching the pre-refactor
@@ -4452,6 +4458,9 @@ class CheckRun:
         ``slot_wait_secs`` (task 5671) and ``admission`` (task 5628) are
         emitted unconditionally too: absent means the run predates them,
         ``None`` means it queued for no slot.
+
+        ``carried_over`` (task 5624) is emitted unconditionally as well: True
+        marks a leg whose timing belongs to the attempt's first pass.
         """
         return {
             'label': self.label,
@@ -4465,6 +4474,7 @@ class CheckRun:
             'load': self.load,
             'slot_wait_secs': self.slot_wait_secs,
             'admission': None if self.admission is None else self.admission.to_dict(),
+            'carried_over': self.carried_over,
         }
 
 
@@ -4483,6 +4493,8 @@ class VerifyAttempt:
     ``timed_out=False`` while ``category`` flipped to ``infra_timeout``.
     With a single property definition read from every call site, first-pass
     and env-recovery are now structurally incapable of disagreeing.
+
+    A re-run attempt is built only through :meth:`with_rerun`.
     """
 
     checks: list[CheckRun]
@@ -4513,11 +4525,11 @@ class VerifyAttempt:
             and all(c.rc == 0 or c.timed_out for c in self.checks)
         )
 
-    def _by_label(self, slot: LegSlot) -> CheckRun:
-        found = next((c for c in self.checks if c.label == slot), None)
+    def _by_label(self, label: str) -> CheckRun:
+        found = next((c for c in self.checks if c.label == label), None)
         if found is None:
             raise KeyError(
-                f'no check labeled {slot.value!r} in {[str(c.label) for c in self.checks]}'
+                f'no check labeled {str(label)!r} in {[str(c.label) for c in self.checks]}'
             )
         return found
 
@@ -4536,6 +4548,25 @@ class VerifyAttempt:
         # enabled — so this is lint-safe; matches the CheckRun.label vocabulary
         # (LegSlot) used throughout verify.py.
         return self._by_label(LegSlot.TYPE)
+
+    def with_rerun(self, run: CheckRun) -> 'VerifyAttempt':
+        """This attempt with *run* replacing its same-label check and every
+        other check that ran carried over; skipped checks stay skipped.
+
+        Raises ``KeyError`` when this attempt holds no check labeled
+        ``run.label``.
+        """
+        replaced = self._by_label(run.label)
+        return VerifyAttempt([
+            run if c is replaced
+            else (replace(c, carried_over=True) if c.cmd is not None else c)
+            for c in self.checks
+        ])
+
+    def wall_secs(self, *, concurrent: bool) -> float:
+        """Wall time of the legs this attempt ran itself."""
+        own = [c.duration_secs for c in self.checks if not c.carried_over]
+        return max(own, default=0.0) if concurrent else sum(own)
 
     def classify_failing_legs(self) -> dict[LegSlot, FailureCategory]:
         """Each failing check's own category (``classify_leg``), keyed by slot."""
@@ -5020,43 +5051,6 @@ async def reap_leftover_verify_scopes(project_root: Path) -> list[str]:
     return reaped
 
 
-# Environment variables that activate a *specific* Python virtualenv / uv
-# project.  The orchestrator runs under `uv run --project orchestrator`, which
-# activates dark-factory/.venv and exports these into our process env.  If they
-# leak into a TARGET project's verify/build/test subprocess, the target's `uv`
-# resolves THIS venv instead of its own and a target `uv sync` writes the
-# target's deps into the orchestrator's runtime interpreter — the 2026-05-29
-# ghost-venv incident (autopilot-video's torch/insightface stack got synced into
-# dark-factory/.venv, flipping it 3.13->3.12 and deleting the live interpreter's
-# stdlib out from under the running orchestrator, which then hit FileNotFoundError
-# every scheduler cycle and stopped dispatching).
-#
-# Denylist, NOT allowlist: reify's cargo verify depends on a broad, evolving set
-# of toolchain/sccache/jobserver vars (RUSTC_WRAPPER, CARGO_*, the jobserver
-# FIFO, ...); an allowlist would silently break Rust verify the first time a new
-# var is needed.  We remove ONLY the python-env-selection vars below plus the
-# orchestrator's own ORCH_* control-plane namespace (see _ORCH_ENV_PREFIX) —
-# the vars that cause a leak — and pass everything else through untouched.
-_VENV_ISOLATION_KEYS: frozenset[str] = frozenset({
-    'VIRTUAL_ENV',
-    'UV_PROJECT_ENVIRONMENT',
-    'UV_PROJECT',
-    'UV_ACTIVE',
-    # Fix 3 may run the orchestrator unit with --frozen; UV_FROZEN / UV_NO_SYNC
-    # must NOT leak to a target, which has to stay free to sync its own deps.
-    'UV_FROZEN',
-    'UV_NO_SYNC',
-    # `uv run` (our ExecStart) sets UV_RUN_RECURSION_DEPTH in our env to guard
-    # against runaway nested invocations.  A target's verify is a logically
-    # independent uv invocation tree, so it must start that counter fresh rather
-    # than inherit our depth — otherwise a uv-based target (dark-factory /
-    # autopilot-video) would `uv run` "pre-loaded" at our depth.
-    'UV_RUN_RECURSION_DEPTH',
-    'CONDA_PREFIX',
-    'CONDA_DEFAULT_ENV',
-    'PYTHONHOME',
-})
-
 # The orchestrator's own control-plane env namespace.  ``OrchestratorConfig`` is
 # a pydantic-settings ``BaseSettings`` whose ``env_settings`` source reads the
 # ENTIRE ``ORCH_`` prefix as config overrides, so ANY ambient ``ORCH_*`` var
@@ -5072,27 +5066,6 @@ _VENV_ISOLATION_KEYS: frozenset[str] = frozenset({
 _ORCH_ENV_PREFIX: str = 'ORCH_'
 
 
-def _strip_venv_bin_from_path(path: str | None, venv: str | None) -> str | None:
-    """Drop the active venv's ``bin`` directory from a PATH string.
-
-    ``uv run`` prepends ``$VIRTUAL_ENV/bin`` to PATH in the orchestrator
-    process, so removing ``VIRTUAL_ENV`` alone is insufficient: the venv's bin
-    dir is still first on PATH and a target's bare ``python`` / ``uv`` / ``pip``
-    would still resolve into the orchestrator venv.  Remove exactly that one
-    component (matched as ``<venv>/bin`` via normpath); every other PATH entry
-    (cargo, sccache, system bins) keeps its order.  Returns *path* unchanged
-    when *path* or *venv* is falsy.
-    """
-    if not path or not venv:
-        return path
-    venv_bin = os.path.normpath(os.path.join(venv, 'bin'))
-    kept = [
-        p for p in path.split(os.pathsep)
-        if p and os.path.normpath(p) != venv_bin
-    ]
-    return os.pathsep.join(kept)
-
-
 def _target_subprocess_env(
     extra: dict[str, str] | None,
     *,
@@ -5101,7 +5074,7 @@ def _target_subprocess_env(
     """Build the subprocess env for a TARGET project's verify/build/test spawn.
 
     Starts from ``os.environ`` minus the orchestrator's own venv/uv activation
-    vars (``_VENV_ISOLATION_KEYS``), minus the orchestrator's ``ORCH_*``
+    vars (``shared.python_env.without_python_env_selection``), minus the orchestrator's ``ORCH_*``
     control-plane namespace (``_ORCH_ENV_PREFIX`` — so an ambient, leaked
     ``ORCH_CONFIG_PATH`` can't make a snapshot-era test load the production
     config; task 2957), and minus the venv ``bin`` dir on PATH, so the target's
@@ -5128,15 +5101,11 @@ def _target_subprocess_env(
     ruff's built-in defaults — a false green.  See pyproject.toml's
     ``[tool.ruff]`` decision block.)
     """
-    venv = os.environ.get('VIRTUAL_ENV')
     env = {
         k: v
-        for k, v in os.environ.items()
-        if k not in _VENV_ISOLATION_KEYS and not k.startswith(_ORCH_ENV_PREFIX)
+        for k, v in without_python_env_selection(os.environ).items()
+        if not k.startswith(_ORCH_ENV_PREFIX)
     }
-    stripped_path = _strip_venv_bin_from_path(env.get('PATH'), venv)
-    if stripped_path is not None:
-        env['PATH'] = stripped_path
     env['PYTHONUNBUFFERED'] = '1'
     # This assignment's POSITION is load-bearing, not incidental: it must stay
     # strictly ABOVE the `extra` overlay so an operator's `verify_env`
@@ -7784,18 +7753,10 @@ async def run_verification(
         )
         test_runs.append(new_test)
 
-        # Recompute pure-timeout consistency for the recovery run via a fresh
-        # VerifyAttempt: lint/type are unchanged from the first pass (only
-        # the test leg was re-run), so this reads the SAME
-        # VerifyAttempt.pure_timeout_failure property the loop above used —
-        # not a second hand-copied formula.  Without this, a recovery run
-        # that itself hits the wall-clock timeout would leave the stale
-        # timed_out=False from the first pass while category flips to
-        # 'infra_timeout' — an inconsistent VerifyResult that both wrongly
-        # marks the worktree warm (the "not result.timed_out" check below)
-        # and hides the timeout from callers that special-case
-        # result.timed_out (merge_queue.py, workflow.py).
-        attempt = VerifyAttempt([new_test, attempt.lint, attempt.type])
+        # Only the test leg was re-run, so lint/type are carried over; the same
+        # VerifyAttempt properties the loop above read recompute timed_out, so
+        # the 6-clause consistency holds for the recovery run too.
+        attempt = attempt.with_rerun(new_test)
         timed_out = (not attempt.passed) and attempt.pure_timeout_failure
 
         leg_categories = attempt.classify_failing_legs()
@@ -7961,13 +7922,8 @@ async def run_verification(
             ),
         )
 
-    # When the three verify commands ran concurrently (asyncio.gather) the
-    # true wall-clock cost is the longest single command, not their sum.
-    # Serial mode is rare (legacy / explicit opt-out) and sums correctly.
-    if concurrent:
-        _wall_secs = max(c.duration_secs for c in attempt.checks)
-    else:
-        _wall_secs = _verify_duration_secs(runs)
+    # Max for concurrent legs, sum for serial, carried-over legs excluded.
+    _wall_secs = attempt.wall_secs(concurrent=concurrent)
 
     # Task μ: parse the junit report written (if any) by the injection above.
     # None when the report does not attribute failures (not a full-breadth

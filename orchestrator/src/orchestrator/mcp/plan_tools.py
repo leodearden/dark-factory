@@ -2015,7 +2015,7 @@ _ESCALATION_FALLBACK_CATEGORY = markup_sink.ESCALATION_FALLBACK_CATEGORY
 #: plan-tools' declaration of its own channel. Every field is stated here
 #: rather than defaulted in ``markup_sink``: adding a server must be a decision
 #: at every axis, not an inheritance of this server's answers.
-_MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
+MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
     server_label='plan-tools',
     agent_role=_MARKUP_AGENT_ROLE,
     residue_anchor_task_id=_MARKUP_RESIDUE_ANCHOR_TASK_ID,
@@ -2036,7 +2036,7 @@ _MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
     ),
 )
 
-_ESCALATION_FALLBACK_SUMMARY = _MARKUP_SINK_SPEC.fallback_summary
+_ESCALATION_FALLBACK_SUMMARY = MARKUP_SINK_SPEC.fallback_summary
 
 
 def _markup_project_root(worktree: Path) -> Path | None:
@@ -2088,7 +2088,7 @@ def _markup_escalation_sink(
     """
     return markup_sink.make_escalation_sink(
         worktree=artifacts.worktree,
-        spec=_MARKUP_SINK_SPEC,
+        spec=MARKUP_SINK_SPEC,
         subject_task_id=lambda: _markup_subject_task_id(artifacts),
         # Resolved through THIS module's globals per call, so a test that
         # substitutes either seam steers an already-built sink.
@@ -2117,7 +2117,7 @@ def _markup_fact_journal(
     """
     return markup_journal.make_fact_journal(
         worktree=artifacts.worktree,
-        server_label=_MARKUP_SINK_SPEC.server_label,
+        server_label=MARKUP_SINK_SPEC.server_label,
         subject_task_id=lambda: _markup_subject_task_id(artifacts),
         resolve_root=lambda worktree: _markup_project_root(worktree),
     )

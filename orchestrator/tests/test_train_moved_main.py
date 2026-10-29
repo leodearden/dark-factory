@@ -114,7 +114,7 @@ def _queue_landed(mover: Mover) -> Mover:
     """*mover*, with its new tip registered as one this queue landed green."""
     def landed(repo: Path) -> str:
         sha = mover(repo)
-        note_queue_verified_main_tip(sha)
+        note_queue_verified_main_tip(repo, sha)
         return sha
     return landed
 

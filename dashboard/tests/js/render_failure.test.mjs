@@ -1,12 +1,14 @@
-// Module-contract tests for tab_render_failure.js — the text app.jsx's
-// TabErrorBoundary shows in place of a tab whose render threw. The boundary
-// itself is `type="text/babel"` and cannot run under node; its wiring is
-// pinned structurally in test_app_tab_error_boundary.py.
+// Module-contract tests for render_failure.js — the text shown in place of
+// whatever part of the page threw while rendering: a tab, a chrome region (the
+// rail, the status strip, the toolbar) or the whole page. The boundary that
+// renders it (shell.jsx::RenderFailureBoundary) is executed in the DOM by
+// jsx_render.test.mjs; this suite stays pure-module, so it runs without npm ci.
 //
 // TOTALITY IS THE CONTRACT. The notice is built while React is recovering from
-// the tab's throw; a second throw there escapes the boundary and unmounts the
-// whole root — the blank page the boundary exists to prevent. So every case
-// below, however hostile the thrown value, must come back as two strings.
+// a throw; a second throw there escapes the boundary and unmounts the whole
+// root — the blank page the boundary exists to prevent. So every case below,
+// however hostile the thrown value, must come back as two strings, from every
+// describer.
 //
 // Run via `node --test` (dashboard/tests/test_graph_layout_js.py's
 // `**/*.test.mjs` glob auto-discovers this file).
@@ -18,7 +20,9 @@ import { createRequire } from 'node:module';
 // load — its window assignment is typeof-guarded.
 import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
 
-const SPECIFIER = '../../src/dashboard/static/redux/tab_render_failure.js';
+import { caughtFrom } from './_caught.mjs';
+
+const SPECIFIER = '../../src/dashboard/static/redux/render_failure.js';
 const DATUM_SPECIFIER = '../../src/dashboard/static/redux/datum.js';
 
 function freshRequire(specifier, win) {
@@ -28,7 +32,7 @@ function freshRequire(specifier, win) {
   return require(specifier);
 }
 
-function loadTabRenderFailure() {
+function loadRenderFailure() {
   const win = {};
   return { api: freshRequire(SPECIFIER, win), window: win };
 }
@@ -39,17 +43,8 @@ function loadDatumJs() {
   return freshRequire(DATUM_SPECIFIER, { DF_ENDPOINT_STALENESS: staleness });
 }
 
-const { api: failureApi, window: loadedWindow } = loadTabRenderFailure();
-const { tabRenderFailureNotice } = failureApi;
-
-function caughtFrom(fn) {
-  try {
-    fn();
-  } catch (thrown) {
-    return thrown;
-  }
-  throw new Error('expected the call to throw');
-}
+const { api: failureApi, window: loadedWindow } = loadRenderFailure();
+const { tabRenderFailureNotice, chromeRenderFailureNotice, pageRenderFailureNotice } = failureApi;
 
 function assertNoticeShape(notice) {
   assert.equal(typeof notice.text, 'string');
@@ -60,11 +55,15 @@ function assertNoticeShape(notice) {
 
 // ── The module ──────────────────────────────────────────────────────────────
 
-test('exports: the module publishes exactly its API, on module.exports and window.DF_TAB_RENDER_FAILURE', () => {
-  assert.deepEqual(Object.keys(failureApi), ['tabRenderFailureNotice']);
-  assert.equal(typeof tabRenderFailureNotice, 'function');
+test('exports: the module publishes exactly its API, on module.exports and window.DF_RENDER_FAILURE', () => {
+  assert.deepEqual(Object.keys(failureApi), [
+    'tabRenderFailureNotice',
+    'chromeRenderFailureNotice',
+    'pageRenderFailureNotice',
+  ]);
+  for (const describer of Object.values(failureApi)) assert.equal(typeof describer, 'function');
   // app.jsx destructures this global at module scope with no fallback.
-  assert.equal(loadedWindow.DF_TAB_RENDER_FAILURE, failureApi);
+  assert.equal(loadedWindow.DF_RENDER_FAILURE, failureApi);
 });
 
 // ── (b) the motivating throw, through the real datum.js ─────────────────────
@@ -78,6 +77,46 @@ test('(b) a StatTile handed a bare number names the tab and keeps the TypeError 
 
   assertNoticeShape(notice);
   assert.ok(notice.text.includes('Overview'), notice.text);
+  assert.ok(notice.detail.includes(caught.name), notice.detail);
+  assert.ok(notice.detail.includes(caught.message), notice.detail);
+});
+
+test('(b) a chrome region that threw is named, the open tab is said to be live, and reload retries', () => {
+  const { assertDatum } = loadDatumJs();
+  const caught = caughtFrom(() => assertDatum(42, 'DatumReading'));
+  assert.equal(caught.name, 'TypeError');
+
+  const notice = chromeRenderFailureNotice('status strip', caught);
+
+  assertNoticeShape(notice);
+  assert.ok(notice.text.includes('status strip'), notice.text);
+  assert.match(notice.text, /tab is still live/i);
+  assert.match(notice.text, /reload/i);
+  assert.ok(notice.detail.includes(caught.name), notice.detail);
+  assert.ok(notice.detail.includes(caught.message), notice.detail);
+});
+
+for (const regionLabel of ['', undefined, null, 42, { region: 'rail' }]) {
+  test(`(b) a chrome region labelled ${String(regionLabel) || "''"} still gets a generic, non-empty name`, () => {
+    const notice = chromeRenderFailureNotice(regionLabel, new Error('x'));
+
+    assertNoticeShape(notice);
+    assert.match(notice.text, /reload/i);
+    for (const leaked of ['undefined', 'null', '42', '[object Object]', 'The  ']) {
+      assert.ok(!notice.text.includes(leaked), notice.text);
+    }
+  });
+}
+
+test('(b) the whole page that threw says the dashboard failed, and reload retries', () => {
+  const { assertDatum } = loadDatumJs();
+  const caught = caughtFrom(() => assertDatum(42, 'App'));
+
+  const notice = pageRenderFailureNotice(caught);
+
+  assertNoticeShape(notice);
+  assert.match(notice.text, /dashboard failed to render/i);
+  assert.match(notice.text, /reload/i);
   assert.ok(notice.detail.includes(caught.name), notice.detail);
   assert.ok(notice.detail.includes(caught.message), notice.detail);
 });
@@ -120,14 +159,23 @@ const NON_ERROR_THROWABLES = [
   ['a function', function thrownFunction() {}, null],
 ];
 
-for (const [label, thrown, mentioned] of NON_ERROR_THROWABLES) {
-  test(`(d) ${label} thrown yields a detail that identifies it`, () => {
-    const notice = tabRenderFailureNotice('Costs', thrown);
+// Every describer, with the label its text must carry (null: none to carry).
+const DESCRIBERS = [
+  ['tab', (thrown) => tabRenderFailureNotice('Merge', thrown), 'Merge'],
+  ['chrome', (thrown) => chromeRenderFailureNotice('toolbar', thrown), 'toolbar'],
+  ['page', pageRenderFailureNotice, null],
+];
 
-    assertNoticeShape(notice);
-    assert.ok(notice.text.includes('Costs'), notice.text);
-    if (mentioned !== null) assert.ok(notice.detail.includes(mentioned), notice.detail);
-  });
+for (const [describerName, describe, named] of DESCRIBERS) {
+  for (const [label, thrown, mentioned] of NON_ERROR_THROWABLES) {
+    test(`(d) ${describerName}: ${label} thrown yields a detail that identifies it`, () => {
+      const notice = describe(thrown);
+
+      assertNoticeShape(notice);
+      if (named !== null) assert.ok(notice.text.includes(named), notice.text);
+      if (mentioned !== null) assert.ok(notice.detail.includes(mentioned), notice.detail);
+    });
+  }
 }
 
 function objectWithKeys(count) {
@@ -209,22 +257,26 @@ const ADVERSARIAL_THROWABLES = [
   ['an object String() cannot convert', objectWithNoPrimitiveForm],
 ];
 
-for (const [label, make] of ADVERSARIAL_THROWABLES) {
-  test(`(e) totality: ${label} still yields two non-empty strings`, () => {
-    const thrown = make();
-    let notice;
+for (const [describerName, describe, named] of DESCRIBERS) {
+  for (const [label, make] of ADVERSARIAL_THROWABLES) {
+    test(`(e) totality, ${describerName}: ${label} still yields two non-empty strings`, () => {
+      const thrown = make();
+      let notice;
 
-    assert.doesNotThrow(() => {
-      notice = tabRenderFailureNotice('Merge', thrown);
+      assert.doesNotThrow(() => {
+        notice = describe(thrown);
+      });
+
+      assertNoticeShape(notice);
+      if (named !== null) assert.ok(notice.text.includes(named), notice.text);
     });
-
-    assertNoticeShape(notice);
-    assert.ok(notice.text.includes('Merge'), notice.text);
-  });
+  }
 }
 
 // ── (f) the notice is immutable ─────────────────────────────────────────────
 
-test('(f) the returned notice is frozen', () => {
-  assert.ok(Object.isFrozen(tabRenderFailureNotice('Overview', new Error('x'))));
-});
+for (const [describerName, describe] of DESCRIBERS) {
+  test(`(f) ${describerName}: the returned notice is frozen`, () => {
+    assert.ok(Object.isFrozen(describe(new Error('x'))));
+  });
+}

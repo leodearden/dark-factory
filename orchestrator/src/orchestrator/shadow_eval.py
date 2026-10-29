@@ -722,6 +722,7 @@ class ShadowCoordinator:
         self.run_id = run_id
         self._incumbents = MappingProxyType(dict(incumbents))
         self._drives: set[asyncio.Task[None]] = set()
+        self._closing = False
         self._open_lock = asyncio.Lock()
         self._storm = _UNPAUSED
         self._cost_unreadable_streak = 0
@@ -812,7 +813,8 @@ class ShadowCoordinator:
         counts this cell and ``max_concurrent`` is a hard limit. The daily cap
         counts dollars already spent, so the runs in flight can overshoot it
         by their own cost; the budget storm guard then pauses. Once inserted,
-        the cell gets its drive even if the announcement is cancelled.
+        the cell gets its drive even if the announcement is cancelled, unless
+        the coordinator is closing.
         """
         async with self._open_lock:
             inputs = await asyncio.to_thread(self._open_inputs, task, shape, candidate)
@@ -910,6 +912,13 @@ class ShadowCoordinator:
     # -- drive --------------------------------------------------------------
 
     def _spawn(self, request: CellRequest) -> None:
+        """Start the cell's drive, the one place a drive is created; none once closing.
+
+        A cell inserted after shutdown has begun therefore starts no work, and
+        ``aclose``'s closing sweep writes its successor.
+        """
+        if self._closing:
+            return
         drive = asyncio.create_task(
             self._drive(request), name=f'shadow-cell-{request.cell.cell_id}',
         )
@@ -1311,16 +1320,19 @@ class ShadowCoordinator:
     async def aclose(self) -> None:
         """Cancel every drive, then fail whatever cell this run still holds (INV-6).
 
-        Cancelling repeats until no drive is left: a drive cancelled while it
-        announces consequence leg 2 still spawns leg 2's drive. A drive
-        cancelled before its first step never wrote its own successor, so the
-        closing sweep does; an insert that lands after the sweep is left to
-        the next start's ``reconcile_on_start``.
+        Closing begins before the first await, so no drive starts after it. A
+        cell inserted by a drive cancelled mid-open, such as consequence leg 2,
+        gets no drive, and the closing sweep fails it from ``sampled``; so
+        does a drive cancelled before its first step, which never wrote its
+        own successor. An insert that lands after the sweep, such as one from
+        an ``on_phase`` arriving once closing has begun, is left to the next
+        start's ``reconcile_on_start``; task 7674 makes that open refuse.
         """
-        while self._drives:
-            for drive in list(self._drives):
-                drive.cancel()
-            await asyncio.gather(*list(self._drives), return_exceptions=True)
+        self._closing = True
+        drives = list(self._drives)
+        for drive in drives:
+            drive.cancel()
+        await asyncio.gather(*drives, return_exceptions=True)
         for cell in await asyncio.to_thread(self._fail_still_held):
             await self._emit_ended(cell)
 

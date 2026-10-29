@@ -111,6 +111,10 @@ from fused_memory.reconciliation.task_filter import (
     strip_snapshot_lines,
 )
 from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
+from fused_memory.reconciliation.unlanded_path_check import (
+    UnlandedPathCheckResult,
+    check_unlanded_path_claims,
+)
 from fused_memory.server.grouped_read import PARENT_ID_KEY, _parent_id_in_meta
 from fused_memory.utils.clip_disclosure import clip_note, elide_text, fetch_cap_note
 
@@ -128,7 +132,7 @@ logger = logging.getLogger(__name__)
 # enforce_summary_pool_cap call trims the pool to at most this many members by
 # deleting the OLDEST entries — deterministically via Qdrant scroll, NOT semantic search.
 STAGE1_CYCLE_SUMMARY_POOL_CAP: int = 2
-_RECORD_BODY_CHARS = 500
+_RECORD_BODY_CHARS = 2_000  # basis: plans/recon-evidence-caps-measurement-2026-10.md
 _STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
 
 
@@ -309,6 +313,9 @@ class MemoryConsolidator(BaseStage):
             self._entity_summary_snapshot_lines_stripped
         )
         report.stats['stage1_fetch_degraded'] = self._fetch_degraded_sources or []
+        report.stats['stage1_assembled_budget'] = (
+            self.assembled_payload.budget_report() if self.assembled_payload is not None else None
+        )
 
         # Always present (task 4574, mirrors stage1_fetch_degraded above): set BEFORE
         # the remediation early-return so the key is unconditionally present, including
@@ -383,6 +390,8 @@ class MemoryConsolidator(BaseStage):
         report.stats['orphaned_recon_escalations_unresolvable'] = 0
         report.stats['orphaned_recon_escalations_errors'] = 0
         report.stats['orphaned_recon_escalations_flags_emitted'] = 0
+        # Same always-present contract for the unlanded-path check (task 5626).
+        report.stats.update(UnlandedPathCheckResult.empty().stats())
 
         # Always present (task 2896 γ): count of recon flags suppressed this cycle
         # by an ACTIVE entity_standing_decision (Hook A).  Overwritten below to the
@@ -715,6 +724,12 @@ class MemoryConsolidator(BaseStage):
                 report.stats['orphaned_recon_escalations_flags_emitted'] = len(
                     orphan_sweep['flags'],
                 )
+
+        # Done-task memories naming paths the branch added then removed before merge (task 5626);
+        # emits flags, so it sits above dedup_flags — see reconciliation/unlanded_path_check.py.
+        unlanded = await check_unlanded_path_claims(self.memory, self.project_id, self.project_root, events)
+        report.items_flagged = (report.items_flagged or []) + list(unlanded.flags)
+        report.stats.update(unlanded.stats())
 
         # Always present (task-2029 amendment): downstream consumers that read this
         # stat symmetrically with stats['stage2_flag_markers_acknowledged'] (which is

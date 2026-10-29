@@ -33,6 +33,7 @@ import uuid
 from collections.abc import MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -72,7 +73,6 @@ from fused_memory.server.write_triage_judge import (
     _DEFAULT_JUDGE_PROVIDER,
     _DEFAULT_JUDGE_TIMEOUT_SECONDS,
     _DEFAULT_MODEL_BY_PROVIDER,
-    _ELIDED_MARKER,
     _JUDGE_MAX_TOKENS,
     _KNOWN_PROVIDERS,
     CANDIDATE_ID_KEY,
@@ -99,7 +99,7 @@ from fused_memory.server.write_triage_judge import (
     select_judge_candidates,
 )
 from fused_memory.services.memory_service import RRF_K, SearchResults
-from fused_memory.utils.clip_disclosure import TruncationFact
+from fused_memory.utils.clip_disclosure import TruncationFact, elision_marker
 
 
 def _payload(word: object, candidate_id: object = None) -> str:
@@ -646,14 +646,15 @@ def _worst_case_call_chars() -> int:
     under-measures every candidate line, so the length is asserted rather
     than assumed.
 
-    THE FIELDS ARE OVER THE DEFAULT FIELD CAP, NOT AT IT. ``_elide`` returns a
-    field of exactly the cap untouched and cuts a longer one to the cap PLUS
-    ``_ELIDED_MARKER`` — so the input that elides renders 9 chars wider per
-    field, 54 across a full slate, than the input that merely fills. A worst
-    case built at the cap is therefore not the worst case; it is the widest
-    input that never trips the behaviour the budget exists to bound.
+    THE FIELDS ARE CUT, AND BY A SIX-DIGIT COUNT. A field at the cap renders
+    untouched, so it is not the worst case. A cut field renders as the cap
+    plus a marker that counts what was cut, one char wider per digit of the
+    count. So every field here is cut by 100,000, a six-digit count, more than
+    ten times the ~9k largest canonical in the calibration fixture.
+    ``JUDGE_PROMPT_CHAR_BUDGET``'s slack covers the further digits.
     """
-    maximal = 'x' * (_DEFAULT_JUDGE_FIELD_CHARS + 1)
+    overshoot = 100_000
+    maximal = 'x' * (_DEFAULT_JUDGE_FIELD_CHARS + overshoot)
     candidates = [
         _result(str(uuid.uuid4()), 0.9, content=maximal)
         for _ in range(_DEFAULT_JUDGE_CANDIDATE_COUNT)
@@ -665,7 +666,7 @@ def _worst_case_call_chars() -> int:
     rendered = build_judge_prompt(
         maximal, candidates, field_chars=_DEFAULT_JUDGE_FIELD_CHARS,
     )
-    assert _ELIDED_MARKER in rendered, (
+    assert 'x' * _DEFAULT_JUDGE_FIELD_CHARS + elision_marker(overshoot) in rendered, (
         'the worst case must be an ELIDED render — otherwise it misses the '
         'marker _elide appends, and under-measures the real ceiling'
     )
@@ -858,19 +859,42 @@ class TestBuildJudgePrompt:
         prompt = build_judge_prompt('new', [_result('m1', 0.9, content=long_body)])
         assert long_body not in prompt
         assert len(prompt) < 9_000
-        assert _ELIDED_MARKER in prompt
+        assert 'x' * _DEFAULT_JUDGE_FIELD_CHARS + elision_marker(9_000 - _DEFAULT_JUDGE_FIELD_CHARS) in prompt
 
     def test_a_long_submitted_content_is_truncated_and_marked(self) -> None:
         """The submitted side is bounded for the same reason as the candidates."""
         long_body = 'y' * 9_000
         prompt = build_judge_prompt(long_body, [_result('m1', 0.9)])
         assert long_body not in prompt
-        assert _ELIDED_MARKER in prompt
+        assert 'y' * _DEFAULT_JUDGE_FIELD_CHARS + elision_marker(9_000 - _DEFAULT_JUDGE_FIELD_CHARS) in prompt
 
     def test_short_content_is_not_marked_as_elided(self) -> None:
         """The marker means something only if it is absent when nothing was cut."""
         prompt = build_judge_prompt('short', [_result('m1', 0.9, content='also short')])
-        assert _ELIDED_MARKER not in prompt
+        lines = prompt.splitlines()
+        assert 'short' in lines
+        assert '  text: also short' in lines
+
+    def test_a_cut_field_tells_the_model_how_much_was_cut(self) -> None:
+        """Two cuts of different size must read differently to the model.
+
+        The size of the loss decides whether it mattered.
+        """
+        lines = build_judge_prompt(
+            'e' * 12, [_result('m1', 0.9, content='c' * 1_837)], field_chars=10,
+        ).splitlines()
+        assert 'e' * 10 + elision_marker(2) in lines
+        assert '  text: ' + 'c' * 10 + elision_marker(1_827) in lines
+
+    def test_a_non_string_field_is_rendered_as_its_text_then_cut(self) -> None:
+        """A field that is not a string is coerced to its text before the cut."""
+        prompt = build_judge_prompt(
+            cast(Any, None),
+            [cast(Any, types.SimpleNamespace(id='m1', content=10**15))],
+            field_chars=10,
+        )
+        assert 'NEW ENTRY:\n\n' in prompt
+        assert '  text: ' + str(10**15)[:10] + elision_marker(6) in prompt.splitlines()
 
     def test_no_repo_or_task_context_reaches_the_model(self) -> None:
         """PRD C1: the judge sees CONTENT, and nothing about who wrote it.
@@ -909,9 +933,9 @@ class TestBuildJudgePrompt:
         prompt = build_judge_prompt(
             'e' * 10, [_result('m1', 0.9, content='c' * 11)], field_chars=10,
         )
-        assert 'e' * 10 + '\n' in prompt
-        assert 'e' * 10 + _ELIDED_MARKER not in prompt
-        assert 'c' * 10 + _ELIDED_MARKER in prompt
+        lines = prompt.splitlines()
+        assert 'e' * 10 in lines
+        assert '  text: ' + 'c' * 10 + elision_marker(1) in lines
         assert 'c' * 11 not in prompt
 
 
@@ -2254,8 +2278,8 @@ class TestJudgeWriteOpenAIArm:
             )
         rendered = client.responses.create.call_args.kwargs['input']
         assert candidate_text in rendered
-        assert candidate_text + _ELIDED_MARKER not in rendered
-        assert 'b' * _DEFAULT_JUDGE_FIELD_CHARS + _ELIDED_MARKER in rendered
+        assert '  text: ' + candidate_text in rendered.splitlines()
+        assert 'b' * _DEFAULT_JUDGE_FIELD_CHARS + elision_marker(1) in rendered
         assert 'b' * (_DEFAULT_JUDGE_FIELD_CHARS + 1) not in rendered
 
     @pytest.mark.asyncio
@@ -2270,7 +2294,7 @@ class TestJudgeWriteOpenAIArm:
                 candidates=[_result('m1', 0.80, content='x' * 60)],
             )
         rendered = client.responses.create.call_args.kwargs['input']
-        assert 'x' * 50 + _ELIDED_MARKER in rendered
+        assert 'x' * 50 + elision_marker(10) in rendered
         assert 'x' * 51 not in rendered
 
     @pytest.mark.asyncio
@@ -2290,9 +2314,9 @@ class TestJudgeWriteOpenAIArm:
                     candidates=[_result('m1', 0.80, content='x' * 60)],
                 )
             rendered.append(client.responses.create.call_args.kwargs['input'])
-        assert 'x' * 50 + _ELIDED_MARKER in rendered[0]
+        assert 'x' * 50 + elision_marker(10) in rendered[0]
         assert 'x' * 51 not in rendered[0]
-        assert 'x' * 55 + _ELIDED_MARKER in rendered[1]
+        assert 'x' * 55 + elision_marker(5) in rendered[1]
         assert 'x' * 56 not in rendered[1]
 
 

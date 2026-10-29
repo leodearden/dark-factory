@@ -13,12 +13,12 @@ from __future__ import annotations
 import pytest
 from _role_splice_contract import MARKDOWN_HEADING, PreambleTailBlock, PreambleTailContractTests
 
+from orchestrator.agents.harness_guidance import EXTERNAL_KILL_GUIDANCE
 from orchestrator.agents.pipeline_status_guidance import (
     PIPELINE_EXIT_STATUS_GUIDANCE,
     PIPELINE_LAST_STAGE_STATUS,
     SIGPIPE_UNDER_PIPEFAIL,
 )
-from orchestrator.agents.roles import EXTERNAL_KILL_GUIDANCE
 
 _HALVES = [
     ('PIPELINE_LAST_STAGE_STATUS', PIPELINE_LAST_STAGE_STATUS),
@@ -98,7 +98,7 @@ class TestPipelineExitStatusSplice(PreambleTailContractTests):
                 'EXTERNAL_KILL_GUIDANCE no longer states what a pipe does to the '
                 'exit code; it points to this block below it. Keep '
                 'PIPELINE_EXIT_STATUS_GUIDANCE after BACKGROUND_WAIT_GUIDANCE in '
-                'roles.py::_BASH_CAPABLE_ROLE_PREAMBLE, or restore the rule to the '
+                'harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE, or restore the rule to the '
                 'kill guidance before moving this block.'
             ),
         )

@@ -111,8 +111,7 @@ class TestDiscoveryItself:
 
     * SELECTS ``TaskKnowledgeSync.assemble_payload``
       ('## Stage 2: Task-Knowledge Sync').
-    * REJECTS ``_format_known_projects_section`` (returns a ``Constant`` or a
-      ``BinOp``), ``_build_live_workflow_section`` (returns an ``Await``) and
+    * REJECTS ``_build_live_workflow_section`` (returns an ``Await``) and
       ``_render_required_sections`` (returns a ``Call``).
     * Never scans ``IntegrityCheck.assemble_payload`` ('## Stage 3: …'),
       because discovery is scoped to the ``TaskKnowledgeSync`` class body.

@@ -810,8 +810,9 @@ def note_unreadable_transcript(
 # input references the background task's id or output-file path (task 3639),
 # or a delivered task-notification naming it (task 5986).  The tool_use
 # clause is tool-agnostic, so it catches the ``Read``-the-output-file shape the
-# role wait-guidance now prescribes (roles.py WAIT_PATTERN_GUIDANCE) — which is
-# why correcting those prompts needed no change to this detector.  If the first
+# role wait-guidance now prescribes
+# (orchestrator/src/orchestrator/agents/harness_guidance.py::WAIT_PATTERN_GUIDANCE)
+# — which is why correcting those prompts needed no change to this detector.  If the first
 # clause were the whole mechanism, only ``TaskStop`` would still fire it.
 #
 # That is an executable claim, not a comment's promise: the exact prescribed
@@ -1197,7 +1198,7 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     reading the bg-log directly — ``Bash tail/cat/grep <log>``, or ``Read`` /
     ``Grep`` on that path, which the CLI's own launch message recommends ("To
     check interim output, use Read on that file path") and which
-    ``agents/roles.py``'s wait-guidance explicitly sanctions — counted as no
+    ``agents/harness_guidance.py``'s wait-guidance explicitly sanctions — counted as no
     engagement at all.  On the ``_lane-31`` specimen (four backgrounded
     ``cargo test`` runs, each tailed, zero ``BashOutput``) the detector fired
     and falsified ``success`` on a completed run; the measured false-positive

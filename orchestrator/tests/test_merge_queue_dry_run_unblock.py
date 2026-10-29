@@ -41,6 +41,7 @@ from test_merge_queue_main_health import (
 
 from orchestrator.b3_gate import ABORT, check_proposal
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.dry_run_unblock import investigation_task_name
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.git_ops import _run as _run_git
@@ -517,7 +518,7 @@ class TestUnblockAutoDisabledSkipsSpawn:
 
 class TestInflightDedupSkipsDuplicate:
     """Step-9 (RED): a not-done investigation task already registered under
-    the same 'unblock-auto-<task_id>' name must suppress a second spawn."""
+    the task's investigation_task_name must suppress a second spawn."""
 
     def test_inflight_dedup_skips_duplicate(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path, escalate_preexisting=False)
@@ -535,7 +536,7 @@ class TestInflightDedupSkipsDuplicate:
                 await asyncio.Event().wait()
 
             dummy_task = asyncio.create_task(
-                _hang_forever(), name=f'unblock-auto-{req.task_id}',
+                _hang_forever(), name=investigation_task_name(req.task_id),
             )
             handles.background_tasks.add(dummy_task)
             try:
@@ -548,6 +549,46 @@ class TestInflightDedupSkipsDuplicate:
                 dummy_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await dummy_task
+
+        outcome = asyncio.run(_run())
+
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+        assert verifier.investigations == [], verifier.investigations
+
+    def test_investigation_running_outside_the_lane_skips_spawn(
+        self, tmp_path: Path,
+    ) -> None:
+        """A workflow-spawned investigation lives in no merge-worker set, so
+        the dedupe must see the whole loop, not handles.background_tasks."""
+        config = _make_config(tmp_path, escalate_preexisting=False)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        handles = _make_handles()
+        verifier = FakeVerifier(default=VerifyScript(result=COMPILE_ERROR_RESULT))
+
+        async def _run() -> MergeOutcome | None:
+            elsewhere = asyncio.create_task(
+                asyncio.Event().wait(), name=investigation_task_name(req.task_id),
+            )
+            try:
+                outcome = await _drive_verify_with_handles(
+                    req, merge_wt, git_ops, verifier=verifier, dry_run_handles=handles,
+                )
+                await asyncio.sleep(0)
+                if handles.background_tasks:
+                    await asyncio.gather(
+                        *handles.background_tasks, return_exceptions=True,
+                    )
+                return outcome
+            finally:
+                elsewhere.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await elsewhere
 
         outcome = asyncio.run(_run())
 

@@ -1964,7 +1964,16 @@ class ReconciliationConfig(BaseModel):
     opus_memory_limit: int = Field(default=1000)
 
     # Token-budget context assembly
-    token_budget: int = Field(default=65_000)
+    token_budget: int = Field(
+        default=130_000,
+        description=(
+            'Bound on the estimated tokens (len // 4) of one backlog chunk\'s '
+            'Stage-1 payload: its events plus their deduplicated context. '
+            'Consumed only by the opus-tier BacklogIterator, via '
+            'ContextAssembler, and sized together with context_assembler\'s '
+            'per-item caps (plans/recon-evidence-caps-measurement-2026-10.md).'
+        ),
+    )
     context_search_limit: int = Field(default=5)
     context_fetch_batch_size: int = Field(default=10)
 
@@ -2875,8 +2884,10 @@ class WriteTriageConfig(BaseModel):
         ge=1,
         description=(
             'Per-field character cap applied to the new entry and to every '
-            'candidate before the judge sees them; a cut field is marked '
-            '`…[elided]` so the model knows it is reading a truncation. Why '
+            'candidate before the judge sees them; a cut field is marked with '
+            'how many characters were elided (utils/clip_disclosure.py::elide_text), '
+            'so the model knows it is reading a truncation and how much is '
+            'missing. Why '
             '4000 replaced 1,200 — the measured recall loss at the old cap and '
             'the call cost at the new one — is the decision record '
             'calibration/write_triage_judge_field_chars_report.md. Bounded ge=1 '

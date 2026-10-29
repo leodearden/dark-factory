@@ -10,6 +10,9 @@ All other escalations start at L0 (level=0) and are promoted by handlers.
 
 L2 cluster fields (default-empty; L0/L1 are unaffected):
   members:    list of member L1 escalation ids forming this cluster
+  member_folded_at:
+              member id -> ISO time a fold appended it (`queue.add_members_to_l2`);
+              members present at creation are absent and joined at `timestamp`
   root_cause: dedup key for pending-L2 lookup, matched on its CANONICAL form
               (`escalation.canonical.canonical_root_cause`; task 3998), so
               near-duplicates differing only in case/whitespace/punctuation fold.
@@ -519,6 +522,10 @@ class Escalation:
     # Old JSON files (pre-L2) deserialise correctly via from_dict's __dataclass_fields__
     # filter: absent keys map to the dataclass defaults without any migration required.
     members: list[str] = field(default_factory=list)  # member L1 escalation ids (cluster composition)
+    # Member id -> ISO time a promote_to_l2 fold appended it.  Members present
+    # at creation are absent: they joined at `timestamp`.  SOLE WRITER:
+    # `queue.add_members_to_l2`.  Zero migration via the from_dict filter.
+    member_folded_at: dict[str, str] = field(default_factory=dict)
     root_cause: str = ''  # root-cause hypothesis; dedup key for pending-L2 lookup, matched on its CANONICAL form (task 3998) but stored verbatim
     options: list[str] = field(default_factory=list)  # proposed resolution options ['A: ...', 'B: ...']
     # Structured raw-OBSERVATION entries backing this escalation (task 2558).

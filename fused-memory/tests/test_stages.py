@@ -24,6 +24,7 @@ from _fused_memory_tool_surface import (
     registered_fused_memory_tools,
 )
 from _tool_surface_classification import assert_tool_surface_classified
+from reconciliation.harness_fixtures import make_harness
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 
@@ -2469,6 +2470,8 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # filters — the only place that increments this counter — never run,
             # leaving it at its __init__/reset value of 0.
             'stage1_undatable_freshness_records': 0,
+            # Always present (task 5499): None because no backlog payload was assembled.
+            'stage1_assembled_budget': None,
             # Always present (task 3052), zeroed in the same block as the
             # task-3084 curator-gate trio above and for the same reason: they
             # are set BEFORE the remediation early-return, so a caller reading
@@ -2490,6 +2493,12 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # human-gate-owned, so the deterministic gate-owned
             # suggested_action normalizer rewrites nothing.
             'gate_owned_suggested_actions_normalized': 0,
+            # Always present (task 5626), pre-initialised before the
+            # remediation early-return; 0 here because no task completed.
+            'unlanded_path_check_checked': 0,
+            'unlanded_path_check_skipped': 0,
+            'unlanded_path_check_errors': 0,
+            'unlanded_path_check_flags_emitted': 0,
             # The auto-consolidation post-step's keys (task 5240). This bare
             # AsyncMock memory's enabled_projects contains nothing, so the
             # post-step stops at its project gate.
@@ -2683,6 +2692,8 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # filters — the only place that increments this counter — never run,
             # leaving it at its __init__/reset value of 0.
             'stage1_undatable_freshness_records': 0,
+            # Always present (task 5499): None because no backlog payload was assembled.
+            'stage1_assembled_budget': None,
             # Always present (task 3052), zeroed in the same block as the
             # task-3084 curator-gate trio above and for the same reason: they
             # are set BEFORE the remediation early-return, so a caller reading
@@ -2704,6 +2715,12 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # human-gate-owned, so the deterministic gate-owned
             # suggested_action normalizer rewrites nothing.
             'gate_owned_suggested_actions_normalized': 0,
+            # Always present (task 5626), pre-initialised before the
+            # remediation early-return; 0 here because no task completed.
+            'unlanded_path_check_checked': 0,
+            'unlanded_path_check_skipped': 0,
+            'unlanded_path_check_errors': 0,
+            'unlanded_path_check_flags_emitted': 0,
             # The auto-consolidation post-step's keys (task 5240). This bare
             # AsyncMock memory's enabled_projects contains nothing, so the
             # post-step stops at its project gate.
@@ -13079,21 +13096,14 @@ class TestBaseStageEscalationQueueAttribute:
 def minimal_harness():
     """Construct a minimal ReconciliationHarness with all deps mocked."""
     from fused_memory.config.schema import FusedMemoryConfig
-    from fused_memory.reconciliation.harness import ReconciliationHarness
 
-    config = FusedMemoryConfig()
-    memory_service = AsyncMock()
-    taskmaster = AsyncMock()
-    journal = AsyncMock()
-    event_buffer = AsyncMock()
-    harness = ReconciliationHarness(
-        memory_service=memory_service,
-        taskmaster=taskmaster,
-        journal=journal,
-        event_buffer=event_buffer,
-        config=config,
+    return make_harness(
+        journal=AsyncMock(),
+        event_buffer=AsyncMock(),
+        memory_service=AsyncMock(),
+        taskmaster=AsyncMock(),
+        config=FusedMemoryConfig(),
     )
-    return harness
 
 
 class TestHarnessWiresEscalationQueueOntoStages:
