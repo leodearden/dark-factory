@@ -306,6 +306,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         WorktreeConflictError,
         WorktreeMissing,
     )
+    from orchestrator.lane_branch_holder import BranchCheckedOutElsewhere
     from orchestrator.recut_ruling import RecutRulingUnreadable, RecutRulingViolation
     from orchestrator.verify import VerifyInfraError
 
@@ -603,6 +604,18 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.BLOCK,
             counts_against_requeue_cap=True,
             reason_prefix='Re-cut ruling unreadable',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # Raised by acquire_warm_lane before any lane is touched. It cannot
+        # self-clear (a human worktree or a lane pinned to another assignment
+        # holds the branch), and it is deliberately NOT a WarmLaneRequeue so it
+        # can never feed the task-4930 steal-retry loop.
+        BranchCheckedOutElsewhere: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Task branch checked out in another worktree',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         # ── BD-2 completeness rows: exported by the 4 covered modules, but
