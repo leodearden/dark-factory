@@ -8292,7 +8292,7 @@ class GitOps:
         #    move refs/heads/<full_branch> itself and the un-stack finds the
         #    lane as the worktree holding the branch.  On an attached lane
         #    this is a reset-to-self.  Best-effort: a failed rebind leaves the
-        #    lane detached, and the un-stack then stays on the old base.
+        #    lane detached, so a stacked branch's un-stack keeps its old base.
         #    NOTE: checkout -B bypasses git's single-checkout guard; a
         #    concurrent worktree on full_branch is a duplicate-dispatch hazard.
         await self.rebind_branch_to_head(lane_dir, full_branch)
