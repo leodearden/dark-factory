@@ -46829,6 +46829,11 @@
       "basis": "current",
       "entry_id": "efabf945-4bbb-436e-8fa3-c568e3312c1f",
       "target_id": "6cc52415-0101-49fa-83b3-b80e47266e8b"
+    },
+    "third_02-000": {
+      "basis": "current",
+      "entry_id": "81fa48ab-f12b-4915-88df-2ceac261a619",
+      "target_id": "e16a01e1-9d06-4ce0-89bf-ed2804b6d8d1"
     }
   },
   "rerates": [
@@ -59044,6 +59049,14 @@
         "third_01-037"
       ],
       "rater": "opus-third-01",
+      "role": "third",
+      "round": 0
+    },
+    "third_02": {
+      "items": [
+        "third_02-000"
+      ],
+      "rater": "opus-third-02",
       "role": "third",
       "round": 0
     }
