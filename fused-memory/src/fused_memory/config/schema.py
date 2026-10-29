@@ -358,6 +358,7 @@ class FalkorDBProviderConfig(BaseModel):
     # database is ignored in shared-server mode — graph name is derived from
     # group_id at request time.  Kept for backward-compat with existing configs.
     database: str | None = None
+    expected_graph_timeout_ms: int = 30000
 
 
 class GraphitiBackendConfig(BaseModel):
