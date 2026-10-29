@@ -36,9 +36,9 @@ def workflow(repo: Path) -> TaskWorkflow:
         assignment=assignment,
         config=config,
         git_ops=GitOps(config.git, repo),
-        scheduler=MagicMock(),  # type: ignore[arg-type]
-        briefing=MagicMock(),  # type: ignore[arg-type]
-        mcp=MagicMock(),  # type: ignore[arg-type]
+        scheduler=MagicMock(),
+        briefing=MagicMock(),
+        mcp=MagicMock(),
     )
     workflow.worktree = repo
     return workflow
