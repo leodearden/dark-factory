@@ -2958,8 +2958,17 @@ class Harness:
             # skip branches (identity-guard defer, no-plan/corrupt-plan
             # release) — runs while no task is yet dispatched, so it only
             # repairs what _recover_crashed_tasks skipped and never races a
-            # live dispatch.
-            await self._reconcile_lane_checkouts()
+            # live dispatch.  Own try/except (non-fatal): a startup repair
+            # sweep must never prevent startup.  A conflicted lane is already
+            # handled per lane inside
+            # git_ops.py::GitOps::detach_lane_checkout; this backstops the rest.
+            try:
+                await self._reconcile_lane_checkouts()
+            except Exception as e:
+                logger.warning(
+                    'Failed to reconcile lane checkouts (non-fatal, startup '
+                    'continues): %s', e, exc_info=True,
+                )
 
             # 2d. Reconcile stranded in-progress tasks (live-claimant-aware)
             await self._reconcile_stranded_in_progress()
