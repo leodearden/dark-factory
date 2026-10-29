@@ -1578,7 +1578,14 @@ merge_verify_breadth: "full"
 merge_gate_history_pure: true
 merge_gate_history_test_command: "uv run --directory fused-memory pytest tests/ -m 'reads_git_history and not integration' --tb=short -q --timeout=300 && uv run --directory orchestrator pytest tests/ -m 'reads_git_history and not warm_lane_bash' --tb=short -q --timeout=300 && uv run --directory dashboard pytest tests/ -m reads_git_history --tb=short -q --timeout=300"
 merge_train_former_enabled: true
-merge_train_coalesce_enabled: true
+# Retroactive coalescing OFF (Leo's ruling, 2026-10-29). Deep merge-ahead chains
+# (merge_deep.chain_cap below) already batch queued singles from any submitter,
+# MCP included, and need no train membership contract. Coalescing competed with
+# chains for the same buffered singles. Evidence and the canary-week
+# measurements are in plans/mcp-coalesce-trains-2026-10-26.md §0 and §4.4.
+# Not in RELOADABLE_FIELDS: goes live at the next fleet restart. Declared
+# atomic trains are unaffected.
+merge_train_coalesce_enabled: false
 merge_train_max_members: 3
 
 # Serialize the per-merge module fan-out to 1 (operator decision, 2026-07-19)
