@@ -35,11 +35,19 @@ __all__ = [
     'ShadowReport',
     'ShapeRule',
     'read_shadow_report',
+    'render_text',
     'shape_rule',
     'summarise_line',
 ]
 
 UNMEASURED_KIND = 'unmeasured'
+_NO_FIGURE = '-'
+_COLUMN_GAP = '  '
+_COLUMNS = (
+    'shape', 'candidate', 'incumbent', 'pairs', 'unpaired', 'cap_excluded', 'expired',
+    'failed', 'usable \u0394 [95% CI]', '$/usable cand', '$/usable inc',
+    'credits/usable cand', 'credits/usable inc', 'terminal_kind', 'tags',
+)
 # On a pair production landed, so production's side of the difference is usable.
 _PRODUCTION_USABLE_ON_A_PAIR = 1.0
 
@@ -88,6 +96,14 @@ class CostPerUsable:
     def usd_imputed(self) -> bool:
         return self.cost_basis.imputes_dollars
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'usd_per_usable': self.usd_per_usable,
+            'usd_imputed': self.usd_imputed,
+            'credits_per_usable': self.credits_per_usable,
+            'cost_basis': self.cost_basis.value,
+        }
+
 
 @dataclass(frozen=True)
 class MissingResult:
@@ -97,6 +113,14 @@ class MissingResult:
     task_id: str
     result_path: Path | None
     detail: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'cell_id': self.cell_id,
+            'task_id': self.task_id,
+            'result_path': None if self.result_path is None else str(self.result_path),
+            'detail': self.detail,
+        }
 
 
 @dataclass(frozen=True)
@@ -135,6 +159,31 @@ class ReportLine:
         )
         return tuple(tag for tag, raised in flagged if raised)
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'shape': self.key.shape.value,
+            'candidate': self.key.candidate,
+            'incumbent': self.key.incumbent,
+            'cost_basis': self.key.cost_basis.value,
+            'pairs': self.pairs,
+            'unpaired': self.unpaired,
+            'cap_excluded': self.cap_excluded,
+            'expired': self.expired,
+            'failed': self.failed,
+            'primary_outcome': {
+                'name': shape_rule(self.key.shape).outcome_name,
+                'n': self.primary.n,
+                'mean_difference': self.primary.mean,
+                'ci95_low': self.primary.ci_low,
+                'ci95_high': self.primary.ci_high,
+            },
+            'candidate_cost': self.candidate_cost.to_dict(),
+            'incumbent_cost': self.incumbent_cost.to_dict(),
+            'terminal_kind': dict(self.terminal_kinds),
+            'tags': [tag.value for tag in self.tags],
+            'result_missing': [gap.to_dict() for gap in self.result_missing],
+        }
+
 
 @dataclass(frozen=True)
 class ShadowReport:
@@ -147,6 +196,16 @@ class ShadowReport:
     @property
     def complete(self) -> bool:
         return not any(line.result_missing for line in self.lines)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'project_id': self.project_id,
+            'db_path': str(self.db_path),
+            'shape': self.shape.value,
+            'n_min': self.n_min,
+            'complete': self.complete,
+            'lines': [line.to_dict() for line in self.lines],
+        }
 
 
 @dataclass(frozen=True)
@@ -320,3 +379,92 @@ def _incumbent_cost(production_usd: Sequence[float]) -> CostPerUsable:
 
 def _per(total: float, count: int) -> float | None:
     return total / count if count else None
+
+
+def render_text(report: ShadowReport) -> str:
+    """The report as a preamble, a column-aligned table and any result_missing detail."""
+    sections = [_preamble(report)]
+    if report.lines:
+        sections.append(_aligned([_COLUMNS, *(_row_cells(line) for line in report.lines)]))
+    else:
+        sections.append('no shadow cells match')
+    trailer = _missing_trailer(report)
+    if trailer:
+        sections.append('\n'.join(trailer))
+    return '\n\n'.join(sections) + '\n'
+
+
+def _preamble(report: ShadowReport) -> str:
+    return '\n'.join((
+        f'shadow-eval report: project {report.project_id}, shape {report.shape.value}',
+        f'runs.db: {report.db_path}',
+        f'n_min {report.n_min}: a line with fewer pairs is UNDERPOWERED '
+        f'(provisional, PRD open question 2; not a power calculation)',
+    ))
+
+
+def _row_cells(line: ReportLine) -> tuple[str, ...]:
+    return (
+        line.key.shape.value,
+        line.key.candidate,
+        line.key.incumbent,
+        *(str(count) for count in (
+            line.pairs, line.unpaired, line.cap_excluded, line.expired, line.failed,
+        )),
+        _difference(line.primary),
+        _dollars(line.candidate_cost),
+        _dollars(line.incumbent_cost),
+        _credits(line.candidate_cost),
+        _credits(line.incumbent_cost),
+        _joined(f'{kind}:{count}' for kind, count in line.terminal_kinds),
+        _joined(tag.value for tag in line.tags),
+    )
+
+
+def _difference(primary: PairedDifference) -> str:
+    if primary.mean is None:
+        return _NO_FIGURE
+    if primary.ci_low is None or primary.ci_high is None:
+        return f'{primary.mean:+.3f}'
+    return f'{primary.mean:+.3f} [{primary.ci_low:+.3f}, {primary.ci_high:+.3f}]'
+
+
+def _dollars(cost: CostPerUsable) -> str:
+    """The only formatter of a dollar figure, so an imputed one can never print untagged."""
+    if cost.usd_per_usable is None:
+        return _NO_FIGURE
+    figure = f'{cost.usd_per_usable:.2f}'
+    return f'{figure} [imputed]' if cost.usd_imputed else figure
+
+
+def _credits(cost: CostPerUsable) -> str:
+    return _NO_FIGURE if cost.credits_per_usable is None else f'{cost.credits_per_usable:.2f}'
+
+
+def _joined(items: Iterable[str]) -> str:
+    return ','.join(items) or _NO_FIGURE
+
+
+def _aligned(rows: Sequence[Sequence[str]]) -> str:
+    widths = [max(len(row[column]) for row in rows) for column in range(len(rows[0]))]
+    return '\n'.join(
+        _COLUMN_GAP.join(
+            cell.ljust(width) for cell, width in zip(row, widths, strict=True)
+        ).rstrip()
+        for row in rows
+    )
+
+
+def _missing_trailer(report: ShadowReport) -> list[str]:
+    trailer = [
+        f'result_missing: cell {gap.cell_id} task {gap.task_id} ({line.key.candidate}) '
+        f'{_NO_FIGURE if gap.result_path is None else gap.result_path}: {gap.detail}'
+        for line in report.lines
+        for gap in line.result_missing
+    ]
+    if not report.complete:
+        trailer.append(
+            f'INCOMPLETE: {len(trailer)} settled cell(s) have no readable result and are '
+            f'counted in no column; this is not a complete measurement'
+        )
+    return trailer
