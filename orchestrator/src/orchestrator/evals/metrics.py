@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -293,6 +293,12 @@ class EvalMetrics:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> EvalMetrics:
+        """A persisted metrics dict read back; a key this dataclass does not declare is ignored."""
+        declared = {field.name for field in fields(cls)}
+        return cls(**{key: value for key, value in data.items() if key in declared})
 
 
 def terminal_kind_of(metrics: dict[str, Any]) -> str | None:
