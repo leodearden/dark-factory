@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from shared.psi import PsiSample
 
     from orchestrator.event_store import EventStore
+    from orchestrator.git_ops import WorktreeKind
 
 from shared.proc_group import terminate_process_group
 from shared.psi import cpu_some10_or_none, read_psi_sample
@@ -6986,6 +6987,49 @@ async def _preprovision_shared_venv(
         _prune_preprovision_guard()
 
 
+async def _provision_main_tip_worktree(
+    worktree: Path,
+    config: OrchestratorConfig,
+    *,
+    role: Literal['merge', 'task', 'background'],
+) -> None:
+    """Provision a throwaway main-tip worktree the way the merge gate provisions its own.
+
+    Goes through ``_preprovision_shared_venv`` (same coalescing and fail-open
+    policy), with *role*'s verify env and in the warm timeout tier its verify legs
+    use. Such a worktree has no ``.task/``, so ``run_verification``'s ``is_cold``
+    gate never provisions it; without this, an environment-only failure on a
+    green main reads as red (task 6917).
+    """
+    await _preprovision_shared_venv(
+        worktree, config,
+        verify_env=_resolve_verify_env(config, None, role=role),
+        timeout=_resolve_verify_timeout(config, None, is_cold=False),
+    )
+
+
+@contextlib.asynccontextmanager
+async def _provisioned_ephemeral_worktree(
+    config: OrchestratorConfig,
+    git_ops: object,
+    kind: 'WorktreeKind',
+    sha: str,
+    *,
+    warm_seed: bool,
+    role: Literal['merge', 'task', 'background'],
+) -> AsyncIterator[Path]:
+    """``GitOps.ephemeral_worktree``, provisioned before the body runs.
+
+    Provisioning follows any warm seed: the seed fills ``target/``, provisioning
+    fills the venv and ``node_modules``.
+    """
+    async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
+        kind, sha, warm_seed=warm_seed,
+    ) as worktree:
+        await _provision_main_tip_worktree(worktree, config, role=role)
+        yield worktree
+
+
 def _log_event_channel(label: str, channel: VerifyEventChannel) -> None:
     if channel.skipped_lines:
         logger.warning(
@@ -9925,6 +9969,9 @@ async def run_main_tip_sweep(
             ``WARM`` CoW-seeds ``target/`` from the warm-lane base as a
             read-only consumer, failing soft to cold.  The
             ``_mainsweepconfirm-`` confirm worktree always stays cold.
+            Either mode provisions the worktree first
+            (``_provision_main_tip_worktree``), as a merge verify does; the
+            seed mode governs only ``target/``.
 
     Returns:
         ``(main_sha, VerifyResult)`` on success (result.passed may be False).
@@ -10022,10 +10069,11 @@ async def run_main_tip_sweep(
         # '_mainsweep-' band, retry-on-lock-contention add, GUARANTEED scoped
         # cleanup on exit — never a broad 'git worktree prune', DD5) is owned
         # by GitOps.ephemeral_worktree; see its docstring for the full
-        # contract.
-        async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
-            WorktreeKind.MAIN_SWEEP, main_sha,
-            warm_seed=seed_mode is SweepSeedMode.WARM,
+        # contract. _provisioned_ephemeral_worktree provisions it before the
+        # body runs.
+        async with _provisioned_ephemeral_worktree(
+            config, git_ops, WorktreeKind.MAIN_SWEEP, main_sha,
+            warm_seed=seed_mode is SweepSeedMode.WARM, role='background',
         ) as tmp_path:
             def _enoent_on_self(r: 'VerifyResult') -> bool:
                 """SECONDARY backstop (task 2507): True iff *r* is a
