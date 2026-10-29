@@ -91,3 +91,38 @@ def test_is_error_with_structured_output_is_salvaged() -> None:
     result = parse_claude_cli_output(stdout=stdout, stderr='', returncode=0)
     assert result.success is True
     assert result.schema_salvaged is True
+
+
+@pytest.mark.parametrize('stdout', ['42', '[1]', '"ok"', 'null'])
+def test_non_object_json_reads_as_text_output(stdout: str) -> None:
+    result = parse_claude_cli_output(stdout=stdout, stderr='', returncode=0)
+    assert result.subtype == 'text_output'
+    assert result.output == stdout
+
+
+@pytest.mark.parametrize(
+    'stdout',
+    [
+        '{"usage": [1]}',
+        '{"usage": "x"}',
+        '{"messages": [1]}',
+        '{"messages": [{"type": "assistant", "content": 5}]}',
+        '{"messages": [{"type": "assistant", "content": [{"type": "text"}]}]}',
+        '{"result": ["x"]}',
+        '{"result": 5}',
+    ],
+)
+def test_malformed_object_parses_without_raising(stdout: str) -> None:
+    result = parse_claude_cli_output(stdout=stdout, stderr='', returncode=0)
+    assert isinstance(result.output, str)
+
+
+def test_assistant_messages_fallback_joins_text_blocks() -> None:
+    stdout = json.dumps({
+        'subtype': 'success',
+        'messages': [
+            {'type': 'assistant', 'content': [{'type': 'text', 'text': 'hi'}, 'there']},
+        ],
+    })
+    result = parse_claude_cli_output(stdout=stdout, stderr='', returncode=0)
+    assert result.output == 'hi\nthere'
