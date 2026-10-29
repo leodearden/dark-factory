@@ -278,8 +278,12 @@ class EscalationRef:
     means "unknown"; ``orchestrator.recovery_emission.escalation_ages_secs``
     maps that to a ``None`` age rather than dropping the id.
 
-    All three added fields are DEFAULTED so every existing construction site
-    keeps working untouched.
+    ``members`` carries an L2's held member ids, so
+    ``escalation.pins.pinned_only_by_human_parked`` can see a promoted hold
+    without a second read.
+
+    Every field after ``level`` is DEFAULTED so every existing construction
+    site keeps working untouched.
     """
 
     id: str
@@ -288,6 +292,7 @@ class EscalationRef:
     severity: str = ''
     filing_claimant_run_id: str | None = None
     created_at: str | None = None
+    members: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -747,9 +752,11 @@ class TaskGroundTruth:
     ) -> tuple[list[EscalationRef], bool]:
         """Map *tid*'s pending escalations to refs, plus the store's readability.
 
-        ``severity``, ``filing_claimant_run_id`` and ``created_at`` travel with
-        each ref so consumers can feed ``escalation.pins.classify_pins``
-        directly, and age a hold, without re-reading the store (spec
+        ``severity``, ``filing_claimant_run_id``, ``created_at`` and
+        ``members`` travel with each ref so consumers can feed
+        ``escalation.pins.classify_pins`` and
+        ``escalation.pins.pinned_only_by_human_parked`` directly, and age a
+        hold, without re-reading the store (spec
         ``docs/task-escalation-state-spec.md`` S6/E7).  ``row.severity or ''``
         normalises a null/absent severity to the unknown-severity sentinel, so
         the classifier reaches its documented fail-safe-to-pinning branch
@@ -789,6 +796,7 @@ class TaskGroundTruth:
                 severity=row.severity or '',
                 filing_claimant_run_id=row.filing_claimant_run_id,
                 created_at=getattr(row, 'timestamp', None),
+                members=tuple(row.members or ()),
             )
             for row in rows
         ], False
