@@ -58,7 +58,7 @@ class Verdict(StrEnum):
     """What the census concluded about one unlanded task branch."""
 
     RECORDED = 'recorded'
-    """A 5618 stack-base record exists, so merge admission un-stacks it."""
+    """A 5618 stack-base record names a commit, so merge admission un-stacks it."""
     INERT = 'inert'
     """Looks stacked, but its task is done or cancelled, so it never merges again."""
     UNADJUDICATED = 'unadjudicated'
@@ -66,9 +66,9 @@ class Verdict(StrEnum):
     ALREADY_CLEAN = 'already_clean'
     """Stacked once, but carries none of the base's commits any more."""
     STRANDED_BASE = 'stranded_base'
-    """Carries an unlanded base that no live branch holds any more."""
+    """Carries an unlanded base that no other branch holds as its own work any more."""
     CONFIRMED = 'confirmed'
-    """Carries an unlanded base a live branch still holds: adopt the record."""
+    """Carries an unlanded base another branch still holds as its own: adopt the record."""
 
 
 class CensusGitError(RuntimeError):
@@ -353,7 +353,10 @@ async def _checked(repo_root: Path, *args: str, answers: tuple[int, ...] = (0,))
 
 
 async def _commit_exists(repo_root: Path, sha: str) -> bool:
-    rc, _, _ = await _git(['git', 'cat-file', '-e', f'{sha}^{{commit}}'], repo_root)
+    """False only when git answers that *sha* names no commit; an unreadable object raises."""
+    rc = await _checked(
+        repo_root, 'rev-parse', '--verify', '--quiet', f'{sha}^{{commit}}', answers=(0, 1),
+    )
     return rc == 0
 
 
@@ -364,13 +367,25 @@ async def _is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
     return rc == 0
 
 
-async def _patch_landed(repo_root: Path, main_sha: str, base: str) -> bool:
-    """Every commit of *base* that main lacks has a patch-equivalent on main."""
-    command = ('git', 'cherry', main_sha, base)
+async def _all_patches_upstream(repo_root: Path, *cherry_args: str) -> bool:
+    """``git cherry <cherry_args>`` lists no commit that lacks an upstream patch-equivalent."""
+    command = ('git', 'cherry', *cherry_args)
     rc, out, err = await _git(command, repo_root)
     if rc != 0:
         raise StackInspectionError(command, err)
     return not any(line.startswith('+') for line in out.splitlines())
+
+
+async def _patch_landed(repo_root: Path, main_sha: str, base: str) -> bool:
+    """Every commit of *base* that main lacks has a patch-equivalent on main."""
+    return await _all_patches_upstream(repo_root, main_sha, base)
+
+
+async def _tip_carries(repo_root: Path, main_sha: str, tip: str, base: str) -> bool:
+    """*tip* holds every commit of *base* that main lacks, as itself or a patch-equivalent."""
+    if await _is_ancestor(repo_root, base, tip):
+        return True
+    return await _all_patches_upstream(repo_root, tip, base, main_sha)
 
 
 class _LandedChecks:
@@ -435,10 +450,28 @@ async def _residual_bases(
 
 
 async def _live_owners(census_run: _CensusRun, branch: str, base: str) -> tuple[str, ...]:
-    """Branches that still carry *base*: at their tip now, or once in their reflog."""
-    at_tip = await base_owners(_git, census_run.repo_root, base)
-    held = _reflog_holders(census_run.snapshot, base)
-    return tuple(sorted((set(at_tip) | held) - {branch}))
+    """Branches other than *branch* that hold *base* as their own work, sorted.
+
+    A branch at *base* holds it.  A branch whose reflog once held *base*
+    holds it only while its tip still carries it.  A branch stacked onto
+    *base* carries it as a foreign prefix, so it is no owner.
+    """
+    snapshot = census_run.snapshot
+    at_tip = set(await base_owners(_git, census_run.repo_root, base))
+    once_held = sorted(_reflog_holders(snapshot, base) - at_tip - {branch})
+    still_held = {
+        name for name in once_held
+        if await _tip_carries(census_run.repo_root, snapshot.main_sha, snapshot.tips[name], base)
+    }
+    return tuple(sorted(
+        name for name in (at_tip | still_held) - {branch}
+        if not _stacked_onto(snapshot, name, base)
+    ))
+
+
+def _stacked_onto(snapshot: _Snapshot, name: str, base: str) -> bool:
+    events = stacking_events(snapshot.reflogs.get(name, ()), snapshot.main_commits)
+    return any(event.base == base for event in events)
 
 
 async def _adjudicate(census_run: _CensusRun, evidence: _Evidence) -> _Adjudication:
@@ -494,8 +527,18 @@ def _unadjudicated_detail(evidence: _Evidence, adjudication: _Adjudication) -> s
 
 
 async def _recorded_finding(census_run: _CensusRun, evidence: _Evidence) -> BranchFinding:
-    base = await StackBaseLedger(census_run.repo_root, _git).base_of(evidence.branch.name)
-    return _unchecked_finding(evidence, Verdict.RECORDED, base)
+    """Merge admission reads the record as no record unless it names a commit."""
+    ledger = StackBaseLedger(census_run.repo_root, _git)
+    base = await ledger.base_of(evidence.branch.name)
+    if base is not None:
+        return _unchecked_finding(evidence, Verdict.RECORDED, base)
+    return _unchecked_finding(
+        evidence, Verdict.UNADJUDICATED, None,
+        detail=(
+            f'{ledger.ref_for(evidence.branch.name)} names no commit, '
+            'so merge admission would not un-stack the branch'
+        ),
+    )
 
 
 def _inert_finding(evidence: _Evidence) -> BranchFinding:
@@ -503,12 +546,14 @@ def _inert_finding(evidence: _Evidence) -> BranchFinding:
     return _unchecked_finding(evidence, Verdict.INERT, newest)
 
 
-def _unchecked_finding(evidence: _Evidence, verdict: Verdict, base: str | None) -> BranchFinding:
+def _unchecked_finding(
+    evidence: _Evidence, verdict: Verdict, base: str | None, *, detail: str = '',
+) -> BranchFinding:
     """A finding decided without stage 2: it has no cut and no owners."""
     return BranchFinding(
         branch=evidence.branch.name, task_status=evidence.task_status, verdict=verdict,
         base=base, cut=None, contained_siblings=evidence.contained, base_owners=(),
-        events=evidence.events, detail='',
+        events=evidence.events, detail=detail,
     )
 
 
@@ -706,9 +751,9 @@ def _remedy(report: CensusReport, finding: BranchFinding) -> str:
         )
     if finding.verdict is Verdict.STRANDED_BASE:
         return (
-            'no live branch holds the base any more, so un-stacking would drop the only '
-            "copy of the base's commits. Decide first whether they must land; once "
-            'adjudicated, record the base with '
+            'no other branch holds the base as its own work any more, so un-stacking '
+            "could drop the last copy of the base's commits. Decide first whether they "
+            'must land; once adjudicated, record the base with '
             f'`git update-ref {STACK_BASE_REF_NAMESPACE}{finding.branch} {finding.base}`'
         )
     return (

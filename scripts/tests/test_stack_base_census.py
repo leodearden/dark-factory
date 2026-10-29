@@ -109,6 +109,12 @@ def stacked_on_p(repo: Path, member: str = 'M') -> tuple[Path, Path]:
     return p_wt, m_wt
 
 
+def delete_member(repo: Path, name: str) -> None:
+    """Remove ``.worktrees/<name>`` and branch ``task/<name>``, reflog included."""
+    git(repo, 'worktree', 'remove', '--force', str(repo / '.worktrees' / name))
+    git(repo, 'branch', '-D', f'task/{name}')
+
+
 # ---------------------------------------------------------------------------
 # step-1: the core census
 # ---------------------------------------------------------------------------
@@ -243,14 +249,87 @@ async def test_a_base_whose_patches_landed_on_main_has_no_finding(repo: Path) ->
 async def test_a_base_with_no_live_carrier_is_stranded(repo: Path) -> None:
     stacked_on_p(repo)
     p_tip = rev(repo, 'task/P')
-    git(repo, 'worktree', 'remove', '--force', str(repo / '.worktrees' / 'P'))
-    git(repo, 'branch', '-D', 'task/P')
+    delete_member(repo, 'P')
 
     finding = findings_of(await census_of(repo))['task/M']
 
     assert finding.verdict is census.Verdict.STRANDED_BASE
     assert finding.base == p_tip
     assert finding.base_owners == ()
+
+
+async def test_an_owner_that_moved_on_from_the_base_still_owns_it(repo: Path) -> None:
+    p_wt, _ = stacked_on_p(repo)
+    p_tip = rev(repo, 'task/P')
+    commit(p_wt, {'p2.txt': 'p2\n'}, 'P: second')
+
+    finding = findings_of(await census_of(repo))['task/M']
+
+    assert finding.verdict is census.Verdict.CONFIRMED
+    assert finding.base == p_tip
+    assert finding.base_owners == ('task/P',)
+
+
+async def test_an_owner_rebased_since_still_owns_the_base_by_patch(repo: Path) -> None:
+    p_wt, _ = stacked_on_p(repo)
+    p_tip = rev(repo, 'task/P')
+    advance_main(repo, {'unrelated.txt': 'u\n'})
+    rebase(p_wt, 'main')
+    assert git(repo, 'merge-base', 'task/P', p_tip) != p_tip
+
+    finding = findings_of(await census_of(repo))['task/M']
+
+    assert finding.verdict is census.Verdict.CONFIRMED
+    assert finding.base_owners == ('task/P',)
+
+
+async def test_an_owner_rewritten_off_the_base_no_longer_owns_it(repo: Path) -> None:
+    p_wt, _ = stacked_on_p(repo)
+    p_tip = rev(repo, 'task/P')
+    git(p_wt, 'reset', '--hard', 'main')
+    commit(p_wt, {'p.txt': 'rewritten\n'}, 'P: rewritten')
+    assert p_tip in git(repo, 'reflog', 'show', '--format=%H', 'refs/heads/task/P').split()
+
+    finding = findings_of(await census_of(repo))['task/M']
+
+    assert finding.verdict is census.Verdict.STRANDED_BASE
+    assert finding.base == p_tip
+    assert finding.base_owners == ()
+
+
+async def test_a_branch_stacked_on_the_same_base_is_no_owner_of_it(repo: Path) -> None:
+    add_member(repo, 'P', 'main', {'p.txt': 'p\n'})
+    p_tip = rev(repo, 'task/P')
+    add_member(repo, 'C1', p_tip, {'c1.txt': 'c1\n'})
+    add_member(repo, 'C2', p_tip, {'c2.txt': 'c2\n'})
+    delete_member(repo, 'P')
+
+    findings = findings_of(await census_of(repo))
+
+    for name in ('task/C1', 'task/C2'):
+        assert findings[name].verdict is census.Verdict.STRANDED_BASE
+        assert findings[name].base == p_tip
+        assert findings[name].base_owners == ()
+
+
+def corrupt_loose_object(repo: Path, sha: str) -> None:
+    path = repo / '.git' / 'objects' / sha[:2] / sha[2:]
+    path.chmod(0o644)
+    path.write_bytes(b'not a zlib stream')
+
+
+async def test_a_base_git_cannot_read_is_unadjudicated(repo: Path) -> None:
+    _, m_wt = stacked_on_p(repo)
+    p_tip = rev(repo, 'task/P')
+    rebase(m_wt, '--onto', 'main', p_tip, 'task/M')
+    delete_member(repo, 'P')
+    corrupt_loose_object(repo, p_tip)
+
+    finding = findings_of(await census_of(repo))['task/M']
+
+    assert finding.verdict is census.Verdict.UNADJUDICATED
+    assert finding.base == p_tip
+    assert 'git inspection failed' in finding.detail
 
 
 async def test_a_contained_sibling_without_a_reflog_stacking_event_is_unadjudicated(
@@ -289,6 +368,18 @@ async def test_a_branch_with_a_stack_base_record_is_recorded(repo: Path) -> None
 
     assert finding.verdict is census.Verdict.RECORDED
     assert finding.base == p_tip
+
+
+async def test_a_record_that_names_no_commit_is_unadjudicated(repo: Path) -> None:
+    stacked_on_p(repo)
+    record = 'refs/dark-factory/stack-base/task/M'
+    git(repo, 'update-ref', record, git(repo, 'rev-parse', 'task/P:p.txt'))
+
+    finding = findings_of(await census_of(repo))['task/M']
+
+    assert finding.verdict is census.Verdict.UNADJUDICATED
+    assert finding.base is None
+    assert record in finding.detail
 
 
 async def test_a_residual_older_base_is_unadjudicated(repo: Path) -> None:
@@ -414,8 +505,7 @@ async def test_only_confirmed_findings_are_adopted(repo: Path) -> None:
     add_member(repo, 'Q', 'main', {'q.txt': 'q\n'})
     stranded_wt = add_member(repo, 'S', 'main', {'s.txt': 's\n'})
     rebase(stranded_wt, 'task/Q')
-    git(repo, 'worktree', 'remove', '--force', str(repo / '.worktrees' / 'Q'))
-    git(repo, 'branch', '-D', 'task/Q')
+    delete_member(repo, 'Q')
     unadjudicated_wt = add_member(repo, 'U', 'main', {'u1.txt': '1\n'})
     u1 = rev(repo, 'task/U')
     commit(unadjudicated_wt, {'u2.txt': '2\n'}, 'U: second')
