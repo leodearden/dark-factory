@@ -284,7 +284,9 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   - `bare-dataclass-double` — an unspecced `MagicMock` shaped like a
     registered stdlib dataclass (`VerifyResult` today), flagged in **any**
     syntactic position including `return MagicMock(...)`. Remedy:
-    `_fake_verify_result(...)` or `MagicMock(spec=VerifyResult)`.
+    `fake_verify_result(...)` (from
+    `orchestrator/tests/_verify_result_doubles.py`) or
+    `MagicMock(spec=VerifyResult)`.
     This rule has **no baseline** and is hot for every scanned file — the
     transitional debt list was retired once its 95 grandfathered sites were
     migrated (task 4354), so the per-site `# noqa: bare-dataclass-double —

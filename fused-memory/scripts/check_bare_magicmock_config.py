@@ -20,7 +20,7 @@ separate message vocabularies and separate ``# noqa`` codes.  Every statement in
       ``return MagicMock(...)``, an argument, a comprehension body — whose literal
       kwargs match a registered stdlib-dataclass shape (``_DATACLASS_SHAPES``;
       ``VerifyResult`` today).  The binding name is never consulted.  Remedies are
-      dataclass-specific (``_fake_verify_result``, ``MagicMock(spec=VerifyResult)``).
+      dataclass-specific (``fake_verify_result``, ``MagicMock(spec=VerifyResult)``).
       Hot for every scanned file: the transitional per-file debt baseline was
       retired once its 95 grandfathered sites were migrated (task 4354).
 
@@ -136,8 +136,8 @@ matches only config/cfg/*_config/*_cfg targets; and its remedies read pydantic
 ``model_fields`` while ``VerifyResult`` is a stdlib dataclass.
 
 Preferred alternatives named in the rejection message:
-  • ``_fake_verify_result(...)``
-    (orchestrator/tests/test_merge_queue_concurrent_verify.py::_fake_verify_result)
+  • ``fake_verify_result(...)``
+    (orchestrator/tests/_verify_result_doubles.py::fake_verify_result)
   • ``MagicMock(spec=VerifyResult)`` seeded from ``dataclasses.fields(VerifyResult)``
 
 Origin: task 3477 (built the factory), task 3980 (migrated ten sites and added a
@@ -260,6 +260,9 @@ class _DataclassShape(NamedTuple):
     (orchestrator/src/orchestrator/merge_types.py::MergeOutcome.verify_skipped) that
     VerifyResult does not have, so a subset rule would have missed precisely the
     defect this rule exists to catch.
+
+    ``factory`` names the helper the message offers as the remedy, and
+    ``factory_home`` the repo-relative path of the module that defines it.
     """
 
     name: str
@@ -268,6 +271,7 @@ class _DataclassShape(NamedTuple):
     anchors: frozenset[str]
     min_field_matches: int
     factory: str
+    factory_home: str
 
 
 # Registered shapes.  The field lists are LITERALS, not imports: this script is
@@ -281,7 +285,7 @@ class _DataclassShape(NamedTuple):
 # slips through.  Its drift guards are in
 # fused-memory/tests/test_check_bare_magicmock_config.py::TestDataclassShapeRegistry,
 # which compare this literal against ``dataclasses.fields(VerifyResult)`` at runtime,
-# one test per drift direction.
+# one test per drift direction, and parse ``factory_home`` for ``factory``.
 _DATACLASS_SHAPES: tuple[_DataclassShape, ...] = (
     _DataclassShape(
         name='VerifyResult',
@@ -314,7 +318,8 @@ _DATACLASS_SHAPES: tuple[_DataclassShape, ...] = (
         }),
         anchors=frozenset({'passed'}),
         min_field_matches=2,
-        factory='_fake_verify_result',
+        factory='fake_verify_result',
+        factory_home='orchestrator/tests/_verify_result_doubles.py',
     ),
 )
 
@@ -374,7 +379,7 @@ def _is_specced(call: ast.Call) -> bool:
 
 # Each rule gets its OWN ``# noqa`` code, under _lint_cli.py's one pragma grammar: the
 # remedies are unrelated (mock_orch_config/pydantic_spec vs
-# _fake_verify_result/spec=VerifyResult vs wait_responsive/MERGE_RESULT_TIMEOUT), so a
+# fake_verify_result/spec=VerifyResult vs wait_responsive/MERGE_RESULT_TIMEOUT), so a
 # pragma for one is not informed consent for another.
 _RULE_A_CODE = 'bare-magicmock'
 _RULE_B_CODE = 'bare-dataclass-double'
@@ -413,7 +418,8 @@ def _dataclass_violation_msg(shape: _DataclassShape, kwargs: set[str]) -> str:
         f' (matched {shape.name} fields: {", ".join(sorted(kwargs & shape.fields))}).'
         ' Reading an absent attribute on it auto-vivifies a truthy child Mock instead'
         f' of raising AttributeError.{drift_clause}'
-        f' Use the {shape.factory}(...) helper, or MagicMock(spec={shape.name}) seeded'
+        f' Use the {shape.factory}(...) helper ({shape.factory_home}),'
+        f' or MagicMock(spec={shape.name}) seeded'
         f' from dataclasses.fields({shape.name}), so unknown-attribute reads raise'
         ' (tasks 3477/3980 built the factory; task 4016 added this guard).'
         ' To suppress: add # noqa: bare-dataclass-double — <reason> on the preceding'
@@ -668,7 +674,7 @@ def _wall_clock_overrun_msg(budget: int, found: int) -> str:
     """Build the message for a Rule C debt file that has grown past its budget.
 
     Carries Rule C's OWN remedy, never Rule B's: a wall-clock deadline is not fixed
-    by speccing a double, so offering ``_fake_verify_result`` here would send the
+    by speccing a double, so offering ``fake_verify_result`` here would send the
     reader down a dead end.
     """
     return (
