@@ -37,6 +37,11 @@ T = TypeVar('T')
 
 _REASON_CHARS = 80
 
+_EVAL_HARNESS_PROJECT = 'dark_factory'
+"""The eval harness is dark-factory's instrument, so its LLM calls are
+dark-factory sessions whichever repository's fixture they grade; the value is
+dark-factory-orchestrator.yaml's ``fused_memory.project_id``."""
+
 
 class MeasurementStage(StrEnum):
     ARCHITECT = 'architect'
@@ -45,6 +50,13 @@ class MeasurementStage(StrEnum):
     MATCHER = 'matcher'
     ASSESSOR = 'assessor'
     SYNTHESIZER = 'synthesizer'
+
+
+def _spawn_identity(stage: MeasurementStage) -> dict[str, str]:
+    return {
+        'CLAUDE_SPAWN_ROLE': f'eval_{stage.value}',
+        'CLAUDE_SPAWN_PROJECT': _EVAL_HARNESS_PROJECT,
+    }
 
 
 class UnmeasuredCause(StrEnum):
@@ -231,9 +243,13 @@ async def measured_call(
     with ``ValueError``/``TypeError``/``KeyError``. Never fabricates a value.
     ``cost_usd`` is the spend summed over every attempt. With *usage_gate* the
     call runs through ``invoke_with_cap_retry``, which injects each account's
-    credentials into *invoke_kwargs*. Any other exception propagates.
+    credentials into *invoke_kwargs*. Any other exception propagates. Every
+    call declares its fleet identity (role ``eval_<stage>``, project
+    ``dark_factory``) via ``spawn_env``, because the ``/tmp`` cwd the judges
+    run in names no project.
     """
     name = label or str(stage)
+    spawn_env = _spawn_identity(stage)
     spent = 0.0
 
     async def _attempt(**dispatch: Any) -> AgentResult:
@@ -244,11 +260,13 @@ async def measured_call(
 
     try:
         if usage_gate is None:
-            result = await _attempt(backend=backend, **invoke_kwargs)
+            result = await _attempt(
+                backend=backend, spawn_env=spawn_env, **invoke_kwargs,
+            )
         else:
             result = await invoke_with_cap_retry(
                 usage_gate, name, invoke_fn=_attempt, backend=backend,
-                **invoke_kwargs,
+                spawn_env=spawn_env, **invoke_kwargs,
             )
     except AllAccountsCappedException as e:
         logger.warning(f'{name}: unmeasured, cap patience exhausted: {e}')
