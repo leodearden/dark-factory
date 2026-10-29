@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _capacity_skip import looks_like_capacity_failure
+from _measured_cli_results import MEASURED_ORG_DISABLED_403
 from _oauth_accounts import available_tokens
 from test_config_dir import PROBE_PREFIX, find_dead_pid, plant
 
@@ -716,22 +717,6 @@ class TestUsageGateProbeExitCodeClassification:
 # ---------------------------------------------------------------------------
 
 
-# The exact CLI result measured live on 2026-09-26 (CLI 2.1.283) for the
-# org-disabled max-b/max-c accounts, via the production probe command.
-MEASURED_ORG_DISABLED_403 = json.dumps({
-    'type': 'result',
-    'subtype': 'success',
-    'is_error': True,
-    'api_error_status': 403,
-    'result': (
-        'Your organization has disabled Claude subscription access for Claude '
-        'Code · Use an Anthropic API key instead, or ask your admin to enable '
-        'access'
-    ),
-    'num_turns': 1,
-    'total_cost_usd': 0,
-}).encode()
-
 SERVED_SUCCESS_RESULT = json.dumps({
     'type': 'result',
     'subtype': 'success',
@@ -758,7 +743,7 @@ class TestUsageGateProbeRequiresServedResult:
         self, probing_gate: tuple[UsageGate, AccountState]
     ) -> None:
         gate, acct = probing_gate
-        assert await self._probe(gate, acct, 0, MEASURED_ORG_DISABLED_403) is False
+        assert await self._probe(gate, acct, 0, MEASURED_ORG_DISABLED_403.encode()) is False
 
     async def test_exit_0_with_is_error_true_and_no_status_is_not_served(
         self, probing_gate: tuple[UsageGate, AccountState]
@@ -840,7 +825,7 @@ class TestUsageGateProbeRequiresServedResult:
         self, probing_gate: tuple[UsageGate, AccountState]
     ) -> None:
         gate, acct = probing_gate
-        assert await self._probe(gate, acct, 1, MEASURED_ORG_DISABLED_403) is False
+        assert await self._probe(gate, acct, 1, MEASURED_ORG_DISABLED_403.encode()) is False
 
     async def test_exit_0_with_a_schema_salvaged_result_is_not_served(
         self, probing_gate: tuple[UsageGate, AccountState]
@@ -862,6 +847,15 @@ class TestUsageGateProbeRequiresServedResult:
         gate, acct = probing_gate
         assert await self._probe(gate, acct, 0, stdout) is False
 
+    @pytest.mark.parametrize(
+        'stdout', [b'{"api_error_status": "403"}', b'{"api_error_status": [1]}'],
+    )
+    async def test_exit_0_with_a_non_int_api_error_status_is_not_served(
+        self, probing_gate: tuple[UsageGate, AccountState], stdout: bytes,
+    ) -> None:
+        gate, acct = probing_gate
+        assert await self._probe(gate, acct, 0, stdout) is False
+
     async def test_not_served_warning_names_the_api_error_status(
         self,
         probing_gate: tuple[UsageGate, AccountState],
@@ -870,7 +864,7 @@ class TestUsageGateProbeRequiresServedResult:
         gate, acct = probing_gate
         caplog.set_level(logging.WARNING, logger='shared.usage_gate')
 
-        await self._probe(gate, acct, 1, MEASURED_ORG_DISABLED_403)
+        await self._probe(gate, acct, 1, MEASURED_ORG_DISABLED_403.encode())
 
         warnings = [
             r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
@@ -888,7 +882,7 @@ class TestUsageGateProbeRequiresServedResult:
         gate, acct = probing_gate
         acct.phase = AccountPhase.AUTH_FAILED
         acct.auth_failed_at = datetime.now(UTC)
-        proc = _fake_probe_proc(0, MEASURED_ORG_DISABLED_403)
+        proc = _fake_probe_proc(0, MEASURED_ORG_DISABLED_403.encode())
 
         with (
             patch('shared.usage_gate.load_dotenv'),
@@ -936,7 +930,7 @@ class TestUsageGateProbeReadsParsedResult:
     ) -> None:
         gate, acct = probing_gate
         caplog.set_level(logging.WARNING, logger='shared.usage_gate')
-        proc = _fake_probe_proc(1, MEASURED_ORG_DISABLED_403)
+        proc = _fake_probe_proc(1, MEASURED_ORG_DISABLED_403.encode())
 
         with patch('shared.usage_gate.asyncio.create_subprocess_exec',
                    return_value=proc):

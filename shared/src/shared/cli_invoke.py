@@ -3994,7 +3994,10 @@ def _parse_claude_output(
     session_id = data.get('session_id', '')
     subtype = data.get('subtype', '')
     structured = data.get('structured_output')
-    api_error_status = data.get('api_error_status')
+    raw_status = data.get('api_error_status')
+    api_error_status = (
+        raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) else None
+    )
     raw_stop_reason = data.get('stop_reason')
     stop_reason = raw_stop_reason if isinstance(raw_stop_reason, str) else None
 

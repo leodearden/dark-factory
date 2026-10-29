@@ -10,24 +10,9 @@ from __future__ import annotations
 import json
 
 import pytest
+from _measured_cli_results import MEASURED_ORG_DISABLED_403, ORG_DISABLED_TEXT
 
 from shared.cli_invoke import BUDGET_EXHAUSTED_SUBTYPE, parse_claude_cli_output
-
-ORG_DISABLED_TEXT = (
-    'Your organization has disabled Claude subscription access for Claude '
-    'Code · Use an Anthropic API key instead, or ask your admin to enable '
-    'access'
-)
-
-MEASURED_ORG_DISABLED_403 = json.dumps({
-    'type': 'result',
-    'subtype': 'success',
-    'is_error': True,
-    'api_error_status': 403,
-    'result': ORG_DISABLED_TEXT,
-    'num_turns': 1,
-    'total_cost_usd': 0,
-})
 
 
 def test_served_result_is_success() -> None:
@@ -100,11 +85,16 @@ def test_non_object_json_reads_as_text_output(stdout: str) -> None:
     assert result.output == stdout
 
 
+@pytest.mark.parametrize('stdout', ['{"usage": [1]}', '{"usage": "x"}'])
+def test_malformed_usage_reads_as_absent_token_counts(stdout: str) -> None:
+    result = parse_claude_cli_output(stdout=stdout, stderr='', returncode=0)
+    assert result.input_tokens is None
+    assert result.output_tokens is None
+
+
 @pytest.mark.parametrize(
     'stdout',
     [
-        '{"usage": [1]}',
-        '{"usage": "x"}',
         '{"messages": [1]}',
         '{"messages": [{"type": "assistant", "content": 5}]}',
         '{"messages": [{"type": "assistant", "content": [{"type": "text"}]}]}',
@@ -112,9 +102,18 @@ def test_non_object_json_reads_as_text_output(stdout: str) -> None:
         '{"result": 5}',
     ],
 )
-def test_malformed_object_parses_without_raising(stdout: str) -> None:
+def test_malformed_output_fields_read_as_empty_output(stdout: str) -> None:
     result = parse_claude_cli_output(stdout=stdout, stderr='', returncode=0)
-    assert isinstance(result.output, str)
+    assert result.output == ''
+
+
+@pytest.mark.parametrize(
+    'stdout',
+    ['{"api_error_status": "403"}', '{"api_error_status": [1]}', '{"api_error_status": true}'],
+)
+def test_non_int_api_error_status_reads_as_absent(stdout: str) -> None:
+    result = parse_claude_cli_output(stdout=stdout, stderr='', returncode=0)
+    assert result.api_error_status is None
 
 
 def test_assistant_messages_fallback_joins_text_blocks() -> None:
