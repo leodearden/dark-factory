@@ -5,23 +5,23 @@ import ast
 import dataclasses
 import logging
 import re
-from collections.abc import Mapping, MutableMapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 import redis.exceptions
 from _fm_helpers import FALKOR_HOST, FALKOR_PORT, falkor_skipif, unique_graph_name
 from falkordb.asyncio import FalkorDB
+from falkordb.asyncio.graph import AsyncGraph
 
 from fused_memory.backends import falkor_read_only
 from fused_memory.backends.falkor_read_only import (
-    COMMAND_BY_PRIMITIVE,
+    FORWARDED_ATTRIBUTES,
     RO_COMMAND,
     NonReadOnlyCommandError,
     PagedQuery,
     ReadOnlyGraphProxy,
     ReadOnlyGraphReader,
-    assert_read_only_command,
     open_graph,
 )
 from fused_memory.backends.graphiti_client import (
@@ -34,6 +34,7 @@ class _RecordingGraph:
     """A graph handle that records reads and refuses writes."""
 
     def __init__(self, *, resultset_cap: int = 10) -> None:
+        self.name = 'g'
         self.resultset_cap = resultset_cap
         self.queries: list[tuple[str, dict | None]] = []
         self.write_calls: list[str] = []
@@ -46,29 +47,20 @@ class _RecordingGraph:
         raise AssertionError('the read-only seam may never issue query()')
 
 
-class TestTheCommandGuard:
-    def test_the_read_only_command_passes(self) -> None:
-        assert RO_COMMAND == 'GRAPH.RO_QUERY'
-        assert assert_read_only_command(RO_COMMAND) is None
-
-    def test_a_writable_command_is_refused_with_a_typed_error(self) -> None:
-        with pytest.raises(NonReadOnlyCommandError) as caught:
-            assert_read_only_command('GRAPH.QUERY')
-        error = caught.value
+class TestTheRefusal:
+    def test_a_refusal_is_a_typed_error_naming_what_was_refused_and_what_is_allowed(self) -> None:
+        error = NonReadOnlyCommandError('query')
         assert isinstance(error, RuntimeError)
-        assert error.command == 'GRAPH.QUERY'
+        assert error.primitive == 'query'
         message = str(error)
-        assert 'GRAPH.QUERY' in message
-        assert 'GRAPH.RO_QUERY' in message
+        assert "'query'" in message
+        assert RO_COMMAND in message
         assert 'read-only' in message
 
-    def test_every_falkordb_primitive_the_proxy_knows_is_mapped(self) -> None:
-        """A primitive absent from the map is forwarded UNGUARDED, so the map is what can go quietly wrong."""
-        assert COMMAND_BY_PRIMITIVE['ro_query'] == RO_COMMAND
-        assert COMMAND_BY_PRIMITIVE['query'] == 'GRAPH.QUERY'
-        assert isinstance(COMMAND_BY_PRIMITIVE, Mapping)
-        assert not isinstance(COMMAND_BY_PRIMITIVE, MutableMapping)
-        assert not hasattr(COMMAND_BY_PRIMITIVE, '__setitem__')
+    def test_the_forwarded_set_is_the_read_primitive_and_the_graph_name_only(self) -> None:
+        assert RO_COMMAND == 'GRAPH.RO_QUERY'
+        assert sorted(FORWARDED_ATTRIBUTES) == ['name', 'ro_query']
+        assert isinstance(FORWARDED_ATTRIBUTES, frozenset)
 
 
 class TestReadOnlyGraphProxy:
@@ -76,20 +68,38 @@ class TestReadOnlyGraphProxy:
         graph = _RecordingGraph()
         assert ReadOnlyGraphProxy(graph).ro_query.__self__ is graph
 
-    def test_the_command_guard_is_reachable_on_a_real_read(self) -> None:
-        """The write primitive is refused before any byte reaches the store, naming the command rather than the method."""
+    def test_the_graph_name_is_forwarded(self) -> None:
+        assert ReadOnlyGraphProxy(_RecordingGraph()).name == 'g'
+
+    def test_the_write_primitive_is_refused_before_any_byte_reaches_the_store(self) -> None:
         graph = _RecordingGraph()
         proxy = ReadOnlyGraphProxy(graph)
-        with pytest.raises(NonReadOnlyCommandError, match='GRAPH.QUERY'):
+        with pytest.raises(NonReadOnlyCommandError, match="'query'"):
             _ = proxy.query
         assert graph.write_calls == []
 
-    def test_unmapped_attributes_are_forwarded_untouched(self) -> None:
-        """A handle legitimately carries bookkeeping; guarding it would make the proxy brittle without making it safer."""
-        graph = _RecordingGraph(resultset_cap=7)
-        proxy = ReadOnlyGraphProxy(graph)
-        assert proxy.queries is graph.queries
-        assert proxy.resultset_cap == graph.resultset_cap
+    def test_an_attribute_the_handle_carries_is_refused_unless_forwarded(self) -> None:
+        """Deny by default: carrying an attribute is no licence to reach it through the seam."""
+        proxy = ReadOnlyGraphProxy(_RecordingGraph())
+        for name in ('queries', 'resultset_cap', 'write_calls'):
+            with pytest.raises(NonReadOnlyCommandError) as caught:
+                getattr(proxy, name)
+            assert caught.value.primitive == name
+
+    def test_every_asyncgraph_primitive_but_the_read_is_refused(self) -> None:
+        """Enumerated from the installed falkordb, so a primitive it adds later is refused, not forwarded."""
+        primitives = {name for name in dir(AsyncGraph) if not name.startswith('__')}
+        refused = primitives - FORWARDED_ATTRIBUTES
+        assert {
+            'query', '_query', 'delete', 'copy', 'call_procedure', 'profile',
+            'create_node_range_index', 'create_edge_unique_constraint',
+            'drop_node_vector_index', 'drop_edge_mandatory_constraint',
+        } <= refused
+        proxy = ReadOnlyGraphProxy(_RecordingGraph())
+        for name in sorted(refused):
+            with pytest.raises(NonReadOnlyCommandError) as caught:
+                getattr(proxy, name)
+            assert caught.value.primitive == name
 
 
 _EDGE_MATCH = 'MATCH (a)-[r:RELATES_TO]->(b) WHERE r.invalid_at IS NULL'
@@ -320,8 +330,9 @@ class TestTheGuardedHandle:
         guarded = _reader(graph).guarded_graph()
         assert isinstance(guarded, ReadOnlyGraphProxy)
         assert guarded.ro_query.__self__ is graph
-        with pytest.raises(NonReadOnlyCommandError):
-            _ = guarded.query
+        for primitive in ('query', 'delete', 'create_node_range_index'):
+            with pytest.raises(NonReadOnlyCommandError):
+                getattr(guarded, primitive)
 
 
 class TestOpening:
@@ -342,8 +353,12 @@ class TestOpening:
         with pytest.raises(ValueError, match='uri'):
             open_graph('g', uri='redis://x', **address)
 
-    def test_the_module_never_constructs_or_imports_the_graphiti_driver(self) -> None:
-        """graphiti's FalkorDriver.__init__ fire-and-forgets build_indices_and_constraints(), a write."""
+    def test_the_module_never_constructs_or_directly_imports_the_graphiti_driver(self) -> None:
+        """graphiti's FalkorDriver.__init__ fire-and-forgets build_indices_and_constraints(), a write.
+
+        Direct imports only: graphiti_client, which this module imports, loads
+        the driver module transitively.
+        """
         tree = ast.parse(Path(falkor_read_only.__file__).read_text(encoding='utf-8'))
         calls = [
             node.lineno for node in ast.walk(tree)
@@ -360,6 +375,81 @@ class TestOpening:
         assert [name for name in imported if name.split('.')[0] == 'graphiti_core'] == []
 
 
+class _OpenedGraph(_CappedGraph):
+    def __init__(self, client: _FakeClient, name: str) -> None:
+        super().__init__(_edge_rows(1))
+        self.client = client
+        self.name = name
+
+
+class _FakeClient:
+    def __init__(self, **address: object) -> None:
+        self.address = address
+        self.closes = 0
+
+    def select_graph(self, graph_name: str) -> _OpenedGraph:
+        return _OpenedGraph(self, graph_name)
+
+    async def aclose(self) -> None:
+        self.closes += 1
+
+
+@pytest.fixture
+def opened_clients(monkeypatch: pytest.MonkeyPatch) -> list[_FakeClient]:
+    """Every client open_graph builds, in order; none of them touches a network."""
+    clients: list[_FakeClient] = []
+
+    def _build(**address: object) -> _FakeClient:
+        client = _FakeClient(**address)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(falkor_read_only, 'FalkorDB', _build)
+    return clients
+
+
+class TestClosing:
+    @pytest.mark.asyncio
+    async def test_aclose_closes_the_client_the_reader_opened(
+        self, opened_clients: list[_FakeClient]
+    ) -> None:
+        reader = ReadOnlyGraphReader(graph_name='g', host='h', port=1)
+        await reader.read_unpaged('MATCH (e:Episodic) RETURN e.uuid')
+        await reader.aclose()
+        assert [(client.address, client.closes) for client in opened_clients] == [
+            ({'host': 'h', 'port': 1}, 1)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_reader_that_never_read_opens_and_closes_nothing(
+        self, opened_clients: list[_FakeClient]
+    ) -> None:
+        await ReadOnlyGraphReader(graph_name='g', host='h', port=1).aclose()
+        assert opened_clients == []
+
+    @pytest.mark.asyncio
+    async def test_an_injected_graph_is_left_to_its_owner(
+        self, opened_clients: list[_FakeClient]
+    ) -> None:
+        owner = _FakeClient()
+        reader = ReadOnlyGraphReader(graph_name='g', graph=_OpenedGraph(owner, 'g'))
+        await reader.read_unpaged('MATCH (e:Episodic) RETURN e.uuid')
+        await reader.aclose()
+        assert owner.closes == 0
+        assert opened_clients == []
+
+    @pytest.mark.asyncio
+    async def test_a_read_after_aclose_opens_a_fresh_client(
+        self, opened_clients: list[_FakeClient]
+    ) -> None:
+        reader = ReadOnlyGraphReader(graph_name='g', host='h', port=1)
+        await reader.read_unpaged('MATCH (e:Episodic) RETURN e.uuid')
+        await reader.aclose()
+        await reader.read_unpaged('MATCH (e:Episodic) RETURN e.uuid')
+        await reader.aclose()
+        assert [client.closes for client in opened_clients] == [1, 1]
+
+
 @pytest.mark.integration
 @falkor_skipif()
 @pytest.mark.timeout(30)
@@ -373,11 +463,19 @@ async def test_a_live_open_yields_a_falkordb_client_and_no_graphiti_driver(
         raise AssertionError('the read-only seam constructed a graphiti FalkorDriver')
 
     monkeypatch.setattr(falkordb_driver.FalkorDriver, '__init__', _boom)
+    opened: list[FalkorDB] = []
+
+    class _RecordingFalkorDB(FalkorDB):
+        def __init__(self, **address: Any) -> None:
+            super().__init__(**address)
+            opened.append(self)
+
+    monkeypatch.setattr(falkor_read_only, 'FalkorDB', _RecordingFalkorDB)
     reader = ReadOnlyGraphReader(
         graph_name=unique_graph_name('6136_ro_seam'), host=FALKOR_HOST, port=FALKOR_PORT
     )
-    client = reader.guarded_graph().client
     try:
-        assert isinstance(client, FalkorDB)
+        assert isinstance(reader.guarded_graph(), ReadOnlyGraphProxy)
     finally:
-        await client.aclose()
+        await reader.aclose()
+    assert len(opened) == 1

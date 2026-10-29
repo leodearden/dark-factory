@@ -12,18 +12,18 @@ the reader has read anything. Nor may it go through the handles of
 
 :class:`ReadOnlyGraphProxy` makes the client-side guard load-bearing. The
 copies it replaces called ``assert_read_only_command(RO_COMMAND)``, a constant
-compared with itself, so the guard could never fire. The proxy asserts at the
-one seam where the choice of primitive is observable: every attribute a reader
-resolves on the handle passes through it, and a primitive mapped to a write
-command raises :class:`NonReadOnlyCommandError` before any byte reaches the
-store.
+compared with itself, so the guard could never fire. The proxy guards the one
+seam where the choice of primitive is observable, and it denies by default:
+it forwards only :data:`FORWARDED_ATTRIBUTES`, and resolving anything else on
+the handle (``query``, ``delete``, ``copy``, ``call_procedure``, every index
+and constraint primitive, and whatever falkordb adds next) raises
+:class:`NonReadOnlyCommandError` before any byte reaches the store.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import Any, TypedDict
 
 from falkordb.asyncio import FalkorDB
@@ -39,28 +39,21 @@ logger = logging.getLogger(__name__)
 
 RO_COMMAND = 'GRAPH.RO_QUERY'
 
-COMMAND_BY_PRIMITIVE = MappingProxyType({
-    'ro_query': 'GRAPH.RO_QUERY',
-    'query': 'GRAPH.QUERY',
-})
+FORWARDED_ATTRIBUTES = frozenset({'ro_query', 'name'})
 
 
 class NonReadOnlyCommandError(RuntimeError):
-    def __init__(self, command: str) -> None:
-        self.command = command
+    def __init__(self, primitive: str) -> None:
+        self.primitive = primitive
         super().__init__(
-            f'{command!r} refused: only {RO_COMMAND} may be issued through '
-            f'the read-only graph seam'
+            f'{primitive!r} refused: the read-only graph seam forwards only '
+            f'{sorted(FORWARDED_ATTRIBUTES)}, so nothing but {RO_COMMAND} can be '
+            f'issued through it'
         )
 
 
-def assert_read_only_command(command: str) -> None:
-    if command != RO_COMMAND:
-        raise NonReadOnlyCommandError(command)
-
-
 class ReadOnlyGraphProxy:
-    """A graph handle whose write primitive is refused and whose bookkeeping is forwarded untouched."""
+    """A graph handle that forwards the read primitive and the graph's name, and refuses everything else."""
 
     __slots__ = ('_graph',)
 
@@ -68,9 +61,8 @@ class ReadOnlyGraphProxy:
         self._graph = graph
 
     def __getattr__(self, name: str) -> Any:
-        command = COMMAND_BY_PRIMITIVE.get(name)
-        if command is not None:
-            assert_read_only_command(command)
+        if name not in FORWARDED_ATTRIBUTES:
+            raise NonReadOnlyCommandError(name)
         return getattr(self._graph, name)
 
 
@@ -177,9 +169,10 @@ def open_graph(
 class ReadOnlyGraphReader:
     """Reads one graph through the guarded handle, paged and census-proven or as one capped query.
 
-    An injected *graph* is wrapped at construction; otherwise the handle is
-    opened by :func:`open_graph` on the first read. A None paging knob means
-    the default in ``fused_memory/backends/graphiti_client.py``.
+    An injected *graph* is wrapped at construction and stays its caller's to
+    close; otherwise the handle is opened by :func:`open_graph` on the first
+    read and closed by :meth:`aclose`. A None paging knob means the default in
+    ``fused_memory/backends/graphiti_client.py``.
     """
 
     def __init__(
@@ -199,13 +192,23 @@ class ReadOnlyGraphReader:
         self._port = port
         self._page_size = _DEFAULT_READ_PAGE_SIZE if page_size is None else page_size
         self._resultset_size = _RESULTSET_SIZE if resultset_size is None else resultset_size
+        self._opened: Any | None = None
         self._guarded = None if graph is None else ReadOnlyGraphProxy(graph)
 
     def guarded_graph(self) -> ReadOnlyGraphProxy:
         if self._guarded is None:
-            graph = open_graph(self.graph_name, uri=self._uri, host=self._host, port=self._port)
-            self._guarded = ReadOnlyGraphProxy(graph)
+            self._opened = open_graph(
+                self.graph_name, uri=self._uri, host=self._host, port=self._port
+            )
+            self._guarded = ReadOnlyGraphProxy(self._opened)
         return self._guarded
+
+    async def aclose(self) -> None:
+        """Close the client this reader opened, if any; a later read opens a fresh one."""
+        if self._opened is None:
+            return
+        opened, self._opened, self._guarded = self._opened, None, None
+        await opened.client.aclose()
 
     async def read_paged(
         self, query: PagedQuery, *, params: dict[str, Any] | None = None

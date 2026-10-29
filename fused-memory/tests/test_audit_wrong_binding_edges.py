@@ -28,7 +28,7 @@ from fused_memory.backends.falkor_read_only import (
     RO_COMMAND,
     NonReadOnlyCommandError,
     PagedQuery,
-    assert_read_only_command,
+    ReadOnlyGraphProxy,
 )
 from fused_memory.backends.graphiti_client import PagedRead
 from fused_memory.utils.canonical_labels import Referent
@@ -1368,8 +1368,8 @@ class TestEdgeReader:
     async def test_only_the_read_only_command_is_ever_issued(self) -> None:
         """Behavioural, not just structural: the double's query() raises.
 
-        The direct ``assert_read_only_command`` call below proves the shared
-        guard RAISES; that every read ROUTES through it is pinned in
+        The ``ReadOnlyGraphProxy`` refusal below proves the shared guard
+        RAISES over this double; that every read ROUTES through it is pinned in
         ``tests/test_falkor_read_only.py``, against the guarded handle the
         shared reader hands to the paged primitive.
         """
@@ -1380,7 +1380,7 @@ class TestEdgeReader:
         assert graph.queries  # something was actually issued
         assert RO_COMMAND == 'GRAPH.RO_QUERY'
         with pytest.raises(NonReadOnlyCommandError, match='read-only'):
-            assert_read_only_command('GRAPH.QUERY')
+            _ = ReadOnlyGraphProxy(graph).query
 
 
 class TestReadTaskNodeIds:
