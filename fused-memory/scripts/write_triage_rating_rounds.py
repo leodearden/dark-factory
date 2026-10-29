@@ -471,7 +471,10 @@ class RatingScratch:
         }
         reask = []
         for row in rows:
-            entry = entries[_keyed_order(row)]
+            entry = entries.get(_keyed_order(row))
+            if entry is None:
+                raise ValueError(f'shard {row["batch"]}: keyed pair {_keyed_order(row)}'
+                                 ' is not in the current inputs')
             if problems := rating_problems(row, entry.child_text, entry.parent_text):
                 item_id = item_ids[row['batch'], *_keyed_order(row)]
                 reask.append(Reask(row, item_id, tuple(problems)))

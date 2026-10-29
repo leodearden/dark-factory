@@ -259,8 +259,7 @@ def _summary(
                           'items': len(spec['items']), 'brief_sha256': spec['brief_sha256']}
                    for name, spec in sorted(key['shards'].items())},
         'strata': inputs.strata,
-        'inputs': {'snapshot_sha256': inputs.snapshot_sha256,
-                   'live_slates_sha256': inputs.live_slates_sha256},
+        'inputs': inputs.digests(),
     }
 
 
@@ -290,6 +289,9 @@ class _Inputs:
             live_slates_sha256=hashlib.sha256(body).hexdigest(),
         )
 
+    def digests(self) -> dict[str, str]:
+        return {'snapshot_sha256': self.snapshot_sha256, 'live_slates_sha256': self.live_slates_sha256}
+
     def entries(self) -> dict[_rounds.Triple, _rounds.ShardEntry]:
         return {(entry.entry_id, entry.target_id, entry.basis): entry
                 for write in self.writes for entry in write.entries()}
@@ -308,8 +310,25 @@ class _Rounds:
 
     @classmethod
     def read(cls, args: argparse.Namespace) -> _Rounds:
+        """The rounds over the inputs *args* name, refused unless they are the inputs the key was built from.
+
+        A new key records the inputs' digests; ``shards`` saves them with its shards.
+        """
         scratch = _rounds.RatingScratch(args.scratch, brief=args.brief)
-        return cls(_Inputs.read(args.snapshot, args.live_slates), scratch, scratch.load_key())
+        inputs, key = _Inputs.read(args.snapshot, args.live_slates), scratch.load_key()
+        digests = inputs.digests()
+        keyed = key.get('inputs')
+        if keyed is None and key['shards']:
+            raise ValueError(f'{scratch.key_path} keys shards but records no inputs;'
+                             f' these inputs are {digests}')
+        if keyed is None:
+            key['inputs'] = keyed = digests
+        drifted = [f'{name} keyed {keyed.get(name)}, given {digest}'
+                   for name, digest in digests.items() if keyed.get(name) != digest]
+        if drifted:
+            raise ValueError('the inputs are not the ones the rounds were keyed from: '
+                             + '; '.join(drifted))
+        return cls(inputs, scratch, key)
 
     def finished(self) -> _rounds.Rated:
         """The effective Opus lines, refused while any awaits a re-ask or any pair lacks a rater.
