@@ -719,6 +719,37 @@ class TestRequeueReuseUnstacks:
         await _assert_clean_and_not_rebasing(lane)
         assert await warm_repo.ledger.base_of('task/M') == p_tip
 
+    async def test_cold_reattach_of_a_train_successor_keeps_its_stack(
+        self, repo: Repo,
+    ) -> None:
+        await _stack_p_and_m(repo)
+        p_tip = await repo.sha('task/P')
+        await _git(repo.root, 'worktree', 'remove', '--force', str(repo.wt('M')))
+        await repo.advance_main({'unrelated.txt': 'main moved\n'})
+
+        info = await repo.git_ops.create_worktree(
+            'M', train={'id': 'T', 'order': 1, 'members': ['P', 'M']},
+        )
+
+        assert info.path == repo.wt('M')
+        assert await repo.ledger.base_of('task/M') == p_tip
+        assert await _diff_vs_main(repo.root, 'task/M') == {
+            'shared.txt', 'p_only.txt', 'm.txt',
+        }
+
+    async def test_cold_reattach_of_a_train_anchor_is_unstacked(self, repo: Repo) -> None:
+        await _stack_p_and_m(repo)
+        await _git(repo.root, 'worktree', 'remove', '--force', str(repo.wt('M')))
+        await repo.advance_main({'unrelated.txt': 'main moved\n'})
+
+        info = await repo.git_ops.create_worktree(
+            'M', train={'id': 'T', 'order': 0, 'members': ['M']},
+        )
+
+        assert info.path == repo.wt('M')
+        assert await _diff_vs_main(repo.root, 'task/M') == {'m.txt'}
+        assert await repo.ledger.base_of('task/M') is None
+
 
 class TestUnstackResultInvariant:
     def test_unstacked_without_base_is_rejected(self) -> None:
