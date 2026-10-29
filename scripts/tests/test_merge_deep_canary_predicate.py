@@ -5,6 +5,7 @@ payload carries every fact and the events.duration_ms column stays NULL.
 """
 from __future__ import annotations
 
+import itertools
 import sqlite3
 import subprocess
 from datetime import UTC, datetime, timedelta
@@ -32,18 +33,69 @@ def _run(db_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _seed_verify(conn, ts: datetime, *, passed: bool, duration_ms=_ABSENT, chain_items: int = 2):
-    data = {'runner': 'local', 'passed': passed, 'chain_items': chain_items}
-    if duration_ms is not _ABSENT:
-        data['duration_ms'] = duration_ms
-    conn.seed_event(ts.isoformat(), 'merge_verify', data=data)
+_FRESH_SHA = object()
+_sha_serial = itertools.count()
+
+
+def _event(ts: datetime, event_type: str, data: dict[str, object], task_id: str | None = None) -> dict[str, object]:
+    """One events row as both make_runs_db and SeedingConnection.seed_event(**row) accept it."""
+    return {'timestamp': ts.isoformat(), 'event_type': event_type, 'task_id': task_id, 'data': data}
+
+
+def _verify_event(
+    ts: datetime,
+    *,
+    passed: object,
+    chain_items: object = 2,
+    runner: object = 'local',
+    duration_ms: object = 600_000,
+    merge_sha: object = _FRESH_SHA,
+    attempt: object = 0,
+    task_id: str | None = None,
+) -> dict[str, object]:
+    """A merge_verify row in VerifyRunnerPool.dispatch's payload shape; ``_ABSENT`` omits a key."""
+    fields = {
+        'runner': runner,
+        'merge_sha': f'sha-{next(_sha_serial)}' if merge_sha is _FRESH_SHA else merge_sha,
+        'passed': passed,
+        'duration_ms': duration_ms,
+        'attempt': attempt,
+        'chain_items': chain_items,
+    }
+    data = {key: value for key, value in fields.items() if value is not _ABSENT}
+    return _event(ts, 'merge_verify', data, task_id)
+
+
+def _finalized_event(ts: datetime, landed_via_chain: object) -> dict[str, object]:
+    return _event(ts, 'merge_finalized', {'state': 'done', 'landed_via_chain': landed_via_chain})
+
+
+def _healthy_round_events(
+    ts: datetime,
+    *,
+    runner: str = 'local',
+    deep_ms: int = 600_000,
+    baseline_ms: int | None = None,
+    task_id: str | None = None,
+    finalized_ts: datetime | None = None,
+) -> list[dict[str, object]]:
+    """A passed deep verify, its same-runner passed solo baseline a minute before, and its landing a minute after."""
+    return [
+        _verify_event(ts, passed=True, runner=runner, duration_ms=deep_ms, task_id=task_id),
+        _verify_event(
+            ts - timedelta(minutes=1), passed=True, chain_items=1, runner=runner,
+            duration_ms=deep_ms if baseline_ms is None else baseline_ms,
+        ),
+        _finalized_event(finalized_ts or ts + timedelta(minutes=1), landed_via_chain=2),
+    ]
+
+
+def _seed_verify(conn, ts: datetime, **fields):
+    conn.seed_event(**_verify_event(ts, **fields))
 
 
 def _seed_finalized(conn, ts: datetime, landed_via_chain: int):
-    conn.seed_event(
-        ts.isoformat(), 'merge_finalized',
-        data={'state': 'done', 'landed_via_chain': landed_via_chain},
-    )
+    conn.seed_event(**_finalized_event(ts, landed_via_chain))
 
 
 def _recent(i: int) -> datetime:
@@ -51,8 +103,8 @@ def _recent(i: int) -> datetime:
 
 
 def _seed_inside(conn, verify_ts: datetime, finalized_ts: datetime | None = None):
-    _seed_verify(conn, verify_ts, passed=True, duration_ms=600_000)
-    _seed_finalized(conn, finalized_ts or verify_ts + timedelta(minutes=1), landed_via_chain=2)
+    for event in _healthy_round_events(verify_ts, finalized_ts=finalized_ts):
+        conn.seed_event(**event)
 
 
 def _seed_intruder(conn, verify_ts: datetime, finalized_ts: datetime | None = None):
