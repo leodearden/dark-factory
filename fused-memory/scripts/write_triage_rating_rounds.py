@@ -184,19 +184,10 @@ def rating_problems(row: Mapping[str, Any], child_text: str, parent_text: str) -
     :func:`validate_rating` presumes a line that keeps it; any other line gets
     :func:`validate_rating`'s evidence problems.
     """
-    violation = _contract_violation(row)
+    violation = _rubric.row_violation(row)
     if violation is not None:
         return [violation]
     return validate_rating(row, child_text, parent_text)
-
-
-def _contract_violation(row: Mapping[str, Any]) -> str | None:
-    """The violation the rubric's ``resolve_judgements`` refuses *row* alone for; None if none."""
-    try:
-        _rubric.resolve_judgements([row])
-    except ValueError as exc:
-        return str(exc)
-    return None
 
 
 def effective_ratings(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:

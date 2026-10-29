@@ -76,7 +76,9 @@ class Role(StrEnum):
 
 
 RATER_ROLES = frozenset({Role.PRIMARY, Role.SECOND, Role.THIRD, Role.CROSS_FAMILY})
-"""The roles of a row a rater answered; only these rows carry evidence or non_consumed answers."""
+"""The roles of a row a rater answered; only these rows carry evidence or non_consumed answers.
+
+A cross_family row keeps the same contract but never votes: ``resolve_judgements`` refuses it."""
 
 
 class Resolved(StrEnum):
@@ -229,9 +231,12 @@ def resolve_judgements(rows: Iterable[Mapping[str, Any]]) -> Mapping[PairKey, Ju
     votes: defaultdict[PairKey, dict[str, tuple[int, Vote]]] = defaultdict(dict)
     for index, row in enumerate(rows):
         pair = (row.get('entry_id'), row.get('target_id'), row.get('basis'))
-        violation = _row_violation(row)
+        violation = row_violation(row)
         if violation is not None:
             raise ValueError(f'verdict row {index} on pair {pair}: {violation}')
+        if row['role'] == Role.CROSS_FAMILY:
+            raise ValueError(f'verdict row {index} on pair {pair}: role cross_family never votes'
+                             ' in a corpus; it is compared with the corpus, not counted in it')
         key = PairKey(row['entry_id'], row['target_id'], Basis(row['basis']))
         if row['rater'] in votes[key]:
             raise ValueError(
@@ -278,8 +283,12 @@ def _refuse_mixed_votes(key: PairKey, indexed: list[tuple[int, Vote]]) -> None:
             )
 
 
-def _row_violation(row: Mapping[str, Any]) -> str | None:
-    """The first rubric invariant *row* breaks, naming the offending value; None if none."""
+def row_violation(row: Mapping[str, Any]) -> str | None:
+    """The first rubric invariant *row* alone breaks, naming the offending value; None if none.
+
+    :func:`resolve_judgements` makes this check of every row before counting it;
+    a cross_family row, which is never counted, is checked here alone.
+    """
     missing = [key for key in _REQUIRED_KEYS if key not in row]
     if missing:
         return f'lacks {", ".join(missing)}'
