@@ -411,6 +411,8 @@ class BacklogPolicy:
         when ``queue.resolve()`` confirms the record reached a terminal status
         — reporting a close that did not happen would be the same silent rot
         this method exists to remove, merely relabelled as success.
+
+        The scan, reads and closes run in one ``asyncio.to_thread`` hop (INV-8).
         """
         project_root = self.project_root_for(project_id)
         if project_root is None:
@@ -420,6 +422,12 @@ class BacklogPolicy:
                 project_id,
             )
             return []
+        return await asyncio.to_thread(
+            self._close_pending_halt_records, project_root, project_id,
+        )
+
+    def _close_pending_halt_records(self, project_root: str, project_id: str) -> list[str]:
+        """Runs on a worker thread; touches no ``_PolicyState`` or ``self._lock``."""
         if not _HAS_ESCALATION or EscalationQueue is None:  # pragma: no cover
             logger.warning(
                 'backlog_policy: cannot close halt escalation for %s — '
