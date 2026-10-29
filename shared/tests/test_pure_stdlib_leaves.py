@@ -81,6 +81,7 @@ PURE_STDLIB_LEAVES = (
     'psi',
     'pytest_jobserver',
     'pytest_mark_grammar',
+    'python_env',
     'ratchet',
     'reify_checkout',
     'safe_io',
