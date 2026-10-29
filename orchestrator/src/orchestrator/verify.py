@@ -10853,7 +10853,10 @@ async def confirm_main_tip_failure_is_real(
     Cleanup (scoped ``git worktree remove --force`` + ``remove_tree``)
     always runs in a ``finally`` block; no broad ``git worktree prune`` (DD5
     guarantee — mirrors ``run_main_tip_sweep``/
-    ``verify_failure_is_preexisting_on_main``).
+    ``verify_failure_is_preexisting_on_main``). Before the re-runs it is
+    provisioned like the sweep's worktree (``_provision_main_tip_worktree``),
+    so a failure that only an unprovisioned environment produces is never
+    confirmed; it stays unseeded (cold).
 
     Node-id -> subproject mapping: module configs are freshly re-discovered
     on the probe worktree (never reused from *config* — that snapshot is for
@@ -10938,6 +10941,8 @@ async def confirm_main_tip_failure_is_real(
                 _sha_prefix,
             )
             return True
+
+        await _provision_main_tip_worktree(tmp_path, config, role='task')
 
         # Each subproject group gets its own scoped + forced-serial isolated
         # re-run. ALL groups must confirm green to suppress.
