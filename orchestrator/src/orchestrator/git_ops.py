@@ -8725,10 +8725,22 @@ class GitOps:
 
         Returns:
             True on success.  False (and logs at ERROR) if ``git checkout
-            --detach`` fails — the caller must NOT treat the branch as freed.
+            --detach`` fails, or if the WIP snapshot is refused — an
+            unmerged index (:class:`WorktreeConflictError`) or a failed
+            ``git commit`` — in which case the lane is left attached,
+            untouched.  On False the caller must NOT treat the branch as
+            freed.
         """
         # commit() returns None when the tree is already clean — fine.
-        await self.commit(lane, 'chore: save WIP before lane-checkout reconcile detach')
+        try:
+            await self.commit(lane, 'chore: save WIP before lane-checkout reconcile detach')
+        except RuntimeError as exc:
+            logger.error(
+                'detach_lane_checkout: WIP snapshot refused for %s (task %s) '
+                '— leaving the checkout attached: %s',
+                lane, bare_id, exc,
+            )
+            return False
 
         rc, _, err = await _run(['git', 'checkout', '--detach'], cwd=lane)
         if rc != 0:
