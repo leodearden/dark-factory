@@ -33,6 +33,7 @@ _SUCCESS_JSON = json.dumps({
 })
 
 _SELECTION_NAMES = ('VIRTUAL_ENV', 'UV_PROJECT_ENVIRONMENT', 'UV_RUN_RECURSION_DEPTH')
+_PATH_NAMED_BACKENDS = ('codex', 'gemini', 'pi')
 
 
 @dataclass(frozen=True)
@@ -62,7 +63,8 @@ def agent_child(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AgentChild:
     original_path = os.environ['PATH'].split(os.pathsep)
 
     fake_claude = tmp_bin / 'fake-claude'
-    _write_env_dumping_fake(fake_claude, _SUCCESS_JSON)
+    for script in (fake_claude, *(tmp_bin / name for name in _PATH_NAMED_BACKENDS)):
+        _write_env_dumping_fake(script, _SUCCESS_JSON)
 
     monkeypatch.setenv('VIRTUAL_ENV', str(orch_venv))
     monkeypatch.setenv('UV_PROJECT_ENVIRONMENT', str(orch_venv))
@@ -110,6 +112,7 @@ _SPAWN_PATHS = [
         SpawnPath('claude', 'opus', True, ['shared'], _bwrap_identity_sandbox),
         id='claude-sandboxed',
     ),
+    *(pytest.param(SpawnPath(name, 'm', False), id=name) for name in _PATH_NAMED_BACKENDS),
 ]
 
 
