@@ -154,7 +154,10 @@ info "Starting backing stores (FalkorDB + Qdrant)"
 mkdir -p "$REPO_ROOT/fused-memory/data/falkordb"
 mkdir -p "$REPO_ROOT/fused-memory/data/qdrant"
 
-docker compose -f "$COMPOSE_FILE" up -d falkordb qdrant
+# Through the AOF gate, never a bare compose-up: on a host that already has a
+# falkordb container, a compose-up recreates it onto whatever AOF is on disk
+# (task 6330). The gate creates it on a fresh host and refuses over stale data.
+python3 "$REPO_ROOT/scripts/falkordb_aof_gate.py" --compose-file "$COMPOSE_FILE"
 
 # Wait for healthy
 for i in $(seq 1 30); do

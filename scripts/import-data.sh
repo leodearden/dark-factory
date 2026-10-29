@@ -173,6 +173,17 @@ fi
 # ---------------------------------------------------------------------------
 info "Starting backing stores"
 
+# A new falkordb container boots with appendonly yes and loads ONLY the AOF,
+# ignoring dump.rdb (task 6330). export-data.sh's BGSAVE makes dump.rdb the
+# export's snapshot, so with no AOF manifest, or one older than dump.rdb, the
+# server would come up stale or empty. Refuse; bootstrapping is by hand.
+FALKOR_DATA="$REPO_ROOT/fused-memory/data/falkordb"
+FALKOR_AOF_MANIFEST="$FALKOR_DATA/appendonlydir/appendonly.aof.manifest"
+if [ -f "$FALKOR_DATA/dump.rdb" ] \
+  && { [ ! -f "$FALKOR_AOF_MANIFEST" ] || [ "$FALKOR_AOF_MANIFEST" -ot "$FALKOR_DATA/dump.rdb" ]; }; then
+  fail "FalkorDB: $FALKOR_DATA/dump.rdb has no AOF manifest at least as new, so starting it would load a stale or empty AOF. NOT starting the backing stores. Follow OPERATIONS.md \"Bootstrapping FalkorDB's AOF from dump.rdb\", then run the section-8 checks by hand."
+fi
+
 docker compose -f "$COMPOSE_FILE" up -d falkordb qdrant
 
 # Wait for healthy
