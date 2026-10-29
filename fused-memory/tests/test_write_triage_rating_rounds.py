@@ -372,6 +372,26 @@ class TestThirdRoundBlockers:
         assert _mod().third_round_blockers({'decided': _decided()}) == []
 
 
+class TestLossConsumingPairs:
+    def test_names_each_current_pair_resolving_home_yes_and_conflict_no(self) -> None:
+        kept = {'home': 'YES', 'conflict': 'NO', 'loss': 'NO'}
+        rows = [
+            _rated('agree', role='primary', **kept), _rated('agree', role='second', **kept),
+            _rated('third-resolved', role='primary', home='YES', conflict='YES'),
+            _rated('third-resolved', role='second', **kept),
+            _rated('third-resolved', role='third', home='YES', conflict='NO', loss='YES'),
+            _rated('conflict', role='primary', home='YES', conflict='YES'),
+            _rated('conflict', role='second', home='YES', conflict='YES'),
+            _rated('tied', role='primary', home='YES', conflict='YES'),
+            _rated('tied', role='second', **kept),
+            _rated('home-no', role='primary', home='NO', conflict='NO'),
+            _rated('home-no', role='second', home='NO', conflict='NO'),
+            _rated('attach', role='primary', basis='attach_time', **kept),
+            _rated('attach', role='second', basis='attach_time', **kept),
+        ]
+        assert _mod().loss_consuming_pairs(rows) == [('agree', 'p1'), ('third-resolved', 'p1')]
+
+
 class TestShard:
     def _shard(self) -> tuple[Any, str, str]:
         child = 'c' * 300 + 'tail of the child ' * 300

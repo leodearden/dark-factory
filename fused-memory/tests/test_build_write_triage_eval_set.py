@@ -292,6 +292,10 @@ def _home_unclear(_: dict[str, str]) -> dict[str, Any]:
     return {'home': 'UNCLEAR', 'conflict': 'NO', 'unclear_reason': 'cut at the subject'}
 
 
+def _home_no(_: dict[str, str]) -> dict[str, Any]:
+    return {'home': 'NO', 'conflict': 'NO'}
+
+
 def _home_only(_: dict[str, str]) -> dict[str, Any]:
     return {'home': 'NO'}
 
@@ -462,6 +466,123 @@ class TestTheRounds:
         assert not evalset.out.exists()
 
 
+THIRD_DECIDED_LOSS = ('o1', 'c')
+"""A pair whose CONFLICT tie a third rater broke NO, so its derivation reads LOSS."""
+THIRD_DECIDED_CONFLICT = ('o2', 'e')
+"""A pair whose CONFLICT tie a third rater broke YES, so its derivation never reads LOSS."""
+LOSS_CONSUMING = sorted([THIRD_DECIDED_LOSS, ('o1', 'd'), ('o2', 'P'), ('l1', 'f'), ('l1', 'g'),
+                         ('l2', 'Q'), ('l2', 'h')])
+
+
+def _rated_through_a_third_round(evalset: _EvalSet) -> None:
+    """Every shard rated: ('o1', 'a') reads CONFLICT YES, ('o1', 'b') HOME NO, and the two
+    third-decided pairs tie first; every other pair reads HOME YES and CONFLICT NO."""
+    evalset.rate({('primary', ('o1', 'a')): _conflict_yes, ('second', ('o1', 'a')): _conflict_yes,
+                  ('primary', ('o1', 'b')): _home_no, ('second', ('o1', 'b')): _home_no,
+                  ('primary', THIRD_DECIDED_LOSS): _conflict_yes,
+                  ('second', THIRD_DECIDED_LOSS): _conflict_no,
+                  ('primary', THIRD_DECIDED_CONFLICT): _conflict_yes,
+                  ('second', THIRD_DECIDED_CONFLICT): _kept})
+    assert evalset.run('third') == 0
+    evalset.rate({('third', THIRD_DECIDED_LOSS): _conflict_no,
+                  ('third', THIRD_DECIDED_CONFLICT): _conflict_yes})
+
+
+def _raters_by_pair(verdicts: list[dict[str, Any]]) -> dict[tuple[str, str], dict[str, str]]:
+    """Each pair's effective rater lines, as rater -> batch."""
+    by_pair: dict[tuple[str, str], dict[str, str]] = {}
+    for row in verdicts:
+        by_pair.setdefault((row['entry_id'], row['target_id']), {})[row['rater']] = row['batch']
+    return by_pair
+
+
+class TestTheRerate:
+    @pytest.fixture
+    def rerated(self, evalset: _EvalSet) -> _EvalSet:
+        _rated_through_a_third_round(evalset)
+        assert evalset.run('rerate', '--brief-version', 'v2.2') == 0
+        return evalset
+
+    def test_keys_a_new_round_of_both_raters_over_exactly_the_loss_consuming_pairs(
+        self, rerated: _EvalSet,
+    ) -> None:
+        key = rerated.key()
+        [rerate] = key['rerates']
+        assert rerate['pairs'] == [list(pair) for pair in LOSS_CONSUMING]
+        assert (rerate['version'], rerate['round']) == ('v2.2', 1)
+        assert rerate['brief_sha256'] == _sha256(_rounds().BRIEF_PATH)
+        assert rerate['retires_third_raters'] == ['opus-third-00']
+        for role in ('primary', 'second'):
+            specs = [key['shards'][name] for name in rerate['shards']
+                     if key['shards'][name]['role'] == role]
+            assert {(spec['rater'], spec['round']) for spec in specs} == {(f'opus-{role}', 1)}
+            assert sorted(_triple(key['items'][item])[:2]
+                          for spec in specs for item in spec['items']) == LOSS_CONSUMING
+        assert (rerated.scratch / 'rater_prompt.md').read_text() == _rounds().rater_prompt()
+
+    def test_the_rerate_supersedes_both_raters_and_retires_the_third_votes_on_its_pairs(
+        self, rerated: _EvalSet,
+    ) -> None:
+        rerated.rate({(role, pair): _loss_yes for role in ('primary', 'second')
+                      for pair in LOSS_CONSUMING})
+        assert rerated.assemble() == 0
+        rerate_shards = set(rerated.key()['rerates'][0]['shards'])
+        by_pair = _raters_by_pair(rerated.jsonl('verdicts.jsonl'))
+        for pair in LOSS_CONSUMING:
+            assert set(by_pair[pair]) == {'opus-primary', 'opus-second'}, pair
+            assert set(by_pair[pair].values()) <= rerate_shards, pair
+        assert by_pair[THIRD_DECIDED_CONFLICT] == {
+            'opus-primary': 'primary_00', 'opus-second': 'second_00', 'opus-third-00': 'third_00'}
+        assert rerated.summary()['reasked'] == 0
+
+    def test_a_tie_the_rerate_leaves_goes_to_a_fresh_third_rater(self, rerated: _EvalSet) -> None:
+        rerated.rate({('primary', THIRD_DECIDED_LOSS): _conflict_yes,
+                      ('second', THIRD_DECIDED_LOSS): _conflict_no})
+        assert rerated.run('third') == 0
+        key = rerated.key()
+        fresh = {name: spec for name, spec in key['shards'].items()
+                 if spec['role'] == 'third' and spec['rater'] != 'opus-third-00'}
+        assert [spec['rater'] for spec in fresh.values()] == ['opus-third-01']
+        assert {_triple(key['items'][item])[:2]
+                for spec in fresh.values() for item in spec['items']} == {THIRD_DECIDED_LOSS}
+        rerated.rate({('third', THIRD_DECIDED_LOSS): _kept})
+        assert rerated.assemble() == 0
+        assert set(_raters_by_pair(rerated.jsonl('verdicts.jsonl'))[THIRD_DECIDED_LOSS]) == {
+            'opus-primary', 'opus-second', 'opus-third-01'}
+
+    def test_a_rerun_keys_nothing_new_and_renders_a_deleted_shard_again(
+        self, rerated: _EvalSet,
+    ) -> None:
+        key_bytes, shard_files = (rerated.scratch / 'key.json').read_bytes(), rerated.shard_files()
+        (rerated.scratch / 'shards' / f'{rerated.key()["rerates"][0]["shards"][0]}.txt').unlink()
+        assert rerated.run('rerate', '--brief-version', 'v2.2') == 0
+        assert (rerated.scratch / 'key.json').read_bytes() == key_bytes
+        assert rerated.shard_files() == shard_files
+
+    def test_refuses_while_a_keyed_shard_has_no_ratings(self, evalset: _EvalSet) -> None:
+        evalset.rate({('primary', THIRD_DECIDED_LOSS): _conflict_yes,
+                      ('second', THIRD_DECIDED_LOSS): _conflict_no})
+        assert evalset.run('third') == 0
+        with pytest.raises(ValueError, match='no ratings'):
+            evalset.run('rerate', '--brief-version', 'v2.2')
+        assert 'rerates' not in evalset.key()
+
+    def test_refuses_a_brief_changed_since_its_rerate_was_keyed(self, rerated: _EvalSet) -> None:
+        key = rerated.key()
+        key['rerates'][0]['brief_sha256'] = '0' * 64
+        (rerated.scratch / 'key.json').write_text(json.dumps(key))
+        with pytest.raises(ValueError, match='brief'):
+            rerated.run('rerate', '--brief-version', 'v2.2')
+
+    def test_the_summary_records_each_rerate(self, rerated: _EvalSet) -> None:
+        rerated.rate()
+        assert rerated.assemble() == 0
+        assert rerated.summary()['rerates'] == [{
+            'version': 'v2.2', 'round': 1, 'pairs': len(LOSS_CONSUMING),
+            'brief_sha256': _sha256(_rounds().BRIEF_PATH),
+        }]
+
+
 class TestTheAssembledEvalSet:
     @pytest.fixture
     def assembled(self, evalset: _EvalSet) -> _EvalSet:
@@ -502,6 +623,7 @@ class TestTheAssembledEvalSet:
         assert summary['rating_volume'] == {'current': {'primary': 10, 'second': 10}}
         assert summary['reasked'] == 0
         assert set(summary['shards']) == set(assembled.key()['shards'])
+        assert summary['rerates'] == []
         assert summary['strata'] == {'offline-write-time': 2, 'live-solar_challenge': 760,
                                      'live-solar_challenge_platform': 553}
         _, snapshot_sha = _freeze().load_snapshot(assembled.snapshot)
