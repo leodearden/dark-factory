@@ -67,9 +67,18 @@ from shared.task_metadata import Milestone, Recurrence
 from fused_memory.middleware.metadata_dict import raw_metadata_dict
 
 __all__ = [
+    'DETERMINISTIC_ROUTING_HINT',
     'deterministic_task_error',
     'inject_task_kind',
 ]
+
+DETERMINISTIC_ROUTING_HINT = (
+    "This is likely task_kind='deterministic' work, which has no commit "
+    'requirement: point metadata.before_done at a committed script for a '
+    'scripted action, or set metadata.always_escalates=True for a human gate. '
+    'If a code deliverable really is intended, declare at least one '
+    'committable path in metadata.files.'
+)
 
 _VALID_KINDS: frozenset[str] = frozenset({'normal', 'deterministic'})
 

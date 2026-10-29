@@ -98,6 +98,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from fused_memory.middleware.deterministic_task_guard import DETERMINISTIC_ROUTING_HINT
 from fused_memory.middleware.metadata_dict import raw_metadata_dict
 
 # ---------------------------------------------------------------------------
@@ -332,6 +333,63 @@ def extract_files(metadata: str | dict[str, Any] | None) -> list[str]:
     return [f for f in files if isinstance(f, str)]
 
 
+_DIRECTORY_HINT = (
+    'Replace each directory with the specific file paths it contains, '
+    'or use files=[] (the defer-to-architect value) to leave scope '
+    'unspecified. Directory strings in metadata.files are rejected '
+    'because they create over-wide lock charters that block unrelated '
+    'work in the same directory. '
+    'Note: extension matching is case-sensitive against a lowercase '
+    'allowlist (e.g. "README.MD" or "config.YAML" is classified as a '
+    'directory — use lowercase extensions like "README.md" instead). '
+    'If the offending path has NO extension at all, "replace it with '
+    'the files it contains" may be unfollowable because it IS a file '
+    '(e.g. "hooks/project-checks"): an extension-less final segment '
+    'counts as a file only when its exact name is listed in '
+    'EXTENSIONLESS_FILENAMES. If it is a genuinely new extension-less '
+    'tracked file, add its name to EXTENSIONLESS_FILENAMES in BOTH '
+    'shared/src/shared/locking.py and '
+    'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, '
+    'AND to reify scripts/lock-charter-guard.sh _EXTLESS (all three '
+    'must agree — the Tier-2 --list-extensionless drift guard goes RED '
+    'otherwise), plus the _CANONICAL_EXTENSIONLESS vector in both test '
+    'copies.'
+)
+
+
+def _has_extension(path: str) -> bool:
+    """True iff *path* is not slash-terminated and its final segment contains a dot."""
+    return not path.endswith('/') and '.' in path.rsplit('/', 1)[-1]
+
+
+def _unrecognised_extension_error(paths: list[str]) -> str:
+    path_list = ', '.join(repr(p) for p in paths)
+    return (
+        f' {path_list} may instead be a FILE whose extension is not on the '
+        'allowlist; if it is gitignored, files=[] will not help, because a '
+        "task_kind='normal' task cannot deliver a gitignored file — file such "
+        "work as task_kind='deterministic' (see hint)."
+    )
+
+
+def _unrecognised_extension_hint(paths: list[str]) -> str:
+    path_list = ', '.join(repr(p) for p in paths)
+    return (
+        f' {path_list} may be a FILE whose extension is not on the '
+        'FILE_EXTENSIONS allowlist. A gitignored file can never be committed, '
+        "so a task_kind='normal' task cannot deliver it, and files=[] only "
+        f'hands the same failure to the architect. {DETERMINISTIC_ROUTING_HINT} '
+        'Whatever the task_kind, leave a gitignored path out of '
+        'metadata.files: this check classifies it as a directory either way. '
+        'If it is instead a TRACKED file, add its extension to FILE_EXTENSIONS '
+        'in BOTH shared/src/shared/locking.py and '
+        'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, AND to '
+        'reify scripts/lock-charter-guard.sh _EXTS (the Tier-2 '
+        '--list-extensions drift guard goes RED otherwise), plus the '
+        '_CANONICAL_EXTENSIONS vector in both test copies.'
+    )
+
+
 def lock_charter_error(
     directories: list[str],
     task_id: str | None = None,
@@ -339,7 +397,8 @@ def lock_charter_error(
     """Return a structured LockCharterViolation error dict.
 
     Shape mirrors ``_done_gate_error`` / ``PathGuardVerdict.to_error_dict``
-    so MCP callers handle it uniformly.
+    so MCP callers handle it uniformly.  ``unrecognised_extension_paths``
+    lists the rejected paths that carry an extension, i.e. may be files.
 
     Args:
         directories: The offending directory-like path strings.
@@ -348,35 +407,21 @@ def lock_charter_error(
     """
     task_clause = f' (task {task_id})' if task_id else ''
     dir_list = ', '.join(repr(d) for d in directories)
+    unrecognised = [d for d in directories if _has_extension(d)]
+    error = (
+        f'metadata.files contains directory declarations{task_clause}: '
+        f'{dir_list}. '
+        f'Declare individual file paths (e.g. "src/foo.py") or use '
+        f'files=[] to defer scope to the architect.'
+    )
+    hint = _DIRECTORY_HINT
+    if unrecognised:
+        error += _unrecognised_extension_error(unrecognised)
+        hint += _unrecognised_extension_hint(unrecognised)
     return {
-        'error': (
-            f'metadata.files contains directory declarations{task_clause}: '
-            f'{dir_list}. '
-            f'Declare individual file paths (e.g. "src/foo.py") or use '
-            f'files=[] to defer scope to the architect.'
-        ),
+        'error': error,
         'error_type': 'LockCharterViolation',
         'directory_paths': directories,
-        'hint': (
-            'Replace each directory with the specific file paths it contains, '
-            'or use files=[] (the defer-to-architect value) to leave scope '
-            'unspecified. Directory strings in metadata.files are rejected '
-            'because they create over-wide lock charters that block unrelated '
-            'work in the same directory. '
-            'Note: extension matching is case-sensitive against a lowercase '
-            'allowlist (e.g. "README.MD" or "config.YAML" is classified as a '
-            'directory — use lowercase extensions like "README.md" instead). '
-            'If the offending path has NO extension at all, "replace it with '
-            'the files it contains" may be unfollowable because it IS a file '
-            '(e.g. "hooks/project-checks"): an extension-less final segment '
-            'counts as a file only when its exact name is listed in '
-            'EXTENSIONLESS_FILENAMES. If it is a genuinely new extension-less '
-            'tracked file, add its name to EXTENSIONLESS_FILENAMES in BOTH '
-            'shared/src/shared/locking.py and '
-            'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, '
-            'AND to reify scripts/lock-charter-guard.sh _EXTLESS (all three '
-            'must agree — the Tier-2 --list-extensionless drift guard goes RED '
-            'otherwise), plus the _CANONICAL_EXTENSIONLESS vector in both test '
-            'copies.'
-        ),
+        'unrecognised_extension_paths': unrecognised,
+        'hint': hint,
     }
