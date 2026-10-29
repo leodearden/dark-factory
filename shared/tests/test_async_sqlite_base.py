@@ -933,6 +933,9 @@ class _ScanGate:
             raise TimeoutError('scan_gate was never released')
         return value
 
+    async def wait_parked(self) -> None:
+        await asyncio.wait_for(self.parked.wait(), timeout=_GATE_HANG_GUARD_SECS)
+
     def release(self) -> None:
         self._released.set()
 
@@ -990,7 +993,7 @@ async def _collide_with_a_pinned_read(
     async with asyncio.TaskGroup() as tasks:
         reader = tasks.create_task(read())
         try:
-            await asyncio.wait_for(gate.parked.wait(), timeout=_GATE_HANG_GUARD_SECS)
+            await gate.wait_parked()
             writer = tasks.create_task(_sqlite_error_name(write))
             await foreign.execute("UPDATE items SET v = 'foreign' WHERE id = 'foreign'")
             await foreign.commit()
@@ -1472,7 +1475,7 @@ class TestAtomicConnectionClose:
     @staticmethod
     async def _cancel_close_in_its_checkpoint(access: AtomicConnection, gate: _ScanGate) -> None:
         closing = asyncio.create_task(access.close())
-        await asyncio.wait_for(gate.parked.wait(), timeout=_GATE_HANG_GUARD_SECS)
+        await gate.wait_parked()
         closing.cancel()
         with pytest.raises(asyncio.CancelledError):
             await closing
