@@ -22,6 +22,7 @@ from _shadow_report_seed import (
 )
 from shared.project_layout import runs_db
 
+from orchestrator.evals.results import ResultStore
 from orchestrator.evals.shadow_report import (
     LineTag,
     ReportLine,
@@ -239,6 +240,23 @@ class TestResultMissing:
         untouched = _line(report, _OTHER)
         assert (untouched.result_missing, untouched.pairs) == ((), 1)
         assert LineTag.RESULT_MISSING not in untouched.tags
+
+    @pytest.mark.asyncio
+    async def test_a_result_whose_metrics_do_not_read_back_is_missing(self, project):
+        cell = seed_scored_cell(project)
+        assert cell.result_path is not None
+
+        def unknown_reference_kind(raw: dict) -> dict:
+            raw['metrics']['reference_kind'] = 'merged'
+            return raw
+
+        ResultStore(project.results_dir).rewrite(cell.result_path, unknown_reference_kind)
+
+        report = await _report(project)
+
+        [gap] = _line(report, CANDIDATE).result_missing
+        assert (gap.cell_id, 'merged' in gap.detail) == (cell.cell_id, True)
+        assert report.complete is False
 
 
 @pytest.mark.asyncio
