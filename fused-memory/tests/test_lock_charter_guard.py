@@ -13,6 +13,10 @@ from pathlib import Path
 import pytest
 import shared.reify_checkout as reify_checkout
 
+from fused_memory.middleware.gitignored_deliverable_guard import (
+    GitignoredDeliverableFinding,
+    gitignored_deliverable_reject,
+)
 from fused_memory.middleware.lock_charter_guard import (
     EXTENSIONLESS_FILENAMES,
     FILE_EXTENSIONS,
@@ -1178,6 +1182,48 @@ class TestLockCharterError:
         result = lock_charter_error(['orchestrator/'])
         assert 'error' in result
         assert result['error_type'] == 'LockCharterViolation'
+
+    @pytest.mark.parametrize(
+        'path',
+        ['tasks.db', '.taskmaster/tasks/tasks.db', 'data/x.sqlite', '.env'],
+    )
+    def test_unrecognised_extension_rejection_names_deterministic_routing(self, path):
+        assert directory_locks([path]) == [path]
+
+        result = lock_charter_error([path])
+
+        assert result['unrecognised_extension_paths'] == [path]
+        assert "task_kind='deterministic'" in result['error']
+        assert "task_kind='deterministic'" in result['hint']
+        assert path in result['hint']
+        assert 'FILE_EXTENSIONS' in result['hint']
+
+    def test_unrecognised_extension_hint_carries_the_gitignored_guard_routing(self):
+        gitignored_hint = gitignored_deliverable_reject(
+            GitignoredDeliverableFinding(ignored_paths=('tasks.db',))
+        )['hint']
+
+        assert gitignored_hint in lock_charter_error(['tasks.db'])['hint']
+
+    @pytest.mark.parametrize(
+        'path',
+        ['crates/', 'orchestrator/', 'src', 'crates/reify-eval/src', 'hooks/some-new-hook', 'tasks.db/'],
+    )
+    def test_genuine_directory_rejection_omits_deterministic_routing(self, path):
+        assert directory_locks([path]) == [path]
+
+        result = lock_charter_error([path])
+
+        assert result['unrecognised_extension_paths'] == []
+        assert 'deterministic' not in result['error']
+        assert 'deterministic' not in result['hint']
+
+    def test_mixed_rejection_lists_only_the_unrecognised_extension_paths(self):
+        result = lock_charter_error(['crates/', 'tasks.db'])
+
+        assert result['directory_paths'] == ['crates/', 'tasks.db']
+        assert result['unrecognised_extension_paths'] == ['tasks.db']
+        assert "task_kind='deterministic'" in result['hint']
 
 
 class TestSkipUnlessCheckout:
