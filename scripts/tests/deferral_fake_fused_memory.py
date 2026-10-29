@@ -1,10 +1,11 @@
-"""An in-process fused-memory MCP server for the deferral scripts' suites.
+"""A fused-memory MCP server, served over a real socket, for the deferral scripts' suites.
 
 A plain module rather than a conftest fixture, the same convention as
 ``legibility_task_store_fake``: conftest appends this directory to
-``sys.path``, so the test files import it by bare name. ``FakeFusedMemory.post``
-has the ``httpx.post`` signature ``legibility.census_trigger.post_mcp_envelope``
-calls, so a test installs it with ``install_fake_httpx(fake.post)``.
+``sys.path``, so the test files import it by bare name. ``FakeFusedMemory.answer``
+is a ``shared.testing_mcp_stub`` tool handler, so a test serves a fake with
+``StubMcpServer(stateful=False, tools=fake.answer)``. A suite that must hand
+out the url before it builds its fake uses :class:`FakeFusedMemoryServer`.
 
 ``set_task_status`` emulates β's guarded re-stamp (``restamp_only``) through
 the shared model: ``task_deferral.parse_request`` decides every pure refusal,
@@ -17,6 +18,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from types import TracebackType
 from typing import Any
 
 from shared.task_deferral import (
@@ -30,22 +32,9 @@ from shared.task_deferral import (
     record_to_json,
     stamp,
 )
+from shared.testing_mcp_stub import StubMcpServer
 
 METADATA_LOOKUP_LIMIT_CAP = 100
-
-
-class FakeResponse:
-    def __init__(self, body: dict[str, Any]) -> None:
-        self._body = body
-        self.status_code = 200
-        self.headers = {'content-type': 'application/json'}
-        self.text = repr(body)
-
-    def json(self) -> dict[str, Any]:
-        return self._body
-
-    def raise_for_status(self) -> None:
-        return None
 
 
 def _metadata(row: Mapping[str, Any]) -> Any:
@@ -88,13 +77,11 @@ class FakeFusedMemory:
     def calls_to(self, tool: str) -> list[dict[str, Any]]:
         return [arguments for name, arguments in self.calls if name == tool]
 
-    def post(self, url: str, *, json: dict[str, Any], headers: Mapping[str, str], timeout: float) -> FakeResponse:
-        params = json['params']
-        tool, arguments = params['name'], copy.deepcopy(params['arguments'])
-        self.calls.append((tool, arguments))
-        return FakeResponse(
-            {'jsonrpc': '2.0', 'id': json.get('id'), 'result': {'structuredContent': self._answer(tool, arguments)}}
-        )
+    def answer(self, tool: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        """Record one ``tools/call`` and return the reply fused-memory would give."""
+        recorded = copy.deepcopy(dict(arguments))
+        self.calls.append((tool, recorded))
+        return self._answer(tool, recorded)
 
     def _answer(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
         root = arguments.get('project_root')
@@ -213,3 +200,41 @@ def _invalid(task_id: int, reason: DeferralInvalidReason, field: str, value: obj
         'field': field,
         'value': value,
     }
+
+
+class FakeFusedMemoryServer:
+    """A stateless MCP server answering through whichever FakeFusedMemory was served last.
+
+    It listens before any fake exists, so a store or a CLI run can be handed
+    :attr:`url` first. Until :meth:`serve` is called, every ``tools/call``
+    answers ``isError``.
+    """
+
+    def __init__(self) -> None:
+        self._fake: FakeFusedMemory | None = None
+        self._server = StubMcpServer(stateful=False, tools=self._answer)
+
+    def __enter__(self) -> FakeFusedMemoryServer:
+        self._server.__enter__()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self._server.close()
+
+    @property
+    def url(self) -> str:
+        return self._server.url
+
+    def serve(self, fake: FakeFusedMemory) -> FakeFusedMemory:
+        self._fake = fake
+        return fake
+
+    def _answer(self, tool: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        if self._fake is None:
+            raise LookupError('no FakeFusedMemory is served')
+        return self._fake.answer(tool, arguments)

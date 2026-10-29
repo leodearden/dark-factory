@@ -10,7 +10,8 @@ boundary test §8.8.
 Every stage is injected through :func:`run_nightly` (``selector``,
 ``digest_builder``, ``invoke`` for the LLM, ``committer`` for git,
 ``census_launcher`` and ``status_fetcher`` for the census, ``poster`` for
-escalation, ``recorder``/``retry_recorder`` for run state). Each seam
+the alarm (:func:`alarm.raise_alarm`), ``recorder``/``retry_recorder`` for
+run state). Each seam
 resolves ``None`` to its real implementation, so a production entrypoint
 that injects nothing still gets the real thing rather than nothing at all
 (task 4148). This is what the
@@ -43,6 +44,7 @@ if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from legibility import (  # noqa: E402
+    alarm,
     census_trigger,
     codebook,
     coder,
@@ -351,157 +353,6 @@ def _git_status_changed(repo: Path | str, relpath: Path | str, *, runner=None) -
 
 
 # ---------------------------------------------------------------------------
-# escalation — fail-loud contract (PRD decision 8): best-effort escalate_info
-# ---------------------------------------------------------------------------
-
-_ESCALATION_TOOL_NAME = 'escalate_info'
-_ESCALATION_AGENT_ROLE = 'legibility-trickle'
-_ESCALATION_CATEGORY = 'infra_issue'
-_ESCALATION_SEVERITY = 'info'
-
-
-def _build_escalation_arguments(cfg: LegibilityConfig, summary: str, detail: str) -> dict:
-    """Build the ``escalate_info`` MCP tool arguments (PRD decision 8): a
-    synthetic ``task_id`` labels the trickle as the source since it is a
-    timer-driven agent, not a Taskmaster task."""
-    return {
-        'task_id': f'legibility-trickle-{cfg.project_id}',
-        'agent_role': _ESCALATION_AGENT_ROLE,
-        'category': _ESCALATION_CATEGORY,
-        'severity': _ESCALATION_SEVERITY,
-        'summary': summary,
-        'detail': detail,
-    }
-
-
-def _default_poster(url: str, envelope: dict) -> None:
-    """Post *envelope* to *url* over the MCP streamable-HTTP transport.
-
-    Delegates to ``census_trigger.post_mcp_envelope``, which single-sources
-    the whole transport contract for this subsystem: the required
-    Accept/Content-Type pair, the session handshake, and response-body
-    decoding. Raises on any network/HTTP failure; :func:`post_escalation`
-    wraps this best-effort.
-
-    Why this is not a bare POST any more (task 3644): the escalation server
-    is a STATEFUL streamable-HTTP server. A session-less ``tools/call`` is
-    rejected at the transport layer, before the tool ever runs, with
-    ``400 Bad Request`` / ``"Missing session ID"`` -- and with
-    :func:`post_escalation` swallowing that best-effort, EVERY trickle
-    fail-loud escalation (extractor crash, coder storm, commit failure) was
-    silently dropped. ``post_mcp_envelope`` performs the
-    ``initialize`` -> ``notifications/initialized`` handshake on that 400 and
-    retries once, and decodes the SSE-framed reply that server then sends.
-
-    Keeps returning None and discarding the decoded body: the caller only
-    needs "did it land", and preserving the ``(url, envelope) -> None`` seam
-    signature keeps every injected ``poster=`` in the test suite working.
-    """
-    census_trigger.post_mcp_envelope(url, envelope, timeout=10.0)
-
-
-def post_escalation(
-    cfg: LegibilityConfig, summary: str, detail: str, *, poster=None,
-    level: int = logging.ERROR,
-) -> bool:
-    """Best-effort escalate_info POST for a fail-loud trigger (PRD decision
-    8): extractor crash, coder storm, or commit failure.
-
-    Also used by the exit-0 notices that are NOT fail-loud triggers, which
-    pass ``level=logging.WARNING``: budget suppression, the barren streak,
-    the deletion directive, and (task 4736) the CAPPED-night deferral. The
-    level rule is exactly that — ERROR iff this escalation is itself the
-    fail-loud trigger returning ``exit_code=1``, WARNING iff it deliberately
-    leaves the exit code untouched.
-
-    JOURNALS THE PAIR FIRST, AT *level*, BEFORE ANYTHING ELSE HAPPENS.
-    That single line is the contract this function now carries: EVERY
-    escalation this module posts is written to the journal here, at the
-    call site's severity, before the envelope is built and before the POST
-    is attempted. Two properties fall out of putting it here rather than
-    at each of the six call sites, and neither survives a per-branch log
-    call:
-
-    * A future fail-loud branch CANNOT FORGET IT. The log sits on the only
-      path to the POST, so a new branch inherits journal visibility by
-      construction rather than by whoever adds it remembering.
-    * A DOWN ESCALATION SERVER NO LONGER COSTS THE DIAGNOSIS. On
-      2026-08-18 (esc-legibility-trickle-reify-3) the only copy of
-      "coder storm: 6/6 digests failed ... [Errno 2] No such file or
-      directory: claude" lived inside the archived escalation JSON, while
-      ``journalctl --user -u legibility-trickle@reify.service`` showed
-      nothing but an unexplained benign 400 and ``status=1/FAILURE``.
-      Ordering the write BEFORE the POST is what makes the reason durable
-      independent of whether the POST lands.
-
-    *level* IS THE RULE, AND IT IS ABOUT THIS ESCALATION, NOT THE NIGHT:
-    ERROR iff this escalation is ITSELF the fail-loud trigger returning
-    ``exit_code=1``, WARNING iff it deliberately leaves the exit code
-    untouched (the run may still fail LATER, for an unrelated reason). The
-    four decision-8 fail-loud branches take the ERROR default and pass
-    nothing, so the cannot-forget property above is untouched. The three
-    exit-0 sites -- the budget-suppression door, the barren streak and the
-    deletion-directive aggregate -- pass ``logging.WARNING``, because each
-    deliberately leaves ``exit_code=0`` (a non-zero exit would make
-    ``check_trickle_liveness.sh`` fail every night for a timer that is
-    running perfectly, and an ERROR journal line is a weaker version of
-    that same false alarm). Tying the level to what THIS escalation does
-    to the exit code is what keeps ``journalctl -p err`` a list of ACTUAL
-    trickle failures rather than a mixed feed a healthy-but-barren timer
-    also appears in.
-
-    The rule is DELIBERATELY NOT stated as "matches the unit's own systemd
-    ``Result``", which reads tighter but is false in two directions -- so
-    a future maintainer must not "fix" a WARNING site to match an observed
-    ``Result=failed``. :func:`_escalate_barren_streak` is reached through
-    :func:`_record_trickle_progress` from ``run_nightly``'s ``finally``
-    block, so a night that crashes, storms or fails its commit AND has hit
-    the streak posts a WARNING escalation on a unit that reports failure.
-    The deletion-directive aggregate posts at WARNING before execution can
-    still fall into the validation-failure or commit-failure branch below
-    it and exit 1. Both WARNINGs are correct: neither escalation is why
-    the night failed, and the branch that IS why logs its own ERROR here.
-
-    *detail* is logged IN FULL -- never truncated, never ``repr()``-ed.
-    ``census_trigger._bounded_repr`` is this package's precedent for
-    bounding text before a log sink and is deliberately not reused:
-    clipping the aggregate reason is precisely the defect this closes.
-    The ``'%s -- %s'`` grammar is carried verbatim from the two call sites
-    that already logged it, so the journal line shape (and any operator
-    grep keyed on it) is unchanged; no prefix is added because every
-    summary already begins with "legibility trickle".
-
-    Posts an MCP ``tools/call`` JSON-RPC envelope for tool
-    ``escalate_info`` to ``http://localhost:<cfg.escalation_port>/mcp``
-    (via *poster*, default :func:`_default_poster`). NEVER raises: any
-    failure (poster exception, network error) is logged as a warning and
-    swallowed, returning False -- a down escalation server must not mask
-    the underlying failure, since the caller's non-zero exit code is the
-    authoritative loud signal regardless of whether this POST succeeded.
-    Returns True on a successful post.
-    """
-    logger.log(level, '%s -- %s', summary, detail)
-    poster_fn = poster if poster is not None else _default_poster
-    url = f'http://localhost:{cfg.escalation_port}/mcp'
-    arguments = _build_escalation_arguments(cfg, summary, detail)
-    envelope = {
-        'jsonrpc': '2.0',
-        'id': 1,
-        'method': 'tools/call',
-        'params': {'name': _ESCALATION_TOOL_NAME, 'arguments': arguments},
-    }
-    try:
-        poster_fn(url, envelope)
-        return True
-    except Exception as exc:  # noqa: BLE001 - best-effort, never propagate
-        logger.warning(
-            'legibility trickle: escalation post failed (best-effort, run '
-            'still exits non-zero): %s', exc,
-        )
-        return False
-
-
-# ---------------------------------------------------------------------------
 # evaluate_census_step — census trigger (ζ) evaluation + best-effort launch
 # ---------------------------------------------------------------------------
 
@@ -761,7 +612,7 @@ class _NightSeams:
 
     invoke: Callable[[str, str], str] | None
     status_fetcher: Callable[[], Any] | None
-    poster: Callable[[str, dict], None]
+    poster: alarm.Poster | None
     committer: Callable[..., unlanded.CommitResult]
     recorder: _Recorder
     retry_recorder: _RetryRecorder
@@ -777,7 +628,7 @@ class _NightSeams:
         return cls(
             invoke=invoke,
             status_fetcher=status_fetcher,
-            poster=poster if poster is not None else _default_poster,
+            poster=poster,
             committer=committer if committer is not None else unlanded.commit_only,
             recorder=recorder if recorder is not None else trickle_state.write_night,
             retry_recorder=(
@@ -806,7 +657,7 @@ class AlarmKind(StrEnum):
 
     @property
     def level(self) -> int:
-        """The journal level :func:`post_escalation` logs this alarm at:
+        """The journal level :func:`alarm.raise_alarm` logs this alarm at:
         ERROR iff the alarm is itself why the night failed, WARNING when it
         leaves the exit code alone."""
         return logging.ERROR if self in _NIGHT_FAILING_ALARMS else logging.WARNING
@@ -1026,7 +877,10 @@ def _raise_alarm(
     cfg: LegibilityConfig, kind: AlarmKind, summary: str, detail: str, *, poster,
 ) -> Alarm:
     """Post one alarm of *kind* at its own journal level; never raises."""
-    landed = post_escalation(cfg, summary, detail, poster=poster, level=kind.level)
+    landed = alarm.raise_alarm(
+        alarm.AlarmProject.of(cfg), alarm.AlarmSource.TRICKLE, summary, detail,
+        level=kind.level, poster=poster,
+    )
     return Alarm(kind=kind, summary=summary, landed=landed)
 
 
@@ -1466,12 +1320,14 @@ def run_nightly(
         )
     else:
         raise ValueError('run_nightly requires either config_path or project_id')
-    result = _run_configured_nightly(
-        cfg, resolved_config_path, seams,
-        projects_root=projects_root, target_date=target_date, now=now,
-        pass_kind=pass_kind, max_barren_runs=max_barren_runs,
-    )
-    logger.info('%s', result.journal_line())
+    project = alarm.AlarmProject.of(cfg)
+    with alarm.fail_loud_boundary(alarm.AlarmSource.TRICKLE, project, poster=seams.poster):
+        result = _run_configured_nightly(
+            cfg, resolved_config_path, seams,
+            projects_root=projects_root, target_date=target_date, now=now,
+            pass_kind=pass_kind, max_barren_runs=max_barren_runs,
+        )
+        logger.info('%s', result.journal_line())
     return result
 
 
@@ -1542,9 +1398,9 @@ def _run_configured_nightly(
     alarms: list[Alarm] = []
 
     def raise_alarm(kind: AlarmKind, summary: str, detail: str) -> Alarm:
-        alarm = _raise_alarm(cfg, kind, summary, detail, poster=seams.poster)
-        alarms.append(alarm)
-        return alarm
+        raised = _raise_alarm(cfg, kind, summary, detail, poster=seams.poster)
+        alarms.append(raised)
+        return raised
 
     sample = _nothing_sampled()
     try:

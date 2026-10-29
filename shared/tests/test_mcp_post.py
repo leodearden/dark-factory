@@ -28,6 +28,7 @@ from shared.mcp_post import (
     check_mcp_post_response,
     decode_mcp_response_body,
     mcp_endpoint_url,
+    mcp_server_base,
     mcp_tool_call_payload,
     open_mcp_client,
     post_mcp_tool_call,
@@ -94,6 +95,29 @@ def test_endpoint_url_matches_the_form_mcp_json_declares():
         assert mcp_endpoint_url(base) == url, (
             f'helper must reproduce the declared endpoint {url!r} exactly'
         )
+
+
+_SERVER_BASE = 'http://127.0.0.1:8102'
+
+
+@pytest.mark.parametrize(
+    'endpoint_url',
+    ['http://127.0.0.1:8102/mcp', 'http://127.0.0.1:8102/mcp/', _SERVER_BASE],
+)
+def test_server_base_drops_the_mcp_endpoint_path(endpoint_url):
+    """The endpoint form, with or without its trailing slash, maps to the base.
+
+    A bare base already has no endpoint path, so it passes through unchanged.
+    """
+    assert mcp_server_base(endpoint_url) == _SERVER_BASE
+
+
+@pytest.mark.parametrize(
+    'endpoint_url',
+    ['http://127.0.0.1:8102/mcp', 'http://127.0.0.1:8102/mcp/', _SERVER_BASE],
+)
+def test_server_base_is_the_inverse_of_endpoint_url(endpoint_url):
+    assert mcp_endpoint_url(mcp_server_base(endpoint_url)) == f'{_SERVER_BASE}/mcp'
 
 
 # ---------------------------------------------------------------------------

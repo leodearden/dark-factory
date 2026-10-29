@@ -814,20 +814,18 @@ def test_find_missing_transcripts_finding_carries_bound_claude_session_id(tmp_pa
     assert by_slug["sess-lost-unbound"].claude_launch_session_id is None
 
 
-def test_build_escalation_arguments_names_bound_claude_session_id(tmp_path):
-    cfg = load_config(_write_config(tmp_path, project_id="proj_a"))
+def test_the_posted_detail_names_the_bound_claude_session_id(tmp_path):
     finding = _missing_finding(claude_session_id=_LOST_SESSION_ID)
 
-    args = mod._build_escalation_arguments([finding], cfg, force_persistence_ok=None)
+    args = _posted_arguments(tmp_path, [finding])
 
     assert _LOST_SESSION_ID in args["detail"]
 
 
-def test_build_escalation_arguments_names_bound_launch_session_id(tmp_path):
-    cfg = load_config(_write_config(tmp_path, project_id="proj_a"))
+def test_the_posted_detail_names_the_bound_launch_session_id(tmp_path):
     finding = _missing_finding(claude_launch_session_id=_LOST_LAUNCH_SESSION_ID)
 
-    args = mod._build_escalation_arguments([finding], cfg, force_persistence_ok=None)
+    args = _posted_arguments(tmp_path, [finding])
 
     assert _LOST_LAUNCH_SESSION_ID in args["detail"]
 
@@ -960,7 +958,7 @@ def test_payload_exports_force_persistence_false_for_quoted_echo():
 
 
 # ---------------------------------------------------------------------------
-# step-11/12: escalation envelope + best-effort poster
+# step-11/12: the transcript-loss alarm, best-effort
 # ---------------------------------------------------------------------------
 
 def _missing_finding(
@@ -983,80 +981,32 @@ def _missing_finding(
 
 
 class _RecordingPoster:
-    """A fake poster capturing (url, envelope) calls (never posts anything)."""
+    """A fake poster capturing (url, arguments) calls (never posts anything)."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
 
-    def __call__(self, url: str, envelope: dict) -> None:
-        self.calls.append((url, envelope))
+    def __call__(self, url: str, arguments) -> None:
+        self.calls.append((url, dict(arguments)))
 
 
-class _FakeHttpxResponse:
-    """A 200 `application/json` reply with an empty JSON-RPC body.
-
-    `status_code`, `headers` and `json()` were added for task 3644:
-    `_default_poster` now delegates to `census_trigger.post_mcp_envelope`,
-    which reads `status_code` (to detect the stateful escalation server's 400
-    "Missing session ID") and `content-type` (to detect an SSE-framed body)
-    before decoding. Without them this fake would die on an AttributeError
-    and stop exercising the real code path -- so the task-2953 header
-    contract below keeps being asserted against the transport that actually
-    ships, not against a fake the implementation has outgrown."""
-
-    status_code = 200
-    headers = {"content-type": "application/json"}
-
-    def raise_for_status(self):
-        pass
-
-    def json(self):
-        return {}
-
-
-def test_default_poster_sends_streamable_http_accept_headers(install_fake_httpx):
-    """Task 2953: the streamable-HTTP MCP transport 406s any tools/call POST
-    lacking an Accept header covering both application/json and
-    text/event-stream (verified live against a local MCP /mcp endpoint).
-    `_default_poster`'s httpx import is lazy, but httpx IS importable here --
-    a direct dependency of `shared` (shared/pyproject.toml, `httpx>=0.27`,
-    task 2965) -- so an un-faked call would really hit the network. The
-    shared `install_fake_httpx` fixture substitutes a stub so the outbound
-    request shape is assertable independent of any live listener.
-    Mirrors nightly.py's identical test for its own `_default_poster`."""
-    captured_kwargs = {}
-
-    def _fake_post(url, **kwargs):
-        captured_kwargs.update(kwargs)
-        return _FakeHttpxResponse()
-
-    install_fake_httpx(_fake_post)
-
-    mod._default_poster('http://localhost:8199/mcp', {'jsonrpc': '2.0'})
-
-    headers = captured_kwargs.get('headers') or {}
-    assert 'application/json' in headers.get('Accept', '')
-    assert 'text/event-stream' in headers.get('Accept', '')
-    # Content-Type is part of the same transport contract -- pin it too so a
-    # future edit dropping it can't pass on the Accept assertions alone.
-    assert headers.get('Content-Type') == 'application/json'
-    # The envelope must still ride along unchanged on the same POST.
-    assert captured_kwargs.get('json') == {'jsonrpc': '2.0'}
-
-
-def test_build_escalation_arguments_shape(tmp_path):
+def _posted_arguments(tmp_path, findings, **kwargs) -> dict:
+    """The escalate_info arguments post_findings posts for *findings* (project proj_a)."""
     cfg = load_config(_write_config(tmp_path, project_id="proj_a"))
+    poster = _RecordingPoster()
+    assert mod.post_findings(cfg, findings, poster=poster, **kwargs) is True
+    [(_url, arguments)] = poster.calls
+    return arguments
+
+
+def test_the_posted_alarm_names_every_lost_session(tmp_path):
     findings = [
         _missing_finding("sess-lost-1", "/home/leo/src/dark-factory/.worktrees/2701"),
         _missing_finding("sess-lost-2", "/home/leo/src/dark-factory/.worktrees/2702"),
     ]
 
-    args = mod._build_escalation_arguments(findings, cfg, force_persistence_ok=None)
+    args = _posted_arguments(tmp_path, findings)
 
-    assert args["task_id"] == "legibility-transcript-check-proj_a"
-    assert args["agent_role"] == "legibility-transcript-check"
-    assert args["category"] == "infra_issue"
-    assert args["severity"] == "info"
     # summary names the count of missing transcripts.
     assert "2" in args["summary"]
     # detail names each finding's slug AND cwd.
@@ -1066,7 +1016,19 @@ def test_build_escalation_arguments_shape(tmp_path):
     assert "/home/leo/src/dark-factory/.worktrees/2702" in args["detail"]
 
 
-def test_post_findings_posts_envelope_and_returns_true(tmp_path):
+@pytest.mark.parametrize(("force_persistence_ok", "verdict"), [(True, "present"), (False, "MISSING")])
+def test_the_posted_detail_carries_the_preventer_verdict(tmp_path, force_persistence_ok, verdict):
+    args = _posted_arguments(
+        tmp_path, [_missing_finding()], force_persistence_ok=force_persistence_ok,
+    )
+
+    assert (
+        "preventer guard (CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 in spawn-claude.sh): "
+        f"{verdict}"
+    ) in args["detail"]
+
+
+def test_post_findings_posts_the_arguments_and_returns_true(tmp_path):
     cfg = load_config(_write_config(tmp_path, project_id="proj_a", escalation_port=8271))
     findings = [_missing_finding()]
     poster = _RecordingPoster()
@@ -1075,21 +1037,19 @@ def test_post_findings_posts_envelope_and_returns_true(tmp_path):
 
     assert ok is True
     assert len(poster.calls) == 1
-    url, envelope = poster.calls[0]
-    assert url == "http://localhost:8271/mcp"
-    # A JSON-RPC tools/call envelope for the escalate_info tool.
-    assert envelope["jsonrpc"] == "2.0"
-    assert envelope["method"] == "tools/call"
-    assert envelope["params"]["name"] == "escalate_info"
-    assert envelope["params"]["arguments"]["agent_role"] == "legibility-transcript-check"
-    assert envelope["params"]["arguments"]["task_id"] == "legibility-transcript-check-proj_a"
+    url, arguments = poster.calls[0]
+    assert url == "http://localhost:8271"
+    assert arguments["task_id"] == "legibility-transcript-check-proj_a"
+    assert arguments["agent_role"] == "legibility-transcript-check"
+    assert arguments["category"] == "infra_issue"
+    assert arguments["severity"] == "info"
 
 
 def test_post_findings_best_effort_swallows_poster_exception(tmp_path):
     cfg = load_config(_write_config(tmp_path))
     findings = [_missing_finding()]
 
-    def _raising(url: str, envelope: dict) -> None:
+    def _raising(url: str, arguments) -> None:
         raise RuntimeError("escalation server down")
 
     # Best-effort contract: a raising poster -> False, never propagates.
@@ -1257,8 +1217,8 @@ def test_run_check_enriches_escalation_detail_with_preventer_verdict(tmp_path):
     assert result.exit_code == 1
     assert result.force_persistence_ok is False
     assert len(poster.calls) == 1
-    _url, envelope = poster.calls[0]
-    detail = envelope["params"]["arguments"]["detail"]
+    _url, arguments = poster.calls[0]
+    detail = arguments["detail"]
     assert "preventer guard" in detail
     # The verdict for a missing token is the loud 'MISSING' marker.
     assert "MISSING" in detail
@@ -1302,142 +1262,3 @@ def test_read_spawn_script_unreadable_returns_empty(tmp_path):
     a_dir = tmp_path / "a_dir"
     a_dir.mkdir()
     assert mod._read_spawn_script(a_dir) == ""
-
-
-# ---------------------------------------------------------------------------
-# task 3644: the transcript-loss alarm must survive a STATEFUL server
-# ---------------------------------------------------------------------------
-#
-# Same defect as nightly.py's and census.py's posters: `_default_poster`
-# bare-POSTed `tools/call`, the escalation server rejects it at the transport
-# layer with `400 Bad Request` / "Missing session ID" (captured live
-# 2026-08-05), and `post_findings` swallows that best-effort and returns
-# False -- so the transcript-loss alarm never reached anyone. Fixed by the
-# same single-sourced transport in census_trigger.
-
-
-class _FakeStatefulResponse:
-    """An `httpx.Response` stand-in for the stateful-server handshake."""
-
-    def __init__(self, *, status_code=200, headers=None, payload=None, text=""):
-        self.status_code = status_code
-        self.headers = headers or {}
-        self.text = text
-        self._payload = payload
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            # A plain RuntimeError, not httpx.HTTPStatusError: the shared
-            # install_fake_httpx stub exposes only `post` and pytest.fails on
-            # any other attribute (task 3376).
-            raise RuntimeError(f"HTTP {self.status_code}")
-
-    def json(self):
-        if self._payload is None:
-            raise ValueError("response has no JSON body")
-        return self._payload
-
-
-def _stateful_escalation_post(recorded, *, session_id="sid-transcript"):
-    """A fake `httpx.post` behaving like the STATEFUL escalation server:
-    session-less `tools/call` -> 400; `initialize` -> 200 + the assigned id
-    as a response header; `notifications/initialized` -> 202; `tools/call`
-    WITH that header -> 200."""
-    def _post(url, **kwargs):
-        recorded.append((url, kwargs))
-        envelope = kwargs.get("json") or {}
-        method = envelope.get("method")
-        if method == "initialize":
-            return _FakeStatefulResponse(
-                headers={"mcp-session-id": session_id,
-                         "content-type": "application/json"},
-                payload={"jsonrpc": "2.0", "id": 1, "result": {}},
-            )
-        if method == "notifications/initialized":
-            return _FakeStatefulResponse(status_code=202)
-        if (kwargs.get("headers") or {}).get("mcp-session-id") != session_id:
-            return _FakeStatefulResponse(
-                status_code=400,
-                headers={"content-type": "application/json"},
-                payload={"jsonrpc": "2.0", "id": "server-error",
-                         "error": {"code": -32600,
-                                   "message": "Bad Request: Missing session ID"}},
-            )
-        return _FakeStatefulResponse(
-            headers={"content-type": "application/json"},
-            payload={"jsonrpc": "2.0", "id": 1,
-                     "result": {"structuredContent": {"id": "esc-11", "status": "queued"}}},
-        )
-
-    return _post
-
-
-def _recording_delete(deleted):
-    """A fake `httpx.delete` recording the MCP session-termination call the
-    transport makes after a handshake, so the long-lived escalation server does
-    not leak a session per transcript-loss alarm."""
-    def _delete(url, **kwargs):
-        deleted.append((url, kwargs))
-        return _FakeStatefulResponse(status_code=200)
-
-    return _delete
-
-
-def test_post_findings_lands_against_a_stateful_server(tmp_path, install_fake_httpx):
-    """The DEFAULT poster (no `poster=` injection) must handshake and land.
-
-    `post_findings` -- NOT `post_escalation`; this module's escalation
-    entrypoint takes a `Sequence[MissingTranscript]` -- so a minimal non-empty
-    findings list is what reaches the POST."""
-    cfg = load_config(_write_config(tmp_path, project_id="proj_a"))
-    recorded = []
-    deleted = []
-    install_fake_httpx(
-        _stateful_escalation_post(recorded), delete=_recording_delete(deleted),
-    )
-
-    assert mod.post_findings(cfg, [_missing_finding("sess-lost-1")]) is True
-
-    methods = [(kwargs.get("json") or {}).get("method") for _url, kwargs in recorded]
-    assert methods == [
-        "tools/call", "initialize", "notifications/initialized", "tools/call",
-    ]
-    # The retried call carries the server-assigned session id...
-    assert (recorded[-1][1].get("headers") or {}).get("mcp-session-id") == "sid-transcript"
-    # ...and is still the escalate_info the alarm meant to file.
-    params = (recorded[-1][1].get("json") or {})["params"]
-    assert params["name"] == "escalate_info"
-    assert "sess-lost-1" in params["arguments"]["detail"]
-    # ...and the session opened to file it is released again.
-    assert [(kw.get("headers") or {}).get("mcp-session-id") for _u, kw in deleted] == [
-        "sid-transcript"
-    ]
-
-
-def test_post_findings_reports_false_on_a_tool_error_envelope(
-    tmp_path, install_fake_httpx, caplog
-):
-    """HTTP 200 is not success. `post_findings` discards the response body and
-    reports True on "no exception", so a tool-level failure
-    (`result.isError: true`) would otherwise read as a landed alarm -- the same
-    green-on-paper/nothing-filed failure task 3644 exists to close, one layer
-    up from the transport."""
-    cfg = load_config(_write_config(tmp_path, project_id="proj_a"))
-
-    def _post(url, **kwargs):
-        return _FakeStatefulResponse(
-            headers={"content-type": "application/json"},
-            payload={"jsonrpc": "2.0", "id": 1, "result": {
-                "isError": True,
-                "content": [{"type": "text", "text": "unknown category 'nope'"}],
-            }},
-        )
-
-    install_fake_httpx(_post)
-
-    with caplog.at_level(logging.WARNING):
-        assert mod.post_findings(cfg, [_missing_finding("sess-lost-1")]) is False
-
-    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert any("escalation post failed" in m for m in warned), warned
-    assert any("isError" in m or "reported an error" in m for m in warned), warned
