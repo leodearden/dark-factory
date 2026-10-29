@@ -126,8 +126,9 @@ class TestSelectDoneTransitions:
     def test_done_transition_is_frozen(self):
         transition = DoneTransition(task_id='1', commit=None)
 
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            transition.commit = MERGE_SHA  # type: ignore[misc]
+        for field in dataclasses.fields(transition):
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(transition, field.name, MERGE_SHA)
 
 
 class TestMentionsPath:
@@ -234,8 +235,11 @@ class TestUnlandedPathCheckResult:
         }
 
     def test_is_frozen(self):
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            UnlandedPathCheckResult.empty().checked = 1  # type: ignore[misc]
+        result = UnlandedPathCheckResult.empty()
+
+        for field in dataclasses.fields(result):
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(result, field.name, 1)
 
 
 # ── check_unlanded_path_claims against a real merged repo ───────────────────
@@ -344,7 +348,7 @@ async def test_clean_merge_costs_no_memory_reads(repo: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_commitless_and_non_merge_transitions_are_skipped(repo: Path) -> None:
-    seed = git(repo, 'rev-list', '--max-parents=0', 'HEAD')
+    seed = git(repo, 'rev-parse', 'HEAD')
     memory = FakeMemoryService({'201': {'m1': INCIDENT_GUARD}, '202': {'m2': INCIDENT_GUARD}})
     events = [
         _status('201', 'done', {'kind': 'operational-verified', 'evidence': 'ran it'}),

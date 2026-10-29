@@ -152,7 +152,7 @@ async def test_clean_branch_is_analyzed_with_nothing_unlanded(repo: Path) -> Non
 
 @pytest.mark.asyncio
 async def test_non_merge_commit_is_not_a_merge(repo: Path) -> None:
-    seed = git(repo, 'rev-list', '--max-parents=0', 'HEAD')
+    seed = git(repo, 'rev-parse', 'HEAD')
 
     probe = await _probe(repo, seed)
 
@@ -185,7 +185,7 @@ def test_probe_and_unlanded_path_are_frozen() -> None:
     item = UnlandedPath(path=INCIDENT_GUARD, branch_commits=('a' * 40,))
     probe = UnlandedPathsProbe(outcome=ProbeOutcome.ANALYZED, merge_commit='b' * 40, unlanded=(item,))
 
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        item.path = 'other.py'  # type: ignore[misc]
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        probe.outcome = ProbeOutcome.UNKNOWN  # type: ignore[misc]
+    for frozen in (item, probe):
+        for field in dataclasses.fields(frozen):
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(frozen, field.name, None)
