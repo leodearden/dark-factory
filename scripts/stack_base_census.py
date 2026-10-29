@@ -48,7 +48,7 @@ from shared.git_async import run_git
 from shared.project_layout import default_project_root
 from shared.task_statuses import TERMINAL
 
-TASK_BRANCH_PREFIX = 'task/'
+_TASK_BRANCH_PREFIX = 'task/'
 _HEADS = 'refs/heads/'
 _REBASE_FINISH = re.compile(r'^rebase \(finish\): \S+ onto (?P<base>[0-9a-f]{40})$')
 _CREATED_FROM = 'branch: Created from '
@@ -81,7 +81,7 @@ class CensusGitError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class ReflogEntry:
+class _ReflogEntry:
     sha: str
     subject: str
 
@@ -99,15 +99,15 @@ class StackingEvent:
 
 
 @dataclass(frozen=True)
-class TaskBranch:
+class _TaskBranch:
     """An unlanded ``task/<id>`` branch; ``task_id`` is None unless ``<id>`` is a number."""
 
     name: str
     task_id: int | None
 
     @classmethod
-    def parse(cls, name: str) -> TaskBranch:
-        suffix = name.removeprefix(TASK_BRANCH_PREFIX)
+    def parse(cls, name: str) -> _TaskBranch:
+        suffix = name.removeprefix(_TASK_BRANCH_PREFIX)
         numeric = suffix.isascii() and suffix.isdigit()
         return cls(name=name, task_id=int(suffix) if numeric else None)
 
@@ -163,7 +163,7 @@ class _Snapshot:
     main_commits: frozenset[str]
     tips: Mapping[str, str]
     dag: Mapping[str, tuple[str, ...]]
-    reflogs: Mapping[str, tuple[ReflogEntry, ...]]
+    reflogs: Mapping[str, tuple[_ReflogEntry, ...]]
     recorded: frozenset[str]
 
 
@@ -186,7 +186,7 @@ async def _main_commits(repo_root: Path, main_sha: str) -> frozenset[str]:
 async def _unlanded_tips(repo_root: Path, main_sha: str) -> dict[str, str]:
     out = await _read(
         repo_root, 'for-each-ref', f'--no-merged={main_sha}',
-        '--format=%(refname) %(objectname)', f'{_HEADS}{TASK_BRANCH_PREFIX}',
+        '--format=%(refname) %(objectname)', f'{_HEADS}{_TASK_BRANCH_PREFIX}',
     )
     tips: dict[str, str] = {}
     for line in out.splitlines():
@@ -212,11 +212,11 @@ async def _unlanded_dag(
     return dag
 
 
-async def _reflog(repo_root: Path, branch: str) -> tuple[ReflogEntry, ...]:
+async def _reflog(repo_root: Path, branch: str) -> tuple[_ReflogEntry, ...]:
     """*branch*'s reflog, newest first."""
     out = await _read(repo_root, 'reflog', 'show', '--format=%H%x09%gs', f'{_HEADS}{branch}')
     entries = (line.partition('\t') for line in out.splitlines() if line.strip())
-    return tuple(ReflogEntry(sha=sha.strip(), subject=subject) for sha, _, subject in entries)
+    return tuple(_ReflogEntry(sha=sha.strip(), subject=subject) for sha, _, subject in entries)
 
 
 async def _recorded_branches(repo_root: Path) -> frozenset[str]:
@@ -250,7 +250,7 @@ async def _snapshot(repo_root: Path, main_branch: str) -> _Snapshot:
 class _Evidence:
     """What stage 1 alone says about one branch."""
 
-    branch: TaskBranch
+    branch: _TaskBranch
     task_status: str | None
     tip: str
     events: tuple[StackingEvent, ...]
@@ -279,7 +279,7 @@ def _ancestry(dag: Mapping[str, tuple[str, ...]], start: str) -> frozenset[str]:
     return frozenset(seen)
 
 
-def contained_siblings(snapshot: _Snapshot, branch: str) -> tuple[str, ...]:
+def _contained_siblings(snapshot: _Snapshot, branch: str) -> tuple[str, ...]:
     """Other unlanded task branches whose tip is a strict ancestor of *branch*'s, sorted.
 
     A sibling at the very same commit is no evidence either way: neither
@@ -292,8 +292,8 @@ def contained_siblings(snapshot: _Snapshot, branch: str) -> tuple[str, ...]:
     ))
 
 
-def stacking_events(
-    reflog: Sequence[ReflogEntry], main_commits: frozenset[str],
+def _stacking_events(
+    reflog: Sequence[_ReflogEntry], main_commits: frozenset[str],
 ) -> tuple[StackingEvent, ...]:
     """Every move of the branch onto an off-main commit, newest first."""
     found = (_event_at(reflog, index) for index in range(len(reflog)))
@@ -302,7 +302,7 @@ def stacking_events(
     )
 
 
-def _event_at(reflog: Sequence[ReflogEntry], index: int) -> StackingEvent | None:
+def _event_at(reflog: Sequence[_ReflogEntry], index: int) -> StackingEvent | None:
     entry = reflog[index]
     rebased = _REBASE_FINISH.match(entry.subject)
     if rebased is not None:
@@ -315,9 +315,9 @@ def _event_at(reflog: Sequence[ReflogEntry], index: int) -> StackingEvent | None
 
 def _evidence(snapshot: _Snapshot, statuses: Mapping[int, str], name: str) -> _Evidence:
     """A contained sibling is explained when any stacking event's base reaches it."""
-    branch = TaskBranch.parse(name)
-    events = stacking_events(snapshot.reflogs[name], snapshot.main_commits)
-    contained = contained_siblings(snapshot, name)
+    branch = _TaskBranch.parse(name)
+    events = _stacking_events(snapshot.reflogs[name], snapshot.main_commits)
+    contained = _contained_siblings(snapshot, name)
     explained: set[str] = set()
     for event in events:
         explained |= _ancestry(snapshot.dag, event.base)
@@ -470,7 +470,7 @@ async def _live_owners(census_run: _CensusRun, branch: str, base: str) -> tuple[
 
 
 def _stacked_onto(snapshot: _Snapshot, name: str, base: str) -> bool:
-    events = stacking_events(snapshot.reflogs.get(name, ()), snapshot.main_commits)
+    events = _stacking_events(snapshot.reflogs.get(name, ()), snapshot.main_commits)
     return any(event.base == base for event in events)
 
 
@@ -668,7 +668,7 @@ def load_task_statuses(db_path: Path) -> dict[int, str]:
 # Rendering
 # ---------------------------------------------------------------------------
 
-ACTIONABLE = (Verdict.CONFIRMED, Verdict.STRANDED_BASE, Verdict.UNADJUDICATED)
+_ACTIONABLE = (Verdict.CONFIRMED, Verdict.STRANDED_BASE, Verdict.UNADJUDICATED)
 _NOT_ACTIONABLE = (Verdict.ALREADY_CLEAN, Verdict.RECORDED, Verdict.INERT)
 
 
@@ -687,7 +687,7 @@ def render_markdown(
         '| verdict | branches |',
         '|---|---|',
         *(f'| {verdict} | {len(_with(report, verdict))} |' for verdict in (
-            *ACTIONABLE, *_NOT_ACTIONABLE,
+            *_ACTIONABLE, *_NOT_ACTIONABLE,
         )),
         '',
         '## Actionable findings',
@@ -706,7 +706,7 @@ def _with(report: CensusReport, verdict: Verdict) -> tuple[BranchFinding, ...]:
 
 
 def _actionable_sections(report: CensusReport) -> list[str]:
-    actionable = [finding for finding in report.findings if finding.verdict in ACTIONABLE]
+    actionable = [finding for finding in report.findings if finding.verdict in _ACTIONABLE]
     if not actionable:
         return ['None.', '']
     return [line for finding in actionable for line in _finding_section(report, finding)]
