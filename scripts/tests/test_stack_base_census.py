@@ -275,7 +275,7 @@ async def test_an_owner_rebased_since_still_owns_the_base_by_patch(repo: Path) -
     p_tip = rev(repo, 'task/P')
     advance_main(repo, {'unrelated.txt': 'u\n'})
     rebase(p_wt, 'main')
-    assert git(repo, 'merge-base', 'task/P', p_tip) != p_tip
+    assert git(repo, 'for-each-ref', f'--contains={p_tip}', 'refs/heads/task/P') == ''
 
     finding = findings_of(await census_of(repo))['task/M']
 
