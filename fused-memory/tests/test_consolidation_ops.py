@@ -409,19 +409,27 @@ class TestAPeerThatCannotBeTaggedIsNamed:
         assert M1 not in _patched_ids(svc)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('value', [1, 'true'])
-    async def test_a_non_bool_canonical_peer_is_tagged_not_refused(self, value):
-        """Only the bool True claims canonical, so such a peer is ordinary."""
+    @pytest.mark.parametrize(
+        'metadata',
+        [{'topic': TOPIC, 'canonical': 1}, {'topic': TOPIC, 'canonical': 'true'}, None],
+        ids=['canonical-int-1', 'canonical-string-true', 'metadata-null'],
+    )
+    async def test_a_peer_without_the_bool_marker_is_tagged_not_refused(
+        self, metadata
+    ):
+        """Only the bool True claims canonical, so such a peer is ordinary —
+        including a row whose metadata is not a mapping at all, which
+        degrades to "not canonical" rather than raising out of the arm."""
         svc = make_service()
         read = svc.get_memory_by_id.side_effect
 
-        async def _get_with_non_bool_canonical(*args, **kwargs):
+        async def _get_with_peer_metadata(*args, **kwargs):
             row = await read(*args, **kwargs)
             if row['id'] == M1:
-                row['metadata']['canonical'] = value
+                row['metadata'] = metadata
             return row
 
-        svc.get_memory_by_id.side_effect = _get_with_non_bool_canonical
+        svc.get_memory_by_id.side_effect = _get_with_peer_metadata
 
         result = await call_execute(svc)
 

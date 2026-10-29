@@ -32,6 +32,7 @@ _CANONICAL_CASES: list[tuple[object, bool, str]] = [
     ('canonical', False, 'a string is not a metadata mapping'),
     ([('canonical', True)], False, 'pairs are not a Mapping'),
     (1, False, 'an int is not a metadata mapping'),
+    (object(), False, 'an arbitrary object'),
 ]
 
 
@@ -39,10 +40,6 @@ class TestCanonicalMarkerPredicate:
     @pytest.mark.parametrize(('meta', 'expected', 'why'), _CANONICAL_CASES)
     def test_predicate_verdicts(self, meta, expected, why):
         assert is_canonical(meta) is expected, f'{meta!r}: {why}'
-
-    def test_non_mapping_input_is_false_without_raising(self):
-        for meta in (None, True, 'canonical', [('canonical', True)], 1, object()):
-            assert is_canonical(meta) is False
 
 
 class TestOnePredicateOneObject:
