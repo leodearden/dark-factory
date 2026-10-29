@@ -1,17 +1,19 @@
 """Pin the FalkorDB plan shape of the Cypher graphiti issues.
 
 ``spy_on_queries`` captures the Cypher a live driver issues, ``explain`` asks
-FalkorDB how it would plan one captured query, and ``non_leaf_scans`` reads the
-structured plan for scans that re-execute once per input row.
+FalkorDB how it would plan one captured query, ``non_leaf_scans`` reads the
+structured plan for scans that re-execute once per input row, and
+``scan_operators`` lists every scan the plan runs.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any
 
 from _query_recorder import IssuedQuery
 from falkordb.asyncio.graph import AsyncGraph
-from falkordb.execution_plan import ExecutionPlan
+from falkordb.execution_plan import ExecutionPlan, Operation
 from graphiti_core.driver.driver import GraphDriver
 
 
@@ -33,13 +35,23 @@ async def explain(graph: AsyncGraph, query: IssuedQuery) -> ExecutionPlan:
     return await graph.explain(query.cypher, params)
 
 
-def non_leaf_scans(plan: ExecutionPlan) -> list[str]:
-    """Scan operators that have children; each is re-executed once per input row."""
-    found: list[str] = []
+def _operations(plan: ExecutionPlan) -> Iterator[Operation]:
     pending = [plan.structured_plan]
     while pending:
         operation = pending.pop()
-        if operation.name.endswith('Scan') and operation.children:
-            found.append(operation.name)
+        yield operation
         pending.extend(operation.children)
-    return found
+
+
+def non_leaf_scans(plan: ExecutionPlan) -> list[str]:
+    """Scan operators that have children; each is re-executed once per input row."""
+    return [
+        operation.name
+        for operation in _operations(plan)
+        if operation.name.endswith('Scan') and operation.children
+    ]
+
+
+def scan_operators(plan: ExecutionPlan) -> list[str]:
+    """Every scan operator in *plan*, leaf or not."""
+    return [operation.name for operation in _operations(plan) if operation.name.endswith('Scan')]

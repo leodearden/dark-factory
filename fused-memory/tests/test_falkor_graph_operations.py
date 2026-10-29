@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import inspect
 import pathlib
+import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -29,6 +30,7 @@ from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.driver.graph_operations.graph_operations import GraphOperationsInterface
 from graphiti_core.edges import EntityEdge, EpisodicEdge
 from graphiti_core.embedder import EmbedderClient
+from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
 from graphiti_core.search import search_utils
 from graphiti_core.utils import bulk_utils
@@ -307,3 +309,141 @@ def test_override_signature_matches_graph_operations_interface(method: str) -> N
     assert inspect.signature(getattr(FalkorGraphOperations, method)) == inspect.signature(
         getattr(GraphOperationsInterface, method)
     )
+
+
+# --- Edge get by uuid(s) -------------------------------------------------------
+
+# One row shaped like graphiti's FalkorDB edge projection (get_entity_edge_return_query).
+CANNED_EDGE_RECORD: dict[str, Any] = {
+    'uuid': 'edge-uuid',
+    'source_node_uuid': 'source-uuid',
+    'target_node_uuid': 'target-uuid',
+    'group_id': 'g',
+    'created_at': '2026-10-29T00:00:00+00:00',
+    'name': 'RELATES_TO',
+    'fact': 'alpha beta',
+    'episodes': ['ep'],
+    'expired_at': None,
+    'valid_at': '2026-10-28T00:00:00+00:00',
+    'invalid_at': None,
+    'attributes': {'confidence': 'high'},
+}
+SECOND_EDGE_RECORD: dict[str, Any] = {
+    **CANNED_EDGE_RECORD,
+    'uuid': 'second-edge-uuid',
+    'fact': 'gamma delta',
+}
+
+
+def match_pattern(cypher: str) -> str:
+    """The text between MATCH and the first WITH, from which FalkorDB plans its scans."""
+    return cypher.split('MATCH', 1)[1].split('WITH', 1)[0]
+
+
+def anchors_on_a_labelled_node(pattern: str) -> bool:
+    """A labelled node such as ``(n:Entity)`` makes FalkorDB scan that label first."""
+    return re.search(r'\(\s*\w*\s*:', pattern) is not None
+
+
+class TestEdgeGetByUuid:
+    @pytest.mark.asyncio
+    async def test_matches_the_edge_index_with_no_labelled_anchor(self) -> None:
+        driver, issued = hardened_driver([CANNED_EDGE_RECORD])
+
+        await EntityEdge.get_by_uuid(driver, 'edge-uuid')
+
+        (query,) = issued
+        pattern = match_pattern(query.cypher)
+        assert '[e:RELATES_TO {uuid: $uuid}]' in pattern
+        assert not anchors_on_a_labelled_node(pattern), query.cypher
+
+    @pytest.mark.asyncio
+    async def test_forwards_graphiti_params(self) -> None:
+        driver, issued = hardened_driver([CANNED_EDGE_RECORD])
+
+        await EntityEdge.get_by_uuid(driver, 'edge-uuid')
+
+        assert issued[0].params == {'uuid': 'edge-uuid', 'routing_': 'r'}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'records',
+        [[CANNED_EDGE_RECORD], [CANNED_EDGE_RECORD, SECOND_EDGE_RECORD]],
+        ids=['one-row', 'first-of-two-rows'],
+    )
+    async def test_returns_the_edge_stock_graphiti_returns(
+        self, records: list[dict[str, Any]]
+    ) -> None:
+        hardened, _ = hardened_driver(records)
+        stock, _ = stock_driver(records)
+
+        edge = await EntityEdge.get_by_uuid(hardened, 'edge-uuid')
+        expected = await EntityEdge.get_by_uuid(stock, 'edge-uuid')
+
+        assert edge.uuid == 'edge-uuid'
+        assert edge.model_dump() == expected.model_dump()
+
+    @pytest.mark.asyncio
+    async def test_no_row_raises_stocks_edge_not_found(self) -> None:
+        """remove_edge catches EdgeNotFoundError for idempotency; update_edge lets it propagate."""
+        hardened, _ = hardened_driver()
+        stock, _ = stock_driver()
+
+        with pytest.raises(EdgeNotFoundError) as raised:
+            await EntityEdge.get_by_uuid(hardened, 'missing-uuid')
+        with pytest.raises(EdgeNotFoundError) as expected:
+            await EntityEdge.get_by_uuid(stock, 'missing-uuid')
+
+        assert str(raised.value) == str(expected.value)
+
+
+class TestEdgeGetByUuids:
+    @pytest.mark.asyncio
+    async def test_no_uuids_issue_nothing(self) -> None:
+        hardened, issued_by_hardened = hardened_driver([CANNED_EDGE_RECORD])
+        stock, issued_by_stock = stock_driver([CANNED_EDGE_RECORD])
+
+        assert await EntityEdge.get_by_uuids(hardened, []) == []
+        assert await EntityEdge.get_by_uuids(stock, []) == []
+        assert issued_by_hardened == issued_by_stock == []
+
+    @pytest.mark.asyncio
+    async def test_matches_the_edge_index_with_no_labelled_anchor(self) -> None:
+        driver, issued = hardened_driver([CANNED_EDGE_RECORD])
+
+        await EntityEdge.get_by_uuids(driver, ['edge-uuid'])
+
+        (query,) = issued
+        pattern = match_pattern(query.cypher)
+        assert 'e.uuid IN $uuids' in pattern
+        assert not anchors_on_a_labelled_node(pattern), query.cypher
+
+    @pytest.mark.asyncio
+    async def test_returns_every_row(self) -> None:
+        """graphiti returns every matching row, so the Cypher must not cap them."""
+        driver, issued = hardened_driver([CANNED_EDGE_RECORD])
+
+        await EntityEdge.get_by_uuids(driver, ['edge-uuid'])
+
+        assert 'LIMIT' not in issued[0].cypher.upper()
+
+    @pytest.mark.asyncio
+    async def test_forwards_graphiti_params(self) -> None:
+        driver, issued = hardened_driver([CANNED_EDGE_RECORD])
+
+        await EntityEdge.get_by_uuids(driver, ['edge-uuid', 'second-edge-uuid'])
+
+        assert issued[0].params == {'uuids': ['edge-uuid', 'second-edge-uuid'], 'routing_': 'r'}
+
+    @pytest.mark.asyncio
+    async def test_returns_the_edges_stock_graphiti_returns(self) -> None:
+        records = [CANNED_EDGE_RECORD, SECOND_EDGE_RECORD]
+        hardened, _ = hardened_driver(records)
+        stock, _ = stock_driver(records)
+        uuids = ['edge-uuid', 'second-edge-uuid']
+
+        edges = await EntityEdge.get_by_uuids(hardened, uuids)
+        expected = await EntityEdge.get_by_uuids(stock, uuids)
+
+        assert [edge.uuid for edge in edges] == uuids
+        assert [edge.model_dump() for edge in edges] == [edge.model_dump() for edge in expected]
