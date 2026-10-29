@@ -38,6 +38,7 @@ from shared.cli_invoke import (  # noqa: F401
 # Process-group termination helper for subprocess tree cleanup
 from shared.proc_group import terminate_process_group
 from shared.process_cost import ProcessCostBasis
+from shared.python_env import without_python_env_selection
 from shared.secret_env import agent_subprocess_env
 
 from orchestrator.agents.sandbox_git_config import sandbox_git_config_env
@@ -569,7 +570,9 @@ async def _invoke_codex(
     )
     codex_input = f'{system_prompt}\n\n{prompt}'.encode()
 
-    cmd, env = _sandbox_spawn(cmd, os.environ, cwd, sandbox_modules, sandbox_extras)
+    cmd, env = _sandbox_spawn(
+        cmd, without_python_env_selection(os.environ), cwd, sandbox_modules, sandbox_extras,
+    )
 
     result = await _run_subprocess_local(
         cmd, cwd, env, 'codex', model, max_budget_usd, timeout_seconds,
@@ -771,7 +774,9 @@ async def _invoke_gemini(
 
         cmd = ['gemini', '-p', prompt, '-m', model, '-o', 'json', '--yolo']
 
-        cmd, env = _sandbox_spawn(cmd, os.environ, cwd, sandbox_modules, sandbox_extras)
+        cmd, env = _sandbox_spawn(
+            cmd, without_python_env_selection(os.environ), cwd, sandbox_modules, sandbox_extras,
+        )
 
         result = await _run_subprocess_local(cmd, cwd, env, 'gemini', model, max_budget_usd, timeout_seconds)
         return _parse_gemini_output(result, model, prices)
@@ -1225,7 +1230,7 @@ async def _invoke_pi(
 
         cmd.append(prompt)
 
-        env = dict(os.environ)
+        env = without_python_env_selection(os.environ)
         if oauth_token:
             # Strip a lingering ANTHROPIC_API_KEY so it can't shadow the
             # OAuth token pi is being asked to use (mirrors
