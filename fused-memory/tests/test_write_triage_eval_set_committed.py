@@ -156,6 +156,9 @@ class TestTheCommittedEvalSet:
         assert summary['pairs'] == dict(Counter(
             row['source'] for row in _writes() for _ in row['targets']))
 
+    def test_the_key_records_the_inputs_the_summary_was_assembled_from(self) -> None:
+        assert _key()['inputs'] == _summary()['inputs']
+
     def test_the_summary_pins_the_committed_live_slates(self) -> None:
         body = (CALIBRATION / f'{STEM}_live_slates.jsonl').read_bytes()
         assert _summary()['inputs']['live_slates_sha256'] == hashlib.sha256(body).hexdigest()

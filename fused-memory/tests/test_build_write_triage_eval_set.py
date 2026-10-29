@@ -399,6 +399,27 @@ class TestTheShardsCommand:
         assert evalset.shard_files() == shard_files
         assert (evalset.scratch / 'texts.json').exists()
 
+    def test_the_key_records_the_inputs_it_was_built_from(self, evalset: _EvalSet) -> None:
+        _, snapshot_sha = _freeze().load_snapshot(evalset.snapshot)
+        assert evalset.key()['inputs'] == {'snapshot_sha256': snapshot_sha,
+                                           'live_slates_sha256': _sha256(evalset.live)}
+
+    @pytest.mark.parametrize('command', ['shards', 'reask', 'third', 'assemble'])
+    def test_every_round_command_refuses_inputs_other_than_the_keyed_ones(
+        self, evalset: _EvalSet, command: str,
+    ) -> None:
+        keyed = _sha256(evalset.live)
+        evalset.live.write_text(evalset.live.read_text() + '\n')
+        with pytest.raises(ValueError, match=rf'live_slates_sha256.*{keyed}.*{_sha256(evalset.live)}'):
+            evalset.run(command)
+
+    def test_a_key_with_shards_and_no_inputs_is_refused(self, evalset: _EvalSet) -> None:
+        key = evalset.key()
+        del key['inputs']
+        (evalset.scratch / 'key.json').write_text(json.dumps(key))
+        with pytest.raises(ValueError, match='inputs'):
+            evalset.run('reask')
+
     def test_refuses_a_scratch_inside_the_snapshots_directory(self, tmp_path: Path) -> None:
         built = _EvalSet(tmp_path)
         built.scratch = built.snapshot.parent / 'rounds'

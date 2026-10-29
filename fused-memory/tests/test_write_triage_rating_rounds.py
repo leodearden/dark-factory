@@ -691,6 +691,14 @@ class TestRatingScratch:
         with pytest.raises(ValueError, match=r"primary_00\.jsonl:1.*\['role'\]"):
             rounds.scratch.ratings(rounds.key(), rounds.entries())
 
+    def test_a_keyed_pair_missing_from_the_inputs_is_refused_naming_shard_and_pair(
+        self, rounds: _Rounds,
+    ) -> None:
+        rounds.rate()
+        entries = {triple: entry for triple, entry in rounds.entries().items() if triple[0] != 'e1'}
+        with pytest.raises(ValueError, match=r"(primary|second)_00: keyed pair \('e1', 'p1', 'current'\)"):
+            rounds.scratch.ratings(rounds.key(), entries)
+
     def test_a_shard_without_ratings_is_refused(self, rounds: _Rounds) -> None:
         rounds.rate()
         (rounds.root / 'ratings' / 'second_00.jsonl').unlink()
