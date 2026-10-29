@@ -30,8 +30,10 @@ barrier and this guard fails on the next run, with no edit here required.
 Selection criterion (the intersection the task verified by hand):
   1. contains a **string constant** matching ``CREATE INDEX`` /
      ``createNodeIndex`` — i.e. it creates an index; and
-  2. contains a real **call** to ``select_graph(...)`` — i.e. it drives a live
-     FalkorDB graph rather than a mock.
+  2. contains a real **call** to ``select_graph(...)``, or to
+     ``_falkor_index_live.scratch_graphs(...)``, which calls ``select_graph`` on
+     the module's behalf — i.e. it drives a live FalkorDB graph rather than a
+     mock.
 Both are AST facts, so a comment or docstring that merely *mentions* index
 creation cannot drag an unrelated module into scope. The other
 ``select_graph`` users (test_startup_identity_scan, test_reassign_edge,
@@ -39,10 +41,11 @@ test_merge_entities, test_refresh_entity_summary, test_falkor_fulltext_query)
 build no index and are correctly excluded — they are not forced to adopt a
 barrier they do not need.
 
-A cheap ``'select_graph' in source`` text prefilter runs before any parsing so
-discovery costs ~130ms rather than ~15s: an ``ast.Call`` to ``select_graph``
-cannot exist without that identifier appearing literally in the source, so the
-prefilter is a strict superset of criterion (2) and cannot hide a module. Only
+A cheap text prefilter — does either live-graph call name appear in the
+source? — runs before any parsing so discovery costs ~130ms rather than ~15s:
+an ``ast.Call`` to ``select_graph`` or ``scratch_graphs`` cannot exist without
+that identifier appearing literally in the source, so the prefilter is a strict
+superset of criterion (2) and cannot hide a module. Only
 the ~7 survivors are parsed. The prefilter narrows the candidate set; every
 actual assertion below is still AST-based.
 
@@ -88,9 +91,10 @@ LOCAL_FORKS = {BARRIER, f'_{BARRIER}'}
 # the range form (`CREATE INDEX FOR (n:Entity) ON (n.name)`) and the fulltext
 # procedure (`CALL db.idx.fulltext.createNodeIndex(...)`).
 _INDEX_CREATION = re.compile(r'CREATE\s+INDEX|createNodeIndex', re.IGNORECASE)
-# Criterion (2): the module drives a live FalkorDB graph. Also the text
-# prefilter — see the module docstring for why that is safe.
-_LIVE_GRAPH_CALL = 'select_graph'
+# Criterion (2): the module drives a live FalkorDB graph, directly or through
+# the shared scratch-graph helper. Also the text prefilter — see the module
+# docstring for why that is safe.
+_LIVE_GRAPH_CALLS = ('select_graph', 'scratch_graphs')
 
 # The floor: modules verified by hand (task 3377) to create an index on a live
 # async graph. Discovery must keep finding at least these; it is free to find
@@ -130,14 +134,16 @@ def _discover_live_index_modules(root: pathlib.Path = TESTS_ROOT) -> list[pathli
         if path.resolve() == SELF:
             # This guard names the tokens in prose; it drives no graph.
             continue
-        if _LIVE_GRAPH_CALL not in path.read_text():
+        source = path.read_text()
+        if not any(name in source for name in _LIVE_GRAPH_CALLS):
             # Cheap prefilter — strict superset of criterion (2). Deliberately a
             # discarded raw read rather than parse_python_module: that would
             # parse AND retain a tree for every test module here, when only ~7
             # survive the prefilter to be parsed at all.
             continue
         tree = parse_python_module(path)
-        if _has_index_creating_literal(tree) and calls_named(tree, _LIVE_GRAPH_CALL):
+        drives_live_graph = any(calls_named(tree, name) for name in _LIVE_GRAPH_CALLS)
+        if _has_index_creating_literal(tree) and drives_live_graph:
             found.append(path)
     return found
 
@@ -160,7 +166,7 @@ class TestDiscoveryItself:
             f'live-index module discovery no longer finds {sorted(missing)} '
             f'(found {sorted(discovered) or "nothing"}). The selection criteria in '
             f'this file have gone stale — most likely FalkorDB or the fixtures '
-            f'renamed {_LIVE_GRAPH_CALL!r} or the index-creation syntax. Fix the '
+            f'renamed one of {_LIVE_GRAPH_CALLS!r} or the index-creation syntax. Fix the '
             f'criteria; do NOT shrink the floor, or this guard silently checks '
             f'nothing.'
         )
