@@ -1,9 +1,11 @@
 """Real-git tests for ``orchestrator.branch_mergeability`` (task 7516).
 
-The merge lands the queued branch REF, never the worktree. These cases build
-the two shapes that produced sha-less merge successes (dark_factory 3493 and
-3580, reify 8363) in a real repository and check the verdict the reader gives
-them, plus the stale-ref and absent-ref shapes that must stay mergeable.
+The pre-enqueue rebind (``workflow.py::TaskWorkflow._submit_to_merge_queue``,
+task 1923) makes the queue land the worktree HEAD, so the verdict is read from
+HEAD first. These cases build the two shapes that produced sha-less merge
+successes (dark_factory 3493 and 3580, reify 8363) in a real repository and
+check the verdict the reader gives them, plus the stale-ref and absent-ref
+shapes that must stay mergeable.
 
 The repository comes from ``_git_fixtures.py::seed_repo``; every git call this
 file makes runs through ``_Checkout``, which applies both esc-3072-3 isolation
@@ -96,7 +98,6 @@ async def test_a_clean_branch_with_work_beyond_main_is_mergeable(scene: _Scene) 
 
     assert state.mergeability is Mergeability.MERGEABLE
     assert state.branch_tip == scene.task_commit
-    assert state.merge_source == scene.task_commit
     assert state.worktree_dirty is False
 
 
@@ -109,7 +110,7 @@ async def test_a_branch_reset_to_main_with_the_work_staged_is_empty(scene: _Scen
     assert state.mergeability is Mergeability.BRANCH_EMPTY
     assert state.worktree_dirty is True
     assert state.branch_tip == scene.main_sha
-    assert state.merge_source == scene.main_sha
+    assert state.worktree_head == scene.main_sha
 
 
 @pytest.mark.asyncio
@@ -142,6 +143,19 @@ async def test_a_detached_head_carrying_newer_work_than_a_stale_ref_is_mergeable
 
 
 @pytest.mark.asyncio
+async def test_a_head_ahead_of_a_ref_left_on_main_is_mergeable(scene: _Scene) -> None:
+    scene.wt.git('checkout', '--detach')
+    newer = scene.wt.commit('feat: task 42 follow-up', {'more.py': 'y = 2\n'})
+    scene.repo.git('branch', '-f', BRANCH.full_name, 'main')
+
+    state = await scene.read()
+
+    assert state.mergeability is Mergeability.MERGEABLE
+    assert state.worktree_head == newer
+    assert state.branch_tip == scene.main_sha
+
+
+@pytest.mark.asyncio
 async def test_an_absent_ref_falls_back_to_the_worktree_head(scene: _Scene) -> None:
     scene.wt.git('checkout', '--detach')
     scene.repo.git('branch', '-D', BRANCH.full_name)
@@ -149,7 +163,7 @@ async def test_an_absent_ref_falls_back_to_the_worktree_head(scene: _Scene) -> N
     ahead = await scene.read()
     assert ahead.branch_tip is None
     assert ahead.mergeability is Mergeability.MERGEABLE
-    assert ahead.merge_source == scene.task_commit
+    assert ahead.worktree_head == scene.task_commit
 
     scene.wt.git('reset', '--hard', 'main')
     on_main = await scene.read()
@@ -159,17 +173,57 @@ async def test_an_absent_ref_falls_back_to_the_worktree_head(scene: _Scene) -> N
 def test_an_unresolved_worktree_head_is_unreadable() -> None:
     state = BranchState(
         branch=BRANCH, branch_tip=None, worktree_head='', main_sha='a' * 40,
-        source_on_main=False, head_on_main=False, worktree_dirty=False,
+        head_beyond_main=False, tip_beyond_main=False, worktree_dirty=False,
     )
 
     assert state.mergeability is Mergeability.UNREADABLE
+
+
+_MAIN = 'm' * 40
+_HEAD = 'h' * 40
+_TIP = 't' * 40
+
+
+@pytest.mark.parametrize(
+    ('head_beyond_main', 'branch_tip', 'tip_beyond_main', 'expected'),
+    [
+        (True, _MAIN, False, Mergeability.MERGEABLE),
+        (True, _TIP, True, Mergeability.MERGEABLE),
+        (True, None, False, Mergeability.MERGEABLE),
+        (False, _TIP, True, Mergeability.WORKTREE_OFF_BRANCH),
+        (False, _MAIN, False, Mergeability.BRANCH_EMPTY),
+        (False, None, False, Mergeability.BRANCH_EMPTY),
+    ],
+    ids=[
+        'head-beyond-tip-on-main',
+        'head-beyond-tip-beyond-elsewhere',
+        'head-beyond-ref-absent',
+        'head-on-main-tip-beyond',
+        'head-on-main-tip-on-main',
+        'head-on-main-ref-absent',
+    ],
+)
+def test_the_verdict_follows_the_worktree_head_first(
+    head_beyond_main: bool,
+    branch_tip: str | None,
+    tip_beyond_main: bool,
+    expected: Mergeability,
+) -> None:
+    worktree_head = _HEAD if head_beyond_main else _MAIN
+    state = BranchState(
+        branch=BRANCH, branch_tip=branch_tip, worktree_head=worktree_head,
+        main_sha=_MAIN, head_beyond_main=head_beyond_main,
+        tip_beyond_main=tip_beyond_main, worktree_dirty=False,
+    )
+
+    assert state.mergeability is expected
 
 
 def test_a_refusal_names_the_branch_its_shas_and_the_recovery_hint() -> None:
     tip, main_sha = '1c3a2b3ae3' + 'a' * 30, '8bee6520df' + 'b' * 30
     state = BranchState(
         branch=BRANCH, branch_tip=tip, worktree_head=main_sha, main_sha=main_sha,
-        source_on_main=False, head_on_main=True, worktree_dirty=True,
+        head_beyond_main=False, tip_beyond_main=True, worktree_dirty=True,
     )
 
     summary = state.refusal_summary()
