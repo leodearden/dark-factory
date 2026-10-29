@@ -726,9 +726,8 @@ class CandidateEndpointPrice:
 
     @property
     def imputed(self) -> bool:
-        """The dollar figure is a list price modelled onto a credit-metered arm,
-        not a measured cost."""
-        return self.cost_basis is CostBasis.SUBSCRIPTION
+        """The dollar figure is modelled, not measured: see CostBasis.imputes_dollars."""
+        return self.cost_basis.imputes_dollars
 
 
 # List rates from the 2026-09-10 live market check (task 5384). Keyed EXACTLY
