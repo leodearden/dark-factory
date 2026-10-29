@@ -181,14 +181,13 @@ for i in $(seq 1 30); do
 done
 
 # ---------------------------------------------------------------------------
-# 3. Python subprojects — uv sync (dependency order)
+# 3. Python workspace — uv sync --all-packages
 # ---------------------------------------------------------------------------
 info "Syncing Python subprojects"
 
-for proj in shared escalation fused-memory orchestrator dashboard; do
-  (cd "$REPO_ROOT/$proj" && uv sync --quiet)
-  ok "$proj"
-done
+# A member-scoped sync is exact and prunes the other members from the shared .venv; see scripts/sync-orchestrator-env.sh.
+(cd "$REPO_ROOT" && uv sync --all-packages --quiet)
+ok "Python workspace synced (every member, client-feed included)"
 
 # ---------------------------------------------------------------------------
 # 4. Systemd user unit for fused-memory
