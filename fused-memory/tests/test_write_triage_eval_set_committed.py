@@ -50,6 +50,18 @@ def _score() -> types.ModuleType:
                               mod_name='score_write_triage_reader')
 
 
+@functools.cache
+def _cross() -> types.ModuleType:
+    return load_script_module(SCRIPTS / 'rate_write_triage_cross_family.py',
+                              mod_name='rate_write_triage_cross_family')
+
+
+@functools.cache
+def _pairs() -> types.ModuleType:
+    return load_script_module(SCRIPTS / 'score_write_triage_pairs.py',
+                              mod_name='score_write_triage_pairs')
+
+
 def _jsonl_rows(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
@@ -77,6 +89,16 @@ def _split() -> dict[str, Any]:
 @functools.cache
 def _key() -> dict[str, Any]:
     return json.loads((CALIBRATION / f'{STEM}_rounds' / 'key.json').read_text())
+
+
+@functools.cache
+def _cross_records() -> list[dict[str, Any]]:
+    return _jsonl_rows(CALIBRATION / f'{STEM}_cross_family.jsonl')
+
+
+@functools.cache
+def _cross_report() -> dict[str, Any]:
+    return json.loads((CALIBRATION / f'{STEM}_cross_family.json').read_text())
 
 
 @functools.cache
@@ -204,3 +226,39 @@ class TestTheCommittedRerates:
             if row['rater'] in rerate['retires_third_raters']
         ]
         assert retired == []
+
+
+@pytest.mark.xdist_group('committed_write_triage_eval_set')
+class TestTheCommittedCrossFamilyRerate:
+    """The committed cross-family records are the report's only input, and cover every discordant pair."""
+
+    def test_reporting_the_records_reproduces_the_committed_report(self) -> None:
+        v1 = _jsonl_rows(CALIBRATION / 'write_triage_pair_verdicts.jsonl')
+        built = _cross().report(_cross_records(), _writes(), _verdicts(), v1)
+        assert json.loads(json.dumps(built)) == _cross_report()
+
+    def test_the_markdown_is_the_rendered_report(self) -> None:
+        rendered = _cross().render_markdown(_cross_report())
+        assert (CALIBRATION / f'{STEM}_cross_family.md').read_text() == rendered
+
+    def test_every_discordant_pair_has_a_row_or_a_recorded_failure(self) -> None:
+        cross = _cross()
+        records = {(record['entry_id'], record['target_id']): record for record in _cross_records()}
+        assert len(records) == len(_cross_records())
+        discordant = set(cross.discordant_pairs(_writes(), _verdicts()))
+        assert discordant - set(records) == set()
+        assert {pair for pair, record in records.items()
+                if record['selection'] == cross.SELECTION_DISCORDANT} == discordant
+        controls = [pair for pair, record in records.items()
+                    if record['selection'] == cross.SELECTION_CONTROL]
+        assert set(controls) <= set(cross.control_pairs(_writes(), _verdicts(), seed=7160))
+        assert [pair for pair, record in records.items()
+                if (record['row'] is None) == (record['failure'] is None)] == []
+
+    def test_every_row_is_cross_family_and_names_its_model_and_effort(self) -> None:
+        for record in _cross_records():
+            model, _, effort = record['rater'].partition(':')
+            assert model in _pairs().LIST_PRICES and effort, record['rater']
+            if record['row'] is not None:
+                assert record['row']['role'] == 'cross_family'
+                assert record['row']['rater'] == record['rater']
