@@ -63,10 +63,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fused_memory.models.scope import Scope
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -315,27 +312,21 @@ async def run(
     # (sweep_toolcall_xml_leak.py: "Nothing was scanned and nothing was
     # mutated").
     #
-    # What that saves is scoped to ``run``, and the message below says so
+    # What that saves is scoped to ``run``, and the extra_detail below says so
     # rather than claiming a doomed --apply costs nothing: ``main`` has already
     # constructed the MemoryService and awaited ``initialize()`` before this
     # function is entered. Neither of those mutates, so the guarantee that
     # matters -- no enumeration, no mutation -- is exactly the one claimed.
     if args.apply:
-        try:
-            assert_store_mutation_allowed(operation='purge_knowlive_namespace --apply')
-        except StoreMutationUnavailable:
-            logger.error(
-                'purge_knowlive_namespace: --apply NOT started (fail-closed) -- this '
-                "process cannot write mem0's history directory, so a purge would "
-                'delete Qdrant points and then fail to write their history, and the '
-                'unbounded Graphiti DETACH DELETE cannot be undone at all. Neither '
-                'namespace was enumerated and nothing was mutated. Route the purge '
-                'through the fused-memory MCP server (the unsandboxed owner of the '
-                'store), or '
-                're-run from an unsandboxed operator shell. To obtain the deletion '
-                'manifest safely from anywhere, re-run without --apply.'
-            )
-            raise
+        assert_store_mutation_allowed(
+            operation='purge_knowlive_namespace --apply',
+            logger=logger,
+            extra_detail=(
+                'a purge would delete Qdrant points and then fail to write their '
+                'history, and the unbounded Graphiti DETACH DELETE cannot be undone '
+                'at all. Neither namespace was enumerated and nothing was mutated.'
+            ),
+        )
 
     graphiti_rows = await enumerate_graphiti_namespace(
         memory_service.graphiti, namespace, limit=limit,

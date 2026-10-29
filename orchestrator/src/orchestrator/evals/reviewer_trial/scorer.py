@@ -9,6 +9,7 @@ from __future__ import annotations
 import functools
 import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -25,6 +26,7 @@ from orchestrator.evals.measurement import (
 )
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, GroundTruthIssue
 from orchestrator.evals.reviewer_trial.runner import PanelRunResult
+from orchestrator.review_payload import ReviewPayload, normalize_review
 
 if TYPE_CHECKING:
     from shared.cli_invoke import AgentResult
@@ -129,7 +131,7 @@ def _normalize_location(loc: str) -> str:
     return normalized.replace('\\', '/')
 
 
-def _deduplicate_issues(reviews: dict[str, dict]) -> list[dict]:
+def _deduplicate_issues(reviews: Mapping[str, ReviewPayload]) -> list[dict]:
     """Deduplicate issues across reviewers within a panel.
 
     Groups by (normalized_location, category). When multiple reviewers
@@ -139,7 +141,7 @@ def _deduplicate_issues(reviews: dict[str, dict]) -> list[dict]:
     seen: dict[tuple[str, str], dict] = {}
 
     for reviewer_name, review in reviews.items():
-        for issue in review.get('issues', []):
+        for issue in review.issues:
             loc = _normalize_location(issue.get('location', ''))
             cat = issue.get('category', '').lower().strip()
             key = (loc, cat)
@@ -331,21 +333,19 @@ async def score_panel_run(
 ) -> ScoringResult:
     """Score one (variant, diff) pair.
 
-    1. Collect all issues from all reviewers in the panel
+    1. Collect every reviewer's issues, each review normalised by
+       ``orchestrator/review_payload.py::normalize_review`` (an ERROR review
+       carries none; an off-contract one raises ``ReviewPayloadError``)
     2. Deduplicate by (normalized_location, category)
     3. Match against ground truth via match_issues() (through *usage_gate*
        when given); an unmeasured match makes the whole result unmeasured,
        with no metric computed
     4. Compute recall, precision, F1, blocking_recall
     """
-    # Filter out ERROR reviews
-    clean_reviews = {
-        name: rev for name, rev in run.reviews.items()
-        if rev.get('verdict') != 'ERROR'
-    }
+    reviews = {name: normalize_review(rev) for name, rev in run.reviews.items()}
 
     # Deduplicate across panel
-    deduped = _deduplicate_issues(clean_reviews)
+    deduped = _deduplicate_issues(reviews)
 
     # Match against ground truth
     outcome = await match_issues(

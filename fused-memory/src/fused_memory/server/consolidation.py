@@ -67,7 +67,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
-from fused_memory.memory_metadata import normalize_supersedes
+from fused_memory.memory_metadata import is_canonical, normalize_supersedes
 from fused_memory.models.enums import MemoryCategory
 from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN, is_valid_topic_slug
 
@@ -796,11 +796,7 @@ def proposal_shape_codes(
 def _closure_member_ref(row: Any) -> dict[str, Any]:
     if not isinstance(row, dict):
         return {'id': None, 'canonical': False}
-    meta = row.get('metadata')
-    return {
-        'id': row.get('id'),
-        'canonical': isinstance(meta, dict) and meta.get('canonical') is True,
-    }
+    return {'id': row.get('id'), 'canonical': is_canonical(row.get('metadata'))}
 
 
 def build_consolidation_result(

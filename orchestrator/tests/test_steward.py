@@ -2096,43 +2096,34 @@ class TestNextEscalation:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestStewardDefaultConfig:
 
-    def test_default_steward_max_attempts_is_one(self, monkeypatch, tmp_path):
+    def test_default_steward_max_attempts_is_one(self):
         """steward_max_attempts default must be 1 (the renamed field)."""
         from orchestrator.config import OrchestratorConfig
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.steward_max_attempts == 1
 
-    def test_default_steward_wall_clock_timeout_is_1800(self, monkeypatch, tmp_path):
+    def test_default_steward_wall_clock_timeout_is_1800(self):
         """timeouts.steward default must be 1800s (per-invocation wall-clock)."""
         from orchestrator.config import OrchestratorConfig
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.timeouts.steward == 1800.0
 
-    def test_default_steward_max_timeouts_per_escalation_is_3(
-        self, monkeypatch, tmp_path,
-    ):
+    def test_default_steward_max_timeouts_per_escalation_is_3(self):
         """steward_max_timeouts_per_escalation default must be 3."""
         from orchestrator.config import OrchestratorConfig
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.steward_max_timeouts_per_escalation == 3
 
-    def test_timeout_cap_default_respects_policy_window(self, monkeypatch, tmp_path):
+    def test_timeout_cap_default_respects_policy_window(self):
         """Default steward_max_timeouts_per_escalation must be in the policy range [2, 5]."""
         from orchestrator.config import OrchestratorConfig
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert 2 <= config.steward_max_timeouts_per_escalation <= 5
 

@@ -12,8 +12,9 @@ This module imports ``orchestrator.session_registry`` read-only (PRD §6 G5:
 consumers import the shared record contract, they never re-derive it).
 
 A spawned session's hooks key its record on ``CLAUDE_SPAWN_SESSION_ID``, the
-slug of the record spawn-claude.sh created; a hand-launched session keys on
-its stdin ``session_id``. See ``docs/session-hook-ownership.md`` §Record keying.
+slug of the record spawn-claude.sh created; a session without one (T3-hosted
+or hand-launched) keys on a registry pointer, else on its stdin
+``session_id``. See ``docs/session-hook-ownership.md`` §Record keying.
 
 IMPORT CONTRACT. ``skills/spawn/hooks/*.sh`` run this file by absolute path
 from a plain shell with only ``PYTHONPATH=<repo>/orchestrator/src``: no venv,
@@ -44,6 +45,7 @@ from typing import Any
 
 from orchestrator import session_registry
 from orchestrator.session_ownership_probes import EventProbes, ProcessTree
+from orchestrator.session_self_exit import SelfExit
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +58,8 @@ def parse_hook_input(raw: str) -> dict[str, Any]:
     """Tolerantly parse the Claude Code hook stdin JSON.
 
     Recognized keys: ``session_id``, ``cwd``, ``hook_event_name``,
-    ``message``, ``transcript_path`` — every one of them optional. Empty,
+    ``message``, ``transcript_path``, ``background_tasks``,
+    ``session_crons`` — every one of them optional. Empty,
     malformed, or non-object input all yield ``{}`` rather than raising, so a
     hook fault here can never block a session.
     """
@@ -214,14 +217,14 @@ def _env_slug_ownership(
     allow_remint: bool = False,
     probes: EventProbes,
 ) -> tuple[bool, bool, _RecordSnapshot | None]:
-    """Is the inherited ``CLAUDE_SPAWN_SESSION_ID`` *slug* this session's own?
+    """Is candidate *slug*, an inherited ``CLAUDE_SPAWN_SESSION_ID`` or a pointer's, this session's own?
 
     Returns ``(owned, may_bind, snapshot)``:
 
-    * ``owned`` -- adopt the env slug (True) or fork onto the hand-launched
-      keying (False). False only when ownership is positively disproved: a
-      bound ``claude_session_id`` that mismatches, or, on an unbound record,
-      an ``owner_ppid_verdict`` of False.
+    * ``owned`` -- adopt the candidate slug (True) or fall through to the
+      hand-launched keying (False). False only when ownership is positively
+      disproved: a bound ``claude_session_id`` that mismatches, or, on an
+      unbound record, an ``owner_ppid_verdict`` of False.
     * ``may_bind`` -- whether this event may stamp its ``session_id`` onto the
       record. False when ownership was adopted but not proven, which leaves
       the record open for its real owner.
@@ -293,12 +296,80 @@ class _HookSlugResolution:
     rather than a silent ownership inversion.
 
     INVARIANT: ``snapshot is None or snapshot.slug == slug``.
+
+    ``session_id_keyed`` -- the slug was reached by this event's own session
+    id, either through its session-id pointer or through the hand-launched
+    keying that embeds it. A record bound to that id is therefore proven this
+    session's, and a dead ``claude_owner_pid`` may be reclaimed;
+    ``_bind_claude_session_id`` still requires the binding to equal the
+    event's id.
     """
 
     slug: str
     rejected_env_slug: str | None
     may_bind: bool
     snapshot: _RecordSnapshot | None
+    session_id_keyed: bool = False
+
+
+def _adopt_pointer_slug(
+    slug: str | None,
+    hook_input: Mapping[str, Any],
+    root: Path | str | None,
+    *,
+    allow_remint: bool,
+    probes: EventProbes,
+    session_id_keyed: bool,
+) -> _HookSlugResolution | None:
+    """Adopt pointer-resolved *slug* iff ``_env_slug_ownership`` owns it and its record reads."""
+    if slug is None:
+        return None
+    owned, may_bind, snapshot = _env_slug_ownership(
+        slug, hook_input, root, allow_remint=allow_remint, probes=probes
+    )
+    if not owned or snapshot is None or snapshot.record is None:
+        return None
+    return _HookSlugResolution(slug, None, may_bind, snapshot, session_id_keyed)
+
+
+def _pointer_resolution(
+    hook_input: Mapping[str, Any],
+    root: Path | str | None,
+    *,
+    allow_remint: bool,
+    probes: EventProbes,
+) -> _HookSlugResolution | None:
+    """The record a registry pointer names for this event, adopted; None falls through.
+
+    The stdin ``session_id``'s pointer first, then the owning claude's pid
+    pointer, which survives a re-mint. A pid-pointed record bound to another
+    session id is adopted only as a re-mint (``_env_slug_ownership``). See
+    ``docs/session-hook-ownership.md`` §Record keying.
+    """
+    session_id = _hook_session_id(hook_input)
+    if not session_id:
+        return None
+    by_session_id = _adopt_pointer_slug(
+        session_registry.resolve_session_slug_for_claude_session_id(session_id, root=root),
+        hook_input,
+        root,
+        allow_remint=allow_remint,
+        probes=probes,
+        session_id_keyed=True,
+    )
+    if by_session_id is not None:
+        return by_session_id
+    pid = probes.owning_claude_pid()
+    if pid is None:
+        return None
+    return _adopt_pointer_slug(
+        session_registry.resolve_session_slug_for_pid(pid, root=root),
+        hook_input,
+        root,
+        allow_remint=allow_remint,
+        probes=probes,
+        session_id_keyed=False,
+    )
 
 
 def _resolve_hook_slug(
@@ -322,6 +393,10 @@ def _resolve_hook_slug(
       the adopt branch, where the slug read is the slug returned. On the fork
       branch it would describe the spawner's record, not the one returned.
 
+    With no ``CLAUDE_SPAWN_SESSION_ID``, ``_pointer_resolution`` is tried
+    before the hand-launched keying, which is session-id keyed: its slug
+    embeds the stdin ``session_id``.
+
     *allow_remint* (SessionStart only) and *probes* are forwarded to
     ``_env_slug_ownership``. See ``docs/session-hook-ownership.md``
     §One read, one decision, one write.
@@ -344,6 +419,10 @@ def _resolve_hook_slug(
             # exactly the record the caller is about to refresh.
             return _HookSlugResolution(candidate, None, may_bind, snapshot)
         rejected = candidate
+    else:
+        pointed = _pointer_resolution(hook_input, root, allow_remint=allow_remint, probes=probes)
+        if pointed is not None:
+            return pointed
 
     # Raw env on the fork branch too: the slug is an opaque key that all three
     # hook events must derive identically. See docs/session-hook-ownership.md
@@ -360,7 +439,7 @@ def _resolve_hook_slug(
     )
     # This slug embeds session_id itself, so binding it is tautological.
     # No snapshot: any read above was of a DIFFERENT record than this slug.
-    return _HookSlugResolution(slug, rejected, True, None)
+    return _HookSlugResolution(slug, rejected, True, None, session_id_keyed=True)
 
 
 def hook_session_slug(
@@ -415,6 +494,7 @@ def _bind_claude_session_id(
     hook_input: Mapping[str, Any],
     *,
     allow_rebind: bool = False,
+    reclaim_dead_owner: bool = False,
     probes: EventProbes,
 ) -> bool:
     """Stamp this hook's ``session_id`` and owning claude pid onto an unbound *record*.
@@ -424,17 +504,22 @@ def _bind_claude_session_id(
     *allow_rebind* lets SessionStart re-bind when ``_is_owner_only_session_start``
     holds, because ``/clear`` re-mints the id inside the owning process; never on
     Notification/Stop. ``claude_owner_pid`` comes from *probes* and is None when
-    unresolvable. Returns whether *record* was mutated. See
-    ``docs/session-hook-ownership.md`` §Owner or inheritor.
+    unresolvable. The first bind also stamps ``claude_launch_session_id``,
+    which no rebind touches. *reclaim_dead_owner* lets an already-bound record
+    take this event's claude pid via ``_reclaim_dead_owner_pid``. Returns
+    whether *record* was mutated. See ``docs/session-hook-ownership.md``
+    §Owner or inheritor and §Session-id re-mints.
     """
     hook_session_id = _hook_session_id(hook_input)
     if not hook_session_id:
         return False
     bound = (record.claude_session_id or '').strip()
     if bound == hook_session_id:
-        return False
+        return reclaim_dead_owner and _reclaim_dead_owner_pid(record, probes)
     if bound and not allow_rebind:
         return False
+    if not bound and record.claude_launch_session_id is None:
+        record.claude_launch_session_id = hook_session_id
     record.claude_session_id = hook_session_id
     # The pid later tells a re-mint inside the owner from a nested claude;
     # None, when unresolvable, reads back as "cannot prove ownership".
@@ -442,20 +527,40 @@ def _bind_claude_session_id(
     return True
 
 
-def _stamp_session_pointer(
+def _reclaim_dead_owner_pid(record: session_registry.SessionRecord, probes: EventProbes) -> bool:
+    """Re-stamp *record*'s ``claude_owner_pid`` with this event's claude pid iff no live process holds it.
+
+    A live recorded owner keeps the record: that is a nested ``claude
+    --resume`` of the same session id. Returns whether *record* was mutated.
+    """
+    pid = probes.owning_claude_pid()
+    owner = record.claude_owner_pid
+    if pid is None or owner == pid or (owner is not None and session_registry.pid_alive(owner)):
+        return False
+    record.claude_owner_pid = pid
+    return True
+
+
+def _stamp_session_pointers(
     record: session_registry.SessionRecord,
     probes: EventProbes,
     root: Path | str | None,
+    *,
+    newly_bound: bool,
 ) -> None:
-    """Point this event's claude pid at *record*, iff the record names it as owner.
+    """Point the session id this event just bound, and its claude pid, at the written *record*.
 
-    The pointer asserts exactly what the written record already proves --
-    ``claude_owner_pid`` is this event's owning claude pid -- so one rule
-    covers every lane (adopt, fork, a withheld launch window, an unproven
-    adopt, a blank session_id) without branching on them. The pid comes from
-    the event's probe memo, the same observation the binding was made from.
-    Fail-soft: ``write_session_pointer`` never raises.
+    Each pointer asserts exactly what the written record already proves: the
+    session-id pointer only when this event changed the binding, the
+    pid pointer whenever ``claude_owner_pid`` is this event's owning claude
+    pid. The pid rule covers every lane (adopt, fork, a withheld launch
+    window, an unproven adopt, a blank session_id) without branching on them.
+    Fail-soft: both registry writers never raise.
     """
+    if newly_bound and record.claude_session_id:
+        session_registry.write_claude_session_pointer(
+            record.claude_session_id, record.session_slug, root=root
+        )
     pid = probes.owning_claude_pid()
     if pid is None or record.claude_owner_pid != pid:
         return
@@ -719,9 +824,10 @@ def run_session_start(
     record is built from the resolved identity with status RUNNING. An
     existing record is refreshed to RUNNING in place, its other fields kept.
     Both then get best-effort enrichment (``parent_session_id`` from
-    ``CLAUDE_SPAWN_PARENT_ID``, display from ``_resolve_display``), a binding
-    when ``may_bind`` allows (``_bind_claude_session_id``, re-binding on an
-    owner-only ``source``), one ``write_record`` and the pid pointer.
+    ``CLAUDE_SPAWN_PARENT_ID``, display from ``_resolve_display`` unless the
+    record's is T3's), a binding when ``may_bind`` allows
+    (``_bind_claude_session_id``, re-binding on an owner-only ``source``), one
+    ``write_record`` and ``_stamp_session_pointers``.
 
     The record is read once per event: on the adopt path the ownership
     probe's snapshot is reused. An UNREADABLE body is re-read so the fault
@@ -793,19 +899,19 @@ def run_session_start(
             record.parent_session_id = parent_session_id
     title = record.title or hook_display_title(identity, identity_env, record)
     display = _resolve_display(env, title, allow_spawn_marker=forked_from is None)
-    if display is not None:
+    if display is not None and not session_registry.is_t3_record(record):
         record.display = display
     # may_bind, not forked_from, guards the bind: an adopted-but-unproven
-    # event refreshes the record without claiming it. The result is unused.
-    if may_bind:
-        _bind_claude_session_id(
-            record,
-            hook_input,
-            allow_rebind=_is_owner_only_session_start(hook_input),
-            probes=probes,
-        )
+    # event refreshes the record without claiming it.
+    newly_bound = may_bind and _bind_claude_session_id(
+        record,
+        hook_input,
+        allow_rebind=_is_owner_only_session_start(hook_input),
+        reclaim_dead_owner=resolution.session_id_keyed,
+        probes=probes,
+    )
     session_registry.write_record(record, root=root)
-    _stamp_session_pointer(record, probes, root)
+    _stamp_session_pointers(record, probes, root, newly_bound=newly_bound)
     return record
 
 
@@ -898,6 +1004,7 @@ def _run_status_refresh_and_retitle(
     *,
     question: session_registry.Question | None = None,
     process_tree: ProcessTree | None,
+    self_exit: SelfExit | None = None,
 ) -> str:
     """Shared refresh-then-retitle body for ``run_notification``/``run_stop``.
 
@@ -911,8 +1018,11 @@ def _run_status_refresh_and_retitle(
     unbound launch window writes only the mtime heartbeat: no status, question
     or binding. Every lane, the UNREADABLE fault included, goes through the one
     shared withhold/refresh/bind/question/write block; do not give a lane its
-    own copy. The pid pointer is stamped on every event. Returns the OSC
+    own copy. ``_stamp_session_pointers`` follows every write. Returns the OSC
     retitle for *status*.
+
+    *self_exit* (Stop only) is evaluated on an owner event, the event that may
+    bind; its stamp rides the one write and its action follows the pointer.
 
     See ``docs/session-hook-ownership.md`` §One read, one decision, one write
     and §The launch window.
@@ -941,15 +1051,27 @@ def _run_status_refresh_and_retitle(
     record = session_registry.apply_refresh(
         slug, prior, status=None if in_launch_window else status
     )
-    # Status, question and binding land in one body. A withheld event never
-    # binds, nor does an adopted-but-unproven one (may_bind False).
-    if not in_launch_window and may_bind:
-        _bind_claude_session_id(record, hook_input, probes=probes)
+    # Status, question, binding and the self-exit stamp land in one body. A
+    # withheld event never acts as the owner, nor does an adopted-but-unproven
+    # one (may_bind False).
+    owner_event = not in_launch_window and may_bind
+    newly_bound = owner_event and _bind_claude_session_id(
+        record, hook_input, reclaim_dead_owner=resolution.session_id_keyed, probes=probes
+    )
     if question is not None and not in_launch_window:
         record.question = question
+    evaluation = (
+        self_exit.evaluate(record, hook_input, owner_pid=probes.owning_claude_pid(), root=root)
+        if self_exit is not None and owner_event
+        else None
+    )
+    if evaluation is not None:
+        evaluation.stamp(record)
     # Unconditional: the heartbeat is owed on every event, a withheld one too.
     session_registry.write_record(record, root=root)
-    _stamp_session_pointer(record, probes, root)
+    _stamp_session_pointers(record, probes, root, newly_bound=newly_bound)
+    if self_exit is not None and evaluation is not None:
+        self_exit.enact(evaluation, record, root)
     identity_env = _own_identity_env(env, resolution)
     identity = resolve_hook_identity(hook_input, identity_env)
     title = hook_display_title(identity, identity_env, record)
@@ -986,16 +1108,24 @@ def run_stop(
     root: Path | str | None = None,
     *,
     process_tree: ProcessTree | None = None,
+    self_exit: SelfExit | None = None,
 ) -> str:
     """Stop hook handler: status -> IDLE, return its OSC retitle.
 
     Resolves the record through the ownership check (task 4193): a nested
     inheritor finishing its turn can no longer idle the spawning session
     mid-turn. *process_tree* is the tree this event's ownership probes
-    read; None reads the live one (see ``ProcessTree``).
+    read; None reads the live one (see ``ProcessTree``). *self_exit* is the
+    opt-in self-exit decision; None uses ``SelfExit()``, which signals with
+    the live ``os.kill``.
     """
     return _run_status_refresh_and_retitle(
-        hook_input, env, root, session_registry.Status.IDLE, process_tree=process_tree
+        hook_input,
+        env,
+        root,
+        session_registry.Status.IDLE,
+        process_tree=process_tree,
+        self_exit=SelfExit() if self_exit is None else self_exit,
     )
 
 

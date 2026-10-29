@@ -14,13 +14,14 @@ synthesis into a dated ``plans/confusion-census-<date>.md`` report with
 the origin x manifestation matrix -> curator-path ``submit_task``
 remediation filing -> codebook update (promote/reject candidates, retire
 fixed, never delete) -> advance ``docs/legibility/census-state.json`` ->
-one scoped commit of all of it (a commit that does not land is rolled
-back to HEAD and quarantined; see ``run_census``).
+the project's landing gate over those outputs -> one scoped commit of all
+of it (a gate refusal, or a commit that does not land, is rolled back to
+HEAD and quarantined; see ``run_census``).
 ``--force`` for operator-initiated runs.
 
 Every LLM / MCP / git side effect in this module is an INJECTED seam
 (``invoke``, ``verify_fn``, ``synthesize_fn``, ``submit_fn``,
-``task_store``, ``escalate_fn``, ``status_fetcher``, ``commit``,
+``task_store``, ``escalate_fn``, ``status_fetcher``, ``gate``, ``commit``,
 ``roll_back``, ``batch_source``, ``selection_of``) --
 mirrors delta's ``coder.code_digests(invoke=)`` and zeta's
 ``census_trigger(status_fetcher=)``. The scripts/ test env (``uv run
@@ -58,7 +59,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import contextvars
 import copy
 import functools
 import json
@@ -68,7 +68,6 @@ import sys
 import tempfile
 import textwrap
 import time
-import traceback
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime
@@ -108,6 +107,7 @@ if str(_ORCH_SRC) not in sys.path:
     sys.path.insert(0, str(_ORCH_SRC))
 
 from legibility import (  # noqa: E402
+    alarm,
     census_findings,
     census_identity,
     census_trigger,
@@ -121,6 +121,7 @@ from legibility import (  # noqa: E402
     filing_policy,
     finding_area,
     invariants,
+    landing_gate,
     prescreen,
     session_ledger,
     session_runner,
@@ -135,6 +136,7 @@ from orchestrator.agents import code_quality  # noqa: E402
 # The banner marker list itself lives in shared.cap_markers and is never
 # restated here -- this module only asks the question, via the predicate.
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
+from shared.mcp_session import SyncMcpSession  # noqa: E402  # debt: task 6760
 from shared.toolcall_markup import escape_envelope_literals  # noqa: E402
 
 logger = logging.getLogger("legibility.census")
@@ -602,122 +604,8 @@ class CensusHeadroomExhausted(Exception):
         self.unverified = unverified
 
 
-class CensusPostRefusedUnderTest(RuntimeError):
-    """Raised when a pytest process tries to POST to a real MCP endpoint
-    through this module.
-
-    The contract: a pytest process never speaks to a real MCP endpoint
-    through census.py. A caller that serves or fakes its OWN endpoint is
-    entitled to, and DECLARES that by wrapping those calls in
-    :func:`own_endpoint`.
-
-    A distinct type, not a bare ``RuntimeError``, so the regression test has
-    something falsifiable to assert on and an operator reading a log can tell
-    a refused test POST from an ordinary transport failure.
-    """
-
-
 class CensusPreconditionFailed(RuntimeError):
     """A check before any spend refused this run."""
-
-
-_own_endpoint_declared: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "census_own_endpoint_declared", default=False,
-)
-"""Whether the calls being made right here post to an endpoint the CALLER
-owns. Set only by :func:`own_endpoint`, and only for the duration of its
-block -- a ``ContextVar`` rather than a module global so the grant cannot
-outlive the ``with`` that made it, and so concurrent contexts cannot inherit
-one another's entitlement."""
-
-
-@contextlib.contextmanager
-def own_endpoint():
-    """Declare that the MCP POSTs made inside this block target an endpoint
-    the CALLER owns -- a server it brought up itself on an ephemeral port, or
-    a faked transport below httpx -- so
-    :func:`_refuse_real_post_under_test` stands aside for exactly those calls.
-
-    THE supported way to reach a real POST from inside a pytest process; see
-    that function for why the default is to refuse. Use it as narrowly as the
-    call it entitles::
-
-        with census.own_endpoint():
-            escalate_fn(category="infra_issue", ...)
-
-    Call-SCOPED on purpose. The entitlement is a claim about one endpoint, and
-    census posts to two (``escalate_info`` on the project's escalation server,
-    ``submit_task`` on fused-memory) -- a grant that lasted a whole test or
-    fixture would silently cover the other one too, which is more than any
-    caller means to claim. Being a public function also gives the two test
-    suites that need it (``scripts/tests/test_legibility_census.py`` and
-    ``escalation/tests/test_legibility_census_escalation_e2e.py``, in
-    different packages) a supported seam to depend on instead of each reaching
-    in and rebinding a private name.
-    """
-    token = _own_endpoint_declared.set(True)
-    try:
-        yield
-    finally:
-        _own_endpoint_declared.reset(token)
-
-
-def _refuse_real_post_under_test(url: str, tool_name: str) -> None:
-    """Refuse a real MCP POST from inside a pytest process; no-op otherwise.
-
-    WHY HERE. :func:`_post_mcp_tool_call` is THE single MCP boundary for both
-    consumers -- :func:`default_submit_fn`'s ``submit_task`` (:8002) and
-    :func:`_build_default_escalate_fn`'s ``escalate_info`` (:8103) -- so one
-    call covers both with no second mechanism. It is also default-safe for
-    tests not yet written: a new ``main()``-level test is protected without
-    doing anything, which matters because the leak arrives through
-    ``main()``'s fail-loud catch-all, i.e. through a test whose
-    monkeypatched ``run_census`` raised UNEXPECTEDLY.
-
-    WHY IT MATTERS. A test-minted escalation is indistinguishable at triage
-    from a genuine census failure -- same synthetic ``task_id``, same
-    ``agent_role`` -- in the one human-facing channel the
-    recon-escalation-watcher closes; ``esc-legibility-census-dark_factory-2``
-    reached ``dedupe_count=21`` that way.
-
-    WHY RAISE. Loud over silent (no-silent-fail-soft): a sentinel return is
-    indistinguishable from a real MCP response at every consumer. ``{}`` is
-    what ``_escalate_fn`` already returns when a POST genuinely fails, and
-    what ``run_census`` reads as "submit_fn returned no ticket id" -- so a
-    suppressed POST would arrive looking like an ordinary weak response
-    rather than like a suppression, and any future caller that checks only
-    for an exception would read it as success. A typed exception says which
-    one it is at both consumers. Raising costs nothing on the escalation
-    path -- ``_escalate_fn``'s existing ``except Exception`` already turns
-    any transport failure into its established WARNING and returns ``{}``,
-    so ``main()`` still prints ``census: FAILED`` and returns 1.
-
-    WHY A DECLARED HATCH RATHER THAN A SNIFFED ONE. No automatic signal
-    separates "a server this test brought up on an ephemeral port" from "the
-    ambient production server on 8103": the leaking tests write
-    ``escalation_port: 8103`` into their own tmp_path config, so port, config
-    shape and project_id all match. Entitlement is therefore a human
-    judgement about who owns the endpoint, declared by wrapping the entitled
-    calls in :func:`own_endpoint` -- see
-    ``escalation/tests/test_legibility_census_escalation_e2e.py`` (task
-    3644's live-server acceptance suite, which must keep reaching the real
-    streamable-HTTP protocol). A caller who forgets fails loud with a message
-    naming the hatch; the opposite default -- allow, and remember to block --
-    is what produced the dedupe_count above.
-    """
-    if _own_endpoint_declared.get():
-        return
-    current_test = os.environ.get("PYTEST_CURRENT_TEST")
-    if current_test is None:
-        return
-    raise CensusPostRefusedUnderTest(
-        f"census: refusing to POST MCP tool {tool_name!r} to a real endpoint "
-        f"({url}) from inside a pytest process (PYTEST_CURRENT_TEST="
-        f"{current_test!r}). A test-minted escalation is indistinguishable at "
-        f"triage from a genuine census failure. If this caller serves or fakes "
-        f"its OWN endpoint, declare that around the call: "
-        f"`with census.own_endpoint(): ...`."
-    )
 
 
 @dataclass
@@ -2004,27 +1892,16 @@ def _pending_cluster(cb: dict, queued: similarity.QueuedCluster) -> dict:
     )
 
 
-def _escalate_once(*, stage: str, summary: str, detail: str, escalate_fn) -> None:
-    """Log *detail* at WARNING and file it as one info escalation. The
-    escalation is best-effort: a raising *escalate_fn* never costs the run."""
-    logger.warning("%s", detail)
-    try:
-        escalate_fn(category="infra_issue", severity="info", summary=summary, detail=detail)
-    except Exception as exc:
-        logger.warning("census: %s escalation failed (best-effort): %s", stage, exc)
-
-
 def _escalate_skipped_similarity(reason: str, *, project_id: str, escalate_fn) -> None:
     """Say once, loudly, that this run's similarity stage was skipped."""
-    _escalate_once(
-        stage="similarity-skip",
+    escalate_fn(
         summary=f"legibility census ({project_id}): similarity stage skipped -- {reason}",
         detail=(
             f"census: similarity stage skipped -- {reason}. No similarity attach and no queue "
             "adjudication happened this run; the pending queue is unchanged, and the next run "
             "retries the whole stage."
         ),
-        escalate_fn=escalate_fn,
+        level=logging.WARNING,
     )
 
 
@@ -2036,15 +1913,14 @@ quotes; its detail carries all of it."""
 def _escalate_unavailable_synthesis(reason: str, *, project_id: str, escalate_fn) -> None:
     """Say once, loudly, that this run's synthesis reply was refused."""
     shown = textwrap.shorten(reason, _SUMMARY_REASON_CHARS, placeholder=" ...")
-    _escalate_once(
-        stage="synthesis-unavailable",
+    escalate_fn(
         summary=f"legibility census ({project_id}): synthesis unavailable -- {shown}",
         detail=(
             f"census: synthesis unavailable -- {reason}. Nothing in the reply was applied; every "
             "data section of the report is complete without it, and its ## Synthesis section "
             "says synthesis was unavailable."
         ),
-        escalate_fn=escalate_fn,
+        level=logging.WARNING,
     )
 
 
@@ -2141,9 +2017,8 @@ def _detect_mass_rejection(offered: int, verified: int, *, clusters: str, escala
     verdicts) presents as an ordinary all-rejected run: the signature of the
     2026-08-03 sandbox incident, where the verify subprocess was rooted outside
     the censused tree. An all-rejected run is legitimately possible, so this
-    never fails or defers a run whose mining is paid for, and the escalation is
-    best-effort because it sits between that spend and the output writes. The
-    returned record is the durable trace: the committed report renders it."""
+    never fails or defers a run whose mining is paid for. The returned record
+    is the durable trace: the committed report renders it."""
     if not offered or verified:
         return None
     suspect = (
@@ -2156,16 +2031,11 @@ def _detect_mass_rejection(offered: int, verified: int, *, clusters: str, escala
         "the per-cluster 'verify failed' warnings above; a run with real findings "
         "is being reported as an empty census if this is systemic."
     )
-    logger.warning("%s", suspect)
-    try:
-        escalate_fn(
-            category="infra_issue",
-            severity="info",
-            summary=f"legibility census: all {offered} {clusters} cluster(s) rejected -- possible systemic verifier failure",
-            detail=suspect,
-        )
-    except Exception as exc:
-        logger.warning("census: mass-rejection escalation failed (best-effort): %s", exc)
+    escalate_fn(
+        summary=f"legibility census: all {offered} {clusters} cluster(s) rejected -- possible systemic verifier failure",
+        detail=suspect,
+        level=logging.WARNING,
+    )
     return MassRejection(offered=offered)
 
 
@@ -2565,6 +2435,9 @@ class CensusOutcome:
     """Where the refused outputs were quarantined and whether the checkout
     is back at HEAD. Set iff ``status == "unlanded"``."""
 
+    gate: landing_gate.GateVerdict | None = None
+    """What the landing gate said, on every run that wrote its outputs."""
+
     deferred_stage: str | None = None
     """Which headroom gate deferred this run: ``"preflight"`` (before any
     work) or ``"verify"`` (after mining, before or during verification).
@@ -2674,21 +2547,16 @@ def _defer(
     rejected: int = 0,
     unverified: int = 0,
 ) -> CensusOutcome:
-    """Abort the census at *stage*: log loudly, escalate, return the outcome.
+    """Abort the census at *stage*: raise one WARNING alarm, return the outcome.
 
     ONE owner of the deferral shape, so the preflight gate, the
     stage-boundary gate and the in-verify abort cannot drift into three
-    slightly different logs/escalations/outcomes (design-invariants:
+    slightly different alarms/outcomes (design-invariants:
     one mechanism, one spelling). Every caller must ``return`` this
     directly -- a defer that keeps going and persists something is the
     exact failure this whole guard exists to prevent.
-
-    The escalation is best-effort, matching ``_detect_mass_rejection``:
-    a raising ``escalate_fn`` must never be what turns a clean abort into
-    a crash, and the warning above it is the real signal either way.
     """
     reason = reason or f"headroom gate failed at the {stage} stage"
-    logger.warning("census deferred at the %s stage: %s", stage, reason)
 
     # Derived here, not threaded from the raise sites, so they cannot
     # disagree about what "total" means (CensusHeadroomExhausted's INVARIANT
@@ -2717,21 +2585,17 @@ def _defer(
             "dedups sightings by session)."
         )
 
-    try:
-        escalate_fn(
-            category="infra_issue",
-            severity="info",
-            summary=(
-                f"legibility census deferred at the {stage} stage "
-                f"({verified} cluster(s) verified, {rejected} rejected, "
-                f"{unverified} unverified of {total} offered): {reason}"
-                if stage != "preflight"
-                else f"legibility census deferred: {reason}"
-            ),
-            detail=detail,
-        )
-    except Exception as exc:  # noqa: BLE001 - best-effort; the warning above is the real signal
-        logger.warning("census: deferral escalation failed (best-effort): %s", exc)
+    escalate_fn(
+        summary=(
+            f"legibility census deferred at the {stage} stage "
+            f"({verified} cluster(s) verified, {rejected} rejected, "
+            f"{unverified} unverified of {total} offered): {reason}"
+            if stage != "preflight"
+            else f"legibility census deferred: {reason}"
+        ),
+        detail=detail,
+        level=logging.WARNING,
+    )
 
     return CensusOutcome(
         status="deferred",
@@ -2743,8 +2607,31 @@ def _defer(
     )
 
 
+@dataclass(frozen=True)
+class _Refusal:
+    """Why a census did not land: the *headline* its escalation summary
+    opens with, and the *cause* its detail opens with."""
+
+    headline: str
+    cause: str
+
+
+def _commit_refusal(landing: unlanded.CommitResult) -> _Refusal:
+    return _Refusal(
+        "legibility census commit did not land",
+        f"git commit did not land after {landing.attempts} attempt(s): {landing.stderr}",
+    )
+
+
+def _gate_refusal(verdict: landing_gate.GateVerdict) -> _Refusal:
+    cause = verdict.describe()
+    if verdict.output_tail:
+        cause += f"; its output ends:\n{verdict.output_tail}"
+    return _Refusal("legibility census refused by its landing gate", cause)
+
+
 def _unlanded(
-    landing: unlanded.CommitResult,
+    refusal: _Refusal,
     landed: CensusOutcome,
     *,
     commit_paths: list[str],
@@ -2752,21 +2639,20 @@ def _unlanded(
     escalate_fn,
     project_id: str,
 ) -> CensusOutcome:
-    """Put back a census whose commit did not land: roll back, log loudly,
-    escalate, return the outcome.
+    """Put back a census that did not land, for *refusal*'s reason: roll
+    back, raise one ERROR alarm, return the outcome.
 
     ONE owner of the ``"unlanded"`` shape, as ``_defer`` is of the deferral
-    shape. *landed* is the outcome the run would have returned had its
-    commit landed; the unlanded outcome is that one with every output --
-    report and dry-run payloads file alike -- rolled back (see
-    ``CensusOutcome`` for what its fields then name). The escalation is
-    best-effort for the same reason as
-    ``_defer``'s: the ERROR line is the real signal either way.
+    shape: a landing-gate refusal and a commit that did not land differ only
+    in *refusal*. *landed* is the outcome the run would have returned had it
+    landed; the unlanded outcome is that one with every output -- report and
+    dry-run payloads file alike -- rolled back (see ``CensusOutcome`` for
+    what its fields then name).
     """
     rollback = roll_back(paths=commit_paths)
     if rollback.restored:
         summary = (
-            f"legibility census commit did not land ({project_id}): outputs "
+            f"{refusal.headline} ({project_id}): outputs "
             "rolled back, census-state NOT advanced"
         )
         state_line = (
@@ -2775,7 +2661,7 @@ def _unlanded(
         )
     else:
         summary = (
-            f"legibility census commit did not land ({project_id}): rollback "
+            f"{refusal.headline} ({project_id}): rollback "
             "INCOMPLETE, outputs still dirty in the checkout"
         )
         state_line = (
@@ -2783,17 +2669,13 @@ def _unlanded(
             "in the working tree."
         )
     detail = (
-        f"git commit did not land after {landing.attempts} attempt(s): {landing.stderr}\n\n"
+        f"{refusal.cause}\n\n"
         f"{rollback.describe()}\n\n"
         "Remediation tickets filed before the commit: "
         f"{', '.join(landed.filed_ticket_ids) or 'none'}.\n"
         f"{state_line}"
     )
-    logger.error("%s -- %s", summary, detail)
-    try:
-        escalate_fn(category="infra_issue", severity="info", summary=summary, detail=detail)
-    except Exception as exc:  # noqa: BLE001 - best-effort; the error line above is the real signal
-        logger.warning("census: unlanded-commit escalation failed (best-effort): %s", exc)
+    escalate_fn(summary=summary, detail=detail, level=logging.ERROR)
     return replace(
         landed, status="unlanded", report_path=None, record_path=None, rollback=rollback,
     )
@@ -2810,6 +2692,7 @@ def run_census(
     task_store: task_store.TaskStore,
     escalate_fn,
     status_fetcher,
+    gate: Callable[[], landing_gate.GateVerdict],
     commit,
     roll_back,
     embedder: embeddings.Embedder,
@@ -2834,7 +2717,9 @@ def run_census(
 
     Every LLM / MCP / git side effect is one of the seam parameters above
     -- this function performs no I/O and calls no model except through
-    them. *config* is a ``config.LegibilityConfig`` (``config.census.
+    them. ``escalate_fn(*, summary, detail, level) -> bool`` raises one
+    alarm, journaled at *level*, and never raises. *config* is a
+    ``config.LegibilityConfig`` (``config.census.
     saturation`` drives the mining stop condition; ``config.models.*``
     drives the ratified static model routing).
 
@@ -2932,7 +2817,12 @@ def run_census(
     (``build_census_record``) and the
     report rendered from it -> ``codebook.dump`` -> ``advance_census_state``
     (done-count from the same *status_fetcher* snapshot, watermark from the
-    mining window) ->
+    mining window) -> *gate*, the project's landing gate
+    (``landing_gate.run_gate``) over the checkout now holding those outputs,
+    at a HEAD that held still while it ran (it re-runs a bounded number of
+    times while the merge worker moves HEAD, then refuses):
+    a verdict that does not pass is rolled back exactly as a commit that did
+    not land, and *commit* is never called ->
     *commit* of report + record + codebook + state -> ledger every merged
     coding's session (``session_ledger``, only once the commit has landed; a
     failed write is ``CensusOutcome.ledger_write_error``, never a crash). A
@@ -3709,6 +3599,7 @@ def run_census(
         done_count=done_count,
     )
 
+    verdict = gate()
     landed = CensusOutcome(
         status="done",
         report_path=str(report_path),
@@ -3724,21 +3615,22 @@ def run_census(
         released_entry_ids=released_entry_ids,
         skipped_deletions=merge.skipped_deletions,
         filing=filing_report,
+        gate=verdict,
     )
     commit_paths = [
         str(report_path), str(record_path), str(codebook_path), str(census_state_path),
     ]
     if dry_run_filing is not None:
         commit_paths.append(dry_run_filing.path)
+    unlanded_as = functools.partial(
+        _unlanded, landed=landed, commit_paths=commit_paths, roll_back=roll_back,
+        escalate_fn=escalate_fn, project_id=project_id,
+    )
+    if not verdict.passed:
+        return unlanded_as(_gate_refusal(verdict))
     landing = commit(paths=commit_paths, message=f"legibility census {date}")
     if not landing.ok:
-        return _unlanded(
-            landing, landed,
-            commit_paths=commit_paths,
-            roll_back=roll_back,
-            escalate_fn=escalate_fn,
-            project_id=project_id,
-        )
+        return unlanded_as(_commit_refusal(landing))
     if selection is None:
         return landed
     return _ledger_census_codings(
@@ -4217,80 +4109,26 @@ var/default -- submit_task lives on the same fused-memory MCP server this
 project's get_statuses call already targets."""
 
 
-def _post_mcp_tool_call(url: str, tool_name: str, arguments: dict, *, timeout: float = 30.0) -> dict:
-    """Call MCP tool *tool_name* at *url*, returning its unwrapped result.
+def _post_mcp_tool_call(base_url: str, tool_name: str, arguments: dict, *, timeout: float = 30.0) -> dict:
+    """Call MCP tool *tool_name* on the server at *base_url*, returning its reply.
 
-    A thin delegate to ``census_trigger.post_mcp_tool_call``, which
-    single-sources the whole MCP transport contract for this subsystem
-    (headers, session handshake, body decoding, envelope unwrap). The seam
-    NAME and signature are preserved deliberately: ~6 tests monkeypatch this
-    function as THE single MCP boundary, and both consumers --
-    :func:`default_submit_fn` and :func:`_build_default_escalate_fn` -- keep
-    routing through it.
-
-    Two transport facts, both verified live and both previously unhandled
-    here, are why this is no longer a bare POST (task 3644):
-
-    * The escalation server (:8103) is a STATEFUL streamable-HTTP server. A
-      session-less ``tools/call`` is rejected at the transport layer, before
-      the tool runs, with ``400 Bad Request`` / ``"Missing session ID"``. The
-      client must first ``initialize`` (session-less), carry the
-      server-assigned ``mcp-session-id``, and retry.
-    * With a session, that server answers ``tools/call`` with
-      ``content-type: text/event-stream``, so ``response.json()`` raises.
-
-    Because :func:`_build_default_escalate_fn` swallows POST failures
-    best-effort, both defects were silent: every legibility census escalation
-    ever filed was dropped at the transport layer. The fused-memory server
-    (:8002) is STATELESS by contrast -- one bare POST, ``application/json``,
-    no session -- and ``post_mcp_tool_call`` handshakes only on a 400, so
-    :func:`default_submit_fn`'s path is unchanged.
-
-    Being the single boundary is also why the pytest guard lives here:
-    :func:`_refuse_real_post_under_test` covers both consumers in one call,
-    and a caller entitled to post for real under pytest declares that by
-    wrapping the call in :func:`own_endpoint`. The census's task store
-    (``task_store.McpTaskStore``) posts through it too, with *timeout* sized
-    to a ``resolve_ticket`` wait.
+    Refused under pytest unless the caller declared the endpoint its own
+    (:func:`alarm.refuse_real_post_under_test`).
     """
-    _refuse_real_post_under_test(url, tool_name)
-    return census_trigger.post_mcp_tool_call(url, tool_name, arguments, timeout=timeout)
+    alarm.refuse_real_post_under_test(base_url, tool_name)
+    with SyncMcpSession(base_url, client_name="legibility-census", timeout=timeout) as session:
+        return session.call_tool(tool_name, arguments)
 
 
-def _fused_memory_mcp_url() -> str:
-    return os.environ.get(_FUSED_MEMORY_URL_ENV_VAR, _DEFAULT_FUSED_MEMORY_URL) + "/mcp"
+def _fused_memory_base_url() -> str:
+    return os.environ.get(_FUSED_MEMORY_URL_ENV_VAR, _DEFAULT_FUSED_MEMORY_URL)
 
 
 def default_submit_fn(**kwargs) -> dict:
     """Real curator-path ``submit_task`` poster (fused-memory MCP server) --
     build_task_payloads' payloads are forwarded verbatim as this call's
     arguments."""
-    return _post_mcp_tool_call(_fused_memory_mcp_url(), "submit_task", kwargs)
-
-
-def _build_default_escalate_fn(cfg):
-    """Build the real info-escalation poster (this project's escalation
-    server, PRD decision 8's poster pattern -- mirrors
-    ``nightly.post_escalation``'s envelope shape): a synthetic ``task_id``
-    labels the census as its source, since it is a CLI-driven run, not a
-    Taskmaster task. Best-effort -- any failure is logged and swallowed,
-    since ``run_census``'s own defer path already logs loudly and the
-    CLI's own exit code is the authoritative signal regardless of whether
-    this POST succeeds."""
-    def _escalate_fn(**kwargs) -> dict:
-        url = f"http://localhost:{cfg.escalation_port}/mcp"
-        arguments = {
-            "task_id": f"legibility-census-{cfg.project_id}",
-            "agent_role": "legibility-census",
-            **kwargs,
-        }
-        try:
-            return _post_mcp_tool_call(url, "escalate_info", arguments)
-        except Exception as exc:  # noqa: BLE001 - best-effort; run_census already logged loudly
-            logger.warning("census: escalation post failed (best-effort): %s", exc)
-            return {}
-
-    return _escalate_fn
+    return _post_mcp_tool_call(_fused_memory_base_url(), "submit_task", kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -4413,7 +4251,7 @@ def _project_identity_mismatch(project_root: Path, cfg, config_path: Path) -> st
     )
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, poster: alarm.Poster | None = None) -> int:
     """CLI entrypoint.
 
     Unless ``--force``, gates on ``census_trigger.decide_for_project``
@@ -4425,7 +4263,8 @@ def main(argv: list[str] | None = None) -> int:
     own ``force`` parameter).
 
     Otherwise builds the real default seams (headless-CLI ``invoke`` for
-    mining/verify/synthesis, MCP posters for ``submit_fn``/``escalate_fn``,
+    mining/verify/synthesis, the fused-memory poster for ``submit_fn``,
+    :func:`alarm.raise_alarm` (through *poster*) for ``escalate_fn``,
     ``census_trigger.default_status_fetcher`` for the done-count baseline,
     a :class:`census_window.WindowBatchSource` over the mining window,
     ``unlanded.commit_only`` for the scoped commit, and the ``unlanded.roll_back`` that puts
@@ -4467,10 +4306,10 @@ def main(argv: list[str] | None = None) -> int:
     resolved after the gate and before any spend.
 
     Returns non-zero only on a genuine fail-loud error. Every such exit
-    after the config has loaded has filed exactly one escalation:
-    :func:`_census_failed`'s for any raise, a refused precondition included,
-    or ``run_census``'s own for an ``"unlanded"`` census whose commit did not
-    land. Before the config loads there is no escalation target, so a bad
+    after the config has loaded has raised exactly one ERROR alarm:
+    :func:`alarm.fail_loud_boundary`'s for any raise, a refused precondition
+    included, or ``run_census``'s own for an ``"unlanded"`` census whose
+    commit did not land. Before the config loads there is no escalation target, so a bad
     ``--project-root`` or an unloadable config is reported on stderr only.
     A deferred (headroom-preflight) outcome still exits 0, mirroring
     ``census_trigger``'s own CLI contract of reserving a non-zero exit for
@@ -4591,27 +4430,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"census: failed to load config at {config_path}: {exc}", file=sys.stderr)
         return 1
 
-    # One escalate_fn closure shared by run_census's own defer/unlanded
-    # escalations and this boundary, so every census escalation has one source.
-    escalate_fn = _build_default_escalate_fn(cfg)
+    project = alarm.AlarmProject.of(cfg)
+    escalate_fn = functools.partial(
+        alarm.raise_alarm, project, alarm.AlarmSource.CENSUS, poster=poster,
+    )
     try:
-        return _run_configured_census(
-            args, project_root=project_root, cfg=cfg, config_path=config_path,
-            escalate_fn=escalate_fn,
-        )
+        with alarm.fail_loud_boundary(alarm.AlarmSource.CENSUS, project, poster=poster):
+            return _run_configured_census(
+                args, project_root=project_root, cfg=cfg, config_path=config_path,
+                escalate_fn=escalate_fn,
+            )
     except Exception as exc:
-        return _census_failed(cfg, escalate_fn, exc)
-
-
-def _census_failed(cfg: config.LegibilityConfig, escalate_fn, exc: Exception) -> int:
-    """Report a census that failed after its config loaded -- stderr, then the
-    journal, then one best-effort escalation -- and return the exit code."""
-    summary = f"legibility census run failed ({cfg.project_id}): {type(exc).__name__}: {exc}"
-    detail = "".join(traceback.format_exception(exc))
-    print(f"census: FAILED -- {exc}", file=sys.stderr)
-    logger.error("%s -- %s", summary, detail)
-    escalate_fn(category="infra_issue", severity="info", summary=summary, detail=detail)
-    return 1
+        print(f"census: FAILED -- {exc}", file=sys.stderr)
+        return 1
 
 
 def _run_configured_census(
@@ -4714,9 +4545,10 @@ def _run_configured_census(
             ),
             synthesize_fn=_build_default_synthesize_fn(synthesis_invoke),
             submit_fn=default_submit_fn,
-            task_store=task_store.McpTaskStore(url=_fused_memory_mcp_url(), post=_post_mcp_tool_call),
+            task_store=task_store.McpTaskStore(url=_fused_memory_base_url(), post=_post_mcp_tool_call),
             escalate_fn=escalate_fn,
             status_fetcher=status_fetcher,
+            gate=functools.partial(landing_gate.run_gate, project_root, cfg.census.landing_gate),
             commit=functools.partial(unlanded.commit_only, project_root),
             roll_back=functools.partial(
                 unlanded.roll_back, project_root,
@@ -4762,6 +4594,12 @@ def _run_configured_census(
             outcome.rollback.describe() if outcome.rollback is not None
             else "no rollback was recorded"
         )
+        if outcome.gate is not None and not outcome.gate.passed:
+            print(
+                f"census: landing gate refused the census -- {outcome.gate.describe()} -- {rollback}",
+                file=sys.stderr,
+            )
+            return 1
         print(
             f"census: commit did not land -- {rollback} "
             f"filed_tickets={len(outcome.filed_ticket_ids)}",

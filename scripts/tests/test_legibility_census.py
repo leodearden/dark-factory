@@ -25,6 +25,7 @@ import logging
 import math
 import re
 import subprocess
+import sys
 from collections.abc import Callable
 from datetime import UTC, datetime, time, timedelta
 from typing import Any
@@ -33,6 +34,7 @@ import pytest
 import yaml
 from legibility import (
     account_pool,
+    alarm,
     census_findings,
     census_identity,
     census_trigger,
@@ -45,6 +47,7 @@ from legibility import (
     filing_policy,
     finding_area,
     invariants,
+    landing_gate,
     prescreen,
     session_ledger,
     session_runner,
@@ -66,6 +69,7 @@ from shared.cap_markers import (
     REAL_CLI_CAP_MESSAGES,
 )
 from shared.finding_key import finding_key
+from shared.testing_mcp_stub import StubMcpServer
 
 
 @pytest.fixture(autouse=True)
@@ -203,13 +207,14 @@ def _make_fake_submit_fn():
 
 
 def _make_fake_escalate_fn():
-    """Fake info-escalation `escalate_fn(**kwargs) -> dict` seam. Records
-    every call's kwargs in `.calls` and returns a fake escalation id."""
+    """Fake `escalate_fn(*, summary, detail, level) -> bool` seam: run_census
+    raises each alarm through it, and it never raises. Records every call's
+    kwargs in `.calls` and reports the alarm landed."""
     calls = []
 
     def fake_escalate_fn(**kwargs):
         calls.append(kwargs)
-        return {"id": f"escalation-{len(calls)}"}
+        return True
 
     fake_escalate_fn.calls = calls
     return fake_escalate_fn
@@ -257,6 +262,12 @@ def _poison(name):
         raise AssertionError(f"{name} must never be called on this path")
 
     return _fn
+
+
+def _passing_gate():
+    """The `gate() -> landing_gate.GateVerdict` seam of a project whose
+    landing gate passes."""
+    return landing_gate.GateVerdict(landing_gate.GateStatus.PASSED, ("true",), 0)
 
 
 # ---------------------------------------------------------------------------
@@ -2847,6 +2858,7 @@ def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
         task_store=FakeTaskStore(),
         escalate_fn=_make_fake_escalate_fn(),
         status_fetcher=_make_fake_status_fetcher(0),
+        gate=_passing_gate,
         commit=_poison("commit"),
         roll_back=_poison("roll_back"),
         codebook_dict=_minimal_v2_codebook(),
@@ -2891,10 +2903,8 @@ def test_run_census_defers_on_headroom_banner(tmp_path, caplog):
 
     assert len(fake_escalate_fn.calls) == 1
     call = fake_escalate_fn.calls[0]
-    assert call.get("category") in ("infra_issue", "risk_identified")
+    assert call["level"] == logging.WARNING
     assert call.get("summary"), "a loud summary naming the deferral"
-
-    assert sum(1 for r in caplog.records if r.levelno >= logging.WARNING) >= 1
 
     assert fake_submit_fn.calls == []
     assert not kwargs["codebook_path"].exists()
@@ -2971,14 +2981,11 @@ def test_run_census_defers_at_verify_boundary_when_cap_arrives_after_preflight(
 
     assert len(fake_escalate_fn.calls) == 1
     call = fake_escalate_fn.calls[0]
-    assert call.get("category") == "infra_issue"
-    assert call.get("severity") == "info"
+    assert call["level"] == logging.WARNING
     summary = call.get("summary") or ""
     detail = call.get("detail") or ""
     assert "verify" in (summary + detail).lower(), "the escalation names the stage"
     assert "1" in (summary + detail), "the escalation names the unverified count"
-
-    assert sum(1 for r in caplog.records if r.levelno >= logging.WARNING) >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -3513,6 +3520,135 @@ def test_run_census_lands_through_a_transient_index_lock(tmp_path):
     head_state = json.loads(_git(repo, "show", "HEAD:docs/legibility/census-state.json"))
     assert head_state["last_census_at"] == "2026-07-14"
     assert _git(repo, "ls-files", "--", "plans/confusion-census-2026-07-14.md") != b""
+
+
+def test_run_census_commit_refusal_keeps_its_summary_and_detail_and_records_the_passed_gate(tmp_path):
+    rollback = unlanded.Rollback(quarantine_dir=tmp_path / "q" / "census-2026-07-14-x", paths=("a",))
+    kwargs = _unlanded_kwargs(tmp_path, roll_back=_make_fake_roll_back(rollback))
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "unlanded"
+    assert outcome.gate == _passing_gate()
+    (call,) = kwargs["escalate_fn"].calls
+    assert call["summary"] == (
+        "legibility census commit did not land (dark_factory): outputs rolled back, "
+        "census-state NOT advanced"
+    )
+    assert call["detail"].startswith(
+        f"git commit did not land after 1 attempt(s): {_REFUSAL}\n\n{rollback.describe()}\n\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 7448: a census lands only once the project's landing gate passes over
+# the outputs it wrote; a refusal takes the same unlanded shape as a refused
+# commit, and the commit is never attempted.
+# ---------------------------------------------------------------------------
+
+_GATE_ARGV = ("uv", "run", "pytest", "scripts/tests/test_codebook.py")
+_GATE_TAIL = "1 failed: test_live_codebook_withdraws_the_refuted_em_dash_framing"
+
+
+def _refusing_gate_verdict(status: landing_gate.GateStatus) -> landing_gate.GateVerdict:
+    if status is landing_gate.GateStatus.FAILED:
+        return landing_gate.GateVerdict(status, _GATE_ARGV, 1, _GATE_TAIL)
+    return landing_gate.GateVerdict(status, _GATE_ARGV, None, _GATE_TAIL, "timed out after 900s")
+
+
+def _make_fake_gate(verdict, *, on_call=None):
+    """Fake `gate() -> landing_gate.GateVerdict` seam returning *verdict*,
+    running *on_call* first when given. Counts its calls in `.calls`."""
+    calls = []
+
+    def fake_gate():
+        calls.append(None)
+        if on_call is not None:
+            on_call()
+        return verdict
+
+    fake_gate.calls = calls
+    return fake_gate
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["filed", "dry-run"])
+@pytest.mark.parametrize(
+    "status", [landing_gate.GateStatus.FAILED, landing_gate.GateStatus.DID_NOT_RUN],
+)
+def test_run_census_refused_by_its_landing_gate_rolls_back_unlanded_and_never_commits(
+    tmp_path, status, dry_run,
+):
+    refusal = _refusing_gate_verdict(status)
+    gate = _make_fake_gate(refusal)
+    rollback = unlanded.Rollback(quarantine_dir=tmp_path / "q" / "census-2026-07-14-x", paths=("a",))
+    fake_roll_back = _make_fake_roll_back(rollback)
+    payloads_path = tmp_path / "confusion-census-2026-07-14-payloads.json" if dry_run else None
+    kwargs = _mined_run_kwargs(
+        tmp_path, gate=gate, commit=_poison("commit"), roll_back=fake_roll_back,
+        dry_run_payloads_path=payloads_path,
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "unlanded"
+    assert outcome.gate is refusal
+    assert outcome.rollback is rollback
+    assert (outcome.report_path, outcome.record_path) == (None, None)
+    assert len(gate.calls) == 1
+    report_path = kwargs["report_path"]
+    written = [
+        str(report_path), str(report_path.with_suffix(".json")),
+        str(kwargs["codebook_path"]), str(kwargs["census_state_path"]),
+    ]
+    if payloads_path is not None:
+        written.append(str(payloads_path))
+    assert fake_roll_back.calls == [{"paths": written}]
+
+    (call,) = kwargs["escalate_fn"].calls
+    assert call["level"] == logging.ERROR
+    assert "landing gate" in call["summary"]
+    assert "dark_factory" in call["summary"]
+    assert "census-state NOT advanced" in call["summary"]
+    assert call["detail"].startswith(refusal.describe())
+    assert _GATE_TAIL in call["detail"]
+    assert str(rollback.quarantine_dir) in call["detail"]
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    [
+        landing_gate.GateVerdict(landing_gate.GateStatus.PASSED, _GATE_ARGV, 0, "2 passed"),
+        landing_gate.GateVerdict(landing_gate.GateStatus.UNGATED),
+    ],
+    ids=["passed", "ungated"],
+)
+def test_run_census_runs_its_gate_over_the_written_outputs_then_commits(tmp_path, verdict):
+    order = []
+    seen = {}
+    kwargs: dict[str, Any] = {}
+
+    def read_written_outputs():
+        order.append("gate")
+        seen["codebook"] = codebook.load(kwargs["codebook_path"])
+        seen["state"] = json.loads(kwargs["census_state_path"].read_text())
+
+    fake_commit = _make_fake_commit()
+
+    def commit(**commit_kwargs):
+        order.append("commit")
+        return fake_commit(**commit_kwargs)
+
+    gate = _make_fake_gate(verdict, on_call=read_written_outputs)
+    kwargs.update(_mined_run_kwargs(tmp_path, gate=gate, commit=commit))
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert outcome.gate is verdict
+    assert order == ["gate", "commit"]
+    assert seen["codebook"] == codebook.load(kwargs["codebook_path"])
+    assert seen["codebook"] != kwargs["codebook_dict"]
+    assert seen["state"]["last_census_at"] == "2026-07-14"
 
 
 # ---------------------------------------------------------------------------
@@ -5177,17 +5313,15 @@ def test_run_census_warns_and_escalates_when_every_cluster_is_rejected(tmp_path,
         commit=_make_fake_commit(),
     )
 
-    with caplog.at_level(logging.WARNING):
-        outcome = mod.run_census(**kwargs)
-
-    warnings = " ".join(r.message.lower() for r in caplog.records)
-    assert "systemic" in warnings, "the pattern must be NAMED, not left to be inferred"
-    assert "3" in warnings, "how many clusters were offered"
+    outcome = mod.run_census(**kwargs)
 
     assert len(fake_escalate_fn.calls) == 1, fake_escalate_fn.calls
     escalation = fake_escalate_fn.calls[0]
-    assert escalation["severity"] == "info"
+    assert escalation["level"] == logging.WARNING
     assert "reject" in escalation["summary"].lower()
+    detail = escalation["detail"].lower()
+    assert "systemic" in detail, "the pattern must be NAMED, not left to be inferred"
+    assert "3" in detail, "how many clusters were offered"
 
     # A suspicious run is still a COMPLETED run: mining is already paid for,
     # and an all-rejected census is legitimately possible. Detect, never fail.
@@ -5215,35 +5349,6 @@ def test_run_census_does_not_warn_when_some_cluster_verifies(tmp_path, caplog):
         mod.run_census(**kwargs)
 
     assert not any("systemic" in r.message.lower() for r in caplog.records)
-
-
-def test_run_census_mass_rejection_escalation_failure_is_not_fatal(tmp_path, caplog):
-    """A raising escalate_fn must not discard a run whose mining is already
-    paid for. Unlike the defer-path escalation (which returns immediately
-    afterwards), this one sits between the mining spend and the output
-    writes."""
-    kwargs = _run_census_kwargs(
-        tmp_path,
-        invoke=_make_fake_invoke(_three_novel_invoke),
-        batch_source=[_three_novel_batch()],
-        verify_fn=_make_fake_verify_fn(verified_titles=set()),
-        synthesize_fn=_make_fake_synthesize_fn(),
-        submit_fn=_make_fake_submit_fn(),
-        escalate_fn=_poison("escalate_fn"),  # raises on the detector's call
-        status_fetcher=_make_fake_status_fetcher(0),
-        commit=_make_fake_commit(),
-    )
-
-    with caplog.at_level(logging.WARNING):
-        outcome = mod.run_census(**kwargs)
-
-    assert outcome.status == "done"
-    assert kwargs["report_path"].exists()
-    assert kwargs["census_state_path"].exists()
-    # Swallowed, but never silently: both the finding and the failed post log.
-    warnings = " ".join(r.message.lower() for r in caplog.records)
-    assert "systemic" in warnings
-    assert "escalation failed" in warnings
 
 
 @pytest.mark.parametrize(
@@ -5827,6 +5932,42 @@ def test_main_exits_nonzero_and_names_the_quarantine_when_the_census_did_not_lan
     assert str(quarantine_dir) in capsys.readouterr().err
 
 
+def test_main_hands_run_census_the_projects_landing_gate_run_in_its_root(tmp_path, monkeypatch):
+    config_path = _write_legibility_yaml(tmp_path)
+    argv = [sys.executable, "-c", "import os; print(os.getcwd())"]
+    with config_path.open("a", encoding="utf-8") as fh:
+        fh.write(f"census: {{landing_gate: {{argv: {json.dumps(argv)}}}}}\n")
+    _commit_all(tmp_path)
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+
+    assert mod.main(["--project-root", str(tmp_path), "--force"]) == 0
+
+    verdict = fake_run_census.calls[0]["gate"]()
+    assert verdict.status is landing_gate.GateStatus.PASSED
+    assert verdict.output_tail.strip() == str(tmp_path.resolve())
+
+
+def test_main_names_the_landing_gate_when_it_refused_the_census(tmp_path, monkeypatch, capsys):
+    _census_project(tmp_path)
+    refusal = _refusing_gate_verdict(landing_gate.GateStatus.FAILED)
+    monkeypatch.setattr(mod, "run_census", _make_fake_main_run_census(outcome=mod.CensusOutcome(
+        status="unlanded",
+        rollback=unlanded.Rollback(
+            quarantine_dir=tmp_path / "q" / "census-2026-07-14-x",
+            paths=("docs/legibility/census-state.json",),
+        ),
+        gate=refusal,
+    )))
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "landing gate refused the census" in err
+    assert refusal.describe() in err
+
+
 @pytest.mark.parametrize("ledger_error", [None, "/state/coded-sessions.sqlite: disk I/O error"])
 def test_main_done_line_names_a_ledger_write_failure_only_when_there_was_one(
     tmp_path, monkeypatch, capsys, ledger_error,
@@ -6025,7 +6166,7 @@ def test_main_cost_control_flags_thread_into_run_census(tmp_path, monkeypatch):
     )
 
 
-def test_main_requires_project_root(tmp_path, monkeypatch, capsys, install_fake_httpx):
+def test_main_requires_project_root(tmp_path, monkeypatch, capsys):
     """The census must REFUSE to guess its target from the process cwd.
 
     An implicit-cwd default on a money-spending entrypoint is the root enabler
@@ -6037,7 +6178,6 @@ def test_main_requires_project_root(tmp_path, monkeypatch, capsys, install_fake_
     # An EMPTY cwd: were the flag silently defaulted, "." must not resolve to
     # a tree holding a real legibility.yaml (the worktree root does).
     monkeypatch.chdir(tmp_path)
-    install_fake_httpx(lambda *a, **k: pytest.fail("no network on this path"))
     monkeypatch.setattr(mod, "run_census", _poison("run_census"))
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
 
@@ -6049,7 +6189,7 @@ def test_main_requires_project_root(tmp_path, monkeypatch, capsys, install_fake_
 
 
 def test_main_rejects_a_project_root_that_disagrees_with_the_config(
-    tmp_path, monkeypatch, capsys, install_fake_httpx,
+    tmp_path, monkeypatch, capsys,
 ):
     """Two sources for "which project is this?" must agree, or the run stops.
 
@@ -6062,18 +6202,23 @@ def test_main_rejects_a_project_root_that_disagrees_with_the_config(
     project_a = tmp_path / "project_a"
     project_b = tmp_path / "project_b"
     project_a.mkdir()
-    config_b = _write_legibility_yaml(project_b, project_id="project_b")
-    install_fake_httpx(lambda *a, **k: pytest.fail("no network on this path"))
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
 
-    exit_code = mod.main([
-        "--project-root", str(project_a), "--config", str(config_b), "--force",
-    ])
+    with StubMcpServer(stateful=True) as server:
+        monkeypatch.setenv("FUSED_MEMORY_MCP_URL", server.url)
+        config_b = _write_legibility_yaml(
+            project_b, project_id="project_b", escalation_port=int(server.url.rsplit(":", 1)[1]),
+        )
+        exit_code = mod.main([
+            "--project-root", str(project_a), "--config", str(config_b), "--force",
+        ])
+        requests = server.requests
 
     assert exit_code == 1
     assert fake_run_census.calls == [], "a mixed-project run must stop before any billable work"
+    assert requests == (), f"a pytest run must reach no real MCP endpoint: {requests}"
     err = capsys.readouterr().err
     # BOTH sides must be named, or the operator cannot tell which one is wrong.
     assert str(project_a) in err
@@ -6242,21 +6387,30 @@ def test_main_returns_nonzero_on_fail_loud_error(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mod, "run_census", raising_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
-    # Once main() routes fail-loud errors through escalate_fn, the failure path
-    # POSTs escalate_info; stub the single MCP boundary so this test never
-    # attempts a real localhost POST (conftest: no test hits a real endpoint).
-    monkeypatch.setattr(mod, "_post_mcp_tool_call", lambda *a, **k: {})
 
-    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"], poster=_AlarmRecorder())
 
     assert exit_code != 0
 
 
+class _AlarmRecorder:
+    """A census.main `poster=` seam recording each alarm's (base_url, arguments)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def __call__(self, base_url, arguments):
+        self.calls.append((base_url, dict(arguments)))
+
+    @property
+    def arguments(self) -> list[dict]:
+        return [arguments for _url, arguments in self.calls]
+
+
 def test_main_failure_files_escalation(tmp_path, monkeypatch):
-    """main()'s fail-loud catch-all must file an escalate_info via the reused
-    escalate_fn closure (PRD decision 8: degradation never silent) -- a hard
-    census failure exits non-zero AND leaves an operator signal, rather than
-    dying with only a stderr line (the silent-census incident this fixes)."""
+    """main()'s fail-loud boundary raises one alarm (PRD decision 8:
+    degradation never silent) -- a hard census failure exits non-zero AND
+    leaves an operator signal, rather than dying with only a stderr line."""
     _census_project(tmp_path)
 
     def raising_run_census(**kwargs):
@@ -6264,21 +6418,13 @@ def test_main_failure_files_escalation(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mod, "run_census", raising_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+    poster = _AlarmRecorder()
 
-    posts = []
-
-    def rec(url, tool_name, arguments):
-        posts.append((url, tool_name, arguments))
-        return {}
-
-    monkeypatch.setattr(mod, "_post_mcp_tool_call", rec)
-
-    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"], poster=poster)
 
     assert exit_code == 1
-    escalations = [args for (_url, tool_name, args) in posts if tool_name == "escalate_info"]
-    assert len(escalations) == 1, "exactly one escalate_info POST for the hard failure"
-    arguments = escalations[0]
+    [(url, arguments)] = poster.calls
+    assert url == "http://localhost:8103"
     assert arguments["task_id"] == "legibility-census-dark_factory"
     assert arguments["category"] == "infra_issue"
     assert arguments["summary"] and "dark_factory" in arguments["summary"]
@@ -6286,9 +6432,8 @@ def test_main_failure_files_escalation(tmp_path, monkeypatch):
 
 
 def test_main_failure_escalation_is_best_effort_when_poster_raises(tmp_path, monkeypatch, caplog):
-    """The failure escalation is best-effort: if the escalation POST itself
-    raises, the closure swallows it (logging a WARNING) and main() STILL
-    returns 1 -- the escalation never masks the authoritative exit code."""
+    """A raising alarm poster is logged, never propagated, and main() STILL
+    returns 1 -- the alarm never masks the authoritative exit code."""
     _census_project(tmp_path)
 
     def raising_run_census(**kwargs):
@@ -6297,17 +6442,16 @@ def test_main_failure_escalation_is_best_effort_when_poster_raises(tmp_path, mon
     monkeypatch.setattr(mod, "run_census", raising_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
 
-    def raising_post(url, tool_name, arguments):
+    def raising_poster(base_url, arguments):
         raise RuntimeError("escalation server down")
 
-    monkeypatch.setattr(mod, "_post_mcp_tool_call", raising_post)
-
-    with caplog.at_level(logging.WARNING, logger="legibility.census"):
-        exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+    with caplog.at_level(logging.WARNING):
+        exit_code = mod.main(["--project-root", str(tmp_path), "--force"], poster=raising_poster)
 
     assert exit_code == 1
     assert any(
-        r.levelno >= logging.WARNING for r in caplog.records
+        r.levelno == logging.WARNING and "escalation server down" in r.getMessage()
+        for r in caplog.records
     ), "a raising escalation poster must be logged, never propagated"
 
 
@@ -6440,235 +6584,22 @@ def test_main_hands_run_census_a_window_source_over_the_project_ledger(tmp_path,
     assert source.selection.ledger.state is session_ledger.LedgerState.CREATED
 
 
-# ---------------------------------------------------------------------------
-# task 2953: _post_mcp_tool_call() streamable-HTTP Accept headers
-# ---------------------------------------------------------------------------
-
-class _FakeHttpxResponse:
-    """A 200 `application/json` reply, i.e. the STATELESS fused-memory shape.
-
-    `status_code` and `headers` were added for task 3644: `_post_mcp_tool_call`
-    now delegates to `census_trigger.post_mcp_tool_call`, which reads
-    `status_code` (to detect the stateful escalation server's 400 "Missing
-    session ID") and `content-type` (to detect an SSE-framed body) before
-    decoding. Without them this fake would die on an AttributeError and stop
-    exercising the real code path -- so the task-2953 header contract below
-    keeps being asserted against the transport that actually ships, not
-    against a fake the implementation has outgrown."""
-
-    def __init__(self, payload):
-        self._payload = payload
-        self.status_code = 200
-        self.headers = {"content-type": "application/json"}
-
-    def raise_for_status(self):
-        pass
-
-    def json(self):
-        return self._payload
-
-
-def test_post_mcp_tool_call_sends_streamable_http_accept_headers(install_fake_httpx, monkeypatch):
-    """Task 2953: the streamable-HTTP MCP transport 406s any tools/call POST
-    lacking an Accept header covering both application/json and
-    text/event-stream (verified live against a local MCP /mcp endpoint --
-    shared by census.py's submit_task and escalate_info posters via this one
-    function). httpx is imported lazily, but it IS importable here -- a
-    direct dependency of `shared` (shared/pyproject.toml, `httpx>=0.27`,
-    task 2965) -- so an un-faked call would really hit the network. The
-    shared `install_fake_httpx` fixture substitutes a stub so the outbound
-    request shape is assertable without a live listener on :8002."""
-    captured_kwargs = {}
-    rpc_response = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": {"structuredContent": {"ok": True}},
-    }
-
-    def _fake_post(url, **kwargs):
-        captured_kwargs.update(kwargs)
-        return _FakeHttpxResponse(rpc_response)
-
-    install_fake_httpx(_fake_post)
-
-    # ENTITLED to reach census's real delegate: this test owns the endpoint --
-    # `install_fake_httpx` substitutes a stub httpx BELOW the transport, so
-    # nothing leaves the process, and the whole point is to assert the real
-    # outbound request shape. Declared around the call rather than inferred
-    # (task 5279 W1).
-    with mod.own_endpoint():
-        result = mod._post_mcp_tool_call(
-            "http://localhost:8002/mcp", "submit_task", {"a": 1},
-        )
-
-    assert result == {"ok": True}
-    headers = captured_kwargs.get("headers") or {}
-    assert "application/json" in headers.get("Accept", "")
-    assert "text/event-stream" in headers.get("Accept", "")
-    # Content-Type is part of the same transport contract -- pin it too so a
-    # future edit dropping it can't pass on the Accept assertions alone.
-    assert headers.get("Content-Type") == "application/json"
-    # The JSON-RPC tools/call body (name + arguments) must still ride along.
-    envelope = captured_kwargs.get("json") or {}
-    assert envelope.get("method") == "tools/call"
-    assert envelope.get("params", {}).get("name") == "submit_task"
-    assert envelope.get("params", {}).get("arguments") == {"a": 1}
-
-
-
-
-# ---------------------------------------------------------------------------
-# task 5279 W1: a pytest process never POSTs to a real MCP endpoint through
-# this module. `_post_mcp_tool_call` is the single transport boundary for BOTH
-# `escalate_info` (:8103) and `submit_task` (:8002), and `main()`'s fail-loud
-# catch-all reaches it with no test-mode gate -- so a main()-level test whose
-# monkeypatched `run_census` raises UNEXPECTEDLY files a real escalation into
-# the live operator queue. The recorder below is installed on
-# `census_trigger.post_mcp_tool_call` -- the layer BELOW census's delegate --
-# precisely so the guard under test cannot be the thing that hides the
-# evidence.
-# ---------------------------------------------------------------------------
-
-def _make_transport_recorder():
-    """Record every call that reaches `census_trigger.post_mcp_tool_call`,
-    the real transport below `census._post_mcp_tool_call`.
-
-    A RECORDER, never a raiser: `_build_default_escalate_fn`'s best-effort
-    `except Exception` would swallow a raise and turn a leak into a passing
-    test. Recording makes the leak assertable on the calls list instead."""
-    calls = []
-
-    def _recorder(url, tool_name, arguments, **kwargs):
-        calls.append((url, tool_name, arguments))
-        return {}
-
-    _recorder.calls = calls
-    return _recorder
-
-
 def test_main_hard_failure_under_pytest_reaches_no_real_mcp_endpoint(tmp_path, monkeypatch):
-    """The live leak, reproduced through the path it actually travelled:
-    `main()` --force -> `run_census` raises UNEXPECTEDLY -> the fail-loud
-    catch-all calls the REAL `_build_default_escalate_fn` poster, which POSTs
-    `escalate_info` to `http://localhost:8103/mcp` -- the production
-    escalation queue, because `_write_legibility_yaml` writes the production
-    `escalation_port: 8103` into its tmp_path config.
-
-    `mod._post_mcp_tool_call` is deliberately NOT monkeypatched here (unlike
-    `test_main_failure_files_escalation`, which fakes it): the real poster
-    must run, so that what is pinned is the GUARD rather than the test's own
-    fixture discipline. A test-minted escalation is indistinguishable at
-    triage from a genuine census failure -- same synthetic `task_id`, same
-    `agent_role` -- which is how `esc-legibility-census-dark_factory-2`
-    reached dedupe_count=21.
-
-    The exit contract is asserted alongside: refusing the POST must not
-    change `main()`'s authoritative signal (tasks 2951/2952/3644)."""
-    _census_project(tmp_path)
-
+    """With no poster injected, the alarm's default poster refuses to post
+    from inside pytest, and main()'s exit contract is unchanged."""
     def raising_run_census(**kwargs):
         raise RuntimeError("codebook merge produced an invalid codebook")
 
     monkeypatch.setattr(mod, "run_census", raising_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
 
-    recorder = _make_transport_recorder()
-    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
+    with StubMcpServer(stateful=True) as server:
+        _census_project(tmp_path, escalation_port=int(server.url.rsplit(":", 1)[1]))
+        exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+        requests = server.requests
 
-    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
-
-    assert recorder.calls == [], (
-        "a pytest run must reach no real MCP endpoint through census.py; "
-        f"these POSTs escaped: {recorder.calls}"
-    )
+    assert requests == (), f"a pytest run must reach no real MCP endpoint: {requests}"
     assert exit_code == 1, "refusing the POST must not change main()'s exit contract"
-
-
-def test_post_mcp_tool_call_outside_pytest_still_reaches_the_transport(monkeypatch):
-    """The production path is untouched: with no `PYTEST_CURRENT_TEST` in the
-    environment the guard no-ops and the delegate forwards url, tool name and
-    arguments to `census_trigger.post_mcp_tool_call` verbatim.
-
-    This is the half of the contract that keeps tasks 2951/2952/3644 intact --
-    a real census hard failure on a real run must still file its escalation."""
-    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
-    recorder = _make_transport_recorder()
-    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
-
-    mod._post_mcp_tool_call("http://localhost:9/mcp", "escalate_info", {"a": 1})
-
-    assert recorder.calls == [("http://localhost:9/mcp", "escalate_info", {"a": 1})]
-    # Pin the GUARD as the no-op, not just the reachability of the transport:
-    # asserting only on `recorder.calls` would pass equally against a guard
-    # that had simply been deleted, which is the regression this test exists
-    # to be the counterweight to.
-    assert mod._refuse_real_post_under_test("http://localhost:9/mcp", "escalate_info") is None
-
-
-def test_own_endpoint_is_the_declared_escape_hatch(monkeypatch):
-    """Entitlement to post for real under pytest is DECLARED, not inferred.
-
-    No automatic signal separates "a server this test brought up on an
-    ephemeral port" from "the ambient production server on 8103" -- the
-    leaking tests use 8103 too. So a caller that serves or fakes its OWN
-    endpoint says so by wrapping the call in `mod.own_endpoint()`, which is
-    what `escalation/tests/test_legibility_census_escalation_e2e.py` (task
-    3644's live-server acceptance suite) does. Pinning the seam is what keeps
-    that opt-out from silently turning into "the guard stopped working"."""
-    recorder = _make_transport_recorder()
-    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
-    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_own_endpoint (call)")
-
-    # Without the declaration: refused, and the refusal explains itself.
-    with pytest.raises(mod.CensusPostRefusedUnderTest) as excinfo:
-        mod._post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {"a": 1})
-    assert recorder.calls == []
-    message = str(excinfo.value)
-    # A future e2e author gets a self-explaining failure, not a mystery: the
-    # tool, the target and the way out are all named in the message itself.
-    assert "escalate_info" in message
-    assert "http://localhost:8103/mcp" in message
-    assert "own_endpoint" in message
-
-    # With the declaration around the call: the transport is reached.
-    with mod.own_endpoint():
-        mod._post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {"a": 1})
-    assert recorder.calls == [("http://localhost:8103/mcp", "escalate_info", {"a": 1})]
-
-
-def test_own_endpoint_grant_does_not_outlive_its_block(monkeypatch):
-    """The grant is CALL-scoped, which is the whole reason it is a context
-    manager rather than a rebind that lasts a test or a fixture.
-
-    census posts to two endpoints -- `escalate_info` on the project's
-    escalation server and `submit_task` on fused-memory -- and a test that
-    owns one of them owns only that one. A grant that leaked past the `with`
-    would quietly entitle the other, which is strictly more than the
-    declaration claims. Also pinned: the grant is released even when the
-    entitled call RAISES, since an e2e test asserting on a failure is exactly
-    the shape that would otherwise leave it set."""
-    recorder = _make_transport_recorder()
-    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
-    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_own_endpoint_scope (call)")
-
-    with mod.own_endpoint():
-        mod._post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {"a": 1})
-    with pytest.raises(mod.CensusPostRefusedUnderTest):
-        mod._post_mcp_tool_call("http://localhost:8002/mcp", "submit_task", {"a": 1})
-
-    def _boom(url, tool_name, arguments, timeout=None):
-        raise RuntimeError("the entitled call itself failed")
-
-    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", _boom)
-    with pytest.raises(RuntimeError), mod.own_endpoint():
-        mod._post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {})
-
-    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
-    with pytest.raises(mod.CensusPostRefusedUnderTest):
-        mod._post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {"a": 1})
-    assert recorder.calls == [("http://localhost:8103/mcp", "escalate_info", {"a": 1})], (
-        "only the one entitled POST may have reached the transport"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -6779,17 +6710,13 @@ def test_main_escalates_once_for_every_failure_after_config_load(
     argv, project_id, cause = setup(tmp_path, monkeypatch)
     monkeypatch.setattr(mod, "run_census", _poison("run_census"))
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
-    recorder = _make_transport_recorder()
-    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
+    poster = _AlarmRecorder()
 
-    with caplog.at_level(logging.ERROR, logger="legibility.census"), mod.own_endpoint():
-        exit_code = mod.main([*argv, "--force"])
+    with caplog.at_level(logging.ERROR):
+        exit_code = mod.main([*argv, "--force"], poster=poster)
 
     assert exit_code == 1
-    assert [tool_name for (_url, tool_name, _args) in recorder.calls] == ["escalate_info"], (
-        f"exactly one escalation and nothing else: {recorder.calls}"
-    )
-    [(_url, _tool_name, arguments)] = recorder.calls
+    [arguments] = poster.arguments
     assert arguments["task_id"] == f"legibility-census-{project_id}"
     assert arguments["agent_role"] == "legibility-census"
     assert arguments["category"] == "infra_issue"
@@ -6819,14 +6746,12 @@ def test_main_files_no_second_escalation_when_run_census_reports_unlanded(
         filed_ticket_ids=["tkt_9"],
     )))
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
-    recorder = _make_transport_recorder()
-    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
+    poster = _AlarmRecorder()
 
-    with mod.own_endpoint():
-        exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"], poster=poster)
 
     assert exit_code == 1
-    assert recorder.calls == []
+    assert poster.calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -6907,12 +6832,11 @@ def test_main_closes_its_one_runner_on_the_done_and_the_failed_exit(
             raise RuntimeError("codebook merge produced an invalid codebook")
 
         monkeypatch.setattr(mod, "run_census", raising_run_census)
-        monkeypatch.setattr(mod, "_post_mcp_tool_call", lambda *a, **k: {})
     else:
         monkeypatch.setattr(mod, "run_census", _make_fake_main_run_census())
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
 
-    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"], poster=_AlarmRecorder())
 
     assert exit_code == (1 if run_fails else 0)
     assert [runner.closed for runner in opened_runners] == [1]
@@ -7209,9 +7133,7 @@ def test_run_census_completes_when_the_real_verifier_returns_cap_themed_verdicts
         "not re-mine this window and re-hit the same cluster forever"
     )
     assert len(fake_submit_fn.calls) == 1, "the verified cluster was filed"
-    assert not any(
-        c.get("category") == "infra_issue" for c in fake_escalate_fn.calls
-    ), "no false 'the account is capped' escalation"
+    assert fake_escalate_fn.calls == [], "no false 'the account is capped' escalation"
 
 
 # ---------------------------------------------------------------------------
@@ -7442,8 +7364,7 @@ def test_run_census_aborts_cleanly_on_mid_verify_headroom_exhaustion(tmp_path, c
     # because the abort returns before it.
     assert len(fake_escalate_fn.calls) == 1, fake_escalate_fn.calls
     call = fake_escalate_fn.calls[0]
-    assert call["category"] == "infra_issue"
-    assert call["severity"] == "info"
+    assert call["level"] == logging.WARNING
     blob = (call.get("summary") or "") + (call.get("detail") or "")
     assert "verify" in blob.lower()
     assert "4" in blob, "the escalation names the unverified count"
@@ -10309,52 +10230,51 @@ def _main_task_store(tmp_path, monkeypatch, *, outcome=None):
     return kwargs["task_store"]
 
 
-def test_main_hands_run_census_a_task_store_on_the_fused_memory_endpoint(tmp_path, monkeypatch):
-    monkeypatch.setenv("FUSED_MEMORY_MCP_URL", "http://fused-memory.test:9999")
-    posts = []
+def _tool_calls(server):
+    return [
+        (request.body["params"]["name"], request.body["params"]["arguments"])
+        for request in server.requests
+        if request.http_method == "POST" and request.body.get("method") == "tools/call"
+    ]
 
-    def rec(url, tool_name, arguments, *, timeout=None):
-        posts.append((url, tool_name, arguments))
-        return _EMPTY_FIND_PAGE
 
-    monkeypatch.setattr(mod, "_post_mcp_tool_call", rec)
-    store = _main_task_store(tmp_path, monkeypatch)
+def test_main_hands_run_census_a_task_store_on_the_fused_memory_base_url(tmp_path, monkeypatch):
+    with StubMcpServer(stateful=False, payload=_EMPTY_FIND_PAGE) as server:
+        monkeypatch.setenv("FUSED_MEMORY_MCP_URL", server.url)
+        store = _main_task_store(tmp_path, monkeypatch)
+        with alarm.own_endpoint():
+            hits = store.find_tasks_by_metadata("/abs/root", key="x_finding_key", value="fk-000000000000")
 
-    assert store.find_tasks_by_metadata("/abs/root", key="x_finding_key", value="fk-000000000000") == ()
-
-    [(url, tool_name, arguments)] = posts
-    assert (url, tool_name) == ("http://fused-memory.test:9999/mcp", "find_tasks_by_metadata")
-    assert {key: arguments[key] for key in ("project_root", "key", "value")} == {
-        "project_root": "/abs/root", "key": "x_finding_key", "value": "fk-000000000000",
+    assert hits == ()
+    assert {request.path for request in server.requests} == {"/mcp"}
+    [(tool_name, arguments)] = _tool_calls(server)
+    assert tool_name == "find_tasks_by_metadata"
+    assert {key: arguments[key] for key in ("project_root", "key", "value", "offset")} == {
+        "project_root": "/abs/root", "key": "x_finding_key", "value": "fk-000000000000", "offset": 0,
     }
 
 
-def test_post_mcp_tool_call_forwards_its_timeout_to_the_transport(install_fake_httpx):
-    captured = {}
+def test_default_submit_fn_reaches_submit_task_on_the_fused_memory_base_url(monkeypatch):
+    with StubMcpServer(stateful=False, payload={"ticket": "tkt_1"}) as server:
+        monkeypatch.setenv("FUSED_MEMORY_MCP_URL", server.url)
+        with alarm.own_endpoint():
+            reply = mod.default_submit_fn(title="t", project_root="/abs/root")
 
-    def _fake_post(url, **kwargs):
-        captured.update(kwargs)
-        return _FakeHttpxResponse({"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"ok": True}}})
-
-    install_fake_httpx(_fake_post)
-
-    # ENTITLED: install_fake_httpx stubs httpx below the transport, so this
-    # test owns the endpoint it posts to.
-    with mod.own_endpoint():
-        mod._post_mcp_tool_call("http://localhost:8002/mcp", "resolve_ticket", {"ticket": "t"}, timeout=130.0)
-
-    assert captured["timeout"] == 130.0
+    assert reply == {"ticket": "tkt_1"}
+    assert {request.path for request in server.requests} == {"/mcp"}
+    assert _tool_calls(server) == [("submit_task", {"title": "t", "project_root": "/abs/root"})]
 
 
 def test_main_task_store_refuses_a_real_post_under_pytest(tmp_path, monkeypatch):
-    recorder = _make_transport_recorder()
-    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
-    store = _main_task_store(tmp_path, monkeypatch)
+    with StubMcpServer(stateful=False, payload=_EMPTY_FIND_PAGE) as server:
+        monkeypatch.setenv("FUSED_MEMORY_MCP_URL", server.url)
+        store = _main_task_store(tmp_path, monkeypatch)
 
-    with pytest.raises(task_store.StoreUnreachable, match="CensusPostRefusedUnderTest"):
-        store.find_tasks_by_metadata("/abs/root", key="x_finding_key", value="fk-000000000000")
+        with pytest.raises(task_store.StoreUnreachable, match="RealPostRefusedUnderTest"):
+            store.find_tasks_by_metadata("/abs/root", key="x_finding_key", value="fk-000000000000")
+        requests = server.requests
 
-    assert recorder.calls == []
+    assert requests == ()
 
 
 @pytest.mark.parametrize("unreachable", [None, "find_tasks_by_metadata: ConnectionError: down"])
@@ -11849,16 +11769,15 @@ def test_a_queue_with_no_novel_cluster_is_gated_on_headroom_before_its_verify_ca
     assert "verify" in escalation["summary"]
 
 
-def test_a_queue_whose_every_representative_is_rejected_is_flagged_and_escalated(tmp_path, caplog):
+def test_a_queue_whose_every_representative_is_rejected_is_flagged_and_escalated(tmp_path):
     kwargs = _queue_kwargs(tmp_path, verify_fn=_queue_verify_fn())
 
-    with caplog.at_level(logging.WARNING):
-        outcome = mod.run_census(**kwargs)
+    outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
-    assert "systemic" in " ".join(record.message.lower() for record in caplog.records)
     [escalation] = kwargs["escalate_fn"].calls
-    assert (escalation["category"], escalation["severity"]) == ("infra_issue", "info")
+    assert escalation["level"] == logging.WARNING
+    assert "systemic" in escalation["detail"].lower()
     assert "queue" in escalation["summary"] and "rejected" in escalation["summary"]
     record = _run_record(kwargs)
     assert record["mass_rejection"] is None
@@ -11898,7 +11817,7 @@ def _stage_skipped_kwargs(tmp_path, **overrides):
 
 def _assert_the_stage_was_skipped(kwargs, reason: str) -> None:
     [escalation] = kwargs["escalate_fn"].calls
-    assert (escalation["category"], escalation["severity"]) == ("infra_issue", "info")
+    assert escalation["level"] == logging.WARNING
     assert "similarity stage" in escalation["summary"] and reason in escalation["summary"]
     assert _offered_titles(kwargs["verify_fn"])[0] == [_L6_NOVEL_TITLE]
 
@@ -11994,7 +11913,7 @@ def test_run_census_row14_an_invalid_synthesis_is_unavailable_and_every_data_sec
     assert _codebook_text_beside(invalid) == _codebook_text_beside(valid)
     assert _run_record(invalid)["synthesis"]["outcome"] == "unavailable"
     [escalation] = escalate_fn.calls
-    assert escalation["severity"] == "info"
+    assert escalation["level"] == logging.WARNING
     assert "synthesis" in escalation["summary"]
 
 

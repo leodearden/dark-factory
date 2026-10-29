@@ -55,15 +55,17 @@ from orchestrator.config import (
     PsiAdmissionConfig,
     coerce_tier,
 )
+from orchestrator.delivered_check_owner import derive_check_owner
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.dependency_verdict import DepKind, DepState, deps_verdict, task_external_deps
+from orchestrator.eligibility_clock import EligibilityClock, EligibilityClockStore
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fm_retry import fm_retry_backoffs
 from orchestrator.guard_state import PersistentMap, guard_path
 from orchestrator.hold_history import HoldHistory
 from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call, tool_error_text
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
-from orchestrator.overrides import OverrideRow, OverrideStore
+from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.pause_policy import PauseClass, PausePolicy, policy_for
 from orchestrator.pending_age import AnchorReading, read_pending_age
@@ -95,6 +97,19 @@ from orchestrator.recovery_emission import (
 )
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.sentinel_l1 import file_sentinel_l1
+from orchestrator.starvation_watchdog import (
+    AUTO_PIN_CAP_SENTINEL,
+    STARVATION_WATCHDOG_ROLE,
+    CandidateFacts,
+    Finding,
+    LockRefusals,
+    ParkBlock,
+    PinOutcome,
+    StarvationDisposition,
+    cap_escalation,
+    classify,
+    escalation_text,
+)
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.strict_event_reads import task_ids_with_event
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
@@ -240,13 +255,6 @@ _STARVATION_NON_ELIGIBLE = frozenset(
     {'blocked', 'deferred', 'review', 'merge-deferred'}
 )
 
-# Stable grep-anchor token leading every starvation-watchdog escalation summary.
-# Tests and downstream classifiers key on this literal, so it is single-sourced
-# here rather than repeated across the two escalation-message branches in
-# _apply_starvation_watchdog (idle-only backstop vs. dual-gate lock-contention) —
-# the one fragment that MUST stay identical between them can no longer drift.
-_STARVATION_WATCHDOG_MARKER = 'STARVATION_WATCHDOG'
-
 
 class SetTaskStatusRejected(Exception):
     """Base class for non-transient set_task_status rejections.
@@ -257,14 +265,34 @@ class SetTaskStatusRejected(Exception):
     the silent-WARNING-and-return behaviour must now wrap the call.
     """
 
-    def __init__(self, task_id: str, error_code: str, raw: str, message: str | None = None):
+    def __init__(
+        self,
+        task_id: str,
+        error_code: str,
+        raw: str,
+        message: str | None = None,
+        *,
+        old_status: str | None = None,
+        target_status: str | None = None,
+    ):
         self.task_id = task_id
         self.error_code = error_code
         self.raw = raw
+        self.old_status = old_status
+        self.target_status = target_status
         super().__init__(
             message
             or f'set_task_status({task_id!r}) rejected: {error_code} — {raw}'
         )
+
+    @property
+    def attempted_transition(self) -> str:
+        return f"{self.old_status or 'unknown'} -> {self.target_status or 'unknown'}"
+
+    @property
+    def row_already_terminal(self) -> bool:
+        """The refusal reports the row already terminal: the write lost a race, not a stuck row."""
+        return self.old_status in TERMINAL_STATUSES
 
 
 class TerminalExitRejection(SetTaskStatusRejected):
@@ -280,8 +308,6 @@ class TerminalExitRejection(SetTaskStatusRejected):
     """
 
     def __init__(self, task_id: str, old_status: str, target_status: str, raw: str):
-        self.old_status = old_status
-        self.target_status = target_status
         super().__init__(
             task_id=task_id,
             error_code='terminal_exit_rejected',
@@ -290,6 +316,8 @@ class TerminalExitRejection(SetTaskStatusRejected):
                 f'set_task_status({task_id!r}, {target_status!r}) refused: '
                 f'task is currently {old_status!r} (terminal-exit gate)'
             ),
+            old_status=old_status,
+            target_status=target_status,
         )
 
 
@@ -312,6 +340,7 @@ class DoneGateRejection(SetTaskStatusRejected):
                 f'set_task_status({task_id!r}, "done") refused: '
                 f'phantom-done gate — missing files: {missing_files!r}'
             ),
+            target_status='done',
         )
 
 
@@ -332,6 +361,7 @@ class ProvenanceValidationRejection(SetTaskStatusRejected):
                 f'set_task_status({task_id!r}, "done") refused: '
                 f'{error_code} — {raw}'
             ),
+            target_status='done',
         )
 
 
@@ -375,6 +405,7 @@ class StaleEvidenceRejection(SetTaskStatusRejected):
                 f'done_evidence_stale — evidence {evidence_commit!r} '
                 f'({evidence_committed_at}) predates reopen_at {reopen_at!r}'
             ),
+            target_status='done',
         )
 
 
@@ -678,6 +709,10 @@ class SchedulerCallbacks:
     bare-Scheduler unit-test contract is unaffected.  Frozen: the Harness
     builds one bundle at construction time; there is no post-hoc mutation or
     half-wired window.
+
+    ``on_starvation_warn(task_id, *, summary, detail, level=0)`` files the
+    watchdog's escalation at *level*: 0 for the pinning gates' info trail, 1
+    for a ``park_blocked`` firing, which only a human or the holder can clear.
     """
 
     on_park_stop_trip: Callable[[str, PauseClass], Any] | None = None
@@ -770,6 +805,10 @@ def _build_delivered_check_escalation(
     field comes from ``shared.capability_manifest.CHECK_SUBJECT_FIELD``,
     so a new check kind never renders a field its descriptor lacks.
 
+    Renders the failure only. The check's owner, declaration sites, remedy and
+    re-pend line are appended at filing time by
+    ``orchestrator/delivered_check_owner.py::render_check_owner``.
+
     Pure rendering — no side effects, no scheduler state.
     """
     name = check.get('name')
@@ -796,10 +835,6 @@ def _build_delivered_check_escalation(
     lines.append(f'paths: {check.get("paths", [])}')
     lines.append(f'expect: {check.get("expect")}')
     lines.append('observed: FAILED')
-    lines.append(
-        f'Blocked dependents are NOT auto-re-pended — set task {task_id} back '
-        f'to pending after the capability lands on main.'
-    )
     detail = '\n'.join(lines)
     return summary, detail
 
@@ -914,6 +949,9 @@ class SchedulerFacade(Protocol):
     async def dispatch_tool(
         self, name: str, arguments: dict, *, timeout: float = ...,
     ) -> dict: ...
+    async def submit_task(
+        self, arguments: dict, *, timeout: float = ...,
+    ) -> SubmitOutcome: ...
     async def get_tasks(self, *, statuses: Iterable[str] | None = ...) -> list[dict]: ...
     async def get_statuses(
         self, ids: list[str] | None = ...,
@@ -1241,54 +1279,44 @@ class ModuleLockTable:
         """
         return modules_conflict(a, b)
 
+    def _conflicting_holders(
+        self, module: str, exclude_task: str | None = None
+    ) -> set[str]:
+        """The *other* tasks holding a lock that conflicts with ``module``."""
+        return {
+            task_id
+            for task_id, task_modules in self._held.items()
+            if task_id != exclude_task
+            and any(self._conflicts(held, module) for held in task_modules)
+        }
+
     def _count_conflicts(self, module: str, exclude_task: str | None = None) -> int:
         """Count how many *other* tasks hold a lock that conflicts with ``module``."""
-        count = 0
-        for task_id, task_modules in self._held.items():
-            if task_id == exclude_task:
-                continue
-            if any(self._conflicts(held, module) for held in task_modules):
-                count += 1
-        return count
+        return len(self._conflicting_holders(module, exclude_task=exclude_task))
 
     # --- Park (reservation) helpers ---
 
-    def _iter_blocking_park_owners(
+    def _rank_blocking_parks(
         self,
         module: str,
         task_id: str,
         *,
-        ignore_owners: frozenset[str] = frozenset(),
-    ) -> Iterator[str]:
-        """EVERY owner of an ACTIVE park that blocks *task_id* on *module*.
+        ignore_owners: frozenset[str],
+    ) -> list[tuple[str, str]]:
+        """``(owner, parked_key)`` for every foreign active top *task_id* cannot pass on *module*.
 
-        THE single rank-aware park-blocking rule.  ``_blocking_park_owner`` is
-        the first-match view over it, ``_is_parked_blocks`` the bool view, and
-        ``park_owners_blocking`` the naming view — one rule, three views
-        (INV-5).  Forking the rank logic is what would let admission believe it
-        can borrow through a park that ``try_acquire`` then refuses: churn with
-        no dispatch.
-
-        A GENERATOR on purpose, so the first-match view stays short-circuiting
-        (``next()`` stops the scan at the first yield, exactly as the old
-        early-``return`` did) while the naming view can drain it.  More than
-        one owner can block a single requested module — two owners parked on
-        different children of the same requested parent both conflict with it —
-        and admission needs ALL of them, because ``try_acquire`` re-checks
-        every park and admits only the owners it was handed.
-
-        A buried (shadowed) reservation never blocks — only the active top of
-        each stack is consulted.
+        A buried (shadowed) reservation is never consulted — only the active
+        top of each stack (INV-2).  Order is ``_parked`` iteration order.
 
         Rank-aware (step-12): first compute task_id's OWN dominant rank — the
         minimum rank over active-top entries that *task_id* itself owns on keys
         conflicting with *module* (None if it has no such top).  A foreign
-        conflicting top then blocks UNLESS task_id's own dominant rank is
+        conflicting top then counts UNLESS task_id's own dominant rank is
         strictly less (strictly higher priority) — in which case task_id
-        preempts that foreign top and is not blocked by it.  This lets a
-        preemptor acquire its own module even when hierarchical victim parks
-        are kept under their original keys (their active tops are no longer
-        moved to the preemptor's key by a re-key step).
+        preempts that foreign top.  This lets a preemptor acquire its own
+        module even when hierarchical victim parks are kept under their
+        original keys (their active tops are no longer moved to the
+        preemptor's key by a re-key step).
 
         *ignore_owners* (task 3823 / PRD C7) names park owners whose parks are
         treated as absent for this request — the EASY-backfill admission
@@ -1307,6 +1335,7 @@ class ModuleLockTable:
                 own_dominant_rank = rank
 
         # Step 2: check each foreign conflicting active top.
+        blocking: list[tuple[str, str]] = []
         for parked_module, stack in self._parked.items():
             if not stack:
                 continue
@@ -1315,12 +1344,89 @@ class ModuleLockTable:
                 continue
             if not self._conflicts(parked_module, module):
                 continue
-            # Foreign conflicting top: block unless task_id has a strictly
+            # Foreign conflicting top: counts unless task_id has a strictly
             # higher-priority (strictly lower rank) own conflicting top.
             if own_dominant_rank is not None and own_dominant_rank < rank:
-                # task_id preempts this foreign top — not blocked by it.
+                # task_id preempts this foreign top.
                 continue
-            yield owner
+            blocking.append((owner, parked_module))
+        return blocking
+
+    def _iter_blocking_park_owners(
+        self,
+        module: str,
+        task_id: str,
+        *,
+        ignore_owners: frozenset[str] = frozenset(),
+    ) -> Iterator[str]:
+        """EVERY owner of an ACTIVE park that blocks *task_id* on *module*.
+
+        THE single rank-aware park-blocking rule.  ``_blocking_park_owner`` is
+        the first-match view over it, ``_is_parked_blocks`` the bool view, and
+        ``park_owners_blocking`` the naming view — one rule, three views
+        (INV-5).  Forking the rank logic is what would let admission believe it
+        can borrow through a park that ``try_acquire`` then refuses: churn with
+        no dispatch.
+
+        More than one owner can block a single requested module — two owners
+        parked on different children of the same requested parent both
+        conflict with it — and admission needs ALL of them, because
+        ``try_acquire`` re-checks every park and admits only the owners it was
+        handed.
+
+        Capacity (task 7313): a park takes one of its key's slots instead of
+        reserving the key exclusively.  A park on key K that
+        :meth:`_rank_blocking_parks` names blocks when either term fires:
+
+        (a) the hold term — a park counts as its owner's hold, so the request
+            is refused once *module* is at ``_limit_for(module)`` counting the
+            foreign holders and the blocking park owners, each task once;
+        (b) the owner's-slot term — a park keeps one slot of its own key, so
+            the request is refused when granting it would fill K for the owner
+            (:meth:`_park_owner_slot_taken`).
+
+        A limit of 1 on *module* makes the hold term always fire, and a limit
+        of 1 on K makes the owner's-slot term fire for every requester not
+        already counted on K, so a limit-1 park admits no new occupant,
+        hierarchical cases included.  The hold term counts park owners first
+        and scans holders only when the owners alone leave *module* room, so a
+        limit-1 request pays no extra scan.  The rule is
+        monotone in *ignore_owners*: ignoring an owner only removes hold-term
+        occupants, and the owner's-slot term reads holders only, never
+        *ignore_owners* — so once admission's named owners are ignored, no
+        remaining park starts blocking.
+
+        The hold term needs the full count, so nothing is yielded before every
+        park has been scanned; a generator keeps every view's call shape.
+        """
+        parks = self._rank_blocking_parks(module, task_id, ignore_owners=ignore_owners)
+        if not parks:
+            return
+        park_owners = {owner for owner, _key in parks}
+        limit = self._limit_for(module)
+        if len(park_owners) >= limit or len(
+            park_owners | self._conflicting_holders(module, exclude_task=task_id)
+        ) >= limit:
+            yield from (owner for owner, _key in parks)
+            return
+        for owner, key in parks:
+            if self._park_owner_slot_taken(owner, key, task_id):
+                yield owner
+
+    def _park_owner_slot_taken(self, owner: str, key: str, requester: str) -> bool:
+        """Would granting *requester* a key conflicting with *key* take *owner*'s slot on it?
+
+        True when the grant is what leaves the park owner's own later
+        acquisition of *key* no room under the held gate: *requester* does not
+        already hold a key conflicting with *key*, and the holders conflicting
+        with *key* plus *owner* itself already reach ``_limit_for(key)``.  A
+        requester already counted on *key* — say, expanding to a sibling under
+        a parked parent — leaves the owner's room unchanged.
+        """
+        holders = self._conflicting_holders(key)
+        if requester in holders:
+            return False
+        return len(holders | {owner}) >= self._limit_for(key)
 
     def _blocking_park_owner(
         self,
@@ -1333,9 +1439,8 @@ class ModuleLockTable:
 
         The first-match view of :meth:`_iter_blocking_park_owners`.  Enough for
         the gate (``_is_parked_blocks`` only needs to know THAT something
-        blocks) and it stops scanning at the first hit, which is why the hot
-        ``try_acquire`` path keeps its original cost.  Callers that must reason
-        about every blocking owner — admission — drain the generator instead.
+        blocks).  Callers that must reason about every blocking owner —
+        admission — drain the generator instead.
         """
         return next(
             self._iter_blocking_park_owners(
@@ -1385,22 +1490,15 @@ class ModuleLockTable:
 
         Honours ``_limit_for`` rather than mere presence: a module with
         headroom (``max_per_module`` > current holders) is free to take, so it
-        contributes no wait.  Built from the existing ``_conflicts`` /
-        ``_count_conflicts`` / ``_limit_for`` trio — no third conflict rule.
+        contributes no wait.  Built from the existing ``_conflicting_holders``
+        / ``_limit_for`` pair — no third conflict rule.
         """
         depth = self._config.lock_depth
         result: dict[str, list[str]] = {}
         for module in {normalize_lock(m, depth) for m in modules}:
-            if self._count_conflicts(module, exclude_task=exclude_task) < self._limit_for(module):
-                continue
-            holders = sorted(
-                task_id
-                for task_id, held in self._held.items()
-                if task_id != exclude_task
-                and any(self._conflicts(h, module) for h in held)
-            )
-            if holders:
-                result[module] = holders
+            holders = self._conflicting_holders(module, exclude_task=exclude_task)
+            if holders and len(holders) >= self._limit_for(module):
+                result[module] = sorted(holders)
         return result
 
     def blockers(self, task_id: str, modules: list[str]) -> list[Blocker]:
@@ -1434,8 +1532,10 @@ class ModuleLockTable:
         *,
         ignore_owners: frozenset[str] = frozenset(),
     ) -> bool:
-        """Return True iff any ACTIVE (top-of-stack) park conflicts with *module*
-        and is owned by a different task that task_id cannot preempt (INV-2).
+        """Return True iff any ACTIVE (top-of-stack) park conflicts with *module*,
+        is owned by a different task that task_id cannot preempt (INV-2), and
+        fires the two-term capacity rule of :meth:`_iter_blocking_park_owners`
+        (task 7313).
 
         The bool view of :meth:`_blocking_park_owner`, which carries the rank
         logic.  Kept as a delegate rather than inlined so ``try_acquire`` /
@@ -1997,7 +2097,8 @@ class ModuleLockTable:
         Uses hierarchical conflict detection: a lock on ``A/B`` conflicts with
         ``A/B/C`` (and vice-versa) but NOT with ``A/D``.  Also refuses if any
         requested module hierarchically conflicts with an active reservation
-        owned by a different task (see ``install_parks``).
+        owned by a different task (see ``install_parks``) under the capacity
+        rule of ``_iter_blocking_park_owners``.
 
         Returns True if all acquired, False if any unavailable.
 
@@ -2264,6 +2365,7 @@ class Scheduler:
         state_snapshot_path: Path | None = None,
         jitter_source: Callable[[float, float], float] | None = None,
         branch_work_reader: Callable[[], Mapping[str, BranchWork]] | None = None,
+        eligibility_clock_store: EligibilityClockStore | None = None,
         pause_policy_lookup: Callable[[PauseClass], PausePolicy] | None = None,
     ):
         self.config = config
@@ -2419,6 +2521,11 @@ class Scheduler:
         self._merge_phase_at: dict[str, float] = {}
         self._memory_url = config.fused_memory.url
         self._project_root = str(config.project_root)
+        # Starvation watchdog inputs (task 3821): the durable eligibility age
+        # and the count of scans that refused a task its locks while a
+        # lower-ranked candidate dispatched.
+        self._eligibility = EligibilityClock(eligibility_clock_store, self._project_root)
+        self._lock_refusals = LockRefusals()
         # The continuity probe's one git child (task 3820, PRD C3); git.* is
         # restart-only, so binding the branch names at construction is correct.
         self._branch_work_reader: Callable[[], Mapping[str, BranchWork]] = branch_work_reader or partial(
@@ -2725,18 +2832,23 @@ class Scheduler:
         # _external_hold_streak / _external_hold_cause.
         # ALIASED to _streak_resolver_degraded.counts (task 2124).
         self._external_resolver_degraded_counts = self._streak_resolver_degraded.counts
-        # --- Starvation watchdog state (task 1880) ---
-        # Wall-clock timestamp (from _time_source) of the first tick a task appeared
-        # as a dispatch-eligible candidate.  Cleared when the task leaves the
-        # candidate pool for any tick (continuity reset) so idle measures uninterrupted
-        # dispatch-eligibility.  GC'd in the per-tick stale-id sweep.
-        # ALIASED to _streak_starvation.first_seen (task 2124).
-        self._starvation_first_seen = self._streak_starvation.first_seen
+        # --- Starvation watchdog state (tasks 1880, 3821) ---
+        # The eligibility age lives in self._eligibility (durable, wall clock)
+        # and the rank-relative lock refusals in self._lock_refusals; the
+        # streak counter holds only the escalated set.
         # Tasks for which a STARVATION_WATCHDOG INFO escalation is currently open.
         # Prevents re-filing per tick (belt-and-suspenders with the harness-side
         # get_by_task dedup).  Cleared when the task dispatches or is GC'd.
         # ALIASED to _streak_starvation.escalated (task 2124).
         self._starvation_escalated = self._streak_starvation.escalated
+        # Whether the escalated set has been seeded from the open watchdog
+        # escalations a previous process filed (task 3821).
+        self._starvation_rehydrated = False
+        # Pin-gate findings the auto-pin cap turned away, not escalated, each
+        # delivered again once a watchdog pin slot frees; and whether the cap
+        # L1 naming them may be open, so it is resolved once none waits.
+        self._starvation_capped: set[str] = set()
+        self._cap_sentinel_maybe_open = False
         # --- Warm-base hard-down watchdog state (task 2061) ---
         # SINGLETON latch — one host-scoped warm-lane CoW seed base, so exactly
         # one signal/window/L2 (unlike the starvation watchdog's per-task dict/
@@ -2821,6 +2933,11 @@ class Scheduler:
         # is a static deployment condition, so one traceback per instance is
         # enough — callers are time-throttled by _write_snapshot_best_effort.
         self._override_store_warned: bool = False
+
+    @property
+    def callbacks(self) -> SchedulerCallbacks:
+        """The immutable Harness callback bundle this scheduler was built with."""
+        return self._callbacks
 
     # --- Park-and-stop pause API (task 1322) ---
 
@@ -3360,6 +3477,11 @@ class Scheduler:
                     if isinstance(structured, dict)
                     else ''
                 )
+                from_status = (
+                    str(structured['from_status'])
+                    if isinstance(structured, dict) and structured.get('from_status')
+                    else None
+                )
                 if error_code == 'terminal_exit_rejected':
                     # Terminal classification reuses the shared TERMINAL_STATUSES
                     # set (imported above) rather than a separate local copy.
@@ -3371,8 +3493,7 @@ class Scheduler:
                         return
                     raise TerminalExitRejection(
                         task_id=task_id,
-                        old_status=str(structured.get('from_status', ''))
-                        if isinstance(structured, dict) else '',
+                        old_status=from_status or '',
                         target_status=status,
                         raw=rejection,
                     )
@@ -3425,6 +3546,8 @@ class Scheduler:
                     task_id=task_id,
                     error_code=error_code or 'unknown',
                     raw=rejection,
+                    old_status=from_status,
+                    target_status=status,
                 )
             logger.info(
                 'set_task_status(%s, %s) transient rejection '
@@ -4493,6 +4616,15 @@ class Scheduler:
         if check is None:
             check = {'name': check_name, 'kind': detail.get('kind')}
         dep_status = status_map.get(dep_id, 'unknown')
+        owner = (
+            derive_check_owner(
+                dep_id=dep_id,
+                dep_metadata=dep_task.get('metadata') or {},
+                check_name=check_name,
+            )
+            if isinstance(check_name, str) and check_name
+            else None
+        )
         summary, esc_detail = _build_delivered_check_escalation(
             task_id=task_id,
             dep_id=dep_id,
@@ -4507,6 +4639,8 @@ class Scheduler:
                     summary=summary,
                     detail=esc_detail,
                     category='dependency_capability',
+                    check=check,
+                    owner=owner,
                 )
             except Exception:
                 logger.warning(
@@ -4522,162 +4656,314 @@ class Scheduler:
                 task_id, dep_id, check_name,
             )
 
-    async def _apply_starvation_watchdog(self, candidates: list[dict]) -> None:
-        """Per-tick starvation watchdog over the dispatch-eligible candidate list.
+    async def _apply_starvation_watchdog(self, ctx: TickContext) -> None:
+        """Per-tick starvation watchdog over the dispatch-eligible candidates.
 
-        Called ONCE per ``acquire_next`` tick right after the candidate list is
-        built and BEFORE ``if not candidates: return None``.  Any exception is
-        caught by the caller's try/except so a watchdog failure can NEVER abort
-        the tick or gate dispatch (PROPERTY 1 — mirrors the
-        ``_apply_external_dep_policy`` wrapper at the call site).
-
-        FULL IMPL (task 1880 step-6): skip-gate + idle-secs gate + enabled check.
-
-        Short-circuits immediately when ``starvation_watchdog.enabled`` is False.
-
-        For each candidate task:
-        1. Continuity reset — drop ``_starvation_first_seen`` for tasks whose tid
-           is no longer in the candidate id set (so idle measures CONTINUOUS
-           dispatch-eligibility; gaps reset the anchor).
-        2. Stamp ``_starvation_first_seen[tid]`` on the first tick the task
-           appears as a candidate.
-        3. Fire ``_on_starvation_warn`` when NOT already escalated, a callback
-           is installed, and EITHER gate is crossed (OR, not AND):
-           - dual gate — ``_skip_count[tid] >= skip_threshold`` AND
-             ``(now - first_seen) >= idle_secs`` (the original lock-contention
-             path, requires the task to have been the top-scored candidate); OR
-           - idle-only backstop — ``(now - first_seen) >= idle_only_secs``
-             regardless of skip_count (the never-top-scored path, reify-5166 /
-             task 2755: a task that can never outscore a higher-tier candidate
-             accrues zero skips and can never cross the dual gate).
+        Stamps every candidate's durable eligibility anchor, then classifies
+        each not-yet-escalated candidate with the predicate in
+        ``starvation_watchdog.py`` and delivers every finding whose task a
+        live status read still shows ``pending`` (INV-3); a failed read
+        delivers nothing, so the findings recur next tick.  A capped task
+        waiting on a full cap is not re-delivered until a slot frees.  Called
+        once per tick by ``_phase_starvation``, whose try/except keeps a
+        watchdog failure from ever aborting the tick (PROPERTY 1).
         """
-        cfg = self.config.starvation_watchdog
-
-        # Short-circuit: watchdog is administratively disabled.
-        if not cfg.enabled:
+        now = self._wall_now()
+        candidates = {str(t.get('id', '')): t for t in ctx.candidates}
+        candidates.pop('', None)
+        self._eligibility.observe(candidates, now)
+        self._rehydrate_starvation_escalated()
+        if not self.config.starvation_watchdog.enabled:
             return
-
-        now = self._time_source()
-        candidate_ids: set[str] = set()
-
-        # Collect current candidate ids for continuity-reset step below.
-        for task in candidates:
-            tid = str(task.get('id', ''))
-            if tid:
-                candidate_ids.add(tid)
-
-        # Continuity reset: drop first_seen anchors for tasks that are no longer
-        # candidates this tick.  Gaps in candidacy mean the task was gated (deps
-        # became unsatisfied, cooldown re-armed, etc.) — the idle clock resets.
-        stale_anchors = [
-            tid for tid in list(self._starvation_first_seen)
-            if tid not in candidate_ids
+        free_slots = self.config.starvation_watchdog.auto_pin_max_concurrent - sum(
+            1 for row in ctx.overrides.values()
+            if row.pinned and row.source is OverrideSource.STARVATION_WATCHDOG
+        )
+        findings = [
+            f for f in self._starvation_findings(candidates, now)
+            if free_slots > 0 or not self._awaits_pin_slot(f, ctx.overrides)
         ]
-        for tid in stale_anchors:
-            del self._starvation_first_seen[tid]
+        if findings:
+            statuses, err = await self.get_statuses([f.facts.task_id for f in findings])
+            if err is not None:
+                logger.warning(
+                    'Starvation watchdog: live status read failed (%r); delivering '
+                    'none of %d finding(s) this tick', err, len(findings),
+                )
+                return
+            live = [f for f in findings if statuses.get(f.facts.task_id) == 'pending']
+            await self._deliver_starvation_findings(ctx, live, free_slots, now)
+        self._resolve_cap_sentinel_once_drained()
 
-        for task in candidates:
-            tid = str(task.get('id', ''))
-            if not tid:
+    def _starvation_findings(
+        self, candidates: Mapping[str, dict[str, Any]], now: datetime,
+    ) -> list[Finding]:
+        """Classify every not-yet-escalated candidate; the predicate's firings."""
+        cfg = self.config.starvation_watchdog
+        parks = self.lock_table.snapshot_parks()
+        findings: list[Finding] = []
+        for tid, task in candidates.items():
+            if self._streak_starvation.is_escalated(tid):
                 continue
+            facts = CandidateFacts(
+                task_id=tid,
+                eligible_age_secs=self._eligibility.age_secs(tid, now),
+                skip_count=self._skip_count.get(tid, 0),
+                lock_refusals=self._lock_refusals.count(tid),
+                park_block=self._park_blocked(tid, parks, now),
+            )
+            gate = classify(facts, cfg)
+            if gate is not None:
+                blockers = tuple(self.lock_table.blockers(tid, self._get_modules(task)))
+                findings.append(Finding(facts, gate, blockers))
+        return findings
 
-            # Stamp first_seen anchor on the first tick this task appears.
-            self._streak_starvation.touch(tid, now=now)
+    def _awaits_pin_slot(self, finding: Finding, overrides: Mapping[str, OverrideRow]) -> bool:
+        """Whether *finding* is a capped task that only a free watchdog pin slot can serve."""
+        tid = finding.facts.task_id
+        return finding.gate.pins and tid in self._starvation_capped and tid not in overrides
 
-            skip = self._skip_count.get(tid, 0)
-            idle_elapsed = self._streak_starvation.age(tid, now)
+    def _rehydrate_starvation_escalated(self) -> None:
+        """Seed the escalated set, once per process, from open watchdog escalations.
 
-            # Two independent fire conditions (OR, not AND):
-            #  - dual_gate: the original lock-contention path — the task keeps
-            #    losing the lock race as the TOP-scored candidate (skip_count
-            #    bumps) AND has been eligible past idle_secs.
-            #  - idle_only: the never-top-scored backstop (reify-5166, task
-            #    2755).  A task that can never outscore a higher-tier candidate
-            #    is never the top-scored candidate, accrues ZERO skips, and so
-            #    can never cross the dual gate.  It fires on continuous
-            #    dispatch-eligibility ALONE once idle_only_secs is crossed,
-            #    regardless of skip_count.  With idle_only_secs default
-            #    == idle_secs (72h) it never trips on ordinary contention.
-            dual_gate = skip >= cfg.skip_threshold and idle_elapsed >= cfg.idle_secs
-            idle_only = idle_elapsed >= cfg.idle_only_secs
-
-            # Fire when EITHER gate is crossed AND not already escalated.
-            if (
-                (dual_gate or idle_only)
-                and not self._streak_starvation.is_escalated(tid)
-                and self._callbacks.on_starvation_warn is not None
-            ):
-                # Shared scaffolding single-sourced across both escalation paths
-                # so it cannot drift on future edits: the marker is the grep-anchor
-                # tests/classifiers key on, and the eligibility clause is identical
-                # verbatim.  Only the path-specific narrative and the (deliberately
-                # different) structured-facts tail branch below.
-                eligibility_note = '(all deps satisfied, no live claimant)'
-                if idle_only and not dual_gate:
-                    # Pure-idle backstop: never top-scored, so skip_count is
-                    # typically 0 — this is priority starvation (a low-priority
-                    # task perpetually outscored), NOT lock contention.  Carry
-                    # structured facts distinguishing this path from the dual
-                    # gate (design-invariants: structured-facts-at-failure).
-                    summary = (
-                        f'{_STARVATION_WATCHDOG_MARKER}: task {tid} dispatch-eligible '
-                        f'for {idle_elapsed:.0f}s (idle_only_secs={cfg.idle_only_secs}) '
-                        f'with skip_count={skip} — never top-scored '
-                        f'(continuous-eligibility backstop)'
-                    )
-                    detail = (
-                        f'Task {tid} has been continuously dispatch-eligible '
-                        f'{eligibility_note} for {idle_elapsed:.0f}s '
-                        f'yet has skip_count={skip} — it has never been the '
-                        f'highest-scored candidate, so the dual skip+idle gate '
-                        f'(skip_threshold={cfg.skip_threshold}, '
-                        f'idle_secs={cfg.idle_secs}) can never trip.  This is '
-                        f'priority starvation (e.g. a low-priority task '
-                        f'perpetually outscored by a stream of higher-tier '
-                        f'candidates on disjoint modules), NOT lock contention.  '
-                        f'The idle-only backstop fired on continuous '
-                        f'dispatch-eligibility alone.\n\n'
-                        f'skip_count={skip}, idle_elapsed={idle_elapsed:.0f}s, '
-                        f'idle_only_secs={cfg.idle_only_secs}'
-                    )
-                else:
-                    summary = (
-                        f'{_STARVATION_WATCHDOG_MARKER}: task {tid} skip_count={skip} '
-                        f'(threshold={cfg.skip_threshold}), dispatch-eligible for '
-                        f'{idle_elapsed:.0f}s (idle_secs={cfg.idle_secs}) — '
-                        f'unable to acquire locks'
-                    )
-                    detail = (
-                        f'Task {tid} has been dispatch-eligible {eligibility_note} '
-                        f'for {idle_elapsed:.0f}s and has '
-                        f'accumulated skip_count={skip} (tallied while this task is '
-                        f'the highest-scored candidate unable to acquire its module '
-                        f'locks; a task displaced by a higher-priority task retains '
-                        f'its accumulated count without incrementing).  This typically '
-                        f'indicates persistent lock contention (broad-footprint task '
-                        f'vs. a long-running narrow task) that has not been resolved '
-                        f'by the fairness parks.\n\n'
-                        f'skip_threshold={cfg.skip_threshold}, idle_secs={cfg.idle_secs}'
-                    )
-                await self._callbacks.on_starvation_warn(tid, summary=summary, detail=detail)
-                self._streak_starvation.mark_escalated(tid)
-
-    async def _resolve_starvation_escalation(self, task_id: str) -> None:
-        """Resolve the open starvation-watchdog INFO escalation for *task_id*.
-
-        Called at BOTH dispatch sites in ``acquire_next`` (pinned + scored paths)
-        right after the task is added to ``_dispatched``.  Idempotent: if the task
-        was never escalated (not in ``_starvation_escalated``), this is a no-op.
-        Always clears ``_starvation_escalated``/``_starvation_first_seen`` entries
-        unconditionally so state is bounded (PROPERTY 2 — no stale residue).
-
-        Callers wrap every call in try/except (log + continue) so a resolve
-        failure can NEVER abort a successful dispatch (PROPERTY 1).
+        A restart then neither re-files an alarm a previous process left open
+        nor leaves it unresolved: the ``'starvation'`` GC resolves it once its
+        task leaves ``pending``.  A failed read retries on the next pass.
         """
+        queue = self.escalation_queue
+        if self._starvation_rehydrated or queue is None:
+            return
+        try:
+            pending = queue.get_pending()
+        except Exception:
+            logger.warning(
+                'Starvation watchdog: cannot read open escalations; retrying next pass',
+                exc_info=True,
+            )
+            return
+        for esc in pending:
+            if esc.agent_role == STARVATION_WATCHDOG_ROLE:
+                self._streak_starvation.mark_escalated(esc.task_id)
+            elif esc.task_id == AUTO_PIN_CAP_SENTINEL:
+                self._cap_sentinel_maybe_open = True
+        self._starvation_rehydrated = True
+
+    async def _deliver_starvation_findings(
+        self, ctx: TickContext, findings: list[Finding], free_slots: int, now: datetime,
+    ) -> None:
+        """Deliver this pass's findings oldest first, auto-pinning within *free_slots*.
+
+        A pin-gate finding the cap turns away files no escalation of its own
+        and is announced once: one sentinel L1 names the newly capped cohort,
+        and the task waits in ``_starvation_capped`` for a slot.  A failure on
+        one finding is logged and leaves it undelivered, to retry next tick
+        (PROPERTY 1).
+        """
+        newly_capped: list[Finding] = []
+        for finding in sorted(findings, key=lambda f: f.facts.eligible_age_secs, reverse=True):
+            tid = finding.facts.task_id
+            row = ctx.overrides.get(tid)
+            try:
+                store = self._override_store
+                if finding.gate.pins and store is not None:
+                    outcome = self._starvation_pin(store, tid, row, now, slot_free=free_slots > 0)
+                else:
+                    disposition = None if finding.gate.pins else StarvationDisposition.ESCALATED_L1
+                    outcome = PinOutcome.of_row(disposition, row)
+                if row is None and outcome.auto_pinned:
+                    free_slots -= 1
+                capped = outcome.disposition is StarvationDisposition.CAP_REACHED
+                if capped and tid in self._starvation_capped:
+                    continue
+                await self._deliver_starvation_finding(finding, outcome)
+                if capped:
+                    newly_capped.append(finding)
+            except Exception:
+                logger.warning(
+                    'Starvation watchdog delivery for %s raised; retrying next tick',
+                    tid, exc_info=True,
+                )
+        if newly_capped:
+            l1 = cap_escalation(newly_capped, self.config.starvation_watchdog)
+            file_sentinel_l1(self.escalation_queue, l1)
+            self._cap_sentinel_maybe_open = True
+
+    def _resolve_cap_sentinel_once_drained(self) -> None:
+        """Resolve the open auto-pin cap L1 once no capped task still waits on a slot."""
+        queue = self.escalation_queue
+        if self._starvation_capped or not self._cap_sentinel_maybe_open or queue is None:
+            return
+        try:
+            for esc in queue.get_by_task(AUTO_PIN_CAP_SENTINEL, status='pending'):
+                queue.resolve(
+                    esc.id,
+                    'auto-resolved: no starving task waits on a watchdog pin slot',
+                    resolved_by=STARVATION_WATCHDOG_ROLE,
+                )
+        except Exception:
+            logger.warning(
+                'Starvation watchdog: cannot resolve the auto-pin cap L1; retrying next pass',
+                exc_info=True,
+            )
+            return
+        self._cap_sentinel_maybe_open = False
+
+    def _starvation_pin(
+        self,
+        store: OverrideStore,
+        task_id: str,
+        row: OverrideRow | None,
+        now: datetime,
+        *,
+        slot_free: bool,
+    ) -> PinOutcome:
+        """Pin a pin-gate finding's task unless it has a row or the cap is full.
+
+        An existing row is never written: an operator's row wins, and a row the
+        watchdog already owns is reported as it stands.
+        """
+        if row is not None:
+            owned = row.source is OverrideSource.STARVATION_WATCHDOG
+            return PinOutcome.of_row(
+                StarvationDisposition.AUTO_PINNED if owned
+                else StarvationDisposition.OPERATOR_OVERRIDE,
+                row,
+            )
+        if not slot_free:
+            return PinOutcome(StarvationDisposition.CAP_REACHED)
+        ttl_until = now + timedelta(seconds=self.config.starvation_watchdog.auto_pin_ttl_secs)
+        pin_order = store.create_watchdog_pin(self._project_root, task_id, ttl_until=ttl_until)
+        if pin_order is None:
+            return PinOutcome(StarvationDisposition.OPERATOR_OVERRIDE)
+        return PinOutcome(
+            StarvationDisposition.AUTO_PINNED,
+            pin_order=pin_order,
+            source=OverrideSource.STARVATION_WATCHDOG,
+        )
+
+    def _release_watchdog_pin(self, task_id: str) -> bool:
+        """Delete *task_id*'s watchdog-owned pin, if any; never an operator row, never raises.
+
+        Returns whether a pin was deleted.
+        """
+        if self._override_store is None:
+            return False
+        try:
+            return self._override_store.release_watchdog_pin(self._project_root, task_id)
+        except Exception:
+            logger.warning(
+                'Starvation watchdog: releasing the pin of %s raised', task_id, exc_info=True,
+            )
+            return False
+
+    def _release_unpending_watchdog_pins(
+        self, overrides: Mapping[str, OverrideRow], status_map: Mapping[str, str],
+    ) -> list[str]:
+        """Release the watchdog pin of every task no longer pending; the released ids.
+
+        The one release for a task that leaves ``pending`` without dispatching,
+        whether or not this process escalated it: a pin a previous process left
+        would otherwise hold a cap slot until its TTL.
+        """
+        released: list[str] = []
+        for tid, row in overrides.items():
+            if row.source is not OverrideSource.STARVATION_WATCHDOG:
+                continue
+            if status_map.get(tid) != 'pending' and self._release_watchdog_pin(tid):
+                released.append(tid)
+        return released
+
+    def _park_blocked(
+        self, task_id: str, parks: Mapping[str, Mapping[str, Any]], now: datetime,
+    ) -> ParkBlock | None:
+        """The live holder *task_id*'s active park waits on, or None.
+
+        *parks* is this pass's ``snapshot_parks()``.  The holder test is the
+        lock table's own ``blocking_holders`` (INV-5).  An unreadable park age
+        yields None: the gate refuses rather than guess, as ``park_age_secs``
+        requires.
+        """
+        park = parks.get(task_id)
+        if park is None:
+            return None
+        held = self.lock_table.blocking_holders(list(park['modules']), exclude_task=task_id)
+        if not held:
+            return None
+        park_age = self.lock_table.park_age_secs(task_id, now=now)
+        if park_age is None:
+            return None
+        module = min(held)
+        return ParkBlock(
+            blocking_holder=held[module][0], blocking_module=module, park_age_secs=park_age,
+        )
+
+    async def _deliver_starvation_finding(self, finding: Finding, outcome: PinOutcome) -> None:
+        """Emit ``starvation_detected``, then file the task's escalation trail.
+
+        A finding the cap turned away is not escalated: it waits in
+        ``_starvation_capped`` and is delivered again once a slot frees.
+        """
+        facts, gate = finding.facts, finding.gate
+        data: dict[str, Any] = {
+            'gate': gate.value,
+            'eligible_age_secs': facts.eligible_age_secs,
+            'skip_count': facts.skip_count,
+            'lock_refusals': facts.lock_refusals,
+            'blockers': [b.as_payload() for b in finding.blockers],
+            **outcome.as_payload(),
+        }
+        if facts.park_block is not None:
+            data.update(asdict(facts.park_block))
+        if self.event_store:
+            self.event_store.emit(
+                EventType.starvation_detected, task_id=facts.task_id, data=data,
+            )
+        if outcome.disposition is StarvationDisposition.CAP_REACHED:
+            self._starvation_capped.add(facts.task_id)
+            return
+        self._starvation_capped.discard(facts.task_id)
+        if self._callbacks.on_starvation_warn is not None:
+            summary, detail = escalation_text(
+                facts, gate, self.config.starvation_watchdog, finding.blockers,
+            )
+            await self._callbacks.on_starvation_warn(
+                facts.task_id, summary=summary, detail=detail, level=gate.escalation_level,
+            )
+        self._streak_starvation.mark_escalated(facts.task_id)
+
+    def _forget_starvation_inputs(self, status_map: Mapping[str, str]) -> None:
+        """Drop the eligibility anchor, lock refusals and cap wait of every task no longer pending.
+
+        Covers terminal tasks and tasks absent from this tick's active fetch as
+        well as live non-pending ones.  A pending task that merely sat out a
+        tick (cooldown, PSI hold) keeps them, so its age is never reset by a gap.
+        """
+        tracked = (
+            self._eligibility.task_ids() | self._lock_refusals.task_ids() | self._starvation_capped
+        )
+        gone = [tid for tid in tracked if status_map.get(tid) != 'pending']
+        self._eligibility.forget(gone)
+        for tid in gone:
+            self._lock_refusals.forget(tid)
+        self._starvation_capped.difference_update(gone)
+
+    async def _settle_starvation_on_dispatch(self, task_id: str) -> None:
+        """Close *task_id*'s watchdog state now that it is dispatching.
+
+        Resolves its open watchdog escalation, if any, and forgets its
+        eligibility anchor, lock refusals and cap wait: a later return to ``pending``
+        starts a fresh eligibility age.  Releases its watchdog pin whether or
+        not this process escalated it, so a pin a previous process left is
+        released too.  Called at BOTH dispatch sites, each
+        of which wraps it so a failure can NEVER abort a dispatch (PROPERTY 1).
+        """
+        self._eligibility.forget([task_id])
+        self._lock_refusals.forget(task_id)
+        self._starvation_capped.discard(task_id)
+        self._release_watchdog_pin(task_id)
         in_escalated = self._streak_starvation.is_escalated(task_id)
         if in_escalated and self._callbacks.on_starvation_resolve is not None:
             await self._callbacks.on_starvation_resolve(task_id)
-        # Unconditionally clear both dicts so no stale residue survives.
         self._streak_starvation.clear(task_id)
 
     async def _starvation_gc_resolve(self, tid: str) -> None:
@@ -4687,7 +4973,8 @@ class Scheduler:
         Harness-installed ``_on_starvation_resolve`` callback (task 2124).
         A no-op when no callback is installed (bare-Scheduler unit tests).
         ``StreakRegistry.gc`` already wraps this call in try/except, so no
-        additional fail-safety is needed here.
+        additional fail-safety is needed here.  The task's watchdog pin is
+        released by ``_release_unpending_watchdog_pins``.
         """
         if self._callbacks.on_starvation_resolve is not None:
             await self._callbacks.on_starvation_resolve(tid)
@@ -6768,6 +7055,7 @@ class Scheduler:
                     departed_anchors[tid_str] = departed
                 stale_ids.add(tid_str)
         self._record_age_anchors(departed_anchors)
+        self._forget_starvation_inputs(ctx.status_map)
         starvation_non_eligible = {
             tid for tid in self._starvation_escalated
             if ctx.status_map.get(tid) in _STARVATION_NON_ELIGIBLE
@@ -7354,7 +7642,8 @@ class Scheduler:
         Reads: ``ctx.status_map``, ``ctx.tasks_by_id``. Writes:
         ``ctx.overrides``. Loads the override snapshot from the override
         store, then removes rows for tasks that are terminal/missing or
-        whose TTL has elapsed. Runs alongside the park_gc sweep so the
+        whose TTL has elapsed, and watchdog pins of tasks no longer
+        pending. Runs alongside the park_gc sweep so the
         rest of the tick sees post-GC state. Always continues.
         """
         current_overrides: dict[str, OverrideRow] = (
@@ -7373,9 +7662,12 @@ class Scheduler:
                 )
                 for tid in cleared_overrides:
                     current_overrides.pop(tid, None)
-            # TTL sweep: clear any rows whose ttl_until has elapsed.
+            for tid in self._release_unpending_watchdog_pins(current_overrides, ctx.status_map):
+                current_overrides.pop(tid)
+            # TTL sweep: clear any rows whose ttl_until has elapsed, on the
+            # same wall clock that stamps a watchdog pin's TTL.
             expired_overrides = self._override_store.clear_expired(
-                self._project_root, datetime.now(UTC)
+                self._project_root, self._wall_now()
             )
             for tid in expired_overrides:
                 current_overrides.pop(tid, None)
@@ -7606,14 +7898,14 @@ class Scheduler:
     async def _phase_starvation(self, ctx: TickContext) -> object:
         """Starvation watchdog pass over dispatch-eligible candidates.
 
-        Reads: ``ctx.candidates``. Writes: none on ctx (side-effecting
+        Reads: ``ctx``. Writes: none on ctx (side-effecting
         scan; may emit escalation callbacks). Runs once per tick, wrapped
         in try/except so a watchdog/callback failure can NEVER abort the
         tick or gate dispatch (PROPERTY 1 — mirrors the
         ``_apply_external_dep_policy`` wrapper). Always continues.
         """
         try:
-            await self._apply_starvation_watchdog(ctx.candidates)
+            await self._apply_starvation_watchdog(ctx)
         except Exception:
             logger.warning(
                 'Starvation watchdog pass raised — continuing tick normally',
@@ -7957,12 +8249,10 @@ class Scheduler:
     async def _dispatch_pin(self, pin: _PinCandidate, modules: list[str]) -> TickOutcome:
         """Book a pin whose ``try_acquire`` just succeeded, and end the tick."""
         self._dispatched.add(pin.task_id)
-        # Starvation-watchdog resolve (task 1880): if a pinned task
-        # had an open INFO escalation, self-resolve it now.
-        # Wrapped in try/except so a resolve failure can NEVER abort
-        # a successful dispatch (PROPERTY 1).
+        # Starvation-watchdog settle (tasks 1880, 3821), wrapped so a
+        # failure can NEVER abort a successful dispatch (PROPERTY 1).
         try:
-            await self._resolve_starvation_escalation(pin.task_id)
+            await self._settle_starvation_on_dispatch(pin.task_id)
         except Exception:
             logger.warning(
                 'Starvation watchdog resolve for pin_tid=%s raised — '
@@ -8108,6 +8398,10 @@ class Scheduler:
         # dispatch ``return`` from inside the loop cannot leak a stale gap into
         # the next tick — the memo must never outlive the state it read.
         self._backfill_scan_cache = _BackfillScanCache()
+        # Candidates refused their locks above this scan's winner, for the
+        # starvation watchdog's lock_refused gate.  PSI-deferred candidates
+        # never tried, and a scan with no winner credits nobody.
+        refused: list[str] = []
         try:
             for _score, task_id, task, pri in scored:
                 if ctx.psi_hold and not self.is_deterministic(task):
@@ -8140,14 +8434,17 @@ class Scheduler:
                         )
                         if not acquired:
                             grant = None
+                if not acquired:
+                    refused.append(task_id)
                 if acquired:
                     self._dispatched.add(task_id)
-                    # Starvation-watchdog resolve (task 1880): if this scored task
-                    # had an open INFO escalation, self-resolve it now that it is
-                    # dispatching.  Wrapped in try/except so a resolve failure can
-                    # NEVER abort a successful dispatch (PROPERTY 1).
+                    self._lock_refusals.note_scan(refused)
+                    # Starvation-watchdog settle (tasks 1880, 3821): resolve any
+                    # open watchdog escalation and forget the task's watchdog
+                    # inputs.  Wrapped so a failure can NEVER abort a successful
+                    # dispatch (PROPERTY 1).
                     try:
-                        await self._resolve_starvation_escalation(task_id)
+                        await self._settle_starvation_on_dispatch(task_id)
                     except Exception:
                         logger.warning(
                             'Starvation watchdog resolve for task_id=%s raised — '

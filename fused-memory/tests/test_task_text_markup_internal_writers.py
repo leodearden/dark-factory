@@ -31,7 +31,7 @@ from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
-from fused_memory.middleware.task_curator import CuratorDecision, RewrittenTask
+from fused_memory.middleware.curator_types import CuratorDecision, RewrittenTask
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.models.scope import ProjectRoot

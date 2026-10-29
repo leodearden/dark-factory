@@ -1395,6 +1395,47 @@ class TestExecutedPlanRecordsModuleSkips:
                 assert executed_mc.test_command == _render_plan_cmd(run['cmd'])
 
 
+class TestExecutedModulesMatchExecutedModulePrefixes:
+    """The modules ``run_scoped_verification`` executes are exactly
+    ``verify_plan.executed_module_prefixes`` of its plan, the predicate the
+    task-verify dispatcher keys remote eligibility on."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('task_files', 'expected'), [
+        pytest.param(['mymod/tests/test_thing.py'], {'mymod'}, id='one-module-touched'),
+        pytest.param(
+            ['mymod/tests/test_thing.py', 'othermod/tests/test_other.py'], {'mymod', 'othermod'},
+            id='both-modules-touched',
+        ),
+        pytest.param(['README.md'], set(), id='docs-only-trivial'),
+    ])
+    async def test_executed_modules_are_the_plans_executed_module_prefixes(
+        self, tmp_path: Path, task_files: list[str], expected: set[str],
+    ):
+        (tmp_path / 'mymod' / 'tests').mkdir(parents=True)
+        (tmp_path / 'mymod' / 'tests' / 'test_thing.py').write_text('def test_thing(): pass\n')
+        (tmp_path / 'othermod' / 'tests').mkdir(parents=True)
+        (tmp_path / 'othermod' / 'tests' / 'test_other.py').write_text('def test_other(): pass\n')
+        (tmp_path / 'README.md').write_text('# docs\n')
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(prefix='mymod', test_command='uv run --directory mymod pytest tests/'),
+            ModuleConfig(prefix='othermod', test_command='uv run --directory othermod pytest tests/'),
+        ]
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=task_files, role='task',
+            )
+
+        plan = verify_plan.derive_verify_plan(
+            task_files, module_configs, config, _real_worktree_reader(tmp_path), role='task',
+        )
+        executed = {mc.prefix for mc in _executed_module_configs(mock_run_verification)}
+        assert executed == verify_plan.executed_module_prefixes(plan) == expected
+
+
 # ---------------------------------------------------------------------------
 # reviewer_comprehensive remediation (verify.py:3660, behavior_change): pin
 # the dataclasses.replace field-preservation as intended.

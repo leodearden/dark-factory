@@ -19,6 +19,7 @@ from shared.plan_deviation import DeviationRecord
 
 from orchestrator import file_mutex
 from orchestrator.config import TASK_META_DIRNAME
+from orchestrator.review_payload import Verdict, normalize_review
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,22 @@ PLAN_TASK_TEXT_FP_KEY = '_task_text_fp'
 
 # Must exceed the longest legitimate critical section: plan_tools._mark_step_done's two timeout=10 git probes.
 PLAN_MUTEX_TIMEOUT_SECS = 60.0
+
+ORCHESTRATOR_ITERATION_SOURCES: frozenset[str] = frozenset({'orchestrator', 'amendment'})
+"""The only ``source`` values :meth:`TaskArtifacts.append_iteration_log` writes."""
+
+
+def iteration_entry_written_by_orchestrator(entry: object) -> bool:
+    """Whether an iterations.jsonl entry went through ``TaskArtifacts.append_iteration_log``.
+
+    Agents also append to iterations.jsonl by hand from their own shell
+    (task 5726); only entries passing this check are orchestrator-written.
+    Total over arbitrary JSON: any non-dict entry or non-str source is False.
+    """
+    if not isinstance(entry, dict):
+        return False
+    source = entry.get('source')
+    return isinstance(source, str) and source in ORCHESTRATOR_ITERATION_SOURCES
 
 
 class ArtifactWriteError(OSError):
@@ -1009,7 +1026,17 @@ class TaskArtifacts:
         return completed
 
     def append_iteration_log(self, entry: dict) -> None:
-        """Append to .task/iterations.jsonl — one JSON object per line."""
+        """Append to iterations.jsonl — one JSON object per line.
+
+        A missing ``source`` is stamped ``'orchestrator'``; any source outside
+        :data:`ORCHESTRATOR_ITERATION_SOURCES` is refused before writing.
+        """
+        entry.setdefault('source', 'orchestrator')
+        if not iteration_entry_written_by_orchestrator(entry):
+            raise ValueError(
+                f'iteration-log source must be one of '
+                f'{sorted(ORCHESTRATOR_ITERATION_SOURCES)}, got {entry["source"]!r}'
+            )
         entry['timestamp'] = datetime.now(UTC).isoformat()
         log_path = self.root / 'iterations.jsonl'
         with open(log_path, 'a') as f:
@@ -1075,26 +1102,22 @@ class TaskArtifacts:
         return reviews
 
     def aggregate_reviews(self) -> ReviewAggregation:
-        """Parse all reviews, separate blocking from suggestions.
-
-        Reviews with verdict ``ERROR`` are filtered into a separate list
-        so the workflow can detect incomplete reviewer coverage.
-        """
+        """Aggregate every review as ``orchestrator/review_payload.py::normalize_review`` reads it."""
         reviews = self.read_reviews()
         blocking = []
         suggestions = []
         errors = []
 
         for reviewer_name, review in reviews.items():
-            if review.get('verdict') == 'ERROR':
+            payload = normalize_review(review)
+            if payload.verdict is Verdict.ERROR:
                 errors.append(reviewer_name)
-                continue
-            for issue in review.get('issues', []):
-                enriched = {**issue, 'reviewer': reviewer_name}
-                if issue.get('severity') == 'blocking':
-                    blocking.append(enriched)
-                else:
-                    suggestions.append(enriched)
+            blocking.extend(
+                {**issue, 'reviewer': reviewer_name} for issue in payload.blocking_issues
+            )
+            suggestions.extend(
+                {**issue, 'reviewer': reviewer_name} for issue in payload.suggestions
+            )
 
         clean = {k: v for k, v in reviews.items() if k not in errors}
         return ReviewAggregation(
@@ -1239,10 +1262,10 @@ class TaskArtifacts:
             return False
 
     def set_plan_files(self, files: list[str], session_id: str) -> None:
-        """Widen plan.json's ``files`` list in place — the orchestrator-side
-        mechanical union used by the resume-path scope-grant consumer
-        (``TaskWorkflow._set_task_scope``) instead of re-invoking the
-        architect for a known file-set append.
+        """Replace plan.json's ``files`` list in place — the orchestrator-side
+        mechanical write used by ``TaskWorkflow._set_task_scope`` (the
+        resume-path scope grant and the merge-gate narrowing pass) instead of
+        re-invoking the architect for a known file set.
 
         Preserves every other plan field (steps, analysis, design_decisions,
         provenance) untouched — only ``files`` is replaced.

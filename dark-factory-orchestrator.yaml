@@ -92,9 +92,10 @@ lock_depth: 12
 # conflicts it was meant to prevent. Authorizations are now one file each and the
 # baseline merges through the ratchet-baseline driver, so concurrent declarers
 # no longer collide. The ledger keys are the RETIRED array path, kept because
-# pending tasks still declare it, and the directory's one fixed file. A PARK
-# still reserves these keys exclusively (task 7313 makes the park gate honour the
-# override). Same red tier as above.
+# pending tasks still declare it, and the directory's one fixed file. A PARK on
+# these keys takes one of the key's slots instead of reserving it exclusively
+# (orchestrator/src/orchestrator/scheduler.py::ModuleLockTable._iter_blocking_park_owners).
+# Same red tier as above.
 module_overrides:
   orchestrator/src/orchestrator/workflow.py: 2
   orchestrator/src/orchestrator/harness.py: 2
@@ -449,9 +450,9 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #   scripts/tests/test_design_invariants_consistency.py — reads
 #       skills/prd/references/gates.md live; its enumeration and citation
 #       scans walk the repo with no skills/ prune (task 4941).
-#   fused-memory/tests/test_referent_declaration_examples.py — reads
-#       skills/reflect/SKILL.md to execute its `entities=` examples against
-#       the live entities_gate (task 3675).
+#   fused-memory/tests/test_referent_declaration_examples.py — reads the
+#       skills/ docs named in its _GUARDED_DOCS to execute their `entities=`
+#       examples against the live entities_gate (tasks 3675, 5555, 5866).
 #   tests/scripts/test_merge_marker_search_snippets.py — EXECUTES every
 #       merge-marker search in skills/**/*.md against a shadowed fixture history (task 5774).
 # So the union includes orchestrator/tests/ — the fleet's largest suite —
@@ -1577,7 +1578,14 @@ merge_verify_breadth: "full"
 merge_gate_history_pure: true
 merge_gate_history_test_command: "uv run --directory fused-memory pytest tests/ -m 'reads_git_history and not integration' --tb=short -q --timeout=300 && uv run --directory orchestrator pytest tests/ -m 'reads_git_history and not warm_lane_bash' --tb=short -q --timeout=300 && uv run --directory dashboard pytest tests/ -m reads_git_history --tb=short -q --timeout=300"
 merge_train_former_enabled: true
-merge_train_coalesce_enabled: true
+# Retroactive coalescing OFF (Leo's ruling, 2026-10-29). Deep merge-ahead chains
+# (merge_deep.chain_cap below) already batch queued singles from any submitter,
+# MCP included, and need no train membership contract. Coalescing competed with
+# chains for the same buffered singles. Evidence and the canary-week
+# measurements are in plans/mcp-coalesce-trains-2026-10-26.md §0 and §4.4.
+# Not in RELOADABLE_FIELDS: goes live at the next fleet restart. Declared
+# atomic trains are unaffected.
+merge_train_coalesce_enabled: false
 merge_train_max_members: 3
 
 # Serialize the per-merge module fan-out to 1 (operator decision, 2026-07-19)
@@ -1785,3 +1793,15 @@ psi_admission:            # PRD plans/load-throttle-harmonisation-prd.md §6.2 (
 # Runbook: plans/d2-context-complete-reviewer-gate.md (watch section 3, kill rule section 4).
 review:
   reviewer_briefing: d2
+
+# Task 5057 (deep-chain canary; plans/deep-merge-ahead-prd.md), Leo's ruling B of
+# 2026-10-20: carry the flip (carrier 7619) one week after reify's canary 3189.
+# Reify's week was neutral: 122 merge verifies, 95 landings (66 the week before),
+# 2 deep verifies, 1 chain landing, 0 chain-attributed red.
+# STOP RULE: back to 0 if gates per landed item exceed 1.0, or on any
+# chain-attributed red main or rebase-conflict cluster. Green tier: reload_config
+# applies a change without a restart; this carry issues none, so 6 goes live at
+# the next restart. The coalesce test this flip once redded pins chain_cap=0
+# since task 7279 (merge 58a69de6a5).
+merge_deep:
+  chain_cap: 6

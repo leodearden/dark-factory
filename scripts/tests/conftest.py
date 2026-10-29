@@ -31,7 +31,9 @@ auto-resolve for every file in this directory, whereas a `from conftest import
 copies of one fake-httpx idiom spread across four of this directory's files.
 
 So do `runs_db_path` / `runs_db` (task 5441): a synthetic orchestrator runs.db
-shared by the model-admission audit and review suites.
+shared by the model-admission audit and review suites. `make_runs_db` (task
+5989), its event-dict factory, replaced the private copies in the wiped-metadata,
+merge-lane-throughput and speculation-depth suites.
 
 And `fake_claude_cli` / `pool_roster` / `sentinel_login` (task 6042): a
 JSON-mode fake `claude` binary keyed on the leased OAuth token, a hermetic
@@ -43,6 +45,7 @@ import os
 import shutil
 import sqlite3
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -296,9 +299,8 @@ def install_fake_httpx(monkeypatch):
     httpx IS installed here — a direct dependency of ``shared``
     (``shared/pyproject.toml``, ``httpx>=0.27``, added for task 2965) — so the
     lazy, function-local ``import httpx`` in the modules under test resolves to
-    the real library and its POST genuinely goes out to
-    ``$FUSED_MEMORY_MCP_URL`` (default ``localhost:8002``).  On any box running
-    the fused-memory stack that POST SUCCEEDS, so a test leaning on ambient
+    the real library and its request genuinely goes out.  On any box where the
+    target is listening that request SUCCEEDS, so a test leaning on ambient
     unreachability flaps with the host's listener state — the exact defect
     tasks 3237/3291 fixed by injecting a fake.  Injecting makes both the
     request shape assertable and the failure path deterministic regardless of
@@ -309,19 +311,17 @@ def install_fake_httpx(monkeypatch):
 
     The stub exposes ``post``, and ``get``/``delete`` when a caller supplies
     one (task 3713: readiness polling hits GET ``/health`` and GET
-    ``/v1/models``, which a POST-only stub cannot express; task 3644:
-    ``census_trigger.post_mcp_envelope`` DELETEs the ``/mcp`` endpoint to
-    terminate the MCP session it opened, so the server does not leak one
-    session dict entry + one live anyio task per legibility escalation).
+    ``/v1/models``, which a POST-only stub cannot express).
     Both stay OPT-IN rather than no-arg defaults, so a module that starts
     issuing a verb without its test saying so still lands in the loud-miss
     path below instead of silently receiving a stub response nobody wrote.
 
     Any OTHER attribute is a loud ``pytest.fail`` rather than an
-    ``AttributeError``, because ``default_status_fetcher`` funnels every
-    ``Exception`` into ``StatusFetchUnavailable``: a future production change
-    reaching for e.g. ``httpx.Timeout`` or ``except httpx.HTTPError`` would
-    otherwise keep its test green off the stub's own miss.  ``pytest.fail``
+    ``AttributeError``, because a module under test whose error boundary is
+    ``except Exception`` would turn the miss into its own failure: a future
+    production change reaching for e.g. ``httpx.Timeout`` or
+    ``except httpx.HTTPError`` would otherwise keep its test green off the
+    stub's own miss.  ``pytest.fail``
     raises a ``BaseException``, which such a handler cannot swallow.  Dunders
     stay ordinary ``AttributeError``s so import machinery and introspection can
     still probe the module.
@@ -358,6 +358,8 @@ def install_fake_httpx(monkeypatch):
 # Moved here from test_audit_model_admission.py so the model-admission audit
 # and review suites seed ONE schema copy through one set of helpers. Fixtures
 # for the same importlib-mode reason as the tasks.db fixtures above.
+# `make_runs_db` (task 5989) is the event-dict factory that replaced the private
+# copies in the wiped-metadata, merge-lane-throughput and speculation-depth suites.
 #
 # RUNS_DB_SCHEMA is a VERBATIM copy of the four tables those scripts read,
 # captured with
@@ -427,6 +429,11 @@ CREATE TABLE runs (
 );
 """
 
+_INSERT_EVENT = (
+    'INSERT INTO events (timestamp, run_id, task_id, event_type, phase, role, '
+    'data, cost_usd, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+)
+
 
 def _payload(value):
     """JSON-encode a dict/list payload; pass a str or None through VERBATIM.
@@ -465,8 +472,7 @@ class SeedingConnection(sqlite3.Connection):
     ):
         """Insert one `events` row, stating its payload as a dict rather than JSON text."""
         self.execute(
-            'INSERT INTO events (timestamp, run_id, task_id, event_type, phase, role, '
-            'data, cost_usd, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            _INSERT_EVENT,
             (
                 timestamp,
                 run_id,
@@ -554,17 +560,63 @@ class SeedingConnection(sqlite3.Connection):
         self.commit()
 
 
+_DEFAULT_EVENTS_EPOCH = datetime(2026, 7, 30, tzinfo=UTC)
+
+
 @pytest.fixture
-def runs_db_path(tmp_path):
+def make_runs_db(tmp_path):
+    """Factory: build a temp runs.db carrying :data:`RUNS_DB_SCHEMA`, seed *events*, return its Path.
+
+    Each event is a dict of column -> value. ``event_type`` is required.
+    ``run_id`` defaults to ``'run-1'``, and ``timestamp`` to one second per row
+    after a fixed epoch, so the defaults stay distinct and sort as TEXT however
+    many rows there are. ``task_id`` is stored as a str unless None. ``phase``,
+    ``role``, ``cost_usd`` and ``duration_ms`` stay NULL when omitted.
+
+    ``data`` follows :func:`_payload`: a str or None is stored VERBATIM — so
+    ``data=None`` is SQL NULL here, unlike :meth:`SeedingConnection.seed_event`,
+    which stores ``'{}'`` — and a dict/list is json-encoded. Rows are inserted
+    in list order, so *events* order IS ascending ``id`` order.
+
+    *directory* defaults to ``tmp_path`` and must already exist; pass it to
+    seed a db at a project-root-relative location such as
+    ``<root>/data/orchestrator/``. Building twice at one path raises
+    ``sqlite3.OperationalError`` rather than appending to the first db's rows.
+    """
+    def _make(events=(), name='runs.db', directory=None):
+        db_path = (Path(directory) if directory is not None else tmp_path) / name
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(RUNS_DB_SCHEMA)
+            for i, event in enumerate(events):
+                task_id = event.get('task_id')
+                conn.execute(
+                    _INSERT_EVENT,
+                    (
+                        event.get('timestamp')
+                        or (_DEFAULT_EVENTS_EPOCH + timedelta(seconds=i)).isoformat(),
+                        event.get('run_id', 'run-1'),
+                        None if task_id is None else str(task_id),
+                        event['event_type'],
+                        event.get('phase'),
+                        event.get('role'),
+                        _payload(event.get('data')),
+                        event.get('cost_usd'),
+                        event.get('duration_ms'),
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        return db_path
+
+    return _make
+
+
+@pytest.fixture
+def runs_db_path(make_runs_db):
     """Path to a fresh, empty runs.db carrying :data:`RUNS_DB_SCHEMA`."""
-    path = tmp_path / 'runs.db'
-    conn = sqlite3.connect(path)
-    try:
-        conn.executescript(RUNS_DB_SCHEMA)
-        conn.commit()
-    finally:
-        conn.close()
-    return path
+    return make_runs_db()
 
 
 @pytest.fixture

@@ -37,11 +37,14 @@ from fused_memory.reconciliation.blocked_gate_audit_section import (
     render_blocked_gate_audit_section,
 )
 from fused_memory.reconciliation.capped_task_list import render_capped_task_list
+from fused_memory.reconciliation.citation_verifier import STAGE_STAT_PREFIX
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE2_DISALLOWED,
     STAGE3_DISALLOWED,
     STAGE3_REPORT_SCHEMA,
 )
+from fused_memory.reconciliation.cross_run_citation_scan import scan_cross_run_citations
+from fused_memory.reconciliation.dangling_citation import build_dangling_citation_finding
 from fused_memory.reconciliation.flag_dedup import (
     _content_fingerprint,
     _normalize_content_description,
@@ -53,6 +56,7 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_snapshot_stat_edge_findings,
 )
 from fused_memory.reconciliation.flag_record_contract import STAGE1_FLAG_MARKER_KIND
+from fused_memory.reconciliation.known_projects_section import render_known_projects_section
 from fused_memory.reconciliation.live_workflow_section import (
     render_live_workflow_section,
 )
@@ -3339,8 +3343,9 @@ class TaskKnowledgeSync(BaseStage):
     # ── Inference-bearing payload sections (task 5113) ──────────────────────
     # INCLUSION CRITERION — a section belongs here iff prompts/stage2.py tells
     # the model to draw an inference from that section's ABSENCE ("If
-    # `### Live-Workflow Signals` is absent from the payload, no task is live
-    # this cycle …"). Every payload builder renders these via
+    # `### Live-Workflow Signals` is absent from the payload, no task the
+    # `### Active Task Tree` lists is live this cycle …"). Every payload builder
+    # renders these via
     # _render_required_sections(). Enforced by
     # tests/reconciliation/test_stage2_payload_section_parity.py, whose module
     # docstring holds the section census: why each other conditional section
@@ -4019,9 +4024,10 @@ class TaskKnowledgeSync(BaseStage):
             )
 
         # Done-Task Completion-Memory Audit — enumerate EVERY task that
-        # transitioned to `done` since the prior successful cycle boundary
-        # (watermark.last_full_run_completed) via an updatedAt-window scan over
-        # the UNCAPPED filtered.all_done_tasks.  This supersedes reliance on the
+        # transitioned to `done` inside the task-change window, which starts when
+        # the previous full run STARTED (why not its completion:
+        # tests/reconciliation/test_recon_window_anchor.py), via an updatedAt scan
+        # over the UNCAPPED filtered.all_done_tasks.  This supersedes reliance on the
         # 5-item Proactive Task Sample for done-task completion-memory coverage,
         # which systematically missed done tasks as throughput grew (the sample
         # sorts done tasks last, so they rarely survive the top-5 cut).  Gated on
@@ -4029,7 +4035,7 @@ class TaskKnowledgeSync(BaseStage):
         # (remediation is a focused second pass, not general sync).
         done_audit_section = ''
         if not self.remediation_mode:
-            boundary = watermark.last_full_run_completed
+            boundary = watermark.last_task_change_timestamp
             audit_tasks = select_done_since_boundary(filtered.all_done_tasks, boundary)
             total_audit = len(audit_tasks)
             boundary_label = (
@@ -4056,7 +4062,7 @@ class TaskKnowledgeSync(BaseStage):
             done_audit_section = (
                 f'\n### Done-Task Completion-Memory Audit '
                 f'({total_audit} since last cycle)\n'
-                f'Boundary (last full-run completed): {boundary_label}\n'
+                f'Boundary (previous full run started): {boundary_label}\n'
                 f'{audit_body}'
             )
 
@@ -4070,7 +4076,7 @@ class TaskKnowledgeSync(BaseStage):
             )
 
         # Inference-bearing sections (see REQUIRED_SECTIONS), bound here so their probes run first.
-        required_sections = await self._render_required_sections(filtered)
+        required_sections = await self._render_required_sections(filtered, tree_read_at)
 
         # Call render_active_section once to get both the visible-task list (for
         # hint-attention slice-then-filter below) and the fully assembled Active
@@ -4373,7 +4379,9 @@ class TaskKnowledgeSync(BaseStage):
                 stale_ids,
             )
 
-        known_projects_section = self._format_known_projects_section()
+        known_projects_section = render_known_projects_section(
+            self.known_projects, current_project_id=self.project_id
+        )
 
         # Step 5 in the Your Task block below prescribes a PLAIN ADDITIVE
         # attach (append=True, metadata_mode OMITTED) for every task in the
@@ -4451,41 +4459,25 @@ Use project_root="{self.project_root}" for tasks scoped to this project.
 For cross-project routing see "Known Projects" above.
 """
 
-    def _format_known_projects_section(self) -> str:
-        """Render the cross-project routing context for the Stage 2 LLM.
-
-        Emits a ``### Known Projects`` markdown section listing every
-        configured project_id and its project_root, marking the current
-        one.  Returns the empty string when fewer than two projects are
-        known — there is no "cross-project" dimension to surface in that
-        case, and the section would only add noise.
-        """
-        known = self.known_projects
-        if len(known) < 2:
-            return ''
-        # Stable ordering: current project first, then alphabetical.
-        ordered = [(self.project_id, known[self.project_id])] if self.project_id in known else []
-        for pid in sorted(p for p in known if p != self.project_id):
-            ordered.append((pid, known[pid]))
-        # Pad the project_id column to a consistent width for readability.
-        width = max(len(pid) for pid, _ in ordered)
-        lines = []
-        for pid, root in ordered:
-            marker = '  (current)' if pid == self.project_id else ''
-            lines.append(f'- {pid:<{width}}  → {root}{marker}')
-        return '\n### Known Projects (for cross-project routing)\n' + '\n'.join(lines) + '\n'
-
-    async def _build_live_workflow_section(self, filtered: FilteredTaskTree) -> str:
+    async def _build_live_workflow_section(
+        self, filtered: FilteredTaskTree, tree_read_at: datetime,
+    ) -> str:
         """Return the Live-Workflow Signals section for *filtered*, or ``''``.
 
         Takes the payload's RESOLVED tree — harness-injected or self-fetched by
-        :meth:`assemble_payload` — which is why it is not a zero-arg reader of
-        ``self.filtered_task_tree`` like Stage 1's same-named renderer. An empty
-        active list renders ``''`` with no I/O.
+        :meth:`assemble_payload` — and the instant it was read, which is why it
+        is not a zero-arg reader of ``self.filtered_task_tree`` like Stage 1's
+        same-named renderer. Claimant heartbeats are aged at *tree_read_at*,
+        not at render time (task 6027). An empty active list renders ``''``
+        with no I/O.
         """
-        return await render_live_workflow_section(filtered.active_tasks, self.scope.project_root)
+        return await render_live_workflow_section(
+            filtered.active_tasks, self.scope.project_root, claims_read_at=tree_read_at,
+        )
 
-    async def _render_required_sections(self, filtered: FilteredTaskTree) -> str:
+    async def _render_required_sections(
+        self, filtered: FilteredTaskTree, tree_read_at: datetime,
+    ) -> str:
         """Render every inference-bearing payload section for *filtered*, in registry order.
 
         Every Stage-2 payload builder MUST interpolate this — enforced
@@ -4493,15 +4485,19 @@ For cross-project routing see "Known Projects" above.
         ``tests/reconciliation/test_stage2_payload_section_parity.py``. See
         :attr:`REQUIRED_SECTIONS` for which sections qualify.
 
-        Renderers receive the payload's resolved *filtered* tree, because
-        :meth:`assemble_payload` may self-fetch it rather than use the
-        harness-injected attribute. Each renderer keeps its own
-        conditional-empty contract, so ``''`` is a normal result and no
-        separator is added. The sections render on remediation passes too: the
-        harness sets the tree there as well.
+        Renderers receive the payload's resolved *filtered* tree AND
+        *tree_read_at*, the instant it was read (harness-injected, or stamped
+        after the self-fetch), because :meth:`assemble_payload` may self-fetch
+        the tree rather than use the harness-injected attribute. Each renderer
+        keeps its own conditional-empty contract, so ``''`` is a normal result
+        and no separator is added. The sections render on remediation passes
+        too: the harness sets the tree there as well.
         """
         return ''.join(
-            [await getattr(self, section.renderer)(filtered) for section in self.REQUIRED_SECTIONS]
+            [
+                await getattr(self, section.renderer)(filtered, tree_read_at)
+                for section in self.REQUIRED_SECTIONS
+            ]
         )
 
     @staticmethod
@@ -4609,7 +4605,10 @@ class IntegrityCheck(BaseStage):
            read a Mem0-only task-count snapshot stat as evidence of a missing
            Graphiti temporal_facts edge, for every project (task 3487).  Records
            report.stats['snapshot_stat_edge_findings_dropped'] = before - after.
-        5. Calls record_task_dump_spot_check() to record a non-destructive
+        5. Calls scan_cross_run_citations() and appends one finding per
+           confirmed-absent mem0 citation on a settled run's finding, recording
+           the scan's stage3_cross_run_* stats (task 5749).
+        6. Calls record_task_dump_spot_check() to record a non-destructive
            observability stat when the cached task tree contains contamination
            signals.
 
@@ -4675,6 +4674,12 @@ class IntegrityCheck(BaseStage):
         report.stats['snapshot_stat_edge_findings_dropped'] = (
             _before - len(report.items_flagged)
         )
+
+        scan = await scan_cross_run_citations(
+            self.journal, self.memory, project_id=self.project_id
+        )
+        report.items_flagged.extend(build_dangling_citation_finding(r) for r in scan.dangling)
+        report.stats.update(scan.as_stats(STAGE_STAT_PREFIX[self.stage_id]))
 
         self.record_task_dump_spot_check(report)
         return report
@@ -4742,6 +4747,9 @@ class IntegrityCheck(BaseStage):
             flagged.extend(stage2_report.items_flagged)
 
         flagged_text = _format_flagged(flagged, run_stage='stage3')
+        known_projects_section = render_known_projects_section(
+            self.known_projects, current_project_id=self.project_id
+        )
 
         return f"""## Stage 3: Cross-System Integrity Check
 ## Project: {self.project_id}
@@ -4753,7 +4761,7 @@ class IntegrityCheck(BaseStage):
 {_format_report(stage2_report)}
 
 ### Items Flagged for Cross-System Verification ({len(flagged)})
-{flagged_text}
+{flagged_text}{known_projects_section}
 
 ## Your Task
 Verify consistency across all three systems:

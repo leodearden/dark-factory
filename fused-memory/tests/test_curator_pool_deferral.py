@@ -16,23 +16,26 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _curator_helpers import agent_result, make_config, pool_with_ids
+from _curator_helpers import (
+    agent_result,
+    empty_corpus,
+    escalator_double,
+    make_config,
+    pool_with_ids,
+    prepared,
+)
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import AuthFailed, CapHit, InvocationOutcome
 from shared.usage_gate import PoolFrozen, UsageGate
 
 from fused_memory.middleware.curation_deferral import DeferReason
-from fused_memory.middleware.task_curator import (
-    CandidateTask,
+from fused_memory.middleware.curator_types import (
     CuratorDecision,
-    PoolWithheld,
     PreparedCandidate,
-    TaskCurator,
 )
+from fused_memory.middleware.task_curator import TaskCurator
 
-INVOKE = 'fused_memory.middleware.task_curator.invoke_with_cap_retry'
-EMPTY_SIZES = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
 DEADLINE_SECS = 30.0
 
 
@@ -46,36 +49,19 @@ def _frozen() -> PoolFrozen:
     )
 
 
-def _prepared(title: str, pool=()) -> PreparedCandidate:
-    pool = list(pool)
-    return PreparedCandidate(
-        candidate=CandidateTask(title=title),
-        pool=pool,
-        pool_sizes={**EMPTY_SIZES, 'module': len(pool)},
-        prompt_tokens=0,
-    )
-
-
-async def _curate(curator: TaskCurator, prepared: PreparedCandidate) -> CuratorDecision:
+async def _curate(curator: TaskCurator, bundle: PreparedCandidate) -> CuratorDecision:
     return await asyncio.wait_for(
-        curator.curate(prepared.candidate, 'p', '/x', prepared=prepared),
+        curator.curate(bundle.candidate, 'p', '/x', prepared=bundle),
         DEADLINE_SECS,
     )
 
 
 async def _curate_batch(
-    curator: TaskCurator, prepared: list[PreparedCandidate],
+    curator: TaskCurator, bundles: list[PreparedCandidate],
 ) -> list[CuratorDecision]:
     return await asyncio.wait_for(
-        curator.curate_batch_prepared(prepared, 'p', '/x'), DEADLINE_SECS,
+        curator.curate_batch_prepared(bundles, 'p', '/x'), DEADLINE_SECS,
     )
-
-
-def _escalator() -> AsyncMock:
-    escalator = AsyncMock()
-    escalator.report_failure = AsyncMock(return_value=None)
-    escalator.report_consecutive_degraded = AsyncMock(return_value=None)
-    return escalator
 
 
 async def _frozen_gate(outcome: InvocationOutcome) -> UsageGate:
@@ -131,11 +117,13 @@ class TestDeferDecision:
 
     @pytest.mark.asyncio
     async def test_the_model_cannot_emit_defer(self):
-        curator = TaskCurator(config=make_config(), taskmaster=None)
         response = agent_result({'action': 'defer', 'justification': 'pool looks busy'})
 
-        with patch(INVOKE, new=AsyncMock(return_value=response)):
-            decision = await _curate(curator, _prepared('T'))
+        curator = TaskCurator(
+            config=make_config(), taskmaster=None,
+            invoke=AsyncMock(return_value=response),
+        )
+        decision = await _curate(curator, prepared('T'))
 
         assert decision.action == 'create'
         assert decision.degraded is True
@@ -147,11 +135,13 @@ class TestCurateDefersOnUnavailablePool:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('error', [_capped, _frozen], ids=['capped', 'frozen'])
     async def test_all_accounts_capped_defers_and_reports_nothing(self, error):
-        escalator = _escalator()
-        curator = TaskCurator(config=make_config(), taskmaster=None, escalator=escalator)
+        escalator = escalator_double()
+        curator = TaskCurator(
+            config=make_config(), taskmaster=None, escalator=escalator,
+            invoke=AsyncMock(side_effect=error()),
+        )
 
-        with patch(INVOKE, new=AsyncMock(side_effect=error())):
-            decision = await _curate(curator, _prepared('T'))
+        decision = await _curate(curator, prepared('T'))
 
         assert decision.action == 'defer'
         assert decision.defer_reason is DeferReason.ALL_ACCOUNTS_CAPPED
@@ -160,8 +150,7 @@ class TestCurateDefersOnUnavailablePool:
 
     @pytest.mark.asyncio
     async def test_a_defer_is_never_cached(self):
-        curator = TaskCurator(config=make_config(), taskmaster=None)
-        prepared = _prepared('T', pool_with_ids(('42', 'pending')))
+        bundle = prepared('T', pool_with_ids(('42', 'pending')))
         combine = agent_result({
             'action': 'combine',
             'target_id': '42',
@@ -170,9 +159,9 @@ class TestCurateDefersOnUnavailablePool:
         })
         invoke = AsyncMock(side_effect=[_capped(), combine])
 
-        with patch(INVOKE, new=invoke):
-            first = await _curate(curator, prepared)
-            second = await _curate(curator, prepared)
+        curator = TaskCurator(config=make_config(), taskmaster=None, invoke=invoke)
+        first = await _curate(curator, bundle)
+        second = await _curate(curator, bundle)
 
         assert first.action == 'defer'
         assert second.action == 'combine'
@@ -181,17 +170,19 @@ class TestCurateDefersOnUnavailablePool:
 
     @pytest.mark.asyncio
     async def test_a_defer_neither_advances_nor_resets_the_degraded_streak(self):
-        escalator = _escalator()
-        curator = TaskCurator(config=make_config(), taskmaster=None, escalator=escalator)
+        escalator = escalator_double()
         unusable = agent_result({'action': 'bogus'})
         invoke = AsyncMock(side_effect=[unusable] * 4 + [_capped(), unusable])
 
-        with patch(INVOKE, new=invoke):
-            for i in range(4):
-                assert (await _curate(curator, _prepared(f'T{i}'))).degraded
-            assert (await _curate(curator, _prepared('T4'))).action == 'defer'
-            escalator.report_consecutive_degraded.assert_not_awaited()
-            await _curate(curator, _prepared('T5'))
+        curator = TaskCurator(
+            config=make_config(), taskmaster=None, escalator=escalator,
+            invoke=invoke,
+        )
+        for i in range(4):
+            assert (await _curate(curator, prepared(f'T{i}'))).degraded
+        assert (await _curate(curator, prepared('T4'))).action == 'defer'
+        escalator.report_consecutive_degraded.assert_not_awaited()
+        await _curate(curator, prepared('T5'))
 
         escalator.report_consecutive_degraded.assert_awaited_once()
         assert escalator.report_consecutive_degraded.await_args.kwargs['streak'] == 5
@@ -202,7 +193,7 @@ class TestCurateDefersOnUnavailablePool:
         gate = await _frozen_gate(outcome())
         curator = _gated_curator(gate, tmp_path)
 
-        decision = await _curate(curator, _prepared('T'))
+        decision = await _curate(curator, prepared('T'))
 
         assert decision.action == 'defer'
         assert decision.defer_reason is reason
@@ -217,19 +208,18 @@ class TestBatchDefersOnUnavailablePool:
         gate = await _frozen_gate(outcome())
         curator = _gated_curator(gate, tmp_path)
 
-        decisions = await _curate_batch(curator, [_prepared('A'), _prepared('B')])
+        decisions = await _curate_batch(curator, [prepared('A'), prepared('B')])
 
         assert [d.action for d in decisions] == ['defer', 'defer']
         assert {d.defer_reason for d in decisions} == {reason}
 
     @pytest.mark.asyncio
     async def test_batch_cap_defers_llm_bound_and_keeps_deterministic_verdicts(self):
-        curator = TaskCurator(config=make_config(), taskmaster=None)
-        batch = [_prepared('A'), _prepared('B'), _prepared('A')]
+        batch = [prepared('A'), prepared('B'), prepared('A')]
 
         invoke = AsyncMock(side_effect=_capped('task-curator-batch[p]'))
-        with patch(INVOKE, new=invoke):
-            decisions = await _curate_batch(curator, batch)
+        curator = TaskCurator(config=make_config(), taskmaster=None, invoke=invoke)
+        decisions = await _curate_batch(curator, batch)
 
         invoke.assert_awaited_once()
         assert [d.action for d in decisions] == ['defer', 'defer', 'drop']
@@ -238,18 +228,14 @@ class TestBatchDefersOnUnavailablePool:
 
     @pytest.mark.asyncio
     async def test_bisect_leaf_cap_defers_instead_of_raising(self):
-        curator = TaskCurator(config=make_config(), taskmaster=None)
         batch_failed = AgentResult(
             success=False, output='boom', subtype='error_max_turns', cost_usd=0.0,
         )
         invoke = AsyncMock(side_effect=[batch_failed, _capped(), _capped()])
 
-        async def empty_corpus(*_args, **_kwargs):
-            return [], dict(EMPTY_SIZES), PoolWithheld()
-
-        with patch(INVOKE, new=invoke), \
-             patch.object(curator, '_build_corpus', side_effect=empty_corpus):
-            decisions = await _curate_batch(curator, [_prepared('A'), _prepared('B')])
+        curator = TaskCurator(config=make_config(), taskmaster=None, invoke=invoke)
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
+            decisions = await _curate_batch(curator, [prepared('A'), prepared('B')])
 
         assert [d.action for d in decisions] == ['defer', 'defer']
         assert invoke.await_count == 3
@@ -257,11 +243,13 @@ class TestBatchDefersOnUnavailablePool:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('error', [_capped, _frozen], ids=['capped', 'frozen'])
     async def test_curate_batch_prepared_never_raises_pool_unavailable(self, error):
-        escalator = _escalator()
-        curator = TaskCurator(config=make_config(), taskmaster=None, escalator=escalator)
+        escalator = escalator_double()
+        curator = TaskCurator(
+            config=make_config(), taskmaster=None, escalator=escalator,
+            invoke=AsyncMock(side_effect=error()),
+        )
 
-        with patch(INVOKE, new=AsyncMock(side_effect=error())):
-            decisions = await _curate_batch(curator, [_prepared('A'), _prepared('B')])
+        decisions = await _curate_batch(curator, [prepared('A'), prepared('B')])
 
         assert [d.action for d in decisions] == ['defer', 'defer']
         escalator.report_failure.assert_not_awaited()

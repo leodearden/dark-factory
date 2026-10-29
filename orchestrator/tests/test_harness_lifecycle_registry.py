@@ -22,6 +22,7 @@ do not yet exist.
 from __future__ import annotations
 
 import asyncio
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -31,7 +32,7 @@ from _escalation_server_capture import create_server_kwargs
 from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
 
-from orchestrator.background_service import BackgroundService
+from orchestrator.background_service import BackgroundService, ManagedService
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.flake_debt_drain import STALE_DUE_ESCALATION_SENTINEL
@@ -47,12 +48,14 @@ from orchestrator.harness import Harness
 from orchestrator.verify_admission_gate import AdmissionPlan, AdmissionPolicy, gate_for
 
 # Canonical start-order registration list — task 2241 plan.json "HARNESS
-# MIGRATION": escalation-server and merge-worker first (the recovery block
-# depends on both being live); the remaining bespoke adapter (offline-lane)
+# MIGRATION": the loop-stall monitor first, so it watches every other
+# service's whole life and stops last (task 7366); then escalation-server and
+# merge-worker (the recovery block depends on both being live); the remaining bespoke adapter (offline-lane)
 # and the seven BackgroundService sweeps follow, then the always-on services
 # that keep their cadence whatever the dispatch loop does (task 5344; the
 # verify-admission watch, task 5628; the flake-debt drain, task 6934).
 _CANONICAL_ORDER = [
+    'loop-stall-monitor',
     'escalation-server',
     'merge-worker',
     'offline-lane',
@@ -106,6 +109,32 @@ class TestLifecycleRegistrationOrder:
         names = [s.name for s in harness._lifecycle.services]
         assert 'warm-lane-gc' not in names
         assert names == [n for n in _CANONICAL_ORDER if n != 'warm-lane-gc']
+
+    @pytest.mark.asyncio
+    async def test_the_first_service_is_a_live_loop_stall_monitor(
+        self, tmp_path: Path,
+    ) -> None:
+        harness = Harness(OrchestratorConfig(project_root=tmp_path))
+        harness._build_lifecycle_registry()
+        assert harness._lifecycle is not None
+        first = harness._lifecycle.services[0]
+        assert isinstance(first, ManagedService)
+        assert first.name == 'loop-stall-monitor'
+
+        await first.start()
+        try:
+            assert len(_live_stall_watchdogs()) == 1
+        finally:
+            await first.stop()
+
+        assert _live_stall_watchdogs() == []
+
+
+def _live_stall_watchdogs() -> list[threading.Thread]:
+    return [
+        t for t in threading.enumerate()
+        if t.name == 'loop-stall-watchdog' and t.is_alive()
+    ]
 
 
 # ---------------------------------------------------------------------------

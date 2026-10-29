@@ -20,7 +20,6 @@ from orchestrator.config import (
     FairnessConfig,
     ModuleConfig,
     OrchestratorConfig,
-    StarvationWatchdogConfig,
 )
 from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
@@ -2219,6 +2218,7 @@ class TestRequeueCooldown:
 class TestDispatchCooldownConfig:
     """Validate the dispatch_cooldown_secs config field defaults and constraints."""
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_dispatch_cooldown_secs(self):
         """OrchestratorConfig() defaults dispatch_cooldown_secs to 1800.0."""
         config = OrchestratorConfig()
@@ -6172,6 +6172,7 @@ class TestFairnessConfigSchema:
             'scheduler_v2 field must be removed from FairnessConfig'
         )
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_skip_threshold_is_per_tier_dict(self):
         """Default skip_threshold is a per-tier dict."""
         cfg = OrchestratorConfig()
@@ -7898,7 +7899,10 @@ class TestClaimantLivenessDispatchGate:
 
     def test_live_claimant_refuses_dispatch(self):
         heartbeat = (self.FIXED_DT - timedelta(minutes=1)).isoformat()  # fresh (ttl=300s default)
-        config = OrchestratorConfig(max_per_module=1)
+        # pin: this test is about the gate refusing dispatch, not the default
+        config = OrchestratorConfig(
+            max_per_module=1, claimant_dispatch_gate_enabled=True,
+        )
         scheduler = Scheduler(config, wall_time_source=lambda: self.FIXED_DT)
 
         task = self._pending_task_with_claimant('5001', 'run-x/session-y/pid=1', heartbeat)
@@ -8595,6 +8599,7 @@ class TestParkStopTrip:
         import re
 
         config = OrchestratorConfig(
+            park_stop_enabled=True,  # pin: these tests are about the trip, not the default
             max_per_module=1,
             park_stop_parked_threshold=3,
             park_stop_parked_window_hours=1.0,
@@ -8719,6 +8724,7 @@ class TestParkStopTrip:
         reached the guard returns early.
         """
         config = OrchestratorConfig(
+            park_stop_enabled=True,  # pin: these tests are about the trip, not the default
             max_per_module=1,
             park_stop_parked_threshold=3,
             park_stop_parked_window_hours=1.0,
@@ -8768,6 +8774,7 @@ class TestParkStopTrip:
         is_paused must still be False.
         """
         config = OrchestratorConfig(
+            park_stop_enabled=True,  # pin: these tests are about the trip, not the default
             max_per_module=1,
             park_stop_parked_threshold=3,
             park_stop_parked_window_hours=1.0,
@@ -12635,655 +12642,6 @@ class TestDrainBuriedOwnerRestoredEvents:
         assert 'm2' in restored[0][1]['data']['modules']
 
 
-# ---- Starvation watchdog (task 1880) ----
-
-
-class TestStarvationWatchdog:
-    """Tests for Scheduler._apply_starvation_watchdog and dispatch-site resolve.
-
-    The watchdog fires an INFO escalation when a dispatch-eligible task
-    keeps being skipped as the TOP-scored candidate past BOTH skip_threshold
-    AND idle_secs.  It self-resolves when the task dispatches.
-    """
-
-    def _make_scheduler(
-        self,
-        *,
-        skip_threshold: int = 3,
-        idle_secs: float = 100.0,
-        idle_only_secs: float = 259200.0,
-        enabled: bool = True,
-    ) -> tuple['Scheduler', list]:
-        """Build a Scheduler with watchdog config tuned small and a mutable clock.
-
-        ``idle_only_secs`` defaults to 259200 (the schema default) so existing
-        dual-gate tests — whose fake clock never advances past a few hundred
-        seconds — are unaffected by the never-top-scored idle-only backstop.
-        """
-        t: list[float] = [0.0]
-
-        def fake_clock() -> float:
-            return t[0]
-
-        config = OrchestratorConfig(
-            max_per_module=1,
-            starvation_watchdog=StarvationWatchdogConfig(
-                enabled=enabled,
-                skip_threshold=skip_threshold,
-                idle_secs=idle_secs,
-                idle_only_secs=idle_only_secs,
-            ),
-        )
-        # Prevent fairness parks from installing before the watchdog threshold
-        # is reached (the watchdog skip_threshold=3 is deliberately smaller
-        # than the test's default fairness skip_threshold per tier so we can
-        # isolate the watchdog logic cleanly).
-        config.fairness.skip_threshold = 9999
-        scheduler = Scheduler(config, time_source=fake_clock)
-        scheduler.finish_startup()
-        return scheduler, t
-
-    @staticmethod
-    def _starved_task(tid: str = 'starved') -> dict:
-        return {
-            'id': tid,
-            'title': f'Starved task {tid}',
-            'status': 'pending',
-            'priority': 'medium',
-            'dependencies': [],
-            'metadata': {'files': ['backend/main.py']},
-        }
-
-    @pytest.mark.asyncio
-    async def test_positive_fires_once_after_both_thresholds(self):
-        """Watchdog fires exactly once when skip_count >= threshold AND clock >= idle_secs.
-
-        Positive firing path:
-        - Drive 3 acquire_next ticks (skip_count bumps to 3 via loop-exhausted path).
-        - Advance clock to 150s (>= idle_secs=100).
-        - One more tick → _on_starvation_warn called exactly once, with task_id='starved'
-          and summary containing the stable 'STARVATION_WATCHDOG' marker.
-        - Additional ticks do NOT re-fire (dedup / no re-arm spam).
-        - 'starved' is in scheduler._starvation_escalated.
-        """
-        scheduler, t = self._make_scheduler()
-        callback = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=callback)
-
-        # Seed a held lock on a dispatched 'seed' task so 'starved' can never
-        # acquire its module (loop-exhausted path → skip_count bumped each tick).
-        scheduler.lock_table.try_acquire('seed', ['backend'])
-        scheduler._dispatched.add('seed')
-
-        task = self._starved_task()
-        scheduler.get_tasks = AsyncMock(return_value=[task])
-
-        # Drive 3 ticks to accumulate skip_count >= skip_threshold (3).
-        # Clock stays at 0 during these ticks.
-        for _ in range(3):
-            result = await scheduler.acquire_next()
-            assert result is None, 'Expected no dispatch while seed holds the lock'
-
-        assert scheduler._skip_count.get('starved', 0) >= 3, (
-            f'Expected skip_count >= 3 after 3 loop-exhausted ticks; '
-            f'got {scheduler._skip_count!r}'
-        )
-
-        # Advance clock past idle_secs (100s) and tick once more.
-        t[0] = 150.0
-        await scheduler.acquire_next()
-
-        # Both thresholds are now crossed → callback must fire exactly once.
-        callback.assert_called_once()
-        call_args = callback.call_args
-        args = call_args.args if call_args.args else ()
-        kwargs = call_args.kwargs if call_args.kwargs else {}
-
-        # task_id must be 'starved'.
-        task_id_arg = args[0] if args else kwargs.get('task_id')
-        assert str(task_id_arg) == 'starved', (
-            f'Expected task_id="starved"; got {task_id_arg!r}'
-        )
-
-        # summary must carry the stable STARVATION_WATCHDOG marker.
-        summary_arg = kwargs.get('summary', '') or (args[1] if len(args) > 1 else '')
-        assert 'STARVATION_WATCHDOG' in str(summary_arg), (
-            f'Expected STARVATION_WATCHDOG in summary; got {summary_arg!r}'
-        )
-
-        # Further ticks must NOT re-fire the callback (dedup guard).
-        for _ in range(5):
-            await scheduler.acquire_next()
-
-        callback.assert_called_once()  # still exactly once
-
-        # 'starved' must be in _starvation_escalated after the first fire.
-        assert 'starved' in scheduler._starvation_escalated, (
-            '_starvation_escalated must contain task_id after the watchdog fires'
-        )
-
-    @pytest.mark.asyncio
-    async def test_self_resolve_on_dispatch(self):
-        """_on_starvation_resolve is called exactly once when the escalated task dispatches.
-
-        Drive 'starved' to the escalated state (task_id in _starvation_escalated).
-        Then release the 'seed' lock so the next acquire_next dispatches 'starved'.
-        Assert:
-        - acquire_next returns a TaskAssignment for 'starved'
-        - _on_starvation_resolve called exactly once with task_id='starved'
-        - 'starved' NOT in scheduler._starvation_escalated
-        - 'starved' NOT in scheduler._starvation_first_seen
-        """
-        scheduler, t = self._make_scheduler()
-        warn_cb = AsyncMock()
-        resolve_cb = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=warn_cb)
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_resolve=resolve_cb)
-
-        # Seed a held lock on 'seed' so 'starved' can't acquire initially.
-        scheduler.lock_table.try_acquire('seed', ['backend'])
-        scheduler._dispatched.add('seed')
-
-        task = self._starved_task()
-        scheduler.get_tasks = AsyncMock(return_value=[task])
-
-        # Drive 3 ticks to hit skip_threshold, then advance clock past idle_secs.
-        for _ in range(3):
-            await scheduler.acquire_next()
-
-        t[0] = 150.0
-        await scheduler.acquire_next()
-
-        # Verify warn callback fired (task is now in _starvation_escalated).
-        warn_cb.assert_called_once()
-        assert 'starved' in scheduler._starvation_escalated, (
-            'Precondition: starved must be in _starvation_escalated'
-        )
-        resolve_cb.assert_not_called()
-
-        # Release 'seed' so 'starved' can acquire 'backend'.
-        scheduler.lock_table.release('seed')
-        scheduler._dispatched.discard('seed')
-
-        # Next acquire_next must dispatch 'starved'.
-        result = await scheduler.acquire_next()
-        assert result is not None, 'Expected TaskAssignment after releasing seed lock'
-        assert result.task_id == 'starved', (
-            f'Expected task_id="starved"; got {result.task_id!r}'
-        )
-
-        # Resolve callback must have fired exactly once with 'starved'.
-        resolve_cb.assert_called_once()
-        call_args = resolve_cb.call_args
-        args = call_args.args if call_args.args else ()
-        kwargs = call_args.kwargs if call_args.kwargs else {}
-        task_id_arg = args[0] if args else kwargs.get('task_id')
-        assert str(task_id_arg) == 'starved', (
-            f'Expected task_id="starved" in resolve callback; got {task_id_arg!r}'
-        )
-
-        # State cleanup: 'starved' must no longer be in the escalated set or seen dict.
-        assert 'starved' not in scheduler._starvation_escalated, (
-            '_starvation_escalated must be cleared on dispatch'
-        )
-        assert 'starved' not in scheduler._starvation_first_seen, (
-            '_starvation_first_seen must be cleared on dispatch'
-        )
-
-    @pytest.mark.asyncio
-    async def test_below_skip_threshold_no_callback(self):
-        """(a) Below skip_threshold: fewer skips than threshold → callback NOT called.
-
-        skip_threshold=3, only 2 ticks (skip_count=2 < 3).  Clock advanced well
-        past idle_secs (100s) to prove the skip-count gate blocks firing.
-        """
-        scheduler, t = self._make_scheduler()
-        callback = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=callback)
-
-        scheduler.lock_table.try_acquire('seed', ['backend'])
-        scheduler._dispatched.add('seed')
-        task = self._starved_task()
-        scheduler.get_tasks = AsyncMock(return_value=[task])
-
-        # 2 ticks → skip_count = 2 < threshold=3.
-        for _ in range(2):
-            await scheduler.acquire_next()
-
-        # Advance clock well past idle_secs.
-        t[0] = 500.0
-        await scheduler.acquire_next()
-
-        callback.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_idle_gate_below_idle_secs_no_callback(self):
-        """(b) Idle gate: skip_count >= threshold but clock < idle_secs → NOT called.
-
-        Proves BOTH conditions are required — the skip-gate alone is not sufficient.
-        Clock advances only to 50s < idle_secs=100s.
-        """
-        scheduler, t = self._make_scheduler()
-        callback = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=callback)
-
-        scheduler.lock_table.try_acquire('seed', ['backend'])
-        scheduler._dispatched.add('seed')
-        task = self._starved_task()
-        scheduler.get_tasks = AsyncMock(return_value=[task])
-
-        # Drive 3+ ticks to cross skip_threshold.
-        for _ in range(4):
-            await scheduler.acquire_next()
-
-        assert scheduler._skip_count.get('starved', 0) >= 3, (
-            'Precondition: skip_count must be >= 3 for this test to be meaningful'
-        )
-
-        # Clock below idle_secs (50s < 100s) — callback must NOT fire.
-        t[0] = 50.0
-        await scheduler.acquire_next()
-
-        callback.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_idle_only_backstop_fires_with_zero_skips(self):
-        """Idle-only backstop fires for a never-top-scored task (skip_count stays 0).
-
-        Drives _apply_starvation_watchdog DIRECTLY (not acquire_next) so
-        _skip_count is never bumped — the faithful reify-5166 shape where a low
-        task can never outscore a medium/high candidate, is never the top-scored
-        candidate, and accrues ZERO skips.  With idle_secs=100, idle_only_secs=200:
-        - t=0: first call stamps first_seen; skip_count==0; no fire.
-        - t=250 (>= idle_only_secs, skip still 0): warn fires EXACTLY once with
-          task_id='starved' and 'STARVATION_WATCHDOG' in the summary; tid escalated.
-        - further calls do not re-fire (dedup).
-
-        RED under the current AND-only gate, which never fires with skip_count==0.
-        """
-        scheduler, t = self._make_scheduler(idle_secs=100.0, idle_only_secs=200.0)
-        callback = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=callback)
-
-        task = self._starved_task()
-
-        # t=0: stamp first_seen.  Direct call must never bump skip_count.
-        await scheduler._apply_starvation_watchdog([task])
-        assert scheduler._skip_count.get('starved', 0) == 0, (
-            f'Direct _apply_starvation_watchdog must never bump skip_count; '
-            f'got {scheduler._skip_count!r}'
-        )
-        callback.assert_not_called()
-
-        # Advance past idle_only_secs (200); skip_count is still 0 (never top).
-        t[0] = 250.0
-        await scheduler._apply_starvation_watchdog([task])
-
-        assert scheduler._skip_count.get('starved', 0) == 0, (
-            'skip_count must remain 0 across the idle-only fire (never top-scored)'
-        )
-        callback.assert_called_once()
-        call_args = callback.call_args
-        args = call_args.args if call_args.args else ()
-        kwargs = call_args.kwargs if call_args.kwargs else {}
-        task_id_arg = args[0] if args else kwargs.get('task_id')
-        assert str(task_id_arg) == 'starved', (
-            f'Expected task_id="starved"; got {task_id_arg!r}'
-        )
-        summary_arg = kwargs.get('summary', '') or (args[1] if len(args) > 1 else '')
-        assert 'STARVATION_WATCHDOG' in str(summary_arg), (
-            f'Expected STARVATION_WATCHDOG in summary; got {summary_arg!r}'
-        )
-        assert 'starved' in scheduler._starvation_escalated, (
-            '_starvation_escalated must contain task_id after the idle-only fire'
-        )
-
-        # Further calls must NOT re-fire (dedup / no re-arm spam).
-        for _ in range(3):
-            await scheduler._apply_starvation_watchdog([task])
-        callback.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_idle_only_does_not_fire_below_idle_only_secs(self):
-        """Guard: skip_count==0 and idle_secs <= elapsed < idle_only_secs → NOT fired.
-
-        Proves the idle-only backstop does not fire prematurely: crossing the
-        dual-gate's idle_secs component (100) is NOT sufficient without skips —
-        only crossing idle_only_secs (200) fires when skip_count==0.
-        """
-        scheduler, t = self._make_scheduler(idle_secs=100.0, idle_only_secs=200.0)
-        callback = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=callback)
-
-        task = self._starved_task()
-
-        # t=0: stamp first_seen.
-        await scheduler._apply_starvation_watchdog([task])
-
-        # t=150: >= idle_secs (100) but < idle_only_secs (200), skip_count==0.
-        t[0] = 150.0
-        await scheduler._apply_starvation_watchdog([task])
-
-        assert scheduler._skip_count.get('starved', 0) == 0, (
-            'Precondition: skip_count must be 0 (never top-scored)'
-        )
-        callback.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_never_top_scored_low_task_e2e_rca_reproduction(self):
-        """End-to-end reify-5166 reproduction: a never-top-scored low task fires idle-only.
-
-        A single 'low'-priority task on module 'backend' is kept perpetually
-        eligible while a stream of FRESH 'high'-priority tasks on the DISJOINT
-        module 'frontend' dispatch first EVERY tick (TIER_BASE high=8000 always
-        outscores low's max of 2999).  Because 'low' is never the top-scored
-        candidate, the scored loop acquires+dispatches the high task and returns
-        BEFORE 'low' is ever reached: _skip_count['low'] stays 0 and the dual
-        skip+idle gate can NEVER trip — the exact structural blind spot from
-        reify-5166 (77h eligible, 547 higher-tier dispatches, zero skips).
-
-        Once continuous eligibility crosses idle_only_secs, the idle-only
-        backstop files exactly one STARVATION_WATCHDOG escalation for 'low'.
-        When contention finally clears, 'low' dispatches and self-resolves
-        (proving the existing resolve/GC state is reused after an idle-only fire).
-        """
-        scheduler, t = self._make_scheduler(
-            skip_threshold=3, idle_secs=100.0, idle_only_secs=200.0,
-        )
-        warn_cb = AsyncMock()
-        resolve_cb = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(
-            scheduler._callbacks,
-            on_starvation_warn=warn_cb,
-            on_starvation_resolve=resolve_cb,
-        )
-
-        low = {
-            'id': 'low',
-            'title': 'Low-priority never-top task',
-            'status': 'pending',
-            'priority': 'low',
-            'dependencies': [],
-            'metadata': {'files': ['backend/main.py']},
-        }
-
-        def high_task(n: int) -> dict:
-            return {
-                'id': f'high{n}',
-                'title': f'High task {n}',
-                'status': 'pending',
-                'priority': 'high',
-                'dependencies': [],
-                'metadata': {'files': ['frontend/main.py']},
-            }
-
-        # Contention phase: many ticks below idle_only_secs.  Each tick a fresh
-        # high task on 'frontend' dispatches first; 'low' is never reached.
-        for n in range(4):
-            scheduler.get_tasks = AsyncMock(return_value=[low, high_task(n)])
-            result = await scheduler.acquire_next()
-            assert result is not None and result.task_id == f'high{n}', (
-                f'Expected high{n} to dispatch first (top-scored); got {result!r}'
-            )
-            # 'low' is continuously eligible (anchored) but never top-scored.
-            assert 'low' in scheduler._starvation_first_seen, (
-                f'low must stay continuously eligible (anchored) at tick {n}'
-            )
-            assert scheduler._skip_count.get('low', 0) == 0, (
-                f'low must NEVER accrue skips (never top-scored); '
-                f'got {scheduler._skip_count!r} at tick {n}'
-            )
-            # Release the dispatched high so next tick's high acquires 'frontend'.
-            scheduler.lock_table.release(f'high{n}')
-            scheduler._dispatched.discard(f'high{n}')
-
-        # No escalation yet (elapsed 0 < idle_only_secs=200).
-        warn_cb.assert_not_called()
-
-        # Advance past idle_only_secs and tick once more (still contended).
-        t[0] = 250.0
-        scheduler.get_tasks = AsyncMock(return_value=[low, high_task(99)])
-        result = await scheduler.acquire_next()
-        assert result is not None and result.task_id == 'high99', (
-            f'high99 must still dispatch first this tick; got {result!r}'
-        )
-        # low still never reached: zero skips, never dispatched.
-        assert scheduler._skip_count.get('low', 0) == 0, (
-            f'low must still have zero skips; got {scheduler._skip_count!r}'
-        )
-
-        # Idle-only backstop fired EXACTLY once for 'low'.
-        warn_cb.assert_called_once()
-        call_args = warn_cb.call_args
-        args = call_args.args if call_args.args else ()
-        kwargs = call_args.kwargs if call_args.kwargs else {}
-        task_id_arg = args[0] if args else kwargs.get('task_id')
-        assert str(task_id_arg) == 'low', (
-            f'Expected watchdog to fire for low; got {task_id_arg!r}'
-        )
-        summary_arg = kwargs.get('summary', '') or (args[1] if len(args) > 1 else '')
-        assert 'STARVATION_WATCHDOG' in str(summary_arg), (
-            f'Expected STARVATION_WATCHDOG in summary; got {summary_arg!r}'
-        )
-        assert 'low' in scheduler._starvation_escalated, (
-            'low must be escalated after the idle-only fire'
-        )
-        scheduler.lock_table.release('high99')
-        scheduler._dispatched.discard('high99')
-
-        # Clear all higher-tier contention: only 'low' remains eligible.
-        scheduler.get_tasks = AsyncMock(return_value=[low])
-        result = await scheduler.acquire_next()
-        assert result is not None and result.task_id == 'low', (
-            f'low must finally dispatch once contention clears; got {result!r}'
-        )
-
-        # Self-resolve reuse works after an idle-only fire.
-        resolve_cb.assert_called_once()
-        r_args = resolve_cb.call_args.args
-        r_kwargs = resolve_cb.call_args.kwargs
-        r_task_id = r_args[0] if r_args else r_kwargs.get('task_id')
-        assert str(r_task_id) == 'low', (
-            f'Expected resolve callback for low; got {r_task_id!r}'
-        )
-        assert 'low' not in scheduler._starvation_escalated, (
-            '_starvation_escalated must clear on dispatch (self-resolve reuse)'
-        )
-        assert 'low' not in scheduler._starvation_first_seen, (
-            '_starvation_first_seen must clear on dispatch'
-        )
-        # warn must not have re-fired during the resolve tick.
-        warn_cb.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_disabled_no_callback(self):
-        """(c) Disabled: starvation_watchdog.enabled=False → NOT called even when both thresholds crossed.
-
-        Set enabled=False, drive skip_count >= threshold, advance clock past
-        idle_secs → callback must never fire.
-        """
-        scheduler, t = self._make_scheduler(enabled=False)
-        callback = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=callback)
-
-        scheduler.lock_table.try_acquire('seed', ['backend'])
-        scheduler._dispatched.add('seed')
-        task = self._starved_task()
-        scheduler.get_tasks = AsyncMock(return_value=[task])
-
-        # Drive 5 ticks to clearly cross skip_threshold=3.
-        for _ in range(5):
-            await scheduler.acquire_next()
-
-        # Advance clock well past idle_secs=100s.
-        t[0] = 500.0
-        await scheduler.acquire_next()
-
-        callback.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_gc_terminal_task_resolves_escalation(self):
-        """(a) GC backstop: escalated task resolved + state cleared when task goes terminal.
-
-        Drive 'starved' to the escalated state (task_id in _starvation_escalated).
-        Then make get_tasks report it as 'done' (terminal).  One more
-        acquire_next tick must:
-        - call _on_starvation_resolve exactly once with task_id='starved',
-        - clear 'starved' from _starvation_escalated, AND
-        - clear 'starved' from _starvation_first_seen.
-
-        Fails until the dedicated watchdog GC block is added to the stale-id
-        sweep inside acquire_next (step-10).
-        """
-        scheduler, t = self._make_scheduler()
-        warn_cb = AsyncMock()
-        resolve_cb = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=warn_cb)
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_resolve=resolve_cb)
-
-        # Seed a held lock on 'seed' so 'starved' can never acquire.
-        scheduler.lock_table.try_acquire('seed', ['backend'])
-        scheduler._dispatched.add('seed')
-
-        task = self._starved_task()
-        scheduler.get_tasks = AsyncMock(return_value=[task])
-
-        # Drive 3 ticks to cross skip_threshold (3), then advance clock past idle_secs.
-        for _ in range(3):
-            await scheduler.acquire_next()
-        t[0] = 150.0
-        await scheduler.acquire_next()
-
-        # Pre-condition: warn fired, task is escalated.
-        warn_cb.assert_called_once()
-        assert 'starved' in scheduler._starvation_escalated, (
-            'Precondition: starved must be in _starvation_escalated before GC tick'
-        )
-        resolve_cb.assert_not_called()
-
-        # Change get_tasks to return 'starved' as terminal ('done').
-        terminal_task = dict(task, status='done')
-        scheduler.get_tasks = AsyncMock(return_value=[terminal_task])
-
-        # One tick — the GC backstop must detect 'starved' is terminal,
-        # call _on_starvation_resolve, and clear all watchdog state.
-        await scheduler.acquire_next()
-
-        resolve_cb.assert_called_once()
-        call_args = resolve_cb.call_args
-        args = call_args.args if call_args.args else ()
-        kwargs = call_args.kwargs if call_args.kwargs else {}
-        task_id_arg = args[0] if args else kwargs.get('task_id')
-        assert str(task_id_arg) == 'starved', (
-            f'Expected task_id="starved" in resolve callback; got {task_id_arg!r}'
-        )
-        assert 'starved' not in scheduler._starvation_escalated, (
-            '_starvation_escalated must be cleared by GC sweep for terminal task'
-        )
-        assert 'starved' not in scheduler._starvation_first_seen, (
-            '_starvation_first_seen must be cleared for terminal task'
-        )
-
-    @pytest.mark.asyncio
-    async def test_gc_non_eligible_status_resolves_escalation(self):
-        """GC backstop resolves escalation when task moves to blocked/deferred.
-
-        A task in 'blocked' or 'deferred' is non-terminal but leaves the
-        candidate pool.  The dispatch-site resolve never fires (no dispatch)
-        and the _stale_ids sweep skips it (not terminal).  The extended GC
-        backstop must detect the non-eligible status and auto-resolve.
-
-        Drive 'starved' to escalated state, then flip its status to 'blocked'.
-        One acquire_next tick must:
-        - call _on_starvation_resolve exactly once with task_id='starved', AND
-        - clear 'starved' from _starvation_escalated.
-
-        Fails until the GC block checks _STARVATION_NON_ELIGIBLE in addition
-        to _stale_ids.
-        """
-        scheduler, t = self._make_scheduler()
-        warn_cb = AsyncMock()
-        resolve_cb = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=warn_cb)
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_resolve=resolve_cb)
-
-        # Seed a held lock on 'seed' so 'starved' can never acquire.
-        scheduler.lock_table.try_acquire('seed', ['backend'])
-        scheduler._dispatched.add('seed')
-
-        task = self._starved_task()
-        scheduler.get_tasks = AsyncMock(return_value=[task])
-
-        # Drive 3 ticks to cross skip_threshold (3), then advance past idle_secs.
-        for _ in range(3):
-            await scheduler.acquire_next()
-        t[0] = 150.0
-        await scheduler.acquire_next()
-
-        # Pre-condition: warn fired, task is escalated.
-        warn_cb.assert_called_once()
-        assert 'starved' in scheduler._starvation_escalated, (
-            'Precondition: starved must be in _starvation_escalated before GC tick'
-        )
-        resolve_cb.assert_not_called()
-
-        # Change get_tasks to return 'starved' as 'blocked' (non-terminal, non-candidate).
-        blocked_task = dict(task, status='blocked')
-        scheduler.get_tasks = AsyncMock(return_value=[blocked_task])
-
-        # One tick — the extended GC backstop must detect 'starved' is blocked,
-        # call _on_starvation_resolve, and clear watchdog state.
-        await scheduler.acquire_next()
-
-        resolve_cb.assert_called_once()
-        call_args = resolve_cb.call_args
-        args = call_args.args if call_args.args else ()
-        kwargs = call_args.kwargs if call_args.kwargs else {}
-        task_id_arg = args[0] if args else kwargs.get('task_id')
-        assert str(task_id_arg) == 'starved', (
-            f'Expected task_id="starved" in resolve callback; got {task_id_arg!r}'
-        )
-        assert 'starved' not in scheduler._starvation_escalated, (
-            '_starvation_escalated must be cleared by GC sweep for blocked task'
-        )
-
-    @pytest.mark.asyncio
-    async def test_continuity_reset_drops_first_seen_when_not_candidate(self):
-        """(b) Continuity reset: _starvation_first_seen cleared when task leaves candidates.
-
-        A task eligible in tick 1 (pending, deps satisfied, in candidates) gets
-        its _starvation_first_seen stamped.  When it becomes terminal (absent
-        from candidates) on tick 2, the entry is dropped so the idle clock
-        resets on any future re-appearance as a candidate.
-        """
-        scheduler, _t = self._make_scheduler()
-
-        # Seed a held lock so 'starved' is a candidate but can't acquire.
-        scheduler.lock_table.try_acquire('seed', ['backend'])
-        scheduler._dispatched.add('seed')
-
-        task = self._starved_task()
-        scheduler.get_tasks = AsyncMock(return_value=[task])
-
-        # Tick 1: 'starved' appears in candidates → _starvation_first_seen stamped.
-        await scheduler.acquire_next()
-        assert 'starved' in scheduler._starvation_first_seen, (
-            'Precondition: _starvation_first_seen must be stamped after tick 1'
-        )
-
-        # Now make 'starved' terminal so it is no longer a dispatch-eligible candidate.
-        terminal_task = dict(task, status='done')
-        scheduler.get_tasks = AsyncMock(return_value=[terminal_task])
-
-        # Tick 2: continuity reset in _apply_starvation_watchdog must drop the entry.
-        await scheduler.acquire_next()
-
-        assert 'starved' not in scheduler._starvation_first_seen, (
-            '_starvation_first_seen must be cleared by the continuity reset '
-            'when the task is no longer a dispatch-eligible candidate'
-        )
-
-
 # ---------------------------------------------------------------------------
 # StreakCounter/StreakRegistry migration (task 2124)
 # ---------------------------------------------------------------------------
@@ -13336,9 +12694,6 @@ class TestStreakRegistryMigration:
             '_external_resolver_degraded_counts must alias '
             '_streak_resolver_degraded.counts'
         )
-        assert scheduler._starvation_first_seen is (
-            scheduler._streak_starvation.first_seen
-        ), '_starvation_first_seen must alias _streak_starvation.first_seen'
         assert scheduler._starvation_escalated is scheduler._streak_starvation.escalated, (
             '_starvation_escalated must alias _streak_starvation.escalated'
         )
@@ -13383,7 +12738,7 @@ class TestStreakRegistryMigration:
         scheduler._external_hold_streak['T'] = 1
         scheduler._external_hold_cause['T'] = 'deps_live'
         scheduler._external_resolver_degraded_counts['T'] = 1
-        scheduler._starvation_first_seen['T'] = 0.0
+        scheduler._starvation_escalated.add('T')
 
         # Spine entry so 'T' enters _all_tracked -> _stale_ids once terminal.
         scheduler._skip_count['T'] = 0

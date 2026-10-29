@@ -145,9 +145,17 @@ def wire_classes() -> tuple[type, ...]:
     from orchestrator.task_verify_spec import TaskVerifySpec
     from orchestrator.verify import VerifyResult
     from orchestrator.verify_admission_record import AdmissionLeg
+    from orchestrator.verify_evidence import VerifyUnit
     from orchestrator.verify_runner import MergeVerifySpec
 
-    return (VerifyResult, MergeVerifySpec, TaskVerifySpec, AdmissionLeg, FlakeSuppression)
+    return (
+        VerifyResult,
+        MergeVerifySpec,
+        TaskVerifySpec,
+        AdmissionLeg,
+        FlakeSuppression,
+        VerifyUnit,
+    )
 
 
 def local_gate_identity(code_sha: str) -> GateIdentity:

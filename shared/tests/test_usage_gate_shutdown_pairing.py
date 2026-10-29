@@ -205,7 +205,7 @@ def test_every_gate_constructor_tears_down(pairing):
           'auth-reprobe tasks, its background cost-event saves and its probe '
           'dirs for the life of the process. Tear it down best-effort in a '
           'try/finally around its use; an eval campaign should own it through '
-          'orchestrator/src/orchestrator/evals/runner.py::campaign_usage_gate. '
+          'orchestrator/src/orchestrator/evals/eval_gate.py::campaign_usage_gate. '
           'A factory that returns the gate to callers who tear it down belongs '
           'in ALLOWLIST, with a justification naming those callers.'
     )

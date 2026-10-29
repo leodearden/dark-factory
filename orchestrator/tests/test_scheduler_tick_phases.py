@@ -19,7 +19,7 @@ from shared.psi import PsiSample
 
 from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig, apply_reload
 from orchestrator.event_store import EventStore
-from orchestrator.overrides import OverrideRow, OverrideStore
+from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
 from orchestrator.pause_policy import PauseClass
 from orchestrator.scheduler import _CONTINUE, PsiHold, Scheduler, TickContext, TickOutcome
 
@@ -382,7 +382,7 @@ class TestPolicySelectionPrepPhases:
         }
         reserve_row = OverrideRow(
             boost_tier=None, pinned=False, pin_order=None, reserve_now=True,
-            ttl_until=None,
+            ttl_until=None, source=OverrideSource.OPERATOR,
         )
         ctx = TickContext(
             tasks=[task],
@@ -415,7 +415,7 @@ class TestPolicySelectionPrepPhases:
 
         row = OverrideRow(
             boost_tier='high', pinned=False, pin_order=None, reserve_now=False,
-            ttl_until=None,
+            ttl_until=None, source=OverrideSource.OPERATOR,
         )
         ctx = TickContext(
             tasks=[], status_map={}, tasks_by_id={},
@@ -445,7 +445,7 @@ class TestPolicySelectionPrepPhases:
 
         row = OverrideRow(
             boost_tier='high', pinned=False, pin_order=None, reserve_now=False,
-            ttl_until=None,
+            ttl_until=None, source=OverrideSource.OPERATOR,
         )
         ctx = TickContext(
             tasks=[], status_map={}, tasks_by_id={},
@@ -618,7 +618,7 @@ class TestSelectionPhases:
         }
         pinned_row = OverrideRow(
             boost_tier=None, pinned=True, pin_order=0, reserve_now=False,
-            ttl_until=None,
+            ttl_until=None, source=OverrideSource.OPERATOR,
         )
         ctx = TickContext(
             tasks=[task],
@@ -650,7 +650,7 @@ class TestSelectionPhases:
         }
         unpinned_row = OverrideRow(
             boost_tier=None, pinned=False, pin_order=None, reserve_now=False,
-            ttl_until=None,
+            ttl_until=None, source=OverrideSource.OPERATOR,
         )
         ctx = TickContext(
             tasks=[task],
@@ -696,7 +696,7 @@ class TestSelectionPhases:
         }
         pinned_row = OverrideRow(
             boost_tier=None, pinned=True, pin_order=0, reserve_now=False,
-            ttl_until=None,
+            ttl_until=None, source=OverrideSource.OPERATOR,
         )
         ctx = TickContext(
             tasks=[pinned_task, scored_task],

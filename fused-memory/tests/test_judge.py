@@ -31,7 +31,6 @@ def _make_judge_config(**overrides) -> ReconciliationConfig:
         'judge_llm_model': 'claude-3-5-sonnet-20241022',
         'agent_max_steps': 10,
         'agent_max_tokens': 4096,
-        'max_mutations_per_stage': 5,
     }
     defaults.update(overrides)
     return ReconciliationConfig(**defaults)
@@ -95,7 +94,6 @@ def mock_journal():
     """A mock ReconciliationJournal that returns empty data."""
     journal = MagicMock()
     journal.get_run = AsyncMock(return_value=None)
-    journal.get_entries = AsyncMock(return_value=[])
     journal.get_recent_verdicts = AsyncMock(return_value=[])
     journal.add_verdict = AsyncMock(return_value=None)
     journal.get_halt_states = AsyncMock(return_value=[])
@@ -403,7 +401,7 @@ async def test_build_review_prompt_handles_error_dict_entries(mock_journal):
     )
 
     # Should NOT raise AttributeError
-    prompt = judge._build_review_prompt(run, entries=[], recent_verdicts=[])
+    prompt = judge._build_review_prompt(run, recent_verdicts=[])
 
     # The prompt should contain data from the valid stage report
     assert 'memory_consolidator' in prompt
@@ -462,13 +460,62 @@ async def test_build_review_prompt_excludes_recent_verdicts(mock_journal):
     ]
 
     prompt = judge._build_review_prompt(
-        run, entries=[], recent_verdicts=prior_verdicts,
+        run, recent_verdicts=prior_verdicts,
     )
 
     assert 'Recent Judge Verdicts' not in prompt
     assert 'trend context' not in prompt
     for v in prior_verdicts:
         assert v.run_id not in prompt
+
+
+@pytest.mark.asyncio
+async def test_build_review_prompt_renders_mcp_actions_without_a_journal_section(mock_journal):
+    """The run's mutation audit reaches the judge as MCP Actions only."""
+
+    from fused_memory.models.reconciliation import (
+        ReconciliationRun,
+        RunStatus,
+        RunType,
+        StageId,
+        StageReport,
+    )
+
+    config = _make_judge_config()
+    judge = Judge(config=config, journal=mock_journal)
+    now = datetime.now(UTC)
+    run = ReconciliationRun(
+        id='run-mcp-actions',
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='test',
+        started_at=now,
+        events_processed=0,
+        status=RunStatus.completed,
+        stage_reports={
+            'memory_consolidator': StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=now,
+                completed_at=now,
+                stats={'memories_added': 1},
+            ),
+        },
+    )
+
+    prompt = judge._build_review_prompt(
+        run,
+        recent_verdicts=[],
+        combined_actions=[{
+            'operation': 'add_memory',
+            'target': 'mem-1',
+            'source': 'run_actions',
+            'created_at': '2026-09-25T00:00:00+00:00',
+        }],
+    )
+
+    assert '### MCP Actions (1 total)' in prompt
+    assert 'mem-1' in prompt
+    assert 'Journal Entries' not in prompt
 
 
 @pytest.mark.asyncio
@@ -2045,6 +2092,9 @@ def test_judge_verdict_schema_shape():
     properties = JUDGE_VERDICT_SCHEMA['properties']
     assert set(properties['severity']['enum']) == {'ok', 'minor', 'moderate', 'serious'}
     assert properties['findings']['type'] == 'array'
+    assert set(properties['findings']['items']['properties']) == {
+        'issue', 'severity', 'recommendation',
+    }
 
 
 @pytest.mark.asyncio
@@ -3179,6 +3229,79 @@ class TestReviewRunInfraFailureHandling:
 
         assert not judge.is_halted('proj-infra-d')
         mock_journal.set_halt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_infra_halt_fires_once_per_run_and_a_fresh_run_needs_the_full_threshold(
+        self, mock_journal,
+    ):
+        """The halt ends the run: after an unhalt, two further failures do not
+        halt again and only the third does."""
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._setup(
+            mock_journal, 'proj-infra-e',
+            halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+        )
+        with patch.object(
+            judge, '_call_llm', AsyncMock(side_effect=JudgeInfraError('cap storm'))
+        ):
+            for _ in range(3):
+                await judge.review_run('run-infra')
+            assert mock_journal.set_halt.call_count == 1
+
+            await judge.unhalt('proj-infra-e')
+            for _ in range(2):
+                await judge.review_run('run-infra')
+            assert mock_journal.set_halt.call_count == 1
+            assert not judge.is_halted('proj-infra-e')
+
+            await judge.review_run('run-infra')
+
+        assert mock_journal.set_halt.call_count == 2
+        assert judge.is_halted('proj-infra-e')
+
+    @pytest.mark.asyncio
+    async def test_infra_streaks_are_independent_per_project(self, mock_journal):
+        from fused_memory.models.reconciliation import (
+            ReconciliationRun,
+            RunStatus,
+            RunType,
+        )
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._setup(
+            mock_journal, 'proj-A',
+            halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+        )
+        runs = {
+            f'run-{project}': ReconciliationRun(
+                id=f'run-{project}',
+                project_id=project,
+                run_type=RunType.full,
+                trigger_reason='buffer_size:3',
+                started_at=datetime.now(UTC),
+                events_processed=3,
+                status=RunStatus.completed,
+                stage_reports={},
+            )
+            for project in ('proj-A', 'proj-B')
+        }
+        mock_journal.get_run = AsyncMock(side_effect=lambda run_id: runs[run_id])
+
+        with patch.object(
+            judge, '_call_llm', AsyncMock(side_effect=JudgeInfraError('cap storm'))
+        ):
+            for _ in range(2):
+                await judge.review_run('run-proj-A')
+                await judge.review_run('run-proj-B')
+            assert not judge.is_halted('proj-A')
+            assert not judge.is_halted('proj-B')
+
+            await judge.review_run('run-proj-A')
+
+        assert judge.is_halted('proj-A')
+        assert not judge.is_halted('proj-B')
+        mock_journal.set_halt.assert_called_once()
 
 
 # ─────────────────────────────────────────────────────────────────────

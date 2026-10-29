@@ -89,9 +89,11 @@ const NARROWED_POLL_URLS = Object.freeze({
 
 // Keys fetched on a USER ACTION rather than by the poll loop, each parameterised
 // by the one value its caller already holds. Two declared rows today:
-// `terminal`, through which tab_tasks.jsx fetches `?terminal=<project>`, and
-// `taskProse`, the Task Detail pane's description/details for the selected
-// task, addressed by the row's own uid (`<project>/T-<id>`).
+// `terminal`, through which tab_tasks.jsx and, via
+// task_snapshot.js::createTerminalWindowHooks, tabs.jsx::OrchTab fetch
+// `?terminal=<project>`, and `taskProse`, the Task Detail pane's
+// description/details for the selected task, addressed by the row's own uid
+// (`<project>/T-<id>`).
 //
 // A ROW CARRIES BUILDERS, NOT TEMPLATE STRINGS, and nothing re-derives either
 // one at a call site — a caller holds the parameter and asks for the row, so
@@ -331,9 +333,14 @@ window.DF_DATA = {
   // Do not reintroduce it.
   __stale: {},
   // Per-endpoint RECEIPTS, keyed by the same flow-control key __stale uses:
-  // each entry is `{servedAt, receivedAt, window}`, published by refreshOne
-  // on the SUCCESS path only. datum.js::plainDatum reads this to give a value
-  // that is not yet served as a Datum the provenance it does have.
+  // each entry is `{servedAt, receivedAt, window, pacingHoldMs}`, published by
+  // refreshOne on the SUCCESS path only. datum.js::plainDatum reads this to
+  // give a value that is not yet served as a Datum the provenance it does have.
+  //
+  // `pacingHoldMs` is the slowness-pacing hold this success imposed, measured
+  // from its request's start (0 when not paced); datum.js::plainDatum adds it
+  // to its bound. It shares the success-only lifetime because it describes the
+  // delivery that put these values on screen.
   //
   // `window` is the served-window echo (`WINDOW: {requested, served, days}`)
   // the four windowed endpoints carry, or null. It lives here, not in the key
@@ -477,22 +484,23 @@ function recordFailure(st, forced, deps) {
 // data_poll.test.mjs's "Slowness pacing" section.
 const MAX_POLL_DUTY_CYCLE = 0.5;
 
-// Unlike recordFailure, a forced attempt still paces: pacing is a pure
-// function of the latest measurement, so clicks cannot inflate it.
 // Pacing never holds an endpoint past BACKOFF_MAX_MS after its request started.
 // The fetch deadline does not bound serviceMs: it races only fetchImpl, so a
 // slow body read, an injected deps.timeoutMs or a wall-clock jump
 // (suspend/resume) can each exceed it, and uncapped would freeze the endpoint
 // with failures at 0 and no staleness banner.
-function recordSuccess(st, deps, startedAt, receivedAt) {
-  const serviceMs = receivedAt - startedAt;
+function slownessPacingHoldMs(deps, serviceMs) {
   const paced = deps.pollIntervalMs !== undefined
     && serviceMs > MAX_POLL_DUTY_CYCLE * deps.pollIntervalMs;
+  return paced ? Math.min(serviceMs / MAX_POLL_DUTY_CYCLE, BACKOFF_MAX_MS) : 0;
+}
+
+// Unlike recordFailure, a forced attempt still paces: pacing is a pure
+// function of the latest measurement, so clicks cannot inflate it.
+function recordSuccess(st, startedAt, receivedAt, holdMs) {
   st.failures = 0;
   st.lastSuccessAt = receivedAt;
-  st.nextAllowedAt = paced
-    ? startedAt + Math.min(serviceMs / MAX_POLL_DUTY_CYCLE, BACKOFF_MAX_MS)
-    : 0;
+  st.nextAllowedAt = holdMs > 0 ? startedAt + holdMs : 0;
 }
 
 // Jitter: spreads the 13 endpoint fetches across part of the 3s interval
@@ -602,11 +610,11 @@ function publishReceipt(stateKey, receipt) {
 // runs.
 //
 // THE POLL LOOP IGNORES THIS, and that is correct — the next tick retries, so
-// there is nothing for it to decide. It exists for a USER ACTION: tab_tasks.jsx,
-// which requests a project's terminal window, has to tell "here are the rows"
-// from "the server said no" from "we did not even ask", and datumFor(key)
-// reports the same pre-request unknown Datum in all three cases, so it reads
-// onDemandDatum instead.
+// there is nothing for it to decide. It exists for a USER ACTION: tab_tasks.jsx
+// and task_snapshot.js::createTerminalWindowHooks, which request a project's
+// terminal window, have to tell "here are the rows" from "the server said no"
+// from "we did not even ask", and datumFor(key) reports the same pre-request
+// unknown Datum in all three cases, so they read onDemandDatum instead.
 const REFRESH_OUTCOMES = Object.freeze({
   applied: 'applied',
   failed: 'failed',
@@ -720,9 +728,11 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
     // ONE clock reading for the whole response, so every key it carries shares
     // a single arrival instant — and so `lastSuccessAt` below cannot drift
     // from `receivedAt` by however long the applies took.
-    const receipt = { servedAt: body.served_at ?? null, receivedAt: deps.now(), window: body.WINDOW ?? null };
+    const receivedAt = deps.now();
+    const pacingHoldMs = slownessPacingHoldMs(deps, receivedAt - startedAt);
+    const receipt = { servedAt: body.served_at ?? null, receivedAt, window: body.WINDOW ?? null, pacingHoldMs };
     Object.entries(keySpecs).forEach(([k, spec]) => applyKey(k, body[k], spec, receipt));
-    recordSuccess(st, deps, startedAt, receipt.receivedAt);
+    recordSuccess(st, startedAt, receivedAt, pacingHoldMs);
     publishReceipt(stateKey, receipt);
     return REFRESH_OUTCOMES.applied;
   } catch (err) {

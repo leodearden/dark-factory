@@ -85,6 +85,7 @@ from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
+    arm_leaked_drain_process_guard,
     reject_unsafe_basetemp,
 )
 
@@ -103,7 +104,7 @@ from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV  # noqa: E402
 
 
 def pytest_configure(config):
-    """Session-start hooks: basetemp safety, and async-httpx leak tracking.
+    """Session-start hooks: basetemp safety, the drain-leak guard, async-httpx leak tracking.
 
     ``track_async_httpx_clients()`` runs HERE — at session start, before
     collection — rather than lazily from a fixture, so clients constructed at
@@ -111,6 +112,7 @@ def pytest_configure(config):
     (task 4412).
     """
     reject_unsafe_basetemp(config)
+    arm_leaked_drain_process_guard(config)
     track_async_httpx_clients()
 
 
@@ -631,9 +633,7 @@ def make_graph_mock():
     carries the stateful query log the truncation tests need — because two
     doubles that both claim to stand in for the same server drift, and the
     drift shows up as a test that passes against a fake nothing else agrees
-    with.  A test that needs the cap should use that one (or, for episode
-    reads through graphiti-core, its API-level counterpart
-    ``FakeCappedEpisodeStore`` in the same module).
+    with.  A test that needs the cap should use that one.
     """
     skip_limit_re = re.compile(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', re.IGNORECASE)
     # Deliberately NARROW: only a query whose entire projection is a bare row
@@ -745,6 +745,9 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
     off: the tracked YAML ships it on (task 3169), and with it on every
     Mem0-primary ``add_memory`` in a unit test would reach the real judge
     client.  A test of the triage path opts in on its own config.
+    ``overreach_guard.shadow_enabled`` is pinned off for the same reason: with
+    it on, every decision write in a unit test would reach the real overreach
+    judge; a test of the shadow opts in on its own config.
     """
     config = FusedMemoryConfig(
         llm=LLMConfig(
@@ -776,6 +779,7 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
         ),
     )
     config.write_triage.enabled = False
+    config.overreach_guard.shadow_enabled = False
     return config
 
 

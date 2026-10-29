@@ -4,6 +4,9 @@
 attacked by an opus critic seat before this PRD was written, see the design note §13).
 **Decomposed 2026-10-14:** α 6966, θ 6967, β1 6968, β2 6969, γ 6970, δ 6971, ε 6972, ζ 6973, η 6974;
 bindings and the G7 walk in `client-feed-prd.capability-manifest.md` and its stamped YAML sidecar.
+**Revised 2026-10-23** (gate 7062, esc-7062-1): the client defect bridge, §14 — a `defect_reported`
+inbox event, a narrowly privileged filer outside §8's boundary, and the `defect_filed` feed event
+(FEED_VERSION 1.1); σ1a, σ1b, σ2–σ5, with portal tasks P1a, P1b, P2 and P3. Supersedes task 7005.
 **Type:** greenfield. A new workspace member, `client-feed/`, that publishes one project's build
 evidence to the LDE client portal through file contracts, one orchestrator event the factory does not
 record today, and a minimal acceptance-criteria data format.
@@ -112,7 +115,8 @@ client-feed/tests/   contract fixtures, source tests over fixture stores, audit-
 ```
 
 The publisher never imports `orchestrator`, `fused_memory` or `dashboard`; it depends on `shared` only
-for `shared.project_layout` (`tasks_db`, `runs_db`) and `shared.task_metadata` (`done_provenance`),
+for `shared.project_layout` (`tasks_db`, `runs_db`) and `shared.task_metadata` (`done_provenance`), plus, from
+§14, `shared.defects` (the ref rule, in the non-vendorable `defect_ref.py`) and `shared.mcp_session` (the filer only),
 and on `pydantic`, `pyyaml` and the standard library. It uses no helper that defaults to the factory's
 own checkout (`shared.project_layout.default_project_root` is banned in `client_feed` by a test).
 
@@ -142,7 +146,9 @@ own checkout (`shared.project_layout.default_project_root` is banned in `client_
    prd_path, prd_task_label, landed_commit, waiting_on`. `description`, `details`, `test_strategy`
    and the rest of `metadata` never leave the publisher. Titles and PRD excerpts have `/home/...` and
    absolute paths redacted. A failing test contributes its id, outcome, duration and exception type,
-   never message or output. `merge_blocked.data.reason` is never copied.
+   never message or output. `merge_blocked.data.reason` is never copied. §14.3 adds exactly two fields to
+   the read side: `defects[].ref` values that are `portal:<policy project_id>:` refs, and
+   `x_client_defect_gate_for`.
 7. **One root per publisher, proven.** The publisher is constructed from one config and opens
    nothing outside the root, `out/` and `in/`; the test installs `sys.addaudithook` and asserts every
    `open`, `sqlite3.connect` and subprocess working directory lies under those three (B1).
@@ -152,6 +158,8 @@ own checkout (`shared.project_layout.default_project_root` is banned in `client_
    `task_upserted`, `task_phase`, `verify_run`, `test_results`, `merge_landed`, `branch_snapshot`,
    `tree_snapshot`, `file_revealed`, `reveal_refused`, `criteria_results`, `criteria_declared`. A new type is a minor
    version; a changed field a major one. The portal ignores unknown types and refuses an unknown major.
+   FEED_VERSION "1.1" adds `defect_filed` and the `Source` member `filer` (§14.3). A new member of an enum the
+   reader validates as closed is not minor for that reader; §14.3 states the ordering that makes it safe.
 10. **Never hide red, from recorded sources.** A failed verify is `verify_run.passed == false`; a
     blocked task is `task_upserted` with that status and `waiting_on: leo` when an open escalation
     whose recorded `level` is 2 exists for it, else `factory` (an open escalation with no recorded
@@ -165,8 +173,11 @@ own checkout (`shared.project_layout.default_project_root` is banned in `client_
 12. **Reveal budget** (design note §5): counted set = visible production files not matching free,
     never-reveal or generated globs (`linguist-generated` honoured); lines = non-blank lines, a line
     over `max_line_bytes` counting as ⌈bytes/max⌉; budget = `reveal_proportion × counted lines added or
-    changed since delivered_commit` (all counted lines when null); each reveal costs
-    `max(file_lines, reveal_floor_lines)`; granted when `spent + cost ≤ budget`. Reveal identity is
+    changed since delivered_commit` (all counted lines when null); a path in the counted set costs
+    `max(its chargeable lines, reveal_floor_lines)` and a path outside it costs 0; a request that adds
+    nothing to `spent` (a path outside the counted set, or one already revealed) is granted whatever
+    `spent` is, and any other is granted when `spent + cost ≤ budget` (where this is implemented:
+    §12, the 2026-10-22 δ entry (b) and the 2026-10-25 entry (a)). Reveal identity is
     the path until a delete event; a recreated path needs a new reveal; renames follow git's default
     detection; a deleted file emits a final `file_revealed {deleted: true}` and stops counting.
 13. **Hostile requests are refused with typed reasons.** A requested path must appear in
@@ -210,6 +221,7 @@ portal half (other repo) consumes α's contract and is filed there with a cross-
 | Review outcome event | this PRD adds to the orchestrator; this PRD consumes | `review_completed` | **this PRD (θ)** |
 | Design tokens | no code seam | `consulting/outputs/design-tokens.css` | mission-control |
 | Operator dashboard | none; nothing shared | — | — |
+| Client defect bridge: `defect_reported`, the filer, `defect_filed`, the portal's MCP-port rule | see §14.7 | §14.3 | this PRD (σ1a–σ5) for the contract, the acknowledgement and the filer; the portal PRD for the writer, the restater and its deploy rule |
 
 No reciprocal ownership remains.
 
@@ -259,7 +271,9 @@ whole `criteria_declared` map. Rewritten atomically after every pass that append
 
 ### 7.4 `in/inbox.jsonl` (portal → publisher)
 
-`{seq, at, type: "reveal_requested", path}`. Answered with `file_revealed` or `reveal_refused`.
+`{seq, at, type: "reveal_requested", path}`. Answered with `file_revealed` or `reveal_refused`. A request
+for a path already revealed and still revealable appends nothing, because the feed already holds its
+content at head (§12, 2026-10-25 entry (b)). A second line type, `defect_reported`, is added by §14.3.
 
 ### 7.5 `in/engagement.json` (portal → publisher)
 
@@ -304,6 +318,8 @@ under O is a function of R's git objects, R's `.taskmaster/tasks/tasks.db` rows 
 R's `data/orchestrator/runs.db`, R's `data/verify-logs/`, R's `acceptance/criteria.yaml`, the policy,
 and I's `inbox.jsonl` and `engagement.json`, filtered by the policy's visible set. It opens no other
 path. It writes nowhere but O. The portal account reads O and nothing under R.
+
+The client defect filer is a separate process under its own invariant (§14.5); it widens nothing here.
 
 ## 9. Boundary-test sketch
 
@@ -370,7 +386,7 @@ The portal: pages, streaming, clients, projects, blocks, stages, the admin page,
 and both directories' creation (portal PRD, other repo). Running the acceptance suite against staging.
 Review issue text (counts only, θ). Test evidence for non-pytest projects. Costs, tokens, model names,
 escalation text (never shown). A second feed transport. Per-person links. Failing-test message text
-(open in the design note; exception type only here).
+(open in the design note; exception type only here). Raw client defect text (§14.2 decision 2).
 
 ## 12. Amendments
 
@@ -509,6 +525,104 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     task 5244's archived junits: 90,933 cases, 3,199 duplicate ids before redaction and 3,220
     after). A join must not assume one case per id.
 
+- 2026-10-22, from δ (task 6971). These bind ζ (6973) and the portal:
+  - (a) A request is refused for the first reason that holds, in the order `not_in_tree`,
+    `not_visible`, `symlink`, `not_revealable` (a `never_reveal_globs` match, or a blob that is not
+    UTF-8), `over_budget` (`client-feed/src/client_feed/budget.py::judge`). A submodule is refused as
+    `symlink`. Tree membership is the request's raw `path` text looked up among the paths `git
+    ls-tree` lists at main's head (`client-feed/src/client_feed/sources/git.py::tree_entries`); it is
+    never normalized, joined to a directory or opened on disk. Content is read only after the path,
+    visibility and kind checks, by the entry's blob sha through `git cat-file --batch`
+    (`client-feed/src/client_feed/sources/git.py::blob_reader`).
+  - (b) A path costs `max(lines, reveal_floor_lines)` only inside the counted set, and 0 outside it
+    (`client-feed/src/client_feed/budget.py::CountedSet.cost`). The counted set is head's production
+    files that match neither `free_globs` nor `never_reveal_globs` and have more than 0 chargeable
+    lines (`client-feed/src/client_feed/budget.py::counted_set`). `spent_lines` is not a running
+    total: it is recomputed at head from the revealed set, so a path that leaves the counted set
+    stops costing (`client-feed/src/client_feed/budget.py::CountedSet.spent`). A path already
+    revealed is granted again without a budget check
+    (`client-feed/src/client_feed/budget.py::CountedSet.grantable`). With a `delivered_commit`, a
+    file's chargeable lines are the lines it added or changed since that commit. Paths are paired by
+    `git diff-tree -M`, and each changed blob pair's added lines are counted by
+    `client-feed/src/client_feed/policy.py::Policy.counted_lines`, not by numstat
+    (`client-feed/src/client_feed/budget.py::lines_since`). A file added since then is charged all
+    its counted lines, and a pure rename is charged none.
+  - (c) `RevealBudget` is said only inside `tree_snapshot`. When the budget changes and the tree
+    does not, the state's tree is re-emitted at the same commit with the new budget
+    (`client-feed/src/client_feed/value_events.py::budget_event`). Two `tree_snapshot` lines with one
+    `commit` are therefore not a duplicate: the later one's budget is current.
+  - (d) The engagement is read first in each pass
+    (`client-feed/src/client_feed/engagement.py::read_engagement`). A missing, unreadable (a symlink
+    included) or invalid file, or a `delivered_commit` the repository does not hold, is named
+    `engagement` in `degraded` (`client-feed/src/client_feed/engagement.py::EngagementUnusable`).
+    Reveals are then disabled for that pass: the inbox is not read, its offset is held, nothing is
+    followed, and a new tree's budget uses §4.12's null `delivered_commit` rule. When the engagement
+    is usable but the reveal unit fails (a git error, say), that unit's source is named in
+    `degraded`, the inbox offset and `reveals_head` are held, and a new tree keeps the state's last
+    budget instead of switching to the null rule for one pass
+    (`client-feed/src/client_feed/publisher.py::_new_tree_budget`). A `project_id` other
+    than the policy's is the refusal
+    `client-feed/src/client_feed/engagement.py::EngagementProjectMismatch`, a `FeedError`: the pass
+    stops before anything is appended, and the CLI exits 1. `heartbeat.engagement_version` echoes
+    only a usable engagement's version, and is null otherwise
+    (`client-feed/src/client_feed/publisher.py::run_pass`).
+  - (e) An inbox that cannot be read (unreadable, a symlink, or shorter than the cursor's offset) is
+    `inbox` in `degraded`, and its offset is held
+    (`client-feed/src/client_feed/inbox.py::InboxUnusable`). A line that is not a reveal request is
+    rejected, never raised: it is counted under `inbox`, and the tail moves past it with the requests
+    around it (`client-feed/src/client_feed/publisher.py::_inbox_unit`).
+  - (f) Follow-head walks main's first-parent commits after `Cursor.reveals_head` through head,
+    oldest first, in one `git log --first-parent -M --raw`
+    (`client-feed/src/client_feed/sources/git.py::first_parent_changes`,
+    `client-feed/src/client_feed/reveals.py::_tracks`). A revealed file whose blob changed is
+    re-emitted at head, and a renamed one is emitted at its new path with `renamed_from`. Its reveal
+    ends with a `file_revealed` at its revealed path with `deleted: true` when the path is deleted,
+    or when at head it is no longer revealable. A followed path is never refused for budget. A path
+    recreated after its delete is not followed, and a change reverted within the walk emits nothing
+    (`client-feed/src/client_feed/reveals.py::_follow_events`). When `reveals_head` is null or no
+    longer an ancestor of head, each revealed file is diffed from its own `commit` to head instead.
+    In one pass the ends come first, then the re-emits, then the inbox's answers in inbox order.
+  - (g) The revealed set's only home is `state.revealed` (path, commit, lines), folded from
+    `file_revealed` (`client-feed/src/client_feed/fold.py::_apply_file_revealed`). `cursor.json`
+    holds `reveals_head`, `inbox_offset` and `added_line_counts`, and no per-path blob shas
+    (`client-feed/src/client_feed/feed_io.py::Cursor`). `added_line_counts` caches (b)'s counted
+    added lines by old then new blob sha, valid only under the `max_line_bytes` they were counted
+    with, as `line_counts` does for whole blobs. A pair already counted is not diffed again, and
+    only the pairs of the latest count are kept
+    (`client-feed/src/client_feed/budget.py::AddedLineCounts`). All three move only when the reveal
+    unit runs and succeeds; an inbox read holding no request moves its offset alone
+    (`client-feed/src/client_feed/publisher.py::_advanced`). After a crash between the append and
+    the cursor, an answer whose identity (what it says, without its envelope) is in the uncommitted
+    tail is consumed there and not emitted again
+    (`client-feed/src/client_feed/reveals.py::answer_of`).
+  - (h) The portal's `in-v1` fixture is vendored byte for byte at
+    `client-feed/tests/fixtures/in-v1` from scoping-intake
+    `f5cea40d8354190c9fa0cce260b2e69adc79ea3a`. Its `delivered_commit` is a fixture sha that no test
+    repository holds, so read as vendored it disables reveals. A test that needs a usable engagement
+    sets it to null after reading the vendored file (`client-feed/tests/test_in_v1_fixture.py`).
+
+- 2026-10-25, from task 7484. These bind ζ (6973) and the portal:
+  - (a) A request that adds nothing to `spent_lines` is granted whatever `spent_lines` is: a path
+    outside the counted set, or one already revealed. Any other request must fit what is left of
+    the budget (`client-feed/src/client_feed/budget.py::CountedSet.grantable`). Follow-head never
+    refuses for budget (δ entry (f)), so `spent_lines` can exceed `budget_lines`. A free file is
+    still granted then, and B14's `spent_lines` is unchanged by its grant.
+  - (b) A granted request for a path already in the revealed set emits no event, so a portal retry
+    or a double-click appends nothing. Within a pass, follow-head runs before the inbox is answered,
+    and it has already re-emitted at head every revealed file whose blob changed
+    (`client-feed/src/client_feed/reveals.py::_follow_events`). The feed therefore already holds
+    head's content for every revealed path. The request is still judged first, so a refusal is
+    emitted exactly as before (`client-feed/src/client_feed/reveals.py::_answer`). A consumer that
+    tracks pending requests therefore settles one when its path is in `state.revealed` or a
+    `reveal_refused` answers it, and never waits for a `file_revealed` per request. An explicit
+    `already_revealed` acknowledgement would need a contract revision.
+  - (c) git output that does not parse is a `GitError` of the command that wrote it, and it
+    degrades `git` like any other git failure
+    (`client-feed/src/client_feed/sources/git.py::_parsing`). Every `git cat-file --batch` read is
+    bounded by `GIT_TIMEOUT_SECS`, as every one-shot git call is. The bound applies per read, so the
+    caller's work between reads never counts against it. A read that outlasts it kills the session
+    and fails as `timed out` (`client-feed/src/client_feed/sources/git.py::blob_reader`).
+
 ## 13. Open questions (tactical)
 
 1. **Tree-snapshot cost on large repos.** Suggested: snapshot only on head change; blob line counts
@@ -524,3 +638,545 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
    (`client-feed/src/client_feed/sources/prds.py::summarize_prd`).
 5. **Where the plugin writes the map when no `--junitxml` is given.** Suggested: nowhere; the plugin is
    inert without a junit target. Decide in ε.
+
+
+## 14. Revision 2026-10-23: the client defect bridge
+
+Authored 2026-10-22/23 for gate task 7062 (esc-7062-1; `plans/defect-tests-prd.md` ν, decision 6), with
+Leo's rulings taken in the session (§14.2), and attacked by an opus critic seat before commit (18
+findings, all folded in). **Code anchors** in this section are verified against main `6885b119db`
+(2026-10-23). Cite-by-symbol; re-locate at implementation time. Approach B+H, as for the rest of this
+PRD: the seam crosses two repositories, carries untrusted outside text, and touches the isolation
+invariant.
+
+### 14.1 Goal and consumers
+
+A client who finds a defect reports it on the portal against a declared criterion of the suite.
+Within a minute of the portal's `defect_reported` line:
+
+- a task in that client's project carries one declared defect with `origin: client` and ref
+  `portal:<project_id>:<block>:<report>`, status `open`;
+- its description is the portal's restatement of the report, screened for prompt injection, or, when
+  the report was quarantined, typed facts only;
+- an always-escalates human gate that the fix depends on is committed. It reaches Leo's L2 queue when
+  the client project's orchestrator dispatches it (§14.2 decision 4). Every report is gated until
+  decision 5's flip.
+
+The feed then carries `defect_filed {ref, block, report, task_id, gated}`, and the portal shows the
+report as filed. Leo reads the original in the portal, checks or writes the description, records his
+verdict, and resumes the gate. The factory then fixes it under the defect-tests rule: a test proven to
+catch it, kept.
+
+When the fix lands, the feed's `merge_landed.task_ids` names the fix task. The portal then marks that
+report fixed, as actor `system`: the merge presses "Fixed" (decision 13). A block may hold any number
+of open reports at once. The client's own words never leave the portal.
+
+What an operator sees:
+
+- `lookup_defect_ref(project_root=R, ref="portal:<id>:<b>:<n>")` returns one live carrier.
+- `get_task` on that carrier shows `metadata.defects[0]` with `origin: client`.
+- A report not filed within `filer_grace_seconds` makes the publisher's heartbeat name `filer` in
+  `degraded`, with the ref.
+
+| Mechanism | Consumer |
+|---|---|
+| `defect_reported` inbox line (§14.3) | the filer (§14.4); the publisher's unfiled check (§14.3); written by the portal (portal PRD, amended §14.7) |
+| The filer, `client-feed file-defects` (§14.4) | the client defect window: the portal's `defect_reported` stage, whose "Fixed" is Leo's (portal PRD decision 5), and the LDE sheet's 90-day promise; Leo's L2 queue (the gate); defect-tests' proof and presence check, which act on the declared defect |
+| `defect_filed` feed event and the `filer` degraded source (§14.3) | the portal's project and admin pages (filed / not filed per report); the portal's per-report "Fixed", pressed when `merge_landed.task_ids` names the filed fix (decision 13); defect-tests ι (7057), which builds its typed defect projection on the same ref reader |
+| Policy `filer:` block and `filer.auto_dispatch` (§14.3) | the filer; gate σ5 flips `auto_dispatch` |
+
+### 14.2 Resolved design decisions
+
+1. **The premise (Leo, 2026-10-16, "Feed amendment, new writer").** The bridge is an inbox line plus a
+   narrowly privileged filer outside the publisher's read-only boundary (§8). Not re-litigated here.
+2. **Raw client text never leaves the portal (Leo, 2026-10-23).**
+   - Its home is the portal's record: the `DefectReport` input on the block's `defect_reported`
+     transition (`scoping_intake/engagement.py::DefectReport`, `::Block.history`). Leo reads and acts
+     on it from the admin page.
+   - The inbox line has no field for the raw text (`extra='forbid'`). Its restated fields are
+     model-written. The portal quarantines a restatement that repeats the report verbatim beyond a
+     threshold (`not_restatable`, P1b), so the restater cannot carry the raw text across by echoing
+     it.
+   - Raw text is written into no task field, prompt, transcript, memory or embedding.
+   - The reasons:
+     - Every dispatched agent runs as Leo's user and can read the whole filesystem. The OS sandbox
+       contains writes only (`plans/os-sandbox-worktree-containment-prd.md`, Out of scope).
+     - Agents have the network, and fused-memory binds no caller to a project.
+     - Task text, once filed, reaches about ten durable sinks: transcripts, recon memories, the
+       curator's Qdrant corpus and its OpenAI embedder, the dashboard, escalations, and others.
+     - Injected text in one client's report could therefore reach every client.
+3. **A tool-less model restates each report on the portal side (Leo, 2026-10-23).**
+   - The model is capable but has no tools. Its prompt is written to watch for prompt injection. For
+     each report it gives exactly one of two outcomes:
+     - a restatement in three fields (observed, expected, steps);
+     - a quarantine with typed reasons.
+   - Any restater failure is a quarantine (`restater_declined`, `restater_failed`). Unscreened text is
+     never filed.
+   - The restater runs on the portal's real-client backend: the `api` backend in
+     `scoping_intake/cli.py::BACKENDS`, with structured output. The `claude-code` backend's
+     implementation of it returns `restater_declined` without calling the model, because that
+     backend's session history keeps every input (`scoping_intake/claude_code.py` module docstring).
+   - The portal owns the prompt and the model. The line records `restater.prompt_version`.
+   - A kept report is never dropped. The portal's ordering and its reconciler (§14.7) guarantee that
+     every kept `DefectReport` transition gets its line, or is shown to Leo with a typed reason why it
+     has none.
+4. **Every report is filed with a gate (Leo, 2026-10-23).**
+   - The filer files two tasks: the fix task, which carries the declared defect, and an
+     always-escalates human gate. The fix depends on the gate, and both are committed `pending`.
+   - The gate is born at L2 when the client project's orchestrator dispatches it, on that project's
+     escalation queue.
+   - Leo then:
+     - reads the report in the portal;
+     - compares it with the fix task's description, editing the description with `update_task` or
+       writing it when the report was quarantined;
+     - records `x_client_defect_review: accepted | corrected | written` on the gate;
+     - resumes the gate, which releases the fix.
+   - Who owns the hold, and how long it may last, come from the existing gate ladder (INV-7). Nothing
+     is left `deferred`.
+5. **Unquarantined reports go ungated only after a soak (Leo, 2026-10-23).**
+   - `filer.auto_dispatch` is shipped `false`. With it `true`, an unquarantined restatement files the
+     fix `pending` with no gate. A quarantined report, or one filed by decision 7's fallback, is always
+     gated.
+   - Gate σ5 flips the flag. It counts the gates' recorded `x_client_defect_review` verdicts with
+     `find_tasks_by_metadata`, so the soak is a recorded fact, not recollection.
+   - This is the shadow-then-enforce pattern of `defect_tests.mode` (`plans/defect-tests-prd.md`
+     decision 3).
+6. **Filing uses `planning_mode` only.**
+   - Every `submit_task` call passes `planning_mode=True`, and the batch is then released with
+     `commit_planning`.
+   - The curator path is never used. It can drop a candidate or combine it into another task, and
+     both discard `metadata.defects`
+     (`fused-memory/src/fused_memory/middleware/task_interceptor.py::_dispatch_ticket_decision`,
+     `::_execute_combine`; θ1, task 7051, is pending).
+   - The declaration is made at creation, through the creation floor
+     (`fused-memory/src/fused_memory/backends/defect_records.py::require_creation_floor`).
+   - `declare_defect` is not needed: each report has its own ref, so a repeat is a new report, never a
+     sighting.
+7. **The ref is the idempotency key; filing converges and always reaches Leo.**
+   - One filer runs per policy. It holds an exclusive, non-blocking `flock` on a file in its state
+     directory for the life of the process, `--once` included, and exits with a typed message when the
+     lock is held.
+   - Before filing, it asks `lookup_defect_ref`; a carrier means the report was filed. A pass that
+     crashed partway is completed by the next one from what the store holds:
+     - the gate is found by `metadata.x_client_defect_gate_for == ref` (`find_tasks_by_metadata`,
+       every status);
+     - the fix is found by the ref;
+     - missing edges and commits are added.
+   - The end state is one fix and at most one gate per ref, with no task left `deferred`. The filer's
+     inbox cursor is an optimisation; correctness never depends on it.
+   - A failed call is classified by a closed table keyed on two things: the
+     `shared/src/shared/mcp_session.py::McpCallError` kind, and the reply's own code (its `error_type`,
+     or for the defect refusals its `error`).
+     - Retried with backoff:
+       - transport and HTTP-status failures;
+       - a backlog refusal.
+
+       Such a report does not hold up later ones; it stays unfiled and the publisher names it.
+     - Not retried, but filed in the quarantined shape (the gated fallback):
+       - a `TOOL_ERROR`, which is how the MCP-markup boundary guard refuses. The guard deliberately
+         over-reports and rejects a restatement quoting `</description>` (`shared/src/shared/toolcall_markup.py`;
+         `fused-memory/src/fused_memory/server/main.py::_install_tool_dispatch_guards`);
+       - a reply carrying `ValidationError`;
+       - a reply carrying `defect_creation_refused`.
+     - Any other code is retried and named under `filer`, and falls back after 5 attempts. This is the
+       storm escape.
+   - The fallback files typed facts only, always gated, with `filer_fallback: {kind, code}` in
+     `x_client_defect` and in the gate's description. Every report therefore reaches Leo.
+8. **The publisher acknowledges filings; the filer writes no file.** The publisher already reads I's
+   inbox and R's `tasks.db` (§8).
+   - A **carrier** is a task whose `metadata.defects` holds the ref and whose status is not
+     `deferred`. A planning-born row, written before its edge and commit, is not yet a filing.
+   - `defect_filed` is keyed by `ref`. It is emitted when a carrier first appears, and emitted again
+     whenever its `(task_id, gated)` changes.
+   - For the unfiled check, the publisher keeps its own position in the inbox:
+     `cursor.json.defect_scan_offset`. This is separate from δ's `inbox_offset`, and it moves on every
+     pass where the inbox is readable, even when reveals are disabled (§12, 2026-10-22 (d)).
+   - Reports seen without a carrier wait in `cursor.json.pending_reports: {ref: line_at}`. The time is
+     the line's own `at`, stamped by the portal, so a re-scan after a crash or outage yields the same
+     value. An entry is pruned once a carrier exists.
+   - `Cursor` is `extra='forbid'`, so 1.0 code cannot read a cursor that 1.1 code has written.
+     Rolling back means deleting `defect_scan_offset` and `pending_reports` first.
+   - The heartbeat names `filer` in `degraded`, with the refs, while any entry is older than
+     `filer_grace_seconds`.
+   - The filer writes nothing under O, I or R, which keeps one writer per directory (§4.1). A dead
+     filer is distinct from "no reports" (INV-6, INV-13).
+9. **The filer is narrow in code shape and in process.**
+   - It runs as its own process and unit, under its own invariant (§14.5).
+   - It calls a closed set of six fused-memory tools, with `project_root` fixed to the policy's root.
+   - The publisher modules and the filer do not import each other. Neither the ref rule nor the MCP
+     client enters a vendorable module (`client-feed/tests/test_import_boundary.py`).
+   - This narrowness is a property of the filer's code, not an enforced boundary. fused-memory has no
+     caller authentication and listens on all interfaces (`fused-memory/config/config.yaml`,
+     `server.host`).
+   - The boundary that matters is that the portal can write tasks only through the inbox. It holds
+     only when both of these are true:
+     - the portal runs as its dedicated account;
+     - that account cannot open a TCP connection to any local or loopback address except its own
+       listeners.
+   - The portal's deploy owns that rule (Leo, 2026-10-23; §14.7). It is default-deny, not a port list,
+     because the factory's MCP ports are an open set: fused-memory, the recon queue, one escalation
+     server per project, and the operator dashboard's unauthenticated write routes (§2). Gate σ4
+     probes it before the filer is enabled for a live client.
+10. **Every text field on a filed task is written by the filer.**
+    - The fix task's title is `Client defect <ref> against criterion <criterion_id>`. Titles reach
+      every prompt and are published to the client (§4.6).
+    - The gate's title is `Human gate: client defect <ref>` for every outcome. It is published too, so
+      it never says "quarantined".
+    - The defect `summary` is `Client report <n> on block <b> against criterion <criterion_id>`. The
+      client is never shown it (defect-tests decision 18). Defect-tests γ renders it into briefings.
+    - The fix description is a fixed template. It holds the criterion id; a pointer to
+      `acceptance/criteria.yaml` in the project; and the restatement's three fields under one heading
+      naming their provenance ("restated by the portal from the client's report"). When the report is
+      quarantined, or filed by the fallback, the template holds the typed reasons instead, plus "Leo
+      writes this description at the gate".
+    - The gate's description holds typed facts only: the ref, the fix task id, the outcome kind and
+      reasons, the portal page to open, and the verdict to record. The restatement lives on the fix
+      task alone (INV-9).
+11. **Identity comes from the policy, not from the line.**
+    - `<project_id>` is the policy's `project_id`, which equals the portal's `FeedBinding.project_id`
+      (`scoping_intake/clients.py::FeedBinding`).
+    - `<block>` is the block's number.
+    - `<report>` is the count of `DefectReport` transitions in that block's history, the new one
+      included. It needs no new portal state.
+    - The filer and the publisher both mint the ref through
+      `client_feed/defect_ref.py::portal_ref(project_id, block, report)`. This module is non-vendorable
+      and calls `shared/src/shared/defects.py::mint_portal_ref`.
+    - The portal never parses a ref. It correlates `defect_filed` to its report by the event's typed
+      `block` and `report`.
+12. **Criterion ids have one rule, and only declared ones cross.**
+    - `CriterionId` (§14.3) becomes the id rule of `acceptance/criteria.yaml`: ε (6972) adopts it for
+      `client_feed.contract.Criterion.id`, amended at decompose.
+    - The portal offers, and writes into a line, only an id the feed has declared in
+      `criteria_declared`.
+    - A report kept while no criteria are declared gets no line. The admin page names it with a typed
+      reason, and the reconciler writes the line once its id is declared. So an id that is legal in
+      `criteria.yaml` but rejected by the inbox contract cannot occur.
+
+13. **The merge presses "Fixed", per report, and a block holds any number of open reports (Leo,
+    2026-10-23, confirming task 7005's constraint of 2026-10-15).**
+    - The portal (P3) joins `merge_landed.task_ids` (§7.2, train members included) with
+      `defects_filed[ref].task_id`. It marks the report `(block, report)` fixed as actor `system`,
+      through an idempotent per-report record operation: a replayed `merge_landed` changes nothing.
+      Only the operation that closes the last open report moves the stage.
+    - When a block's last open report is fixed, it leaves `defect_reported`:
+      - a paid block goes back to `defect_window`;
+      - an unpaid block is re-demonstrated, with a review window of the original length starting on
+        the landing date.
+    - Leo can still mark a report fixed by hand, for instance after cancelling its fix as not a defect.
+    - Under defect-tests `shadow` mode, a fix can land without a proven test. "Fixed" then means
+      "merged", and enforce mode adds the proof.
+    - A client may report again while other reports are open. Each report gets its own number, ref, fix
+      and gate.
+    - The factory side needs nothing beyond σ1b's `defect_filed` and γ's `merge_landed`. Task 7005,
+      the 2026-10-15 milestone gate for this same bridge, is superseded by this section and cancelled.
+
+### 14.3 Contract
+
+All models live in `client_feed/contract.py` (§7, `extra='forbid'`, frozen), except the ref rule,
+which is in `client_feed/defect_ref.py`.
+
+**`in/inbox.jsonl` gains a second line type.** The inbox model becomes a union discriminated on
+`type`: `RevealRequested | DefectReported`. `parse_inbox_line` returns the union. δ's reveal path
+handles only `RevealRequested`.
+
+```
+DefectReported   {seq: Seq, at: UtcTimestamp, type: "defect_reported", block: int ≥ 1, report: int ≥ 1,
+                  criterion_id: CriterionId, restater: {prompt_version: Token},
+                  outcome: Restated | Quarantined}                      # discriminated on outcome.kind
+Restated         {kind: "restated", observed: str 1..2000, expected: str 1..2000,
+                  steps: [str 1..500] (0..20 items)}
+Quarantined      {kind: "quarantined", reasons: [QuarantineReason] (≥ 1, unique)}
+QuarantineReason = suspected_injection | not_restatable | restater_declined | restater_failed
+CriterionId      = ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$     # also Criterion.id in acceptance/criteria.yaml (ε)
+Token            = ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$
+
+client_feed/defect_ref.py:  portal_ref(project_id, block, report) -> str   # shared.defects.mint_portal_ref(project_id, str(block), report)
+```
+
+A line that fails the contract is rejected and counted under `inbox` (§12, 2026-10-22 (e)). A
+`defect_reported` line that validates is never counted as rejected.
+
+**Feed (FEED_VERSION "1.1"): one new event type and one new `Source` member.**
+
+| type | fields | source | emitted when |
+|---|---|---|---|
+| `defect_filed` | `ref`, `block`, `report`, `task_id`, `gated: bool` | carriers (decision 8) in `tasks.db` whose `metadata.defects[].ref` is a `portal:<policy project_id>:` ref; `gated` = the fix depends on a task carrying `x_client_defect_gate_for == ref` | a carrier first appears, or its `(task_id, gated)` changes |
+
+- `state.json` gains `defects_filed: {ref: {block, report, task_id, gated}}`. Natural key: `ref`.
+- `Source` gains `filer`. `heartbeat.degraded` names it with the reason
+  `N defect report(s) unfiled past <filer_grace_seconds>s: <ref>, …`.
+- **Compatibility.** A new type and a new state key are minor changes: the portal ignores both until
+  it reads them. A new `Source` member is not minor for a reader that validates `Source` as a closed
+  enum, and the portal's `scoping_intake/feed.py::FeedSource` does. P1a therefore adds `filer` to
+  `FeedSource`.
+- **Ordering.** The publisher names `filer` only for a `defect_reported` line. Only P1b writes such
+  lines, and P1b depends on P1a, so P1a is deployed first. This holds while the portal is the inbox's
+  only writer (§4.1).
+
+**The ref reader** (`client_feed/sources/tasks.py`) adds to §4 decision 6's allowlist exactly two
+fields:
+
+- `metadata.defects[].ref` values that are `portal:<policy project_id>:` refs;
+- `metadata.x_client_defect_gate_for`.
+
+Refs of other origins (`review:`, `followup:`, `human:`, …) and other projects' portal refs are never
+selected (B3, extended). Defect-tests ι (7057) extends this reader into its typed `defects`
+projection; it does not add a second one.
+
+**Policy (§7.6) gains (all in σ1a):** `filer_grace_seconds: 600` (read by the publisher) and
+
+```
+filer: {fused_memory_url: "http://127.0.0.1:8002", state_dir: str, auto_dispatch: false,
+        interval_seconds: 10, fix_priority: "high"}
+```
+
+`state_dir` is the filer's own directory, owned by Leo's account. It must be none of O, I or R, and
+must lie under none of them. `policy.py` refuses a policy that breaks this.
+
+**The filer's closed tool set:**
+
+- The tools: `lookup_defect_ref`, `find_tasks_by_metadata`, `get_task`, `submit_task` (always
+  `planning_mode=True`), `add_dependency` and `commit_planning`.
+- The client: `shared/src/shared/mcp_session.py::SyncMcpSession`. σ2 makes its `httpx` client
+  injectable, so the filer passes `trust_env=False` and no proxy setting can redirect it. Every call
+  carries `project_root=R`.
+- The filer calls no other tool. In particular it never calls `update_task`, `set_task_status`,
+  `remove_task`, `declare_defect`, any memory tool or any escalation tool.
+
+**The tasks it files:**
+
+| | fix task | gate (when gated) |
+|---|---|---|
+| `task_kind` | `normal` | `deterministic`, `metadata.always_escalates: true` |
+| title | `Client defect <ref> against criterion <criterion_id>` | `Human gate: client defect <ref>` |
+| description | the template of decision 10 | typed facts: ref, fix task id, outcome kind and reasons (or `filer_fallback`), the portal page to open, "edit task <fix> if needed, record `x_client_defect_review`, then resume" |
+| metadata | `defects: [{ref, origin: client, summary, declared_at, declared_by: "client-defect-filer", status: open, sightings: 1}]`, `source: "client-defect-filer"`, `x_client_defect: {block, report, criterion_id, outcome_kind, restater_prompt_version, filer_fallback?}` | `source: "client-defect-filer"`, `x_client_defect_gate_for: <ref>`; later `x_client_defect_review` (Leo) |
+| priority | `filer.fix_priority` | same |
+| dependencies | the gate | none |
+
+### 14.4 Sketch
+
+```
+portal (LDE account)                                    factory (Leo's account)
+report_defect: keep the move (lock) ─► restate (api backend, no tools; outside the lock)
+   │  record keeps the raw text (home)        └─► append the line (lock); the reconciler fills any gap
+   └─► in/inbox.jsonl  defect_reported{block, report, criterion_id, restated | quarantined}
+                                   │
+                    client-feed file-defects (σ2) ─lookup / submit(planning) / add_dependency / commit─►  fused-memory
+                                   │                                                                       │
+                    client-feed publish reads in/ + tasks.db ◄──────────────────────────────── tasks.db ◄───┘
+                                   └─► out/feed.jsonl  defect_filed{ref, block, report, task_id, gated} | degraded: filer
+```
+
+`client_feed/filer.py` holds one pass:
+
+1. Tail the inbox from the filer's own cursor.
+2. For each `defect_reported` line, converge its filing (decision 7).
+3. Advance the cursor past the lines that are filed.
+
+The CLI has three forms:
+
+- `client-feed file-defects --config C` is the loop.
+- `--once` runs one pass.
+- `--check` writes nothing. It takes the lock, handshakes with U, confirms that U lists the six tools,
+  calls `lookup_defect_ref` on a ref the portal can never mint (block token `check`), and prints the
+  calls one pass would make over the inbox. It is σ4's install check.
+
+`client_feed/filer.py` uses `client_feed.contract`, `client_feed.defect_ref`, `client_feed.policy` and
+`shared.mcp_session`. It imports nothing from `client_feed.publisher`, `client_feed.sources` or
+`client_feed.feed_io`. §3's dependency sentence gains `shared.defects` (through `defect_ref.py`) and
+`shared.mcp_session` (the filer only).
+
+### 14.5 Filer isolation invariant (normative)
+
+For a filer configured with policy P (root R, inbox directory I, state directory S, fused-memory URL U):
+
+- It opens P, `I/inbox.jsonl` for reading, and S. Python's own and its libraries' reads under
+  `sys.prefix`, site-packages and the CA bundle are outside this rule.
+- It runs no subprocess. Its only connections are to U, even with proxy environment variables set.
+- It calls only the closed tool set (§14.3), every call with `project_root=R`, and `submit_task` only
+  with `planning_mode=True`.
+- It writes nothing under O, I or R.
+- Everything it submits is a function of the `defect_reported` lines in I and of P. No other text
+  reaches a task.
+
+§8 is unchanged. The publisher still opens nothing beyond R, O and I. Its new reads, the
+`defect_reported` lines and the two allowlisted fields, are inside them.
+
+### 14.6 Boundary-test sketch
+
+| # | Scenario | Preconditions | Postconditions |
+|---|---|---|---|
+| B23 | Inbox contract, both ways | the portal's committed `tests/fixtures/in-v2/` (a restated and a quarantined `defect_reported` line between two `reveal_requested` lines), vendored byte for byte | each line validates under `client_feed.contract`. A `defect_reported` line is rejected in each of these cases: it carries an extra `text` field; its `observed` is empty; it has both outcomes or neither; it has an unknown reason; its criterion id holds a `:`. The portal's suite validates its own writer output against the same fixture (P21's rule) |
+| B24 | One ref rule | policy `project_id: acme-widgets`; block 2, report 3 | `defect_ref.portal_ref` gives `portal:acme-widgets:2:3`. The filer and the publisher get it through that one function. The import-boundary test stays green with `contract` vendorable |
+| B25 | Filed, gated | one restated line; `auto_dispatch: false` | one fix task with one `defects` entry `{origin: client, status: open, sightings: 1}`, the filer-authored title, and the restatement under the provenance heading; one gate, `deterministic` and `always_escalates`, titled `Human gate: client defect <ref>`; the fix depends on the gate; both `pending`; every `submit_task` passes `planning_mode=True` |
+| B26 | Quarantined | one quarantined line; `auto_dispatch: true` | the fix description holds no restated field and names the reasons; a gate is filed regardless |
+| B27 | Auto-dispatch | one restated line; `auto_dispatch: true` | the fix is `pending` with no gate |
+| B28 | Idempotent, single instance | the same inbox run twice; again with S's cursor deleted; and a second filer started while the first holds the lock | one fix and one gate in total; the second filer exits with its typed lock message |
+| B29 | Crash convergence | the filer killed after the gate's submit, after the fix's submit, and before the commit | each following pass ends with one fix and one gate, the edge in place, both `pending`, and no `deferred` task |
+| B30 | Narrow by construction | a fake MCP server that records calls; the audit-hook recorder `client-feed/tests/_audit_hook.py`; proxy environment variables set | tool names ⊆ the closed set; every `project_root == R`; outside `sys.prefix`, site-packages and the CA bundle, opens only P, `I/inbox.jsonl` and S; connects only U; no subprocess; nothing written under O, I or R; an import test shows the filer and the publisher modules do not import each other |
+| B31 | No raw text | owned by the portal: its P-row P30 (P1b), a raw report carrying `CANARY-RAW-…` | no line under `in/` holds it. On the factory side, B23's `extra` rejection is the guarantee: no line can carry a text field |
+| B32 | Acknowledgement | a carrier for the ref in `tasks.db`; then its gate edge added; then a planning-born `deferred` carrier for a second ref | one `defect_filed {ref, block, report, task_id, gated: false}`, then one with `gated: true`; nothing for the deferred carrier; no duplicate after a restart (B18's rules) |
+| B33 | Unfiled is loud | a `defect_reported` line read on a pass before its grace expires, with no carrier; then the engagement made unusable; then only a `deferred` carrier | the heartbeat names `filer` with the ref once the grace passes, on every later pass in all three states; it clears once a non-deferred carrier appears |
+| B34 | Reveals unaffected | an inbox interleaving both line types | reveal answers as in B12–B16; the filer ignores `reveal_requested`; no valid `defect_reported` line is counted under `inbox` |
+| B35 | Validation fallback | a restatement whose `observed` contains `</description>`; the fake returns the guard's real shape (an `isError` reply), and B36 repeats it against the real guard | the restated fix is refused; the filer files the quarantined shape with `filer_fallback` and a gate, even with `auto_dispatch: true` |
+| B36 | Real tool layer end to end | the server built as the fixture in `fused-memory/tests/test_defect_write_tools.py` builds it (`SqliteTaskBackend`, `TaskInterceptor`, `create_mcp_server`), plus `fused_memory.server.main._install_tool_dispatch_guards`, its HTTP app served by uvicorn in a background thread on a free 127.0.0.1 port; the filer pointed at that URL; the vendored `in-v2` inbox | B25, B29 and B35 hold on the rows that store wrote and against the real guard; the publisher, run over that same `tasks.db`, emits `defect_filed` for each filed ref |
+
+B3 is extended with a task carrying a `review:` ref and a foreign project's `portal:` ref: neither
+reaches O.
+
+### 14.7 Cross-PRD relationship (additions to §6)
+
+| Seam | Direction | Mechanism | Owner | Status |
+|---|---|---|---|---|
+| `defect_reported` inbox line | the portal writes it; this PRD defines and reads it | `client_feed.contract.DefectReported`; the portal's `in-v2` fixture | **this PRD (σ1a)** for the contract; the portal (P1a, P1b) for the writer, the restater, the fixture and the reconciler | portal PRD amended and portal tasks filed 2026-10-23 |
+| Restater prompt, model, quarantine judgement and verbatim-overlap check | portal only | `scoping_intake` `ScopingModel`, api backend | portal PRD (P1b) | filed |
+| `defect_filed`, `defects_filed`, `Source.filer` | this PRD produces; the portal reads and renders | feed 1.1 | this PRD (σ1b); the portal (P1a reads, P1b renders) | filed |
+| "Fixed" pressed by the merge, per report; concurrent open reports | this PRD produces the join keys; the portal consumes them | `defects_filed[ref].task_id` (σ1b) with `merge_landed.task_ids` (γ) | portal PRD (P3): its edge table, `Block`'s open reports, the join | filed |
+| The portal account's TCP to local and loopback addresses | the portal's deploy | default-deny for the portal uid except its own listeners, plus the deploy's own check | portal PRD (P2) | filed; σ4 probes it |
+| Criterion id rule | this PRD defines; ε adopts; the portal checks | `CriterionId`; `criteria_declared` | this PRD (σ1a); ε (6972) amended to use it and to depend on σ1a | amended at decompose |
+| Declared client defect → proof, presence check, display | this PRD files the declaration; defect-tests acts on it | `metadata.defects`, origin `client` | defect-tests (β1…η, ι) | ι (7057) amended at decompose to build on σ1b's ref reader and to depend on σ1b; if ι adds a feed type it bumps FEED_VERSION to 1.2 |
+| Audit-hook recorder | σ2 creates it; ζ uses it | `client-feed/tests/_audit_hook.py` | this PRD (σ2) | ζ (6973) amended at decompose to import it and to depend on σ2 |
+| Interim hand filing (θ2's `client` recipe) | superseded per project once σ4 enables the filer for it | `docs/task-authoring.md` | defect-tests θ2 (7056) | unchanged |
+
+The portal PRD's amendment (committed with this revision) changes these places:
+
+- Its inbox contract line gains `defect_reported`, carrying the report id (`block`, `report`) and the
+  criterion id. The line is written only from the restater's output, and only with a declared
+  criterion id.
+- Its `report_defect` gains an order:
+  1. keep the move under the lock;
+  2. restate outside the lock;
+  3. append the line under the lock;
+  4. a reconciler appends the line for any kept `DefectReport` transition that has none, idempotent by
+     `(block, report)`, and the admin page names any that cannot yet be written.
+- Its feed reader gains `FeedSource.filer`, `defect_filed` and `defects_filed`.
+- Its pages gain filed / not filed per report.
+- Its state machine lets a block hold many open reports, adding a `defect_reported` → `defect_reported`
+  edge for another report, and lets the merge press "Fixed" per report (decision 13; P3).
+- Its deploy gains the default-deny rule.
+- Its P-rows gain P29 to P32.
+
+### 14.8 Decomposition (additions to §10)
+
+Pre-conditions:
+
+- δ (6971) has landed.
+- η (6974) defines the unit template and the "Client feed" section of `OPERATIONS.md`, which σ2
+  extends.
+- Portal task 55 (the report-defect route) is done.
+
+| Label | Task | Modules | Observable signal | Prereqs |
+|---|---|---|---|---|
+| σ1a | Inbox union with `defect_reported`, `CriterionId`, and the ref rule | `client_feed/contract.py` (`DefectReported`, `Restated`, `Quarantined`, `CriterionId`, the union, `parse_inbox_line`), `client_feed/inbox.py` (`InboxRead` over the union; δ's reveal path takes `RevealRequested` only), `client_feed/defect_ref.py` (new), `client_feed/policy.py` (`filer_grace_seconds` and the `filer:` block's model with its O/I/R checks), `client-feed/tests/test_import_boundary.py` (`shared.defects` allowed), a factory fixture `client-feed/tests/fixtures/in-v2-factory/`, tests | Intermediate: unlocks σ1b, σ2 and ε's adoption of `CriterionId`. B24; B23's rejection cases over the factory fixture; a policy naming its `state_dir` under O is refused; δ's reveal tests stay green | — |
+| σ1b | The acknowledgement: `defect_filed`, `defects_filed`, `Source.filer`, the ref reader, the unfiled check, feed 1.1 | `client_feed/contract.py` (`DefectFiled`, `Source.filer`, `FEED_VERSION`), `client_feed/sources/tasks.py` (the ref reader), `client_feed/feed_io.py` (`Cursor.defect_scan_offset`, `pending_reports`), `client_feed/publisher.py`, `client_feed/value_events.py` or `stream_events.py`, `client_feed/fold.py`, the committed 1.1 feed fixture, tests | `client-feed snapshot` over a fixture root whose inbox holds a `defect_reported` line and whose `tasks.db` holds its carrier writes one `defect_filed` and folds it into `state.json`. Without a carrier, and past the grace, the heartbeat names `filer`, with reveals disabled too (B32, B33, B34, B3 extended). `validate-feed` passes on the 1.1 fixture | σ1a, ε (6972) (shares `publisher.py` and `contract.py`) |
+| σ2 | The filer: `client-feed file-defects` (`--once`, `--check`), the closed MCP client, convergent gated filing with the validation fallback, the lock, the unit template and operator docs | `client_feed/filer.py` (new), `client_feed/cli.py` (`file-defects`), `shared/src/shared/mcp_session.py` (an injectable `httpx` client), `client-feed/tests/test_import_boundary.py` (`shared.mcp_session` allowed, for the filer only), `client-feed/tests/_audit_hook.py` (new; ζ imports it), `client-feed/tests/test_filer*.py`, `scripts/client-feed-filer.service.template`, `scripts/setup-host.sh` (render only), `OPERATIONS.md` ("Client feed": the filer, `--check`, σ4's preconditions) | Intermediate: unlocks σ3, σ4 and ζ's import. B25–B30 and B35 pass in the client-feed suite | σ1a, ε (6972) (shares `cli.py`), η (6974) |
+| σ3 | Integration gate: the real tool layer and the portal's fixture, end to end | `client-feed/tests/fixtures/in-v2/` (vendored, with its source sha), B36's test and its home: where both the filer and `fused_memory.server` import, e.g. `fused-memory/tests/` with `client-feed` as a fused-memory dev dependency (src unchanged). σ3 decides | B23 against the portal's real fixture; B36 against the real fused-memory tool layer and its markup guard, ending with `defect_filed` in the feed | σ1b, σ2, `scoping_intake:<P1a>` |
+| σ4 | Human gate: enable the filer for the first live client | `task_kind: deterministic`, `always_escalates` | Leo confirms each of the following, then enables `client-feed-filer@<name>`; the first real report shows `defect_filed` in the feed and no `filer` degradation. **Checks:** (1) the portal runs as its dedicated account; (2) P2's check passes on this host; (3) a probe from the portal account to the fused-memory URL and to every escalation port named in the registered projects' `dark-factory-orchestrator.yaml` is refused; (4) the client project's orchestrator is running and its L2 queue is watched; (5) its feed declares criteria; (6) `client-feed file-defects --config C --check` passes | σ3, `scoping_intake:<P1b>`, `scoping_intake:<P2>` |
+| σ5 | Human gate: flip `filer.auto_dispatch` | `task_kind: deterministic`, `always_escalates`, `metadata.milestone {mode: delayed, after_secs: 2592000}` | `find_tasks_by_metadata(x_client_defect_review)` counts at least 10 gated live reports, with no `corrected` verdict on an unquarantined restatement. Leo then sets `filer.auto_dispatch: true` in the policy. If the count is short, the gate is re-armed with a new delayed milestone, not left in an open deferral | σ4 |
+
+Amendments at decompose to tasks already filed:
+
+- ε (6972) adopts `CriterionId` for `Criterion.id`, gains `client_feed/contract.py` in its files, and
+  depends on σ1a, with which it shares `contract.py`. σ2 depends on ε, with which it shares `cli.py`.
+  σ1b depends on ε, with which it shares `publisher.py` and `contract.py`.
+- ζ (6973) imports `_audit_hook.py` and depends on σ2.
+- ι (7057) builds on σ1b's ref reader and depends on σ1b.
+- 7005, the 2026-10-15 milestone gate for this same bridge, is cancelled as superseded (decision 13).
+  It has no dependents.
+
+Portal tasks, filed in scoping-intake's tree, are the portal PRD's ξ1, ξ2, π and ρ:
+
+- **P1a (ξ1).** The `feed.py` contract side:
+  - the inbox union;
+  - `FeedSource.filer`;
+  - readers for `defect_filed`, `defects_filed` and `criteria_declared`;
+  - `pending_reveals` filtering by type;
+  - the `in-v2` fixture, byte-exact.
+
+  Also vendors the factory's committed 1.1 feed fixture. Depends on `dark_factory:<σ1a>` and
+  `dark_factory:<σ1b>`.
+- **P1b (ξ2).** The report path:
+  - the restater method on `ScopingModel`: an injection-briefed prompt on the api backend, a
+    synthetic backend for tests, and `restater_declined` on claude-code;
+  - typed quarantine and the verbatim-overlap check;
+  - the report number, counted from history;
+  - `report_defect`'s order and the reconciler;
+  - only declared criteria offered;
+  - the canary test (P30, which owns B31);
+  - filed / not filed on the project and admin pages, from P1a's readers.
+
+  Depends on P1a, P3 and `dark_factory:6972`.
+- **P2 (π).** The deploy's default-deny for the portal uid's TCP to local and loopback addresses
+  except its own listeners, with the deploy's check. Depends on the portal's deployment recipe ι (53).
+- **P3 (ρ).** Concurrent reports and "Fixed" pressed by the merge (decision 13):
+  - `Block`'s open reports replace the single `defect`;
+  - the `defect_reported` → `defect_reported` edge for another report;
+  - `fix_report`, idempotent per report, which moves the stage only when it closes the last open report;
+  - the exits' actor set and their second guard;
+  - the `merge_landed` × `defects_filed` join;
+  - the re-demonstration window;
+  - μ's deemed-acceptance rule over open reports;
+  - the edge table in the portal PRD and its P9/P10 tests.
+
+  Depends on P1a and the portal's μ (61).
+
+Edges:
+
+- Within this PRD: σ1a → σ1b, σ2; ε (6972) → σ1b, σ2; η (6974) → σ2; σ1b, σ2, P1a → σ3; σ3, P1b, P2
+  → σ4; σ4 → σ5.
+- Amendments to filed tasks: σ1a → ε (6972); σ2 → ζ (6973); σ1b → ι (7057).
+- Into the portal: σ1a, σ1b → P1a; P1a, μ (61) → P3; P1a, P3, 6972 → P1b; ι (53) → P2.
+
+σ3 is the integration gate and names B23 and B36 as its signal.
+
+G7, design-time notes:
+
+- `no-silent-fail-soft`:
+  - A restater failure is a quarantine.
+  - A validation refusal is a gated fallback.
+  - An unfiled report is `degraded: filer`.
+  - A rejected line is counted under `inbox`.
+  - A kept report with no line is named on the admin page.
+- `holds-owned-and-bounded`: the gate is owned by Leo through the L2 ladder; `deferred` appears only
+  inside one convergent pass (B29); σ5 re-arms by milestone.
+- `corroborate-before-acting`: `lookup_defect_ref` is called before every filing; the acknowledgement
+  is read from the producer's own non-deferred rows.
+- `one-fact-one-home`:
+  - the raw report lives in the portal record;
+  - the restatement lives on the fix task;
+  - the ref is minted by one function;
+  - `CriterionId` is one pattern, shared with ε;
+  - the policy has one file.
+- `contracts-machine-checked`:
+  - the contract is pydantic, with fixtures on both sides;
+  - the tool set is checked by a recording fake;
+  - the substrate is checked by B36 against the real tool layer and its markup guard.
+- `readers-prove-their-producer`: `defect_filed` is emitted only from real non-deferred `tasks.db`
+  rows (B36), and `degraded: filer` separates a silent filer from no reports.
+- `guards-exercise-behaviour`: B30 runs the filer; it does not grep its source.
+- `storm-escape-required`: one unfileable report does not hold the others. A transport failure is
+  retried with backoff and stays visible under `filer`; a validation refusal falls back once.
+
+### 14.9 Out of scope
+
+- Raw client text anywhere on the factory side.
+- Disputed reports, such as a change request presented as a defect. These are Leo's call at the gate;
+  defect-tests' withdrawal and exemption rules apply to the declared defect.
+- Authentication on the factory's MCP servers. The residual is recorded in decision 9, and the
+  portal's default-deny is the chosen control.
+- Read containment for agents.
+- Client channels other than the portal.
+- The client-facing display of defect outcomes (defect-tests ι, and the portal).
+
+### 14.10 Open questions (tactical)
+
+1. **Where `filer.state_dir` defaults and what its cursor holds.** Suggested:
+   `~/.local/state/client-feed/<name>/filer/`, holding the lock file, the inbox offset and per-ref
+   attempt counts. Decide in σ2.
+2. **The fix task's priority by stage.** Suggested: `high` in both the unpaid review window and the
+   paid defect window. Decide in σ2.
+3. **The restater's details.** Its retries before `restater_failed`, its exact prompt, its model and
+   its verbatim-overlap threshold are the portal's, in P1b. `prompt_version` records which ones ran.
+4. **`filer_grace_seconds`.** Suggested: 600 (60 filer intervals). Decide in σ1b.
+5. **The soak threshold of 10 in σ5.** Provisional; σ5 records the count it actually saw.

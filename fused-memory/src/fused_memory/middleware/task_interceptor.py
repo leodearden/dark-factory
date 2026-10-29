@@ -45,11 +45,21 @@ from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.backends.task_backend_types import MetadataLookupResult
 from fused_memory.config.schema import CuratorConfig
 from fused_memory.middleware import deferral_gate, recon_write_policy
+from fused_memory.middleware.candidate_key import normalize_title
 from fused_memory.middleware.curation_deferral import (
     POOL_UNAVAILABLE_ERRORS,
     CurationRetryPolicy,
+    DeferReason,
     dedupe_skipped_marker,
     pool_defer_reason,
+)
+from fused_memory.middleware.curator_types import (
+    CandidateTask,
+    CuratorDecision,
+    CuratorFailureError,
+    PreparedCandidate,
+    exception_summary,
+    is_combine_eligible_status,
 )
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     CorpusSearcher,
@@ -109,17 +119,7 @@ from fused_memory.middleware.task_creation_journal import (
     CreationAttribution,
     creation_operation_for,
 )
-from fused_memory.middleware.task_curator import (
-    CandidateTask,
-    CuratorDecision,
-    CuratorFailureError,
-    PreparedCandidate,
-    TaskCurator,
-    exception_summary,
-    flatten_task_tree,
-    is_combine_eligible_status,
-    normalize_title,
-)
+from fused_memory.middleware.task_curator import TaskCurator, flatten_task_tree
 from fused_memory.middleware.ticket_store import AWAITING_CURATION
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -456,18 +456,35 @@ def _format_ticket_result(row: dict) -> dict:
     return result
 
 
-def _create_after_curator_failure(exc: CuratorFailureError) -> CuratorDecision:
-    """Degrade a curator failure that escaped ``curate()`` to create.
+def _decision_after_curator_failure(
+    ticket_id: str, exc: CuratorFailureError,
+) -> tuple[CuratorDecision, str | None]:
+    """Decide a ticket whose curation raised out of ``curate()``.
 
-    Keeps the ZOT marker, so the no-orchestrator path still gets swept and
-    stamped even though no escalation could be filed for it.
+    Returns the decision and the degrade reason a create records. A
+    zero-output hang degrades to create with the ZOT marker, so the
+    no-orchestrator path still gets swept and stamped even though no
+    escalation could be filed for it. Any other failure defers, so the ticket
+    is parked until the curator can judge it; a parked row records only its
+    defer reason, so it gets no degrade reason and the failure is logged here.
     """
-    return CuratorDecision(
+    if not exc.zero_output_timeout:
+        logger.warning(
+            'ticket %s: curator.curate raised CuratorFailureError, deferring curation: %s',
+            ticket_id, exc,
+        )
+        return CuratorDecision.deferred(DeferReason.LLM_FAILED), None
+    logger.warning(
+        'ticket %s: curator.curate hung with zero output, degrading to create: %s',
+        ticket_id, exc,
+    )
+    decision = CuratorDecision(
         action='create',
         justification=f'curator-failed: {exception_summary(exc)}',
         degraded=True,
-        degraded_by_zot=exc.zero_output_timeout,
+        degraded_by_zot=True,
     )
+    return decision, str(exc)
 
 
 # The label a non-create decision carries when its ticket still ends in a
@@ -618,25 +635,19 @@ class TaskInterceptor:
         # write inside the worker). Held only across the fast Taskmaster
         # stdio call. Every mutation takes this lock.
         #
-        # ``_curator_locks`` (long, curator-family) serialises the
-        # remove_task flow so concurrent candidates can't both
-        # decide "create" for a duplicate. Held across ``curator.curate()``
-        # (an LLM round-trip, 25-35s tail) plus the synchronous
-        # ``note_created`` + awaited ``record_task`` so the NEXT waiter on
-        # the curator lock sees the new entry on its pre-LLM check (R3).
+        # ``_curator_locks`` (long, curator-family) serialises curator
+        # decisions within a project so concurrent candidates can't both
+        # decide "create" for a duplicate (R3). The worker holds it across
+        # each whole batch, an LLM round-trip included, and ``remove_tasks``
+        # takes it too; ``_curator_lock``'s docstring states the span.
         #
-        # NOTE: add_task's *queueing* is now provided by per-project ticket
+        # NOTE: add_task's *queueing* is provided by per-project ticket
         # queues and workers (_curator_worker) — one asyncio.Queue and one
         # asyncio.Task per project_id — so a slow curator round-trip on
-        # project A does not delay submissions on project B.  The worker
-        # STILL acquires ``_curator_lock(project_id)`` around curator.curate()
-        # through note_created + record_task to preserve R3: remove_task
-        # still enters _curator_lock directly, and without this
-        # acquisition its curate() call could race against the worker's
-        # on a stale pre-note_created snapshot and both decide "create" for
-        # the same candidate.  Within a project, the lock provides
-        # single-threaded curator execution; across projects, the per-project
-        # queue+worker+lock architecture preserves fairness.
+        # project A does not delay submissions on project B.  Within a
+        # project, the lock provides single-threaded curator execution;
+        # across projects, the per-project queue+worker+lock architecture
+        # preserves fairness.
         #
         # Lock ordering is always curator_lock BEFORE write_lock to avoid
         # deadlock. Write-only ops take just write_lock, so a long curator
@@ -2581,7 +2592,7 @@ class TaskInterceptor:
         """Run the FILES-CERTAIN path-scope check and return its verdict.
 
         Classifies concrete ``metadata.files`` entries via the exact
-        ``registry.project_for_path`` lookup (:func:`check_files_for_scope`)
+        ``registry.attributed_owner`` lookup (:func:`check_files_for_scope`)
         — the CERTAIN counterpart to the heuristic regex-over-prose
         :meth:`_path_guard_check`.  A rejection here is definitive: the
         file is either owned by a known other project or it isn't, so
@@ -2825,7 +2836,7 @@ class TaskInterceptor:
 
         * ROUTING OVERRIDE — a deliberate operator bypass.  Spending an LLM
           call there would defeat the override.
-        * FILES-CERTAIN reject — ``project_for_path`` is exact.  A file's
+        * FILES-CERTAIN reject — ``attributed_owner`` is exact.  A file's
           owner is either known and different or it isn't; there is nothing
           to adjudicate.
         * CROSS-REPO allow-and-tag (task 3004) — already tagged
@@ -2833,7 +2844,7 @@ class TaskInterceptor:
           result.
         * PROSE-ADVISORY SUPPRESSED BY LOCAL ATTRIBUTION (task 3106) — a
           deliberate attribution decision reached with the CERTAIN
-          ``project_for_path`` classifier over declared deliverables, whose
+          ``attributed_owner`` classifier over declared deliverables, whose
           stated purpose is REMOVING operator-queue noise.  Re-adjudicating
           it would spend an LLM call to second-guess a certain classifier
           with an uncertain one and re-raise precisely the noise 3106
@@ -3691,20 +3702,27 @@ class TaskInterceptor:
     def _curator_lock(self, project_id: str) -> asyncio.Lock:
         """Per-project lock for curator-family operations.
 
-        Long-held; covers ``curator.curate()`` (LLM round-trip) plus the
-        post-write ``note_created``/``record_task`` steps so the next waiter
-        on this lock sees the new entry on its pre-LLM check.
-
-        Taken by: ``remove_task`` (conservative: protects concurrent
-        combine-target integrity) AND by ``_process_add_ticket`` (the add_task
-        worker path) so curator decisions are mutually exclusive within a
-        project.  Lock order: curator_lock BEFORE write_lock. Short writes
+        Taken by ``remove_tasks`` (curator_lock, then write_lock) and by the
+        worker's batch path, :meth:`_process_add_tickets_batch_prepared`, so
+        curator decisions are mutually exclusive within a project.  Lock
+        order: curator_lock BEFORE write_lock.  Short writes
         (set_task_status etc.) never take this lock and so are not blocked
         by an in-flight curator decision.
 
-        NOTE: Routing ``remove_task`` through the per-project worker queue is
-        a planned follow-up; until then the worker must acquire this lock to
-        preserve R3.
+        On the batch path the span is the contract.  The R4 idempotency
+        check, the curate call (an LLM round-trip) and, per ticket, the
+        dispatch, :meth:`_persist_worker_outcome`, the ``task_created``
+        journal event and the waiter signal all run inside the lock.  So a
+        ``remove_tasks`` never observes a created task whose ticket still
+        reads ``pending``.
+
+        A cancellation between ``tm.add_task`` and the persist is
+        deliberately not shielded.  The restart sweep marks the ticket
+        ``failed/server_restart``, and a re-submit collides on the
+        ``candidate_key`` partial UNIQUE index, which
+        :meth:`_dispatch_ticket_decision` resolves ``combined``.  The
+        rationale is decision 9 of
+        ``plans/review-all-s11-curator-pipeline-prd.md``.
         """
         lock = self._curator_locks.get(project_id)
         if lock is None:
@@ -3986,11 +4004,12 @@ class TaskInterceptor:
         mid-flight, the task may be written to ``tasks.json`` but the ticket
         row stays ``pending`` (the worker was interrupted before
         ``mark_resolved``).  On the next ``start()``, that ticket is marked
-        ``failed/server_restart`` — a caller that retries without passing
-        ``escalation_id`` + ``suggestion_hash`` metadata may therefore create a
-        duplicate.  Callers in contexts where duplication is unacceptable
-        should supply idempotency metadata so the R4 gate short-circuits the
-        retry.
+        ``failed/server_restart``.  A re-submit with the same title and files
+        then collides on the ``candidate_key`` index and resolves
+        ``combined`` (decision 9 of
+        ``plans/review-all-s11-curator-pipeline-prd.md``).  A retry that
+        changes either is not caught there: supply ``escalation_id`` +
+        ``suggestion_hash`` metadata so the R4 gate short-circuits it.
         """
         if self._closed:
             return {
@@ -4347,10 +4366,12 @@ class TaskInterceptor:
         synthetic failed dict WITHOUT mutating the ticket row — the worker may
         still resolve it later.
 
-        ``awaiting_curation`` is the one non-terminal answer: the curator's
-        account pool could not serve, so the submission is durably parked and
-        retried by the ticket janitor. It carries the row's ``reason`` and no
-        ``task_id``; a waiter blocked before the park is woken with it.
+        ``awaiting_curation`` is the one non-terminal answer: the curator
+        could not judge the submission (for one of the reasons in
+        :class:`~fused_memory.middleware.curation_deferral.DeferReason`), so
+        the submission is durably parked and retried by the ticket janitor. It
+        carries the row's ``reason`` and no ``task_id``; a waiter blocked
+        before the park is woken with it.
 
         The worker-liveness reaper (:meth:`TicketJanitor.tick`) terminalises
         pending tickets whose project's curator worker has died, marking them
@@ -4580,9 +4601,10 @@ class TaskInterceptor:
         Failure handling: an exception escaping the batch is logged, every
         ticket in it is marked ``failed/curator_failed`` (best-effort) and its
         waiters are signalled so ``resolve_ticket`` callers are not blocked
-        forever. The worker never waits on account-pool capacity: a pool that
-        cannot serve comes back as a ``defer`` decision, which parks the ticket
-        durably (``awaiting_curation``) for the ticket janitor to requeue.
+        forever. The worker never waits for the curator to recover: a
+        submission the curator could not judge comes back as a ``defer``
+        decision, which parks the ticket durably (``awaiting_curation``) for
+        the ticket janitor to requeue.
 
         Independent workers per project restore the per-project fairness of
         the old curator_lock approach: project B is never blocked by a slow
@@ -4768,8 +4790,8 @@ class TaskInterceptor:
                     # prepare_candidate already swallows corpus-build failure
                     # to an empty pool; an exception here is unexpected.
                     # Continue with prepared=None — dispatch falls through
-                    # to a per-ticket curate() call inside the prepared
-                    # variant of _process_add_tickets_batch.
+                    # to a per-ticket curate() call inside
+                    # _process_add_tickets_batch_prepared.
                     logger.exception(
                         '_prepare_ticket: curator.prepare_candidate failed for ticket %s',
                         ticket_id,
@@ -4806,11 +4828,10 @@ class TaskInterceptor:
         Does NOT persist, signal, journal, or commit — the caller does, via
         :meth:`_persist_worker_outcome`.
 
-        The single dispatch chokepoint: the worker's batch path
-        (``_process_add_tickets_batch_prepared``) and the single-ticket
-        ``_process_add_ticket`` both reach it, so a branch added here is
-        inherited by both. A create that no curator verdict judged is stamped
-        ``metadata.dedupe_skipped`` here (:func:`_dedupe_skipped_reason`).
+        The one dispatch chokepoint, reached from the worker's batch path,
+        :meth:`_process_add_tickets_batch_prepared`. A create that no curator
+        verdict judged is stamped ``metadata.dedupe_skipped`` here
+        (:func:`_dedupe_skipped_reason`).
         """
         if decision is not None and decision.action == 'refuse':
             # Deterministic refusal (cancelled-premise blocklist / recon premise
@@ -4916,9 +4937,7 @@ class TaskInterceptor:
         if decision is not None and decision.action == 'route_deterministic':
             # Operational-ask registry match (filing-policy gate): stamp
             # metadata as a deterministic PURE-GATE and fall through to the
-            # ordinary create path below — this covers both the single
-            # (_process_add_ticket) and batch (_process_add_tickets_batch_prepared)
-            # dispatch callers, which both converge here.
+            # ordinary create path below.
             metadata = self._inject_deterministic_pure_gate(metadata)
 
         # ── Create task ───────────────────────────────────────────────
@@ -5203,10 +5222,11 @@ class TaskInterceptor:
         still happened, so the task it minted or folded into is real.
 
         Args:
-            caller: Short label identifying which worker path invoked this
-                helper (e.g. ``'add_ticket'``, ``'add_ticket_cancel'``,
-                ``'add_tickets_batch'``).  Included in the orphan-race WARNING
-                so production logs remain greppable per-caller.
+            caller: Short label identifying which worker step invoked this
+                helper (``'add_tickets_batch'`` or
+                ``'add_tickets_batch_idempotency'``).  Included in the
+                orphan-race WARNING so production logs remain greppable
+                per-caller.
 
         Returns:
             The ``bool`` returned by ``mark_resolved`` (``True`` if the row was
@@ -5245,249 +5265,6 @@ class TaskInterceptor:
         )
         return resolved
 
-    async def _process_add_ticket(self, ticket_id: str) -> None:
-        """Run the full curator + write pipeline for a single ticket.
-
-        The single-ticket twin of :meth:`_process_add_tickets_batch_prepared`,
-        which is what the worker runs; it persists outcomes the same way, via
-        :meth:`_persist_worker_outcome`, and the result is read back by
-        ``resolve_ticket``.
-
-        Status values written:
-        - ``created``  — task was created via ``tm.add_task``
-        - ``combined`` — candidate was folded into an existing task (drop/combine/idempotency)
-        - ``awaiting_curation`` — the curator deferred; the ticket is parked, nothing created
-        - ``failed``   — an unrecoverable error occurred
-
-        Decision order: R4 idempotency check → curator decision (drop /
-        combine / create) → atomic write under ``_write_lock``.  On any
-        unhandled exception in the write section, ticket is marked ``failed``
-        and no ``task_created`` journal event is emitted.
-        """
-        if self._ticket_store is None:
-            return
-
-        row = await self._ticket_store.get(ticket_id)
-        if row is None:
-            logger.warning('_process_add_ticket: ticket %s not found in store', ticket_id)
-            return
-        if row['status'] != 'pending':
-            logger.warning(
-                '_process_add_ticket: ticket %s already terminal (%s), skipping',
-                ticket_id,
-                row['status'],
-            )
-            return
-
-        try:
-            blob = json.loads(row['candidate_json'])
-        except Exception:
-            logger.exception('_process_add_ticket: bad candidate_json for %s', ticket_id)
-            await self._ticket_store.mark_resolved(
-                ticket_id,
-                status='failed',
-                reason='bad_candidate_json',
-            )
-            self._signal_ticket_event(ticket_id)
-            return
-
-        project_root: str = blob['project_root']
-        kwargs: dict = dict(blob.get('kwargs', {}))
-        metadata = blob.get('metadata')
-        project_id = resolve_project_id(project_root)
-        attribution = CreationAttribution.from_blob_value(blob.get('creation_attribution'))
-
-        # Rebuild candidate for curator
-        kwargs_for_candidate = dict(kwargs)
-        if metadata is not None:
-            kwargs_for_candidate['metadata'] = metadata
-        candidate = self._build_candidate(kwargs_for_candidate)
-
-        status = 'failed'
-        task_id: str | None = None
-        reason: str | None = None
-        result_dict: dict | None = None
-        curator_degrade_reason: str | None = None
-        decision: CuratorDecision | None = None
-
-        try:
-            # ── R3 invariant: serialise curator+write within this project ─
-            # The worker runs per-project, but remove_task still takes
-            # _curator_lock in its own path.  Lock ordering:
-            # curator_lock (outer) → write_lock (inner), matching remove_task.
-            async with self._curator_lock(project_id):
-                # ── R4: escalation-level idempotency ─────────────────────────
-                # Short-circuits curator when (escalation_id, suggestion_hash) in
-                # metadata matches a non-cancelled existing task — avoids duplicate
-                # tasks when reconciliation retries an escalation suggestion.
-                # _idem_check_failed is intentionally unused today: both hit=None,
-                # check_failed=True and hit=None, check_failed=False fall through to
-                # the curator gate — the tuple is retained for future observability/metrics.
-                idempotency_hit, _idem_check_failed = (
-                    await self._check_escalation_idempotency(
-                        project_root=project_root,
-                        metadata=metadata,
-                    )
-                )
-                if idempotency_hit is not None:
-                    existing_task_id = str(idempotency_hit.get('id', ''))
-                    await self._persist_worker_terminal(
-                        ticket_id,
-                        status='combined',
-                        task_id=existing_task_id or None,
-                        reason='idempotency_hit',
-                        result_dict=idempotency_hit,
-                        caller='add_ticket_idempotency',
-                        project_root=project_root,
-                        attribution=attribution,
-                    )
-                    self._signal_ticket_event(ticket_id)
-                    return
-                # check_failed=True means get_tasks raised; fall through to
-                # the curator gate so the ticket is not lost (loud bypass —
-                # WARNING already emitted inside _check_escalation_idempotency).
-
-                # ── Curator gate ─────────────────────────────────────────────
-                curator = await self._get_curator()
-                if curator is not None and candidate is not None:
-                    try:
-                        decision = await curator.curate(candidate, project_id, project_root)
-                    except CuratorFailureError as exc:
-                        logger.warning(
-                            '_process_add_ticket: curator.curate raised CuratorFailureError '
-                            'for %s; degrading to create. reason=%s',
-                            ticket_id,
-                            exc,
-                        )
-                        # Degrade gracefully to create — avoids losing the task on
-                        # transient LLM failures.  Record the failure so the facade
-                        # and callers can see it in result_json.
-                        curator_degrade_reason = str(exc)
-                        decision = _create_after_curator_failure(exc)
-
-                status, task_id, reason, result_dict, _ = await self._dispatch_ticket_decision(
-                    ticket_id=ticket_id,
-                    project_root=project_root,
-                    project_id=project_id,
-                    candidate=candidate,
-                    decision=decision,
-                    kwargs=kwargs,
-                    metadata=metadata,
-                    curator=curator,
-                    curator_degrade_reason=curator_degrade_reason,
-                )
-
-        except asyncio.CancelledError:
-            # Worker task cancelled (close() path) while inside _process_add_ticket.
-            # Ensure the ticket reaches a terminal state even if mark_resolved wasn't
-            # reached yet — cancellation may have interrupted the flow AFTER
-            # tm.add_task already mutated tasks.json (status latched to 'created').
-            # _persist_worker_terminal wraps mark_resolved in asyncio.shield internally
-            # and emits the orphan-race WARNING when status='created' and task_id is
-            # non-None (race detected), giving uniform observability across all three
-            # worker terminal-write paths.
-            logger.debug(
-                '_process_add_ticket: cancelled for ticket %s; persisting status=%s',
-                ticket_id,
-                status,
-            )
-            try:
-                await self._persist_worker_outcome(
-                    ticket_id,
-                    decision=decision,
-                    status=status,
-                    task_id=task_id,
-                    reason=reason
-                    if reason
-                    else ('cancelled_during_write' if status != 'created' else None),
-                    result_dict=result_dict,
-                    caller='add_ticket_cancel',
-                    project_root=project_root,
-                    attribution=attribution,
-                )
-                self._signal_ticket_event(ticket_id)
-            except Exception:
-                logger.exception(
-                    '_process_add_ticket: mark_resolved failed after cancellation '
-                    'for ticket %s; ticket remains pending and will be cleaned up '
-                    'by flush_pending_on_startup on next restart',
-                    ticket_id,
-                )
-            raise
-
-        except Exception as exc:
-            logger.exception(
-                '_process_add_ticket: unexpected error for ticket %s',
-                ticket_id,
-            )
-            if status == 'created':
-                # Failure happened after tm.add_task succeeded — preserve the
-                # 'created' resolution; demote the error to a warning so the
-                # facade and callers can surface it without losing the task.
-                logger.warning(
-                    '_process_add_ticket: post-create error for ticket %s, task %s: %s',
-                    ticket_id,
-                    task_id,
-                    exc,
-                )
-                if result_dict is None:
-                    result_dict = {}
-                result_dict.setdefault('post_create_warnings', []).append(
-                    {'stage': 'post_create', 'error': str(exc)}
-                )
-            else:
-                reason = str(exc)
-                status = 'failed'
-                result_dict = None
-
-        # ── Persist terminal state ────────────────────────────────────────
-        # Shield from cancellation so that a close()-triggered CancelledError
-        # that arrives here (after the try/except block) does not prevent the
-        # ticket from reaching a terminal state.
-        await self._persist_worker_outcome(
-            ticket_id,
-            decision=decision,
-            status=status,
-            task_id=task_id,
-            reason=reason,
-            result_dict=result_dict,
-            caller='add_ticket',
-            project_root=project_root,
-            attribution=attribution,
-        )
-
-        # ── Emit journal event and schedule commit (create path only) ────
-        if status == 'created' and task_id:
-            event = self._make_event(
-                EventType.task_created,
-                project_root,
-                {'operation': 'add_task', 'task_id': task_id},
-            )
-            await self._journal(event)
-
-        self._signal_ticket_event(ticket_id)
-
-    async def _process_add_tickets_batch(self, ticket_ids: list[str]) -> None:
-        """Thin wrapper: prepare each ticket and delegate to the prepared variant.
-
-        Preserves the historical entry point used by tests that drove batches
-        via raw ticket IDs (the worker now calls
-        :meth:`_process_add_tickets_batch_prepared` directly so it can
-        accumulate prepared bundles under the soft token threshold).  Tickets
-        that ``_prepare_ticket`` rejects (missing/terminal/bad-json) are
-        dropped here; the prepare step already wrote the failure terminal
-        and signalled waiters.
-        """
-        if not ticket_ids:
-            return
-        prepared: list[_PreparedTicket] = []
-        for tid in ticket_ids:
-            p = await self._prepare_ticket(tid)
-            if p is not None:
-                prepared.append(p)
-        if prepared:
-            await self._process_add_tickets_batch_prepared(prepared)
-
     async def _process_add_tickets_batch_prepared(
         self,
         prepared_tickets: list[_PreparedTicket],
@@ -5509,11 +5286,13 @@ class TaskInterceptor:
         Per-ticket failures are isolated: one ticket failing does not prevent
         other tickets from being processed.
 
-        A curator account pool that cannot serve (``POOL_UNAVAILABLE_ERRORS``,
-        whether returned as ``defer`` decisions or raised from
-        ``curate_batch_prepared``) parks every LLM-bound ticket
-        ``awaiting_curation``, and a within-batch drop onto a parked sibling
-        parks with it; nothing is created for them.
+        A submission the curator could not judge parks ``awaiting_curation``,
+        and a within-batch drop onto a parked sibling parks with it; nothing
+        is created for them. That covers a ``defer`` decision, an account
+        pool that cannot serve raised from ``curate_batch_prepared``
+        (``POOL_UNAVAILABLE_ERRORS``), a :class:`CuratorFailureError` escaping
+        ``curate()`` other than a zero-output hang, and any other exception
+        ``curate_batch_prepared`` raises instead of deciding.
         """
         if self._ticket_store is None:
             return
@@ -5681,9 +5460,10 @@ class TaskInterceptor:
                         '_process_add_tickets_batch_prepared: '
                         'curate_batch_prepared raised CuratorFailureError '
                         'for project %s; falling back to %d individual '
-                        'curate() calls',
+                        'curate() calls: %s',
                         project_id,
                         len(non_none_prepared),
+                        exc,
                     )
                     # Iterate curatable_records only — unprepared_records are
                     # curated exactly once by the dedicated backfill loop
@@ -5702,20 +5482,20 @@ class TaskInterceptor:
                                 project_root,
                             )
                         except CuratorFailureError as e:
-                            rec.decision = _create_after_curator_failure(e)
-                            rec.degrade_reason = str(e)
-                    # Refer to exc to satisfy linters; main signal logged above.
-                    _ = exc
-                except Exception:  # pyright: ignore[reportUnusedExcept]
+                            rec.decision, rec.degrade_reason = _decision_after_curator_failure(
+                                rec.ticket.ticket_id, e,
+                            )
+                except Exception:
                     logger.exception(
                         '_process_add_tickets_batch_prepared: '
                         'curate_batch_prepared failed for project %s; '
-                        'degrading all %d candidates to create',
+                        'deferring %d candidates',
                         project_id,
-                        len(non_none_prepared),
+                        len(curatable_records),
                     )
-                    for rec in records:
-                        rec.decision = None
+                    for rec in curatable_records:
+                        rec.decision = CuratorDecision.deferred(DeferReason.CURATOR_RAISED)
+                        rec.target = None
 
             # Backfill any unprepared candidates via single-item curate() so
             # we still get a curator decision instead of falling through to
@@ -5735,8 +5515,9 @@ class TaskInterceptor:
                             project_root,
                         )
                     except CuratorFailureError as exc:
-                        rec.decision = _create_after_curator_failure(exc)
-                        rec.degrade_reason = str(exc)
+                        rec.decision, rec.degrade_reason = _decision_after_curator_failure(
+                            rec.ticket.ticket_id, exc,
+                        )
 
             # ── Topologically-ordered dispatch ────────────────────────────────
             # Records with a target wait for that target to be dispatched
@@ -7500,34 +7281,6 @@ async def _check_reopen_freshness(
         task_id, evidence_commit, evidence_committed_at, reopen_at, agent_id,
     )
     return None
-
-
-def _merged_audit_metadata(before: dict, audit_fields: dict) -> dict:
-    """Merge ``audit_fields`` onto the task's pre-existing metadata.
-
-    ``set_task_status`` writes audit fields (``reopen_reason`` /
-    ``done_provenance``) via a separate ``tm.update_task(metadata=…)`` call.
-    The default backend path is now shallow-merge (``metadata_mode=None``), so
-    this read-modify-write is belt-and-braces — the backend would also preserve
-    sibling keys.  The explicit merge is kept for clarity and defence-in-depth
-    (it is not safe to rely on the backend default never changing).
-
-    Audit fields win on collision (a fresh ``reopen_reason`` should never be
-    shadowed by a stale one from an earlier reopen).
-
-    Delegates the malformed-string policy to
-    :func:`shared.task_metadata.parse_metadata` (``direction='read'``) via
-    :func:`_parse_metadata_value` and emits a ``task_metadata.schema_warning``
-    WARNING when a non-None ``before['metadata']`` cannot be resolved to a
-    dict — I4: this replaces a silent discard (the merge still proceeds onto
-    ``{}`` so behaviour is otherwise unchanged).
-    """
-    raw = before.get('metadata') if isinstance(before, dict) else None
-    parsed, warnings = _parse_metadata_value(raw)
-    if warnings:
-        _warn_metadata_discard('_merged_audit_metadata', raw, warnings)
-    existing: dict = parsed if isinstance(parsed, dict) else {}
-    return {**existing, **audit_fields}
 
 
 async def _repair_done_provenance_same_status(

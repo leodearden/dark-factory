@@ -146,11 +146,11 @@ Record the form (`final`, `interim` or `none`), the chain task ids, any supersed
 
 ```
 add_memory(
-  content="Review {run_id} ({scope}, as_of {as_of_sha:10}, since {since:10|none}): {n} findings — {high} high/{medium} medium/{low} low; filed {filed}; {already} already owned; {structural} structural for deliberation; {fixed} fixed since last run. Next run: {chain form, task ids}.",
+  content="Review {run_id} ({scope}, as_of {as_of_sha:10}, since {since:10|none}): {n} findings — {high} high/{medium} medium/{low} low; filed {filed}; {already} already owned; {structural} structural for deliberation; {fixed} fixed since last run. Next run: {chain form}, human gate task 3127.",
   category="observations_and_summaries",
   project_id="<project_id>",
   agent_id="claude-review",
-  entities=[]
+  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the human gate Step 7 filed, here and in content; if Step 7 filed no chain, use [] and drop the human gate clause from content
 )
 ```
 

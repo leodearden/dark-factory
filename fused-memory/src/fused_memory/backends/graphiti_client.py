@@ -33,6 +33,7 @@ from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
+from fused_memory.backends.exact_episode_window import ExactEpisodeWindowGraphiti
 from fused_memory.backends.falkor_edge_search import FalkorEdgeSearch
 from fused_memory.backends.falkor_fulltext import build_query
 from fused_memory.backends.falkor_indices import (
@@ -49,6 +50,7 @@ from fused_memory.backends.falkor_indices import (
     vector_drop_statement,
     vector_index_properties,
 )
+from fused_memory.backends.falkor_string_bounds import exact_string_upper_bound
 from fused_memory.backends.llm_clients import (
     ForceJsonObjectOpenAIGenericClient,
     TokenRecordingOpenAIGenericClient,
@@ -58,6 +60,7 @@ from fused_memory.backends.llm_token_usage import (
     TokenMeasurement,
     measure_llm_tokens,
 )
+from fused_memory.backends.recent_episodes import read_recent_group_episodes
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.backends.timeout_budget import await_within
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
@@ -429,6 +432,20 @@ class EdgeDict(TypedDict):
     name: str
 
 
+class EdgeWithEndpoints(TypedDict):
+    """A RELATES_TO edge with its endpoint names, as get_edges_by_uuids returns it.
+
+    ``active`` is ``_ACTIVE_EDGE_PREDICATE`` evaluated on the edge.
+    """
+
+    uuid: str
+    fact: str
+    source_name: str
+    target_name: str
+    episodes: list[str]
+    active: bool
+
+
 @dataclass(frozen=True, kw_only=True)
 class StaleSummaryResult:
     """Structured return type for detect_stale_with_edges.
@@ -718,10 +735,14 @@ _EMBEDDED_EDGES_CENSUS = _EMBEDDED_EDGES_MATCH + 'RETURN count(*)'
 
 # Edges whose valid_at falls in a window (task 4869). `e.uuid` is total for the
 # directed-pattern reason given at _EMBEDDED_EDGES_MATCH. No vector here, so the
-# plain RETURN-then-ORDER shape suffices.
+# plain RETURN-then-ORDER shape suffices. The upper bound goes through
+# exact_string_upper_bound because FalkorDB's RANGE index over-returns on a
+# string `<=` (task 7543).
 _EDGES_IN_VALID_AT_WINDOW_MATCH = (
     'MATCH ()-[e:RELATES_TO]->() '
-    'WHERE e.valid_at >= $start AND e.valid_at <= $end '
+    'WHERE e.valid_at >= $start AND '
+    + exact_string_upper_bound('e.valid_at', 'end', inclusive=True)
+    + ' '
 )
 _EDGES_IN_VALID_AT_WINDOW_PAGE_TEMPLATE = (
     _EDGES_IN_VALID_AT_WINDOW_MATCH
@@ -733,10 +754,12 @@ _EDGES_IN_VALID_AT_WINDOW_CENSUS = _EDGES_IN_VALID_AT_WINDOW_MATCH + 'RETURN cou
 
 # Ids starting with a uuid prefix, for services/id_resolver.py (task 5323).
 # `$prefix`/`$upper` are bound, never interpolated. The half-open range
-# [$prefix, $upper) lets FalkorDB use the uuid RANGE index; STARTS WITH stays
-# as the exact predicate. No invalid_at filter: a superseded edge's uuid is
-# still an id a prefix can cite. The edge pattern is DIRECTED for the
-# one-row-per-edge reason given at _EMBEDDED_EDGES_MATCH.
+# [$prefix, $upper) lets FalkorDB use the uuid RANGE index; STARTS WITH is
+# load-bearing, because that index can over-return on a string `<` (see
+# plans/falkordb-resultset-cap-audit.md, section 'String < / <= on
+# RANGE-indexed properties (task 7543)'). No invalid_at filter: a superseded
+# edge's uuid is still an id a prefix can cite. The edge pattern is DIRECTED
+# for the one-row-per-edge reason given at _EMBEDDED_EDGES_MATCH.
 _ENTITY_UUID_PREFIX_MATCH = (
     'MATCH (n:Entity) '
     'WHERE n.uuid >= $prefix AND n.uuid < $upper AND n.uuid STARTS WITH $prefix '
@@ -1095,46 +1118,6 @@ async def _paged_ro_query(
     )
 
 
-async def _read_all_group_episodes(
-    driver: GraphDriver,
-    group_ids: list[str],
-    *,
-    page_size: int = _DEFAULT_READ_PAGE_SIZE,
-    max_pages: int = _MAX_READ_PAGES,
-) -> list[EpisodicNode]:
-    """Read every episode in ``group_ids``, past the server's row cap.
-
-    A different mechanism from ``_paged_ro_query`` because this read goes
-    through graphiti-core, not ``ro_query``.  ``EpisodicNode.get_by_group_ids``'
-    own ``uuid_cursor`` is KEYSET paging (``uuid < cursor ORDER BY uuid DESC``),
-    and keyset pages never shift under concurrent insert.  Only an EMPTY page
-    ends the read, never a short one, so a server cap below ``page_size``
-    cannot truncate it — which is why neither ``_paged_ro_query``'s refusal
-    guard nor a census is needed.  See plans/falkordb-resultset-cap-audit.md.
-
-    Raises:
-        IncompleteEnumerationError: ``max_pages`` ran out on a non-empty page.
-    """
-    episodes: list[EpisodicNode] = []
-    cursor: str | None = None
-    for _ in range(max_pages):
-        page = await EpisodicNode.get_by_group_ids(
-            driver, group_ids, limit=page_size, uuid_cursor=cursor
-        )
-        if not page:
-            return episodes
-        episodes.extend(page)
-        cursor = min(ep.uuid for ep in page)
-    raise IncompleteEnumerationError(
-        f'_read_all_group_episodes(group_ids={group_ids!r}): the enumeration '
-        f'was structurally incomplete (incomplete_kind={INCOMPLETE_PAGE_CAP!r}): '
-        f'max_pages={max_pages} exhausted at page_size={page_size} with '
-        f'episodes_seen={len(episodes)} and the last page non-empty, so the '
-        f'episodes read are a uuid-ordered prefix and sorting them by '
-        f'created_at would select the wrong most-recent episodes'
-    )
-
-
 def apply_incompleteness_policy(
     paged: PagedRead,
     *,
@@ -1314,15 +1297,12 @@ def _embedding_dim(raw) -> int:
     return len(str(raw).strip('<>').split(', '))
 
 
-def _as_sortable_utc(created_at: datetime | None) -> datetime:
+def _as_sortable_utc(created_at: datetime) -> datetime:
     """Coerce an episode's created_at to a tz-aware UTC datetime for sorting.
 
     Naive (tzinfo-less) datetimes are assumed to already be UTC rather than
-    raising on naive-vs-aware comparison; None sorts as the minimum possible
-    value (oldest/unknown), landing last in a descending sort.
+    raising on naive-vs-aware comparison.
     """
-    if created_at is None:
-        return datetime.min.replace(tzinfo=UTC)
     if created_at.tzinfo is None:
         return created_at.replace(tzinfo=UTC)
     return created_at.astimezone(UTC)
@@ -1691,11 +1671,14 @@ class GraphitiBackend:
         ``graphiti_max_coroutines`` (each call's own internal fan-out) — by
         default 3 × 5 = 15 concurrent OpenAI calls at most, unchanged by
         this per-group cache.
+
+        Per-group clients are ``ExactEpisodeWindowGraphiti`` so add_episode's
+        previous-episode read is exact (task 7543).
         """
         cached = self._group_clients.get(group_id)
         if cached is not None:
             return cached
-        client = Graphiti(
+        client = ExactEpisodeWindowGraphiti(
             graph_driver=self._driver_for(group_id),
             llm_client=self._llm_client,
             embedder=self._embedder,
@@ -2088,44 +2071,34 @@ class GraphitiBackend:
         last_n: int = 10,
         reference_time: datetime | None = None,
     ) -> list[Any]:
-        """Retrieve recent episodes by group, ordered by created_at (most recent first) and truncated to last_n.
-
-        EpisodicNode.get_by_group_ids truncates via ``ORDER BY uuid DESC LIMIT``,
-        which is unrelated to recency, so we read the group's full episode set
-        in keyset pages (``_read_all_group_episodes``, task 4869) and
-        sort/truncate by created_at ourselves.
+        """Return the group's last_n most recent episodes, newest created_at first, ties by uuid descending.
 
         Raises:
-            IncompleteEnumerationError: The keyset read ran out of page budget.
+            ValueError: last_n is outside 1 <= last_n < ``_RESULTSET_SIZE``.
             TimeoutError: The read overran its budget (class TIMEOUT POSTURE).
                 MemoryConsolidator then marks 'episodes' a degraded fetch
                 source, and get_episodes answers an error, not an empty list.
+
+        Why the read is neither keyset-paged nor a full scan:
+        plans/falkordb-resultset-cap-audit.md, the ``retrieve_episodes`` entry.
         """
-        driver = self._driver_for(group_ids[0]) if group_ids else self._require_driver()
-        # The full set is still read, now in keyset pages, because the
-        # created_at sort must see every episode: a cap-truncated set would
-        # silently select the wrong episodes, not merely fewer of them. The
-        # cheaper bounded read (ORDER BY created_at ... LIMIT last_n) was
-        # declined; its cost and reasons are in
-        # plans/falkordb-resultset-cap-audit.md.
+        if not 1 <= last_n < _RESULTSET_SIZE:
+            raise ValueError(
+                f'retrieve_episodes: last_n={last_n} must satisfy 1 <= last_n < '
+                f'{_RESULTSET_SIZE} (the assumed FalkorDB RESULTSET_SIZE); at or '
+                f'above it the server truncates this unpaged read silently'
+            )
+        if not group_ids:
+            return []
         episodes = await self._timed_read(
-            _read_all_group_episodes(driver, group_ids), 'retrieve_episodes',
+            read_recent_group_episodes(self._graph_for(group_ids[0]), group_ids, last_n),
+            'retrieve_episodes',
         )
-        episodes = sorted(
-            episodes or [],
-            # Secondary key (uuid) makes this a total order: get_by_group_ids
-            # truncates via ORDER BY uuid DESC, so without a tie-breaker,
-            # episodes sharing created_at (batch/rapid co-ingestion, or
-            # reduced-precision storage) fall back to that upstream order,
-            # which is not guaranteed reproducible across executions and can
-            # read as non-monotonic to a strict-descending observer.
-            key=lambda ep: (
-                _as_sortable_utc(getattr(ep, 'created_at', None)),
-                getattr(ep, 'uuid', None) or '',
-            ),
+        return sorted(
+            episodes,
+            key=lambda ep: (_as_sortable_utc(ep.created_at), ep.uuid),
             reverse=True,
         )
-        return episodes[:last_n]
 
     @_canonicalize_group_args
     async def get_episode_by_uuid(self, episode_uuid: str, *, group_id: str) -> EpisodicNode | None:
@@ -5271,6 +5244,34 @@ class GraphitiBackend:
             raise EdgeNotFoundError(f'RELATES_TO edge not found: {uuid}')
         row = result.result_set[0]
         return (row[0] or '', row[1] or '')
+
+    @_canonicalize_group_args
+    async def get_edges_by_uuids(
+        self, uuids: Sequence[str], *, group_id: str,
+    ) -> list[EdgeWithEndpoints]:
+        """The surviving RELATES_TO edges among *uuids*, in input order, one per uuid.
+
+        The survivor read for services/overreach_shadow.py: by the time the
+        identity lock is released, _dedup_episode_edges may have deleted a
+        duplicate edge and the node passes may have renamed an endpoint, so
+        the write's own result is stale. Retired edges are returned too,
+        marked by ``active``.
+        """
+        if not uuids:
+            return []
+        result = await self._graph_for(group_id).ro_query(
+            'MATCH (a)-[e:RELATES_TO]->(b) WHERE e.uuid IN $uuids '
+            f'RETURN e.uuid, e.fact, a.name, b.name, e.episodes, {_ACTIVE_EDGE_PREDICATE}',
+            {'uuids': list(uuids)},
+        )
+        by_uuid: dict[str, EdgeWithEndpoints] = {}
+        for edge_uuid, fact, source_name, target_name, episodes, active in result.result_set:
+            by_uuid.setdefault(edge_uuid, EdgeWithEndpoints(
+                uuid=edge_uuid, fact=fact or '', source_name=source_name or '',
+                target_name=target_name or '', episodes=list(episodes or []),
+                active=bool(active),
+            ))
+        return [by_uuid[wanted] for wanted in dict.fromkeys(uuids) if wanted in by_uuid]
 
     @_canonicalize_group_args
     async def get_edge_invalid_at(self, uuid: str, *, group_id: str) -> Any:

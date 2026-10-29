@@ -390,6 +390,15 @@ another project's files. A submission from an **unregistered** filer, or one
 that **mixes** local and foreign files, is **not** tagged and stays a hard
 path-scope reject (the task-2206 anti-bypass guard is preserved).
 
+Ownership of a **relative** `metadata.files` entry is resolved against the
+filing project's own root first: an entry whose leading directory exists in
+the filing project is that project's, even when another registered project
+has a same-named top-level directory (a stream_touch `sessions/…` entry is
+never credited to mission_control). Only an entry whose leading directory
+exists solely in another project makes the task cross-repo; generic names
+such as `docs/` or `src/` count for neither side. The rule has one home:
+`fused-memory/src/fused_memory/middleware/project_prefix_registry.py::ProjectPrefixRegistry.attributed_owner`.
+
 When the marker is present, the orchestrator pre-merge narrowing gate treats
 the task as a cross-repo deliverable: instead of flagging "files not
 touched" and forcing a dishonest plan-narrowing pass, it routes the merge
@@ -694,7 +703,15 @@ they never affect the exit code and no gating test sweeps them.
 mis-authored now carries an `AUTHORING DIAGNOSIS` block in its `detail`,
 naming the code and a remedy. Without it a malformed check and a genuinely
 undelivered capability produce identical records, and they need opposite
-responses.
+responses. Every such escalation also names the check's OWNER, which is the
+dependency whose `metadata.delivered_checks` declares it, never the blocked
+dependent. It says where the check is declared both as data in
+`delivered_check_owner` (`escalation/src/escalation/models.py::DeliveredCheckOwner`:
+the owner task, the check name, and the owner's sidecar with whether it declares
+the check on `main`) and as the `Check owner:` / `Declared in:` / `Sidecar:`
+lines of `detail`, which are rendered from that same value. A stale or
+mis-authored check is corrected at the owner's sites (see "Stale scope paths");
+the blocked dependent is only re-pended.
 
 **Dispatch-time policy**
 
@@ -702,7 +719,7 @@ responses.
 |---|---|
 | All checks DELIVERED on `main@SHA` | Satisfied — dep counts toward dispatch |
 | ≥1 check FAILED, consecutive-fail streak `< grace_cycles` | Withheld; `delivered_check_gate_held` event emitted each held tick (hold-visibility only) |
-| ≥1 check FAILED, streak reaches `grace_cycles` | Born-at-L2 `dependency_capability` escalation naming the failed check/pattern-or-script/dep id/`main` SHA; dependent → `blocked`; streak cleared (re-fires on a later re-crossing) |
+| ≥1 check FAILED, streak reaches `grace_cycles` | Born-at-L2 `dependency_capability` escalation naming the failed check/pattern-or-script/dep id/`main` SHA and the check's owner and declaration sites (`delivered_check_owner`); dependent → `blocked`; streak cleared (re-fires on a later re-crossing) |
 | A check ERRORS (git/script failure) or exceeds `check_timeout_secs` | Fail-safe wait — dep left uncached, **no** streak bump on either counter, retried next tick |
 | `delivered_checks.enabled = false` | Gate entirely inert — no sweep, no cache, no streaks, no escalation; the dep gate takes its legacy arm-off path as if the metadata didn't exist |
 
@@ -1559,8 +1576,9 @@ supply is dropped, not honoured, and the strip is logged under
 waiting to be dispatched. It is written only by the fused-memory status
 chokepoints (`sqlite_task_backend.py::stamp_pending_since`, reached from
 `add_task`, `set_task_status` and `set_status_and_stamp_audit`) on a
-`* -> pending` landing, and read by the scheduler's age term and the watchdog
-idle clock. `pending_since_backfilled` is written only by the one-shot v4 ->
+`* -> pending` landing, and read by the orchestrator scheduler's age term
+through `orchestrator/src/orchestrator/pending_age.py::read_pending_age`.
+`pending_since_backfilled` is written only by the one-shot v4 ->
 v5 migration, marking the rows it anchored from `updated_at` so that
 population stays countable.
 
@@ -2206,13 +2224,26 @@ were prose.
   the default shallow merge can add and overwrite but never delete. Send
   the complete new blob — a `replace` drops every key you omit, including
   the gate markers (`task_kind`, `operational_mode`, `always_escalates`,
-  `execution_class`).
-- `description` is replace-only and capped at 5,000 characters. Breaching
-  the cap times out and the write does NOT land. Combining `append=True`
-  with `description`/`title`/`priority` is rejected outright.
-- Split `details` (append-capable) and `metadata`/`title` into separate
-  `update_task` calls — `append=True` silently drops `metadata` and
-  `title` passed in the same call.
+  `execution_class`). It also drops the stored `pending_since` anchor, even
+  one you copy into the blob (§8).
+- Four keys are the exception: a `replace` must carry `done_provenance`,
+  `defects` and `defect_test_retirements` (§8) and `deferral` (§9
+  "Deferring a task") exactly as stored, present if stored and absent if
+  not; a stored blob that is corrupt or not a JSON object counts as
+  storing none of them. Otherwise the call is refused and nothing is
+  written. Send those keys back exactly as you read them
+  (`sqlite_task_backend.py::_assert_passthrough_only_keys`,
+  `sqlite_task_backend.py::_assert_deferral_unchanged`).
+- `title`, `description` and `priority` are replace-only. Combining any of
+  them with `append=True` is refused with `AppendUnsupportedFieldError`
+  (task 4039), and nothing is written. `append=True` concatenates onto
+  `details`. With `metadata` and no `metadata_mode` it selects the additive
+  merge, which only grows the blob: it unions lists, keeps the stored value
+  on any scalar collision, and never removes a key. So append to `details`
+  in one call, and rotate `description` and `metadata` in a separate call
+  with `append` omitted and `metadata_mode='replace'`.
+- No column has a length cap of its own. The only size guidance is the
+  whole-task threshold above, and no write is refused for exceeding it.
 - Re-read the task from the store afterwards and confirm the status, the
   gate markers and the untouched columns survived.
 
@@ -2255,6 +2286,55 @@ Worked precedents: `autopilot_video` 648 (mem0
 
 ---
 
+## 11. In-place memory amendments are not task-agent work
+
+**A plan step — or a task description — that amends an EXISTING memory in
+place must be routed to a curator sitting or a reconciliation stage, never
+assigned to an orchestrator-dispatched task agent.** In-place amendment
+means `update_memory`'s `content_amend` arm, which rewrites a record's text
+and re-embeds it under the same point id. Architect, implementer, debugger,
+`simple_task` and steward are all dispatched roles; none of them may be told
+to make that call.
+
+**This is certain, not merely discouraged.** The arm is gated on an
+`agent_id`-prefix allowlist that ships as `['recon-stage-', 'curator-']`,
+and every dispatched `agent_id` is `claude-task-<id>-<role>`
+(`orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._agent_identity`),
+which matches neither prefix. The refusal — `Mem0UpdateNotAuthorized` — is
+deterministic, not a race or a flake. The tool is not even reachable: no
+dispatched role is granted `update_memory` at all
+(`orchestrator/src/orchestrator/agents/roles.py::_MEMORY_TOOLS`). A plan
+step naming that call is unexecutable twice over.
+
+**Write this instead.** Either write a NEW memory recording the correction
+— `add_memory` *is* granted to dispatched roles, and a superseding record is
+the sanctioned way for a task agent to correct the store — or file a
+follow-up task for a curator sitting to perform the amendment. Adopting a
+`curator-` `agent_id` to get past the refusal is explicitly forbidden: that
+is self-authorization for a silent-rewrite primitive.
+
+**Widening the allowlist is not the remedy.** The narrow bar on
+`mem0_update.content_amend_allowed_agent_prefixes` is ratified as
+working-as-designed; the suggestion to widen it was retracted in esc-3891-6.
+
+**The cost is measured, not theoretical.** Task 3891's plan step-6
+instructed an implementer to call the arm, pre-specifying a fallback only
+for a metadata rejection. It produced five escalations (esc-3891-4, -5, -6,
+-7, -8) and left residual task 4478 — a curator sitting — outstanding, all
+for a single memory edit.
+
+For the mechanics, read these rather than re-deriving them:
+
+- **`skills/curate-fused-memories/SKILL.md`** — the sanctioned curator
+  route, and the passage separating legitimate adoption of `curator-` from
+  adopting it because you hit `Mem0UpdateNotAuthorized`.
+- **`plans/mem0-in-place-update-decision.md`** §4 — the ratified
+  authorization model, and why the two arms carry different bars.
+- **`OPERATIONS.md`** — the two `mem0_update.*` allowlist keys and the
+  `mem0_update.enabled` kill switch.
+
+---
+
 ## Cross-references
 
 - **`README.md`** — repo orientation and top-level entry points.
@@ -2268,3 +2348,8 @@ Worked precedents: `autopilot_video` 648 (mem0
   of `metadata.delivered_checks`-bearing capability tasks (§3.3).
 - **`docs/legibility/design-invariants.md`** — the design invariants gating
   `/prd` decompose and `/review` phase 2.
+- **`skills/curate-fused-memories/SKILL.md`** — the sanctioned curator
+  sitting: the only dispatched-agent-adjacent route that may amend a memory
+  in place (§11).
+- **`plans/mem0-in-place-update-decision.md`** — the ratified `update_memory`
+  design: tool shape, and the two-arm authorization model behind §11.

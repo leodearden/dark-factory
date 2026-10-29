@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import time
+from datetime import UTC, datetime, timedelta
 from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
@@ -96,6 +97,13 @@ class TestConstructorInjectedHooksFire:
         spy = AsyncMock()
         config = OrchestratorConfig(
             max_per_module=1,
+            # task 4481: pin the trip ON rather than inheriting it.  This test
+            # is about the CALLBACK firing, not about park_stop_enabled's
+            # default; an operator setting park_stop_enabled=false in
+            # dark-factory-orchestrator.yaml disarms the trip and the spy is
+            # never called.  The threshold/window beside it are already pinned
+            # for the same reason.
+            park_stop_enabled=True,
             park_stop_parked_threshold=1,
             park_stop_parked_window_hours=1.0,
         )
@@ -152,12 +160,12 @@ class TestConstructorInjectedHooksFire:
 
     @pytest.mark.asyncio
     async def test_on_starvation_warn_fires(self):
-        """A constructor-injected on_starvation_warn fires once both gates cross."""
-        t: list[float] = [0.0]
+        """A constructor-injected on_starvation_warn fires once both dual-gate halves cross.
 
-        def fake_clock() -> float:
-            return t[0]
-
+        The eligibility age runs on the WALL clock (task 3821), so that is the
+        clock this test advances.
+        """
+        wall: list[datetime] = [datetime(2026, 10, 1, tzinfo=UTC)]
         spy = AsyncMock()
         config = OrchestratorConfig(
             max_per_module=1,
@@ -170,7 +178,7 @@ class TestConstructorInjectedHooksFire:
         config.fairness.skip_threshold = 9999
         scheduler = Scheduler(
             config,
-            time_source=fake_clock,
+            wall_time_source=lambda: wall[0],
             callbacks=SchedulerCallbacks(on_starvation_warn=spy),
         )
 
@@ -187,14 +195,19 @@ class TestConstructorInjectedHooksFire:
         scheduler.lock_table.try_acquire('seed', ['backend'])
         scheduler._dispatched.add('seed')
         scheduler.get_tasks = AsyncMock(return_value=[task])
+        # The watchdog corroborates a finding with a live status read before
+        # it fires (task 3821).
+        scheduler.get_statuses = AsyncMock(return_value=({'starved': 'pending'}, None))
         scheduler.finish_startup()
 
         # Drive 3 ticks to accumulate skip_count >= skip_threshold (3).
         for _ in range(3):
             await scheduler.acquire_next()
 
-        # Advance clock past idle_secs (100s) and tick once more.
-        t[0] = 150.0
+        spy.assert_not_called()
+        # Advance the wall clock past idle_secs (100s) from the first observed
+        # tick and tick once more.
+        wall[0] += timedelta(seconds=150)
         await scheduler.acquire_next()
 
         spy.assert_called_once()

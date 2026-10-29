@@ -30,6 +30,7 @@ from typing import Any
 
 import aiosqlite
 import httpx
+from shared.sqlite_column_migration import add_column_if_missing
 
 from dashboard.config import DashboardConfig
 from dashboard.data.census import SERIES_KEYS, TaskCensus
@@ -59,6 +60,9 @@ logger = logging.getLogger(__name__)
 # acquire_snapshot never spends it.
 _SNAPSHOT_UNIT_WORST_CASE_SECONDS = _LOCK_ACQUIRE_TIMEOUT_SECONDS + PER_CALL_TIMEOUT
 
+# Wall-clock-aligned sampling tick for the burndown (and metrics) collectors.
+SAMPLE_INTERVAL_SECONDS = 600
+
 # Whole-operation backstop for ONE root's snapshot acquisition, enforced by
 # collect_snapshot's Phase-2 gather. Expiry is a GAP row naming this budget,
 # never a skipped root.
@@ -69,7 +73,7 @@ _SNAPSHOT_UNIT_WORST_CASE_SECONDS = _LOCK_ACQUIRE_TIMEOUT_SECONDS + PER_CALL_TIM
 #
 # FLOOR: _SNAPSHOT_UNIT_WORST_CASE_SECONDS, so the backstop never pre-empts a
 # unit still inside its own bounds and turns a bounded read into a gap row.
-# CEILING: half of loops._SAMPLE_INTERVAL_SECONDS, so one collector cycle is
+# CEILING: half of SAMPLE_INTERVAL_SECONDS, so one collector cycle is
 # finished before the next begins.
 #
 # 60.0 is ~3x the floor. Both bounds pinned by TestCollectSnapshotPerRootBudget
@@ -77,9 +81,8 @@ _SNAPSHOT_UNIT_WORST_CASE_SECONDS = _LOCK_ACQUIRE_TIMEOUT_SECONDS + PER_CALL_TIM
 _SNAPSHOT_PER_ROOT_BUDGET = 60.0
 
 # The age past which a burndown sample is no longer fresh: two sample
-# intervals of dashboard/loops.py::_SAMPLE_INTERVAL_SECONDS (not imported —
-# loops imports this module). Pinned through the wire by test_redux_api.py.
-SAMPLE_FRESHNESS_BOUND_SECONDS = 1200
+# intervals. Pinned through the wire by test_redux_api.py.
+SAMPLE_FRESHNESS_BOUND_SECONDS = 2 * SAMPLE_INTERVAL_SECONDS
 
 BURNDOWN_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -157,12 +160,11 @@ class SnapshotState(enum.StrEnum):
 async def ensure_snapshot_columns(conn: aiosqlite.Connection) -> None:
     """Bring an existing ``snapshots`` table up to the current column set.
 
-    Additive only: probes ``PRAGMA table_info`` and issues one
-    ``ALTER TABLE ... ADD COLUMN`` per missing column.  Idempotent, never drops
-    or rewrites anything, so pre-existing rows keep their data and take the
-    column defaults: ``0`` for the split (task 3543), and ``NULL`` for the cap
-    and for every column task 5591 added — an honest "not recorded", since
-    none of them was measured when the row was written.
+    Additive only: one ``ALTER TABLE ... ADD COLUMN`` per missing column.
+    Idempotent, never drops or rewrites anything, so pre-existing rows keep
+    their data and take the column defaults: ``0`` for the split (task 3543),
+    and ``NULL`` for the cap and for every column task 5591 added — an honest
+    "not recorded", since none of them was measured when the row was written.
 
     Mandatory, not cosmetic: :data:`BURNDOWN_SCHEMA` is applied with
     ``CREATE TABLE IF NOT EXISTS``, which is a no-op against every already
@@ -170,17 +172,11 @@ async def ensure_snapshot_columns(conn: aiosqlite.Connection) -> None:
     every current column, would fail on the first collection cycle after
     deploy.  Call it at store open, before the collector runs.
 
-    Mirrors fused-memory's ``_migrate_v1_to_v2`` probe-then-add idiom.  The
-    caller commits.
+    The caller commits.
     """
-    cursor = await conn.execute('PRAGMA table_info(snapshots)')
-    existing = {row[1] for row in await cursor.fetchall()}
-    await cursor.close()
     for column, ddl in _ADDED_SNAPSHOT_COLUMNS:
-        if column in existing:
-            continue
-        await conn.execute(f'ALTER TABLE snapshots ADD COLUMN {column} {ddl}')
-        logger.info('burndown: added snapshots.%s (%s)', column, ddl)
+        if await add_column_if_missing(conn, 'snapshots', column, ddl):
+            logger.info('burndown: added snapshots.%s (%s)', column, ddl)
 
 
 @dataclass(frozen=True, slots=True)

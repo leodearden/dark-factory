@@ -24,7 +24,7 @@ import posixpath
 import re
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import Awaitable, Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -286,49 +286,52 @@ def _emit_merge_attempt(
         )
 
 
-#: Bounded FIFO of main-tip SHAs this process's merge queue itself landed —
-#: i.e. the main tips a GREEN gate run has actually been observed on.
+#: Per repository, a bounded FIFO of the main-tip SHAs that repository's merge
+#: queue itself landed — i.e. the main tips a GREEN gate run has actually been
+#: observed on.
 #:
 #: Written at the single clean-landing return of :func:`_finalize_advanced_merge`
 #: (shared by SpeculativeMergeWorker's CAS advance and the train pipeline), read
 #: by :func:`_reverify_rebased_tree` to decide whether footprint-disjointness may
 #: be trusted (see :func:`_disjoint_skip_blockers`).
 #:
-#: Process-global rather than worker-owned on purpose: there is exactly one merge
-#: queue per orchestrator process, both landing paths funnel through
-#: ``_finalize_advanced_merge``, and the alternative (threading a handle through
-#: the module-level finalize/advance helpers and the ``_TrainMergeHost`` protocol)
-#: would fan the same one fact out across four signatures.  Same shape as
-#: ``verify._suppressed_flake_records`` and ``MergeProvenance``'s process-global
-#: facade.
+#: Module-level storage keyed by the landing queue's ``GitOps.project_root``, so
+#: the stored fact is "this queue landed it green", not "some queue in this
+#: process did".  A byte-identical commit in another repository is never vouched
+#: for; such commits are routine for test fixtures copied from one template and
+#: committed within one second.  Pinned by
+#: orchestrator/tests/test_merge_reverify_gate_record.py::TestReverifyGateRecordsItsDecision::test_a_tip_another_repositorys_queue_landed_does_not_vouch_for_this_one.
 #:
 #: NOT durable, and deliberately so: after a restart the set is empty, every
 #: rebase-under-drift re-verifies, and the registry refills from the first
 #: landing onward.  Empty means "I have not seen this tip go green", which is
 #: the fail-SAFE answer — the same direction ``_OVERLAP_GIT_ERROR_SENTINEL``
-#: fails.
-_QUEUE_VERIFIED_MAIN_TIPS: list[str] = []
+#: fails.  A root spelled differently from the landing queue's (a symlink, a
+#: relative path) gets that same answer: keys compare as given, unresolved, and
+#: every production writer and reader passes the worker's one ``GitOps``.
+_QUEUE_VERIFIED_MAIN_TIPS: dict[Path, list[str]] = {}
 
-#: Cap on :data:`_QUEUE_VERIFIED_MAIN_TIPS`.  Only the most recent tips can ever
-#: be a rebase target (a rebase is onto CURRENT main), so a short window is
-#: sufficient; the bound exists so a long-lived process cannot grow the list
-#: without limit.
+#: Per-repository cap on :data:`_QUEUE_VERIFIED_MAIN_TIPS`.  Only the most
+#: recent tips can ever be a rebase target (a rebase is onto CURRENT main), so a
+#: short window is sufficient; the bound exists so a long-lived process cannot
+#: grow the list without limit.
 _QUEUE_VERIFIED_MAIN_TIPS_CAP = 64
 
 
-def note_queue_verified_main_tip(sha: str) -> None:
-    """Record *sha* as a main tip this queue landed after a green gate run."""
+def note_queue_verified_main_tip(project_root: Path, sha: str) -> None:
+    """Record *sha* as a main tip *project_root*'s queue landed after a green gate run."""
     if not sha:
         return
-    if sha in _QUEUE_VERIFIED_MAIN_TIPS:
+    tips = _QUEUE_VERIFIED_MAIN_TIPS.setdefault(project_root, [])
+    if sha in tips:
         return
-    _QUEUE_VERIFIED_MAIN_TIPS.append(sha)
-    del _QUEUE_VERIFIED_MAIN_TIPS[:-_QUEUE_VERIFIED_MAIN_TIPS_CAP]
+    tips.append(sha)
+    del tips[:-_QUEUE_VERIFIED_MAIN_TIPS_CAP]
 
 
-def main_tip_is_queue_verified(sha: str) -> bool:
-    """True iff *sha* is a main tip this queue landed after a green gate run."""
-    return bool(sha) and sha in _QUEUE_VERIFIED_MAIN_TIPS
+def main_tip_is_queue_verified(project_root: Path, sha: str) -> bool:
+    """True iff *sha* is a main tip *project_root*'s queue landed after a green gate run."""
+    return bool(sha) and sha in _QUEUE_VERIFIED_MAIN_TIPS.get(project_root, ())
 
 
 @dataclass
@@ -1049,7 +1052,7 @@ async def _finalize_advanced_merge(
     # disjoint-delta fast path (premise P2 in _disjoint_skip_blockers).  A tip
     # produced by any other writer (nightly job, direct commit, push) never
     # reaches this line and is therefore never trusted.
-    note_queue_verified_main_tip(advanced_sha)
+    note_queue_verified_main_tip(git_ops.project_root, advanced_sha)
     push_status = await git_ops.push_main()
     return MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status)
 
@@ -1907,7 +1910,7 @@ async def _resolve_already_landed_branch(
     evidence exactly: 3604's landed file set equals its 3 declared plan
     files, 3572's equals its 7.
 
-    **4. SURVIVAL** — :meth:`GitOps.commit_effect_present_in_main` says the
+    **4. SURVIVAL** — ``describe_commit_effect_in_main(...).present`` says the
     attributing commit's own effect is STILL PRESENT at main's current HEAD
     (amendment pass, review finding #1).  Signals 1-3 are all statements about
     IMMUTABLE HISTORY: a merge commit stays an ancestor of main forever, and
@@ -2079,13 +2082,23 @@ async def _resolve_already_landed_branch(
     # the reconcile sweep applies before MARK_DONE (harness.py, the FIX 1'
     # effect-present refinement), so the two seams answer "is it still there"
     # identically instead of drifting.
-    if not await git_ops.commit_effect_present_in_main(landed_sha):
+    effect = await git_ops.describe_commit_effect_in_main(landed_sha)
+    if not effect.present:
         logger.warning(
             'already-landed: landing %s (mechanism=%s) for task_id=%s is an '
-            'ancestor of main but its effect is NOT present at current HEAD '
-            '(post-hoc revert) — failing closed rather than telling an '
-            'operator to close a task whose work is no longer on main',
-            landed_sha, mechanism, task_id,
+            'ancestor of main but the effect check did not confirm it '
+            'survives at current HEAD (failure=%s aggregate_survival=%s '
+            'added_lines_total=%s aggregate_threshold=%s '
+            'worst_guarded_path=%s worst_guarded_survival=%s '
+            'per_file_threshold=%s vacuous_paths=%s) — this check cannot '
+            'tell a genuine revert from a heavy later rewrite of the same '
+            'lines; failing closed rather than telling an operator to close '
+            'a task whose work may no longer be on main',
+            landed_sha, mechanism, task_id, effect.failure,
+            effect.aggregate_survival, effect.added_lines_total,
+            effect.aggregate_threshold, effect.worst_guarded_path,
+            effect.worst_guarded_survival, effect.per_file_threshold,
+            list(effect.vacuous_paths),
         )
         return None
 
@@ -2169,6 +2182,42 @@ def _entry_covered(norm: str, touched_set: set[str]) -> bool:
     return (
         _entry_touched_exactly(norm, touched_set)
         or _entry_touched_beneath(norm, touched_set)
+    )
+
+
+@dataclass(frozen=True)
+class DeclarationCoverage:
+    undeclared: tuple[str, ...]
+    """Changed paths no declared entry covers, sorted."""
+    undelivered: tuple[str, ...]
+    """Declared entries, exactly as written, that cover no changed path, sorted."""
+
+
+def declaration_coverage(
+    declared: Iterable[str], paths: Iterable[str],
+) -> DeclarationCoverage:
+    """Difference a declaration against changed paths, in both directions.
+
+    The git-free half of :func:`_check_plan_files_touched_in_branch`'s
+    coverage rule (:func:`_normalize_plan_path` + :func:`_entry_covered`),
+    applied per changed path for ``undeclared`` and per declared entry for
+    ``undelivered``.  The gate's existence probe and rename arm need git and
+    are not applied, so a renamed declared path reads as one undelivered
+    entry plus one undeclared path.  Caller:
+    ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._stamp_landed_scope``.
+    """
+    norms = {entry: _normalize_plan_path(entry) for entry in declared if entry}
+    path_set = set(paths)
+    undeclared = sorted(
+        p for p in path_set
+        if not any(_entry_covered(norm, {p}) for norm in norms.values())
+    )
+    undelivered = sorted(
+        entry for entry, norm in norms.items()
+        if not _entry_covered(norm, path_set)
+    )
+    return DeclarationCoverage(
+        undeclared=tuple(undeclared), undelivered=tuple(undelivered),
     )
 
 
@@ -3240,6 +3289,7 @@ async def _rebase_delta_touched_overlap(
 def _disjoint_skip_blockers(
     req: MergeRequest,
     *,
+    project_root: Path,
     rebased_onto: str,
 ) -> list[str]:
     """Reasons footprint-disjointness may NOT be trusted for this rebase.
@@ -3277,7 +3327,8 @@ def _disjoint_skip_blockers(
         needed even for a perfectly diff-scoped gate — a merge onto an
         already-red base is red — and it is the one the incident violated.
         Signal used: :func:`main_tip_is_queue_verified`, i.e. *rebased_onto* is
-        a tip THIS queue landed after a green gate run.  Drift from any other
+        a tip THIS queue, the one landing into *project_root*, landed after a
+        green gate run.  Drift from any other
         writer (an unattended job, a direct commit, a push) has unknown health.
         Generic and observed, not declared: it needs no project config at all.
 
@@ -3315,7 +3366,7 @@ def _disjoint_skip_blockers(
         config, 'merge_disjoint_skip_requires_verified_drift', True,
     )
     if requires_verified_drift is not False and not main_tip_is_queue_verified(
-        rebased_onto,
+        project_root, rebased_onto,
     ):
         blockers.append(
             f'intervening main tip {rebased_onto[:8]} was not landed green by '
@@ -3382,7 +3433,9 @@ async def _decide_reverify_gate(
         return decide(reason=ReverifyGateReason.overlap_unknown)
     if overlap:
         return decide(reason=ReverifyGateReason.overlap, overlap=tuple(overlap))
-    blockers = _disjoint_skip_blockers(req, rebased_onto=rebased_onto)
+    blockers = _disjoint_skip_blockers(
+        req, project_root=git_ops.project_root, rebased_onto=rebased_onto,
+    )
     if blockers:
         return decide(reason=ReverifyGateReason.disjoint_untrusted, blockers=tuple(blockers))
     return decide(reason=ReverifyGateReason.disjoint)
@@ -3463,8 +3516,8 @@ async def _reverify_rebased_tree(
        with no verify.  Disjointness alone is NOT sufficient: see that
        function's docstring for the two premises.
     2. Otherwise (an overlap, an unknown overlap, or untrusted disjointness):
-       delegate to *run_post_merge_verify* against the rebased *merge_wt*,
-       forwarding *event_store* so the re-verify writes its ``merge_verify``
+       delegate to *run_post_merge_verify* against the rebased *merge_wt*;
+       the worker's handles it carries write the re-verify's ``merge_verify``
        row.  ``None`` from it → ``GateClearance.reverified``; a
        ``MergeOutcome`` → verification failed or the disk guard fired, and
        *merge_wt* has already been cleaned up.
@@ -3491,11 +3544,12 @@ async def _reverify_rebased_tree(
         verbatim to ``_run_post_merge_verify``.  Default ``None`` produces
         legacy single-keep behaviour (only ``merge_wt`` is protected).
     run_post_merge_verify:
-        The worker's ``_run_post_merge_verify``, which this gate delegates the
-        re-verify to when it fires, and the declared history leg to, as
+        The worker's verify callable, carrying the worker's handles, its
+        event store included.  This gate delegates the re-verify to it when
+        it fires, and the declared history leg to it, as
         ``history_leg_command``, on a same tree.
     event_store:
-        Receives the decision row, and is forwarded to the re-verify.
+        Receives the decision row only.
     """
     decision = await _decide_reverify_gate(
         git_ops, req,
@@ -3516,7 +3570,6 @@ async def _reverify_rebased_tree(
         max_enospc=max_enospc,
         merge_sha=merge_sha,
         keep_worktrees=keep_worktrees,
-        event_store=event_store,
         history_leg_command=decision.history_leg_command,
     )
     if failure is not None:

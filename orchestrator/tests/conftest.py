@@ -16,6 +16,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import _async_mock_orphans
 import pytest
 import pytest_asyncio
 
@@ -63,13 +64,11 @@ from _orch_helpers import (  # noqa: E402
     CLAIMANT_TTL_SECS,
     ExitContractViolationCollector,
     ample_disk_usage,
-    drain_async_mock_coroutines,
     idle_psi_sample,
     pydantic_spec,
     reap_leaked_aiosqlite_connections,
     reap_leaked_claimant_heartbeats,
     stamp_stock_routing_config,
-    track_async_mock_coroutines,
 )
 from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
@@ -77,6 +76,7 @@ from df_pytest_isolation import (  # noqa: E402
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
     _df_no_synthetic_heartbeats_in_live_fleet,  # noqa: F401  — the binding IS the wiring
+    arm_leaked_drain_process_guard,
     reject_unsafe_basetemp,
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
@@ -98,7 +98,7 @@ from orchestrator.merge_lane import worker  # noqa: E402
 # module-level _DEBUG_ASSERTS seed at False.
 worker._DEBUG_ASSERTS = True
 
-track_async_mock_coroutines()
+_async_mock_orphans.track_async_mock_coroutines()
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -549,7 +549,7 @@ def df_warm_lane_script_dir(monkeypatch, tmp_path: Path):
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Refuse an unsafe ``--basetemp``, then register ``real_psi_reader`` (task 2418).
+    """Refuse an unsafe ``--basetemp``, arm the drain-leak guard, register ``real_psi_reader``.
 
     The ``reject_unsafe_basetemp`` call comes FIRST and is unrelated to the
     marker below: it aborts collection when ``--basetemp`` points inside a live
@@ -567,6 +567,7 @@ def pytest_configure(config: pytest.Config) -> None:
     load-bearing yet.
     """
     reject_unsafe_basetemp(config)
+    arm_leaked_drain_process_guard(config)
     config.addinivalue_line(
         'markers',
         'real_psi_reader: opt a test OUT of the autouse `_hermetic_psi_reader` '
@@ -898,18 +899,17 @@ def _neutralize_verify_admission(monkeypatch, request):
 
 @pytest.fixture(autouse=True)
 def _drain_async_mock_coroutines():
-    """Close this test's un-awaited AsyncMock call coroutines before the next test starts.
+    """Fail this test if it called an AsyncMock without awaiting it, closing the orphan first.
 
-    Task 1714 / esc-1702-13; rationale in ``_orch_helpers.py::drain_async_mock_coroutines``.
-    ``track_async_mock_coroutines()`` runs when this conftest is imported, so
-    mocks called during collection are covered too.
+    Tasks 1714 / 5669; rationale in ``_async_mock_orphans.py``.
+    ``track_async_mock_coroutines()`` runs at conftest import, so collection-time mocks are covered.
 
     KNOWN LIMITATION: an orphan created in the teardown of a fixture set up
-    BEFORE this one (module- or session-scoped) is created after this drain has
-    run, so it is closed at the next test's boundary rather than this one's.
+    BEFORE this one (module- or session-scoped) is created after this check has
+    run, so the NEXT test fails instead; the message names where it was created.
     """
     yield
-    drain_async_mock_coroutines()
+    _async_mock_orphans.fail_on_orphaned_async_mock_calls()
 
 
 @pytest.fixture
@@ -1156,6 +1156,7 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
       - ``escalation`` = pre-created sub-section mock (no default value)
       - ``overrides_db_path`` = ``tmp_path / 'overrides.db'``
       - ``park_eviction_requests_db_path`` = ``tmp_path / 'park_eviction_requests.db'``
+      - ``eligibility_clock_db_path`` = ``tmp_path / 'scheduler_eligibility.db'``
 
     The top-level mock and each sub-section (usage_cap, review, sandbox,
     fused_memory, escalation) are spec_set'd against their pydantic model's
@@ -1264,6 +1265,9 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # Same failure mode as overrides_db_path above (tasks 1313/1339); this
     # instance of it is task 2045.
     config.park_eviction_requests_db_path = tmp_path / 'park_eviction_requests.db'
+    # Real Path for EligibilityClockStore.from_config(config), which Harness
+    # wires at construction (task 3821); same stray-file failure mode as above.
+    config.eligibility_clock_db_path = tmp_path / 'scheduler_eligibility.db'
     # Production default (task 4757). Unassigned, TaskWorkflow._invoke would
     # read a truthy Mock and run every mock-config workflow test strictly scoped.
     config.strict_mcp_config = False

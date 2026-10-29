@@ -1,0 +1,18 @@
+{
+  "task_id": "3932",
+  "reason": "Net-additive guard wiring, not a refactor that grew: orchestrator/tests/conftest.py imports one more fixture, _df_no_leaked_drain_processes, from the repo-root df_pytest_isolation.py into its existing isolation import block, alongside the sibling _df_* fixtures. Without the binding the drain-process leak guard (task 3798) is silently absent from the orchestrator pytest session, which runs from its own rootdir and stamps no DF_PYTEST_LEAK_TOKEN, so it reports all-clear unconditionally; orchestrator/src/orchestrator/service_restart.py is the production caller of scripts/restart-all-orchestrators.sh. The raise is that one import line: lines +1, prose_lines +1, reexport_names +1 (esc-3932-1).",
+  "measures": [
+    {
+      "measure": "reexport_names",
+      "key": "orchestrator/tests/conftest.py",
+      "baseline": 5,
+      "current": 6
+    },
+    {
+      "measure": "total:reexport_names",
+      "key": "<cluster>",
+      "baseline": 6,
+      "current": 7
+    }
+  ]
+}

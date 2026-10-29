@@ -18,6 +18,9 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from shared.task_statuses import OwnerLiveness, owner_liveness
+
+from orchestrator.flake_ledger import DebtTrigger
 from orchestrator.guard_state import PersistentMap, guard_path
 from orchestrator.offline_lane_confirm import Confirmed, Outage, Unconfirmable, reproduce_line
 from orchestrator.offline_lane_filing import EvidenceNote
@@ -413,6 +416,28 @@ class PassReads:
     previous_detect: RunRecord | None
 
 
+_LIVE_LIVENESS = frozenset({OwnerLiveness.OPEN, OwnerLiveness.DEFERRED})
+
+
+def is_live_owner(status: str | None) -> bool:
+    """Whether a task with *status* still owns its work: open or deferred, not done, cancelled or unknown."""
+    return owner_liveness(status) in _LIVE_LIVENESS
+
+
+@dataclass(frozen=True)
+class CoveringStatuses:
+    """The pass's one batched status read of every bound covering task; *error* when it could not be read."""
+
+    statuses: Mapping[str, str]
+    error: str | None = None
+
+    @property
+    def terminal_task_ids(self) -> frozenset[str]:
+        if self.error is not None:
+            return frozenset()
+        return frozenset(task_id for task_id, status in self.statuses.items() if not is_live_owner(status))
+
+
 class EndReason(StrEnum):
     CLEARED = 'cleared'
     PASSED = 'passed'
@@ -429,6 +454,15 @@ class EndedEpisode:
 
 
 @dataclass(frozen=True)
+class OfferedDebt:
+    """A test this pass put on the flake ledger's due list, and the head of its evidence."""
+
+    node: str
+    trigger: DebtTrigger
+    head: str
+
+
+@dataclass(frozen=True)
 class PassEffect:
     tests_counted: tuple[str, ...]
     episodes_started: tuple[str, ...]
@@ -439,6 +473,8 @@ class PassEffect:
     no_decision: tuple[str, ...]
     tasks_filed: tuple[str, ...]
     escalations_raised: tuple[str, ...]
+    debts_offered: tuple[OfferedDebt, ...] = ()
+    debts_undecided: tuple[str, ...] = ()
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -459,6 +495,10 @@ class PassEffect:
             'no_decision': list(self.no_decision),
             'tasks_filed': list(self.tasks_filed),
             'escalations_raised': list(self.escalations_raised),
+            'debts_offered': [
+                {'node': debt.node, 'trigger': debt.trigger.value, 'head': debt.head} for debt in self.debts_offered
+            ],
+            'debts_undecided': list(self.debts_undecided),
         }
 
 

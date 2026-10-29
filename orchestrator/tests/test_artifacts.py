@@ -22,7 +22,9 @@ from orchestrator.artifacts import (
     ReviewAggregation,
     TaskArtifacts,
     _normalize_plan,
+    iteration_entry_written_by_orchestrator,
 )
+from orchestrator.review_payload import ReviewPayloadError
 
 
 @pytest.fixture
@@ -359,6 +361,100 @@ class TestIterationLog:
         artifacts.clear_iteration_log()  # must not raise
 
         assert artifacts.read_iteration_log() == ([], [])
+
+
+_AGENT_AUTHORED_SHAPES = [
+    pytest.param(
+        {
+            'iteration': 2,
+            'agent': 'implementer',
+            'steps_completed': ['step-2'],
+            'blocker': 'escalated',
+            'deviations': [],
+            'next': 'resume after escalation',
+        },
+        id='no-source-no-timestamp-no-committed-5588',
+    ),
+    pytest.param(
+        {
+            'agent': 'implementer',
+            'steps_completed': ['step-2'],
+            'committed': True,
+            'source': 'agent',
+            'timestamp': '2026-08-06T04:25:00',
+        },
+        id='source-agent-committed-true-3713',
+    ),
+    pytest.param(
+        {
+            'agent': 'implementer',
+            'steps_completed': ['step-2'],
+            'committed': True,
+            'source': 'post-escalation-resume',
+        },
+        id='post-escalation-resume-3668',
+    ),
+    pytest.param(
+        {'agent': 'implementer', 'steps_completed': ['step-2'], 'source': 'implementer'},
+        id='source-implementer-3023',
+    ),
+    pytest.param(
+        {'agent': 'claude-task-3088-implementer', 'steps_completed': ['step-2']},
+        id='role-named-agent-no-source-3088',
+    ),
+    pytest.param(
+        {'agent': 'implementer', 'steps_completed': ['step-2'], 'source': ['orchestrator']},
+        id='list-valued-source',
+    ),
+]
+
+
+class TestIterationLogProvenance:
+    """Only entries written through append_iteration_log count as orchestrator-written.
+
+    Agents also append to iterations.jsonl by hand from their own shell
+    (task 5726); those lines must never pass the provenance predicate.
+    """
+
+    def test_entry_without_source_is_stamped_orchestrator(self, artifacts: TaskArtifacts):
+        artifacts.append_iteration_log({'agent': 'implementer', 'steps_completed': ['step-1']})
+
+        (entry,), _ = artifacts.read_iteration_log()
+        assert entry['source'] == 'orchestrator'
+        assert iteration_entry_written_by_orchestrator(entry) is True
+
+    def test_amendment_source_is_preserved(self, artifacts: TaskArtifacts):
+        artifacts.append_iteration_log({
+            'agent': 'implementer', 'steps_completed': ['step-1'], 'source': 'amendment',
+        })
+
+        (entry,), _ = artifacts.read_iteration_log()
+        assert entry['source'] == 'amendment'
+        assert iteration_entry_written_by_orchestrator(entry) is True
+
+    def test_unknown_source_is_refused_before_writing(self, artifacts: TaskArtifacts):
+        with pytest.raises(ValueError, match='iteration-log source') as exc_info:
+            artifacts.append_iteration_log({'agent': 'implementer', 'source': 'agent'})
+
+        message = str(exc_info.value)
+        assert "'agent'" in message
+        assert 'orchestrator' in message
+        assert 'amendment' in message
+        assert artifacts.read_iteration_log() == ([], [])
+
+    @pytest.mark.parametrize('agent_entry', _AGENT_AUTHORED_SHAPES)
+    def test_hand_appended_agent_entries_are_not_orchestrator_written(
+        self, artifacts: TaskArtifacts, agent_entry: dict,
+    ):
+        with open(artifacts.root / 'iterations.jsonl', 'a') as log:
+            log.write(json.dumps(agent_entry) + '\n')
+
+        (entry,), _ = artifacts.read_iteration_log()
+        assert iteration_entry_written_by_orchestrator(entry) is False
+
+    @pytest.mark.parametrize('value', ['orchestrator', ['orchestrator'], None])
+    def test_predicate_is_total_over_non_dict_values(self, value: object):
+        assert iteration_entry_written_by_orchestrator(value) is False
 
 
 VALID_PLAN_WITH_STEPS = {
@@ -1206,6 +1302,17 @@ class TestReviews:
         assert 'reviewer1' in agg.reviews
         assert 'reviewer2' not in agg.reviews
         assert not agg.all_reviewers_errored
+
+    def test_aggregate_reviews_rejects_an_off_contract_verdict(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer1', {
+            'reviewer': 'reviewer1',
+            'verdict': 'NEEDS_CHANGES',
+            'issues': [],
+            'summary': 'not a contract verdict',
+        })
+
+        with pytest.raises(ReviewPayloadError, match='NEEDS_CHANGES'):
+            artifacts.aggregate_reviews()
 
 
 class TestBlockingDependency:

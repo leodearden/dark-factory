@@ -19,9 +19,7 @@ What the ticker reports is the WORST GAP between its turns, not how many turns
 it got: a wedge puts a hard floor under that gap, while a tick count also
 tracks machine speed and would red on a busy CI box.
 
-Harness scaffolding is re-created locally rather than imported from
-tests/test_harness.py — the convention set by tests/reconciliation/test_active_runs.py,
-since ``fused-memory/tests`` is not an importable package.
+The harness and its stores come from ``reconciliation.harness_fixtures``.
 """
 from __future__ import annotations
 
@@ -47,16 +45,23 @@ from fused_memory.models.reconciliation import (
     RunType,
     StageReport,
 )
-from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation import escalation_archive
-from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import (
     _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
     TierConfig,
     _derive_affected_ids,
 )
-from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.reconciliation.stages.task_knowledge_sync import IntegrityCheck
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
+from reconciliation.consolidator_fixtures import make_scope
+from reconciliation.harness_fixtures import (
+    make_harness,
+    make_harness_config,
+    make_memory_service,
+    open_event_buffer,
+    open_journal,
+    stub_stage_runs,
+)
 
 pytest.importorskip('escalation.queue')
 from escalation.dedupe import compute_content_fingerprint  # noqa: E402
@@ -85,99 +90,35 @@ def _max_gap_ceiling(blocked_seconds: float) -> float:
     return blocked_seconds * 0.75
 
 
-# ── Local harness scaffolding (mirrors tests/test_harness.py) ────────────────
-
-
-def _scope(project_id: str, project_root: str) -> ProjectScope:
-    return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
-
-
-def _rescope(stages: list, scope: ProjectScope) -> list:
-    """Re-scope pinned stage instances in place so the ``_make_stages`` shim
-    honors the scope production passes while keeping the mocked ``.run``."""
-    for s in stages:
-        s.scope = scope
-    return stages
+# ── Harness wiring ───────────────────────────────────────────────────────────
 
 
 @pytest_asyncio.fixture
 async def journal(tmp_path):
-    j = ReconciliationJournal(tmp_path / 'tail_offload_journal')
-    await j.initialize()
-    yield j
-    await j.close()
+    async with open_journal(tmp_path / 'tail_offload_journal') as j:
+        yield j
 
 
 @pytest_asyncio.fixture
 async def event_buffer(tmp_path):
-    buf = EventBuffer(
-        db_path=tmp_path / 'tail_offload_eb.db',
-        buffer_size_threshold=2,
-        max_staleness_seconds=3600,
-    )
-    await buf.initialize()
-    yield buf
-    await buf.close()
+    async with open_event_buffer(tmp_path / 'tail_offload_eb.db') as b:
+        yield b
 
 
 @pytest.fixture
 def memory_service():
-    svc = AsyncMock()
-    svc.search = AsyncMock(return_value=[])
-    svc.get_episodes = AsyncMock(return_value=[])
-    svc.get_status = AsyncMock(
-        return_value={
-            'graphiti': {'connected': True},
-            'mem0': {'connected': True},
-            'projects': {},
-        }
-    )
-    svc.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
-    svc.get_memories_by_metadata = AsyncMock(return_value=[])
-    svc.mem0 = AsyncMock()
-    svc.mem0.get_all = AsyncMock(return_value={'results': []})
-    return svc
+    return make_memory_service()
 
 
 def _make_harness(journal, event_buffer, memory_service):
-    from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
-    from fused_memory.reconciliation.harness import ReconciliationHarness
-
-    config = FusedMemoryConfig(
-        reconciliation=ReconciliationConfig(
-            enabled=True,
-            explore_codebase_root='/tmp/test',
-            agent_llm_provider='anthropic',
-            agent_llm_model='claude-sonnet-4-20250514',
-        )
-    )
-    harness = ReconciliationHarness(
-        memory_service=memory_service,
-        taskmaster=AsyncMock(),
+    return make_harness(
         journal=journal,
         event_buffer=event_buffer,
-        config=config,
+        memory_service=memory_service,
+        taskmaster=AsyncMock(),
+        config=make_harness_config(judge_enabled=False),
+        known_projects={PROJECT_ID: PROJECT_ROOT},
     )
-    harness.judge = None
-    harness._known_projects = {PROJECT_ID: PROJECT_ROOT}
-    harness.stages = harness._make_stages(_scope(PROJECT_ID, PROJECT_ROOT))
-    harness._make_stages = lambda scope, **k: _rescope(harness.stages, scope)
-    return harness
-
-
-def _mock_stage_run(stage, items_flagged=None):
-    async def mock_run(events, watermark, prior_reports, run_id, model=None, _s=stage):
-        return StageReport(
-            stage=_s.stage_id,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=items_flagged or [],
-            stats={},
-            llm_calls=0,
-            tokens_used=0,
-        )
-
-    stage.run = mock_run
 
 
 def _finding_citing(
@@ -320,9 +261,16 @@ async def _prepare_pass(
 
     await _seed_persistence(journal, findings)
 
-    _mock_stage_run(harness.stages[0])
-    _mock_stage_run(harness.stages[1])
-    _mock_stage_run(harness.stages[2], items_flagged=findings)
+    async def fake_run(
+        self, events, watermark, prior_reports, run_id, model=None, resume_session_id=None,
+    ):
+        now = datetime.now(UTC)
+        items_flagged = findings if isinstance(self, IntegrityCheck) else []
+        return StageReport(
+            stage=self.stage_id, started_at=now, completed_at=now, items_flagged=items_flagged,
+        )
+
+    stub_stage_runs(monkeypatch, fake_run)
 
     tree = FilteredTaskTree(
         active_tasks=list(cited_tasks or []), total_count=len(cited_tasks or []),
@@ -332,7 +280,7 @@ async def _prepare_pass(
     def run_pass():
         return harness._run_remediation_pass(
             PROJECT_ID, 'parent-run-id', findings, tier,
-            scope=_scope(PROJECT_ID, PROJECT_ROOT),
+            scope=make_scope(PROJECT_ID, PROJECT_ROOT),
             filtered_task_tree=tree,
             filtered_task_tree_fetched_at=datetime.now(UTC),
         )

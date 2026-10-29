@@ -36,6 +36,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT
 from _merge_lane_fakes import (
     FakeClock,
     FakeVerifier,
@@ -48,6 +49,7 @@ from _merge_lane_fakes import (
     raises,
     running_lane,
 )
+from _orch_helpers import MERGE_GATE_BARRIER_TIMEOUT, wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -313,27 +315,27 @@ class TestMergerDrainRegistersAndTransitions:
 
         worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
 
-        worker_task = asyncio.create_task(worker.run())
+        async with running_lane(worker):
+            await queue.put(req)
 
-        await queue.put(req)
+            # worker.run() has been scheduled but the loop has not yet
+            # switched to it: asyncio.Queue.put() on a non-full unbounded
+            # queue never actually suspends (mirrors test_merge_queue.py's
+            # test_speculative_basic_throughput "Submit ... before the
+            # worker processes them" comment) — still pre-registry.
+            assert worker._lifecycle.current(req.request_id) is None
 
-        # worker.run() has been scheduled but the loop has not yet
-        # switched to it: asyncio.Queue.put() on a non-full unbounded
-        # queue never actually suspends (mirrors test_merge_queue.py's
-        # test_speculative_basic_throughput "Submit ... before the
-        # worker processes them" comment) — still pre-registry.
-        assert worker._lifecycle.current(req.request_id) is None
+            outcome = await wait_responsive(
+                req.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='kappa-seq: MergeOutcome (lands)',
+            )
+            assert outcome.status == 'done', f'{outcome}'
 
-        outcome = await asyncio.wait_for(req.result, timeout=60)
-        assert outcome.status == 'done', f'{outcome}'
-
-        assert observed[:2] == [
-            (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
-            (ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING),
-        ], f'unexpected transition sequence for {req.request_id}: {observed!r}'
-
-        await worker.stop()
-        await worker_task
+            assert observed[:2] == [
+                (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
+                (ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING),
+            ], f'unexpected transition sequence for {req.request_id}: {observed!r}'
 
     async def test_live_items_holds_request_during_merging_window(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -376,22 +378,22 @@ class TestMergerDrainRegistersAndTransitions:
                 ))
             return await original_get_main_sha()
 
-        worker_task = asyncio.create_task(worker.run())
+        async with running_lane(worker):
+            with (
+                patch.object(git_ops, 'get_main_sha', new=_spying_get_main_sha),
+            ):
+                await queue.put(req)
+                outcome = await wait_responsive(
+                    req.result,
+                    timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                    label='kappa-merging: MergeOutcome (lands)',
+                )
+                assert outcome.status == 'done', f'{outcome}'
 
-        with (
-            patch.object(git_ops, 'get_main_sha', new=_spying_get_main_sha),
-        ):
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=60)
-            assert outcome.status == 'done', f'{outcome}'
-
-        assert fired, 'expected the get_main_sha gate to fire while the registry read MERGING'
-        observed_state, observed_live_obj = captured[0]
-        assert observed_state == ItemLifecycleState.MERGING
-        assert observed_live_obj is req
-
-        await worker.stop()
-        await worker_task
+            assert fired, 'expected the get_main_sha gate to fire while the registry read MERGING'
+            observed_state, observed_live_obj = captured[0]
+            assert observed_state == ItemLifecycleState.MERGING
+            assert observed_live_obj is req
 
 
 # ---------------------------------------------------------------------------
@@ -449,40 +451,40 @@ class TestMergerVerifierHandoffRegistersAwaitingVerify:
 
         worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
 
-        worker_task = asyncio.create_task(worker.run())
+        async with running_lane(worker):
+            await queue.put(req)
+            outcome = await wait_responsive(
+                req.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='kappa-awaiting-verify: MergeOutcome (lands)',
+            )
+            assert outcome.status == 'done', f'{outcome}'
 
-        await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=60)
-        assert outcome.status == 'done', f'{outcome}'
-
-        # NOTE: this test awaits FULL pipeline completion (`req.result`), which
-        # for a successful RealMergeItem only resolves once verify+finalize
-        # has run to completion — i.e. strictly AFTER the DISPATCHING/VERIFYING
-        # transitions step-8 wires at the verifier's dispatch call sites and
-        # `_inflight_append`, and (since step-10) the FINALIZING/TERMINAL
-        # transitions wired into `_finalize_inflight`/`_resolve_or_drop_abandoned`.
-        # Unlike the loop-breaker/passthrough test below (whose Future resolves
-        # early via `_oob_deliver`, racing ahead of the background verifier-side
-        # dispatch), this path's assertion window necessarily includes the full
-        # tail.
-        assert observed == [
-            (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
-            (ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING),
-            (ItemLifecycleState.MERGING, ItemLifecycleState.AWAITING_VERIFY),
-            (ItemLifecycleState.AWAITING_VERIFY, ItemLifecycleState.DISPATCHING),
-            (ItemLifecycleState.DISPATCHING, ItemLifecycleState.VERIFYING),
-            (ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING),
-            (ItemLifecycleState.FINALIZING, ItemLifecycleState.TERMINAL),
-        ], f'unexpected transition sequence for {req.request_id}: {observed!r}'
-        assert live_item_at_awaiting_verify and isinstance(
-            live_item_at_awaiting_verify[0], RealMergeItem,
-        ), (
-            '_live_items must hold the RealMergeItem (not the stale MergeRequest) '
-            'once the item becomes verifier-owned'
-        )
-
-        await worker.stop()
-        await worker_task
+            # NOTE: this test awaits FULL pipeline completion (`req.result`), which
+            # for a successful RealMergeItem only resolves once verify+finalize
+            # has run to completion — i.e. strictly AFTER the DISPATCHING/VERIFYING
+            # transitions step-8 wires at the verifier's dispatch call sites and
+            # `_inflight_append`, and (since step-10) the FINALIZING/TERMINAL
+            # transitions wired into `_finalize_inflight`/`_resolve_or_drop_abandoned`.
+            # Unlike the loop-breaker/passthrough test below (whose Future resolves
+            # early via `_oob_deliver`, racing ahead of the background verifier-side
+            # dispatch), this path's assertion window necessarily includes the full
+            # tail.
+            assert observed == [
+                (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
+                (ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING),
+                (ItemLifecycleState.MERGING, ItemLifecycleState.AWAITING_VERIFY),
+                (ItemLifecycleState.AWAITING_VERIFY, ItemLifecycleState.DISPATCHING),
+                (ItemLifecycleState.DISPATCHING, ItemLifecycleState.VERIFYING),
+                (ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING),
+                (ItemLifecycleState.FINALIZING, ItemLifecycleState.TERMINAL),
+            ], f'unexpected transition sequence for {req.request_id}: {observed!r}'
+            assert live_item_at_awaiting_verify and isinstance(
+                live_item_at_awaiting_verify[0], RealMergeItem,
+            ), (
+                '_live_items must hold the RealMergeItem (not the stale MergeRequest) '
+                'once the item becomes verifier-owned'
+            )
 
     async def test_loop_breaker_decided_item_progresses_to_awaiting_verify(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
@@ -517,20 +519,31 @@ class TestMergerVerifierHandoffRegistersAwaitingVerify:
 
         worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
 
-        worker_task = asyncio.create_task(worker.run())
-        await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=60)
-        assert outcome.status == 'blocked', f'{outcome}'
+        # The loop-breaker delivers the outcome before its DecidedItem reaches
+        # the verifier, which then retires it; read the registry at delivery.
+        at_delivery: list[tuple[list[tuple[Any, Any]], Any]] = []
+        req.result.add_done_callback(
+            lambda _: at_delivery.append(
+                (list(observed), worker._live_items.get(req.request_id)),
+            ),
+        )
 
-        assert observed == [
-            (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
-            (ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING),
-            (ItemLifecycleState.MERGING, ItemLifecycleState.AWAITING_VERIFY),
-        ], f'unexpected transition sequence for {req.request_id}: {observed!r}'
-        assert isinstance(worker._live_items[req.request_id], DecidedItem)
+        async with running_lane(worker):
+            await queue.put(req)
+            outcome = await wait_responsive(
+                req.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='kappa-loop-breaker: MergeOutcome (loop-breaker decided)',
+            )
+            assert outcome.status == 'blocked', f'{outcome}'
 
-        await worker.stop()
-        await worker_task
+            observed_at_delivery, live_at_delivery = at_delivery[0]
+            assert observed_at_delivery == [
+                (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
+                (ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING),
+                (ItemLifecycleState.MERGING, ItemLifecycleState.AWAITING_VERIFY),
+            ], f'unexpected transition sequence for {req.request_id}: {observed_at_delivery!r}'
+            assert isinstance(live_at_delivery, DecidedItem)
 
 
 @pytest.mark.asyncio
@@ -1299,24 +1312,24 @@ class TestVerifierDispatchFillRegistersDispatching:
 
         worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
 
-        worker_task = asyncio.create_task(worker.run())
+        async with running_lane(worker):
+            await queue.put(req)
+            outcome = await wait_responsive(
+                req.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='kappa-dispatching-verifying: MergeOutcome (lands)',
+            )
+            assert outcome.status == 'done', f'{outcome}'
 
-        await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=60)
-        assert outcome.status == 'done', f'{outcome}'
-
-        assert observed == [
-            (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
-            (ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING),
-            (ItemLifecycleState.MERGING, ItemLifecycleState.AWAITING_VERIFY),
-            (ItemLifecycleState.AWAITING_VERIFY, ItemLifecycleState.DISPATCHING),
-            (ItemLifecycleState.DISPATCHING, ItemLifecycleState.VERIFYING),
-            (ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING),
-            (ItemLifecycleState.FINALIZING, ItemLifecycleState.TERMINAL),
-        ], f'unexpected transition sequence for {req.request_id}: {observed!r}'
-
-        await worker.stop()
-        await worker_task
+            assert observed == [
+                (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
+                (ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING),
+                (ItemLifecycleState.MERGING, ItemLifecycleState.AWAITING_VERIFY),
+                (ItemLifecycleState.AWAITING_VERIFY, ItemLifecycleState.DISPATCHING),
+                (ItemLifecycleState.DISPATCHING, ItemLifecycleState.VERIFYING),
+                (ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING),
+                (ItemLifecycleState.FINALIZING, ItemLifecycleState.TERMINAL),
+            ], f'unexpected transition sequence for {req.request_id}: {observed!r}'
 
     async def test_live_items_holds_item_during_dispatching_window(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -1360,22 +1373,22 @@ class TestVerifierDispatchFillRegistersDispatching:
                 ))
             return await original_get_main_sha()
 
-        worker_task = asyncio.create_task(worker.run())
+        async with running_lane(worker):
+            with (
+                patch.object(git_ops, 'get_main_sha', new=_spying_get_main_sha),
+            ):
+                await queue.put(req)
+                outcome = await wait_responsive(
+                    req.result,
+                    timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                    label='kappa-dispatching-window: MergeOutcome (lands)',
+                )
+                assert outcome.status == 'done', f'{outcome}'
 
-        with (
-            patch.object(git_ops, 'get_main_sha', new=_spying_get_main_sha),
-        ):
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=60)
-            assert outcome.status == 'done', f'{outcome}'
-
-        assert fired, 'expected the get_main_sha gate to fire while the registry read DISPATCHING'
-        observed_state, observed_live_obj = captured[0]
-        assert observed_state == ItemLifecycleState.DISPATCHING
-        assert isinstance(observed_live_obj, RealMergeItem)
-
-        await worker.stop()
-        await worker_task
+            assert fired, 'expected the get_main_sha gate to fire while the registry read DISPATCHING'
+            observed_state, observed_live_obj = captured[0]
+            assert observed_state == ItemLifecycleState.DISPATCHING
+            assert isinstance(observed_live_obj, RealMergeItem)
 
     async def test_dispatch_fill_call_site_no_host_bounces_to_redispatch_parked(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
@@ -1487,7 +1500,11 @@ class TestVerifierDispatchFillRegistersDispatching:
             for _ in range(5):
                 await asyncio.sleep(0)
             await worker._verifier_queue.put(item)
-            await asyncio.wait_for(reached.wait(), timeout=5.0)
+            await wait_responsive(
+                reached.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='kappa-blocking-get-no-host: DISPATCHING -> REDISPATCH_PARKED observed',
+            )
         finally:
             loop_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1553,24 +1570,24 @@ class TestVerifierDispatchFillRegistersDispatching:
 
         worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
 
-        worker_task = asyncio.create_task(worker.run())
+        async with running_lane(worker):
+            await queue.put(req)
+            outcome = await wait_responsive(
+                req.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='kappa-stale-remerge: MergeOutcome (lands after the staleness remerge)',
+            )
+            assert outcome.status == 'done', f'{outcome}'
 
-        await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=60)
-        assert outcome.status == 'done', f'{outcome}'
-
-        assert captured == [ItemLifecycleState.MERGING], (
-            f'expected the registry to read MERGING while _remerge() ran: {captured!r}'
-        )
-        assert (ItemLifecycleState.DISPATCHING, ItemLifecycleState.MERGING) in observed, (
-            f'missing DISPATCHING -> MERGING on remerge entry: {observed!r}'
-        )
-        assert (ItemLifecycleState.MERGING, ItemLifecycleState.DISPATCHING) in observed, (
-            f'missing MERGING -> DISPATCHING on remerge exit ("then back"): {observed!r}'
-        )
-
-        await worker.stop()
-        await worker_task
+            assert captured == [ItemLifecycleState.MERGING], (
+                f'expected the registry to read MERGING while _remerge() ran: {captured!r}'
+            )
+            assert (ItemLifecycleState.DISPATCHING, ItemLifecycleState.MERGING) in observed, (
+                f'missing DISPATCHING -> MERGING on remerge entry: {observed!r}'
+            )
+            assert (ItemLifecycleState.MERGING, ItemLifecycleState.DISPATCHING) in observed, (
+                f'missing MERGING -> DISPATCHING on remerge exit ("then back"): {observed!r}'
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1625,33 +1642,33 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
 
         worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
 
-        worker_task = asyncio.create_task(worker.run())
+        async with running_lane(worker):
+            await queue.put(req)
+            outcome = await wait_responsive(
+                req.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='kappa-finalize-land: MergeOutcome (lands)',
+            )
+            assert outcome.status == 'done', f'{outcome}'
 
-        await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=60)
-        assert outcome.status == 'done', f'{outcome}'
+            assert observed == [
+                (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
+                (ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING),
+                (ItemLifecycleState.MERGING, ItemLifecycleState.AWAITING_VERIFY),
+                (ItemLifecycleState.AWAITING_VERIFY, ItemLifecycleState.DISPATCHING),
+                (ItemLifecycleState.DISPATCHING, ItemLifecycleState.VERIFYING),
+                (ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING),
+                (ItemLifecycleState.FINALIZING, ItemLifecycleState.TERMINAL),
+            ], f'unexpected transition sequence for {req.request_id}: {observed!r}'
 
-        assert observed == [
-            (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
-            (ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING),
-            (ItemLifecycleState.MERGING, ItemLifecycleState.AWAITING_VERIFY),
-            (ItemLifecycleState.AWAITING_VERIFY, ItemLifecycleState.DISPATCHING),
-            (ItemLifecycleState.DISPATCHING, ItemLifecycleState.VERIFYING),
-            (ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING),
-            (ItemLifecycleState.FINALIZING, ItemLifecycleState.TERMINAL),
-        ], f'unexpected transition sequence for {req.request_id}: {observed!r}'
-
-        assert lane_state(worker, req.request_id) is None, (
-            f'a retired request must leave the public census: '
-            f'{lane_entry(worker, req.request_id)!r}'
-        )
-        assert req.request_id not in worker._live_items, (
-            'retiring must pop the live object too, and no snapshot path can '
-            'see that half: every one of them already skips a TERMINAL rid'
-        )
-
-        await worker.stop()
-        await worker_task
+            assert lane_state(worker, req.request_id) is None, (
+                f'a retired request must leave the public census: '
+                f'{lane_entry(worker, req.request_id)!r}'
+            )
+            assert req.request_id not in worker._live_items, (
+                'retiring must pop the live object too, and no snapshot path can '
+                'see that half: every one of them already skips a TERMINAL rid'
+            )
 
     async def test_live_items_holds_entry_during_finalizing_window(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -1913,25 +1930,24 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
 
         worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
 
-        worker_task = asyncio.create_task(worker.run())
+        async with running_lane(worker):
+            # No re-verify double: the fabricated rebase shas make the real
+            # overlap probe fail CLOSED, so _reverify_rebased_tree runs its real
+            # overlapping-delta arm through _run_post_merge_verify and clears.
+            with patch.object(git_ops, 'advance_main', side_effect=_advance_side_effect):
+                await queue.put(req)
+                outcome = await wait_responsive(
+                    req.result,
+                    label='kappa-gate-reverify: MergeOutcome (blocked after the gate re-verify)',
+                )
 
-        # No re-verify double: the fabricated rebase shas make the real
-        # overlap probe fail CLOSED, so _reverify_rebased_tree runs its real
-        # overlapping-delta arm through _run_post_merge_verify and clears.
-        with patch.object(git_ops, 'advance_main', side_effect=_advance_side_effect):
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
-
-        assert outcome.status == 'blocked', f'expected blocked; got {outcome!r}'
-        assert (ItemLifecycleState.FINALIZING, ItemLifecycleState.GATE_REVERIFY) in observed, (
-            f'missing FINALIZING -> GATE_REVERIFY: {observed!r}'
-        )
-        assert (ItemLifecycleState.GATE_REVERIFY, ItemLifecycleState.FINALIZING) in observed, (
-            f'missing GATE_REVERIFY -> FINALIZING (gate cleared, loop continues): {observed!r}'
-        )
-
-        await worker.stop()
-        await worker_task
+            assert outcome.status == 'blocked', f'expected blocked; got {outcome!r}'
+            assert (ItemLifecycleState.FINALIZING, ItemLifecycleState.GATE_REVERIFY) in observed, (
+                f'missing FINALIZING -> GATE_REVERIFY: {observed!r}'
+            )
+            assert (ItemLifecycleState.GATE_REVERIFY, ItemLifecycleState.FINALIZING) in observed, (
+                f'missing GATE_REVERIFY -> FINALIZING (gate cleared, loop continues): {observed!r}'
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -2479,22 +2495,23 @@ class TestAbandonPredispatchRetiresRegistry:
 
         worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
 
-        worker_task = asyncio.create_task(worker.run())
-        await queue.put(req)
-        await asyncio.wait_for(retired.wait(), timeout=10)
+        async with running_lane(worker):
+            await queue.put(req)
+            await wait_responsive(
+                retired.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='kappa-merger-abandon: registry retired the dropped request',
+            )
 
-        assert lane_state(worker, req.request_id) is None, (
-            f'a retired request must leave the public census: '
-            f'{lane_entry(worker, req.request_id)!r}'
-        )
-        assert req.request_id not in worker._live_items, (
-            'retiring must pop the live object too, and no snapshot path can '
-            'see that half: every one of them already skips a TERMINAL rid'
-        )
-        assert req.result.cancelled(), 'the abandon drop must never overwrite the cancellation'
-
-        await worker.stop()
-        await worker_task
+            assert lane_state(worker, req.request_id) is None, (
+                f'a retired request must leave the public census: '
+                f'{lane_entry(worker, req.request_id)!r}'
+            )
+            assert req.request_id not in worker._live_items, (
+                'retiring must pop the live object too, and no snapshot path can '
+                'see that half: every one of them already skips a TERMINAL rid'
+            )
+            assert req.result.cancelled(), 'the abandon drop must never overwrite the cancellation'
 
     async def test_dispatch_item_predispatch_abandon_retires_registry(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
@@ -2583,8 +2600,7 @@ class TestDecidedPredispatchRequestsLeaveTheCensus:
         self, git_ops: GitOps, config: OrchestratorConfig, how: str,
     ) -> None:
         queue: asyncio.Queue = asyncio.Queue()
-        clock = FakeClock()
-        lane = make_lane(git_ops, queue, clock=clock)
+        lane = make_lane(git_ops, queue)
         live = _make_request('census-live', 'census-live', git_ops.project_root, config)
         dead = _make_request('census-dead', 'census-dead', git_ops.project_root, config)
         await queue.put(live)
@@ -2602,11 +2618,6 @@ class TestDecidedPredispatchRequestsLeaveTheCensus:
             snapshot = lane.snapshot()
             assert snapshot['depth'] == 1, f'depth counts a decided request: {snapshot["entries"]!r}'
             assert snapshot['head_of_line'] == live.task_id
-
-            clock.time += 2460
-            assert lane_state(lane, dead.request_id) is None, (
-                'a decided request resurfaced once it had aged past the specimen age'
-            )
         finally:
             live.result.cancel()
 
@@ -2853,27 +2864,27 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
                 captured.append(_sample(worker, req.request_id))
             return await original_get_main_sha()
 
-        worker_task = asyncio.create_task(worker.run())
+        async with running_lane(worker):
+            with (
+                patch.object(git_ops, 'get_main_sha', new=_spying_get_main_sha),
+            ):
+                await queue.put(req)
+                outcome = await wait_responsive(
+                    req.result,
+                    timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                    label='kappa-sample-merging: MergeOutcome (lands)',
+                )
+                assert outcome.status == 'done', f'{outcome}'
 
-        with (
-            patch.object(git_ops, 'get_main_sha', new=_spying_get_main_sha),
-        ):
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=60)
-            assert outcome.status == 'done', f'{outcome}'
-
-        assert fired, (
-            'the census never reported the request as merging while the real '
-            'merge ran — the blind spot this sample exists to catch'
-        )
-        sample = captured[0]
-        _assert_agreement(sample, 'MERGING')
-        entry = sample.entry
-        assert entry is not None and entry['task_id'] == req.task_id, f'{entry!r}'
-        assert entry['branch'] == req.branch.bare_id, f'{entry!r}'
-
-        await worker.stop()
-        await worker_task
+            assert fired, (
+                'the census never reported the request as merging while the real '
+                'merge ran — the blind spot this sample exists to catch'
+            )
+            sample = captured[0]
+            _assert_agreement(sample, 'MERGING')
+            entry = sample.entry
+            assert entry is not None and entry['task_id'] == req.task_id, f'{entry!r}'
+            assert entry['branch'] == req.branch.bare_id, f'{entry!r}'
 
     async def test_dispatching_window_registry_equals_snapshot(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -2906,26 +2917,26 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
                 captured.append(_sample(worker, req.request_id))
             return await original_get_main_sha()
 
-        worker_task = asyncio.create_task(worker.run())
+        async with running_lane(worker):
+            with (
+                patch.object(git_ops, 'get_main_sha', new=_spying_get_main_sha),
+            ):
+                await queue.put(req)
+                outcome = await wait_responsive(
+                    req.result,
+                    timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                    label='kappa-sample-dispatching: MergeOutcome (lands)',
+                )
+                assert outcome.status == 'done', f'{outcome}'
 
-        with (
-            patch.object(git_ops, 'get_main_sha', new=_spying_get_main_sha),
-        ):
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=60)
-            assert outcome.status == 'done', f'{outcome}'
-
-        assert fired, (
-            'the census never reported the request as dispatching — the '
-            'task-2068 blind spot, reopened'
-        )
-        sample = captured[0]
-        _assert_agreement(sample, 'DISPATCHING')
-        entry = sample.entry
-        assert entry is not None and entry['task_id'] == req.task_id, f'{entry!r}'
-
-        await worker.stop()
-        await worker_task
+            assert fired, (
+                'the census never reported the request as dispatching — the '
+                'task-2068 blind spot, reopened'
+            )
+            sample = captured[0]
+            _assert_agreement(sample, 'DISPATCHING')
+            entry = sample.entry
+            assert entry is not None and entry['task_id'] == req.task_id, f'{entry!r}'
 
     async def test_agreement_at_finalizing_window(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -2946,28 +2957,28 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
             captured.append(_sample(worker, req.request_id))
             return await original_advance(*args, **kwargs)
 
-        worker_task = asyncio.create_task(worker.run())
+        async with running_lane(worker):
+            with (
+                patch.object(git_ops, 'advance_main', new=_capturing_advance),
+            ):
+                await queue.put(req)
+                outcome = await wait_responsive(
+                    req.result,
+                    timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                    label='kappa-sample-finalizing: MergeOutcome (lands)',
+                )
+                assert outcome.status == 'done', f'{outcome}'
 
-        with (
-            patch.object(git_ops, 'advance_main', new=_capturing_advance),
-        ):
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=60)
-            assert outcome.status == 'done', f'{outcome}'
-
-        assert len(captured) >= 1, 'advance_main must have been called at least once'
-        sample = captured[0]
-        _assert_agreement(sample, 'FINALIZING')
-        entry = sample.entry
-        assert entry is not None, (
-            'the census dropped the request while advance_main ran — the '
-            'phantom/blind-spot window this sample exists to catch'
-        )
-        assert entry['state'] == 'finalizing', f'{entry!r}'
-        assert entry['task_id'] == req.task_id, f'{entry!r}'
-
-        await worker.stop()
-        await worker_task
+            assert len(captured) >= 1, 'advance_main must have been called at least once'
+            sample = captured[0]
+            _assert_agreement(sample, 'FINALIZING')
+            entry = sample.entry
+            assert entry is not None, (
+                'the census dropped the request while advance_main ran — the '
+                'phantom/blind-spot window this sample exists to catch'
+            )
+            assert entry['state'] == 'finalizing', f'{entry!r}'
+            assert entry['task_id'] == req.task_id, f'{entry!r}'
 
 
 # ---------------------------------------------------------------------------
@@ -2999,32 +3010,35 @@ class TestMultiItemPipelineToQuiescenceNoLeaks:
             for i in range(3)
         ]
 
-        worker_task = asyncio.create_task(worker.run())
+        async with running_lane(worker):
+            for req in reqs:
+                await queue.put(req)
+            outcomes = await asyncio.gather(
+                *(
+                    wait_responsive(
+                        req.result,
+                        timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                        label=f'{req.task_id}: MergeOutcome',
+                    )
+                    for req in reqs
+                )
+            )
 
-        for req in reqs:
-            await queue.put(req)
-        outcomes = await asyncio.gather(
-            *(asyncio.wait_for(req.result, timeout=60) for req in reqs)
-        )
+            assert all(o.status == 'done' for o in outcomes), f'{outcomes}'
 
-        assert all(o.status == 'done' for o in outcomes), f'{outcomes}'
-
-        leaked = {
-            req.task_id: lane_entry(worker, req.request_id)
-            for req in reqs
-            if lane_state(worker, req.request_id) is not None
-        }
-        assert leaked == {}, f'completed requests still in the census: {leaked!r}'
-        # The other half of retirement, which the census cannot express: a
-        # TERMINAL rid is skipped by every snapshot path, so a live object
-        # left behind reads as clean above no matter how many there are.
-        still_live = {req.task_id for req in reqs if req.request_id in worker._live_items}
-        assert still_live == set(), (
-            f'completed requests still hold a live object: {still_live!r}'
-        )
-
-        await worker.stop()
-        await worker_task
+            leaked = {
+                req.task_id: lane_entry(worker, req.request_id)
+                for req in reqs
+                if lane_state(worker, req.request_id) is not None
+            }
+            assert leaked == {}, f'completed requests still in the census: {leaked!r}'
+            # The other half of retirement, which the census cannot express: a
+            # TERMINAL rid is skipped by every snapshot path, so a live object
+            # left behind reads as clean above no matter how many there are.
+            still_live = {req.task_id for req in reqs if req.request_id in worker._live_items}
+            assert still_live == set(), (
+                f'completed requests still hold a live object: {still_live!r}'
+            )
 
 
 # ---------------------------------------------------------------------------

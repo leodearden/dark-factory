@@ -3683,6 +3683,15 @@ def _gate_sequence_transcript(scene: _GateScene) -> list[dict]:
 # comparison against a re-run would go green for two runs that were identically
 # WRONG.
 #
+# Why ``halving_state: None`` in every round is not an artifact of this worker
+# never having been deep: a fresh — or restarted — worker starts at ``None``
+# (test_merge_queue_deep_dispatch.py::TestChainHalvingWorkerState::
+# test_state_is_none_at_construction), and at cap=0 ``select_chain_depth``
+# returns ``None`` before halving state is read
+# (test_merge_queue_deep_dispatch.py::TestSelectChainDepth::
+# test_cap_zero_is_the_kill_switch_for_every_input).  So no state a previous
+# process left behind can move this transcript.
+#
 # Why the POSITIVE CONTROL is mandatory.  A golden of absences passes trivially
 # over an inert scene.  The SAME script over the SAME seeded queue at cap=6
 # must produce a transcript that differs in every one of those fields — which
@@ -3828,8 +3837,9 @@ class TestRow7KillSwitchByteIdentity:
         a copy of that instrument here is what would let the two budgets drift
         apart.  What is local to THIS scene is the size of the seam that a
         single-seam instrument would have missed: ``create_subprocess_exec``
-        carries the bulk (231 / 110 / 110), and each of these three tests
-        makes exactly 3 ``create_subprocess_shell`` calls on top.
+        carries the bulk (231 for the cap-six control, 110 for the golden),
+        and each test here makes exactly 3 ``create_subprocess_shell`` calls
+        on top.
         """
         spawns = count_git_spawns(monkeypatch)
         yield
@@ -3938,46 +3948,6 @@ class TestRow7KillSwitchByteIdentity:
             f'the golden proves cap=0 never does); got '
             f'{transcript[1]["halving_state"]!r}'
         )
-
-    async def test_a_restarted_worker_inherits_no_halving_suspicion(
-        self, git_repo: Path, tmp_path: Path, monkeypatch,
-    ) -> None:
-        """The golden survives a worker restart, for a STRUCTURAL reason.
-
-        ``halving_state: None`` appears in all three golden rounds, and a
-        reader could reasonably suspect that is an artifact of THIS worker
-        never having been deep.  It is not: a freshly constructed worker starts
-        at ``None``, and at cap=0 ``select_chain_depth`` short-circuits on the
-        cap BEFORE halving state is consulted at all — so no state a previous
-        process could have left behind can change the transcript.
-        """
-        from orchestrator.merge_lane.worker import select_chain_depth
-
-        scene = await self._sequence(
-            git_repo, tmp_path, monkeypatch,
-            chain_cap=0, db_name='gate-row7-restart.db',
-        )
-        assert scene.worker._chain_halving_state is None, (
-            f'the kill-switched run armed the bisector: '
-            f'{scene.worker._chain_halving_state!r}'
-        )
-
-        restarted = _make_worker(scene.git_ops)
-        assert restarted._chain_halving_state is None, (
-            f'a fresh worker must start with no suspicion; got '
-            f'{restarted._chain_halving_state!r}'
-        )
-        assert restarted._n_failed is False and restarted._remerge_occurred is False
-
-        # ...and the cap short-circuit makes the point unconditional: NO
-        # halving state, inherited or otherwise, can produce a chain at cap=0.
-        for queue_len in (1, 2, 8, 32):
-            for state in (None, 1, 2, 4, 16):
-                assert select_chain_depth(0, queue_len, state) is None, (
-                    f'select_chain_depth(0, {queue_len}, {state}) returned '
-                    f'{select_chain_depth(0, queue_len, state)!r} — the kill '
-                    f'switch must be unconditional'
-                )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

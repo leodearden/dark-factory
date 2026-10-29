@@ -2,8 +2,8 @@
 
 The drift-check runner (runs a local and a remote leg concurrently through
 :class:`~orchestrator.verify_runner.DriftDetector`, the local leg in a
-throwaway worktree), the remote-runner builder, and the land-hook cadence
-gate.  A due check that cannot get both host slots defers, and the gate
+throwaway worktree) and the land-hook cadence gate; the remote-pool builder
+lives in :mod:`orchestrator.verify_hosts`.  A due check that cannot get both host slots defers, and the gate
 re-arms it for the next landing.  The local trust-anchor verifies through the
 worker's injected :class:`~orchestrator.merge_lane.ports.VerifyPort`; this
 module never imports the worker.
@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from orchestrator.deployed_sha import DeployedSha, resolve_code_checkout
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.types import MergeRequest
@@ -35,7 +34,6 @@ from orchestrator.verify_runner import (
     HostAllocator,
     HostLease,
     LocalRunner,
-    RemoteRunner,
     RunnerUnavailableSink,
     VerifyRunner,
     VerifyRunnerPool,
@@ -43,7 +41,6 @@ from orchestrator.verify_runner import (
 )
 
 if TYPE_CHECKING:
-    from orchestrator.config import OrchestratorConfig
     from orchestrator.merge_lane.ports import VerifyPort
     from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
@@ -55,51 +52,6 @@ logger = logging.getLogger('orchestrator.merge_lane')
 # in its finally, after this land hook, refresh_warm_base and the CAS walk.
 _DRIFT_HOST_SETTLE_SECS = 600.0
 _DRIFT_HOST_POLL_SECS = 5.0
-
-
-def _build_remote_runners(
-    config: OrchestratorConfig,
-    cwd: str | Path,
-    *,
-    deployed_sha: DeployedSha,
-    quarantine: set[str] | None = None,
-) -> list[RemoteRunner]:
-    """Build the list of RemoteRunner instances from operator config (Lever C).
-
-    Returns REMOTES ONLY — the LocalRunner trust anchor is prepended by callers
-    since it needs call-specific arguments (worktree path, module configs, etc.).
-
-    Filters out disabled runners (enabled=False) and any runner whose name is in
-    the quarantine set (in-memory worker-level quarantine from DriftDetector).
-    quarantine=None is treated as an empty set (no quarantine).
-
-    _build_verify_runners passes main_branch=config.git.main_branch so the
-    remote host receives a freshness push before the merge-sha transport.
-
-    Each runner gates its verifies on *deployed_sha* (task 6565, the commit
-    this process's wire path was imported from) through the runner's
-    :meth:`~orchestrator.config.VerifyRunnerConfig.gate_paths`, publishing the
-    sha from this process's own code checkout, resolved once here.
-    """
-    code_checkout = resolve_code_checkout()
-    runners = []
-    for r in config.enabled_verify_runners:
-        if quarantine is not None and r.name in quarantine:
-            continue
-        gate = r.gate_paths()
-        runners.append(RemoteRunner(
-            name=r.name,
-            ssh_host=r.ssh_host,
-            git_remote=r.git_remote,
-            cwd=cwd,
-            config_path=r.config_path,
-            main_branch=config.git.main_branch,
-            df_remote_checkout=gate.source,
-            gate_checkouts_path=gate.root,
-            deployed_sha=deployed_sha,
-            code_checkout=code_checkout,
-        ))
-    return runners
 
 
 # ---------------------------------------------------------------------------

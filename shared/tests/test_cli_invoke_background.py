@@ -1,14 +1,16 @@
 """Tests for the background-task abandonment detector + downgrade (task 2761).
 
 Layer 2 of the headless ``--print`` background-task footgun fix: detect when an
-otherwise-successful ``claude --print`` run ended its turn while a backgrounded
-Bash command was still pending (launched via ``Bash run_in_background=true``,
-never subsequently reaped), and downgrade ``success``→failure so existing
+otherwise-successful ``claude --print`` run ended its turn while a background
+task it started was still pending, and downgrade ``success``→failure so existing
 non-success handling retries/resumes instead of proceeding on a half-done tree.
+A launch is a ``Bash run_in_background=true`` call or a confirmed ``Monitor``
+arm (task 5986), never subsequently reaped.
 
-A session reaps either by calling a background-management tool named in
-``_BACKGROUND_REAP_TOOLS`` or — the tool-agnostic second clause (task 3639) — by
-issuing any tool_use whose input references the task's id or output-file path.
+A session reaps by calling a background-management tool named in
+``_BACKGROUND_REAP_TOOLS``, by issuing any tool_use whose input references the
+task's id or output-file path (the tool-agnostic clause, task 3639), or by
+having a task-notification naming the task delivered to it (task 5986).
 The tool names appearing in the fixtures below are test DATA standing in for
 whatever a CLI build might emit, not a claim that each is live — only
 ``TaskStop`` is (task 5332).  Exercising the accept set's full membership is
@@ -26,6 +28,7 @@ complete and exited success, silently abandoning the work mid-task.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -146,6 +149,140 @@ def _kill_shell(shell_id: str = 'sh-1', *, name: str = 'KillShell') -> dict:
 
 def _text(text: str = 'thinking') -> dict:
     return {'type': 'text', 'text': text}
+
+
+MONITOR_TASK_ID = 'byk7waubd'
+
+
+def _monitor_call(
+    *,
+    tool_id: str = 'toolu_mon1',
+    command: str = 'until [ -s /tmp/x.log ]; do sleep 10; done; tail -8 /tmp/x.log',
+    timeout_ms: int = 900000,
+) -> dict:
+    """A ``Monitor`` tool_use block, in the CLI's measured input shape."""
+    return {
+        'type': 'tool_use',
+        'id': tool_id,
+        'name': 'Monitor',
+        'input': {
+            'command': command,
+            'description': 'test run completion',
+            'timeout_ms': timeout_ms,
+            'persistent': False,
+        },
+    }
+
+
+def _monitor_armed(
+    tool_id: str = 'toolu_mon1',
+    task_id: object = MONITOR_TASK_ID,
+    timeout_ms: int = 900000,
+    *,
+    nested: bool = True,
+) -> dict:
+    """The ``user`` record confirming a Monitor arm: a tool_result naming the
+    call plus the structured ``toolUseResult`` carrying the armed task's id.
+    ``nested=False`` puts the content list flat under ``record['content']``."""
+    content = [
+        {
+            'type': 'tool_result',
+            'tool_use_id': tool_id,
+            'content': (
+                f'Monitor started (task {task_id}, timeout {timeout_ms}ms).'
+                ' You will be notified on each event.'
+                ' Keep working — do not poll or sleep.'
+            ),
+        },
+    ]
+    record: dict = {
+        'type': 'user',
+        'toolUseResult': {'taskId': task_id, 'timeoutMs': timeout_ms, 'persistent': False},
+    }
+    if nested:
+        record['message'] = {'role': 'user', 'content': content}
+    else:
+        record['content'] = content
+    return record
+
+
+def _monitor_rejected(tool_id: str = 'toolu_mon1') -> dict:
+    """The ``user`` record for a Monitor call the CLI REJECTED: nothing armed."""
+    return {
+        'type': 'user',
+        'message': {
+            'role': 'user',
+            'content': [
+                {
+                    'type': 'tool_result',
+                    'tool_use_id': tool_id,
+                    'is_error': True,
+                    'content': (
+                        '<tool_use_error>InputValidationError: Monitor failed due to'
+                        ' the following issues:\nThe required parameter `description`'
+                        ' is missing</tool_use_error>'
+                    ),
+                },
+            ],
+        },
+        'toolUseResult': 'InputValidationError: [...]',
+    }
+
+
+def _monitor_event_text(
+    task_id: str = MONITOR_TASK_ID,
+    event: str = '4953 passed, 1 skipped in 262.80s',
+    summary: str = 'test sweep result',
+) -> str:
+    """The text of a Monitor event (or expiry) notification."""
+    return (
+        '<task-notification>\n'
+        f'<task-id>{task_id}</task-id>\n'
+        f'<summary>Monitor event: "{summary}"</summary>\n'
+        f'<event>{event}</event>\n'
+        '</task-notification>'
+    )
+
+
+def _bash_completion_text(task_id: str = 'bz89cdzmh', tool_use_id: str = 'toolu_1') -> str:
+    """The text of a background Bash completion notification."""
+    return (
+        '<task-notification>\n'
+        f'<task-id>{task_id}</task-id>\n'
+        f'<tool-use-id>{tool_use_id}</tool-use-id>\n'
+        f'<output-file>{_bg_log_path(task_id)}</output-file>\n'
+        '<status>completed</status>\n'
+        '<summary>Background command "cargo test" completed (exit code 0)</summary>\n'
+        '</task-notification>'
+    )
+
+
+def _delivered_mid_turn(text: str) -> dict:
+    """A notification delivered to the model inside the running turn."""
+    return {
+        'type': 'attachment',
+        'attachment': {
+            'type': 'queued_command',
+            'prompt': text,
+            'commandMode': 'task-notification',
+        },
+    }
+
+
+def _delivered_new_turn(text: str, *, as_blocks: bool = False) -> dict:
+    """A notification delivered to the model as the prompt of a new turn.
+    ``as_blocks=True`` carries the text as a ``text`` sub-block list."""
+    content: object = [{'type': 'text', 'text': text}] if as_blocks else text
+    return {
+        'type': 'user',
+        'message': {'role': 'user', 'content': content},
+        'origin': {'kind': 'task-notification', 'producer': 'session-task'},
+    }
+
+
+def _enqueued_only(text: str) -> dict:
+    """Queue bookkeeping for a notification: NOT a delivery to the model."""
+    return {'type': 'queue-operation', 'operation': 'enqueue', 'content': text}
 
 
 def _write_transcript(base: Path, session_id: str, records: list) -> Path:
@@ -338,7 +475,7 @@ class TestForegroundBgLogReadIsAReap:
         recommends ("use Read on that file path") → False.
 
         This is also the shape
-        orchestrator/src/orchestrator/agents/roles.py::WAIT_PATTERN_GUIDANCE
+        orchestrator/src/orchestrator/agents/harness_guidance.py::WAIT_PATTERN_GUIDANCE
         now steers every Bash-capable role into (task 5332), which is why
         correcting those prompts needed no change to the detector. Keep it: it
         is the executable form of that claim, and narrowing
@@ -584,6 +721,384 @@ class TestVerdictSubmissionClearsVerdict:
         assert detect_ended_awaiting_background(records) is True
 
 
+class TestMonitorArmIsALaunch:
+    """A CONFIRMED Monitor arm is a launch (task 5986).
+
+    The launch is the ``user`` record whose tool_result names an earlier
+    ``Monitor`` call and whose structured ``toolUseResult.taskId`` is a usable
+    token — not the call, which the CLI may reject.  The Monitor call itself is
+    neither a launch nor a reap, and the armed task's id becomes a reap token.
+    """
+
+    def test_armed_monitor_then_turn_ends_is_true(self) -> None:
+        """Specimens df 3220 / reify 5690: arm, announce standing by, end."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant([_text('Monitor armed. Standing by for the ratchet test result.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_flat_arm_result_is_a_launch(self) -> None:
+        """The confirming record is found in the flat content shape too."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(nested=False),
+            _assistant([_text('Monitor armed. Standing by for the ratchet test result.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_monitor_tailing_a_pending_bg_log_is_true(self) -> None:
+        """Specimen df 2889: a Monitor whose command watches the pending Bash
+        launch's bg-log is a new wait, not a reap of that launch."""
+        log = _bg_log_path()
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(),
+            _assistant([_monitor_call(command=f'until grep -q "test result" {log}; do sleep 10; done')]),
+            _monitor_armed(),
+            _assistant([_text('Monitor armed. Waiting for the test result.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_rejected_monitor_naming_the_bg_log_does_not_reap_it(self) -> None:
+        """Specimen reify 5536: a REJECTED Monitor naming the bg-log armed
+        nothing and engaged with nothing, so the Bash launch stays pending."""
+        log = _bg_log_path()
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(),
+            _assistant([_monitor_call(command=f'tail -f {log}')]),
+            _monitor_rejected(),
+            _assistant([_text('Waiting for the sweep to finish.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_unrelated_activity_after_arm_is_true(self) -> None:
+        """Activity that never references the armed task is not a reap."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant([_fg_bash('git status')]),
+            _assistant(
+                [{'type': 'tool_use', 'name': 'Read', 'input': {'file_path': '/etc/hosts'}}]
+            ),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_rejected_monitor_alone_is_false(self) -> None:
+        """Specimen df 2849: a rejected call armed nothing, so nothing is pending."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_rejected(),
+            _assistant([_text('done')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_monitor_call_with_no_result_is_false(self) -> None:
+        """A call with no confirming record is not a launch."""
+        records = [
+            _assistant([_monitor_call()]),
+            _assistant([_text('done')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_task_id_result_for_a_non_monitor_call_is_not_a_launch(self) -> None:
+        """A ``taskId`` result confirms a launch only when it answers a Monitor call."""
+        records = [
+            _assistant([{'type': 'tool_use', 'id': 'toolu_some', 'name': 'SomeTool', 'input': {}}]),
+            {
+                'type': 'user',
+                'message': {
+                    'role': 'user',
+                    'content': [
+                        {'type': 'tool_result', 'tool_use_id': 'toolu_some', 'content': 'ok'},
+                    ],
+                },
+                'toolUseResult': {'taskId': 'bq9imj9co'},
+            },
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    @pytest.mark.parametrize('degenerate_id', ['', 'a', 'xyz', 42])
+    def test_degenerate_monitor_task_id_is_not_a_launch(self, degenerate_id: object) -> None:
+        """An id no notification could ever be matched on is not a launch:
+        honoring it would fire on every such session."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(task_id=degenerate_id),
+            _assistant([_text('Monitor armed.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_task_stop_of_armed_monitor_is_false(self) -> None:
+        """Stopping the armed Monitor reaps it."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant(
+                [{'type': 'tool_use', 'name': 'TaskStop', 'input': {'task_id': MONITOR_TASK_ID}}]
+            ),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_reference_to_the_monitor_task_id_is_false(self) -> None:
+        """The arm's ``taskId`` is harvested as a token, so reading the armed
+        task's output file reaps it."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant(
+                [
+                    {
+                        'type': 'tool_use',
+                        'name': 'Read',
+                        'input': {'file_path': f'/tmp/claude-1000/s/tasks/{MONITOR_TASK_ID}.output'},
+                    }
+                ]
+            ),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+
+_EXPIRY = '[Monitor expired after 10m with 2 events delivered. Re-arm it if you still need the watch.]'
+
+
+class TestDeliveredNotificationIsAReap:
+    """A task-notification DELIVERED to the model whose text names a harvested
+    token is a reap, for every launch kind (task 5986).
+
+    Delivery takes one of two shapes: a mid-turn ``attachment`` record
+    (``queued_command`` with ``commandMode`` ``task-notification``), or a
+    ``user`` record whose ``origin.kind`` is ``task-notification`` — the shape
+    a headless session that outlived its turn uses.  ``queue-operation``
+    records are queue bookkeeping, not delivery.
+    """
+
+    def test_monitor_event_delivered_mid_turn_then_more_work_is_false(self) -> None:
+        """Specimen df 2991: the Monitor's event reached the model mid-turn."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant([_fg_bash('git status')]),
+            _delivered_mid_turn(_monitor_event_text()),
+            _assistant([_fg_bash('git diff --stat')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_monitor_expiry_delivered_as_new_turn_is_false(self) -> None:
+        """Specimen reify 7838: the CLI stayed alive after the turn ended and
+        delivered the Monitor's expiry as a new turn."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant([_text('Standing by for the eval result.')]),
+            _delivered_new_turn(_monitor_event_text(event=_EXPIRY)),
+            _assistant([_text('The watch expired after both results arrived. Done.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_bash_completion_delivered_mid_turn_is_false(self) -> None:
+        """The dominant false-downgrade shape of a Bash-only reap rule: the
+        completion reached the model and the session moved on."""
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(),
+            _delivered_mid_turn(_bash_completion_text()),
+            _assistant(
+                [{'type': 'tool_use', 'name': 'Read', 'input': {'file_path': '/etc/hosts'}}]
+            ),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_bash_completion_delivered_as_new_turn_is_false(self) -> None:
+        """The session ended its turn to wait, and the CLI delivered the
+        completion as a new turn rather than exiting."""
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(),
+            _assistant([_text("I'll wait for the notification.")]),
+            _delivered_new_turn(_bash_completion_text()),
+            _assistant([_text('All tests passed.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    @pytest.mark.parametrize(
+        ('structured', 'in_text'),
+        [(True, False), (False, True)],
+        ids=['task-id-token', 'log-path-token'],
+    )
+    def test_completion_matches_on_either_token(self, structured: bool, in_text: bool) -> None:
+        """The completion names both the task id and the output file, so either
+        harvested token identifies it."""
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(structured=structured, in_text=in_text),
+            _delivered_mid_turn(_bash_completion_text()),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_text_sub_block_content_is_read(self) -> None:
+        """A new-turn delivery whose content is a list of text sub-blocks."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant([_text('Standing by for the eval result.')]),
+            _delivered_new_turn(_monitor_event_text(event=_EXPIRY), as_blocks=True),
+            _assistant([_text('Done.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_streamed_monitor_event_then_end_is_false_documented_gap(self) -> None:
+        """DOCUMENTED, ACCEPTED false negative.  Specimen reify 5623: a
+        progress-streaming Monitor delivered a mid-stream event and the session
+        ended awaiting a later one → the delivery reaps → False.
+
+        No structured flag tells a terminal event from a mid-stream one; only
+        the notification text does, and parsing it is the fragility the
+        detector refuses.  The Monitor analogue of
+        test_poll_once_still_running_then_end_is_false_documented_gap.
+        """
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _delivered_mid_turn(
+                _monitor_event_text(event='progress: 74 suites finished, 0 failures/errors so far')
+            ),
+            _assistant([_text('Suite still running clean. Waiting for completion.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    @pytest.mark.parametrize(
+        'later_launch',
+        [
+            [_assistant([_monitor_call()]), _monitor_armed()],
+            [
+                _assistant([_bash_launch(command='job-b', tool_id='toolu_b')]),
+                _bg_launch_result(tool_id='toolu_b', task_id='bbb22222'),
+            ],
+        ],
+        ids=['later-monitor-arm', 'later-bash-launch'],
+    )
+    def test_earlier_completion_after_later_launch_is_false_documented_gap(
+        self, later_launch: list
+    ) -> None:
+        """DOCUMENTED, ACCEPTED false negative.  Reaps are positional, not per
+        launch: Bash A launches, a later launch L follows, A's completion is
+        delivered, and the turn ends with L still pending → the delivery is
+        the final event → False.
+
+        A notification arrives asynchronously, so it can land after a launch
+        the agent made later, unlike a tool_use reap the agent issues itself.
+        Clearing only the launch a reap names would need per-launch tracking,
+        and the module errs toward not downgrading.  Sibling of
+        test_streamed_monitor_event_then_end_is_false_documented_gap.
+        """
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(),
+            *later_launch,
+            _delivered_mid_turn(_bash_completion_text()),
+            _assistant([_text('Tests passed. Standing by for the second result.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_notification_for_an_unknown_task_is_not_a_reap(self) -> None:
+        """A delivery that names no harvested token engages with nothing pending."""
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(),
+            _delivered_mid_turn(_monitor_event_text(task_id='zz99other')),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_enqueued_but_undelivered_is_not_a_reap(self) -> None:
+        """An event enqueued after the final turn, by a process that then
+        exited, never reached the agent."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant([_text('Monitor armed. Standing by.')]),
+            _enqueued_only(_monitor_event_text()),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_launch_after_a_delivered_notification_is_true(self) -> None:
+        """The reap is positional: a later launch outranks it."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _delivered_mid_turn(_monitor_event_text()),
+            _assistant([_bash_launch(command='job-b', tool_id='toolu_b')]),
+            _bg_launch_result(tool_id='toolu_b', task_id='bbb22222'),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    @pytest.mark.parametrize(
+        'record',
+        [
+            {'type': 'attachment', 'attachment': 'junk'},
+            {
+                'type': 'attachment',
+                'attachment': {
+                    'type': 'queued_command', 'commandMode': 'task-notification', 'prompt': None,
+                },
+            },
+            {
+                'type': 'attachment',
+                'attachment': {
+                    'type': 'queued_command', 'commandMode': 'task-notification', 'prompt': 42,
+                },
+            },
+            {
+                'type': 'attachment',
+                'attachment': {
+                    'type': 'queued_command', 'commandMode': 'prompt',
+                    'prompt': _monitor_event_text(),
+                },
+            },
+            {
+                'type': 'user',
+                'origin': 'task-notification',
+                'message': {'role': 'user', 'content': _monitor_event_text()},
+            },
+            {
+                'type': 'user',
+                'origin': {'kind': 'other'},
+                'message': {'role': 'user', 'content': _monitor_event_text()},
+            },
+            {
+                'type': 'user',
+                'origin': {'kind': 'task-notification'},
+                'message': {'role': 'user', 'content': None},
+            },
+            {
+                'type': 'user',
+                'origin': {'kind': 'task-notification'},
+                'message': {'role': 'user', 'content': 42},
+            },
+        ],
+        ids=[
+            'attachment-not-a-dict',
+            'prompt-none',
+            'prompt-int',
+            'command-mode-prompt',
+            'origin-not-a-dict',
+            'origin-kind-other',
+            'content-none',
+            'content-int',
+        ],
+    )
+    def test_malformed_notification_records_never_raise(self, record: dict) -> None:
+        """Records that are not a well-formed delivery reap nothing and never raise."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            record,
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+
 class TestEndedAwaitingBackgroundForSession:
     """File-reading seam: mirrors count_transcript_turns' shape — delegate to
     read_transcript_records, then the pure detector, mapping None (unresolvable
@@ -674,6 +1189,40 @@ class TestEndedAwaitingBackgroundForSession:
         ]
         _write_transcript(tmp_path, sid, records)
         assert ended_awaiting_background_for_session(tmp_path, sid) is True
+
+    def test_monitor_armed_transcript_is_true(self, tmp_path: Path) -> None:
+        """Specimen df 3220: the session arms a Monitor and ends its turn
+        standing by, so the process exits before the result arrives."""
+        sid = 'sess-monitor-armed'
+        records: list = [
+            _assistant([_text('arm a watch on the ratchet test')]),
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant([_text('Monitor armed. Standing by for the ratchet test result.')]),
+        ]
+        _write_transcript(tmp_path, sid, records)
+        assert ended_awaiting_background_for_session(tmp_path, sid) is True
+
+    def test_reify7838_shaped_transcript_is_false(self, tmp_path: Path) -> None:
+        """Specimen reify 7838: both Monitor events were delivered mid-turn, the
+        turn ended, and the CLI stayed alive to deliver the expiry as a new
+        turn.  The session engaged with everything it armed."""
+        sid = 'sess-reify7838'
+        expiry = _monitor_event_text(event=_EXPIRY)
+        records: list = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant([_fg_bash('cargo run --bin eval')]),
+            _delivered_mid_turn(_monitor_event_text(event='eval rc=0')),
+            _assistant([_fg_bash('git commit -am "eval green"')]),
+            _delivered_mid_turn(_monitor_event_text(event='stdlib rc=0\n[exited with code 0]')),
+            _assistant([_text('Both suites are green and committed.')]),
+            _enqueued_only(expiry),
+            _delivered_new_turn(expiry),
+            _assistant([_text('The watch expired after delivering both results.')]),
+        ]
+        _write_transcript(tmp_path, sid, records)
+        assert ended_awaiting_background_for_session(tmp_path, sid) is False
 
 
 # A clean success envelope: subtype='success', is_error absent, returncode 0 —
@@ -813,7 +1362,8 @@ class TestDetectorTotalityAndTokenHygiene:
     records/blocks ... are skipped, never raise" previously covered only
     records), a degenerate identity token cannot mute the whole verdict, and
     the token scan sees the same strings the old whole-input ``json.dumps``
-    exposed.
+    exposed.  Task 5986 adds a fourth: that scan reaches the bottom of an
+    input of any depth.
     """
 
     def test_non_str_tool_use_name_never_raises(self) -> None:
@@ -894,6 +1444,26 @@ class TestDetectorTotalityAndTokenHygiene:
             }]),
         ]
         assert detect_ended_awaiting_background(records) is False
+
+    @pytest.mark.parametrize(
+        ('innermost', 'expected'),
+        [(_bg_log_path(), False), ('/etc/hosts', True)],
+        ids=['token-at-the-bottom-reaps', 'no-token-still-fires'],
+    )
+    def test_input_nested_past_the_recursion_limit_is_scanned_whole(
+        self, innermost: str, expected: bool
+    ) -> None:
+        """``json.loads`` decodes a transcript line nested far deeper than the
+        interpreter's recursion limit, so the token scan must walk such an
+        input to the bottom rather than raise or give up partway."""
+        depth = sys.getrecursionlimit() + 500
+        deep_input = json.loads('[' * depth + json.dumps(innermost) + ']' * depth)
+        records = [
+            _assistant([_bash_launch()]),
+            _bg_launch_result(),
+            _assistant([{'type': 'tool_use', 'name': 'SomeTool', 'input': {'deep': deep_input}}]),
+        ]
+        assert detect_ended_awaiting_background(records) is expected
 
     def test_input_with_no_strings_is_not_a_reap(self) -> None:
         """An input carrying no ``str`` anywhere cannot match a token."""

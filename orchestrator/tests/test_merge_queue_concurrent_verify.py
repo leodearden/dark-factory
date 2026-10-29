@@ -31,9 +31,8 @@ import contextlib
 import dataclasses
 import inspect
 import logging
-import math
 import traceback
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal, TypeGuard
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -56,11 +55,13 @@ from _orch_helpers import (
     # real `[tool.pytest.ini_options].timeout`
     # (test_whole_tree_scan_timeout_guard.py).
     PYPROJECT_DEFAULT_TIMEOUT,
-    RESPONSIVE_WAIT_STRETCH,
-    RESPONSIVE_WAIT_WALL_CAP,
+    STOP_WORKER_JOIN_TIMEOUT,
     UNDER_LOAD_HEADROOM_FACTOR,
-    VERIFY_CLI_PER_TEST_TIMEOUT,
     wait_responsive,
+)
+from _wait_hygiene_scan import (
+    suppressed_result_wait_items,
+    unguarded_worker_teardown_items,
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
@@ -184,6 +185,19 @@ def _make_real_item(
     )
 
 
+# THIS FILE CARRIES DEBT under rule `wall-clock-deadline` in
+# fused-memory/scripts/check_bare_magicmock_config.py (task 4246), which checks
+# the SHAPE of a load-bearing wait: a `MergeRequest.result` future or a
+# zero-argument `.wait()` barrier must be awaited through `wait_responsive(...)`
+# with a descriptive `label=`, its bound derived from MERGE_RESULT_TIMEOUT rather
+# than written as a number. This file is on that rule's shrink-only, opt-out
+# `_WALL_CLOCK_DEADLINE_DEBT` baseline: its pre-existing sites are
+# grandfathered, but the budget is CHECKED -- add one more offending wait and
+# the gate reports the overrun. New load-bearing waits here must therefore use
+# `wait_responsive(...)`, and the recorded number may only be lowered as sites
+# migrate, never raised.
+
+
 async def _await_outcome(
     fut: asyncio.Future[MergeOutcome],
     *,
@@ -222,18 +236,15 @@ async def _await_outcome(
         )
 
 
-_STOP_WORKER_JOIN_TIMEOUT = 5.0
-
-
 async def _stop_worker(
     worker: SpeculativeMergeWorker,
     worker_task: asyncio.Task[None],
     *,
-    join_timeout: float = _STOP_WORKER_JOIN_TIMEOUT,
+    join_timeout: float = STOP_WORKER_JOIN_TIMEOUT,
 ) -> None:
     """Shut *worker* down and join its run task -- the ONE teardown shape
-    shared by this module and test_merge_speculation.py, so no site can
-    drift or be forgotten.
+    shared by this module and every sibling merge-worker test module that
+    imports it, so no site can drift or be forgotten.
 
     ALWAYS call this from a ``finally:`` whose ``try:`` encloses every wait in
     the test body (task 3980 amendment, esc-3980-4). ``wait_responsive``
@@ -242,7 +253,8 @@ async def _stop_worker(
     ``stop()`` entirely and leaked a live merge worker plus its run task into
     pytest-asyncio teardown. That leak is why one red test used to cascade
     into unrelated failures elsewhere in the session.
-    ``_unguarded_worker_teardown_methods`` enforces the ``finally:``.
+    ``_wait_hygiene_scan.py::unguarded_worker_teardown_items`` enforces
+    the ``finally:``.
 
     Safe on the give-up path even when a gate was never released: ``stop()``
     cancels every in-flight verify task rather than awaiting it
@@ -259,7 +271,8 @@ async def _stop_worker(
     (fused-memory/scripts/check_bare_magicmock_config.py): its target is a
     bare Name, not a ``.result`` future or a zero-argument ``.wait()`` barrier, so the
     exemption is structural rather than a listed name. It is still a real
-    wait, so ``_call_wait_budget`` bills its *join_timeout*.
+    wait, so ``_wait_budget_audit.py::_call_wait_budget`` bills its
+    *join_timeout*.
     """
     await worker.stop()
     with contextlib.suppress(Exception):
@@ -270,10 +283,11 @@ async def _stop_worker(
 # budget. SHARED, not per-class, so the marks cannot drift apart (task 3477
 # found two that had; task 3492 generalized CASCADE_TEST_TIMEOUT into this).
 #
-# No class's budget is written here or beside its mark: TestTimeoutMarkCoverage
-# recomputes each one from source on every run (_worst_per_method_wait_budget)
-# and checks it against the class's mark, or against the ambient budget for an
-# unmarked class -- so leaving a class unmarked is a checked decision too.
+# No test's budget is written here or beside its mark:
+# test_wait_budget_coverage_guard.py recomputes each one from source on every
+# run and checks it against the closest timeout mark, or against the ambient
+# budget for an unmarked test -- so leaving a class unmarked is a checked
+# decision too.
 #
 # A literal, pinned by TestHeavyBarrierTimeoutConstant against the measured
 # worst case below x UNDER_LOAD_HEADROOM_FACTOR and against
@@ -287,524 +301,6 @@ HEAVY_BARRIER_TEST_TIMEOUT = 540
 # test_merge_speculation.py::TestSpecLaneAbortReleasesLane::test_operator_halt_releases_spec_lane.
 # Corpus: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 _HEAVY_BARRIER_MEASURED_UNDER_LOAD_WORST_CASE = 14.59
-
-
-# task 3492: known-name table for _worst_per_method_wait_budget below. These
-# are this module's own numeric constants -- referenced directly (not
-# re-derived) so the audit helper can never drift from the values the marks
-# themselves use.
-_KNOWN_WAIT_CONSTANTS: dict[str, float] = {
-    'MERGE_RESULT_TIMEOUT': float(MERGE_RESULT_TIMEOUT),
-    'HEAVY_BARRIER_TEST_TIMEOUT': float(HEAVY_BARRIER_TEST_TIMEOUT),
-    # task 3980: `wait_responsive`'s hard wall backstop and the merge-pipeline
-    # gate-barrier nominal, so a scanned call site spelling either one
-    # resolves to its value rather than billing as unbounded.
-    'RESPONSIVE_WAIT_WALL_CAP': float(RESPONSIVE_WAIT_WALL_CAP),
-    'MERGE_GATE_BARRIER_TIMEOUT': float(MERGE_GATE_BARRIER_TIMEOUT),
-}
-
-# task 3980: a wait routed through `_orch_helpers.wait_responsive` charges its
-# budget in loop-responsive time, so its worst-case WALL clock is the nominal
-# `timeout` stretched by RESPONSIVE_WAIT_STRETCH and hard-bounded by
-# RESPONSIVE_WAIT_WALL_CAP.  IMPORTED, not re-derived: the helper computes its
-# own per-call default cap from the very same constant, so the RATIO cannot
-# drift and the bill `_wait_responsive_budget` computes is an EXACT upper bound
-# on every site, whatever it passes.
-_RESPONSIVE_WAIT_STRETCH = RESPONSIVE_WAIT_STRETCH
-
-
-def _resolve_wait_value(node: ast.expr | None) -> float:
-    """Resolve a wait-value expression to the most wall clock it can allow.
-
-    Never guesses: a numeric literal resolves to itself (a negative one
-    waits no time, so 0.0), and a name ONLY via ``_KNOWN_WAIT_CONSTANTS``.
-    Anything else -- a local variable, an attribute access, arithmetic, an
-    unknown name, the literal None, a missing value -- resolves to
-    ``math.inf``: the scan cannot read it, so it may allow any wall clock,
-    and no timeout mark clears an unbounded bill. Failing closed is what
-    keeps every recognised shape's bill an upper bound.
-    """
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
-        return max(float(node.value), 0.0)
-    if isinstance(node, ast.Name) and node.id in _KNOWN_WAIT_CONSTANTS:
-        return _KNOWN_WAIT_CONSTANTS[node.id]
-    return math.inf
-
-
-def _keyword(call: ast.Call, name: str) -> ast.expr | None:
-    """Return the value of *call*'s ``name=`` keyword argument, or None."""
-    return next((kw.value for kw in call.keywords if kw.arg == name), None)
-
-
-def _wait_responsive_budget(call: ast.Call) -> float:
-    """Return the worst-case WALL clock a ``wait_responsive(...)`` call can
-    consume -- an unconditional upper bound, not an estimate (task 3980).
-
-    The helper gives up once its wall clock reaches its cap: an explicit
-    ``max_wall_s`` when one is passed, else the nominal ``timeout`` (hidden
-    default ``MERGE_RESULT_TIMEOUT``) stretched by ``_RESPONSIVE_WAIT_STRETCH``
-    and clamped to ``RESPONSIVE_WAIT_WALL_CAP``. So an explicit
-    ``max_wall_s`` other than the literal None is billed as resolved -- one
-    the scan cannot read is unbounded -- and otherwise the stretched,
-    clamped nominal is billed, which an unreadable nominal cannot push past
-    the clamp.
-    """
-    max_wall = _keyword(call, 'max_wall_s')
-    explicit_none = isinstance(max_wall, ast.Constant) and max_wall.value is None
-    if max_wall is not None and not explicit_none:
-        return _resolve_wait_value(max_wall)
-
-    timeout = _keyword(call, 'timeout')
-    nominal = (
-        _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
-        if timeout is None
-        else _resolve_wait_value(timeout)
-    )
-    return min(
-        nominal * _RESPONSIVE_WAIT_STRETCH,
-        _KNOWN_WAIT_CONSTANTS['RESPONSIVE_WAIT_WALL_CAP'],
-    )
-
-
-def _call_wait_budget(call: ast.Call) -> float:
-    """Return the wait-budget contribution of a single ``ast.Call`` node.
-
-    Recognises exactly four call shapes -- ``asyncio.wait_for(..., timeout=N)``
-    (the attribute's value must itself be the ``asyncio`` name, so
-    ``gate.wait_for(...)`` or ``self.wait_for(...)`` do NOT match),
-    ``_await_outcome(...)`` (whose hidden default is ``MERGE_RESULT_TIMEOUT``
-    when no ``timeout=`` kwarg is given), ``wait_responsive(...)``
-    (task 3980), billed by ``_wait_responsive_budget`` as an unconditional
-    upper bound on its wall clock, and the ``_stop_worker(...)`` teardown,
-    whose join is billed its ``join_timeout=`` kwarg or hidden default
-    ``_STOP_WORKER_JOIN_TIMEOUT``. Within a recognised shape, a value the
-    scan cannot read bills ``math.inf`` (``_resolve_wait_value``), so a
-    recognised wait is never under-billed. Every
-    other call shape -- ``asyncio.sleep``, ``.wait()``, ``.result()``,
-    ``.join()``, a non-``asyncio`` ``.wait_for(...)``, attribute access,
-    arithmetic, unknown names -- contributes 0.0 and is skipped silently
-    (this is a conservative FLOOR over call *shapes*: an unrecognised shape
-    can only under-count, never fabricate a wait; see the plan's
-    floor/superset design decision, and ``_method_wait_budget`` below for
-    the orthogonal over-count risk from control flow).
-    """
-    func = call.func
-    if (
-        isinstance(func, ast.Attribute)
-        and func.attr == 'wait_for'
-        and isinstance(func.value, ast.Name)
-        and func.value.id == 'asyncio'
-    ):
-        timeout = _keyword(call, 'timeout')
-        if timeout is None and len(call.args) >= 2:
-            timeout = call.args[1]
-        return _resolve_wait_value(timeout)
-    if isinstance(func, ast.Name) and func.id == '_await_outcome':
-        timeout = _keyword(call, 'timeout')
-        if timeout is None:
-            return _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
-        return _resolve_wait_value(timeout)
-    if isinstance(func, ast.Name) and func.id == 'wait_responsive':
-        return _wait_responsive_budget(call)
-    if isinstance(func, ast.Name) and func.id == '_stop_worker':
-        join_timeout = _keyword(call, 'join_timeout')
-        if join_timeout is None:
-            return _STOP_WORKER_JOIN_TIMEOUT
-        return _resolve_wait_value(join_timeout)
-    return 0.0
-
-
-def _method_wait_budget(fn: ast.AST) -> float:
-    """Sum every recognised wait-call contribution anywhere in *fn*'s body.
-
-    Control-flow-BLIND by construction: ``ast.walk`` visits every call in
-    the subtree regardless of branch, so waits in mutually exclusive
-    ``if``/``else`` arms or ``try``/``except`` handlers are summed
-    together rather than maxed -- the computed total can OVER-count
-    relative to any single real execution path (pinned by
-    ``TestWaitBudgetAuditHelper.test_mutually_exclusive_branches_are_summed_not_maxed``).
-    This is a deliberate, tolerated imprecision, not a design goal: it runs
-    in the opposite direction from ``_call_wait_budget``'s shape-based
-    under-count (an unrecognised call shape contributes 0.0), so the
-    "conservative FLOOR" framing used elsewhere in this module applies to
-    shape recognition only, not to control flow. The combined result is a
-    same-ballpark estimate meant to catch gross under-marking, not a
-    number that is exactly load-bearing.
-    """
-    return sum(
-        _call_wait_budget(node) for node in ast.walk(fn) if isinstance(node, ast.Call)
-    )
-
-
-def _iter_test_methods(
-    source: str,
-) -> list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]]:
-    """Statically parse *source* and return every ``(class_name, method)``
-    pair for a ``test_*`` method defined directly in the body of a
-    top-level ``Test*`` class.
-
-    The shared traversal behind `_worst_per_method_wait_budget`,
-    `_suppressed_result_wait_methods`, and `_unguarded_worker_teardown_methods`
-    (task 4219 amendment): all three previously re-implemented this exact
-    walk independently, so a blind spot (nested classes, module-level
-    helper functions, non-``Test*`` classes) had to be fixed in three
-    places instead of one.
-
-    Must never raise: a crash here would fail the whole suite over an
-    unrelated edit to this file. Unparseable source returns [].
-    """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-
-    pairs: list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]] = []
-    for class_node in ast.iter_child_nodes(tree):
-        if not (isinstance(class_node, ast.ClassDef) and class_node.name.startswith('Test')):
-            continue
-        for method in class_node.body:
-            if (
-                isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and method.name.startswith('test_')
-            ):
-                pairs.append((class_node.name, method))
-    return pairs
-
-
-def _worst_per_method_wait_budget(source: str) -> dict[str, float]:
-    """Statically scan *source* and compute, per top-level ``Test*`` class,
-    the MAX over its ``test_*`` methods of that method's summed sequential
-    real-time wait budget (task 3492's audit engine).
-
-    pytest-timeout applies a class-level ``@pytest.mark.timeout`` mark to
-    EACH test method independently, not to the class total -- so the unit
-    that matters is per-method, not a class-wide sum (see the plan's design
-    decision: summing would false-positive on many-light-methods classes
-    like ``TestRunInflightVerifyAbortPoll`` and could dilute one heavy
-    method below the threshold).
-
-    Must never raise: a crash here would fail the whole suite over an
-    unrelated edit to this file. Unparseable source returns {}.
-    """
-    budgets: dict[str, float] = {}
-    for class_name, method in _iter_test_methods(source):
-        budget = _method_wait_budget(method)
-        prev = budgets.get(class_name)
-        budgets[class_name] = budget if prev is None else max(prev, budget)
-    return budgets
-
-
-def _suppressed_result_wait_methods(source: str) -> dict[str, set[str]]:
-    """Statically scan *source* for the executable form of the `outcome is
-    None` anti-pattern `_await_outcome`'s docstring names above ("The shape
-    this replaces"): either (a) a `with contextlib.suppress(TimeoutError):`
-    block enclosing an `asyncio.wait_for(...)` call, or (b) a
-    `try: outcome = await asyncio.wait_for(...) except TimeoutError: outcome
-    = None` block -- an `except` handler catching `TimeoutError` (bare or
-    `asyncio.TimeoutError`, alone or inside a tuple) AND whose body
-    SWALLOWS the timeout (every statement is either `pass` or an assignment
-    of the literal `None`) whose `try:` body contains an
-    `asyncio.wait_for(...)` call. Both spellings convert a genuine pipeline
-    hang or a missing cascade into a confusing `outcome is None` assertion
-    failure instead of failing loudly by label (task 4219; the try/except
-    spelling was added in the task 4219 amendment pass after a reviewer
-    found it undetected at
-    `TestHaltAndUnavailable::test_runner_unavailable_quarantine_fallback`,
-    L3340-3346).
-
-    The swallowing-body requirement on spelling (b) matters: a handler that
-    catches `TimeoutError` and then fails LOUDLY -- e.g. `except
-    TimeoutError: ...cleanup...; pytest.fail('descriptive RED message')`,
-    the shape used at `TestOverlapSignal::test_both_verifies_enter_before_either_released`
-    and `TestLastItemOfBurstFinalizes::test_single_item_resolves_with_free_remote_slot`
-    -- is already the DESIRED behaviour, not the anti-pattern, and matching
-    on the caught exception type alone (an earlier version of this scanner,
-    task 4219 amendment) false-positived on both (found by running the
-    scanner against this module's own source, not by review). Conservative
-    by construction, matching this module's documented floor-over-shapes
-    stance elsewhere: an `except TimeoutError:` handler that does anything
-    OTHER than `pass` or assign `None` is treated as already-loud and is
-    NOT reported, even if it happens to also be confusing in some other way
-    -- a false negative here is the safe direction.
-
-    For each top-level ``Test*`` class, reports every ``test_*`` method
-    whose body contains at least one such suppressed wait, as a
-    ``{class_name: {method_names}}`` mapping. ``suppress(Exception)`` (the
-    blessed best-effort teardown-join shape used for the worker-task join
-    in this module), a ``suppress(TimeoutError)`` block enclosing no
-    ``asyncio.wait_for`` call, a ``try/except`` whose handler does not
-    catch ``TimeoutError``, and a ``try/except TimeoutError`` whose handler
-    does anything other than swallow (``pass`` / assign ``None``) are all
-    deliberately NOT reported.
-
-    Must never raise: a crash here would fail the whole suite over an
-    unrelated edit to this file (mirrors `_worst_per_method_wait_budget`'s
-    contract above; delegates to `_iter_test_methods`, which returns []
-    on unparseable source). Unparseable source returns {}.
-    """
-
-    def _is_timeout_error_arg(node: ast.expr) -> bool:
-        if isinstance(node, ast.Name) and node.id == 'TimeoutError':
-            return True
-        return (
-            isinstance(node, ast.Attribute)
-            and node.attr == 'TimeoutError'
-            and isinstance(node.value, ast.Name)
-            and node.value.id == 'asyncio'
-        )
-
-    def _is_suppress_timeout_error_call(node: ast.expr) -> bool:
-        if not isinstance(node, ast.Call):
-            return False
-        func = node.func
-        is_suppress = (isinstance(func, ast.Attribute) and func.attr == 'suppress') or (
-            isinstance(func, ast.Name) and func.id == 'suppress'
-        )
-        return is_suppress and any(_is_timeout_error_arg(arg) for arg in node.args)
-
-    def _is_asyncio_wait_for_call(node: ast.AST) -> bool:
-        return (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == 'wait_for'
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == 'asyncio'
-        )
-
-    def _is_timeout_error_handler(handler: ast.ExceptHandler) -> bool:
-        node = handler.type
-        if node is None:
-            return False
-        if _is_timeout_error_arg(node):
-            return True
-        return isinstance(node, ast.Tuple) and any(
-            _is_timeout_error_arg(elt) for elt in node.elts
-        )
-
-    def _is_none_assignment(stmt: ast.stmt) -> bool:
-        return (
-            isinstance(stmt, ast.Assign)
-            and isinstance(stmt.value, ast.Constant)
-            and stmt.value.value is None
-        )
-
-    def _is_swallowing_handler(handler: ast.ExceptHandler) -> bool:
-        return all(
-            isinstance(stmt, ast.Pass) or _is_none_assignment(stmt)
-            for stmt in handler.body
-        )
-
-    result: dict[str, set[str]] = {}
-    for class_name, method in _iter_test_methods(source):
-        for node in ast.walk(method):
-            if isinstance(node, ast.With):
-                if not any(
-                    _is_suppress_timeout_error_call(item.context_expr) for item in node.items
-                ):
-                    continue
-                if any(_is_asyncio_wait_for_call(n) for n in ast.walk(node)):
-                    result.setdefault(class_name, set()).add(method.name)
-                    break
-            elif isinstance(node, ast.Try):
-                if not any(
-                    _is_timeout_error_handler(h) and _is_swallowing_handler(h)
-                    for h in node.handlers
-                ):
-                    continue
-                if any(
-                    _is_asyncio_wait_for_call(n)
-                    for stmt in node.body
-                    for n in ast.walk(stmt)
-                ):
-                    result.setdefault(class_name, set()).add(method.name)
-                    break
-    return result
-
-
-def _unguarded_worker_teardown_methods(source: str) -> list[str]:
-    """Statically scan *source* for the esc-3980-4 leak invariant recorded
-    in `_stop_worker`'s docstring: `wait_responsive` gives up by raising
-    `_pytest.outcomes.Failed` (a
-    ``BaseException`` subclass), so on a straight-line body a give-up --
-    like a mid-body ``assert`` -- skips the worker-stop call entirely and
-    leaks a live ``SpeculativeMergeWorker`` plus its run task into
-    pytest-asyncio teardown. That leak is why one red test used to cascade
-    into unrelated failures elsewhere in the session (task 4219).
-
-    For each top-level ``Test*`` class, reports every ``test_*`` method
-    that calls ``wait_responsive(...)`` AND calls a worker-stop -- either
-    ``worker.stop()`` or the shared ``_stop_worker(worker, ...)`` teardown
-    helper -- from somewhere that is NOT inside a ``finally:`` block whose guarded ``try:`` body encloses
-    EVERY ``wait_responsive`` call in the method, as a sorted list of
-    ``'ClassName::method_name'`` strings. Requiring the ``try:`` to enclose
-    every ``wait_responsive`` call (not just crediting any ``finally`` in
-    the method) matters: a give-up from a ``wait_responsive`` call that
-    sits OUTSIDE that ``try:`` -- e.g. before it -- is not caught by its
-    ``finally`` either, so the leak window stays open even though a
-    finally-wrapped stop call is present somewhere in the method
-    (task 4219 amendment; found by review). Recognising the ``_stop_worker``
-    helper alongside ``worker.stop()`` matters for the same reason: a
-    straight-line ``await _stop_worker(worker, worker_task)`` leaks exactly
-    like a straight-line ``await worker.stop()`` would, and the guard must
-    not go quietly vacuous for a method that adopts the module's OTHER
-    blessed teardown shape.
-
-    Deliberately scoped to methods that call ``wait_responsive``: this
-    module has ~25 pre-existing straight-line teardown sites that have not
-    been migrated yet, and this guard's job is to stop the migrated set
-    from regressing, not to flag every unmigrated one. A method calling
-    ``wait_responsive`` but never a worker-stop at all is not reported
-    either -- there is no stop call to be unguarded.
-
-    Deliberately narrow to a variable literally named ``worker``: this
-    module names the worker ``worker`` at every relevant site, and a false
-    NEGATIVE (missing an oddly-named variable) is the correct failure
-    direction for a guard whose job is to stop a known regression --
-    matching `_call_wait_budget`'s documented conservative-floor stance
-    above.
-
-    Must never raise: a crash here would fail the whole suite over an
-    unrelated edit to this file (delegates to `_iter_test_methods`, which
-    returns [] on unparseable source). Unparseable source returns [].
-    """
-
-    def _is_wait_responsive_call(node: ast.AST) -> bool:
-        return (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == 'wait_responsive'
-        )
-
-    def _is_worker_stop_call(node: ast.AST) -> bool:
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == 'stop'
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == 'worker'
-        ):
-            return True
-        return (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == '_stop_worker'
-        )
-
-    offenders: list[str] = []
-    for class_name, method in _iter_test_methods(source):
-        wait_calls = [n for n in ast.walk(method) if _is_wait_responsive_call(n)]
-        if not wait_calls:
-            continue
-
-        stop_calls = [n for n in ast.walk(method) if _is_worker_stop_call(n)]
-        if not stop_calls:
-            continue
-
-        guarded: set[ast.AST] = set()
-        for try_node in ast.walk(method):
-            if not isinstance(try_node, ast.Try):
-                continue
-            try_body_ids = {id(n) for stmt in try_node.body for n in ast.walk(stmt)}
-            if not all(id(w) in try_body_ids for w in wait_calls):
-                # This try's body does not enclose every wait_responsive
-                # call in the method, so a give-up raised by one it does
-                # NOT enclose is not caught by its finally -- the esc-3980-4
-                # leak window stays open. Do not credit its finalbody stop
-                # call(s) as guarding anything.
-                continue
-            for final_stmt in try_node.finalbody:
-                for n in ast.walk(final_stmt):
-                    if _is_worker_stop_call(n):
-                        guarded.add(n)
-
-        if any(call not in guarded for call in stop_calls):
-            offenders.append(f'{class_name}::{method.name}')
-
-    return sorted(offenders)
-
-
-# The per-test budget an UNMARKED class actually runs under: the tighter of
-# the ini default (a bare local run) and the `--timeout` verify passes on its
-# CLI (the merge-gating run).  Why the two differ, and why verify's is the
-# tighter one, is recorded once at `_orch_helpers.VERIFY_CLI_PER_TEST_TIMEOUT`.
-_AMBIENT_TEST_TIMEOUT = min(PYPROJECT_DEFAULT_TIMEOUT, VERIFY_CLI_PER_TEST_TIMEOUT)
-
-
-def _timeout_mark_offenders(
-    budgets: dict[str, float],
-    resolve: Callable[[str], object | None],
-) -> list[str]:
-    """Pure offender-accumulation for the timeout-mark coverage guard: every
-    class's computed worst-case per-method *budget* must be cleared by the
-    timeout it actually runs under.
-
-    For each ``class_name -> budget`` pair, in sorted order:
-
-    - a budget <= 0 has nothing to cover and is skipped;
-    - a *class_name* that *resolve* cannot look up is an offender;
-    - a class carrying a ``timeout`` mark runs under THAT mark, whatever
-      the ambient budget -- a mark replaces it rather than raising a floor
-      under it -- so it is an offender iff the mark value is None or below
-      *budget*, at any budget;
-    - an unmarked class runs under ``_AMBIENT_TEST_TIMEOUT``, so it is an
-      offender iff *budget* reaches it.
-
-    Returns one formatted offender string per failing class; an empty list
-    means every class is adequately covered.
-
-    Extracted as a pure function (independent of ``globals()`` and this
-    module's real classes) so its failure branches -- unresolvable class
-    name, missing mark, mark value too tight -- are each directly testable
-    with synthetic stubs, rather than only ever exercised by the happy path
-    over this module's own (now fully-marked) classes.
-    """
-    offenders: list[str] = []
-    for class_name, budget in sorted(budgets.items()):
-        if budget <= 0:
-            continue
-        budget_text = (
-            'unbounded (some wait in the method has no resolvable '
-            'wall-clock cap)'
-            if math.isinf(budget)
-            else f'{budget}s'
-        )
-
-        cls = resolve(class_name)
-        if cls is None:
-            offenders.append(
-                f'{class_name}: computed budget {budget_text}, but the '
-                f'class could not be resolved from module globals to '
-                f'inspect its marks.'
-            )
-            continue
-
-        mark = next(
-            (m for m in getattr(cls, 'pytestmark', []) if m.name == 'timeout'),
-            None,
-        )
-        if mark is None:
-            if budget < _AMBIENT_TEST_TIMEOUT:
-                continue
-            offenders.append(
-                f'{class_name}: computed worst-case per-method wait '
-                f'budget is {budget_text}, reaching the '
-                f'{_AMBIENT_TEST_TIMEOUT}s an unmarked class runs under '
-                f'(the tighter of the {PYPROJECT_DEFAULT_TIMEOUT}s ini '
-                f'default and verify\'s --timeout='
-                f'{VERIFY_CLI_PER_TEST_TIMEOUT}), but the class carries '
-                f'no @pytest.mark.timeout mark at all.'
-            )
-            continue
-
-        mark_value = mark.args[0] if mark.args else None
-        if mark_value is None or mark_value < budget:
-            offenders.append(
-                f'{class_name}: computed worst-case per-method wait '
-                f'budget is {budget_text}, but its @pytest.mark.timeout '
-                f'mark is only {mark_value!r} -- too tight to clear '
-                f'it.'
-            )
-    return offenders
 
 
 # ---------------------------------------------------------------------------
@@ -1138,7 +634,16 @@ def _inject_two_host_allocator(
     models a concurrent acquirer.  Returns the allocator so callers can
     introspect slot state or verify calls.
     """
-    allocator = allocator_cls([fake_remote], quarantine=worker._runner_quarantine)
+    return _inject_host_allocator(worker, fake_remote, allocator_cls=allocator_cls)
+
+
+def _inject_host_allocator(
+    worker: SpeculativeMergeWorker,
+    *fake_remotes: Any,
+    allocator_cls: type[HostAllocator] = HostAllocator,
+) -> HostAllocator:
+    """Inject a HostAllocator over local plus every one of *fake_remotes*."""
+    allocator = allocator_cls(list(fake_remotes), quarantine=worker._runner_quarantine)
     worker._host_allocator = allocator
     return allocator
 
@@ -2755,71 +2260,76 @@ class TestOverlapSignal:
         )
 
         worker_task = asyncio.create_task(worker.run())
-
-        # Submit both requests; merger will process them while verifier runs
-        await q.put(req_a)
-        await q.put(req_b)
-
-        # N (local) should enter its gated verify quickly
-        await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-
-        # While N is STILL verifying (gate_a NOT released), N+1 should ALSO
-        # start verifying (remote slot is free → dispatch-fill overlap).
-        # RED: times out — serial loop only dispatches N+1 after N finalizes.
-        # GREEN (step-18): concurrent fill → gate_b_entered fires quickly.
         try:
-            # task 2376: widened from 3.0s (host-oversubscription flake — a
-            # starved worker missed the deadline while the invariant held;
-            # see the 45.0s convention already used at lines ~2251/4185).
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
-        except TimeoutError:
-            # Cleanup: release gates so worker can drain cleanly
-            gate_a_release.set()
-            gate_b_release.set()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(req_a.result, timeout=10.0)
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(req_b.result, timeout=10.0)
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
-            pytest.fail(
-                'OVERLAP not observed: gate_b timed out while gate_a was set. '
-                'RED: serial blocking-get path finalizes N before fetching N+1 '
-                '— N+1 only dispatched after N fully completes. '
-                'GREEN (step-18): blocking-get path loops back to fill → '
-                'dispatch-fill picks up N+1 to remote slot while N is in-flight.'
+            # Submit both requests; merger will process them while verifier runs
+            await q.put(req_a)
+            await q.put(req_b)
+
+            # N (local) should enter its gated verify quickly
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='ov-a: local verify entered',
             )
 
-        # ── Both verifies entered — overlap confirmed ──────────────────
-        # gate_a is still blocking, gate_b is still blocking → true overlap
-        assert gate_a_entered.is_set(), 'N (local) gate not entered'
-        assert gate_b_entered.is_set(), 'N+1 (remote) gate not entered'
-        assert not gate_a_release.is_set(), 'gate_a already released (test bug)'
-        assert not gate_b_release.is_set(), 'gate_b already released (test bug)'
+            # While N is STILL verifying (gate_a NOT released), N+1 should ALSO
+            # start verifying (remote slot is free → dispatch-fill overlap).
+            # RED: times out — serial loop only dispatches N+1 after N finalizes.
+            # GREEN (step-18): concurrent fill → gate_b_entered fires quickly.
+            try:
+                # task 2376: widened from 3.0s (host-oversubscription flake — a
+                # starved worker missed the deadline while the invariant held;
+                # see the 45.0s convention already used at lines ~2251/4185).
+                await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
+            except TimeoutError:
+                # Cleanup: release gates so worker can drain cleanly
+                gate_a_release.set()
+                gate_b_release.set()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(req_a.result, timeout=10.0)
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(req_b.result, timeout=10.0)
+                pytest.fail(
+                    'OVERLAP not observed: gate_b timed out while gate_a was set. '
+                    'RED: serial blocking-get path finalizes N before fetching N+1 '
+                    '— N+1 only dispatched after N fully completes. '
+                    'GREEN (step-18): blocking-get path loops back to fill → '
+                    'dispatch-fill picks up N+1 to remote slot while N is in-flight.'
+                )
 
-        # Peak _inflight == 2: both entries in deque before head was popped
-        # RED: max_len == 1 (N appended, popped, finalized; then N+1 appended)
-        # GREEN: max_len == 2 (N appended, N+1 appended, then head popped)
-        assert tracked.max_len == 2, (
-            f'Expected peak _inflight length 2 (both entries before popleft), '
-            f'got {tracked.max_len}. '
-            'RED: serial dispatch never fills two slots simultaneously. '
-            'GREEN (step-18): fill loop appends N then N+1 before any popleft.'
-        )
+            # ── Both verifies entered — overlap confirmed ──────────────────
+            # gate_a is still blocking, gate_b is still blocking → true overlap
+            assert gate_a_entered.is_set(), 'N (local) gate not entered'
+            assert gate_b_entered.is_set(), 'N+1 (remote) gate not entered'
+            assert not gate_a_release.is_set(), 'gate_a already released (test bug)'
+            assert not gate_b_release.is_set(), 'gate_b already released (test bug)'
 
-        # ── Submission-order finalize: release N+1 FIRST ──────────────
-        # Even though N+1's verify finishes before N's, main must advance N first.
-        gate_b_release.set()   # N+1 (remote) verify completes first
-        gate_a_release.set()   # N (local) verify completes second
+            # Peak _inflight == 2: both entries in deque before head was popped
+            # RED: max_len == 1 (N appended, popped, finalized; then N+1 appended)
+            # GREEN: max_len == 2 (N appended, N+1 appended, then head popped)
+            assert tracked.max_len == 2, (
+                f'Expected peak _inflight length 2 (both entries before popleft), '
+                f'got {tracked.max_len}. '
+                'RED: serial dispatch never fills two slots simultaneously. '
+                'GREEN (step-18): fill loop appends N then N+1 before any popleft.'
+            )
 
-        # Both should resolve 'done'
-        outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
-        outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            # ── Submission-order finalize: release N+1 FIRST ──────────────
+            # Even though N+1's verify finishes before N's, main must advance N first.
+            gate_b_release.set()   # N+1 (remote) verify completes first
+            gate_a_release.set()   # N (local) verify completes second
 
-        await worker.stop()
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=45.0)
+            # Both should resolve 'done'
+            outcome_a = await wait_responsive(
+                req_a.result,
+                label='ov-a: MergeOutcome (submission-order finalize)',
+            )
+            outcome_b = await wait_responsive(
+                req_b.result,
+                label='ov-b: MergeOutcome (submission-order finalize)',
+            )
+        finally:
+            await _stop_worker(worker, worker_task, join_timeout=45.0)
 
         assert outcome_a.status == 'done', f'N: expected done, got {outcome_a}'
         assert outcome_b.status == 'done', f'N+1: expected done, got {outcome_b}'
@@ -2865,8 +2375,6 @@ class TestLastItemOfBurstFinalizes:
         git_config: GitConfig,
         config: OrchestratorConfig,
     ) -> None:
-        import contextlib
-
         # Gated LOCAL verify: enters, then blocks until released — guarantees the
         # fill loop reaches the empty-queue branch while N is still running.
         gate_release = asyncio.Event()
@@ -2894,33 +2402,32 @@ class TestLastItemOfBurstFinalizes:
         )
 
         worker_task = asyncio.create_task(worker.run())
-        # Submit ONLY this one item — the last (and only) item of the burst.
-        await q.put(req)
-
-        # N enters its gated verify; the dispatch-fill loop is now parked
-        # waiting for either a new queue item or N's verify to complete.
-        await asyncio.wait_for(gate_entered.wait(), timeout=15.0)
-
-        # Release N's verify.  With the bug, FINALIZE-HEAD is unreachable
-        # (loop blocked on get()) and this Future never resolves.
-        gate_release.set()
         try:
-            outcome = await asyncio.wait_for(req.result, timeout=10.0)
-        except TimeoutError:
-            with contextlib.suppress(Exception):
-                await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
-            pytest.fail(
-                'LAST-ITEM HANG: single-item burst never finalized. '
-                'RED: fill loop blocked on bare _verifier_queue.get() — the '
-                'completing verify did not wake it, so FINALIZE-HEAD never ran. '
-                'GREEN: race persistent getter vs running verify tasks.'
+            # Submit ONLY this one item — the last (and only) item of the burst.
+            await q.put(req)
+
+            # N enters its gated verify; the dispatch-fill loop is now parked
+            # waiting for either a new queue item or N's verify to complete.
+            await wait_responsive(
+                gate_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='burst-n: local verify entered',
             )
 
-        await worker.stop()
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            # Release N's verify.  With the bug, FINALIZE-HEAD is unreachable
+            # (loop blocked on get()) and this Future never resolves.
+            gate_release.set()
+            try:
+                outcome = await asyncio.wait_for(req.result, timeout=10.0)
+            except TimeoutError:
+                pytest.fail(
+                    'LAST-ITEM HANG: single-item burst never finalized. '
+                    'RED: fill loop blocked on bare _verifier_queue.get() — the '
+                    'completing verify did not wake it, so FINALIZE-HEAD never ran. '
+                    'GREEN: race persistent getter vs running verify tasks.'
+                )
+        finally:
+            await _stop_worker(worker, worker_task)
 
         assert outcome.status == 'done', f'expected done, got {outcome}'
 
@@ -3328,8 +2835,6 @@ class TestHaltAndUnavailable:
         GREEN (step-22): cascade skips REQUEUED entries; _remerge is never
         called; both reqs land on _queue exactly once and are resolved cleanly.
         """
-        import contextlib
-
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
         gate_b_release = asyncio.Event()
@@ -3376,28 +2881,33 @@ class TestHaltAndUnavailable:
         worker._remerge = _spy_remerge  # type: ignore[method-assign]
 
         worker_task = asyncio.create_task(worker.run())
+        try:
+            await q.put(req_a)
+            await q.put(req_b)
 
-        await q.put(req_a)
-        await q.put(req_b)
+            # Wait for both verifies to enter (true concurrent overlap)
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='halt-a: local verify entered',
+            )
+            await wait_responsive(
+                gate_b_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='halt-b: remote verify entered',
+            )
 
-        # Wait for both verifies to enter (true concurrent overlap)
-        await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-        await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+            # Set operator halt — both abort-polls fire within 0.01s
+            worker._operator_halt.set()
 
-        # Set operator halt — both abort-polls fire within 0.01s
-        worker._operator_halt.set()
+            # Give abort-polls time to fire and requeue
+            await asyncio.sleep(0.15)
 
-        # Give abort-polls time to fire and requeue
-        await asyncio.sleep(0.15)
-
-        # Release gates so the leaked inner tasks can complete (harmlessly)
-        gate_a_release.set()
-        gate_b_release.set()
-
-        await worker.stop()
-
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            # Release gates so the leaked inner tasks can complete (harmlessly)
+            gate_a_release.set()
+            gate_b_release.set()
+        finally:
+            await _stop_worker(worker, worker_task)
 
         # Both futures should be resolved (by stop()→shutdown, not by double-dispatch)
         assert req_a.result.done(), 'req_a.result should be resolved by stop()'
@@ -3503,12 +3013,10 @@ class TestHaltAndUnavailable:
 
             outcome_a = await wait_responsive(
                 req_a.result,
-                timeout=15.0,
                 label='unav-a: MergeOutcome (local verify passed)',
             )
             outcome_b = await wait_responsive(
                 req_b.result,
-                timeout=15.0,
                 label='unav-b: MergeOutcome (re-dispatched on local after quarantine)',
             )
         finally:
@@ -4853,12 +4361,8 @@ class TestCascadeErrorContainment:
             # N fails → head-failure cascade fires → _killer_remerge raises for N+1
             gate_a_release.set()
 
-            # nominal PRESERVED at 15.0 as a literal -- never measured to
-            # fail (see the design decision on never-widen); this is
-            # deliberate, not an oversight.
             outcome_a = await wait_responsive(
                 req_a.result,
-                timeout=15.0,
                 label='cascade-err-a: MergeOutcome (N head verify fails)',
             )
             assert outcome_a.status not in ('done', 'already_merged'), (
@@ -5969,7 +5473,7 @@ class _DriftCheckTakesRemoteAllocator(HostAllocator):
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: a deliberate over-mark -- a loop.time()-deadline poll loop here is invisible to _worst_per_method_wait_budget
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: a deliberate over-mark -- a loop.time()-deadline poll loop here is invisible to _wait_budget_audit.py::item_wait_budgets
 class TestRedispatchSpeculativeConservation:
     """Signal/e2e regression lock (task 2063): a genuinely speculative item
     parked on ``_redispatch`` must stay counted by
@@ -6055,110 +5559,117 @@ class TestRedispatchSpeculativeConservation:
         req_b = _make_request('rc-b', 'task/rc-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
+        try:
+            await q.put(req_a)
+            await q.put(req_b)
 
-        await q.put(req_a)
-        await q.put(req_b)
-
-        await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-
-        # Bounded poll (not a flat sleep): the merger's real git worktree
-        # + commit calls have variable latency, so wait until B has
-        # actually landed on _redispatch rather than guessing a delay.
-        deadline = asyncio.get_running_loop().time() + 15.0
-        while not worker._redispatch and asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(0.05)
-
-        parked = list(worker._redispatch)
-        assert len(parked) == 1 and parked[0].speculative, (
-            f'Expected exactly one speculative item parked on _redispatch '
-            f'while A is gated (proves the fix is actually exercised); '
-            f'got {parked!r}.'
-        )
-        inflight_speculative = worker.snapshot()['speculation']['inflight_speculative']
-        assert inflight_speculative == 1, (
-            f'the parked speculative B must stay counted as verifier-owned; '
-            f'snapshot speculation.inflight_speculative={inflight_speculative}'
-        )
-
-        # NOTE(test-determinism): from here on this test calls
-        # worker._maybe_log_queue_heartbeat(...) directly from the test
-        # coroutine while worker_task (the real worker.run() loop) keeps
-        # running concurrently. That manual interleaving is only safe
-        # because _maybe_log_queue_heartbeat — and the
-        # _check_resource_audit / snapshot() calls it makes — are fully
-        # synchronous (no `await` anywhere in that call chain), so each
-        # call is atomic with respect to worker_task's own event-loop
-        # iterations and can never observe state torn mid-dispatch. If
-        # any of those methods ever gains an `await`, this interleaving
-        # could start observing torn state and flake intermittently; a
-        # future async refactor of the heartbeat/audit path must
-        # revisit this test.
-        #
-        # Sample the audit at several heartbeat-observable points while
-        # the speculative item sits parked (the multi-heartbeat window
-        # the original false positive persisted across). Check the
-        # recorded_violations delta AROUND EACH INDIVIDUAL call (rather
-        # than leaning on the blanket non-empty check further below,
-        # which the explicit speculation_accounting_violations() call a
-        # few lines down would satisfy all on its own) so the test
-        # proves _maybe_log_queue_heartbeat itself drives the audit
-        # (via _check_resource_audit and snapshot()'s own
-        # resource_audit key) on every one of these calls while B is
-        # parked — not merely that *some* call somewhere recorded a
-        # sample. Asserts a non-empty delta rather than a hardcoded
-        # multiplier: the exact number of speculation_accounting_
-        # violations() calls per heartbeat (currently 2 — once via
-        # _check_resource_audit, once via snapshot()'s resource_audit
-        # key) is an incidental implementation detail, not the contract
-        # under test.
-        heartbeat_samples: list[list[str]] = []
-        for heartbeat_ts in (1_000_000.0, 1_000_100.0, 1_000_200.0):
-            _pre_count = len(recorded_violations)
-            worker._maybe_log_queue_heartbeat(heartbeat_ts)
-            _new_samples = recorded_violations[_pre_count:]
-            assert _new_samples, (
-                f'expected _maybe_log_queue_heartbeat({heartbeat_ts}) to '
-                f'invoke speculation_accounting_violations at least once '
-                f'via _check_resource_audit — proves the audit genuinely '
-                f'runs on the heartbeat path itself while B is parked, '
-                f'not just via the explicit call below; got no new '
-                f'recorded samples'
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='rc-a: local verify entered',
             )
-            heartbeat_samples.extend(_new_samples)
-        assert all(v == [] for v in heartbeat_samples), (
-            f'speculation-slot identity must hold on every '
-            f'heartbeat-triggered audit call while the speculative item '
-            f'is parked on _redispatch; got {heartbeat_samples!r}'
-        )
 
-        assert worker.speculation_accounting_violations() == [], (
-            'speculation-slot identity must hold while the speculative '
-            'item is parked on _redispatch'
-        )
+            # Bounded poll (not a flat sleep): the merger's real git worktree
+            # + commit calls have variable latency, so wait until B has
+            # actually landed on _redispatch rather than guessing a delay.
+            deadline = asyncio.get_running_loop().time() + 15.0
+            while not worker._redispatch and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.05)
 
-        # A fails -> the existing 'previous_failed' chain-invalidation
-        # path re-merges B against actual main and re-dispatches it.
-        gate_a_release.set()
+            parked = list(worker._redispatch)
+            assert len(parked) == 1 and parked[0].speculative, (
+                f'Expected exactly one speculative item parked on _redispatch '
+                f'while A is gated (proves the fix is actually exercised); '
+                f'got {parked!r}.'
+            )
+            inflight_speculative = worker.snapshot()['speculation']['inflight_speculative']
+            assert inflight_speculative == 1, (
+                f'the parked speculative B must stay counted as verifier-owned; '
+                f'snapshot speculation.inflight_speculative={inflight_speculative}'
+            )
 
-        outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
-        outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            # NOTE(test-determinism): from here on this test calls
+            # worker._maybe_log_queue_heartbeat(...) directly from the test
+            # coroutine while worker_task (the real worker.run() loop) keeps
+            # running concurrently. That manual interleaving is only safe
+            # because _maybe_log_queue_heartbeat — and the
+            # _check_resource_audit / snapshot() calls it makes — are fully
+            # synchronous (no `await` anywhere in that call chain), so each
+            # call is atomic with respect to worker_task's own event-loop
+            # iterations and can never observe state torn mid-dispatch. If
+            # any of those methods ever gains an `await`, this interleaving
+            # could start observing torn state and flake intermittently; a
+            # future async refactor of the heartbeat/audit path must
+            # revisit this test.
+            #
+            # Sample the audit at several heartbeat-observable points while
+            # the speculative item sits parked (the multi-heartbeat window
+            # the original false positive persisted across). Check the
+            # recorded_violations delta AROUND EACH INDIVIDUAL call (rather
+            # than leaning on the blanket non-empty check further below,
+            # which the explicit speculation_accounting_violations() call a
+            # few lines down would satisfy all on its own) so the test
+            # proves _maybe_log_queue_heartbeat itself drives the audit
+            # (via _check_resource_audit and snapshot()'s own
+            # resource_audit key) on every one of these calls while B is
+            # parked — not merely that *some* call somewhere recorded a
+            # sample. Asserts a non-empty delta rather than a hardcoded
+            # multiplier: the exact number of speculation_accounting_
+            # violations() calls per heartbeat (currently 2 — once via
+            # _check_resource_audit, once via snapshot()'s resource_audit
+            # key) is an incidental implementation detail, not the contract
+            # under test.
+            heartbeat_samples: list[list[str]] = []
+            for heartbeat_ts in (1_000_000.0, 1_000_100.0, 1_000_200.0):
+                _pre_count = len(recorded_violations)
+                worker._maybe_log_queue_heartbeat(heartbeat_ts)
+                _new_samples = recorded_violations[_pre_count:]
+                assert _new_samples, (
+                    f'expected _maybe_log_queue_heartbeat({heartbeat_ts}) to '
+                    f'invoke speculation_accounting_violations at least once '
+                    f'via _check_resource_audit — proves the audit genuinely '
+                    f'runs on the heartbeat path itself while B is parked, '
+                    f'not just via the explicit call below; got no new '
+                    f'recorded samples'
+                )
+                heartbeat_samples.extend(_new_samples)
+            assert all(v == [] for v in heartbeat_samples), (
+                f'speculation-slot identity must hold on every '
+                f'heartbeat-triggered audit call while the speculative item '
+                f'is parked on _redispatch; got {heartbeat_samples!r}'
+            )
 
-        # Same source-specific proof for the post-resolution heartbeat.
-        _pre_final_heartbeat_samples = len(recorded_violations)
-        worker._maybe_log_queue_heartbeat(1_000_300.0)
-        final_heartbeat_samples = recorded_violations[_pre_final_heartbeat_samples:]
-        assert final_heartbeat_samples and all(
-            v == [] for v in final_heartbeat_samples
-        ), (
-            f'expected the post-resolution heartbeat call to invoke the '
-            f'audit at least once and find it clean; got '
-            f'{final_heartbeat_samples!r}'
-        )
+            assert worker.speculation_accounting_violations() == [], (
+                'speculation-slot identity must hold while the speculative '
+                'item is parked on _redispatch'
+            )
 
-        await worker.stop()
+            # A fails -> the existing 'previous_failed' chain-invalidation
+            # path re-merges B against actual main and re-dispatches it.
+            gate_a_release.set()
 
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            outcome_a = await wait_responsive(
+                req_a.result,
+                label='rc-a: MergeOutcome (head verify failed)',
+            )
+            outcome_b = await wait_responsive(
+                req_b.result,
+                label='rc-b: MergeOutcome (re-merged and re-verified after A failed)',
+            )
+
+            # Same source-specific proof for the post-resolution heartbeat.
+            _pre_final_heartbeat_samples = len(recorded_violations)
+            worker._maybe_log_queue_heartbeat(1_000_300.0)
+            final_heartbeat_samples = recorded_violations[_pre_final_heartbeat_samples:]
+            assert final_heartbeat_samples and all(
+                v == [] for v in final_heartbeat_samples
+            ), (
+                f'expected the post-resolution heartbeat call to invoke the '
+                f'audit at least once and find it clean; got '
+                f'{final_heartbeat_samples!r}'
+            )
+        finally:
+            await _stop_worker(worker, worker_task)
 
         assert outcome_a.status != 'done', (
             f'Expected A to fail (gated verify returns passed=False), got {outcome_a!r}'
@@ -6520,1024 +6031,6 @@ class TestAwaitOutcomeHelper:
         )
 
 
-# ---------------------------------------------------------------------------
-# task 3492 step-1: wait-budget audit helper (source-level AST scan)
-# ---------------------------------------------------------------------------
-
-
-class TestWaitBudgetAuditHelper:
-    """Unit tests for `_worst_per_method_wait_budget`, task 3492's audit
-    engine -- see ITS docstring for the full per-method-vs-class-wide-sum
-    and shape-floor/branch-blind rationale; this class only pins the
-    observable behaviour case by case.
-
-    Every case here is driven from a SYNTHETIC source string, not this
-    module's own source, so these tests are provably non-vacuous and do not
-    shift when this file is later edited.
-    """
-
-    def test_two_sequential_wait_for_calls_sum_within_one_method(self) -> None:
-        """Two sequential `asyncio.wait_for(..., timeout=45.0)` calls in the
-        SAME method sum to 90.0 -- pytest-timeout enforces the whole method
-        body, so sequential waits stack.
-        """
-        source = '''
-class TestTwoSequentialWaits:
-    async def test_two_waits(self):
-        await asyncio.wait_for(x, timeout=45.0)
-        await asyncio.wait_for(y, timeout=45.0)
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestTwoSequentialWaits': 90.0}, (
-            f'Expected two sequential 45.0s waits in one method to sum to '
-            f'90.0, got {budgets!r}.'
-        )
-
-    def test_mutually_exclusive_branches_are_summed_not_maxed(self) -> None:
-        """Two 45.0s waits in opposite arms of an `if`/`else` -- which can
-        never both execute in a single real run -- sum to 90.0, not the
-        45.0 a control-flow-aware count would give.
-
-        This pins a deliberate, tolerated LIMITATION, not a design goal:
-        `_method_wait_budget` walks the whole method body via `ast.walk`
-        with no awareness of branches, so mutually exclusive arms over-count
-        relative to any real execution path (see `_method_wait_budget`'s
-        docstring). It is why `TestOverlapSignal`'s computed budget exceeds
-        a control-flow-aware hand count over the same method's try/except
-        paths.
-        """
-        source = '''
-class TestBranchesSummed:
-    async def test_branches(self, cond):
-        if cond:
-            await asyncio.wait_for(x, timeout=45.0)
-        else:
-            await asyncio.wait_for(y, timeout=45.0)
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestBranchesSummed': 90.0}, (
-            f'Expected mutually exclusive if/else branches to be SUMMED '
-            f'(90.0), not maxed (45.0) -- this pins the branch-blind '
-            f'limitation documented on _method_wait_budget, not a design '
-            f'goal; got {budgets!r}.'
-        )
-
-    def test_non_asyncio_wait_for_is_not_counted(self) -> None:
-        """A `.wait_for(...)` call on something other than `asyncio` (e.g.
-        `gate.wait_for(x, timeout=999.0)`) contributes 0.0 -- the match is
-        deliberately narrowed to `asyncio.wait_for` specifically, so an
-        unrelated same-named method can't be mistaken for the real thing.
-        """
-        source = '''
-class TestNonAsyncioWaitFor:
-    async def test_it(self, gate):
-        await gate.wait_for(x, timeout=999.0)
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestNonAsyncioWaitFor': 0.0}, (
-            f'Expected a non-asyncio .wait_for(...) call to contribute 0.0, '
-            f'got {budgets!r}.'
-        )
-
-    def test_takes_max_over_methods_not_class_wide_sum(self) -> None:
-        """A class with TWO methods, each with one 45.0 wait, budgets at
-        45.0 -- the MAX over methods, NOT the 90.0 class-wide sum.
-
-        This is the distinction that makes the audit correct: pytest-timeout
-        applies the class mark to each method independently. Summing across
-        methods would misidentify a class like
-        `TestRunInflightVerifyAbortPoll` (four 45s methods, a 180s
-        class-wide sum but only a 45s worst method) as a false-positive
-        breach.
-        """
-        source = '''
-class TestTwoLightMethods:
-    async def test_one(self):
-        await asyncio.wait_for(x, timeout=45.0)
-
-    async def test_two(self):
-        await asyncio.wait_for(y, timeout=45.0)
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestTwoLightMethods': 45.0}, (
-            f'Expected the MAX over methods (45.0), not the class-wide sum '
-            f'(90.0); got {budgets!r}. Summing across methods would '
-            f'misidentify the breaching set the guard is meant to compute.'
-        )
-
-    def test_bare_await_outcome_contributes_hidden_default_budget(self) -> None:
-        """A bare `_await_outcome(req, label='x')` call with no explicit
-        `timeout=` contributes the hidden default, MERGE_RESULT_TIMEOUT
-        (45.0) -- invisible to a naive `timeout=` grep, which is exactly
-        why the guard must special-case this call shape.
-        """
-        source = '''
-class TestBareAwaitOutcome:
-    async def test_bare_default(self):
-        await _await_outcome(req, label='x')
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestBareAwaitOutcome': 45.0}, (
-            f'Expected a bare _await_outcome() call to contribute the '
-            f'hidden MERGE_RESULT_TIMEOUT default (45.0), got {budgets!r}.'
-        )
-
-    def test_await_outcome_explicit_timeout_overrides_default(self) -> None:
-        """`_await_outcome(req, label='x', timeout=10.0)` contributes its
-        explicit 10.0, not the 45.0 default -- proves the explicit
-        `timeout=` kwarg is read, not just assumed.
-        """
-        source = '''
-class TestExplicitAwaitOutcome:
-    async def test_explicit_timeout(self):
-        await _await_outcome(req, label='x', timeout=10.0)
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestExplicitAwaitOutcome': 10.0}, (
-            f'Expected an explicit timeout=10.0 kwarg to override the '
-            f'hidden default, got {budgets!r}.'
-        )
-
-    def test_dynamic_timeout_value_is_unbounded_and_does_not_raise(self) -> None:
-        """A non-literal/dynamic timeout such as `timeout=some_var` bills
-        `math.inf` and does NOT raise: the scan cannot read the value, so
-        the wait may run for any wall clock, and no mark clears that.
-        """
-        source = '''
-class TestDynamicTimeout:
-    async def test_dynamic(self):
-        await asyncio.wait_for(x, timeout=some_var)
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestDynamicTimeout': math.inf}, (
-            f'Expected an unresolvable dynamic timeout to bill math.inf '
-            f'without raising, got {budgets!r}.'
-        )
-
-    def test_wait_for_positional_dynamic_timeout_is_unbounded(self) -> None:
-        """The positional spelling `asyncio.wait_for(x, some_var)` is the
-        same unreadable wait, so it bills `math.inf` too.
-        """
-        source = '''
-class TestPositionalDynamicTimeout:
-    async def test_dynamic(self):
-        await asyncio.wait_for(x, some_var)
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestPositionalDynamicTimeout': math.inf}, (
-            f'Expected an unresolvable positional timeout to bill math.inf, '
-            f'got {budgets!r}.'
-        )
-
-    def test_wait_for_none_timeout_is_unbounded(self) -> None:
-        """`asyncio.wait_for(x, timeout=None)` waits forever, so it bills
-        `math.inf`, not the 0.0 a literal zero would.
-        """
-        source = '''
-class TestNoneTimeout:
-    async def test_forever(self):
-        await asyncio.wait_for(x, timeout=None)
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestNoneTimeout': math.inf}, (
-            f'Expected timeout=None to bill math.inf, got {budgets!r}.'
-        )
-
-    def test_await_outcome_unresolvable_timeout_is_unbounded(self) -> None:
-        """An explicit `_await_outcome(..., timeout=some_var)` replaces the
-        hidden default with a value the scan cannot read, so it bills
-        `math.inf`.
-        """
-        source = '''
-class TestAwaitOutcomeUnknownTimeout:
-    async def test_it(self):
-        await _await_outcome(req, label='x', timeout=some_var)
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestAwaitOutcomeUnknownTimeout': math.inf}, (
-            f'Expected an unresolvable _await_outcome timeout to bill '
-            f'math.inf, got {budgets!r}.'
-        )
-
-    def test_merge_result_timeout_name_resolves_to_45(self) -> None:
-        """`timeout=MERGE_RESULT_TIMEOUT` resolves the name reference to
-        its known numeric value, 45.0.
-        """
-        source = '''
-class TestMergeResultTimeoutName:
-    async def test_it(self):
-        await asyncio.wait_for(x, timeout=MERGE_RESULT_TIMEOUT)
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestMergeResultTimeoutName': 45.0}, (
-            f'Expected timeout=MERGE_RESULT_TIMEOUT to resolve to 45.0, '
-            f'got {budgets!r}.'
-        )
-
-    def test_heavy_barrier_test_timeout_name_resolves_to_its_value(self) -> None:
-        """`timeout=HEAVY_BARRIER_TEST_TIMEOUT` resolves the name reference
-        to the constant's numeric value rather than billing it as unbounded.
-        """
-        source = '''
-class TestHeavyBarrierTimeoutName:
-    async def test_it(self):
-        await asyncio.wait_for(x, timeout=HEAVY_BARRIER_TEST_TIMEOUT)
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert math.isfinite(budgets['TestHeavyBarrierTimeoutName']), (
-            f'Expected timeout=HEAVY_BARRIER_TEST_TIMEOUT to resolve to a '
-            f'finite budget, got {budgets!r}: the name was billed as unbounded.'
-        )
-        expected = float(HEAVY_BARRIER_TEST_TIMEOUT)
-        assert budgets == {'TestHeavyBarrierTimeoutName': expected}, (
-            f'Expected timeout=HEAVY_BARRIER_TEST_TIMEOUT to resolve to '
-            f'{expected}, got {budgets!r}.'
-        )
-
-    def test_wait_responsive_bare_bills_the_stretched_hidden_default(self) -> None:
-        """A `wait_responsive(...)` with no `timeout=` bills its hidden
-        MERGE_RESULT_TIMEOUT default stretched by RESPONSIVE_WAIT_STRETCH
-        (2 x 45 = 90.0), the wall clock the helper can actually consume.
-        """
-        source = '''
-class TestWaitResponsiveBare:
-    async def test_it(self):
-        await wait_responsive(req.result, label='x')
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestWaitResponsiveBare': 90.0}, (
-            f'Expected the stretched hidden default (90.0), got {budgets!r}.'
-        )
-
-    def test_wait_responsive_gate_barrier_bills_twice_its_nominal(self) -> None:
-        """`timeout=MERGE_GATE_BARRIER_TIMEOUT` (15) bills 2 x 15 = 30.0."""
-        source = '''
-class TestWaitResponsiveGate:
-    async def test_it(self, g):
-        await wait_responsive(g.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label='x')
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestWaitResponsiveGate': 30.0}, (
-            f'Expected a stretched gate-barrier nominal (30.0), got {budgets!r}.'
-        )
-
-    def test_wait_responsive_large_nominal_is_clamped_to_the_wall_cap(self) -> None:
-        """A nominal whose stretch exceeds RESPONSIVE_WAIT_WALL_CAP bills
-        the cap (90.0): the helper's default cap never exceeds it.
-        """
-        source = '''
-class TestWaitResponsiveClamped:
-    async def test_it(self):
-        await wait_responsive(req.result, timeout=500.0, label='x')
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestWaitResponsiveClamped': 90.0}, (
-            f'Expected the RESPONSIVE_WAIT_WALL_CAP clamp (90.0), got {budgets!r}.'
-        )
-
-    def test_wait_responsive_explicit_max_wall_is_billed_verbatim(self) -> None:
-        """An explicit `max_wall_s` replaces the helper's scaled default cap,
-        so it is the wall clock the site may consume and is billed as is --
-        not the 2 x nominal a default-cap site would get.
-        """
-        source = '''
-class TestWaitResponsiveExplicitCap:
-    async def test_it(self):
-        await wait_responsive(req.result, timeout=1.0, max_wall_s=1000.0, label='x')
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestWaitResponsiveExplicitCap': 1000.0}, (
-            f'Expected an explicit max_wall_s=1000.0 to be billed verbatim, '
-            f'got {budgets!r}.'
-        )
-
-    def test_wait_responsive_explicit_max_wall_name_resolves(self) -> None:
-        """`max_wall_s=RESPONSIVE_WAIT_WALL_CAP` resolves the name and bills
-        it (90.0).
-        """
-        source = '''
-class TestWaitResponsiveNamedCap:
-    async def test_it(self):
-        await wait_responsive(
-            req.result, timeout=1.0, max_wall_s=RESPONSIVE_WAIT_WALL_CAP, label='x'
-        )
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestWaitResponsiveNamedCap': 90.0}, (
-            f'Expected max_wall_s=RESPONSIVE_WAIT_WALL_CAP to bill 90.0, '
-            f'got {budgets!r}.'
-        )
-
-    def test_wait_responsive_explicit_none_max_wall_is_the_default(self) -> None:
-        """`max_wall_s=None` IS the helper's default, so the site bills the
-        stretched nominal (2 x 15 = 30.0), not an unknown cap.
-        """
-        source = '''
-class TestWaitResponsiveNoneCap:
-    async def test_it(self, g):
-        await wait_responsive(
-            g.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, max_wall_s=None, label='x'
-        )
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestWaitResponsiveNoneCap': 30.0}, (
-            f'Expected max_wall_s=None to bill the stretched nominal (30.0), '
-            f'got {budgets!r}.'
-        )
-
-    def test_wait_responsive_unresolvable_max_wall_is_unbounded(self) -> None:
-        """An explicit `max_wall_s` the auditor cannot resolve could allow
-        any wall clock at all, so the site bills `math.inf` -- which no mark
-        clears, making the coverage guard fail loudly rather than quietly
-        under-billing.
-        """
-        source = '''
-class TestWaitResponsiveUnknownCap:
-    async def test_it(self):
-        await wait_responsive(req.result, timeout=1.0, max_wall_s=some_var, label='x')
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestWaitResponsiveUnknownCap': math.inf}, (
-            f'Expected an unresolvable max_wall_s to bill math.inf, got {budgets!r}.'
-        )
-
-    def test_wait_responsive_unresolvable_nominal_bills_the_wall_cap(self) -> None:
-        """With a default cap the helper never exceeds
-        RESPONSIVE_WAIT_WALL_CAP whatever its nominal, so an unresolvable
-        `timeout=` bills that exact bound (90.0) rather than 0.0.
-        """
-        source = '''
-class TestWaitResponsiveUnknownNominal:
-    async def test_it(self):
-        await wait_responsive(req.result, timeout=some_var, label='x')
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestWaitResponsiveUnknownNominal': 90.0}, (
-            f'Expected an unresolvable wait_responsive nominal to bill '
-            f'RESPONSIVE_WAIT_WALL_CAP (90.0), got {budgets!r}.'
-        )
-
-    def test_stop_worker_bills_its_hidden_default_join(self) -> None:
-        """`_stop_worker(worker, worker_task)` joins the worker task for up
-        to its hidden default (5.0s), so a teardown through it is billed.
-        """
-        source = '''
-class TestStopWorkerDefault:
-    async def test_it(self):
-        await _stop_worker(worker, worker_task)
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestStopWorkerDefault': 5.0}, (
-            f'Expected the hidden default join (5.0), got {budgets!r}.'
-        )
-
-    def test_stop_worker_bills_an_explicit_join_timeout(self) -> None:
-        """An explicit `join_timeout=` is the join actually waited (20.0)."""
-        source = '''
-class TestStopWorkerExplicit:
-    async def test_it(self):
-        await _stop_worker(worker, worker_task, join_timeout=20.0)
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestStopWorkerExplicit': 20.0}, (
-            f'Expected an explicit join_timeout=20.0 to be billed, got {budgets!r}.'
-        )
-
-    def test_stop_worker_unresolvable_join_timeout_is_unbounded(self) -> None:
-        """The teardown join is real wall clock, so a `join_timeout=` the
-        scan cannot read bills `math.inf` rather than vanishing from the
-        budget.
-        """
-        source = '''
-class TestStopWorkerUnknownJoin:
-    async def test_it(self):
-        await _stop_worker(worker, worker_task, join_timeout=some_var)
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestStopWorkerUnknownJoin': math.inf}, (
-            f'Expected an unresolvable join_timeout to bill math.inf, '
-            f'got {budgets!r}.'
-        )
-
-    def test_asyncio_sleep_is_outside_the_counted_shape_set(self) -> None:
-        """`asyncio.sleep(999)` contributes 0.0 -- sleeps are deliberately
-        OUT of the counted shape set (the guard is a conservative floor,
-        not a full audit; see the floor/superset design decision).
-        """
-        source = '''
-class TestSleepNotCounted:
-    async def test_sleeps(self):
-        await asyncio.sleep(999)
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestSleepNotCounted': 0.0}, (
-            f'Expected asyncio.sleep(...) to contribute 0.0 (not a counted '
-            f'call shape), got {budgets!r}.'
-        )
-
-    def test_non_test_methods_do_not_contribute(self) -> None:
-        """A non-`test_*` method (a private helper or a fixture) contributes
-        nothing -- only real test methods drive the budget.
-        """
-        source = '''
-class TestHelperMethodsIgnored:
-    async def _helper(self):
-        await asyncio.wait_for(x, timeout=999.0)
-
-    @pytest.fixture
-    def some_fixture(self):
-        return object()
-
-    async def test_actual(self):
-        await asyncio.wait_for(y, timeout=5.0)
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {'TestHelperMethodsIgnored': 5.0}, (
-            f'Expected only test_* methods to contribute to the budget '
-            f'(5.0), with the 999.0s wait in a non-test helper ignored; '
-            f'got {budgets!r}.'
-        )
-
-    def test_class_with_no_test_methods_is_zero_or_absent(self) -> None:
-        """A class with no test methods at all budgets 0.0 (or is absent
-        from the result) -- no crash.
-        """
-        source = '''
-class TestNoTestMethods:
-    async def _helper(self):
-        await asyncio.wait_for(x, timeout=45.0)
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets.get('TestNoTestMethods', 0.0) == 0.0, (
-            f'Expected a class with no test_* methods to budget 0.0 (or be '
-            f'absent), got {budgets!r}.'
-        )
-
-    def test_class_with_no_waits_is_zero(self) -> None:
-        """A class whose test methods never wait budgets 0.0 -- no crash."""
-        source = '''
-class TestNoWaits:
-    async def test_nothing(self):
-        x = 1 + 1
-        return x
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets.get('TestNoWaits', 0.0) == 0.0, (
-            f'Expected a class with no waits at all to budget 0.0, got '
-            f'{budgets!r}.'
-        )
-
-    def test_syntactically_odd_but_parseable_input_does_not_raise(self) -> None:
-        """A syntactically odd but still-parseable module -- no `Test*`
-        classes at all, only module-level and conditionally-nested code --
-        does not raise.
-        """
-        source = '''
-x = 1
-def free_function():
-    return 42
-if x:
-    class NotATestClass:
-        def method(self):
-            pass
-'''
-        budgets = _worst_per_method_wait_budget(source)
-
-        assert budgets == {}, (
-            f'Expected a module with no Test* classes to yield an empty '
-            f'result without raising, got {budgets!r}.'
-        )
-
-
-# ---------------------------------------------------------------------------
-# task 4219: suppressed-wait debt-ratchet scanners
-# ---------------------------------------------------------------------------
-
-
-class TestSuppressedWaitScanner:
-    """Unit tests for `_suppressed_result_wait_methods` -- the executable
-    form of the `outcome is None` anti-pattern `_await_outcome`'s docstring
-    names (see "The shape this replaces", above): either a `with
-    contextlib.suppress(TimeoutError): outcome = await
-    asyncio.wait_for(fut, timeout=N)` shape, or a `try: outcome = await
-    asyncio.wait_for(...) except TimeoutError: outcome = None` shape. Both
-    convert a genuine pipeline hang or a missing cascade into a confusing
-    `outcome is None` assertion failure instead of failing loudly by label
-    (task 4219; the try/except spelling was added in the task 4219
-    amendment pass).
-
-    Every case here is driven from a SYNTHETIC source string, not this
-    module's own source, so these tests are provably non-vacuous and do not
-    shift when this file is later edited.
-    """
-
-    def test_suppressed_timeout_error_around_wait_for_is_reported(self) -> None:
-        """A `with contextlib.suppress(TimeoutError):` block enclosing an
-        `asyncio.wait_for(...)` call IS reported -- this is the anti-pattern
-        itself.
-        """
-        source = '''
-class TestSuppressedWait:
-    async def test_it(self):
-        with contextlib.suppress(TimeoutError):
-            outcome = await asyncio.wait_for(fut, timeout=5.0)
-'''
-        result = _suppressed_result_wait_methods(source)
-
-        assert result == {'TestSuppressedWait': {'test_it'}}, (
-            f'Expected the suppress(TimeoutError)-wrapped wait_for to be '
-            f'reported, got {result!r}.'
-        )
-
-    def test_suppress_asyncio_timeout_error_attribute_form_is_reported(self) -> None:
-        """The `asyncio.TimeoutError` attribute spelling (as opposed to the
-        bare `TimeoutError` Name form) inside `suppress(...)` IS also
-        recognised. No site in this module currently uses this spelling --
-        this pins the branch so it does not silently rot un-covered.
-        """
-        source = '''
-class TestSuppressedWaitAttributeForm:
-    async def test_it(self):
-        with contextlib.suppress(asyncio.TimeoutError):
-            outcome = await asyncio.wait_for(fut, timeout=5.0)
-'''
-        result = _suppressed_result_wait_methods(source)
-
-        assert result == {'TestSuppressedWaitAttributeForm': {'test_it'}}, (
-            f'Expected the suppress(asyncio.TimeoutError)-wrapped wait_for '
-            f'to be reported, got {result!r}.'
-        )
-
-    def test_bare_suppress_name_import_form_is_reported(self) -> None:
-        """`suppress(TimeoutError):` -- the bare `Name` call from a
-        `from contextlib import suppress` import, rather than the
-        `contextlib.suppress` attribute form -- IS also recognised.
-        """
-        source = '''
-class TestBareSuppressImport:
-    async def test_it(self):
-        with suppress(TimeoutError):
-            outcome = await asyncio.wait_for(fut, timeout=5.0)
-'''
-        result = _suppressed_result_wait_methods(source)
-
-        assert result == {'TestBareSuppressImport': {'test_it'}}, (
-            f'Expected the bare suppress(TimeoutError)-wrapped wait_for to '
-            f'be reported, got {result!r}.'
-        )
-
-    def test_try_except_timeout_error_around_wait_for_is_reported(self) -> None:
-        """The second spelling of the anti-pattern: a bare `try: outcome =
-        await asyncio.wait_for(...) except TimeoutError: outcome = None`
-        block IS reported -- this is the exact shape found (undetected,
-        until this amendment) at
-        `TestHaltAndUnavailable::test_runner_unavailable_quarantine_fallback`,
-        L3340-3346.
-        """
-        source = '''
-class TestTryExceptTimeoutError:
-    async def test_it(self):
-        try:
-            outcome = await asyncio.wait_for(fut, timeout=5.0)
-        except TimeoutError:
-            outcome = None
-'''
-        result = _suppressed_result_wait_methods(source)
-
-        assert result == {'TestTryExceptTimeoutError': {'test_it'}}, (
-            f'Expected the try/except TimeoutError-wrapped wait_for to be '
-            f'reported, got {result!r}.'
-        )
-
-    def test_try_except_other_exception_is_not_reported(self) -> None:
-        """A `try/except` around a wait_for call whose handler catches a
-        DIFFERENT exception (not `TimeoutError`) is NOT reported -- the
-        anti-pattern is specifically about swallowing a timeout, not about
-        exception handling in general.
-        """
-        source = '''
-class TestTryExceptOtherException:
-    async def test_it(self):
-        try:
-            outcome = await asyncio.wait_for(fut, timeout=5.0)
-        except ValueError:
-            outcome = None
-'''
-        result = _suppressed_result_wait_methods(source)
-
-        assert result == {}, (
-            f'Expected a try/except catching ValueError (not TimeoutError) '
-            f'to NOT be reported, got {result!r}.'
-        )
-
-    def test_try_except_timeout_error_that_fails_loudly_is_not_reported(self) -> None:
-        """A `try/except TimeoutError:` handler that does NOT swallow --
-        e.g. it runs cleanup and then calls `pytest.fail(...)` with a clear
-        diagnostic message, the exact shape used at
-        `TestOverlapSignal::test_both_verifies_enter_before_either_released`
-        and `TestLastItemOfBurstFinalizes::test_single_item_resolves_with_free_remote_slot`
-        -- is NOT reported. This is already the DESIRED loud-failure
-        behaviour, not the `outcome is None` anti-pattern; an earlier
-        version of this scanner (task 4219 amendment) matched on the
-        caught exception type alone and false-positived on both real
-        sites.
-        """
-        source = '''
-class TestTryExceptLoudFailure:
-    async def test_it(self):
-        try:
-            outcome = await asyncio.wait_for(fut, timeout=5.0)
-        except TimeoutError:
-            with contextlib.suppress(Exception):
-                await cleanup()
-            pytest.fail('descriptive RED message explaining the failure')
-'''
-        result = _suppressed_result_wait_methods(source)
-
-        assert result == {}, (
-            f'Expected a try/except TimeoutError handler that fails loudly '
-            f'via pytest.fail(...) (not a swallow) to NOT be reported, '
-            f'got {result!r}.'
-        )
-
-    def test_try_except_timeout_error_without_wait_for_is_not_reported(self) -> None:
-        """A `try/except TimeoutError:` block whose `try:` body encloses no
-        `asyncio.wait_for` call at all is NOT reported.
-        """
-        source = '''
-class TestTryExceptNoWaitFor:
-    async def test_it(self):
-        try:
-            do_something_unrelated()
-        except TimeoutError:
-            pass
-'''
-        result = _suppressed_result_wait_methods(source)
-
-        assert result == {}, (
-            f'Expected a try/except TimeoutError block with no enclosed '
-            f'wait_for call in the try body to NOT be reported, '
-            f'got {result!r}.'
-        )
-
-    def test_multiple_classes_and_methods_are_all_aggregated(self) -> None:
-        """Offenders across MULTIPLE classes and MULTIPLE methods within
-        one class are all accumulated into the returned mapping -- not just
-        the first one found. Pins the dict-of-sets aggregation and the
-        per-class method-name set, which the single-offender cases above
-        cannot distinguish from an implementation that stops at the first
-        hit.
-        """
-        source = '''
-class TestFirstOffender:
-    async def test_one(self):
-        with contextlib.suppress(TimeoutError):
-            outcome = await asyncio.wait_for(fut, timeout=5.0)
-
-    async def test_two(self):
-        try:
-            outcome = await asyncio.wait_for(fut, timeout=5.0)
-        except TimeoutError:
-            outcome = None
-
-    async def test_clean(self):
-        outcome = await asyncio.wait_for(fut, timeout=5.0)
-
-class TestSecondOffender:
-    async def test_only(self):
-        with contextlib.suppress(TimeoutError):
-            outcome = await asyncio.wait_for(fut, timeout=5.0)
-'''
-        result = _suppressed_result_wait_methods(source)
-
-        assert result == {
-            'TestFirstOffender': {'test_one', 'test_two'},
-            'TestSecondOffender': {'test_only'},
-        }, (
-            f'Expected offenders from both classes and both offending '
-            f'methods in TestFirstOffender to be aggregated together, '
-            f'got {result!r}.'
-        )
-
-    def test_suppress_exception_is_not_reported(self) -> None:
-        """`contextlib.suppress(Exception):` (not `TimeoutError`
-        specifically) around a wait_for call is NOT reported -- this is the
-        blessed best-effort teardown-join shape (the `worker_task` join at
-        line 4616), which asserts nothing and so isn't the None-outcome
-        anti-pattern.
-        """
-        source = '''
-class TestSuppressException:
-    async def test_it(self):
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
-'''
-        result = _suppressed_result_wait_methods(source)
-
-        assert result == {}, (
-            f'Expected suppress(Exception) (not TimeoutError) to NOT be '
-            f'reported, got {result!r}.'
-        )
-
-    def test_bare_wait_for_without_suppress_is_not_reported(self) -> None:
-        """A bare `await asyncio.wait_for(...)` with no enclosing suppress
-        at all is NOT reported -- a loud TimeoutError is exactly the
-        desired behaviour, not the anti-pattern.
-        """
-        source = '''
-class TestBareWaitFor:
-    async def test_it(self):
-        outcome = await asyncio.wait_for(fut, timeout=5.0)
-'''
-        result = _suppressed_result_wait_methods(source)
-
-        assert result == {}, (
-            f'Expected a bare, unsuppressed wait_for to NOT be reported, '
-            f'got {result!r}.'
-        )
-
-    def test_suppress_timeout_error_without_wait_for_is_not_reported(self) -> None:
-        """A `suppress(TimeoutError):` block that encloses no
-        `asyncio.wait_for` call at all is NOT reported -- the anti-pattern
-        is specifically about swallowing a result-future wait, not about
-        `suppress(TimeoutError)` used for some unrelated purpose.
-        """
-        source = '''
-class TestSuppressNoWaitFor:
-    async def test_it(self):
-        with contextlib.suppress(TimeoutError):
-            do_something_unrelated()
-'''
-        result = _suppressed_result_wait_methods(source)
-
-        assert result == {}, (
-            f'Expected a suppress(TimeoutError) block with no enclosed '
-            f'wait_for call to NOT be reported, got {result!r}.'
-        )
-
-    def test_non_test_method_and_non_test_class_are_skipped(self) -> None:
-        """A non-`test_*` method (even carrying the anti-pattern) and a
-        class whose name does not start with `Test` are both skipped
-        entirely.
-        """
-        source = '''
-class TestHelperMethodSkipped:
-    async def _helper(self):
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(fut, timeout=5.0)
-
-class NotATestClass:
-    async def test_it(self):
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(fut, timeout=5.0)
-'''
-        result = _suppressed_result_wait_methods(source)
-
-        assert result == {}, (
-            f'Expected a non-test_* method and a non-Test* class to both '
-            f'be skipped, got {result!r}.'
-        )
-
-    def test_unparseable_source_returns_empty_dict_without_raising(self) -> None:
-        """Unparseable source returns `{}` rather than raising -- mirrors
-        `_worst_per_method_wait_budget`'s must-never-raise contract: a
-        crash here would fail the whole suite over an unrelated edit to
-        this file.
-        """
-        result = _suppressed_result_wait_methods('def not valid python(:')
-
-        assert result == {}, (
-            f'Expected unparseable source to return {{}} without raising, '
-            f'got {result!r}.'
-        )
-
-
-class TestWorkerTeardownGuardScanner:
-    """Unit tests for `_unguarded_worker_teardown_methods` -- the executable
-    form of the esc-3980-4 leak invariant recorded in `_stop_worker`'s
-    docstring: `wait_responsive` gives up by raising `_pytest.outcomes.Failed`, so a
-    give-up on a straight-line body (like a mid-body `assert`) skips the
-    worker-stop call entirely and leaks a live SpeculativeMergeWorker plus
-    its run task into pytest-asyncio teardown -- how one red test used to
-    cascade into unrelated failures elsewhere in the session (task 4219).
-
-    A stop call counts as guarded only when the `finally:`'s guarding
-    `try:` body encloses EVERY `wait_responsive` call in the method (not
-    merely when SOME finally exists somewhere in the method), and either
-    `worker.stop()` or the shared `_stop_worker(...)` helper counts as a
-    stop call (task 4219 amendment; both fixed after review found the
-    original implementation's blind spots).
-
-    Every case here is driven from a SYNTHETIC source string, not this
-    module's own source, so these tests are provably non-vacuous and do not
-    shift when this file is later edited.
-    """
-
-    def test_straight_line_stop_after_wait_responsive_is_reported(self) -> None:
-        """A `test_*` method that calls `wait_responsive(...)` and then
-        calls `worker.stop()` from straight-line code (not inside a
-        `finally:`) IS reported -- a give-up mid-body would skip the stop
-        call entirely.
-        """
-        source = '''
-class TestUnguardedTeardown:
-    async def test_it(self):
-        await wait_responsive(fut, timeout=5.0, label='x')
-        await worker.stop()
-'''
-        result = _unguarded_worker_teardown_methods(source)
-
-        assert result == ['TestUnguardedTeardown::test_it'], (
-            f'Expected the straight-line worker.stop() after wait_responsive '
-            f'to be reported, got {result!r}.'
-        )
-
-    def test_stop_inside_finally_is_not_reported(self) -> None:
-        """The same method with `worker.stop()` moved into a
-        `try: ... finally:` block is NOT reported -- a give-up mid-try
-        still runs the finally, so the worker is always stopped.
-        """
-        source = '''
-class TestGuardedTeardown:
-    async def test_it(self):
-        try:
-            await wait_responsive(fut, timeout=5.0, label='x')
-        finally:
-            await worker.stop()
-'''
-        result = _unguarded_worker_teardown_methods(source)
-
-        assert result == [], (
-            f'Expected worker.stop() inside a finally: block to NOT be '
-            f'reported, got {result!r}.'
-        )
-
-    def test_finally_that_does_not_enclose_the_wait_is_still_reported(self) -> None:
-        """A `finally:` block that stops the worker IS present, but the
-        `try:` guarding it does NOT enclose the `wait_responsive` call
-        (which sits before the try, as straight-line code) -- this IS
-        reported. A give-up from that wait_responsive call raises before
-        the try is ever entered, so its finally never runs and the worker
-        still leaks; crediting ANY finally-wrapped stop() in the method,
-        regardless of what its try actually encloses, would make the guard
-        vacuous for exactly this shape (task 4219 amendment; reviewer
-        finding, empirically verified against the pre-fix implementation).
-        """
-        source = '''
-class TestFinallyDoesNotEncloseWait:
-    async def test_it(self):
-        await wait_responsive(fut, timeout=5.0, label='x')
-        try:
-            await something()
-        finally:
-            await worker.stop()
-'''
-        result = _unguarded_worker_teardown_methods(source)
-
-        assert result == ['TestFinallyDoesNotEncloseWait::test_it'], (
-            f'Expected a finally that does not enclose the wait_responsive '
-            f'call to still be reported, got {result!r}.'
-        )
-
-    def test_one_guarded_and_one_unguarded_stop_call_is_reported(self) -> None:
-        """A method with TWO worker-stop calls -- one correctly
-        finally-guarded, one straight-line -- IS reported. Pins the
-        `any(call not in guarded ...)` branch: a single well-guarded stop
-        call must not paper over a second, unguarded one.
-        """
-        source = '''
-class TestMixedGuardedAndUnguarded:
-    async def test_it(self):
-        try:
-            await wait_responsive(fut, timeout=5.0, label='x')
-        finally:
-            await worker.stop()
-        await worker.stop()
-'''
-        result = _unguarded_worker_teardown_methods(source)
-
-        assert result == ['TestMixedGuardedAndUnguarded::test_it'], (
-            f'Expected the method with one guarded and one unguarded '
-            f'worker.stop() call to be reported, got {result!r}.'
-        )
-
-    def test_straight_line_stop_worker_helper_is_reported(self) -> None:
-        """A straight-line `await _stop_worker(worker, worker_task)` --
-        the shared teardown helper -- IS reported when not inside a
-        finally, exactly like a straight-line `worker.stop()`. Without this, a future migration
-        that adopts the module's OTHER blessed teardown shape would make
-        the guard silently vacuous instead of rewarding the correct usage.
-        """
-        source = '''
-class TestUnguardedStopWorkerHelper:
-    async def test_it(self):
-        await wait_responsive(fut, timeout=5.0, label='x')
-        await _stop_worker(worker, worker_task)
-'''
-        result = _unguarded_worker_teardown_methods(source)
-
-        assert result == ['TestUnguardedStopWorkerHelper::test_it'], (
-            f'Expected the straight-line _stop_worker(...) helper call to '
-            f'be reported, got {result!r}.'
-        )
-
-    def test_stop_worker_helper_inside_finally_is_not_reported(self) -> None:
-        """The same `_stop_worker(...)` helper call, moved into a
-        `try: ... finally:` block whose try encloses the wait_responsive
-        call, is NOT reported.
-        """
-        source = '''
-class TestGuardedStopWorkerHelper:
-    async def test_it(self):
-        try:
-            await wait_responsive(fut, timeout=5.0, label='x')
-        finally:
-            await _stop_worker(worker, worker_task)
-'''
-        result = _unguarded_worker_teardown_methods(source)
-
-        assert result == [], (
-            f'Expected a finally-wrapped _stop_worker(...) helper call to '
-            f'NOT be reported, got {result!r}.'
-        )
-
-    def test_stop_without_wait_responsive_is_not_reported(self) -> None:
-        """A method that calls `worker.stop()` outside a finally but never
-        calls `wait_responsive` at all is NOT reported -- the guard is
-        deliberately scoped to migrated methods, so it starts empty and
-        cannot mass-fail the ~25 pre-existing straight-line teardown sites
-        in this module that have not been migrated yet.
-        """
-        source = '''
-class TestUnmigratedTeardown:
-    async def test_it(self):
-        await asyncio.wait_for(fut, timeout=5.0)
-        await worker.stop()
-'''
-        result = _unguarded_worker_teardown_methods(source)
-
-        assert result == [], (
-            f'Expected worker.stop() with no wait_responsive call in the '
-            f'method to NOT be reported (guard scoped to migrated methods '
-            f'only), got {result!r}.'
-        )
-
-    def test_wait_responsive_without_stop_is_not_reported(self) -> None:
-        """A method that calls `wait_responsive` but never calls
-        `worker.stop()` at all is NOT reported -- there is no stop call to
-        be unguarded.
-        """
-        source = '''
-class TestNoStopCall:
-    async def test_it(self):
-        await wait_responsive(fut, timeout=5.0, label='x')
-'''
-        result = _unguarded_worker_teardown_methods(source)
-
-        assert result == [], (
-            f'Expected a method with no worker.stop() call at all to NOT '
-            f'be reported, got {result!r}.'
-        )
-
-    def test_unparseable_source_returns_empty_list_without_raising(self) -> None:
-        """Unparseable source returns `[]` rather than raising -- mirrors
-        `_worst_per_method_wait_budget`'s must-never-raise contract.
-        """
-        result = _unguarded_worker_teardown_methods('def not valid python(:')
-
-        assert result == [], (
-            f'Expected unparseable source to return [] without raising, '
-            f'got {result!r}.'
-        )
-
-
 class TestLoudWaitMigrationRatchet:
     """Enforced invariant, task 4219, ratcheted to zero by task 4846: THIS
     module's own source carries no suppressed result wait -- neither the
@@ -7546,29 +6039,25 @@ class TestLoudWaitMigrationRatchet:
     through `wait_responsive` stops its worker from a `finally:`.
 
     No `@pytest.mark.timeout` mark needed: neither of these two methods
-    performs a real await, so `_worst_per_method_wait_budget` would compute
-    0.0 for this class.
+    performs a real await, so `_wait_budget_audit.py::item_wait_budgets`
+    bills each of them 0.0.
     """
 
     def test_no_suppressed_result_waits(self) -> None:
-        """`_suppressed_result_wait_methods` finds nothing in this module's
+        """`suppressed_result_wait_items` finds nothing in this module's
         own source -- a fresh suppressed wait, in either recognised
         spelling, or a migrated method that regressed, fails loudly, naming
         the class and method and pointing at the two blessed replacements.
         """
         source = Path(__file__).read_text()
-        scanned = _suppressed_result_wait_methods(source)
+        scanned = suppressed_result_wait_items(source)
 
-        assert scanned == {}, (
+        assert not scanned, (
             'The following test methods contain a suppressed result wait '
             '(either `with contextlib.suppress(TimeoutError): await '
             'asyncio.wait_for(...)`, or `try: ... await asyncio.wait_for(...) '
             'except TimeoutError: ... = None`):\n'
-            + '\n'.join(
-                f'  - {class_name}::{method_name}'
-                for class_name, methods in sorted(scanned.items())
-                for method_name in sorted(methods)
-            )
+            + '\n'.join(f'  - {item}' for item in scanned)
             + '\n\nThis is the `outcome is None` anti-pattern: a genuine '
             'timeout is swallowed and a downstream assertion reports a '
             'confusing None/wrong-value failure instead of a loud, '
@@ -7586,7 +6075,7 @@ class TestLoudWaitMigrationRatchet:
         cascade into unrelated failures elsewhere in the session.
         """
         source = Path(__file__).read_text()
-        offenders = _unguarded_worker_teardown_methods(source)
+        offenders = unguarded_worker_teardown_items(source)
 
         assert not offenders, (
             'The following methods call wait_responsive but do not call '
@@ -7597,179 +6086,11 @@ class TestLoudWaitMigrationRatchet:
         )
 
 
-# ---------------------------------------------------------------------------
-# task 3492 amend: cover _timeout_mark_offenders' failure branches directly
-# ---------------------------------------------------------------------------
-
-
-#: A synthetic per-method wait budget on the GUARDED side of the threshold
-#: `_timeout_mark_offenders` applies to an unmarked class -- one second over
-#: `_AMBIENT_TEST_TIMEOUT` -- for the offender-loop unit tests below. Derived
-#: rather than written, mirroring the `_AMBIENT_TEST_TIMEOUT - 1` spelling its
-#: sibling `test_budget_below_threshold_is_skipped_even_with_no_mark` uses for
-#: the UNGUARDED side, so both sides of the threshold stay pinned to it.
-#:
-#: WHY IT IS NOT A LITERAL: it was `200.0`, chosen when the ini default was 60.
-#: Raising `[tool.pytest.ini_options].timeout` to 300 (2026-09-12) dropped 200
-#: BELOW the threshold, at which point all three failure branches below stopped
-#: being exercised at all -- they would have gone green by being skipped, which
-#: is the vacuity this whole class exists to prevent.
-_SYNTHETIC_HEAVY_BUDGET = float(_AMBIENT_TEST_TIMEOUT + 1)
-
-#: A mark value that comfortably clears :data:`_SYNTHETIC_HEAVY_BUDGET`, for the
-#: happy-path case. Derived for the same reason.
-_SYNTHETIC_ADEQUATE_MARK = _SYNTHETIC_HEAVY_BUDGET + 1
-
-
-class TestTimeoutMarkOffenders:
-    """`_timeout_mark_offenders` is the pure offender-accumulation loop
-    behind `TestTimeoutMarkCoverage`'s guard. Driven here from synthetic
-    stub classes (not this module's own, now fully-marked, classes) so its
-    failure branches -- no mark at all, a mark too tight for the budget,
-    and an unresolvable class name -- are each independently non-vacuous,
-    rather than only ever exercised by the happy path.
-    """
-
-    def test_class_with_no_pytestmark_is_one_offender(self) -> None:
-        """A resolved class with no `timeout` mark at all yields exactly
-        one offender naming the missing mark.
-        """
-
-        class _NoMark:
-            pass
-
-        offenders = _timeout_mark_offenders(
-            {'_NoMark': _SYNTHETIC_HEAVY_BUDGET}, {'_NoMark': _NoMark}.get
-        )
-
-        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
-        assert '_NoMark' in offenders[0]
-        assert 'no @pytest.mark.timeout mark' in offenders[0]
-
-    def test_mark_too_tight_for_budget_is_one_offender(self) -> None:
-        """A class whose mark sits just UNDER its computed budget yields
-        exactly one offender naming the too-tight value -- this is the exact
-        failure mode task 3477 hit (a mark present but too tight to clear the
-        real wait profile).
-        """
-
-        too_tight_mark = _SYNTHETIC_HEAVY_BUDGET - 1
-
-        @pytest.mark.timeout(too_tight_mark)
-        class _TooTight:
-            pass
-
-        offenders = _timeout_mark_offenders(
-            {'_TooTight': _SYNTHETIC_HEAVY_BUDGET}, {'_TooTight': _TooTight}.get
-        )
-
-        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
-        assert '_TooTight' in offenders[0]
-        assert str(too_tight_mark) in offenders[0]
-
-    def test_unresolvable_class_name_is_one_offender(self) -> None:
-        """A budgeted class name that *resolve* cannot look up (e.g. it was
-        renamed or removed after the scan ran) yields exactly one offender
-        rather than raising -- the guard degrades to a loud failure, never
-        a silent skip.
-        """
-        offenders = _timeout_mark_offenders({'DoesNotExist': _SYNTHETIC_HEAVY_BUDGET}, {}.get)
-
-        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
-        assert 'DoesNotExist' in offenders[0]
-        assert 'could not be resolved' in offenders[0]
-
-    def test_adequate_mark_yields_no_offenders(self) -> None:
-        """A class whose mark value clears its computed budget yields no
-        offenders -- pins the happy path so it stays non-vacuous too.
-
-        The budget is on the GUARDED side of the threshold, so this really
-        exercises the "mark clears it" branch rather than the skip.
-        """
-
-        @pytest.mark.timeout(_SYNTHETIC_ADEQUATE_MARK)
-        class _Adequate:
-            pass
-
-        offenders = _timeout_mark_offenders(
-            {'_Adequate': _SYNTHETIC_HEAVY_BUDGET}, {'_Adequate': _Adequate}.get
-        )
-
-        assert offenders == [], f'Expected no offenders, got {offenders!r}.'
-
-    def test_budget_below_threshold_is_skipped_even_with_no_mark(self) -> None:
-        """An UNMARKED class computing below `_AMBIENT_TEST_TIMEOUT` yields
-        no offender -- the budget it runs under already clears it.
-        """
-
-        class _LightNoMark:
-            pass
-
-        offenders = _timeout_mark_offenders(
-            {'_LightNoMark': _AMBIENT_TEST_TIMEOUT - 1},
-            {'_LightNoMark': _LightNoMark}.get,
-        )
-
-        assert offenders == [], f'Expected no offenders below threshold, got {offenders!r}.'
-
-    def test_marked_class_below_the_ambient_budget_is_still_checked(self) -> None:
-        """A mark REPLACES the ambient budget rather than raising a floor
-        under it (see `_orch_helpers.VERIFY_CLI_PER_TEST_TIMEOUT`), so a mark
-        below the class's budget is fatal however generous the ambient is.
-        """
-
-        @pytest.mark.timeout(200)
-        class _MarkedTooTight:
-            pass
-
-        offenders = _timeout_mark_offenders(
-            {'_MarkedTooTight': 250.0}, {'_MarkedTooTight': _MarkedTooTight}.get
-        )
-
-        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
-        assert '_MarkedTooTight' in offenders[0]
-        assert 'too tight' in offenders[0]
-
-    def test_unmarked_class_at_the_verify_cli_budget_is_an_offender(self) -> None:
-        """An unmarked class runs under verify's `--timeout`, not the looser
-        ini default, so a budget reaching it needs a mark.
-        """
-
-        class _UnmarkedAtCli:
-            pass
-
-        offenders = _timeout_mark_offenders(
-            {'_UnmarkedAtCli': float(VERIFY_CLI_PER_TEST_TIMEOUT)},
-            {'_UnmarkedAtCli': _UnmarkedAtCli}.get,
-        )
-
-        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
-        assert '_UnmarkedAtCli' in offenders[0]
-        assert 'no @pytest.mark.timeout mark' in offenders[0]
-
-    def test_unbounded_budget_is_reported_as_unbounded(self) -> None:
-        """An infinite budget -- some wait with no resolvable wall-clock cap
-        -- is one offender whatever the mark, and says so in words rather
-        than rendering a meaningless `infs`.
-        """
-
-        @pytest.mark.timeout(10**6)
-        class _Unbounded:
-            pass
-
-        offenders = _timeout_mark_offenders(
-            {'_Unbounded': math.inf}, {'_Unbounded': _Unbounded}.get
-        )
-
-        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
-        assert '_Unbounded' in offenders[0]
-        assert 'unbounded' in offenders[0]
-
-
 class TestHeavyBarrierTimeoutConstant:
     """HEAVY_BARRIER_TEST_TIMEOUT is a literal held up by two floors.
 
-    The per-class WAIT floor is TestTimeoutMarkCoverage's job, not this one's.
+    Whether each marked test's waits fit under it is checked per item by
+    test_wait_budget_coverage_guard.py, not here.
     """
 
     def test_clears_the_measured_wall_clock_with_headroom(self) -> None:
@@ -7792,85 +6113,4 @@ class TestHeavyBarrierTimeoutConstant:
             '_orch_helpers.VERIFY_CLI_PER_TEST_TIMEOUT), so below the ini default '
             'the merge-barrier classes carrying this mark run TIGHTER than every '
             'unmarked test on a bare local or agent run. Raise the constant.'
-        )
-
-
-# ---------------------------------------------------------------------------
-# task 3492 step-3: enforced coverage invariant over THIS module's own source
-# ---------------------------------------------------------------------------
-#
-# RELATED, BUT ENFORCED ELSEWHERE (task 4246): the SHAPE of a load-bearing wait
-# — a `MergeRequest.result` future or a zero-argument `.wait()` barrier reached through a
-# bare `asyncio.wait_for(...)`, or carrying a raw numeric `timeout=` literal —
-# is now checked repo-wide by rule `wall-clock-deadline` in
-# fused-memory/scripts/check_bare_magicmock_config.py, run by the seven package
-# lint_commands, dark-factory-orchestrator.yaml and hooks/project-checks. That
-# rule and this class are complements, not overlaps: the rule says a wait must
-# be loop-responsive (`wait_responsive(...)` with a descriptive `label=`, bound
-# derived from MERGE_RESULT_TIMEOUT rather than a written number); this class
-# says whatever budget the resulting waits add up to must be covered by an
-# adequate `@pytest.mark.timeout`. It stays here because it needs runtime marks
-# and imported helper constants, which the stdlib-only checker cannot have —
-# see the policy note above test_merge_speculation.py::TestTimeoutMarkCoverage.
-#
-# THIS FILE CARRIES DEBT under that rule: it is on the shrink-only, opt-out
-# `_WALL_CLOCK_DEADLINE_DEBT` baseline, recorded at its measured day-one count
-# (90 violations) and lowered as sites migrate, so its pre-existing sites are
-# grandfathered but the budget is
-# CHECKED — add one more offending wait and the gate reports the overrun. New
-# load-bearing waits added here must therefore use `wait_responsive(...)`, and
-# the recorded number may only be lowered as sites are migrated, never raised.
-
-
-class TestTimeoutMarkCoverage:
-    """Enforced invariant: every class in THIS module must have its computed
-    worst-case per-method wait budget cleared by the timeout it actually
-    runs under -- its own `@pytest.mark.timeout` mark if it has one, else
-    the ambient budget (see `_timeout_mark_offenders`).
-
-    This is what stops the recurrence task 3492 exists to fix: task 2350
-    widened a wait region without adding a mark, task 2376 widened five more
-    sites without a mark, and task 3477 then found its own two marks had
-    drifted too tight for the wait profile they were guarding ("was a bare
-    180, too tight"). Literal values can still drift, but a class going
-    under-marked can no longer land silently -- this guard recomputes the
-    audit from the module's own source on every run.
-
-    The guard is a conservative FLOOR, not the whole audit -- see
-    `_call_wait_budget`'s docstring for exactly which call shapes are
-    counted and why under-demanding (never over-demanding) is the
-    deliberate failure direction.
-    """
-
-    def test_heavy_wait_classes_carry_adequate_timeout_mark(self) -> None:
-        """Every Test* class's computed worst-case per-method wait budget
-        must be cleared by the timeout it actually runs under (its own mark
-        if it has one, else the ambient budget).
-
-        First run (task 3492 step-3, before step-4 added marks) flagged six
-        classes computing >= 60s with no timeout mark at all --
-        TestSingleHostSerialByteIdentical, TestOverlapSignal,
-        TestChainInvalidationUnderOverlap, TestHaltAndUnavailable,
-        TestRunInflightVerifyRemoteCancelOnAbort, TestCascadeErrorContainment.
-        Marks were added for those six (plus TestRedispatchSpeculativeConservation,
-        over-marked on the strength of a wait shape this scan cannot see) in
-        the same change; the two task-3477 cascade classes already passed.
-        """
-        source = Path(__file__).read_text()
-        budgets = _worst_per_method_wait_budget(source)
-        offenders = _timeout_mark_offenders(budgets, globals().get)
-
-        assert not offenders, (
-            'The following classes have a computed worst-case per-method '
-            'wait budget that the timeout they actually run under (their '
-            'own mark if they have one, else the ambient budget) does not '
-            'clear:\n'
-            + '\n'.join(f'  - {offender}' for offender in offenders)
-            + '\n\nConsequence: pytest-timeout\'s thread method os._exit()s '
-            'the xdist worker under --max-worker-restart=0, so a '
-            'slow-but-correct run reports as a worker death instead of a '
-            'clean per-test failure. Add '
-            '@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT) (or another '
-            'value clearing the computed budget) directly above each '
-            'offending class.'
         )

@@ -1218,6 +1218,23 @@ class TestTheJournalPathIsAnchoredOnTheMainCheckout:
         assert result.journal_path == 'data/j.db'
 
 
+class TestTheDefaultJournalIsTheMainCheckouts:
+    """The default `--journal` is derived from where the checkout really lives.
+
+    It names no user's home directory, and a lane run reads the same live
+    journal as a run from the main checkout.
+    """
+
+    def test_a_lane_copy_defaults_to_the_main_checkouts_journal(self, tmp_path):
+        main, lane = _seed_checkout_with_harvest_copy(tmp_path)
+
+        args = _load_copy_in(lane).build_parser().parse_args(
+            ['--out', str(tmp_path / 'out.jsonl')]
+        )
+
+        assert Path(args.journal).resolve() == main / 'data' / 'reconciliation' / 'write_journal.db'
+
+
 class TestTheCommittedArtifactsCarryNoAbsolutePath:
     """The published artifacts must not name anyone's home directory either.
 

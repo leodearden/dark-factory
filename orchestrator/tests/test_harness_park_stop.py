@@ -1354,20 +1354,22 @@ class TestHarnessCostCeiling:
     ) -> None:
         """_auto_eval_budget_used_24h sums only tracked task_ids within the 24h window.
 
-        Seeds three rows:
+        Seeds four rows:
           - task_id='redo-1', within 24h,  cost=4.0  — INCLUDED
           - task_id='redo-2', outside 24h, cost=10.0 — EXCLUDED (too old)
           - task_id='untracked-3', within 24h, cost=99.0 — EXCLUDED (not tracked)
+          - task_id='redo-1', within 24h, cost=50.0, another project — EXCLUDED
         harness._auto_eval_redo_task_ids = {'redo-1', 'redo-2'} (tracks redo-1 & redo-2).
-        Expected sum = 4.0 (only redo-1 qualifies on both axes).
+        Expected sum = 4.0 (only the first row qualifies on every axis).
         """
         harness, _, _ = _make_harness_with_mocks(tmp_path)
         store = await _cost_store_factory()
         harness.cost_store = store
+        project_id = harness.config.fused_memory.project_id
 
         # Row 1: tracked, within 24h — should be counted
         await store.save_invocation(
-            run_id='r1', task_id='redo-1', project_id='dark_factory',
+            run_id='r1', task_id='redo-1', project_id=project_id,
             account_name='acct', model='sonnet', role='orchestrator',
             cost_usd=4.0, input_tokens=None, output_tokens=None,
             cache_read_tokens=None, cache_create_tokens=None,
@@ -1377,7 +1379,7 @@ class TestHarnessCostCeiling:
         )
         # Row 2: tracked, but outside 24h window — should be excluded
         await store.save_invocation(
-            run_id='r2', task_id='redo-2', project_id='dark_factory',
+            run_id='r2', task_id='redo-2', project_id=project_id,
             account_name='acct', model='sonnet', role='orchestrator',
             cost_usd=10.0, input_tokens=None, output_tokens=None,
             cache_read_tokens=None, cache_create_tokens=None,
@@ -1387,7 +1389,7 @@ class TestHarnessCostCeiling:
         )
         # Row 3: not tracked, within 24h — should be excluded
         await store.save_invocation(
-            run_id='r3', task_id='untracked-3', project_id='dark_factory',
+            run_id='r3', task_id='untracked-3', project_id=project_id,
             account_name='acct', model='sonnet', role='orchestrator',
             cost_usd=99.0, input_tokens=None, output_tokens=None,
             cache_read_tokens=None, cache_create_tokens=None,
@@ -1396,14 +1398,46 @@ class TestHarnessCostCeiling:
             completed_at=_iso(timedelta(hours=-2)),
         )
 
+        # Row 4: tracked, within 24h, but another project's spend — excluded
+        await store.save_invocation(
+            run_id='r4', task_id='redo-1', project_id='other_project',
+            account_name='acct', model='sonnet', role='orchestrator',
+            cost_usd=50.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-1)),
+            completed_at=_iso(timedelta(hours=-1)),
+        )
+
         harness._auto_eval_redo_task_ids = {'redo-1', 'redo-2'}
 
         result = await harness._auto_eval_budget_used_24h()
         assert result == pytest.approx(4.0), (
-            f'Expected 4.0 (only redo-1: tracked AND within 24h); '
-            f'redo-2 is outside window, untracked-3 is not in tracked set. '
-            f'Got {result!r}'
+            f'Expected 4.0 (only redo-1: tracked AND within 24h AND this project); '
+            f'redo-2 is outside window, untracked-3 is not in tracked set, '
+            f'the 50.0 row is another project. Got {result!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_auto_eval_budget_used_24h_fails_open_on_store_error(
+        self, tmp_path: Path, _cost_store_factory, caplog
+    ) -> None:
+        """A failing cost query reads as 0.0 spend and warns; it never blocks dispatch."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        store = await _cost_store_factory()
+        await store.close()
+        harness.cost_store = store
+        harness._auto_eval_redo_task_ids = {'redo-1'}
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            result = await harness._auto_eval_budget_used_24h()
+
+        assert result == 0.0
+        assert any(
+            'auto_eval_budget_used_24h' in r.getMessage() and 'fail-open' in r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        ), [r.getMessage() for r in caplog.records]
 
     @pytest.mark.asyncio
     async def test_auto_eval_budget_used_24h_returns_zero_when_no_tracked_ids(
@@ -1763,143 +1797,6 @@ class TestHarnessCostCeiling:
             'Scheduler must NOT be paused when cost query fails (fail-open)'
         )
         mock_run_store.save_scheduler_pause.assert_not_called()
-
-    # ------------------------------------------------------------------
-    # SQL contract: _trailing_24h_fetch_one rejects bad sql suffix
-    # ------------------------------------------------------------------
-
-    @pytest.mark.asyncio
-    async def test_trailing_24h_fetch_one_raises_valueerror_on_bad_sql_suffix(
-        self, tmp_path: Path
-    ) -> None:
-        """_trailing_24h_fetch_one raises ValueError when sql does not end with 'completed_at >= ?'.
-
-        The guard must fire unconditionally — even under python -O — so it must
-        be a raise, not an assert.  cost_store=None is sufficient because the
-        ValueError is raised BEFORE the cost_store None-check.
-        """
-        harness, _, _ = _make_harness_with_mocks(tmp_path)
-        harness.cost_store = None  # guard fires before None-check; defensive only
-
-        bad_sql = (
-            'SELECT cost_usd FROM invocations WHERE completed_at >= ? LIMIT 1'
-        )
-        with pytest.raises(ValueError, match=r'_trailing_24h_fetch_one: sql must end with'):
-            await harness._trailing_24h_fetch_one(bad_sql, (), label='bad-sql-test')
-
-    # ------------------------------------------------------------------
-    # Direct tests for _trailing_24h_fetch_one: fail-open contract
-    # ------------------------------------------------------------------
-
-    @pytest.mark.asyncio
-    async def test_trailing_24h_fetch_one_returns_none_and_warns_on_exception(
-        self, tmp_path: Path, _cost_store_factory, caplog
-    ) -> None:
-        """_trailing_24h_fetch_one returns None and logs a warning when the query raises.
-
-        Closing the store before calling the helper forces _require_conn() to
-        raise RuntimeError — exercising the fail-open except Exception branch.
-        Both call sites (_auto_eval_budget_used_24h, _enforce_cost_ceilings)
-        treat None as "skip / assume zero"; dispatch must never be blocked by a
-        transient cost-DB error.
-        """
-        harness, _, _ = _make_harness_with_mocks(tmp_path)
-        store = await _cost_store_factory()
-        harness.cost_store = store
-
-        # Force _require_conn() to raise RuntimeError on the next call.
-        # The fixture teardown calls close() again, which is idempotent.
-        await store.close()
-
-        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
-            result = await harness._trailing_24h_fetch_one(
-                'SELECT COALESCE(SUM(cost_usd), 0.0) FROM invocations WHERE completed_at >= ?',
-                (),
-                label='fail-open-test',
-            )
-
-        assert result is None, (
-            'fail-open contract: _trailing_24h_fetch_one must return None when '
-            f'the query raises; got {result!r}'
-        )
-        matching = [
-            r for r in caplog.records
-            if 'fail-open-test' in r.getMessage()
-            and 'trailing-24h cost query failed' in r.getMessage()
-        ]
-        assert matching, (
-            "Expected at least one WARNING containing 'fail-open-test' and "
-            "'trailing-24h cost query failed'. Records: "
-            + repr([r.getMessage() for r in caplog.records])
-        )
-
-    @pytest.mark.asyncio
-    async def test_trailing_24h_fetch_one_binds_leading_params_before_cutoff(
-        self, tmp_path: Path, _cost_store_factory
-    ) -> None:
-        """_trailing_24h_fetch_one passes leading_params before the cutoff timestamp.
-
-        Seeds task-a (3.0), task-b (2.0), and a noise row untracked-c (99.0) —
-        all within the 24h window.  Queries with IN(?,?) for task-a and task-b.
-        Expected sum = 5.0.
-
-        If leading_params were appended AFTER the cutoff (reversed order), the
-        cutoff ISO string would be bound to the first IN slot — no rows would
-        match and the sum would be 0.0.  The noise row rules out a false-positive
-        "wildcard match" scenario where everything was included.
-        """
-        harness, _, _ = _make_harness_with_mocks(tmp_path)
-        store = await _cost_store_factory()
-        harness.cost_store = store
-
-        # Row A: task-a, within 24h window
-        await store.save_invocation(
-            run_id='r-a', task_id='task-a', project_id='dark_factory',
-            account_name='acct', model='sonnet', role='orchestrator',
-            cost_usd=3.0, input_tokens=None, output_tokens=None,
-            cache_read_tokens=None, cache_create_tokens=None,
-            duration_ms=100, capped=False,
-            started_at=_iso(timedelta(hours=-1)),
-            completed_at=_iso(timedelta(hours=-1)),
-        )
-        # Row B: task-b, within 24h window
-        await store.save_invocation(
-            run_id='r-b', task_id='task-b', project_id='dark_factory',
-            account_name='acct', model='sonnet', role='orchestrator',
-            cost_usd=2.0, input_tokens=None, output_tokens=None,
-            cache_read_tokens=None, cache_create_tokens=None,
-            duration_ms=100, capped=False,
-            started_at=_iso(timedelta(hours=-1)),
-            completed_at=_iso(timedelta(hours=-1)),
-        )
-        # Row C: noise — within 24h but NOT in leading_params
-        await store.save_invocation(
-            run_id='r-c', task_id='untracked-c', project_id='dark_factory',
-            account_name='acct', model='sonnet', role='orchestrator',
-            cost_usd=99.0, input_tokens=None, output_tokens=None,
-            cache_read_tokens=None, cache_create_tokens=None,
-            duration_ms=100, capped=False,
-            started_at=_iso(timedelta(hours=-1)),
-            completed_at=_iso(timedelta(hours=-1)),
-        )
-
-        row = await harness._trailing_24h_fetch_one(
-            'SELECT COALESCE(SUM(cost_usd), 0.0) FROM invocations '
-            'WHERE task_id IN (?,?) AND completed_at >= ?',
-            ('task-a', 'task-b'),
-            label='ordering-test',
-        )
-
-        assert row is not None, (
-            '_trailing_24h_fetch_one must return a row (not None) for a valid store'
-        )
-        assert float(row[0]) == pytest.approx(5.0), (
-            f'Expected sum 5.0 (task-a 3.0 + task-b 2.0). Got {row[0]!r}. '
-            '0.0 would indicate reversed param ordering (cutoff bound to IN slot, '
-            'no task-id match); ~104.0 or similar would indicate noise row leaked in '
-            '(IN clause matched everything).'
-        )
-
 
     @pytest.mark.asyncio
     async def test_enforce_cost_ceilings_delegates_to_cost_totals_in_window(

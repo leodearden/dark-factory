@@ -343,10 +343,12 @@ Tasks reach the queue through `mcp__fused-memory__submit_task`
   (`{"ticket": "tkt_..."}`) and returns immediately; an async `TaskCurator`
   (`fused-memory/src/fused_memory/middleware/task_curator.py`) dedupes,
   combines, or creates the real task row in the SQLite backend
-  (`<project_root>/.taskmaster/tasks/tasks.db`). When the curator's account
-  pool cannot serve, the ticket parks as `awaiting_curation` and the ticket
-  janitor retries it until it is curated; every create the curator did not
-  judge is marked `metadata.dedupe_skipped`.
+  (`<project_root>/.taskmaster/tasks/tasks.db`). When the curator cannot judge
+  a submission (the reasons are
+  `fused-memory/src/fused_memory/middleware/curation_deferral.py::DeferReason`),
+  the ticket parks as `awaiting_curation` and the ticket janitor retries it
+  until it gets a verdict; every create the curator did not judge is marked
+  `metadata.dedupe_skipped`.
 - **`planning_mode=True` path.** Used by `/prd` batch decomposition: writes
   the task directly in status `deferred`, bypassing the curator, so a whole
   batch of interdependent tasks can be authored and wired together (deps,
@@ -826,7 +828,11 @@ path, snapshotting `main` at run start and coalescing advances — it never
 gates a merge, and defaults to disabled (`git.offline_lane_enabled: false`). Each pass writes a record; each failing
 test is a per-test episode that is filed as one fix task once reproduced on
 `git.offline_lane_persist_passes` spaced passes, with one bounded level-1
-escalation if the fix stays unlanded. A command that declares an outage probe
+escalation if the fix stays unlanded. Every non-outage red pass is recorded in
+the flake ledger at call site `offline_lane`, and a cleared test, or a held red
+that failed and passed at one head with no fix task filed, owes flake debt
+whose de-flake task the ledger's drain files (`plans/offline-lane-red-path-prd.md`
+D6). A command that declares an outage probe
 (`outage_probe`) runs it after a red detection, and a probe that exits 75
 naming a dependency makes the pass an outage, which is escalated, not filed.
 The lane re-runs the probe alone until it passes, then closes its own
@@ -1046,13 +1052,18 @@ a defense is active when it isn't:
   effect of the verify test leg's `cd <module> && uv run pytest`
   (`orchestrator/src/orchestrator/verify.py::_preprovision_shared_venv`).
   Either way, there's no `.venv` at all before that first cold verify.
-  The real edge: an agent's Bash subprocess inherits a copy of the
-  orchestrator's environment, including main's `VIRTUAL_ENV`
-  (`orchestrator/src/orchestrator/agents/invoke.py`), so a first-party
+  The real edge: an interactive session's shell keeps its launching
+  shell's environment, often main's `VIRTUAL_ENV`, so a first-party
   `import` there can resolve main's editable source instead of the
-  worktree's edits. Verify is unaffected —
-  `orchestrator/src/orchestrator/verify.py::_target_subprocess_env` strips
-  `VIRTUAL_ENV` so the target always resolves its own `.venv`. See
+  worktree's edits. A dispatched agent's shell carries no Python-env
+  selection (`shared/src/shared/python_env.py::without_python_env_selection`,
+  which Claude spawns reach via
+  `shared/src/shared/secret_env.py::agent_subprocess_env`; task 7399), so it
+  meets this only by naming main's `.venv/bin/python` in a
+  worktree with no `.venv` yet; its bare `python` is the system
+  interpreter. Verify is unaffected —
+  `orchestrator/src/orchestrator/verify.py::_target_subprocess_env` applies
+  the same scrub so the target always resolves its own `.venv`. See
   `### Locating installed code` in `CLAUDE.md` for the one-line
   provenance check.
 - **Verify commands default to repo-wide scope in places**, not always

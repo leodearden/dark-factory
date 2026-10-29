@@ -1760,6 +1760,13 @@ class TestCuratorEntryCharCaps:
             f'binding constraints.'
         )
 
+    @pytest.mark.parametrize('value', [0, -1])
+    @pytest.mark.parametrize('field', ['entry_description_chars', 'entry_details_chars'])
+    def test_a_non_positive_entry_cap_is_refused_at_load(self, field, value):
+        """A cap of 0 or less would make every curator prompt build raise in utils/clip_disclosure.py::TruncationFact, so it is refused when the config loads."""
+        with pytest.raises(ValidationError, match=field):
+            CuratorConfig(**{field: value})
+
 
 class TestCuratorConfigBudgetRaise:
     """Regression guard: TaskCurator per-call budget is a durable flat $2.00 (task 1980).

@@ -93,6 +93,7 @@ from orchestrator.verify_cancel import (
     start_stdin_heartbeat,
 )
 from orchestrator.verify_categories import FailureCategory, _assert_sentinels_disjoint
+from orchestrator.verify_evidence import verify_event_fields
 from orchestrator.verify_spec_shared import (
     VerifyCommand,
     apply_spec_to_host_config,
@@ -283,6 +284,11 @@ class UnscopedTypecheckSpec:
 @dataclass(frozen=True)
 class MergeVerifySpec:
     """Full pre-advance merge-verify bundle — PRD §A contract.
+
+    Which OrchestratorConfig names the merge path reads, and whether each rides
+    this spec, is classified and census-guarded in
+    ``orchestrator/tests/test_merge_verify_config_fidelity.py::MERGE_PATH_CONFIG_READS``;
+    adding a merge-path config read or a spec field means updating that table.
 
     Fields
     ------
@@ -891,6 +897,9 @@ class LocalRunner:
                 # likely to occur under load — and would REGRESS an emission that
                 # happened inline before the recorder was split out.
                 flake_suppression=getattr(scoped, 'flake_suppression', None),
+                # The scoped plan did run; the unscoped gate is not one of its units.
+                plan=scoped.plan,
+                units=scoped.units,
             )
 
         return scoped
@@ -922,6 +931,19 @@ _SSH_BASE_OPTS = [
     '-o', f'ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL}',
     '-o', f'ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}',
 ]
+
+# Env probes only: the dispatch sites keep _SSH_BASE_OPTS, because the
+# verify-merge ssh child must own its connection for the heartbeat protocol.
+# The socket lives in the dispatching user's home, which always exists and is
+# not world-writable; %C makes it per host, port and user.  ssh reaps it: the
+# master exits 30s after its last session and unlinks it, and the next
+# ControlMaster=auto client replaces a stale socket a killed master left.
+_SSH_PROBE_OPTS = (
+    *_SSH_BASE_OPTS,
+    '-o', 'ControlMaster=auto',
+    '-o', 'ControlPersist=30',
+    '-o', 'ControlPath=~/.df-env-probe-%C',
+)
 
 # The same options for git's own ssh transport, as a `git -c` global option, so
 # a RemoteRunner push to a sleeping host fails as fast and as batch-safely as
@@ -1067,9 +1089,9 @@ async def env_probe_local_run(
 #: writer's only blocking operation is a ``threading.Event.wait`` that ``stop()``
 #: ends within one GIL switch, and its write end is non-blocking so ``os.write``
 #: can never park on a full pipe — so 5.0s is ~6x the ~0.85s worst single-gap
-#: additive scheduling delay measured at loadavg 113-178 (recorded in
-#: ``test_laptop_warm_verify_boundary.py``'s ``HeartbeatWriter`` comment) and is
-#: never reached in practice.
+#: additive scheduling delay measured at loadavg 113-178 (recorded in the
+#: ROW_WATCHDOG banner of ``orchestrator/tests/_verify_boundary_ceilings.py``)
+#: and is never reached in practice.
 #:
 #: WHO PAYS THE WAIT: not the event loop.  ``Thread.join`` is synchronous, and
 #: the coroutine that tears the writer down runs on the orchestrator's single
@@ -1378,6 +1400,8 @@ class RemoteRunner:
         # The request cancel_verify() last signalled: its verify then dies by
         # this dispatcher's hand, which says nothing about the host.
         self._cancelled_request_id: str | None = None
+        # The request whose verify ssh has started: the only one with a remote process to kill.
+        self._verify_started_request_id: str | None = None
 
     async def health(self) -> bool:
         """Best-effort health probe: ``ssh <host> true``.
@@ -1764,7 +1788,9 @@ class RemoteRunner:
         exclusive-use invariant and raises ConcurrentDispatchError, leaving
         the live claim untouched.  :meth:`ensure_gate` runs on every call, so
         every verify runs the deployed sha's gate.  After a successful push the
-        ref is deleted best-effort on every exit.
+        ref is deleted best-effort on every exit.  A :meth:`cancel_verify`
+        before the verify ssh starts makes it raise RunnerUnavailable
+        ('transport') instead of starting the verify.
 
         Raises RunnerUnavailable, whose ``kind`` says why, whenever the host
         produced no usable verdict — a parseable no-verdict result included.
@@ -1790,6 +1816,7 @@ class RemoteRunner:
                     )
         finally:
             self._inflight_request_id = None
+            self._verify_started_request_id = None
 
     async def _run_gate_verify(
         self, sha: str, subcommand: RemoteVerifySubcommand, spec_json: str, request_id: str,
@@ -1799,6 +1826,13 @@ class RemoteRunner:
             subcommand, '--sha', sha, '--spec', spec_json, *self._config_args(),
             '--request-id', request_id,
         ])
+        if request_id == self._cancelled_request_id:
+            raise RunnerUnavailable(
+                f'request {request_id!r} was cancelled before its verify ssh to '
+                f'{self._ssh_host!r} started',
+                kind='transport',
+            )
+        self._verify_started_request_id = request_id
         ssh_t0 = time.monotonic()
         try:
             ssh_rc, ssh_stdout, ssh_stderr = await self._ssh_run(
@@ -2042,19 +2076,33 @@ class RemoteRunner:
         including during run_merge_verify's main-mirror push, which precedes
         the claim — matching α's contract: cancel an unknown/finished id exits 0.
 
-        Otherwise issues, through the gate binary (design D3):
+        Before the request's verify ssh starts (ensure_gate's sha publish and
+        ensure-gate.sh, which may be building the gate binary, then the
+        verify-ref push) it is a local no-op returning 0 that makes
+        ``_run_gate_verify`` refuse to start the verify, so this 0 guarantees
+        the verify never starts.
+
+        Once the verify ssh has started it issues, through the gate binary
+        (design D3):
             ssh <_SSH_BASE_OPTS> <host>
                 env ORCH_GATE_BIN=<gate bin> orchestrator cancel-verify
                     --request-id <id> [--config <path>]
 
-        Returns the ssh return code.  An OSError (host unreachable) returns a
+        and returns the remote cancel-verify's rc.  That 0 is weaker: the remote
+        (``orchestrator/src/orchestrator/cli.py::cancel_verify``) also exits 0
+        when the verify has not yet written its pgid file, so a
+        verify still starting up can outlive it, and the caller must still
+        cancel its local dispatch.  An OSError (host unreachable) returns a
         non-zero sentinel so the caller treats it as a cancel failure.
         """
-        if self._inflight_request_id is None:
+        request_id = self._inflight_request_id
+        if request_id is None:
             return 0
-        self._cancelled_request_id = self._inflight_request_id
+        self._cancelled_request_id = request_id
+        if request_id != self._verify_started_request_id:
+            return 0
         remote_cmd = self._gate_command([
-            'cancel-verify', '--request-id', self._inflight_request_id, *self._config_args(),
+            'cancel-verify', '--request-id', request_id, *self._config_args(),
         ])
         try:
             rc, _, _ = await self._run(
@@ -2086,94 +2134,90 @@ class RemoteRunner:
         except Exception:
             return False  # fail-safe: stay PARKED on any transport error
 
-    def env_probe_run(self) -> Callable[..., Awaitable[tuple[int, str, str]]]:
-        """Return a :func:`capture_env_fingerprint`-compatible run adapter.
+    async def env_probe_run(self) -> Callable[..., Awaitable[tuple[int, str, str]]]:
+        """Open (or reuse) the probe ssh master, then return a run adapter for it.
 
-        The returned async callable has capture's ``(argv, *, cwd=None) ->
-        (rc, stdout, stderr)`` shape, and dispatches each probe as::
+        The adapter has :func:`capture_env_fingerprint`'s ``(argv, *, cwd=None)
+        -> (rc, stdout, stderr)`` shape and dispatches each probe as::
 
-            ssh <_SSH_BASE_OPTS> <host> <REMOTE_TOOL_PATH_PRELUDE> <shlex-joined argv>
+            ssh <_SSH_PROBE_OPTS> <host> <REMOTE_TOOL_PATH_PRELUDE> <shlex-joined argv>
 
-        so a remote fingerprint can be captured through exactly the same
-        function that captures the local one.  The rc/stdout/stderr triple is
-        returned unchanged.  The prelude (task 7097) puts ``~/.local/bin`` on
-        the non-login shell's PATH, as for RemoteRunner's own remote ``uv
-        sync``; without it a host with uv installed reports rc=127.
+        so a remote fingerprint is captured through exactly the same function
+        that captures the local one, and every probe of a check rides one
+        multiplexed connection instead of paying a full handshake each.  The
+        prelude (task 7097) puts ``~/.local/bin`` on the non-login shell's PATH,
+        as for RemoteRunner's own remote ``uv sync``.
+
+        THE OPEN IS ITS OWN AWAITED STEP.  ``ssh ... true`` establishes the
+        master under its own ``_SSH_PROBE_TIMEOUT_SECS`` bound before any probe
+        runs.  Folded into the first adapter call, open plus probe could exceed
+        that bound and race the longer ``_PROBE_TIMEOUT_SECS`` that
+        :func:`_probe_run_safe` wraps around each call: a slow handshake would
+        then be recorded as ``'<unavailable rc=124>'`` against a real local
+        version, which is a false env-divergence alarm.  A failed open raises
+        RunnerUnavailable here, which ``DriftDetector.check_env`` reads as
+        INCONCLUSIVE.
 
         Routed through ``self._run`` (the plain seam shared with health /
         cancel_verify / probe_clean) rather than ``self._ssh_run``: probes are
-        short read-only commands, not the load-bearing long build that needs
-        the stdin heartbeat.  Using ``self._run`` also means every existing
-        test that injects only ``run`` gets the probe path for free.
+        short read-only commands, not the long build that needs the stdin
+        heartbeat.
 
-        A binary absent on the REMOTE host makes the remote shell exit 127,
-        which capture records as ``'<unavailable rc=127>'`` — the same value
-        the local ENOENT normalisation in :func:`_probe_run_safe` produces, so
-        a tool missing on both hosts compares equal rather than as drift.
-
-        TRANSPORT FAILURE IS RAISED, NOT RECORDED
-        -----------------------------------------
-        ``self._run`` defaults to :func:`_default_subprocess_run`, which
-        RETURNS ``(rc, stdout, stderr)`` for every outcome and never raises —
-        so an unreachable host arrives here as ssh's own rc=255, not as an
-        exception.  Recorded verbatim that would render EVERY probe
-        ``'<unavailable rc=255>'`` against real local versions, i.e. a
-        sleeping laptop would read as total env skew.  This adapter therefore
-        converts ssh-level failure into RunnerUnavailable, which is what
-        ``DriftDetector.check_env`` already catches to return INCONCLUSIVE
-        (Invariant 5: transport failure is not divergence) — the same
-        conversion ``run_merge_verify`` performs for the dispatch itself.
-
-        Each probe is additionally bounded by ``_SSH_PROBE_TIMEOUT_SECS``.
-        ``ConnectTimeout=10`` in ``_SSH_BASE_OPTS`` bounds only the HANDSHAKE;
-        a connection that establishes and then hangs would otherwise hold the
-        merge-verify lease and both host slots indefinitely.  A hang converts
-        to RunnerUnavailable for the same reason rc=255 does — transport
-        failure is not divergence.
-
-        Scoped to ``_SSH_TRANSPORT_ERROR_RC`` and OSError specifically, NOT to
-        rc != 0: a reached host that simply lacks the tool exits 127, and that
-        is a genuine reportable difference between the two hosts — the most
-        likely real finding this detector exists to produce.  Broadening the
-        guard would silently disarm it.
+        Transport failure is RAISED, never recorded; see :meth:`_probe_ssh`.  A
+        binary absent on a REACHED host exits 127 through the remote shell and
+        is returned unchanged: capture records it as ``'<unavailable rc=127>'``,
+        the value the local ENOENT normalisation produces, so a tool missing on
+        both hosts compares equal while a tool missing on one side is the real
+        finding this detector exists to produce.
         """
-        async def _run_probe(
-            argv: list[str],
-            *,
-            cwd: str | Path | None = None,
-        ) -> tuple[int, str, str]:
-            remote_cmd = ' '.join(shlex.quote(a) for a in argv)
-            try:
-                async with asyncio.timeout(_SSH_PROBE_TIMEOUT_SECS):
-                    rc, stdout, stderr = await self._run([
-                        'ssh', *_SSH_BASE_OPTS, self._ssh_host,
-                        f'{REMOTE_TOOL_PATH_PRELUDE} {remote_cmd}',
-                    ])
-            except TimeoutError as exc:
-                # BEFORE the OSError clause: TimeoutError subclasses OSError.
-                # A reached-then-wedged connection is a transport failure, not
-                # a finding about the remote's tooling — recording it as
-                # rc=124 would compare a sentinel against real local versions
-                # and file a false divergence L1 over a slow link.
-                raise RunnerUnavailable(
-                    f'ssh {self._ssh_host} probe {remote_cmd!r} exceeded '
-                    f'{_SSH_PROBE_TIMEOUT_SECS}s'
-                ) from exc
-            except OSError as exc:
-                # Spawning the LOCAL ssh binary failed.  Must not fall through
-                # to _probe_run_safe's OSError→rc=127 normalisation: that rule
-                # exists to make an absent binary compare EQUAL across hosts,
-                # and here it would mark every remote probe unavailable while
-                # the local side reports real versions.
-                raise RunnerUnavailable(f'ssh spawn failed: {exc}') from exc
-            if rc == _SSH_TRANSPORT_ERROR_RC:
-                raise RunnerUnavailable(
-                    f'ssh {self._ssh_host} exited {rc} probing '
-                    f'{remote_cmd!r}: {stderr}'
-                )
-            return (rc, stdout, stderr)
+        await self._probe_ssh('true')
+        return self._run_env_probe
 
-        return _run_probe
+    async def _run_env_probe(
+        self,
+        argv: list[str],
+        *,
+        cwd: str | Path | None = None,
+    ) -> tuple[int, str, str]:
+        remote_cmd = ' '.join(shlex.quote(a) for a in argv)
+        return await self._probe_ssh(f'{REMOTE_TOOL_PATH_PRELUDE} {remote_cmd}')
+
+    async def _probe_ssh(self, remote_cmd: str) -> tuple[int, str, str]:
+        """One bounded probe-option ssh; every transport failure is RunnerUnavailable.
+
+        ``self._run`` defaults to :func:`_default_subprocess_run`, which RETURNS
+        ssh's own rc=255 for an unreachable host rather than raising.  Recorded
+        verbatim, a sleeping laptop would read as total env skew, so rc=255, a
+        spawn OSError and a hang past ``_SSH_PROBE_TIMEOUT_SECS`` (ConnectTimeout
+        bounds only the handshake) all raise instead (Invariant 5: transport
+        failure is not divergence).  Any other rc is the remote command's own and
+        is returned unchanged: broadening this to rc != 0 would swallow a real
+        missing-tool finding.
+        """
+        try:
+            async with asyncio.timeout(_SSH_PROBE_TIMEOUT_SECS):
+                rc, stdout, stderr = await self._run(
+                    ['ssh', *_SSH_PROBE_OPTS, self._ssh_host, remote_cmd]
+                )
+        except TimeoutError as exc:
+            # BEFORE the OSError clause: TimeoutError subclasses OSError.
+            raise RunnerUnavailable(
+                f'ssh {self._ssh_host} probe {remote_cmd!r} exceeded '
+                f'{_SSH_PROBE_TIMEOUT_SECS}s'
+            ) from exc
+        except OSError as exc:
+            # Spawning the LOCAL ssh binary failed.  _probe_run_safe's
+            # OSError->rc=127 rule must not see it: that rule makes an absent
+            # binary compare EQUAL across hosts, and here it would mark every
+            # remote probe unavailable against real local versions.
+            raise RunnerUnavailable(
+                f'ssh {self._ssh_host} probe {remote_cmd!r}: spawn failed: {exc}'
+            ) from exc
+        if rc == _SSH_TRANSPORT_ERROR_RC:
+            raise RunnerUnavailable(
+                f'ssh {self._ssh_host} exited {rc} probing {remote_cmd!r}: {stderr}'
+            )
+        return (rc, stdout, stderr)
 
     @property
     def dispatch_in_flight(self) -> bool:
@@ -2569,6 +2613,7 @@ class VerifyRunnerPool:
                     # spec.verify_env, so a narrowed retry is never miscounted as
                     # a full green gate.
                     **retry_scope_event_fields(spec.verify_env),
+                    **verify_event_fields(result),
                 },
             )
 
@@ -2819,7 +2864,8 @@ _PROBE_TIMEOUT_SECS = 30.0
 # which would read as env divergence and file a false L1 against a slow link.
 # ssh's own ConnectTimeout=10 in _SSH_BASE_OPTS bounds only the HANDSHAKE; a
 # connection that establishes and then hangs is bounded by this and nothing
-# else.
+# else.  RemoteRunner.env_probe_run's master open gets its own bound of this
+# size, separate from every probe's, so no single adapter call can exceed it.
 _SSH_PROBE_TIMEOUT_SECS = 20.0
 
 
@@ -2896,10 +2942,8 @@ async def capture_env_fingerprint(
         correct only when the caller will not COMPARE those fields — see
         :meth:`DriftDetector.check_env`, which derives this from its
         ``dimensions``.  The saving is not cosmetic: on the remote side each
-        probe is a separate ssh invocation (``_SSH_BASE_OPTS`` sets up no
-        ControlMaster), so skipping three of them turns a 4-probe check from
-        seven full TCP+auth handshakes into four, serially, over a possibly-WAN
-        link — plus three fewer local subprocess spawns.
+        probe is a separate ssh round trip over the probe master, serially, over
+        a possibly-WAN link — plus three fewer local subprocess spawns.
 
     Absent binaries
     ---------------
@@ -3433,7 +3477,7 @@ class DriftDetector:
 
         Captures an EnvFingerprint on each host through the SAME
         :func:`capture_env_fingerprint` (local via *local_run* /
-        :func:`env_probe_local_run`, remote via ``remote.env_probe_run()``),
+        :func:`env_probe_local_run`, remote via ``await remote.env_probe_run()``),
         then compares them under :func:`compare_env_fingerprints` scoped to
         *dimensions*.
 
@@ -3556,7 +3600,7 @@ class DriftDetector:
         )
         try:
             remote_fp = await capture_env_fingerprint(
-                probe_run(),
+                await probe_run(),
                 extra_probe_specs=probe_specs,
                 include_toolchain=include_toolchain,
             )

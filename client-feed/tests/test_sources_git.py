@@ -1,19 +1,33 @@
 """Read-only git plumbing confined to one root, over throwaway repositories."""
 
+import functools
 import os
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from _git_repo import Repo, make_repo
+from _git_repo import (
+    Repo,
+    make_repo,
+    path_with_git_answering,
+    path_with_git_replaced_on,
+    path_with_git_stalled_on,
+)
 
 from client_feed.contract import Branch
 from client_feed.sources.git import (
+    ChangeStatus,
     EntryKind,
     GitError,
     MergeStats,
+    PathChange,
     TreeEntry,
+    added_lines,
     blob_reader,
+    first_parent_changes,
     generated_paths,
     has_commit,
     is_ancestor,
@@ -22,6 +36,7 @@ from client_feed.sources.git import (
     merge_stats,
     repository_toplevel,
     task_branches,
+    tree_changes,
     tree_entries,
 )
 
@@ -164,6 +179,24 @@ def test_reading_an_unknown_blob_raises_a_typed_error(repo: Repo) -> None:
 
     assert caught.value.subcommand == 'cat-file'
     assert str(repo.root) not in str(caught.value)
+
+
+def test_a_blob_read_git_never_answers_fails_as_a_timeout(
+    repo: Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo.write('a.txt', 'a\n')
+    commit = repo.commit('one', when=T0)
+    blob = repo.rev(f'{commit}:a.txt')
+    monkeypatch.setenv('PATH', path_with_git_stalled_on(tmp_path / 'bin', 'cat-file', seconds=30))
+    started = time.monotonic()
+
+    with pytest.raises(GitError) as caught, blob_reader(repo.root, timeout_secs=0.5) as read:
+        read(blob)
+
+    assert caught.value.subcommand == 'cat-file'
+    assert caught.value.returncode is None
+    assert 'timed out' in caught.value.reason
+    assert time.monotonic() - started < 15
 
 
 @pytest.mark.parametrize('commit', ['--output=x', 'HEAD', 'a' * 39, 'A' * 40, f'{"a" * 40}\n'])
@@ -379,3 +412,272 @@ def test_has_commit_of_a_missing_root_raises_rather_than_answering_false(tmp_pat
         has_commit(tmp_path / 'missing', 'e' * 40)
 
     assert caught.value.returncode is None
+
+
+@dataclass(frozen=True)
+class _History:
+    c1: str
+    c2: str
+    c3: str
+
+
+@pytest.fixture
+def history(repo: Repo) -> _History:
+    """c1 holds x, y and z; c2 modifies x, renames y to w unchanged and deletes z; c3 recreates z."""
+    repo.write('x.py', 'x = 1\n')
+    repo.write('y.py', 'why = "a line long enough to be its own file"\n')
+    repo.write('z.py', 'zed = 3\n')
+    c1 = repo.commit('c1', when=T0)
+    repo.write('x.py', 'x = 2\n')
+    repo.git('mv', 'y.py', 'w.py')
+    repo.git('rm', '-q', 'z.py')
+    c2 = repo.commit('c2', when=T1)
+    repo.write('z.py', 'zed = "recreated"\n')
+    c3 = repo.commit('c3', when=T2)
+    return _History(c1=c1, c2=c2, c3=c3)
+
+
+def _file_change(
+    status: ChangeStatus, old: tuple[str, str] | None, new: tuple[str, str] | None
+) -> PathChange:
+    """A change between regular files, each side given as (path, blob) or None when absent."""
+    return PathChange(
+        status=status,
+        old_path=None if old is None else old[0],
+        new_path=None if new is None else new[0],
+        old_blob=None if old is None else old[1],
+        new_blob=None if new is None else new[1],
+        old_kind=None if old is None else EntryKind.FILE,
+        new_kind=None if new is None else EntryKind.FILE,
+    )
+
+
+def test_first_parent_changes_are_one_change_set_per_commit_oldest_first(
+    repo: Repo, history: _History
+) -> None:
+    c1, c2, c3 = history.c1, history.c2, history.c3
+    y_blob = repo.rev(f'{c1}:y.py')
+
+    changes = first_parent_changes(repo.root, since=c1, head=c3)
+
+    assert len(changes) == 2
+    in_c2, in_c3 = changes
+    assert set(in_c2) == {
+        _file_change(
+            ChangeStatus.MODIFIED,
+            ('x.py', repo.rev(f'{c1}:x.py')),
+            ('x.py', repo.rev(f'{c2}:x.py')),
+        ),
+        _file_change(ChangeStatus.RENAMED, ('y.py', y_blob), ('w.py', y_blob)),
+        _file_change(ChangeStatus.DELETED, ('z.py', repo.rev(f'{c1}:z.py')), None),
+    }
+    assert repo.rev(f'{c1}:x.py') != repo.rev(f'{c2}:x.py')
+    assert in_c3 == (_file_change(ChangeStatus.ADDED, None, ('z.py', repo.rev(f'{c3}:z.py'))),)
+
+
+def test_first_parent_changes_keep_an_empty_change_set_for_a_commit_that_changes_nothing(
+    repo: Repo, history: _History
+) -> None:
+    repo.git(
+        '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', '-c', 'commit.gpgsign=false',
+        'commit', '-q', '--allow-empty', '--no-verify', '-m', 'nothing',
+    )
+    empty = repo.rev('HEAD')
+
+    changes = first_parent_changes(repo.root, since=history.c2, head=empty)
+
+    assert len(changes) == 2
+    assert changes[1] == ()
+
+
+def test_a_merge_contributes_its_diff_against_its_first_parent_and_the_branch_commits_none(
+    repo: Repo,
+) -> None:
+    repo.write('a.txt', 'a\n')
+    repo.write('b.txt', 'b\n')
+    base = repo.commit('base', when=T0)
+    repo.branch('task/7')
+    repo.checkout('task/7')
+    repo.write('b.txt', 'b two\n')
+    repo.commit('seven one', when=T1)
+    repo.write('b.txt', 'b three\n')
+    repo.write('c.txt', 'c\n')
+    tip = repo.commit('seven two', when=T1)
+    repo.checkout('main')
+    repo.write('d.txt', 'd\n')
+    meanwhile = repo.commit('meanwhile on main', when=T2)
+    merge = repo.merge_no_ff('task/7', 'Merge task/7 into main', when=T3)
+
+    changes = first_parent_changes(repo.root, since=base, head=merge)
+
+    assert changes == (
+        (_file_change(ChangeStatus.ADDED, None, ('d.txt', repo.rev(f'{meanwhile}:d.txt'))),),
+        (
+            _file_change(
+                ChangeStatus.MODIFIED,
+                ('b.txt', repo.rev(f'{base}:b.txt')),
+                ('b.txt', repo.rev(f'{tip}:b.txt')),
+            ),
+            _file_change(ChangeStatus.ADDED, None, ('c.txt', repo.rev(f'{tip}:c.txt'))),
+        ),
+    )
+
+
+def test_tree_changes_compare_two_trees_directly(repo: Repo, history: _History) -> None:
+    c1, c3 = history.c1, history.c3
+    y_blob = repo.rev(f'{c1}:y.py')
+
+    changes = tree_changes(repo.root, c1, c3)
+
+    assert set(changes) == {
+        _file_change(
+            ChangeStatus.MODIFIED,
+            ('x.py', repo.rev(f'{c1}:x.py')),
+            ('x.py', repo.rev(f'{c3}:x.py')),
+        ),
+        _file_change(ChangeStatus.RENAMED, ('y.py', y_blob), ('w.py', y_blob)),
+        _file_change(
+            ChangeStatus.MODIFIED,
+            ('z.py', repo.rev(f'{c1}:z.py')),
+            ('z.py', repo.rev(f'{c3}:z.py')),
+        ),
+    }
+    assert len(changes) == 3
+
+
+def test_a_regular_file_turned_symlink_is_a_type_change_to_a_symlink(repo: Repo) -> None:
+    repo.write('l.py', 'l = 1\n')
+    before = repo.commit('file', when=T0)
+    (repo.root / 'l.py').unlink()
+    repo.symlink('l.py', '/etc/passwd')
+    after = repo.commit('symlink', when=T1)
+
+    assert tree_changes(repo.root, before, after) == (
+        PathChange(
+            status=ChangeStatus.TYPE_CHANGED,
+            old_path='l.py',
+            new_path='l.py',
+            old_blob=repo.rev(f'{before}:l.py'),
+            new_blob=repo.rev(f'{after}:l.py'),
+            old_kind=EntryKind.FILE,
+            new_kind=EntryKind.SYMLINK,
+        ),
+    )
+
+
+def _blob_pair(repo: Repo, path: str, old: str, new: str) -> tuple[str, str]:
+    repo.write(path, old)
+    before = repo.commit(f'{path} before', when=T0)
+    repo.write(path, new)
+    after = repo.commit(f'{path} after', when=T1)
+    return repo.rev(f'{before}:{path}'), repo.rev(f'{after}:{path}')
+
+
+def test_added_lines_are_the_added_or_changed_lines_only(repo: Repo) -> None:
+    old, new = _blob_pair(repo, 'f.txt', 'a\nb\nc\n', 'a\nB\nc\n\nnew line\n')
+
+    assert added_lines(repo.root, old, new) == b'B\n\nnew line'
+
+
+def test_an_added_line_starting_with_plus_plus_loses_only_the_diffs_own_plus(repo: Repo) -> None:
+    old, new = _blob_pair(repo, 'g.txt', 'a\n', 'a\n++x\n+++ b/fake\n')
+
+    assert added_lines(repo.root, old, new) == b'++x\n+++ b/fake'
+
+
+def test_added_lines_of_identical_blobs_are_empty(repo: Repo) -> None:
+    old, _ = _blob_pair(repo, 'h.txt', 'same\n', 'other\n')
+
+    assert added_lines(repo.root, old, old) == b''
+
+
+@pytest.mark.parametrize('bad', ['--output=x', 'HEAD', 'a' * 39, 'A' * 40, f'{"a" * 40}\n'])
+def test_change_readers_refuse_a_non_hex_sha_before_git_runs(tmp_path: Path, bad: str) -> None:
+    root = tmp_path / 'missing'
+    good = 'a' * 40
+    calls = [
+        lambda: tree_changes(root, bad, good),
+        lambda: tree_changes(root, good, bad),
+        lambda: first_parent_changes(root, since=bad, head=good),
+        lambda: first_parent_changes(root, since=good, head=bad),
+        lambda: added_lines(root, bad, good),
+        lambda: added_lines(root, good, bad),
+    ]
+    for call in calls:
+        with pytest.raises(ValueError, match='sha'):
+            call()
+
+
+def _answering(subcommand: str, stdout: bytes) -> Callable[[Path], str]:
+    return functools.partial(path_with_git_answering, subcommand=subcommand, stdout=stdout)
+
+
+def _read_one_blob(root: Path, sha: str) -> bytes:
+    with blob_reader(root) as read:
+        return read(sha)
+
+
+PARSE_FAILURE = 'output not understood'
+UNPARSABLE_OUTPUTS = [
+    pytest.param(
+        'ls-tree', _answering('ls-tree', b'garbage\0'), tree_entries, id='tree_entries'
+    ),
+    pytest.param(
+        'for-each-ref',
+        _answering('for-each-ref', b'refs/heads/task/7\x00not-a-time\x000 0\n'),
+        lambda root, sha: task_branches(root),
+        id='task_branches',
+    ),
+    pytest.param(
+        'diff-tree', _answering('diff-tree', b'x\ty\tpath\0'), merge_stats, id='merge_stats'
+    ),
+    pytest.param(
+        'log',
+        _answering('log', b'\x01not-a-time\0'),
+        lambda root, sha: last_changes(root, sha, since=None),
+        id='last_changes',
+    ),
+    pytest.param(
+        'diff-tree',
+        _answering('diff-tree', b':bogus\0'),
+        lambda root, sha: tree_changes(root, sha, sha),
+        id='tree_changes',
+    ),
+    pytest.param(
+        'log',
+        _answering('log', b':bogus\0'),
+        lambda root, sha: first_parent_changes(root, since=sha, head=sha),
+        id='first_parent_changes',
+    ),
+    pytest.param(
+        'cat-file',
+        functools.partial(
+            path_with_git_replaced_on,
+            subcommand='cat-file',
+            shell='read line; printf \'%s blob many\\n\' "$line"; exit 0',
+        ),
+        _read_one_blob,
+        id='blob_reader',
+    ),
+]
+
+
+@pytest.mark.parametrize(('subcommand', 'fake_git', 'reads'), UNPARSABLE_OUTPUTS)
+def test_git_output_that_does_not_parse_is_a_git_error_of_its_command(
+    repo: Repo,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    subcommand: str,
+    fake_git: Callable[[Path], str],
+    reads: Callable[[Path, str], object],
+) -> None:
+    repo.write('a.txt', 'a\n')
+    commit = repo.commit('one', when=T0)
+    monkeypatch.setenv('PATH', fake_git(tmp_path / 'bin'))
+
+    with pytest.raises(GitError) as caught:
+        reads(repo.root, commit)
+
+    assert caught.value.subcommand == subcommand
+    assert PARSE_FAILURE in caught.value.reason
+    assert str(repo.root) not in str(caught.value)

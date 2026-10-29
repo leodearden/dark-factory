@@ -14,7 +14,7 @@ import logging
 import os
 import threading
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -28,15 +28,15 @@ from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir, reset_sweep_once
 from shared.usage_gate import UsageGate
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
-from fused_memory.middleware.task_curator import (
+from fused_memory.middleware.curation_deferral import DeferReason
+from fused_memory.middleware.curator_types import (
     CandidateTask,
     CuratorDecision,
     PoolWithheld,
-    TaskCurator,
 )
+from fused_memory.middleware.task_curator import TaskCurator
 
 _CURATOR_MODULE = 'fused_memory.middleware.task_curator'
-_INVOKE = f'{_CURATOR_MODULE}.invoke_with_cap_retry'
 _EVIDENCE_READ = f'{_CURATOR_MODULE}.transcript_evidence_for_session'
 _SWEEP = f'{_CURATOR_MODULE}.sweep_stale_pid_dirs'
 _CURATOR_SWEEP_PREFIX = CONFIG_DIR_PREFIX + 'fm-curator-'
@@ -70,26 +70,26 @@ def _stub_corpus(curator: TaskCurator, pools_by_title: Mapping[str, Pool]):
 
 
 async def _curate(
-    curator: TaskCurator, invoke: AsyncMock, title: str = 'T', pool: Pool = _DROP_TARGET_POOL,
+    curator: TaskCurator, title: str = 'T', pool: Pool = _DROP_TARGET_POOL,
 ) -> CuratorDecision:
-    with _stub_corpus(curator, {title: pool}), patch(_INVOKE, new=invoke):
+    with _stub_corpus(curator, {title: pool}):
         return await curator.curate(CandidateTask(title=title), project_id='p', project_root='/p')
 
 
 async def _curate_batch(
-    curator: TaskCurator, invoke: AsyncMock, pools: Sequence[Pool] = ((), ()),
+    curator: TaskCurator, pools: Sequence[Pool] = ((), ()),
 ) -> list[CuratorDecision]:
     titles = [f'T{i}' for i in range(len(pools))]
-    with _stub_corpus(curator, dict(zip(titles, pools, strict=True))), patch(_INVOKE, new=invoke):
+    with _stub_corpus(curator, dict(zip(titles, pools, strict=True))):
         return await curator.curate_batch(
             [CandidateTask(title=title) for title in titles], project_id='p', project_root='/p',
         )
 
 
 def _gated_curator(
-    config_dir_base: Path, config: FusedMemoryConfig | None = None,
+    config_dir_base: Path, invoke: AsyncMock, config: FusedMemoryConfig | None = None,
 ) -> tuple[TaskCurator, AsyncMock]:
-    """A curator with a UsageGate, and the escalator its failures reach."""
+    """A curator with a UsageGate that calls *invoke*, and the escalator its failures reach."""
     escalator = AsyncMock()
     escalator.report_failure = AsyncMock(return_value=None)
     curator = TaskCurator(
@@ -98,14 +98,18 @@ def _gated_curator(
         usage_gate=MagicMock(spec=UsageGate),
         config_dir_base=config_dir_base,
         escalator=escalator,
+        invoke=invoke,
     )
     return curator, escalator
 
 
-def _gate_less_curator() -> tuple[TaskCurator, AsyncMock]:
+def _gate_less_curator(invoke: AsyncMock) -> tuple[TaskCurator, AsyncMock]:
     escalator = AsyncMock()
     escalator.report_failure = AsyncMock(return_value=None)
-    curator = TaskCurator(config=make_config(), taskmaster=None, usage_gate=None, escalator=escalator)
+    curator = TaskCurator(
+        config=make_config(), taskmaster=None, usage_gate=None, escalator=escalator,
+        invoke=invoke,
+    )
     return curator, escalator
 
 
@@ -114,15 +118,20 @@ def _reported_failure(escalator: AsyncMock) -> dict[str, Any]:
     return dict(escalator.report_failure.await_args.kwargs)
 
 
-async def _single_call_kwargs(curator: TaskCurator) -> dict[str, Any]:
+CuratorFactory = Callable[[AsyncMock], TaskCurator]
+
+
+async def _single_call_kwargs(curator_calling: CuratorFactory) -> dict[str, Any]:
+    """The kwargs of the one LLM call a single curation makes."""
     invoke = AsyncMock(return_value=agent_result(_SINGLE_OK))
-    await _curate(curator, invoke)
+    await _curate(curator_calling(invoke))
     return dict(invoke.call_args.kwargs)
 
 
-async def _batch_call_kwargs(curator: TaskCurator) -> dict[str, Any]:
+async def _batch_call_kwargs(curator_calling: CuratorFactory) -> dict[str, Any]:
+    """The kwargs of the one LLM call a batch of two makes."""
     invoke = AsyncMock(return_value=agent_result(_BATCH_OK))
-    await _curate_batch(curator, invoke)
+    await _curate_batch(curator_calling(invoke))
     invoke.assert_awaited_once()
     return dict(invoke.call_args.kwargs)
 
@@ -159,9 +168,7 @@ class TestCuratorMcpScoping:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(('call_kwargs', 'expected_timeout'), _CALL_SITES)
     async def test_passes_zero_server_strict_mcp_config(self, call_kwargs, expected_timeout):
-        curator, _ = _gate_less_curator()
-
-        kwargs = await call_kwargs(curator)
+        kwargs = await call_kwargs(lambda invoke: _gate_less_curator(invoke)[0])
 
         assert kwargs.get('mcp_config') == {'mcpServers': {}}
         assert kwargs.get('strict_mcp_config') is True
@@ -190,9 +197,7 @@ class TestCuratorTranscriptThreading:
     async def test_gated_call_uses_one_per_process_config_dir(
         self, call_kwargs, expected_timeout, tmp_path,
     ):
-        curator, _ = _gated_curator(tmp_path)
-
-        kwargs = await call_kwargs(curator)
+        kwargs = await call_kwargs(lambda invoke: _gated_curator(tmp_path, invoke)[0])
 
         config_dir = kwargs.get('config_dir')
         assert isinstance(config_dir, TaskConfigDir)
@@ -206,9 +211,7 @@ class TestCuratorTranscriptThreading:
     async def test_gated_call_passes_a_uuid_session_id(
         self, call_kwargs, expected_timeout, tmp_path,
     ):
-        curator, _ = _gated_curator(tmp_path)
-
-        kwargs = await call_kwargs(curator)
+        kwargs = await call_kwargs(lambda invoke: _gated_curator(tmp_path, invoke)[0])
 
         uuid.UUID(kwargs['session_id'])
 
@@ -218,9 +221,7 @@ class TestCuratorTranscriptThreading:
         self, call_kwargs, expected_timeout, tmp_path,
     ):
         config = make_config()
-        curator, _ = _gated_curator(tmp_path, config)
-
-        kwargs = await call_kwargs(curator)
+        kwargs = await call_kwargs(lambda invoke: _gated_curator(tmp_path, invoke, config)[0])
 
         assert kwargs.get('startup_grace_secs') == kwargs['timeout_seconds']
         assert kwargs['timeout_seconds'] == expected_timeout(config.curator)
@@ -229,11 +230,11 @@ class TestCuratorTranscriptThreading:
     async def test_successive_calls_share_the_dir_but_not_the_session(self, tmp_path):
         """A reused committed session id makes ``--session-id`` exit at once
         with 'already in use' (reify-3604), so every call needs a fresh one."""
-        curator, _ = _gated_curator(tmp_path)
         invoke = AsyncMock(return_value=agent_result(_SINGLE_OK))
+        curator, _ = _gated_curator(tmp_path, invoke)
 
-        await _curate(curator, invoke, title='first')
-        await _curate(curator, invoke, title='second')
+        await _curate(curator, title='first')
+        await _curate(curator, title='second')
 
         first, second = (call.kwargs for call in invoke.await_args_list)
         assert first['config_dir'] is second['config_dir']
@@ -242,9 +243,7 @@ class TestCuratorTranscriptThreading:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(('call_kwargs', 'expected_timeout'), _CALL_SITES)
     async def test_gate_less_call_threads_nothing(self, call_kwargs, expected_timeout):
-        curator, _ = _gate_less_curator()
-
-        kwargs = await call_kwargs(curator)
+        kwargs = await call_kwargs(lambda invoke: _gate_less_curator(invoke)[0])
 
         assert kwargs.get('config_dir') is None
         assert kwargs.get('session_id') is None
@@ -295,11 +294,10 @@ class TestCuratorStaleConfigDirSweep:
     async def test_gated_call_does_not_wait_for_the_stale_config_dir_sweep(
         self, call_kwargs, expected_timeout, tmp_path,
     ):
-        curator, _ = _gated_curator(tmp_path)
         sweep = _HeldSweep()
 
         with patch(_SWEEP, new=sweep):
-            await call_kwargs(curator)
+            await call_kwargs(lambda invoke: _gated_curator(tmp_path, invoke)[0])
             returned_while_held = not sweep.finished.is_set()
             sweep.release.set()
             assert await asyncio.to_thread(sweep.finished.wait, _SWEEP_HOLD_CEILING_SECONDS)
@@ -434,15 +432,15 @@ class TestCuratorFailureEvidence:
 
     @pytest.mark.asyncio
     async def test_tool_wandering_run_reports_its_tools(self, tmp_path, caplog):
-        curator, escalator = _gated_curator(tmp_path)
         invoke = _killed_run_invoker(
             _fixture_lines(_TOOL_WANDERING),
             subtype='error_timeout_killed_with_progress',
             transcript_turns=6,
         )
+        curator, escalator = _gated_curator(tmp_path, invoke)
 
         with caplog.at_level(logging.WARNING, logger=_CURATOR_MODULE):
-            await _curate(curator, invoke)
+            await _curate(curator)
 
         report = _reported_failure(escalator)
         assert report['transcript_turns'] == 6
@@ -457,7 +455,6 @@ class TestCuratorFailureEvidence:
     @pytest.mark.asyncio
     async def test_tool_wandering_batch_logs_its_tools(self, tmp_path, caplog):
         """A failed batch is bisected, not escalated, so its log is its only report."""
-        curator, escalator = _gated_curator(tmp_path)
         invoke = _scripted_invoker(
             (
                 _fixture_lines(_TOOL_WANDERING),
@@ -466,9 +463,10 @@ class TestCuratorFailureEvidence:
             _HEALTHY,
             _HEALTHY,
         )
+        curator, escalator = _gated_curator(tmp_path, invoke)
 
         with caplog.at_level(logging.WARNING, logger=_CURATOR_MODULE):
-            decisions = await _curate_batch(curator, invoke)
+            decisions = await _curate_batch(curator)
 
         assert [d.action for d in decisions] == ['create', 'create']
         assert invoke.await_count == 3
@@ -479,15 +477,15 @@ class TestCuratorFailureEvidence:
 
     @pytest.mark.asyncio
     async def test_pre_turn_stall_is_a_zero_output_timeout(self, tmp_path, caplog):
-        curator, escalator = _gated_curator(tmp_path)
         invoke = _killed_run_invoker(
             _fixture_lines('esc_curator_4_pre_turn_stall.jsonl'),
             subtype='error_empty_output',
             transcript_turns=0,
         )
+        curator, escalator = _gated_curator(tmp_path, invoke)
 
         with caplog.at_level(logging.WARNING, logger=_CURATOR_MODULE):
-            await _curate(curator, invoke)
+            await _curate(curator)
 
         report = _reported_failure(escalator)
         assert report['zero_output_timeout'] is True
@@ -498,10 +496,10 @@ class TestCuratorFailureEvidence:
     @pytest.mark.asyncio
     async def test_missing_transcript_leaves_tools_unknown(self, tmp_path):
         """Absence of a transcript is never reported as an empty tool list."""
-        curator, escalator = _gated_curator(tmp_path)
         invoke = _killed_run_invoker(None, subtype='error_empty_output', transcript_turns=None)
+        curator, escalator = _gated_curator(tmp_path, invoke)
 
-        await _curate(curator, invoke)
+        await _curate(curator)
 
         report = _reported_failure(escalator)
         assert report['tools_used'] is None
@@ -512,11 +510,11 @@ class TestCuratorFailureEvidence:
 
     @pytest.mark.asyncio
     async def test_gate_less_curator_reads_no_evidence(self):
-        curator, escalator = _gate_less_curator()
         invoke = _killed_run_invoker(None, subtype='error_empty_output', transcript_turns=None)
+        curator, escalator = _gate_less_curator(invoke)
 
         with patch(_EVIDENCE_READ) as evidence_read:
-            await _curate(curator, invoke)
+            await _curate(curator)
 
         evidence_read.assert_not_called()
         report = _reported_failure(escalator)
@@ -525,16 +523,16 @@ class TestCuratorFailureEvidence:
 
     @pytest.mark.asyncio
     async def test_evidence_read_fault_never_replaces_the_llm_failure(self, tmp_path, caplog):
-        curator, escalator = _gated_curator(tmp_path)
         invoke = _killed_run_invoker(
             None, subtype='error_timeout_killed_with_progress', transcript_turns=6,
         )
+        curator, escalator = _gated_curator(tmp_path, invoke)
 
         with (
             patch(_EVIDENCE_READ, side_effect=OSError('transcript read fault')),
             caplog.at_level(logging.WARNING, logger=_CURATOR_MODULE),
         ):
-            await _curate(curator, invoke)
+            await _curate(curator)
 
         report = _reported_failure(escalator)
         assert report['subtype'] == 'error_timeout_killed_with_progress'
@@ -552,11 +550,11 @@ class TestCuratorFailureEvidence:
         def blocking_read(*_args: Any) -> None:
             probe.block()
 
-        curator, _ = _gated_curator(tmp_path)
         invoke = _killed_run_invoker(None, subtype='error_empty_output', transcript_turns=0)
+        curator, _ = _gated_curator(tmp_path, invoke)
 
         with patch(_EVIDENCE_READ, side_effect=blocking_read):
-            await _curate(curator, invoke)
+            await _curate(curator)
 
         probe.assert_loop_stayed_free()
 
@@ -581,17 +579,17 @@ class TestCuratorTranscriptSalvage:
     accepted returns that verdict instead of failing.
 
     This is the transcript route, for a run whose stdout never arrived; the
-    stdout route is ``TestCurateFallbacks::test_call_llm_salvages_schema_payload``.
+    stdout route is ``TestCurateFallbacks::test_a_salvaged_schema_payload_is_parsed``.
     A salvaged verdict is held to exactly the validation a returned one is.
     """
 
     @pytest.mark.asyncio
     async def test_completed_verdict_is_salvaged(self, tmp_path, caplog):
-        curator, escalator = _gated_curator(tmp_path)
         invoke = _scripted_invoker((_structured_output_lines(_SALVAGEABLE_DROP), _SALVAGEABLE_KILL))
+        curator, escalator = _gated_curator(tmp_path, invoke)
 
         with caplog.at_level(logging.WARNING, logger=_CURATOR_MODULE):
-            decision = await _curate(curator, invoke)
+            decision = await _curate(curator)
 
         assert decision.action == 'drop'
         assert decision.target_id == '9001'
@@ -603,17 +601,16 @@ class TestCuratorTranscriptSalvage:
     @pytest.mark.asyncio
     async def test_salvaged_verdict_meets_the_normal_validation(self, tmp_path):
         pool: Pool = (('42', 'pending'),)
-        returned_by, _ = _gated_curator(tmp_path / 'returned')
-        returned = await _curate(
-            returned_by, _scripted_invoker((None, agent_result(_SALVAGEABLE_DROP))), pool=pool,
+        returned_by, _ = _gated_curator(
+            tmp_path / 'returned', _scripted_invoker((None, agent_result(_SALVAGEABLE_DROP))),
         )
+        returned = await _curate(returned_by, pool=pool)
 
-        salvaged_by, _ = _gated_curator(tmp_path / 'salvaged')
-        salvaged = await _curate(
-            salvaged_by,
+        salvaged_by, _ = _gated_curator(
+            tmp_path / 'salvaged',
             _scripted_invoker((_structured_output_lines(_SALVAGEABLE_DROP), _SALVAGEABLE_KILL)),
-            pool=pool,
         )
+        salvaged = await _curate(salvaged_by, pool=pool)
 
         assert salvaged.action == 'create'
         assert (salvaged.action, salvaged.target_id, salvaged.justification) == (
@@ -624,15 +621,15 @@ class TestCuratorTranscriptSalvage:
     async def test_salvaged_verdict_resets_the_breaker(self, tmp_path):
         """ZOT, salvage, ZOT: had the salvage not reset the count, the second ZOT
         would reach the threshold of two and short-circuit the fourth call."""
-        curator, _ = _gated_curator(tmp_path, _breaker_config(threshold=2))
         invoke = _scripted_invoker(
             _ZOT,
             (_structured_output_lines(_SALVAGEABLE_DROP), _SALVAGEABLE_KILL),
             _ZOT,
             _HEALTHY,
         )
+        curator, _ = _gated_curator(tmp_path, invoke, _breaker_config(threshold=2))
 
-        decisions = [await _curate(curator, invoke, title) for title in 'ABCD']
+        decisions = [await _curate(curator, title) for title in 'ABCD']
 
         assert decisions[1].action == 'drop'
         assert invoke.await_count == 4
@@ -640,14 +637,14 @@ class TestCuratorTranscriptSalvage:
 
     @pytest.mark.asyncio
     async def test_batch_verdict_is_salvaged(self, tmp_path):
-        curator, _ = _gated_curator(tmp_path)
         verdict = {'decisions': [
             {'candidate_index': 0, 'action': 'create', 'justification': 'j0'},
             {**_SALVAGEABLE_DROP, 'candidate_index': 1},
         ]}
         invoke = _scripted_invoker((_structured_output_lines(verdict), _SALVAGEABLE_KILL))
+        curator, _ = _gated_curator(tmp_path, invoke)
 
-        decisions = await _curate_batch(curator, invoke, pools=((), _DROP_TARGET_POOL))
+        decisions = await _curate_batch(curator, pools=((), _DROP_TARGET_POOL))
 
         assert [d.action for d in decisions] == ['create', 'drop']
         assert decisions[1].target_id == '9001'
@@ -657,18 +654,18 @@ class TestCuratorTranscriptSalvage:
     async def test_batch_salvage_resets_the_breaker(self, tmp_path):
         """ZOT, batch salvage, ZOT: as for a single salvage, the fourth call
         still reaches the LLM."""
-        curator, _ = _gated_curator(tmp_path, _breaker_config(threshold=2))
         invoke = _scripted_invoker(
             _ZOT,
             (_structured_output_lines(_BATCH_OK), _SALVAGEABLE_KILL),
             _ZOT,
             _HEALTHY,
         )
+        curator, _ = _gated_curator(tmp_path, invoke, _breaker_config(threshold=2))
 
-        await _curate(curator, invoke, 'A')
-        await _curate_batch(curator, invoke)
-        await _curate(curator, invoke, 'C')
-        after = await _curate(curator, invoke, 'D')
+        await _curate(curator, 'A')
+        await _curate_batch(curator)
+        await _curate(curator, 'C')
+        after = await _curate(curator, 'D')
 
         assert invoke.await_count == 4
         assert 'zero-output-breaker' not in after.justification
@@ -676,26 +673,26 @@ class TestCuratorTranscriptSalvage:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('transcript_lines', _NO_COMPLETED_VERDICT)
     async def test_no_completed_verdict_is_escalated(self, transcript_lines, tmp_path):
-        curator, escalator = _gated_curator(tmp_path)
         invoke = _scripted_invoker((transcript_lines, _SALVAGEABLE_KILL))
+        curator, escalator = _gated_curator(tmp_path, invoke)
 
-        decision = await _curate(curator, invoke)
+        decision = await _curate(curator)
 
-        assert decision.action == 'create'
+        assert (decision.action, decision.defer_reason) == ('defer', DeferReason.LLM_FAILED)
         assert _reported_failure(escalator)['subtype'] == 'error_timeout_killed_with_progress'
 
     @pytest.mark.asyncio
     async def test_gate_less_curator_never_salvages(self):
-        curator, escalator = _gate_less_curator()
         invoke = _scripted_invoker((None, _SALVAGEABLE_KILL))
+        curator, escalator = _gate_less_curator(invoke)
         salvageable = TranscriptEvidence(
             assistant_turns=2, accepted_schema_payload=_SALVAGEABLE_DROP, other_tool_uses=(),
         )
 
         with patch(_EVIDENCE_READ, return_value=salvageable):
-            decision = await _curate(curator, invoke)
+            decision = await _curate(curator)
 
-        assert decision.action == 'create'
+        assert (decision.action, decision.defer_reason) == ('defer', DeferReason.LLM_FAILED)
         escalator.report_failure.assert_awaited_once()
 
 
@@ -745,10 +742,12 @@ class TestCitedTranscriptCorpus:
 
     @pytest.mark.asyncio
     async def test_esc_curator_4_is_the_genuine_pre_turn_stall(self, tmp_path, caplog):
-        curator, escalator = _gated_curator(tmp_path)
+        curator, escalator = _gated_curator(
+            tmp_path, _fixture_invoker('esc_curator_4_pre_turn_stall.jsonl'),
+        )
 
         with caplog.at_level(logging.WARNING, logger=_CURATOR_MODULE):
-            await _curate(curator, _fixture_invoker('esc_curator_4_pre_turn_stall.jsonl'))
+            await _curate(curator)
 
         report = _reported_failure(escalator)
         assert report['zero_output_timeout'] is True
@@ -761,21 +760,19 @@ class TestCitedTranscriptCorpus:
         name = 'esc_curator_33_salvageable.jsonl'
         verdict = transcript_evidence(_fixture_records(name)).accepted_schema_payload
         assert verdict is not None
-        curator, _ = _gated_curator(tmp_path)
+        curator, _ = _gated_curator(tmp_path, _fixture_invoker(name))
 
-        decision = await _curate(
-            curator, _fixture_invoker(name), pool=((verdict['target_id'], 'pending'),),
-        )
+        decision = await _curate(curator, pool=((verdict['target_id'], 'pending'),))
 
         assert decision.action == verdict['action']
         assert decision.target_id == verdict['target_id']
 
     @pytest.mark.asyncio
     async def test_esc_curator_2_reports_its_tool_excursion(self, tmp_path, caplog):
-        curator, escalator = _gated_curator(tmp_path)
+        curator, escalator = _gated_curator(tmp_path, _fixture_invoker(_TOOL_WANDERING))
 
         with caplog.at_level(logging.WARNING, logger=_CURATOR_MODULE):
-            await _curate(curator, _fixture_invoker(_TOOL_WANDERING))
+            await _curate(curator)
 
         report = _reported_failure(escalator)
         assert report['zero_output_timeout'] is False
@@ -854,13 +851,13 @@ class TestSalvageRequiresAKilledRunWithAnAcceptedVerdict:
     async def test_single_failure_is_escalated_as_it_was(
         self, transcript_lines, failure, tmp_path, caplog,
     ):
-        curator, escalator = _gated_curator(tmp_path)
         invoke = _scripted_invoker((transcript_lines, failure))
+        curator, escalator = _gated_curator(tmp_path, invoke)
 
         with caplog.at_level(logging.WARNING, logger=_CURATOR_MODULE):
-            decision = await _curate(curator, invoke)
+            decision = await _curate(curator)
 
-        assert decision.action == 'create'
+        assert (decision.action, decision.defer_reason) == ('defer', DeferReason.LLM_FAILED)
         report = _reported_failure(escalator)
         assert report['schema_tool_denied'] is failure.schema_tool_denied
         assert report['subtype'] == failure.subtype
@@ -870,11 +867,11 @@ class TestSalvageRequiresAKilledRunWithAnAcceptedVerdict:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(('transcript_lines', 'failure'), _UNSALVAGEABLE_BATCH)
     async def test_batch_failure_is_bisected(self, transcript_lines, failure, tmp_path, caplog):
-        curator, _ = _gated_curator(tmp_path)
         invoke = _scripted_invoker((transcript_lines, failure), _HEALTHY, _HEALTHY)
+        curator, _ = _gated_curator(tmp_path, invoke)
 
         with caplog.at_level(logging.WARNING, logger=_CURATOR_MODULE):
-            await _curate_batch(curator, invoke)
+            await _curate_batch(curator)
 
         assert invoke.await_count == 3
         assert _salvage_warnings(caplog) == []
@@ -882,10 +879,10 @@ class TestSalvageRequiresAKilledRunWithAnAcceptedVerdict:
     @pytest.mark.asyncio
     async def test_killed_run_with_only_a_rejected_verdict_is_escalated(self, tmp_path, caplog):
         """A real CLI 2.1.283 transcript whose only StructuredOutput call failed the schema."""
-        curator, escalator = _gated_curator(tmp_path)
+        curator, escalator = _gated_curator(tmp_path, _fixture_invoker('schema_rejected_only.jsonl'))
 
         with caplog.at_level(logging.WARNING, logger=_CURATOR_MODULE):
-            await _curate(curator, _fixture_invoker('schema_rejected_only.jsonl'))
+            await _curate(curator)
 
         report = _reported_failure(escalator)
         assert report['zero_output_timeout'] is False
@@ -909,12 +906,12 @@ class TestGatedSchemaToolDenialEscalates:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('transcript_lines', _DENIAL_TRANSCRIPTS_WITH_A_DROP)
     async def test_denial_reaches_report_failure(self, transcript_lines, tmp_path):
-        curator, escalator = _gated_curator(tmp_path)
         invoke = _scripted_invoker((transcript_lines, _schema_tool_denied()))
+        curator, escalator = _gated_curator(tmp_path, invoke)
 
-        decision = await _curate(curator, invoke)
+        decision = await _curate(curator)
 
-        assert decision.action == 'create'
+        assert (decision.action, decision.defer_reason) == ('defer', DeferReason.LLM_FAILED)
         assert _reported_failure(escalator)['schema_tool_denied'] is True
 
     @pytest.mark.asyncio
@@ -922,13 +919,13 @@ class TestGatedSchemaToolDenialEscalates:
     async def test_denial_does_not_reset_the_breaker(self, transcript_lines, tmp_path):
         """ZOT, denial, ZOT: a denial is neither a ZOT nor a success, so the two
         ZOTs reach the threshold of two and the fourth call short-circuits."""
-        curator, _ = _gated_curator(tmp_path, _breaker_config(threshold=2))
         invoke = _scripted_invoker(
             _ZOT, (transcript_lines, _schema_tool_denied()), _ZOT, _HEALTHY,
         )
+        curator, _ = _gated_curator(tmp_path, invoke, _breaker_config(threshold=2))
 
-        decisions = [await _curate(curator, invoke, title) for title in 'ABCD']
+        decisions = [await _curate(curator, title) for title in 'ABCD']
 
-        assert decisions[1].action == 'create'
+        assert decisions[1].defer_reason is DeferReason.LLM_FAILED
         assert invoke.await_count == 3
-        assert decisions[3].justification == 'zero-output-breaker-open'
+        assert decisions[3].defer_reason is DeferReason.ZERO_OUTPUT_BREAKER_OPEN

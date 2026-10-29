@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 import yaml
 from _git_repo import Repo, make_repo
+from _in_dir import write_engagement
 from _stores import RunsDb, TasksDb
 
 from client_feed.cli import main
@@ -94,6 +95,7 @@ def out_dir(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def config(tmp_path: Path, root: Path, out_dir: Path) -> Path:
+    write_engagement(tmp_path / 'in', project_id='acme')
     return write_config(tmp_path, root)
 
 
@@ -124,6 +126,19 @@ def test_snapshot_publishes_one_pass_and_prints_its_report(
     assert report.degraded == ()
     assert (out_dir / FEED_FILENAME).is_file() and (out_dir / STATE_FILENAME).is_file()
     assert validates(capsys, out_dir)
+
+
+def test_snapshot_of_an_engagement_for_another_project_exits_1_naming_both_ids(
+    tmp_path: Path, config: Path, out_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_engagement(tmp_path / 'in', project_id='other')
+
+    code, out, err = cli(capsys, 'snapshot', '--config', str(config))
+
+    assert (code, out) == (1, '')
+    assert "'other'" in err
+    assert "'acme'" in err
+    assert not (out_dir / FEED_FILENAME).exists()
 
 
 def test_every_out_file_is_group_readable_under_any_umask_and_takes_the_setgid_group(
