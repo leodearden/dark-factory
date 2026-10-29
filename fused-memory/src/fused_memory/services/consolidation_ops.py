@@ -51,7 +51,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from fused_memory.memory_metadata import EXPERIMENTAL_KEY_PREFIX
+from fused_memory.memory_metadata import EXPERIMENTAL_KEY_PREFIX, is_canonical
 from fused_memory.server.consolidation import build_consolidation_result
 from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 from fused_memory.services.topic_anchor import select_canonical_payload
@@ -553,7 +553,7 @@ async def apply_retain_arm(
         # A peer that does not resolve is NOT refused here: it falls
         # through to `update_memory`, which reports MemoryNotFound in the
         # structured shape below. One vocabulary for one condition.
-        if (peer_record or {}).get('metadata', {}).get('canonical') is True:
+        if is_canonical((peer_record or {}).get('metadata')):
             retain_failures.append({
                 'id': retain_id,
                 'error': (

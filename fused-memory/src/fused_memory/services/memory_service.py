@@ -44,6 +44,7 @@ from fused_memory.memory_metadata import (
     MetadataViolation,
     ParentHasChildrenError,
     check_canonical_routing,
+    is_canonical,
     is_valid_topic_slug,
     parent_liveness_violation,
     validate_memory_metadata,
@@ -1118,6 +1119,8 @@ async def _check_canonical_uniqueness(
        Compared as a PAIR, not on ``canonical`` alone: a canonical record
        re-homed from topic T to topic U changes no ``canonical`` value but
        is acquiring a claim at U, where it genuinely is not the incumbent.
+       The held claim is read through ``is_canonical``, so a non-bool
+       pre-image (int ``1`` or ``1.0``) is not a held claim and is probed.
     4. the write will not reach Mem0 → return (task 3508).  The seam already
        censused — and under ``enforce`` refused — it as
        ``canonical_on_non_mem0_write``; the probe could only ever count 0.
@@ -1215,7 +1218,7 @@ async def _check_canonical_uniqueness(
     after-the-fact backstop that resolves a duplicate pair.  Do NOT add
     locking here — that would be an unreviewed scope expansion.
     """
-    if meta.get('canonical') is not True:
+    if not is_canonical(meta):
         return
 
     topic = meta.get('topic')
@@ -1225,8 +1228,10 @@ async def _check_canonical_uniqueness(
     # Guard 3 (task 3523) — no NEW claim, no probe.  See the numbered list in
     # the docstring: this is what makes the record's own presence in the
     # store irrelevant, so no `exclude_id` is needed anywhere below.
-    if baseline is not None and (
-        (baseline.get('canonical'), baseline.get('topic')) == (True, topic)
+    if (
+        baseline is not None
+        and is_canonical(baseline)
+        and baseline.get('topic') == topic
     ):
         return
 

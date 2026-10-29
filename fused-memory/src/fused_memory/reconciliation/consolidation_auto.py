@@ -9,7 +9,8 @@ text).
 Import-leaf rule
 ----------------
 This module imports **only the standard library**, plus the stdlib-only
-``shared.memory_supersession`` constant, and must keep doing so.
+``shared.memory_supersession`` constant and the stdlib-only
+``fused_memory.canonical_marker`` leaf, and must keep doing so.
 :class:`~fused_memory.config.schema.ConsolidationAutoConfig` is referenced under
 ``TYPE_CHECKING`` only, so importing this module never loads config, pydantic,
 yaml or the mem0 SDK. That is a STRICTLY STRONGER property than its sibling leaf
@@ -18,9 +19,9 @@ records a MEASURED hard import cycle from a careless import of exactly this kind
 (``config/schema.py`` -> ``memory_metadata`` -> ``backends.mem0_client`` ->
 ``config.schema``, raising ``ImportError: cannot import name
 'FusedMemoryConfig'``). ``tests/test_consolidation_auto.py`` pins the property in
-a fresh interpreter; if you add a runtime ``fused_memory`` import here, this
-module's import cost becomes a whole config build and the cycle above is one
-edit away.
+a fresh interpreter; if you add any other runtime ``fused_memory`` import here,
+this module's import cost becomes a whole config build and the cycle above is
+one edit away.
 
 Two properties a reader must not get wrong
 ------------------------------------------
@@ -46,6 +47,8 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from shared.memory_supersession import SUPERSEDED_BY_METADATA_KEY
+
+from fused_memory.canonical_marker import is_canonical
 
 if TYPE_CHECKING:  # pragma: no cover - a runtime import here would cost the leaf
     from fused_memory.config.schema import ConsolidationAutoConfig
@@ -323,7 +326,7 @@ def _is_incumbent(record: object, topic: str) -> bool:
     hazard instead.
     """
     metadata = _metadata(record)
-    return metadata.get('canonical') is True and metadata.get('topic') == topic
+    return is_canonical(metadata) and metadata.get('topic') == topic
 
 
 def _member_categories(
@@ -519,7 +522,7 @@ def _member_hazards(
         # incumbent stays exempt, so this code and the canonical-level codes
         # remain disjoint. `member_different_topic` is an `elif` because this
         # detail already names the foreign topic: one fact, one code.
-        if metadata.get('canonical') is True and not _is_incumbent(record, proposal.topic):
+        if is_canonical(metadata) and not _is_incumbent(record, proposal.topic):
             reasons.append(
                 AutoReason(
                     code=AutoReasonCode.member_already_canonical,
