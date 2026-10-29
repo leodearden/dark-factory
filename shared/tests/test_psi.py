@@ -1387,3 +1387,37 @@ class TestLiveSignal:
         )
         assert sample.own_cgroup
         assert live.startswith(sample.own_cgroup)
+
+
+class TestCpuSome10OrNone:
+    """The one mapping from a sample to host CPU pressure as a ledger records it."""
+
+    @staticmethod
+    def _sample(cpu_some10: float, *, read_ok: bool):
+        from shared.psi import PsiSample
+
+        return PsiSample(cpu_some10=cpu_some10, mem_some10=0.0, mem_full10=0.0, io_some10=0.0, read_ok=read_ok)
+
+    def test_a_healthy_read_maps_to_its_cpu_some10(self):
+        from shared.psi import cpu_some10_or_none
+
+        assert cpu_some10_or_none(self._sample(12.5, read_ok=True)) == 12.5
+
+    def test_a_real_idle_reading_is_kept_as_zero(self):
+        from shared.psi import cpu_some10_or_none
+
+        value = cpu_some10_or_none(self._sample(0.0, read_ok=True))
+
+        assert value == 0.0
+        assert value is not None
+
+    @pytest.mark.parametrize('cpu_some10', [0.0, 3.25, 99.0])
+    def test_a_failed_read_maps_to_none_never_zero(self, cpu_some10):
+        from shared.psi import cpu_some10_or_none
+
+        assert cpu_some10_or_none(self._sample(cpu_some10, read_ok=False)) is None
+
+    def test_it_is_public(self):
+        import shared.psi
+
+        assert 'cpu_some10_or_none' in shared.psi.__all__

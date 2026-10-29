@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from orchestrator.event_store import EventStore
 
 from shared.proc_group import terminate_process_group
-from shared.psi import read_psi_sample
+from shared.psi import cpu_some10_or_none, read_psi_sample
 from shared.python_env import without_python_env_selection
 from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
 
@@ -11273,19 +11273,9 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
 def _psi_cpu_some10_or_none() -> float | None:
     """Host CPU pressure at observation, or ``None`` when it is not knowable.
 
-    ``read_ok=False`` is ``shared.psi``'s documented fail-open sentinel, and
-    maps to ``None`` (NOT ``0.0``, which would read as "the host was idle").
+    The sample-to-value mapping has one home, ``shared.psi.cpu_some10_or_none``.
     The ``except`` is belt to that braces: a TELEMETRY read must never change
     a gate's verdict, so it may not raise into the discriminator.
-
-    Deliberately NOT refactored to read its value off ``_load_sample`` above
-    (task 3353). The two are the same two invariants over the same reader, so
-    the duplicated try/except is tempting to collapse — but this one feeds the
-    flake discriminator's ``psi_cpu_some10`` column, which is an idempotency-
-    adjacent value in §8.3's ledger, and the refactor would buy nothing except
-    putting a second caller's WARNING text on that path. One reader, two thin
-    wrappers, each with a single caller, is the cheaper place to leave the
-    duplication.
     """
     try:
         sample = read_psi_sample()
@@ -11303,7 +11293,7 @@ def _psi_cpu_some10_or_none() -> float | None:
             exc_info=True,
         )
         return None
-    return sample.cpu_some10 if sample.read_ok else None
+    return cpu_some10_or_none(sample)
 
 
 #: The only failing-leg categories verify_classify.py::classify_failure

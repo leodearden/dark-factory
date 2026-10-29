@@ -38,6 +38,7 @@ from _lane_episode_fakes import (
 )
 from shared.lane_probe import OUTAGE_EXIT_STATUS
 
+from orchestrator.flake_ledger import DebtTrigger
 from orchestrator.guard_state import PersistentMap
 from orchestrator.offline_lane_confirm import (
     Outage,
@@ -47,12 +48,16 @@ from orchestrator.offline_lane_confirm import (
 from orchestrator.offline_lane_episode_state import (
     EPISODE_RETENTION,
     CommandRecord,
+    CoveringStatuses,
     CoveringVerdict,
     Episode,
     EpisodeStore,
     LanePolicy,
+    OfferedDebt,
+    PassEffect,
     PassObservation,
     apply_outage,
+    is_live_owner,
     recheck_due,
     unconfirmable_node,
     with_recorded_history,
@@ -207,6 +212,57 @@ def test_the_pass_effect_is_json(tmp_path: Path):
     assert json.loads(json.dumps(applied.effect.to_json()))['episodes_ended'] == [
         {'node': A, 'reason': 'cleared', 'counted_passes': 1, 'reproduced_heads': [HEAD0]},
     ]
+
+
+def test_covering_statuses_name_the_done_and_closed_tasks_terminal():
+    covering = CoveringStatuses(
+        {'1': 'pending', '2': 'in-progress', '3': 'blocked', '4': 'deferred', '5': 'done', '6': 'cancelled'},
+    )
+
+    assert covering.terminal_task_ids == frozenset({'5', '6'})
+
+
+def test_unreadable_covering_statuses_name_no_task_terminal():
+    assert CoveringStatuses({'5': 'done'}, 'task store unreachable').terminal_task_ids == frozenset()
+
+
+@pytest.mark.parametrize(
+    ('status', 'live'),
+    [
+        ('pending', True), ('in-progress', True), ('blocked', True), ('deferred', True),
+        ('done', False), ('cancelled', False), ('', False), (None, False),
+    ],
+)
+def test_an_owner_is_live_while_open_or_deferred(status: str | None, live: bool):
+    assert is_live_owner(status) is live
+
+
+def _effect(**debts) -> PassEffect:
+    return PassEffect(
+        tests_counted=(), episodes_started=(), episodes_extended=(), episodes_ended=(), threshold_reached=(),
+        stale_heads=(), no_decision=(), tasks_filed=(), escalations_raised=(), **debts,
+    )
+
+
+def test_a_pass_effect_built_without_debts_offers_none():
+    payload = _effect().to_json()
+
+    assert (payload['debts_offered'], payload['debts_undecided']) == ([], [])
+
+
+def test_the_pass_effect_names_the_debts_it_offered_and_left_undecided():
+    effect = _effect(
+        debts_offered=(OfferedDebt(node=A, trigger=DebtTrigger.cleared, head=HEAD1), OfferedDebt(B, DebtTrigger.recovered, HEAD0)),
+        debts_undecided=(C,),
+    )
+
+    payload = json.loads(json.dumps(effect.to_json()))
+
+    assert payload['debts_offered'] == [
+        {'node': A, 'trigger': 'cleared', 'head': HEAD1},
+        {'node': B, 'trigger': 'recovered', 'head': HEAD0},
+    ]
+    assert payload['debts_undecided'] == [C]
 
 
 # --- D5: what one pass does to a held test's episode -------------------------------
