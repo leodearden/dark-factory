@@ -16321,12 +16321,12 @@ class TaskWorkflow:
         """Refuse a merge whose branch gives the queue nothing honest to land (task 7516).
 
         Returns ``None`` for a mergeable or unreadable branch, and the merge
-        proceeds. A clean branch with no commits beyond main runs the shared
-        landing ladder on the branch TIP and returns its outcome when it
-        stamps one. Every other case (an empty branch whose worktree holds
-        uncommitted work, a ladder miss, a worktree HEAD on main while the
-        branch is ahead) blocks behind an L1 with
-        ``root_cause='merge-refused:<kind>'``.
+        proceeds. The shared landing ladder runs only when neither the
+        worktree HEAD nor the ref carries commits beyond main and the
+        worktree is clean; its outcome is returned when it stamps one. Every
+        other case (an empty branch whose worktree holds uncommitted work, a
+        ladder miss, a worktree HEAD on main while the branch is ahead)
+        blocks behind an L1 with ``root_cause='merge-refused:<kind>'``.
         """
         assert self.worktree is not None
         state = await read_branch_state(
@@ -16340,7 +16340,7 @@ class TaskWorkflow:
         verdict: str | None = None
         if kind is Mergeability.BRANCH_EMPTY and not state.worktree_dirty:
             landed = await self._recover_landed_branch(
-                state.merge_source, main_sha, guard=guard,
+                state.landing_anchor, main_sha, guard=guard,
             )
             if isinstance(landed, WorkflowOutcome):
                 return landed
@@ -16361,7 +16361,7 @@ class TaskWorkflow:
 
         Runs at the top of :meth:`_run_merge_phase`, once
         :meth:`_settle_unmergeable_branch` has let the branch through (it
-        refuses or settles every branch whose merge source has no commits
+        refuses or settles every branch whose worktree HEAD has no commits
         beyond main, so this guard's journal-first rung is what recovers a
         branch that is still ahead) — prevents infinite
         merge retry when the code was already merged (e.g. by an external

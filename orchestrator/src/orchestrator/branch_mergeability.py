@@ -1,12 +1,13 @@
 """Whether a task branch gives the merge queue anything honest to land (task 7516).
 
-A merge lands the queued branch REF, never the worktree. So a branch with no
-commits beyond main, or a worktree whose HEAD sits on main while the branch is
-ahead, leaves the queue nothing honest to land: the first can only produce a
-no-op "success" (and strands any uncommitted work), and the second is undone by
-the pre-enqueue rebind of the ref to HEAD. :func:`read_branch_state` reads the
-facts through ``GitOps``' public methods; :attr:`BranchState.mergeability`
-decides from them alone.
+The pre-enqueue rebind (``workflow.py::TaskWorkflow._submit_to_merge_queue``,
+task 1923) moves the queued branch ref onto the worktree HEAD, so the queue
+lands HEAD. A HEAD with no commits beyond main leaves the queue nothing honest
+to land: with the ref on main too, the merge can only produce a no-op
+"success" (and strands any uncommitted work); with the ref ahead, the rebind
+would move it off its commits. :func:`read_branch_state` reads the facts
+through ``GitOps``' public methods; :attr:`BranchState.mergeability` decides
+from them alone.
 """
 
 from __future__ import annotations
@@ -44,37 +45,38 @@ def _short(sha: str | None) -> str:
 class BranchState:
     """What git says about a task branch and its worktree at one moment.
 
-    ``branch_tip`` is None when the ref is absent. ``source_on_main`` and
-    ``head_on_main`` say whether :attr:`merge_source` and ``worktree_head``
-    are ancestors of ``main_sha``, i.e. carry no commits beyond it.
+    ``branch_tip`` is None when the ref is absent. ``head_beyond_main`` and
+    ``tip_beyond_main`` say whether ``worktree_head`` and ``branch_tip`` carry
+    commits ``main_sha`` lacks; ``tip_beyond_main`` is False for an absent ref.
     """
 
     branch: QueuedBranch
     branch_tip: str | None
     worktree_head: str
     main_sha: str
-    source_on_main: bool
-    head_on_main: bool
+    head_beyond_main: bool
+    tip_beyond_main: bool
     worktree_dirty: bool
 
     @property
-    def merge_source(self) -> str:
-        """The commit the queue would land: the ref's tip, else the worktree HEAD."""
+    def landing_anchor(self) -> str:
+        """The commit the landing ladder tests for a BRANCH_EMPTY branch; not the merge source.
+
+        At that verdict the ref's tip and HEAD are both on main. The tip is
+        preferred because ``merge_lane/landing_evidence.py::validate_landing_evidence``
+        pairs ``branch_tip_sha`` with the branch ref name.
+        """
         return self.branch_tip or self.worktree_head
 
     @property
     def mergeability(self) -> Mergeability:
         if not self.worktree_head or not self.main_sha:
             return Mergeability.UNREADABLE
-        if self.source_on_main:
-            return Mergeability.BRANCH_EMPTY
-        if (
-            self.branch_tip is not None
-            and self.branch_tip != self.worktree_head
-            and self.head_on_main
-        ):
+        if self.head_beyond_main:
+            return Mergeability.MERGEABLE
+        if self.tip_beyond_main:
             return Mergeability.WORKTREE_OFF_BRANCH
-        return Mergeability.MERGEABLE
+        return Mergeability.BRANCH_EMPTY
 
     def refusal_summary(self) -> str:
         """One line naming the refusal and the offending shas."""
@@ -83,7 +85,8 @@ class BranchState:
             dirty = '; its worktree holds uncommitted changes' if self.worktree_dirty else ''
             return (
                 f'Merge refused: {self.branch.full_name} has no commits beyond main '
-                f'(tip {_short(self.merge_source)}, main {_short(self.main_sha)}){dirty}'
+                f'(tip {_short(self.branch_tip)}, HEAD {_short(self.worktree_head)}, '
+                f'main {_short(self.main_sha)}){dirty}'
             )
         if kind is Mergeability.WORKTREE_OFF_BRANCH:
             return (
@@ -109,8 +112,9 @@ class BranchState:
         if landing_verdict is not None:
             lines.append(f'landing_verdict: {landing_verdict}')
         lines += [
-            'A merge lands the queued branch ref, never the worktree, so this '
-            'branch gives the queue nothing honest to land.',
+            'The pre-enqueue rebind (workflow.py::TaskWorkflow._submit_to_merge_queue, '
+            'task 1923) makes the queue land the worktree HEAD, and HEAD has no '
+            'commits beyond main, so the queue has nothing honest to land.',
             f'recover: git reflog show {self.branch.full_name}',
             f'recover: git -C {worktree} diff --cached --stat',
             f'refused at: {_REFUSING_SITE}',
@@ -129,22 +133,25 @@ async def read_branch_state(
     """Read *branch*'s tip and *worktree*'s state against *main_sha*.
 
     A failed git read comes back as a value, never an exception: an absent ref
-    is None, and an unreadable ancestry reads as "beyond main", so the merge
-    proceeds and the merge worker's own guards decide.
+    is None, and an unreadable ancestry reads as "beyond main". For HEAD that
+    means MERGEABLE, so the merge proceeds and the merge worker's own guards
+    decide; for the tip with HEAD on main it means WORKTREE_OFF_BRANCH, a
+    refusal that keeps the rebind from moving the ref onto main.
     """
     branch_tip = await git_ops.resolve_branch_sha(branch.full_name)
-    merge_source = branch_tip or worktree_head
-    source_on_main = await git_ops.is_ancestor(merge_source, main_sha)
-    if merge_source == worktree_head:
-        head_on_main = source_on_main
+    head_beyond_main = not await git_ops.is_ancestor(worktree_head, main_sha)
+    if branch_tip is None:
+        tip_beyond_main = False
+    elif branch_tip == worktree_head:
+        tip_beyond_main = head_beyond_main
     else:
-        head_on_main = await git_ops.is_ancestor(worktree_head, main_sha)
+        tip_beyond_main = not await git_ops.is_ancestor(branch_tip, main_sha)
     return BranchState(
         branch=branch,
         branch_tip=branch_tip,
         worktree_head=worktree_head,
         main_sha=main_sha,
-        source_on_main=source_on_main,
-        head_on_main=head_on_main,
+        head_beyond_main=head_beyond_main,
+        tip_beyond_main=tip_beyond_main,
         worktree_dirty=await git_ops.has_uncommitted_work(worktree),
     )
