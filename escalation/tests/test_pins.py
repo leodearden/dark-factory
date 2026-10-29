@@ -105,6 +105,18 @@ class TestPinRecordProtocol:
         record: PinRecord = esc
         assert record.id == 'esc-42-1'
 
+    def test_escalation_satisfies_cluster_pin_record_statically(self) -> None:
+        """The members-carrying sub-protocol accepts the server-side record too."""
+        from escalation.pins import ClusterPinRecord
+
+        esc = Escalation(
+            id='esc-42-2', task_id='42', agent_role='escalation-watcher-auto',
+            severity='blocking', category='infra_issue', summary='s', level=2,
+            members=['esc-42-1'],
+        )
+        record: ClusterPinRecord = esc
+        assert list(record.members) == ['esc-42-1']
+
 
 class TestPinsModuleExports:
     def test_all_exports_the_public_surface(self) -> None:
@@ -137,6 +149,7 @@ class _Rec:
     level: int
     severity: str
     filing_claimant_run_id: str | None
+    members: tuple[str, ...] = ()
 
 
 def _rec(
@@ -145,12 +158,14 @@ def _rec(
     level: int = 0,
     severity: str | None = 'blocking',
     filing: str | None = None,
+    members: tuple[str, ...] = (),
 ) -> _Rec:
     return _Rec(
         id=id,
         level=level,
         severity=typing.cast('str', severity),
         filing_claimant_run_id=filing,
+        members=members,
     )
 
 
@@ -726,6 +741,7 @@ def _esc(
     level: int = 0,
     severity: str = 'blocking',
     filing_claimant_run_id: str | None = None,
+    members: tuple[str, ...] = (),
 ) -> Escalation:
     """A real ``escalation.models.Escalation`` — the server-side PinRecord."""
     return Escalation(
@@ -737,6 +753,7 @@ def _esc(
         summary='s',
         level=level,
         filing_claimant_run_id=filing_claimant_run_id,
+        members=list(members),
     )
 
 
@@ -903,6 +920,79 @@ class TestPinnedOnlyByHumanParked:
         report = classify_pins('42', [_rec(id='esc-42-1', level=2)], live_claimant=False)
 
         assert pinned_only_by_human_parked(report, [_rec(id='esc-42-2', level=2)]) is False
+
+    # -- task 7709: an L1 a human-level handoff holds as a member is parked --
+
+    def test_an_l1_its_l2_holds_is_human_parked(self) -> None:
+        """The promoted hold: the L2 names the L1 it was promoted from."""
+        records = [
+            _rec(id='esc-42-1', level=1),
+            _rec(id='esc-42-2', level=2, members=('esc-42-1',)),
+        ]
+        assert self._parked(records) is True
+
+    def test_an_l1_its_l2_holds_is_human_parked_on_real_escalations(self) -> None:
+        records = [
+            _esc(id='esc-42-1', level=1),
+            _esc(id='esc-42-2', level=2, members=('esc-42-1',)),
+        ]
+        assert self._parked(records) is True
+
+    def test_an_unheld_l1_beside_a_held_one_is_not(self) -> None:
+        records = [
+            _rec(id='esc-42-1', level=1),
+            _rec(id='esc-42-2', level=2, members=('esc-42-1',)),
+            _rec(id='esc-42-3', level=1),
+        ]
+        assert self._parked(records) is False
+
+    def test_an_info_l2_holds_nothing(self) -> None:
+        """Link 1 makes an info L2 an annotation, not a handoff, so it is no
+        proof that anyone must act on its members."""
+        records = [
+            _rec(id='esc-42-1', level=1),
+            _rec(id='esc-42-2', level=2, severity='info', members=('esc-42-1',)),
+        ]
+        assert self._parked(records) is False
+
+    def test_a_holder_below_human_level_parks_nothing(self) -> None:
+        records = [
+            _rec(id='esc-42-1', level=1),
+            _rec(id='esc-42-2', level=1, members=('esc-42-1',)),
+        ]
+        assert self._parked(records) is False
+
+    @pytest.mark.parametrize('level', ['1', 1.0, True, None, 0])
+    def test_a_held_member_that_is_not_a_genuine_l1_is_not(self, level: typing.Any) -> None:
+        """``promote_to_l2``: members stay at L1.  Anything else is contradictory
+        state, and a level is never coerced."""
+        records = [
+            _rec(id='esc-42-1', level=level),
+            _rec(id='esc-42-2', level=2, members=('esc-42-1',)),
+        ]
+        assert self._parked(records, live_claimant=True) is False
+
+    @pytest.mark.parametrize('members', [None, 'esc-42-1'], ids=['none', 'bare-string'])
+    def test_members_that_are_not_a_list_or_tuple_hold_nothing(
+        self, members: typing.Any,
+    ) -> None:
+        """Never coerced, and a bare string is never substring-matched."""
+        records = [
+            _rec(id='esc-42-1', level=1),
+            _rec(id='esc-42-2', level=2, members=typing.cast('tuple[str, ...]', members)),
+        ]
+        assert self._parked(records) is False
+
+    def test_an_unreadable_store_is_not_even_with_a_held_l1(self) -> None:
+        from escalation.pins import pinned_only_by_human_parked
+
+        records = [
+            _rec(id='esc-42-1', level=1),
+            _rec(id='esc-42-2', level=2, members=('esc-42-1',)),
+        ]
+        report = classify_pins('42', None, live_claimant=False)
+
+        assert pinned_only_by_human_parked(report, records) is False
 
 
 # ---------------------------------------------------------------------------
