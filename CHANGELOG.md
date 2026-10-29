@@ -574,11 +574,13 @@ storms were all `skip_count=0`.
   - At most `auto_pin_max_concurrent` (new, default 3) exist at once.
   - A firing past the cap is recorded as `cap_reached` and files no escalation of its
     own. Instead, one level-1 escalation under `__starvation_auto_pin_cap__` names the
-    whole cohort.
+    newly capped cohort. A capped task is not marked escalated: it is announced once,
+    then pinned (with its level-0 trail) on the first pass that finds a slot free. The
+    cap escalation is resolved once no capped task still waits on a slot.
   - An existing operator row is never touched, and that firing is recorded as
     `operator_override`.
-  - A watchdog pin is released when its task dispatches, whichever process created
-    it, or when the task leaves `pending`.
+  - A watchdog pin is released, whichever process created it, when its task dispatches
+    or is seen in any status other than `pending`.
 
   `park_blocked` takes no pin. It files a level-1 info escalation.
 - **`overrides.source`.** The overrides table gains `source TEXT NOT NULL DEFAULT

@@ -314,6 +314,36 @@ async def test_a_candidacy_gap_does_not_reset_the_eligibility_age(tmp_path: Path
     assert event['eligible_age_secs'] == FLOOR
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('restart', [False, True], ids=['same-process', 'across-restart'])
+@pytest.mark.parametrize('status', ['cancelled', 'blocked'])
+async def test_leaving_pending_restarts_the_eligibility_age(
+    tmp_path: Path, status: str, restart: bool,
+) -> None:
+    wall = [T0]
+    tasks: list[dict] = []
+    rig = _rig(tmp_path, tasks=tasks, wall=wall)
+    await _top_skipped(rig, 1)
+    rig.set_status('2', status)
+    await rig.tick()
+
+    wall[0] = T0 + timedelta(seconds=FLOOR)
+    rig.set_status('2', 'pending')
+    if restart:
+        rig.set_status('0', 'pending')
+        rig = _rig(tmp_path, tasks=tasks, wall=wall)
+        assert await rig.tick_id() == '0'
+    for _ in range(3):
+        assert await rig.tick() is None
+    assert rig.detected() == []
+
+    wall[0] = T0 + timedelta(seconds=2 * FLOOR)
+    await rig.tick()
+
+    [event] = rig.detected('2')
+    assert event['eligible_age_secs'] == FLOOR
+
+
 PARK_FLOOR = 14400.0
 
 
@@ -436,10 +466,9 @@ async def test_an_operator_row_is_never_touched(tmp_path: Path, override: dict) 
     assert rig.warned_ids() == ['2']
 
 
-@pytest.mark.asyncio
-async def test_the_cap_bounds_watchdog_pins_and_files_one_cohort_l1(tmp_path: Path) -> None:
-    rig = _rig(tmp_path, auto_pin_max_concurrent=2, auto_pin_ttl_secs=10 * FLOOR)
-    queue = EscalationQueue(tmp_path / 'esc')
+async def _three_starve_behind_a_cap_of_two(rig: _Rig, *extra: dict) -> EscalationQueue:
+    """S1 and S2 starve first and take both watchdog pins; the cap turns S3 away."""
+    queue = EscalationQueue(rig.scheduler.config.project_root / 'esc')
     rig.scheduler.escalation_queue = queue
     seed = _task('0', 'critical', 'hot/a.py', 'hot/b.py', 'hot/c.py', 'hot/d.py')
     rig.set_tasks([seed, _task('S1', 'medium', 'hot/b.py'), _task('S2', 'medium', 'hot/c.py')])
@@ -448,10 +477,16 @@ async def test_the_cap_bounds_watchdog_pins_and_files_one_cohort_l1(tmp_path: Pa
     rig.tasks.append(_task('S3', 'medium', 'hot/d.py'))
     assert await rig.tick() is None
     rig.advance(FLOOR)
-    rig.tasks.append(_task('1', 'high', 'hot/a.py'))
-    rig.tasks.append(_task('S4', 'medium', 'hot/d.py'))
+    rig.tasks.extend([_task('1', 'high', 'hot/a.py'), *extra])
     for _ in range(4):
         await rig.tick_with_low_winner()
+    return queue
+
+
+@pytest.mark.asyncio
+async def test_the_cap_bounds_watchdog_pins_and_files_one_cohort_l1(tmp_path: Path) -> None:
+    rig = _rig(tmp_path, auto_pin_max_concurrent=2, auto_pin_ttl_secs=10 * FLOOR)
+    queue = await _three_starve_behind_a_cap_of_two(rig, _task('S4', 'medium', 'hot/d.py'))
 
     assert sorted(rig.watchdog_pins()) == ['S1', 'S2']
     [capped] = rig.detected('S3')
@@ -468,6 +503,25 @@ async def test_the_cap_bounds_watchdog_pins_and_files_one_cohort_l1(tmp_path: Pa
     assert later['disposition'] == 'cap_reached'
     assert len(queue.get_by_task(AUTO_PIN_CAP_SENTINEL, status='pending', level=1)) == 1
     assert sorted(rig.watchdog_pins()) == ['S1', 'S2']
+    assert len(rig.detected('S3')) == 1, 'a task still waiting on a full cap is not re-announced'
+
+
+@pytest.mark.asyncio
+async def test_a_freed_slot_pins_the_capped_task_and_resolves_the_cap_l1(tmp_path: Path) -> None:
+    rig = _rig(tmp_path, auto_pin_max_concurrent=2, auto_pin_ttl_secs=10 * FLOOR)
+    queue = await _three_starve_behind_a_cap_of_two(rig)
+    assert queue.get_by_task(AUTO_PIN_CAP_SENTINEL, status='pending')
+
+    rig.scheduler.release('0')
+    assert await rig.tick_id() == 'S1'
+    assert await rig.tick_id() == 'S2'
+
+    assert [e['disposition'] for e in rig.detected('S3')] == ['cap_reached', 'auto_pinned']
+    assert rig.watchdog_pins() == ['S3']
+    assert sorted(rig.warned_ids()) == ['S1', 'S2', 'S3']
+    assert queue.get_by_task(AUTO_PIN_CAP_SENTINEL, status='pending') == []
+    [resolved] = queue.get_by_task(AUTO_PIN_CAP_SENTINEL)
+    assert resolved.resolved_by == STARVATION_WATCHDOG_ROLE
 
 
 @pytest.mark.asyncio
@@ -513,6 +567,25 @@ async def test_a_previous_process_watchdog_pin_is_released_at_dispatch(tmp_path:
     assert await rig.tick_id() == 'W'
 
     assert 'W' not in rig.override_rows()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', ['blocked', 'in-progress'])
+async def test_a_previous_process_watchdog_pin_is_released_once_its_task_is_not_pending(
+    tmp_path: Path, status: str,
+) -> None:
+    store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+    store.create_watchdog_pin(str(tmp_path), 'W', ttl_until=T0 + timedelta(days=3650))
+    store.set_override(str(tmp_path), 'OP', pinned=True)
+    tasks = [_task('W', 'low', 'free/w.py'), _task('OP', 'low', 'free/op.py')]
+    for task in tasks:
+        task['status'] = status
+    rig = _rig(tmp_path, tasks=tasks)
+
+    await rig.tick()
+
+    assert 'W' not in rig.override_rows()
+    assert rig.override_rows()['OP'].source is OverrideSource.OPERATOR
 
 
 # ---------------------------------------------------------------------------
