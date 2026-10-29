@@ -2229,7 +2229,7 @@ rather than mtime because an idle server's incr file mtime does not move.
 | `aof_last_write_status:err` | the AOF write failed: check free space and IO errors on the disk holding `fused-memory/data/falkordb`, then restart |
 | compose file and container disagree on the data dir | run the gate with the main checkout's compose file, never a worktree's (a worktree's binds an empty data dir) |
 | container restarting / paused / dead | wait for it to settle (`docker ps -a`), then restart fused-memory |
-| stopped without AOF at boot, or absent over data | the bootstrap procedure below |
+| stopped without AOF at boot, absent over data, or an `import-data.sh` refusal | "Deciding which FalkorDB copy is newest" below, BEFORE removing any container |
 | host AOF size disagrees with the server, or state unreadable | inspect by hand before restarting anything |
 
 To check the verdict without acting, run the gate with the main checkout's
@@ -2240,36 +2240,83 @@ python3 /home/leo/src/dark-factory/scripts/falkordb_aof_gate.py \
   --compose-file /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml --check-only
 ```
 
+#### Deciding which FalkorDB copy is newest
+
+A data dir can hold two copies of the graph: the AOF (`appendonlydir/`, base
+plus incr) and `dump.rdb`. A server started with `appendonly yes` loads only
+the AOF, and one started without it loads only `dump.rdb`. Whichever copy is
+older loses every write made after it. Do not assume `dump.rdb` is newer.
+Take a container whose runtime AOF was on and stop it: the AOF is fsynced
+first, and the final RDB save is SIGKILLed at compose's 10 s grace, so the AOF
+holds writes that `dump.rdb` lacks. Decide before any `docker rm`, because a
+stopped container's log is the best evidence. Everything below uses the main
+checkout.
+
+1. **Set aside a copy first**, so that a wrong choice can be undone. The files
+   are root-owned, so copy them inside a container. This needs free space
+   equal to their size.
+
+   ```bash
+   D=/home/leo/src/dark-factory/fused-memory/data/falkordb
+   IMG=falkordb/falkordb@sha256:58a95a33d591b25648bbb13268a23329aa39e70b4cbeff0752c65f8b4beba6db
+   docker run --rm --entrypoint sh -v "$D":/d "$IMG" -c \
+     'cp -a /d/appendonlydir /d/appendonlydir.pre-bootstrap; cp -a /d/dump.rdb /d/dump.rdb.pre-bootstrap'
+   ```
+
+2. **Read the stopped container's log**, if a container exists:
+   `docker logs --tail 50 docker-falkordb-1`. If "Saving the final RDB
+   snapshot" is followed by "DB saved on disk", the final save finished and
+   `dump.rdb` is current.
+3. **Otherwise, compare mtimes**: `stat -c '%y %n' "$D"/dump.rdb
+   "$D"/appendonlydir/*.incr.aof`. After an `import-data.sh` refusal, run this
+   on the export's files.
+4. **If the AOF is newer**, start onto it. No bootstrap is needed:
+
+   ```bash
+   docker rm docker-falkordb-1      # the stopped container, if one exists
+   docker compose -f /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml up -d falkordb
+   ```
+
+   Then record the graph counts below and check them against what you expect.
+5. **Only if `dump.rdb` is newer**, follow the bootstrap below.
+
+**Graph counts.** Record these from the first server that loads the data, and
+compare them after each later step:
+
+```bash
+C=docker-falkordb-1   # or falkordb-bootstrap during the bootstrap
+for g in $(docker exec $C redis-cli GRAPH.LIST); do
+  printf '%s %s\n' "$g" "$(docker exec $C redis-cli GRAPH.RO_QUERY "$g" 'MATCH (n) RETURN count(n)' | sed -n 2p)"
+done > /tmp/falkordb-graph-counts-$(date +%s).txt
+```
+
 #### Bootstrapping FalkorDB's AOF from dump.rdb
 
-Use this when `dump.rdb` is the newest complete copy of the graph and the AOF
-is missing or stale: after `scripts/import-data.sh` refuses, or when the gate
-refuses a stopped container that boots without the AOF or an absent container
-over data. It loads `dump.rdb` into one container that has no `REDIS_ARGS`
-(so the AOF is off and `dump.rdb` is what loads), turns the AOF on so Redis
-rewrites it from the loaded data, then hands over to the normal start.
-Everything below uses the main checkout.
+Use this only when the decision above found `dump.rdb` to be the newest copy,
+for example an RDB-only export. It loads `dump.rdb` into one container that has
+no `REDIS_ARGS` (so the AOF is off and `dump.rdb` is what loads), then turns
+the AOF on, so that Redis rewrites the AOF from the loaded data. That rewrite
+replaces the old AOF; the set-aside copy from step 1 is the way back.
 
 ```bash
 systemctl --user stop fused-memory
 docker rm docker-falkordb-1            # only if it exists and is stopped; never a running one
-docker run -d --name falkordb-bootstrap -p 6379:6379 \
-  -v /home/leo/src/dark-factory/fused-memory/data/falkordb:/var/lib/falkordb/data \
-  -e FALKORDB_ARGS="MAX_QUEUED_QUERIES 25 TIMEOUT 30000 RESULTSET_SIZE 10000" \
-  falkordb/falkordb@sha256:58a95a33d591b25648bbb13268a23329aa39e70b4cbeff0752c65f8b4beba6db
+docker run -d --name falkordb-bootstrap -p 6379:6379 -v "$D":/var/lib/falkordb/data \
+  -e FALKORDB_ARGS="MAX_QUEUED_QUERIES 25 TIMEOUT 30000 RESULTSET_SIZE 10000" "$IMG"
 docker exec falkordb-bootstrap redis-cli INFO persistence   # repeat until loading:0
-docker exec falkordb-bootstrap redis-cli DBSIZE             # record it, with GRAPH.LIST
+# record the graph counts (C=falkordb-bootstrap)
 docker exec falkordb-bootstrap redis-cli CONFIG SET appendonly yes
 docker exec falkordb-bootstrap redis-cli INFO persistence   # repeat until aof_rewrite_in_progress:0, aof_last_write_status:ok
 docker stop falkordb-bootstrap && docker rm falkordb-bootstrap
 docker compose -f /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml up -d falkordb
-docker exec docker-falkordb-1 redis-cli DBSIZE              # must match the recorded value
+# record the graph counts again (C=docker-falkordb-1): every graph's count must match
 systemctl --user start fused-memory
 ```
 
 The compose-up by hand is deliberate: with no container and data on disk, the
 gate refuses to create one. Here the AOF was written moments ago from the
-loaded data, so it is current.
+loaded data, so it is current. Delete the `.pre-bootstrap` copies once the
+counts match.
 
 ### Dashboard unit-parity check
 
