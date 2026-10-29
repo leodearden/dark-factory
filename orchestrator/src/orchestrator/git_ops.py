@@ -5011,6 +5011,7 @@ class GitOps:
                 reattached = await self._reattach_cold_worktree(
                     worktree_path, full_branch,
                     branch_name=branch_name, expected_title=expected_title,
+                    keep_stack=train is not None and train.get('order', 0) > 0,
                 )
                 if reattached is not None:
                     return reattached
@@ -5074,6 +5075,7 @@ class GitOps:
         *,
         branch_name: str,
         expected_title: str | None = None,
+        keep_stack: bool = False,
     ) -> 'WorktreeInfo | None':
         """Re-attach ``worktree_path`` to a surviving orphan ``full_branch``.
 
@@ -5128,6 +5130,8 @@ class GitOps:
                 the full branch itself).
             expected_title: The live task's title, or ``None`` to skip the
                 identity guard.
+            keep_stack: Passed to :meth:`_reuse_warm_lane`; True for a train
+                successor, which keeps its predecessor's commits.
 
         Raises:
             RuntimeError: ``git worktree add`` failed (e.g. *full_branch* is
@@ -5209,7 +5213,9 @@ class GitOps:
                 await self._relocate_foreign_meta_root(worktree_path, dest)
                 return None
 
-        return await self._reuse_warm_lane(worktree_path, full_branch)
+        return await self._reuse_warm_lane(
+            worktree_path, full_branch, keep_stack=keep_stack,
+        )
 
     async def create_interactive_worktree(
         self, slug: str, *, start_ref: str | None = None,
@@ -8254,7 +8260,7 @@ class GitOps:
             )
 
     async def _reuse_warm_lane(
-        self, lane_dir: Path, full_branch: str,
+        self, lane_dir: Path, full_branch: str, *, keep_stack: bool = False,
     ) -> 'WorktreeInfo':
         """Handle a live-requeue: same task on the same lane (in-memory map hit).
 
@@ -8265,6 +8271,8 @@ class GitOps:
            continue on old base) — :meth:`_rebase_requeued_onto_main`.
         4. Recompute ``base_commit`` as ``merge-base main HEAD``.
         5. Re-provision the debug port (inv.7).
+
+        *keep_stack* skips step 3's un-stack, for a train successor.
 
         ``.task/plan.json`` is NOT committed by ``commit()`` (task metadata
         lives outside the worktree for the orchestrator hot path; any
@@ -8293,7 +8301,9 @@ class GitOps:
         #    branch on its old base).  A BranchResetError (task 2403)
         #    propagates to the caller's try/except-release wrapper and on to
         #    _drive()'s exception handler.
-        rebased = await self._rebase_requeued_onto_main(lane_dir, full_branch)
+        rebased = await self._rebase_requeued_onto_main(
+            lane_dir, full_branch, keep_stack=keep_stack,
+        )
         if not rebased:
             logger.info(
                 '_reuse_warm_lane: rebase failed for %s; continuing on old base', lane_dir,
@@ -8316,7 +8326,9 @@ class GitOps:
         )
         return WorktreeInfo(path=lane_dir, base_commit=base_commit, reify_debug_port=port)
 
-    async def _rebase_requeued_onto_main(self, worktree: Path, full_branch: str) -> bool:
+    async def _rebase_requeued_onto_main(
+        self, worktree: Path, full_branch: str, *, keep_stack: bool,
+    ) -> bool:
         """Rebase a requeued branch onto main from its own delta.
 
         A branch stacked on a base that never landed
@@ -8324,8 +8336,12 @@ class GitOps:
         is un-stacked first.  When the un-stack stops, the branch stays on its
         old base and keeps its record: a plain rebase would replay the base's
         commits under its own and hand them to the agent and the reviewer
-        (task 6219).  Returns whether the branch now sits on main.
+        (task 6219).  *keep_stack* skips the un-stack, for a train successor
+        stacked on its predecessor on purpose.  Returns whether the branch
+        now sits on main.
         """
+        if keep_stack:
+            return await self.rebase_preserving_task_commits(worktree)
         unstack = await self.unstack_from_unlanded_base(full_branch)
         if unstack.stops_merge:
             logger.warning(
