@@ -61,7 +61,7 @@
     "complete": true
   },
   "files": {
-    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1480, "function_local_imports": 4, "lines": 16267, "prose_lines": 9356, "reexport_names": 1},
+    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1482, "function_local_imports": 4, "lines": 16286, "prose_lines": 9363, "reexport_names": 1},
     "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 39, "function_local_imports": 1, "lines": 660, "prose_lines": 299, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/__init__.py": {"cognitive": 0, "function_local_imports": 0, "lines": 96, "prose_lines": 21, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/coalesce_unwind.py": {"cognitive": 9, "function_local_imports": 0, "lines": 100, "prose_lines": 22, "reexport_names": 0},
@@ -172,6 +172,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_scan_merge_marker": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_scrub_seeded_lane_target": 11,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_seed_warm_lane": 14,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::_shed_unlanded_base": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_spec_lane_cold_fallback": 0,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_stack_ledger": 0,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_stack_member": 4,
@@ -282,7 +283,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::resolve_queued_branch_ref": 2,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::resolve_rebased_citation": 7,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::restore_pre_stack_tip": 1,
-    "orchestrator/src/orchestrator/git_ops.py::GitOps::stack_train_branches": 7,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::stack_train_branches": 8,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::task_verify_lease": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::unlanded_stack_base": 2,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::unstack_from_unlanded_base": 2,

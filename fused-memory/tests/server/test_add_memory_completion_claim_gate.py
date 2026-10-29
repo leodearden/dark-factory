@@ -53,13 +53,23 @@ def _mock_service(**config_overrides) -> AsyncMock:
 
 
 def _server(mock_service, root: Path, *, statuses: dict | None = None):
+    return _multi_project_server(
+        mock_service,
+        known_projects={_PROJECT_ID: str(root)},
+        get_statuses=AsyncMock(return_value=statuses or {}),
+    )
+
+
+def _multi_project_server(
+    mock_service, *, known_projects: dict[str, str], get_statuses: AsyncMock,
+):
     task_interceptor = MagicMock()
-    task_interceptor.get_statuses = AsyncMock(return_value=statuses or {})
+    task_interceptor.get_statuses = get_statuses
     task_interceptor.get_ticket_row = AsyncMock(return_value=None)
     server = create_mcp_server(
         mock_service,
         task_interceptor=task_interceptor,
-        known_projects={_PROJECT_ID: str(root)},
+        known_projects=known_projects,
     )
     return server, task_interceptor
 
@@ -341,3 +351,63 @@ class TestBothServiceCallSitesCarryTheTag:
                 f'the {label} call dropped the tag: {call.kwargs!r}'
             )
         assert result.get('unverified_claim', {}).get('claims'), f'{result!r}'
+
+
+# Mem0 baa4473a-3bb7-4adf-b8df-7718a4511f14, verbatim: a solar_challenge agent
+# naming the dark_factory task it filed, in the hyphenated spelling.
+_SPECIMEN_6141 = (
+    'Gotcha seen on solar_challenge task 121 (2026-10-01, dark-factory main '
+    '1e6a7074c0): when a task branch cannot rebase onto main, every requeue '
+    're-dispatches a full architect revalidation even if main has not moved. The '
+    "prompt's \"Files Changed on Main\" list is then the fork-point diff "
+    '(merge-base..main), not the diff since the last confirm_plan, because '
+    "confirm_plan never advances metadata.json's base_commit, so the Lever B "
+    'revalidation skip never fires (filed as dark-factory task 6141). Check '
+    "main's reflog against the plan's _finalized_at, then compare the plan's "
+    'recorded blob IDs and the `git merge-tree --write-tree main HEAD` output: if '
+    'nothing changed, call confirm_plan without re-running tests.'
+)
+
+
+class TestForeignQualifiedRefIsAdjudicatedInItsOwnProject:
+    """Task 6142: a ref qualified by another registered project, in any spelling
+    the shared project-id fold accepts, is checked in THAT project's store."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('content', 'status'),
+        [
+            pytest.param(_SPECIMEN_6141, 'pending', id='esc-unverified-claim-6141-1'),
+            pytest.param(
+                'dark-factory task 6141 has been applied', 'done', id='hyphenated-applied',
+            ),
+        ],
+    )
+    async def test_claim_is_verified_against_the_named_project(
+        self, tmp_path, content, status,
+    ):
+        df_root = tmp_path / 'dark-factory'
+        solar_root = tmp_path / 'solar-challenge'
+        df_root.mkdir()
+        solar_root.mkdir()
+
+        async def statuses_by_root(*, project_root, ids):
+            return {'6141': status} if project_root == str(df_root) else {}
+
+        get_statuses = AsyncMock(side_effect=statuses_by_root)
+        mock_service = _mock_service()
+        server, _ = _multi_project_server(
+            mock_service,
+            known_projects={'dark_factory': str(df_root), 'solar_challenge': str(solar_root)},
+            get_statuses=get_statuses,
+        )
+
+        result = await _call(server, content=content, project_id='solar_challenge')
+
+        consulted = [call.kwargs for call in get_statuses.await_args_list]
+        assert {'project_root': str(df_root), 'ids': ['6141']} in consulted, consulted
+        assert all(kw.get('project_root') != str(solar_root) for kw in consulted), consulted
+        assert 'unverified_claim' not in mock_service.add_memory.call_args.kwargs
+        assert 'unverified_claim' not in result, f'{result!r}'
+        assert _pending_escalations(df_root) == []
+        assert _pending_escalations(solar_root) == []

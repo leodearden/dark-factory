@@ -46,12 +46,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import redis.exceptions
-
-# ``LIVE_HEADER`` — the measured live ``CALL db.indexes()`` header — is
-# IMPORTED, not restated, exactly as test_ensure_indices.py imports it: one
-# definition per suite, so a FalkorDB shape change is a one-place edit rather
-# than a silent disagreement between two suites about what they test (INV-5).
-from test_falkor_indices import LIVE_HEADER
+from _falkor_index_doubles import LIVE_HEADER
 
 from fused_memory.backends.falkor_indices import (
     IndexCatalogUnsettledError,
