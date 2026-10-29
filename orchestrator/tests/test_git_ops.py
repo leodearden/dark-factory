@@ -48,6 +48,7 @@ from orchestrator.git_ops import (
     _merge_subject,
     _run,
 )
+from orchestrator.lane_branch_holder import BranchCheckedOutElsewhere, BranchHolderAction
 
 
 @pytest.fixture
@@ -11469,6 +11470,19 @@ class TestCleanupWorktreeColdBranchRetention:
         )
 
 
+def _worktree_listing_unreadable(git_ops: GitOps):
+    """Patch context forcing ``GitOps._settle_branch_checkout``'s fail-open read.
+
+    An unreadable ``git worktree list`` leaves the settle with no holder, so
+    the acquire enters its route as it did before task 5565 and the route's
+    own reattach rc guard is what must hold.
+    """
+    async def _no_holder(full_branch: str) -> None:
+        return None
+
+    return patch.object(git_ops, '_worktree_holding_branch', side_effect=_no_holder)
+
+
 # ===========================================================================
 # Task-1914 step-5: RED — create-once leftover protective guard + fail-safe
 # ===========================================================================
@@ -11477,10 +11491,12 @@ class TestCleanupWorktreeColdBranchRetention:
 @pytest.mark.asyncio
 class TestAcquireWarmLaneCreateOnceLeftoverGuard:
     """create-once site NEVER destroys a leftover task/<id> branch that carries
-    commits beyond main.  If the leftover cannot be re-attached (e.g. already
-    checked out in another worktree), acquire returns WarmLaneUnavailable.FAULT
-    while leaving the branch intact.  Fail-safe: _branch_has_commits_beyond_main
-    True (including on git error) → reattach/retain direction taken on both paths."""
+    commits beyond main.  A leftover checked out in a worktree outside the pool
+    is refused before the route (BranchCheckedOutElsewhere, task 5565); when
+    that pre-route read fails open and re-attach is refused by git, acquire
+    returns WarmLaneUnavailable.FAULT while leaving the branch intact.
+    Fail-safe: _branch_has_commits_beyond_main True (including on git error)
+    → reattach/retain direction taken on both paths."""
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
@@ -11503,14 +11519,13 @@ class TestAcquireWarmLaneCreateOnceLeftoverGuard:
         be re-attached (already checked out in another worktree).
 
         Setup: create task/A with commits via a temp worktree and LEAVE the
-        worktree in place (not removed).  When acquire_warm_lane tries
-        `git worktree add <lane> task/A`, git refuses with 'branch already
-        checked out' — and the branch must NOT be deleted as a fallback.
+        worktree in place (not removed).
 
-        After step-4: the reattach guard fires and `git worktree add` (no -b)
-        fails → FAULT returned; task/A is never touched → both assertions PASS.
-        After step-6: same external result; the raise-not-destroy contract is
-        the same observable effect.
+        With the worktree listing readable, the pre-route settle refuses with
+        BranchCheckedOutElsewhere(REFUSE_FOREIGN_WORKTREE) and no lane is
+        created.  With it unreadable (fail-open), acquire enters the
+        create-once route, `git worktree add <lane> task/A` is refused by git
+        → FAULT, and the branch must NOT be deleted as a fallback.
         """
         from orchestrator.git_ops import WarmLaneUnavailable
 
@@ -11539,12 +11554,24 @@ class TestAcquireWarmLaneCreateOnceLeftoverGuard:
 
         # FRESH pool — _lane-0 never acquired
         git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        (lane_path,) = pool.lane_paths()
 
-        result = await git_ops.acquire_warm_lane('A', start_ref)
+        with pytest.raises(BranchCheckedOutElsewhere) as refused:
+            await git_ops.acquire_warm_lane('A', start_ref)
+        assert refused.value.action is BranchHolderAction.REFUSE_FOREIGN_WORKTREE
+        assert refused.value.holder.resolve() == tmp_wt_a.resolve()
+        assert pool.assignment_for('A') is None
+        assert not pool.is_assigned(lane_path)
+        assert not lane_path.exists(), 'the refusal must come before any lane is created'
 
-        # Must return WarmLaneUnavailable (FAULT), NOT WorktreeInfo
-        assert isinstance(result, WarmLaneUnavailable), (
-            f'Expected WarmLaneUnavailable for unattachable orphan, got {result!r}'
+        with _worktree_listing_unreadable(git_ops):
+            result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        # Must return WarmLaneUnavailable.FAULT, NOT WorktreeInfo
+        assert result is WarmLaneUnavailable.FAULT, (
+            f'Expected WarmLaneUnavailable.FAULT for unattachable orphan, got {result!r}'
         )
 
         # task/A branch must be RETAINED — never destroyed regardless of failure
@@ -11767,16 +11794,14 @@ class TestAcquireWarmLaneResetInPlaceCheckoutGuard:
         (a) Create task/A with 2 commits via tmp_wt_a; LEAVE it checked out.
         (b) Register+free _lane-0 as 'seed' so the lane is on task/seed and
             the next acquire for 'A' hits the registered (else) path.
-        (c) Acquire for 'A' — reattach guard fires (task/A exists + commits)
-            but git checkout -f task/A inside the lane FAILS because task/A
-            is already checked out in tmp_wt_a.
-
-        RED today: rc of checkout is discarded and _reuse_warm_lane(lane,
-        task/A) runs against the lane still on task/seed, returning WorktreeInfo
-        instead of WarmLaneUnavailable.
-
-        GREEN after step-8: rc is captured; non-zero → RuntimeError →
-        top-level except → WarmLaneUnavailable.FAULT, task/A intact.
+        (c) Acquire for 'A' with the worktree listing readable: the pre-route
+            settle refuses with BranchCheckedOutElsewhere(REFUSE_FOREIGN_WORKTREE)
+            and the lane stays FREE on task/seed.
+        (d) Acquire for 'A' with the listing unreadable (fail-open): the
+            reattach guard fires (task/A exists + commits) but git checkout -f
+            task/A inside the lane FAILS because task/A is already checked out
+            in tmp_wt_a.  The rc is captured; non-zero → RuntimeError →
+            top-level except → WarmLaneUnavailable.FAULT, task/A intact.
         """
         from orchestrator.git_ops import WarmLaneUnavailable
 
@@ -11821,13 +11846,27 @@ class TestAcquireWarmLaneResetInPlaceCheckoutGuard:
             f'Lane should be on task/seed before reattach attempt, got {seed_head_raw.strip()!r}'
         )
 
-        # (d) Acquire for 'A' — hits reset-in-place site → reattach guard fires
-        #     → git checkout -f task/A FAILS (task/A checked out in tmp_wt_a)
-        result = await git_ops.acquire_warm_lane('A', start_ref)
+        # (c) Listing readable — refused before the route touches the lane.
+        with pytest.raises(BranchCheckedOutElsewhere) as refused:
+            await git_ops.acquire_warm_lane('A', start_ref)
+        assert refused.value.action is BranchHolderAction.REFUSE_FOREIGN_WORKTREE
+        assert refused.value.holder.resolve() == tmp_wt_a.resolve()
+        assert git_ops.warm_lane_pool.assignment_for('A') is None
+        assert not git_ops.warm_lane_pool.is_assigned(lane_path)
+        _, refused_head_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane_path,
+        )
+        assert refused_head_raw.strip() == 'task/seed', (
+            f'The refusal must leave the lane on task/seed, got {refused_head_raw.strip()!r}'
+        )
 
-        # PRIMARY discriminator (RED today → GREEN after step-8):
-        # must return WarmLaneUnavailable.FAULT, NOT WorktreeInfo
-        assert isinstance(result, WarmLaneUnavailable), (
+        # (d) Listing unreadable — hits reset-in-place site → reattach guard
+        #     fires → git checkout -f task/A FAILS (task/A checked out in tmp_wt_a)
+        with _worktree_listing_unreadable(git_ops):
+            result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        # PRIMARY discriminator: must return WarmLaneUnavailable.FAULT, NOT WorktreeInfo
+        assert result is WarmLaneUnavailable.FAULT, (
             f'Expected WarmLaneUnavailable.FAULT when checkout -f task/A fails '
             f'(branch already checked out in another worktree), got {result!r}. '
             f'The reset-in-place site must capture the checkout rc and raise, '
