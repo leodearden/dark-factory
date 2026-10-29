@@ -89,6 +89,11 @@ from orchestrator.branch_stack import (
     rebase_own_delta,
 )
 from orchestrator.config import TASK_META_DIRNAME, GitConfig, TranscriptArchiveConfig
+from orchestrator.lane_branch_holder import (
+    BranchCheckedOutElsewhere,
+    BranchHolderAction,
+    decide_branch_holder,
+)
 from orchestrator.lane_lifecycle import (
     ACQUIRE_ROUTE_TRANSITIONS,
     LANE_STATE_DIRNAME,
@@ -7091,8 +7096,16 @@ class GitOps:
         ``recut_ruling`` — a pending re-cut ruling: raise
         :class:`RecutRulingViolation` before any route is entered while a
         prior incarnation of the branch survives.
+
+        A task branch already checked out in another worktree is settled the
+        same way, before any route: :meth:`_settle_branch_checkout` reuses or
+        detaches the lane holding it, or raises
+        :class:`BranchCheckedOutElsewhere` with no lane touched.  That is also
+        why an "already used by worktree" checkout can no longer reach the
+        steal-retry loop, whose FAULT retry would only livelock on it.
         """
         await self._refuse_prior_incarnation(branch_name, recut_ruling)
+        await self._settle_branch_checkout(branch_name)
         excluded: set[Path] = set()
         attempted: list[tuple[Path, WarmLaneUnavailable]] = []
         for attempt in range(1, _WARM_LANE_STEAL_MAX_ATTEMPTS + 1):
@@ -7140,6 +7153,47 @@ class GitOps:
             ', '.join(f'{lane}={sentinel.value}' for lane, sentinel in attempted),
         )
         return WarmLaneUnavailable.STEAL_FAILED
+
+    async def _settle_branch_checkout(self, branch_name: str) -> None:
+        """Settle the worktree that already holds ``task/<branch_name>``, if any.
+
+        git checks a branch out in at most one worktree, so landing it on any
+        other lane fails "already used by worktree".  The decision is
+        :func:`orchestrator.lane_branch_holder.decide_branch_holder`: a lane
+        the task still durably owns is re-pinned so the REUSE route takes it;
+        an ownerless lane is detached and released, pinned to this task
+        meanwhile so no concurrent acquire can take it mid-detach (on a
+        refused detach the pin stays, keeping its WIP away from other tasks);
+        anything else raises :class:`BranchCheckedOutElsewhere`.  An
+        unreadable worktree listing fails open.
+        """
+        pool = self.warm_lane_pool
+        if pool is None or pool.assignment_for(branch_name) is not None:
+            return
+        full_branch = f'{self.config.branch_prefix}{branch_name}'
+        holder = await self._worktree_holding_branch(full_branch)
+        if holder is None:
+            return
+        lane = pool.canonical_lane(holder)
+        action = decide_branch_holder(
+            task_id=branch_name,
+            lane=lane,
+            lane_held=lane is not None and pool.is_assigned(lane),
+            record=self._lane_lifecycle.read(lane) if lane is not None else None,
+        )
+        if lane is not None and action is BranchHolderAction.REUSE_OWN_LANE:
+            pool.restore_assignment(branch_name, lane)
+            logger.info(
+                'acquire_warm_lane: %s is checked out in its own lane %s — '
+                're-pinned for reuse', full_branch, lane,
+            )
+            return
+        if lane is not None and action is BranchHolderAction.DETACH_OWNERLESS_LANE:
+            pool.restore_assignment(branch_name, lane)
+            if await self.detach_lane_checkout(lane, branch_name):
+                await pool.release(lane)
+                return
+        raise BranchCheckedOutElsewhere(full_branch, holder, action)
 
     async def prewarm_pool(self, start_ref: str) -> PoolPrewarmResult:
         """Eagerly materialize every pool lane to its at-rest idle state (task 2879).

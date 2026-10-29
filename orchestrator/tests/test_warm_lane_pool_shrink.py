@@ -17,40 +17,30 @@ a conftest edit trips verify.py's has_conftest full-suite fallback.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, WorktreeInfo, _run
 from orchestrator.harness import Harness
 from orchestrator.lane_branch_holder import BranchCheckedOutElsewhere, BranchHolderAction
+from orchestrator.lane_lifecycle import LaneLifecycle, LaneRecord
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool, WarmLanePoolShrink
 
 # ── Module-local fixtures + helpers ─────────────────────────────────────
 
 
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def ig_git_repo(tmp_path: Path) -> Path:
     """Temporary git repo with an initial commit, a warm base and pool-root sentinel."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    repo = seed_repo(tmp_path / 'repo')
     default_base = repo / '.worktrees' / '_merge-verify' / 'target'
     default_base.mkdir(parents=True, exist_ok=True)
     (default_base / '.keep').write_text('warm base sentinel\n')
@@ -155,6 +145,9 @@ class _ShrunkHost:
     def lane(self, k: int) -> Path:
         return self.base / f'_lane-{k}'
 
+    def durable_record(self, lane: Path) -> LaneRecord | None:
+        return LaneLifecycle(self.base).read(lane)
+
     @property
     def pool(self) -> WarmLanePool:
         pool = self.harness.git_ops.warm_lane_pool
@@ -230,7 +223,7 @@ async def test_recovery_adopts_over_cap_lane_which_drains_on_cleanup(
     assert pool.assignment_for('43') == lane2
     assert pool.state(lane2) is LaneState.ASSIGNED
     assert '43' in host.harness._recovered_plans
-    record = host.harness.git_ops._lane_lifecycle.read(lane2)
+    record = host.durable_record(lane2)
     assert record is not None
     assert record.state is DurableLaneState.ASSIGNED
     assert pool.lane_paths() == [host.lane(0)]
@@ -250,7 +243,7 @@ async def test_recovery_adopts_over_cap_lane_which_drains_on_cleanup(
     await host.harness.git_ops.cleanup_worktree(lane2, '43')
 
     assert pool.state(lane2) is None
-    record = host.harness.git_ops._lane_lifecycle.read(lane2)
+    record = host.durable_record(lane2)
     assert record is not None
     assert record.state is DurableLaneState.RELEASED
     assert lane2.is_dir()
@@ -269,7 +262,7 @@ async def test_recovery_releases_over_cap_lane_of_terminal_task(ig_git_repo: Pat
     assert pool.state(lane2) is None
     assert lane2.is_dir()
     assert await _head_is_detached(lane2)
-    record = host.harness.git_ops._lane_lifecycle.read(lane2)
+    record = host.durable_record(lane2)
     assert record is not None
     assert record.state is DurableLaneState.RELEASED
 

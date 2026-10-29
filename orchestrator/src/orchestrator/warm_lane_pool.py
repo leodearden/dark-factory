@@ -160,15 +160,15 @@ class WarmLanePool:
     ) -> None:
         self._base = worktree_base
         self._name_prefix = name_prefix
-        self._capacity = size
+        # The configured slots _lane-0.._lane-{size-1}.
+        self._slots: tuple[Path, ...] = tuple(
+            worktree_base / f'{name_prefix}{k}' for k in range(size)
+        )
         # Admitted over-cap members of _lanes (always ASSIGNED, drained on release).
         self._over_cap: set[Path] = set()
         # Ordered dict preserves insertion order so try_acquire always hands
         # out the lowest-numbered free lane first (stable, deterministic).
-        self._lanes: dict[Path, LaneState] = {
-            worktree_base / f'{name_prefix}{k}': LaneState.FREE
-            for k in range(size)
-        }
+        self._lanes: dict[Path, LaneState] = dict.fromkeys(self._slots, LaneState.FREE)
         # branch_name -> lane_path assignment map (for live-requeue + disk backstop)
         self._assignments: dict[str, Path] = {}
         self._lock = asyncio.Lock()
@@ -201,7 +201,7 @@ class WarmLanePool:
     @property
     def capacity(self) -> int:
         """Configured number of slots (0 → always exhausted)."""
-        return self._capacity
+        return len(self._slots)
 
     def set_lane_lifecycle(self, lane_lifecycle: LaneLifecycle) -> None:
         """Wire the shared durable-record writer post-construction.
@@ -279,7 +279,7 @@ class WarmLanePool:
     def _over_cap_slot(self, path: Path) -> Path | None:
         """Return the over-cap lane key *path* names, or None."""
         index = self._slot_index(path)
-        if index is None or index < self._capacity:
+        if index is None or index < self.capacity:
             return None
         return self._base / path.name
 
@@ -431,9 +431,7 @@ class WarmLanePool:
                 # Re-check dispatched synchronously under lock (TOCTOU guard).
                 if is_dispatched(victim):
                     continue
-                if self._lanes.get(lane) != LaneState.ASSIGNED:
-                    continue
-                if lane in self._over_cap:
+                if self._lanes.get(lane) != LaneState.ASSIGNED or lane in self._over_cap:
                     continue
                 # Atomically re-key: victim → branch_name, keep ASSIGNED.
                 del self._assignments[victim]
@@ -465,7 +463,7 @@ class WarmLanePool:
         loop) and no lock is needed.  Returns ``[]`` for a size-0 pool.
         Admitted over-cap lanes are excluded, so prewarm's target stays N.
         """
-        return [lane for lane in self._lanes if lane not in self._over_cap]
+        return list(self._slots)
 
     def canonical_lane(self, path: Path) -> Path | None:
         """Return this pool's key for the lane *path* names, or None.
@@ -503,11 +501,11 @@ class WarmLanePool:
         over_cap = {
             lane.name: index
             for lane in filter(None, map(self.canonical_lane, resident))
-            if (index := self._slot_index(lane)) is not None and index >= self._capacity
+            if (index := self._slot_index(lane)) is not None and index >= self.capacity
         }
         names = sorted(over_cap, key=over_cap.__getitem__)
         return WarmLanePoolShrink(
-            capacity=self._capacity,
+            capacity=self.capacity,
             lanes=tuple(OverCapLane.from_record(name, records.get(name)) for name in names),
         )
 
@@ -515,6 +513,10 @@ class WarmLanePool:
         """Return the current LaneState for *lane*, or None if unknown."""
         matched = self._match_lane(lane)
         return self._lanes[matched] if matched is not None else None
+
+    def is_assigned(self, lane: Path) -> bool:
+        """Return True if the pool currently holds *lane* for an assignment."""
+        return self.state(lane) is LaneState.ASSIGNED
 
     def assignment_for(self, branch_name: str) -> Path | None:
         """Return the lane path currently assigned to *branch_name*, or None."""
@@ -677,7 +679,7 @@ class WarmLanePool:
             logger.info(
                 'warm_lane_pool: admitted over-cap lane %s for task %s '
                 '(capacity=%d) — it drains on release',
-                matched.name, task_id, self._capacity,
+                matched.name, task_id, self.capacity,
             )
         self._lanes[matched] = LaneState.ASSIGNED
         self._assignments[task_id] = matched
