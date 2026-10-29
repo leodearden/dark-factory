@@ -22,7 +22,7 @@ from _orch_helpers import build_usage_gate
 from shared.cli_invoke import AgentResult, apply_spawn_env
 from shared.config_models import AccountConfig
 
-from orchestrator.evals.compare import _assess_task, compare_models
+from orchestrator.evals.compare import compare_models
 from orchestrator.evals.judge import judge_plan_quality, run_judge
 from orchestrator.evals.measurement import (
     MeasurementStage,
@@ -162,16 +162,10 @@ async def _plan_judge(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[d
     return calls
 
 
-async def _assessor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[dict[str, Any]]:
-    invoke, calls = _repeating_invoke(_ASSESSMENT)
-    monkeypatch.setattr('orchestrator.evals.compare.invoke_agent', invoke)
-    monkeypatch.setattr('orchestrator.evals.compare.get_diff', AsyncMock(return_value='+x'))
-    await _assess_task(_TASK, _eval_result('A', tmp_path / 'wt_a'),
-                       _eval_result('B', tmp_path / 'wt_b'), 'A', 'B')
-    return calls
-
-
-async def _synthesizer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[dict[str, Any]]:
+async def _compare_models_calls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> list[dict[str, Any]]:
+    """One fixture compared once: the assessor dispatch, then the synthesizer's."""
     invoke, calls = _repeating_invoke({**_ASSESSMENT, **_SYNTHESIS})
     monkeypatch.setattr('orchestrator.evals.compare.invoke_agent', invoke)
     monkeypatch.setattr('orchestrator.evals.compare.get_diff', AsyncMock(return_value='+x'))
@@ -179,8 +173,16 @@ async def _synthesizer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[
         [_eval_result('A', tmp_path / 'wt_a'), _eval_result('B', tmp_path / 'wt_b')],
         ['A'], ['B'], {_FIXTURE_ID: _TASK},
     )
-    assert len(calls) == 2, 'the synthesizer was never reached'
-    return calls[1:]
+    assert len(calls) == 2, 'expected one assessor and one synthesizer dispatch'
+    return calls
+
+
+async def _assessor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[dict[str, Any]]:
+    return (await _compare_models_calls(monkeypatch, tmp_path))[:1]
+
+
+async def _synthesizer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[dict[str, Any]]:
+    return (await _compare_models_calls(monkeypatch, tmp_path))[1:]
 
 
 @pytest.mark.asyncio
@@ -205,4 +207,3 @@ async def test_tmp_cwd_eval_calls_resolve_off_the_tmp_bucket(
     identity = parse_spawn_identity(env, '', '', str(kwargs['cwd']))
     assert identity.project == 'dark_factory'
     assert identity.role == role
-    assert identity.project != 'tmp'

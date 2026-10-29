@@ -39,8 +39,9 @@ _REASON_CHARS = 80
 
 _EVAL_HARNESS_PROJECT = 'dark_factory'
 """The eval harness is dark-factory's instrument, so its LLM calls are
-dark-factory sessions whichever repository's fixture they grade; the value is
-dark-factory-orchestrator.yaml's ``fused_memory.project_id``."""
+dark-factory sessions whichever repository's fixture they grade. It is meant
+to name the same project as dark-factory-orchestrator.yaml's
+``fused_memory.project_id``; nothing derives or checks that."""
 
 
 class MeasurementStage(StrEnum):
@@ -244,9 +245,9 @@ async def measured_call(
     ``cost_usd`` is the spend summed over every attempt. With *usage_gate* the
     call runs through ``invoke_with_cap_retry``, which injects each account's
     credentials into *invoke_kwargs*. Any other exception propagates. Every
-    call declares its fleet identity (role ``eval_<stage>``, project
-    ``dark_factory``) via ``spawn_env``, because the ``/tmp`` cwd the judges
-    run in names no project.
+    call declares the fleet identity ``_spawn_identity`` builds for *stage*
+    via ``spawn_env``, because the ``/tmp`` cwd the judges run in names no
+    project.
     """
     name = label or str(stage)
     spawn_env = _spawn_identity(stage)
