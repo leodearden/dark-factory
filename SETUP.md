@@ -203,7 +203,13 @@ docker compose up -d falkordb qdrant
   backend Graphiti is configured for here) on `6379`.
   - It persists to `fused-memory/data/falkordb` with both RDB snapshots and
     an append-only file (`appendfsync everysec`), enabled by `REDIS_ARGS` in
-    the compose file.
+    the compose file. The query `TIMEOUT 30000` is set by `FALKORDB_ARGS`
+    there too, and the image is pinned by digest. The compose file is the
+    only durable home for these settings: a runtime `CONFIG SET` is lost on
+    the next container restart, so never treat one as the fix.
+  - After setup, the fused-memory unit brings FalkorDB up through
+    `scripts/falkordb_aof_gate.py`, which recreates the container only onto a
+    current AOF (`OPERATIONS.md` "FalkorDB settings and the recreate gate").
 - **Qdrant** (vector store for Mem0) on `6333` (HTTP) / `6334` (gRPC).
 
 A third compose service, `fused-mcp`, builds and runs fused-memory itself
@@ -216,6 +222,7 @@ Verify:
 ```bash
 docker compose exec falkordb redis-cli ping   # → PONG
 docker compose exec falkordb redis-cli CONFIG GET appendonly   # → appendonly / yes
+docker compose exec falkordb redis-cli GRAPH.CONFIG GET TIMEOUT   # → TIMEOUT / 30000
 curl -sf http://localhost:6333/readyz && echo ok
 ```
 

@@ -2179,6 +2179,56 @@ writing streak state: `is_unit_enabled` (operator intent) and the 120s
 `STARTUP_GRACE_SECS` window after the unit starts (a not-yet-bound port is
 neither failure evidence nor recovery).
 
+### FalkorDB settings and the recreate gate
+
+FalkorDB's durable settings live in `fused-memory/docker/docker-compose.yml`
+and nowhere else: `REDIS_ARGS` turns the AOF on (`appendonly yes`,
+`appendfsync everysec`), `FALKORDB_ARGS` sets the query `TIMEOUT 30000`, and
+the image is pinned by digest (FalkorDB 4.18.0; `:latest` is now the 6.0
+engine). The image runs `redis-server` with no config file, so a runtime
+`CONFIG SET` or `GRAPH.CONFIG SET` lasts only until the next container
+restart, and a crash restart drops it silently (task 6330, 6848; the 10-26
+segfault reset both). Use `CONFIG SET` only as a stop-gap, never as the fix.
+
+fused-memory checks both at startup and logs a WARNING naming the shortfall
+when `TIMEOUT` is below `graphiti.falkordb.expected_graph_timeout_ms` or
+`appendonly` is not `yes`. `get_status` reports the live values on every call
+under `graphiti.server_settings` (`ok`, `shortfalls`, `read_errors`). It never
+sets them.
+
+The unit's `ExecStartPre` runs `scripts/falkordb_aof_gate.py` instead of a bare
+compose-up. A recreate starts the new server with `appendonly yes`, which
+loads only the AOF and ignores `dump.rdb`, so a stale AOF would drop every
+write made since it went stale. The gate therefore decides as follows:
+
+| falkordb container | Gate action |
+|---|---|
+| running, AOF current | `compose up -d falkordb qdrant` (a recreate goes ahead) |
+| running, AOF not current or unreadable | falkordb is left running, qdrant comes up, ERROR logged with the remedy |
+| created / exited | `docker start` the existing container unchanged and bring qdrant up; any pending recreate waits for the next restart |
+| restarting / paused / dead / removing | falkordb is left alone, qdrant comes up, ERROR logged |
+| absent, data dir empty | `compose up -d falkordb qdrant` (fresh install) |
+| absent, `dump.rdb` or `appendonlydir` present | not created, qdrant comes up, ERROR logged; fused-memory then fails at its port wait |
+
+"AOF current" means the live server reports `appendonly yes`, `aof_enabled:1`,
+`loading:0`, `aof_last_write_status:ok` and `aof_rewrite_in_progress:0`. It
+also means the base and incr files in the host-side manifest total exactly
+the server's `aof_current_size`, bracketed by two `INFO` reads. Size is used
+rather than mtime because an idle server's incr file mtime does not move.
+
+**When it refuses**: run `docker exec docker-falkordb-1 redis-cli CONFIG SET
+appendonly yes`. Wait until `redis-cli INFO persistence` shows
+`aof_rewrite_in_progress:0`, then restart fused-memory. To check the verdict
+without acting, run `python3 scripts/falkordb_aof_gate.py --compose-file
+fused-memory/docker/docker-compose.yml --check-only` (exit 0 means a recreate
+is allowed). With **no container but data on disk**, the gate cannot tell
+whether `dump.rdb` or the AOF holds the newest complete data, so do not create
+the container blind. Decide by hand: check whether the last container ran with
+`appendonly yes` (if it did, the AOF is complete), and compare the incr AOF's
+mtime with `dump.rdb`'s. If the AOF is the newest, run the compose-up by hand.
+If `dump.rdb` is, start one container without `REDIS_ARGS` so that it loads
+`dump.rdb`, then apply the `CONFIG SET` remedy above and restart fused-memory.
+
 ### Dashboard unit-parity check
 
 Each orchestrator-watchdog tick also runs
