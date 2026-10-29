@@ -21,6 +21,7 @@ store.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
@@ -59,3 +60,63 @@ class ReadOnlyGraphProxy:
         if command is not None:
             assert_read_only_command(command)
         return getattr(self._graph, name)
+
+
+@dataclass(frozen=True)
+class PagedQuery:
+    """One population, read in pages ordered on ``<row>.uuid`` and proven complete by ``count(<row>)``.
+
+    Both strings are built from the one ``match``, so the page and the census
+    always describe the same population, as
+    ``fused_memory/backends/graphiti_client.py::_paged_ro_query`` requires.
+
+    PRECONDITION: the MATCH yields exactly one result row per binding of
+    ``row`` — a directed edge pattern with ``row`` the relationship, or a
+    single node label with ``row`` the node. That is what makes ``<row>.uuid``
+    a total order over the rows and ``count(<row>)`` their number.
+
+    The sort key must be projected. A driver may refuse to order on a property
+    the query does not return, and a reader or a test double can only audit
+    which rows a page returned through a returned identifying column.
+
+    The census counts ``row``, never ``*``. With the relationship variable
+    unreferenced, FalkorDB's ``count(*)`` over an edge pattern counts connected
+    (source, target) node pairs, not edges. Measured on dark_factory
+    2026-10-01: 19,409 pairs against 20,491 edges, so a ``count(*)`` census
+    would pass a read truncated by exactly the multi-edge excess. See
+    docs/ruling-overreach-guard-design-2026-10-01/design.md section 2.1.
+    """
+
+    match: str
+    row: str
+    returns: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.returns:
+            raise ValueError(
+                f'PagedQuery needs at least one returned column, got returns={self.returns!r}'
+            )
+        if not self.row.isidentifier():
+            raise ValueError(
+                f'PagedQuery row must be a bare Cypher variable, got row={self.row!r}'
+            )
+        if self.sort_key not in self.returns:
+            raise ValueError(
+                f'PagedQuery pages on {self.sort_key!r}, which must be projected, '
+                f'but returns={self.returns!r} omits it'
+            )
+
+    @property
+    def sort_key(self) -> str:
+        return f'{self.row}.uuid'
+
+    @property
+    def page_template(self) -> str:
+        return (
+            f"{self.match.strip()} RETURN {', '.join(self.returns)} "
+            f'ORDER BY {self.sort_key} SKIP {{skip}} LIMIT {{limit}}'
+        )
+
+    @property
+    def census_cypher(self) -> str:
+        return f'{self.match.strip()} RETURN count({self.row})'
