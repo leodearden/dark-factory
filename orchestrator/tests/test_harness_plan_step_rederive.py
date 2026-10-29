@@ -362,6 +362,38 @@ class TestRederiveStepStatusDefensive:
         assert result == []
         assert artifacts.read_plan()['steps'][0]['status'] == 'pending'
 
+    async def test_unreadable_head_returns_empty_and_writes_no_commit(
+        self, config, git_ops, task_assignment,
+    ):
+        """An unreadable worktree HEAD (unborn branch: ``git rev-parse HEAD``
+        exits 128) must never re-derive a step to done with an empty commit
+        (task 4068)."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'impl.py').write_text('implementation\n')
+        step_commit = await git_ops.commit(wt, 'feat: GREEN — step-1')
+        assert step_commit, 'Setup: expected a real commit to be made'
+
+        workflow.plan = _write_plan(artifacts, workflow, [
+            {'id': 'step-1', 'type': 'impl', 'status': 'pending', 'commit': None},
+        ])
+        artifacts.append_iteration_log({
+            'agent': 'implementer', 'steps_completed': ['step-1'], 'commit': step_commit,
+        })
+        await _run(['git', 'symbolic-ref', 'HEAD', 'refs/heads/unborn-head'], cwd=wt)
+
+        result = await workflow._rederive_step_status_from_branch_state()
+
+        assert result == []
+        step = artifacts.read_plan()['steps'][0]
+        assert step['status'] == 'pending'
+        assert step['commit'] is None
+        entries, _ = artifacts.read_iteration_log()
+        assert not any(e.get('event') == 'plan_step_rederive' for e in entries), entries
+
 
 # ---------------------------------------------------------------------------
 # step-7 RED: observability log entry
