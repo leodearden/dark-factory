@@ -24,20 +24,16 @@ from orchestrator.shadow_scoring import ShadowReference, score_implementer_cell
 from orchestrator.shadow_types import CostBasis, ReferenceKind, ShadowCellState, ShadowShape
 
 __all__ = [
-    'SHAPE_RULES',
     'CostPerUsable',
     'LineKey',
     'LineTag',
     'MissingResult',
     'ReportLine',
     'RunsDbMissingError',
-    'ScoredCell',
     'ShadowReport',
-    'ShapeRule',
+    'UnsupportedShapeError',
     'read_shadow_report',
     'render_text',
-    'shape_rule',
-    'summarise_line',
 ]
 
 UNMEASURED_KIND = 'unmeasured'
@@ -63,6 +59,10 @@ class RunsDbMissingError(FileNotFoundError):
     def __init__(self, db_path: Path) -> None:
         super().__init__(f'no runs.db at {db_path}')
         self.db_path = db_path
+
+
+class UnsupportedShapeError(ValueError):
+    """The report has no rule for the requested shape; the message names the supported ones."""
 
 
 @dataclass(frozen=True, order=True)
@@ -124,7 +124,7 @@ class MissingResult:
 
 
 @dataclass(frozen=True)
-class ScoredCell:
+class _ScoredCell:
     """A settled cell read back from its result: whether it pairs, and its outcome."""
 
     cell: ShadowCell
@@ -171,7 +171,7 @@ class ReportLine:
             'expired': self.expired,
             'failed': self.failed,
             'primary_outcome': {
-                'name': shape_rule(self.key.shape).outcome_name,
+                'name': _shape_rule(self.key.shape).outcome_name,
                 'n': self.primary.n,
                 'mean_difference': self.primary.mean,
                 'ci95_low': self.primary.ci_low,
@@ -209,7 +209,7 @@ class ShadowReport:
 
 
 @dataclass(frozen=True)
-class ShapeRule:
+class _ShapeRule:
     """How a settled cell of one shape becomes a paired outcome."""
 
     outcome_name: str
@@ -227,20 +227,20 @@ def _implementer_usable(metrics: EvalMetrics, reference: ShadowReference) -> boo
     return all(gate is True for gate in gates) and score.review_blocking_issues == 0
 
 
-SHAPE_RULES: Mapping[ShadowShape, ShapeRule] = MappingProxyType({
-    ShadowShape.IMPLEMENTER: ShapeRule(
+_SHAPE_RULES: Mapping[ShadowShape, _ShapeRule] = MappingProxyType({
+    ShadowShape.IMPLEMENTER: _ShapeRule(
         outcome_name='usable', needs_reference=True, usable=_implementer_usable,
     ),
 })
 
 
-def shape_rule(shape: ShadowShape) -> ShapeRule:
+def _shape_rule(shape: ShadowShape) -> _ShapeRule:
     try:
-        return SHAPE_RULES[shape]
+        return _SHAPE_RULES[shape]
     except KeyError:
-        raise ValueError(
+        raise UnsupportedShapeError(
             f'the shadow report has no rule for shape {shape.value!r}; '
-            f'supported shapes: {", ".join(sorted(SHAPE_RULES))}'
+            f'supported shapes: {", ".join(sorted(_SHAPE_RULES))}'
         ) from None
 
 
@@ -253,7 +253,7 @@ async def read_shadow_report(
     n_min: int,
 ) -> ShadowReport:
     """Report *project_id*'s *shape* cells in the runs.db at *db_path*, optionally one candidate's."""
-    rule = shape_rule(shape)
+    rule = _shape_rule(shape)
     if not db_path.is_file():
         raise RunsDbMissingError(db_path)
     cells = RunStore(db_path).find_shadow_cells(
@@ -264,16 +264,16 @@ async def read_shadow_report(
         for cell in cells
         if cell.state is ShadowCellState.SETTLED
     }
-    pairs = [r.cell for r in readings.values() if isinstance(r, ScoredCell) and r.paired]
+    pairs = [r.cell for r in readings.values() if isinstance(r, _ScoredCell) and r.paired]
     production_costs = await _production_costs(db_path, project_id, pairs)
     lines = tuple(
-        summarise_line(key, group, readings, production_costs, n_min)
+        _summarise_line(key, group, readings, production_costs, n_min)
         for key, group in sorted(_group_by_line(cells).items())
     )
     return ShadowReport(project_id, db_path, shape, n_min, lines)
 
 
-def _read_settled_cell(cell: ShadowCell, rule: ShapeRule) -> ScoredCell | MissingResult:
+def _read_settled_cell(cell: ShadowCell, rule: _ShapeRule) -> _ScoredCell | MissingResult:
     reference = _reference_of(cell)
     if cell.result_path is None:
         return MissingResult(cell.cell_id, cell.task_id, None, 'the row names no result_path')
@@ -282,7 +282,7 @@ def _read_settled_cell(cell: ShadowCell, rule: ShapeRule) -> ScoredCell | Missin
     except ResultLoadError as e:
         return MissingResult(cell.cell_id, cell.task_id, cell.result_path, e.detail)
     kind = terminal_kind_of(raw)
-    return ScoredCell(
+    return _ScoredCell(
         cell=cell,
         paired=rule.pairs(reference),
         usable=rule.usable(metrics, reference),
@@ -329,16 +329,16 @@ def _group_by_line(cells: Iterable[ShadowCell]) -> dict[LineKey, list[ShadowCell
     return groups
 
 
-def summarise_line(
+def _summarise_line(
     key: LineKey,
     cells: Sequence[ShadowCell],
-    readings: Mapping[str, ScoredCell | MissingResult],
+    readings: Mapping[str, _ScoredCell | MissingResult],
     production_costs: Mapping[str, float],
     n_min: int,
 ) -> ReportLine:
     """One line from its cells, their settled readings and production's cost on each pair."""
     read = [readings[cell.cell_id] for cell in cells if cell.cell_id in readings]
-    scored = [r for r in read if isinstance(r, ScoredCell)]
+    scored = [r for r in read if isinstance(r, _ScoredCell)]
     pairs = [r for r in scored if r.paired]
     states = Counter(cell.state for cell in cells)
     return ReportLine(
@@ -358,7 +358,7 @@ def summarise_line(
     )
 
 
-def _candidate_cost(basis: CostBasis, pairs: Sequence[ScoredCell]) -> CostPerUsable:
+def _candidate_cost(basis: CostBasis, pairs: Sequence[_ScoredCell]) -> CostPerUsable:
     """The row's own spend is the authority (PRD decision 11), never the result JSON's."""
     usable = sum(pair.usable for pair in pairs)
     credits = sum(pair.cell.cost_credits for pair in pairs)

@@ -1997,6 +1997,7 @@ def eval_shadow_report_cmd(config_path, shape, candidate, as_json):
         sys.exit(1)
     from orchestrator.evals.shadow_report import (
         RunsDbMissingError,
+        UnsupportedShapeError,
         read_shadow_report,
         render_text,
     )
@@ -2011,7 +2012,7 @@ def eval_shadow_report_cmd(config_path, shape, candidate, as_json):
     except RunsDbMissingError as e:
         click.echo(f'Error: {e}. Does --config name the intended project?', err=True)
         sys.exit(1)
-    except ValueError as e:
+    except UnsupportedShapeError as e:
         click.echo(f'Error: {e}', err=True)
         sys.exit(1)
     if as_json:

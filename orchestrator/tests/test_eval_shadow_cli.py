@@ -9,18 +9,26 @@ from datetime import timedelta
 import pytest
 from _shadow_report_seed import (
     CANDIDATE,
+    CONTRACTED_COLUMNS,
     OPENED_AT,
+    OTHER_CANDIDATE,
     PROJECT_ID,
     SeededProject,
     make_project,
+    seed_cell,
     seed_production_cost,
+    seed_two_lines,
+    table_header,
+    table_row,
+    table_rows,
     write_config,
 )
 from click.testing import CliRunner, Result
 from shared.project_layout import runs_db
-from test_shadow_report import _COLUMNS, _OTHER, _cells_of, _row, _seed_two_lines, _table
 
 from orchestrator.cli import main
+from orchestrator.evals.shadow_report import UnsupportedShapeError
+from orchestrator.shadow_types import ReferenceKind
 
 
 @pytest.fixture
@@ -40,19 +48,18 @@ def _tags(cell: str) -> list[str]:
 def test_the_table_prints_the_contracted_columns_and_reads_n_min_from_the_config(
     project, tmp_path, n_min, underpowered,
 ):
-    _seed_two_lines(project)
+    seed_two_lines(project)
 
     result = _report('--config', str(write_config(tmp_path, project.project_root, n_min)))
 
     assert result.exit_code == 0, result.output
-    [header] = [line for line in result.stdout.splitlines() if _cells_of(line)[0] == 'shape']
-    assert tuple(_cells_of(header)) == _COLUMNS
-    assert ('UNDERPOWERED' in _row(result.stdout, CANDIDATE)['tags']) is underpowered
-    assert 'UNDERPOWERED' in _row(result.stdout, _OTHER)['tags']
+    assert table_header(result.stdout) == CONTRACTED_COLUMNS
+    assert ('UNDERPOWERED' in table_row(result.stdout, CANDIDATE)['tags']) is underpowered
+    assert 'UNDERPOWERED' in table_row(result.stdout, OTHER_CANDIDATE)['tags']
 
 
 def test_production_spend_is_read_from_the_selected_projects_store(project, tmp_path):
-    paired = _seed_two_lines(project)
+    paired = seed_two_lines(project)
     asyncio.run(seed_production_cost(
         project.db_path, PROJECT_ID, paired.task_id, 4.0, OPENED_AT + timedelta(hours=1),
     ))
@@ -60,11 +67,11 @@ def test_production_spend_is_read_from_the_selected_projects_store(project, tmp_
     result = _report('--config', str(write_config(tmp_path, project.project_root, 3)))
 
     assert result.exit_code == 0, result.output
-    assert _row(result.stdout, CANDIDATE)['$/usable inc'] == '1.00'
+    assert table_row(result.stdout, CANDIDATE)['$/usable inc'] == '1.00'
 
 
 def test_the_json_form_parses_and_carries_the_tables_lines(project, tmp_path):
-    _seed_two_lines(project)
+    seed_two_lines(project)
     config = str(write_config(tmp_path, project.project_root, 3))
 
     text = _report('--config', config)
@@ -73,12 +80,12 @@ def test_the_json_form_parses_and_carries_the_tables_lines(project, tmp_path):
     assert as_json.exit_code == 0, as_json.output
     payload = json.loads(as_json.stdout)
     assert [(line['candidate'], line['tags']) for line in payload['lines']] == [
-        (row['candidate'], _tags(row['tags'])) for row in _table(text.stdout)
+        (row['candidate'], _tags(row['tags'])) for row in table_rows(text.stdout)
     ]
 
 
 def test_a_missing_result_fails_both_forms_and_names_the_cell(project, tmp_path):
-    gone = _seed_two_lines(project)
+    gone = seed_two_lines(project)
     assert gone.result_path is not None
     gone.result_path.unlink()
     config = str(write_config(tmp_path, project.project_root, 3))
@@ -97,14 +104,14 @@ def test_a_missing_result_fails_both_forms_and_names_the_cell(project, tmp_path)
 
 
 def test_a_candidate_filter_limits_both_forms_to_that_candidate(project, tmp_path):
-    _seed_two_lines(project)
+    seed_two_lines(project)
     config = str(write_config(tmp_path, project.project_root, 3))
 
-    text = _report('--config', config, '--candidate', _OTHER)
-    as_json = _report('--config', config, '--candidate', _OTHER, '--json')
+    text = _report('--config', config, '--candidate', OTHER_CANDIDATE)
+    as_json = _report('--config', config, '--candidate', OTHER_CANDIDATE, '--json')
 
-    assert [row['candidate'] for row in _table(text.stdout)] == [_OTHER]
-    assert [line['candidate'] for line in json.loads(as_json.stdout)['lines']] == [_OTHER]
+    assert [row['candidate'] for row in table_rows(text.stdout)] == [OTHER_CANDIDATE]
+    assert [line['candidate'] for line in json.loads(as_json.stdout)['lines']] == [OTHER_CANDIDATE]
 
 
 def test_a_project_that_has_no_runs_db_is_refused_and_left_without_one(tmp_path):
@@ -120,8 +127,20 @@ def test_a_shape_without_a_report_rule_is_refused_naming_the_supported_shapes(pr
         '--config', str(write_config(tmp_path, project.project_root, 3)), '--shape', 'architect',
     )
 
-    assert result.exit_code != 0
+    assert result.exit_code == 1
+    assert 'Error:' in result.output
     assert 'implementer' in result.output
+
+
+def test_a_corrupt_row_escapes_rather_than_reading_as_a_usage_error(project, tmp_path):
+    incoherent = seed_cell(project.store, reference_kind=ReferenceKind.LANDED, reference_sha=None)
+
+    result = _report('--config', str(write_config(tmp_path, project.project_root, 3)))
+
+    assert isinstance(result.exception, ValueError)
+    assert not isinstance(result.exception, UnsupportedShapeError)
+    assert incoherent.cell_id in str(result.exception)
+    assert 'Error:' not in result.output
 
 
 def test_the_group_and_its_report_command_are_listed():

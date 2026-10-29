@@ -1,15 +1,18 @@
-"""Seeds a real project for the shadow-report tests: cells, their result JSONs and production spend.
+"""Seeds a real project for the shadow-report tests, and reads the rendered table back.
 
 One home for what ``test_shadow_report.py`` and ``test_eval_shadow_cli.py``
-share. Everything is written through the public ``RunStore``, ``ResultStore``
-and ``CostStore`` APIs, so a seeded store is one the production writers could
-have produced. A module rather than ``conftest.py`` for the reason
-``_briefing_helpers.py`` gives.
+share: the seeded cells, their result JSONs and production spend, and the C5
+table's contracted columns with a parser for the rendered rows. Everything is
+written through the public ``RunStore``, ``ResultStore`` and ``CostStore``
+APIs, so a seeded store is one the production writers could have produced. A
+module rather than ``conftest.py`` for the reason ``_briefing_helpers.py``
+gives.
 """
 
 from __future__ import annotations
 
 import itertools
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -27,10 +30,18 @@ from orchestrator.shadow_types import CostBasis, ReferenceKind, ShadowCellState,
 
 PROJECT_ID = 'demo'
 CANDIDATE = 'glm-5.3-endpoint'
+OTHER_CANDIDATE = 'kimi-k2-endpoint'
 INCUMBENT = 'claude-opus-high'
 OPENED_AT = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
 SETTLED_AT = OPENED_AT + timedelta(hours=2)
 LANDED_SHA = 'b' * 40
+
+# The contracted C5 columns, spelled out as the pin rather than imported from the report.
+CONTRACTED_COLUMNS = (
+    'shape', 'candidate', 'incumbent', 'pairs', 'unpaired', 'cap_excluded', 'expired',
+    'failed', 'usable \u0394 [95% CI]', '$/usable cand', '$/usable inc',
+    'credits/usable cand', 'credits/usable inc', 'terminal_kind', 'tags',
+)
 
 USABLE_METRICS: Mapping[str, Any] = {
     'tests_pass': True,
@@ -131,6 +142,20 @@ def seed_scored_cell(
     return scored
 
 
+def seed_two_lines(project: SeededProject) -> ShadowCell:
+    """Four metered pairs for CANDIDATE and two subscription pairs for OTHER_CANDIDATE.
+
+    Returns the first metered cell.
+    """
+    metered = [seed_scored_cell(project, cost_usd=1.0) for _ in range(4)]
+    for credits in (4.0, 2.0):
+        seed_scored_cell(
+            project, candidate=OTHER_CANDIDATE, cost_basis=CostBasis.SUBSCRIPTION,
+            cost_usd=0.5, cost_credits=credits,
+        )
+    return metered[0]
+
+
 async def seed_production_cost(
     db_path: Path, project_id: str, task_id: str, cost_usd: float, completed_at: datetime,
 ) -> None:
@@ -153,3 +178,34 @@ def write_config(tmp_path: Path, project_root: Path, n_min: int) -> Path:
         'shadow_eval': {'n_min': n_min},
     }))
     return path
+
+
+def _row_cells(line: str) -> list[str]:
+    return re.split(r'\s{2,}', line.strip())
+
+
+def _header_index(lines: list[str]) -> int:
+    [index] = [i for i, line in enumerate(lines) if _row_cells(line)[0] == 'shape']
+    return index
+
+
+def table_header(text: str) -> tuple[str, ...]:
+    lines = text.splitlines()
+    return tuple(_row_cells(lines[_header_index(lines)]))
+
+
+def table_rows(text: str) -> list[dict[str, str]]:
+    """The rendered table's rows, each keyed by the header's column names."""
+    lines = text.splitlines()
+    start = _header_index(lines)
+    rows = []
+    for line in lines[start + 1:]:
+        if not line.strip():
+            break
+        rows.append(dict(zip(_row_cells(lines[start]), _row_cells(line), strict=True)))
+    return rows
+
+
+def table_row(text: str, candidate: str) -> dict[str, str]:
+    [row] = [row for row in table_rows(text) if row['candidate'] == candidate]
+    return row
