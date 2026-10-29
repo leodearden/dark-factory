@@ -347,7 +347,8 @@ def _l1_to_l2_promotion(records: list[Escalation], by_id: Mapping[str, Escalatio
     its own filing to the time it joined the cluster (:func:`_member_joined_at`),
     whether or not the L2 is still pending. A member whose join time is unknown
     is counted in ``fold_time_unknown`` and not logged. A missing member, an
-    unparseable time, and a join before filing are skipped with a WARNING.
+    unparseable time, and a join before filing are skipped with a WARNING, as
+    is a whole cluster whose ``member_folded_at`` is not a mapping.
     ``p50_secs``/``p90_secs`` are ``None`` when no delay was measured.
     """
     deltas: list[float] = []
@@ -361,6 +362,12 @@ def _l1_to_l2_promotion(records: list[Escalation], by_id: Mapping[str, Escalatio
             logger.warning(
                 '_l1_to_l2_promotion: unparseable timestamp on L2 cluster %s: %r',
                 l2.id, l2.timestamp,
+            )
+            continue
+        if not isinstance(l2.member_folded_at, dict):
+            logger.warning(
+                '_l1_to_l2_promotion: member_folded_at on L2 cluster %s is not a mapping: %r',
+                l2.id, l2.member_folded_at,
             )
             continue
         for member_id in l2.members:

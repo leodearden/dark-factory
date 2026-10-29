@@ -98,6 +98,24 @@ def test_unstamped_member_filed_after_its_l2_is_counted_not_warned(tmp_path, cap
     assert _warnings(caplog) == []
 
 
+@pytest.mark.parametrize('corrupt', [['esc-301-1'], 'esc-301-1'], ids=['list', 'string'])
+def test_a_non_mapping_fold_stamp_skips_its_cluster_with_a_warning(tmp_path, caplog, corrupt):
+    esc_dir = tmp_path / 'esc'
+    _write_cluster(
+        esc_dir, folded_member_filed_at=_L2_FILED_AT + timedelta(hours=2),
+        member_folded_at=corrupt,
+    )
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        promotion = _promotion(esc_dir, tmp_path / 'runs.db', now=_NOW)
+
+    assert promotion == {
+        'count': 0, 'p50_secs': None, 'p90_secs': None, 'fold_time_unknown': 0,
+    }
+    assert len(_warnings(caplog)) == 1
+    assert 'esc-300-1' in _warnings(caplog)[0]
+
+
 def _l1(queue: EscalationQueue, task_id: str) -> Escalation:
     esc = Escalation(
         id=queue.make_id(task_id), task_id=task_id, agent_role='steward',
