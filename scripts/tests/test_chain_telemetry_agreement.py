@@ -16,7 +16,7 @@ from pathlib import Path
 
 import analyze_speculation_depth
 import merge_lane_throughput
-from canary_predicate_summary import metric, n_deep_verifies
+from canary_predicate_summary import metric, n_deep_verifies, population
 from cli_subprocess_timeout import cli_timeout_from_env
 from orchestrator.chain_telemetry import ChainBucket, summarize_chain_telemetry
 from orchestrator.event_store import EventStore
@@ -111,7 +111,8 @@ class TestReaderAgreement:
         # no duration; 2 is an infra fault.
         assert result.returncode in (0, 1), f'{result.returncode=} {result.stdout=} {result.stderr=}'
         assert n_deep_verifies(result.stdout) == TRUE_DEEP_VERIFIES, result.stdout
-        assert metric(result.stdout, 'deep_fail_rate') == round(TRUE_DEEP_FAIL_RATE, 4), result.stdout
+        # The digest's deep_fail_rate is the RAW rate; the predicate's gated leg excludes item-attributed tips.
+        assert population(result.stdout, 'deep_fail_rate_raw') == round(TRUE_DEEP_FAIL_RATE, 4), result.stdout
         # Its items_per_verify divides by passed deep ROUNDS, not deep verifies, so it is
         # deliberately a different quantity from the digest's per-deep-verify 2.0 (task 7722).
         assert metric(result.stdout, 'items_per_verify') == round(

@@ -415,3 +415,59 @@ class TestItemsPerPassedDeepRound:
         assert result.returncode == 1, f'{result.stdout=} {result.stderr=}'
         assert metric(result.stdout, 'items_per_verify') is None
         assert verdict(result.stdout, 'items_per_verify') == 'FAIL'
+
+
+_TIP_AT = _AS_OF - timedelta(days=2)
+_LATE_TIP_AT = _AS_OF - timedelta(hours=1)
+
+
+def _store_with_failed_tip(make_runs_db, tip_at: datetime, *neighbours, name: str = 'reify.db') -> Path:
+    """7 healthy rounds plus one failed deep tip dispatched by task 7098 at *tip_at*."""
+    failed_tip = _verify_event(tip_at, passed=False, runner='local', duration_ms=600_000, task_id='7098')
+    return make_runs_db([*_healthy_rounds(7), failed_tip, *neighbours], name=name)
+
+
+class TestItemAttributedFailures:
+    @pytest.mark.parametrize(('task_id', 'passed', 'tip_at', 'solo_at', 'attributed'), [
+        pytest.param('7098', False, _TIP_AT, _TIP_AT + timedelta(minutes=15), True, id='solo-failure-after'),
+        pytest.param('7098', False, _TIP_AT, _TIP_AT + timedelta(hours=6), True, id='solo-failure-at-horizon'),
+        pytest.param(
+            '7098', False, _TIP_AT, _TIP_AT + timedelta(hours=6, seconds=1), False, id='solo-failure-past-horizon',
+        ),
+        pytest.param('7098', False, _TIP_AT, _TIP_AT - timedelta(minutes=15), False, id='solo-failure-before-tip'),
+        pytest.param('7098', True, _TIP_AT, _TIP_AT + timedelta(minutes=15), False, id='solo-pass'),
+        pytest.param('7190', False, _TIP_AT, _TIP_AT + timedelta(minutes=15), False, id='another-task'),
+        pytest.param(
+            '7098', False, _LATE_TIP_AT, _AS_OF + timedelta(hours=1), False, id='solo-failure-after-now',
+        ),
+    ])
+    def test_a_failed_tip_is_item_attributed_only_by_its_dispatchers_solo_failure(
+        self, make_runs_db, task_id, passed, tip_at, solo_at, attributed,
+    ):
+        solo = _verify_event(solo_at, passed=passed, chain_items=1, task_id=task_id)
+        store = _store_with_failed_tip(make_runs_db, tip_at, solo)
+
+        result = _run(store, *_NOW_ARGS, '--deep-fail-rate-max', '0.1')
+
+        assert n_deep_verifies(result.stdout) == 8, result.stdout
+        assert population(result.stdout, 'deep_fail_rate_raw') == 0.125
+        if attributed:
+            assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
+            assert metric(result.stdout, 'deep_fail_rate') == 0.0
+            assert population(result.stdout, 'item_attributed_failures') == 1
+        else:
+            assert result.returncode == 1, f'{result.stdout=} {result.stderr=}'
+            assert metric(result.stdout, 'deep_fail_rate') == 0.125
+            assert verdict(result.stdout, 'deep_fail_rate') == 'FAIL'
+            assert population(result.stdout, 'item_attributed_failures') == 0
+
+    def test_attribution_never_crosses_stores(self, make_runs_db):
+        store_a = _store_with_failed_tip(make_runs_db, _TIP_AT, name='reify.db')
+        solo = _verify_event(_TIP_AT + timedelta(minutes=15), passed=False, chain_items=1, task_id='7098')
+        store_b = make_runs_db([solo], name='df.db')
+
+        result = _run_stores([store_a, store_b], *_NOW_ARGS, '--deep-fail-rate-max', '0.1')
+
+        assert result.returncode == 1, f'{result.stdout=} {result.stderr=}'
+        assert metric(result.stdout, 'deep_fail_rate') == 0.125
+        assert population(result.stdout, 'item_attributed_failures') == 0
