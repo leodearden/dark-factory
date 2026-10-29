@@ -358,6 +358,33 @@ class TestReconcileDoneStepCommits:
 
         assert artifacts.read_plan()['steps'][0]['commit'] == 'deadbeef'
 
+    async def test_unreadable_head_files_no_escalation_and_persists_nothing(
+        self, config, git_ops, task_assignment,
+    ):
+        """An unreadable worktree HEAD (unborn branch: ``git rev-parse HEAD``
+        exits 128) must not make every done step look orphaned (task 4068)."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        escalation_queue = MagicMock()
+        escalation_queue.make_id.return_value = 'esc-42-1'
+        workflow, artifacts = _make_workflow(
+            config, git_ops, task_assignment, wt, escalation_queue=escalation_queue,
+        )
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'feature.py').write_text('implementation\n')
+        step_commit = await git_ops.commit(wt, 'feat: GREEN — step-1 implementation')
+        assert step_commit, 'Setup: expected a real commit to be made'
+
+        workflow.plan = _write_done_step_plan(artifacts, 'step-1', step_commit)
+        await _run(['git', 'symbolic-ref', 'HEAD', 'refs/heads/unborn-head'], cwd=wt)
+
+        await workflow._reconcile_done_step_commits()
+
+        escalation_queue.submit.assert_not_called()
+        assert artifacts.read_emitted_step_escalations() == set()
+        assert artifacts.read_plan()['steps'][0]['commit'] == step_commit
+
     # -----------------------------------------------------------------
     # step-5 RED: flag-for-review (non-blocking info escalation) branch
     # -----------------------------------------------------------------
