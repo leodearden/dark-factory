@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 
 from shared.proc_group import terminate_process_group
 from shared.psi import read_psi_sample
+from shared.python_env import without_python_env_selection
 from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
 
 from orchestrator import verify_evidence, verify_plan
@@ -5050,43 +5051,6 @@ async def reap_leftover_verify_scopes(project_root: Path) -> list[str]:
     return reaped
 
 
-# Environment variables that activate a *specific* Python virtualenv / uv
-# project.  The orchestrator runs under `uv run --project orchestrator`, which
-# activates dark-factory/.venv and exports these into our process env.  If they
-# leak into a TARGET project's verify/build/test subprocess, the target's `uv`
-# resolves THIS venv instead of its own and a target `uv sync` writes the
-# target's deps into the orchestrator's runtime interpreter — the 2026-05-29
-# ghost-venv incident (autopilot-video's torch/insightface stack got synced into
-# dark-factory/.venv, flipping it 3.13->3.12 and deleting the live interpreter's
-# stdlib out from under the running orchestrator, which then hit FileNotFoundError
-# every scheduler cycle and stopped dispatching).
-#
-# Denylist, NOT allowlist: reify's cargo verify depends on a broad, evolving set
-# of toolchain/sccache/jobserver vars (RUSTC_WRAPPER, CARGO_*, the jobserver
-# FIFO, ...); an allowlist would silently break Rust verify the first time a new
-# var is needed.  We remove ONLY the python-env-selection vars below plus the
-# orchestrator's own ORCH_* control-plane namespace (see _ORCH_ENV_PREFIX) —
-# the vars that cause a leak — and pass everything else through untouched.
-_VENV_ISOLATION_KEYS: frozenset[str] = frozenset({
-    'VIRTUAL_ENV',
-    'UV_PROJECT_ENVIRONMENT',
-    'UV_PROJECT',
-    'UV_ACTIVE',
-    # Fix 3 may run the orchestrator unit with --frozen; UV_FROZEN / UV_NO_SYNC
-    # must NOT leak to a target, which has to stay free to sync its own deps.
-    'UV_FROZEN',
-    'UV_NO_SYNC',
-    # `uv run` (our ExecStart) sets UV_RUN_RECURSION_DEPTH in our env to guard
-    # against runaway nested invocations.  A target's verify is a logically
-    # independent uv invocation tree, so it must start that counter fresh rather
-    # than inherit our depth — otherwise a uv-based target (dark-factory /
-    # autopilot-video) would `uv run` "pre-loaded" at our depth.
-    'UV_RUN_RECURSION_DEPTH',
-    'CONDA_PREFIX',
-    'CONDA_DEFAULT_ENV',
-    'PYTHONHOME',
-})
-
 # The orchestrator's own control-plane env namespace.  ``OrchestratorConfig`` is
 # a pydantic-settings ``BaseSettings`` whose ``env_settings`` source reads the
 # ENTIRE ``ORCH_`` prefix as config overrides, so ANY ambient ``ORCH_*`` var
@@ -5102,27 +5066,6 @@ _VENV_ISOLATION_KEYS: frozenset[str] = frozenset({
 _ORCH_ENV_PREFIX: str = 'ORCH_'
 
 
-def _strip_venv_bin_from_path(path: str | None, venv: str | None) -> str | None:
-    """Drop the active venv's ``bin`` directory from a PATH string.
-
-    ``uv run`` prepends ``$VIRTUAL_ENV/bin`` to PATH in the orchestrator
-    process, so removing ``VIRTUAL_ENV`` alone is insufficient: the venv's bin
-    dir is still first on PATH and a target's bare ``python`` / ``uv`` / ``pip``
-    would still resolve into the orchestrator venv.  Remove exactly that one
-    component (matched as ``<venv>/bin`` via normpath); every other PATH entry
-    (cargo, sccache, system bins) keeps its order.  Returns *path* unchanged
-    when *path* or *venv* is falsy.
-    """
-    if not path or not venv:
-        return path
-    venv_bin = os.path.normpath(os.path.join(venv, 'bin'))
-    kept = [
-        p for p in path.split(os.pathsep)
-        if p and os.path.normpath(p) != venv_bin
-    ]
-    return os.pathsep.join(kept)
-
-
 def _target_subprocess_env(
     extra: dict[str, str] | None,
     *,
@@ -5131,7 +5074,7 @@ def _target_subprocess_env(
     """Build the subprocess env for a TARGET project's verify/build/test spawn.
 
     Starts from ``os.environ`` minus the orchestrator's own venv/uv activation
-    vars (``_VENV_ISOLATION_KEYS``), minus the orchestrator's ``ORCH_*``
+    vars (``shared.python_env.without_python_env_selection``), minus the orchestrator's ``ORCH_*``
     control-plane namespace (``_ORCH_ENV_PREFIX`` — so an ambient, leaked
     ``ORCH_CONFIG_PATH`` can't make a snapshot-era test load the production
     config; task 2957), and minus the venv ``bin`` dir on PATH, so the target's
@@ -5158,15 +5101,11 @@ def _target_subprocess_env(
     ruff's built-in defaults — a false green.  See pyproject.toml's
     ``[tool.ruff]`` decision block.)
     """
-    venv = os.environ.get('VIRTUAL_ENV')
     env = {
         k: v
-        for k, v in os.environ.items()
-        if k not in _VENV_ISOLATION_KEYS and not k.startswith(_ORCH_ENV_PREFIX)
+        for k, v in without_python_env_selection(os.environ).items()
+        if not k.startswith(_ORCH_ENV_PREFIX)
     }
-    stripped_path = _strip_venv_bin_from_path(env.get('PATH'), venv)
-    if stripped_path is not None:
-        env['PATH'] = stripped_path
     env['PYTHONUNBUFFERED'] = '1'
     # This assignment's POSITION is load-bearing, not incidental: it must stay
     # strictly ABOVE the `extra` overlay so an operator's `verify_env`

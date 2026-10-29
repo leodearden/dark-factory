@@ -99,6 +99,22 @@ class TestAgentSubprocessEnv:
         child = agent_subprocess_env(_environ_with_secrets())
         assert {k for k in child if is_secret_env_name(k)} == {'CLAUDE_CODE_OAUTH_TOKEN'}
 
+    def test_drops_python_env_selection(self):
+        environ = {
+            'VIRTUAL_ENV': '/srv/orch/.venv',
+            'UV_PROJECT_ENVIRONMENT': '/srv/orch/.venv',
+            'UV_RUN_RECURSION_DEPTH': '1',
+            'PATH': '/srv/orch/.venv/bin:/usr/bin:/bin',
+            'CLAUDE_CODE_OAUTH_TOKEN': 'session-' + 's' * 40,
+            'CLAUDE_OAUTH_TOKEN_A': POOL['CLAUDE_OAUTH_TOKEN_A'],
+        }
+        child = agent_subprocess_env(environ)
+        for name in ('VIRTUAL_ENV', 'UV_PROJECT_ENVIRONMENT', 'UV_RUN_RECURSION_DEPTH'):
+            assert name not in child
+        assert child['PATH'] == '/usr/bin:/bin'
+        assert child['CLAUDE_CODE_OAUTH_TOKEN'] == environ['CLAUDE_CODE_OAUTH_TOKEN']
+        assert 'CLAUDE_OAUTH_TOKEN_A' not in child
+
 
 class TestSecretEnvValues:
     def test_maps_every_secret_name_with_a_value(self):
