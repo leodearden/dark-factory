@@ -717,6 +717,49 @@ def _writing_verify_clock() -> FakeClock:
     return FakeClock(tick=_LANE_SECS_PER_READING, content_mtime=1000.0, content_tick=1.0)
 
 
+def _cpu_burning_clock() -> FakeClock:
+    """Lane time for a verify whose process tree burns CPU but writes nothing.
+
+    Every CPU probe reads a different tick sum, the progress a busy pytest
+    that writes its junit only at completion makes (task 5290).
+    """
+    return FakeClock(tick=_LANE_SECS_PER_READING, cpu_ticks=100, cpu_tick=7)
+
+
+def _cpu_idle_clock() -> FakeClock:
+    """Lane time for a wedged verify: its process exists, its ticks never move."""
+    return FakeClock(tick=_LANE_SECS_PER_READING, cpu_ticks=100, cpu_tick=0)
+
+
+def _local_lease() -> Any:
+    from orchestrator.verify_runner import HostLease
+
+    fake_local = MagicMock()
+    fake_local.name = 'local'
+    fake_local.is_local = True
+    return HostLease(name='local', runner=fake_local, is_local=True)
+
+
+def _coasting_remote_lease(never_release: asyncio.Event) -> Any:
+    """A remote lease with no live ssh dispatch whose verify never returns.
+
+    The post-dispatch window: task 2822's cross-check, or a lease-held coast.
+    """
+    from orchestrator.verify_runner import HostLease
+
+    async def _hangs(*args: object, **kwargs: object) -> MagicMock:
+        await never_release.wait()
+        raise AssertionError('unreachable — never_release is never set in this test')
+
+    fake_remote = MagicMock()
+    fake_remote.name = 'remote-host'
+    fake_remote.is_local = False
+    fake_remote.dispatch_in_flight = False
+    fake_remote.run_merge_verify = AsyncMock(side_effect=_hangs)
+    fake_remote.cancel_verify = AsyncMock(return_value=0)
+    return HostLease(name='remote-host', runner=fake_remote, is_local=False)
+
+
 async def _poll_for_lane_budgets(
     verify_future: asyncio.Future,
     worker: Any,
@@ -1495,6 +1538,142 @@ class TestDeadInflightVerifyAborts:
         # Sanity: the abort still lands exactly as it does in the negative
         # twin above (this test's clock must not change behaviour).
         assert result.status == InflightStatus.REQUEUED
+
+    # ── task 5290: the verify process tree's CPU time is progress too ──────
+
+    async def test_cpu_burning_local_verify_that_writes_nothing_is_not_aborted(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """The pytest-junit case: a busy verify that writes only at completion is alive."""
+        release_event = asyncio.Event()
+        req, item = await _make_merged_item(
+            git_ops, config, 'cpu-burn-local-a', 'cbl.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        clock = _cpu_burning_clock()
+        store = _RecordingEventStore()
+        worker = make_lane(
+            git_ops, q,
+            verifier=FakeVerifier(hangs_until(release_event)),
+            clock=clock,
+            event_store=store,
+        )
+        worker._register_owned_merge_worktree(item.merge_wt)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+
+        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, _local_lease()))
+        await _poll_for_lane_budgets(verify_future, worker, clock, budgets=4)
+        release_event.set()
+        result = await asyncio.wait_for(verify_future, timeout=5.0)
+
+        assert result.status is None, f'a CPU-burning verify was aborted: {result.status!r}'
+        assert q.empty()
+        assert _progress_aborts(store) == []
+        assert item.merge_wt in clock.cpu_probes
+
+    async def test_wedged_local_verify_with_zero_cpu_delta_is_still_aborted(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A process that exists but neither burns CPU nor writes is still dead."""
+        from orchestrator.merge_lane.worker import InflightStatus
+
+        never_release = asyncio.Event()
+        req, item = await _make_merged_item(
+            git_ops, config, 'cpu-wedged-local-a', 'cwl.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        clock = _cpu_idle_clock()
+        store = _RecordingEventStore()
+        worker = make_lane(
+            git_ops, q,
+            verifier=FakeVerifier(hangs_until(never_release)),
+            clock=clock,
+            event_store=store,
+        )
+        worker._register_owned_merge_worktree(item.merge_wt)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
+            result = await asyncio.wait_for(
+                worker._run_inflight_verify(item, _local_lease()), timeout=15.0,
+            )
+
+        assert result.status == InflightStatus.REQUEUED
+        assert not q.empty()
+        assert any(
+            req.task_id in r.message and 'progress' in r.message.lower()
+            for r in caplog.records if r.levelno == logging.WARNING
+        ), caplog.text
+        [abort] = _progress_aborts(store)
+        assert (abort['task_id'], abort['lease_kind']) == (req.task_id, 'local')
+        assert item.merge_wt in clock.cpu_probes
+
+    async def test_remote_post_dispatch_cross_check_burning_cpu_is_not_aborted(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """The dispatch returned and the local cross-check burns CPU, writing nothing yet."""
+        never_release = asyncio.Event()
+        req, item = await _make_merged_item(
+            git_ops, config, 'cpu-burn-remote-a', 'cbr.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        clock = _cpu_burning_clock()
+        store = _RecordingEventStore()
+        worker = make_lane(git_ops, q, clock=clock, event_store=store)
+        worker._register_owned_merge_worktree(item.merge_wt)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+
+        verify_future = asyncio.ensure_future(
+            worker._run_inflight_verify(item, _coasting_remote_lease(never_release)),
+        )
+        await _poll_for_lane_budgets(verify_future, worker, clock, budgets=5)
+
+        assert not verify_future.done(), 'a CPU-burning post-dispatch cross-check was aborted'
+        assert q.empty()
+        assert _progress_aborts(store) == []
+        assert item.merge_wt in clock.cpu_probes
+
+        verify_future.cancel()
+        with contextlib.suppress(BaseException):
+            await verify_future
+
+    async def test_remote_coast_with_zero_cpu_delta_is_aborted(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """The same remote shape, wedged: the same trigger aborts it, no is_local gate."""
+        from orchestrator.merge_lane.worker import InflightStatus
+
+        never_release = asyncio.Event()
+        req, item = await _make_merged_item(
+            git_ops, config, 'cpu-wedged-remote-a', 'cwr.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        clock = _cpu_idle_clock()
+        store = _RecordingEventStore()
+        worker = make_lane(git_ops, q, clock=clock, event_store=store)
+        worker._register_owned_merge_worktree(item.merge_wt)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+
+        result = await asyncio.wait_for(
+            worker._run_inflight_verify(item, _coasting_remote_lease(never_release)),
+            timeout=15.0,
+        )
+
+        assert result.status == InflightStatus.REQUEUED
+        assert not q.empty()
+        [abort] = _progress_aborts(store)
+        assert (abort['task_id'], abort['lease_kind']) == (req.task_id, 'remote')
+        assert abort['dispatch_seen_in_flight'] is False
+        assert item.merge_wt in clock.cpu_probes
 
 
 # ---------------------------------------------------------------------------
