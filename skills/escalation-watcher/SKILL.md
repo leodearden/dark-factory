@@ -689,6 +689,22 @@ carries the brief. Check "Always ask — keyed on record content" below first: i
     names has been recovered from `data/escalations/archive/<date>/` and routed: appended to a
     `pending` owner task (line 5), or filed to the owner task of its class. The resolution names
     where each note went (Leo, 2026-10-22, on scoping_intake's esc-__stale_l0_strand_sweep__-6).
+11. Cancelling a task auto-filed by the completion-claim gate (`spawned_from: unverified-claim-<n>`)
+    whose flagged claim is TRUE, with `resolve_issue(action='abandon')` on its L2. Verify yourself
+    against the authority in the project the claim names: the cited task's status and
+    `done_provenance`, and `git merge-base --is-ancestor <commit> main` in that project's repo. The
+    task must have no dependents, no branch commits (`git rev-list --count main..task/<id>` is 0)
+    and no pin. A FALSE claim needs corpus repair, so it still goes to Leo (Leo, 2026-10-29,
+    solar_challenge_platform esc-1558-2; precedent esc-1185-2).
+12. Marking a task done `found_on_main` when another task's commit already delivered its whole
+    outcome, then `close_only` on its L2. Verify yourself: the delivering commit is an ancestor of
+    main, and every item of the task's ask is present on main (read the file, and grep for the text
+    it says to remove). Pass `done_provenance` naming the delivering task and commit. The task must
+    have no branch commits and no pin. Any item not on main sends it to Leo (Leo, 2026-10-29,
+    solar_challenge_platform esc-1556-2; precedents 1470, 1058, 683).
+
+Lines 11 and 12 are exceptions to the scope-change class below. Cancelling a task WITH dependents
+still goes to Leo.
 
 #### Always ask — keyed on record content
 
