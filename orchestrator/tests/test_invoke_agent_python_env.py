@@ -121,6 +121,7 @@ _SPAWN_PATHS = [
 async def test_child_inherits_no_python_env_selection(agent_child, tmp_path, spawn_path):
     workdir = tmp_path / 'work'
     workdir.mkdir()
+    parent_env_before = dict(os.environ)
 
     with spawn_path.context():
         result = await invoke_agent(
@@ -141,4 +142,4 @@ async def test_child_inherits_no_python_env_selection(agent_child, tmp_path, spa
     for name in _SELECTION_NAMES:
         assert name not in env
     assert env['PATH'].split(os.pathsep) == agent_child.expected_path
-    assert 'VIRTUAL_ENV' in os.environ, 'the orchestrator keeps its own venv'
+    assert dict(os.environ) == parent_env_before, 'the orchestrator keeps its own env'

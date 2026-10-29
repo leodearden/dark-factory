@@ -95,10 +95,10 @@ venv can even be a different interpreter (measured: several `.worktrees/*/.venv`
 3.14.0 against main's 3.13.9). Before that it has no `.venv` at all. A
 dispatched agent's shell has no venv: every agent spawn path drops
 `VIRTUAL_ENV`, uv's project vars and the venv's `bin` from `PATH`
-(`shared/src/shared/secret_env.py::agent_subprocess_env`, built on
-`shared/src/shared/python_env.py::without_python_env_selection`). There a bare
-`python` is the system 3.12, so name the checkout's own `.venv/bin/python`
-instead in the recipes below. An interactive session keeps its launching
+(`shared/src/shared/python_env.py::without_python_env_selection`, which Claude
+spawns reach via `shared/src/shared/secret_env.py::agent_subprocess_env`).
+There a bare `python` is the system interpreter (3.12 on this host), so name
+the checkout's own `.venv/bin/python` instead in the recipes below. An interactive session keeps its launching
 shell's env, often main's `VIRTUAL_ENV` even in a worktree.
 
 So the venv path is **not derivable from your cwd**. Ask the interpreter; never

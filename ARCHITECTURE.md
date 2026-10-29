@@ -1052,9 +1052,10 @@ a defense is active when it isn't:
   shell's environment, often main's `VIRTUAL_ENV`, so a first-party
   `import` there can resolve main's editable source instead of the
   worktree's edits. A dispatched agent's shell carries no Python-env
-  selection (`shared/src/shared/secret_env.py::agent_subprocess_env`, built
-  on `shared/src/shared/python_env.py::without_python_env_selection`; task
-  7399), so it meets this only by naming main's `.venv/bin/python` in a
+  selection (`shared/src/shared/python_env.py::without_python_env_selection`,
+  which Claude spawns reach via
+  `shared/src/shared/secret_env.py::agent_subprocess_env`; task 7399), so it
+  meets this only by naming main's `.venv/bin/python` in a
   worktree with no `.venv` yet; its bare `python` is the system
   interpreter. Verify is unaffected —
   `orchestrator/src/orchestrator/verify.py::_target_subprocess_env` applies
