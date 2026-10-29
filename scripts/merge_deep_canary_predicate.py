@@ -36,8 +36,13 @@ aggressiveness assessment) retunes them against real canary telemetry.
   deep_fail_rate   <= 0.35  failed deep verifies / deep verifies. The replay
                             study saw 2/59 ~= 0.034, so this is a loose gate.
   items_per_verify >= 1.3   the merge_finalized ``landed_via_chain`` sum (items
-                            a chain landed) / deep verifies: a chain must land
-                            materially more than one item per verify.
+                            a chain landed) / passed deep ROUNDS: a chain must
+                            land materially more than one item per round. A
+                            passed deep round is a distinct (store, merge_sha)
+                            over deep verifies with a str ``merge_sha``,
+                            ``attempt`` 0 and ``passed`` true, so a re-dispatch
+                            of the same tip and a failed tip, which land
+                            nothing, do not dilute it. No passed round -> n/a.
   verify_p90_secs  <= 5400  nearest-rank p90 of the deep verifies' payload
                             ``duration_ms`` (75% of the 7200 s verify timeout);
                             the events.duration_ms column is NULL for this
@@ -47,8 +52,9 @@ aggressiveness assessment) retunes them against real canary telemetry.
 A leg with no value FAILs: a canary that never exercised chains must not
 silently promote.
 
-STDOUT. The store lines, then either the insufficient_signal line or the
-verdict line, always LAST:
+STDOUT. The store lines, then a ``populations: <name>=<value> ...`` line
+carrying the pooled populations behind the legs, then either the
+insufficient_signal line or the verdict line, always LAST:
 ``merge-deep-canary window_days=7 n_deep_verifies=N: <leg>=<value>(ok|FAIL
 <bound>) ... -> PASS|HOLD``. DeterministicRunner keeps only that final line as
 the done-provenance note.
@@ -119,6 +125,24 @@ class StoreSample:
     @property
     def deep(self) -> tuple[VerifyRow, ...]:
         return tuple(row for row in self.verifies if row.is_deep)
+
+    @property
+    def passed_deep_rounds(self) -> int:
+        return len({
+            row.merge_sha for row in self.deep
+            if row.merge_sha is not None and row.attempt == 0 and row.passed
+        })
+
+
+@dataclass(frozen=True)
+class Pool:
+    """The deep-verify populations every leg reads, summed across stores."""
+
+    n_deep: int
+    failures: int
+    landed_via_chain: int
+    passed_deep_rounds: int
+    durations: tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -308,21 +332,34 @@ def _sampled_p90(xs: Sequence[float], minimum: int) -> float | None:
     return pct(xs, 0.90) if len(xs) >= minimum else None
 
 
-def _legs(samples: Sequence[StoreSample], settings: Settings) -> list[Leg]:
+def _pool(samples: Sequence[StoreSample]) -> Pool:
     deep = [row for sample in samples for row in sample.deep]
-    failures = sum(1 for row in deep if not row.passed)
-    landed = sum(sample.landed_via_chain for sample in samples)
-    durations = [row.duration_secs for row in deep if row.duration_secs is not None]
-    p90 = _sampled_p90(durations, settings.min_deep_verifies)
+    return Pool(
+        n_deep=len(deep),
+        failures=sum(1 for row in deep if not row.passed),
+        landed_via_chain=sum(sample.landed_via_chain for sample in samples),
+        passed_deep_rounds=sum(sample.passed_deep_rounds for sample in samples),
+        durations=tuple(row.duration_secs for row in deep if row.duration_secs is not None),
+    )
+
+
+def _legs(pool: Pool, settings: Settings) -> list[Leg]:
+    fail_rate = _ratio(pool.failures, pool.n_deep)
+    items = _ratio(pool.landed_via_chain, pool.passed_deep_rounds)
+    p90 = _sampled_p90(pool.durations, settings.min_deep_verifies)
     return [
-        Leg('deep_fail_rate', _ratio(failures, len(deep)), settings.deep_fail_rate_max, at_most=True),
-        Leg('items_per_verify', _ratio(landed, len(deep)), settings.items_per_verify_min, at_most=False),
+        Leg('deep_fail_rate', fail_rate, settings.deep_fail_rate_max, at_most=True),
+        Leg('items_per_verify', items, settings.items_per_verify_min, at_most=False),
         Leg('verify_p90_secs', p90, settings.verify_p90_max_secs, at_most=True),
     ]
 
 
 def _store_line(sample: StoreSample) -> str:
-    return f'store {sample.path}: n_deep={len(sample.deep)}'
+    return f'store {sample.path}: n_deep={len(sample.deep)} passed_deep_rounds={sample.passed_deep_rounds}'
+
+
+def _populations_line(pool: Pool) -> str:
+    return f'populations: landed_via_chain={pool.landed_via_chain} passed_deep_rounds={pool.passed_deep_rounds}'
 
 
 def _verdict_line(n_deep: int, legs: Sequence[Leg], window: Window) -> str:
@@ -338,14 +375,15 @@ def main(argv: Sequence[str]) -> int:
     except PredicateFault as fault:
         print(f'predicate: {fault}', file=sys.stderr)
         return 2
+    pool = _pool(samples)
     for sample in samples:
         print(_store_line(sample))
-    n_deep = sum(len(sample.deep) for sample in samples)
-    if n_deep < settings.min_deep_verifies:
-        print(f'insufficient_signal n_deep_verifies={n_deep} (< {settings.min_deep_verifies})')
+    print(_populations_line(pool))
+    if pool.n_deep < settings.min_deep_verifies:
+        print(f'insufficient_signal n_deep_verifies={pool.n_deep} (< {settings.min_deep_verifies})')
         return 1
-    legs = _legs(samples, settings)
-    print(_verdict_line(n_deep, legs, settings.window))
+    legs = _legs(pool, settings)
+    print(_verdict_line(pool.n_deep, legs, settings.window))
     return 0 if all(leg.passed for leg in legs) else 1
 
 

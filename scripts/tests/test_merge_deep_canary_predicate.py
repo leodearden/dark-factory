@@ -383,6 +383,7 @@ class TestItemsPerPassedDeepRound:
             dict(merge_sha='tip-a', attempt=1, passed=True),
             dict(merge_sha='tip-b', attempt=0, passed=False),
             dict(merge_sha='tip-c', attempt=0, passed=True),
+            dict(merge_sha='tip-c', attempt=0, passed=True),
             dict(merge_sha=_ABSENT, attempt=0, passed=True),
         ]
         events = []
