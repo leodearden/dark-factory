@@ -19,6 +19,8 @@ from _distinct_git_repo import init_distinct_git_repo
 from _fm_helpers import load_script_module
 from shared.project_layout import tasks_db
 
+from fused_memory.backends.falkor_read_only import RO_COMMAND
+
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'audit_unverified_completion_claims.py'
 )
@@ -37,7 +39,6 @@ vars_of = _mod.vars_of
 UNRESOLVABLE = _mod.UNRESOLVABLE
 build_report = _mod.build_report
 _build_parser = _mod._build_parser
-RO_COMMAND = _mod.RO_COMMAND
 EpisodeReader = _mod.EpisodeReader
 EPISODE_CYPHER = _mod.EPISODE_CYPHER
 PROJECTED_FIELDS = _mod.PROJECTED_FIELDS
@@ -903,6 +904,11 @@ class TestEpisodeReader:
         batch = await EpisodeReader(graph=graph).fetch_derived_edges_batch(['ep-1'])
         assert batch == {'ep-1': ('edge-scalar',)}
 
+    async def test_the_derived_edge_batch_reaches_the_store_with_its_uuids(self) -> None:
+        graph = _FakeGraph(edge_rows=[])
+        await EpisodeReader(graph=graph).fetch_derived_edges_batch(['ep-1', 'ep-2'])
+        assert [params for _query, params in graph.queries] == [{'uuids': ['ep-1', 'ep-2']}]
+
     async def test_empty_batch_issues_no_query(self) -> None:
         graph = _FakeGraph()
         assert await EpisodeReader(graph=graph).fetch_derived_edges_batch([]) == {}
@@ -966,7 +972,8 @@ class TestEpisodeReader:
         graph = _FakeGraph(rows=[_episode_row()])
         reader = EpisodeReader(graph=graph)
         await reader.fetch_population()
-        assert reader._graph is graph
+        # The injected double served the read, so no lazily opened client replaced it.
+        assert graph.queries
 
 
 class _FakeReader:
