@@ -139,11 +139,13 @@ class TestVerifyP90ReadsThePayloadDuration:
     def test_p90_comes_from_the_merge_verify_payload(self, runs_db_path, runs_db):
         for k in range(1, 11):
             _seed_verify(runs_db, _recent(k), passed=True, duration_ms=60_000 * k)
+            _seed_verify(runs_db, _recent(k), passed=True, chain_items=1, duration_ms=600_000)
             _seed_finalized(runs_db, _recent(k), landed_via_chain=2)
 
         result = _run(runs_db_path)
 
         assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
+        assert verdict(result.stdout, 'verify_p90_ratio') == 'ok'
         assert metric(result.stdout, 'verify_p90_secs') == 540.0
         assert metric(result.stdout, 'deep_fail_rate') == 0.0
         assert metric(result.stdout, 'items_per_verify') == 2.0
@@ -164,11 +166,13 @@ class TestVerifyP90ReadsThePayloadDuration:
     def test_non_numeric_payload_durations_are_not_durations(self, runs_db_path, runs_db):
         for i, duration_ms in enumerate((True, None, '600000', _ABSENT, float('nan'), float('inf'), 300_000)):
             _seed_verify(runs_db, _recent(i), passed=True, duration_ms=duration_ms)
+            _seed_verify(runs_db, _recent(i), passed=True, chain_items=1, duration_ms=600_000)
             _seed_finalized(runs_db, _recent(i), landed_via_chain=2)
 
         result = _run(runs_db_path, '--min-deep-verifies', '1')
 
         assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
+        assert verdict(result.stdout, 'verify_p90_ratio') == 'ok'
         assert metric(result.stdout, 'verify_p90_secs') == 300.0
 
 
@@ -263,6 +267,8 @@ class TestUsageFaultsExitTwo:
         ('--min-deep-verifies', '-1'),
         ('--min-deep-verifies', 'eight'),
         ('--min-deep-verifies', '2.5'),
+        ('--p90-ratio-max', 'nan'),
+        ('--p90-ratio-max', 'x'),
     ])
     def test_malformed_numeric_flag_is_a_usage_fault(self, runs_db_path, flag, value):
         result = _run(runs_db_path, flag, value)
@@ -471,3 +477,77 @@ class TestItemAttributedFailures:
         assert result.returncode == 1, f'{result.stdout=} {result.stderr=}'
         assert metric(result.stdout, 'deep_fail_rate') == 0.125
         assert population(result.stdout, 'item_attributed_failures') == 0
+
+
+class TestSameRunnerP90Ratio:
+    def test_local_deep_verifies_at_local_speed_pass_the_ratio(self, make_runs_db):
+        store = make_runs_db(_healthy_rounds(8, deep_ms=9_000_000, baseline_ms=8_000_000), name='reify.db')
+
+        lifted = _run(store, *_NOW_ARGS, '--verify-p90-max-secs', '10800')
+        default = _run(store, *_NOW_ARGS)
+
+        assert lifted.returncode == 0, f'{lifted.stdout=} {lifted.stderr=}'
+        assert metric(lifted.stdout, 'verify_p90_ratio') == 1.125
+        assert verdict(lifted.stdout, 'verify_p90_ratio') == 'ok'
+        assert metric(lifted.stdout, 'verify_p90_secs') == 9000.0
+        assert verdict(lifted.stdout, 'verify_p90_secs') == 'ok'
+        assert default.returncode == 1, f'{default.stdout=} {default.stderr=}'
+        assert verdict(default.stdout, 'verify_p90_ratio') == 'ok'
+        assert verdict(default.stdout, 'verify_p90_secs') == 'FAIL'
+
+    def test_a_deep_verify_slow_for_its_runner_holds(self, make_runs_db):
+        store = make_runs_db(
+            _healthy_rounds(8, runner='laptop', deep_ms=2_000_000, baseline_ms=1_000_000), name='reify.db',
+        )
+
+        default = _run(store, *_NOW_ARGS)
+        loosened = _run(store, *_NOW_ARGS, '--p90-ratio-max', '2.5')
+
+        assert default.returncode == 1, f'{default.stdout=} {default.stderr=}'
+        assert metric(default.stdout, 'verify_p90_ratio') == 2.0
+        assert verdict(default.stdout, 'verify_p90_ratio') == 'FAIL'
+        assert metric(default.stdout, 'verify_p90_secs') == 2000.0
+        assert verdict(default.stdout, 'verify_p90_secs') == 'ok'
+        assert loosened.returncode == 0, f'{loosened.stdout=} {loosened.stderr=}'
+
+    def test_each_runner_is_its_own_baseline(self, make_runs_db):
+        local = _healthy_rounds(4, runner='local', deep_ms=9_000_000, baseline_ms=9_000_000)
+        laptop = _healthy_rounds(
+            4, first=_AS_OF - timedelta(days=2), runner='laptop', deep_ms=2_000_000, baseline_ms=1_000_000,
+        )
+        store = make_runs_db([*local, *laptop], name='reify.db')
+
+        result = _run(store, *_NOW_ARGS, '--verify-p90-max-secs', '10800')
+
+        assert result.returncode == 1, f'{result.stdout=} {result.stderr=}'
+        assert metric(result.stdout, 'verify_p90_ratio') == 2.0
+        assert verdict(result.stdout, 'verify_p90_ratio') == 'FAIL'
+
+    def test_the_same_runner_name_is_baselined_per_store(self, make_runs_db):
+        store_a = make_runs_db(_healthy_rounds(4, deep_ms=8_000_000, baseline_ms=8_000_000), name='reify.db')
+        store_b = make_runs_db(_healthy_rounds(4, deep_ms=2_000_000, baseline_ms=1_000_000), name='df.db')
+
+        result = _run_stores([store_a, store_b], *_NOW_ARGS, '--verify-p90-max-secs', '10800')
+
+        assert result.returncode == 1, f'{result.stdout=} {result.stderr=}'
+        assert metric(result.stdout, 'verify_p90_ratio') == 2.0
+        assert verdict(result.stdout, 'verify_p90_ratio') == 'FAIL'
+
+    def test_a_deep_verify_without_a_same_runner_baseline_has_no_ratio(self, make_runs_db):
+        first = _AS_OF - timedelta(days=3)
+        events = []
+        for k in range(8):
+            at = first + timedelta(hours=k)
+            events += [
+                _verify_event(at, passed=True, runner='remote-x'),
+                _verify_event(at - timedelta(minutes=1), passed=True, chain_items=1, runner='local'),
+                _finalized_event(at + timedelta(minutes=1), landed_via_chain=2),
+            ]
+        store = make_runs_db(events, name='reify.db')
+
+        result = _run(store, *_NOW_ARGS)
+
+        assert result.returncode == 1, f'{result.stdout=} {result.stderr=}'
+        assert metric(result.stdout, 'verify_p90_ratio') is None
+        assert verdict(result.stdout, 'verify_p90_ratio') == 'FAIL'
+        assert metric(result.stdout, 'verify_p90_secs') == 600.0
