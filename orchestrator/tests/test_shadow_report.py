@@ -6,12 +6,15 @@ and real production invocations, all seeded through ``_shadow_report_seed``.
 
 from __future__ import annotations
 
+import json
+import re
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
 from _shadow_report_seed import (
     CANDIDATE,
+    INCUMBENT,
     OPENED_AT,
     PROJECT_ID,
     SeededProject,
@@ -29,7 +32,9 @@ from orchestrator.evals.shadow_report import (
     RunsDbMissingError,
     ShadowReport,
     read_shadow_report,
+    render_text,
 )
+from orchestrator.run_store import ShadowCell
 from orchestrator.shadow_types import CostBasis, ReferenceKind, ShadowCellState, ShadowShape
 
 _OTHER = 'kimi-k2-endpoint'
@@ -300,3 +305,185 @@ async def test_a_settled_row_with_an_incoherent_reference_is_refused_naming_the_
 
     with pytest.raises(ValueError, match=incoherent.cell_id):
         await _report(project)
+
+
+# The contracted C5 columns, spelled out here as the pin rather than imported.
+_COLUMNS = (
+    'shape', 'candidate', 'incumbent', 'pairs', 'unpaired', 'cap_excluded', 'expired',
+    'failed', 'usable \u0394 [95% CI]', '$/usable cand', '$/usable inc',
+    'credits/usable cand', 'credits/usable inc', 'terminal_kind', 'tags',
+)
+_N_MIN = 3
+
+
+def _seed_two_lines(project: SeededProject) -> ShadowCell:
+    """A metered line of four pairs and an under-n_min subscription line of two."""
+    metered = [seed_scored_cell(project, cost_usd=1.0) for _ in range(4)]
+    for credits in (4.0, 2.0):
+        seed_scored_cell(
+            project, candidate=_OTHER, cost_basis=CostBasis.SUBSCRIPTION,
+            cost_usd=0.5, cost_credits=credits,
+        )
+    return metered[0]
+
+
+def _cells_of(row: str) -> list[str]:
+    return re.split(r'\s{2,}', row.strip())
+
+
+def _table(text: str) -> list[dict[str, str]]:
+    lines = text.splitlines()
+    [start] = [i for i, line in enumerate(lines) if _cells_of(line)[0] == 'shape']
+    rows = []
+    for line in lines[start + 1:]:
+        if not line.strip():
+            break
+        rows.append(dict(zip(_cells_of(lines[start]), _cells_of(line), strict=True)))
+    return rows
+
+
+def _row(text: str, candidate: str) -> dict[str, str]:
+    [row] = [row for row in _table(text) if row['candidate'] == candidate]
+    return row
+
+
+class TestRenderText:
+    @pytest.mark.asyncio
+    async def test_the_table_header_is_exactly_the_contracted_columns(self, project):
+        _seed_two_lines(project)
+
+        text = render_text(await _report(project, n_min=_N_MIN))
+
+        [header] = [line for line in text.splitlines() if _cells_of(line)[0] == 'shape']
+        assert tuple(_cells_of(header)) == _COLUMNS
+
+    @pytest.mark.asyncio
+    async def test_the_preamble_names_the_store_shape_and_n_min_basis(self, project):
+        _seed_two_lines(project)
+
+        text = render_text(await _report(project, n_min=_N_MIN))
+        preamble = text.split('\n\n')[0]
+
+        for fact in (PROJECT_ID, str(project.db_path), 'implementer', f'n_min {_N_MIN}'):
+            assert fact in preamble
+        assert 'provisional' in preamble
+        assert 'not a power calculation' in preamble
+
+    @pytest.mark.asyncio
+    async def test_an_underpowered_line_prints_tagged_never_hidden(self, project):
+        _seed_two_lines(project)
+
+        text = render_text(await _report(project, n_min=_N_MIN))
+
+        assert 'UNDERPOWERED' in _row(text, _OTHER)['tags']
+        assert _row(text, CANDIDATE)['tags'] == '-'
+
+    @pytest.mark.asyncio
+    async def test_only_an_imputed_dollar_figure_is_tagged_imputed(self, project):
+        _seed_two_lines(project)
+
+        text = render_text(await _report(project, n_min=_N_MIN))
+
+        assert 'imputed' in _row(text, _OTHER)['$/usable cand']
+        assert 'imputed' not in _row(text, CANDIDATE)['$/usable cand']
+        assert all('imputed' not in row['$/usable inc'] for row in _table(text))
+
+    @pytest.mark.asyncio
+    async def test_a_figure_that_does_not_exist_prints_a_dash(self, project):
+        _seed_two_lines(project)
+
+        text = render_text(await _report(project, n_min=_N_MIN))
+
+        assert _row(text, CANDIDATE)['credits/usable cand'] == '-'
+        assert {row['credits/usable inc'] for row in _table(text)} == {'-'}
+        assert _row(text, _OTHER)['credits/usable cand'] != '-'
+
+    @pytest.mark.asyncio
+    async def test_a_missing_result_is_tagged_and_named_and_the_report_says_incomplete(
+        self, project,
+    ):
+        gone = _seed_two_lines(project)
+        assert gone.result_path is not None
+        gone.result_path.unlink()
+
+        text = render_text(await _report(project, n_min=_N_MIN))
+
+        assert 'result_missing' in _row(text, CANDIDATE)['tags']
+        [detail] = [line for line in text.splitlines() if line.startswith('result_missing:')]
+        for fact in (gone.cell_id, gone.task_id, str(gone.result_path)):
+            assert fact in detail
+        assert text.rstrip().splitlines()[-1].startswith('INCOMPLETE')
+
+    @pytest.mark.asyncio
+    async def test_a_report_with_no_lines_says_so(self, project):
+        text = render_text(await _report(project))
+
+        assert 'no shadow cells match' in text
+        assert 'INCOMPLETE' not in text
+
+
+_LINE_KEYS = {
+    'shape', 'candidate', 'incumbent', 'cost_basis', 'pairs', 'unpaired', 'cap_excluded',
+    'expired', 'failed', 'primary_outcome', 'candidate_cost', 'incumbent_cost',
+    'terminal_kind', 'tags', 'result_missing',
+}
+_COST_KEYS = {'usd_per_usable', 'usd_imputed', 'credits_per_usable', 'cost_basis'}
+
+
+class TestToDict:
+    @pytest.mark.asyncio
+    async def test_the_json_form_carries_every_contracted_field(self, project):
+        _seed_two_lines(project)
+
+        payload = json.loads(json.dumps((await _report(project, n_min=_N_MIN)).to_dict()))
+
+        assert {'project_id', 'shape', 'n_min', 'complete', 'lines'} <= set(payload)
+        assert (payload['project_id'], payload['shape']) == (PROJECT_ID, 'implementer')
+        assert (payload['n_min'], payload['complete']) == (_N_MIN, True)
+        for line in payload['lines']:
+            assert set(line) == _LINE_KEYS
+            assert set(line['primary_outcome']) == {
+                'name', 'n', 'mean_difference', 'ci95_low', 'ci95_high',
+            }
+            assert line['primary_outcome']['name'] == 'usable'
+            assert set(line['candidate_cost']) == _COST_KEYS
+            assert set(line['incumbent_cost']) == _COST_KEYS
+            assert line['incumbent'] == INCUMBENT
+            assert line['incumbent_cost']['cost_basis'] == 'metered'
+        imputed = [line for line in payload['lines'] if line['candidate'] == _OTHER]
+        assert [line['candidate_cost']['usd_imputed'] for line in imputed] == [True]
+        assert [line['cost_basis'] for line in imputed] == ['subscription']
+
+    @pytest.mark.asyncio
+    async def test_a_missing_result_appears_in_the_json_and_marks_it_incomplete(self, project):
+        gone = _seed_two_lines(project)
+        assert gone.result_path is not None
+        gone.result_path.unlink()
+
+        payload = json.loads(json.dumps((await _report(project, n_min=_N_MIN)).to_dict()))
+
+        assert payload['complete'] is False
+        [line] = [line for line in payload['lines'] if line['candidate'] == CANDIDATE]
+        [gap] = line['result_missing']
+        assert (gap['cell_id'], gap['task_id']) == (gone.cell_id, gone.task_id)
+        assert gap['result_path'] == str(gone.result_path)
+        assert gap['detail']
+        assert 'result_missing' in line['tags']
+
+    @pytest.mark.asyncio
+    async def test_the_json_lines_and_the_table_rows_are_the_same_rows(self, project):
+        gone = _seed_two_lines(project)
+        assert gone.result_path is not None
+        gone.result_path.unlink()
+        report = await _report(project, n_min=_N_MIN)
+
+        from_json = [
+            (line['candidate'], line['incumbent'], line['pairs'], line['tags'])
+            for line in report.to_dict()['lines']
+        ]
+        from_text = [
+            (row['candidate'], row['incumbent'], int(row['pairs']),
+             [] if row['tags'] == '-' else row['tags'].split(','))
+            for row in _table(render_text(report))
+        ]
+        assert from_json == from_text
