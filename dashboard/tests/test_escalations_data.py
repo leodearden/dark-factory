@@ -707,6 +707,65 @@ class TestBuildEscalationQueuesSubsections:
         assert shaped['ESCALATIONS']['summary']['skipped_count'] == 2
 
 
+def _dependency_capability_record(owner) -> dict:
+    """A ``dependency_capability`` escalation as orchestrator/src/orchestrator/harness.py files it."""
+    from escalation.models import Escalation
+
+    return Escalation(
+        id='esc-7600-1', task_id='7600', agent_role='orchestrator-scheduler',
+        severity='critical', category='dependency_capability',
+        summary='delivered check graph-index-provisioned fails on main', level=2,
+        timestamp='2026-09-01T00:00:00+00:00', delivered_check_owner=owner,
+    ).to_dict()
+
+
+def _served_rows(config) -> list[dict]:
+    """Every row of *config*'s corpus as ``/escalations`` serves it: shaped, then JSON round-tripped."""
+    from dashboard.data import redux_api
+    from dashboard.data.escalations import card_datums
+
+    built = _build(config)
+    body = json.loads(json.dumps(
+        redux_api.shape_escalations(built, card_datums(built, {}), served_at=NOW),
+    ))
+    return [row for sub in body['ESCALATIONS']['subsections'] for row in sub['escalations']]
+
+
+class TestDeliveredCheckOwnerReachesTheWire:
+    """Task 7725: a record's ``delivered_check_owner`` reaches the served row verbatim.
+
+    The sidebar renders the owning task, its declaration sites and the
+    sidecar's on_main state from this one field, so the data layer must carry
+    it whole. A record written before task 7514 still serves the key, as null.
+    """
+
+    @pytest.mark.parametrize('owner', [
+        {'task_id': '7514', 'check_name': 'graph-index-provisioned',
+         'sidecar': {'path': 'plans/x.capabilities.yaml', 'on_main': 'declares'}},
+        {'task_id': '7514', 'check_name': 'graph-index-provisioned', 'sidecar': None},
+    ], ids=['declaring-sidecar', 'no-sidecar'])
+    def test_the_owner_is_served_verbatim(self, tmp_path, owner):
+        primary = tmp_path / 'primary'
+        config = _config(primary)
+        _put(_queues_dir(primary), _dependency_capability_record(owner))
+
+        (row,) = _served_rows(config)
+
+        assert row['delivered_check_owner'] == owner
+
+    def test_a_record_written_without_the_key_serves_null(self, tmp_path):
+        primary = tmp_path / 'primary'
+        config = _config(primary)
+        record = _dependency_capability_record(None)
+        del record['delivered_check_owner']
+        _put(_queues_dir(primary), record)
+
+        (row,) = _served_rows(config)
+
+        assert 'delivered_check_owner' in row
+        assert row['delivered_check_owner'] is None
+
+
 class TestOwnerAttribution:
     """Each row's owning root: its queue's, or — for reconciliation — worktree, then active rows."""
 
