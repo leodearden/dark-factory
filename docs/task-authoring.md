@@ -989,7 +989,9 @@ A path whose extension is not on the lock-charter allowlist (for example
 `tasks.db`) is refused earlier, as a "directory declaration" with
 `LockCharterViolation`, so this lint never sees it. That rejection lists
 such paths under `unrecognised_extension_paths`, and its hint gives the same
-`task_kind='deterministic'` routing as this lint. Leave a gitignored path out
+`task_kind='deterministic'` routing as this lint. An upper-case spelling of a
+listed extension, such as `README.MD`, is not listed there: it gets only the
+advice to lowercase the extension. Leave a gitignored path out
 of `metadata.files` whatever the `task_kind`: the lock-charter check runs
 first and classifies it as a directory either way.
 

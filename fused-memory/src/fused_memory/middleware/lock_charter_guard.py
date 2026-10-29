@@ -333,6 +333,17 @@ def extract_files(metadata: str | dict[str, Any] | None) -> list[str]:
     return [f for f in files if isinstance(f, str)]
 
 
+def _allowlist_lockstep(vector: str, reify_var: str, reify_flag: str, test_vector: str) -> str:
+    """Name every home of the allowlist *vector*, which must all change together."""
+    return (
+        f'{vector} in BOTH shared/src/shared/locking.py and '
+        'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, '
+        f'AND to reify scripts/lock-charter-guard.sh {reify_var} (all three '
+        f'must agree — the Tier-2 {reify_flag} drift guard goes RED '
+        f'otherwise), plus the {test_vector} vector in both test copies.'
+    )
+
+
 _DIRECTORY_HINT = (
     'Replace each directory with the specific file paths it contains, '
     'or use files=[] (the defer-to-architect value) to leave scope '
@@ -347,19 +358,21 @@ _DIRECTORY_HINT = (
     '(e.g. "hooks/project-checks"): an extension-less final segment '
     'counts as a file only when its exact name is listed in '
     'EXTENSIONLESS_FILENAMES. If it is a genuinely new extension-less '
-    'tracked file, add its name to EXTENSIONLESS_FILENAMES in BOTH '
-    'shared/src/shared/locking.py and '
-    'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, '
-    'AND to reify scripts/lock-charter-guard.sh _EXTLESS (all three '
-    'must agree — the Tier-2 --list-extensionless drift guard goes RED '
-    'otherwise), plus the _CANONICAL_EXTENSIONLESS vector in both test '
-    'copies.'
+    'tracked file, add its name to '
+    + _allowlist_lockstep(
+        'EXTENSIONLESS_FILENAMES', '_EXTLESS', '--list-extensionless', '_CANONICAL_EXTENSIONLESS',
+    )
 )
 
 
-def _has_extension(path: str) -> bool:
-    """True iff *path* is not slash-terminated and its final segment contains a dot."""
-    return not path.endswith('/') and '.' in path.rsplit('/', 1)[-1]
+def _has_unrecognised_extension(path: str) -> bool:
+    """True iff *path* is not slash-terminated and its final segment's extension is unlisted in any case."""
+    segment = path.rsplit('/', 1)[-1]
+    return (
+        not path.endswith('/')
+        and '.' in segment
+        and segment.rsplit('.', 1)[1].lower() not in FILE_EXTENSIONS
+    )
 
 
 def _unrecognised_extension_error(paths: list[str]) -> str:
@@ -381,12 +394,8 @@ def _unrecognised_extension_hint(paths: list[str]) -> str:
         f'hands the same failure to the architect. {DETERMINISTIC_ROUTING_HINT} '
         'Whatever the task_kind, leave a gitignored path out of '
         'metadata.files: this check classifies it as a directory either way. '
-        'If it is instead a TRACKED file, add its extension to FILE_EXTENSIONS '
-        'in BOTH shared/src/shared/locking.py and '
-        'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, AND to '
-        'reify scripts/lock-charter-guard.sh _EXTS (the Tier-2 '
-        '--list-extensions drift guard goes RED otherwise), plus the '
-        '_CANONICAL_EXTENSIONS vector in both test copies.'
+        'If it is instead a TRACKED file, add its extension to '
+        + _allowlist_lockstep('FILE_EXTENSIONS', '_EXTS', '--list-extensions', '_CANONICAL_EXTENSIONS')
     )
 
 
@@ -398,7 +407,7 @@ def lock_charter_error(
 
     Shape mirrors ``_done_gate_error`` / ``PathGuardVerdict.to_error_dict``
     so MCP callers handle it uniformly.  ``unrecognised_extension_paths``
-    lists the rejected paths that carry an extension, i.e. may be files.
+    lists the rejected paths whose extension is unlisted in any case, i.e. may be files.
 
     Args:
         directories: The offending directory-like path strings.
@@ -407,7 +416,7 @@ def lock_charter_error(
     """
     task_clause = f' (task {task_id})' if task_id else ''
     dir_list = ', '.join(repr(d) for d in directories)
-    unrecognised = [d for d in directories if _has_extension(d)]
+    unrecognised = [d for d in directories if _has_unrecognised_extension(d)]
     error = (
         f'metadata.files contains directory declarations{task_clause}: '
         f'{dir_list}. '

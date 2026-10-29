@@ -1218,6 +1218,16 @@ class TestLockCharterError:
         assert 'deterministic' not in result['error']
         assert 'deterministic' not in result['hint']
 
+    @pytest.mark.parametrize('path', ['README.MD', 'config/app.YAML'])
+    def test_case_variant_of_an_allowlisted_extension_gets_only_the_lowercase_advice(self, path):
+        assert directory_locks([path]) == [path]
+
+        result = lock_charter_error([path])
+
+        assert result['unrecognised_extension_paths'] == []
+        assert 'deterministic' not in result['error'] + result['hint']
+        assert 'lowercase' in result['hint']
+
     def test_mixed_rejection_lists_only_the_unrecognised_extension_paths(self):
         result = lock_charter_error(['crates/', 'tasks.db'])
 
