@@ -27,8 +27,8 @@ verified tree carried two or more chained items.
 
 MINIMUM SAMPLE. When the pooled deep-verify count is below
 ``--min-deep-verifies`` (default 8, an integer >= 1), no leg is evaluated:
-the store lines are followed by the final line
-``insufficient_signal n_deep_verifies=<n> (< <N>)`` and the exit is 1. Too
+the final line (see STDOUT) is ``insufficient_signal n_deep_verifies=<n>
+(< <N>)`` and the exit is 1. Too
 little signal never promotes, and is labelled as what it is rather than as a
 failed leg.
 
@@ -92,7 +92,9 @@ the done-provenance note.
 EXIT CODES. The DeterministicRunner decides by exit code only:
   0  canary healthy          -> task done (promote 6->32 proceeds)
   1  unhealthy OR no signal  -> born-at-L2 milestone_check_failed (hold)
-  2  usage or infra fault    -> never masquerades as a health verdict
+  2  fault                   -> never masquerades as a health verdict: a
+                                usage or infra fault, or an internal error,
+                                whose traceback goes to stderr
 """
 from __future__ import annotations
 
@@ -102,6 +104,7 @@ import math
 import sqlite3
 import sys
 import time
+import traceback
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -506,4 +509,8 @@ def main(argv: Sequence[str]) -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main(sys.argv[1:]))
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Exception:
+        traceback.print_exc()
+        sys.exit(2)
