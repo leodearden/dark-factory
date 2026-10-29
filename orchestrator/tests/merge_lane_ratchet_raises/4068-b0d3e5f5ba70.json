@@ -1,0 +1,24 @@
+{
+  "task_id": "4068",
+  "reason": "Regression tests for task 4068: an unreadable worktree HEAD (real unborn-HEAD git fixture) must make _get_head_commit return '' and make _reconcile_done_step_commits / _rederive_step_status_from_branch_state fail closed; the private methods under test are called exactly as every existing test in those files already does, with no public entry point short of a full workflow run.",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_plan_step_rederive.py",
+      "baseline": 17,
+      "current": 18
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_reconcile_done_step_commits.py",
+      "baseline": 27,
+      "current": 28
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6592,
+      "current": 6597
+    }
+  ]
+}
