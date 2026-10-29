@@ -202,7 +202,6 @@ LOOP_BLOCKING_LEDGER = governed_exceptions(
     dispositions={
         'fused-memory/src/fused_memory/mcp_tools/scheduler_state.py::read_scheduler_events::14947dd93734': Debt(TaskRef(7572)),
         'fused-memory/src/fused_memory/middleware/task_curator.py::TaskCurator._invoke_curator::2be781b317a0': Debt(TaskRef(7572)),
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py::BacklogPolicy._maybe_write_escalation::0d761c10e563': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._recover_one_run::f05da1451b63': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._persist_stage_reports_then_gc_config_dir::f05da1451b63': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._recover_stale_runs::0787c60051a4': Debt(TaskRef(5270)),

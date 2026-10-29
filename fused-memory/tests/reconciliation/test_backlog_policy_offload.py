@@ -2,6 +2,7 @@
 loop's thread (INV-8, task 6086)."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -68,3 +69,28 @@ class TestUnhaltRunsOffTheEventLoop:
         closed = EscalationQueue(escalation_queue_dir(project_root)).get(halt_id)
         assert closed is not None
         assert closed.status == 'resolved'
+
+
+class TestFilingRunsOffTheEventLoop:
+    @pytest.mark.asyncio
+    async def test_filing_a_halt_escalation_leaves_the_event_loop_free(
+        self, event_buffer, tmp_path, monkeypatch,
+    ):
+        policy = _policy(event_buffer, tmp_path / 'proj_root')
+
+        probe = LoopFreedomProbe()
+        real = backlog_policy.submit_or_dedupe
+
+        def blocking(*a, **kw):
+            probe.block()
+            return real(*a, **kw)
+
+        monkeypatch.setattr(backlog_policy, 'submit_or_dedupe', blocking)
+
+        verdict = await policy.on_judge_halt('proj', reason='probe')
+
+        probe.assert_loop_stayed_free()
+        assert verdict.outcome == 'escalated'
+        assert verdict.escalation_path is not None
+        record = json.loads(Path(verdict.escalation_path).read_text(encoding='utf-8'))
+        assert record['error_type'] == 'ReconciliationJudgeHalted'
