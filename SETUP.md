@@ -55,7 +55,7 @@ The script is idempotent (safe to re-run) and self-reports each step with
 `✓`/`!`/`✗`. It works through, in order:
 
 1. **Prerequisite check** — docker, uv, Node ≥22, Claude Code, `curl`/`jq`/`bubblewrap`; installs what it can, warns about what needs a manual step (e.g. Node version management, `docker` group membership requiring re-login).
-2. **Backing stores** — `docker compose up -d falkordb qdrant` from `fused-memory/docker/`, then polls both for health.
+2. **Backing stores** — brings up `falkordb` and `qdrant` through `scripts/falkordb_aof_gate.py` (a compose-up that refuses to recreate FalkorDB onto a stale AOF; see §5), then polls both for health.
 3. **`uv sync`** across the Python subprojects (`shared`, `escalation`, `fused-memory`, `orchestrator`, `dashboard`), in dependency order.
 4. **fused-memory systemd unit** — renders `scripts/fused-memory.service.template` into `~/.config/systemd/user/fused-memory.service` (substituting your real repo path and `uv` binary path), enables it, and starts it only if `fused-memory/.env` already exists (see §4 — you'll usually run this once before secrets exist, then `systemctl --user restart fused-memory` after writing them).
 5. **Orchestrator systemd units + watchdog** — see the **Known gap** callout immediately below; this step is the one you must edit for your own project set.
