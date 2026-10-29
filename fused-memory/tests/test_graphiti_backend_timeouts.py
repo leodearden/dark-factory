@@ -76,8 +76,7 @@ _READS = (
         lambda b: b.search_nodes('q', group_ids=[_GROUP]),
     ),
     _TimedCall(
-        'retrieve_episodes',
-        lambda b: patch.object(EpisodicNode, 'get_by_group_ids', AsyncMock(side_effect=_hang)),
+        'retrieve_episodes', _graph_hanging_on('ro_query'),
         lambda b: b.retrieve_episodes([_GROUP]),
     ),
     _TimedCall(

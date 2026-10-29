@@ -128,7 +128,7 @@ logger = logging.getLogger(__name__)
 # enforce_summary_pool_cap call trims the pool to at most this many members by
 # deleting the OLDEST entries — deterministically via Qdrant scroll, NOT semantic search.
 STAGE1_CYCLE_SUMMARY_POOL_CAP: int = 2
-_RECORD_BODY_CHARS = 500
+_RECORD_BODY_CHARS = 2_000  # basis: plans/recon-evidence-caps-measurement-2026-10.md
 _STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
 
 
@@ -309,6 +309,9 @@ class MemoryConsolidator(BaseStage):
             self._entity_summary_snapshot_lines_stripped
         )
         report.stats['stage1_fetch_degraded'] = self._fetch_degraded_sources or []
+        report.stats['stage1_assembled_budget'] = (
+            self.assembled_payload.budget_report() if self.assembled_payload is not None else None
+        )
 
         # Always present (task 4574, mirrors stage1_fetch_degraded above): set BEFORE
         # the remediation early-return so the key is unconditionally present, including

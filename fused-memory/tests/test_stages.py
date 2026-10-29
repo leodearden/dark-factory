@@ -2470,6 +2470,8 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # filters — the only place that increments this counter — never run,
             # leaving it at its __init__/reset value of 0.
             'stage1_undatable_freshness_records': 0,
+            # Always present (task 5499): None because no backlog payload was assembled.
+            'stage1_assembled_budget': None,
             # Always present (task 3052), zeroed in the same block as the
             # task-3084 curator-gate trio above and for the same reason: they
             # are set BEFORE the remediation early-return, so a caller reading
@@ -2684,6 +2686,8 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # filters — the only place that increments this counter — never run,
             # leaving it at its __init__/reset value of 0.
             'stage1_undatable_freshness_records': 0,
+            # Always present (task 5499): None because no backlog payload was assembled.
+            'stage1_assembled_budget': None,
             # Always present (task 3052), zeroed in the same block as the
             # task-3084 curator-gate trio above and for the same reason: they
             # are set BEFORE the remediation early-return, so a caller reading
