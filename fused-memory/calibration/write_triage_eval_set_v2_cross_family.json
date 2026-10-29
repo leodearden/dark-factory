@@ -1,0 +1,354 @@
+{
+  "agreement": {
+    "control": {
+      "action_changing": {
+        "vs_primary": {
+          "agree": 6,
+          "n": 8,
+          "rate": 0.75,
+          "wilson95": [
+            0.4093,
+            0.9285
+          ]
+        },
+        "vs_resolved": {
+          "agree": 5,
+          "kappa": 0.0,
+          "n": 6,
+          "rate": 0.8333,
+          "wilson95": [
+            0.4365,
+            0.9699
+          ]
+        },
+        "vs_second": {
+          "agree": 6,
+          "n": 8,
+          "rate": 0.75,
+          "wilson95": [
+            0.4093,
+            0.9285
+          ]
+        }
+      },
+      "conflict": {
+        "vs_primary": {
+          "agree": 95,
+          "n": 100,
+          "rate": 0.95,
+          "wilson95": [
+            0.8882,
+            0.9785
+          ]
+        },
+        "vs_resolved": {
+          "agree": 95,
+          "kappa": 0.7346,
+          "n": 100,
+          "rate": 0.95,
+          "wilson95": [
+            0.8882,
+            0.9785
+          ]
+        },
+        "vs_second": {
+          "agree": 95,
+          "n": 100,
+          "rate": 0.95,
+          "wilson95": [
+            0.8882,
+            0.9785
+          ]
+        }
+      },
+      "home": {
+        "vs_primary": {
+          "agree": 98,
+          "n": 100,
+          "rate": 0.98,
+          "wilson95": [
+            0.93,
+            0.9945
+          ]
+        },
+        "vs_resolved": {
+          "agree": 98,
+          "kappa": 0.8643,
+          "n": 100,
+          "rate": 0.98,
+          "wilson95": [
+            0.93,
+            0.9945
+          ]
+        },
+        "vs_second": {
+          "agree": 98,
+          "n": 100,
+          "rate": 0.98,
+          "wilson95": [
+            0.93,
+            0.9945
+          ]
+        }
+      },
+      "loss": {
+        "vs_primary": {
+          "agree": 5,
+          "n": 6,
+          "rate": 0.8333,
+          "wilson95": [
+            0.4365,
+            0.9699
+          ]
+        },
+        "vs_resolved": {
+          "agree": 5,
+          "kappa": 0.0,
+          "n": 6,
+          "rate": 0.8333,
+          "wilson95": [
+            0.4365,
+            0.9699
+          ]
+        },
+        "vs_second": {
+          "agree": 5,
+          "n": 6,
+          "rate": 0.8333,
+          "wilson95": [
+            0.4365,
+            0.9699
+          ]
+        }
+      },
+      "scope": {
+        "vs_primary": {
+          "agree": 8,
+          "n": 8,
+          "rate": 1.0,
+          "wilson95": [
+            0.6756,
+            1.0
+          ]
+        },
+        "vs_resolved": {
+          "agree": 8,
+          "kappa": 1.0,
+          "n": 8,
+          "rate": 1.0,
+          "wilson95": [
+            0.6756,
+            1.0
+          ]
+        },
+        "vs_second": {
+          "agree": 8,
+          "n": 8,
+          "rate": 1.0,
+          "wilson95": [
+            0.6756,
+            1.0
+          ]
+        }
+      }
+    },
+    "discordant": {
+      "action_changing": {
+        "vs_primary": {
+          "agree": 45,
+          "n": 52,
+          "rate": 0.8654,
+          "wilson95": [
+            0.7473,
+            0.9332
+          ]
+        },
+        "vs_resolved": {
+          "agree": 73,
+          "kappa": 0.6276,
+          "n": 82,
+          "rate": 0.8902,
+          "wilson95": [
+            0.8044,
+            0.9412
+          ]
+        },
+        "vs_second": {
+          "agree": 60,
+          "n": 65,
+          "rate": 0.9231,
+          "wilson95": [
+            0.8322,
+            0.9667
+          ]
+        }
+      },
+      "conflict": {
+        "vs_primary": {
+          "agree": 143,
+          "n": 219,
+          "rate": 0.653,
+          "wilson95": [
+            0.5878,
+            0.7129
+          ]
+        },
+        "vs_resolved": {
+          "agree": 150,
+          "kappa": 0.383,
+          "n": 219,
+          "rate": 0.6849,
+          "wilson95": [
+            0.6207,
+            0.7428
+          ]
+        },
+        "vs_second": {
+          "agree": 146,
+          "n": 219,
+          "rate": 0.6667,
+          "wilson95": [
+            0.6018,
+            0.7258
+          ]
+        }
+      },
+      "home": {
+        "vs_primary": {
+          "agree": 166,
+          "n": 220,
+          "rate": 0.7545,
+          "wilson95": [
+            0.6936,
+            0.8067
+          ]
+        },
+        "vs_resolved": {
+          "agree": 173,
+          "kappa": 0.5666,
+          "n": 220,
+          "rate": 0.7864,
+          "wilson95": [
+            0.7275,
+            0.8354
+          ]
+        },
+        "vs_second": {
+          "agree": 177,
+          "n": 220,
+          "rate": 0.8045,
+          "wilson95": [
+            0.7471,
+            0.8515
+          ]
+        }
+      },
+      "loss": {
+        "vs_primary": {
+          "agree": 25,
+          "n": 34,
+          "rate": 0.7353,
+          "wilson95": [
+            0.5688,
+            0.854
+          ]
+        },
+        "vs_resolved": {
+          "agree": 30,
+          "kappa": 0.3622,
+          "n": 46,
+          "rate": 0.6522,
+          "wilson95": [
+            0.5077,
+            0.7732
+          ]
+        },
+        "vs_second": {
+          "agree": 11,
+          "n": 32,
+          "rate": 0.3438,
+          "wilson95": [
+            0.2041,
+            0.5169
+          ]
+        }
+      },
+      "scope": {
+        "vs_primary": {
+          "agree": 44,
+          "n": 52,
+          "rate": 0.8462,
+          "wilson95": [
+            0.7248,
+            0.9199
+          ]
+        },
+        "vs_resolved": {
+          "agree": 68,
+          "kappa": 0.6285,
+          "n": 84,
+          "rate": 0.8095,
+          "wilson95": [
+            0.7128,
+            0.8792
+          ]
+        },
+        "vs_second": {
+          "agree": 51,
+          "n": 65,
+          "rate": 0.7846,
+          "wilson95": [
+            0.6703,
+            0.8671
+          ]
+        }
+      }
+    }
+  },
+  "calls": 320,
+  "coverage": {
+    "control": {
+      "failed": 0,
+      "rated": 100
+    },
+    "discordant": {
+      "failed": 0,
+      "rated": 220,
+      "selected": 220
+    }
+  },
+  "failures": [],
+  "raters": [
+    "gpt-6.1-sol:high"
+  ],
+  "related_boundary": {
+    "by_v1_word": {
+      "CORRECTS": {
+        "NO": 2,
+        "UNCLEAR": 0,
+        "YES": 13
+      },
+      "EXTENDS": {
+        "NO": 13,
+        "UNCLEAR": 0,
+        "YES": 33
+      },
+      "RELATED/UNRELATED": {
+        "NO": 18,
+        "UNCLEAR": 0,
+        "YES": 1
+      },
+      "SAME/SUBSUMED": {
+        "NO": 0,
+        "UNCLEAR": 0,
+        "YES": 6
+      }
+    },
+    "home_split": {
+      "agree_resolved": 36,
+      "cross_family_yes": 58,
+      "n": 69
+    }
+  },
+  "spend_usd": 4.05048
+}
