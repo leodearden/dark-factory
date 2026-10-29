@@ -1,12 +1,16 @@
 """Tests for fused_memory/backends/falkor_read_only.py, the read-only FalkorDB seam."""
 from __future__ import annotations
 
+import dataclasses
+from collections.abc import Mapping, MutableMapping
+
 import pytest
 
 from fused_memory.backends.falkor_read_only import (
     COMMAND_BY_PRIMITIVE,
     RO_COMMAND,
     NonReadOnlyCommandError,
+    PagedQuery,
     ReadOnlyGraphProxy,
     assert_read_only_command,
 )
@@ -48,8 +52,9 @@ class TestTheCommandGuard:
         """A primitive absent from the map is forwarded UNGUARDED, so the map is what can go quietly wrong."""
         assert COMMAND_BY_PRIMITIVE['ro_query'] == RO_COMMAND
         assert COMMAND_BY_PRIMITIVE['query'] == 'GRAPH.QUERY'
-        with pytest.raises(TypeError):
-            COMMAND_BY_PRIMITIVE['query'] = RO_COMMAND  # type: ignore[index]
+        assert isinstance(COMMAND_BY_PRIMITIVE, Mapping)
+        assert not isinstance(COMMAND_BY_PRIMITIVE, MutableMapping)
+        assert not hasattr(COMMAND_BY_PRIMITIVE, '__setitem__')
 
 
 class TestReadOnlyGraphProxy:
@@ -71,3 +76,49 @@ class TestReadOnlyGraphProxy:
         proxy = ReadOnlyGraphProxy(graph)
         assert proxy.queries is graph.queries
         assert proxy.resultset_cap == graph.resultset_cap
+
+
+_EDGE_MATCH = 'MATCH (a)-[r:RELATES_TO]->(b) WHERE r.invalid_at IS NULL'
+_EDGE_QUERY = PagedQuery(match=_EDGE_MATCH, row='r', returns=('r.uuid', 'r.fact'))
+_NODE_QUERY = PagedQuery(match='MATCH (n:Entity)', row='n', returns=('n.uuid', 'n.name'))
+
+
+class TestPagedQuery:
+    def test_an_edge_query_builds_its_page_and_census_from_one_match(self) -> None:
+        assert _EDGE_QUERY.page_template == (
+            'MATCH (a)-[r:RELATES_TO]->(b) WHERE r.invalid_at IS NULL '
+            'RETURN r.uuid, r.fact ORDER BY r.uuid SKIP {skip} LIMIT {limit}'
+        )
+        assert _EDGE_QUERY.census_cypher == (
+            'MATCH (a)-[r:RELATES_TO]->(b) WHERE r.invalid_at IS NULL RETURN count(r)'
+        )
+
+    def test_the_census_counts_the_row_variable_never_star(self) -> None:
+        """count(*) over an edge pattern counts (source, target) pairs, so a multi-edge reads short."""
+        assert _NODE_QUERY.census_cypher == 'MATCH (n:Entity) RETURN count(n)'
+        for query in (_EDGE_QUERY, _NODE_QUERY):
+            assert 'count(*)' not in query.census_cypher
+
+    @pytest.mark.parametrize('query', [_EDGE_QUERY, _NODE_QUERY], ids=['edges', 'nodes'])
+    def test_census_and_page_describe_one_population(self, query: PagedQuery) -> None:
+        match = query.match.strip()
+        assert query.page_template.startswith(match + ' RETURN ')
+        assert query.census_cypher.startswith(match + ' RETURN ')
+
+    def test_returns_that_omit_the_sort_key_are_refused(self) -> None:
+        with pytest.raises(ValueError, match=r'r\.uuid') as caught:
+            PagedQuery(match=_EDGE_MATCH, row='r', returns=('r.fact',))
+        assert "('r.fact',)" in str(caught.value)
+
+    def test_empty_returns_are_refused(self) -> None:
+        with pytest.raises(ValueError, match='returns'):
+            PagedQuery(match=_EDGE_MATCH, row='r', returns=())
+
+    def test_a_row_that_is_not_an_identifier_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="'r.x'"):
+            PagedQuery(match=_EDGE_MATCH, row='r.x', returns=('r.x.uuid',))
+
+    @pytest.mark.parametrize('field', ['match', 'row', 'returns'])
+    def test_the_query_is_frozen(self, field: str) -> None:
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(_EDGE_QUERY, field, getattr(_NODE_QUERY, field))
