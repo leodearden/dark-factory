@@ -34,6 +34,7 @@ from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
+    from orchestrator.verify_runner import HostLease
 
 logger = logging.getLogger('orchestrator.merge_lane')
 
@@ -1761,6 +1762,36 @@ class PendingGate:
     rebased_onto: str
 
 
+class LeaseActivity(StrEnum):
+    """What an in-flight entry's held host lease is doing (task 5290).
+
+    DISPATCHING and VERIFYING are the live members: work is about to run, or
+    runs, on the leased host.  POST_DISPATCH is a remote lease with no live
+    ssh dispatch while work still runs on THIS host: the dispatch returned
+    (task 2822's cross-check, a task-6155 gate re-verify) or, briefly, has
+    not yet claimed (the main-mirror push before it).  FINISHED holds the
+    lease until finalize with nothing left to run.
+    """
+
+    DISPATCHING = 'dispatching'
+    VERIFYING = 'verifying'
+    POST_DISPATCH = 'post_dispatch'
+    FINISHED = 'finished'
+
+    @property
+    def is_live(self) -> bool:
+        return self in (LeaseActivity.DISPATCHING, LeaseActivity.VERIFYING)
+
+
+def remote_dispatch_live(lease: HostLease) -> bool:
+    """THE "an ssh dispatch is live on this remote lease" predicate (task 5290).
+
+    Shared by Abort trigger 3 and :attr:`InflightEntry.lease_activity`.  A
+    runner without ``dispatch_in_flight`` reads live, trigger 3's fail-safe.
+    """
+    return not lease.is_local and bool(getattr(lease.runner, 'dispatch_in_flight', True))
+
+
 @dataclass
 class InflightEntry:
     """An in-flight verify entry held in SpeculativeMergeWorker._inflight deque.
@@ -1870,6 +1901,20 @@ class InflightEntry:
     def pending_task(self) -> asyncio.Task[object] | None:
         """The task finalize waits for: the parked gate's, else the verify's."""
         return self.gate.task if self.gate is not None else self.verify_task
+
+    @property
+    def lease_activity(self) -> LeaseActivity | None:
+        """What this entry's lease is doing, read off :attr:`pending_task`; None without one."""
+        if self.lease is None:
+            return None
+        task = self.pending_task
+        if task is None:
+            return LeaseActivity.DISPATCHING
+        if task.done():
+            return LeaseActivity.FINISHED
+        if self.lease.is_local or remote_dispatch_live(self.lease):
+            return LeaseActivity.VERIFYING
+        return LeaseActivity.POST_DISPATCH
 
     @property
     def in_verify_frontier(self) -> bool:

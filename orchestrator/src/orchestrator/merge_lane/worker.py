@@ -170,6 +170,7 @@ from orchestrator.merge_lane.types import (
     InflightVerifyResult,
     ItemLifecycleState,
     LandingCandidate,
+    LeaseActivity,
     MainHealthAutoHealRegistry,
     MergeBounceRegistry,
     MergeCancelRefusal,
@@ -199,6 +200,7 @@ from orchestrator.merge_lane.types import (
     _InFlightEntry,
     item_merge_wt,
     quarantine_class,
+    remote_dispatch_live,
 )
 from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.scheduler import StaleEvidenceRejection
@@ -5095,6 +5097,32 @@ def _first_copy_per_request(entries: list[dict]) -> tuple[list[dict], list[str]]
         seen.add(rid)
         kept.append({**entry, 'position': len(kept)})
     return kept, dropped
+
+
+def _lease_is_verifying(row: Mapping[str, Any]) -> bool:
+    """Whether an ``occupancy.leases`` row counts toward ``verifying_by_host``."""
+    return LeaseActivity(row['activity']).is_live and not row['host_quarantined']
+
+
+def _lease_part(row: Mapping[str, Any]) -> str:
+    """``host=task_id``, annotated ``(activity[,quarantined])`` unless counted verifying."""
+    occupant = f'{row["host"]}={row["task_id"]}'
+    if _lease_is_verifying(row):
+        return occupant
+    flags = (row['activity'], 'quarantined') if row['host_quarantined'] else (row['activity'],)
+    return f'{occupant}({",".join(flags)})'
+
+
+def _occupancy_suffix(occ: Mapping[str, Any]) -> str:
+    """The heartbeat's `` | verifying N/M hosts: ...`` segment; '' with no lease held.
+
+    N counts the hosts of ``verifying_by_host``, and every lease is named, so a
+    held lease with nothing running on its host reads ``laptop=5300(finished)``.
+    """
+    if not occ['leases']:
+        return ''
+    parts = ' '.join(_lease_part(row) for row in occ['leases'])
+    return f' | verifying {len(occ["verifying_by_host"])}/{occ["hosts_total"]} hosts: {parts}'
 
 
 class _DuplicateRenderLog:
@@ -14240,6 +14268,50 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             req.request_id for req in (*buffered, *arrivals) if req.result.done()
         })
 
+    def _occupancy_block(
+        self, fh_entry: InflightEntry | None, occupying: list[InflightEntry],
+    ) -> dict:
+        """:meth:`snapshot`'s ``occupancy``: the finalize head, then *occupying*.
+
+        by_host / inflight_by_host / hosts_busy / inflight_total are LEASE
+        occupancy; ``leases`` and ``verifying_by_host`` say what each lease is
+        doing (task 5290).
+        """
+        leased = [
+            (entry, entry.lease) for entry in (fh_entry, *occupying)
+            if entry is not None and entry.lease is not None
+        ]
+        inflight_by_host: dict[str, list[str]] = {}
+        for entry, lease in leased:
+            inflight_by_host.setdefault(lease.name, []).append(entry.item.request.task_id)
+        leases = [self._lease_row(entry, lease) for entry, lease in leased]
+        verifying_by_host: dict[str, list[str]] = {}
+        for row in filter(_lease_is_verifying, leases):
+            verifying_by_host.setdefault(row['host'], []).append(row['task_id'])
+        return {
+            'hosts_total': (
+                len(self._host_allocator.host_names)
+                if self._host_allocator is not None else 1
+            ),
+            'hosts_busy': len(inflight_by_host),
+            # LOSSY on purpose (historical shape): the last occupant per host.
+            'by_host': {lease.name: entry.item.request.task_id for entry, lease in leased},
+            'inflight_by_host': inflight_by_host,
+            'inflight_total': len(leased),
+            'leases': leases,
+            'verifying_by_host': verifying_by_host,
+        }
+
+    def _lease_row(self, entry: InflightEntry, lease: HostLease) -> dict:
+        """One ``occupancy.leases`` row: who holds *lease* and what it is doing."""
+        return {
+            'host': lease.name,
+            'task_id': entry.item.request.task_id,
+            'request_id': entry.item.request.request_id,
+            'activity': str(entry.lease_activity),
+            'host_quarantined': lease.name in self._runner_quarantine,
+        }
+
     def snapshot(self) -> dict:
         """Return a synchronous read-only snapshot of the merge worker pipeline state.
 
@@ -14265,14 +14337,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
               in-flight count must read inflight_total (task 3275).
             by_host: {host: task_id}, retained at its historical shape for
               backward compatibility.  LOSSY: when two entries share a host it
-              keeps only the last (and the finalize-head prepend drops the
-              head's task_id in that case).  Preserved verbatim for existing
-              consumers and task 3044's in-flight rework; inflight_by_host is
-              the authoritative view.
+              keeps only the last.  inflight_by_host is the authoritative view.
             inflight_by_host: {host: [task_id, ...]} — lossless, every leased
               occupant present.  Ordered finalize head first, then _inflight
               order, mirroring `entries`.
             inflight_total: total leased in-flight entries across all hosts.
+            These four are LEASE occupancy: a lease is not evidence that its
+            host is reachable or verifying (task 5290).  The activity view:
+            leases: one {host, task_id, request_id, activity,
+              host_quarantined} row per lease, in inflight_by_host order;
+              activity is a :class:`LeaseActivity` value.
+            verifying_by_host: {host: [task_id, ...]} for the leases whose
+              activity is live and whose host is not quarantined.
           hosts: list of per-host state dicts (task 3275), one per host the
             allocator manages, in allocator order (local first), each
             {name, is_local, slot_state, quarantined, quarantine_class,
@@ -14571,49 +14647,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 ),
             }
 
-        # occupancy: per-host in-flight breakdown for heartbeat and dashboard consumers.
-        _by_host = {
-            _infl.lease.name: _infl.item.request.task_id
-            for _infl in _occupying
-            if _infl.lease is not None
-        }
-        # Include the finalizing head (if any) — it is the submission-order head
-        # and its host slot is still occupied while _finalize_inflight awaits.
-        # Inserted head-first so 'local' leads the dict, matching position 0 in entries.
-        if _fh_entry is not None and _fh_entry.lease is not None:
-            _fh_name = _fh_entry.lease.name
-            _fh_tid = _fh_entry.item.request.task_id
-            _by_host = {_fh_name: _fh_tid, **_by_host}
-        # 3275 additive: lossless per-host occupant lists, built in the SAME
-        # order (finalize head first, then _inflight order) as _by_host above.
-        # _by_host is left byte-for-byte unchanged — it is lossy by two paths
-        # (the dict comprehension collapses two entries sharing a host
-        # last-writer-wins, and the prepend splat above drops the head's
-        # task_id when the head shares a host with an in-flight entry) and it
-        # is the field task 3044 is reworking, so it is preserved verbatim
-        # rather than widened.
-        _inflight_by_host: dict[str, list[str]] = {}
-        if _fh_entry is not None and _fh_entry.lease is not None:
-            _inflight_by_host[_fh_entry.lease.name] = [_fh_entry.item.request.task_id]
-        for _infl in _occupying:
-            if _infl.lease is not None:
-                _inflight_by_host.setdefault(_infl.lease.name, []).append(
-                    _infl.item.request.task_id
-                )
-        _hosts_total = (
-            len(self._host_allocator.host_names)
-            if self._host_allocator is not None else 1
-        )
-        occupancy = {
-            'hosts_total': _hosts_total,
-            # Identical value to len(_by_host) (same key set by construction),
-            # but sourced from the lossless map so a future edit to _by_host
-            # cannot silently perturb this count.
-            'hosts_busy': len(_inflight_by_host),
-            'by_host': _by_host,
-            'inflight_by_host': _inflight_by_host,
-            'inflight_total': sum(len(v) for v in _inflight_by_host.values()),
-        }
+        occupancy = self._occupancy_block(_fh_entry, _occupying)
 
         return {
             'entries': entries,
@@ -15044,7 +15078,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         carrying the same facts structurally (repo structured-facts-at-failure
         invariant — the log line must not be the only carrier).  It is built
         from ``snapshot()['hosts']`` rather than from ``occupancy`` **on
-        purpose**: the occupancy suffix is gated on a non-empty ``by_host``, so
+        purpose**: the occupancy suffix is gated on a held lease, so
         a pool that is quarantined but idle would report no degradation at all
         — one of the three 2026-07 incidents where a stuck merge queue was
         diagnosed only by hand-correlating a ``verifying N/M hosts`` line
@@ -15092,19 +15126,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         }
 
         occ = snap['occupancy']
-        _occ_suffix = ''
-        if occ['by_host']:
-            _host_parts = ' '.join(
-                f'{h}={tid}' for h, tid in occ['by_host'].items()
-            )
-            _occ_suffix = (
-                f' | verifying {occ["hosts_busy"]}/{occ["hosts_total"]} hosts: '
-                f'{_host_parts}'
-            )
+        _occ_suffix = _occupancy_suffix(occ)
 
         # 3275: degradation segment, built from snap['hosts'] and deliberately
-        # INDEPENDENT of the `if occ['by_host']:` gate above — a quarantined
-        # pool with nothing in flight has an empty by_host and would otherwise
+        # INDEPENDENT of the occupancy suffix's lease gate — a quarantined
+        # pool with nothing in flight holds no lease and would otherwise
         # report no degradation at all.
         _deg = [h for h in snap['hosts'] if h['quarantined']]
         _deg_suffix = ''
@@ -19713,11 +19739,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # progress once — one extra budget window of slack if that mtime came from a foreign
                 # writer rather than the cross-check, not a masked coast (same busy-loop-cap
                 # argument as the SAFETY paragraph above).
-                _dispatch_live = (
-                    not lease.is_local
-                    and getattr(lease.runner, 'dispatch_in_flight', True)
-                )
-                if _dispatch_live:
+                if remote_dispatch_live(lease):
                     _last_progress_at = _now
                     _dispatch_seen_in_flight = True
                 # Evidence A — content progress under merge_wt (BOTH lease kinds), probed only when

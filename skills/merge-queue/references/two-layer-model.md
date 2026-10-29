@@ -132,7 +132,13 @@ the number of verifies in flight — read `inflight_total` for that.
 `inflight_by_host` is the authoritative lossless `{host: [task_id, ...]}` view
 (finalize head first, then `_inflight` order); `by_host` is the
 retained-for-compatibility lossy `{host: task_id}` map, which keeps only the last
-occupant when two entries share a host.
+occupant when two entries share a host. All four are **lease** occupancy, and a
+lease is never evidence that its host is reachable: a finished verify holds its
+lease until finalize, and a lease can sit on a host benched since it was taken.
+Whether a verify really runs on a host is `leases[].activity` (`dispatching`,
+`verifying`, `post_dispatch`, `finished`) with `leases[].host_quarantined`, and
+`verifying_by_host`, which counts the live leases on unquarantined hosts and is
+the `N` of the heartbeat's `verifying N/M hosts` line (task 5290).
 
 ---
 
