@@ -355,6 +355,24 @@ async def test_readmit_resolves_the_skew_l1(scene: _Scene):
     assert (recovered['quarantine_class'], recovered['evidence']) == ('skew', 'ensure_gate')
 
 
+@pytest.mark.asyncio
+async def test_a_sticky_skew_alarm_resolved_while_benched_reopens_on_the_next_tick(scene: _Scene):
+    """The same re-assert rule as the 'ru' class (task 5290): benched means alarmed."""
+    scene.bench('gate')
+    await scene.tick()
+    scene.bench('gate')
+    [l1] = scene.open_l1s()
+    scene.escalations.resolve(
+        l1.id, 'Self-resolved — occupancy.by_host shows laptop verifying',
+        resolved_by='escalation-watcher',
+    )
+
+    await scene.tick()
+
+    [reopened] = scene.open_l1s()
+    assert (reopened.id != l1.id, reopened.task_id) == (True, l1.task_id)
+
+
 # ---------------------------------------------------------------------------
 # The operator clear (escalation tool clear_verify_host_quarantine)
 # ---------------------------------------------------------------------------

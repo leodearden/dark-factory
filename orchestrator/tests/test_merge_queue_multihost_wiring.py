@@ -3249,8 +3249,8 @@ class TestReprobeQuarantinedHosts:
         """health()=True with an open alarm → resolved, reported by event, nothing filed."""
         from orchestrator.merge_lane.liveness import _verify_host_unreachable_sentinel
         worker, eq = make_reprobe_worker()
-        es = _FakeEventStore()
-        worker._event_store = es  # type: ignore[assignment]
+        es = _RecordingEventStore()
+        worker._event_store = es
 
         fake_runner = MagicMock()
         fake_runner.health = AsyncMock(return_value=True)
@@ -3267,7 +3267,7 @@ class TestReprobeQuarantinedHosts:
         await worker._reprobe_quarantined_hosts(now)
 
         assert eq.submitted == [], 'recovery files no info escalation (task 5290)'
-        assert [e['evidence'] for e in _recovered_events(es)] == ['ssh_health_probe']
+        assert es.field('evidence') == ['ssh_health_probe']
 
     async def test_divergence_quarantined_host_is_skipped(self):
         """CRITICAL: host in allocator quarantine but NOT in RU tracker is never touched."""
@@ -3338,8 +3338,9 @@ class TestReprobeQuarantinedHosts:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
-        # Very large downtime — would trip the alarm if the guard is `>= 0`
-        seed_ru_tracker(worker, 'zero-secs-host', first_unavailable_at=now - 9999)
+        # Very large downtime — would trip the alarm if the guard is `>= 0`.
+        # streak=1 < n keeps the streak ladder quiet: this test is about the time gate alone.
+        seed_ru_tracker(worker, 'zero-secs-host', first_unavailable_at=now - 9999, streak=1)
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -3400,9 +3401,8 @@ class TestRecoveryInfoEscalationsAreBounded:
         queue = EscalationQueue(tmp_path / 'esc')
         clock = FakeClock()
         worker, _ = make_reprobe_worker(escalate_after_n=1, escalation_queue=queue, clock=clock)
-        runner = MagicMock()
-        runner.health = AsyncMock(return_value=False)
-        worker._host_allocator = _FakeAllocatorForReprobe({'laptop': runner})  # type: ignore[assignment]
+        runner = _runner_double('laptop', is_local=False)
+        worker._host_allocator = HostAllocator([runner], quarantine=worker._runner_quarantine)
 
         flaps = 4
         for _ in range(flaps):
@@ -3418,6 +3418,126 @@ class TestRecoveryInfoEscalationsAreBounded:
         assert len(alarms) == flaps
         assert {(a.status, a.level) for a in alarms} == {('resolved', 1)}
         assert queue.get_by_task('__verify_host_recovered__laptop') == []
+
+
+class TestHostAlarmDue:
+    """_HostUnavailability.alarm_due: whether a bench episode warrants an open alarm (task 5290).
+
+    The immediate escalation policy, OR the streak ladder, OR the time gate
+    when it is enabled; the bench site and the reprobe sweep both ask it.
+    """
+
+    @staticmethod
+    def _entry(
+        *, streak: int = 1, downtime: float = 0.0,
+        kind: RunnerUnavailableKind = 'transport', sticky: bool = False,
+    ):
+        from orchestrator.merge_lane.types import _HostUnavailability
+        return _HostUnavailability(
+            streak=streak, first_unavailable_at=1000.0 - downtime,
+            reason='ssh: connect timed out', kind=kind, sticky=sticky,
+        )
+
+    @staticmethod
+    def _due(entry, *, after_n: int = 3, after_secs: float = 600.0) -> bool:
+        return entry.alarm_due(1000.0, after_n=after_n, after_secs=after_secs)
+
+    @pytest.mark.parametrize('downtime', [0.0, 30.0, 1e6])
+    def test_a_streak_at_the_threshold_is_due_whatever_the_downtime(self, downtime):
+        assert self._due(self._entry(streak=3, downtime=downtime))
+
+    def test_downtime_past_the_time_gate_is_due_below_the_streak(self):
+        assert self._due(self._entry(streak=1, downtime=600.0))
+
+    def test_zero_secs_disables_the_time_arm(self):
+        assert not self._due(self._entry(streak=1, downtime=1e6), after_secs=0.0)
+
+    def test_both_below_is_not_due(self):
+        assert not self._due(self._entry(streak=2, downtime=599.0))
+
+    @pytest.mark.parametrize(('kind', 'sticky'), [('wire_shape', False), ('gate', True)])
+    def test_an_immediate_policy_bench_is_due_at_once(self, kind, sticky):
+        assert self._due(self._entry(streak=1, downtime=0.0, kind=kind, sticky=sticky))
+
+
+@pytest.mark.asyncio
+class TestFalseResolveReopens:
+    """A resolve issued while the host still fails its probe is re-opened (task 5290, #3044).
+
+    On 2026-07-24 a watcher resolved an unreachability L1 on an occupancy
+    read while the host was still down.  The sweep re-asserts the alarm
+    while ``alarm_due`` holds, and the ``has_open_l1`` dedup makes that a
+    no-op until the alarm is resolved.
+    """
+
+    @staticmethod
+    def _scene(tmp_path, *, escalate_after_secs: float, streak: int):
+        from escalation.queue import EscalationQueue
+        queue = EscalationQueue(tmp_path / 'esc')
+        worker, _ = make_reprobe_worker(
+            escalate_after_n=3, escalate_after_secs=escalate_after_secs, escalation_queue=queue,
+        )
+        runner = _runner_double('laptop', is_local=False)
+        runner.health.return_value = False
+        worker._host_allocator = HostAllocator([runner], quarantine=worker._runner_quarantine)
+        now = 1000.0
+        seed_ru_tracker(worker, 'laptop', first_unavailable_at=now - 30.0, streak=streak)
+        return worker, queue, now
+
+    @staticmethod
+    def _open_l1s(queue) -> list:
+        return [esc for esc in queue.get_pending() if esc.level == 1]
+
+    async def _assert_reopens(self, worker, queue, now: float) -> None:
+        await worker._reprobe_quarantined_hosts(now)
+        [first] = self._open_l1s(queue)
+        queue.resolve(
+            first.id, 'Self-resolved — occupancy.by_host shows laptop verifying',
+            resolved_by='escalation-watcher',
+        )
+
+        await worker._reprobe_quarantined_hosts(now + 120.0)
+        [fresh] = self._open_l1s(queue)
+        assert (fresh.id != first.id, fresh.task_id, fresh.level) == (True, first.task_id, 1)
+
+        await worker._reprobe_quarantined_hosts(now + 240.0)
+        assert len(queue.get_by_task(first.task_id)) == 2, 'an open alarm is not re-filed'
+
+    async def test_streak_alarmed_episode_reopens_after_external_resolve(self, tmp_path):
+        worker, queue, now = self._scene(tmp_path, escalate_after_secs=600.0, streak=5)
+        await self._assert_reopens(worker, queue, now)
+
+    async def test_streak_only_mode_also_reopens(self, tmp_path):
+        worker, queue, now = self._scene(tmp_path, escalate_after_secs=0.0, streak=5)
+        await self._assert_reopens(worker, queue, now)
+
+    async def test_sub_threshold_blip_stays_quiet(self, tmp_path):
+        worker, queue, now = self._scene(tmp_path, escalate_after_secs=600.0, streak=1)
+        await worker._reprobe_quarantined_hosts(now)
+        assert self._open_l1s(queue) == []
+
+
+class TestBenchSiteSharesTheAlarmPredicate:
+    """The bench site asks alarm_due too, so its time arm matches the sweep's (task 5290)."""
+
+    def test_a_bench_past_the_time_gate_files_below_the_streak(self, tmp_path):
+        from _merge_lane_fakes import FakeClock
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        clock = FakeClock()
+        worker, _ = make_reprobe_worker(
+            escalate_after_n=3, escalate_after_secs=600.0, escalation_queue=queue, clock=clock,
+        )
+        worker.bench_unavailable_runner('laptop', RunnerUnavailable('ssh: connect timed out'))
+        assert queue.get_pending() == []
+
+        clock.time += 700.0
+        worker.bench_unavailable_runner('laptop', RunnerUnavailable('ssh: connect timed out'))
+
+        assert [esc.category for esc in queue.get_pending()] == ['verify_host_unreachable']
 
 
 # ---------------------------------------------------------------------------
