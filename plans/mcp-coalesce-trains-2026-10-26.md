@@ -1,10 +1,52 @@
 # MCP merge requests in coalesce trains: investigation memo
 
-**Date:** 2026-10-26 · **Status:** discussion draft for Leo. No tasks, PRD or code until Leo rules.
-**Code pinned at:** main `70063c3638`.
-**Evidence window:** `data/orchestrator/runs.db` to 2026-10-26T16:28Z, plus orchestrator journald from 2026-10-07. Every figure's counting rule is in Appendix A, and the seats that produced the figures are in Appendix B.
+**Date:** 2026-10-26, amended 2026-10-29 · **Status:** RULED on 2026-10-29 (§0). Sections 1–7 are the 2026-10-26 discussion draft, kept as the record. Where they conflict with §0, §0 wins.
+**Code pinned at:** main `70063c3638` for the draft. The §0 and §4.4 additions were read on main `6d2f46a04b`.
+**Evidence window:** `data/orchestrator/runs.db` to 2026-10-26T16:28Z, plus orchestrator journald from 2026-10-07. §0 and §4.4 add chain events to 2026-10-29T14:41Z. Every figure's counting rule is in Appendix A, and the seats that produced the figures are in Appendix B.
+
+## 0. Ruling and amendment (2026-10-29)
+
+**What the draft missed.** Deep merge-ahead chains are a second way to land several queued singles with one verify, and **they do not care who submitted a request**. They come from `plans/deep-merge-ahead-prd.md` and are switched on by `merge_deep.chain_cap`. So MCP singles are already batched today, through chains.
+
+- **When they went live here.** This repo's yaml flipped `chain_cap` to 6 on 2026-10-27 at 21:42Z (carrier 7619, task 5057). The first chain verify ran at 2026-10-29T01:17Z.
+- **Why the draft missed them.** Chains were off throughout the draft's evidence window, where every `merge_verify` row had `chain_items` = 1. No seat looked at them.
+- **How they compare.** §4.4 sets chains against coalesce trains.
+
+**Leo's rulings, 2026-10-29.**
+
+1. **A1 is withdrawn.** Admitting MCP singles to coalesce trains is superseded, because chains already batch them without any of the membership machinery A1 would need. §3 and §4.1 stay as the record of why coalesce trains can't simply admit MCP singles.
+2. **`merge_train_coalesce_enabled: false`** in `dark-factory-orchestrator.yaml`.
+   - The knob is not in `RELOADABLE_FIELDS`, so it takes effect at the next fleet restart.
+   - Automatic coalescing of independent singles is treated as obsolete unless the measurements below say otherwise.
+   - **Declared atomic trains are kept.** They are the only way to land interdependent stacked work as one merge (§4.4).
+3. **Stream 1 goes to `/prd`**, worked by a sibling `/team` session, re-scoped for a lane with coalescing off:
+   - **Kept, now applied to every verify:**
+     - a seconds-cheap whole-tree screen (`inline_suppressions.py --check` and the other cheap `scripts/` checks) run before a merge item's verify. It matters most per link before a chain tip is built, because a link with its own defect fails the tip and halves the chain depth.
+     - never start a verify (chain tip, speculative, or a declared train) on a base the lane has just judged main-red.
+   - **Kept while the declared-train former is enabled** (`merge_train_former_enabled: true`): the bare-id `get_changed_line_ranges` fix, §6.1.
+   - **Moot while coalescing is off:** unwinding on exceptions and `stop()` (it lives in coalesce-only code; task 6450 keeps it as-is), and the `has_workflow_waiter` read (the coalescer is its only consumer).
+   - **Not low-risk; needs a code read and a measurement first:** reordering the verify legs to fail fast.
+4. **Stream 2 is moot while coalescing is off.** It served members of coalesce trains that didn't land.
+
+**What to measure in the chain canary week.**
+
+| Measure | What it tells us |
+|---|---|
+| How often chains fire: the share of speculative dispatches that build a chain with `chain_items` ≥ 2 | Whether chains actually do the batching |
+| Items landed per chain verify | How much each verify buys |
+| MCP singles landed via a chain (`landed_via_chain`) | Whether MCP singles get batched in practice |
+| Chain-attributed reds | The canary's existing stop rule |
+
+**Baseline for the canary.** Since 4953, 135 of 435 single verifies were speculative, and only speculative dispatches can chain. Since the flip there have been 2 chain verifies: 3 items on `local` (47.4 min, passed) and 2 items on `laptop` (16.9 min, passed). 2 links landed via a chain.
+
+**Still open for Leo.**
+
+- **The declared-train former.** The workflow-side train former (`merge_train_former_enabled: true`) is the same kind of opportunistic batching as coalescing. It formed no trains in the evidence window. Turn it off too?
+- **A measurement gap.** How many of the 56 post-4953 coalesce trains formed while no chain could have fired was not measured. That is the only coverage trains had that chains lack.
 
 ## 1. The question, and the short answer
+
+> The short answer below is the 2026-10-26 draft. It is superseded by §0: chains already batch MCP singles, A1 is withdrawn, and coalescing is switched off.
 
 **Question (Leo, 2026-10-26).** How do we make automatic coalesce trains work reliably for merge requests submitted over MCP (interactive `/unblock`, `/unblock-low-risk`, `/merge-queue`, hand carries), instead of excluding them?
 
@@ -263,7 +305,42 @@ The consequences:
 
 Making either work needs a patch-equivalence rule that the existing docstring argues against. **The lever that does work is not to re-pend at all** (Stream 2).
 
+### 4.4 Deep merge-ahead chains: the mechanism the draft missed (added 2026-10-29)
+
+**How a chain works.** When the speculative slot dispatches an item, `merge_lane/worker.py::SpeculativeMergeWorker._deep_chain_placement` may build a chain. It takes the item plus a contiguous FIFO run of the queued singles behind it, merges them `--no-ff` in a scratch lane, and verifies the tip. A passing tip lands the run link by link (`_land_chain_prefix`).
+
+Each link goes through the same terminal path as a solo request: `_journal_landed_then_advance`, then `_finalize_advanced_merge`, then `_resolve_or_drop_abandoned`. So each link gets its own merge commit and its own `done`. The only items `_link_refusal` rejects are trains and branches stacked on an unlanded base. It never checks `awaited_by_workflow`.
+
+| | Coalesce train | Deep chain |
+|---|---|---|
+| **Who can join** | Only singles a workflow awaits (the 4953 rule) | Any single |
+| **The member's request** | Absorbed: future resolved `superseded`, request retired, journal row removed | Stays buffered and live until it lands |
+| **The member's branch** | Rebased in place by stacking | Untouched; the chain is built in a scratch lane |
+| **Landing and credit** | Lands the tip only. Members are credited by callbacks that require `merge-deferred` | Every link lands normally, with its own `done` |
+| **Failure** | Derail, then unwind, re-pend and one-strike marks | Silent fall-back for the links, and the chain depth halves |
+| **Restart or drain** | Not journaled; a drain dissolves it | Nothing to lose |
+| **Latency** | Waits at the buffer tail | Built from the head of the queue when the verify is dispatched |
+| **Effect on the merger** | Runs inline, so no other merge can start until it finishes | No effect; uses the speculative slot |
+| **Depth** | `merge_train_max_members` = 3 | `chain_cap` = 6 |
+
+**Interference when both are on.**
+
+1. They compete for the same buffered singles. The coalesce test fixture pins `chain_cap=0` for exactly this reason (`orchestrator/tests/test_merge_queue_coalesce.py::coalesce_config`). `plans/deep-merge-ahead-prd.md` never mentions coalescing or trains.
+2. A coalesce train sitting in the buffer stops any chain at its position (`_link_refusal` returns `train_request`).
+3. Nothing stops the coalescer absorbing a chain link while the chain's tip is verifying. The landing walk then stops at that link ("no longer buffered — stopping"), wasting the coverage of everything behind it. Whether the coalescing pass actually runs while both verify slots are busy was not confirmed.
+
+**What trains still offer that chains don't.**
+
+1. **Atomic landing of dependent stacked work. This is declared trains only.** `plans/orchestrator-atomic-train-merge-prd.md` was written for reify's 3997 case, where α alone reds main and only α+β+γ together is green. Chains refuse stacked branches and land link by link, so they can't carry this.
+2. **Batching when the speculative slot isn't in use.** Chains only fire from slot 2; slot 1 stays the trust anchor (deep-merge PRD decision 2). The value of this coverage is unmeasured (§0).
+3. **Choosing members with a risk screen.** A train picks members out of FIFO order and excludes one-strike and recently-blocked branches. A chain takes the contiguous FIFO run and has no risk screen. When a bad link fails the tip, the cost is bounded: the links fall back silently and the depth halves.
+4. **One merge commit for the batch.** A chain advances main once per link, and only the cumulative tip tree was verified. For independent items this is harmless: the replay study passed 57 of 59 chains, and both failures were due to a single bad item.
+
+**Verify cost per landed item is roughly a wash.** A merged 2–3 member train costs about 1.13× one solo verify. A chain costs the head verify, which runs anyway, plus the tip at about +8% wall time per extra item. These two figures come from different sources: the lead's runner-matched measurement for trains, and the replay study for chains.
+
 ## 5. Recommendation
+
+> Superseded by §0 on 2026-10-29. This was the draft's recommendation, kept for the record. Stream 1 is re-scoped in §0, Stream 2 is moot while coalescing is off, and the A1 decision is withdrawn.
 
 **Stream 1: cheap gate and hygiene fixes.** About 4–5 low-risk tasks, none touching Table A.
 
@@ -338,6 +415,8 @@ How to decide:
 
 ## 7. Questions for Leo
 
+> Answered on 2026-10-29 (§0). A1 is withdrawn, so questions 2–6 lapse, and question 1 is settled by Leo's ruling. Question 7 lapses with Stream 2. The questions still open are listed in §0.
+
 1. **Sequencing.** Do Streams 1 and 2 now, and take A1 as a separate, measured decision? Or build A1 now as well?
 2. **Which way in for MCP singles?** The measured population is mostly hand-carry campaigns. The options:
    - **A1 general.** Every held member is admitted.
@@ -408,5 +487,13 @@ A `/team` run on 2026-10-26/27, led by an opus session. Seat outputs (`w1_*.md`,
 - Confirmed the bare-id `git diff` failure and the live `5563` collision.
 - Re-read `_resume_merge_retry_if_pending`, `InFlightMergeRegistry.attach`'s mirroring of `superseded`, the `expected_stamped_at` CAS, `create_worktree`'s rebase on reuse, and `latest_merge_finalized`'s run-scoped default.
 - Re-ran the critic's run-scoped eligibility reconstruction: 19 eligible singles, 6 with an exclusion event and 13 without.
+
+**Amendment, 2026-10-29.** §0 and §4.4 were written by the lead alone, with no seats, after Leo asked how this feature relates to deep speculative verifies. The lead read four things on main `6d2f46a04b`:
+- the chain code in `worker.py`: `_deep_chain_placement`, `_link_refusal`, `chain_snapshot` and `_land_chain_prefix`;
+- `SpeculationController.can_coalesce`;
+- the deep-merge and atomic-train PRDs;
+- the coalesce test fixture.
+
+The lead also queried `runs.db` for chain verifies, chain landings and speculative verify counts. These additions were not reviewed by a critic.
 
 **Model routing.** Fable was judged appropriate for the design and critic seats. They ran on opus because the brief did not authorise fable.
