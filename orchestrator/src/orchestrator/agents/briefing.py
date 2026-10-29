@@ -1523,6 +1523,11 @@ Handle this escalation, then call `resolve_issue` with a summary.
         which raises ``TypeError`` on comparison — so a formatting hiccup
         never silently drops persisted analysis.
 
+        Staleness compares ``timestamp``, which is re-stamped when a re-block
+        is covered by the latest entry (task 3125), while the rendered
+        'Investigated at' line shows ``investigated_at``, falling back to
+        ``timestamp``.
+
         Called only from retry/resume prompt builders
         (``build_revalidation_prompt``, ``build_resume_prompt``) and, behind
         ``include_prior_proposals=True``, from ``build_architect_prompt``'s
@@ -1540,12 +1545,13 @@ Handle this escalation, then call `resolve_issue` with a summary.
         proposal_text = proposal.get('proposal_text', '')
         risk_label = proposal.get('risk_label', '')
         files_referenced = proposal.get('files_referenced') or []
-        created_at = proposal.get('timestamp') or proposal.get('investigated_at') or ''
+        stamped_at = proposal.get('timestamp') or proposal.get('investigated_at') or ''
+        investigated_at = proposal.get('investigated_at') or proposal.get('timestamp') or ''
 
         last_blocked_at = (task.get('metadata') or {}).get('last_blocked_at')
-        if created_at and last_blocked_at:
+        if stamped_at and last_blocked_at:
             try:
-                is_stale = datetime.fromisoformat(created_at) < datetime.fromisoformat(last_blocked_at)
+                is_stale = datetime.fromisoformat(stamped_at) < datetime.fromisoformat(last_blocked_at)
             except (ValueError, TypeError):
                 pass  # fail open — never silently drop persisted analysis
             else:
@@ -1567,7 +1573,7 @@ A prior block-time investigation concluded the following; verify against the cur
 **Proposal:** {proposal_text}
 **Risk:** {risk_label}
 **Files referenced:** {files_str}
-**Investigated at:** {created_at}
+**Investigated at:** {investigated_at}
 """
 
     def _format_task(
