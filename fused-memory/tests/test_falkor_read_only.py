@@ -217,9 +217,12 @@ _EDGE_ROWS_QUERY = PagedQuery(
 )
 
 
-def _reader(graph: _CappedGraph, **knobs: int) -> ReadOnlyGraphReader:
-    knobs = {'page_size': 5, 'resultset_size': 10, **knobs}
-    return ReadOnlyGraphReader(graph=graph, graph_name='g', **knobs)
+def _reader(
+    graph: _CappedGraph, *, page_size: int = 5, resultset_size: int = 10
+) -> ReadOnlyGraphReader:
+    return ReadOnlyGraphReader(
+        graph=graph, graph_name='g', page_size=page_size, resultset_size=resultset_size
+    )
 
 
 class TestReadPaged:

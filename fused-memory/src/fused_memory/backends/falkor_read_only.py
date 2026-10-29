@@ -21,9 +21,21 @@ store.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
+from typing import Any, TypedDict
+
+from falkordb.asyncio import FalkorDB
+
+from fused_memory.backends.graphiti_client import (
+    _DEFAULT_READ_PAGE_SIZE,
+    _RESULTSET_SIZE,
+    PagedRead,
+    _paged_ro_query,
+)
+
+logger = logging.getLogger(__name__)
 
 RO_COMMAND = 'GRAPH.RO_QUERY'
 
@@ -120,3 +132,106 @@ class PagedQuery:
     @property
     def census_cypher(self) -> str:
         return f'{self.match.strip()} RETURN count({self.row})'
+
+
+class _HostPort(TypedDict, total=False):
+    host: str
+    port: int
+
+
+def open_graph(
+    graph_name: str,
+    *,
+    uri: str | None = None,
+    host: str | None = None,
+    port: int | None = None,
+) -> Any:
+    """Open a ``falkordb.asyncio`` handle on *graph_name*, addressed by a uri OR by host/port.
+
+    Opening is not free, which is why readers open on first read rather than
+    at construction. ``FalkorDB.__init__`` runs a SYNCHRONOUS ``INFO server``
+    (``falkordb/cluster.py::Is_Cluster``) against its host and port, so a
+    refused address raises right here. ``FalkorDB.from_url`` calls ``cls()``
+    before it applies the url, so a uri open first probes localhost:6379.
+    That is why the host/port form exists beside the uri one: rewriting a
+    host/port address as a ``redis://`` url would add a hidden dependency on
+    a localhost server.
+    """
+    if uri is not None and (host is not None or port is not None):
+        raise ValueError(
+            f'open_graph takes a uri OR a host/port, not both: '
+            f'uri={uri!r} host={host!r} port={port!r}'
+        )
+    if uri is not None:
+        client = FalkorDB.from_url(uri)
+    else:
+        address: _HostPort = {}
+        if host is not None:
+            address['host'] = host
+        if port is not None:
+            address['port'] = port
+        client = FalkorDB(**address)
+    return client.select_graph(graph_name)
+
+
+class ReadOnlyGraphReader:
+    """Reads one graph through the guarded handle, paged and census-proven or as one capped query.
+
+    An injected *graph* is wrapped at construction; otherwise the handle is
+    opened by :func:`open_graph` on the first read. A None paging knob means
+    the default in ``fused_memory/backends/graphiti_client.py``.
+    """
+
+    def __init__(
+        self,
+        *,
+        graph_name: str,
+        graph: Any | None = None,
+        uri: str | None = None,
+        host: str | None = None,
+        port: int | None = None,
+        page_size: int | None = None,
+        resultset_size: int | None = None,
+    ) -> None:
+        self.graph_name = graph_name
+        self._uri = uri
+        self._host = host
+        self._port = port
+        self._page_size = _DEFAULT_READ_PAGE_SIZE if page_size is None else page_size
+        self._resultset_size = _RESULTSET_SIZE if resultset_size is None else resultset_size
+        self._guarded = None if graph is None else ReadOnlyGraphProxy(graph)
+
+    def guarded_graph(self) -> ReadOnlyGraphProxy:
+        if self._guarded is None:
+            graph = open_graph(self.graph_name, uri=self._uri, host=self._host, port=self._port)
+            self._guarded = ReadOnlyGraphProxy(graph)
+        return self._guarded
+
+    async def read_paged(
+        self, query: PagedQuery, *, params: dict[str, Any] | None = None
+    ) -> PagedRead:
+        return await _paged_ro_query(
+            self.guarded_graph(),
+            query.page_template,
+            query.census_cypher,
+            params=params,
+            page_size=self._page_size,
+            resultset_size=self._resultset_size,
+        )
+
+    async def read_unpaged(
+        self, cypher: str, params: dict[str, Any] | None = None
+    ) -> list[list]:
+        """One query, whose answer the server truncates silently at its row cap; :meth:`read_paged` is the complete read."""
+        result = await self.guarded_graph().ro_query(cypher, params)
+        rows = list(getattr(result, 'result_set', None) or [])
+        if len(rows) >= self._resultset_size:
+            logger.warning(
+                'read_unpaged on graph %r returned %d rows, at or above the assumed '
+                'server cap resultset_size=%d: the server may have truncated it '
+                'silently. read_paged is the complete alternative.',
+                self.graph_name,
+                len(rows),
+                self._resultset_size,
+            )
+        return rows
