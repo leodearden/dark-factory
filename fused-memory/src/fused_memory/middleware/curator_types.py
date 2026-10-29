@@ -304,11 +304,12 @@ class PoolWithheld:
     actual similarity — the stream whose withheld entries are the likeliest
     duplicates of all.
 
-    Every count is deliberately per-STREAM and not only at ``total_cap``:
-    under stock config the stream caps are the binding constraints and
-    ``total_cap`` never fires at all (see the pool-cap block in
-    ``config/schema.py::CuratorConfig``), so a census keyed on the final trim
-    alone would be permanently silent.
+    Every count is deliberately per-STREAM and not only at ``total_cap``: a
+    stream cap discards entries before the final trim ever sees them, and
+    under stock config the embedding cap binds on every candidate measured
+    (see the pool-cap block in ``config/schema.py::CuratorConfig``), so a
+    census keyed on the final trim alone would miss most of what the pool
+    loses.
 
     An empty census renders nothing: a pool that fit says nothing about
     fitting, exactly as a complete result surface carries no delta.

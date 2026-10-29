@@ -6953,9 +6953,9 @@ class TestSingleCallBudgetScaling:
     async def test_oversized_pool_clamped_at_cap(self):
         """N=50 → unclamped would be 2.00 + 0.0125*50 = 2.625; clamped at $2.00.
 
-        NOTE: In production _trim_pool caps the pool at pool_total_cap (default 30)
-        while the corpus is assembled, so len(pool) can never exceed 30
-        on the normal code path.  The cap (2.00) now equals the base floor, so
+        NOTE: In production _trim_pool caps the pool at pool_total_cap while
+        the corpus is assembled, so len(pool) can never exceed that cap on the
+        normal code path.  The cap (2.00) now equals the base floor, so
         every pool size — including pathologically large ones — clamps to the
         same flat $2.00.  This test verifies the clamping arithmetic but does
         NOT represent a reachable runtime scenario — it bypasses _trim_pool by
