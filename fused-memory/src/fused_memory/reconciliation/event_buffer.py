@@ -301,10 +301,12 @@ class EventBuffer:
         middle constituent folds again and over-counts by one.
         The INSERT runs first: a unit whose first statement writes is
         serialised against other connections, which a unit that SELECTs first
-        is not (``AtomicConnection.write``).  A fold landing between
-        ``peek_buffered`` and ``drain_by_ids`` reaches the stage as the
-        pre-fold payload; that is benign, because the target's task is already
-        in that batch and ``_ctx_task_event`` reads the task's live state.
+        is not (``AtomicConnection.write``).  A transition into done never
+        folds (``coalescing.coalesce_key``), so ``select_done_transitions`` sees
+        each with its own ``done_provenance``; every other drained task-event
+        reader uses task_id or the live task.  That also makes a fold landing
+        between ``peek_buffered`` and ``drain_by_ids`` benign: the stage gets
+        the pre-fold payload, and no done event can have folded into it.
         """
         key = coalesce_key(event)
         async with self._require_access().write() as db:

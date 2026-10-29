@@ -224,6 +224,8 @@ sized it: `task_modified` was 1157/1741 (66%) of dark_factory's inflow and
   (`AtomicConnection.write`).
 - A `task_status_changed` event folds by task id. A `task_modified` event folds only when
   its `operation` is `update_task`.
+- A `task_status_changed` into `done` is a fold barrier: it never folds and never becomes a
+  fold target, because its row stores no `coalesce_key`.
 - `add_dependency` / `remove_dependency` never fold: each `depends_on` is a distinct fact.
   On 2026-10-19, 113 live dependency events covered 111 distinct edges. Task creation and
   deletion, `deferral_restamped` and every memory event never fold either.
@@ -235,12 +237,16 @@ sized it: `task_modified` was 1157/1741 (66%) of dark_factory's inflow and
 
 - **(a) The stage still sees what happened.** The merged payload describes itself.
   `old_status` comes from the earliest constituent. `new_status` and every producer key
-  (`done_provenance`, `reopen_*`, `deferral`, `deferral_cleared`, `_project_root`) come
-  from the newest, replaced rather than unioned, so no stale per-transition key survives.
+  (`reopen_*`, `deferral`, `deferral_cleared`, `_project_root`) come from the newest,
+  replaced rather than unioned, so no stale per-transition key survives.
   `_coalesced_status_path` (capped at 20 and flagged when truncated) and
-  `_coalesced_count` record the chain. Pushes can arrive out of timestamp order (several
+  `_coalesced_count` record the chain; the path bridges a status event held in another
+  row, such as a `done` barrier. Pushes can arrive out of timestamp order (several
   processes, an async queue), and the merge classifies each arrival as older, newer or
   middle so the result does not depend on arrival order.
+  `unlanded_path_check` reads each `done` transition's own `done_provenance`, and every
+  other drained-event reader uses `task_id` or live task state. A new reader of a
+  per-transition key adds its transition to `coalescing._FOLD_BARRIER_STATUSES`.
 - **(b) Drain ids stay stable.** The target row keeps its id, so an id `peek_buffered`
   handed out still drains through `drain_by_ids`. Scoping to `status='buffered'` means a
   drained or dead-lettered row is never mutated; a later push starts a fresh row.
@@ -250,8 +256,8 @@ sized it: `task_modified` was 1157/1741 (66%) of dark_factory's inflow and
   cannot walk its event past `max_staleness_seconds`.
 
 A fold landing between `peek_buffered` and `drain_by_ids` reaches the stage as the
-pre-fold payload. That is benign: the task is already in that batch, and
-`_ctx_task_event` reads its live state.
+pre-fold payload. That is benign: the task is already in that batch, `_ctx_task_event`
+reads its live state, and no `done` event can have folded into it.
 
 **Fold ratios, 2026-10-19** (live `event_buffer`, rows per distinct task id, `update_task`):
 2.28x dark_factory, 2.69x solar_challenge, 2.62x solar_challenge_platform, 1.31x reify.
