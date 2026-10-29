@@ -1,8 +1,10 @@
 """The shared VerifyResult doubles' own contract (``_verify_result_doubles``).
 
-The merge-lane tests lean on these doubles to reach the real disposition
-classifier, so what each one returns is pinned here through their public
-surface.
+The merge-lane tests lean on ``fake_verify_result`` to reach the real
+disposition classifier. That a failing double classifies without failing open
+is proven two-sidedly, against the classifier itself, by
+``orchestrator/tests/test_merge_speculation.py::TestDispositionDoubleFidelity``.
+This module pins the factory's own surface.
 """
 from __future__ import annotations
 
@@ -11,20 +13,29 @@ import dataclasses
 import pytest
 from _verify_result_doubles import fake_verify_result, real_verify_result
 
-from orchestrator.merge_lane.disposition import (
-    _extract_failing_tests_and_candidate_files,
-)
 from orchestrator.verify import VerifyResult
 
 
 class TestFakeVerifyResultFidelity:
-    """`fake_verify_result` doubles must survive the real disposition-
-    classification extraction path, unlike a bare `MagicMock(passed=...)`.
+    """`fake_verify_result` is a ``MagicMock(spec=VerifyResult)`` seeded from a
+    real VerifyResult, with its overrides validated against VerifyResult's fields.
+
+    It stays a MagicMock rather than a real VerifyResult, so its methods stay
+    mocked. On a real one, ``failure_report()`` returns a real report, and
+    ``orchestrator/src/orchestrator/merge_lane/worker.py`` appends that report
+    to the blocked-merge reasons it renders. That would change assertions in
+    tests that only needed a double the classifier can read.
     """
 
-    def test_failing_double_survives_disposition_extraction(self) -> None:
-        """A failing `fake_verify_result` double must not TypeError inside
-        `_extract_failing_tests_and_candidate_files`.
+    def test_failing_double_carries_a_real_str_cause_hint(self) -> None:
+        """The task-3477 root cause, pinned on its own.
+
+        A bare ``MagicMock(passed=False, ...)`` that omits ``cause_hint``
+        auto-vivifies it as a truthy child Mock. The classifier's evidence
+        extraction ``str.join``s ``(cause_hint, test_output)`` and raises
+        ``TypeError``. ``classify_merge_failure_disposition`` swallows that into
+        a silent fail-open (WARNING + INDETERMINATE), so every disposition
+        assertion built on such a double is vacuous.
         """
         double = fake_verify_result(
             passed=False,
@@ -33,26 +44,10 @@ class TestFakeVerifyResultFidelity:
             category='test_failure',
         )
 
-        failing_tests, candidate_files = _extract_failing_tests_and_candidate_files(
-            double,
-        )
-        assert (failing_tests, candidate_files) == ((), ()), (
-            f'Expected an uninformative failing double to degrade to the '
-            f'honest empty-candidate-set return, not raise or manufacture a '
-            f'false candidate; got {(failing_tests, candidate_files)!r}.'
-        )
-
-        # Root-cause pin: a bare MagicMock auto-vivifies `.cause_hint` as a
-        # truthy child Mock (not a str) — that is the whole bug. The factory
-        # must seed a real string default (VerifyResult's own default: '')
-        # instead.
         assert isinstance(double.cause_hint, str), (
             f'Expected double.cause_hint to be a real str (the VerifyResult '
             f'default is \'\'), not an auto-vivified MagicMock child; got '
-            f'{double.cause_hint!r} ({type(double.cause_hint)!r}). This is '
-            f'the root cause of the file-wide fail-open: '
-            f'_extract_failing_tests_and_candidate_files joins '
-            f'(cause_hint, test_output) and str.join rejects a non-str item.'
+            f'{double.cause_hint!r} ({type(double.cause_hint)!r}).'
         )
 
     def test_rejects_unknown_override_field(self) -> None:
@@ -66,12 +61,19 @@ class TestFakeVerifyResultFidelity:
         leftover ``verify_skipped=`` would silently produce a double whose
         real field keeps its seeded default instead of raising -- the same
         class of silent drift this factory exists to eliminate.
+        ``verify_skipped`` is
+        ``orchestrator/src/orchestrator/merge_lane/types.py::MergeOutcome.verify_skipped``,
+        never a VerifyResult field: a caller migrating off an old inline
+        double drops it.
         """
         with pytest.raises(TypeError, match='verify_skipped'):
             fake_verify_result(passed=False, verify_skipped=True)
 
     @pytest.mark.parametrize('passed', [True, False])
     def test_every_field_is_seeded_from_real_verify_result(self, passed: bool) -> None:
+        """Seeding walks ``dataclasses.fields(VerifyResult)``, so a field added
+        to VerifyResult is seeded with its real default with no edit to the
+        factory."""
         real = real_verify_result(passed)
         assert isinstance(real, VerifyResult)
         assert real.passed == passed
@@ -91,6 +93,9 @@ class TestFakeVerifyResultFidelity:
         assert (fake.summary, fake.category) == ('x', 'lint_failure')
 
     def test_unknown_attribute_read_raises(self) -> None:
+        """``spec=VerifyResult`` makes a read of an attribute VerifyResult lacks
+        fail loudly instead of auto-vivifying. That covers the next missing
+        field as well as today's ``cause_hint``."""
         fake = fake_verify_result(passed=True)
 
         with pytest.raises(AttributeError):
