@@ -111,7 +111,7 @@ from orchestrator.verify_cancel import (
     write_lock_holder_pgid,
 )
 from orchestrator.verify_classify import reports_disk_full
-from orchestrator.warm_lane_pool import WarmLanePool, WarmLanePoolCensus
+from orchestrator.warm_lane_pool import WarmLanePool, WarmLanePoolCensus, WarmLanePoolShrink
 from orchestrator.worktree_admin_entries import unlock_dangling_locked_entries
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
@@ -6935,6 +6935,38 @@ class GitOps:
             n_quarantined=n_quarantined,
         )
 
+    def warn_on_warm_lane_pool_shrink(self) -> WarmLanePoolShrink | None:
+        """Log ONE WARNING naming every lane resident beyond the pool's capacity.
+
+        A startup diagnostic for a restart with a smaller pool: each over-cap
+        lane is named with its durable state and task, i.e. the assignments
+        recovery is about to adopt.  Returns the report, or None when the pool
+        is disabled or the pool directory / durable records cannot be read.
+        Never raises.
+        """
+        pool = self.warm_lane_pool
+        if pool is None:
+            return None
+        try:
+            resident = [entry for entry in self.worktree_base.iterdir() if entry.is_dir()]
+            records = self._lane_lifecycle.all_records()
+        except OSError:
+            logger.warning(
+                'warm-lane pool shrink check could not read %s — skipped',
+                self.worktree_base, exc_info=True,
+            )
+            return None
+        report = pool.over_cap_report(resident, records)
+        if report.lanes:
+            logger.warning(
+                'warm-lane pool SHRINK: %d lane(s) resident beyond capacity %d '
+                '— live assignments on them are adopted as over-cap lanes that '
+                'drain on release; any left assigned-but-unadopted after '
+                'startup stays stranded until released: %s',
+                len(report.lanes), report.capacity, report.render(),
+            )
+        return report
+
     def _note_structural_exhaustion(self, census: 'WarmLanePoolCensus') -> None:
         """Count consecutive pool EXHAUSTED; fire the loudness callback at
         threshold (task 2988, PRD ε pole-2 — the silent-infinite-requeue pole).
@@ -9086,9 +9118,10 @@ class GitOps:
         instead of resolving one target branch, it walks every ``worktree``/
         ``branch`` pair in ``git worktree list --porcelain`` and keeps those
         whose branch is namespaced under ``config.branch_prefix`` AND whose
-        worktree path resolves to a registered :class:`WarmLanePool` lane
-        (via :meth:`WarmLanePool._match_lane`).  Non-task branches, detached
-        entries, and non-pool worktrees are filtered out.
+        worktree path names a :class:`WarmLanePool` lane (via
+        :meth:`WarmLanePool.canonical_lane`, so over-cap lanes a pool shrink
+        left behind are included).  Non-task branches, detached entries, and
+        non-pool worktrees are filtered out.
 
         Returns:
             ``{bare_id: canonical_lane}`` (bare_id has ``branch_prefix``
@@ -9120,7 +9153,7 @@ class GitOps:
             name = line[len('branch '):].strip()
             if not name.startswith(head_prefix):
                 continue
-            matched = pool._match_lane(current)
+            matched = pool.canonical_lane(current)
             if matched is not None:
                 result[name[len(head_prefix):]] = matched
         return result
