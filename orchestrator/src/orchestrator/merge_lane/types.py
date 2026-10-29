@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_name
 
 from orchestrator.branch_stack import PreStackTip
+from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
 from orchestrator.merge_lane.reverify_gate_decision import GateClearance
@@ -2070,6 +2071,20 @@ class _HostUnavailability:
     kind: RunnerUnavailableKind = 'transport'
     identity: GateIdentityPair | None = None
     sticky: bool = False
+
+    def alarm_due(self, now: float, *, after_n: int, after_secs: float) -> bool:
+        """THE definition of "this bench episode warrants an open alarm" (task 5290).
+
+        The immediate :func:`escalation_policy`, the *after_n* streak ladder,
+        or *after_secs* of downtime when that gate is enabled (> 0).  The bench
+        site and every still-down reprobe sweep ask it, so a resolve issued
+        while it still holds is re-opened by the next sweep.
+        """
+        return (
+            escalation_policy(self.kind, sticky=self.sticky) == 'immediate'
+            or critical_filing_gate(streak=self.streak, threshold=after_n)
+            or (after_secs > 0 and now - self.first_unavailable_at >= after_secs)
+        )
 
     def to_wire(self, now: float) -> dict[str, Any]:
         """This episode as the heartbeat ``hosts`` block shows it, aged against *now*.

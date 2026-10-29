@@ -511,9 +511,11 @@ def _alarm_verify_host_unreachable(
 ) -> None:
     """Submit a dedup'd L1 escalation when a remote verify host is persistently unreachable.
 
-    Fires at most ONCE per downtime episode per host (dedup'd via
-    ``has_open_l1(sentinel)``).  Recovery clears the open L1 via
-    :func:`_clear_verify_host_unreachable`.
+    At most one open L1 per host at a time (dedup'd via
+    ``has_open_l1(sentinel)``).  The reprobe sweep re-asserts it while the
+    bench is ``alarm_due``, so a resolve issued while the host is still down
+    is re-opened; recovery resolves it via
+    :func:`_clear_verify_host_unreachable` (task 5290).
 
     The escalation is:
 
@@ -562,9 +564,13 @@ def _alarm_verify_host_unreachable(
         'The orchestrator is falling back to serial-local verification; '
         'throughput is degraded but correctness is preserved.\n'
         '\n'
-        'Auto-reprobe is active: when the host becomes reachable again '
-        '(ssh health check passes) the quarantine is cleared automatically '
-        'and this alarm is resolved without a restart.'
+        'Auto-reprobe is active: every reprobe sweep runs the ssh health probe '
+        '`ssh -o BatchMode=yes -o ConnectTimeout=10 <host> true`; a pass '
+        're-admits the host and resolves this alarm without a restart.  While '
+        'the probe still fails, every sweep re-asserts this alarm, so resolving '
+        'it while the host is still down re-opens it.  Recovery is decided by '
+        'that probe, never by get_merge_queue occupancy (by_host is lease '
+        'bookkeeping, not host health).'
     )
 
     esc = Escalation(
@@ -578,11 +584,12 @@ def _alarm_verify_host_unreachable(
         detail=detail,
         suggested_action=(
             f'Check SSH connectivity to {host!r}.  '
-            'The auto-reprobe loop will clear the quarantine and resolve this '
-            'alarm once the host responds to `ssh -o BatchMode=yes -o '
-            'ConnectTimeout=10 <host> true`.  '
-            'To manually re-engage: fix SSH access and the orchestrator will '
-            'recover automatically on the next reprobe cycle.'
+            'The reprobe sweep resolves this alarm once the host answers `ssh -o '
+            'BatchMode=yes -o ConnectTimeout=10 <host> true`; do not resolve it '
+            'while the host is still down, since the next sweep re-opens it.  '
+            f'To lift the bench now, call clear_verify_host_quarantine(host={host!r}); '
+            'to retire a host that is gone for good, remove it from the '
+            'verify_runners config.'
         ),
     )
     escalation_queue.submit(esc)

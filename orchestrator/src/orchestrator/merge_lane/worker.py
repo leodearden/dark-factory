@@ -46,7 +46,6 @@ from escalation.models import Escalation
 from shared.mcp_post import open_mcp_client, post_mcp_tool_call
 
 from orchestrator.branch_stack import UnstackOutcome
-from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
 from orchestrator.deployed_sha import DeployedSha
 from orchestrator.dry_run_unblock import (
@@ -198,7 +197,6 @@ from orchestrator.merge_lane.types import (
     VerifyWorktreeHandle,
     _HostUnavailability,
     _InFlightEntry,
-    escalation_policy,
     item_merge_wt,
     quarantine_class,
 )
@@ -11040,11 +11038,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         never downgrades a skew entry: it refreshes the reason of a transport
         entry only.
 
-        Returns whether the caller should alarm: always for an
-        :func:`escalation_policy` of 'immediate', else once ``streak`` reaches
-        ``self._unreachable_escalate_after_n`` (via the shared
-        ``critical_gate.critical_filing_gate``, task 2558).  The alarm helpers'
-        ``has_open_l1`` dedup prevents re-submitting.
+        Returns whether the caller should alarm: the entry's
+        :meth:`_HostUnavailability.alarm_due` against this worker's streak and
+        time thresholds, the same predicate the reprobe sweep re-asserts
+        (task 5290).  The alarm helpers' ``has_open_l1`` dedup prevents
+        re-submitting.
         """
         entry = self._runner_unavailable.setdefault(
             host, _HostUnavailability(streak=0, first_unavailable_at=now, reason=reason),
@@ -11056,11 +11054,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             entry.kind, entry.reason, entry.identity = kind, reason, identity
         elif quarantine_class(entry.kind) == 'ru':
             entry.reason = reason
-        if escalation_policy(entry.kind, sticky=entry.sticky) == 'immediate':
-            return True
-        return critical_filing_gate(
-            streak=entry.streak,
-            threshold=self._unreachable_escalate_after_n,
+        return entry.alarm_due(
+            now,
+            after_n=self._unreachable_escalate_after_n,
+            after_secs=self._unreachable_escalate_after_secs,
         )
 
     def _open_skew_bench(self, host: str, entry: _HostUnavailability) -> None:
@@ -11135,8 +11132,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         semantics are DELEGATED to :meth:`_record_runner_unavailable` so they
         are identical across this path and the existing RUNNER_UNAVAILABLE
         finalize path, and the L1 alarm keeps the existing
-        ``has_open_l1`` dedup (exactly one open alarm per host per downtime
-        episode).
+        ``has_open_l1`` dedup (at most one open alarm per host at a time).
 
         Local is a no-op *for state*: it is the trust anchor, is never
         quarantined, and has no remote to probe for recovery.  It is NOT a
@@ -11371,13 +11367,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
            ``acquire_remote`` additionally requires ``_SLOT_FREE`` — then
            :meth:`readmit_host` resets the tracker and resolves the alarms on
            the evidence the probe named.
-        3. **On failure** (host still unreachable): if
-           ``self._unreachable_escalate_after_secs > 0`` **and**
-           ``now - entry.first_unavailable_at >= self._unreachable_escalate_after_secs``
-           fires the time-based variant of the unreachability alarm (dedup'd via
-           ``has_open_l1``).  When *escalate_after_secs* is **0** the time-based
-           trip is disabled (streak-only mode); see
-           ``OrchestratorConfig.verify_host_unreachable_escalate_after_secs``.
+        3. **On failure** (host still unreachable): re-asserts the alarm while
+           :meth:`_HostUnavailability.alarm_due` holds (dedup'd via
+           ``has_open_l1``), so a resolve issued while the host still fails its
+           probe — on an occupancy read, say — is re-opened on the next sweep:
+           recovery is a measurement (the probe), never a proxy (task 5290).
            Probing before alarming avoids a spurious open→immediate-resolve L1
            churn for a host that recovers in the same cycle it would have tripped
            the time-based threshold.
@@ -11571,7 +11565,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         return False
 
     def _note_host_still_out(self, name: str, entry: _HostUnavailability, now: float) -> None:
-        """Log a failed reprobe (rate-limited) and fire the time-based alarm when due."""
+        """Log a failed reprobe (rate-limited) and re-assert the alarm while it is due."""
         downtime_s = now - entry.first_unavailable_at
         # Rate-limited (task 3043 amend): this is the one record that repeats
         # forever for a permanently-gone host.  INFO for the first
@@ -11602,8 +11596,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             entry.streak,
             _sweeps + 1,
         )
-        # `> 0` guard: secs=0 disables the time-based trip (streak-only).
-        if 0 < self._unreachable_escalate_after_secs <= downtime_s:
+        if entry.alarm_due(
+            now,
+            after_n=self._unreachable_escalate_after_n,
+            after_secs=self._unreachable_escalate_after_secs,
+        ):
             self._alarm_host(name, entry, downtime_s)
 
     def readmit_host(
