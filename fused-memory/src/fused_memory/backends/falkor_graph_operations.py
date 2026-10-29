@@ -1,5 +1,10 @@
 """graphiti ``graph_operations_interface`` for FalkorDB (task 7714).
 
+Entity edge get-by-uuid(s) read through
+:func:`fused_memory.backends.falkor_entity_edges.read_entity_edges`, which
+FalkorDB plans as a single edge-index scan rather than graphiti's Entity label
+scan.
+
 Dispatch contract: graphiti-core hands six graph operations to
 ``driver.graph_operations_interface`` UNCONDITIONALLY, with no
 NotImplementedError fallback: the four bulk saves in
@@ -16,6 +21,7 @@ from typing import Any
 
 from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.graph_operations.graph_operations import GraphOperationsInterface
+from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.models.edges.edge_db_queries import (
     get_entity_edge_save_bulk_query,
     get_episodic_edge_save_bulk_query,
@@ -25,6 +31,8 @@ from graphiti_core.models.nodes.node_db_queries import (
     get_episode_node_save_bulk_query,
 )
 from graphiti_core.search import search_utils
+
+from fused_memory.backends.falkor_entity_edges import read_entity_edges
 
 
 def _builtin_operations_driver(driver: GraphDriver) -> GraphDriver:
@@ -40,6 +48,21 @@ def _builtin_operations_driver(driver: GraphDriver) -> GraphDriver:
 
 
 class FalkorGraphOperations(GraphOperationsInterface):
+    async def edge_get_by_uuid(self, _cls: Any, driver: Any, uuid: str) -> Any:
+        edges = await read_entity_edges(
+            driver, 'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->()', uuid=uuid
+        )
+        if not edges:
+            raise EdgeNotFoundError(uuid)
+        return edges[0]
+
+    async def edge_get_by_uuids(self, _cls: Any, driver: Any, uuids: list[str]) -> list[Any]:
+        if not uuids:
+            return []
+        return await read_entity_edges(
+            driver, 'MATCH ()-[e:RELATES_TO]->() WHERE e.uuid IN $uuids', uuids=uuids
+        )
+
     async def node_load_embeddings_bulk(
         self,
         driver: Any,
