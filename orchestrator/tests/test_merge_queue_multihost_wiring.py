@@ -2851,19 +2851,22 @@ class _FakeEscalationQueueWithResolution(_FakeEscalationQueue):
         self._by_task: dict = {}
         self.resolved: list = []  # list of (escalation_id, resolution) pairs
 
-    def seed_pending_l1(self, task_id: str, esc_id: str = 'esc-1001') -> None:
-        """Pre-seed a pending L1 escalation for the given task_id."""
+    def seed_pending(self, task_id: str, esc_id: str = 'esc-1001', *, level: int = 1) -> None:
+        """Pre-seed a pending escalation at *level*; only a level-1 seed opens has_open_l1."""
         from types import SimpleNamespace
-        esc = SimpleNamespace(id=esc_id, task_id=task_id, status='pending', level=1)
+        esc = SimpleNamespace(id=esc_id, task_id=task_id, status='pending', level=level)
         self._by_task.setdefault(task_id, []).append(esc)
-        # Mark the queue as having an open L1 so has_open_l1 returns True
-        self._open_l1 = True
+        if level == 1:
+            self._open_l1 = True
 
-    def get_by_task(self, task_id: str, status: str | None = None) -> list:
-        escs = list(self._by_task.get(task_id, []))
-        if status is not None:
-            escs = [e for e in escs if e.status == status]
-        return escs
+    def seed_pending_l1(self, task_id: str, esc_id: str = 'esc-1001') -> None:
+        self.seed_pending(task_id, esc_id, level=1)
+
+    def get_by_task(self, task_id: str, status: str | None = None, level: int | None = None) -> list:
+        return [
+            e for e in self._by_task.get(task_id, [])
+            if (status is None or e.status == status) and (level is None or e.level == level)
+        ]
 
     def resolve(self, escalation_id: str, resolution: str, **kwargs) -> None:
         self.resolved.append((escalation_id, resolution))
@@ -2876,15 +2879,26 @@ class _FakeEscalationQueueWithResolution(_FakeEscalationQueue):
         self._open_l1 = False
 
 
-class TestClearVerifyHostUnreachable:
-    """_clear_verify_host_unreachable module-level helper (task 1795 step-11).
+def _recovered_events(es) -> list[dict]:
+    from orchestrator.event_store import EventType
+    return [e['data'] for e in es.emitted if e['event_type'] == EventType.verify_host_recovered]
 
-    RED until step-12 GREEN adds the function to merge_queue.py.
+
+class TestClearVerifyHostUnreachable:
+    """_clear_verify_host_unreachable: recovery names its evidence (task 5290).
+
+    The pending records on the host's sentinel, at EVERY level, are both the
+    set resolved and the "an alarm was open" guard; recovery is reported by the
+    ``verify_host_recovered`` event alone and files no escalation.
     """
 
-    def _call(self, eq, es, host, *, downtime_s: float = 300.0):
-        from orchestrator.merge_lane.worker import _clear_verify_host_unreachable
-        _clear_verify_host_unreachable(eq, es, host, downtime_s=downtime_s)
+    def _call(self, eq, es, host, *, downtime_s: float = 300.0, evidence=None):
+        from orchestrator.merge_lane.liveness import _clear_verify_host_unreachable
+        from orchestrator.merge_lane.types import RecoveryEvidence
+        _clear_verify_host_unreachable(
+            eq, es, host, downtime_s=downtime_s,
+            evidence=RecoveryEvidence.SSH_HEALTH_PROBE if evidence is None else evidence,
+        )
 
     def test_none_queue_is_noop(self):
         """None escalation_queue → returns silently, no raise."""
@@ -2934,58 +2948,98 @@ class TestClearVerifyHostUnreachable:
         assert events, 'no verify_host_recovered event emitted'
         assert any('my-box' in str(e) for e in events)
 
-    def test_submits_info_severity_recovery_escalation(self):
-        """An info-severity recovery escalation is submitted when an alarm was open."""
+    def test_recovery_with_an_open_alarm_files_no_escalation(self):
+        """Recovery is reported by the event and the resolution alone (task 5290, #4440-1)."""
         from orchestrator.merge_lane.liveness import _verify_host_unreachable_sentinel
         eq = _FakeEscalationQueueWithResolution()
         eq.seed_pending_l1(_verify_host_unreachable_sentinel('recovered-host'))
-        self._call(eq, None, 'recovered-host', downtime_s=60.0)
-        assert len(eq.submitted) >= 1
-        info_escs = [e for e in eq.submitted if getattr(e, 'severity', None) == 'info']
-        assert info_escs, f'Expected info-severity escalation; got {eq.submitted}'
+        self._call(eq, _FakeEventStore(), 'recovered-host', downtime_s=60.0)
+        assert eq.submitted == []
 
-    def test_recovery_escalation_has_level_0(self):
-        """The recovery escalation is level=0 (informational, not L1 blocking)."""
+    def test_recovery_event_carries_the_evidence_and_what_it_resolved(self):
         from orchestrator.merge_lane.liveness import _verify_host_unreachable_sentinel
         eq = _FakeEscalationQueueWithResolution()
-        eq.seed_pending_l1(_verify_host_unreachable_sentinel('recovered-host'))
-        self._call(eq, None, 'recovered-host', downtime_s=60.0)
-        info_escs = [e for e in eq.submitted if getattr(e, 'severity', None) == 'info']
-        assert info_escs
-        assert all(e.level == 0 for e in info_escs)
+        eq.seed_pending_l1(_verify_host_unreachable_sentinel('worker-node'), 'esc-7')
+        es = _FakeEventStore()
+        self._call(eq, es, 'worker-node', downtime_s=90.0)
+        [data] = _recovered_events(es)
+        assert data == {
+            'host': 'worker-node',
+            'downtime_s': 90.0,
+            'evidence': 'ssh_health_probe',
+            'quarantine_class': 'ru',
+            'resolved_escalation_ids': ['esc-7'],
+        }
 
-    def test_recovery_escalation_names_the_host(self):
-        """Recovery escalation summary, detail, or task_id includes the host name."""
+    def test_no_event_store_still_resolves_and_files_nothing(self):
         from orchestrator.merge_lane.liveness import _verify_host_unreachable_sentinel
         eq = _FakeEscalationQueueWithResolution()
-        eq.seed_pending_l1(_verify_host_unreachable_sentinel('worker-node'))
-        self._call(eq, None, 'worker-node', downtime_s=90.0)
-        info_escs = [e for e in eq.submitted if getattr(e, 'severity', None) == 'info']
-        assert info_escs
-        esc = info_escs[0]
-        host_present = (
-            'worker-node' in (esc.summary or '')
-            or 'worker-node' in (esc.detail or '')
-            or 'worker-node' in (esc.task_id or '')
-        )
-        assert host_present, f'Host not found in recovery escalation: {esc}'
-
-    def test_safe_when_no_open_l1(self):
-        """No L1 pre-seeded → resolve() is never called; no recovery noise emitted."""
-        eq = _FakeEscalationQueueWithResolution()
-        # Must not raise even when there is no pending L1 to resolve
-        self._call(eq, None, 'fresh-host')
-        assert len(eq.resolved) == 0
-        assert len(eq.submitted) == 0, 'no recovery noise when no alarm was open'
-
-    def test_no_event_when_event_store_none(self):
-        """No event store → no event emitted; info escalation still submitted when alarm was open."""
-        from orchestrator.merge_lane.liveness import _verify_host_unreachable_sentinel
-        eq = _FakeEscalationQueueWithResolution()
-        eq.seed_pending_l1(_verify_host_unreachable_sentinel('host1'))
+        eq.seed_pending_l1(_verify_host_unreachable_sentinel('host1'), 'esc-9')
         self._call(eq, None, 'host1', downtime_s=60.0)
-        # Recovery escalation is still submitted even without an event store
-        assert len(eq.submitted) >= 1
+        assert [r[0] for r in eq.resolved] == ['esc-9']
+        assert eq.submitted == []
+
+    @pytest.mark.parametrize(('evidence', 'named', 'absent'), [
+        ('SSH_HEALTH_PROBE', 'ssh_health_probe', 'operator_clear'),
+        ('OPERATOR_CLEAR', 'operator_clear', 'automatically via SSH'),
+    ])
+    def test_resolution_names_the_evidence(self, evidence, named, absent):
+        from orchestrator.merge_lane.liveness import _verify_host_unreachable_sentinel
+        from orchestrator.merge_lane.types import RecoveryEvidence
+        eq = _FakeEscalationQueueWithResolution()
+        eq.seed_pending_l1(_verify_host_unreachable_sentinel('laptop'))
+        self._call(eq, None, 'laptop', evidence=RecoveryEvidence[evidence])
+        [(_id, resolution)] = eq.resolved
+        assert named in resolution
+        assert absent not in resolution
+
+    @pytest.mark.parametrize('level', [0, 2])
+    def test_non_l1_record_on_sentinel_is_resolved_and_reported(self, level):
+        """A promoted L2 carries the sentinel as its task_id; recovery closes AND reports it.
+
+        Only that record is seeded, so has_open_l1 is False: the guard must be
+        the same read as the resolve set, at every level (task 5290, #4440-2).
+        """
+        from orchestrator.merge_lane.liveness import _verify_host_unreachable_sentinel
+        sentinel = _verify_host_unreachable_sentinel('laptop')
+        eq = _FakeEscalationQueueWithResolution()
+        eq.seed_pending(sentinel, 'esc-l2', level=level)
+        assert not eq.has_open_l1(sentinel), 'fixture precondition: no open L1'
+        es = _FakeEventStore()
+        self._call(eq, es, 'laptop')
+        assert [r[0] for r in eq.resolved] == ['esc-l2']
+        assert [e['resolved_escalation_ids'] for e in _recovered_events(es)] == [['esc-l2']]
+
+    def test_nothing_pending_means_no_resolve_and_no_event(self):
+        """A sub-threshold blip filed no alarm, so recovery is silent."""
+        eq = _FakeEscalationQueueWithResolution()
+        es = _FakeEventStore()
+        self._call(eq, es, 'fresh-host')
+        assert eq.resolved == []
+        assert eq.submitted == []
+        assert _recovered_events(es) == []
+
+
+class TestClearVerifyHostSkewAgreesOnLevel:
+    """The skew clear shares the unreachable clear's one-read guard (task 5290, #4440-2)."""
+
+    def test_a_level_2_skew_record_is_resolved_and_reported(self):
+        from orchestrator.merge_lane.liveness import (
+            _clear_verify_host_skew,
+            _verify_host_skew_sentinel,
+        )
+        from orchestrator.merge_lane.types import RecoveryEvidence
+        sentinel = _verify_host_skew_sentinel('laptop')
+        eq = _FakeEscalationQueueWithResolution()
+        eq.seed_pending(sentinel, 'esc-skew-l2', level=2)
+        es = _FakeEventStore()
+        _clear_verify_host_skew(
+            eq, es, 'laptop', downtime_s=60.0, evidence=RecoveryEvidence.ENSURE_GATE,
+        )
+        assert [r[0] for r in eq.resolved] == ['esc-skew-l2']
+        [data] = _recovered_events(es)
+        assert (data['quarantine_class'], data['evidence']) == ('skew', 'ensure_gate')
+        assert data['resolved_escalation_ids'] == ['esc-skew-l2']
 
 
 # ---------------------------------------------------------------------------
@@ -3054,22 +3108,29 @@ class _FakeAllocatorForReprobe:
         return name in self._parked
 
 
-def make_reprobe_worker(*, escalate_after_secs: float = 5.0, escalate_after_n: int = 3):
+def make_reprobe_worker(
+    *, escalate_after_secs: float = 5.0, escalate_after_n: int = 3,
+    escalation_queue=None, clock=None,
+):
     """A bare worker whose escalations land in a queue the caller can read.
 
     Module-level so the four reprobe classes share ONE builder instead of
     reaching into a sibling test class for it; the queue goes in through the
-    constructor keyword.
+    constructor keyword.  *escalation_queue* defaults to the fake; pass a real
+    ``EscalationQueue`` to measure what is pending on the real store.
     """
     import asyncio
 
-    from orchestrator.merge_lane.worker import SpeculativeMergeWorker
+    from orchestrator.merge_lane.worker import PRODUCTION_CLOCK, SpeculativeMergeWorker
 
     git_ops = _make_git_ops_mock()
     git_ops.project_root = None
     q: asyncio.Queue = asyncio.Queue()
-    eq = _FakeEscalationQueueWithResolution()
-    worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q, escalation_queue=eq)
+    eq = _FakeEscalationQueueWithResolution() if escalation_queue is None else escalation_queue
+    worker = SpeculativeMergeWorker(
+        git_ops=git_ops, queue=q, escalation_queue=eq,
+        clock=PRODUCTION_CLOCK if clock is None else clock,
+    )
     worker._unreachable_escalate_after_secs = escalate_after_secs
     worker._unreachable_escalate_after_n = escalate_after_n
     return worker, eq
@@ -3184,10 +3245,12 @@ class TestReprobeQuarantinedHosts:
 
         assert 'good-host' not in worker._runner_unavailable, 'tracker entry should be cleared'
 
-    async def test_healthy_host_recovery_escalation_submitted(self):
-        """health()=True with an open alarm → _clear_verify_host_unreachable submits info escalation."""
+    async def test_healthy_host_recovery_is_an_event_naming_the_probe(self):
+        """health()=True with an open alarm → resolved, reported by event, nothing filed."""
         from orchestrator.merge_lane.liveness import _verify_host_unreachable_sentinel
         worker, eq = make_reprobe_worker()
+        es = _FakeEventStore()
+        worker._event_store = es  # type: ignore[assignment]
 
         fake_runner = MagicMock()
         fake_runner.health = AsyncMock(return_value=True)
@@ -3203,8 +3266,8 @@ class TestReprobeQuarantinedHosts:
 
         await worker._reprobe_quarantined_hosts(now)
 
-        info_escs = [e for e in eq.submitted if getattr(e, 'severity', None) == 'info']
-        assert info_escs, 'expected recovery info escalation after healthy reprobe with open alarm'
+        assert eq.submitted == [], 'recovery files no info escalation (task 5290)'
+        assert [e['evidence'] for e in _recovered_events(es)] == ['ssh_health_probe']
 
     async def test_divergence_quarantined_host_is_skipped(self):
         """CRITICAL: host in allocator quarantine but NOT in RU tracker is never touched."""
@@ -3319,6 +3382,44 @@ class TestReprobeQuarantinedHosts:
         )
 
 
+@pytest.mark.asyncio
+class TestRecoveryInfoEscalationsAreBounded:
+    """A flapping host cannot grow the pending pile (task 5290, #4440-1).
+
+    Each bench files one L1 and each recovery resolves it; recovery itself
+    files nothing, so after N flaps the real store holds N resolved alarms and
+    no pending record at all.
+    """
+
+    async def test_a_flapping_host_leaves_nothing_pending(self, tmp_path):
+        from _merge_lane_fakes import FakeClock
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        clock = FakeClock()
+        worker, _ = make_reprobe_worker(escalate_after_n=1, escalation_queue=queue, clock=clock)
+        runner = MagicMock()
+        runner.health = AsyncMock(return_value=False)
+        worker._host_allocator = _FakeAllocatorForReprobe({'laptop': runner})  # type: ignore[assignment]
+
+        flaps = 4
+        for _ in range(flaps):
+            runner.health.return_value = False
+            worker.bench_unavailable_runner('laptop', RunnerUnavailable('ssh: connect timed out'))
+            assert len(queue.get_pending()) == 1
+            clock.time += 120.0
+            runner.health.return_value = True
+            await worker._reprobe_quarantined_hosts(clock.now())
+            assert queue.get_pending() == []
+
+        alarms = queue.get_by_task('__verify_host_unreachable__laptop')
+        assert len(alarms) == flaps
+        assert {(a.status, a.level) for a in alarms} == {('resolved', 1)}
+        assert queue.get_by_task('__verify_host_recovered__laptop') == []
+
+
 # ---------------------------------------------------------------------------
 # 3043/step-11 RED: reprobe candidacy is TRACKER-driven and recovery un-PARKs
 # ---------------------------------------------------------------------------
@@ -3410,9 +3511,9 @@ class TestReprobeIsTrackerDriven:
         assert alloc.readmitted == ['strand-host'], 'strand host must be re-engaged in the pool'
         assert 'strand-host' not in worker._runner_unavailable, 'tracker entry must be popped'
         assert 'esc-1001' in [r[0] for r in eq.resolved], 'open L1 must be resolved on recovery'
-        info_escs = [e for e in eq.submitted if getattr(e, 'severity', None) == 'info']
-        assert info_escs, 'expected the info-severity recovery escalation'
+        assert eq.submitted == [], 'recovery files no info escalation (task 5290)'
         assert EventType.verify_host_recovered in [e['event_type'] for e in es.emitted]
+        assert [e['evidence'] for e in _recovered_events(es)] == ['ssh_health_probe']
 
     # ── (b) recovery uses readmit(), not clear_quarantine() alone ───────────
 

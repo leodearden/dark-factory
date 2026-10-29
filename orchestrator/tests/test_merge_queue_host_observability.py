@@ -32,9 +32,11 @@ import logging
 import sqlite3
 import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
@@ -49,7 +51,7 @@ from orchestrator.merge_lane.worker import (
     SpeculativeMergeWorker,
     _HostUnavailability,
 )
-from orchestrator.verify_runner import HostAllocator, HostLease
+from orchestrator.verify_runner import HostAllocator, HostLease, RunnerUnavailable
 
 # ── fixtures (ported verbatim from test_merge_queue_finalize_head_visibility) ──
 
@@ -128,11 +130,13 @@ def _make_entry(
     req: MergeRequest,
     lease: HostLease | None,
     started_at: float | None = None,
+    *,
+    verify_task: asyncio.Future[Any] | None = None,
 ) -> InflightEntry:
     return InflightEntry(
         item=_make_item(req),
         lease=lease,
-        verify_task=None,
+        verify_task=verify_task,
         merge_wt=None,
         was_speculative=False,
         started_at=started_at,
@@ -214,7 +218,7 @@ def _real_worker(
     git_ops: GitOps,
     *,
     remotes: list[str] | None = None,
-    escalation_queue: _FakeEscalationQueue | None = None,
+    escalation_queue: _FakeEscalationQueue | EscalationQueue | None = None,
 ):
     """Bare worker + a REAL HostAllocator sharing worker._runner_quarantine.
 
@@ -944,3 +948,48 @@ class TestHeartbeatDegradation:
         hosts = {h['name']: h for h in _json.loads(rows[-1][0])}
         assert hosts['laptop']['quarantined'] is False
         assert hosts['laptop']['quarantine_class'] is None
+
+
+# ── 5290: recovery is a measurement, never an occupancy read ──────────────────
+
+
+@pytest.mark.asyncio
+class TestRecoveryIgnoresOccupancy:
+    """A lease on a benched host is not evidence that it recovered (the 07-24 signal).
+
+    occupancy.by_host reports LEASES; a verify task leased to a host that has
+    since been benched still shows there.  Only the host's probe answer
+    resolves its alarm.
+    """
+
+    async def test_a_lease_on_a_benched_host_leaves_its_alarm_open(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path,
+    ) -> None:
+        queue = EscalationQueue(tmp_path / 'esc')
+        worker, _alloc, runners = _real_worker(git_ops, escalation_queue=queue)
+        for _ in range(3):
+            worker.bench_unavailable_runner('laptop', RunnerUnavailable('ssh: connect timed out'))
+        [l1] = [esc for esc in queue.get_pending() if esc.level == 1]
+
+        verify_task: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        lease = HostLease(name='laptop', runner=MagicMock(), is_local=False)
+        req = _make_req('occ-phantom', 'task/occ-phantom', config, git_repo)
+        worker._inflight.append(_make_entry(req, lease, verify_task=verify_task))
+        try:
+            assert worker.snapshot()['occupancy']['by_host'] == {'laptop': 'occ-phantom'}
+
+            runners['laptop'].health.return_value = False
+            await worker._reprobe_quarantined_hosts(time.time())
+
+            assert [esc.id for esc in queue.get_pending()] == [l1.id]
+            assert queue.get_by_task(l1.task_id, status='resolved') == []
+            assert _by_name(worker.snapshot())['laptop']['quarantined'] is True
+
+            runners['laptop'].health.return_value = True
+            await worker._reprobe_quarantined_hosts(time.time())
+
+            assert queue.get_pending() == []
+            [resolved] = queue.get_by_task(l1.task_id, status='resolved')
+            assert 'ssh_health_probe' in (resolved.resolution or '')
+        finally:
+            verify_task.cancel()

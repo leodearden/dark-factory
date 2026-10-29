@@ -26,7 +26,6 @@ import pytest
 def test_merge_liveness_exports_moved_public_symbols() -> None:
     from orchestrator.merge_lane.liveness import (
         _MERGE_WORKER_LOOP_DIED_SENTINEL,
-        _VERIFY_HOST_RECOVERED_SENTINEL_PREFIX,
         _VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX,
         MergeLivenessAssessment,
         MergeLivenessConfigError,
@@ -49,7 +48,6 @@ def test_merge_liveness_exports_moved_public_symbols() -> None:
         'PersistentWorktreeConfigError': PersistentWorktreeConfigError,
         '_safety_valve_due': _safety_valve_due,
         '_VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX': _VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX,
-        '_VERIFY_HOST_RECOVERED_SENTINEL_PREFIX': _VERIFY_HOST_RECOVERED_SENTINEL_PREFIX,
         '_MERGE_WORKER_LOOP_DIED_SENTINEL': _MERGE_WORKER_LOOP_DIED_SENTINEL,
         '_verify_host_unreachable_sentinel': _verify_host_unreachable_sentinel,
         '_alarm_verify_host_unreachable': _alarm_verify_host_unreachable,
