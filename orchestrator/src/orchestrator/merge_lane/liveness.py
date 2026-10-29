@@ -1,9 +1,11 @@
-"""Startup liveness-margin guard, verify-host-unreachable alarms, and
-persistent-worktree operational guards (MQ-refactor task γ).
+"""Startup liveness-margin guard, in-flight verify progress watch,
+verify-host-unreachable alarms, and persistent-worktree operational guards
+(MQ-refactor task γ).
 
 The startup liveness-margin guard (heartbeat-floor vs. reaper-window safety
-check), the verify-host-unreachable alarm/recovery helpers, and the
-persistent warm-merge-verify-worktree serial-lane guards.  These three subsystems are
+check), the in-flight verify's progress evidence (task 5290), the
+verify-host-unreachable alarm/recovery helpers, and the
+persistent warm-merge-verify-worktree serial-lane guards.  These subsystems are
 folded into one module as "operational guards" (PRD Open Q5 resolution —
 see plan.json design_decisions) rather than split into their own modules,
 since none is individually large and all three gate/monitor worker-level
@@ -27,10 +29,12 @@ import dataclasses
 import logging
 import math
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from escalation.models import Escalation
+from shared.proc_group import cpu_ticks_under_path
 
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps
@@ -142,8 +146,9 @@ Adjusted at module level or injected via `liveness_secs` in tests."""
 
 
 # ---------------------------------------------------------------------------
-# Merge-worktree CONTENT-mtime no-progress signal (task 2420 / DEFECT 1,
-# split from 2357; extends #1728)
+# In-flight verify no-progress signals: merge-worktree CONTENT mtime (task
+# 2420 / DEFECT 1, split from 2357; extends #1728) and the verify process
+# tree's CPU time (task 5290)
 # ---------------------------------------------------------------------------
 
 
@@ -204,6 +209,74 @@ def newest_content_mtime(root: Path) -> float | None:
         # Top-level scan failure (e.g. root exists but is unreadable).
         return None
     return newest
+
+
+def verify_tree_cpu_ticks(root: Path) -> int | None:
+    """The CPU-time fingerprint of the verify process tree working under *root*.
+
+    Excludes the orchestrator's own process group, so nothing it does in
+    process can refresh the signal: the #1728 anti-masking property that
+    :func:`newest_content_mtime` gets by skipping the root inode and ``.git``
+    (the owner heartbeat is an ``os.utime``, not a process).  Verify
+    subprocesses run in their own session (``start_new_session``) and count.
+    """
+    return cpu_ticks_under_path(root, exclude_pgids=frozenset({os.getpgrp()}))
+
+
+@dataclasses.dataclass(frozen=True)
+class VerifyProgressWatch:
+    """Whether an in-flight verify is making progress: the union of its evidence.
+
+    A live remote ssh dispatch is progress outright.  Otherwise each throttled
+    probe asks the verify process tree's CPU fingerprint first, and walks
+    merge_wt for a newer content mtime only when that is silent.  Each is a
+    measurement of the verify itself, not of a filesystem proxy for it.  The
+    evidence is generous on purpose: a false kill livelocks the lane, a late
+    kill delays one request.  A sample not refreshed while a stronger signal
+    held can grant one extra budget window when that signal stops, never a
+    permanent mask.
+    """
+
+    last_progress_at: float
+    last_probe_at: float
+    last_cpu_ticks: int | None
+    last_content_mtime: float | None
+    dispatch_seen_in_flight: bool = False
+
+    @classmethod
+    def start(
+        cls, now: float, *, cpu_ticks: int | None, content_mtime: float | None,
+    ) -> VerifyProgressWatch:
+        return cls(
+            last_progress_at=now, last_probe_at=now,
+            last_cpu_ticks=cpu_ticks, last_content_mtime=content_mtime,
+        )
+
+    def observe(
+        self,
+        now: float,
+        *,
+        dispatch_live: bool,
+        probe_every_secs: float,
+        cpu_ticks: Callable[[], int | None],
+        content_mtime: Callable[[], float | None],
+    ) -> VerifyProgressWatch:
+        """This watch after one poll at *now*; the probes run only when due."""
+        if dispatch_live:
+            return dataclasses.replace(self, last_progress_at=now, dispatch_seen_in_flight=True)
+        if now - self.last_probe_at < probe_every_secs:
+            return self
+        probed = dataclasses.replace(self, last_probe_at=now)
+        cpu = cpu_ticks()
+        if cpu is not None and cpu != self.last_cpu_ticks:
+            return dataclasses.replace(probed, last_progress_at=now, last_cpu_ticks=cpu)
+        mtime = content_mtime()
+        if mtime is not None and (self.last_content_mtime is None or mtime > self.last_content_mtime):
+            return dataclasses.replace(probed, last_progress_at=now, last_content_mtime=mtime)
+        return probed
+
+    def no_progress_secs(self, now: float) -> float:
+        return now - self.last_progress_at
 
 
 # ---------------------------------------------------------------------------
