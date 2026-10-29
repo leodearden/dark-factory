@@ -99,4 +99,4 @@ class TestFakeVerifyResultFidelity:
         fake = fake_verify_result(passed=True)
 
         with pytest.raises(AttributeError):
-            fake.verify_skipped  # noqa: B018
+            _ = fake.verify_skipped
