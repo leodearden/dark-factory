@@ -107,14 +107,14 @@ class _Fields:
     def optional_instant(self, key: str, *, absent: Any = _REQUIRED) -> datetime | None:
         return None if self.raw(key, absent=absent) is None else self.instant(key)
 
-    def strings(self, key: str) -> tuple[str, ...]:
-        values = self.typed(key, list)
+    def strings(self, key: str, *, absent: Any = _REQUIRED) -> tuple[str, ...]:
+        values = self.typed(key, list, absent=absent)
         if not all(isinstance(value, str) for value in values):
             raise ValueError(f'{self._what}: {key!r} must list strings')
         return tuple(values)
 
-    def objects(self, key: str) -> list[object]:
-        return self.typed(key, list)
+    def objects(self, key: str, *, absent: Any = _REQUIRED) -> list[object]:
+        return self.typed(key, list, absent=absent)
 
 
 def _iso(instant: datetime | None) -> str | None:
@@ -500,6 +500,44 @@ class PassEffect:
             ],
             'debts_undecided': list(self.debts_undecided),
         }
+
+    @classmethod
+    def from_json(cls, payload: object) -> PassEffect:
+        """Strict on every key but the two debt fields, which an effect written before task 6865 lacks."""
+        fields = _Fields(payload, 'pass effect')
+        return cls(
+            tests_counted=fields.strings('tests_counted'),
+            episodes_started=fields.strings('episodes_started'),
+            episodes_extended=fields.strings('episodes_extended'),
+            episodes_ended=tuple(_ended_from_json(item) for item in fields.objects('episodes_ended')),
+            threshold_reached=fields.strings('threshold_reached'),
+            stale_heads=fields.strings('stale_heads'),
+            no_decision=fields.strings('no_decision'),
+            tasks_filed=fields.strings('tasks_filed'),
+            escalations_raised=fields.strings('escalations_raised'),
+            debts_offered=tuple(_offered_from_json(item) for item in fields.objects('debts_offered', absent=[])),
+            debts_undecided=fields.strings('debts_undecided', absent=[]),
+        )
+
+
+def _ended_from_json(payload: object) -> EndedEpisode:
+    fields = _Fields(payload, 'ended episode')
+    return EndedEpisode(
+        node=fields.typed('node', str),
+        reason=fields.typed('reason', str),
+        counted_passes=fields.typed('counted_passes', int),
+        reproduced_heads=fields.strings('reproduced_heads'),
+    )
+
+
+def _offered_from_json(payload: object) -> OfferedDebt:
+    fields = _Fields(payload, 'offered debt')
+    trigger = fields.typed('trigger', str)
+    try:
+        debt_trigger = DebtTrigger(trigger)
+    except ValueError as exc:
+        raise ValueError(f"offered debt: 'trigger' is not a debt trigger: {trigger!r}") from exc
+    return OfferedDebt(node=fields.typed('node', str), trigger=debt_trigger, head=fields.typed('head', str))
 
 
 @dataclass(frozen=True)
