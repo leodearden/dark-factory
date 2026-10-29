@@ -9,8 +9,9 @@ read-only census of them, produced by `scripts/stack_base_census.py`.
 
 ## The run
 
-- Command, from the task worktree at `task/6125` commit `c40ce46abd`
-  ("fix(6125): a sibling at the very same commit is not a contained sibling"):
+- Command, from the task worktree on `task/6125` at the commit "fix(6125): a
+  sibling at the very same commit is not a contained sibling". It is cited by
+  subject because every rebase of the branch gives it a new SHA:
   `uv run --project shared python scripts/stack_base_census.py --project-root /home/leo/src/dark-factory`
 - READ-ONLY: `--adopt-confirmed` was NOT passed. Without it the census issues
   no write command. After the run, `refs/dark-factory/stack-base/` held seven
@@ -21,6 +22,24 @@ read-only census of them, produced by `scripts/stack_base_census.py`.
   task statuses were applied. Branches whose task is done or cancelled are INERT.
 - 639 unlanded task branches, 104 findings: 1 confirmed, 3 stranded_base,
   0 unadjudicated, 18 already_clean, 7 recorded, 75 inert.
+
+### Re-run after the review amendments, 2026-10-29
+
+The review amendments (the `amend:` commits on `task/6125`) changed three
+verdict rules. A base's owner must still hold the base as its own work. A base
+that git cannot read is UNADJUDICATED. So is a record that names no commit. The
+same read-only command then ran again from the amended worktree:
+
+- Finished 2026-10-29T01:40Z against `main` at `914da890003937187f46b4ce283acfdee8e844e2`.
+- Exit code 0. Census elapsed 60.3s; wall clock 61.4s; max RSS 60 MB.
+- `refs/dark-factory/stack-base/` held the same ten records before and after the run.
+- 643 unlanded task branches, 106 findings: 1 confirmed, 3 stranded_base,
+  0 unadjudicated, 16 already_clean, 10 recorded, 76 inert.
+- The four actionable findings below are unchanged: same branches, bases,
+  verdicts and owner. The other counts moved because main and the branch set
+  did. The recorded set is now `task/4763`, `task/4847`, `task/5612`,
+  `task/5758`, `task/5766`, `task/6018`, `task/6128`, `task/6163`, `task/6387`
+  and `task/7502`.
 
 ## What it found
 
@@ -94,6 +113,11 @@ finding the re-run reports.
   Containment of a sibling's tip then surfaces it as UNADJUDICATED instead.
 - A sibling at the very same commit is not counted as contained: neither branch
   has a commit the other lacks.
+- A base's owner is another branch that holds the base as its own work. Either
+  it points at the base, or its reflog once held the base and its tip still
+  carries every unlanded commit of it, as an ancestor or a patch-equivalent. A
+  branch stacked onto the same base is no owner. With no owner, the verdict is
+  STRANDED_BASE, never CONFIRMED.
 - INERT trusts the task store's status. A branch with no numeric task id, or no
   row, is adjudicated as live.
 
