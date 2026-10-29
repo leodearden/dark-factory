@@ -27,6 +27,7 @@ from orchestrator.evals.results import (
     MissingResultsDirError,
     ResultLoadError,
     ResultStore,
+    load_result,
     normalize_legacy_metrics,
 )
 from orchestrator.workflow import WorkflowOutcome
@@ -200,6 +201,33 @@ class TestLoudLoad:
         assert excinfo.value.path == bad
         assert str(bad) in str(excinfo.value)
         assert excinfo.value.detail.startswith(error_type)
+
+
+class TestLoadResult:
+    def test_a_saved_cell_reads_back_equal_metrics_included(self, store: ResultStore):
+        saved = _result(metrics={'tests_pass': True, 'review_blocking_issues': 2})
+        assert load_result(store.save(saved)) == saved
+
+    def test_a_missing_cell_is_named(self, store: ResultStore):
+        missing = store.directory / 'absent.json'
+        with pytest.raises(ResultLoadError) as excinfo:
+            load_result(missing)
+        assert excinfo.value.path == missing
+        assert str(missing) in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        'text', ['[1, 2, 3]', '{"task_id": "x", "conf'], ids=['a-list', 'truncated'],
+    )
+    def test_an_unreadable_cell_is_named_never_a_bare_error(
+        self, store: ResultStore, text: str
+    ):
+        store.directory.mkdir(parents=True)
+        bad = store.directory / 'bad.json'
+        bad.write_text(text)
+        with pytest.raises(ResultLoadError) as excinfo:
+            load_result(bad)
+        assert excinfo.value.path == bad
+        assert str(bad) in str(excinfo.value)
 
 
 class TestRewrite:
