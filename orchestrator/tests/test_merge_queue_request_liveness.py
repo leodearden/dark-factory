@@ -731,15 +731,6 @@ def _cpu_idle_clock() -> FakeClock:
     return FakeClock(tick=_LANE_SECS_PER_READING, cpu_ticks=100, cpu_tick=0)
 
 
-def _local_lease() -> Any:
-    from orchestrator.verify_runner import HostLease
-
-    fake_local = MagicMock()
-    fake_local.name = 'local'
-    fake_local.is_local = True
-    return HostLease(name='local', runner=fake_local, is_local=True)
-
-
 def _coasting_remote_lease(never_release: asyncio.Event) -> Any:
     """A remote lease with no live ssh dispatch whose verify never returns.
 

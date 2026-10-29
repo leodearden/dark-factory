@@ -173,10 +173,10 @@ def newest_content_mtime(root: Path) -> float | None:
     Cost (reviewer finding, task 2420 amend): this is a full recursive
     directory walk plus a ``stat()`` per entry — O(number of files/dirs
     below *root*), unavoidable for a "what is the true newest mtime"
-    query without OS-level change notification (inotify) support. The
-    caller (``SpeculativeMergeWorker._run_inflight_verify``) invokes this
-    once per ``INFLIGHT_VERIFY_PROGRESS_PROBE_SECS`` for the duration of
-    every LOCAL in-flight verify, so its probe cadence assumes this walk
+    query without OS-level change notification (inotify) support.
+    :class:`VerifyProgressWatch` invokes this at most once per
+    ``INFLIGHT_VERIFY_PROGRESS_PROBE_SECS`` of an in-flight verify, only
+    while the cheaper CPU fingerprint is silent, so its cadence assumes this walk
     stays cheap relative to the verify — i.e. the worktree's content tree
     (build/test output, excluding ``.git``) has at most thousands, not
     millions, of entries. A repo with a much larger generated tree should
@@ -232,9 +232,10 @@ class VerifyProgressWatch:
     merge_wt for a newer content mtime only when that is silent.  Each is a
     measurement of the verify itself, not of a filesystem proxy for it.  The
     evidence is generous on purpose: a false kill livelocks the lane, a late
-    kill delays one request.  A sample not refreshed while a stronger signal
-    held can grant one extra budget window when that signal stops, never a
-    permanent mask.
+    kill delays one request, and a verify spinning in a loop is bounded by its
+    own per-command timeout.  A sample not refreshed while a stronger signal
+    held, or a foreign write into merge_wt, can grant one extra budget window,
+    never a permanent mask.
     """
 
     last_progress_at: float

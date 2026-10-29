@@ -108,6 +108,7 @@ from orchestrator.merge_lane.liveness import (
     _MERGE_AHEAD_BOUND,
     _MERGE_WORKER_LOOP_DIED_SENTINEL,
     INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
+    VerifyProgressWatch,
     _acquire_warm_verify_worktree,
     _alarm_verify_host_skew,
     _alarm_verify_host_unreachable,
@@ -120,6 +121,7 @@ from orchestrator.merge_lane.liveness import (
     check_serial_lane_tripwire,
     newest_content_mtime,
     release_chain_build_lane,
+    verify_tree_cpu_ticks,
 )
 from orchestrator.merge_lane.member_redrive import MemberRedriveOutcome, MemberRedriver
 from orchestrator.merge_lane.no_progress_abort import NoProgressAbort, emit_no_progress_abort
@@ -707,7 +709,9 @@ PRODUCTION_VERIFIER: VerifyPort = ProductionVerifier(
     ),
     dry_run=lambda: run_dry_run_unblock,
 )
-PRODUCTION_CLOCK: ClockPort = ProductionClock(content_mtime=lambda: newest_content_mtime)
+PRODUCTION_CLOCK: ClockPort = ProductionClock(
+    content_mtime=lambda: newest_content_mtime, cpu_ticks=lambda: verify_tree_cpu_ticks,
+)
 
 
 def _main_health_fingerprint(category: str, cause_hint: str, probe_sha: str) -> str:
@@ -9271,91 +9275,40 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # monkeypatch convention above.
     VERIFY_ABANDON_POLL_SECS: float = 10.0
     # task 2420 (DEFECT 1, split from 2357; extends #1728): no-progress
-    # budget for the in-flight verify abort-poll loop.  The #1728 alpha
-    # owner-heartbeat keeps a LIVE worker's merge worktree ROOT mtime fresh
-    # every _HEARTBEAT_POLL_S seconds even while its verify subprocess is
-    # dead/hung, so the 3h root-mtime reaper
+    # budget for the in-flight verify abort-poll loop (Abort trigger 3).  The
+    # #1728 owner-heartbeat keeps a LIVE worker's merge worktree ROOT mtime
+    # fresh even while its verify is dead/hung, so the 3h root-mtime reaper
     # (INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS) never fires for that failure
-    # mode.  Kept small relative to the reaper window so a genuinely dead
-    # verify is caught promptly; kept as a class attribute so tests can
-    # monkeypatch it tiny (e.g. worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS
-    # = 0.2) for fast, deterministic abort-path coverage.  Mirrors the
-    # VERIFY_ABANDON_POLL_SECS monkeypatch convention above.
-    # INVARIANT (reviewer finding, task 2420 amend): this heuristic's
-    # liveness signal is filesystem content mtime under merge_wt, so it
-    # assumes a HEALTHY verify writes some file incrementally within every
-    # budget window (test/lint/type-check output, build artifacts, etc.). A
-    # purely CPU-bound stretch that writes nothing to disk for longer than
-    # this budget (e.g. fully-buffered test output, a compiler that emits
-    # artifacts only at the very end) would be misclassified as dead and
-    # re-dispatched — and after MAX_INFLIGHT_DEAD_VERIFY_ABORTS repeats,
-    # escalated to a terminal 'blocked' even though the verify was healthy.
-    # Tune this budget to the longest expected no-write stretch of your
-    # verify workloads, not just the dead-verify symptom's timescale.
-    # BLIND SPOT (reviewer finding, task 2420 amend #2): the same risk
-    # applies to any verify toolchain that writes primarily OUTSIDE
-    # merge_wt — e.g. pytest/mypy/ruff caches under ~/.cache, $TMPDIR
-    # scratch, or an out-of-tree build directory are all invisible to
-    # newest_content_mtime(merge_wt). This assumption ("a healthy verify
-    # writes some file incrementally under merge_wt within every budget
-    # window") is NOT enforced or validated anywhere — it is a per-repo
-    # tuning concern. Operators whose verify command writes its working
-    # output outside the worktree should raise this budget accordingly (or,
-    # if feasible, route that tool's cache/scratch dir back under merge_wt).
-    # REMOTE LEASES (task 4579 addition): this budget now governs BOTH lease
-    # kinds. For a REMOTE lease it additionally bounds the POST-DISPATCH
-    # window — the stretch after dispatch_in_flight goes False
-    # (verify_runner.py:1483) in which task 2822's cross-check runs a FULL
-    # LOCAL verify, authorised for up to merge_verify_cold_command_timeout_secs
-    # per command (far above this 1800s default). The tuning rule above is
-    # therefore stricter than it looks once a remote runner is enabled: this
-    # budget must exceed the longest expected no-write stretch of the
-    # CROSS-CHECK's local verify, not just of the remote dispatch itself.
-    # Measured reify mismatch: 345 of 463 local verifies in a 30-day window
-    # exceeded 1800s (mean 2561s, max 10263s) — a 1800s default is not
-    # automatically safe the moment a remote runner is turned on. The BLIND
-    # SPOT above (toolchains writing outside merge_wt) applies verbatim to
-    # the cross-check leg of the REMOTE arm too.
-    #
-    # INVARIANT (task 4659 incident, 2026-08-29): this budget MUST EXCEED the
-    # longest PER-COMMAND verify timeout the target can authorise, because a
-    # command that is still within its own sanctioned runtime is by definition
-    # healthy and must never be killed here. pytest writes its junit XML only
-    # at command COMPLETION, so a single verify command legitimately produces
-    # ZERO writes under merge_wt for its entire duration — the no-progress
-    # signal cannot distinguish that from a hang, and must not try to.
-    # dark-factory authorises up to `verify_command_timeout_secs: 3600` on the
-    # global fallback path (the path a zero-.py / cross-cutting diff routes
-    # to), above every per-module budget (max: scripts/ at 2400s). The old
-    # 1800.0 sat BELOW that 3600s ceiling, so this watchdog could fire on a
-    # verify with 30 minutes of authorised runtime still to go.
-    # It did: under host oversubscription (load 76-137 on 32 cores) three
-    # consecutive head-of-line verifies — tasks 4659, 4810, 4055 — were each
-    # killed at 1800s and re-queued, main took ZERO landings for 3+ hours, and
-    # the queue grew 1 -> 19 while the scheduler kept dispatching the task
-    # pytest runs that caused the contention. A livelock, not a hang.
-    # 5400s clears the 3600s ceiling with 1800s of headroom. Raise this again
-    # if any per-command budget is ever raised past 5400s; the ordering is the
-    # contract, not the number.
-    # Cost of the raise, accepted deliberately: a genuinely hung verify now
-    # holds the (single) verifier host 90min x MAX_INFLIGHT_DEAD_VERIFY_ABORTS
-    # = 4.5h before resolving `blocked`, up from 1.5h. That is strictly better
-    # than the livelock above, which had no terminating condition at all.
+    # mode.  A class attribute so tests can monkeypatch it tiny, like
+    # VERIFY_ABANDON_POLL_SECS above.
+    # LIVENESS (task 5290) is the union of a live remote ssh dispatch, a
+    # change in the verify process tree's CPU time, and a newer content mtime
+    # under merge_wt, on BOTH lease kinds (task 2566); a remote lease's
+    # post-dispatch window, where task 2822's cross-check runs a full local
+    # verify, is judged the same way.  The rationale lives once, at
+    # orchestrator/src/orchestrator/merge_lane/liveness.py::VerifyProgressWatch.
+    # The CPU signal covers a verify that writes nothing until it completes
+    # (pytest's junit) or writes only outside merge_wt (~/.cache, $TMPDIR),
+    # which used to need a per-repo raise of this budget.
+    # INVARIANT: this budget MUST EXCEED the longest PER-COMMAND verify
+    # timeout the target can authorise (3600s on dark-factory's global
+    # fallback), because a command inside its own sanctioned runtime is
+    # healthy by definition.  The CPU signal does not retire this ordering:
+    # it can be absent (no /proc, or work running in a container outside the
+    # process tree).  Raise this if any per-command budget passes 5400s; the
+    # ordering is the contract, not the number.  Incident: task 4659
+    # (2026-08-29), whose 1800s kills livelocked main for 3h+ (2e58a8fc28).
+    # Cost, accepted: a genuinely hung verify holds its host 90min x
+    # MAX_INFLIGHT_DEAD_VERIFY_ABORTS = 4.5h before resolving `blocked`.
     INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS: float = 5400.0
-    # Throttle for the newest_content_mtime() worktree-subtree walk that
-    # drives the budget above — distinct from VERIFY_ABANDON_POLL_SECS so
-    # the walk cost is bounded independently of the 10s abort-poll cadence.
-    # Kept as a class attribute so tests can monkeypatch it tiny for fast,
-    # deterministic coverage.  Mirrors the VERIFY_ABANDON_POLL_SECS
-    # monkeypatch convention above.
-    # COST (reviewer finding, task 2420 amend): each probe is a full
-    # recursive os.walk + per-entry stat() over merge_wt — O(number of
-    # filesystem entries below root); see newest_content_mtime's docstring.
-    # The 60s default assumes the worktree's content tree (build/test
-    # output, excluding .git) stays in the thousands-of-entries range, not
-    # millions.  A repo whose verify writes a much larger tree should raise
-    # this interval so the per-probe I/O stays negligible relative to the
-    # verify itself — this is NOT currently self-tuning/adaptive.
+    # Throttle for trigger 3's progress probes, distinct from
+    # VERIFY_ABANDON_POLL_SECS so their cost is bounded independently of the
+    # 10s abort-poll cadence; a class attribute so tests can monkeypatch it.
+    # Each probe reads the verify tree's CPU fingerprint (a stat and a cwd
+    # readlink per pid) and runs the newest_content_mtime() walk of merge_wt
+    # only when that is silent.  The walk is O(entries below merge_wt), so
+    # the 60s default assumes thousands, not millions, of entries outside
+    # .git; it is not self-tuning.
     INFLIGHT_VERIFY_PROGRESS_PROBE_SECS: float = 60.0
     # task 2420 (DEFECT 1): busy-loop guard for the no-progress abort trigger.
     # After this many CONSECUTIVE no-progress aborts for the same task_id,
@@ -19531,36 +19484,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 merge_base_sha=verify_base.merge_base_sha,
                 main_sha=verify_base.main_sha,
             ))
-            # task 2420 (DEFECT 1, split from 2357; extends #1728), revised by
-            # task 4579: no-progress budget seed.  Content-mtime is sampled
-            # for BOTH lease kinds — a REMOTE lease's ssh dispatch itself
-            # writes nothing to this local merge_wt, but task 2822's
-            # post-dispatch cross-check runs a FULL LOCAL verify
-            # (LocalRunner(merge_wt, ...), merge_queue.py:2977-3015) on THIS
-            # host inside the SAME awaited verify_task, and that cross-check
-            # genuinely does advance merge_wt's content mtime.  See the union
-            # of evidence sources in the poll loop below (Abort trigger 3).
-            # newest_content_mtime never stats merge_wt's own root inode, so
-            # the #1728 alpha owner-heartbeat's os.utime(merge_wt) can never
-            # mask a dead verify on EITHER arm.  The seed is unconditional
-            # (not `if lease.is_local else None`): leaving it None for a
-            # remote lease would make the first probe hit the
-            # `_last_content_mtime is None` arm and hand a genuinely
-            # coasting remote lease one free budget window.
-            _last_content_mtime = self._clock.newest_content_mtime(merge_wt)
-            # task 2420 amend (reviewer finding, robustness): time.monotonic(),
-            # not time.time(), for _last_progress_at/_last_probe_at/_now below
-            # — all three are pure duration references (never persisted or
-            # compared against a stored wall-clock value), so they must be
-            # immune to NTP/manual clock steps. A backward step would delay a
-            # real dead-verify abort; a forward step could prematurely trip
-            # the budget and, after MAX_INFLIGHT_DEAD_VERIFY_ABORTS repeats,
-            # false-'block' a healthy task. Matches the time.monotonic()
-            # convention used elsewhere in this file (e.g. _elapsed_ms,
-            # per-attempt t0 at the top of the dequeue loop).
-            _last_progress_at = self._clock.monotonic()
-            _last_probe_at = _last_progress_at
-            _dispatch_seen_in_flight = False
+            # Abort trigger 3's progress watch, seeded unconditionally (both
+            # lease kinds) before the first await, so a coasting remote lease
+            # gets no free budget window from an unseeded first probe.  Its
+            # times are monotonic: durations, immune to wall-clock steps.
+            _watch = VerifyProgressWatch.start(
+                self._clock.monotonic(),
+                cpu_ticks=self._clock.verify_cpu_ticks(merge_wt),
+                content_mtime=self._clock.newest_content_mtime(merge_wt),
+            )
             # task 2420 amend (reviewer finding, correctness); revised by task
             # 4579: guard against INFLIGHT_VERIFY_PROGRESS_PROBE_SECS not
             # being comfortably smaller than INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS.
@@ -19671,89 +19603,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         merge_wt=None,
                         status=InflightStatus.REQUEUED,
                     )
-                # Abort trigger 3 — no in-flight verify progress budget
-                # (task 2420 DEFECT 1, split from 2357; extends #1728;
-                # un-gated to cover REMOTE leases by task 2566, closing the
-                # latent 7200s-coast gap; task 4579 unions the two evidence
-                # sources instead of branching on lease type — see below):
-                # terminate a verify with no progress observed for a full
-                # budget and RE-QUEUE, mirroring the operator-halt branch above.
-                # Checked last so abandon/halt precedence (triggers 1/2) is
-                # preserved when they land on the same poll.
-                # Each firing is recorded, and counted as a strike, per
-                # orchestrator/src/orchestrator/merge_lane/no_progress_abort.py::NoProgressAbort.
-                #
-                # PROGRESS is the UNION of two independent evidence sources
-                # (task 4579 — previously an if/elif branched by lease type,
-                # which made a REMOTE lease structurally unable to see its
-                # own post-dispatch local writes; see the reify mr-945466ca
-                # incident this closed):
-                #   A. content progress under merge_wt (throttled by
-                #      _progress_probe_secs), sampled for BOTH lease kinds —
-                #      resets the clock, so a genuinely long-running healthy
-                #      verify is never false-killed. For a LOCAL lease this
-                #      is the verify itself; for a REMOTE lease this is
-                #      task 2822's post-dispatch cross-check, a FULL LOCAL
-                #      verify (LocalRunner(merge_wt, ...),
-                #      merge_queue.py:2977-3015) that runs on THIS host
-                #      inside the SAME awaited verify_task once the ssh
-                #      dispatch returns.
-                #   B. a live remote ssh dispatch (REMOTE leases only) —
-                #      RemoteRunner.dispatch_in_flight (task 2566): a live
-                #      dispatch is progress (its death is owned by task
-                #      2362's ssh keepalive, never touched here) and resets
-                #      the clock every poll. dispatch_in_flight goes False
-                #      the instant run_merge_verify returns
-                #      (verify_runner.py:1483) — which is precisely when
-                #      evidence A takes over for the cross-check's window.
-                #      getattr(..., True) fails safe: a runner not exposing
-                #      the property is treated as live and never
-                #      progress-aborted.
-                #
-                # SAFETY: adding evidence A for remote leases can only make this trigger LESS
-                # trigger-happy, never introduce a false abort. The one way it could instead MASK a
-                # genuine remote coast — some writer other than the verify touching merge_wt — is
-                # narrower than it first looks: task 2873's merge_verify_lease
-                # (merge_queue.py:3006-3014) wraps ONLY the cross-check's own local verify call,
-                # gated on persistent_merge_worktree and entered just before
-                # cross_check_runner.run_merge_verify(...) — it does NOT cover the window before
-                # that lease is acquired, and it does not exist at all on paths where no cross-check
-                # runs at all (remote verify FAILs, a trivial pass, verify_cross_check_remote_green
-                # disabled, or an infra-transient retry between dispatches). A concurrent foreign
-                # write into merge_wt during one of those windows would reset the clock same as a
-                # real cross-check write. This narrows the guarantee, it does not remove it: masking
-                # is unreachable while evidence B is live (it dominates below), RemoteRunner's own
-                # writes during a coast touch only `.git` (pruned by newest_content_mtime) and
-                # archive outside merge_wt, and the busy-loop cap counts only actual aborts — so the
-                # residual exposure can DELAY a coast abort by a foreign write's timing, never
-                # suppress it the way a permanent mask would.
+                # Abort trigger 3 — no in-flight verify progress for a full
+                # budget (task 2420; both lease kinds since task 2566): RE-QUEUE,
+                # mirroring the operator-halt branch above, and checked last so
+                # triggers 1/2 keep precedence on the same poll.  Each firing is
+                # recorded and counted as a strike per
+                # orchestrator/src/orchestrator/merge_lane/no_progress_abort.py::NoProgressAbort;
+                # what counts as progress lives once, at
+                # orchestrator/src/orchestrator/merge_lane/liveness.py::VerifyProgressWatch.
                 _now = self._clock.monotonic()
-                # Evidence B is checked FIRST and short-circuits evidence A: while a remote dispatch
-                # is live it is already progress on its own, so probing content-mtime too would only
-                # re-confirm what B already established, at the cost of a synchronous os.walk of
-                # merge_wt (newest_content_mtime, merge_liveness.py) on the merge worker's event
-                # loop every _progress_probe_secs for the whole dispatch — 17-40+ minutes on reify —
-                # for zero marginal signal (reviewer finding, performance). Trade-off:
-                # _last_content_mtime stays at its seed for that whole window, so the first
-                # post-dispatch probe treats whatever mtime the tree is ACTUALLY at as fresh
-                # progress once — one extra budget window of slack if that mtime came from a foreign
-                # writer rather than the cross-check, not a masked coast (same busy-loop-cap
-                # argument as the SAFETY paragraph above).
-                if remote_dispatch_live(lease):
-                    _last_progress_at = _now
-                    _dispatch_seen_in_flight = True
-                # Evidence A — content progress under merge_wt (BOTH lease kinds), probed only when
-                # evidence B is not already live.
-                elif _now - _last_probe_at >= _progress_probe_secs:
-                    _last_probe_at = _now
-                    _cur_content_mtime = self._clock.newest_content_mtime(merge_wt)
-                    if _cur_content_mtime is not None and (
-                        _last_content_mtime is None
-                        or _cur_content_mtime > _last_content_mtime
-                    ):
-                        _last_content_mtime = _cur_content_mtime
-                        _last_progress_at = _now
-                _no_progress_secs = _now - _last_progress_at
+                _watch = _watch.observe(
+                    _now,
+                    dispatch_live=remote_dispatch_live(lease),
+                    probe_every_secs=_progress_probe_secs,
+                    cpu_ticks=lambda: self._clock.verify_cpu_ticks(merge_wt),
+                    content_mtime=lambda: self._clock.newest_content_mtime(merge_wt),
+                )
+                _no_progress_secs = _watch.no_progress_secs(_now)
                 if _no_progress_secs >= self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS:
                     # Busy-loop guard (task 2420): count CONSECUTIVE
                     # no-progress aborts per task_id.  Once the count
@@ -19775,7 +19641,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         budget_secs=self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS,
                         strike=_dead_abort_n,
                         max_strikes=self.MAX_INFLIGHT_DEAD_VERIFY_ABORTS,
-                        dispatch_seen_in_flight=_dispatch_seen_in_flight,
+                        dispatch_seen_in_flight=_watch.dispatch_seen_in_flight,
                     )
                     logger.warning(
                         'Task %s: no in-flight verify progress for %.0fs '
