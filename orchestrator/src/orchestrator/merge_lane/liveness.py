@@ -214,13 +214,19 @@ def newest_content_mtime(root: Path) -> float | None:
 
 
 def verify_tree_cpu_ticks(root: Path) -> int | None:
-    """The CPU-time fingerprint of the verify process tree working under *root*.
+    """The CPU-time fingerprint of the processes working under *root*: the verify tree.
 
-    Excludes the orchestrator's own process group, so nothing it does in
-    process can refresh the signal: the #1728 anti-masking property that
-    :func:`newest_content_mtime` gets by skipping the root inode and ``.git``
-    (the owner heartbeat is an ``os.utime``, not a process).  Verify
-    subprocesses run in their own session (``start_new_session``) and count.
+    Excludes exactly one process group, the orchestrator's own, so its
+    in-process work cannot refresh the signal.  The owner heartbeat is an
+    ``os.utime`` in that process, so it cannot either; that is the #1728
+    anti-masking property :func:`newest_content_mtime` gets by skipping the
+    root inode and ``.git``.  Every other process whose cwd is under *root*
+    counts, whoever started it.  Verify subprocesses run in their own session
+    (``start_new_session``), and so does any other child the orchestrator
+    starts that way (``shared.git_async`` git calls, for one): such a child
+    with its cwd under *root* would count as verify progress too.  Nothing
+    runs there during an in-flight verify today; the signal cannot tell the
+    two apart.
     """
     return cpu_ticks_under_path(root, exclude_pgids=frozenset({os.getpgrp()}))
 
@@ -236,8 +242,9 @@ class VerifyProgressWatch:
     evidence is generous on purpose: a false kill livelocks the lane, a late
     kill delays one request, and a verify spinning in a loop is bounded by its
     own per-command timeout.  A sample not refreshed while a stronger signal
-    held, or a foreign write into merge_wt, can grant one extra budget window,
-    never a permanent mask.
+    held, or a foreign write into merge_wt, can grant one extra budget window.
+    A foreign process that keeps working under merge_wt keeps the watch alive
+    for as long as it runs (:func:`verify_tree_cpu_ticks`).
     """
 
     last_progress_at: float

@@ -394,6 +394,7 @@ class TestVerifyTreeCpuTicks:
 
     @pytest.mark.timeout(60)
     def test_a_busy_verify_subprocess_in_its_own_session_is_counted(self, tmp_path: Path) -> None:
+        """Any child in its own session counts, a verify's or not: only the caller's pgrp is excluded."""
         root = tmp_path.resolve()
         child = _busy_child(root, own_session=True)
         try:
