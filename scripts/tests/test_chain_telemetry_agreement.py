@@ -28,8 +28,8 @@ _PREDICATE_TIMEOUT = cli_timeout_from_env('CHAIN_TELEMETRY_AGREEMENT_CLI_TIMEOUT
 # four items then landed, a halved 2-item round that failed, an ordinary
 # adjacent speculative verify (its depth is frontier height) and a probe-era row.
 MERGE_VERIFY = [
-    {'chain_items': 4, 'passed': True, 'depth': 1},
-    {'chain_items': 2, 'passed': False, 'depth': 1},
+    {'chain_items': 4, 'passed': True, 'depth': 1, 'merge_sha': 'tip-4', 'attempt': 0},
+    {'chain_items': 2, 'passed': False, 'depth': 1, 'merge_sha': 'tip-2', 'attempt': 0},
     {'chain_items': 1, 'passed': True, 'depth': 2},
     {'depth': 3, 'passed': True},
 ]
@@ -44,6 +44,7 @@ TRUE_DEEP_FAILURES = 1
 TRUE_DEEP_FAIL_RATE = 0.5
 TRUE_ITEMS_LANDED = 4
 TRUE_ITEMS_LANDED_PER_DEEP_VERIFY = 2.0
+TRUE_ITEMS_LANDED_PER_PASSED_DEEP_ROUND = 4.0
 TRUE_LEGACY_ROWS = 1
 
 
@@ -111,6 +112,8 @@ class TestReaderAgreement:
         assert result.returncode in (0, 1), f'{result.returncode=} {result.stdout=} {result.stderr=}'
         assert n_deep_verifies(result.stdout) == TRUE_DEEP_VERIFIES, result.stdout
         assert metric(result.stdout, 'deep_fail_rate') == round(TRUE_DEEP_FAIL_RATE, 4), result.stdout
+        # Its items_per_verify divides by passed deep ROUNDS, not deep verifies, so it is
+        # deliberately a different quantity from the digest's per-deep-verify 2.0 (task 7722).
         assert metric(result.stdout, 'items_per_verify') == round(
-            TRUE_ITEMS_LANDED_PER_DEEP_VERIFY, 4
+            TRUE_ITEMS_LANDED_PER_PASSED_DEEP_ROUND, 4
         ), result.stdout

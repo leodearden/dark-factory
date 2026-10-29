@@ -16,7 +16,9 @@ from canary_predicate_summary import (
     insufficient_signal,
     metric,
     n_deep_verifies,
+    population,
     store_n_deep,
+    store_population,
     verdict,
 )
 from cli_subprocess_timeout import cli_timeout_from_env
@@ -371,3 +373,44 @@ class TestMinimumSample:
         assert n_deep_verifies(result.stdout) == 8
         assert metric(result.stdout, 'verify_p90_secs') is None
         assert verdict(result.stdout, 'verify_p90_secs') == 'FAIL'
+
+
+class TestItemsPerPassedDeepRound:
+    def test_denominator_counts_distinct_passed_first_attempt_tips(self, make_runs_db):
+        first = _AS_OF - timedelta(days=2)
+        tips = [
+            dict(merge_sha='tip-a', attempt=0, passed=True),
+            dict(merge_sha='tip-a', attempt=1, passed=True),
+            dict(merge_sha='tip-b', attempt=0, passed=False),
+            dict(merge_sha='tip-c', attempt=0, passed=True),
+            dict(merge_sha=_ABSENT, attempt=0, passed=True),
+        ]
+        events = []
+        for k, tip in enumerate(tips):
+            at = first + timedelta(hours=k)
+            events.append(_verify_event(at, **tip))
+            events.append(_verify_event(at - timedelta(minutes=1), passed=True, chain_items=1))
+        events += [_finalized_event(first + timedelta(hours=k, minutes=30), landed_via_chain=1) for k in range(4)]
+        store = make_runs_db(events, name='reify.db')
+
+        result = _run(store, *_NOW_ARGS, '--min-deep-verifies', '1')
+
+        assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
+        assert metric(result.stdout, 'items_per_verify') == 2.0
+        assert population(result.stdout, 'landed_via_chain') == 4
+        assert population(result.stdout, 'passed_deep_rounds') == 2
+        assert store_population(result.stdout, str(store), 'passed_deep_rounds') == 2
+
+    def test_a_window_with_no_passed_deep_round_has_no_items_signal(self, make_runs_db):
+        first = _AS_OF - timedelta(days=2)
+        events = [
+            *(_verify_event(first + timedelta(hours=k), passed=False) for k in range(2)),
+            _finalized_event(first + timedelta(hours=3), landed_via_chain=2),
+        ]
+        store = make_runs_db(events, name='reify.db')
+
+        result = _run(store, *_NOW_ARGS, '--min-deep-verifies', '1')
+
+        assert result.returncode == 1, f'{result.stdout=} {result.stderr=}'
+        assert metric(result.stdout, 'items_per_verify') is None
+        assert verdict(result.stdout, 'items_per_verify') == 'FAIL'

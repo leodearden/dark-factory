@@ -53,3 +53,23 @@ def insufficient_signal(stdout: str) -> tuple[int, int] | None:
     lines = stdout.splitlines()
     match = re.fullmatch(r'insufficient_signal n_deep_verifies=(\d+) \(< (\d+)\)', lines[-1]) if lines else None
     return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def population(stdout: str, name: str) -> float:
+    """A ``name=value`` token of the single ``populations:`` line."""
+    lines = [line for line in stdout.splitlines() if line.startswith('populations:')]
+    assert len(lines) == 1, stdout
+    return _token(lines[0], name)
+
+
+def store_population(stdout: str, store: str, name: str) -> float:
+    """A ``name=value`` token of the ``store <store>:`` line."""
+    lines = [line for line in stdout.splitlines() if line.startswith(f'store {store}: ')]
+    assert len(lines) == 1, stdout
+    return _token(lines[0], name)
+
+
+def _token(line: str, name: str) -> float:
+    match = re.search(rf'(?:^|\s){re.escape(name)}=(\S+)', line)
+    assert match, line
+    return float(match.group(1))
