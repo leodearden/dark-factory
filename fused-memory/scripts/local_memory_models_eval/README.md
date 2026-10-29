@@ -177,7 +177,9 @@ The builder issues exactly one `GRAPH.RO_QUERY`. Read-only here is
 command path is refused by FalkorDB and materializes nothing. A client-side
 guard sits on top of it so a violation surfaces as a typed `CorpusBuildError`
 at the seam that owns the guarantee, rather than as a redis error three layers
-down.
+down. Both the guard and the client opener live in
+`fused-memory/src/fused_memory/backends/falkor_read_only.py`, the read-only
+seam every audit and corpus script shares.
 
 It connects with `falkordb.asyncio.FalkorDB(...).select_graph(...)` and
 **never** constructs `graphiti_core.driver.falkordb_driver.FalkorDriver`, whose
