@@ -59,7 +59,10 @@ class Remedy(enum.Enum):
         "i.e. the main checkout's fused-memory/docker/docker-compose.yml, never a worktree's"
     )
     SETTLE = "wait for the container to settle (`docker ps -a`), then restart fused-memory"
-    BOOTSTRAP = "follow OPERATIONS.md \"Bootstrapping FalkorDB's AOF from dump.rdb\""
+    BOOTSTRAP = (
+        "decide which copy is newest (OPERATIONS.md \"Deciding which FalkorDB copy is newest\") before "
+        "removing any container, then start falkordb onto that copy"
+    )
     INVESTIGATE = (
         "inspect `docker ps -a` and `docker exec docker-falkordb-1 redis-cli INFO persistence` "
         "by hand before restarting fused-memory"
@@ -233,6 +236,11 @@ def _decide(docker: Docker) -> Verdict:
     container_id = docker.read(docker.compose("ps", "-a", "-q", "falkordb")).strip()
     compose_data_dir = _compose_data_dir(docker)
     if not container_id:
+        if _in_linked_worktree(docker):
+            return _refuse(
+                "create REFUSED: the compose file is in a linked git worktree",
+                Problem(f"{docker.compose_file} would create falkordb over {compose_data_dir}", Remedy.USE_MAIN_COMPOSE),
+            )
         return _verdict_without_container(compose_data_dir)
     container = Container.parse(container_id, docker.read(["docker", "inspect", container_id]))
     if container.data_mount is None or not _same_dir(container.data_mount, compose_data_dir):
@@ -262,6 +270,16 @@ def _compose_data_dir(docker: Docker) -> str:
     if not sources:
         raise ProbeFailed(f"{docker.compose_file} mounts nothing at {DATA_DIR_IN_CONTAINER}")
     return sources[0]
+
+
+def _in_linked_worktree(docker: Docker) -> bool:
+    compose_dir = str(Path(docker.compose_file).parent)
+    try:
+        dirs = docker.read(["git", "-C", compose_dir, "rev-parse", "--path-format=absolute",
+                            "--git-dir", "--git-common-dir"]).split()
+    except ProbeFailed:
+        return False
+    return len(dirs) == 2 and not _same_dir(dirs[0], dirs[1])
 
 
 def _same_dir(left: str, right: str) -> bool:
