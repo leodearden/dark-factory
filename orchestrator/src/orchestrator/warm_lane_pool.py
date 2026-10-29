@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -21,7 +21,7 @@ from orchestrator.lane_lifecycle import IllegalLaneTransition
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 
 if TYPE_CHECKING:
-    from orchestrator.lane_lifecycle import LaneLifecycle
+    from orchestrator.lane_lifecycle import LaneLifecycle, LaneRecord
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,13 @@ logger = logging.getLogger(__name__)
 class LaneState(Enum):
     FREE = 'free'
     ASSIGNED = 'assigned'
+
+
+def _resolved(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except OSError:
+        return path
 
 
 @dataclass(frozen=True)
@@ -85,11 +92,54 @@ class WarmLanePoolCensus:
         )
 
 
+@dataclass(frozen=True)
+class OverCapLane:
+    """One lane resident beyond the pool's capacity, with its durable record."""
+
+    name: str
+    record_state: DurableLaneState | None
+    record_task_id: str | None
+
+    @classmethod
+    def from_record(cls, name: str, record: LaneRecord | None) -> OverCapLane:
+        if record is None:
+            return cls(name=name, record_state=None, record_task_id=None)
+        return cls(name=name, record_state=record.state, record_task_id=record.task_id)
+
+    def render(self) -> str:
+        state = self.record_state.value if self.record_state is not None else 'no-record'
+        task = f':{self.record_task_id}' if self.record_task_id is not None else ''
+        return f'{self.name}:{state}{task}'
+
+
+@dataclass(frozen=True)
+class WarmLanePoolShrink:
+    """Typed snapshot of the lanes a pool shrink left resident beyond capacity.
+
+    Built by :meth:`WarmLanePool.over_cap_report` from caller-supplied disk
+    and durable-record data, so this module stays git/FS-free.
+    """
+
+    capacity: int
+    lanes: tuple[OverCapLane, ...]
+
+    def render(self) -> str:
+        """Return the stable single-line ``key=value`` string."""
+        lanes = ','.join(lane.render() for lane in self.lanes)
+        return f'capacity={self.capacity} over_cap={len(self.lanes)} lanes={lanes}'
+
+
 class WarmLanePool:
     """Per-host pool of warm task-dispatch lanes.
 
     Lanes are named ``<worktree_base>/<name_prefix><k>`` for k in range(size).
     State is purely in-memory (one process, one orchestrator, one GitOps).
+
+    A lane ``k >= size`` is an OVER-CAP lane: one a restart with a smaller
+    pool left behind on disk.  It joins the pool only through
+    ``restore_assignment`` (admitted ASSIGNED, never FREE, never stolen) and
+    leaves it on ``release`` (drained), so new work never exceeds ``size``
+    while the tasks still holding such lanes run to completion.
 
     All mutating operations (try_acquire, release) run under a single
     asyncio.Lock so concurrent coroutines never receive the same lane.
@@ -110,6 +160,9 @@ class WarmLanePool:
     ) -> None:
         self._base = worktree_base
         self._name_prefix = name_prefix
+        self._capacity = size
+        # Admitted over-cap members of _lanes (always ASSIGNED, drained on release).
+        self._over_cap: set[Path] = set()
         # Ordered dict preserves insertion order so try_acquire always hands
         # out the lowest-numbered free lane first (stable, deterministic).
         self._lanes: dict[Path, LaneState] = {
@@ -142,8 +195,13 @@ class WarmLanePool:
 
     @property
     def size(self) -> int:
-        """Number of lanes in the pool (0 → always exhausted)."""
+        """Number of member lanes: configured slots plus admitted over-cap lanes."""
         return len(self._lanes)
+
+    @property
+    def capacity(self) -> int:
+        """Configured number of slots (0 → always exhausted)."""
+        return self._capacity
 
     def set_lane_lifecycle(self, lane_lifecycle: LaneLifecycle) -> None:
         """Wire the shared durable-record writer post-construction.
@@ -201,25 +259,41 @@ class WarmLanePool:
         """
         if path in self._lanes:
             return path
-        try:
-            resolved = path.resolve()
-        except OSError:
-            resolved = path
+        resolved = _resolved(path)
         for known_lane in self._lanes:
-            try:
-                known_resolved = known_lane.resolve()
-            except OSError:
-                known_resolved = known_lane
-            if known_resolved == resolved:
+            if _resolved(known_lane) == resolved:
                 return known_lane
         return None
 
+    def _slot_index(self, path: Path) -> int | None:
+        """Return k when *path* is ``<base>/<prefix><k>`` (canonical decimal k), else None."""
+        digits = path.name.removeprefix(self._name_prefix)
+        if digits == path.name or not (digits.isascii() and digits.isdigit()):
+            return None
+        if digits != str(int(digits)):
+            return None
+        if path.parent != self._base and _resolved(path.parent) != _resolved(self._base):
+            return None
+        return int(digits)
+
+    def _over_cap_slot(self, path: Path) -> Path | None:
+        """Return the over-cap lane key *path* names, or None."""
+        index = self._slot_index(path)
+        if index is None or index < self._capacity:
+            return None
+        return self._base / path.name
+
     async def release(self, lane: Path) -> None:
-        """Mark *lane* as FREE.
+        """Mark *lane* as FREE, or drain it when it is an over-cap lane.
 
         Idempotent: releasing a FREE lane or an unknown path is a no-op
         (never raises).  Also drops any ``_assignments`` entry whose value
         resolves to *lane* so the assignment map stays coherent.
+
+        An admitted over-cap lane leaves the pool instead of turning FREE.  A
+        non-member over-cap lane changes nothing in memory but still gets the
+        durable RELEASED mirror, so a terminal record on a lane no live
+        process admitted converges too.
 
         When a ``LaneLifecycle`` is wired, the durable record is mirrored
         through to ``RELEASED`` at the SAME moment the in-memory state flips to
@@ -230,11 +304,15 @@ class WarmLanePool:
         blocking file I/O never runs inside the lock).
         """
         async with self._lock:
-            matched = self._match_lane(lane)
+            matched = self.canonical_lane(lane)
             if matched is None:
                 # Unknown path — silently ignore (idempotent)
                 return
-            self._lanes[matched] = LaneState.FREE
+            if matched in self._over_cap:
+                self._over_cap.discard(matched)
+                del self._lanes[matched]
+            elif matched in self._lanes:
+                self._lanes[matched] = LaneState.FREE
             # Drop any assignment entry pointing at this lane
             to_drop = [
                 br for br, assigned in self._assignments.items()
@@ -320,6 +398,7 @@ class WarmLanePool:
           close the TOCTOU window where a candidate was re-dispatched during
           the async ``get_statuses`` call that populated *candidates*.
         - Accepts only lanes in ``LaneState.ASSIGNED``.
+        - Skips over-cap lanes: they only drain, never change hands.
 
         On success: atomically removes ``_assignments[victim]``, sets
         ``_assignments[branch_name] = lane``, leaves lane ``ASSIGNED``, and
@@ -354,6 +433,8 @@ class WarmLanePool:
                     continue
                 if self._lanes.get(lane) != LaneState.ASSIGNED:
                     continue
+                if lane in self._over_cap:
+                    continue
                 # Atomically re-key: victim → branch_name, keep ASSIGNED.
                 del self._assignments[victim]
                 self._assignments[branch_name] = lane
@@ -372,22 +453,63 @@ class WarmLanePool:
     # ── Read-only helpers ──────────────────────────────────────────────────
 
     def lane_paths(self) -> list[Path]:
-        """Return every pool lane Path in insertion order (``_lane-0 .. _lane-{N-1}``).
+        """Return every configured lane Path in order (``_lane-0 .. _lane-{N-1}``).
 
         A public, git-free snapshot of the lane keys used by
         ``GitOps.prewarm_pool`` to iterate EVERY lane — including the
         high-numbered ones a lazy acquire never demands — without reaching
         into the private ``_lanes`` dict.  The list is a fresh copy of the
         dict keys (dict insertion order is stable), so the caller may iterate
-        it freely; ``list(...)`` contains no ``await`` point, so no concurrent
-        acquire/release coroutine can interleave during the copy (single
-        asyncio loop) and no lock is needed.  Returns ``[]`` for a size-0 pool.
+        it freely; the copy contains no ``await`` point, so no concurrent
+        acquire/release coroutine can interleave during it (single asyncio
+        loop) and no lock is needed.  Returns ``[]`` for a size-0 pool.
+        Admitted over-cap lanes are excluded, so prewarm's target stays N.
         """
-        return list(self._lanes.keys())
+        return [lane for lane in self._lanes if lane not in self._over_cap]
+
+    def canonical_lane(self, path: Path) -> Path | None:
+        """Return this pool's key for the lane *path* names, or None.
+
+        A member lane (configured or admitted over-cap) returns its key; a
+        non-member over-cap slot returns ``<base>/<prefix><k>``.
+        """
+        matched = self._match_lane(path)
+        if matched is not None:
+            return matched
+        return self._over_cap_slot(path)
+
+    def is_over_cap(self, path: Path) -> bool:
+        """Return True if *path* names a lane at an index >= capacity."""
+        lane = self.canonical_lane(path)
+        return lane is not None and self._over_cap_slot(lane) is not None
 
     def is_lane(self, path: Path) -> bool:
-        """Return True if *path* (resolved) is a known pool lane."""
-        return self._match_lane(path) is not None
+        """Return True if *path* names one of this pool's lanes.
+
+        That is a configured slot or an over-cap one a pool shrink left behind.
+        """
+        return self.canonical_lane(path) is not None
+
+    def over_cap_report(
+        self,
+        resident: Iterable[Path],
+        records: Mapping[str, LaneRecord],
+    ) -> WarmLanePoolShrink:
+        """Return the over-cap lanes among *resident*, by index, with their records.
+
+        *resident* is the caller's listing of the pool directory and *records*
+        its durable records keyed by lane name; this method reads neither.
+        """
+        over_cap = {
+            lane.name: index
+            for lane in filter(None, map(self.canonical_lane, resident))
+            if (index := self._slot_index(lane)) is not None and index >= self._capacity
+        }
+        names = sorted(over_cap, key=over_cap.__getitem__)
+        return WarmLanePoolShrink(
+            capacity=self._capacity,
+            lanes=tuple(OverCapLane.from_record(name, records.get(name)) for name in names),
+        )
 
     def state(self, lane: Path) -> LaneState | None:
         """Return the current LaneState for *lane*, or None if unknown."""
@@ -530,10 +652,14 @@ class WarmLanePool:
         concurrent fresh dispatch's ``try_acquire``/``acquire_for`` cannot grab
         the lane before the original task is re-dispatched.
 
-        Startup is single-threaded, so no lock is needed (mirrors
-        ``note_assignment``/``drop_assignment``).
+        Synchronous with no ``await``, so no lock is needed (mirrors
+        ``note_assignment``/``drop_assignment``); besides crash recovery it is
+        also called at runtime by the lane-checkout reconciler and by
+        acquire-time branch settlement.
 
-        Unknown *lane* path → no-op (never raises).
+        An over-cap *lane* is ADMITTED: it joins the pool ASSIGNED and leaves
+        it again on ``release``.  A path naming no lane slot → no-op (never
+        raises).
 
         *task_id* is always a bare task id (e.g. ``'42'``), never a real
         ``task/<id>`` branch string — see ``_note_assigned_durable``.
@@ -542,10 +668,17 @@ class WarmLanePool:
         also mirrors this assignment onto the durable record (best-effort;
         see ``_note_assigned_durable``). No-op when unwired.
         """
-        matched = self._match_lane(lane)
+        matched = self.canonical_lane(lane)
         if matched is None:
             # Unknown lane path — silently ignore (idempotent).
             return
+        if matched not in self._lanes:
+            self._over_cap.add(matched)
+            logger.info(
+                'warm_lane_pool: admitted over-cap lane %s for task %s '
+                '(capacity=%d) — it drains on release',
+                matched.name, task_id, self._capacity,
+            )
         self._lanes[matched] = LaneState.ASSIGNED
         self._assignments[task_id] = matched
         self._note_assigned_durable(task_id, matched)
