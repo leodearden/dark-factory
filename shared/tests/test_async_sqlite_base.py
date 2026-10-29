@@ -1497,3 +1497,21 @@ class TestAtomicConnectionClose:
             await conn.execute('SELECT 1')
         await asyncio.to_thread(worker.join, _GATE_HANG_GUARD_SECS)
         assert not worker.is_alive()
+
+    async def test_a_close_after_a_cancelled_close_returns_at_once(self, tmp_path, open_conn):
+        """Re-entering aiosqlite's close() after stop() queues a second stop
+        sentinel that the exiting worker never serves, so it would hang."""
+        conn = await open_conn(tmp_path / 'recut.db')
+        access = AtomicConnection(conn)
+        worker = _worker_thread(conn)
+        gate = _ScanGate(asyncio.get_running_loop())
+        await conn.set_trace_callback(gate)
+
+        try:
+            await self._cancel_close_in_its_checkpoint(access, gate)
+            await asyncio.wait_for(access.close(), timeout=_GATE_HANG_GUARD_SECS)
+        finally:
+            gate.release()
+
+        await asyncio.to_thread(worker.join, _GATE_HANG_GUARD_SECS)
+        assert not worker.is_alive()
