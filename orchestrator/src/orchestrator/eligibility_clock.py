@@ -7,7 +7,10 @@ PSI hold, one tick off the candidate list), and is dropped only when the task
 dispatches, leaves ``pending``, or goes terminal.
 
 Because candidacy already requires satisfied dependencies, the age measured
-from this anchor excludes dependency-wait time.  Because the anchors are
+from this anchor excludes any dependency wait before the task's first
+candidacy.  A wait after it is counted: a still-pending task that loses
+candidacy (a dependency reopens, an external-dependency hold) keeps its
+anchor, as for any other candidacy gap.  Because the anchors are
 reloaded at startup, a restart re-stamps nothing, so the backlog cannot be
 stamped into one cohort that ages past the watchdog's floor together.
 
