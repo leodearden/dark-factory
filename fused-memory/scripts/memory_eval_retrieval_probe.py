@@ -305,9 +305,9 @@ class SearchScope:
 
     Declared only for an entry whose caller scopes its own search — today the
     briefing's conventions channel
-    (``orchestrator/src/orchestrator/agents/briefing.py::_mcp_search``). An
-    entry without one is searched unscoped and the read router picks, which
-    is what an agent's own ad-hoc search experiences.
+    (``orchestrator/src/orchestrator/agents/memory_recall.py::MemoryRecall._search``).
+    An entry without one is searched unscoped and the read router picks,
+    which is what an agent's own ad-hoc search experiences.
     """
 
     stores: tuple[str, ...] = ()
@@ -316,9 +316,10 @@ class SearchScope:
     def as_search_kwargs(self) -> dict[str, list[str]]:
         """``MemoryService.search`` keyword arguments, an empty dimension omitted.
 
-        Omitted rather than sent empty, as ``briefing.py::_mcp_search`` does,
-        so an undeclared dimension is left to the server's own routing
-        instead of becoming a filter that matches nothing.
+        Omitted rather than sent empty, as
+        ``memory_recall.py::MemoryRecall._search`` does, so an undeclared
+        dimension is left to the server's own routing instead of becoming a
+        filter that matches nothing.
         """
         kwargs: dict[str, list[str]] = {}
         if self.stores:

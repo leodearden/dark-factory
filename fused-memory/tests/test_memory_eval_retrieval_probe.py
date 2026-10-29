@@ -3250,8 +3250,8 @@ class TestRegistrySearchScope:
     """An entry may declare the store/category scope its real caller searches with.
 
     The briefing's conventions channel is store- and category-scoped
-    (``orchestrator/src/orchestrator/agents/briefing.py::_mcp_search``), so
-    probing its phrasings unscoped would measure a query nobody issues.
+    (``orchestrator/src/orchestrator/agents/memory_recall.py::MemoryRecall._search``),
+    so probing its phrasings unscoped would measure a query nobody issues.
     """
 
     def test_a_declared_scope_loads_as_tuples(self, tmp_path):
@@ -3342,8 +3342,9 @@ class TestRegistrySearchScope:
             assert kwargs_by_query[query]['categories'] == [
                 'preferences_and_norms', 'procedural_knowledge',
             ]
-        # Omitted, not empty: briefing.py::_mcp_search omits an empty scope so
-        # the server applies its own routing, and the probe must do the same.
+        # Omitted, not empty: memory_recall.py::MemoryRecall._search omits an
+        # empty scope so the server applies its own routing, and the probe
+        # must do the same.
         for query in unscoped_queries:
             assert 'stores' not in kwargs_by_query[query]
             assert 'categories' not in kwargs_by_query[query]
