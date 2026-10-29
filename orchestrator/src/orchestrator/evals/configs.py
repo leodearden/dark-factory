@@ -150,8 +150,8 @@ VLLM_EVAL_CONFIGS = [
     # the HF name and the runtime resolves locally via TRANSFORMERS_OFFLINE.
     # Switched 2026-04-07 PM after the :latest + HF download path hit a
     # pre-download Python init hang that --enforce-eager did not fix.
-    # Qwen3-Coder series emits <tool_call><function=name><parameter=name>val</parameter>
-    # </function></tool_call> XML, not hermes JSON — must use qwen3_coder parser.
+    # Qwen3-Coder series emits <tool_call><function=name>\x3cparameter=name>val\x3c/parameter>
+    # \x3c/function>\x3c/tool_call> XML, not hermes JSON — must use qwen3_coder parser.
     # Hardware: 2× RTX PRO 6000 (192 GB aggregate); RunPod's per-DC layer
     # cache makes second-pull TTFT ≪ HF download once warm.
     # ENFORCE_EAGER=1 retained as a belt-and-braces against the
