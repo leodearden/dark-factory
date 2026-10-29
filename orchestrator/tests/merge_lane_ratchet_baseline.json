@@ -61,7 +61,7 @@
     "complete": true
   },
   "files": {
-    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1480, "function_local_imports": 4, "lines": 16267, "prose_lines": 9356, "reexport_names": 1},
+    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1482, "function_local_imports": 4, "lines": 16290, "prose_lines": 9359, "reexport_names": 1},
     "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 39, "function_local_imports": 1, "lines": 660, "prose_lines": 299, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/__init__.py": {"cognitive": 0, "function_local_imports": 0, "lines": 96, "prose_lines": 21, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/coalesce_unwind.py": {"cognitive": 9, "function_local_imports": 0, "lines": 100, "prose_lines": 22, "reexport_names": 0},
@@ -143,6 +143,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_quarantine_cold_incarnation": 2,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_reattach_cold_worktree": 7,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_rebase_off_base": 5,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::_rebase_requeued_onto_main": 2,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_reconcile_pool_storage_before_sweep": 3,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_record_stack_base": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_refuse_foreign_band": 11,
