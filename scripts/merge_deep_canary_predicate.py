@@ -7,7 +7,8 @@ the entry point gate 3190 runs; it execs this module with every argument.
 Usage:
     merge-deep-canary-predicate.sh --runs-db PATH [--runs-db PATH ...]
         [--window-days N] [--deep-fail-rate-max R] [--items-per-verify-min R]
-        [--verify-p90-max-secs S] [--min-deep-verifies N] [--now EPOCH_SECS]
+        [--verify-p90-max-secs S] [--p90-ratio-max R] [--min-deep-verifies N]
+        [--now EPOCH_SECS]
 
 STORES. Each ``--runs-db`` names one orchestrator runs.db, the append-only
 sqlite event store. Every store is opened read-only (a ``mode=ro`` URI) and
@@ -63,11 +64,25 @@ aggressiveness assessment) retunes them against real canary telemetry.
                             the events.duration_ms column is NULL for this
                             event type. Reported only when the TIMED deep
                             verifies (those carrying a finite duration) reach
-                            the minimum sample.
+                            the minimum sample. An absolute ceiling, kept
+                            beside the ratio below.
+  verify_p90_ratio <= 1.5   nearest-rank p90 of per-deep-verify ratios: each
+                            timed deep verify's duration / the p90 of its OWN
+                            (store, runner) non-chain verifies in the window
+                            (``chain_items`` 1, a str ``runner``, a finite
+                            duration). Runner names are host labels reused
+                            across projects, so baselines are keyed by store
+                            too. For one runner this equals deep p90 /
+                            baseline p90, because scaling preserves order. A
+                            deep verify with no (or a zero) same-store,
+                            same-runner baseline has no ratio, and the leg is
+                            reported only when the ratios reach the minimum
+                            sample, so a missing baseline can only HOLD.
 A leg with no value FAILs: a canary that never exercised chains must not
 silently promote.
 
-STDOUT. The store lines, then a ``populations: <name>=<value> ...`` line
+STDOUT. The store lines (each with its ``baseline_p90_secs <runner>=<secs>
+(n=<k>)`` baselines), then a ``populations: <name>=<value> ...`` line
 carrying the pooled populations behind the legs, then either the
 insufficient_signal line or the verdict line, always LAST:
 ``merge-deep-canary window_days=7 n_deep_verifies=N: <leg>=<value>(ok|FAIL
@@ -95,6 +110,15 @@ from pathlib import Path
 ITEM_ATTRIBUTION_HORIZON = timedelta(hours=6)
 
 
+def pct(xs: Sequence[float], q: float) -> float | None:
+    """Nearest-rank percentile of *xs* (any order); None for an empty population."""
+    if not xs:
+        return None
+    ordered = sorted(xs)
+    k = max(0, min(len(ordered) - 1, int(round(q * (len(ordered) - 1)))))
+    return ordered[k]
+
+
 class PredicateFault(Exception):
     """A usage or infra fault: reported on stderr, exit 2, never a verdict."""
 
@@ -114,6 +138,7 @@ class Settings:
     deep_fail_rate_max: float
     items_per_verify_min: float
     verify_p90_max_secs: float
+    p90_ratio_max: float
     min_deep_verifies: int
 
 
@@ -135,6 +160,12 @@ class VerifyRow:
 
 
 @dataclass(frozen=True)
+class Baseline:
+    p90_secs: float
+    n: int
+
+
+@dataclass(frozen=True)
 class StoreSample:
     path: str
     verifies: tuple[VerifyRow, ...]
@@ -152,6 +183,30 @@ class StoreSample:
             if row.merge_sha is not None and row.attempt == 0 and row.passed
         })
 
+    @property
+    def baselines(self) -> dict[str, Baseline]:
+        """Each runner's non-chain verify p90 in this store, sorted by runner."""
+        by_runner: dict[str, list[float]] = {}
+        for row in self.verifies:
+            if row.chain_items == 1 and row.runner is not None and row.duration_secs is not None:
+                by_runner.setdefault(row.runner, []).append(row.duration_secs)
+        return {
+            runner: Baseline(p90_secs=p90, n=len(durations))
+            for runner, durations in sorted(by_runner.items())
+            if (p90 := pct(durations, 0.90)) is not None
+        }
+
+    @property
+    def ratios(self) -> tuple[float, ...]:
+        """Each timed deep verify's duration over its runner's baseline p90, when it has one."""
+        baselines = self.baselines
+        ratios = []
+        for row in self.deep:
+            baseline = baselines.get(row.runner) if row.runner is not None else None
+            if row.duration_secs is not None and baseline is not None and baseline.p90_secs > 0:
+                ratios.append(row.duration_secs / baseline.p90_secs)
+        return tuple(ratios)
+
 
 @dataclass(frozen=True)
 class Pool:
@@ -163,6 +218,7 @@ class Pool:
     landed_via_chain: int
     passed_deep_rounds: int
     durations: tuple[float, ...]
+    ratios: tuple[float, ...]
 
 
 def _rendered(value: float | None) -> str:
@@ -245,6 +301,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--deep-fail-rate-max', default='0.35')
     parser.add_argument('--items-per-verify-min', default='1.3')
     parser.add_argument('--verify-p90-max-secs', default='5400')
+    parser.add_argument('--p90-ratio-max', default='1.5')
     parser.add_argument('--min-deep-verifies', default='8')
     parser.add_argument('--now', default=None, metavar='EPOCH_SECS')
     return parser
@@ -255,6 +312,7 @@ def _settings(argv: Sequence[str]) -> Settings:
     deep_fail_rate_max = _finite('--deep-fail-rate-max', args.deep_fail_rate_max)
     items_per_verify_min = _finite('--items-per-verify-min', args.items_per_verify_min)
     verify_p90_max_secs = _finite('--verify-p90-max-secs', args.verify_p90_max_secs)
+    p90_ratio_max = _finite('--p90-ratio-max', args.p90_ratio_max)
     min_deep_verifies = _positive_int('--min-deep-verifies', args.min_deep_verifies)
     window = _window(args.window_days, args.now)
     return Settings(
@@ -263,6 +321,7 @@ def _settings(argv: Sequence[str]) -> Settings:
         deep_fail_rate_max=deep_fail_rate_max,
         items_per_verify_min=items_per_verify_min,
         verify_p90_max_secs=verify_p90_max_secs,
+        p90_ratio_max=p90_ratio_max,
         min_deep_verifies=min_deep_verifies,
     )
 
@@ -366,15 +425,6 @@ def _load_store(path: str, window: Window) -> StoreSample:
     )
 
 
-def pct(xs: Sequence[float], q: float) -> float | None:
-    """Nearest-rank percentile of *xs* (any order); None for an empty population."""
-    if not xs:
-        return None
-    ordered = sorted(xs)
-    k = max(0, min(len(ordered) - 1, int(round(q * (len(ordered) - 1)))))
-    return ordered[k]
-
-
 def _ratio(numerator: float, denominator: int) -> float | None:
     return numerator / denominator if denominator else None
 
@@ -392,6 +442,7 @@ def _pool(samples: Sequence[StoreSample]) -> Pool:
         landed_via_chain=sum(sample.landed_via_chain for sample in samples),
         passed_deep_rounds=sum(sample.passed_deep_rounds for sample in samples),
         durations=tuple(row.duration_secs for row in deep if row.duration_secs is not None),
+        ratios=tuple(ratio for sample in samples for ratio in sample.ratios),
     )
 
 
@@ -400,17 +451,23 @@ def _legs(pool: Pool, settings: Settings) -> list[Leg]:
     fail_rate = _ratio(pool.failures - attributed, pool.n_deep - attributed)
     items = _ratio(pool.landed_via_chain, pool.passed_deep_rounds)
     p90 = _sampled_p90(pool.durations, settings.min_deep_verifies)
+    p90_ratio = _sampled_p90(pool.ratios, settings.min_deep_verifies)
     return [
         Leg('deep_fail_rate', fail_rate, settings.deep_fail_rate_max, at_most=True),
         Leg('items_per_verify', items, settings.items_per_verify_min, at_most=False),
         Leg('verify_p90_secs', p90, settings.verify_p90_max_secs, at_most=True),
+        Leg('verify_p90_ratio', p90_ratio, settings.p90_ratio_max, at_most=True),
     ]
 
 
 def _store_line(sample: StoreSample) -> str:
+    baselines = ' '.join(
+        f'{runner}={_rendered(baseline.p90_secs)}(n={baseline.n})' for runner, baseline in sample.baselines.items()
+    )
     return (
         f'store {sample.path}: n_deep={len(sample.deep)} passed_deep_rounds={sample.passed_deep_rounds} '
-        f'item_attributed_failures={sample.item_attributed_failures}'
+        f'item_attributed_failures={sample.item_attributed_failures} '
+        f'baseline_p90_secs {baselines or "none"}'
     )
 
 
@@ -418,7 +475,8 @@ def _populations_line(pool: Pool) -> str:
     return (
         f'populations: deep_fail_rate_raw={_rendered(_ratio(pool.failures, pool.n_deep))} '
         f'deep_failures={pool.failures} item_attributed_failures={pool.item_attributed_failures} '
-        f'landed_via_chain={pool.landed_via_chain} passed_deep_rounds={pool.passed_deep_rounds}'
+        f'landed_via_chain={pool.landed_via_chain} passed_deep_rounds={pool.passed_deep_rounds} '
+        f'timed_deep_verifies={len(pool.durations)} ratio_deep_verifies={len(pool.ratios)}'
     )
 
 
