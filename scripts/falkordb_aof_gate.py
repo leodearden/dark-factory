@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """Bring up fused-memory's backing stores, recreating FalkorDB only onto a current AOF (task 6330).
 
-The fused-memory unit's ExecStartPre runs this in place of a bare
-``docker compose up -d falkordb qdrant``. Once docker-compose.yml changes, that
-compose-up recreates the falkordb container, and the new server starts with
-``--appendonly yes``. Redis then loads ONLY the AOF named by its manifest and
-ignores dump.rdb, so a stale AOF silently drops every write made since it went
-stale (and no AOF at all starts the server empty).
+The fused-memory unit's ExecStartPre (and setup-host.sh) runs this in place of
+a bare ``docker compose up -d falkordb qdrant``. Once docker-compose.yml
+changes, that compose-up recreates the falkordb container, and the new server
+starts with ``--appendonly yes``. Redis then loads ONLY the AOF named by its
+manifest and ignores dump.rdb, so a stale AOF silently drops every write made
+since it went stale (and no AOF at all starts the server empty).
 
-A recreate is allowed only when the live server proves its AOF is current:
-appendonly yes, aof_enabled:1, loading:0, aof_last_write_status:ok,
-aof_rewrite_in_progress:0, and the manifest's base + incr files on the HOST
-side of the bind mount total exactly what the server says it has appended
-(aof_current_size), bracketed by two INFO reads taken around the stat. That is
-"current" whatever the write rate: an idle server's incr mtime does not move,
-but its size still equals aof_current_size.
+A recreate is allowed only when the compose file binds the live container's
+own data dir and the live server proves its AOF is current: appendonly yes,
+aof_enabled:1, loading:0, aof_last_write_status:ok, aof_rewrite_in_progress:0,
+and the manifest's base + incr files on the HOST side of the bind mount total
+exactly what the server says it has appended (aof_current_size), bracketed by
+two INFO reads taken around the stat. That is "current" whatever the write
+rate: an idle server's incr mtime does not move, but its size still equals
+aof_current_size.
 
-A refusal never takes fused-memory down: falkordb is left as it is, qdrant is
-still brought up, and the remedy is logged at error priority. Stdlib only, so
-it runs under the system python3 with no environment set up.
+On a refusal falkordb is not touched, qdrant is still brought up, and each
+problem is logged at error priority with its own remedy. Stdlib only, so it
+runs under the system python3 with no environment set up.
 """
 
 import argparse
@@ -27,6 +28,7 @@ import json
 import os
 import subprocess
 import sys
+import traceback
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,12 +36,71 @@ from pathlib import Path
 DATA_DIR_IN_CONTAINER = "/var/lib/falkordb/data"
 PERSISTED_ARTIFACTS = ("dump.rdb", "appendonlydir")
 LOADED_MANIFEST_TYPES = ("b", "i")
+STOPPED_STATES = ("created", "exited")
 COMMAND_TIMEOUT_SECS = 240
-REMEDY = (
-    "remedy: `docker exec docker-falkordb-1 redis-cli CONFIG SET appendonly yes`, wait until "
-    "`redis-cli INFO persistence` shows aof_rewrite_in_progress:0, then restart fused-memory "
-    "(OPERATIONS.md \"FalkorDB settings and the recreate gate\")"
-)
+RUNBOOK = 'OPERATIONS.md "FalkorDB settings and the recreate gate"'
+
+
+class Remedy(enum.Enum):
+    ENABLE_AOF = (
+        "run `docker exec docker-falkordb-1 redis-cli CONFIG SET appendonly yes`, wait until "
+        "`redis-cli INFO persistence` shows aof_rewrite_in_progress:0, then restart fused-memory"
+    )
+    WAIT = (
+        "wait until `docker exec docker-falkordb-1 redis-cli INFO persistence` shows loading:0 and "
+        "aof_rewrite_in_progress:0, then restart fused-memory"
+    )
+    FIX_DISK = (
+        "the server cannot write its AOF: check free space and IO errors on the disk holding the "
+        "host data dir, then restart fused-memory"
+    )
+    USE_MAIN_COMPOSE = (
+        "run the gate with the compose file whose falkordb volume is the live container's data dir, "
+        "i.e. the main checkout's fused-memory/docker/docker-compose.yml, never a worktree's"
+    )
+    SETTLE = "wait for the container to settle (`docker ps -a`), then restart fused-memory"
+    BOOTSTRAP = "follow OPERATIONS.md \"Bootstrapping FalkorDB's AOF from dump.rdb\""
+    INVESTIGATE = (
+        "inspect `docker ps -a` and `docker exec docker-falkordb-1 redis-cli INFO persistence` "
+        "by hand before restarting fused-memory"
+    )
+
+
+@dataclass(frozen=True)
+class Problem:
+    finding: str
+    remedy: Remedy
+
+
+class Action(enum.Enum):
+    RECONCILE_BOTH = "compose up falkordb and qdrant"
+    START_EXISTING = "start the existing falkordb container, compose up qdrant"
+    LEAVE_FALKORDB = "leave falkordb as it is, compose up qdrant"
+
+
+@dataclass(frozen=True)
+class Verdict:
+    action: Action
+    summary: str
+    problems: tuple[Problem, ...] = ()
+    container: str | None = None
+
+    @property
+    def recreate_allowed(self) -> bool:
+        return self.action is Action.RECONCILE_BOTH
+
+    @property
+    def message(self) -> str:
+        if not self.problems:
+            return self.summary
+        findings = "; ".join(problem.finding for problem in self.problems)
+        remedies = " ALSO: ".join(dict.fromkeys(problem.remedy.value for problem in self.problems))
+        return f"{self.summary} ({findings}). REMEDY: {remedies} ({RUNBOOK})"
+
+
+def _refuse(summary: str, *problems: Problem, container: str | None = None) -> Verdict:
+    unique = tuple(dict.fromkeys(problems))
+    return Verdict(Action.LEAVE_FALKORDB, summary, unique, container)
 
 
 @dataclass(frozen=True)
@@ -60,22 +121,6 @@ def run_command(argv: Sequence[str]) -> CommandResult:
     return CommandResult(done.returncode, done.stdout, done.stderr)
 
 
-class Action(enum.Enum):
-    RECONCILE_BOTH = "compose up falkordb and qdrant"
-    START_EXISTING = "start the existing falkordb container, compose up qdrant"
-    LEAVE_FALKORDB = "leave falkordb as it is, compose up qdrant"
-
-
-@dataclass(frozen=True)
-class Verdict:
-    action: Action
-    reason: str
-
-    @property
-    def recreate_allowed(self) -> bool:
-        return self.action is Action.RECONCILE_BOTH
-
-
 class ProbeFailed(Exception):
     pass
 
@@ -83,7 +128,7 @@ class ProbeFailed(Exception):
 class Docker:
     def __init__(self, run: Runner, compose_file: str):
         self._run = run
-        self._compose = ["docker", "compose", "-f", compose_file]
+        self.compose_file = compose_file
 
     def read(self, argv: Sequence[str]) -> str:
         result = self._run(argv)
@@ -92,7 +137,7 @@ class Docker:
         return result.stdout
 
     def compose(self, *args: str) -> list[str]:
-        return [*self._compose, *args]
+        return ["docker", "compose", "-f", self.compose_file, *args]
 
     def act(self, argv: Sequence[str]) -> int:
         result = self._run(argv)
@@ -101,85 +146,191 @@ class Docker:
         return result.returncode
 
 
-def decide(docker: Docker) -> tuple[Verdict, str | None]:
+@dataclass(frozen=True)
+class Container:
+    id: str
+    status: str
+    data_mount: str | None
+    redis_args: str
+
+    @classmethod
+    def parse(cls, container_id: str, inspect_json: str) -> "Container":
+        details = json.loads(inspect_json)[0]
+        data_mount = next(
+            (m["Source"] for m in details.get("Mounts") or [] if m.get("Destination") == DATA_DIR_IN_CONTAINER),
+            None,
+        )
+        env = dict(entry.partition("=")[::2] for entry in details["Config"]["Env"] or [])
+        return cls(container_id, details["State"]["Status"], data_mount, env.get("REDIS_ARGS", ""))
+
+    @property
+    def boots_with_aof(self) -> bool:
+        tokens = self.redis_args.split()
+        return any(name == "--appendonly" and value == "yes" for name, value in zip(tokens, tokens[1:], strict=False))
+
+
+@dataclass(frozen=True)
+class ServerAofConfig:
+    appendonly: str
+    dir: str
+    appenddirname: str
+    appendfilename: str
+
+    @classmethod
+    def parse(cls, config_json: str) -> "ServerAofConfig":
+        config = json.loads(config_json)
+        return cls(*(str(config[name]) for name in ("appendonly", "dir", "appenddirname", "appendfilename")))
+
+
+@dataclass(frozen=True)
+class Persistence:
+    """One ``INFO persistence`` read. Redis omits the aof_* sizes while the AOF is off."""
+
+    loading: str | None
+    aof_enabled: str | None
+    aof_rewrite_in_progress: str | None
+    aof_last_write_status: str | None
+    aof_current_size: int | None
+
+    @classmethod
+    def parse(cls, info_text: str) -> "Persistence":
+        lines = (line.partition(":") for line in info_text.splitlines() if line and not line.startswith("#"))
+        fields = {key: value.strip() for key, _, value in lines}
+        size = fields.get("aof_current_size", "")
+        return cls(
+            fields.get("loading"),
+            fields.get("aof_enabled"),
+            fields.get("aof_rewrite_in_progress"),
+            fields.get("aof_last_write_status"),
+            int(size) if size.isdigit() else None,
+        )
+
+    def problems(self) -> list[Problem]:
+        found = []
+        if self.aof_enabled != "1":
+            found.append(Problem(f"aof_enabled:{self.aof_enabled}", Remedy.ENABLE_AOF))
+        if self.loading != "0":
+            found.append(Problem(f"loading:{self.loading}", Remedy.WAIT))
+        if self.aof_rewrite_in_progress != "0":
+            found.append(Problem(f"aof_rewrite_in_progress:{self.aof_rewrite_in_progress}", Remedy.WAIT))
+        if self.aof_last_write_status != "ok":
+            found.append(Problem(f"aof_last_write_status:{self.aof_last_write_status}", Remedy.FIX_DISK))
+        return found
+
+
+def decide(docker: Docker) -> Verdict:
     try:
-        container = docker.read(docker.compose("ps", "-a", "-q", "falkordb")).strip()
-        if not container:
-            return _verdict_without_container(docker), None
-        status, mounts = _inspect(docker, container)
-        if status == "running":
-            return _verdict_for_running(docker, container, mounts), container
+        return _decide(docker)
     except ProbeFailed as exc:
-        return Verdict(Action.LEAVE_FALKORDB, f"recreate REFUSED: cannot read falkordb state ({exc}); {REMEDY}"), None
-    if status in ("created", "exited"):
+        return _refuse("recreate REFUSED: cannot read the falkordb state", Problem(str(exc), Remedy.INVESTIGATE))
+    except Exception as exc:
+        for line in traceback.format_exc().splitlines():
+            log("error", line)
+        return _refuse("recreate REFUSED: the gate could not decide", Problem(repr(exc), Remedy.INVESTIGATE))
+
+
+def _decide(docker: Docker) -> Verdict:
+    container_id = docker.read(docker.compose("ps", "-a", "-q", "falkordb")).strip()
+    compose_data_dir = _compose_data_dir(docker)
+    if not container_id:
+        return _verdict_without_container(compose_data_dir)
+    container = Container.parse(container_id, docker.read(["docker", "inspect", container_id]))
+    if container.data_mount is None or not _same_dir(container.data_mount, compose_data_dir):
+        return _refuse(
+            "recreate REFUSED: the compose file and the live container disagree on the data dir",
+            Problem(
+                f"{docker.compose_file} binds {compose_data_dir}, the container mounts {container.data_mount}",
+                Remedy.USE_MAIN_COMPOSE,
+            ),
+            container=container.id,
+        )
+    if container.status == "running":
+        return _verdict_for_running(docker, container)
+    if container.status in STOPPED_STATES:
+        return _verdict_for_stopped(container)
+    return _refuse(
+        "recreate REFUSED: falkordb is not running",
+        Problem(f"container status is {container.status}", Remedy.SETTLE),
+        container=container.id,
+    )
+
+
+def _compose_data_dir(docker: Docker) -> str:
+    config = json.loads(docker.read(docker.compose("config", "--no-env-resolution", "--format", "json")))
+    volumes = config["services"]["falkordb"]["volumes"]
+    sources = [v["source"] for v in volumes if v.get("target") == DATA_DIR_IN_CONTAINER]
+    if not sources:
+        raise ProbeFailed(f"{docker.compose_file} mounts nothing at {DATA_DIR_IN_CONTAINER}")
+    return sources[0]
+
+
+def _same_dir(left: str, right: str) -> bool:
+    return Path(left).resolve() == Path(right).resolve()
+
+
+def _verdict_for_running(docker: Docker, container: Container) -> Verdict:
+    problems = _aof_problems(docker, container)
+    if problems:
+        return _refuse("recreate REFUSED: AOF not current", *problems, container=container.id)
+    return Verdict(Action.RECONCILE_BOTH, "AOF current, recreate allowed", container=container.id)
+
+
+def _verdict_for_stopped(container: Container) -> Verdict:
+    if container.boots_with_aof:
         return Verdict(
             Action.START_EXISTING,
-            f"falkordb is {status}; starting the existing container unchanged, because its AOF "
-            "cannot be read while it is stopped. Any pending recreate waits for the next "
-            "fused-memory restart, when the gate can read the live AOF",
-        ), container
-    return Verdict(
-        Action.LEAVE_FALKORDB,
-        f"recreate REFUSED: falkordb container is {status}, not running; {REMEDY}",
-    ), container
+            f"falkordb is {container.status} and boots with appendonly yes; starting the existing "
+            "container unchanged, because its AOF cannot be read while it is stopped. Any pending "
+            "recreate waits for the next fused-memory restart, when the gate can read the live AOF",
+            container=container.id,
+        )
+    return _refuse(
+        "start REFUSED: the stopped container would boot with appendonly no",
+        Problem(
+            f"falkordb is {container.status} and its REDIS_ARGS ({container.redis_args!r}) do not enable "
+            "the AOF, so it would load dump.rdb and drop every write only the AOF holds",
+            Remedy.BOOTSTRAP,
+        ),
+        container=container.id,
+    )
 
 
-def _inspect(docker: Docker, container: str) -> tuple[str, dict[str, str]]:
+def _aof_problems(docker: Docker, container: Container) -> list[Problem]:
+    redis_cli = ["docker", "exec", container.id, "redis-cli"]
     try:
-        details = json.loads(docker.read(["docker", "inspect", container]))[0]
-        mounts = {m["Destination"]: m["Source"] for m in details["Mounts"] if m.get("Type") == "bind"}
-        return details["State"]["Status"], mounts
-    except (ValueError, LookupError, TypeError) as exc:
-        raise ProbeFailed(f"unexpected `docker inspect` output: {exc!r}") from exc
-
-
-def _verdict_for_running(docker: Docker, container: str, mounts: dict[str, str]) -> Verdict:
-    problems = _aof_problems(docker, container, mounts)
-    if problems:
-        return Verdict(Action.LEAVE_FALKORDB, f"recreate REFUSED: AOF not current ({'; '.join(problems)}); {REMEDY}")
-    return Verdict(Action.RECONCILE_BOTH, "AOF current, recreate allowed")
-
-
-def _aof_problems(docker: Docker, container: str, mounts: dict[str, str]) -> list[str]:
-    redis_cli = ["docker", "exec", container, "redis-cli"]
-    try:
-        config = json.loads(docker.read([*redis_cli, "--json", "CONFIG", "GET",
-                                         "appendonly", "dir", "appenddirname", "appendfilename"]))
-        before = _parse_info(docker.read([*redis_cli, "INFO", "persistence"]))
-        host_dir = mounts.get(config["dir"])
-        on_disk = _manifest_bytes_on_host(host_dir, config) if host_dir else None
-        after = _parse_info(docker.read([*redis_cli, "INFO", "persistence"]))
+        config = ServerAofConfig.parse(docker.read(
+            [*redis_cli, "--json", "CONFIG", "GET", "appendonly", "dir", "appenddirname", "appendfilename"]))
+        before = Persistence.parse(docker.read([*redis_cli, "INFO", "persistence"]))
+        on_disk = _manifest_bytes_on_host(container.data_mount, config)
+        after = Persistence.parse(docker.read([*redis_cli, "INFO", "persistence"]))
     except (ProbeFailed, ValueError, LookupError, TypeError, OSError) as exc:
-        return [f"cannot read the live AOF state: {exc}"]
+        return [Problem(f"cannot read the live AOF state: {exc}", Remedy.INVESTIGATE)]
 
     problems = []
-    if config["appendonly"] != "yes":
-        problems.append(f"appendonly is {config['appendonly']}")
-    for info in (before, after):
-        for field, wanted in (("aof_enabled", "1"), ("loading", "0"),
-                              ("aof_last_write_status", "ok"), ("aof_rewrite_in_progress", "0")):
-            if info.get(field) != wanted:
-                problems.append(f"{field}:{info.get(field)}")
-    if host_dir is None:
-        problems.append(f"{config['dir']} is not bind-mounted from the host")
+    if config.appendonly != "yes":
+        problems.append(Problem(f"appendonly is {config.appendonly}", Remedy.ENABLE_AOF))
+    problems += before.problems() + after.problems()
+    if config.dir != DATA_DIR_IN_CONTAINER:
+        problems.append(Problem(f"the server writes to {config.dir}, not the mounted {DATA_DIR_IN_CONTAINER}",
+                                Remedy.INVESTIGATE))
     elif on_disk is None:
-        problems.append(f"no AOF manifest under {host_dir}")
-    elif not int(before["aof_current_size"]) <= on_disk <= int(after["aof_current_size"]):
-        problems.append(
-            f"host AOF files total {on_disk} bytes, server reports "
-            f"{before['aof_current_size']}..{after['aof_current_size']}"
-        )
+        problems.append(Problem(f"no AOF manifest under {container.data_mount}", Remedy.ENABLE_AOF))
+    elif before.aof_current_size is None or after.aof_current_size is None:
+        problems.append(Problem("INFO reports no aof_current_size", Remedy.ENABLE_AOF))
+    elif not before.aof_current_size <= on_disk <= after.aof_current_size:
+        problems.append(Problem(
+            f"host AOF files total {on_disk} bytes, the server reports "
+            f"{before.aof_current_size}..{after.aof_current_size}",
+            Remedy.INVESTIGATE,
+        ))
     return list(dict.fromkeys(problems))
 
 
-def _parse_info(text: str) -> dict[str, str]:
-    pairs = (line.partition(":") for line in text.splitlines() if line and not line.startswith("#"))
-    return {key: value.strip() for key, _, value in pairs}
-
-
-def _manifest_bytes_on_host(host_dir: str, config: dict[str, str]) -> int | None:
-    aof_dir = Path(host_dir) / config["appenddirname"]
-    manifest = aof_dir / f"{config['appendfilename']}.manifest"
+def _manifest_bytes_on_host(host_dir: str | None, config: ServerAofConfig) -> int | None:
+    if host_dir is None:
+        return None
+    aof_dir = Path(host_dir) / config.appenddirname
+    manifest = aof_dir / f"{config.appendfilename}.manifest"
     if not manifest.is_file():
         return None
     total = 0
@@ -191,33 +342,27 @@ def _manifest_bytes_on_host(host_dir: str, config: dict[str, str]) -> int | None
     return total
 
 
-def _verdict_without_container(docker: Docker) -> Verdict:
-    try:
-        config_json = docker.read(docker.compose("config", "--no-env-resolution", "--format", "json"))
-        services = json.loads(config_json)["services"]
-        host_dir = next(
-            v["source"] for v in services["falkordb"]["volumes"] if v.get("target") == DATA_DIR_IN_CONTAINER
-        )
-    except (ProbeFailed, ValueError, LookupError, TypeError, StopIteration) as exc:
-        return Verdict(Action.LEAVE_FALKORDB, f"create REFUSED: cannot resolve the falkordb data dir ({exc!r})")
+def _verdict_without_container(host_dir: str) -> Verdict:
     persisted = [name for name in PERSISTED_ARTIFACTS if (Path(host_dir) / name).exists()]
     if not persisted:
         return Verdict(Action.RECONCILE_BOTH, f"no falkordb container and no persisted data in {host_dir}; creating it")
-    return Verdict(
-        Action.LEAVE_FALKORDB,
-        f"create REFUSED: no falkordb container, and {host_dir} holds {', '.join(persisted)}. A new "
-        "container starts with appendonly yes and loads only the AOF, so a stale or missing AOF "
-        "would drop data. fused-memory will not reach FalkorDB until it is created by hand "
-        "(OPERATIONS.md \"FalkorDB settings and the recreate gate\")",
+    return _refuse(
+        "create REFUSED: no falkordb container over persisted data",
+        Problem(
+            f"{host_dir} holds {', '.join(persisted)}; a new container boots with appendonly yes and loads "
+            "only the AOF, so a stale or missing AOF would drop data. fused-memory will not reach FalkorDB "
+            "until it is brought up by hand",
+            Remedy.BOOTSTRAP,
+        ),
     )
 
 
-def act(docker: Docker, verdict: Verdict, container: str | None) -> int:
+def act(docker: Docker, verdict: Verdict) -> int:
     if verdict.action is Action.RECONCILE_BOTH:
         return docker.act(docker.compose("up", "-d", "falkordb", "qdrant"))
     start_rc = 0
-    if verdict.action is Action.START_EXISTING and container:
-        start_rc = docker.act(["docker", "start", container])
+    if verdict.action is Action.START_EXISTING and verdict.container:
+        start_rc = docker.act(["docker", "start", verdict.container])
     return docker.act(docker.compose("up", "-d", "qdrant")) or start_rc
 
 
@@ -236,19 +381,20 @@ def _level(verdict: Verdict) -> str:
 
 
 def main(argv: Sequence[str] | None = None, *, run: Runner = run_command) -> int:
-    parser = argparse.ArgumentParser(description="Bring up the backing stores, recreating FalkorDB only onto a current AOF.")
+    parser = argparse.ArgumentParser(
+        description="Bring up the backing stores, recreating FalkorDB only onto a current AOF.")
     parser.add_argument("--compose-file", required=True)
     parser.add_argument("--check-only", action="store_true",
                         help="report the verdict and act on nothing; exit 0 if a recreate is allowed, else 1")
     args = parser.parse_args(argv)
 
     docker = Docker(run, args.compose_file)
-    verdict, container = decide(docker)
-    log(_level(verdict), verdict.reason)
+    verdict = decide(docker)
+    log(_level(verdict), verdict.message)
     if args.check_only:
         return 0 if verdict.recreate_allowed else 1
     log("info", f"action: {verdict.action.value}")
-    return act(docker, verdict, container)
+    return act(docker, verdict)
 
 
 if __name__ == "__main__":
