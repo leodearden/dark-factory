@@ -1987,7 +1987,6 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py',
     'orchestrator/tests/test_harness.py',
     'orchestrator/tests/test_invoke.py',
-    'orchestrator/tests/test_merge_queue_coalesce.py',
     'orchestrator/tests/test_merge_queue_deep_integration_gate.py',
     'orchestrator/tests/test_merge_queue_invariant_integration_gate.py',
     'orchestrator/tests/test_merge_skew_tripwire.py',
