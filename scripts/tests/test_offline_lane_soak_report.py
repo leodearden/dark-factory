@@ -5,14 +5,18 @@ the task store is a fake, injected through ``main``'s ``task_reader`` keyword.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import socket
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import offline_lane_soak_report as soak_report
 import pytest
+from migrate_metadata_modules_to_files import DEFAULT_SERVER, MCP_IS_ERROR_KEY, RAW_REPLY_KEY
 from offline_lane_soak_fixtures import (
     FAILURE_LINE,
     HEAD,
@@ -26,6 +30,7 @@ from offline_lane_soak_fixtures import (
     episode,
     failure,
 )
+from offline_lane_soak_inputs import FusedMemoryTaskReader
 from orchestrator.flake_ledger import (
     UNKNOWN_TEST_ID,
     DebtTrigger,
@@ -997,3 +1002,104 @@ def test_without_json_stdout_names_each_figure_and_its_rule(tmp_path: Path, caps
     for figure in report['figures']:
         assert figure['name'] in out
         assert figure['rule'] in out
+
+
+# --- end to end, and the production task reader ------------------------------------------
+
+
+def test_a_seeded_soak_passes_every_check_and_exits_zero(tmp_path: Path, capsys):
+    seeded = _seeded(tmp_path)
+    seeded.project.open_lane_debt(
+        NODE_A, DebtTrigger.recovered, seeded.recovering, earlier=[seeded.started, seeded.filing],
+    )
+
+    code, report, err = _report(seeded.project, capsys)
+
+    assert code == 0
+    assert report['commands'] == [LINT, UNIT]
+    assert [(check['name'], check['verdict']) for check in report['checks']] == [(name, 'pass') for name in CHECKS]
+    assert all(check['examined'] > 0 for check in report['checks'])
+    assert [line for line in err.splitlines() if line.startswith('[')] == [
+        f"[PASS] {check['name']}: examined {check['examined']}; rule: {check['rule']}" for check in report['checks']
+    ]
+
+
+class _ToolStub:
+    """A fused-memory client that answers every call with one reply, or raises one exception."""
+
+    def __init__(self, reply: Any = None, *, raises: Exception | None = None) -> None:
+        self.reply = reply
+        self.raises = raises
+        self.calls: list[tuple[str, dict]] = []
+
+    async def call_tool(self, name: str, arguments: dict, *, timeout: float | None = None) -> dict:
+        self.calls.append((name, arguments))
+        if self.raises is not None:
+            raise self.raises
+        return self.reply
+
+
+def _read(stub: _ToolStub, task_id: str = '42') -> tuple[dict | None, Exception | None]:
+    return asyncio.run(FusedMemoryTaskReader(stub, '/srv/project').get_task(task_id))
+
+
+def test_the_task_reader_answers_a_task_it_read():
+    task = {'id': '42', 'title': 'fix it', 'details': 'digest', 'metadata': {LANE_METADATA_KEY: {}}}
+    stub = _ToolStub(task)
+
+    assert _read(stub) == (task, None)
+    assert stub.calls == [('get_task', {'id': '42', 'project_root': '/srv/project'})]
+
+
+def test_the_task_reader_answers_a_task_the_store_has_not_as_an_absence():
+    stub = _ToolStub({'error': 'Task 42 not found', 'error_type': 'TaskNotFoundError'})
+
+    assert _read(stub) == (None, None)
+
+
+@pytest.mark.parametrize('reply', [
+    {'error': 'database is locked', 'error_type': 'OperationalError'},
+    {'id': '42', MCP_IS_ERROR_KEY: True},
+    {RAW_REPLY_KEY: 'Error calling tool get_task: validation failed'},
+    {},
+    ['not', 'a', 'task'],
+])
+def test_the_task_reader_answers_any_other_failed_reply_as_an_error(reply: Any):
+    task, error = _read(_ToolStub(reply))
+
+    assert task is None
+    assert isinstance(error, Exception)
+    assert '42' in str(error)
+
+
+def test_the_task_reader_answers_a_transport_failure_with_that_exception():
+    failure = httpx.ConnectError('connection refused')
+
+    assert _read(_ToolStub(raises=failure)) == (None, failure)
+
+
+def _closed_port_url() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(('127.0.0.1', 0))
+        port = probe.getsockname()[1]
+    return f'http://127.0.0.1:{port}'
+
+
+def test_without_an_injected_reader_main_reads_tasks_from_the_server_url(tmp_path: Path, capsys):
+    project, _, _ = _filing_project(tmp_path, NODE_A)
+    url = _closed_port_url()
+
+    code = soak_report.main(['--project-root', str(project.root), '--json', '--server-url', url], now=NOW)
+    report = json.loads(capsys.readouterr().out)
+
+    assert code == 2
+    assert 'task store' in report['unjudgeable']
+    assert url in report['unjudgeable']
+
+
+def test_the_server_url_defaults_to_the_fused_memory_server(capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        soak_report.main(['--help'])
+
+    assert exit_info.value.code == 0
+    assert DEFAULT_SERVER in capsys.readouterr().out
