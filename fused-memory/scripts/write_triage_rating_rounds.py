@@ -22,8 +22,10 @@ A :class:`RatingScratch` directory holds the rounds:
 - ``shards/<name>.txt``: what a rater reads, re-renderable from the key and the texts.
 - ``ratings/<name>.jsonl``: the rater's answers, one line per item.
 
-Callers choose which pairs to rate and what the effective lines mean; this
-module imports only the rubric.
+Callers choose which pairs to rate and what the effective lines mean, save
+that a re-rate covers the pairs whose derivation reads LOSS
+(:func:`ensure_rerate`), from derivations the caller supplies; this module
+imports only the rubric.
 """
 from __future__ import annotations
 
@@ -33,7 +35,7 @@ import math
 import random
 import sqlite3
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
@@ -73,6 +75,8 @@ def _double_rater(role: str) -> str:
 
 Triple = tuple[str, str, str]
 """A pair and basis: (entry id, target id, basis)."""
+Pair = tuple[str, str]
+"""A pair: (entry id, target id)."""
 
 
 @dataclass(frozen=True)
@@ -260,16 +264,29 @@ def third_round_blockers(
     return sorted(blocked)
 
 
-def loss_consuming_pairs(rows: Iterable[Mapping[str, Any]]) -> list[tuple[str, str]]:
-    """The sorted (entry, target) pairs whose current-basis *rows* resolve to the answers LOSS
-    is asked after, so a derivation reads LOSS on them."""
-    needs = _rubric.FOLLOW_UPS[Binary.LOSS]
-    return sorted(
-        (pair.entry_id, pair.target_id)
-        for pair, judgement in _rubric.resolve_judgements(rows).items()
-        if pair.basis == Basis.CURRENT
-        and all(judgement.answer(binary) == needed for binary, needed in needs.items())
-    )
+def pairs_reading_loss(derivations: Mapping[Pair, _rubric.Derivation]) -> set[Pair]:
+    """The pairs whose derivation consumes LOSS, or leaves it unclear."""
+    loss = _rubric.Binary.LOSS
+    return {
+        pair for pair, derivation in derivations.items()
+        if isinstance(derivation, _rubric.Decided)
+        and any(binary == loss for _, binary in derivation.consumed)
+        or isinstance(derivation, _rubric.Unclear)
+        and any(binary == loss for _, binary in derivation.binaries)
+    }
+
+
+def refuse_loss_outside_the_latest_rerate(
+    key: Mapping[str, Any], derivations: Mapping[Pair, _rubric.Derivation],
+) -> None:
+    """Once any rerate is keyed, every pair reading LOSS must be one the latest rerate re-rated."""
+    rerates = key.get('rerates', ())
+    if not rerates:
+        return
+    outside = sorted(pairs_reading_loss(derivations) - {tuple(pair) for pair in rerates[-1]['pairs']})
+    if outside:
+        raise ValueError(f'pairs read LOSS but the latest re-rate ({rerates[-1]["version"]}) did not'
+                         ' re-rate them:\n' + '\n'.join(f'{entry} {target}' for entry, target in outside))
 
 
 def rating_volume(key: Mapping[str, Any]) -> dict[str, dict[str, int]]:
@@ -463,14 +480,21 @@ class RatingScratch:
             for record in json.loads((self.root / 'texts.json').read_text())
         }
 
-    def effective_lines(self, key: Mapping[str, Any]) -> list[dict[str, Any]]:
+    def effective_lines(
+        self, key: Mapping[str, Any], *, brief_sha256: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Every rater's effective lines, read from the key and the ratings alone.
 
         A third rater a re-rate retires has no line on that re-rate's pairs. A
         line is refused unless its shard was rated under the round-0 brief or
         under the brief of a re-rate covering its pair (:func:`refuse_foreign_briefs`).
+        Given *brief_sha256*, only the lines of shards recording that brief
+        compete, so each rater's line is its latest under that brief.
         """
-        return effective_ratings(self._lines(key))
+        lines = self._lines(key)
+        if brief_sha256 is not None:
+            lines = [line for line in lines if key['shards'][line['batch']]['brief_sha256'] == brief_sha256]
+        return effective_ratings(lines)
 
     def _lines(self, key: Mapping[str, Any]) -> list[dict[str, Any]]:
         retired = _retired_votes(key)
@@ -683,6 +707,39 @@ def rerate_round(
     key.setdefault('rerates', []).append(rerate)
     scratch.save_key(key)
     return rerate
+
+
+def ensure_rerate(
+    scratch: RatingScratch, key: dict[str, Any], entries: Mapping[Triple, ShardEntry], *,
+    version: str, derivations: Callable[[], Mapping[Pair, _rubric.Derivation]],
+) -> dict[str, Any]:
+    """Key the re-rate under *scratch*'s brief labelled *version*, unless *key* records it; then
+    render every missing shard text and ``rater_prompt.md``. Returns a summary of the re-rate.
+
+    A new re-rate covers exactly :func:`pairs_reading_loss` of *derivations*,
+    which is called only then, so a rerun needs no rated corpus. It is refused
+    while any pair awaits a third rater (:func:`third_round_blockers`).
+    """
+    rerate = keyed_rerate(key, version, scratch.brief)
+    new_shards: dict[str, dict[str, int]] = {}
+    if rerate is None:
+        current = derivations()
+        pending = third_round_blockers(
+            (entry_id, derivation) for (entry_id, _), derivation in current.items())
+        if pending:
+            raise ValueError('run third until it shards nothing before a rerate; pairs awaiting'
+                             f' a third rater: {pending}')
+        rerate = rerate_round(scratch, key, entries, sorted(pairs_reading_loss(current)), version=version)
+        for name in rerate['shards']:
+            spec = key['shards'][name]
+            new_shards.setdefault(spec['role'], {})[name] = len(spec['items'])
+    rendered = scratch.render_missing(key, entries)
+    (scratch.root / 'rater_prompt.md').write_text(rater_prompt(scratch.brief))
+    return {
+        'version': rerate['version'], 'round': rerate['round'], 'pairs': len(rerate['pairs']),
+        'retires_third_raters': rerate['retires_third_raters'],
+        'new_shards': new_shards, 'rendered_again': rendered,
+    }
 
 
 def _retired_votes(key: Mapping[str, Any]) -> frozenset[tuple[str, str, str]]:
