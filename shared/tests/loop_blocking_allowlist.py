@@ -162,41 +162,6 @@ _ESCALATE_ARCHIVE_SCAN_WHY = (
     'with task 4781.'
 )
 
-#: The shared justification of every ``reconciliation/backlog_policy.py`` row.
-_BACKLOG_POLICY_RECORD_IO_WHY = (
-    'ROOT CAUSE (one defect): BacklogPolicy scans, reads and '
-    'writes its escalation records on the loop thread. on_judge_unhalt '
-    'is_dirs data/escalations, then globs every judge_halt*.json record '
-    'in the queue root -- an O(N) directory read that grows with the '
-    'pending queue -- read_texts each match and reaches '
-    '_restore_policy_keys; _maybe_write_escalation reaches '
-    '_merge_onto_persisted; both helpers read_text then write_text the '
-    'located record under escalation_id_lock. UNDERSTATED BY THESE '
-    'ROWS, and recorded here because no row can carry it: the dominant '
-    'blocking work on the write path is the '
-    'escalation.dedupe.submit_or_dedupe call one line ABOVE the '
-    '_merge_onto_persisted site -- find_dedupe_parent globs and '
-    'JSON-parses every pending record in the project queue '
-    '(queue.get_pending, O(N); N=41 measured on the live dark_factory '
-    'queue 2026-09-18), then queue.submit writes with a durable fsync. '
-    'The scanner reports only _merge_onto_persisted because those '
-    'primitives live in the escalation package, across a boundary its '
-    'fused-memory/src scope cannot follow -- so another row would be a '
-    'blessing test_no_stale_blessings rejects, and this paragraph is '
-    'the only honest place to state it. Filesystem, the limb task '
-    '3778\'s subprocess-only vocabulary omitted. The record '
-    'read/write rows are OWNED BY TASK 5270 -- do not file again: task '
-    '4484 step-9\'s ticket tkt_0RT7RHRS9ZTJSQK328919XXEJW became task '
-    '5075, coalesced into 5270. The is_dir and glob rows task 5099 '
-    'added when it widened the vocabulary are TASK 6086, filed to fold '
-    'into the same offload. The queue.resolve row task 6089 added is '
-    'escalation.queue.EscalationQueue.resolve, matched by the method name '
-    'resolve though it is not Path.resolve: an escalation_id_lock flock, an '
-    'atomic record rewrite and an archive move, once per pending halt '
-    'record. It is TASK 6086\'s, whose offload moves the whole closing loop '
-    'into one asyncio.to_thread hop.'
-)
-
 #: The shared justification of every ``CodebaseVerifier.verify`` LLM-tool row.
 _VERIFIER_LLM_TOOL_IO_WHY = (
     'ROOT CAUSE (one defect): the async tools '
@@ -442,50 +407,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'f485b909e349',
         'accepted',
         _MKDIR_ON_STORE_OPEN_WHY,
-    ),
-
-    # ---- reconciliation/backlog_policy.py ----
-    (
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
-        'BacklogPolicy.on_judge_unhalt',
-        '8f53c74a5d76',
-        'filed',
-        _BACKLOG_POLICY_RECORD_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
-        'BacklogPolicy.on_judge_unhalt',
-        '08a103635fd7',
-        'filed',
-        _BACKLOG_POLICY_RECORD_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
-        'BacklogPolicy._maybe_write_escalation',
-        '0d761c10e563',
-        'filed',
-        _BACKLOG_POLICY_RECORD_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
-        'BacklogPolicy.on_judge_unhalt',
-        'cb226477b1bf',
-        'filed',
-        _BACKLOG_POLICY_RECORD_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
-        'BacklogPolicy.on_judge_unhalt',
-        '48269c8edbbd',
-        'filed',
-        _BACKLOG_POLICY_RECORD_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
-        'BacklogPolicy.on_judge_unhalt',
-        'f8315799ebea',
-        'filed',
-        _BACKLOG_POLICY_RECORD_IO_WHY,
     ),
 
     # ---- reconciliation/cli_stage_runner.py ----

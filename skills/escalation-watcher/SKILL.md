@@ -227,9 +227,10 @@ The handover lives at `<project_root>/data/escalations/l2-handover.md`, one per 
 beside the queue it describes. It is runtime state like that queue: never committed (dark-factory
 gitignores `/data/`), and overwritten by each stop. The watcher reacts only to `esc-*.json`, so
 writing it never fires a wake. `scripts/sitting/ownership.py::HANDOVER_CANDIDATES` holds the path
-and its fallback. The sitting preparer reads only dark-factory's own handover, as ownership
-`mentions` evidence (`scripts/sitting/prepare_sitting.py::handover_file`). Another project's
-handover reaches the next watcher of that project, never the cross-project sitting.
+and its fallback. The sitting preparer reads each item's own project's handover, resolved under
+that project's root, as ownership `mentions` evidence (`scripts/sitting/prepare_sitting.py::read_sources`).
+A project with no handover reads as `unavailable`, never as another project's.
+`--handover PROJECT=PATH` substitutes one project's file.
 
 **As of writing.** A handover is written from session knowledge, without re-probing. Every figure
 in it is as of the time it was written and must be re-verified before anyone acts on it.

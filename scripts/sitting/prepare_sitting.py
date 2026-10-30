@@ -29,6 +29,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
 
+from shared.project_id import fold_project_token
+
 # Bind scripts/ and orchestrator/ to THIS checkout, never an editable install's (tasks 2881/2882).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 for _path in (_REPO_ROOT / 'orchestrator' / 'src', _REPO_ROOT / 'scripts'):
@@ -90,6 +92,18 @@ DEFAULT_PREPARATION = _REPO_ROOT / preparations.DEFAULT_PREPARATION_PATH
 
 
 @dataclass(frozen=True)
+class HandoverOverride:
+    """`--handover PROJECT=PATH`: read PATH as PROJECT's handover instead of the one under its root."""
+
+    project: str
+    path: Path
+
+    def __post_init__(self) -> None:
+        if not self.project or fold_project_token(self.project) != self.project:
+            raise ValueError(f'HandoverOverride project {self.project!r} is not a folded project token')
+
+
+@dataclass(frozen=True)
 class Sources:
     """What the stores of record said, read once per run."""
 
@@ -97,7 +111,7 @@ class Sources:
     queues_scanned: tuple[str, ...]
     sessions: SessionIndex
     task_rows: Mapping[str, TaskRows]
-    handover_path: Path | None
+    handovers: Mapping[str, Path]
     preparations: PreparationStore
     shortfalls: tuple[Shortfall, ...]
 
@@ -106,6 +120,9 @@ class Sources:
         if rows is None:
             return TaskRows(MappingProxyType({}), f'no project root is known for {item.project or "an unscoped item"}')
         return rows
+
+    def handover_for(self, item: OpenItem) -> Path | None:
+        return self.handovers.get(item.project)
 
 
 @dataclass(frozen=True)
@@ -143,7 +160,7 @@ def read_sources(
     project_roots: Sequence[str] | None,
     decisions_root: Path,
     sessions_root: Path,
-    handover_path: Path | None,
+    handover_override: HandoverOverride | None,
     preparation_path: Path,
     project: str | None,
     now: datetime,
@@ -157,9 +174,11 @@ def read_sources(
     sessions = ownership.index_sessions(sessions_root)
     if not sessions.available:
         shortfalls.append(Shortfall('session_registry', str(sessions_root), 'no sessions root'))
-    task_rows = _task_rows(queues)
+    queue_roots = inventory.queue_project_roots(queues)
+    task_rows = _task_rows(queue_roots)
     stored, problem = _load_preparations(preparation_path)
     shortfalls += [*found.shortfalls, *sessions.shortfalls, *([problem] if problem else [])]
+    shortfalls += _unread_override(handover_override, found.items)
     shortfalls += [Shortfall('tasks_db', project, rows.unavailable) for project, rows in task_rows.items()
                    if rows.unavailable]
     return Sources(
@@ -167,7 +186,7 @@ def read_sources(
         queues_scanned=queues,
         sessions=sessions,
         task_rows=task_rows,
-        handover_path=handover_path,
+        handovers=_handovers(queue_roots, handover_override),
         preparations=stored,
         shortfalls=tuple(shortfalls),
     )
@@ -200,7 +219,7 @@ def classify(
     for item in sources.inventory.items:
         finding = ownership.sweep(
             item, sessions=sources.sessions, task_rows=sources.rows_for(item),
-            handover_path=sources.handover_path, now=now,
+            handover_path=sources.handover_for(item), now=now,
         )
         prep = sources.preparations.get(item.key)
         facts = gather_facts(item, sources, prep)
@@ -354,9 +373,23 @@ def _queueless(roots: Iterable[str]) -> list[Shortfall]:
     ]
 
 
-def _task_rows(queues: Iterable[str]) -> Mapping[str, TaskRows]:
-    roots = {inventory.queue_project(q): root for q in queues if (root := inventory.queue_project_root(q)) is not None}
+def _task_rows(roots: Mapping[str, Path]) -> Mapping[str, TaskRows]:
     return MappingProxyType({project: ownership.load_task_rows(root) for project, root in roots.items()})
+
+
+def _handovers(roots: Mapping[str, Path], override: HandoverOverride | None) -> Mapping[str, Path]:
+    found = {project: path for project, root in roots.items()
+             if (path := ownership.resolve_handover_path(root)) is not None}
+    if override is not None:
+        found[override.project] = override.path
+    return MappingProxyType(found)
+
+
+def _unread_override(override: HandoverOverride | None, items: Iterable[OpenItem]) -> list[Shortfall]:
+    if override is None or any(item.project == override.project for item in items):
+        return []
+    reason = f'--handover names {override.project!r}, but no item of that project is in this run; never read'
+    return [Shortfall('handover', str(override.path), reason)]
 
 
 def _load_preparations(path: Path) -> tuple[PreparationStore, Shortfall | None]:
@@ -572,18 +605,12 @@ def _now(args: argparse.Namespace) -> datetime:
     return args.now or datetime.now(UTC)
 
 
-def handover_file(explicit: Path | None) -> Path | None:
-    """*explicit*, else this checkout's newest handover; None unless it is a file."""
-    handover = explicit if explicit is not None else ownership.resolve_handover_path(_REPO_ROOT)
-    return handover if handover is not None and handover.is_file() else None
-
-
 def _sources(args: argparse.Namespace) -> Sources:
     return read_sources(
         project_roots=args.project_roots,
         decisions_root=fleet_root(args.decisions_root),
         sessions_root=args.sessions_root if args.sessions_root is not None else sessions_dir(),
-        handover_path=handover_file(args.handover),
+        handover_override=args.handover,
         preparation_path=args.preparation,
         project=args.project,
         now=_now(args),
@@ -684,6 +711,14 @@ def parse_instant(text: str) -> datetime:
     return parsed
 
 
+def parse_handover_override(text: str) -> HandoverOverride:
+    project, has_path, path = text.partition('=')
+    folded = fold_project_token(project)
+    if not (has_path and folded and path):
+        raise argparse.ArgumentTypeError(f'--handover takes PROJECT=PATH, got {text!r}')
+    return HandoverOverride(folded, Path(path))
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='prepare_sitting.py', description='Prepare a sitting brief Leo answers by number.')
     commands = parser.add_subparsers(dest='command', required=True)
@@ -694,7 +729,9 @@ def _parser() -> argparse.ArgumentParser:
                         help='repeatable; default: _task_db_scan.discover_project_roots()')
     stores.add_argument('--decisions-root', type=Path, help='fleet root holding decisions/ (default: fleet_root())')
     stores.add_argument('--sessions-root', type=Path, help='default: session_registry.sessions_dir()')
-    stores.add_argument('--handover', type=Path, help='default: ownership.resolve_handover_path(<this checkout>)')
+    stores.add_argument('--handover', type=parse_handover_override, metavar='PROJECT=PATH',
+                        help="read PATH as PROJECT's handover; default: each project root's own, "
+                             'via ownership.resolve_handover_path')
     stores.add_argument('--preparation', type=Path, default=DEFAULT_PREPARATION)
     stores.add_argument('--project', help='keep only this project, folded through shared.project_id.fold_project_token')
 

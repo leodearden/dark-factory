@@ -13,6 +13,8 @@ import { buildDashboardWindow, seedDashboardData } from './dom_harness.mjs';
 import {
   burndownBlock,
   escalationAnalytics,
+  escalationRow,
+  escalationsPayload,
   mergeQueueBlock,
   openEscalationItem,
   orchestratorRow,
@@ -638,4 +640,136 @@ test("app.jsx leaves a full-page notice naming the error when App's own body thr
   assert.ok(detail.startsWith('TypeError'), detail);
   assert.equal(root.querySelector('.app'), null, 'the page that threw must not render beside its notice');
   assertReportsOnlyContainedThrows(page.consoleErrors);
+});
+
+// ── Decision 7: the sidebar's check-owner section (escalation_check_owner.js::checkOwnerPanel) ──
+// A dependency_capability record names two tasks: its own task_id is the
+// blocked dependent, and delivered_check_owner.task_id is the owner whose
+// declaration sites are edited. The fixture ids differ, so a swap is caught.
+
+const CHECK_OWNER_TASK = '7514';
+const CHECK_DEPENDENT_TASK = '7600';
+const CHECK_SIDECAR_PATH = 'plans/x.capabilities.yaml';
+
+function checkOwnerRow(deliveredCheckOwner) {
+  return escalationRow({
+    id: `esc-${CHECK_DEPENDENT_TASK}-1`,
+    taskId: CHECK_DEPENDENT_TASK,
+    summary: 'delivered check graph-index-provisioned fails on main',
+    project: PROJECT,
+    deliveredCheckOwner,
+  });
+}
+
+function declaredCheckOwner(sidecar) {
+  return { task_id: CHECK_OWNER_TASK, check_name: 'graph-index-provisioned', sidecar };
+}
+
+function shownTaskId(window, id) {
+  return `T-${window.DF_SHELL.taskId(id)}`;
+}
+
+// Land `row` as the only escalation, open the tab, click the row, and return
+// the sidebar it opens.
+function openSidebar(harness, row) {
+  const { window } = harness;
+  seedDashboardData(window, {
+    ESCALATIONS: escalationsPayload([{ project: PROJECT, rows: [row] }]),
+    __receipt: receiptsFor(window.DF_DATA_LOADER, ['ESCALATIONS']),
+  });
+  const { container } = harness.mount(window.DF_TABS.EscalationsTab, { projectFilter: [] });
+  const tableRow = [...container.querySelectorAll('tbody tr')].find(
+    tr => tr.querySelector('td')?.textContent === shownTaskId(window, row.task_id),
+  );
+  assert.ok(tableRow, "the escalation's row did not render, so its sidebar cannot be opened");
+  click(window, tableRow);
+  const dialog = container.querySelector('[role="dialog"]');
+  assert.ok(dialog, 'clicking the row opened no sidebar');
+  return dialog;
+}
+
+function oneByTestId(root, testId) {
+  const found = root.querySelectorAll(`[data-testid="${testId}"]`);
+  assert.equal(found.length, 1, `expected exactly one [data-testid="${testId}"], found ${found.length}`);
+  return found[0];
+}
+
+test("tab_escalations.jsx::EscalationSidebar renders checkOwnerPanel's owner, check, declaration sites and dependent", t => {
+  const harness = openWindow(t);
+  const row = checkOwnerRow(declaredCheckOwner({ path: CHECK_SIDECAR_PATH, on_main: 'declares' }));
+  const dialog = openSidebar(harness, row);
+
+  const panel = harness.window.DF_ESCALATION_CHECK_OWNER.checkOwnerPanel(row);
+  const owner = shownTaskId(harness.window, panel.ownerTaskId);
+  const dependent = shownTaskId(harness.window, panel.dependentTaskId);
+  assert.notEqual(owner, dependent, 'the fixture must make the owner and the dependent differ');
+  const section = oneByTestId(dialog, 'esc-check-owner');
+
+  const ownerLine = oneByTestId(section, 'esc-check-owner-owner').textContent;
+  assert.ok(ownerLine.includes(owner) && ownerLine.includes(panel.checkName), ownerLine);
+  assert.ok(!ownerLine.includes(dependent), `the owner line names the dependent: ${ownerLine}`);
+
+  const metadataSite = oneByTestId(section, 'esc-check-owner-metadata').textContent;
+  assert.ok(metadataSite.includes(owner) && metadataSite.includes(panel.checkName), metadataSite);
+
+  const sidecarSite = oneByTestId(section, 'esc-check-owner-sidecar').textContent;
+  assert.ok(sidecarSite.includes(panel.sidecarPath) && sidecarSite.includes(panel.sidecarCaption), sidecarSite);
+
+  const dependentLine = oneByTestId(section, 'esc-check-owner-dependent').textContent;
+  assert.ok(dependentLine.includes(dependent), dependentLine);
+  assert.ok(!dependentLine.includes(owner), `the dependent line names the owner: ${dependentLine}`);
+});
+
+test("tab_escalations.jsx::EscalationSidebar tones an unverified sidecar's caption with checkOwnerPanel's tone", t => {
+  const harness = openWindow(t);
+  const row = checkOwnerRow(declaredCheckOwner({ path: CHECK_SIDECAR_PATH, on_main: 'unverified' }));
+  const dialog = openSidebar(harness, row);
+
+  const panel = harness.window.DF_ESCALATION_CHECK_OWNER.checkOwnerPanel(row);
+  assert.ok(panel.sidecarTone, 'the fixture must be a toned sidecar state');
+  const captions = [...oneByTestId(dialog, 'esc-check-owner-sidecar').querySelectorAll('span')].filter(
+    span => span.textContent === panel.sidecarCaption,
+  );
+  assert.equal(captions.length, 1, 'the sidecar site must render its caption in exactly one span');
+  assert.ok(captions[0].classList.contains(panel.sidecarTone), captions[0].className);
+});
+
+test("tab_escalations.jsx::EscalationSidebar renders checkOwnerPanel's no-sidecar caption and no sidecar path", t => {
+  const harness = openWindow(t);
+  const row = checkOwnerRow(declaredCheckOwner(null));
+  const dialog = openSidebar(harness, row);
+
+  const panel = harness.window.DF_ESCALATION_CHECK_OWNER.checkOwnerPanel(row);
+  assert.equal(panel.sidecarPath, null);
+  const sidecarSite = oneByTestId(dialog, 'esc-check-owner-sidecar');
+  assert.ok(sidecarSite.textContent.includes(panel.sidecarCaption), sidecarSite.textContent);
+  assert.equal(sidecarSite.querySelector('.mono'), null, 'a site with no sidecar renders no sidecar path');
+  assert.ok(!dialog.textContent.includes(CHECK_SIDECAR_PATH), 'the sidebar names a sidecar path it was not given');
+  oneByTestId(dialog, 'esc-check-owner-owner');
+});
+
+test("tab_escalations.jsx::EscalationSidebar renders a sidecar with no path or on_main as a sidecar, in checkOwnerPanel's words", t => {
+  const harness = openWindow(t);
+  const row = checkOwnerRow(declaredCheckOwner({}));
+  const dialog = openSidebar(harness, row);
+
+  const panel = harness.window.DF_ESCALATION_CHECK_OWNER.checkOwnerPanel(row);
+  const sidecarSite = oneByTestId(dialog, 'esc-check-owner-sidecar');
+  assert.equal(sidecarSite.querySelector('.mono')?.textContent, panel.sidecarPath, 'a pathless sidecar must keep its path slot');
+  assert.ok(sidecarSite.textContent.includes(panel.sidecarCaption), sidecarSite.textContent);
+  assert.ok(!dialog.textContent.includes('undefined'), dialog.textContent);
+});
+
+test('tab_escalations.jsx::EscalationSidebar renders no check-owner section without an owner, the same for an absent key as for null', t => {
+  const absentHarness = openWindow(t);
+  const absent = checkOwnerRow(undefined);
+  assert.equal('delivered_check_owner' in absent, false, 'the fixture must make absence real, not undefined-valued');
+  const absentDialog = openSidebar(absentHarness, absent);
+  assert.equal(absentHarness.window.DF_ESCALATION_CHECK_OWNER.checkOwnerPanel(absent), null);
+  assert.equal(absentDialog.querySelector('[data-testid="esc-check-owner"]'), null);
+
+  const nullHarness = openWindow(t);
+  const nullDialog = openSidebar(nullHarness, checkOwnerRow(null));
+
+  assert.equal(nullDialog.innerHTML, absentDialog.innerHTML);
 });
