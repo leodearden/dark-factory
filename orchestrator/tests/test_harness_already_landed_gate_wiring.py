@@ -28,7 +28,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from escalation.models import Escalation
@@ -876,25 +876,29 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         assert 'content_fallback_error' not in esc.detail
 
     @pytest.mark.parametrize(
-        ('citation_sha', 'twin_sha', 'evidence_sha'),
+        ('citation_sha', 'twin_sha', 'effect_present', 'evidence_sha', 'twin_lookups'),
         [
-            pytest.param('d' * 40, None, 'd' * 40, id='cited'),
-            pytest.param(None, '7' * 40, '7' * 40, id='uncited-patch-id-twin'),
+            pytest.param('d' * 40, None, True, 'd' * 40, 0, id='cited'),
+            pytest.param(None, '7' * 40, False, '7' * 40, 1, id='uncited-patch-id-twin'),
         ],
     )
     async def test_content_equivalent_attributed_landing_marks_done_on_its_evidence(
-        self, mock_orch_config, citation_sha, twin_sha, evidence_sha,
+        self, mock_orch_config, citation_sha, twin_sha, effect_present, evidence_sha,
+        twin_lookups,
     ) -> None:
         """A content-equivalent branch is stamped done anchored on the
-        evidence that attributes it: the citation when main has one, else
-        the tip's patch-id twin on main (task 4862's fallback; esc-4881-8
-        shape), never main HEAD. No escalation is filed.
+        evidence that attributes it, never main HEAD, and no escalation is
+        filed. The evidence is the citation when main has one, else the
+        patch-id twin on main that the uncited tip's lookup finds (task
+        4862's fallback; esc-4881-8 shape). That lookup judges the tip sha
+        (task 3103) on patch-id alone, and the twin accept runs no
+        effect-present check, so its row holds the effect absent.
         """
         h = _wired_content_harness(
             mock_orch_config,
             citation_sha=citation_sha,
             content_in_main=True,
-            effect_present=True,
+            effect_present=effect_present,
             twin_sha=twin_sha,
         )
 
@@ -908,6 +912,10 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         assert call_args.args[1] == evidence_sha
         assert call_args.args[3] == 'dispatch-gate-content-equivalent'
         cast(MagicMock, h._escalation_queue).submit.assert_not_called()
+        twin_lookup = call(h.git_ops.project_root, '8' * 40, 'f' * 40, patch_id_only=True)
+        assert cast(AsyncMock, h.git_ops.find_equivalent_commit).await_args_list == (
+            [twin_lookup] * twin_lookups
+        )
 
     async def test_content_equivalent_with_citation_and_effect_absent_escalates(
         self, mock_orch_config,
