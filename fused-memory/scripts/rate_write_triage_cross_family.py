@@ -15,7 +15,8 @@ recorded as a failure, never invented.
 Subcommands, run from ``fused-memory/``:
 
 - ``rate``: append one record per pair to ``--out``
-  (``calibration/write_triage_eval_set_v2_cross_family.jsonl``). A re-run
+  (``calibration/write_triage_eval_set_v2_cross_family.jsonl``), and one
+  record of the run, budget stop or not, to its :func:`runs_path`. A re-run
   skips recorded pairs, and the run stops before a call that would pass
   ``--budget-usd`` at list price. Needs ``OPENAI_API_KEY``.
 - ``report``: agreement per selection and binary, and the RELATED-boundary
@@ -77,8 +78,11 @@ V1_GROUPS: Mapping[str, str] = {
 """Each lambda v1 word's group in the RELATED-boundary cross-tab; UNCLEAR is left out."""
 _HOME_WORDS = ('YES', 'NO', 'UNCLEAR')
 
-_CALIBRATION = _SCRIPTS.parent / 'calibration'
-_STEM = 'write_triage_eval_set_v2'
+
+def _eval_file(suffix: str) -> Path:
+    """The committed eval-set file named *suffix*."""
+    return _eval.CALIBRATION_DIR / f'{_eval.OUT_STEM}_{suffix}'
+
 
 Pair = tuple[str, str]
 
@@ -181,6 +185,11 @@ def read_records(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
+def runs_path(out: Path) -> Path:
+    """The file beside *out* that records each ``rate`` run: its budget, spend, and whether it stopped."""
+    return out.with_name(f'{out.stem}_runs.jsonl')
+
+
 async def rate_pairs(
     selection: Sequence[tuple[Pair, str]], entries: Mapping[Pair, _rounds.ShardEntry], ask: Ask,
     *, out: Path, model: str, effort: str, batch: str, budget_usd: float, concurrency: int = 1,
@@ -188,7 +197,8 @@ async def rate_pairs(
     """Ask about each selected pair not yet recorded in *out*, appending one record per pair.
 
     Returns the pairs rated, whether the budget stopped the run, the spend so
-    far (earlier runs included) and the pairs left.
+    far (earlier runs included) and the pairs left, and appends that, with the
+    batch, model, effort and budget, to :func:`runs_path` of *out*.
     """
     price = _pairs.LIST_PRICES.get(model)
     if price is None:
@@ -233,7 +243,11 @@ async def rate_pairs(
     out.parent.mkdir(parents=True, exist_ok=True)
     await asyncio.gather(*(worker() for _ in range(concurrency)))
     left = len([pair for pair, _ in selection if pair not in done]) - rated
-    return {'rated': rated, 'stopped': ledger.stopped, 'spent_usd': ledger.spent, 'remaining': left}
+    run = {'rated': rated, 'stopped': ledger.stopped, 'spent_usd': ledger.spent, 'remaining': left}
+    with runs_path(out).open('a') as handle:
+        handle.write(json.dumps({**run, 'batch': batch, 'model': model, 'effort': effort,
+                                 'budget_usd': budget_usd}, sort_keys=True) + '\n')
+    return run
 
 
 def _record(pair: Pair, chosen: str, rater: str, row: dict[str, Any] | None, failure: str | None,
@@ -244,10 +258,14 @@ def _record(pair: Pair, chosen: str, rater: str, row: dict[str, Any] | None, fai
 
 def report(
     records: Iterable[Mapping[str, Any]], writes: Iterable[Mapping[str, Any]],
-    verdicts: Iterable[Mapping[str, Any]], v1_rows: Iterable[Mapping[str, Any]],
+    verdicts: Iterable[Mapping[str, Any]], v1_rows: Iterable[Mapping[str, Any]], *,
+    runs: Iterable[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """How the cross-family answers agree with the Opus labels, per selection and binary."""
-    records, writes, verdicts = list(records), list(writes), list(verdicts)
+    """How the cross-family answers agree with the Opus labels, per selection and binary.
+
+    *runs* are the ``rate`` runs that wrote *records*; a run the budget stopped is listed.
+    """
+    records, writes, verdicts, runs = list(records), list(writes), list(verdicts), list(runs)
     judgements = _rubric.resolve_judgements(verdicts)
     _, answered = _consumed_answers(writes, verdicts)
     rows = {(r['entry_id'], r['target_id']): r['row'] for r in records if r['row'] is not None}
@@ -268,6 +286,9 @@ def report(
                 'failed': counts(SELECTION_DISCORDANT, True)},
             SELECTION_CONTROL: {'rated': counts(SELECTION_CONTROL, False),
                                 'failed': counts(SELECTION_CONTROL, True)},
+            'runs': len(runs),
+            'budget_stops': [{key: run[key] for key in ('batch', 'budget_usd', 'spent_usd', 'remaining')}
+                             for run in runs if run['stopped']],
         },
         'failures': sorted(({'entry_id': r['entry_id'], 'target_id': r['target_id'],
                              'failure': r['failure']} for r in records if r['row'] is None),
@@ -351,6 +372,7 @@ def render_markdown(report_: Mapping[str, Any]) -> str:
         f' {coverage[SELECTION_DISCORDANT]["failed"]} failed.',
         f'- Control pairs: {coverage[SELECTION_CONTROL]["rated"]} rated,'
         f' {coverage[SELECTION_CONTROL]["failed"]} failed.',
+        _runs_line(coverage),
     ])
     agreement = _table(
         ['selection', 'binary', 'versus', 'n', 'agree', 'rate', 'wilson95', 'kappa'],
@@ -372,6 +394,13 @@ def render_markdown(report_: Mapping[str, Any]) -> str:
                 for group in dict.fromkeys(V1_GROUPS.values())]),
     ])
     return '\n\n'.join([summary, agreement, related]) + '\n'
+
+
+def _runs_line(coverage: Mapping[str, Any]) -> str:
+    stops = coverage['budget_stops']
+    where = '; '.join(f'at {stop["budget_usd"]:.2f} USD with {stop["remaining"]} pairs left'
+                      for stop in stops)
+    return f'- Runs: {coverage["runs"]}; budget stops: {len(stops)}' + (f' ({where}).' if stops else '.')
 
 
 def _shown(value: Any) -> str:
@@ -432,12 +461,8 @@ def openai_ask(model: str, effort: str, *, timeout: float = 600.0,
     return ask
 
 
-def _jsonl(path: Path) -> list[dict[str, Any]]:
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-
-
 def _rate_command(args: argparse.Namespace) -> dict[str, Any]:
-    writes, verdicts = _jsonl(args.writes), _jsonl(args.verdicts)
+    writes, verdicts = read_records(args.writes), read_records(args.verdicts)
     projects = {row['entry_id']: row['project'] for row in writes}
     entries = {(record['entry_id'], record['target_id']): _rounds.ShardEntry(
         **record, project=projects[record['entry_id']]) for record in json.loads(args.texts.read_text())
@@ -453,8 +478,8 @@ def _rate_command(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _report_command(args: argparse.Namespace) -> dict[str, Any]:
-    built = report(read_records(args.records), _jsonl(args.writes), _jsonl(args.verdicts),
-                   _jsonl(args.v1_verdicts))
+    built = report(read_records(args.records), read_records(args.writes), read_records(args.verdicts),
+                   read_records(args.v1_verdicts), runs=read_records(runs_path(args.records)))
     args.out.with_suffix('.json').write_text(json.dumps(built, indent=2, sort_keys=True) + '\n')
     args.out.with_suffix('.md').write_text(render_markdown(json.loads(json.dumps(built))))
     return {'coverage': built['coverage'], 'spend_usd': built['spend_usd']}
@@ -465,13 +490,13 @@ def _build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest='command', required=True)
     for name in ('rate', 'report'):
         command = commands.add_parser(name)
-        command.add_argument('--writes', type=Path, default=_CALIBRATION / f'{_STEM}_writes.jsonl')
+        command.add_argument('--writes', type=Path, default=_eval_file('writes.jsonl'))
         command.add_argument('--verdicts', type=Path,
-                             default=_CALIBRATION / f'{_STEM}_verdicts.jsonl')
+                             default=_eval_file('verdicts.jsonl'))
     rate = commands.choices['rate']
-    rate.add_argument('--texts', type=Path, default=_CALIBRATION / f'{_STEM}_rounds' / 'texts.json',
+    rate.add_argument('--texts', type=Path, default=_eval.DEFAULT_SCRATCH / 'texts.json',
                       help='the rounds scratch texts.json, as the Opus raters saw each pair')
-    rate.add_argument('--out', type=Path, default=_CALIBRATION / f'{_STEM}_cross_family.jsonl')
+    rate.add_argument('--out', type=Path, default=_eval_file('cross_family.jsonl'))
     rate.add_argument('--model', default=DEFAULT_MODEL)
     rate.add_argument('--effort', default=DEFAULT_EFFORT)
     rate.add_argument('--budget-usd', type=float, default=DEFAULT_BUDGET_USD)
@@ -481,10 +506,10 @@ def _build_parser() -> argparse.ArgumentParser:
     rate.add_argument('--batch', default=f'cross-family-{datetime.now(UTC).date().isoformat()}')
     report_ = commands.choices['report']
     report_.add_argument('--records', type=Path,
-                         default=_CALIBRATION / f'{_STEM}_cross_family.jsonl')
+                         default=_eval_file('cross_family.jsonl'))
     report_.add_argument('--v1-verdicts', type=Path,
-                         default=_CALIBRATION / 'write_triage_pair_verdicts.jsonl')
-    report_.add_argument('--out', type=Path, default=_CALIBRATION / f'{_STEM}_cross_family',
+                         default=_eval.CALIBRATION_DIR / 'write_triage_pair_verdicts.jsonl')
+    report_.add_argument('--out', type=Path, default=_eval_file('cross_family'),
                          help='the report path without suffix: <out>.json and <out>.md')
     return parser
 

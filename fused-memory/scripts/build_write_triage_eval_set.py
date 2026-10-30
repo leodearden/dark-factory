@@ -83,10 +83,11 @@ SOURCE_LIVE = 'live'
 SOAK_BUNDLE_NAME = 'write-triage-soak-2026-10-19'
 """The read-only soak bundle, beside the snapshot's directory in the main checkout's data/."""
 
-_CALIBRATION = _SCRIPTS.parent / 'calibration'
+CALIBRATION_DIR = _SCRIPTS.parent / 'calibration'
+"""Where the eval set's committed files live."""
 OUT_STEM = 'write_triage_eval_set_v2'
-DEFAULT_LIVE_SLATES = _CALIBRATION / f'{OUT_STEM}_live_slates.jsonl'
-DEFAULT_SCRATCH = _CALIBRATION / f'{OUT_STEM}_rounds'
+DEFAULT_LIVE_SLATES = CALIBRATION_DIR / f'{OUT_STEM}_live_slates.jsonl'
+DEFAULT_SCRATCH = CALIBRATION_DIR / f'{OUT_STEM}_rounds'
 _SCRATCH_IGNORED = ('shards/', 'texts.json', 'rater_prompt.md')
 """The scratch files re-rendered from the inputs; the key and the ratings are committed."""
 
@@ -612,10 +613,10 @@ def _build_parser() -> argparse.ArgumentParser:
     commands.choices['rerate'].add_argument(
         '--brief-version', required=True, metavar='LABEL',
         help="the brief's version label (e.g. v2.2), recorded in the key and the summary")
-    commands.choices['assemble'].add_argument('--out-dir', type=Path, default=_CALIBRATION,
+    commands.choices['assemble'].add_argument('--out-dir', type=Path, default=CALIBRATION_DIR,
                                               metavar='DIR')
     split = commands.add_parser('split')
-    split.add_argument('--eval-dir', type=Path, default=_CALIBRATION, metavar='DIR',
+    split.add_argument('--eval-dir', type=Path, default=CALIBRATION_DIR, metavar='DIR',
                        help='the directory holding the assembled writes and verdicts')
     split.add_argument('--refreeze', action='store_true',
                        help='replace an already frozen split')
