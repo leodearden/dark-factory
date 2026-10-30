@@ -210,3 +210,130 @@ def test_loader_on_a_store_without_arrival_rows_returns_an_empty_window(make_run
     sample = mod.load_arrival_plans(db)
 
     assert (sample.plans, sample.window_days) == ((), 0.0)
+
+
+
+# measure() fixture. Busy = 150 + 1550 + 180 + 10 + 50 = 1940 s over 2 days.
+#   red:        task  a red 0-40; b 50-150 (queued at red); d red 160-170 (arrived 100) -> b, d avoidable = 110 s
+#   retry:      task  fm timed out 1000-2200, fm retry green 2201-2501, c 2600-2650 -> BY_LEG only: 300 + 50
+#   sweep:      background x red 3000-3020; y 3030-3100; r red twice 3100-3150, 3151-3191 -> 160 s, out of headline
+#   single:     task  one green leg 4000-4010
+#   waiter:     task  w waits 80-120, w2 waits 100-150: their union covers 70 s of b's 50-150 hold
+RED = _plan(
+    _leg('a', 0.0, 40.0, red=True),
+    _leg('b', 50.0, 100.0),
+    _leg('d', 160.0, 10.0, red=True, arrived_at=100.0),
+    plan_id='red',
+)
+RETRY = _plan(
+    _leg('fm', 1000.0, 1200.0, red=True, arrived_at=1000.0),
+    _leg('fm', 2201.0, 300.0, arrived_at=1000.0),
+    _leg('c', 2600.0, 50.0, arrived_at=1000.0),
+    plan_id='retry',
+)
+SWEEP = _plan(
+    _leg('x', 3000.0, 20.0, red=True, arrived_at=3000.0),
+    _leg('y', 3030.0, 70.0, arrived_at=3000.0),
+    _leg('r', 3100.0, 50.0, red=True, arrived_at=3000.0),
+    _leg('r', 3151.0, 40.0, red=True, arrived_at=3000.0),
+    role='background',
+    plan_id='sweep',
+)
+SINGLE = _plan(_leg('z', 4000.0, 10.0, arrived_at=4000.0), plan_id='single')
+WAITER = _plan(
+    _leg('w', 120.0, 30.0, arrived_at=80.0),
+    _leg('w2', 150.0, 20.0, arrived_at=100.0),
+    plan_id='waiter',
+)
+SAMPLE = mod.Sample(
+    plans=(RED, RETRY, SWEEP, SINGLE, WAITER),
+    window_start='2026-10-17T00:00:00+00:00',
+    window_end='2026-10-19T00:00:00+00:00',
+    window_days=2.0,
+)
+BUSY = 1940.0
+
+
+def _measure(sample=SAMPLE, resamples=500, seed=1):
+    return mod.measure('alpha', sample, resamples=resamples, seed=seed)
+
+
+def test_measure_copies_the_window_and_counts_plans_by_role():
+    m = _measure()
+
+    assert (m.project, m.window_start, m.window_end, m.window_days) == (
+        'alpha', SAMPLE.window_start, SAMPLE.window_end, 2.0,
+    )
+    assert m.plans == mod.PlanCounts(total=5, task=4, background=1)
+
+
+def test_n_counts_task_plans_whose_red_module_is_red_on_its_final_attempt():
+    assert _measure().multi_module_red_plans == 1
+
+
+def test_busy_is_every_leg_of_every_role():
+    assert _measure().busy_secs == BUSY
+
+
+def test_headline_is_task_role_by_module_and_background_is_reported_apart():
+    m = _measure()
+
+    assert (m.avoidable_secs, m.avoidable_share) == (110.0, 110.0 / BUSY)
+    assert m.background_avoidable_secs == 160.0
+
+
+def test_literal_figure_adds_exactly_the_passing_retry_and_its_later_sibling():
+    m = _measure()
+
+    assert m.literal_avoidable_secs - m.avoidable_secs == 300.0 + 50.0
+    assert m.literal_avoidable_share == m.literal_avoidable_secs / BUSY
+
+
+def test_share_interval_is_a_seeded_bootstrap_around_the_point():
+    first, second = _measure(seed=3), _measure(seed=3)
+    low, high = first.share_interval
+
+    assert first == second
+    assert low <= first.avoidable_share <= high
+    assert low < high
+
+
+def test_share_interval_collapses_when_every_plan_contributes_alike():
+    alike = mod.Sample(plans=(RED, RED, RED), window_start='s', window_end='e', window_days=1.0)
+    m = _measure(alike)
+
+    assert m.share_interval == (m.avoidable_share, m.avoidable_share)
+
+
+def test_imposed_wait_is_the_union_of_other_plans_waiting_during_avoidable_holds():
+    assert _measure().imposed_wait_secs == 70.0
+
+
+def test_cost_side_counts_what_a_cancel_would_have_thrown_away():
+    assert _measure().cost == mod.CostSide(
+        avoidable_legs=2,
+        avoidable_legs_queued_at_red=1,
+        avoidable_modules_red=1,
+        plans_losing_a_red=1,
+    )
+
+
+def test_timeout_retries_decompose_the_non_final_attempts_of_every_role():
+    assert _measure().timeout_retries == mod.TimeoutRetries(
+        attempts=2,
+        held_secs=1250.0,
+        share_of_busy=1250.0 / BUSY,
+        modules=2,
+        modules_final_green=1,
+    )
+
+
+def test_avoidable_hours_per_day_spreads_the_headline_over_the_window():
+    assert _measure().avoidable_hours_per_day == 110.0 / 3600 / 2.0
+
+
+def test_an_empty_sample_measures_zero_without_dividing_by_zero():
+    m = _measure(mod.Sample(plans=(), window_start='', window_end='', window_days=0.0))
+
+    assert (m.busy_secs, m.avoidable_share, m.literal_avoidable_share, m.share_interval) == (0.0, 0.0, 0.0, (0.0, 0.0))
+    assert (m.avoidable_hours_per_day, m.timeout_retries.share_of_busy) == (0.0, 0.0)
