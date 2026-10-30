@@ -2997,6 +2997,8 @@ class TestSweepCancelledDescendants:
     async def test_escalate_queue_io_runs_off_the_event_loop(
         self, make_reconciler, mock_taskmaster, mock_interceptor, monkeypatch, tmp_path,
     ):
+        """INV-8: the sweep's L1 filing must not block the shared event loop on
+        the queue's mkdir, flock and fsync."""
         self._orchestrator_live(monkeypatch)
         mock_taskmaster.get_tasks = AsyncMock(return_value=self._block_branch_tasks())
         threads: list[int] = []
@@ -6091,6 +6093,8 @@ async def test_unblock_sweep_scans_escalation_store_once_for_many_dependents(
 async def test_unblock_veto_reads_the_escalation_store_off_the_event_loop(
     make_reconciler, mock_taskmaster, tmp_path,
 ):
+    """INV-8: the pin-veto index builds its queue (a mkdir) and scans it off
+    the shared event loop, not just the scan."""
     threads: list[int] = []
     reconciler = make_reconciler(escalation_queue_factory=_thread_recording_factory(threads))
     _wire_mock_interceptor(reconciler)
@@ -7242,6 +7246,9 @@ class TestContradictedEscalation:
     async def test_contradicted_escalation_queue_io_runs_off_the_event_loop(
         self, make_reconciler, tmp_path,
     ):
+        """INV-8: the contradicted-verdict filing stays off the shared event
+        loop through the shared filing helper (a guard for that refactor, so it
+        was green from the start)."""
         threads: list[int] = []
         reconciler = make_reconciler(
             escalation_queue_factory=_thread_recording_factory(threads),

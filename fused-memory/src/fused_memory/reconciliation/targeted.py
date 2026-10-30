@@ -1795,9 +1795,9 @@ class TargetedReconciler:
     ) -> dict | None:
         """File an L1 escalation for an ambiguous descendant when orch is live.
 
-        Journals the filing as write/skip under ``escalation``/``submit``,
-        symmetric with :meth:`_sweep_cancel_orphan` and
-        :meth:`_sweep_block_orphan`.
+        Journals the filing as write/skip under ``escalation``/``submit``
+        through :meth:`_journal_l1_filing`, symmetric with
+        :meth:`_sweep_cancel_orphan` and :meth:`_sweep_block_orphan`.
         """
         factory = self._escalation_queue_factory
         if factory is None:
@@ -1821,6 +1821,11 @@ class TargetedReconciler:
         if escalation_id:
             detail_lines.append(f'Originating review escalation: {escalation_id}')
         detail = '\n'.join(detail_lines)
+        filing = {
+            'task_id': task_id,
+            'parent_id': parent_id,
+            'type': 'descendant_escalated',
+        }
 
         try:
             esc_id = await asyncio.to_thread(
@@ -1837,33 +1842,9 @@ class TargetedReconciler:
                 'sweep: L1 escalate failed for orphan %s (parent %s): %s',
                 task_id, parent_id, e,
             )
-            await self.journal.add_run_action(
-                run_id, 'skip', 'escalation', 'submit',
-                {
-                    'task_id': task_id,
-                    'parent_id': parent_id,
-                    'type': 'descendant_escalated',
-                    'error': str(e)[:200],
-                },
-                causation_id=run_id,
-            )
+            await self._journal_l1_filing(run_id, filing, e)
             return None
-        await self.journal.add_run_action(
-            run_id, 'write', 'escalation', 'submit',
-            {
-                'task_id': task_id,
-                'parent_id': parent_id,
-                'type': 'descendant_escalated',
-                'escalation_id': esc_id,
-            },
-            causation_id=run_id,
-        )
-        return {
-            'type': 'descendant_escalated',
-            'task_id': task_id,
-            'parent_id': parent_id,
-            'escalation_id': esc_id,
-        }
+        return await self._journal_l1_filing(run_id, filing, esc_id)
 
     async def _escalate_contradicted_l1(
         self,
@@ -1919,7 +1900,7 @@ class TargetedReconciler:
 
         Returns the action dict for `result['actions']`, or None when the
         escalation package is unavailable or the filing failed.  A filing is
-        journaled as a write|skip escalation/submit row, symmetric with
+        journaled through :meth:`_journal_l1_filing`, the same as in
         :meth:`_sweep_escalate_l1`; an unavailable package stays journal-silent.
         """
         factory = self._escalation_queue_factory
@@ -1962,6 +1943,7 @@ class TargetedReconciler:
             f'verify|codebase|contradicted audit row for run {run_id}.',
         ])
         detail = '\n'.join(detail_lines)
+        filing = {'task_id': task_id, 'type': 'verification_contradicted_escalated'}
 
         # Offloaded (INV-8): _on_task_done runs on the shared event loop.
         # Contained HERE, not at the call site, which sits inside
@@ -1987,30 +1969,32 @@ class TargetedReconciler:
                 'verification_contradicted_escalate_failed task=%s project_root=%s: %s',
                 task_id, project_root, e,
             )
+            await self._journal_l1_filing(run_id, filing, e)
+            return None
+        return await self._journal_l1_filing(run_id, filing, esc_id)
+
+    async def _journal_l1_filing(
+        self, run_id: str, filing: dict, outcome: str | Exception,
+    ) -> dict | None:
+        """Journal one reconciler-L1 filing as an ``escalation``/``submit`` row.
+
+        ``filing`` is the caller's row detail. ``outcome`` is either the filed
+        escalation's id, which writes a ``write`` row and returns the action
+        for ``result['actions']``, or the exception that stopped the filing,
+        which writes a ``skip`` row and returns None.
+        """
+        if isinstance(outcome, Exception):
             await self.journal.add_run_action(
                 run_id, 'skip', 'escalation', 'submit',
-                {
-                    'task_id': task_id,
-                    'type': 'verification_contradicted_escalated',
-                    'error': str(e)[:200],
-                },
+                {**filing, 'error': str(outcome)[:200]},
                 causation_id=run_id,
             )
             return None
+        action = {**filing, 'escalation_id': outcome}
         await self.journal.add_run_action(
-            run_id, 'write', 'escalation', 'submit',
-            {
-                'task_id': task_id,
-                'type': 'verification_contradicted_escalated',
-                'escalation_id': esc_id,
-            },
-            causation_id=run_id,
+            run_id, 'write', 'escalation', 'submit', action, causation_id=run_id,
         )
-        return {
-            'type': 'verification_contradicted_escalated',
-            'task_id': task_id,
-            'escalation_id': esc_id,
-        }
+        return action
 
     async def _sweep_unblock_dependents(
         self,
