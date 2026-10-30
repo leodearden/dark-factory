@@ -1451,8 +1451,11 @@ class TestPersistStateConcurrency:
 
             async def _patched_to_thread(func, *args, **kwargs):
                 nonlocal in_flight, max_in_flight
-                if func is curator_escalator.is_orchestrator_lock_held:
-                    # The liveness probe's hop is not a state write.
+                if func in (
+                    curator_escalator.is_orchestrator_lock_held,
+                    curator_escalator._file_curator_escalation,
+                ):
+                    # Neither the liveness probe's hop nor the queue filing's is a state write.
                     return await real_to_thread(func, *args, **kwargs)
                 in_flight += 1
                 if in_flight > max_in_flight:

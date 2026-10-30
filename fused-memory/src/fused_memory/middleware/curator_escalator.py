@@ -144,22 +144,56 @@ def _curator_escalation(
     )
 
 
-def _submit_logged(
-    queue: EscalationQueue, escalation: Escalation, *, kind: str, project_id: str,
-) -> bool:
-    """Submit ``escalation``; on queue I/O failure log it and return ``False``.
+def _file_curator_escalation(
+    queue: EscalationQueue, *, category: str, summary: str, detail: str,
+) -> str:
+    return queue.submit(_curator_escalation(queue, category=category, summary=summary, detail=detail))
+
+
+async def _file_logged(
+    queue: EscalationQueue, *, kind: str, project_id: str, category: str, summary: str, detail: str,
+) -> str | None:
+    """File one curator record off the loop; on queue I/O failure log it and return ``None``.
 
     Never raises: the caller's task write must not fail because the queue broke.
     """
     try:
-        queue.submit(escalation)
+        return await asyncio.to_thread(
+            _file_curator_escalation, queue, category=category, summary=summary, detail=detail,
+        )
     except Exception:
         logger.exception(
             'curator_escalator: failed to submit %s escalation for project %s',
             kind, project_id,
         )
-        return False
-    return True
+        return None
+
+
+def _file_zot_escalation(queue: EscalationQueue, *, project_id: str, detail: str) -> dict[str, Any]:
+    escalation = _curator_escalation(
+        queue,
+        category=_ZOT_CATEGORY,
+        summary=(
+            'curator zero-output/full-timeout hang (accepted recurring class, '
+            'esc-task-curator-17) — dedupe degraded to create; recurrences fold '
+            'here and dedupe_count counts them.'
+        ),
+        detail=detail,
+        root_cause=_ZOT_ROOT_CAUSE,
+        dedupe_fingerprint=compute_content_fingerprint(  # type: ignore[possibly-unbound]
+            _ZOT_CATEGORY, _ZOT_ROOT_CAUSE, affected_ids=[f'project:{project_id}'],
+        ),
+    )
+    config = DedupeConfig(  # type: ignore[possibly-unbound]
+        infra_dedupe_enabled=True,
+        # UNBOUNDED, on the dead_letter_escalator precedent: these recur
+        # days and weeks apart, and a resolved parent leaves the pending
+        # set, so a recurrence after resolution still mints a new record.
+        infra_dedupe_window_secs=float('inf'),
+        infra_dedupe_categories=(_ZOT_CATEGORY,),
+        key_fn=content_fingerprint_key,  # type: ignore[possibly-unbound]
+    )
+    return submit_or_dedupe(queue, escalation, config)  # type: ignore[possibly-unbound]
 
 
 class CuratorEscalator:
@@ -195,6 +229,9 @@ class CuratorEscalator:
         # (task_interceptor.py:288-289,1308,1332) for per-project mutations.
         # Constructed without a running loop (valid on py>=3.10).
         self._persist_lock: asyncio.Lock = asyncio.Lock()
+        # Held across the ZOT window check, the off-loop filing and the stamp;
+        # see _submit_zero_output_timeout.
+        self._zot_window_lock: asyncio.Lock = asyncio.Lock()
         # Reload persisted burst log if state_path is set and exists.
         if self._state_path is not None and self._state_path.exists():
             self._load_state()
@@ -488,9 +525,10 @@ class CuratorEscalator:
             )
         detail = '\n'.join(detail_lines)
 
-        queue = self._queue_for(project_root)
-        escalation = _curator_escalation(
-            queue,
+        escalation_id = await _file_logged(
+            self._queue_for(project_root),
+            kind='curator-failure',
+            project_id=project_id,
             category='curator_failure',
             summary=(
                 'TaskCurator LLM failing; this submission is parked awaiting '
@@ -498,13 +536,13 @@ class CuratorEscalator:
             ),
             detail=detail,
         )
-        if not _submit_logged(queue, escalation, kind='curator-failure', project_id=project_id):
+        if escalation_id is None:
             return None
 
         logger.warning(
             'curator_escalator: queued L1 escalation %s for project %s '
             '(failure %d of %d in window)',
-            escalation.id, project_id, count, self._ESCALATE_FIRST_N,
+            escalation_id, project_id, count, self._ESCALATE_FIRST_N,
         )
         return None
 
@@ -561,9 +599,10 @@ class CuratorEscalator:
             'whether to cancel one of the two as SUPERSEDED.',
         ]
 
-        queue = self._queue_for(project_root)
-        escalation = _curator_escalation(
-            queue,
+        escalation_id = await _file_logged(
+            self._queue_for(project_root),
+            kind='post-ZOT duplicate',
+            project_id=project_id,
             category=_ZOT_DUPLICATE_CATEGORY,
             summary=(
                 f'possible duplicate created while curator dedupe was degraded by a '
@@ -572,13 +611,13 @@ class CuratorEscalator:
             ),
             detail='\n'.join(detail_lines),
         )
-        if not _submit_logged(queue, escalation, kind='post-ZOT duplicate', project_id=project_id):
+        if escalation_id is None:
             return
 
         logger.warning(
             'curator_escalator: queued post-ZOT duplicate L1 escalation %s for '
             'project %s — task %s ~ task %s (score %.3f)',
-            escalation.id, project_id, finding.task_id,
+            escalation_id, project_id, finding.task_id,
             finding.duplicate_task_id, finding.score,
         )
 
@@ -624,9 +663,10 @@ class CuratorEscalator:
         )
         detail = '\n'.join(detail_lines)
 
-        queue = self._queue_for(project_root)
-        escalation = _curator_escalation(
-            queue,
+        escalation_id = await _file_logged(
+            self._queue_for(project_root),
+            kind='schema-tool-denied',
+            project_id=project_id,
             category='curator_schema_tool_denied',
             summary=(
                 'CRITICAL: schema StructuredOutput tool DENIED — CLI '
@@ -636,16 +676,14 @@ class CuratorEscalator:
             ),
             detail=detail,
         )
-        if not _submit_logged(
-            queue, escalation, kind='schema-tool-denied', project_id=project_id,
-        ):
+        if escalation_id is None:
             return
 
         logger.error(
             'curator_escalator: queued schema-tool-denied L1 escalation %s for '
             "project %s — StructuredOutput tool blocked despite cli_invoke's --tools ''; "
             'submissions park awaiting curation until fixed',
-            escalation.id, project_id,
+            escalation_id, project_id,
         )
 
     async def report_consecutive_degraded(
@@ -716,12 +754,10 @@ class CuratorEscalator:
             'served by the same curator may be healthy.',
         ])
 
-        queue = self._queue_for(project_root)
-        escalation = Escalation(
-            id=queue.make_id('curator'),
-            task_id=_ANCHOR_TASK_ID,
-            agent_role='fused-memory/task-curator',
-            severity='blocking',
+        escalation_id = await _file_logged(
+            self._queue_for(project_root),
+            kind='consecutive-degraded',
+            project_id=project_id,
             category='curator_consecutive_degraded',
             summary=(
                 f'curator degraded {streak} consecutive curations (threshold '
@@ -729,24 +765,14 @@ class CuratorEscalator:
                 f'dedupe. Cause unknown to this alarm by design; see detail.'
             ),
             detail=detail,
-            level=1,
         )
-        try:
-            queue.submit(escalation)
-        except Exception:
-            logger.exception(
-                'curator_escalator: failed to submit consecutive-degraded '
-                'escalation for project %s',
-                project_id,
-            )
-            # Do not re-raise — falling through to action='create' is safer than
-            # failing add_task just because queue I/O broke.
+        if escalation_id is None:
             return
 
         logger.error(
             'curator_escalator: queued consecutive-degraded L1 escalation %s for '
             'project %s — streak=%d threshold=%d last_justification=%r',
-            escalation.id, project_id, streak, threshold, last_justification,
+            escalation_id, project_id, streak, threshold, last_justification,
         )
 
     async def report_backend_binary_unresolvable(
@@ -814,12 +840,10 @@ class CuratorEscalator:
             'startup self-check logs a resolved absolute path.',
         ])
 
-        queue = self._queue_for(project_root)
-        escalation = Escalation(
-            id=queue.make_id('curator'),
-            task_id=_ANCHOR_TASK_ID,
-            agent_role='fused-memory/task-curator',
-            severity='blocking',
+        escalation_id = await _file_logged(
+            self._queue_for(project_root),
+            kind='backend-binary-unresolvable',
+            project_id=project_id,
             category='curator_backend_binary_unresolvable',
             summary=(
                 f'curator backend binary {binary_spec!r} does not resolve — '
@@ -827,24 +851,14 @@ class CuratorEscalator:
                 f'environment is fixed. Config break, not a flaky candidate.'
             ),
             detail=detail,
-            level=1,
         )
-        try:
-            queue.submit(escalation)
-        except Exception:
-            logger.exception(
-                'curator_escalator: failed to submit backend-binary-unresolvable '
-                'escalation for project %s',
-                project_id,
-            )
-            # Do not re-raise — falling through to action='create' is safer than
-            # failing add_task just because queue I/O broke.
+        if escalation_id is None:
             return
 
         logger.error(
             'curator_escalator: queued backend-binary-unresolvable L1 escalation '
             '%s for project %s — binary_spec=%r PATH=%s',
-            escalation.id, project_id, binary_spec, search_path,
+            escalation_id, project_id, binary_spec, search_path,
         )
 
     async def _submit_zero_output_timeout(
@@ -881,21 +895,57 @@ class CuratorEscalator:
 
         The in-process ``_ZOT_DEDUP_WINDOW_SECS`` window makes one batch bisect
         (N concurrent size-1 curate() calls) count as one recurrence, not N.
+        ``_zot_window_lock`` is what keeps that check-then-stamp atomic across
+        the off-loop filing await, so every sibling gets the first filer's id;
+        ``tests/test_curator_escalator.py::TestZeroOutputTimeoutEscalation``
+        pins it in
+        ``test_concurrent_batch_bisect_files_one_record_and_hands_every_sibling_its_id``.
         """
-        now_mono = time.monotonic()
-        last = self._zot_last_submitted.get(project_id)
-        if last is not None and (now_mono - last[0]) < _ZOT_DEDUP_WINDOW_SECS:
-            logger.info(
-                'curator_escalator: deduplicating ZOT escalation for project %s '
-                '(last submitted %.1fs ago < dedup window %.0fs); '
-                'candidate_title=%r',
-                project_id,
-                now_mono - last[0],
-                _ZOT_DEDUP_WINDOW_SECS,
-                candidate_title,
-            )
-            return last[1]
+        async with self._zot_window_lock:
+            now_mono = time.monotonic()
+            last = self._zot_last_submitted.get(project_id)
+            if last is not None and (now_mono - last[0]) < _ZOT_DEDUP_WINDOW_SECS:
+                logger.info(
+                    'curator_escalator: deduplicating ZOT escalation for project %s '
+                    '(last submitted %.1fs ago < dedup window %.0fs); '
+                    'candidate_title=%r',
+                    project_id,
+                    now_mono - last[0],
+                    _ZOT_DEDUP_WINDOW_SECS,
+                    candidate_title,
+                )
+                return last[1]
 
+            escalation_id = await self._file_zero_output_timeout(
+                project_root=project_root,
+                project_id=project_id,
+                justification=justification,
+                candidate_title=candidate_title,
+                timed_out=timed_out,
+                duration_ms=duration_ms,
+                account_name=account_name,
+                proc_tree=proc_tree,
+                transcript_turns=transcript_turns,
+                tools_used=tools_used,
+            )
+            self._zot_last_submitted[project_id] = (now_mono, escalation_id)
+            return escalation_id
+
+    async def _file_zero_output_timeout(
+        self,
+        *,
+        project_root: str,
+        project_id: str,
+        justification: str,
+        candidate_title: str,
+        timed_out: bool | None,
+        duration_ms: int | None,
+        account_name: str | None,
+        proc_tree: str | None,
+        transcript_turns: int | None,
+        tools_used: tuple[str, ...] | None,
+    ) -> str | None:
+        """File one ZOT record off the loop and return its live id, or ``None`` when filing failed."""
         detail_lines = [
             f'candidate_title={candidate_title!r}',
             f'project_id={project_id!r}',
@@ -926,32 +976,13 @@ class CuratorEscalator:
         )
         detail = '\n'.join(detail_lines)
 
-        queue = self._queue_for(project_root)
-        escalation = _curator_escalation(
-            queue,
-            category=_ZOT_CATEGORY,
-            summary=(
-                'curator zero-output/full-timeout hang (accepted recurring class, '
-                'esc-task-curator-17) — dedupe degraded to create; recurrences fold '
-                'here and dedupe_count counts them.'
-            ),
-            detail=detail,
-            root_cause=_ZOT_ROOT_CAUSE,
-            dedupe_fingerprint=compute_content_fingerprint(  # type: ignore[possibly-unbound]
-                _ZOT_CATEGORY, _ZOT_ROOT_CAUSE, affected_ids=[f'project:{project_id}'],
-            ),
-        )
-        config = DedupeConfig(  # type: ignore[possibly-unbound]
-            infra_dedupe_enabled=True,
-            # UNBOUNDED, on the dead_letter_escalator precedent: these recur
-            # days and weeks apart, and a resolved parent leaves the pending
-            # set, so a recurrence after resolution still mints a new record.
-            infra_dedupe_window_secs=float('inf'),
-            infra_dedupe_categories=(_ZOT_CATEGORY,),
-            key_fn=content_fingerprint_key,  # type: ignore[possibly-unbound]
-        )
         try:
-            response = submit_or_dedupe(queue, escalation, config)  # type: ignore[possibly-unbound]
+            response = await asyncio.to_thread(
+                _file_zot_escalation,
+                self._queue_for(project_root),
+                project_id=project_id,
+                detail=detail,
+            )
         except Exception:
             logger.exception(
                 'curator_escalator: failed to submit zero-output-timeout '
@@ -960,11 +991,9 @@ class CuratorEscalator:
             )
             # Do not re-raise — falling through to action='create' is safer than
             # failing add_task just because queue I/O broke.
-            self._zot_last_submitted[project_id] = (now_mono, None)
             return None
 
         escalation_id: str = response['id']
-        self._zot_last_submitted[project_id] = (now_mono, escalation_id)
         if response['status'] == 'dedup_skipped':
             logger.warning(
                 'curator_escalator: zero-output-timeout recurrence for project %s '
