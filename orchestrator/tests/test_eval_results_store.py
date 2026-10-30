@@ -206,7 +206,9 @@ class TestLoudLoad:
 
 class TestLoadResult:
     def test_a_saved_cell_reads_back_equal_metrics_included(self, store: ResultStore):
-        saved = _result(metrics={'tests_pass': True, 'review_blocking_issues': 2})
+        saved = _result(
+            metrics={'tests_pass': True, 'review_blocking_issues': 2, 'role_under_test': 'implementer'},
+        )
         assert load_result(store.save(saved)) == saved
 
     def test_a_missing_cell_is_named(self, store: ResultStore):
