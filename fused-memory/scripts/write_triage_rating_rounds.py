@@ -33,6 +33,7 @@ import hashlib
 import json
 import math
 import random
+import re
 import sqlite3
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -240,27 +241,24 @@ _THIRD_ROUND_GAPS = frozenset({_rubric.GapKind.TIED, _rubric.GapKind.OPEN})
 """The gaps a third rater answering the whole item can fill: a tie, or an open follow-up."""
 
 
-def third_round_blockers(
-    derivations: Iterable[tuple[str, _rubric.Derivation]],
-) -> list[tuple[str, str]]:
-    """The sorted (entry, target) pairs whose derivation only a third rater can unblock.
+def third_round_blockers(derivations: Mapping[Pair, _rubric.Derivation]) -> list[Pair]:
+    """The sorted pairs whose derivation only a third rater can unblock.
 
-    *derivations* gives (entry, derivation) pairs; an entry may come once per
-    item, or once per pair of a write. An Incomplete derivation blocks on the
-    target of each of its gaps, provided every gap is a decisive tie or an open
-    follow-up; an unrated gap is refused, naming the entry.
+    An Incomplete derivation blocks on the target of each of its gaps, provided
+    every gap is a decisive tie or an open follow-up; an unrated gap is refused,
+    naming the pair.
     """
-    blocked: set[tuple[str, str]] = set()
-    for entry_id, derivation in derivations:
+    blocked: set[Pair] = set()
+    for pair, derivation in derivations.items():
         if not isinstance(derivation, _rubric.Incomplete):
             continue
         unrated = [str(gap.binary) for gap in derivation.missing if gap.kind not in _THIRD_ROUND_GAPS]
         if unrated:
             raise ValueError(
-                f'entry {entry_id!r} has unrated decisive binaries {unrated};'
+                f'pair {pair!r} has unrated decisive binaries {unrated};'
                 ' a third rater fills only ties and open follow-ups'
             )
-        blocked.update((entry_id, gap.target_id) for gap in derivation.missing)
+        blocked.update((pair[0], gap.target_id) for gap in derivation.missing)
     return sorted(blocked)
 
 
@@ -657,6 +655,17 @@ def refuse_foreign_briefs(key: Mapping[str, Any], rows: Iterable[Mapping[str, An
                          + '\n'.join(sorted(foreign)))
 
 
+_BRIEF_VERSION = re.compile(r'v\d+(\.\d+)*')
+
+
+def brief_version(label: str) -> str:
+    """*label*, refused unless it reads ``v<N>[.<N>...]`` (e.g. ``v2.2``), so that it is safe
+    in a file name."""
+    if _BRIEF_VERSION.fullmatch(label) is None:
+        raise ValueError(f'brief version label {label!r} is not v<N>[.<N>...], e.g. v2.2')
+    return label
+
+
 def keyed_rerate(key: Mapping[str, Any], version: str, brief: Path = BRIEF_PATH) -> Mapping[str, Any] | None:
     """The re-rate *key* records under brief *version*; None if none.
 
@@ -684,7 +693,7 @@ def rerate_round(
     the shards, and every third rater keyed so far, whose lines on those pairs
     are retired. Saves the key; returns the record.
     """
-    if keyed_rerate(key, version, scratch.brief) is not None:
+    if keyed_rerate(key, brief_version(version), scratch.brief) is not None:
         raise ValueError(f'a rerate under brief {version} is already keyed')
     selected = sorted(set(pairs))
     if not selected:
@@ -713,19 +722,19 @@ def ensure_rerate(
     scratch: RatingScratch, key: dict[str, Any], entries: Mapping[Triple, ShardEntry], *,
     version: str, derivations: Callable[[], Mapping[Pair, _rubric.Derivation]],
 ) -> dict[str, Any]:
-    """Key the re-rate under *scratch*'s brief labelled *version*, unless *key* records it; then
-    render every missing shard text and ``rater_prompt.md``. Returns a summary of the re-rate.
+    """Key the re-rate under *scratch*'s brief labelled *version* (a :func:`brief_version`),
+    unless *key* records it; then render every missing shard text and ``rater_prompt.md``.
+    Returns a summary of the re-rate.
 
     A new re-rate covers exactly :func:`pairs_reading_loss` of *derivations*,
     which is called only then, so a rerun needs no rated corpus. It is refused
     while any pair awaits a third rater (:func:`third_round_blockers`).
     """
-    rerate = keyed_rerate(key, version, scratch.brief)
+    rerate = keyed_rerate(key, brief_version(version), scratch.brief)
     new_shards: dict[str, dict[str, int]] = {}
     if rerate is None:
         current = derivations()
-        pending = third_round_blockers(
-            (entry_id, derivation) for (entry_id, _), derivation in current.items())
+        pending = third_round_blockers(current)
         if pending:
             raise ValueError('run third until it shards nothing before a rerate; pairs awaiting'
                              f' a third rater: {pending}')

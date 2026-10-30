@@ -8,6 +8,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import re
 import sqlite3
 import types
 from collections.abc import Callable
@@ -356,42 +357,38 @@ def _decided() -> Any:
 
 class TestThirdRoundBlockers:
     def test_names_each_pair_a_tie_or_an_open_follow_up_alone_blocks(self) -> None:
-        derivations = [
-            ('tied', _incomplete(_gap('p1', 'conflict', 'tied'))),
-            ('open', _incomplete(_gap('p2', 'loss', 'open'))),
-            ('both', _incomplete(_gap('p3', 'home', 'tied'), _gap('p3', 'loss', 'open'))),
-            ('decided', _decided()),
-            ('unclear', _rubric().Unclear(binaries=(('p4', _rubric().Binary.HOME),))),
-        ]
+        derivations = {
+            ('tied', 'p1'): _incomplete(_gap('p1', 'conflict', 'tied')),
+            ('open', 'p2'): _incomplete(_gap('p2', 'loss', 'open')),
+            ('both', 'p3'): _incomplete(_gap('p3', 'home', 'tied'), _gap('p3', 'loss', 'open')),
+            ('decided', 'p1'): _decided(),
+            ('unclear', 'p4'): _rubric().Unclear(binaries=(('p4', _rubric().Binary.HOME),)),
+        }
         assert _mod().third_round_blockers(derivations) == [
             ('both', 'p3'), ('open', 'p2'), ('tied', 'p1'),
         ]
 
-    def test_a_multi_target_derivation_blocks_only_its_gap_targets(self) -> None:
-        derivations = [('stored', _incomplete(_gap('t2', 'home', 'tied'), _gap('t5', 'conflict', 'tied')))]
-        assert _mod().third_round_blockers(derivations) == [('stored', 't2'), ('stored', 't5')]
-
-    def test_one_entry_may_come_once_per_pair(self) -> None:
-        derivations = [('w', _incomplete(_gap('t1', 'home', 'tied'))), ('w', _decided()),
-                       ('w', _incomplete(_gap('t3', 'loss', 'open')))]
+    def test_one_entry_may_come_once_per_target(self) -> None:
+        derivations = {('w', 't1'): _incomplete(_gap('t1', 'home', 'tied')), ('w', 't2'): _decided(),
+                       ('w', 't3'): _incomplete(_gap('t3', 'loss', 'open'))}
         assert _mod().third_round_blockers(derivations) == [('w', 't1'), ('w', 't3')]
 
-    def test_an_unrated_decisive_binary_is_refused_naming_the_entry_and_binaries(self) -> None:
-        derivations = [
-            ('fine', _incomplete(_gap('p1', 'conflict', 'tied'))),
-            ('unrated-entry', _incomplete(_gap('p1', 'home', 'tied'), _gap('p1', 'conflict', 'unrated'))),
-        ]
-        with pytest.raises(ValueError, match=r"'unrated-entry'.*\['conflict'\]"):
+    def test_an_unrated_decisive_binary_is_refused_naming_the_pair_and_binaries(self) -> None:
+        derivations = {
+            ('fine', 'p1'): _incomplete(_gap('p1', 'conflict', 'tied')),
+            ('unrated-entry', 'p1'): _incomplete(_gap('p1', 'home', 'tied'), _gap('p1', 'conflict', 'unrated')),
+        }
+        with pytest.raises(ValueError, match=r"\('unrated-entry', 'p1'\).*\['conflict'\]"):
             _mod().third_round_blockers(derivations)
 
     def test_an_unrated_gap_after_a_tie_on_one_pair_is_refused(self) -> None:
         derivation = _incomplete(_gap('p1', 'conflict', 'tied'), _gap('p1', 'loss', 'unrated'))
         assert [str(gap.kind) for gap in derivation.missing] == ['tied', 'unrated']
-        with pytest.raises(ValueError, match=r"'w'.*\['loss'\]"):
-            _mod().third_round_blockers([('w', derivation)])
+        with pytest.raises(ValueError, match=r"\('w', 'p1'\).*\['loss'\]"):
+            _mod().third_round_blockers({('w', 'p1'): derivation})
 
     def test_nothing_blocked_is_an_empty_list(self) -> None:
-        assert _mod().third_round_blockers([('decided', _decided())]) == []
+        assert _mod().third_round_blockers({('decided', 'p1'): _decided()}) == []
 
 
 _KEPT = {'home': 'YES', 'conflict': 'NO', 'loss': 'NO'}
@@ -1032,6 +1029,20 @@ class TestEffectiveLinesUnderOneBrief:
         assert {row['batch'] for row in lines} <= set(key['rerates'][0]['shards'])
 
 
+_UNSAFE_LABELS = ('../v2.2', 'v2.2/x', 'v2.2 ', '2.2', 'v2.', 'v2..2', '')
+
+
+class TestBriefVersion:
+    @pytest.mark.parametrize('label', ['v2', 'v2.2', 'v10.0.3'])
+    def test_returns_a_v_numbered_label(self, label: str) -> None:
+        assert _mod().brief_version(label) == label
+
+    @pytest.mark.parametrize('label', _UNSAFE_LABELS)
+    def test_refuses_any_other_label_naming_it(self, label: str) -> None:
+        with pytest.raises(ValueError, match=re.escape(f'brief version label {label!r} ')):
+            _mod().brief_version(label)
+
+
 def _never_called() -> dict[tuple[str, str], Any]:
     raise AssertionError('the derivations were read though the re-rate is already keyed')
 
@@ -1075,6 +1086,18 @@ class TestEnsureRerate:
         tied = {**_restated({'w': _KEPT}), ('x', 'p1'): _incomplete(_gap('p1', 'conflict', 'tied'))}
         with pytest.raises(ValueError, match=r"run third.*\('x', 'p1'\)"):
             _mod().ensure_rerate(scratch, key, _two_writes(), version='v2.2', derivations=lambda: tied)
+        assert 'rerates' not in key
+        assert 'rerates' not in scratch.load_key()
+
+    @pytest.mark.parametrize('label', _UNSAFE_LABELS)
+    def test_refuses_a_label_that_is_not_a_brief_version_reading_nothing_keying_nothing(
+        self, scratch: Any, label: str,
+    ) -> None:
+        key = scratch.load_key()
+        with pytest.raises(ValueError, match='brief version label'):
+            _mod().ensure_rerate(scratch, key, _two_writes(), version=label, derivations=_never_called)
+        with pytest.raises(ValueError, match='brief version label'):
+            _mod().rerate_round(scratch, key, _two_writes(), [('w', 'p1')], version=label)
         assert 'rerates' not in key
         assert 'rerates' not in scratch.load_key()
 

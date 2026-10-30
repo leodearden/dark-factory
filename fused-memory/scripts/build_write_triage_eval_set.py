@@ -211,12 +211,6 @@ def pair_derivations(
     }
 
 
-def _third_round_pairs(derivations: Mapping[_rounds.Pair, _rubric.Derivation]) -> list[_rounds.Pair]:
-    """The pairs only a third rater can unblock; an unrated decisive binary is refused."""
-    return _rounds.third_round_blockers(
-        (entry_id, derivation) for (entry_id, _), derivation in derivations.items())
-
-
 def _refuse_incomplete(derivations: Mapping[_rounds.Pair, _rubric.Derivation]) -> None:
     gaps = [
         f'{gap.kind} {entry_id} {gap.target_id} {gap.binary}'
@@ -372,7 +366,7 @@ def _third_command(args: argparse.Namespace) -> dict[str, Any]:
     rounds = _Rounds.read(args)
     derivations = pair_derivations(rounds.inputs.rows(), rounds.finished().rows)
     return _rounds.third_round(rounds.scratch, rounds.key, rounds.inputs.entries(),
-                               _third_round_pairs(derivations))
+                               _rounds.third_round_blockers(derivations))
 
 
 def _rerate_command(args: argparse.Namespace) -> dict[str, Any]:

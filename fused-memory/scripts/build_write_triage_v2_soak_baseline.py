@@ -328,8 +328,7 @@ def third_round_pairs(
     Each is blocked by a decisive tie or an open follow-up alone. A pair also
     blocked by an unrated decisive binary is refused.
     """
-    return _rounds.third_round_blockers(
-        (entry_id, derivation) for (entry_id, _), derivation in current_derivations(items, verdicts).items())
+    return _rounds.third_round_blockers(current_derivations(items, verdicts))
 
 
 def extend_sample(
@@ -631,88 +630,93 @@ def _shards_command(args: argparse.Namespace) -> dict[str, Any]:
 
 
 @dataclass(frozen=True)
-class _Corpus:
-    """The scratch state of a fully rated soak, and its assembled verdict corpus."""
+class _Keyed:
+    """The scratch, its key, the keyed soak items, and each keyed pair and basis as its raters
+    saw it; no rating is read."""
 
     scratch: _rounds.RatingScratch
     key: dict[str, Any]
     bundle: _SoakBundle
     soak: list[_SoakItem]
-    entries: Mapping[tuple[str, str, str], _rounds.ShardEntry]
-    rated: _rounds.Rated
-    assembly: Assembly
+    entries: Mapping[_rounds.Triple, _rounds.ShardEntry]
 
 
-def _corpus(args: argparse.Namespace) -> _Corpus:
-    """The assembled corpus, refused while any line awaits a re-ask or any pair lacks a rater."""
+def _keyed(args: argparse.Namespace) -> _Keyed:
     bundle = _SoakBundle.read(args.bundle)
     scratch = _rounds.RatingScratch(args.scratch, brief=args.brief)
     key = _soak_key(scratch)
     soak = bundle.keyed_items(key)
-    entries = scratch.entries(_projects(soak))
-    rated = scratch.ratings(key, entries)
-    _rounds.refuse_unfinished(rated, entries)
+    return _Keyed(scratch, key, bundle, soak, scratch.entries(_projects(soak)))
+
+
+@dataclass(frozen=True)
+class _Corpus:
+    """The scratch state of a fully rated soak, and its assembled verdict corpus."""
+
+    keyed: _Keyed
+    rated: _rounds.Rated
+    assembly: Assembly
+
+
+def _corpus(keyed: _Keyed) -> _Corpus:
+    """The assembled corpus, refused while any line awaits a re-ask or any pair lacks a rater."""
+    scratch, key, soak = keyed.scratch, keyed.key, keyed.soak
+    rated = scratch.ratings(key, keyed.entries)
+    _rounds.refuse_unfinished(rated, keyed.entries)
     assembly = assemble(
         {soaked.pair: soaked.adjudication for soaked in soak}, rated.rows,
         {soaked.item['entry_id']: soaked.child_text for soaked in soak},
         checked_rows=scratch.effective_lines(key, brief_sha256=_rounds.round_0_brief(key)),
     )
-    return _Corpus(scratch, key, bundle, soak, entries, rated, assembly)
+    return _Corpus(keyed, rated, assembly)
 
 
 def _corpus_derivations(corpus: _Corpus) -> dict[_rounds.Pair, _rubric.Derivation]:
-    return current_derivations([soaked.item for soaked in corpus.soak], corpus.assembly.verdicts)
-
-
-def _keyed_scratch(
-    args: argparse.Namespace,
-) -> tuple[_rounds.RatingScratch, dict[str, Any], dict[_rounds.Triple, _rounds.ShardEntry]]:
-    """The scratch, its key, and each keyed pair and basis as its raters saw it; no rating is read."""
-    scratch = _rounds.RatingScratch(args.scratch, brief=args.brief)
-    key = _soak_key(scratch)
-    entries = scratch.entries(_projects(_SoakBundle.read(args.bundle).keyed_items(key)))
-    return scratch, key, entries
+    return current_derivations([soaked.item for soaked in corpus.keyed.soak], corpus.assembly.verdicts)
 
 
 def _reask_command(args: argparse.Namespace) -> dict[str, Any]:
-    return _rounds.reask_round(*_keyed_scratch(args))
+    keyed = _keyed(args)
+    return _rounds.reask_round(keyed.scratch, keyed.key, keyed.entries)
 
 
 def _third_command(args: argparse.Namespace) -> dict[str, Any]:
-    corpus = _corpus(args)
-    blocked = third_round_pairs([soaked.item for soaked in corpus.soak], corpus.assembly.verdicts)
-    return _rounds.third_round(corpus.scratch, corpus.key, corpus.entries, blocked)
+    corpus = _corpus(_keyed(args))
+    keyed = corpus.keyed
+    blocked = third_round_pairs([soaked.item for soaked in keyed.soak], corpus.assembly.verdicts)
+    return _rounds.third_round(keyed.scratch, keyed.key, keyed.entries, blocked)
 
 
 def _rerate_command(args: argparse.Namespace) -> dict[str, Any]:
-    scratch, key, entries = _keyed_scratch(args)
-    return _rounds.ensure_rerate(scratch, key, entries, version=args.brief_version,
-                                 derivations=lambda: _corpus_derivations(_corpus(args)))
+    keyed = _keyed(args)
+    return _rounds.ensure_rerate(keyed.scratch, keyed.key, keyed.entries, version=args.brief_version,
+                                 derivations=lambda: _corpus_derivations(_corpus(keyed)))
 
 
 def rating_suffix(key: Mapping[str, Any]) -> str:
     """The suffix of the brief-dependent output names: none before a re-rate, else the latest
-    re-rate's version with each '.' as '_' (``v2.2`` gives ``_v2_2``)."""
+    re-rate's version (``write_triage_rating_rounds.py::brief_version``) with each '.' as '_'
+    (``v2.2`` gives ``_v2_2``)."""
     rerates = key.get('rerates', ())
-    return f'_{rerates[-1]["version"].replace(".", "_")}' if rerates else ''
+    return f'_{_rounds.brief_version(rerates[-1]["version"]).replace(".", "_")}' if rerates else ''
 
 
 def _assemble_command(args: argparse.Namespace) -> dict[str, Any]:
-    corpus = _corpus(args)
-    key = corpus.key
+    corpus = _corpus(_keyed(args))
+    key, soak = corpus.keyed.key, corpus.keyed.soak
     _rounds.refuse_loss_outside_the_latest_rerate(key, _corpus_derivations(corpus))
     suffix = rating_suffix(key)
     derivation = corpus.assembly.derivation
     out: Path = args.out_dir
     out.mkdir(parents=True, exist_ok=True)
-    _write_jsonl(out / 'write_triage_v2_soak_items.jsonl', [soaked.item for soaked in corpus.soak])
+    _write_jsonl(out / 'write_triage_v2_soak_items.jsonl', [soaked.item for soaked in soak])
     _write_jsonl(out / f'write_triage_v2_soak_verdicts{suffix}.jsonl', corpus.assembly.verdicts)
     _write_json(out / 'write_triage_v2_soak_strata.json', dict(STRATA))
     _write_json(out / f'write_triage_v2_soak_derivation{suffix}.json', {
         **derivation,
         'check': {**derivation['check'], 'brief_sha256': _rounds.round_0_brief(key)},
         'rating_volume': _rounds.rating_volume(key),
-        'sample': _sample(corpus.bundle, key),
+        'sample': _sample(corpus.keyed.bundle, key),
         'unrecoverable': key['unrecoverable'],
         'attach_time_unrecoverable': sorted(key['attach_time_unrecoverable']),
         'reasked': corpus.rated.reasked,
@@ -723,7 +727,7 @@ def _assemble_command(args: argparse.Namespace) -> dict[str, Any]:
                           'items': len(spec['items']), 'brief_sha256': spec['brief_sha256']}
                    for name, spec in sorted(key['shards'].items())},
     })
-    return {'items': len(corpus.soak), 'verdicts': len(corpus.assembly.verdicts)}
+    return {'items': len(soak), 'verdicts': len(corpus.assembly.verdicts)}
 
 
 _SAMPLE_COUNTS = ('adjudicated', 'extension', 'unrecoverable')

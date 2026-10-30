@@ -1160,6 +1160,26 @@ class TestTheRerate:
             self._rerate(bundle, brief)
         assert 'rerates' not in bundle.key()
 
+    def test_refuses_a_brief_version_that_is_not_a_v_numbered_label(
+        self, bundle: _Bundle, brief: Path,
+    ) -> None:
+        _rate(bundle)
+        with pytest.raises(ValueError, match=r"brief version label '\.\./v2\.2'"):
+            bundle.run('rerate', '--brief', str(brief), '--brief-version', '../v2.2')
+        assert 'rerates' not in bundle.key()
+
+    def test_assemble_refuses_a_hand_edited_rerate_label_writing_nothing(
+        self, rerated: _Bundle, brief: Path, tmp_path: Path,
+    ) -> None:
+        key = rerated.key()
+        key['rerates'][0]['version'] = '../../escaped'
+        (rerated.scratch / 'key.json').write_text(json.dumps(key))
+        _rate(rerated)
+        out = tmp_path / 'nested' / 'out'
+        with pytest.raises(ValueError, match=r"brief version label '\.\./\.\./escaped'"):
+            self._assemble(rerated, out, brief)
+        assert not (tmp_path / 'nested').exists()
+
     def test_a_rerun_keys_nothing_new_and_renders_a_deleted_shard_again(
         self, rerated: _Bundle, brief: Path,
     ) -> None:
