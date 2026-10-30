@@ -1265,7 +1265,7 @@ _BARE_DIGIT_RE: re.Pattern[str] = re.compile(r'\b\d+\b')
 # The clause-ish boundary that closes a colon-introduced list segment (which
 # has no closing delimiter of its own) and backstops an unterminated bracket
 # segment is task_filter.STRICT_CLAUSE_BOUNDARY_RE — the fail-safe-STRICT
-# alphabet [.;\n!?], NOT task_filter._CLAUSE_SPLIT_RE, which narrowed its dot
+# alphabet [.;\n!?], NOT task_filter.WIDE_CLAUSE_BOUNDARY_RE, which narrowed its dot
 # to '\.(?!\w)' at task 3403 so dotted technical tokens stop shattering a
 # sentence. The two started out identical; the canonical rationale for keeping
 # them apart lives next to STRICT_CLAUSE_BOUNDARY_RE. This module's stake in
