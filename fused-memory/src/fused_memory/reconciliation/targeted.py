@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 import uuid as uuid_mod
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -49,23 +50,24 @@ from fused_memory.utils.clip_disclosure import fit_at_word
 from fused_memory.utils.task_dependency_ids import task_dependency_ids
 from fused_memory.utils.validation import InputValidationError, require_project_root
 
-# Defensive import — escalation is an optional workspace package (mirrors
-# scope_violation_escalator.py:43-48).  When absent, L1 escalation degrades
-# to a logged no-op; the sweep still cancels deterministic orphans and
-# blocks ambiguous ones, so the dashboard still surfaces orphan state.
-try:
+if TYPE_CHECKING:
     from escalation.models import Escalation  # type: ignore[import-untyped]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
-    _HAS_ESCALATION = True
-except ImportError:  # pragma: no cover — exercised only in minimal envs
-    Escalation = None  # type: ignore[assignment,misc]
-    EscalationQueue = None  # type: ignore[assignment,misc]
-    _HAS_ESCALATION = False
 
-if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.middleware.task_interceptor import TaskInterceptor
     from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
+
+EscalationQueueFactory = Callable[[Path], 'EscalationQueue']
+
+# `escalation` is an optional workspace package. When it is absent the default
+# factory is None and every escalation path degrades to its logged no-op or veto.
+try:
+    from escalation.models import Escalation  # type: ignore[import-untyped,no-redef]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
+    _INSTALLED_ESCALATION_QUEUE_FACTORY: EscalationQueueFactory | None = EscalationQueue
+except ImportError:  # pragma: no cover — exercised only in minimal envs
+    _INSTALLED_ESCALATION_QUEUE_FACTORY = None
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +230,10 @@ class TargetedReconciler:
         journal: ReconciliationJournal,
         config: FusedMemoryConfig,
         event_buffer: EventBuffer | None = None,
+        *,
+        escalation_queue_factory: EscalationQueueFactory | None = (
+            _INSTALLED_ESCALATION_QUEUE_FACTORY
+        ),
     ):
         self.memory = memory_service
         self.taskmaster = taskmaster
@@ -235,6 +241,7 @@ class TargetedReconciler:
         self.config = config.reconciliation
         self.verifier = CodebaseVerifier(config.reconciliation)
         self.buffer = event_buffer
+        self._escalation_queue_factory = escalation_queue_factory
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
         # Wire post-construction (mirroring the planned_episode_registry pattern) so that
         # _on_task_blocked routes metadata writes through the interceptor's write_lock.
@@ -1759,9 +1766,8 @@ class TargetedReconciler:
         symmetric with :meth:`_sweep_cancel_orphan` and
         :meth:`_sweep_block_orphan`.
         """
-        # is-None narrows the optional types for pyright (mirrors
-        # stage1_stall_detector.py:241).  HAS_ESCALATION is informational.
-        if not _HAS_ESCALATION or Escalation is None or EscalationQueue is None:
+        factory = self._escalation_queue_factory
+        if factory is None:
             logger.debug(
                 'sweep: escalation pkg unavailable; cannot file L1 for orphan %s',
                 task_id,
@@ -1784,7 +1790,7 @@ class TargetedReconciler:
         detail = '\n'.join(detail_lines)
 
         try:
-            queue = EscalationQueue(escalation_queue_dir(project_root))
+            queue = factory(escalation_queue_dir(project_root))
             esc = Escalation(
                 id=queue.make_id(task_id),
                 task_id=task_id,
@@ -1885,22 +1891,14 @@ class TargetedReconciler:
         Returns the action dict for `result['actions']`, or None when the
         escalation package is unavailable.
         """
-        # is-None narrows the optional types for pyright (mirrors
-        # _sweep_escalate_l1). _HAS_ESCALATION is informational.
-        if not _HAS_ESCALATION or Escalation is None or EscalationQueue is None:
+        factory = self._escalation_queue_factory
+        if factory is None:
             logger.debug(
                 'verify: escalation pkg unavailable; cannot file L1 for '
                 'contradicted task %s',
                 task_id,
             )
             return None
-        # Rebound to locals because pyright's narrowing above does NOT reach
-        # into the nested `_file` scope below: a module-level global could be
-        # reassigned between closure capture and call, so reading
-        # `Escalation`/`EscalationQueue` there re-widens to `... | None` and
-        # trips reportOptionalCall.  These locals are never reassigned, so the
-        # narrowed types survive into the closure.
-        esc_cls, queue_cls = Escalation, EscalationQueue
 
         # One line, and a free-text title must not be what breaks that
         # contract — hence both the newline scrub and the bounded truncate.
@@ -1940,8 +1938,8 @@ class TargetedReconciler:
             # contradicted branch would create data/escalations/ in every
             # target project as a side effect of an unrelated done
             # transition — the trap _escalation_pin_index_for documents.
-            queue = queue_cls(escalation_queue_dir(project_root))
-            esc = esc_cls(
+            queue = factory(escalation_queue_dir(project_root))
+            esc = Escalation(
                 id=queue.make_id(task_id),
                 task_id=task_id,
                 agent_role='reconciler',
@@ -2106,10 +2104,9 @@ class TargetedReconciler:
         ``EscalationQueue`` is synchronous blocking filesystem I/O and this
         coroutine runs on the shared fused-memory event loop.
 
-        Returns the index, or ``None`` when the store is unavailable -- the
-        ``escalation`` package isn't importable in this env (mirrors the
-        module's defensive import at the top of this file), construction
-        raised, or the scan itself raised (all logged at warning with
+        Returns the index, or ``None`` when the store is unavailable -- there
+        is no escalation-queue factory, construction raised, or the scan
+        itself raised (the latter two logged at warning with
         ``exc_info=True``). Every such arm vetoes rather than flips: a store
         you cannot read cannot prove "no open escalation", and a false
         negative would unblock a task the orchestrator (or a human)
@@ -2126,12 +2123,13 @@ class TargetedReconciler:
         """
         if queue_memo:
             return queue_memo[0]
-        if not _HAS_ESCALATION or EscalationQueue is None:
+        factory = self._escalation_queue_factory
+        if factory is None:
             queue_memo.append(None)
             return None
         index: dict[str, list[str]] | None
         try:
-            queue = EscalationQueue(escalation_queue_dir(project_root))
+            queue = factory(escalation_queue_dir(project_root))
             index = {}
             for esc in await asyncio.to_thread(queue.get_pending):
                 # str() both sides of what get_by_task compared with ==, so an

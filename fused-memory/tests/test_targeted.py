@@ -1187,8 +1187,8 @@ def _dep_tasks(*dependents: dict) -> dict:
     return {'tasks': [{'id': '1', 'status': 'done', 'dependencies': []}, *dependents]}
 
 
-def _wire_mock_interceptor(reconciler: TargetedReconciler) -> TargetedReconciler:
-    """Attach a mocked ``TaskInterceptor`` to *reconciler* and return it.
+def _wire_mock_interceptor(reconciler: TargetedReconciler) -> AsyncMock:
+    """Attach a mocked ``TaskInterceptor`` to *reconciler* and return the mock.
 
     ``set_task_status`` returns a realistic happy-path ``SetTaskStatusResult``
     -- note the deliberate absence of a ``success`` key (task_interceptor.py
@@ -1212,7 +1212,7 @@ def _wire_mock_interceptor(reconciler: TargetedReconciler) -> TargetedReconciler
         'id': '2', 'message': 'Updated claimant fields for task 2',
     })
     reconciler.task_interceptor = interceptor
-    return reconciler
+    return interceptor
 
 
 @pytest.fixture
@@ -1223,7 +1223,8 @@ def wired_reconciler(reconciler):
     leaves ``task_interceptor = None`` -- the unwired-safety case depends
     on that default.
     """
-    return _wire_mock_interceptor(reconciler)
+    _wire_mock_interceptor(reconciler)
+    return reconciler
 
 
 # ── task-1136: route _on_task_blocked metadata write through TaskInterceptor ──
@@ -5854,15 +5855,14 @@ async def test_unblock_dependent_vetoed_when_escalation_store_unreadable(
     An env without the escalation package (no factory) is the same unreadable
     store: absence vetoes too, it does not wave the unblock through.
     """
-    wired_reconciler = _wire_mock_interceptor(
-        make_reconciler(escalation_queue_factory=escalation_queue_factory),
-    )
+    reconciler = make_reconciler(escalation_queue_factory=escalation_queue_factory)
+    interceptor = _wire_mock_interceptor(reconciler)
 
     mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
         {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
     ))
 
-    result = await wired_reconciler.reconcile_task(
+    result = await reconciler.reconcile_task(
         task_id='1', transition='done', project_id='test-project',
         project_root=str(tmp_path),
         task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
@@ -5876,7 +5876,7 @@ async def test_unblock_dependent_vetoed_when_escalation_store_unreadable(
     assert actions[0].get('reason') == 'escalation_store_unavailable', (
         f'Expected reason=escalation_store_unavailable, got: {actions[0]!r}'
     )
-    wired_reconciler.task_interceptor.set_task_status.assert_not_awaited()
+    interceptor.set_task_status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -5901,16 +5901,15 @@ async def test_unblock_proceeds_when_no_open_escalation(
             construct_calls.append((args, kwargs))
             super().__init__(*args, **kwargs)
 
-    wired_reconciler = _wire_mock_interceptor(
-        make_reconciler(escalation_queue_factory=_SpyQueue),
-    )
+    reconciler = make_reconciler(escalation_queue_factory=_SpyQueue)
+    interceptor = _wire_mock_interceptor(reconciler)
 
     mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
         {'id': '2', 'title': 'Downstream Two', 'status': 'blocked', 'dependencies': ['1']},
         {'id': '3', 'title': 'Downstream Three', 'status': 'blocked', 'dependencies': ['1']},
     ))
 
-    result = await wired_reconciler.reconcile_task(
+    result = await reconciler.reconcile_task(
         task_id='1', transition='done', project_id='test-project',
         project_root=str(tmp_path),
         task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
@@ -5927,9 +5926,9 @@ async def test_unblock_proceeds_when_no_open_escalation(
         f'Expected the escalation queue constructed at most once per sweep '
         f'(lazy per-sweep memo), got {len(construct_calls)} constructions: {construct_calls}'
     )
-    assert wired_reconciler.task_interceptor.set_task_status.await_count == 2, (
+    assert interceptor.set_task_status.await_count == 2, (
         f'Expected both dependents to be attempted, got '
-        f'{wired_reconciler.task_interceptor.set_task_status.await_count} awaits'
+        f'{interceptor.set_task_status.await_count} awaits'
     )
 
 
@@ -5951,15 +5950,14 @@ async def test_unblock_dependent_vetoed_when_pending_scan_raises(
         def get_pending(self):
             raise OSError('escalation store read failed')
 
-    wired_reconciler = _wire_mock_interceptor(
-        make_reconciler(escalation_queue_factory=_ExplodingQueue),
-    )
+    reconciler = make_reconciler(escalation_queue_factory=_ExplodingQueue)
+    interceptor = _wire_mock_interceptor(reconciler)
 
     mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
         {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
     ))
 
-    result = await wired_reconciler.reconcile_task(
+    result = await reconciler.reconcile_task(
         task_id='1', transition='done', project_id='test-project',
         project_root=str(tmp_path),
         task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
@@ -5973,7 +5971,7 @@ async def test_unblock_dependent_vetoed_when_pending_scan_raises(
     assert actions[0].get('reason') == 'escalation_store_unavailable', (
         f'Expected reason=escalation_store_unavailable, got: {actions[0]!r}'
     )
-    wired_reconciler.task_interceptor.set_task_status.assert_not_awaited()
+    interceptor.set_task_status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -6002,9 +6000,8 @@ async def test_unblock_sweep_scans_escalation_store_once_for_many_dependents(
             scans.append(1)
             return super().get_pending()
 
-    wired_reconciler = _wire_mock_interceptor(
-        make_reconciler(escalation_queue_factory=_CountingQueue),
-    )
+    reconciler = make_reconciler(escalation_queue_factory=_CountingQueue)
+    _wire_mock_interceptor(reconciler)
 
     mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
         {'id': '2', 'title': 'Downstream Two', 'status': 'blocked', 'dependencies': ['1']},
@@ -6012,7 +6009,7 @@ async def test_unblock_sweep_scans_escalation_store_once_for_many_dependents(
         {'id': '4', 'title': 'Downstream Four', 'status': 'blocked', 'dependencies': ['1']},
     ))
 
-    result = await wired_reconciler.reconcile_task(
+    result = await reconciler.reconcile_task(
         task_id='1', transition='done', project_id='test-project',
         project_root=str(tmp_path),
         task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
