@@ -60,6 +60,7 @@ from shared.task_metadata import RetryLedger
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import (
     MERGE_BOUNCE_CAP,
@@ -291,7 +292,7 @@ def _make_tracker(
     return SuffixConflictTracker(
         git_ops=lambda: git_ops,
         lane_buffers=lambda: lane_buffers,
-        frozen_prefix=lambda: (),
+        frozen_requests=lambda: (),
         frozen_prefix_tip=lambda _main_sha: frozen_tip,
         retire_item=_record,
     )
@@ -506,6 +507,10 @@ class TestBounceDrivenByTheLane:
                 assert 'suffix-b' not in verifier.verified, (
                     'the bounced item consumed a verify slot: the bounce must divert it '
                     f'before dispatch, but the verifier was asked for {verifier.verified!r}'
+                )
+                assert outcome.block_category is MergeBlockCategory.MERGE_NEEDS_REBASE
+                assert outcome.conflict_evidence == ConflictEvidence(
+                    conflicted_paths=('shared.txt',), counterpart_task_ids=('frozen-a',),
                 )
             finally:
                 release.set()
