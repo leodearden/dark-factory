@@ -1082,6 +1082,51 @@ class TestEmittedStepEscalations:
             for record in caplog.records
         )
 
+    def test_malformed_entries_are_skipped_with_a_warning(
+        self, artifacts: TaskArtifacts, caplog
+    ):
+        (artifacts.root / 'reconcile_state.json').write_text(
+            json.dumps({
+                'emitted_done_step_escalations': [
+                    [1, 2],
+                    ['only-one'],
+                    ['step-1', 'abc123'],
+                ]
+            })
+        )
+
+        with caplog.at_level('WARNING'):
+            assert artifacts.read_emitted_step_escalations() == {
+                ('step-1', 'abc123')
+            }
+
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == 'orchestrator.artifacts'
+            and record.levelname == 'WARNING'
+            and 'reconcile_state.json' in record.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert '2 malformed' in warnings[0]
+
+    def test_well_formed_store_reads_without_warning(
+        self, artifacts: TaskArtifacts, caplog
+    ):
+        artifacts.append_emitted_step_escalation('step-1', 'abc123')
+        artifacts.append_emitted_step_escalation('step-1', 'abc123')
+
+        with caplog.at_level('WARNING'):
+            assert artifacts.read_emitted_step_escalations() == {
+                ('step-1', 'abc123')
+            }
+
+        assert not [
+            record
+            for record in caplog.records
+            if record.name == 'orchestrator.artifacts'
+        ]
+
     def test_append_over_malformed_field_rewrites_valid_store(
         self, artifacts: TaskArtifacts
     ):

@@ -1378,7 +1378,8 @@ class TaskArtifacts:
         Stored at ``self.root/reconcile_state.json`` (beside plan.json in the
         meta-root).  JSON has no set/tuple types, so the on-disk shape is
         ``{"emitted_done_step_escalations": [[step_id, commit], ...]}``; each
-        2-element list is re-tupled here and malformed entries are skipped.
+        2-element list of strings is re-tupled here; any other entry is
+        skipped, with one warning counting the skipped entries.
 
         Fail-safe: a missing file, corrupt/unreadable or non-UTF-8 JSON, a
         non-object payload, or a non-list ``emitted_done_step_escalations``
@@ -1397,17 +1398,19 @@ class TaskArtifacts:
                 name, self._read_path(name), key,
             )
             return set()
-        result: set[tuple[str, str]] = set()
-        for entry in entries:
-            # Each entry must be a 2-element [step_id, commit] list of strings;
-            # skip anything malformed rather than raising (fail-safe read).
-            if (
-                isinstance(entry, list)
-                and len(entry) == 2
-                and all(isinstance(x, str) for x in entry)
-            ):
-                result.add((entry[0], entry[1]))
-        return result
+        pairs = [
+            (entry[0], entry[1])
+            for entry in entries
+            if isinstance(entry, list)
+            and len(entry) == 2
+            and all(isinstance(x, str) for x in entry)
+        ]
+        if len(pairs) < len(entries):
+            logger.warning(
+                'Malformed %s at %s: skipped %d malformed %s entries',
+                name, self._read_path(name), len(entries) - len(pairs), key,
+            )
+        return set(pairs)
 
     def append_emitted_step_escalation(
         self, step_id: str, stale_commit: str
