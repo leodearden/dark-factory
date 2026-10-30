@@ -610,7 +610,7 @@ class TestTheRerate:
         key = rerated.key()
         key['rerates'][0]['pairs'].remove(['l1', 'g'])
         (rerated.scratch / 'key.json').write_text(json.dumps(key))
-        with pytest.raises(ValueError, match=r'latest re-rate.*l1 g'):
+        with pytest.raises(ValueError, match=r'(?s)latest re-rate.*l1 g'):
             rerated.assemble()
         assert not rerated.out.exists()
 
