@@ -40,6 +40,11 @@ from shared.mcp_missing_arguments import MissingArgumentMiddleware
 
 from orchestrator.artifacts import TaskArtifacts, _validate_verdict_role
 from orchestrator.mcp import markup_journal, markup_sink
+from orchestrator.review_payload import (
+    ReviewPayloadError,
+    note_dispositions_record,
+    parse_note_dispositions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +71,8 @@ def _envelope(role: str, session_id: str, payload: dict) -> dict:
 # Standalone implementation functions (testable without MCP transport)
 #
 # Only _submit_review_verdict has constrained/validated fields (the
-# reviewer==role identity check and the verdict enum below) — the other
-# three payloads (completion/triage/merge) have no enum-like fields today,
+# reviewer==role identity check, the verdict enum and the note_dispositions
+# shape below) — the other three payloads (completion/triage/merge) have no enum-like fields today,
 # so they write whatever they receive. Booleans and lists are still
 # type-checked at the pydantic MCP tool boundary in create_server(). Add
 # parallel validation here if any of those payloads gain a constrained
@@ -94,6 +99,7 @@ def _submit_review_verdict(
     verdict: str,
     issues: list[dict],
     summary: str,
+    note_dispositions: list[dict] | None = None,
 ) -> dict[str, Any]:
     if reviewer != role:
         return {
@@ -109,11 +115,16 @@ def _submit_review_verdict(
             'status': 'error',
             'message': f'verdict must be one of PASS/ISSUES_FOUND, got {verdict!r}',
         }
+    try:
+        parsed_notes = parse_note_dispositions(note_dispositions, reviewer=reviewer)
+    except ReviewPayloadError as exc:
+        return {'status': 'error', 'message': str(exc)}
     payload = {
         'reviewer': reviewer,
         'verdict': verdict,
         'issues': issues,
         'summary': summary,
+        **note_dispositions_record(parsed_notes),
     }
     return _write_and_ack(artifacts, role, session_id, payload)
 
@@ -475,6 +486,7 @@ def create_server(
             verdict: str,
             issues: list[dict],
             summary: str,
+            note_dispositions: list[dict] | None = None,
         ) -> dict[str, Any]:
             """Submit a reviewer's verdict for this task.
 
@@ -485,9 +497,16 @@ def create_server(
                 verdict: One of "PASS" or "ISSUES_FOUND".
                 issues: Structured list of issues found (empty if PASS).
                 summary: One-paragraph summary of the review.
+                note_dispositions: One entry per id listed in the briefing's
+                    "Implementer notes (open info escalations)" block, each
+                    {escalation_id, disposition: "addressed" | "no_action" |
+                    "work", rationale}. Omit it when the briefing lists no
+                    notes. A malformed list is rejected (status: error)
+                    rather than written.
             """
             return _submit_review_verdict(
                 artifacts, role, session_id, reviewer, verdict, issues, summary,
+                note_dispositions,
             )
 
     return mcp

@@ -1030,6 +1030,7 @@ class AgentStub:
                     rev_artifacts, role, session_id or 'sid',
                     so.get('reviewer'), so.get('verdict'),
                     so.get('issues'), so.get('summary'),
+                    note_dispositions=so.get('note_dispositions'),
                 )
             return result
         elif role == 'merger':
