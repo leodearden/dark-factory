@@ -22,7 +22,7 @@ from shared.project_id import fold_project_token
 from sitting import ledger as ledger_mod
 from sitting import preparation as prep_mod
 from sitting import prepare_sitting as mod
-from sitting.inventory import ItemKey, escalation_key, key_str
+from sitting.inventory import ItemKey, Shortfall, decision_key, escalation_key, key_str
 from sitting.ownership import ProbeResult
 from sitting.preparation import Manual, Standing
 
@@ -720,14 +720,22 @@ def _queue_key(root: Path, esc_id: str) -> ItemKey:
     return escalation_key(normalize_escalations_dir(root / 'data' / 'escalations'), esc_id)
 
 
-def _handover_probes(env: Env, roots: list[Path], override=None) -> dict[ItemKey, ProbeResult]:
-    now = datetime.fromisoformat(NOW)
-    sources = mod.read_sources(
+def _sources(env: Env, roots: list[Path], override=None) -> mod.Sources:
+    return mod.read_sources(
         project_roots=[str(root) for root in roots], decisions_root=env.fleet, sessions_root=env.sessions,
-        handover_override=override, preparation_path=env.preparation, project=None, now=now,
+        handover_override=override, preparation_path=env.preparation, project=None,
+        now=datetime.fromisoformat(NOW),
     )
-    classified = mod.classify(sources, recommend_only=True, ledger_standing={}, now=now)
+
+
+def _handover_probes(env: Env, roots: list[Path], override=None) -> dict[ItemKey, ProbeResult]:
+    sources = _sources(env, roots, override)
+    classified = mod.classify(sources, recommend_only=True, ledger_standing={}, now=datetime.fromisoformat(NOW))
     return {c.item.key: next(p for p in c.ownership.probes if p.probe == 'handover') for c in classified}
+
+
+def _handover_shortfalls(sources: mod.Sources) -> list[Shortfall]:
+    return [shortfall for shortfall in sources.shortfalls if shortfall.source == 'handover']
 
 
 class TestHandoverPerProject:
@@ -764,11 +772,33 @@ class TestHandoverPerProject:
         assert 'dark-factory watcher' not in reify_probe.evidence
         assert probes[_queue_key(third, 'esc-950-1')].status == 'unavailable'
 
+    def test_a_decision_item_reads_its_folded_projects_handover(self, env, reify):
+        record = DecisionRecord(id='dec-reify-1', project='Reify', text='keep the reify cockpit gate?',
+                                filed_at='2026-09-19T09:00:00+00:00', task_id='950')
+        (env.fleet / 'decisions' / 'dec-reify-1.json').write_text(record.to_json())
+        _write_handover(env.df, '# handover\n\ntask 950: the dark-factory watcher holds this\n')
+        _write_handover(reify, '# handover\n\ntask 950: the reify cockpit holds this\n')
+
+        probe = _handover_probes(env, [env.df, reify])[decision_key('dec-reify-1')]
+
+        assert probe.status == 'mentions'
+        assert 'the reify cockpit' in probe.evidence
+        assert 'dark-factory watcher' not in probe.evidence
+
     def test_an_override_replaces_only_its_projects_handover(self, env, reify, elsewhere):
         probes = _handover_probes(env, [env.df, reify], mod.HandoverOverride('reify', elsewhere))
 
         assert 'read from the override' in probes[_queue_key(reify, 'esc-100-1')].evidence
         assert 'the dark-factory watcher' in probes[_queue_key(env.df, 'esc-100-1')].evidence
+
+    def test_an_override_no_item_reads_is_a_stated_shortfall(self, env, reify, elsewhere):
+        read = _sources(env, [env.df, reify], mod.HandoverOverride('reify', elsewhere))
+        unread = _sources(env, [env.df, reify], mod.HandoverOverride('darkfactory', elsewhere))
+
+        assert _handover_shortfalls(read) == []
+        (shortfall,) = _handover_shortfalls(unread)
+        assert shortfall.path == str(elsewhere)
+        assert "'darkfactory'" in shortfall.reason
 
     def test_an_override_naming_a_missing_file_is_unavailable_and_names_it(self, env, reify):
         absent = env.tmp / 'absent.md'
@@ -798,7 +828,7 @@ class TestHandoverPerProject:
             mod.main(['brief', *env.args(), '--handover', str(elsewhere)])
 
         assert exited.value.code == 2
-        assert 'PROJECT=PATH' in capsys.readouterr().err
+        assert f'--handover takes PROJECT=PATH, got {str(elsewhere)!r}' in capsys.readouterr().err
 
 
 class TestMachineOutputs:

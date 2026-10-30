@@ -178,6 +178,7 @@ def read_sources(
     task_rows = _task_rows(queue_roots)
     stored, problem = _load_preparations(preparation_path)
     shortfalls += [*found.shortfalls, *sessions.shortfalls, *([problem] if problem else [])]
+    shortfalls += _unread_override(handover_override, found.items)
     shortfalls += [Shortfall('tasks_db', project, rows.unavailable) for project, rows in task_rows.items()
                    if rows.unavailable]
     return Sources(
@@ -382,6 +383,13 @@ def _handovers(roots: Mapping[str, Path], override: HandoverOverride | None) -> 
     if override is not None:
         found[override.project] = override.path
     return MappingProxyType(found)
+
+
+def _unread_override(override: HandoverOverride | None, items: Iterable[OpenItem]) -> list[Shortfall]:
+    if override is None or any(item.project == override.project for item in items):
+        return []
+    reason = f'--handover names {override.project!r}, but no item of that project is in this run; never read'
+    return [Shortfall('handover', str(override.path), reason)]
 
 
 def _load_preparations(path: Path) -> tuple[PreparationStore, Shortfall | None]:
