@@ -845,3 +845,17 @@ test('tab_tasks.jsx::TasksTab reports a preference it cannot store on console.wa
     `no console.warn named 'df.tasks.views' with its QuotaExceededError: ${JSON.stringify(warnings.map(([message]) => String(message)))}`,
   );
 });
+
+test('tab_tasks.jsx::TasksTab stores a flipped view, seeds the next mount with it, and removes the key when flipped back', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const first = mountTasks(harness);
+  click(window, viewButton(window, first.container, 'terminal'));
+  assert.equal(JSON.parse(window.localStorage.getItem('df.tasks.views'))?.terminal, true, 'the flipped view was not stored');
+  first.unmount();
+
+  const { container } = mountTasks(harness);
+  assert.ok(viewButton(window, container, 'terminal').classList.contains('on'), 'the stored view did not seed the next mount');
+  click(window, viewButton(window, container, 'terminal'));
+  assert.ok(!storedKeys(window).includes('df.tasks.views'), 'the view is back at its default, yet its key is still stored');
+});
