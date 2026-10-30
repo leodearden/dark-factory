@@ -2675,23 +2675,29 @@ class MemoryService:
         """Open only what search, count_memories_by_metadata and get_memories_by_metadata need.
 
         Runs no Graphiti startup maintenance, starts no durable write queue and
-        opens the planned registry read-only. It does NOT make the service
+        opens the planned registry read-only, unless one is already wired, which
+        it keeps as initialize() does. It does NOT make the service
         write-proof: mem0 writes would still reach Qdrant, hence not "read_only".
         """
         await self.graphiti.initialize(skip_maintenance=True)
 
+        if self.planned_episode_registry is None:
+            self.planned_episode_registry = await self._open_planned_registry_read_only()
+
+        logger.info('MemoryService initialized for reads')
+
+    async def _open_planned_registry_read_only(self) -> PlannedEpisodeRegistry | None:
         from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
         data_dir = self.config.queue.data_dir
         try:
-            self.planned_episode_registry = await PlannedEpisodeRegistry.open_read_only(data_dir)
+            return await PlannedEpisodeRegistry.open_read_only(data_dir)
         except FileNotFoundError:
             logger.warning(
                 'no planned episode registry under %s; search will filter no '
                 'planned-only Graphiti edges',
                 data_dir,
             )
-
-        logger.info('MemoryService initialized for reads')
+            return None
 
     async def _safe_close(self, label: str, resource: Any, timeout: float) -> None:
         """Close one resource, time-boxed and logging any failure without re-raising.

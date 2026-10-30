@@ -76,3 +76,17 @@ async def test_a_populated_queue_dir_gains_no_queue_or_sidecar(svc, mock_config)
     assert await registry.get_planned_uuids('proj') == {'ep-1'}
     with pytest.raises(sqlite3.OperationalError):
         await registry.register('ep-2', 'proj')
+
+
+@pytest.mark.asyncio
+async def test_a_wired_registry_is_kept(svc, mock_config):
+    data_dir = Path(mock_config.queue.data_dir)
+    wired = PlannedEpisodeRegistry(data_dir=data_dir)
+    await wired.initialize()
+    svc.set_planned_registry(wired)
+
+    await svc.initialize_for_reads()
+
+    assert svc.planned_episode_registry is wired
+    await wired.register('ep-1', 'proj')
+    assert await wired.get_planned_uuids('proj') == {'ep-1'}

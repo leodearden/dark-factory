@@ -53,9 +53,9 @@ class PlannedEpisodeRegistry:
         await registry.close()
     """
 
-    def __init__(self, data_dir: str | Path) -> None:
+    def __init__(self, data_dir: str | Path, *, access: AtomicConnection | None = None) -> None:
         self._data_dir = Path(data_dir)
-        self._access: AtomicConnection | None = None
+        self._access = access
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -85,9 +85,7 @@ class PlannedEpisodeRegistry:
         if not await asyncio.to_thread(path.is_file):
             raise FileNotFoundError(f'no planned episode registry at {path}')
         conn = await connect_daemon(f'{path.resolve().as_uri()}?mode=ro', uri=True)
-        registry = cls(data_dir)
-        registry._access = AtomicConnection(conn)
-        return registry
+        return cls(data_dir, access=AtomicConnection(conn))
 
     def _require_access(self) -> AtomicConnection:
         if self._access is None:
