@@ -47,6 +47,7 @@ from orchestrator.merge_lane.types import (
     OutcomeKind,
     TerminalOutcomeRetention,
 )
+from orchestrator.rebase_drops import DroppedCommit, RebaseDropLedger
 from orchestrator.verify import VerifyResult, run_verification
 
 if TYPE_CHECKING:
@@ -388,11 +389,19 @@ class PlanFilesTouchedResult:
             architect's spelling, pre-normalization) so the diagnostic names
             exactly what plan.json says.  A resolution alone never passes the
             gate — the resolved path must additionally be in the touched set.
+        dropped_by_rebase: Declared entry → the commits a rebase dropped
+            from the branch that wrote it, keyed by the ORIGINAL declared
+            string like ``resolved_renames``.  ALWAYS a subset of
+            ``not_touched`` and disjoint from ``missing_from_tree``.  A key
+            means the branch DID write a change to that entry and a later
+            rebase dropped it because the rebase target already carried the
+            change (task 4669) — not under-delivery.
     """
 
     not_touched: list[str] = field(default_factory=list)
     missing_from_tree: list[str] = field(default_factory=list)
     resolved_renames: dict[str, str] = field(default_factory=dict)
+    dropped_by_rebase: dict[str, tuple[DroppedCommit, ...]] = field(default_factory=dict)
 
 
 DROPPED_PLAN_TARGETS_REASON_PREFIX = 'Merge commit is missing plan target files'
@@ -410,6 +419,80 @@ the branch's history (``base..HEAD``) doesn't touch them, the implementation
 hasn't actually delivered against the plan — short-circuit straight to L1
 without involving the steward (mutating plan.json to silence the gate
 would defeat its purpose)."""
+
+
+def plan_files_not_touched_reason(check: PlanFilesTouchedResult) -> str:
+    """The block reason for a failed plan-files gate, scoped class by class.
+
+    The head, :data:`PLAN_FILES_NOT_TOUCHED_REASON_PREFIX` plus every
+    untouched entry, is the contract
+    ``orchestrator/src/orchestrator/unblock_types.py::classify_block_reason``
+    keys on via ``startswith``.  Each clause after it names only its own
+    class, because each class is a different failure: entries no commit
+    touched, entries a rebase dropped (task 4669), entries absent from the
+    tree (task 3110), and the rename audit trail.
+    """
+    stale_set = set(check.missing_from_tree)
+    live = [e for e in check.not_touched if e not in stale_set]
+    return ''.join((
+        f'{PLAN_FILES_NOT_TOUCHED_REASON_PREFIX}: {", ".join(check.not_touched)}. ',
+        _unwritten_clause([e for e in live if e not in check.dropped_by_rebase]),
+        _dropped_clause({
+            e: check.dropped_by_rebase[e] for e in live if e in check.dropped_by_rebase
+        }),
+        _stale_clause([e for e in check.not_touched if e in stale_set]),
+        _rename_clause(check.resolved_renames),
+    )).strip()
+
+
+def _unwritten_clause(entries: list[str]) -> str:
+    if not entries:
+        return ''
+    return (
+        f'The architect declared these files but no commit on the branch '
+        f'touched them: {", ".join(entries)}.  '
+        f'Implementation has not delivered against the plan.  '
+    )
+
+
+def _dropped_clause(dropped: dict[str, tuple[DroppedCommit, ...]]) -> str:
+    if not dropped:
+        return ''
+    entries = '; '.join(
+        f'{entry} (by {", ".join(_commit_label(c) for c in commits)})'
+        for entry, commits in dropped.items()
+    )
+    return (
+        f'These changes were written on this branch and then dropped by a '
+        f'rebase whose target already carried them, so this is not an '
+        f'implementation gap: {entries}.  Re-derive each change against '
+        f'current main (a version or cache-buster bump must be recomputed '
+        f"past main's value), commit it, and re-submit.  "
+    )
+
+
+def _commit_label(commit: DroppedCommit) -> str:
+    return f'{commit.sha[:12]} "{commit.subject}"'
+
+
+def _stale_clause(entries: list[str]) -> str:
+    if not entries:
+        return ''
+    return (
+        f'Declared path does not exist in the tree at branch HEAD (renamed or '
+        f'never created), so the branch-touched set was not consulted for: '
+        f'{", ".join(entries)} — investigate the declared path, not the '
+        f'branch.  '
+    )
+
+
+def _rename_clause(resolved_renames: dict[str, str]) -> str:
+    if not resolved_renames:
+        return ''
+    pairs = ', '.join(
+        f'{declared} -> {resolved}' for declared, resolved in resolved_renames.items()
+    )
+    return f'Rename resolution: {pairs}.'
 
 
 CROSS_REPO_DELIVERABLE_REASON_PREFIX = 'Cross-repo deliverable'
@@ -2676,6 +2759,7 @@ async def _check_plan_files_touched_in_branch(
     git_ops: GitOps,
     *,
     task_id: str | None = None,
+    branch: str | None = None,
 ) -> PlanFilesTouchedResult:
     """Pre-merge Decision-1 check: every plan file must be touched on the branch.
 
@@ -2702,6 +2786,12 @@ async def _check_plan_files_touched_in_branch(
     measure.
 
     Empty ``plan_files`` returns no entries — vacuously satisfied.
+
+    When *branch* (the full branch name) is given, each untouched entry that
+    is present in the tree is checked against the commits a rebase dropped
+    from that branch (``orchestrator/src/orchestrator/rebase_drops.py::RebaseDropLedger``)
+    and reported in ``dropped_by_rebase``.  That attribution only explains a
+    failure; it never passes the gate.
 
     Fail-open on git error (matches :func:`_check_plan_targets_in_tree`):
     return an empty ``PlanFilesTouchedResult`` so a transient diff error
@@ -2847,19 +2937,56 @@ async def _check_plan_files_touched_in_branch(
 
         not_touched.append(entry)
 
+    dropped_by_rebase = await _attribute_rebase_drops(
+        [e for e in not_touched if e not in missing_from_tree],
+        branch, git_ops, task_id=task_id,
+    )
     if not_touched:
         logger.warning(
             'plan-files-touched: not_touched task_id=%s '
             'base=%s head=%s entries=%r '
-            'missing_from_tree=%r resolved_renames=%r',
+            'missing_from_tree=%r resolved_renames=%r dropped_by_rebase=%r',
             task_id or '<unknown>', base_sha, branch_head, not_touched,
-            missing_from_tree, resolved_renames,
+            missing_from_tree, resolved_renames, dropped_by_rebase,
         )
     return PlanFilesTouchedResult(
         not_touched=not_touched,
         missing_from_tree=missing_from_tree,
         resolved_renames=resolved_renames,
+        dropped_by_rebase=dropped_by_rebase,
     )
+
+
+async def _attribute_rebase_drops(
+    entries: list[str],
+    branch: str | None,
+    git_ops: GitOps,
+    *,
+    task_id: str | None,
+) -> dict[str, tuple[DroppedCommit, ...]]:
+    """Map each of *entries* to the commits a rebase dropped from *branch*
+    that covered it, through the same exact-or-beneath predicate
+    (:func:`_entry_covered`) the already-landed resolver uses.
+
+    Fail-open: a ledger that cannot be read attributes nothing.
+    """
+    if branch is None or not entries:
+        return {}
+    try:
+        dropped = await RebaseDropLedger(git_ops.project_root, _run).dropped_of(branch)
+    except Exception as exc:
+        logger.warning(
+            'plan-files-touched: could not read rebase drops task_id=%s branch=%s: %s',
+            task_id or '<unknown>', branch, exc,
+        )
+        return {}
+    attributed: dict[str, tuple[DroppedCommit, ...]] = {}
+    for entry in entries:
+        norm = _normalize_plan_path(entry)
+        covering = tuple(c for c in dropped if _entry_covered(norm, set(c.paths)))
+        if covering:
+            attributed[entry] = covering
+    return attributed
 
 
 async def _rename_aware_compare_set(
