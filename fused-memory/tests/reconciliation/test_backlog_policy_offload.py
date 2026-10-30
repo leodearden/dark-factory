@@ -47,6 +47,19 @@ def _probe_the_queue_dir(monkeypatch: pytest.MonkeyPatch, probe: LoopFreedomProb
     )
 
 
+def _probe_the_queue(monkeypatch: pytest.MonkeyPatch, probe: LoopFreedomProbe) -> None:
+    class _ProbedQueue(EscalationQueue):
+        def __init__(self, *a, **kw):
+            probe.block()
+            super().__init__(*a, **kw)
+
+        def resolve(self, *a, **kw):
+            probe.block()
+            return super().resolve(*a, **kw)
+
+    monkeypatch.setattr(backlog_policy, 'EscalationQueue', _ProbedQueue)
+
+
 class TestUnhaltRunsOffTheEventLoop:
     @pytest.mark.asyncio
     async def test_scanning_and_closing_a_halt_leaves_the_event_loop_free(
@@ -62,6 +75,7 @@ class TestUnhaltRunsOffTheEventLoop:
 
         probe = LoopFreedomProbe()
         _probe_the_queue_dir(monkeypatch, probe)
+        _probe_the_queue(monkeypatch, probe)
 
         assert await policy.on_judge_unhalt('proj') == [halt_id]
         probe.assert_loop_stayed_free()
