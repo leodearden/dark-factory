@@ -7258,6 +7258,30 @@ class TestContradictedEscalation:
         assert len(escalated) == 1, result.get('actions')
         _assert_store_io_off_the_loop(threads, loop_thread)
 
+    @pytest.mark.asyncio
+    async def test_contradicted_escalation_writes_an_escalation_journal_row(
+        self, reconciler, journal, tmp_path,
+    ):
+        """Journaled as write/escalation/submit like the sweep's filings, and
+        never as a second verify row, which would double-count task 4343's
+        one-outcome-row census."""
+        from escalation.queue import EscalationQueue
+
+        reconciler.verifier.verify = AsyncMock(return_value=_contradicted_result())
+
+        await _run_done_transition(reconciler, project_root=str(tmp_path))
+
+        [filed] = EscalationQueue(escalation_queue_dir(tmp_path)).get_pending()
+        writes = await _journal_rows(journal, 'write', 'escalation', 'submit')
+        assert [w['detail'] for w in writes] == [{
+            'task_id': '1', 'type': 'verification_contradicted_escalated',
+            'escalation_id': filed.id,
+        }], f'Expected one write/escalation/submit row naming {filed.id!r}, got: {writes}'
+        skips = await _journal_rows(journal, 'skip', 'escalation', 'submit')
+        assert not skips, f'A filed escalation is not a skip; got: {skips}'
+        ops = [r['operation'] for r in _verify_rows(await _run_rows(journal))]
+        assert ops == ['contradicted'], f'Expected only the outcome verify row, got {ops}'
+
     @pytest.mark.parametrize('result_kwargs, label', [
         ({'verdict': VerificationVerdict.confirmed}, 'confirmed'),
         ({'verdict': VerificationVerdict.inconclusive}, 'inconclusive'),
@@ -7266,7 +7290,7 @@ class TestContradictedEscalation:
     ])
     @pytest.mark.asyncio
     async def test_non_contradicted_verdicts_file_nothing(
-        self, reconciler, tmp_path, result_kwargs, label
+        self, reconciler, journal, tmp_path, result_kwargs, label
     ):
         """Only `contradicted AND not agent_failed` alerts a human.
 
@@ -7290,6 +7314,10 @@ class TestContradictedEscalation:
             a for a in result.get('actions', [])
             if a['type'] == 'verification_contradicted_escalated'
         ], f'A {label} verdict must not escalate, got {result.get("actions")}'
+        escalation_rows = [r for r in await _run_rows(journal) if r['target'] == 'escalation']
+        assert not escalation_rows, (
+            f'A {label} verdict must not journal an escalation, got {escalation_rows}'
+        )
 
 
 class TestContradictedEscalationFailureContainment:
@@ -7304,10 +7332,14 @@ class TestContradictedEscalationFailureContainment:
     escalation method so none of that can happen.
     """
 
-    @pytest.mark.parametrize('stage', ['init', 'submit'])
+    @pytest.mark.parametrize('stage,raised', [
+        pytest.param('init', 'read-only fs', id='init'),
+        pytest.param('submit', 'disk full', id='submit'),
+    ])
     @pytest.mark.asyncio
     async def test_broken_escalation_store_does_not_damage_the_run(
-        self, make_reconciler, journal, mock_memory_service, caplog, tmp_path, stage
+        self, make_reconciler, journal, mock_memory_service, caplog, tmp_path,
+        stage, raised,
     ):
         reconciler = make_reconciler(
             escalation_queue_factory=_raising_escalation_queue_factory(stage),
@@ -7345,6 +7377,16 @@ class TestContradictedEscalationFailureContainment:
         assert not [
             a for a in rows if a['operation'] in ('post_verify_error', 'error')
         ], f'No failure row may be emitted, got {[a["operation"] for a in rows]}'
+
+        # The failed filing is journaled as the symmetric skip row, the way
+        # the sweep's test_escalate_failure_writes_skip_row pins its own.
+        skips = await _journal_rows(journal, 'skip', 'escalation', 'submit')
+        assert [s['detail'] for s in skips] == [{
+            'task_id': '1', 'type': 'verification_contradicted_escalated',
+            'error': raised,
+        }], f'Expected one skip/escalation/submit row, got: {skips}'
+        writes = await _journal_rows(journal, 'write', 'escalation', 'submit')
+        assert not writes, f'Nothing was filed, so expected no write row; got: {writes}'
 
         # The WARNING names the task and identifies the escalation as the
         # failed stage — the generic verify failure message would misdiagnose it.
@@ -7486,6 +7528,11 @@ class TestContradictedEscalationWithoutTheEscalationPackage:
         ops = [a['operation'] for a in _verify_rows(await journal.get_run_actions(runs[0].id))]
         assert ops == ['contradicted'], (
             f'Expected only the outcome row, got {ops}'
+        )
+        escalation_rows = [r for r in await _run_rows(journal) if r['target'] == 'escalation']
+        assert not escalation_rows, (
+            f'An absent optional package is not a failed filing: expected no '
+            f'escalation rows, got {escalation_rows}'
         )
         msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
         assert not any('escalat' in m.lower() for m in msgs), (
