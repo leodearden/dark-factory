@@ -606,10 +606,14 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             reason_prefix='Re-cut ruling unreadable',
             block_class=BlockClass.AGENT_FAILURE,
         ),
-        # Raised by acquire_warm_lane before any lane is touched. It cannot
-        # self-clear (a human worktree or a lane pinned to another assignment
-        # holds the branch), and it is deliberately NOT a WarmLaneRequeue so it
-        # can never feed the task-4930 steal-retry loop.
+        # Raised by acquire_warm_lane before any lane is touched, and
+        # deliberately NOT a WarmLaneRequeue so it can never feed the
+        # task-4930 steal-retry loop. A foreign worktree, a quarantined lane
+        # or a refused detach does not clear on its own. A lane the pool holds
+        # (REFUSE_HELD_LANE) can: a steal race, or a 4930 retry still holding a
+        # declined lane, frees it within seconds. That case blocks and
+        # escalates all the same, as the generic acquire FAULT did before
+        # task 5565.
         BranchCheckedOutElsewhere: BlockDisposition(
             category=FailureCategory.NONE,
             escalate_to_human=True,
