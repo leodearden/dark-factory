@@ -16,9 +16,11 @@ from _curator_fake import FakeCurator
 from _workflow_helpers import (
     AgentStub,
     _build_workflow_with_escalation,
-    _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see its docstring
     _init_repo,
     _make_git_ops,
+)
+from _workflow_helpers import (
+    _derive_meta_root_like_production as _derive_meta_root_like_production,
 )
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue

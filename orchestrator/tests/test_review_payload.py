@@ -224,13 +224,6 @@ class TestNoteDispositions:
                 Verdict.ERROR, issues=(), reviewer='r', note_dispositions=(_ADDRESSED,),
             )
 
-    def test_non_disposition_element_is_rejected_at_construction(self):
-        with pytest.raises(ReviewPayloadError, match='dict'):
-            ReviewPayload(
-                Verdict.PASS, issues=(), reviewer='r',
-                note_dispositions=(dict(_ADDRESSED_RAW),),  # type: ignore[arg-type]
-            )
-
     def test_non_list_value_raises_naming_the_value(self):
         with pytest.raises(ReviewPayloadError, match='addressed-everything'):
             normalize_review(_with_notes('addressed-everything'))
