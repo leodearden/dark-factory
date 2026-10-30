@@ -1082,6 +1082,19 @@ class TestEmittedStepEscalations:
             for record in caplog.records
         )
 
+    def test_append_over_malformed_field_rewrites_valid_store(
+        self, artifacts: TaskArtifacts
+    ):
+        store = artifacts.root / 'reconcile_state.json'
+        store.write_text(json.dumps({'emitted_done_step_escalations': None}))
+
+        artifacts.append_emitted_step_escalation('step-1', 'abc123')
+
+        assert artifacts.read_emitted_step_escalations() == {('step-1', 'abc123')}
+        assert json.loads(store.read_text()) == {
+            'emitted_done_step_escalations': [['step-1', 'abc123']]
+        }
+
 
 class TestVerdicts:
     """Verdict artifacts written by the verdict-tools MCP server (task 2481)."""
