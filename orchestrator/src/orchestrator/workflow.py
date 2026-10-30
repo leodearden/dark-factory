@@ -110,7 +110,13 @@ from orchestrator.dry_run_unblock import (
     investigation_task_name,
     run_dry_run_unblock,
 )
-from orchestrator.escalation_router import InfoL0Sweep, RouterPorts, exit_kind_for, router_owns
+from orchestrator.escalation_router import (
+    InfoL0Sweep,
+    RouterPorts,
+    exit_kind_for,
+    reviewer_notes,
+    router_owns,
+)
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.exit_contract import (
     ExitStatusWriteFailure,
@@ -11329,16 +11335,18 @@ class TaskWorkflow:
         set, briefs the context-complete generation from it instead of *diff*.
         """
         assert self.worktree is not None and self.artifacts is not None
+        notes = self._reviewer_notes()
         if subject is None:
             build_prompt = partial(
                 self.briefing.build_reviewer_prompt,
                 role.name, diff, amendment_suggestions=amendment_suggestions,
-                task=self.task,
+                task=self.task, open_info_notes=notes,
             )
         else:
             build_prompt = partial(
                 self.briefing.build_context_complete_reviewer_prompt,
                 role.name, subject, amendment_suggestions=amendment_suggestions,
+                open_info_notes=notes,
             )
 
         # I-FRESH: never consume a stale verdict from a prior invocation on
@@ -18715,6 +18723,23 @@ class TaskWorkflow:
             project_root=str(self.config.project_root),
             filing_claimant_run_id=self._filing_claimant_run_id,
         )
+
+    def _reviewer_notes(self) -> list[Escalation]:
+        """The open info notes the reviewer is briefed to disposition (D2); a queue fault costs only the list."""
+        queue = self.escalation_queue
+        if queue is None:
+            return []
+        try:
+            return reviewer_notes(
+                queue, task_id=self.task_id, enabled=self.config.info_l0_router_enabled,
+            )
+        except Exception as exc:
+            logger.warning(
+                'Task %s: reading the open info notes for the reviewer briefing failed '
+                '(%s: %s); the reviewer runs without them',
+                self.task_id, type(exc).__name__, exc, exc_info=True,
+            )
+            return []
 
     def _steward_work_outstanding(self) -> bool:
         """Whether there is anything for :meth:`_await_steward_completion` to
