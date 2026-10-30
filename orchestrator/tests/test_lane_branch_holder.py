@@ -44,7 +44,6 @@ class TestDecideBranchHolder:
         [
             pytest.param(LaneRecord(state=DurableLaneState.ASSIGNED, task_id='99'), id='other-task'),
             pytest.param(LaneRecord(state=DurableLaneState.RELEASED), id='released'),
-            pytest.param(LaneRecord(state=DurableLaneState.QUARANTINED), id='quarantined'),
             pytest.param(None, id='no-record'),
         ],
     )
@@ -52,6 +51,14 @@ class TestDecideBranchHolder:
         action = decide_branch_holder(task_id='43', lane=_LANE, lane_held=False, record=record)
 
         assert action is BranchHolderAction.DETACH_OWNERLESS_LANE
+
+    @pytest.mark.parametrize('owner', ['43', '99', None])
+    def test_unheld_quarantined_lane_is_refused_whoever_it_names(self, owner: str | None):
+        record = LaneRecord(state=DurableLaneState.QUARANTINED, task_id=owner)
+
+        action = decide_branch_holder(task_id='43', lane=_LANE, lane_held=False, record=record)
+
+        assert action is BranchHolderAction.REFUSE_QUARANTINED_LANE
 
 
 class TestBranchCheckedOutElsewhere:
@@ -82,6 +89,19 @@ class TestBranchCheckedOutElsewhere:
         message = str(exc)
         assert 'task/99' in message
         assert '/pool/_lane-1' in message
+        assert 'no lane was touched' in message
+
+    def test_quarantined_lane_refusal_says_no_lane_was_touched(self):
+        exc = BranchCheckedOutElsewhere(
+            branch='task/43',
+            holder=Path('/pool/_lane-1'),
+            action=BranchHolderAction.REFUSE_QUARANTINED_LANE,
+        )
+
+        message = str(exc)
+        assert 'task/43' in message
+        assert '/pool/_lane-1' in message
+        assert 'quarantined' in message
         assert 'no lane was touched' in message
 
     def test_failed_detach_says_the_lane_stays_pinned_to_the_task(self):

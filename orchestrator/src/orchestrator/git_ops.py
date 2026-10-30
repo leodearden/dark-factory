@@ -7171,10 +7171,10 @@ class GitOps:
         other lane fails "already used by worktree".  The decision is
         :func:`orchestrator.lane_branch_holder.decide_branch_holder`: a lane
         the task still durably owns is re-pinned so the REUSE route takes it;
-        an ownerless lane is detached and released, pinned to this task
-        meanwhile so no concurrent acquire can take it mid-detach (on a
-        refused detach the pin stays, keeping its WIP away from other tasks);
-        anything else raises :class:`BranchCheckedOutElsewhere`.  An
+        an ownerless, unquarantined lane is detached and released, pinned to
+        this task meanwhile so no concurrent acquire can take it mid-detach
+        (on a refused detach the pin stays, keeping its WIP away from other
+        tasks); anything else raises :class:`BranchCheckedOutElsewhere`.  An
         unreadable worktree listing fails open.
         """
         pool = self.warm_lane_pool

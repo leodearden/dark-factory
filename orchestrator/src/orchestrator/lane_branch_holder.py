@@ -5,7 +5,10 @@ would ``git checkout`` or ``git worktree add`` ``task/<id>`` while another
 worktree holds it fails with "already used by worktree".  The acquire settles
 that holder first: it reuses a lane the task still durably owns, detaches an
 ownerless lane, and refuses everything else with
-:class:`BranchCheckedOutElsewhere` before touching any lane.
+:class:`BranchCheckedOutElsewhere` before touching any lane.  A QUARANTINED
+lane is refused too, never detached: recovery leaves it alone on purpose, and
+its working tree may hold another incarnation's work that a detach would
+commit onto this task's branch.
 
 Pure: no git and no I/O.  The git-side orchestration lives on
 ``orchestrator/src/orchestrator/git_ops.py::GitOps._settle_branch_checkout``.
@@ -23,6 +26,7 @@ class BranchHolderAction(Enum):
     REUSE_OWN_LANE = 'reuse_own_lane'
     DETACH_OWNERLESS_LANE = 'detach_ownerless_lane'
     REFUSE_HELD_LANE = 'refuse_held_lane'
+    REFUSE_QUARANTINED_LANE = 'refuse_quarantined_lane'
     REFUSE_FOREIGN_WORKTREE = 'refuse_foreign_worktree'
 
 
@@ -43,6 +47,8 @@ def decide_branch_holder(
         return BranchHolderAction.REFUSE_FOREIGN_WORKTREE
     if lane_held:
         return BranchHolderAction.REFUSE_HELD_LANE
+    if record is not None and record.state is LaneState.QUARANTINED:
+        return BranchHolderAction.REFUSE_QUARANTINED_LANE
     if (
         record is not None
         and record.state in (LaneState.ASSIGNED, LaneState.IN_USE)
@@ -63,6 +69,11 @@ _REFUSAL_MESSAGES: dict[BranchHolderAction, str] = {
         'for another assignment — no lane was touched. Once that assignment '
         'is released, run `git -C {holder} checkout --detach` if the branch '
         'is still checked out there, then unblock the task.'
+    ),
+    BranchHolderAction.REFUSE_QUARANTINED_LANE: (
+        '{branch} is checked out in quarantined warm lane {holder} — no lane '
+        'was touched. Inspect that lane (`git -C {holder} status`), then '
+        'detach or remove it and unblock the task.'
     ),
     BranchHolderAction.DETACH_OWNERLESS_LANE: (
         '{branch} is checked out in ownerless warm lane {holder} and the detach '

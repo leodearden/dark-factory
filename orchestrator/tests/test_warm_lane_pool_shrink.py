@@ -510,6 +510,31 @@ async def test_acquire_refuses_branch_checked_out_in_lane_the_pool_holds(ig_git_
 
 
 @pytest.mark.asyncio
+async def test_acquire_refuses_branch_checked_out_in_quarantined_lane(ig_git_repo: Path):
+    await _add_warm_lane_scripts(ig_git_repo)
+    git_ops = GitOps(_git_config(), ig_git_repo, warm_lane_pool_size=2)
+    pool = git_ops.warm_lane_pool
+    assert pool is not None
+    lane1 = git_ops.worktree_base / '_lane-1'
+    await _raw_task_checkout(ig_git_repo, lane1, '77')
+    lifecycle = LaneLifecycle(git_ops.worktree_base)
+    lifecycle.transition(lane1, DurableLaneState.QUARANTINED, task_id='77')
+    head = await _git(ig_git_repo, 'rev-parse', 'main')
+
+    with pytest.raises(BranchCheckedOutElsewhere) as refused:
+        await git_ops.acquire_warm_lane('77', head)
+
+    assert refused.value.action is BranchHolderAction.REFUSE_QUARANTINED_LANE
+    assert refused.value.holder.resolve() == lane1.resolve()
+    assert await _checked_out_branch(lane1) == 'refs/heads/task/77'
+    assert pool.assignment_for('77') is None
+    assert all(pool.state(lane) is LaneState.FREE for lane in pool.lane_paths())
+    record = lifecycle.read(lane1)
+    assert record is not None
+    assert record.state is DurableLaneState.QUARANTINED
+
+
+@pytest.mark.asyncio
 async def test_acquire_keeps_ownerless_lane_pinned_when_its_detach_is_refused(
     ig_git_repo: Path,
 ):
