@@ -18,9 +18,12 @@ import contextlib
 import dataclasses
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from _canned_mcp import CannedMCP
 from _dashboard_helpers import bug_warnings, node_path
 from shared.task_statuses import TERMINAL
+
+pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')
 
 # ---------------------------------------------------------------------------
 # /api/v2/dashboard/tasks?terminal=<project> — the on-demand window (task 5587)
@@ -59,29 +62,21 @@ def _install_terminal_roots(client, tmp_path, labels):
 
 @contextlib.contextmanager
 def _over_the_substrate(monkeypatch, canned):
-    """Requests made inside run with only ``mcp_tool_call`` canned, from a cold unit.
+    """Requests made inside run with only ``mcp_tool_call`` canned.
 
     Everything above the substrate is real: the handler, the collectors,
     ``acquire_snapshot`` and its cache. Requests made inside one block share
     that cache, as two renders inside one TTL do. The runtime probe is stubbed
     empty because the default render's full collector runs it, and it must
-    dial no orchestrator. The unit cache and the root rotation start, and are
-    left, empty.
+    dial no orchestrator. Each test enters one block, and the module's
+    ``fresh_task_snapshot_state`` fixture is what starts it from a cold unit
+    cache and root rotation.
     """
-    import dashboard.data.active_tasks as active_tasks_mod
-    import dashboard.data.task_snapshot as snapshot_mod
-
     monkeypatch.setattr(
         'dashboard.data.active_tasks.fetch_task_runtime', AsyncMock(return_value={}),
     )
-    snapshot_mod._snapshot_cache_clear()
-    active_tasks_mod._reset_root_rotation()
-    try:
-        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
-            yield
-    finally:
-        snapshot_mod._snapshot_cache_clear()
-        active_tasks_mod._reset_root_rotation()
+    with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+        yield
 
 
 def _terminal_render(

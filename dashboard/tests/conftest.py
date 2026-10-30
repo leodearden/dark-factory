@@ -123,6 +123,21 @@ async def dummy_client():
 
 
 @pytest.fixture()
+def fresh_task_snapshot_state():
+    """A test using this starts and leaves the task-snapshot collectors' state empty.
+
+    That per-process state is the snapshot unit cache, the last-good store
+    and the root rotation. Modules opt in with
+    ``pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')``.
+    """
+    from dashboard.data.active_tasks import reset_task_snapshot_state
+
+    reset_task_snapshot_state()
+    yield
+    reset_task_snapshot_state()
+
+
+@pytest.fixture()
 def dummy_config(tmp_path):
     from dashboard.config import DashboardConfig
 

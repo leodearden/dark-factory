@@ -49,45 +49,18 @@ from dashboard.data.census import TaskCensus
 from dashboard.data.datum import DatumState
 from dashboard.data.task_snapshot import SnapshotHealth, TaskSnapshot, classify
 
+# REQUIRED, not tidy. The rotation offset advances on every collector call,
+# so a test asserting WHICH roots were served, or in what order, would
+# otherwise depend on how many collector calls EARLIER tests made. The unit
+# cache and last-good store are keyed by project-root STRING and tests here
+# reuse root names across ``tmp_path`` directories, so a test's first
+# acquisition could otherwise be answered from an earlier test's cache, or
+# served an earlier test's rows as ``stale``.
+pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')
+
 # ---------------------------------------------------------------------------
 # helpers used inside the aggregator
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(autouse=True)
-def _reset_root_rotation_between_tests():
-    """Start every test from rotation offset 0.
-
-    REQUIRED, not tidy. ``active_tasks._root_rotation_offset`` is module state
-    that ``collect_tasks_with_counts`` advances on every call (task 4884), so
-    without this any test that asserts WHICH roots were served — or in what
-    order they were admitted — silently depends on how many times an EARLIER
-    test in the session happened to call the collector. That is a test that
-    passes or fails by file order, which is worse than one that fails.
-    """
-    import dashboard.data.active_tasks as at_mod
-
-    at_mod._reset_root_rotation()
-    yield
-    at_mod._reset_root_rotation()
-
-
-@pytest.fixture(autouse=True)
-def _clear_the_snapshot_unit_between_tests():
-    """No test may be served the previous test's snapshot.
-
-    REQUIRED for the same reason as the rotation reset above. The unit holds
-    a 15 s TTL cache AND a never-expiring last-good store, both keyed by
-    project-root STRING, and tests here reuse root names across ``tmp_path``
-    directories. Without this a test's first acquisition can be answered from
-    an earlier test's cache — issuing no MCP call at all — or, worse, served
-    an earlier test's rows as ``stale``.
-    """
-    import dashboard.data.task_snapshot as snapshot_mod
-
-    snapshot_mod._snapshot_cache_clear()
-    yield
-    snapshot_mod._snapshot_cache_clear()
 
 
 def test_minutes_since_handles_z_suffix_and_naive_iso():
@@ -3374,8 +3347,6 @@ class TestCollectTasksWithCountsFairness:
         the one ``_rotated_project_roots`` implements; deriving the count here
         keeps this test correct if that choice is ever revisited.
         """
-        import dashboard.data.active_tasks as at_mod
-
         config = self._n_root_config(tmp_path, 9)
         _register_runtime(monkeypatch, {})
         # DETERMINISTIC cut, not a wall-clock one. The served count must be a
@@ -3398,7 +3369,6 @@ class TestCollectTasksWithCountsFairness:
         budget = replace(
             TASKS_BUDGET, root_concurrency=1, per_project=0.05, total=5.0,
         )
-        at_mod._reset_root_rotation()
 
         async def _one_render() -> set[str]:
             admissions.clear()  # serve_first counts within ONE render
@@ -3441,15 +3411,12 @@ class TestCollectTasksWithCountsFairness:
         A random shuffle would also spread the starvation but would make both
         of those impossible.
         """
-        import dashboard.data.active_tasks as at_mod
-
         config = self._n_root_config(tmp_path, 5)
         _register_runtime(monkeypatch, {})
         admissions = self._admission_recorder(monkeypatch, dwell=0.0)
         # Width 1 so admission order is unambiguous rather than a race between
         # concurrently-admitted roots.
         width_one = replace(TASKS_BUDGET, root_concurrency=1)
-        at_mod._reset_root_rotation()
 
         await collect_tasks_with_counts(client=dummy_client, config=config, budget=width_one)
         first = list(admissions)
@@ -3477,12 +3444,9 @@ class TestCollectTasksWithCountsFairness:
         reshuffle on every 3 s poll — a fix for invisibility that trades it
         for unreadability.
         """
-        import dashboard.data.active_tasks as at_mod
-
         config = self._n_root_config(tmp_path, 5)
         _register_runtime(monkeypatch, {})
         self._admission_recorder(monkeypatch, dwell=0.0)
-        at_mod._reset_root_rotation()
 
         expected = [f'proj-{i:02d}' for i in range(5)]
         for render in range(4):

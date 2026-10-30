@@ -21,6 +21,9 @@ import pytest
 from _canned_mcp import CannedMCP, _raw_row
 from shared.task_statuses import ACTIVE
 
+pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')
+"""No unit, last good or rotation offset may cross a test."""
+
 NOW = datetime(2026, 9, 20, 12, 0, 0, tzinfo=UTC)
 """The one injected instant every collector call here stamps against."""
 
@@ -35,18 +38,6 @@ def _canned(pairs=_PAIRS) -> CannedMCP:
         status_map=dict(pairs),
         status_page_size=2000,
     )
-
-
-@pytest.fixture(autouse=True)
-def _isolate_caches():
-    """No unit, last good or rotation offset may cross a test."""
-    import dashboard.data.active_tasks as active_tasks_mod
-    import dashboard.data.task_snapshot as snapshot_mod
-
-    snapshot_mod._snapshot_cache_clear()
-    active_tasks_mod._reset_root_rotation()
-    yield
-    snapshot_mod._snapshot_cache_clear()
 
 
 @pytest.fixture()
@@ -241,11 +232,11 @@ class TestCollectCensusSnapshots:
         share, so a real acquisition is cut off without waiting out the
         shipped 14 s one.
         """
-        import dashboard.data.task_snapshot as snapshot_mod
         from dashboard.data.active_tasks import (
             TASKS_BUDGET,
             collect_census_snapshots,
             collect_tasks_with_counts,
+            reset_task_snapshot_state,
         )
         from dashboard.data.task_snapshot import SnapshotFailure, SnapshotHealth, classify
 
@@ -257,7 +248,7 @@ class TestCollectCensusSnapshots:
             census = await collect_census_snapshots(
                 dummy_client, two_roots, now=NOW, budget=budget,
             )
-            snapshot_mod._snapshot_cache_clear()
+            reset_task_snapshot_state()
             _rows, full = await collect_tasks_with_counts(
                 dummy_client, two_roots, now=NOW, budget=budget,
             )
