@@ -224,14 +224,15 @@ class TestGateAttributesAQualifiedTrainMember:
         assert result.landed_sha == sha
         assert result.matched_files == self.PLAN_FILES
 
-    async def test_a_revert_and_a_superstring_id_are_not_its_delivery(
+    async def test_a_superstring_id_is_not_its_delivery(
         self, git_ops: GitOps, git_repo: Path,
     ) -> None:
-        """Paired with the positive above, which alone would pass a template matching everything."""
-        _commit(
-            git_repo, {'src/pkg/member.py': '# reverted\n'},
-            'Revert "impl(924 step-2): deliver"',
-        )
+        """Paired with the positive above, which alone would pass a template matching everything.
+
+        No revert decoy here: ``_REVERT_SUBJECT_RE`` would mask a template
+        regression at this level, so revert rejection is pinned at the
+        template by ``TestGitDialect`` and ``TestNonDeliveriesDoNotAttribute``.
+        """
         parked = _commit(
             git_repo, {'src/pkg/member.py': '# another task\n'},
             'impl(9240 step-2): another task',

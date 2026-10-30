@@ -514,9 +514,9 @@ two templates agree on scope-position subjects.
 
 The narrowing trades recall for precision: a delivery cited only outside
 scope position, as in ``fix(git_ops): ... (task 3717)``, is not attributed
-here (census: the task-6221 commit message).  Anything this template misses
-falls through to the UNCHANGED ``plan_files_not_touched`` path —
-fail-closed, per this predicate's contract.
+here (census: the message of commit ``impl(6221 step-2): accept the qualified
+scope``).  Anything this template misses falls through to the UNCHANGED
+``plan_files_not_touched`` path — fail-closed, per this predicate's contract.
 
 Valid as both a git ``--extended-regexp`` pattern and a Python ``re``, which
 ``find_task_citation_commit`` requires of any override.
