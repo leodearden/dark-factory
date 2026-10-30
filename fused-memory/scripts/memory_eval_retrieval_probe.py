@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import tempfile
 import textwrap
@@ -1903,7 +1904,7 @@ async def _probe(args: argparse.Namespace, registry: TopicRegistry) -> ProbeOutc
     try:
         try:
             await memory.initialize_for_reads()
-        except OSError as exc:
+        except (OSError, sqlite3.Error) as exc:
             raise ProbeRunError(
                 f'the memory store could not be opened ({type(exc).__name__}): {exc}'
             ) from exc

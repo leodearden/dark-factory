@@ -24,6 +24,7 @@ from __future__ import annotations
 import errno
 import functools
 import json
+import sqlite3
 import types
 from pathlib import Path
 
@@ -4182,10 +4183,14 @@ class TestRunStampOverride:
 
 
 class _UnopenableStoreDouble(_ServiceDouble):
-    """A store whose open raises an OSError."""
+    """A store whose open raises *error*."""
+
+    def __init__(self, error: Exception):
+        super().__init__()
+        self._error = error
 
     async def initialize_for_reads(self):
-        raise PermissionError(errno.EACCES, 'Permission denied', '/unwritable/queue-data')
+        raise self._error
 
 
 def _error_lines(stderr: str) -> list[str]:
@@ -4215,9 +4220,23 @@ class TestNonStdoutOSErrorsAreAttributedAtTheirSeam:
             '--project-id', 'dark_factory',
         ]
 
-    def test_a_store_that_cannot_be_opened(self, monkeypatch, tmp_path, capsys):
+    @pytest.mark.parametrize(
+        ('error', 'detail'),
+        [
+            (
+                PermissionError(errno.EACCES, 'Permission denied', '/unreadable/planned_episodes.db'),
+                '/unreadable/planned_episodes.db',
+            ),
+            (
+                sqlite3.OperationalError('unable to open database file'),
+                'unable to open database file',
+            ),
+        ],
+        ids=['oserror', 'sqlite-error'],
+    )
+    def test_a_store_that_cannot_be_opened(self, monkeypatch, tmp_path, capsys, error, detail):
         m = _mod()
-        double = _UnopenableStoreDouble()
+        double = _UnopenableStoreDouble(error)
         _install_double(monkeypatch, double)
         out_root = tmp_path / 'out'
 
@@ -4227,7 +4246,7 @@ class TestNonStdoutOSErrorsAreAttributedAtTheirSeam:
         errors = _error_lines(capsys.readouterr().err)
         assert len(errors) == 1
         assert 'store' in errors[0]
-        assert '/unwritable/queue-data' in errors[0]
+        assert detail in errors[0]
         assert 'stdout' not in errors[0]
         assert double.closed
         assert not list(out_root.rglob('metrics-*.json'))
