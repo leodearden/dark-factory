@@ -10102,12 +10102,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # graph over the unfrozen suffix, debounce signature, cached main SHA,
         # per-branch bounce counter) now live on a SuffixConflictTracker
         # (orchestrator.suffix_graph), owned here as self._suffix_tracker.
-        # git_ops/lane_buffers/frozen_prefix/frozen_prefix_tip/retire_item are ALL injected
+        # git_ops/lane_buffers/frozen_requests/frozen_prefix_tip/retire_item are ALL injected
         # as narrow callables that RE-READ the live attribute on `self` on
         # every call (not `self` itself, and not a value/bound-method
         # snapshot captured once here) so the tracker is unit-testable
         # without a worker AND stays correct if this worker's `_git_ops` /
-        # `frozen_prefix` / `frozen_prefix_tip` is ever reassigned after
+        # `frozen_prefix_requests` / `frozen_prefix_tip` is ever reassigned after
         # construction (amend: reviewer robustness_stale_reference +
         # consistency — previously git_ops was a direct snapshot and
         # frozen_prefix/frozen_prefix_tip were bound-method snapshots, an
@@ -10123,7 +10123,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._suffix_tracker = SuffixConflictTracker(
             git_ops=lambda: self._git_ops,
             lane_buffers=lambda: self._lane_buffers,
-            frozen_prefix=lambda: self.frozen_prefix(),
+            frozen_requests=lambda: self.frozen_prefix_requests(),
             frozen_prefix_tip=lambda main_sha: self.frozen_prefix_tip(main_sha),
             retire_item=lambda rid: self._retire_item(rid),
         )
@@ -12408,7 +12408,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Pure/synchronous (no await).
         """
-        return tuple(e.item.request.request_id for e in self._frozen_inflight_entries())
+        return tuple(req.request_id for req in self.frozen_prefix_requests())
+
+    def frozen_prefix_requests(self) -> tuple[MergeRequest, ...]:
+        """Return the frozen prefix as request OBJECTS, in submission order.
+
+        The :class:`MergeRequest`-typed twin of :meth:`frozen_prefix`, as
+        :meth:`chain_snapshot` is of :meth:`unfrozen_suffix`.
+
+        Pure/synchronous (no await).
+        """
+        return tuple(e.item.request for e in self._frozen_inflight_entries())
 
     def unfrozen_suffix(self) -> tuple[str, ...]:
         """Return request_ids of the unfrozen suffix in pick order (ε=1890).
