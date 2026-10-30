@@ -211,6 +211,10 @@ class TestTheCommittedRerates:
             for rerate in _key().get('rerates', ())
         ]
 
+    def test_the_summary_names_the_brief_of_every_keyed_shard(self) -> None:
+        assert {name: spec['brief_sha256'] for name, spec in _summary()['shards'].items()} == {
+            name: spec['brief_sha256'] for name, spec in _key()['shards'].items()}
+
     def test_the_latest_rerate_was_keyed_under_the_committed_brief(self) -> None:
         rerates = _key().get('rerates', ())
         if not rerates:
