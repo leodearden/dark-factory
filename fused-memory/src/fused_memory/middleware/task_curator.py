@@ -2905,7 +2905,7 @@ class TaskCurator:
         embedding_withheld = _count_absent(embedding_unvisited_ids, seen_ids)
         dependency_withheld = _count_absent(dep_overflow_ids, seen_ids)
 
-        # Final cap — trim weakest entries first (embedding, then module, then dep).
+        # Final cap — trim weakest entries first (POOL_SOURCES reversed).
         pool, total_cap_dropped = _trim_pool(
             pool, self._config.curator.pool_total_cap,
         )
@@ -2915,12 +2915,14 @@ class TaskCurator:
         }
         withheld = PoolWithheld(
             by_source={
+                'sibling': 0,
                 'module': module_withheld,
                 'embedding': embedding_withheld,
                 'dependency': dependency_withheld,
                 'total_cap': total_cap_dropped,
             },
             caps={
+                'sibling': self._config.curator.pool_sibling_cap,
                 'module': module_cap,
                 'embedding': self._config.curator.pool_embedding_cap,
                 'dependency': dependency_cap,
@@ -3408,7 +3410,7 @@ def _trim_pool(
 ) -> tuple[list[PoolEntry], int]:
     """Trim a pool that exceeds the total cap, dropping the weakest first.
 
-    Weak = dependency > embedding > module > anchor, preserving anchor always.
+    Weak = the reverse of ``POOL_SOURCES``, preserving anchor always.
 
     Returns ``(kept, dropped_n)``. ``dropped_n`` is how many entries the cap
     removed, and it feeds the :class:`PoolWithheld` census so the prompt can
@@ -3419,7 +3421,7 @@ def _trim_pool(
     """
     if len(pool) <= total_cap:
         return pool, 0
-    weakest_order = ['dependency', 'embedding', 'module', 'anchor']
+    weakest_order = list(reversed(POOL_SOURCES))
     result = list(pool)
     for source in weakest_order:
         if len(result) <= total_cap:
