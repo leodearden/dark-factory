@@ -85,8 +85,12 @@ def episode(
     covering_task_id: str | None = None,
     filing_due_since: datetime | None = None,
     prior_task_ids: Sequence[str] = (),
+    ended_at: datetime | None = None,
 ) -> Episode:
-    """A live episode of *node* counted on *passes*: bound to *covering_task_id*, or due since *filing_due_since*."""
+    """An episode of *node* counted on *passes*, ended at *ended_at* (None: live).
+
+    It is bound to *covering_task_id*, or its filing is due since *filing_due_since*.
+    """
     last = passes[-1]
     return Episode(
         node=node,
@@ -105,7 +109,7 @@ def episode(
         escalation_id=None,
         notes=(),
         prior_task_ids=tuple(prior_task_ids),
-        ended_at=None,
+        ended_at=ended_at,
         last_refreshed_at=last.started_at,
         reproduce=None if filing_due_since is None else 'pytest tests',
     )

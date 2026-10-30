@@ -753,6 +753,62 @@ def test_a_resolved_stuck_record_does_not_own_the_filing(tmp_path: Path, capsys)
     assert _stranded(report)['verdict'] == 'fail'
 
 
+def test_a_re_crossing_after_its_filed_task_is_done_is_stranded_without_a_new_filing(tmp_path: Path, capsys):
+    project, second, (task,) = _filing_project(tmp_path, NODE_A)
+    project.tasks.tasks[task]['status'] = 'done'
+    recur = _red(project, T0 + timedelta(days=2), NODE_A, episodes_started=(NODE_A,))
+    recrossing = _red(
+        project, T0 + timedelta(days=2, hours=1), NODE_A, episodes_extended=(NODE_A,), threshold_reached=(NODE_A,),
+    )
+    project.save_command(command_record(UNIT, [
+        episode(NODE_A, [recur, recrossing], filing_due_since=NOW - timedelta(hours=5), prior_task_ids=(task,)),
+    ]))
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 1
+    assert (_stranded(report)['verdict'], _stranded(report)['examined']) == ('fail', 2)
+    (failure_line,) = _stranded(report)['failures']
+    assert recrossing.pass_id in failure_line
+    assert NODE_A in failure_line
+    assert second.pass_id not in failure_line
+
+
+def test_a_crossing_owned_only_by_an_ended_episodes_binding_is_owned(tmp_path: Path, capsys):
+    project, first, crossing = _crossing_project(tmp_path)
+    task_id = project.file_fix_task(UNIT, [NODE_A], [first, crossing])
+    project.save_command(command_record(UNIT, [
+        episode(NODE_A, [first, crossing], covering_task_id=task_id, ended_at=NOW - timedelta(hours=1)),
+    ]))
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    assert (_stranded(report)['verdict'], _stranded(report)['examined']) == ('pass', 1)
+
+
+def _absent_binding(project: SoakProject, first: LanePass, crossing: LanePass) -> str:
+    return '424242'
+
+
+def _binding_covering_another_test(project: SoakProject, first: LanePass, crossing: LanePass) -> str:
+    return project.file_fix_task(UNIT, [NODE_B], [first, crossing])
+
+
+@pytest.mark.parametrize('binding', [_absent_binding, _binding_covering_another_test])
+def test_a_binding_that_does_not_read_back_covering_the_test_does_not_own_it(tmp_path: Path, capsys, binding):
+    project, first, crossing = _crossing_project(tmp_path)
+    task_id = binding(project, first, crossing)
+    project.save_command(command_record(UNIT, [episode(NODE_A, [first, crossing], covering_task_id=task_id)]))
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 1
+    (failure_line,) = _stranded(report)['failures']
+    assert NODE_A in failure_line
+    assert crossing.pass_id in failure_line
+
+
 # --- figures ---------------------------------------------------------------------------
 
 NODE_C = 'tests/test_c.py::test_c'
