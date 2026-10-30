@@ -1377,15 +1377,24 @@ class TaskArtifacts:
         ``{"emitted_done_step_escalations": [[step_id, commit], ...]}``; each
         2-element list is re-tupled here and malformed entries are skipped.
 
-        Fail-safe: a missing file, corrupt/unreadable or non-UTF-8 JSON, or a
-        non-object payload all return an empty ``set``, so a corrupt sidecar
-        re-files rather than silently suppressing.
+        Fail-safe: a missing file, corrupt/unreadable or non-UTF-8 JSON, a
+        non-object payload, or a non-list ``emitted_done_step_escalations``
+        field all return an empty ``set``, so a corrupt sidecar re-files
+        rather than silently suppressing.
         """
-        data = self._read_json_object('reconcile_state.json')
+        name = 'reconcile_state.json'
+        data = self._read_json_object(name)
         if data is None:
             return set()
+        entries = data.get('emitted_done_step_escalations', [])
+        if not isinstance(entries, list):
+            logger.warning(
+                'Malformed %s at %s: emitted_done_step_escalations is not a list',
+                name, self._read_path(name),
+            )
+            return set()
         result: set[tuple[str, str]] = set()
-        for entry in data.get('emitted_done_step_escalations', []):
+        for entry in entries:
             # Each entry must be a 2-element [step_id, commit] list of strings;
             # skip anything malformed rather than raising (fail-safe read).
             if (
