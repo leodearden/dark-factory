@@ -5,10 +5,12 @@ BODY quotes a merge subject shadows the genuine merge. The selecting form in
 ``skills/_shared/deriving-landed-sha.md`` step 1 scans past such a body match;
 a ``--max-count=1`` stops at it. This guard extracts every marker search in
 ``skills/**/*.md`` (any fenced block or inline code span in which a
-``git log`` or ``git rev-list`` greps for ``$S`` or a ``Merge task/…`` /
-``Merge branch 'task/…'`` subject, whatever its other flags), RUNS it against a
-fixture history where a body match shadows the genuine marker, and requires it
-to print the genuine marker and nothing else.
+``git log`` or ``git rev-list`` greps for ``$S``, a ``Merge task/…`` /
+``Merge branch 'task/…'`` subject or the bare ``task/…`` branch name, whatever
+its other flags), RUNS it against a fixture history where a body match and a
+newer sibling marker whose branch extends the fixture's (``task/70010`` beside
+``task/7001``) shadow the genuine marker, and requires it to print the genuine
+marker and nothing else.
 
 It executes rather than greps for a flag because INV-10
 ``guards-exercise-behaviour`` (``docs/legibility/design-invariants.md``) asks a
@@ -44,7 +46,7 @@ COUNTEREXAMPLE_MARKER = 'marker-search-guard: counterexample'
 
 _COUNTEREXAMPLE_TAG = re.compile(rf'[ \t]*<!--[ \t]*{re.escape(COUNTEREXAMPLE_MARKER)}[ \t]*-->')
 _HISTORY_SEARCH_COMMAND = re.compile(r'\bgit\s+(?:log|rev-list)\b')
-_MARKER_GREP_OPTION = re.compile(r'''--grep[= ]['"]?\^?(?:\$\{?S\b|Merge (?:branch ')?task/[<\d])''')
+_MARKER_GREP_OPTION = re.compile(r'''--grep[= ]['"]?\^?(?:\$\{?S\b|(?:Merge (?:branch ')?)?task/[<\d])''')
 _FENCE_OPEN = re.compile(r'^\s*(`{3,})[^`]*$')
 _FENCE_CLOSE = re.compile(r'^\s*(`{3,})\s*$')
 _INLINE_SPAN = re.compile(r'(?<!`)`([^`]+)`(?!`)')
@@ -165,10 +167,24 @@ git log main --extended-regexp --format='%H%x09%s' --grep='^Merge task/[0-9]+ in
 ```
 
 Split with `awk -F'\t' '{print $1}'`, never use the bare `--grep ... --max-count=1`, and note that `--grep="Merge task/<task-id> into main"` alone is no command.
+
+Or pre-filter on the bare branch name:
+
+```bash
+S="Merge task/<TASK_ID> into main"
+git log main --fixed-strings --grep="task/<TASK_ID>" --format='%H%x09%s' \
+  | awk -F'\t' -v s="$S" '$2==s && !seen {print $1; seen=1}'
+```
+
+A careless bare-branch rewrite: `git log main --grep=task/42 --max-count=1 --format=%H`.
 """
 
 _SYNTHETIC_FENCED_SHELL = r"""S="Merge task/<TASK_ID> into main"
 git log main --fixed-strings --grep="$S" --format='%H%x09%s' \
+  | awk -F'\t' -v s="$S" '$2==s && !seen {print $1; seen=1}'"""
+
+_SYNTHETIC_BARE_BRANCH_FENCED_SHELL = r"""S="Merge task/<TASK_ID> into main"
+git log main --fixed-strings --grep="task/<TASK_ID>" --format='%H%x09%s' \
   | awk -F'\t' -v s="$S" '$2==s && !seen {print $1; seen=1}'"""
 
 _SYNTHETIC_INLINE_SHELL = (
@@ -192,11 +208,16 @@ def test_marker_search_extractor_reads_every_snippet_shape() -> None:
         MarkerSearch(
             'skills/synthetic.md', 18, '''git rev-list -1 main --grep="^Merge branch 'task/42'"''',
         ),
+        MarkerSearch('skills/synthetic.md', 28, _SYNTHETIC_BARE_BRANCH_FENCED_SHELL),
+        MarkerSearch(
+            'skills/synthetic.md', 34, 'git log main --grep=task/42 --max-count=1 --format=%H',
+        ),
     ]
 
 
 FIXTURE_TASK_ID = '7001'
 _FIXTURE_BRANCH = f'task/{FIXTURE_TASK_ID}'
+_SIBLING_BRANCH = f'{_FIXTURE_BRANCH}0'
 _MARKER_SUBJECT = format_merge_subject(_FIXTURE_BRANCH, 'main')
 _HAND_MERGE_SUBJECT = f"Merge branch '{_FIXTURE_BRANCH}'"
 _FIXTURE_IDENTITY = (
@@ -219,6 +240,7 @@ def _skill_marker_searches() -> list[MarkerSearch]:
 
 
 _LIVE_MARKER_SEARCHES = _skill_marker_searches()
+_NORMATIVE_MARKER_SEARCH_SOURCE = 'skills/_shared/deriving-landed-sha.md'
 
 
 def _search_id(search: MarkerSearch) -> str:
@@ -259,16 +281,40 @@ def _commit_file(root: Path, name: str, *messages: str) -> str:
     return _fixture_git(root, 'rev-parse', 'HEAD')
 
 
-def _merge_into_main(root: Path, subject: str) -> str:
+def _merge_into_main(root: Path, branch: str, message: str) -> str:
     _fixture_git(root, 'checkout', '-q', 'main')
-    _fixture_git(root, 'merge', '--no-ff', '-m', subject, _FIXTURE_BRANCH)
+    _fixture_git(root, 'merge', '--no-ff', '-m', message, branch)
     return _fixture_git(root, 'rev-parse', 'HEAD')
 
 
-@pytest.fixture(scope='module')
-def shadowed_history(tmp_path_factory: pytest.TempPathFactory) -> ShadowedHistory:
-    root = tmp_path_factory.mktemp('shadowed-history') / 'repo'
-    root.mkdir()
+def _wrapped_first_paragraph(subject: str) -> str:
+    wrapped = subject.replace(' into ', '\ninto ', 1)
+    assert wrapped != subject, f'{subject!r} has no " into " at which to wrap it onto two lines'
+    return wrapped
+
+
+_MARKER_MESSAGES = {
+    'one-line-subject': _MARKER_SUBJECT,
+    'wrapped-subject': _wrapped_first_paragraph(_MARKER_SUBJECT),
+}
+
+
+def _assert_marker_subject_premise(root: Path, marker: str, message: str) -> None:
+    subject = _fixture_git(root, 'log', '-1', '--format=%s', marker)
+    assert subject == _MARKER_SUBJECT, (
+        f'git log --format=%s printed {subject!r} for the orchestrator marker written with '
+        f'message {message!r}, not {_MARKER_SUBJECT!r}: git no longer joins a wrapped first '
+        'paragraph into one subject, which this history and GitOps._merge_markers_by_branch rely on'
+    )
+    if message != _MARKER_SUBJECT:
+        first_line = _fixture_git(root, 'log', '-1', '--format=%B', marker).split('\n', 1)[0]
+        assert first_line != _MARKER_SUBJECT, (
+            f'the orchestrator marker written with message {message!r} has the one-line first '
+            f'line {first_line!r}, so the wrapped-subject history is not wrapped'
+        )
+
+
+def _build_shadowed_history(root: Path, marker_message: str) -> ShadowedHistory:
     _fixture_git(root, 'init', '-q', '-b', 'main')
     assert (root / '.git').is_dir(), f'git init did not make {root} a repository root'
     _commit_file(root, 'README', 'initial commit')
@@ -276,10 +322,14 @@ def shadowed_history(tmp_path_factory: pytest.TempPathFactory) -> ShadowedHistor
     _commit_file(root, 'work-1', 'task work, part one')
     _fixture_git(root, 'checkout', '-q', 'main')
     _commit_file(root, 'main-1', 'main moves on')
-    orchestrator_marker = _merge_into_main(root, _MARKER_SUBJECT)
+    orchestrator_marker = _merge_into_main(root, _FIXTURE_BRANCH, marker_message)
+    _assert_marker_subject_premise(root, orchestrator_marker, marker_message)
     _fixture_git(root, 'checkout', '-q', _FIXTURE_BRANCH)
     _commit_file(root, 'work-2', 'task work, part two')
-    hand_merge = _merge_into_main(root, _HAND_MERGE_SUBJECT)
+    hand_merge = _merge_into_main(root, _FIXTURE_BRANCH, _HAND_MERGE_SUBJECT)
+    _fixture_git(root, 'checkout', '-q', '-b', _SIBLING_BRANCH)
+    _commit_file(root, 'sibling-work', 'sibling task work')
+    _merge_into_main(root, _SIBLING_BRANCH, format_merge_subject(_SIBLING_BRANCH, 'main'))
     shadow = _commit_file(
         root, 'docs',
         'docs: explain the marker search',
@@ -288,6 +338,15 @@ def shadowed_history(tmp_path_factory: pytest.TempPathFactory) -> ShadowedHistor
         f'{_MARKER_SUBJECT}\n{_HAND_MERGE_SUBJECT}',
     )
     return ShadowedHistory(root, frozenset({orchestrator_marker, hand_merge}), shadow)
+
+
+@pytest.fixture(scope='module', params=list(_MARKER_MESSAGES.values()), ids=list(_MARKER_MESSAGES))
+def shadowed_history(
+    request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory,
+) -> ShadowedHistory:
+    root = tmp_path_factory.mktemp('shadowed-history') / 'repo'
+    root.mkdir()
+    return _build_shadowed_history(root, request.param)
 
 
 def _snippet_env(history: ShadowedHistory) -> dict[str, str]:
@@ -304,7 +363,7 @@ def _violated_condition(
     if returncode != 0:
         return f'the snippet exited rc={returncode} instead of running cleanly'
     if not printed:
-        return 'the snippet printed no commit sha: the genuine marker behind a newer body match was lost'
+        return 'the snippet printed no commit sha: the genuine marker was not selected'
     if history.shadow in printed:
         return (
             f'the snippet printed {history.shadow}, a non-merge commit that only '
@@ -344,8 +403,12 @@ def _with_max_count(search: MarkerSearch) -> MarkerSearch:
 def test_skills_present_marker_searches() -> None:
     assert _LIVE_MARKER_SEARCHES, (
         'no merge-marker search (a code snippet whose git log or git rev-list greps for '
-        '$S or a merge subject) was found in skills/**/*.md, so the parametrised guards below collected '
-        'nothing and would pass without running a single snippet'
+        '$S, a merge subject or the bare task/… branch name) was found in skills/**/*.md, so the '
+        'parametrised guards below collected nothing and would pass without running a single snippet'
+    )
+    assert _NORMATIVE_MARKER_SEARCH_SOURCE in {search.source for search in _LIVE_MARKER_SEARCHES}, (
+        f'{_NORMATIVE_MARKER_SEARCH_SOURCE} presents no merge-marker search the selector '
+        'recognises, so its step-1 command, the normative copy, is no longer under guard'
     )
 
 
@@ -367,4 +430,21 @@ def test_max_count_reintroduction_is_caught(
         'marker: the fixture history does not shadow this snippet\'s subject, so the '
         'guard could not go red for it. Extend shadowed_history to cover it.\n'
         f'mutant:\n{mutant.shell}'
+    )
+
+
+_SUBSTRING_SELECTING_SEARCH = MarkerSearch(
+    'tests/scripts/test_merge_marker_search_snippets.py', 0,
+    r"""git log main --fixed-strings --grep="task/<TASK_ID>" --format='%H%x09%s' """
+    r"""| awk -F'\t' 'index($2, "task/<TASK_ID>") && !seen {print $1; seen=1}'""",
+)
+
+
+def test_substring_selection_is_caught(shadowed_history: ShadowedHistory) -> None:
+    assert _selection_defect(shadowed_history, _SUBSTRING_SELECTING_SEARCH) is not None, (
+        'a search that selects by branch SUBSTRING rather than subject equality still '
+        'selected only genuine markers: the fixture history has no newer sibling marker '
+        f'whose branch extends {_FIXTURE_BRANCH}, so the guard cannot catch a task/1 vs '
+        'task/10 collision.\n'
+        f'search:\n{_SUBSTRING_SELECTING_SEARCH.shell}'
     )
