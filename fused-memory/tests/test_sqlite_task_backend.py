@@ -1542,8 +1542,10 @@ async def test_update_task_additive_merge_too_deep_is_typed_under_enforce_mode(
 async def test_update_task_merge_mode_overwrites_a_too_deep_key_and_keeps_done_provenance(
     backend, project_root,
 ):
-    """The remedy the refusal names: metadata_mode='merge' replaces the deep
-    key wholesale without recursing, and every other stored key survives."""
+    """Pins the remedy the refusal's message names: metadata_mode='merge'
+    replaces the deep key wholesale without recursing, and every other stored
+    key survives. Merge mode never reaches the recursive merge, so this is a
+    contract test for that advice, not a regression test for the refusal."""
     depth = _too_deep_to_merge()
     await _seed_row_with_deep_key(backend, project_root, depth)
     await backend.update_task(

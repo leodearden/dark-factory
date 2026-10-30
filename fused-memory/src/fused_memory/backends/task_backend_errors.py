@@ -371,11 +371,11 @@ class MetadataNotAnObjectError(TaskmasterError):
 class MetadataTooDeepError(TaskmasterError):
     """Raised when an additive metadata merge is nested too deeply to recurse.
 
-    The merge used to fall back to last-write-wins here, keeping only the
-    payload's keys and dropping every stored key it omitted, ``done_provenance``
-    included (task 6248). Keeps the ``TASKMASTER_TOOL_ERROR`` code. Like
-    :class:`AppendUnsupportedFieldError` it has no ``to_error_dict()`` and
-    reaches callers raw through ``server/tool_errors.py::mcp_tool_errors``.
+    The write is refused and nothing is written: the stored metadata,
+    ``done_provenance`` included, is left unchanged. Keeps the
+    ``TASKMASTER_TOOL_ERROR`` code. Like :class:`AppendUnsupportedFieldError`
+    it has no ``to_error_dict()`` and reaches callers raw through
+    ``server/tool_errors.py::mcp_tool_errors``.
 
     Attributes:
         task_id: The task the rejected write targeted (``None`` if not supplied).
