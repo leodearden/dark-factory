@@ -23,6 +23,7 @@ import sys
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,7 @@ from _orch_helpers import (
     mcp_tool_envelope,
     required_timeout_secs,
 )
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.task_statuses import TaskStatus
 
@@ -44,6 +46,7 @@ from orchestrator.config import GitConfig, LaneCommand, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.offline_lane_episode_state import CommandRecord, Episode, EpisodeStore
+from orchestrator.offline_lane_escalations import UNLANDED_RED_CATEGORY, sentinel_task_id
 from orchestrator.offline_lane_filing import SPAWN_CONTEXT
 from orchestrator.offline_lane_pass import PassOutcomeHook
 from orchestrator.offline_lane_records import PassRecord, RunRecordStore
@@ -372,6 +375,20 @@ def submit_payload(case: str, **fields: Any) -> dict[str, Any]:
     return {**submit_responses()[case]['payload'], **fields}
 
 
+class StoreFault(StrEnum):
+    """How the task store can refuse a filing: unreachable, answering a tool error, or answering a ticket."""
+
+    TRANSPORT_DOWN = 'transport_down'
+    TOOL_ERROR = 'tool_error'
+    TICKET = 'ticket'
+
+
+#: The ``submit_task`` answer, by scenario-24 case, of a store degraded by each fault that answers.
+FAULT_SUBMIT_CASES: Mapping[StoreFault | None, str] = {
+    StoreFault.TOOL_ERROR: 'tool_error_structured', StoreFault.TICKET: 'ticket',
+}
+
+
 def metadata_holds(held: object, value: object) -> bool:
     return held == value or (isinstance(held, list) and value in held)
 
@@ -381,17 +398,47 @@ class FakeTaskStore:
 
     Every answer is the JSON-RPC body of a ``tools/call``; every ``submit_task`` answer is
     built from the scenario-24 fixture's payloads.  A submission collides with any
-    non-cancelled task of the same title, as fused-memory's dedup does.
+    non-cancelled task of the same title, as fused-memory's dedup does.  A degraded
+    store refuses as its ``StoreFault`` says; a store with parked commits holds every
+    ``commit_planning`` until the caller is cancelled.
     """
 
     def __init__(self) -> None:
         self.tasks: dict[str, dict[str, Any]] = {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.issued = 0
+        self.fault: StoreFault | None = None
+        self.commits_parked = False
+        self.commit_reached = asyncio.Event()
 
     async def call_tool(self, name: str, arguments: dict, *, timeout: float = 30) -> dict:
         self.calls.append((name, copy.deepcopy(arguments)))
+        if self.fault is StoreFault.TRANSPORT_DOWN:
+            raise ConnectionError('fused-memory is unreachable')
+        if name == 'commit_planning' and self.commits_parked:
+            self.commit_reached.set()
+            await asyncio.get_running_loop().create_future()
         return mcp_tool_envelope(self.answer(name, arguments))
+
+    def degrade(self, fault: StoreFault) -> None:
+        self.fault = fault
+
+    def restore(self) -> None:
+        self.fault = None
+
+    def park_commits(self) -> None:
+        self.commits_parked = True
+        self.commit_reached = asyncio.Event()
+
+    def release(self) -> None:
+        self.commits_parked = False
+
+    def set_status(self, task_id: str, status: str, *, fix_commit: str | None = None) -> None:
+        """Move a task as a person or the merge path would; a fix commit is recorded as its merged done provenance."""
+        task = self.tasks[task_id]
+        task['status'] = status
+        if fix_commit is not None:
+            task['metadata']['done_provenance'] = {'kind': 'merged', 'commit': fix_commit}
 
     def answer(self, name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
         match name:
@@ -409,6 +456,9 @@ class FakeTaskStore:
                 raise NotImplementedError(f'the fake task store answers no {name!r}')
 
     def submitted(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        fault_case = FAULT_SUBMIT_CASES.get(self.fault)
+        if fault_case is not None:
+            return submit_payload(fault_case)
         if not arguments.get('planning_mode'):
             raise NotImplementedError('the fake task store files planning-mode submissions only')
         title = arguments['title']
@@ -549,6 +599,10 @@ class RedPathLane:
     def command_name(self) -> str:
         return self.command.name
 
+    def restart(self) -> None:
+        """A process restart: a fresh worker, holding nothing in memory, over the same stores, git, queue and clock."""
+        self.worker = self.build_worker()
+
     def build_worker(self) -> OfflineLaneWorker:
         return OfflineLaneWorker(
             self.git,
@@ -562,6 +616,14 @@ class RedPathLane:
 
     async def head(self) -> str:
         return await head(self.project_root)
+
+    async def side_commit(self) -> str:
+        """A real commit whose parent is main's head and which main does not contain."""
+        return await git(self.project_root, 'commit-tree', 'main^{tree}', '-p', 'main', '-m', 'a fix not yet on main')
+
+    async def merge(self, sha: str) -> str:
+        await git(self.project_root, 'merge', '--no-ff', '-m', f'merge {sha[:12]}', sha)
+        return await self.head()
 
     async def drive(self, reads: int = 1, until: asyncio.Event | None = None) -> None:
         """Run the worker until it parks on the read after *reads* head reads, or until *until* is set."""
@@ -578,23 +640,26 @@ class RedPathLane:
                     await task
         assert failures.messages == [], f'the worker run loop failed a pass: {failures.messages}'
 
-    async def advance(self, *runs: Run, minutes: float = 30) -> PassRecord:
-        """Advance the clock and main, then drive the pass the merge trigger starts; *runs* are its sub-runs."""
+    async def advance(self, *runs: Run, minutes: float = 30, until: asyncio.Event | None = None) -> PassRecord:
+        """Advance the clock and main, then drive the pass the merge trigger starts; *runs* are its sub-runs.
+
+        With *until*, the worker is cancelled once that event is set, wherever the pass then is.
+        """
         self.clock.advance(minutes=minutes)
         self.advances += 1
         await commit(self.project_root, {ADVANCE_FILE: f'{self.advances}\n'}, f'advance {self.advances}')
-        return await self.triggered_pass(runs)
+        return await self.triggered_pass(runs, until)
 
     async def rerun(self, *runs: Run, minutes: float = 30) -> PassRecord:
         """Advance the clock only, then drive a triggered pass at the same head."""
         self.clock.advance(minutes=minutes)
         return await self.triggered_pass(runs)
 
-    async def triggered_pass(self, runs: Sequence[Run]) -> PassRecord:
+    async def triggered_pass(self, runs: Sequence[Run], until: asyncio.Event | None = None) -> PassRecord:
         self.stub.script(*runs)
         started = self.clock()
         await self.worker.on_post_merge('lane-fixture-merge', '', '')
-        await self.drive()
+        await self.drive(until=until)
         assert self.stub.unconsumed() == [], 'the pass left scripted sub-runs unconsumed'
         started_passes = self.passes(started)
         assert started_passes, 'the triggered drive started no pass'
@@ -618,3 +683,18 @@ class RedPathLane:
 
     def episode(self, node: str) -> Episode | None:
         return self.record().episodes.get(node)
+
+    def pending(self, category: str) -> list[Escalation]:
+        """The pending escalations of *category* on this command's sentinel task id."""
+        sentinel = sentinel_task_id(self.command_name)
+        return [
+            escalation for escalation in self.queue.get_pending()
+            if escalation.task_id == sentinel and escalation.category == category
+        ]
+
+    def unlanded(self) -> list[Escalation]:
+        return self.pending(UNLANDED_RED_CATEGORY)
+
+    def resolve(self, escalation_id: str) -> None:
+        """Resolve a record as a person would."""
+        assert self.queue.resolve(escalation_id, 'resolved by hand', resolved_by='operator') is not None
