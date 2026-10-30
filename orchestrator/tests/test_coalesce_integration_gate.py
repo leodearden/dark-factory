@@ -18,6 +18,7 @@ Four boundary scenarios + one speculative-cap bookkeeping assertion:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -43,6 +44,8 @@ from test_merge_queue_coalesce import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from orchestrator.config import OrchestratorConfig
     from orchestrator.git_ops import GitOps
 
@@ -71,6 +74,20 @@ def _solo_gate(target_task_id: str, gate_release: asyncio.Event) -> FakeVerifier
     is still held.
     """
     return FakeVerifier(scripts={target_task_id: hangs_until(gate_release)})
+
+
+@contextlib.contextmanager
+def _release_on_exit(gate: asyncio.Event) -> Iterator[None]:
+    """Set *gate* however the block is left.
+
+    A ``wait_responsive`` give-up or a failed assertion inside the block must
+    still free a verify parked on *gate*; otherwise the worker's stop meets
+    that verify still parked.
+    """
+    try:
+        yield
+    finally:
+        gate.set()
 
 
 async def _await_parked_verify(
@@ -224,7 +241,7 @@ class TestScenario1:
                 'orchestrator.merge_lane.worker.run_scoped_verification',
                 _gated_verify(gate_release, gate_entered),
             ):
-                try:
+                with _release_on_exit(gate_release):
                     # Wait for gated verify.  When gate_entered fires:
                     #   • _maybe_coalesce_waiting_singles has run — all 3 singles resolved
                     #     MergeOutcome('superseded') and the GroupMergeRequest is in _lane_buffers.
@@ -290,12 +307,8 @@ class TestScenario1:
                     assert len(absorbed) == 3, (
                         f'Expected 3 absorbed_request_ids; got {absorbed}'
                     )
-                finally:
-                    # Release gate — verify completes, advance_main runs.
-                    # On a give-up or failed assert above too, so the worker's
-                    # stop never meets a train verify still parked on the gate.
-                    gate_release.set()
 
+                # Gate released — verify completes, advance_main runs.
                 # Wait for all 3 mark_member_done calls (train fully landed).
                 # RED: FakeScheduler.statuses is empty → build_train_callback_factory's
                 # mark_member_done existence check no-ops (mid absent from scheduler) →
@@ -451,54 +464,49 @@ class TestScenario2:
         await queue.put(req3)
 
         async with running_merge_worker(worker):
-            with _no_predecessor_interlock():
-                try:
-                    await _await_parked_verify(verifier, 'ig_s23')
+            with _no_predecessor_interlock(), _release_on_exit(gate_release):
+                await _await_parked_verify(verifier, 'ig_s23')
 
-                    # (b) s23's future must be UNRESOLVED — it is not absorbed.
-                    # GREEN timing: once the injected verifier has been asked about
-                    # ig_s23, that solo's verify is parked on gate_release.
-                    # ig_s23 was dequeued by the merger (as a solo) before the
-                    # GroupMergeRequest, but its result has NOT been delivered yet because
-                    # the verifier is suspended.  s23 is therefore neither superseded
-                    # (coalescing excluded it) nor done (verifier hasn't resolved it yet).
-                    assert not req3.result.done(), (
-                        's23 must remain solo (future unresolved); '
-                        'expected s23 NOT absorbed by the train'
-                    )
+                # (b) s23's future must be UNRESOLVED — it is not absorbed.
+                # GREEN timing: once the injected verifier has been asked about
+                # ig_s23, that solo's verify is parked on gate_release.
+                # ig_s23 was dequeued by the merger (as a solo) before the
+                # GroupMergeRequest, but its result has NOT been delivered yet because
+                # the verifier is suspended.  s23 is therefore neither superseded
+                # (coalescing excluded it) nor done (verifier hasn't resolved it yet).
+                assert not req3.result.done(), (
+                    's23 must remain solo (future unresolved); '
+                    'expected s23 NOT absorbed by the train'
+                )
 
-                    # (a) Train has exactly 2 members: s21 + s22.
-                    train_id = req1.result.result().superseded_by
-                    assert train_id is not None and train_id.startswith('coalesce-'), (
-                        f'train_id must start with "coalesce-"; got {train_id!r}'
-                    )
-                    assert req2.result.result().superseded_by == train_id, (
-                        's22 must be absorbed into the same train as s21'
-                    )
+                # (a) Train has exactly 2 members: s21 + s22.
+                train_id = req1.result.result().superseded_by
+                assert train_id is not None and train_id.startswith('coalesce-'), (
+                    f'train_id must start with "coalesce-"; got {train_id!r}'
+                )
+                assert req2.result.result().superseded_by == train_id, (
+                    's22 must be absorbed into the same train as s21'
+                )
 
-                    # (c) train_coalesced event member_task_ids == {{s21, s22}}.
-                    events = _events_of_type(db_path, 'train_coalesced')
-                    assert len(events) == 1, f'Expected 1 train_coalesced event; got {len(events)}'
-                    event_data = events[0]['data']
-                    assert set(event_data.get('member_task_ids', [])) == {'ig_s21', 'ig_s22'}, (
-                        f'train_coalesced member_task_ids must be {{s21, s22}}; got {event_data}'
-                    )
+                # (c) train_coalesced event member_task_ids == {{s21, s22}}.
+                events = _events_of_type(db_path, 'train_coalesced')
+                assert len(events) == 1, f'Expected 1 train_coalesced event; got {len(events)}'
+                event_data = events[0]['data']
+                assert set(event_data.get('member_task_ids', [])) == {'ig_s21', 'ig_s22'}, (
+                    f'train_coalesced member_task_ids must be {{s21, s22}}; got {event_data}'
+                )
 
-                    # GREEN fix: wait for the 2-member train to land WHILE the gate is
-                    # still held.  The gate blocks ig_s23's advance_main (the injected
-                    # verifier is parked on that solo's run_scoped), preventing it from
-                    # racing with the train's rebase_onto_main.  The train's own verify
-                    # never reaches the injected port (see _solo_gate), so the train CAN
-                    # land while the gate is held.  Only release it AFTER train_done fires.
-                    await wait_responsive(
-                        train_done.wait(),
-                        timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
-                        label='2-member train (ig_s21 + ig_s22) landed while ig_s23 is parked',
-                    )
-                finally:
-                    # On a give-up or failed assert above too, so the worker's
-                    # stop never meets ig_s23's verify still parked on the gate.
-                    gate_release.set()
+                # GREEN fix: wait for the 2-member train to land WHILE the gate is
+                # still held.  The gate blocks ig_s23's advance_main (the injected
+                # verifier is parked on that solo's run_scoped), preventing it from
+                # racing with the train's rebase_onto_main.  The train's own verify
+                # never reaches the injected port (see _solo_gate), so the train CAN
+                # land while the gate is held.  Only release it AFTER train_done fires.
+                await wait_responsive(
+                    train_done.wait(),
+                    timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                    label='2-member train (ig_s21 + ig_s22) landed while ig_s23 is parked',
+                )
 
             # (d) s21 and s22 files on main after the train lands.
             from orchestrator.git_ops import _run
@@ -632,44 +640,39 @@ class TestScenario3:
         await queue.put(req3)
 
         async with running_merge_worker(worker):
-            with _no_predecessor_interlock():
-                try:
-                    await _await_parked_verify(verifier, 'ig_s31')
+            with _no_predecessor_interlock(), _release_on_exit(gate_release):
+                await _await_parked_verify(verifier, 'ig_s31')
 
-                    # (c) s31's future must be UNRESOLVED while parked — excluded, not absorbed.
-                    assert not req1.result.done(), (
-                        's31 must remain solo (future unresolved while its verify is '
-                        'parked); expected s31 NOT absorbed into the train'
-                    )
+                # (c) s31's future must be UNRESOLVED while parked — excluded, not absorbed.
+                assert not req1.result.done(), (
+                    's31 must remain solo (future unresolved while its verify is '
+                    'parked); expected s31 NOT absorbed into the train'
+                )
 
-                    # (a) train_coalesced event member_task_ids == {s32, s33} (excludes s31).
-                    events = _events_of_type(db_path, 'train_coalesced')
-                    assert len(events) == 1, f'Expected 1 train_coalesced event; got {len(events)}'
-                    event_data = events[0]['data']
-                    assert set(event_data.get('member_task_ids', [])) == {'ig_s32', 'ig_s33'}, (
-                        f'train_coalesced member_task_ids must be {{s32, s33}}; got {event_data}'
-                    )
+                # (a) train_coalesced event member_task_ids == {s32, s33} (excludes s31).
+                events = _events_of_type(db_path, 'train_coalesced')
+                assert len(events) == 1, f'Expected 1 train_coalesced event; got {len(events)}'
+                event_data = events[0]['data']
+                assert set(event_data.get('member_task_ids', [])) == {'ig_s32', 'ig_s33'}, (
+                    f'train_coalesced member_task_ids must be {{s32, s33}}; got {event_data}'
+                )
 
-                    # (b) exclusions list has exactly 1 entry for s31 with a 'blocked' reason.
-                    exc = event_data.get('exclusions', [])
-                    assert len(exc) == 1, f'Expected 1 exclusion entry for s31; got {exc}'
-                    assert exc[0]['request_id'] == req1.request_id, (
-                        f"exclusions[0].request_id must be req1's; got {exc[0]['request_id']!r}"
-                    )
-                    assert 'blocked' in exc[0]['reason'], (
-                        f"exclusions[0].reason must contain 'blocked'; got {exc[0]['reason']!r}"
-                    )
+                # (b) exclusions list has exactly 1 entry for s31 with a 'blocked' reason.
+                exc = event_data.get('exclusions', [])
+                assert len(exc) == 1, f'Expected 1 exclusion entry for s31; got {exc}'
+                assert exc[0]['request_id'] == req1.request_id, (
+                    f"exclusions[0].request_id must be req1's; got {exc[0]['request_id']!r}"
+                )
+                assert 'blocked' in exc[0]['reason'], (
+                    f"exclusions[0].reason must contain 'blocked'; got {exc[0]['reason']!r}"
+                )
 
-                    # Wait for the 2-member train to land, then release the gate.
-                    await wait_responsive(
-                        train_done.wait(),
-                        timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
-                        label='2-member train (ig_s32 + ig_s33) landed while ig_s31 is parked',
-                    )
-                finally:
-                    # On a give-up or failed assert above too, so the worker's
-                    # stop never meets ig_s31's verify still parked on the gate.
-                    gate_release.set()
+                # Wait for the 2-member train to land, then release the gate.
+                await wait_responsive(
+                    train_done.wait(),
+                    timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                    label='2-member train (ig_s32 + ig_s33) landed while ig_s31 is parked',
+                )
 
             # (d) s32 and s33 files on main after the train lands.
             from orchestrator.git_ops import _run
@@ -921,17 +924,13 @@ class TestBookkeeping:
                 'orchestrator.merge_lane.worker.run_scoped_verification',
                 _gated_verify(gate_release, gate_entered),
             ):
-                try:
+                with _release_on_exit(gate_release):
                     await wait_responsive(
                         gate_entered.wait(),
                         timeout=REAL_GIT_TRAIN_TIMEOUT,
                         max_wall_s=REAL_GIT_TRAIN_MAX_WALL_S,
                         label='coalesced train verify entry (2 singles rebased + merged)',
                     )
-                finally:
-                    # On a give-up too, so the worker's stop never meets a
-                    # train verify still parked on the gate.
-                    gate_release.set()
                 await wait_responsive(
                     all_done.wait(),
                     timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
