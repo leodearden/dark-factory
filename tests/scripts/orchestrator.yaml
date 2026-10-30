@@ -314,7 +314,7 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # this one and scripts/ included, for parity with a live member. Read them
 # there; do not restate them here, or the two will drift and only one copy is
 # guarded.
-lint_command: "uv run --project shared ruff check tests/scripts/"
+lint_command: "uv run --project shared ruff check tests/scripts/ && python3 tests/scripts/raw_envelope_literal_guard.py tests/scripts"
 type_check_command: "uv run --project shared pyright tests/scripts/"
 
 # Per-module verify budget. MEASUREMENT PROVENANCE — every recorded run, the
