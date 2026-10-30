@@ -113,6 +113,7 @@ from orchestrator.dry_run_unblock import (
 from orchestrator.escalation_router import (
     InfoL0Sweep,
     RouterPorts,
+    apply_reviewer_disposition,
     exit_kind_for,
     reviewer_notes,
     router_owns,
@@ -8624,6 +8625,7 @@ class TaskWorkflow:
             used_ctx = amendment_ctx
             amendment_ctx = None
             reviews = await self._review(amendment_ctx=used_ctx)
+            self._apply_note_dispositions(reviews)
             if reviews.reviewer_errors:
                 names = ', '.join(reviews.reviewer_errors)
                 return await self._mark_blocked(
@@ -18740,6 +18742,17 @@ class TaskWorkflow:
                 self.task_id, type(exc).__name__, exc, exc_info=True,
             )
             return []
+
+    def _apply_note_dispositions(self, reviews: ReviewAggregation) -> None:
+        """Apply the review round's verdicts on the task's info notes (D2); a note left pending is the exit router's."""
+        queue = self.escalation_queue
+        if queue is None or not reviews.note_dispositions:
+            return
+        ports = self._router_ports(queue)
+        for note in reviews.note_dispositions:
+            apply_reviewer_disposition(
+                note, ports, task_id=self.task_id, enabled=self.config.info_l0_router_enabled,
+            )
 
     def _steward_work_outstanding(self) -> bool:
         """Whether there is anything for :meth:`_await_steward_completion` to
