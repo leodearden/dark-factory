@@ -12,8 +12,23 @@ from typing import Any
 
 import offline_lane_soak_report as soak_report
 import pytest
-from offline_lane_soak_fixtures import LINT, T0, UNIT, SoakProject, effect, failure
-from orchestrator.flake_ledger import UNKNOWN_TEST_ID, FlakeCallSite, FlakeVerdict, ledger_db_path
+from offline_lane_soak_fixtures import (
+    FAILURE_LINE,
+    HEAD,
+    LINT,
+    T0,
+    UNIT,
+    SoakProject,
+    effect,
+    failure,
+)
+from orchestrator.flake_ledger import (
+    UNKNOWN_TEST_ID,
+    DebtTrigger,
+    FlakeCallSite,
+    FlakeVerdict,
+    ledger_db_path,
+)
 from orchestrator.offline_lane_confirm import (
     Confirmed,
     ConfirmMode,
@@ -21,7 +36,7 @@ from orchestrator.offline_lane_confirm import (
     Unconfirmable,
     UnconfirmableReason,
 )
-from orchestrator.offline_lane_episode_state import CommandRecord, unconfirmable_node
+from orchestrator.offline_lane_episode_state import CommandRecord, OfferedDebt, unconfirmable_node
 from orchestrator.offline_lane_filing import LANE_METADATA_KEY
 from orchestrator.offline_lane_records import LanePass, Phase, ProbeKind, ProbeResult
 from shared.project_layout import escalation_queue_dir
@@ -491,3 +506,116 @@ def test_unconfirmable_outage_and_green_passes_examine_nothing(tmp_path: Path, c
     assert code == 0
     check = _check(report, 'ledger_rows_per_pass')
     assert (check['verdict'], check['examined']) == ('no_data', 0)
+
+
+# --- (e) deflake_tasks_carry_evidence and (g) offered_debts_owned_or_due ---------------
+
+
+def _debt_project(
+    tmp_path: Path, *, owned: tuple[str, ...] = (NODE_A, NODE_B), due: tuple[str, ...] = (),
+    due_at: datetime = NOW - timedelta(minutes=5),
+) -> tuple[SoakProject, LanePass, dict[str, str]]:
+    """NODE_A and NODE_B red at T0; at T0+1h NODE_A clears and NODE_B recovers, and both are offered as debt.
+
+    Each node in *owned* gets its debt opened by the real ``open_debt``; each in *due* is only enqueued.
+    """
+    project = SoakProject(tmp_path)
+    project.provision(UNIT)
+    first = _red(project, T0, NODE_A, NODE_B, episodes_started=(NODE_A, NODE_B))
+    offered = ((NODE_A, DebtTrigger.cleared), (NODE_B, DebtTrigger.recovered))
+    offering = project.add_pass(
+        UNIT, at=T0 + timedelta(hours=1), detect=[failure(NODE_A)], confirm=[],
+        outcome=Confirmed(ConfirmMode.NARROWED, (), (NODE_A,), ()),
+        effect=effect(debts_offered=tuple(OfferedDebt(node, trigger, HEAD) for node, trigger in offered)),
+    )
+    project.occurrence(offering, [NODE_A], FlakeVerdict.passes_in_isolation)
+    owners: dict[str, str] = {}
+    for node, trigger in offered:
+        if node in owned:
+            row = project.open_lane_debt(node, trigger, offering, earlier=[first])
+            assert row.owner_task_id is not None
+            owners[node] = row.owner_task_id
+        elif node in due:
+            project.due(node, trigger, offering, enqueued_at=due_at, earlier=[first])
+    return project, offering, owners
+
+
+def test_lane_owned_debts_carry_trigger_and_evidence_and_are_owned(tmp_path: Path, capsys):
+    project, _, _ = _debt_project(tmp_path)
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    for name in ('deflake_tasks_carry_evidence', 'offered_debts_owned_or_due'):
+        assert (_check(report, name)['verdict'], _check(report, name)['examined']) == ('pass', 2)
+
+
+def test_an_owner_without_its_trigger_fails_naming_the_owner(tmp_path: Path, capsys):
+    project, _, owners = _debt_project(tmp_path)
+    del project.tasks.tasks[owners[NODE_B]]['metadata']['flake_debt_trigger']
+
+    code, report, err = _report(project, capsys)
+
+    assert code == 1
+    assert '[FAIL] deflake_tasks_carry_evidence: examined 2;' in err
+    (failure_line,) = _check(report, 'deflake_tasks_carry_evidence')['failures']
+    assert owners[NODE_B] in failure_line
+    assert 'flake_debt_trigger' in failure_line
+
+
+def test_an_owner_whose_text_lacks_every_failure_line_of_its_test_fails(tmp_path: Path, capsys):
+    project, _, owners = _debt_project(tmp_path)
+    owner = project.tasks.tasks[owners[NODE_A]]
+    owner['description'] = owner['description'].replace(FAILURE_LINE, 'redacted')
+    owner['details'] = owner['details'].replace(FAILURE_LINE, 'redacted')
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 1
+    (failure_line,) = _check(report, 'deflake_tasks_carry_evidence')['failures']
+    assert owners[NODE_A] in failure_line
+    assert NODE_A in failure_line
+
+
+def test_an_owner_of_a_debt_opened_at_another_call_site_is_not_examined(tmp_path: Path, capsys):
+    project, _, owners = _debt_project(tmp_path)
+    project.tasks.tasks[owners[NODE_B]]['metadata']['flake_debt_call_site'] = FlakeCallSite.merge_gate.value
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    assert _check(report, 'deflake_tasks_carry_evidence')['examined'] == 1
+
+
+def test_a_debt_still_due_is_owed_and_has_no_owner_to_examine(tmp_path: Path, capsys):
+    project, _, _ = _debt_project(tmp_path, owned=(NODE_A,), due=(NODE_B,))
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    assert _check(report, 'deflake_tasks_carry_evidence')['examined'] == 1
+    check = _check(report, 'offered_debts_owned_or_due')
+    assert (check['verdict'], check['examined']) == ('pass', 2)
+
+
+def test_an_offered_debt_with_neither_owner_nor_due_item_fails_naming_the_pass_and_test(tmp_path: Path, capsys):
+    project, offering, _ = _debt_project(tmp_path, owned=(NODE_A,))
+
+    code, report, err = _report(project, capsys)
+
+    assert code == 1
+    assert '[FAIL] offered_debts_owned_or_due: examined 2;' in err
+    (failure_line,) = _check(report, 'offered_debts_owned_or_due')['failures']
+    assert offering.pass_id in failure_line
+    assert NODE_B in failure_line
+
+
+def test_a_stale_due_item_is_reported_and_alone_does_not_fail(tmp_path: Path, capsys):
+    project, _, _ = _debt_project(tmp_path, owned=(NODE_A,), due=(NODE_B,), due_at=NOW - timedelta(hours=1))
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    check = _check(report, 'offered_debts_owned_or_due')
+    assert check['verdict'] == 'pass'
+    assert [note for note in check['notes'] if NODE_B in note and 'stale' in note]
