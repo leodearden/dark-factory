@@ -303,11 +303,9 @@ class SuffixConflictTracker:
         # ε=1890 defensive exclusion: frozen items (currently verifying) must
         # never appear as suffix-graph nodes — the frozen/suffix partition is
         # invariant (§5.3). Compute the frozen-rid set once, then filter.
-        frozen = self._frozen_requests()
-        frozen_rids: frozenset[str] = frozenset(req.request_id for req in frozen)
-        # Captured with the probe base, so a frozen prefix that changes before
-        # the bounce runs cannot misattribute the conflict.
-        counterparts = tuple(req.task_id for req in frozen)
+        frozen_rids: frozenset[str] = frozenset(
+            req.request_id for req in self._frozen_requests()
+        )
         suffix: list[MergeRequest] = []
         for lane in MERGE_LANES:  # high → normal
             for req in self._lane_buffers()[lane]:  # FIFO within each lane
@@ -486,6 +484,9 @@ class SuffixConflictTracker:
         # bounce before it consumes a verify slot.
         # The _probe_cache is keyed by frozenset({probe_base, head}) so that any
         # pair already probed in the textual-edge step reuses its cached result.
+        # The frozen prefix moves while the steps above await git, so the
+        # counterparts are read together with the tip they describe.
+        counterparts = tuple(req.task_id for req in self._frozen_requests())
         probe_base = self._frozen_prefix_tip(main_sha)
         conflicts_with_main: set[str] = set()
         evidence: dict[str, ConflictEvidence] = {}
