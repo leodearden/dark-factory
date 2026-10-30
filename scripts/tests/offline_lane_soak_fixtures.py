@@ -17,8 +17,10 @@ from pathlib import Path
 from typing import Any
 
 import _checkout as _checkout
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from orchestrator.config import LaneCommand
+from orchestrator.flake_debt_drain import REGRESSED_AFTER_RESOLUTION, call_site_evidence
 from orchestrator.flake_ledger import (
     DebtContext,
     DebtRow,
@@ -42,6 +44,7 @@ from orchestrator.offline_lane_episode_state import (
     PassEffect,
     PassObservation,
 )
+from orchestrator.offline_lane_escalations import ProbeReport, file_outage, release_lane_record
 from orchestrator.offline_lane_filing import (
     CountedPassEvidence,
     TestEvidence,
@@ -362,6 +365,37 @@ class SoakProject:
         ))
         assert row is not None and row.owner_task_id is not None, f'{node}: open_debt filed no owner'
         return row
+
+    def file_outage(self, lane_pass: LanePass, probe: ProbeResult) -> str:
+        """The outage record the lane files for *lane_pass*'s probe answer."""
+        report = ProbeReport(
+            command=lane_pass.command,
+            probe_command='scripts/probe-dependencies.sh',
+            cwd=str(self.root),
+            timeout_secs=60,
+            probe=probe,
+            record_dir=str(lane_pass.directory),
+        )
+        return file_outage(self.escalations(), report)
+
+    def release(self, escalation_id: str, resolution: str) -> None:
+        release_lane_record(self.escalations(), escalation_id, resolution)
+
+    def regression_escalation(self, call_site: FlakeCallSite, test_id: str, *, at: datetime) -> str:
+        """A ``regressed_after_resolution`` record as the debt drain submits it, re-entered at *call_site*."""
+        queue = self.escalations()
+        key = 'flake-regressed-after-resolution'
+        return queue.submit(Escalation(
+            id=queue.make_id(key),
+            task_id=f'{key}::{test_id}::{call_site}',
+            agent_role='orchestrator-flake-ledger',
+            severity='critical',
+            level=2,
+            category=REGRESSED_AFTER_RESOLUTION,
+            summary=f'Flake regressed after its fix: {test_id} re-entered flake debt (cycle 2)',
+            timestamp=at.isoformat(),
+            evidence=[call_site_evidence(call_site, observed_at=at.isoformat())],
+        ))
 
     def file_fix_task(self, command: str, nodes: Sequence[str], passes: Sequence[LanePass]) -> str:
         """A lane fix task covering *nodes*, rendered by ``build_lane_fix_task_arguments``."""

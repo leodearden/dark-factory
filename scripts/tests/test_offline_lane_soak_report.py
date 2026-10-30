@@ -6,6 +6,7 @@ the task store is a fake, injected through ``main``'s ``task_reader`` keyword.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from offline_lane_soak_fixtures import (
     FAILURE_LINE,
     HEAD,
     LINT,
+    OTHER_HEAD,
     T0,
     UNIT,
     SoakProject,
@@ -38,14 +40,21 @@ from orchestrator.offline_lane_confirm import (
     Unconfirmable,
     UnconfirmableReason,
 )
-from orchestrator.offline_lane_episode_state import CommandRecord, OfferedDebt, unconfirmable_node
+from orchestrator.offline_lane_episode_state import (
+    CommandRecord,
+    EndedEpisode,
+    EndReason,
+    OfferedDebt,
+    unconfirmable_node,
+)
 from orchestrator.offline_lane_escalations import (
+    LANE_ESCALATION_ROLE,
     StuckFiling,
     file_stuck_filing,
     resolve_stuck_filing,
 )
 from orchestrator.offline_lane_filing import LANE_METADATA_KEY
-from orchestrator.offline_lane_records import LanePass, Phase, ProbeKind, ProbeResult
+from orchestrator.offline_lane_records import LanePass, Phase, ProbeKind, ProbeResult, records_root
 from shared.project_layout import escalation_queue_dir
 
 NOW = T0 + timedelta(days=7)
@@ -737,3 +746,240 @@ def test_a_resolved_stuck_record_does_not_own_the_filing(tmp_path: Path, capsys)
 
     assert code == 1
     assert _stranded(report)['verdict'] == 'fail'
+
+
+# --- figures ---------------------------------------------------------------------------
+
+NODE_C = 'tests/test_c.py::test_c'
+NODE_D = 'tests/test_d.py::test_d'
+NODE_E = 'tests/test_e.py::test_e'
+UP_PROBE = ProbeResult(ProbeKind.UP, 0, None, 'every dependency answered', 0.4)
+FIGURES = (
+    'passes_per_command_per_day',
+    'episodes_by_length',
+    'filing_delay',
+    'lane_debts',
+    'due_list',
+    'undecided_tests',
+    'due_offers_per_pass',
+    'clearing_passes_per_day',
+    'held_reds_ended_elsewhere',
+    'regression_escalations',
+    'outages',
+    'interrupted_passes',
+    'record_directory_bytes',
+)
+
+
+@dataclass(frozen=True)
+class _Seeded:
+    project: SoakProject
+    started: LanePass
+    filing: LanePass
+    recovering: LanePass
+    outage: LanePass
+    interrupted: LanePass
+    fix_task: str
+    owner: str
+    outage_escalation: str
+    regression: str
+
+
+def _seed_filing(project: SoakProject, started: LanePass) -> tuple[LanePass, str, str]:
+    """T0+1h: NODE_A crosses and is filed, NODE_B clears and is offered as debt, NODE_C is undecided."""
+    filing = project.add_pass(
+        UNIT, at=T0 + timedelta(hours=1), detect=[failure(NODE_A), failure(NODE_B)], confirm=[failure(NODE_A)],
+        blocks=False,
+    )
+    project.occurrence(filing, [NODE_A], FlakeVerdict.fails_in_isolation)
+    project.occurrence(filing, [NODE_B], FlakeVerdict.passes_in_isolation)
+    fix_task = project.file_fix_task(UNIT, [NODE_A], [started, filing])
+    project.set_blocks(filing, outcome=Confirmed(ConfirmMode.NARROWED, (NODE_A,), (NODE_B,), ()), effect=effect(
+        tests_counted=(NODE_A,), episodes_extended=(NODE_A,), threshold_reached=(NODE_A,), tasks_filed=(fix_task,),
+        episodes_ended=(EndedEpisode(NODE_B, EndReason.CLEARED, 1, (HEAD,)),),
+        debts_offered=(OfferedDebt(NODE_B, DebtTrigger.cleared, HEAD),), debts_undecided=(NODE_C,),
+    ))
+    owner = project.open_lane_debt(NODE_B, DebtTrigger.cleared, filing, earlier=[started]).owner_task_id
+    assert owner is not None
+    project.tasks.tasks[owner]['status'] = 'in-progress'
+    return filing, fix_task, owner
+
+
+def _seed_recovery(project: SoakProject, started: LanePass, filing: LanePass) -> LanePass:
+    """T0+2h on another head: NODE_A and NODE_C pass there (A offered as recovered), NODE_E passes on its own head."""
+    recovering = project.add_pass(UNIT, at=T0 + timedelta(hours=2), head=OTHER_HEAD, effect=effect(
+        episodes_ended=(
+            EndedEpisode(NODE_A, EndReason.PASSED, 2, (HEAD,)),
+            EndedEpisode(NODE_C, EndReason.PASSED, 1, (HEAD,)),
+            EndedEpisode(NODE_E, EndReason.PASSED, 1, (OTHER_HEAD,)),
+        ),
+        debts_offered=(OfferedDebt(NODE_A, DebtTrigger.recovered, HEAD),),
+    ))
+    project.due(NODE_A, DebtTrigger.recovered, recovering, enqueued_at=NOW - timedelta(hours=1),
+                earlier=[started, filing])
+    return recovering
+
+
+def _seed_outage(project: SoakProject) -> tuple[LanePass, str]:
+    """T0+3h: a unit outage, its record released; T0+3h30: a lint red whose probe says every dependency is up."""
+    outage = project.add_pass(
+        UNIT, at=T0 + timedelta(hours=3), detect=[failure(NODE_A)], probe=OUTAGE_PROBE, blocks=False,
+    )
+    escalation_id = project.file_outage(outage, OUTAGE_PROBE)
+    project.set_blocks(outage, outcome=Outage(OUTAGE_PROBE), effect=effect(escalations_raised=(escalation_id,)))
+    project.release(escalation_id, 'the outage probe passed')
+    project.add_pass(
+        LINT, at=T0 + timedelta(hours=3, minutes=30), detect=[failure(NODE_E)], probe=UP_PROBE,
+        outcome=Unconfirmable(UnconfirmableReason.DETECT_RED_NAMED_NO_TEST, 'exit 1 naming no test'), effect=effect(),
+    )
+    return outage, escalation_id
+
+
+def _seeded(tmp_path: Path) -> _Seeded:
+    project = SoakProject(tmp_path)
+    project.provision(UNIT, LINT)
+    started = _red(project, T0, NODE_A, NODE_B, episodes_started=(NODE_A, NODE_B))
+    filing, fix_task, owner = _seed_filing(project, started)
+    recovering = _seed_recovery(project, started, filing)
+    outage, outage_escalation = _seed_outage(project)
+    clearing = project.add_pass(
+        UNIT, at=T0 + timedelta(days=1), detect=[failure(NODE_C)], confirm=[],
+        outcome=Confirmed(ConfirmMode.NARROWED, (), (NODE_C,), ()), effect=effect(),
+    )
+    project.occurrence(clearing, [NODE_C], FlakeVerdict.passes_in_isolation)
+    interrupted = project.add_pass(UNIT, at=T0 + timedelta(days=1, hours=1), detect=None, blocks=False)
+    project.save_command(command_record(UNIT, [episode(NODE_D, [started, filing, clearing])]))
+    regression = project.regression_escalation(FlakeCallSite.offline_lane, NODE_B, at=T0 + timedelta(hours=5))
+    project.regression_escalation(FlakeCallSite.merge_gate, NODE_B, at=T0 + timedelta(hours=5))
+    project.regression_escalation(FlakeCallSite.offline_lane, NODE_C, at=T0 - timedelta(days=1))
+    return _Seeded(project, started, filing, recovering, outage, interrupted, fix_task, owner, outage_escalation,
+                   regression)
+
+
+def _seeded_report(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> tuple[_Seeded, dict[str, Any]]:
+    seeded = _seeded(tmp_path)
+    _, report, _ = _report(seeded.project, capsys)
+    return seeded, report
+
+
+def test_every_figure_is_reported_with_its_rule(tmp_path: Path, capsys):
+    _, report = _seeded_report(tmp_path, capsys)
+
+    assert sorted(figure['name'] for figure in report['figures']) == sorted(FIGURES)
+    assert all(isinstance(figure['rule'], str) and figure['rule'] for figure in report['figures'])
+
+
+def test_episodes_by_length_count_ended_episodes_by_reason_and_live_ones(tmp_path: Path, capsys):
+    _, report = _seeded_report(tmp_path, capsys)
+
+    assert _figure(report, 'episodes_by_length') == {
+        'ended': {'cleared': {'1': 1}, 'passed': {'1': 2, '2': 1}},
+        'live': {'3': 1},
+    }
+
+
+def test_filing_delay_runs_from_the_episode_start_to_the_filing_pass(tmp_path: Path, capsys):
+    seeded, report = _seeded_report(tmp_path, capsys)
+
+    assert _figure(report, 'filing_delay') == [{
+        'task_id': seeded.fix_task, 'command': UNIT, 'episode_pass': seeded.started.pass_id,
+        'filing_pass': seeded.filing.pass_id, 'delay_secs': 3600.0,
+    }]
+
+
+def test_lane_debts_name_the_trigger_evidence_head_owner_and_its_status(tmp_path: Path, capsys):
+    seeded, report = _seeded_report(tmp_path, capsys)
+
+    assert _figure(report, 'lane_debts') == [
+        {
+            'pass_id': seeded.filing.pass_id, 'test': NODE_B, 'trigger': 'cleared', 'evidence_head': HEAD,
+            'owner': seeded.owner, 'owner_status': 'in-progress',
+        },
+        {
+            'pass_id': seeded.recovering.pass_id, 'test': NODE_A, 'trigger': 'recovered', 'evidence_head': HEAD,
+            'owner': None, 'owner_status': None,
+        },
+    ]
+
+
+def test_the_due_list_shows_each_item_and_the_stale_count(tmp_path: Path, capsys):
+    _, report = _seeded_report(tmp_path, capsys)
+
+    assert _figure(report, 'due_list') == {
+        'items': [{
+            'test': NODE_A, 'call_site': FlakeCallSite.offline_lane.value, 'age_secs': 3600.0, 'attempts': 0,
+            'last_error': None,
+        }],
+        'stale': 1,
+    }
+
+
+def test_undecided_tests_and_due_offers_are_listed_per_pass(tmp_path: Path, capsys):
+    seeded, report = _seeded_report(tmp_path, capsys)
+
+    assert _figure(report, 'undecided_tests') == [
+        {'command': UNIT, 'pass_id': seeded.filing.pass_id, 'tests': [NODE_C]},
+    ]
+    assert _figure(report, 'due_offers_per_pass') == {'0': 4, '1': 2}
+
+
+def test_clearing_passes_count_confirmed_outcomes_that_cleared_by_utc_date(tmp_path: Path, capsys):
+    _, report = _seeded_report(tmp_path, capsys)
+
+    assert _figure(report, 'clearing_passes_per_day') == {UNIT: {'2026-10-20': 1, '2026-10-21': 1}}
+
+
+def test_held_reds_ended_elsewhere_are_flagged_by_their_recovered_offer(tmp_path: Path, capsys):
+    seeded, report = _seeded_report(tmp_path, capsys)
+
+    assert _figure(report, 'held_reds_ended_elsewhere') == [
+        {
+            'command': UNIT, 'pass_id': seeded.recovering.pass_id, 'test': NODE_A, 'head': OTHER_HEAD,
+            'recovered_debt_offered': True,
+        },
+        {
+            'command': UNIT, 'pass_id': seeded.recovering.pass_id, 'test': NODE_C, 'head': OTHER_HEAD,
+            'recovered_debt_offered': False,
+        },
+    ]
+
+
+def test_regression_escalations_are_the_offline_lane_ones_filed_in_the_window(tmp_path: Path, capsys):
+    seeded, report = _seeded_report(tmp_path, capsys)
+
+    (regression,) = _figure(report, 'regression_escalations')
+    assert regression['id'] == seeded.regression
+    assert regression['status'] == 'pending'
+    assert regression['timestamp'] == (T0 + timedelta(hours=5)).isoformat()
+
+
+def test_outages_list_their_passes_probe_results_and_released_records(tmp_path: Path, capsys):
+    seeded, report = _seeded_report(tmp_path, capsys)
+
+    assert _figure(report, 'outages') == {
+        'passes': [{'command': UNIT, 'pass_id': seeded.outage.pass_id}],
+        'probe_results': {LINT: {'up': 1}, UNIT: {'outage': 1}},
+        'escalations': [{
+            'id': seeded.outage_escalation, 'command': UNIT, 'pass_id': seeded.outage.pass_id, 'status': 'resolved',
+            'resolved_by': LANE_ESCALATION_ROLE, 'resolution': 'the outage probe passed',
+        }],
+    }
+
+
+def test_interrupted_passes_and_the_record_directory_size_are_reported(tmp_path: Path, capsys):
+    seeded, report = _seeded_report(tmp_path, capsys)
+
+    assert _figure(report, 'interrupted_passes') == [{'command': UNIT, 'pass_id': seeded.interrupted.pass_id}]
+    stored = records_root(tmp_path).rglob('*')
+    assert _figure(report, 'record_directory_bytes') == sum(path.stat().st_size for path in stored if path.is_file())
+
+
+def test_without_json_stdout_names_each_figure_and_its_rule(tmp_path: Path, capsys):
+    seeded, report = _seeded_report(tmp_path, capsys)
+
+    soak_report.main(['--project-root', str(tmp_path)], task_reader=seeded.project.tasks, now=NOW)
+    out = capsys.readouterr().out
+
+    for figure in report['figures']:
+        assert figure['name'] in out
+        assert figure['rule'] in out
