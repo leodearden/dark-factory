@@ -89,6 +89,8 @@ FIXTURE_DIR = 'lane'
 LANE_COMMAND = LaneCommand(name='lane-fixture', command='pytest -m integration tests', cwd=FIXTURE_DIR)
 #: ``lane-suite`` is no tool the command parser knows, so the lane cannot narrow it and intersects instead.
 OPAQUE_COMMAND = LaneCommand(name='lane-opaque', command='lane-suite tests', cwd=FIXTURE_DIR)
+#: The lane command declaring an outage probe; ``lane-probe`` plays back the stub's scripted ``ProbeAnswer``s.
+PROBED_COMMAND = LANE_COMMAND.model_copy(update={'outage_probe': 'lane-probe'})
 
 #: The junit resolver maps a report's classnames to node ids only through module files that exist under the cwd.
 LANE_SEED = RepoSeed(
@@ -270,11 +272,70 @@ main()
 '''
 
 
-class LaneStub:
-    """The lane's test runner: one stdlib program on a bin dir, playing back scripted ``Run``s in order.
+@dataclass(frozen=True)
+class ProbeAnswer:
+    """One scripted launch of the outage probe: what it prints, how long it takes, and how it ends."""
 
-    Every launch logs its argv and cwd and pops the next run; with none left it is a
-    green session that ran no tests.
+    exit: int = 0
+    stdout: str = 'all dependencies up'
+    sleep_secs: float = 0
+    signal: int | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            'exit': self.exit,
+            'stdout': self.stdout,
+            'sleep_secs': self.sleep_secs,
+            'signal': None if self.signal is None else int(self.signal),
+        }
+
+
+_PROBE_BODY = r'''
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+ANSWERS = Path(CTL, 'probes.json')
+INVOCATIONS = Path(CTL, 'probe_invocations.jsonl')
+
+
+def pop_answer():
+    queue = json.loads(ANSWERS.read_text()) if ANSWERS.exists() else []
+    if not queue:
+        return UP
+    ANSWERS.write_text(json.dumps(queue[1:]))
+    return queue[0]
+
+
+def main():
+    with INVOCATIONS.open('a') as log:
+        log.write(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd()}) + '\n')
+    answer = pop_answer()
+    if answer['stdout']:
+        print(answer['stdout'])
+    sys.stdout.flush()
+    time.sleep(answer['sleep_secs'])
+    if answer['signal'] is not None:
+        os.kill(os.getpid(), answer['signal'])
+    sys.exit(answer['exit'])
+
+
+main()
+'''
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+class LaneStub:
+    """The lane's test runner and outage probe: stdlib programs on a bin dir, playing back scripted answers in order.
+
+    Every runner launch logs its argv and cwd and pops the next ``Run``; with none left
+    it is a green session that ran no tests.  Every ``lane-probe`` launch does the same
+    with the next ``ProbeAnswer``; with none left every dependency is up.
     """
 
     def __init__(self, root: Path) -> None:
@@ -284,12 +345,16 @@ class LaneStub:
         self.ctl.mkdir(parents=True)
         self.runs_path = self.ctl / 'runs.json'
         self.invocations_path = self.ctl / 'invocations.jsonl'
+        self.probes_path = self.ctl / 'probes.json'
+        self.probe_invocations_path = self.ctl / 'probe_invocations.jsonl'
         for name in ('pytest', 'lane-suite', 'lane-stub'):
-            self.install(name)
+            self.install(name, _STUB_BODY)
+        self.install('lane-probe', _PROBE_BODY, UP=ProbeAnswer().to_json())
 
-    def install(self, name: str) -> None:
+    def install(self, name: str, body: str, **constants: object) -> None:
         program = self.bin_dir / name
-        program.write_text(f'#!{sys.executable} -I\nCTL = {str(self.ctl)!r}\n{_STUB_BODY}')
+        header = ''.join(f'{key} = {value!r}\n' for key, value in {'CTL': str(self.ctl), **constants}.items())
+        program.write_text(f'#!{sys.executable} -I\n{header}{body}')
         program.chmod(0o755)
 
     def put_on_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -303,9 +368,16 @@ class LaneStub:
         return json.loads(self.runs_path.read_text()) if self.runs_path.exists() else []
 
     def invocations(self) -> list[dict[str, Any]]:
-        if not self.invocations_path.exists():
-            return []
-        return [json.loads(line) for line in self.invocations_path.read_text().splitlines()]
+        return read_jsonl(self.invocations_path)
+
+    def probe(self, *answers: ProbeAnswer) -> None:
+        self.probes_path.write_text(json.dumps([*self.unanswered(), *(answer.to_json() for answer in answers)]))
+
+    def unanswered(self) -> list[dict[str, Any]]:
+        return json.loads(self.probes_path.read_text()) if self.probes_path.exists() else []
+
+    def probe_invocations(self) -> list[dict[str, Any]]:
+        return read_jsonl(self.probe_invocations_path)
 
 
 def effect_of(record: PassRecord) -> dict[str, Any]:
@@ -371,18 +443,23 @@ class MeteredGitOps(GitOps):
 
 
 class RunLoopFailures(logging.Handler):
-    """Collects what the worker's run loop logs at ERROR, which it does only when a pass raised."""
+    """Collects what the worker's run loop logs at ERROR, which it does only when a pass raised.
+
+    Only before *stop* is set: from then on the worker is being cancelled, as a restart
+    would stop it, and a pass that fails then is the restart's to answer for.
+    """
 
     LOGGER = 'orchestrator.offline_lane'
 
-    def __init__(self) -> None:
+    def __init__(self, stop: asyncio.Event) -> None:
         super().__init__(level=logging.ERROR)
+        self.stop = stop
         self.messages: list[str] = []
         self.raised = asyncio.Event()
         self.loop = asyncio.get_running_loop()
 
     def emit(self, record: logging.LogRecord) -> None:
-        if record.name == self.LOGGER:
+        if record.name == self.LOGGER and not self.stop.is_set():
             self.messages.append(record.getMessage())
             self.loop.call_soon_threadsafe(self.raised.set)
 
@@ -682,6 +759,23 @@ class RedPathLane:
         """A process restart: a fresh worker, holding nothing in memory, over the same stores, git, queue and clock."""
         self.worker = self.build_worker()
 
+    @contextlib.contextmanager
+    def fail_episode_saves(self) -> Iterator[asyncio.Event]:
+        """Inside, every episode save raises ``OSError``; the yielded event is set when one is attempted.
+
+        The engine saves off the loop, so the event is set through the loop.
+        """
+        attempted = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def refused_save(store: EpisodeStore, record: CommandRecord) -> None:
+            loop.call_soon_threadsafe(attempted.set)
+            raise OSError(f'the test refuses to save the episodes of {record.command}')
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(EpisodeStore, 'save', refused_save)
+            yield attempted
+
     def build_worker(self) -> OfflineLaneWorker:
         return OfflineLaneWorker(
             self.git,
@@ -708,7 +802,7 @@ class RedPathLane:
         """Run the worker until it parks on the read after *reads* head reads, or until *until* is set."""
         self.git.allow(reads)
         stop = self.git.parked if until is None else until
-        failures = RunLoopFailures()
+        failures = RunLoopFailures(stop)
         with failures.attached():
             task = asyncio.create_task(self.worker.run())
             try:
@@ -729,10 +823,10 @@ class RedPathLane:
         await commit(self.project_root, {ADVANCE_FILE: f'{self.advances}\n'}, f'advance {self.advances}')
         return await self.triggered_pass(runs, until)
 
-    async def rerun(self, *runs: Run, minutes: float = 30) -> PassRecord:
-        """Advance the clock only, then drive a triggered pass at the same head."""
+    async def rerun(self, *runs: Run, minutes: float = 30, until: asyncio.Event | None = None) -> PassRecord:
+        """Advance the clock only, then drive a triggered pass at the same head, as ``advance`` does."""
         self.clock.advance(minutes=minutes)
-        return await self.triggered_pass(runs)
+        return await self.triggered_pass(runs, until)
 
     async def triggered_pass(self, runs: Sequence[Run], until: asyncio.Event | None = None) -> PassRecord:
         self.stub.script(*runs)
