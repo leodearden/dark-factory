@@ -76,7 +76,6 @@ CREATE TABLE IF NOT EXISTS deferred_writes (
     claimed_at TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_dw_project_claimed ON deferred_writes(project_id, claimed_at);
 
 -- Task 3049: durable hourly inflow record.  event_buffer rows are DELETEd by
 -- cleanup_drained once they are drained and older than max_age_seconds
@@ -263,12 +262,13 @@ class EventBuffer:
             # had idx_dw_project.
             await db.execute('DROP INDEX IF EXISTS idx_dw_project')
 
+            # Same placement as idx_eb_coalesce above, for the same reason.
             if await add_column_if_missing(db, 'deferred_writes', 'claimed_at', 'TEXT'):
-                await db.execute(
-                    'CREATE INDEX IF NOT EXISTS idx_dw_project_claimed'
-                    ' ON deferred_writes(project_id, claimed_at)'
-                )
                 logger.info('EventBuffer: migrated deferred_writes — added claimed_at column')
+            await db.execute(
+                'CREATE INDEX IF NOT EXISTS idx_dw_project_claimed'
+                ' ON deferred_writes(project_id, claimed_at)'
+            )
 
             # Add attempt_count if missing — tracks poison-pill detection across restarts.
             if await add_column_if_missing(
