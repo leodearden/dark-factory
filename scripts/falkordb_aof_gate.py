@@ -128,6 +128,10 @@ class ProbeFailed(Exception):
     pass
 
 
+def redis_cli(container_id: str, *args: str) -> list[str]:
+    return ["docker", "exec", container_id, "redis-cli", *args]
+
+
 class Docker:
     def __init__(self, run: Runner, compose_file: str):
         self._run = run
@@ -172,6 +176,9 @@ class Container:
         return any(name == "--appendonly" and value == "yes" for name, value in zip(tokens, tokens[1:], strict=False))
 
 
+AOF_CONFIG_KEYS = ("appendonly", "dir", "appenddirname", "appendfilename")
+
+
 @dataclass(frozen=True)
 class ServerAofConfig:
     appendonly: str
@@ -182,7 +189,30 @@ class ServerAofConfig:
     @classmethod
     def parse(cls, config_json: str) -> "ServerAofConfig":
         config = json.loads(config_json)
-        return cls(*(str(config[name]) for name in ("appendonly", "dir", "appenddirname", "appendfilename")))
+        return cls(*(str(config[name]) for name in AOF_CONFIG_KEYS))
+
+    @classmethod
+    def read(cls, docker: Docker, container_id: str) -> "ServerAofConfig":
+        return cls.parse(docker.read(redis_cli(container_id, "--json", "CONFIG", "GET", *AOF_CONFIG_KEYS)))
+
+    @property
+    def manifest_name(self) -> str:
+        return f"{self.appendfilename}.manifest"
+
+
+def parse_info_fields(info_text: str) -> dict[str, str]:
+    lines = (line.partition(":") for line in info_text.splitlines() if line and not line.startswith("#"))
+    return {key: value.strip() for key, _, value in lines}
+
+
+def loaded_aof_file_names(manifest_text: str) -> list[str]:
+    names = []
+    for line in manifest_text.splitlines():
+        tokens = line.split()
+        entry = dict(zip(tokens[0::2], tokens[1::2], strict=False))
+        if entry.get("type") in LOADED_MANIFEST_TYPES:
+            names.append(entry["file"])
+    return names
 
 
 @dataclass(frozen=True)
@@ -197,8 +227,7 @@ class Persistence:
 
     @classmethod
     def parse(cls, info_text: str) -> "Persistence":
-        lines = (line.partition(":") for line in info_text.splitlines() if line and not line.startswith("#"))
-        fields = {key: value.strip() for key, _, value in lines}
+        fields = parse_info_fields(info_text)
         size = fields.get("aof_current_size", "")
         return cls(
             fields.get("loading"),
@@ -314,13 +343,12 @@ def _verdict_for_stopped(container: Container) -> Verdict:
 
 
 def _aof_problems(docker: Docker, container: Container) -> list[Problem]:
-    redis_cli = ["docker", "exec", container.id, "redis-cli"]
+    info = redis_cli(container.id, "INFO", "persistence")
     try:
-        config = ServerAofConfig.parse(docker.read(
-            [*redis_cli, "--json", "CONFIG", "GET", "appendonly", "dir", "appenddirname", "appendfilename"]))
-        before = Persistence.parse(docker.read([*redis_cli, "INFO", "persistence"]))
+        config = ServerAofConfig.read(docker, container.id)
+        before = Persistence.parse(docker.read(info))
         on_disk = _manifest_bytes_on_host(container.data_mount, config)
-        after = Persistence.parse(docker.read([*redis_cli, "INFO", "persistence"]))
+        after = Persistence.parse(docker.read(info))
     except (ProbeFailed, ValueError, LookupError, TypeError, OSError) as exc:
         return [Problem(f"cannot read the live AOF state: {exc}", Remedy.INVESTIGATE)]
 
@@ -348,16 +376,10 @@ def _manifest_bytes_on_host(host_dir: str | None, config: ServerAofConfig) -> in
     if host_dir is None:
         return None
     aof_dir = Path(host_dir) / config.appenddirname
-    manifest = aof_dir / f"{config.appendfilename}.manifest"
+    manifest = aof_dir / config.manifest_name
     if not manifest.is_file():
         return None
-    total = 0
-    for line in manifest.read_text().splitlines():
-        tokens = line.split()
-        entry = dict(zip(tokens[0::2], tokens[1::2], strict=False))
-        if entry.get("type") in LOADED_MANIFEST_TYPES:
-            total += (aof_dir / entry["file"]).stat().st_size
-    return total
+    return sum((aof_dir / name).stat().st_size for name in loaded_aof_file_names(manifest.read_text()))
 
 
 def _verdict_without_container(host_dir: str) -> Verdict:
