@@ -192,7 +192,7 @@ class TestTheCommittedEvalSet:
         assert [row['entry_id'] for row in _writes()
                 if row['source'] == 'offline' and row['entry_id'] in test] == []
 
-    def test_the_offline_writes_are_the_production_judged_write_time_draw(self) -> None:
+    def test_the_offline_writes_count_stratum_and_snapshot(self) -> None:
         offline = [row for row in _writes() if row['source'] == 'offline']
         assert len(offline) == OFFLINE_JUDGED_WRITES
         assert {row['stratum'] for row in offline} == {_build().OFFLINE_STRATUM}

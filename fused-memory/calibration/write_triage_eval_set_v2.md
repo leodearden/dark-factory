@@ -36,18 +36,25 @@ which is gitignored, read-only, and only in the main checkout.
 | File | What | Re-derive |
 |---|---|---|
 | `write_triage_eval_set_v2_live_slates.jsonl` | header + 400 rebuilt live judge-band writes (§4) | `scripts/rebuild_write_triage_live_slates.py` (its docstring gives the command) |
-| `write_triage_eval_set_v2_rounds/key.json` | the scratch key: shard items, raters, rounds, the `rerates` record | `scripts/build_write_triage_eval_set.py shards`, `reask`, `third`, `rerate` |
+| `write_triage_eval_set_v2_rounds/key.json` | the scratch key: shard items, raters, rounds, each shard's `brief_sha256`, the `rerates` record, and the `inputs` digests | `scripts/build_write_triage_eval_set.py shards`, `reask`, `third`, `rerate` |
 | `write_triage_eval_set_v2_rounds/ratings/*.jsonl` | 238 rater files, one per shard, 9,367 lines | written by the blind raters; never edited |
 | `write_triage_eval_set_v2_writes.jsonl` | 884 write rows, each with its ranked targets | `build_write_triage_eval_set.py assemble --snapshot S --out-dir calibration/` |
 | `write_triage_eval_set_v2_verdicts.jsonl` | 8,733 effective rater rows, DIGEST added | the same `assemble` |
 | `write_triage_eval_set_v2_summary.json` | pairs, labels, kappa, rating volume, re-rates, shards, strata, input hashes | the same `assemble` |
 | `write_triage_eval_set_v2_split.json` | the frozen split (§9) | `build_write_triage_eval_set.py split`; refuses to overwrite without `--refreeze` |
 | `write_triage_eval_set_v2_cross_family.{jsonl,json,md}` | the cross-family re-rate (§10) | `scripts/rate_write_triage_cross_family.py rate`, then `report` |
+| `write_triage_eval_set_v2_cross_family_runs.jsonl` | one record per `rate` run: budget, spend, pairs left, whether the budget stopped it | written by `rate` |
 
 The round commands take `--snapshot S --live-slates calibration/write_triage_eval_set_v2_live_slates.jsonl --scratch calibration/write_triage_eval_set_v2_rounds`.
-`shards` re-renders the gitignored `shards/`, `texts.json` and
-`rater_prompt.md` byte for byte from the committed key. `assemble` refuses
-while any pair is not fully labelled.
+They refuse inputs whose digests differ from the key's `inputs`.
+`shards` re-renders the gitignored `shards/` and `texts.json` byte for byte
+from the committed key. It also writes `rater_prompt.md` for the brief given
+by `--brief PATH` (default: the committed brief). A rater prompt for the
+v2.1 round-0 shards therefore needs `--brief` with the v2.1 text (commit
+`c7b682bcb9`). Every shard records the sha256 of the brief it was rendered
+for, and the effective lines refuse a shard rated under neither the round-0
+brief nor a re-rate covering its pair (§6). `assemble` refuses while any pair
+is not fully labelled.
 `fused-memory/tests/test_write_triage_eval_set_committed.py` pins the
 committed files against each other. It checks that a re-computation
 reproduces the summary, the split and the cross-family report, and it holds
@@ -131,9 +138,9 @@ current basis (the text the judge was shown):
   OPEN follow-ups. The round machinery is
   `scripts/write_triage_rating_rounds.py`, which the soak baseline builder
   shares.
-- **Volume**: 9,367 rater lines (`summary.rating_volume`). Primary and second
-  each rated 4,256 pairs. Third raters rated 264 distinct pairs in three
-  rounds: third_00 (opus-third-00, 236 items), and third_01 (opus-third-01,
+- **Volume**: 9,367 rater lines (counted from `ratings/*.jsonl`). The
+  distinct pairs per role are primary 4,256, second 4,256 and third 264
+  (`summary.rating_volume`). The third raters worked in three rounds: third_00 (opus-third-00, 236 items), and third_01 (opus-third-01,
   38) and third_02 (opus-third-02, 1), both after the re-rate. No line ever
   needed a re-ask (`summary.reasked` 0).
 
@@ -354,9 +361,12 @@ All 320 were rated in one call each, with no failures and no re-asks
 **Spend**: 4.05 USD at list price (`spend_usd` 4.05048). The task's estimate
 was about 1 to 3 USD; the run went past it because a call cost about 0.0127
 USD and the selection was 320 calls. It stayed under the 4.50 USD cap the
-lead approved for the run, which was inside the plan's 15 USD cap. A 3.00 USD
-leg stopped with 2 discordant pairs and every control unrated, and was
-resumed after approval.
+lead approved for the run, which was inside the plan's 15 USD cap. There
+were three runs (`coverage.runs`, recorded in
+`write_triage_eval_set_v2_cross_family_runs.jsonl`). Two of them were budget
+stops (`coverage.budget_stops`): a 0.25 USD probe that left 302 pairs, and a
+3.00 USD leg that left 102 (2 discordant pairs and every control). The third
+run was resumed after approval.
 
 **Agreement with the resolved Opus label**:
 

@@ -248,13 +248,15 @@ under the provisional weights.
 brief v2.1. M1 <= 0.15, and M3 population <= 0.35 (esc-7301-1, recorded on
 task 3131), were set against the v2.1 soak baseline (§8). v2.2 narrows LOSS,
 which can only lower the figures that rest on it (§8). The post-fix
-measurement must therefore do one of two things. It can render its rater
-prompt from the v2.1 brief text (`git show
-c7b682bcb9:fused-memory/calibration/write_triage_rater_brief_v2.md`) and
-score with `--rubric v2.1`. Or it can wait for Leo to re-confirm the bounds
-against a v2.2 re-rate of the soak's LOSS-consuming pairs. It must not
-silently pick up v2.2 from the file. This is a choice for Leo; nothing here
-makes it.
+measurement must therefore do one of two things. It can rate under the v2.1
+text, by writing `git show
+c7b682bcb9:fused-memory/calibration/write_triage_rater_brief_v2.md` to a file
+and passing that file as `--brief PATH` to every round command. Each shard
+then records that brief's sha256, the rater prompt is rendered from it, and
+the result is scored with `--rubric v2.1`. Or it can wait for Leo to
+re-confirm the bounds against a v2.2 re-rate of the soak's LOSS-consuming
+pairs. Left without `--brief`, a run picks up v2.2 from the file. This is a
+choice for Leo; nothing here makes it.
 
 **After the embedder cutover (6807)** re-run the whole measurement: the band
 edges and every cosine-derived threshold move with the embedder.
