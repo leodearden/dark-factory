@@ -41,21 +41,26 @@ def _short(sha: str | None) -> str:
     return sha[:_SHORT_SHA_LEN] if sha else '(absent)'
 
 
+def _ancestry(beyond_main: bool | None) -> str:
+    return 'unreadable (git error)' if beyond_main is None else str(beyond_main)
+
+
 @dataclass(frozen=True)
 class BranchState:
     """What git says about a task branch and its worktree at one moment.
 
     ``branch_tip`` is None when the ref is absent. ``head_beyond_main`` and
     ``tip_beyond_main`` say whether ``worktree_head`` and ``branch_tip`` carry
-    commits ``main_sha`` lacks; ``tip_beyond_main`` is False for an absent ref.
+    commits ``main_sha`` lacks, and are None when git could not read that
+    ancestry; ``tip_beyond_main`` is False for an absent ref.
     """
 
     branch: QueuedBranch
     branch_tip: str | None
     worktree_head: str
     main_sha: str
-    head_beyond_main: bool
-    tip_beyond_main: bool
+    head_beyond_main: bool | None
+    tip_beyond_main: bool | None
     worktree_dirty: bool
 
     @property
@@ -70,11 +75,12 @@ class BranchState:
 
     @property
     def mergeability(self) -> Mergeability:
-        if not self.worktree_head or not self.main_sha:
+        """HEAD decides first; an unreadable tip with HEAD on main still refuses."""
+        if not self.worktree_head or not self.main_sha or self.head_beyond_main is None:
             return Mergeability.UNREADABLE
         if self.head_beyond_main:
             return Mergeability.MERGEABLE
-        if self.tip_beyond_main:
+        if self.tip_beyond_main is not False:
             return Mergeability.WORKTREE_OFF_BRANCH
         return Mergeability.BRANCH_EMPTY
 
@@ -89,9 +95,15 @@ class BranchState:
                 f'main {_short(self.main_sha)}){dirty}'
             )
         if kind is Mergeability.WORKTREE_OFF_BRANCH:
+            tip = _short(self.branch_tip)
+            ref_state = (
+                f'the ancestry of {self.branch.full_name} tip {tip} against main is unreadable'
+                if self.tip_beyond_main is None
+                else f'{self.branch.full_name} carries {tip}'
+            )
             return (
                 f'Merge refused: worktree HEAD {_short(self.worktree_head)} is on main '
-                f'while {self.branch.full_name} carries {_short(self.branch_tip)}'
+                f'while {ref_state}'
             )
         raise ValueError(f'{kind.value} is not a refusal')
 
@@ -107,6 +119,8 @@ class BranchState:
             f'worktree: {worktree}',
             f'worktree_head: {self.worktree_head}',
             f'main_sha: {self.main_sha}',
+            f'head_beyond_main: {_ancestry(self.head_beyond_main)}',
+            f'tip_beyond_main: {_ancestry(self.tip_beyond_main)}',
             f'worktree_dirty: {self.worktree_dirty}',
         ]
         if landing_verdict is not None:
@@ -133,19 +147,20 @@ async def read_branch_state(
     """Read *branch*'s tip and *worktree*'s state against *main_sha*.
 
     A failed git read comes back as a value, never an exception: an absent ref
-    is None, and an unreadable ancestry reads as "beyond main". For HEAD that
-    means MERGEABLE, so the merge proceeds and the merge worker's own guards
-    decide; for the tip with HEAD on main it means WORKTREE_OFF_BRANCH, a
-    refusal that keeps the rebind from moving the ref onto main.
+    is None, an unreadable status is clean (``GitOps.has_uncommitted_work``),
+    and an unreadable ancestry is None. For HEAD that means UNREADABLE, so the
+    merge proceeds and the merge worker's own guards decide; for the tip with
+    HEAD on main it means WORKTREE_OFF_BRANCH, a refusal that keeps the rebind
+    from moving the ref onto main.
     """
     branch_tip = await git_ops.resolve_branch_sha(branch.full_name)
-    head_beyond_main = not await git_ops.is_ancestor(worktree_head, main_sha)
+    head_beyond_main = await _beyond_main(git_ops, worktree_head, main_sha)
     if branch_tip is None:
-        tip_beyond_main = False
+        tip_beyond_main: bool | None = False
     elif branch_tip == worktree_head:
         tip_beyond_main = head_beyond_main
     else:
-        tip_beyond_main = not await git_ops.is_ancestor(branch_tip, main_sha)
+        tip_beyond_main = await _beyond_main(git_ops, branch_tip, main_sha)
     return BranchState(
         branch=branch,
         branch_tip=branch_tip,
@@ -155,3 +170,8 @@ async def read_branch_state(
         tip_beyond_main=tip_beyond_main,
         worktree_dirty=await git_ops.has_uncommitted_work(worktree),
     )
+
+
+async def _beyond_main(git_ops: GitOps, sha: str, main_sha: str) -> bool | None:
+    on_main = await git_ops.is_ancestor_checked(sha, main_sha)
+    return None if on_main is None else not on_main

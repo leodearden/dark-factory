@@ -711,6 +711,10 @@ def _make(
     get_main_sha = AsyncMock(return_value=main_sha)
     git_ops = MagicMock()
     git_ops.is_ancestor = is_ancestor
+
+    async def _is_ancestor_checked(ancestor: str, descendant: str) -> bool:
+        return await git_ops.is_ancestor(ancestor, descendant)
+    git_ops.is_ancestor_checked = _is_ancestor_checked
     git_ops.get_main_sha = get_main_sha
     git_ops.resolve_branch_sha = AsyncMock(return_value=None)
     git_ops.has_uncommitted_work = AsyncMock(return_value=False)

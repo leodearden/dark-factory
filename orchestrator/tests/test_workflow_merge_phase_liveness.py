@@ -99,6 +99,7 @@ def _make(
     git_ops.resolve_branch_sha = AsyncMock(return_value=None)
     git_ops.has_uncommitted_work = AsyncMock(return_value=False)
     git_ops.is_ancestor = AsyncMock(return_value=False)
+    git_ops.is_ancestor_checked = AsyncMock(return_value=False)
 
     queue = MagicMock()
     queue.get_by_task = MagicMock(return_value=[])
@@ -695,7 +696,7 @@ class TestRetryLoopReStamp:
         wf.git_ops.rebase_onto_main = AsyncMock(return_value=True)
         # False → the post-steward _settle_unmergeable_branch read finds the
         # branch beyond main, so the loop actually reaches attempt 2.
-        wf.git_ops.is_ancestor = AsyncMock(return_value=False)
+        wf.git_ops.is_ancestor_checked = AsyncMock(return_value=False)
 
         # The REAL stamp/clear helpers run; the stamp is only wrapped so calls
         # are counted. get_task mirrors the in-memory blob so the

@@ -963,6 +963,7 @@ def _make_run_wf(
     wf.scheduler.get_task = AsyncMock(return_value=None)
     wf.git_ops.get_main_sha = AsyncMock(return_value='deadbeef00')
     wf.git_ops.is_ancestor = AsyncMock(return_value=False)  # not already merged
+    wf.git_ops.is_ancestor_checked = AsyncMock(return_value=False)
     wf.git_ops.resolve_branch_sha = AsyncMock(return_value=None)
     wf.git_ops.has_uncommitted_work = AsyncMock(return_value=False)
     wf.git_ops.rebase_onto_main = AsyncMock(return_value=True)
@@ -1264,6 +1265,7 @@ class TestMergePhaseGraceStampLifecycle:
         wf._recover_before_merge = AsyncMock(return_value=None)  # type: ignore[method-assign]
         wf.git_ops.get_main_sha = AsyncMock(return_value='main_sha')
         wf.git_ops.is_ancestor = AsyncMock(return_value=False)
+        wf.git_ops.is_ancestor_checked = AsyncMock(return_value=False)
         wf.git_ops.resolve_branch_sha = AsyncMock(return_value=None)
         wf.git_ops.has_uncommitted_work = AsyncMock(return_value=False)
         wf.git_ops.rebase_onto_main = AsyncMock(return_value=True)

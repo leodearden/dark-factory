@@ -311,6 +311,7 @@ async def test_merge_phase_returns_a_terminal_done_without_running_the_merge_suc
     wf.git_ops.rebase_onto_main = AsyncMock(return_value=True)
     # A branch still beyond main at merge entry, so the merge attempt runs.
     wf.git_ops.is_ancestor = AsyncMock(return_value=False)
+    wf.git_ops.is_ancestor_checked = AsyncMock(return_value=False)
     wf.git_ops.resolve_branch_sha = AsyncMock(return_value=None)
     wf.git_ops.has_uncommitted_work = AsyncMock(return_value=False)
     finalise_merged_done = AsyncMock(return_value=WorkflowOutcome.DONE)

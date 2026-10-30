@@ -5,7 +5,7 @@ task 1923) makes the queue land the worktree HEAD, so the verdict is read from
 HEAD first. These cases build the two shapes that produced sha-less merge
 successes (dark_factory 3493 and 3580, reify 8363) in a real repository and
 check the verdict the reader gives them, plus the stale-ref and absent-ref
-shapes that must stay mergeable.
+shapes that must stay mergeable, and the verdicts git read failures produce.
 
 The repository comes from ``_git_fixtures.py::seed_repo``; every git call this
 file makes runs through ``_Checkout``, which applies both esc-3072-3 isolation
@@ -80,10 +80,21 @@ class _Scene:
             self.repo.root,
         )
 
-    async def read(self) -> BranchState:
+    def point_branch_at_a_blob(self) -> str:
+        """Leave the ref on an object git cannot test ancestry for.
+
+        ``git update-ref`` refuses a non-commit under ``refs/heads``, so the
+        loose ref file is written directly.
+        """
+        blob = self.repo.git('hash-object', '-w', 'README.md')
+        common_dir = self.repo.root / self.repo.git('rev-parse', '--git-common-dir')
+        (common_dir / 'refs' / 'heads' / BRANCH.full_name).write_text(f'{blob}\n')
+        return blob
+
+    async def read(self, *, worktree: Path | None = None, main_sha: str | None = None) -> BranchState:
         return await read_branch_state(
-            self.git_ops, self.wt.root, BRANCH,
-            worktree_head=self.wt.sha('HEAD'), main_sha=self.main_sha,
+            self.git_ops, worktree or self.wt.root, BRANCH,
+            worktree_head=self.wt.sha('HEAD'), main_sha=main_sha or self.main_sha,
         )
 
 
@@ -170,6 +181,56 @@ async def test_an_absent_ref_falls_back_to_the_worktree_head(scene: _Scene) -> N
     assert on_main.mergeability is Mergeability.BRANCH_EMPTY
 
 
+@pytest.mark.asyncio
+async def test_an_unreadable_head_ancestry_is_unreadable_so_the_merge_proceeds(
+    scene: _Scene,
+) -> None:
+    state = await scene.read(main_sha='0' * 40)
+
+    assert state.head_beyond_main is None
+    assert state.mergeability is Mergeability.UNREADABLE
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_tip_ancestry_with_head_on_main_is_refused_by_name(
+    scene: _Scene,
+) -> None:
+    scene.wt.git('checkout', '--detach', 'main')
+    blob = scene.point_branch_at_a_blob()
+
+    state = await scene.read()
+
+    assert state.branch_tip == blob
+    assert state.head_beyond_main is False
+    assert state.tip_beyond_main is None
+    assert state.mergeability is Mergeability.WORKTREE_OFF_BRANCH
+    summary = state.refusal_summary()
+    assert 'unreadable' in summary
+    assert 'carries' not in summary
+    detail = state.refusal_detail(
+        task_id='42', worktree=scene.wt.root, landing_verdict=None,
+    )
+    assert 'tip_beyond_main: unreadable' in detail
+
+
+@pytest.mark.asyncio
+async def test_an_absent_ref_and_an_unreadable_worktree_still_yield_a_verdict(
+    scene: _Scene, tmp_path: Path,
+) -> None:
+    scene.wt.git('reset', '--hard', 'main')
+    scene.wt.git('checkout', '--detach')
+    scene.repo.git('branch', '-D', BRANCH.full_name)
+    broken = tmp_path / 'broken-checkout'
+    broken.mkdir()
+    (broken / '.git').write_text(f'gitdir: {tmp_path / "no-such-gitdir"}\n')
+
+    state = await scene.read(worktree=broken)
+
+    assert state.branch_tip is None
+    assert state.worktree_dirty is False
+    assert state.mergeability is Mergeability.BRANCH_EMPTY
+
+
 def test_an_unresolved_worktree_head_is_unreadable() -> None:
     state = BranchState(
         branch=BRANCH, branch_tip=None, worktree_head='', main_sha='a' * 40,
@@ -235,3 +296,17 @@ def test_a_refusal_names_the_branch_its_shas_and_the_recovery_hint() -> None:
     assert tip[:7] in summary
     assert main_sha[:7] in summary
     assert 'git reflog show task/42' in detail
+
+
+def test_a_ladder_miss_refusal_carries_the_landing_verdict() -> None:
+    state = BranchState(
+        branch=BRANCH, branch_tip=_MAIN, worktree_head=_MAIN, main_sha=_MAIN,
+        head_beyond_main=False, tip_beyond_main=False, worktree_dirty=False,
+    )
+
+    detail = state.refusal_detail(
+        task_id='42', worktree=Path('/fake/wt'), landing_verdict='journal miss; not landed',
+    )
+
+    assert state.mergeability is Mergeability.BRANCH_EMPTY
+    assert 'landing_verdict: journal miss; not landed' in detail
