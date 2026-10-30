@@ -8,24 +8,32 @@ resolved with ``recut=True`` issues a re-cut ruling, the task-3154 dispatch
 gate parks the prior incarnation (nothing deleted), and the next run plans
 fresh with the architect.
 
+Two specimens of stale reuse are covered: Lever B reusing the on-disk plan
+(task 5027), and boot recovery's plan snapshot handed to the slot as
+``initial_plan`` (task 3310).
+
 Driven through the real ``resolve_issue`` tool, a real ``EscalationQueue``,
-the harness resolve callback, ``recut_ruling.enforce_recut_ruling`` (exactly
-as ``harness.py::Harness._run_recut_ruling_gate`` calls it) and
-``TaskWorkflow.run``; asserted on emitted events and agent invocations.
+the harness resolve callback and ``Harness._run_slot``, the dispatch slot that
+runs the re-cut gate and decides the recovered plan. Only its
+``build_workflow`` seam is replaced, by a real ``TaskWorkflow`` built on the
+``_workflow_helpers`` fakes; the slot's own ``initial_plan`` is handed through.
+``_run_slot`` is private: no public seam dispatches one task. Asserted on the
+task store, emitted events and agent invocations.
 """
 
 from __future__ import annotations
 
-import asyncio
 import copy
-import functools
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _harness_escalation_link import drain_background_tasks, link_escalation_queue
+from _task_store_doubles import TaskStoreDouble
 from _workflow_helpers import (
     PLAN,
     AgentStub,
@@ -44,17 +52,12 @@ from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig, SandboxConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.harness import Harness
+from orchestrator.harness import Harness, TaskReport
 from orchestrator.merge_lane.gates import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
-from orchestrator.recut_ruling import (
-    RECUT_EXECUTED_KEY,
-    RECUT_RULING_KEY,
-    GateVerdict,
-    RecutGateResult,
-    enforce_recut_ruling,
-)
+from orchestrator.recut_ruling import RECUT_EXECUTED_KEY, RECUT_RULING_KEY
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 pytestmark = pytest.mark.asyncio
 
@@ -79,32 +82,6 @@ class _EventRecorder:
             if event_type == EventType.phase_skipped
             and (kwargs.get('data') or {}).get('reason') == LEVER_B_REASON
         ]
-
-
-class _TaskStore:
-    """The task record the harness writes and the next dispatch reads fresh."""
-
-    def __init__(self, task: dict[str, Any]) -> None:
-        self.task = task
-
-    async def get_task(self, task_id: str) -> dict[str, Any] | None:
-        return copy.deepcopy(self.task) if task_id == self.task['id'] else None
-
-    async def get_status(self, task_id: str) -> str | None:
-        return self.task['status'] if task_id == self.task['id'] else None
-
-    async def update_task(
-        self, task_id: str, metadata: dict[str, Any], *,
-        append: bool = False, metadata_mode: str | None = None,
-    ) -> bool:
-        if metadata_mode == 'replace':
-            self.task['metadata'] = copy.deepcopy(metadata)
-        else:
-            self.task['metadata'] = {**self.task['metadata'], **copy.deepcopy(metadata)}
-        return True
-
-    async def set_task_status(self, task_id: str, status: str, **_: Any) -> None:
-        self.task['status'] = status
 
 
 @pytest.fixture
@@ -139,15 +116,13 @@ def git_ops(config: OrchestratorConfig) -> GitOps:
 
 
 @pytest.fixture
-def store() -> _TaskStore:
-    return _TaskStore({
-        'id': TASK_ID,
-        'title': TITLE,
-        'description': DESCRIPTION,
-        'status': 'blocked',
-        'metadata': {'files': ['lib']},
-        'dependencies': [],
-    })
+def store() -> TaskStoreDouble:
+    store = TaskStoreDouble()
+    store.add(
+        TASK_ID, metadata={'files': ['lib']},
+        title=TITLE, description=DESCRIPTION, dependencies=[],
+    )
+    return store
 
 
 @pytest.fixture
@@ -156,15 +131,15 @@ def queue(tmp_path: Path) -> EscalationQueue:
 
 
 @pytest.fixture
-def harness(config: OrchestratorConfig, store: _TaskStore, queue: EscalationQueue) -> Harness:
+def harness(
+    config: OrchestratorConfig, git_ops: GitOps, store: TaskStoreDouble, queue: EscalationQueue,
+) -> Harness:
     h = _build_harness(config)
-    h.scheduler.get_task = AsyncMock(side_effect=store.get_task)  # type: ignore[method-assign]
-    h.scheduler.get_status = AsyncMock(side_effect=store.get_status)  # type: ignore[method-assign]
-    h.scheduler.update_task = AsyncMock(side_effect=store.update_task)  # type: ignore[method-assign]
-    h.scheduler.set_task_status = AsyncMock(side_effect=store.set_task_status)  # type: ignore[method-assign]
+    store.wire_into(h.scheduler)
+    h.scheduler.is_deterministic = MagicMock(return_value=False)  # type: ignore[method-assign]
+    h.git_ops = git_ops
     h.is_workflow_active = lambda task_id: False  # type: ignore[method-assign]
-    h._escalation_queue = queue
-    queue.set_resolve_callback(h._on_escalation_resolved)
+    link_escalation_queue(h, queue)
     return h
 
 
@@ -182,8 +157,14 @@ def agents(monkeypatch: pytest.MonkeyPatch) -> AgentStub:
     return stub
 
 
-async def _seed_prior_incarnation(git_ops: GitOps) -> str:
-    """A Lever-B-eligible, plan-files-not-touched prior incarnation; its tip sha."""
+@dataclass(frozen=True)
+class _PriorIncarnation:
+    tip: str
+    plan: dict[str, Any]
+
+
+async def _seed_prior_incarnation(git_ops: GitOps) -> _PriorIncarnation:
+    """A Lever-B-eligible, plan-files-not-touched prior incarnation."""
     main_sha = await git_ops.get_main_sha()
     worktree = (await git_ops.create_worktree(TASK_ID)).path
     (worktree / 'NOTES.md').write_text('prior incarnation: touched no plan file\n')
@@ -207,7 +188,7 @@ async def _seed_prior_incarnation(git_ops: GitOps) -> str:
     )
     assert all((worktree / f).exists() for f in plan['files'])
     (artifacts.root / 'plan.json').write_text(json.dumps(plan))
-    return tip
+    return _PriorIncarnation(tip, plan)
 
 
 async def _resolve_plan_touch_block(
@@ -229,73 +210,110 @@ async def _resolve_plan_touch_block(
         escalation_id=esc.id, resolution='re-plan on current main', **kwargs,
     )
     assert 'error' not in result, result
-    while harness._background_tasks:
-        await asyncio.gather(*list(harness._background_tasks))
+    await drain_background_tasks(harness)
     return esc
 
 
+@dataclass(frozen=True)
+class _Dispatch:
+    report: TaskReport | None
+    initial_plan: dict[str, Any] | None
+    events: _EventRecorder
+
+
 async def _dispatch(
-    config: OrchestratorConfig, git_ops: GitOps, store: _TaskStore,
-    agents: AgentStub, tmp_path: Path,
-) -> tuple[RecutGateResult, _EventRecorder]:
-    """The next dispatch: the re-cut gate on the stored task, then the workflow."""
-    gate = await enforce_recut_ruling(
-        await store.get_task(TASK_ID) or {},
-        ops=git_ops,
-        persist=functools.partial(store.update_task, TASK_ID),
-        now=datetime.now(UTC),
-    )
+    harness: Harness, config: OrchestratorConfig, git_ops: GitOps,
+    store: TaskStoreDouble, agents: AgentStub, tmp_path: Path,
+) -> _Dispatch:
+    """The next dispatch, through the harness slot, of the task as stored."""
+    events = _EventRecorder()
+    built: dict[str, Any] = {}
+
+    def _build_real_workflow(**kwargs: Any) -> TaskWorkflow:
+        built.update(kwargs)
+        workflow, _, _ = _build_workflow_with_escalation(
+            config, git_ops, kwargs['assignment'], agents, tmp_path,
+        )
+        workflow.initial_plan = kwargs['initial_plan']
+        workflow.event_store = events  # type: ignore[assignment]
+        return workflow
+
     assignment = TaskAssignment(
         task_id=TASK_ID, task=await store.get_task(TASK_ID) or {}, modules=['lib'],
     )
-    workflow, _, _ = _build_workflow_with_escalation(
-        config, git_ops, assignment, agents, tmp_path,
-    )
-    events = _EventRecorder()
-    workflow.event_store = events  # type: ignore[assignment]
-    await workflow.run()
-    return gate, events
+    with patch('orchestrator.harness.build_workflow', side_effect=_build_real_workflow):
+        report = await harness._run_slot(assignment, MagicMock())
+    assert built, f'the slot never built the workflow: {report}'
+    return _Dispatch(report, built['initial_plan'], events)
 
 
-async def test_plain_restart_reuses_the_prior_plan_without_the_architect(
+def _stage_recovered_plan(harness: Harness, plan: dict[str, Any]) -> None:
+    """What boot recovery leaves for the slot when it snapshots a task's plan."""
+    harness._recovered_plans[TASK_ID] = plan
+
+
+def _architect_ran_before_review(agents: AgentStub) -> bool:
+    first_review = agents.calls.index('reviewer_comprehensive')
+    return 'architect' in agents.calls[:first_review]
+
+
+async def test_plain_restart_reuses_the_prior_plan_through_lever_b(
     config, git_ops, store, queue, harness, agents, tmp_path,
 ):
     await _seed_prior_incarnation(git_ops)
     await _resolve_plan_touch_block(harness, queue, action='restart')
-    assert store.task['status'] == 'pending'
-    assert RECUT_RULING_KEY not in store.task['metadata']
+    assert store.status(TASK_ID) == 'pending'
+    assert RECUT_RULING_KEY not in store.metadata(TASK_ID)
 
-    gate, events = await _dispatch(config, git_ops, store, agents, tmp_path)
+    dispatch = await _dispatch(harness, config, git_ops, store, agents, tmp_path)
 
-    assert gate.verdict is GateVerdict.PROCEED
-    assert events.lever_b_skips(), 'the seed must be Lever-B eligible'
-    first_review = agents.calls.index('reviewer_comprehensive')
-    assert 'architect' not in agents.calls[:first_review], (
+    assert RECUT_EXECUTED_KEY not in store.metadata(TASK_ID)
+    assert dispatch.initial_plan is None
+    assert dispatch.events.lever_b_skips(), 'the seed must be Lever-B eligible'
+    assert not _architect_ran_before_review(agents), (
         'the stale plan reached review without the architect re-planning it'
     )
 
 
-async def test_recut_restart_parks_the_prior_incarnation_and_runs_the_architect(
+async def test_plain_restart_hands_the_recovered_plan_to_the_workflow(
     config, git_ops, store, queue, harness, agents, tmp_path,
 ):
-    prior_tip = await _seed_prior_incarnation(git_ops)
+    prior = await _seed_prior_incarnation(git_ops)
+    _stage_recovered_plan(harness, prior.plan)
+    await _resolve_plan_touch_block(harness, queue, action='restart')
+
+    dispatch = await _dispatch(harness, config, git_ops, store, agents, tmp_path)
+
+    assert dispatch.initial_plan == prior.plan
+    assert not _architect_ran_before_review(agents)
+
+
+@pytest.mark.parametrize('recovered', [False, True], ids=['on-disk-plan', 'recovered-plan'])
+async def test_recut_restart_parks_the_prior_incarnation_and_runs_the_architect(
+    config, git_ops, store, queue, harness, agents, tmp_path, recovered,
+):
+    prior = await _seed_prior_incarnation(git_ops)
+    if recovered:
+        _stage_recovered_plan(harness, prior.plan)
     esc = await _resolve_plan_touch_block(harness, queue, action='restart', recut=True)
-    assert store.task['status'] == 'pending'
-    assert store.task['metadata'][RECUT_RULING_KEY]['ruling_id'] == esc.id
+    assert store.status(TASK_ID) == 'pending'
+    assert store.metadata(TASK_ID)[RECUT_RULING_KEY]['ruling_id'] == esc.id
 
-    gate, events = await _dispatch(config, git_ops, store, agents, tmp_path)
+    dispatch = await _dispatch(harness, config, git_ops, store, agents, tmp_path)
 
-    assert gate.verdict is GateVerdict.EXECUTED, gate.reason
+    assert dispatch.report is not None
+    assert dispatch.report.outcome is not WorkflowOutcome.BLOCKED, dispatch.report
+    assert dispatch.initial_plan is None
     assert agents.calls[0] == 'architect'
-    assert events.lever_b_skips() == []
-    executed = store.task['metadata'][RECUT_EXECUTED_KEY]
+    assert dispatch.events.lever_b_skips() == []
+    executed = store.metadata(TASK_ID)[RECUT_EXECUTED_KEY]
     assert executed['ruling_id'] == esc.id
     parked_branch = executed['parked_branch']
     assert parked_branch.startswith(f'task/{TASK_ID}-')
     _, parked_sha, _ = await _run(
         ['git', 'rev-parse', parked_branch], cwd=config.project_root,
     )
-    assert parked_sha.strip() == prior_tip
+    assert parked_sha.strip() == prior.tip
     parked_plans = [
         json.loads(p.read_text()) for p in git_ops.quarantine_base.rglob('plan.json')
     ]
