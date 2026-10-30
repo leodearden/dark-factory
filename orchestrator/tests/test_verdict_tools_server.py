@@ -120,20 +120,27 @@ class TestSubmitReviewVerdict:
         assert envelope['verdict']['note_dispositions'] == [_NO_ACTION_NOTE]
 
     @pytest.mark.parametrize(
-        ('note_dispositions', 'named'),
+        ('note_dispositions', 'named', 'located'),
         [
             pytest.param(
-                [{**_NO_ACTION_NOTE, 'disposition': 'fixed'}], 'fixed', id='unknown-disposition',
+                [
+                    dict(_NO_ACTION_NOTE),
+                    {**_NO_ACTION_NOTE, 'escalation_id': 'esc-42-2', 'disposition': 'fixed'},
+                ],
+                "'fixed'",
+                'note_dispositions entry 1 ',
+                id='unknown-disposition',
             ),
             pytest.param(
                 [dict(_NO_ACTION_NOTE), {**_NO_ACTION_NOTE, 'disposition': 'work'}],
-                'esc-42-1',
+                "'esc-42-1'",
+                'note_dispositions entries 0 and 1 ',
                 id='duplicated-id',
             ),
         ],
     )
     def test_malformed_note_dispositions_return_error_and_write_nothing(
-        self, artifacts, note_dispositions, named,
+        self, artifacts, note_dispositions, named, located,
     ):
         result = _submit_review_verdict(
             artifacts,
@@ -147,7 +154,7 @@ class TestSubmitReviewVerdict:
         )
         assert result['status'] == 'error'
         assert named in result['message']
-        assert 'entr' in result['message']
+        assert located in result['message']
 
         assert artifacts.read_verdict('test_analyst') is None
 

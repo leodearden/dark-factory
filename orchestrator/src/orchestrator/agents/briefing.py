@@ -51,14 +51,19 @@ def _open_info_note_entry(note: Escalation, detail_chars: int) -> str:
     return f"""\
 ## {note.id}
 
-- filed by: {note.agent_role}
+- filed by: {_one_line(note.agent_role)}
 - filed at: {note.timestamp}
-- summary: {note.summary}
-- suggested action: {note.suggested_action or '(none)'}
+- summary: {_one_line(note.summary)}
+- suggested action: {_one_line(note.suggested_action) or '(none)'}
 - detail:
 
 {quoted}
 """
+
+
+def _one_line(text: str) -> str:
+    """*text* with its line breaks collapsed, so a field cannot start a heading of its own."""
+    return ' '.join(text.split())
 
 COMMIT_BULLET_LIMIT = 40
 """Max commit bullets rendered in one briefing section (task 3033 amendment).
