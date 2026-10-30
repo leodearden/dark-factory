@@ -2,8 +2,9 @@
 
 ``RedPathLane`` owns a real ``OfflineLaneWorker`` over a seeded tmp repo whose
 ``lane/`` fixture project is the command's cwd, a stub ``pytest`` on PATH that
-plays back one scripted ``Run`` per launch, a real escalation queue and an injected
-clock.  The worker is stepped through its public surface only: ``on_post_merge``
+plays back one scripted ``Run`` per launch, the production typed task client over a
+stateful stand-in for fused-memory's task tools, a real escalation queue and an
+injected clock.  The worker is stepped through its public surface only: ``on_post_merge``
 then ``run`` as a background task, which ends when the worker reads main's head
 once more than the drive allowed (``MeteredGitOps``).
 """
@@ -12,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
+import functools
 import json
 import logging
 import math
@@ -30,16 +33,21 @@ from _orch_helpers import (
     MEASURED_SPAWN_LATENCY_SECS,
     VERIFY_CLI_PER_TEST_TIMEOUT,
     git_env_with_ceiling,
+    mcp_tool_envelope,
     required_timeout_secs,
 )
 from escalation.queue import EscalationQueue
+from shared.task_statuses import TaskStatus
 
+from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
 from orchestrator.config import GitConfig, LaneCommand, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.offline_lane_episode_state import CommandRecord, Episode, EpisodeStore
+from orchestrator.offline_lane_filing import SPAWN_CONTEXT
 from orchestrator.offline_lane_pass import PassOutcomeHook
 from orchestrator.offline_lane_records import PassRecord, RunRecordStore
+from orchestrator.scheduler import Scheduler
 
 A = 'tests/test_a.py::test_one'
 B = 'tests/test_b.py::test_two'
@@ -49,6 +57,8 @@ NINE = tuple(f'tests/test_n.py::test_{index}' for index in range(9))
 
 FIXTURE_DIR = 'lane'
 LANE_COMMAND = LaneCommand(name='lane-fixture', command='pytest -m integration tests', cwd=FIXTURE_DIR)
+#: ``lane-suite`` is no tool the command parser knows, so the lane cannot narrow it and intersects instead.
+OPAQUE_COMMAND = LaneCommand(name='lane-opaque', command='lane-suite tests', cwd=FIXTURE_DIR)
 
 #: The junit resolver maps a report's classnames to node ids only through module files that exist under the cwd.
 LANE_SEED = RepoSeed(
@@ -227,7 +237,8 @@ class LaneStub:
         self.ctl.mkdir(parents=True)
         self.runs_path = self.ctl / 'runs.json'
         self.invocations_path = self.ctl / 'invocations.jsonl'
-        self.install('pytest')
+        for name in ('pytest', 'lane-suite'):
+            self.install(name)
 
     def install(self, name: str) -> None:
         program = self.bin_dir / name
@@ -248,6 +259,12 @@ class LaneStub:
         if not self.invocations_path.exists():
             return []
         return [json.loads(line) for line in self.invocations_path.read_text().splitlines()]
+
+
+def effect_of(record: PassRecord) -> dict[str, Any]:
+    """The effect block every completed pass record carries."""
+    assert isinstance(record.effect, dict), f'pass {record.pass_id} has no effect block'
+    return record.effect
 
 
 async def git(repo: Path, *args: str) -> str:
@@ -341,8 +358,132 @@ async def first_set(events: Sequence[asyncio.Event], timeout: float, what: str) 
         raise AssertionError(f'{what}: nothing happened within {timeout}s')
 
 
+SUBMIT_RESPONSES_PATH = Path(__file__).resolve().parents[2] / 'shared' / 'tests' / 'fixtures' / 'submit_task_responses.json'
+DEFLAKE_SPAWN_CONTEXT = 'flake_ledger_debt'
+
+
+@functools.cache
+def submit_responses() -> Mapping[str, Any]:
+    """The scenario-24 cases: the submit_task payloads fused-memory's own tests assert it returns."""
+    return json.loads(SUBMIT_RESPONSES_PATH.read_text())['cases']
+
+
+def submit_payload(case: str, **fields: Any) -> dict[str, Any]:
+    return {**submit_responses()[case]['payload'], **fields}
+
+
+def metadata_holds(held: object, value: object) -> bool:
+    return held == value or (isinstance(held, list) and value in held)
+
+
+class FakeTaskStore:
+    """fused-memory's task tools as the production typed client reaches them, over one in-memory task table.
+
+    Every answer is the JSON-RPC body of a ``tools/call``; every ``submit_task`` answer is
+    built from the scenario-24 fixture's payloads.  A submission collides with any
+    non-cancelled task of the same title, as fused-memory's dedup does.
+    """
+
+    def __init__(self) -> None:
+        self.tasks: dict[str, dict[str, Any]] = {}
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.issued = 0
+
+    async def call_tool(self, name: str, arguments: dict, *, timeout: float = 30) -> dict:
+        self.calls.append((name, copy.deepcopy(arguments)))
+        return mcp_tool_envelope(self.answer(name, arguments))
+
+    def answer(self, name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        match name:
+            case 'submit_task':
+                return self.submitted(arguments)
+            case 'get_task':
+                return self.got(str(arguments['id']))
+            case 'get_statuses':
+                return {'statuses': {i: self.tasks[i]['status'] for i in map(str, arguments['ids']) if i in self.tasks}}
+            case 'find_tasks_by_metadata':
+                return self.found(arguments)
+            case 'commit_planning':
+                return self.committed(str(arguments['task_ids']).split(','), arguments['target_status'])
+            case _:
+                raise NotImplementedError(f'the fake task store answers no {name!r}')
+
+    def submitted(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        if not arguments.get('planning_mode'):
+            raise NotImplementedError('the fake task store files planning-mode submissions only')
+        title = arguments['title']
+        collided = next(
+            (task for task in self.tasks.values() if task['title'] == title and task['status'] != TaskStatus.CANCELLED),
+            None,
+        )
+        if collided is not None:
+            return submit_payload('planning_collision_terminal', task_id=collided['id'], status=collided['status'])
+        self.issued += 1
+        task_id = str(self.issued)
+        self.tasks[task_id] = {
+            'id': task_id,
+            'title': title,
+            'description': arguments.get('description', ''),
+            'details': arguments.get('details', ''),
+            'priority': arguments.get('priority'),
+            'status': TaskStatus.DEFERRED.value,
+            'metadata': copy.deepcopy(arguments.get('metadata') or {}),
+        }
+        return submit_payload('planning_create', task_id=task_id, status=TaskStatus.DEFERRED.value)
+
+    def got(self, task_id: str) -> dict[str, Any]:
+        if task_id not in self.tasks:
+            return {'error': f'Task {task_id} not found', 'error_type': 'TaskNotFoundError'}
+        return {'data': copy.deepcopy(self.tasks[task_id])}
+
+    def found(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        statuses = arguments.get('statuses')
+        matches = [
+            task for task in self.tasks.values()
+            if (statuses is None or task['status'] in statuses)
+            and metadata_holds(task['metadata'].get(arguments['key']), arguments.get('value'))
+        ]
+        offset, limit = arguments.get('offset', 0), arguments.get('limit', 100)
+        page = matches[offset:offset + limit]
+        return {
+            'results': [{'task_id': int(task['id']), 'status': task['status']} for task in page],
+            'pagination': {
+                'offset': offset, 'limit': limit, 'returned': len(page), 'has_more': offset + len(page) < len(matches),
+            },
+        }
+
+    def committed(self, task_ids: Sequence[str], target_status: str) -> dict[str, Any]:
+        for task_id in task_ids:
+            task = self.tasks.get(task_id)
+            if task is not None and task['status'] == TaskStatus.DEFERRED:
+                task['status'] = target_status
+        return {'success': True}
+
+    def task(self, task_id: str) -> dict[str, Any]:
+        return copy.deepcopy(self.tasks[task_id])
+
+    def spawned(self, spawn_context: str) -> list[dict[str, Any]]:
+        return [
+            copy.deepcopy(task) for task in self.tasks.values() if task['metadata'].get('spawn_context') == spawn_context
+        ]
+
+    def lane_tasks(self) -> list[dict[str, Any]]:
+        return self.spawned(SPAWN_CONTEXT)
+
+    def deflake_tasks(self) -> list[dict[str, Any]]:
+        return self.spawned(DEFLAKE_SPAWN_CONTEXT)
+
+    def calls_since(self, mark: int) -> list[tuple[str, dict[str, Any]]]:
+        return self.calls[mark:]
+
+
+def typed_task_client(config: OrchestratorConfig, store: FakeTaskStore) -> SchedulerChronicFlakeTaskClient:
+    """The lane's task client exactly as ``Harness._start_offline_lane`` wires it, over *store*."""
+    return SchedulerChronicFlakeTaskClient(Scheduler(config, mcp_session=store), config.project_root)
+
+
 class RedPathLane:
-    """One real offline-lane worker over a seeded repo, a stub test runner, a real queue and a fake clock."""
+    """One real offline-lane worker over a seeded repo, a stub test runner, a fake task store, a real queue and a fake clock."""
 
     def __init__(
         self,
@@ -350,6 +491,7 @@ class RedPathLane:
         config: OrchestratorConfig,
         git_ops: MeteredGitOps,
         queue: EscalationQueue,
+        store: FakeTaskStore,
         stub: LaneStub,
         clock: Clock,
         command: LaneCommand,
@@ -359,6 +501,7 @@ class RedPathLane:
         self.config = config
         self.git = git_ops
         self.queue = queue
+        self.store = store
         self.stub = stub
         self.clock = clock
         self.command = command
@@ -390,6 +533,7 @@ class RedPathLane:
             config=OrchestratorConfig(project_root=repo, git=git_config),
             git_ops=MeteredGitOps(git_config, repo),
             queue=EscalationQueue(tmp_path / 'escalations'),
+            store=FakeTaskStore(),
             stub=stub,
             clock=Clock(start=datetime.now(UTC).replace(second=0, microsecond=0)),
             command=command,
@@ -410,6 +554,7 @@ class RedPathLane:
             self.git,
             self.config,
             lock_path=self.lock_path,
+            task_client=typed_task_client(self.config, self.store),
             escalation_queue=self.queue,
             pass_outcome_hooks=self.hooks,
             now=self.clock,

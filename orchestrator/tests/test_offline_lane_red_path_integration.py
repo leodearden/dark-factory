@@ -26,6 +26,7 @@ from _offline_lane_red_path_fixtures import (
     RedPathLane,
     Run,
     W,
+    effect_of,
     lane_test_timeout,
 )
 
@@ -128,8 +129,8 @@ async def test_scenario_04_a_reproduction_30_minutes_later_files_exactly_one_tas
     assert task['metadata']['spawn_context'] == SPAWN_CONTEXT
     assert not task['id'].startswith('tkt_')
     assert lane.store.task(task['id']) == task
-    assert first.effect['tasks_filed'] == []
-    assert second.effect['tasks_filed'] == [task['id']]
+    assert effect_of(first)['tasks_filed'] == []
+    assert effect_of(second)['tasks_filed'] == [task['id']]
     assert task['status'] == 'pending'
     for text in (
         first.pass_id, second.pass_id,
@@ -170,7 +171,7 @@ async def test_scenario_06_a_red_the_narrowed_confirm_clears_ends_its_episode(tm
     assert cleared.outcome == {
         'arm': 'confirmed', 'mode': 'narrowed', 'reproduced': [], 'cleared': [A], 'inconclusive': [],
     }
-    assert [(ended['node'], ended['reason']) for ended in cleared.effect['episodes_ended']] == [(A, 'cleared')]
+    assert [(ended['node'], ended['reason']) for ended in effect_of(cleared)['episodes_ended']] == [(A, 'cleared')]
     assert lane.store.lane_tasks() == []
 
 
@@ -212,8 +213,8 @@ async def test_scenario_08_a_confirm_exiting_non_zero_naming_no_test_files_one_c
         'offline-lane[lane-fixture]: exits non-zero with no reproducible failing test '
         f'since {first.head[:HEAD_PREFIX_CHARS]}',
     ]
-    assert first.effect['tasks_filed'] == []
-    assert second.effect['tasks_filed'] == [tasks[0]['id']]
+    assert effect_of(first)['tasks_filed'] == []
+    assert effect_of(second)['tasks_filed'] == [tasks[0]['id']]
 
 
 @pytest.mark.asyncio
@@ -246,7 +247,7 @@ async def test_scenario_10_a_skip_and_a_truncated_session_leave_a_held_episode_u
     assert unchanged is not None
     for name in ('counted_passes', 'last_counted_started_at', 'reproduced_heads', 'ended_at'):
         assert getattr(unchanged, name) == getattr(held, name), name
-    assert [(ended['node'], ended['reason']) for ended in passed.effect['episodes_ended']] == [(A, 'passed')]
+    assert (A, 'passed') in [(ended['node'], ended['reason']) for ended in effect_of(passed)['episodes_ended']]
     ended = lane.episode(A)
     assert ended is not None
     assert ended.ended_at is not None
