@@ -20,9 +20,9 @@ import logging
 import math
 import os
 import sys
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any
@@ -43,6 +43,21 @@ from shared.task_statuses import TaskStatus
 
 from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
 from orchestrator.config import GitConfig, LaneCommand, OrchestratorConfig
+from orchestrator.flake_debt_drain import DrainPassReport, run_drain_pass
+from orchestrator.flake_ledger import (
+    DebtRow,
+    DueRow,
+    FlakeCallSite,
+    FlakeOccurrenceRow,
+    FlakeSuppression,
+    FlakeVerdict,
+    ledger_db_path,
+    read_debt,
+    read_due_items,
+    read_occurrences,
+)
+from orchestrator.flake_recorder import record_flake_observation
+from orchestrator.flake_report import FlakeLedgerReport, build_report
 from orchestrator.git_ops import GitOps
 from orchestrator.guard_state import guard_path
 from orchestrator.offline_lane import OfflineLaneWorker
@@ -563,6 +578,29 @@ def typed_task_client(config: OrchestratorConfig, store: FakeTaskStore) -> Sched
     return SchedulerChronicFlakeTaskClient(Scheduler(config, mcp_session=store), config.project_root)
 
 
+def wall_clock() -> datetime:
+    return datetime.now(UTC)
+
+
+#: Due items are stamped with the wall clock and backed off from it; a read this far
+#: ahead sees every item, backed off or not.
+DUE_READ_AHEAD = timedelta(days=365)
+DUE_READ_LIMIT = 1000
+
+
+def merge_gate_suppression(test_id: str, index: int) -> FlakeSuppression:
+    """The merge gate's suppression of *test_id*, observed *index* minutes after now, with no evidence."""
+    return FlakeSuppression(
+        verdict=FlakeVerdict.passes_in_isolation,
+        test_ids=(test_id,),
+        observed_at=(wall_clock() + timedelta(minutes=index)).isoformat(),
+        call_site=FlakeCallSite.merge_gate,
+        runner='local',
+        psi_cpu_some10=None,
+        unconfirmable_reason=None,
+    )
+
+
 class RedPathLane:
     """One real offline-lane worker over a seeded repo, a stub test runner, a fake task store, a real queue and a fake clock."""
 
@@ -739,3 +777,44 @@ class RedPathLane:
     def resolve(self, escalation_id: str) -> None:
         """Resolve a record as a person would."""
         assert self.queue.resolve(escalation_id, 'resolved by hand', resolved_by='operator') is not None
+
+    @property
+    def ledger(self) -> Path:
+        return ledger_db_path(self.project_root)
+
+    async def drain(self, clock: Callable[[], datetime] | None = None) -> DrainPassReport:
+        """One pass of the flake-debt drain over the lane's ledger, filing through the lane's typed client."""
+        return await run_drain_pass(
+            self.ledger,
+            self.config.fused_memory.project_id,
+            task_client=typed_task_client(self.config, self.store),
+            git=self.git,
+            escalation_queue=self.queue,
+            clock=clock or wall_clock,
+        )
+
+    async def record_merge_gate(self, suppression: FlakeSuppression, task_id: str | None) -> None:
+        """Record *suppression* as the merge gate does, at main's head, into the lane's ledger and queue."""
+        await record_flake_observation(
+            suppression,
+            project_root=self.project_root,
+            project_id=self.config.fused_memory.project_id,
+            merge_sha=await self.head(),
+            task_id=task_id,
+            escalation_queue=self.queue,
+        )
+
+    def rows(self, test_id: str | None = None) -> list[FlakeOccurrenceRow]:
+        return read_occurrences(self.ledger, test_id=test_id)
+
+    def due(self) -> list[DueRow]:
+        """Every item on the due list, backed off or not."""
+        items = read_due_items(self.ledger, now=wall_clock() + DUE_READ_AHEAD, limit=DUE_READ_LIMIT)
+        assert items is not None, 'the due list could not be read'
+        return items
+
+    def debt(self, test_id: str) -> DebtRow | None:
+        return read_debt(self.ledger, test_id)
+
+    def report(self, now: datetime) -> FlakeLedgerReport:
+        return build_report(self.ledger, now=now)
