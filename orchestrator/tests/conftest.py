@@ -331,8 +331,10 @@ def _isolate_orch_config(monkeypatch, tmp_path):
 
     Precedence keeps this safe: explicit kwargs still win over the env, which overrides
     only ``project_root`` and the host-reaching knobs: laptop runner, ``prefer_remote``
-    (task 5053) and ``verify_use_cgroup_scope`` (task 5206), so a bare config never
-    ssh's the laptop or spawns a real systemd scope; all else loads from yaml/defaults.
+    (task 5053), ``verify_use_cgroup_scope`` (task 5206) and
+    ``verify_cold_preprovision_command`` (task 6917), so a bare config never ssh's the
+    laptop, spawns a real systemd scope or runs a real ``uv sync``; all else loads from
+    yaml/defaults.
     Config-loading tests already use ``tmp_path`` as their project_root, so the
     env value agrees with the YAML they write.  The opt-in
     ``code_default_config`` fixture runs after this autouse fixture and still
@@ -344,6 +346,7 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     monkeypatch.setenv("ORCH_VERIFY_RUNNERS", "[]")
     monkeypatch.setenv("ORCH_VERIFY_HOST_POLICY", "prefer_local")
     monkeypatch.setenv("ORCH_VERIFY_USE_CGROUP_SCOPE", "false")
+    monkeypatch.setenv("ORCH_VERIFY_COLD_PREPROVISION_COMMAND", "")
 
 
 @pytest.fixture
@@ -382,6 +385,7 @@ def code_default_config(monkeypatch, tmp_path):
     monkeypatch.delenv("ORCH_VERIFY_RUNNERS", raising=False)
     monkeypatch.delenv("ORCH_VERIFY_HOST_POLICY", raising=False)
     monkeypatch.delenv("ORCH_VERIFY_USE_CGROUP_SCOPE", raising=False)
+    monkeypatch.delenv("ORCH_VERIFY_COLD_PREPROVISION_COMMAND", raising=False)
 
 
 #: Guaranteed-absent path for the autouse warm-lane script-dir pin below.

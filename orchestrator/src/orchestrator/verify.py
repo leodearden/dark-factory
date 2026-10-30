@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from shared.psi import PsiSample
 
     from orchestrator.event_store import EventStore
+    from orchestrator.git_ops import GitOps, WorktreeKind
 
 from shared.proc_group import terminate_process_group
 from shared.psi import cpu_some10_or_none, read_psi_sample
@@ -6959,7 +6960,12 @@ async def _preprovision_shared_venv(
         if done_at is not None and time.monotonic() - done_at < _PREPROVISION_DONE_TTL:
             return
         logger.info('Cold-verify shared-venv pre-provision: running %r in %s', cmd, worktree)
+        started = time.monotonic()
         rc, out, _ = await _run_cmd(cmd, worktree, timeout, env=verify_env or None)
+        logger.info(
+            'Cold-verify shared-venv pre-provision finished in %.1fs (rc=%d) in %s',
+            time.monotonic() - started, rc, worktree,
+        )
         if rc != 0:
             # Fail-open + loud (honours the loud-over-silent-degradation norm;
             # mirrors the _govern_cpu_str fail-open convention).  A SUCCESSFUL
@@ -6984,6 +6990,51 @@ async def _preprovision_shared_venv(
         # prune stale entries so the guard stays bounded across many worktrees.
         _PREPROVISION_DONE[key] = time.monotonic()
         _prune_preprovision_guard()
+
+
+async def _provision_main_tip_worktree(
+    worktree: Path,
+    config: OrchestratorConfig,
+    *,
+    role: Literal['merge', 'task', 'background'],
+) -> None:
+    """Provision a throwaway main-tip worktree the way the merge gate provisions its own.
+
+    Goes through ``_preprovision_shared_venv`` (same coalescing and fail-open
+    policy), with *role*'s verify env and in the warm timeout tier its verify legs
+    use. Such a worktree has no ``.task/``, so ``run_verification``'s ``is_cold``
+    gate never provisions it; without this, an environment-only failure on a
+    green main reads as red (task 6917).
+    """
+    await _preprovision_shared_venv(
+        worktree, config,
+        verify_env=_resolve_verify_env(config, None, role=role),
+        timeout=_resolve_verify_timeout(config, None, is_cold=False),
+    )
+
+
+@contextlib.asynccontextmanager
+async def _provisioned_ephemeral_worktree(
+    config: OrchestratorConfig,
+    git_ops: 'GitOps',
+    kind: 'WorktreeKind',
+    sha: str,
+    *,
+    warm_seed: bool,
+    role: Literal['merge', 'task', 'background'],
+) -> AsyncIterator[Path]:
+    """``GitOps.ephemeral_worktree``, provisioned before the body runs.
+
+    Every ``WorktreeKind`` is a main-tip kind, so each takes
+    ``_provision_main_tip_worktree``'s policy; a kind that is not would need
+    its own. Provisioning follows any warm seed: the seed fills ``target/``,
+    provisioning fills the venv and ``node_modules``.
+    """
+    async with git_ops.ephemeral_worktree(
+        kind, sha, warm_seed=warm_seed,
+    ) as worktree:
+        await _provision_main_tip_worktree(worktree, config, role=role)
+        yield worktree
 
 
 def _log_event_channel(label: str, channel: VerifyEventChannel) -> None:
@@ -9898,7 +9949,7 @@ async def verify_failure_is_preexisting_on_main(
 
 async def run_main_tip_sweep(
     config: 'OrchestratorConfig',
-    git_ops: object,
+    git_ops: 'GitOps',
     *,
     main_sha: str | None = None,
     seed_mode: SweepSeedMode = SweepSeedMode.COLD,
@@ -9925,6 +9976,9 @@ async def run_main_tip_sweep(
             ``WARM`` CoW-seeds ``target/`` from the warm-lane base as a
             read-only consumer, failing soft to cold.  The
             ``_mainsweepconfirm-`` confirm worktree always stays cold.
+            Either mode provisions the worktree first
+            (``_provision_main_tip_worktree``), as a merge verify does; the
+            seed mode governs only ``target/``.
 
     Returns:
         ``(main_sha, VerifyResult)`` on success (result.passed may be False).
@@ -10011,7 +10065,7 @@ async def run_main_tip_sweep(
         # gate and the worktree pin (both now use the same resolved value).
         if main_sha is None:
             try:
-                main_sha = await git_ops.get_main_sha()  # type: ignore[union-attr]
+                main_sha = await git_ops.get_main_sha()
             except Exception:
                 logger.debug('run_main_tip_sweep: get_main_sha failed', exc_info=True)
                 return None
@@ -10022,10 +10076,11 @@ async def run_main_tip_sweep(
         # '_mainsweep-' band, retry-on-lock-contention add, GUARANTEED scoped
         # cleanup on exit — never a broad 'git worktree prune', DD5) is owned
         # by GitOps.ephemeral_worktree; see its docstring for the full
-        # contract.
-        async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
-            WorktreeKind.MAIN_SWEEP, main_sha,
-            warm_seed=seed_mode is SweepSeedMode.WARM,
+        # contract. _provisioned_ephemeral_worktree provisions it before the
+        # body runs.
+        async with _provisioned_ephemeral_worktree(
+            config, git_ops, WorktreeKind.MAIN_SWEEP, main_sha,
+            warm_seed=seed_mode is SweepSeedMode.WARM, role='background',
         ) as tmp_path:
             def _enoent_on_self(r: 'VerifyResult') -> bool:
                 """SECONDARY backstop (task 2507): True iff *r* is a
@@ -10805,7 +10860,10 @@ async def confirm_main_tip_failure_is_real(
     Cleanup (scoped ``git worktree remove --force`` + ``remove_tree``)
     always runs in a ``finally`` block; no broad ``git worktree prune`` (DD5
     guarantee — mirrors ``run_main_tip_sweep``/
-    ``verify_failure_is_preexisting_on_main``).
+    ``verify_failure_is_preexisting_on_main``). Before the re-runs it is
+    provisioned like the sweep's worktree (``_provision_main_tip_worktree``),
+    so a failure that only an unprovisioned environment produces is never
+    confirmed; it stays unseeded (cold).
 
     Node-id -> subproject mapping: module configs are freshly re-discovered
     on the probe worktree (never reused from *config* — that snapshot is for
@@ -10890,6 +10948,8 @@ async def confirm_main_tip_failure_is_real(
                 _sha_prefix,
             )
             return True
+
+        await _provision_main_tip_worktree(tmp_path, config, role='task')
 
         # Each subproject group gets its own scoped + forced-serial isolated
         # re-run. ALL groups must confirm green to suppress.
