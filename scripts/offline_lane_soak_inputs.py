@@ -15,7 +15,12 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import _checkout as _checkout
-from orchestrator.flake_ledger import ledger_db_path, read_call_sites_written
+from orchestrator.flake_ledger import (
+    FlakeOccurrenceRow,
+    ledger_db_path,
+    read_call_sites_written,
+    read_occurrences,
+)
 from orchestrator.guard_state import guard_path
 from orchestrator.offline_lane_confirm import PassOutcome, outcome_from_json
 from orchestrator.offline_lane_episode_state import (
@@ -99,6 +104,7 @@ class SoakInputs:
     passes: tuple[WindowPass, ...]
     episodes: Mapping[str, CommandRecord]
     tasks: Mapping[str, Mapping[str, Any] | None]
+    occurrences: tuple[FlakeOccurrenceRow, ...]
 
     def effects(self) -> Iterator[tuple[WindowPass, PassEffect]]:
         """Each windowed pass that carries a readable effect block, with that block."""
@@ -235,4 +241,5 @@ async def load_inputs(
         passes=window,
         episodes=episodes,
         tasks=tasks,
+        occurrences=tuple(read_occurrences(stores.ledger, since=since.isoformat())),
     )

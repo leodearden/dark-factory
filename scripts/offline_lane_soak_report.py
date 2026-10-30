@@ -34,9 +34,16 @@ from typing import Any
 import _checkout as _checkout
 from migrate_metadata_modules_to_files import DEFAULT_SERVER
 from offline_lane_soak_inputs import SoakInputs, TaskReader, Unjudgeable, WindowPass, load_inputs
-from orchestrator.flake_ledger import DUE_ITEM_STALE_MINUTES
-from orchestrator.offline_lane_episode_state import LanePolicy
+from orchestrator.flake_ledger import (
+    DUE_ITEM_STALE_MINUTES,
+    UNKNOWN_TEST_ID,
+    FlakeCallSite,
+    FlakeVerdict,
+)
+from orchestrator.offline_lane_confirm import Confirmed
+from orchestrator.offline_lane_episode_state import LanePolicy, unconfirmable_node
 from orchestrator.offline_lane_filing import LANE_METADATA_KEY
+from orchestrator.offline_lane_records import PassRecord
 from shared.project_layout import default_project_root
 
 
@@ -178,11 +185,43 @@ def _filings_bounded_by_threshold(inputs: SoakInputs, rule: str, settings: Setti
     return _judged(Check.FILINGS_BOUNDED_BY_THRESHOLD, rule, len(blocks), notes=[counts])
 
 
+def _lane_rows(inputs: SoakInputs) -> set[tuple[str, datetime, str]]:
+    return {
+        (row.test_id, datetime.fromisoformat(row.observed_at), row.verdict)
+        for row in inputs.occurrences
+        if row.call_site == FlakeCallSite.offline_lane
+    }
+
+
+def _owed_rows(record: PassRecord, outcome: Confirmed) -> list[tuple[str, FlakeVerdict]]:
+    exempt = {unconfirmable_node(record.command), UNKNOWN_TEST_ID}
+    owed = [(node, FlakeVerdict.fails_in_isolation) for node in outcome.reproduced]
+    owed += [(node, FlakeVerdict.passes_in_isolation) for node in outcome.cleared]
+    return [(node, verdict) for node, verdict in owed if node not in exempt]
+
+
+def _ledger_rows_per_pass(inputs: SoakInputs, rule: str, settings: Settings) -> CheckResult:
+    rows = _lane_rows(inputs)
+    examined = 0
+    failures: list[str] = []
+    for window_pass in inputs.passes:
+        record = window_pass.stored.record
+        if record is None or not isinstance(window_pass.outcome, Confirmed):
+            continue
+        owed = _owed_rows(record, window_pass.outcome)
+        examined += len(owed)
+        missing = [f'{node} ({verdict})' for node, verdict in owed if (node, record.started_at, verdict) not in rows]
+        if missing:
+            failures.append(f'{_label(window_pass)}: no offline_lane row for ' + ', '.join(missing))
+    return _judged(Check.LEDGER_ROWS_PER_PASS, rule, examined, failures)
+
+
 _CHECKS: dict[Check, CheckFn] = {
     **{check: _not_yet_judged(check) for check in Check},
     Check.RECORDS_WELL_FORMED: _records_well_formed,
     Check.FILINGS_RESOLVE: _filings_resolve,
     Check.FILINGS_BOUNDED_BY_THRESHOLD: _filings_bounded_by_threshold,
+    Check.LEDGER_ROWS_PER_PASS: _ledger_rows_per_pass,
 }
 
 
