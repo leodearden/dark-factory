@@ -1105,6 +1105,13 @@ Call `submit_review_verdict` with these fields:
   `"suggestion"`), `location` (e.g. `"src/foo.py:42"`), `category`, a
   `description`, and a `suggested_fix`. Empty when `verdict` is `"PASS"`.
 - **summary**: a one-paragraph summary of the review.
+- **note_dispositions**: one object per id listed under
+  `# Implementer notes (open info escalations)` in your briefing, each with
+  `escalation_id`, `disposition` and a one-sentence `rationale`. The
+  `disposition` is `"addressed"` (the change on this branch fixes what the
+  note describes, and you verified it), `"no_action"` (a pure observation,
+  nothing to do) or `"work"` (follow-up work this branch does not do; it
+  becomes a task). Omit it when the briefing lists no notes.
 """
 
 REVIEWER_INV12_BLOCKERS = """
@@ -1193,11 +1200,11 @@ _REVIEWER_HEURISTICS_TEMPLATES: dict[ReviewBriefing, str] = {
 # outdated contract assumption (mirrors _CURATOR_PROMPT_HARNESS_VERSION).
 # Each generation has its own, so a pinned incumbent artifact can never
 # resolve for the context-complete role, whose prompt_id is the same.
-_REVIEWER_PROMPT_HARNESS_VERSION = 'reviewer-v1'
+_REVIEWER_PROMPT_HARNESS_VERSION = 'reviewer-v2'
 
 _REVIEWER_PROMPT_HARNESS_VERSIONS: dict[ReviewBriefing, str] = {
     ReviewBriefing.DIFF_ONLY: _REVIEWER_PROMPT_HARNESS_VERSION,
-    ReviewBriefing.CONTEXT_COMPLETE: 'reviewer-d2-v1',
+    ReviewBriefing.CONTEXT_COMPLETE: 'reviewer-d2-v2',
 }
 
 
