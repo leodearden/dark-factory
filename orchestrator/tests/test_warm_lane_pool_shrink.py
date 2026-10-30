@@ -300,6 +300,37 @@ async def test_recovery_warns_once_naming_every_over_cap_lane(
 
 
 @pytest.mark.asyncio
+async def test_shrink_guard_names_drained_over_cap_lanes_at_info_only(
+    ig_git_repo: Path, caplog: pytest.LogCaptureFixture,
+):
+    host = await _shrunk_host(ig_git_repo)
+    host.pool.set_lane_lifecycle(LaneLifecycle(host.base))
+    for task_id, k in (('42', 1), ('43', 2)):
+        await host.harness.git_ops.cleanup_worktree(host.lane(k), task_id)
+        record = host.durable_record(host.lane(k))
+        assert record is not None
+        assert record.state is DurableLaneState.RELEASED
+        assert host.lane(k).is_dir()
+    caplog.clear()
+
+    with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+        report = host.harness.git_ops.warn_on_warm_lane_pool_shrink()
+
+    assert report is not None
+    assert report.undrained().lanes == ()
+    assert not _shrink_warnings(caplog)
+    drained_infos = [
+        r.getMessage() for r in caplog.records
+        if r.name == 'orchestrator.git_ops'
+        and r.levelno == logging.INFO
+        and 'drained' in r.getMessage()
+    ]
+    assert len(drained_infos) == 1, drained_infos
+    assert '_lane-1' in drained_infos[0]
+    assert '_lane-2' in drained_infos[0]
+
+
+@pytest.mark.asyncio
 async def test_shrink_guard_is_silent_without_over_cap_lanes(
     ig_git_repo: Path, caplog: pytest.LogCaptureFixture,
 ):

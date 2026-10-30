@@ -30,6 +30,10 @@ def _make_pool(tmp_path: Path, size: int, name_prefix: str = '_lane-') -> WarmLa
     return WarmLanePool(worktree_base=base, size=size, name_prefix=name_prefix)
 
 
+def _reported_over_cap(pool: WarmLanePool, path: Path) -> bool:
+    return bool(pool.over_cap_report([path], {}).lanes)
+
+
 def _wire_lifecycle(pool: WarmLanePool, tmp_path: Path) -> LaneLifecycle:
     lifecycle = LaneLifecycle(worktree_base=tmp_path / 'worktrees')
     pool.set_lane_lifecycle(lifecycle)
@@ -54,7 +58,7 @@ class TestLaneRecognition:
         lane = base / '_lane-0'
 
         assert pool.is_lane(lane)
-        assert not pool.is_over_cap(lane)
+        assert not _reported_over_cap(pool, lane)
         assert pool.canonical_lane(lane) == lane
 
     def test_over_cap_slot_is_lane_and_over_cap(self, tmp_path: Path):
@@ -63,7 +67,7 @@ class TestLaneRecognition:
         lane = base / '_lane-5'
 
         assert pool.is_lane(lane)
-        assert pool.is_over_cap(lane)
+        assert _reported_over_cap(pool, lane)
         assert pool.canonical_lane(lane) == base / '_lane-5'
 
     @pytest.mark.parametrize(
@@ -74,7 +78,7 @@ class TestLaneRecognition:
         path = tmp_path / 'worktrees' / relative
 
         assert not pool.is_lane(path)
-        assert not pool.is_over_cap(path)
+        assert not _reported_over_cap(pool, path)
         assert pool.canonical_lane(path) is None
 
     def test_same_name_under_another_base_is_not_a_lane(self, tmp_path: Path):
@@ -82,7 +86,7 @@ class TestLaneRecognition:
         path = tmp_path / 'elsewhere' / '_lane-5'
 
         assert not pool.is_lane(path)
-        assert not pool.is_over_cap(path)
+        assert not _reported_over_cap(pool, path)
         assert pool.canonical_lane(path) is None
 
     def test_prefix_scopes_the_namespace(self, tmp_path: Path):
@@ -90,7 +94,7 @@ class TestLaneRecognition:
         base = tmp_path / 'worktrees'
 
         assert pool.is_lane(base / '_spec-4')
-        assert pool.is_over_cap(base / '_spec-4')
+        assert _reported_over_cap(pool, base / '_spec-4')
         assert not pool.is_lane(base / '_lane-4')
 
 
@@ -219,6 +223,33 @@ class TestOverCapReport:
         assert report.lanes == (
             OverCapLane(name='_lane-4', record_state=None, record_task_id=None),
         )
+
+    def test_undrained_keeps_lanes_that_may_hold_an_assignment(self, tmp_path: Path):
+        pool = _make_pool(tmp_path, size=2)
+        base = tmp_path / 'worktrees'
+        records = {
+            '_lane-2': LaneRecord(state=DurableLaneState.ASSIGNED, task_id='42'),
+            '_lane-3': LaneRecord(state=DurableLaneState.RELEASED),
+            '_lane-5': LaneRecord(state=DurableLaneState.IN_USE, task_id='45'),
+            '_lane-6': LaneRecord(state=DurableLaneState.QUARANTINED),
+        }
+        resident = [base / f'_lane-{k}' for k in range(2, 7)]
+
+        report = pool.over_cap_report(resident, records)
+
+        undrained, drained = report.undrained(), report.drained()
+        assert [lane.name for lane in undrained.lanes] == ['_lane-2', '_lane-4', '_lane-5']
+        assert [lane.name for lane in drained.lanes] == ['_lane-3', '_lane-6']
+        assert undrained.capacity == drained.capacity == 2
+
+    def test_admitted_over_cap_lane_is_reported_in_index_order(self, tmp_path: Path):
+        pool = _make_pool(tmp_path, size=2)
+        base = tmp_path / 'worktrees'
+        pool.restore_assignment('43', base / '_lane-10')
+
+        report = pool.over_cap_report([base / '_lane-10', base / '_lane-9'], {})
+
+        assert [lane.name for lane in report.lanes] == ['_lane-9', '_lane-10']
 
     def test_no_resident_over_cap_lane_gives_empty_report(self, tmp_path: Path):
         pool = _make_pool(tmp_path, size=2)

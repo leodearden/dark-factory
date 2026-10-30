@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -92,6 +92,9 @@ class WarmLanePoolCensus:
         )
 
 
+_ASSIGNMENT_STATES = frozenset({DurableLaneState.ASSIGNED, DurableLaneState.IN_USE})
+
+
 @dataclass(frozen=True)
 class OverCapLane:
     """One lane resident beyond the pool's capacity, with its durable record."""
@@ -105,6 +108,11 @@ class OverCapLane:
         if record is None:
             return cls(name=name, record_state=None, record_task_id=None)
         return cls(name=name, record_state=record.state, record_task_id=record.task_id)
+
+    @property
+    def may_hold_assignment(self) -> bool:
+        """True unless the durable record shows no assignment (RELEASED, QUARANTINED, ...)."""
+        return self.record_state is None or self.record_state in _ASSIGNMENT_STATES
 
     def render(self) -> str:
         state = self.record_state.value if self.record_state is not None else 'no-record'
@@ -127,6 +135,16 @@ class WarmLanePoolShrink:
         """Return the stable single-line ``key=value`` string."""
         lanes = ','.join(lane.render() for lane in self.lanes)
         return f'capacity={self.capacity} over_cap={len(self.lanes)} lanes={lanes}'
+
+    def undrained(self) -> WarmLanePoolShrink:
+        """The lanes that may still hold an assignment."""
+        return replace(self, lanes=tuple(lane for lane in self.lanes if lane.may_hold_assignment))
+
+    def drained(self) -> WarmLanePoolShrink:
+        """The lanes whose durable record shows no assignment."""
+        return replace(
+            self, lanes=tuple(lane for lane in self.lanes if not lane.may_hold_assignment),
+        )
 
 
 class WarmLanePool:
@@ -276,12 +294,12 @@ class WarmLanePool:
             return None
         return int(digits)
 
-    def _over_cap_slot(self, path: Path) -> Path | None:
-        """Return the over-cap lane key *path* names, or None."""
+    def _over_cap_index(self, path: Path) -> int | None:
+        """Return k when *path* names the lane slot k and k >= capacity, else None."""
         index = self._slot_index(path)
         if index is None or index < self.capacity:
             return None
-        return self._base / path.name
+        return index
 
     async def release(self, lane: Path) -> None:
         """Mark *lane* as FREE, or drain it when it is an over-cap lane.
@@ -474,12 +492,9 @@ class WarmLanePool:
         matched = self._match_lane(path)
         if matched is not None:
             return matched
-        return self._over_cap_slot(path)
-
-    def is_over_cap(self, path: Path) -> bool:
-        """Return True if *path* names a lane at an index >= capacity."""
-        lane = self.canonical_lane(path)
-        return lane is not None and self._over_cap_slot(lane) is not None
+        if self._over_cap_index(path) is None:
+            return None
+        return self._base / path.name
 
     def is_lane(self, path: Path) -> bool:
         """Return True if *path* names one of this pool's lanes.
@@ -498,12 +513,12 @@ class WarmLanePool:
         *resident* is the caller's listing of the pool directory and *records*
         its durable records keyed by lane name; this method reads neither.
         """
-        over_cap = {
-            lane.name: index
+        names_by_index = {
+            index: lane.name
             for lane in filter(None, map(self.canonical_lane, resident))
-            if (index := self._slot_index(lane)) is not None and index >= self.capacity
+            if (index := self._over_cap_index(lane)) is not None
         }
-        names = sorted(over_cap, key=over_cap.__getitem__)
+        names = [names_by_index[index] for index in sorted(names_by_index)]
         return WarmLanePoolShrink(
             capacity=self.capacity,
             lanes=tuple(OverCapLane.from_record(name, records.get(name)) for name in names),

@@ -6941,13 +6941,15 @@ class GitOps:
         )
 
     def warn_on_warm_lane_pool_shrink(self) -> WarmLanePoolShrink | None:
-        """Log ONE WARNING naming every lane resident beyond the pool's capacity.
+        """Log ONE WARNING naming every over-cap lane that may still hold an assignment.
 
         A startup diagnostic for a restart with a smaller pool: each over-cap
-        lane is named with its durable state and task, i.e. the assignments
-        recovery is about to adopt.  Returns the report, or None when the pool
-        is disabled or the pool directory / durable records cannot be read.
-        Never raises.
+        lane whose durable record is ASSIGNED/IN_USE, or missing, is named
+        with its state and task, i.e. the assignments recovery is about to
+        adopt.  Lanes that already drained keep their directories, so they
+        are named at INFO only and the warning clears once the shrink's lanes
+        drain.  Returns the full report, or None when the pool is disabled or
+        the pool directory / durable records cannot be read.  Never raises.
         """
         pool = self.warm_lane_pool
         if pool is None:
@@ -6962,13 +6964,21 @@ class GitOps:
             )
             return None
         report = pool.over_cap_report(resident, records)
-        if report.lanes:
+        undrained, drained = report.undrained(), report.drained()
+        if undrained.lanes:
             logger.warning(
                 'warm-lane pool SHRINK: %d lane(s) resident beyond capacity %d '
-                '— live assignments on them are adopted as over-cap lanes that '
-                'drain on release; any left assigned-but-unadopted after '
-                'startup stays stranded until released: %s',
-                len(report.lanes), report.capacity, report.render(),
+                'may still hold an assignment — live assignments on them are '
+                'adopted as over-cap lanes that drain on release; any left '
+                'assigned-but-unadopted after startup stays stranded until '
+                'released: %s',
+                len(undrained.lanes), report.capacity, undrained.render(),
+            )
+        if drained.lanes:
+            logger.info(
+                'warm-lane pool: %d drained over-cap lane(s) kept on disk beyond '
+                'capacity %d: %s',
+                len(drained.lanes), report.capacity, drained.render(),
             )
         return report
 
