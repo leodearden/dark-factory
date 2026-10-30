@@ -1527,7 +1527,9 @@ def emit_series(series, root: str | Path, *, stamp: str | None = None) -> tuple[
 #
 # D8's runner pattern (audit_duplicate_memories.py:364-378) minus every
 # mutation: CONFIG_PATH from --config, FusedMemoryConfig(), MemoryService(),
-# initialize(), try/finally close(). MemoryService rather than Mem0Backend
+# initialize_for_reads(), try/finally close(); the full initialize() starts the
+# durable write queue and runs Graphiti startup maintenance, which repairs
+# edges. MemoryService rather than Mem0Backend
 # because a retrieval probe MUST embed its queries — unlike the census, which
 # skips the embedder deliberately, this one cannot.
 #
@@ -1900,7 +1902,7 @@ async def _probe(args: argparse.Namespace, registry: TopicRegistry) -> ProbeOutc
     memory = MemoryService(FusedMemoryConfig())
     try:
         try:
-            await memory.initialize()
+            await memory.initialize_for_reads()
         except OSError as exc:
             raise ProbeRunError(
                 f'the memory store could not be opened ({type(exc).__name__}): {exc}'
