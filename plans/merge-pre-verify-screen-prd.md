@@ -165,24 +165,32 @@ No lane, metadata or diff-reachability proxy separates fixing verifies from doom
      - Speculation permits release only at finalize (`_finalize_inflight`), and K = 1 + verify runners = 2 = hosts. So after each speculative landing, the freed host waits while the merger merges and screens the next item (critic K44).
      - Cold, that is about 45–65 s per landing: roughly 2% of local and 6% of laptop host time. Once β removes most defects upstream, that cost would outweigh the screen's value.
      - Neither existing tree is warm here. The ephemeral `_merge-*` worktree is fresh for every item. The chain lane is cold too: `merge_spec_warm_lane_pool` is off in this repo, so `GitOps.acquire_spec_lane` falls back to an ephemeral worktree.
-   - **α builds two persistent screen lanes,** on the `_merge-verify` precedent: reset in place to the screened sha (`GitOps.reset_persistent_merge_worktree`'s `git reset --hard` plus `git clean` with an exclusion), keeping their `.venv` and bytecode across resets.
+   - **α builds two persistent screen lanes,** `_screen-merger` and `_screen-chain`, on the `_merge-verify` precedent.
+     - **Reset.** Each is reset in place to the screened sha: `git reset --hard`, then the clean builder's `git clean -xfd` with `also_retain=('.venv/', '__pycache__/')`, the parameter `_reset_warm_lane` already uses.
+       - The precedent as configured keeps only `reap_build_artifact_dirs` (`target`). It would wipe the venv and the bytecode on every reset and bring the cold cost back (critic K46).
+       - Bytecode recompiles only for files the reset changed.
+       - A `uv.lock` change costs one re-sync of 2–8 s. An offline-cache miss there is an `error`, and the screen fails open.
 
      | Lane | Used by |
      |---|---|
-     | merger lane | the per-item screen, its base re-runs, and γ1's F runs |
-     | chain lane | δ's chain screen; it checks the chain's link commits out by sha, since they are in the shared object store |
+     | `_screen-merger` | the per-item screen, its base re-runs, γ1's F runs, and γ1's bare-main re-probes (the tick wakes the merger's wait, so re-probes run on the merger task) |
+     | `_screen-chain` | δ's chain screen; it checks the chain's link commits out by sha, since they are in the shared object store |
 
-     Each lane is used serially by its own loop, so it needs no lock. Both get exact-name `PROTECTED_PREFIXES` entries.
+     - **Locking.** Each lane is used serially by its own task, so it needs no in-process lock. The reset keeps the cross-process lane flock that the precedent's helper already takes.
+     - **Names and reaping.** Both names sit **outside** the `_merge-*` band. `GitOps.prune_stale_merge_worktrees` and the merge-worktree ledger audit force-remove every `_merge-*` worktree except `_merge-verify`, whatever `PROTECTED_PREFIXES` says (critic K48). Both lanes are registered as exact names in `PROTECTED_PREFIXES` and in the bash mirror.
    - **The ephemeral worktree is the fallback,** used when a lane is unavailable. The fallback is counted on the `merge_screen` event.
    - **The task-role screen** runs in the task's own venv, which is warm after its first verify.
-   - **α's acceptance criterion:** the per-item lane screen's median wall, over α's boundary runs and its first live day, is **≤ 20 s**, recorded in α's commit message. The basis is L3: 9.8 s for the seven run in parallel warm, plus a reset of a few seconds. Over the criterion, ζ judges whether the lane screen still pays.
+   - **α's acceptance criterion:** the per-item lane screen's median wall, over α's boundary runs and its first live day, is **≤ 20 s**, recorded in α's commit message. The basis: the `scripts` group ≈ 8–10 s warm (L5) and the `orchestrator` group ≈ 3–5 s (L3), run concurrently through `run_node_ids` (decision 5), plus a reset of a few seconds. α re-measures the figure through the runner before recording it. If the criterion is missed, ζ judges whether the lane screen still pays.
 5. **The screen's verdict is structured data, never an exit code alone** (heuristic 12; INV-1; INV-2; INV-11).
    - **All seven checks are pytest node ids.** The ratchet runs as its own gate test, `scripts/tests/test_inline_suppression_ratchet.py::test_the_live_tree_passes_the_gate_once_the_baseline_is_seeded`, rather than as the bare scanner.
      - Pytest separates a failing test from a collection, import or usage error.
      - The bare scanner can't: under `python -I` an import failure exits 1, the scanner's own finding code (L1).
    - **The lane runs the manifest through the shared node-id runner,** `verify.py::run_node_ids` (built by γ0; §4).
      - It returns `pass`, `fail`, `error` or `skipped` per node id, from junit's failing and never-ran vectors.
-     - `screen.py` makes one `run_node_ids` call per check and runs the calls concurrently, as L3 did. The runner itself runs module groups serially.
+     - `screen.py` makes **one** `run_node_ids` call per screen, with every manifest id, and maps the per-id results back to checks through the manifest.
+       - With `concurrent_groups=True`, the runner runs its module groups (here `scripts` and `orchestrator`) concurrently, each with its own junit path.
+       - The discriminator keeps the serial default.
+       - Separate concurrent calls per check would collide on the per-module junit file, `<tree>/.df-verify-junit/report.<module>.xml` (critic K47).
      - A check is a `finding` when any of its ids fails.
      - A check is an `error` when any of its ids errors, is skipped or is not collected. SKIP is not ALLOW: the ratchet's node skips when its baseline is absent, and it must not read as green.
      - The finding text is the failure summary plus captured output. The ratchet test asserts on the scanner's stderr, so its output carries the `file:line` violations.
@@ -282,7 +290,7 @@ Each assumed capability is either verified by reading main `07bd68fd99` or built
 | Run named pytest node ids on a given tree and report each one's result | **built here (γ0)** | `verify.py::confirm_isolated_rerun_verdict` takes a `VerifyResult` and returns a flake verdict per call-site policy. γ0 extracts its group → command → `run_verification` body into a public `verify.py::run_node_ids`, which both the discriminator and the screen call (INV-5) |
 | `OutcomeKind` and `ChainTruncationReason` are extendable | exists | `merge_lane/types.py` |
 | A persistent worktree reset in place, keeping its venv | exists (pattern); **two screen lanes built here (α)** | `GitOps.reset_persistent_merge_worktree`, which serves the `_merge-verify` lane. The warm spec pool (`merge_spec_warm_lane_pool`) is off in this repo, so `acquire_spec_lane` is cold here |
-| A throwaway worktree at any sha, for the screen's cold fallback and bare-main re-probes | exists | `GitOps.ephemeral_worktree(kind, sha)`; `verify.py::_on_main_probe_worktree`. The new `WorktreeKind.MERGE_SCREEN` and the two persistent screen lanes also need `git_ops.py::PROTECTED_PREFIXES` entries and their bash mirror in `orchestrator/scripts/warm-lane/lib_lane_state.sh::lane_protect_glob` |
+| A throwaway worktree at any sha, for the screen's cold fallback | exists | `GitOps.ephemeral_worktree(kind, sha)`. Bare-main re-probes run in `_screen-merger` (decision 4). The new `WorktreeKind.MERGE_SCREEN` and the two persistent screen lanes also need `git_ops.py::PROTECTED_PREFIXES` entries and their bash mirror in `orchestrator/scripts/warm-lane/lib_lane_state.sh::lane_protect_glob` |
 | Provisioning a tree with `uv run` alone, without a cold-preprovision `npm ci` | exists, measured | `verify.py::run_verification` runs `_preprovision_shared_venv` only when `_is_verify_cold`, which is False without `.task/` (critic-verified); cost in L2 |
 | The ratchet as a pytest node | exists | `scripts/tests/test_inline_suppression_ratchet.py::test_the_live_tree_passes_the_gate_once_the_baseline_is_seeded` runs `inline_suppressions.main(['--check', …])` against the tree holding the test file. It skips while the baseline is absent |
 | Task-role base attribution for a red main | exists | the task-verify contagion guard: `workflow.py` calls `verify_failure_is_preexisting_on_main` on a failing task verify, then `_block_on_inherited_break` |
@@ -320,7 +328,8 @@ checks:
   - ...                            # C8 C11 C14 C15 C18 C20
 
 # orchestrator/src/orchestrator/verify.py (extracted, shared with the isolated-rerun discriminator)
-async run_node_ids(tree: Path, config, module_configs, ids: Collection[str])
+async run_node_ids(tree: Path, config, module_configs, ids: Collection[str], *,
+                   concurrent_groups: bool = False)   # True: per-group junit path
     -> Mapping[str, Literal['pass', 'fail', 'error', 'skipped']]
 
 # orchestrator/src/orchestrator/merge_lane/screen.py (new; imports nothing from worker.py)
@@ -385,6 +394,7 @@ Invariants:
 | Re-probe keeps erroring | K consecutive re-probe errors, interleaved with clean item screens | degraded at the K-th re-probe error (the item screens do not reset it); owner L1 amended |
 | Direct-commit fix while all held | every buffered item held; a fix lands by direct commit | the merger's tick sees the new main sha; re-probe passes; cleared within one `reprobe_interval_secs` |
 | `merge_status` shows held | MCP caller polls a held request | wire state `held`, with the owner id |
+| Screen lanes survive the reapers | disk-pressure `prune_stale_merge_worktrees`; the merge-worktree ledger audit; the bash lane GC | `_screen-merger` and `_screen-chain` left in place, with their `.venv` intact after a reset |
 | Held train does not spin | a declared train is held | marked held before `_stand_down_train` requeues it; not popped again until the verdict changes; its train `merge_wt` cleaned |
 | Stacked on a fix | slot-2 item whose base is a high-lane fix's merge commit | its tree passes t ⇒ proceeds |
 | Held item cancelled or relaned | `merge_cancel` / `merge_relane` on a held request | acts as on any buffered request; held mark dropped |
@@ -418,7 +428,9 @@ Rules for every leaf:
 The leaves:
 
 - **γ0, the shared node-id runner** (medium). No dependencies. It touches no `worker.py`, so it can start at once.
-  - Extracts `verify.py::run_node_ids` from the isolated-rerun discriminator (`confirm_isolated_rerun_verdict`), which then calls it. It groups ids by module, runs each group as a structured pytest command under the module's own cwd and `uv run` form, and reads junit.
+  - Extracts `verify.py::run_node_ids` from the isolated-rerun discriminator (`confirm_isolated_rerun_verdict`), which then calls it.
+    - It groups ids by module, runs each group as a structured pytest command under the module's own cwd and `uv run` form, and reads junit into `pass` / `fail` / `error` / `skipped`.
+    - `concurrent_groups=True` runs the groups concurrently, each with its own junit path. The default stays serial, as the discriminator's isolation requires.
   - Modules: orchestrator (`verify.py` and the discriminator's tests). ~300 LOC.
   - **Signal:** the discriminator's existing tests pass unchanged through the extracted runner. A new public-seam test runs `run_node_ids` on a real fixture tree with one passing, one failing and one uncollectable id, and gets `pass` / `fail` / `error`.
 - **α, the screen and the per-item lane screen** (high). Depends on γ0.
@@ -431,7 +443,9 @@ The leaves:
     - the config block `merge_screen.{manifest, timeout_secs, chain_timeout_secs, error_streak_alarm}` (reloadable, default off), enabled in this repo's yaml. That is a shipped-config change, so the whole orchestrator suite runs first (the conftest pins `ORCH_CONFIG_PATH` to the shipped yaml).
   - Adds a guard test that *runs* every manifest node id on the pinned tree and fails if any is missing or skipped (INV-10): a renamed or skipping test must not silently empty the screen.
   - Builds the two persistent screen lanes, each with an ephemeral fallback (decision 4).
-  - **Acceptance:** the per-item lane screen's median wall is ≤ 20 s (decision 4), recorded in the commit.
+  - **Acceptance:** the per-item lane screen's median wall is ≤ 20 s (decision 4), recorded in the commit, together with the warm figure re-measured through `run_node_ids`.
+    - Basis: the `scripts` group ≈ 8–10 s warm and the `orchestrator` group ≈ 3–5 s, run concurrently, plus a reset of a few seconds.
+    - With the groups run serially it would be ≈ 15–20 s, which is borderline.
   - Modules: orchestrator, scripts, dashboard. ~1,100 LOC.
   - **Signal:** the boundary rows "own-defect bounce", "review category", "red base is not blamed", "instrument error fails open", "kill switch" and "declared train finding".
   - Live confirmation: a `merge_attempt outcome=screen_failed` row in runs.db with no `merge_verify` row for that request.
@@ -535,4 +549,4 @@ No waiver needed.
 | 3 | Culprit search in δ: bisect or a linear prefix walk? | The bound is the contract (C7); pick by chain-lane checkout cost | δ |
 | 4 | β's non-failing note | Needs a run shape the task-verify runner reports without failing; use `PlannedRun`'s existing fields | β |
 | 5 | Do held requests stay in `unfrozen_suffix` for the needs_rebase conflict graph? | They are already out of `chain_snapshot`. Either way, the twin test states the chosen relation | γ1 |
-| 6 | Persistent screen lane details: the reset/clean exclusions, the venv sync after a `uv.lock` change, and the fallback trigger | Follow `reset_persistent_merge_worktree`; meet α's ≤ 20 s acceptance (decision 4) | α |
+| 6 | What triggers the screen lane's ephemeral fallback: lane flock held, reset failure, disk | Fall back and count it on the `merge_screen` event; never block the merger | α |
