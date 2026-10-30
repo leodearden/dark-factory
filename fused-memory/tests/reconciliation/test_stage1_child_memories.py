@@ -1,12 +1,25 @@
-"""Stage 1 sees child memories (amendments/sightings) as children of their parent (task 6193)."""
+"""Stage 1 sees child memories (amendments/sightings) as children of their parent.
+
+Covers both Stage 1 payload paths: the time-windowed fetch (task 6193) and the
+ContextAssembler backlog chunk (task 6294).
+"""
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
 import pytest
 
-from fused_memory.models.reconciliation import Watermark
+from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.memory import MemoryCategory, MemoryResult, SourceStore
+from fused_memory.models.reconciliation import (
+    EventSource,
+    EventType,
+    ReconciliationEvent,
+    Watermark,
+)
+from fused_memory.reconciliation.context_assembler import ContextAssembler
 from fused_memory.reconciliation.prompts.stage1 import CHILD_MEMORY_AUTHORITY_RULE
 from fused_memory.server.grouped_read import CHILD_KINDS, PARENT_ID_KEY
 from reconciliation.consolidator_fixtures import make_consolidator
@@ -116,6 +129,113 @@ class TestStage1PayloadRendersNoLinkForNonChildren:
         payload = await _render_payload([memory])
         line = _line_for(payload, _NOT_A_CHILD_ID)
         assert line == f'- [{_NOT_A_CHILD_ID}] ({rendered_category}): {_PARENT_BODY}', (
+            'Only a grouped_read child (child kind + string parent id) gets a parent '
+            f'link; line={line!r}; payload:\n{payload}'
+        )
+
+
+def _as_search_hit(memory: dict) -> MemoryResult:
+    return MemoryResult(
+        id=memory['id'],
+        content=memory['memory'],
+        category=MemoryCategory.procedural_knowledge,
+        source_store=SourceStore.mem0,
+        metadata=dict(memory['metadata'] or {}),
+    )
+
+
+async def _render_backlog_payload(memories: list[dict] | None = None) -> str:
+    records = _fixture_memories() if memories is None else memories
+    assembler = ContextAssembler(
+        memory_service=AsyncMock(
+            search=AsyncMock(return_value=[_as_search_hit(m) for m in records])
+        ),
+        taskmaster=None,
+        config=ReconciliationConfig(),
+        project_root='/tmp/test',
+    )
+    event = ReconciliationEvent(
+        id='backlog-event',
+        type=EventType.memory_added,
+        source=EventSource.agent,
+        project_id='test_project',
+        timestamp=datetime.now(UTC),
+        payload={'content_preview': 'uv sync before pytest', 'category': 'procedural_knowledge'},
+    )
+    ap = await assembler.assemble([event], Watermark(project_id='test_project'), 'test_project')
+    stage = make_consolidator()
+    stage.assembled_payload = ap
+    return await stage.assemble_payload(
+        events=ap.events, watermark=Watermark(project_id='test_project'), prior_reports=[]
+    )
+
+
+def _link_of(line: str, memory_id: str) -> str:
+    after_id = line.split(f'[{memory_id}]', 1)[1]
+    return after_id.split(' (', 1)[0]
+
+
+class TestBacklogPayloadRendersChildLinks:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kind', sorted(CHILD_KINDS))
+    async def test_child_line_carries_parent_id_and_kind(self, kind: str):
+        payload = await _render_backlog_payload()
+        line = _line_for(payload, _CHILD_IDS[kind])
+        assert _PARENT_ID in line, (
+            f'Backlog child ({kind}) line must name its parent id; line={line!r}; '
+            f'payload:\n{payload}'
+        )
+        assert kind in line, (
+            f'Backlog child line must name its kind {kind!r}; line={line!r}; payload:\n{payload}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kind', sorted(CHILD_KINDS))
+    async def test_child_link_matches_time_windowed_path(self, kind: str):
+        child_id = _CHILD_IDS[kind]
+        backlog_link = _link_of(_line_for(await _render_backlog_payload(), child_id), child_id)
+        windowed_link = _link_of(_line_for(await _render_payload(), child_id), child_id)
+        assert windowed_link, f'Time-windowed path must render a link for child {kind!r}'
+        assert backlog_link == windowed_link, (
+            'Both Stage 1 payload paths must render the same parent link for the same '
+            f'record; backlog={backlog_link!r}, time-windowed={windowed_link!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_plain_hit_line_unchanged(self):
+        payload = await _render_backlog_payload()
+        line = _line_for(payload, _PARENT_ID)
+        assert line == f'- [{_PARENT_ID}] (mem0/procedural_knowledge): {_PARENT_BODY}', (
+            f'A hit without {PARENT_ID_KEY} must keep the pre-existing line format; '
+            f'payload:\n{payload}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            pytest.param(
+                {'category': 'procedural_knowledge', PARENT_ID_KEY: _PARENT_ID,
+                 'kind': _NON_CHILD_KIND},
+                id='parent-id-with-non-child-kind',
+            ),
+            pytest.param(
+                {'category': 'procedural_knowledge', PARENT_ID_KEY: _PARENT_ID},
+                id='parent-id-without-kind',
+            ),
+            pytest.param(
+                {'category': 'procedural_knowledge', PARENT_ID_KEY: 42,
+                 'kind': min(CHILD_KINDS)},
+                id='child-kind-with-non-string-parent-id',
+            ),
+            pytest.param({}, id='empty-metadata'),
+        ],
+    )
+    async def test_non_child_hit_keeps_plain_format(self, metadata: dict):
+        memory = {'id': _NOT_A_CHILD_ID, 'memory': _PARENT_BODY, 'metadata': metadata}
+        payload = await _render_backlog_payload([memory])
+        line = _line_for(payload, _NOT_A_CHILD_ID)
+        assert line == f'- [{_NOT_A_CHILD_ID}] (mem0/procedural_knowledge): {_PARENT_BODY}', (
             'Only a grouped_read child (child kind + string parent id) gets a parent '
             f'link; line={line!r}; payload:\n{payload}'
         )
