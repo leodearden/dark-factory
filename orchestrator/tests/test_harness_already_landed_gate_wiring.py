@@ -762,6 +762,7 @@ class TestAlreadyLandedDispatchGateMarkerPath:
 
 def _wired_content_harness(
     mock_orch_config, *, citation_sha, content_in_main, effect_present=True,
+    twin_sha: str | None = None,
 ) -> Harness:
     """Bare harness with the branch existing but is_ancestor(branch, main)
     False and find_merge_marker None, so neither the ancestry path nor the
@@ -785,7 +786,9 @@ def _wired_content_harness(
     is deleted. ``merge_base_with_main`` and ``find_equivalent_commit`` are
     stubbed so the citation-miss content-equivalence fallback decides on its
     own logic rather than on the TypeError a bare MagicMock auto-child
-    raises when awaited.
+    raises when awaited. ``twin_sha`` None means main holds no patch-id twin
+    and the fallback declines as 'unanchored'; a 40-hex sha is the twin the
+    fallback anchors on.
     """
     h = _build_harness(mock_orch_config)
     h.git_ops = MagicMock()
@@ -806,7 +809,7 @@ def _wired_content_harness(
     h.git_ops.find_task_citation_commit = AsyncMock(return_value=citation_sha)
     h.git_ops.branch_content_in_main = AsyncMock(return_value=content_in_main)
     h.git_ops.merge_base_with_main = AsyncMock(return_value='8' * 40)
-    h.git_ops.find_equivalent_commit = AsyncMock(return_value=None)
+    h.git_ops.find_equivalent_commit = AsyncMock(return_value=twin_sha)
     h.git_ops.get_main_sha = AsyncMock(return_value='c' * 40)
     h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=effect_present)
 
