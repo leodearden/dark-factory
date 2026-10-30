@@ -26,7 +26,7 @@ plan), tickets would otherwise sit or terminalise silently in
 
 Routing parallels :mod:`curator_escalator`:
 
-* Per-project :class:`EscalationQueue` instances built lazily.
+* Each filing opens the project's :class:`EscalationQueue` inside its off-loop hop.
 * Orchestrator liveness via
   ``fused_memory/services/orchestrator_detector.py::is_orchestrator_lock_held``.
   No live orchestrator → log + retry on the next tick (failures stay flagged
@@ -143,9 +143,10 @@ def is_dedup_outage(health: DedupHealth, cfg: DedupOutageDetectorConfig) -> bool
 
 
 def _file_janitor_escalation(
-    queue: EscalationQueue, *, task_id: str, severity: str, category: str, summary: str, detail: str,
+    project_root: str, *, task_id: str, severity: str, category: str, summary: str, detail: str,
 ) -> str:
-    """Mint and durably submit one janitor record; blocking queue I/O, so callers run it off the loop."""
+    """Open the project's queue, mint and durably submit one janitor record; blocking queue I/O, so callers run it off the loop."""
+    queue = EscalationQueue(escalation_queue_dir(project_root))
     return queue.submit(Escalation(
         id=queue.make_id('ticket-janitor'),
         task_id=task_id,
@@ -240,7 +241,6 @@ class TicketJanitor:
         # rolling-window cooldown. group_key is (project_id, task_id,
         # escalation_id). Reset on process restart by design.
         self._escalation_log: dict[tuple[str, str, str], list[float]] = defaultdict(list)
-        self._queues: dict[str, EscalationQueue] = {}
         if not TicketJanitor._registry_log_emitted:
             TicketJanitor._registry_log_emitted = True
             logger.info(
@@ -248,13 +248,6 @@ class TicketJanitor:
                 'restart to pick up DASHBOARD_KNOWN_PROJECT_ROOTS changes (task 1164)',
                 len(self._known_projects),
             )
-
-    def _queue_for(self, project_root: str) -> EscalationQueue:
-        q = self._queues.get(project_root)
-        if q is None:
-            q = EscalationQueue(escalation_queue_dir(project_root))
-            self._queues[project_root] = q
-        return q
 
     def _parse_candidate(self, row: dict) -> dict:
         """Extract the candidate metadata block, gracefully handling bad JSON.
@@ -337,7 +330,7 @@ class TicketJanitor:
         try:
             escalation_id = await asyncio.to_thread(
                 _file_janitor_escalation,
-                self._queue_for(project_root),
+                project_root,
                 task_id=_ANCHOR_TASK_ID,
                 severity=severity,
                 category='infra_issue',
@@ -706,7 +699,7 @@ class TicketJanitor:
             try:
                 filed_id = await asyncio.to_thread(
                     _file_janitor_escalation,
-                    self._queue_for(project_root),
+                    project_root,
                     task_id=task_id if task_id and task_id != '_unparseable_' else _ANCHOR_TASK_ID,
                     severity='info',
                     category='ticket_failure',

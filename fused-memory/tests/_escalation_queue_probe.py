@@ -1,4 +1,4 @@
-"""Make every EscalationQueue.make_id and .submit call report to a LoopFreedomProbe before its real work."""
+"""Make every EscalationQueue construction, make_id and submit call report to a LoopFreedomProbe before its real work."""
 
 from __future__ import annotations
 
@@ -19,5 +19,5 @@ def _probed(real: Callable[..., Any], probe: LoopFreedomProbe) -> Callable[..., 
 
 
 def probe_escalation_queue_io(monkeypatch: pytest.MonkeyPatch, probe: LoopFreedomProbe) -> None:
-    for name in ('make_id', 'submit'):
+    for name in ('__init__', 'make_id', 'submit'):
         monkeypatch.setattr(EscalationQueue, name, _probed(getattr(EscalationQueue, name), probe))

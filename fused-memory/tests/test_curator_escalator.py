@@ -1230,6 +1230,21 @@ class TestQueueFilingRunsOffTheEventLoop:
         finally:
             handle.close()
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('method_name', 'kwargs'), _EVERY_ROUTE)
+    async def test_every_route_swallows_a_queue_that_cannot_be_opened(
+        self, tmp_path, method_name: str, kwargs: dict[str, Any],
+    ):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalation_queue_dir(tmp_path).write_text('a file where the queue directory belongs')
+
+            assert await getattr(CuratorEscalator(), method_name)(
+                project_root=str(tmp_path), project_id='proj-x', **kwargs,
+            ) is None
+        finally:
+            handle.close()
+
 
 class TestBurstLogCompositeKey:
     """Lever 2b — different subtypes for the same project are counted

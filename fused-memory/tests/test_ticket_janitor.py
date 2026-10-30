@@ -985,6 +985,36 @@ async def test_ticket_failure_whose_id_cannot_be_minted_is_retried_next_tick(
 
 
 @pytest.mark.asyncio
+async def test_ticket_failure_whose_queue_cannot_be_opened_is_retried_next_tick(store, tmp_path):
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        ticket_id = await store.submit(
+            project_id=_project_id_for(tmp_path),
+            candidate_json=_candidate_blob(task_id='task-7', escalation_id='esc-7-1'),
+        )
+        await _force_failed(store, ticket_id, reason='curator_rejected')
+        janitor = TicketJanitor(store, primary_project_root=str(tmp_path))
+        queue_dir_blocker = escalation_queue_dir(tmp_path)
+        queue_dir_blocker.write_text('a file where the queue directory belongs')
+
+        await janitor.tick()
+
+        row = await store.get(ticket_id)
+        assert row is not None
+        assert row['escalated_at'] is None
+
+        queue_dir_blocker.unlink()
+        await janitor.tick()
+
+        assert _escalation_categories(tmp_path) == ['ticket_failure']
+        row = await store.get(ticket_id)
+        assert row is not None
+        assert row['escalated_at'] is not None
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
 async def test_startup_nudge_emitted_once_across_two_constructions(
     store, tmp_path, caplog, monkeypatch
 ):

@@ -144,14 +144,14 @@ def _curator_escalation(
     )
 
 
-def _file_curator_escalation(
-    queue: EscalationQueue, *, category: str, summary: str, detail: str,
-) -> str:
+def _file_curator_escalation(project_root: str, *, category: str, summary: str, detail: str) -> str:
+    """Open the project's queue, mint and durably submit one curator record; blocking queue I/O, so callers run it off the loop."""
+    queue = EscalationQueue(escalation_queue_dir(project_root))
     return queue.submit(_curator_escalation(queue, category=category, summary=summary, detail=detail))
 
 
 async def _file_logged(
-    queue: EscalationQueue, *, kind: str, project_id: str, category: str, summary: str, detail: str,
+    project_root: str, *, kind: str, project_id: str, category: str, summary: str, detail: str,
 ) -> str | None:
     """File one curator record off the loop; on queue I/O failure log it and return ``None``.
 
@@ -159,7 +159,7 @@ async def _file_logged(
     """
     try:
         return await asyncio.to_thread(
-            _file_curator_escalation, queue, category=category, summary=summary, detail=detail,
+            _file_curator_escalation, project_root, category=category, summary=summary, detail=detail,
         )
     except Exception:
         logger.exception(
@@ -169,7 +169,53 @@ async def _file_logged(
         return None
 
 
-def _file_zot_escalation(queue: EscalationQueue, *, project_id: str, detail: str) -> dict[str, Any]:
+def _zot_detail(
+    *,
+    project_id: str,
+    justification: str,
+    candidate_title: str,
+    timed_out: bool | None,
+    duration_ms: int | None,
+    account_name: str | None,
+    proc_tree: str | None,
+    transcript_turns: int | None,
+    tools_used: tuple[str, ...] | None,
+) -> str:
+    """The forensic detail body of a zero-output-timeout record."""
+    detail_lines = [
+        f'candidate_title={candidate_title!r}',
+        f'project_id={project_id!r}',
+    ]
+    if timed_out is not None:
+        detail_lines.append(f'timed_out={timed_out}')
+    if duration_ms is not None:
+        detail_lines.append(f'duration_ms={duration_ms}')
+    if account_name is not None:
+        detail_lines.append(f'account_name={account_name!r}')
+    detail_lines.extend(_transcript_evidence_lines(transcript_turns, tools_used))
+    if proc_tree:
+        # Truncate to avoid overwhelming the escalation body.
+        snippet = proc_tree[:1500]
+        detail_lines.append(f'proc_tree=\n{snippet}')
+    detail_lines.append(f'justification={justification}')
+    detail_lines.append('')
+    detail_lines.append(
+        'NOTE: ruled ACCEPT-AND-RETUNE on esc-task-curator-17 (2026-08-27): an '
+        'accepted, recurring, transient pre-turn empty-output hang on the '
+        f"curator's sonnet + json-schema call shape, pinned as root_cause "
+        f'{_ZOT_ROOT_CAUSE!r}. Recurrences fold into this record, so its '
+        'dedupe_count is the recurrence counter (one burst of concurrent hangs '
+        'counts once). transcript_turns=0 is a transcript-confirmed pre-turn '
+        'stall; unknown means the transcript was not read. Dedupe degraded to '
+        'create for this candidate; the circuit breaker short-circuits further '
+        'curator LLM calls if hangs come back to back.',
+    )
+    return '\n'.join(detail_lines)
+
+
+def _file_zot_escalation(project_root: str, *, project_id: str, detail: str) -> dict[str, Any]:
+    """Open the project's queue and file one ZOT record through ``submit_or_dedupe``; blocking queue I/O, so callers run it off the loop."""
+    queue = EscalationQueue(escalation_queue_dir(project_root))
     escalation = _curator_escalation(
         queue,
         category=_ZOT_CATEGORY,
@@ -196,6 +242,40 @@ def _file_zot_escalation(queue: EscalationQueue, *, project_id: str, detail: str
     return submit_or_dedupe(queue, escalation, config)  # type: ignore[possibly-unbound]
 
 
+async def _file_zot_logged(
+    project_root: str, *, project_id: str, detail: str, account_name: str | None, duration_ms: int | None,
+) -> str | None:
+    """File one ZOT record off the loop and return its live id, or ``None`` when filing failed."""
+    try:
+        response = await asyncio.to_thread(
+            _file_zot_escalation, project_root, project_id=project_id, detail=detail,
+        )
+    except Exception:
+        logger.exception(
+            'curator_escalator: failed to submit zero-output-timeout '
+            'escalation for project %s',
+            project_id,
+        )
+        # Do not re-raise — falling through to action='create' is safer than
+        # failing add_task just because queue I/O broke.
+        return None
+
+    escalation_id: str = response['id']
+    if response['status'] == 'dedup_skipped':
+        logger.warning(
+            'curator_escalator: zero-output-timeout recurrence for project %s '
+            'folded into %s — account=%s duration_ms=%s; dedupe degraded to create',
+            project_id, escalation_id, account_name, duration_ms,
+        )
+        return escalation_id
+    logger.error(
+        'curator_escalator: queued zero-output-timeout L1 escalation %s for '
+        'project %s — account=%s duration_ms=%s; dedupe degraded to create',
+        escalation_id, project_id, account_name, duration_ms,
+    )
+    return escalation_id
+
+
 class CuratorEscalator:
     """Route :class:`CuratorFailureError` to the orchestrator or back to the caller."""
 
@@ -217,7 +297,6 @@ class CuratorEscalator:
         # making reloaded values meaningless.
         # Pruned on every report_failure call.
         self._failure_log: dict[tuple[str, str | None], list[float]] = {}
-        self._queues: dict[str, EscalationQueue] = {}
         # project_id → (monotonic timestamp, live ZOT escalation id or None) of
         # the last ZOT submit attempt. Prevents a batch of N concurrent curate()
         # ZOT calls from flooding the escalation queue with N identical entries
@@ -360,13 +439,6 @@ class CuratorEscalator:
                     tmp_path.unlink(missing_ok=True)
 
             await asyncio.to_thread(_write)
-
-    def _queue_for(self, project_root: str) -> EscalationQueue:
-        q = self._queues.get(project_root)
-        if q is None:
-            q = EscalationQueue(escalation_queue_dir(project_root))
-            self._queues[project_root] = q
-        return q
 
     async def report_failure(
         self,
@@ -526,7 +598,7 @@ class CuratorEscalator:
         detail = '\n'.join(detail_lines)
 
         escalation_id = await _file_logged(
-            self._queue_for(project_root),
+            project_root,
             kind='curator-failure',
             project_id=project_id,
             category='curator_failure',
@@ -600,7 +672,7 @@ class CuratorEscalator:
         ]
 
         escalation_id = await _file_logged(
-            self._queue_for(project_root),
+            project_root,
             kind='post-ZOT duplicate',
             project_id=project_id,
             category=_ZOT_DUPLICATE_CATEGORY,
@@ -664,7 +736,7 @@ class CuratorEscalator:
         detail = '\n'.join(detail_lines)
 
         escalation_id = await _file_logged(
-            self._queue_for(project_root),
+            project_root,
             kind='schema-tool-denied',
             project_id=project_id,
             category='curator_schema_tool_denied',
@@ -755,7 +827,7 @@ class CuratorEscalator:
         ])
 
         escalation_id = await _file_logged(
-            self._queue_for(project_root),
+            project_root,
             kind='consecutive-degraded',
             project_id=project_id,
             category='curator_consecutive_degraded',
@@ -841,7 +913,7 @@ class CuratorEscalator:
         ])
 
         escalation_id = await _file_logged(
-            self._queue_for(project_root),
+            project_root,
             kind='backend-binary-unresolvable',
             project_id=project_id,
             category='curator_backend_binary_unresolvable',
@@ -901,6 +973,17 @@ class CuratorEscalator:
         pins it in
         ``test_concurrent_batch_bisect_files_one_record_and_hands_every_sibling_its_id``.
         """
+        detail = _zot_detail(
+            project_id=project_id,
+            justification=justification,
+            candidate_title=candidate_title,
+            timed_out=timed_out,
+            duration_ms=duration_ms,
+            account_name=account_name,
+            proc_tree=proc_tree,
+            transcript_turns=transcript_turns,
+            tools_used=tools_used,
+        )
         async with self._zot_window_lock:
             now_mono = time.monotonic()
             last = self._zot_last_submitted.get(project_id)
@@ -916,94 +999,12 @@ class CuratorEscalator:
                 )
                 return last[1]
 
-            escalation_id = await self._file_zero_output_timeout(
-                project_root=project_root,
+            escalation_id = await _file_zot_logged(
+                project_root,
                 project_id=project_id,
-                justification=justification,
-                candidate_title=candidate_title,
-                timed_out=timed_out,
-                duration_ms=duration_ms,
+                detail=detail,
                 account_name=account_name,
-                proc_tree=proc_tree,
-                transcript_turns=transcript_turns,
-                tools_used=tools_used,
+                duration_ms=duration_ms,
             )
             self._zot_last_submitted[project_id] = (now_mono, escalation_id)
             return escalation_id
-
-    async def _file_zero_output_timeout(
-        self,
-        *,
-        project_root: str,
-        project_id: str,
-        justification: str,
-        candidate_title: str,
-        timed_out: bool | None,
-        duration_ms: int | None,
-        account_name: str | None,
-        proc_tree: str | None,
-        transcript_turns: int | None,
-        tools_used: tuple[str, ...] | None,
-    ) -> str | None:
-        """File one ZOT record off the loop and return its live id, or ``None`` when filing failed."""
-        detail_lines = [
-            f'candidate_title={candidate_title!r}',
-            f'project_id={project_id!r}',
-        ]
-        if timed_out is not None:
-            detail_lines.append(f'timed_out={timed_out}')
-        if duration_ms is not None:
-            detail_lines.append(f'duration_ms={duration_ms}')
-        if account_name is not None:
-            detail_lines.append(f'account_name={account_name!r}')
-        detail_lines.extend(_transcript_evidence_lines(transcript_turns, tools_used))
-        if proc_tree:
-            # Truncate to avoid overwhelming the escalation body.
-            snippet = proc_tree[:1500]
-            detail_lines.append(f'proc_tree=\n{snippet}')
-        detail_lines.append(f'justification={justification}')
-        detail_lines.append('')
-        detail_lines.append(
-            'NOTE: ruled ACCEPT-AND-RETUNE on esc-task-curator-17 (2026-08-27): an '
-            'accepted, recurring, transient pre-turn empty-output hang on the '
-            f"curator's sonnet + json-schema call shape, pinned as root_cause "
-            f'{_ZOT_ROOT_CAUSE!r}. Recurrences fold into this record, so its '
-            'dedupe_count is the recurrence counter (one burst of concurrent hangs '
-            'counts once). transcript_turns=0 is a transcript-confirmed pre-turn '
-            'stall; unknown means the transcript was not read. Dedupe degraded to '
-            'create for this candidate; the circuit breaker short-circuits further '
-            'curator LLM calls if hangs come back to back.',
-        )
-        detail = '\n'.join(detail_lines)
-
-        try:
-            response = await asyncio.to_thread(
-                _file_zot_escalation,
-                self._queue_for(project_root),
-                project_id=project_id,
-                detail=detail,
-            )
-        except Exception:
-            logger.exception(
-                'curator_escalator: failed to submit zero-output-timeout '
-                'escalation for project %s',
-                project_id,
-            )
-            # Do not re-raise — falling through to action='create' is safer than
-            # failing add_task just because queue I/O broke.
-            return None
-
-        escalation_id: str = response['id']
-        if response['status'] == 'dedup_skipped':
-            logger.warning(
-                'curator_escalator: zero-output-timeout recurrence for project %s '
-                'folded into %s — account=%s duration_ms=%s; dedupe degraded to create',
-                project_id, escalation_id, account_name, duration_ms,
-            )
-            return escalation_id
-        logger.error(
-            'curator_escalator: queued zero-output-timeout L1 escalation %s for '
-            'project %s — account=%s duration_ms=%s; dedupe degraded to create',
-            escalation_id, project_id, account_name, duration_ms,
-        )
-        return escalation_id
