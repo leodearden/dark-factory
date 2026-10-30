@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import pytest
 from _review_fixtures import review_aggregation, review_issue
+from escalation.disposition import ReviewerDisposition
 from shared import safe_io
 
 from orchestrator.artifacts import (
@@ -24,7 +25,8 @@ from orchestrator.artifacts import (
     _normalize_plan,
     iteration_entry_written_by_orchestrator,
 )
-from orchestrator.review_payload import ReviewPayloadError
+from orchestrator.mcp.verdict_tools import _submit_review_verdict
+from orchestrator.review_payload import NoteDisposition, ReviewPayloadError
 
 
 @pytest.fixture
@@ -1313,6 +1315,77 @@ class TestReviews:
 
         with pytest.raises(ReviewPayloadError, match='NEEDS_CHANGES'):
             artifacts.aggregate_reviews()
+
+
+_ADDRESSED_NOTE = {
+    'escalation_id': 'esc-42-1', 'disposition': 'addressed', 'rationale': 'fixed in foo.py',
+}
+_WORK_NOTE = {
+    'escalation_id': 'esc-42-2', 'disposition': 'work', 'rationale': 'needs its own task',
+}
+_TYPED_NOTES = (
+    NoteDisposition('esc-42-1', ReviewerDisposition.ADDRESSED, 'fixed in foo.py'),
+    NoteDisposition('esc-42-2', ReviewerDisposition.WORK, 'needs its own task'),
+)
+
+
+class TestReviewNoteDispositions:
+    def test_mirrored_review_dispositions_reach_the_aggregation_in_order(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_review('reviewer_comprehensive', {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 'OK',
+            'note_dispositions': [dict(_ADDRESSED_NOTE), dict(_WORK_NOTE)],
+        })
+
+        assert artifacts.aggregate_reviews().note_dispositions == _TYPED_NOTES
+
+    def test_an_error_review_contributes_no_dispositions(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer_comprehensive', {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'ERROR',
+            'issues': [],
+            'summary': 'Reviewer error',
+            'note_dispositions': [dict(_ADDRESSED_NOTE)],
+        })
+
+        assert artifacts.aggregate_reviews().note_dispositions == ()
+
+    def test_a_review_without_the_key_gives_none(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer_comprehensive', {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 'OK',
+        })
+
+        assert artifacts.aggregate_reviews().note_dispositions == ()
+
+    def test_dispositions_survive_the_verdict_tool_to_mirror_round_trip(
+        self, artifacts: TaskArtifacts,
+    ):
+        role = 'reviewer_comprehensive'
+        result = _submit_review_verdict(
+            artifacts, role, 'sid', role, 'PASS', [], 'OK',
+            note_dispositions=[dict(_ADDRESSED_NOTE), dict(_WORK_NOTE)],
+        )
+        assert result['status'] == 'ok'
+        envelope = artifacts.read_verdict(role)
+        assert envelope is not None
+
+        artifacts.write_review(role, envelope['verdict'])
+
+        assert artifacts.aggregate_reviews().note_dispositions == _TYPED_NOTES
+
+    def test_a_directly_built_aggregation_carries_no_dispositions(self):
+        aggregation = ReviewAggregation(
+            has_blocking_issues=False, blocking_issues=[], suggestions=[], reviews={},
+        )
+
+        assert aggregation.note_dispositions == ()
 
 
 class TestBlockingDependency:
