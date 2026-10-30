@@ -55,6 +55,7 @@ from escalation.models import (
     LateResolution,
     max_severity,
     note_to_file_class_conflict,
+    recut_action_conflict,
 )
 
 logger = logging.getLogger(__name__)
@@ -1354,6 +1355,7 @@ class EscalationQueue:
         resolution_class: str | None = None,
         granted_files: list[str] | None = None,
         resolution_action: str | None = None,
+        recut: bool = False,
         outcome: ResolveOutcome | None = None,
     ) -> Escalation | None:
         """Update an escalation's status to resolved or dismissed.
@@ -1372,6 +1374,14 @@ class EscalationQueue:
         path, and not propagated through the member cascade.  Legality is the
         caller's job: ``escalation/action_effects.py::effect_for`` is the
         authority ``escalation/server.py::resolve_issue`` consults first.
+
+        ``recut`` (task 5516): qualifies a ``'restart'`` resolution — the next
+        dispatch re-cuts the task fresh off main.  Any other pairing
+        (``models.recut_action_conflict``) raises ``ValueError`` BEFORE the
+        lock, so nothing is persisted (INV-1).  Stamped beside
+        ``resolution_action`` on the applied path only; never on the
+        already-terminal path and not propagated through the member cascade —
+        a cascade member inherits it from its parent, as it does the action.
 
         ``resolution_class`` (plans/escalation-lifecycle-dashboard-prd.md Seam 1):
         an optional explicit ``'benign' | 'actionable'`` classification stamp,
@@ -1461,6 +1471,8 @@ class EscalationQueue:
                 f'invalid resolution_class {resolution_class!r}; '
                 f'expected one of {sorted(RESOLUTION_CLASSES)} or None'
             )
+        if (conflict := recut_action_conflict(resolution_action, recut)) is not None:
+            raise ValueError(conflict)
 
         # Seed BEFORE the lock so the early returns below leave a complete dict
         # rather than a stale caller-supplied one (the add_members_to_l2
@@ -1517,6 +1529,7 @@ class EscalationQueue:
                 esc.granted_files = granted_files
             if resolution_action is not None:
                 esc.resolution_action = resolution_action
+            esc.recut = recut
 
             self._atomic_write(escalation_id, esc.to_json())
             self._archive_resolved(escalation_id, esc.resolved_at)
