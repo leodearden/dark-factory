@@ -2,11 +2,14 @@
 
 Synthetic rows only: the soak bundle is gitignored and lives in the main
 checkout, so no test reads it. The script is loaded by path (``scripts/`` is
-not a package), lazily through ``_mod()``.
+not a package), lazily through ``_mod()``. The round protocol it builds on has
+its own tests in ``test_write_triage_rating_rounds.py``; the shards and
+rating-round tests here drive it end to end through the soak CLI.
 """
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import sqlite3
 import types
@@ -25,6 +28,13 @@ def _mod() -> types.ModuleType:
     return load_script_module(
         SCRIPTS / 'build_write_triage_v2_soak_baseline.py',
         mod_name='build_write_triage_v2_soak_baseline',
+    )
+
+
+@functools.cache
+def _rounds() -> types.ModuleType:
+    return load_script_module(
+        SCRIPTS / 'write_triage_rating_rounds.py', mod_name='write_triage_rating_rounds',
     )
 
 
@@ -259,165 +269,8 @@ def _history_db(path: Path, rows: list[tuple[str, str | None, str, str, str]]) -
     return path
 
 
-class TestAttachTimeText:
-    @pytest.fixture
-    def history(self, tmp_path: Path) -> Path:
-        return _history_db(tmp_path / 'history.db', [
-            ('p1', None, 'first', 'ADD', '2026-10-01T00:00:00+00:00'),
-            ('p1', 'first', 'second', 'UPDATE', '2026-10-05T00:00:00+00:00'),
-            ('p1', 'second', 'third', 'UPDATE', '2026-10-09T00:00:00+00:00'),
-            ('p2', 'other', 'other v2', 'UPDATE', '2026-10-03T00:00:00+00:00'),
-            ('p3', None, 'lost', 'UPDATE', '2026-10-03T00:00:00+00:00'),
-        ])
-
-    @pytest.mark.parametrize(('child_created_at', 'expected'), [
-        ('2026-10-02T12:00:00.000001+00:00', 'first'),
-        ('2026-10-07T00:00:00+00:00', 'second'),
-        ('2026-10-10T00:00:00+00:00', 'third, current'),
-    ])
-    def test_is_the_text_before_the_first_edit_after_the_child(
-        self, history: Path, child_created_at: str, expected: str,
-    ) -> None:
-        assert _mod().attach_time_text(history, 'p1', child_created_at, 'third, current') == expected
-
-    def test_an_edit_without_its_old_text_is_unrecoverable(self, history: Path) -> None:
-        assert _mod().attach_time_text(history, 'p3', '2026-10-02T00:00:00+00:00', 'lost') is None
-
-
-CHILD = 'The deploy uses blue-green.\nRollback takes   five minutes.'
-PARENT = 'The deploy uses canary releases. Rollback is manual.'
-
-
-def _line(**fields: Any) -> dict[str, Any]:
-    return {'id': 'primary_00-000', 'reason': 'two claims', **fields}
-
-
-class TestValidateRating:
-    def _problems(self, line: dict[str, Any]) -> list[str]:
-        return _mod().validate_rating(line, CHILD, PARENT)
-
-    def test_verbatim_quotes_and_spans_pass(self) -> None:
-        assert self._problems(_line(
-            home='YES', conflict='YES', scope='CENTRAL', action_changing='YES',
-            conflict_quote={'parent': 'The deploy uses canary releases.',
-                            'child': 'The deploy uses blue-green.'},
-        )) == []
-        assert self._problems(_line(
-            home='YES', conflict='NO', loss='YES', loss_spans=['Rollback takes five minutes.'],
-        )) == []
-        assert self._problems(_line(home='NO')) == []
-
-    def test_a_quote_differing_only_in_whitespace_passes(self) -> None:
-        assert self._problems(_line(
-            home='YES', conflict='YES', scope='CENTRAL',
-            conflict_quote={'parent': 'canary\n  releases.', 'child': 'blue-green. Rollback takes five'},
-        )) == []
-
-    @pytest.mark.parametrize(('field', 'quote', 'conflict_quote'), [
-        ('conflict_quote.child', 'The deploy is blue-green.',
-         {'parent': 'canary releases', 'child': 'The deploy is blue-green.'}),
-        ('conflict_quote.child', 'Rollback is manual.',
-         {'parent': 'canary releases', 'child': 'Rollback is manual.'}),
-        ('conflict_quote.parent', 'The deploy uses blue-green.',
-         {'parent': 'The deploy uses blue-green.', 'child': 'blue-green'}),
-    ])
-    def test_a_conflict_quote_not_in_its_text_fails(
-        self, field: str, quote: str, conflict_quote: dict[str, str],
-    ) -> None:
-        problems = self._problems(_line(
-            home='YES', conflict='YES', scope='CENTRAL', conflict_quote=conflict_quote,
-        ))
-        assert len(problems) == 1
-        assert field in problems[0] and quote in problems[0]
-
-    def test_each_loss_span_must_be_in_child(self) -> None:
-        problems = self._problems(_line(
-            home='YES', conflict='NO', loss='YES',
-            loss_spans=['Rollback takes five minutes.', 'Rollback is manual.', 'uses canary'],
-        ))
-        assert len(problems) == 2
-        assert 'loss_spans' in problems[0] and 'Rollback is manual.' in problems[0]
-        assert 'loss_spans' in problems[1] and 'uses canary' in problems[1]
-
-    def test_a_rater_line_carrying_digest_fails(self) -> None:
-        problems = self._problems(_line(
-            home='YES', conflict='NO', loss='YES', loss_spans=['five minutes'], digest='YES',
-        ))
-        assert len(problems) == 1
-        assert 'digest is computed from loss_spans' in problems[0]
-
-
-def _quoting(row: dict[str, Any], **evidence: Any) -> dict[str, Any]:
-    """*row* with its evidence fields set to *evidence*."""
-    return {**row, **evidence}
-
-
 def _without(row: dict[str, Any], field: str) -> dict[str, Any]:
     return {name: value for name, value in row.items() if name != field}
-
-
-_VERBATIM_QUOTE = {'parent': 'The deploy uses canary releases.', 'child': 'The deploy uses blue-green.'}
-_DISPUTED = {'home': 'YES', 'conflict': 'YES', 'scope': 'CENTRAL', 'action_changing': 'YES'}
-
-
-class TestRatingProblems:
-    def _problems(self, row: dict[str, Any]) -> list[str]:
-        return _mod().rating_problems(row, CHILD, PARENT)
-
-    def test_a_valid_line_with_verbatim_evidence_has_none(self) -> None:
-        assert self._problems(_quoting(_rated('e1', **_DISPUTED), conflict_quote=_VERBATIM_QUOTE)) == []
-        assert self._problems(_quoting(
-            _rated('e1', home='YES', conflict='NO', loss='YES'),
-            loss_spans=['Rollback takes five minutes.'],
-        )) == []
-
-    @pytest.mark.parametrize(('row', 'fragment'), [
-        (_rated('e1', home='YES', conflict='NO'), 'lacks loss'),
-        (_without(_rated('e1', conflict='YES', scope='CENTRAL', action_changing='YES'),
-                  'conflict_quote'), 'conflict_quote'),
-        (_without(_rated('e1', home='YES', conflict='NO', loss='YES'), 'loss_spans'),
-         'loss_spans'),
-        ({**_rated('e1', conflict='NO'), 'home': ['YES']}, "home ['YES']"),
-    ])
-    def test_a_line_breaking_the_row_contract_names_that_alone(
-        self, row: dict[str, Any], fragment: str,
-    ) -> None:
-        problems = self._problems(row)
-        assert len(problems) == 1
-        assert fragment in problems[0]
-
-    def test_a_contract_valid_line_with_unfound_evidence_names_it(self) -> None:
-        problems = self._problems(_quoting(
-            _rated('e1', **_DISPUTED),
-            conflict_quote={**_VERBATIM_QUOTE, 'child': 'The deploy is blue-green.'},
-        ))
-        assert len(problems) == 1
-        assert 'conflict_quote.child' in problems[0]
-
-    def test_a_contract_violation_hides_the_unfound_evidence_beside_it(self) -> None:
-        problems = self._problems(_quoting(
-            _rated('e1', home='YES', conflict='NO'), loss_spans=['not in the child'],
-        ))
-        assert len(problems) == 1
-        assert 'lacks loss' in problems[0]
-        assert 'not in the child' not in problems[0]
-
-
-class TestEffectiveRatings:
-    def test_the_highest_round_of_each_rater_on_each_pair_and_basis_survives(self) -> None:
-        reasked = {**_rated('e1', role='primary', home='YES'), 'batch': 'reask_01_primary'}
-        rows = [
-            {**reasked, 'round': 1},
-            {**_rated('e1', role='primary', home='NO'), 'round': 0},
-            {**_rated('e1', role='second', home='NO'), 'round': 0},
-            {**_rated('e1', role='primary', basis='attach_time', home='NO'), 'round': 0},
-        ]
-        effective = _mod().effective_ratings(rows)
-        assert sorted(effective, key=lambda row: (row['basis'], row['rater'])) == [
-            _rated('e1', role='primary', basis='attach_time', home='NO'),
-            reasked,
-            _rated('e1', role='second', home='NO'),
-        ]
 
 
 EARLY = 'Early detail sits here.'
@@ -630,42 +483,6 @@ class TestItemRow:
         }
 
 
-class TestShard:
-    def _shard(self) -> tuple[Any, str, str]:
-        child = 'c' * 300 + 'tail of the child ' * 300
-        parent = 'p' * 4500
-        builder = _mod()
-        shard = builder.shard([
-            builder.ShardEntry('entry-one', 'target-one', 'current', 'df', child, parent),
-            builder.ShardEntry('entry-two', 'target-two', 'attach_time', 'reify', 'short', 'old'),
-        ], name='primary_00')
-        return shard, child, parent
-
-    def test_caps_each_text_and_marks_the_cut(self) -> None:
-        shard, child, parent = self._shard()
-        assert parent[:4000] + '…[truncated, 4500 chars total]' in shard.text
-        assert parent[:4001] not in shard.text
-        assert child[:4000] + f'…[truncated, {len(child)} chars total]' in shard.text
-
-    def test_shows_no_digest_because_raters_are_not_asked_digest(self) -> None:
-        shard, _, _ = self._shard()
-        assert 'DIGEST' not in shard.text
-
-    def test_item_ids_are_opaque_and_the_key_maps_them_back(self) -> None:
-        shard, _, _ = self._shard()
-        assert 'entry-one' not in shard.text and 'target-one' not in shard.text
-        assert sorted(shard.key.values(), key=lambda entry: entry['entry_id']) == [
-            {'entry_id': 'entry-one', 'target_id': 'target-one', 'basis': 'current'},
-            {'entry_id': 'entry-two', 'target_id': 'target-two', 'basis': 'attach_time'},
-        ]
-        for item_id in shard.key:
-            assert f'=== ITEM id={item_id}' in shard.text
-
-    def test_an_attach_time_item_says_so(self) -> None:
-        shard, _, _ = self._shard()
-        assert 'basis=attach_time' in shard.text
-
-
 POPULATION = frozenset(f'i{index:02d}' for index in range(30))
 SAMPLED = frozenset({'i00', 'i01', 'i02'})
 
@@ -699,49 +516,6 @@ class TestExtendSample:
             self._draw(31)
 
 
-def _entries(count: int) -> list[Any]:
-    builder = _mod()
-    return [
-        builder.ShardEntry(f'e{index:02d}', f't{index:02d}', 'current', 'df', 'child', 'parent')
-        for index in range(count)
-    ]
-
-
-class TestPlanShards:
-    def _plan(self, entries: list[Any], role: str = 'primary', **overrides: Any) -> list[Any]:
-        options: dict[str, Any] = {'prefix': '', 'seed': 7, 'first_index': 0, **overrides}
-        return _mod().plan_shards(entries, role=role, **options)
-
-    def test_every_entry_lands_in_exactly_one_shard_of_at_most_shard_size(self) -> None:
-        builder = _mod()
-        assert builder.SHARD_SIZE == 40
-        entries = _entries(95)
-        plan = self._plan(entries)
-        planned = [entry for _, members in plan for entry in members]
-        assert sorted(planned, key=lambda entry: entry.entry_id) == entries
-        assert all(len(members) <= builder.SHARD_SIZE for _, members in plan)
-
-    def test_names_count_from_the_first_index(self) -> None:
-        assert [name for name, _ in self._plan(_entries(50))] == ['primary_00', 'primary_01']
-        assert [name for name, _ in self._plan(_entries(50), 'second', prefix='attach_',
-                                               first_index=3)] == [
-            'attach_second_03', 'attach_second_04',
-        ]
-
-    def test_each_role_reads_the_entries_in_its_own_order(self) -> None:
-        def order(role: str) -> list[str]:
-            return [entry.entry_id for _, members in self._plan(_entries(50), role)
-                    for entry in members]
-
-        assert order('primary') != order('second')
-
-    def test_the_plan_is_deterministic(self) -> None:
-        assert self._plan(_entries(50)) == self._plan(list(reversed(_entries(50))))
-
-    def test_every_rater_is_opus(self) -> None:
-        assert dict(_mod().RATER_MODELS) == {'primary': 'opus', 'second': 'opus', 'third': 'opus'}
-
-
 ADJUDICATED = {'i-r0': 'restated', 'i-c0': 'contested'}
 RESTATED = ['i-r1', 'i-r2', 'i-r3', 'i-r4']
 AMENDED = ['i-a1', 'i-a2', 'i-a3', 'i-a4']
@@ -753,6 +527,11 @@ def _drawn(outcome: str, total: int) -> list[str]:
     """The extension the builder must draw: ``extend_sample`` seeded with ``'<seed>:<outcome>'``."""
     population = {'restated': {'i-r0', *RESTATED}, 'amended': set(AMENDED)}[outcome]
     return _mod().extend_sample(population, set(ADJUDICATED), total, seed=f'7:{outcome}')
+
+
+BRIEF_SHA256 = hashlib.sha256(
+    (SCRIPTS.parent / 'calibration' / 'write_triage_rater_brief_v2.md').read_bytes()).hexdigest()
+"""The committed brief's sha256, which every shard a default run writes records."""
 
 
 class _Bundle:
@@ -819,11 +598,11 @@ class _Bundle:
         connection.close()
         return path
 
-    def shards(self, *, restated: int = 3, amended: int = 3) -> int:
+    def shards(self, *extra: str, restated: int = 3, amended: int = 3) -> int:
         return _mod().main([
             'shards', '--bundle', str(self.dir), '--history-db', str(self.history),
             '--journal-db', str(self.journal), '--scratch', str(self.scratch), '--seed', '7',
-            '--restated-total', str(restated), '--amended-total', str(amended),
+            '--restated-total', str(restated), '--amended-total', str(amended), *extra,
         ])
 
     def key(self) -> dict[str, Any]:
@@ -895,7 +674,7 @@ class TestTheShardsCommand:
             assert roles == ['primary', 'second'], keyed
         for spec in key['shards'].values():
             assert spec == {'role': spec['role'], 'rater': f'opus-{spec["role"]}', 'round': 0,
-                            'items': spec['items']}
+                            'items': spec['items'], 'brief_sha256': BRIEF_SHA256}
 
     def test_attach_time_pairs_sit_only_in_attach_shards(self, bundle: _Bundle) -> None:
         key = bundle.key()
@@ -940,9 +719,18 @@ class TestTheShardsCommand:
             bundle.shards(amended=2)
         assert (bundle.scratch / 'key.json').read_bytes() == key_bytes
 
+    def test_shards_renders_and_records_the_brief_it_is_given(self, tmp_path: Path) -> None:
+        old_brief = tmp_path / 'brief_v2_1.md'
+        old_brief.write_text('# Rater brief v2.1\n\nThe older LOSS wording.\n')
+        built = _Bundle(tmp_path)
+        assert built.shards('--brief', str(old_brief)) == 0
+        sha = hashlib.sha256(old_brief.read_bytes()).hexdigest()
+        assert {spec['brief_sha256'] for spec in built.key()['shards'].values()} == {sha}
+        assert (built.scratch / 'rater_prompt.md').read_text() == _rounds().rater_prompt(old_brief)
+
     def test_the_rater_prompt_asks_for_evidence_and_not_digest(self, bundle: _Bundle) -> None:
         prompt = (bundle.scratch / 'rater_prompt.md').read_text()
-        brief = _mod().BRIEF_PATH.read_text()
+        brief = _rounds().BRIEF_PATH.read_text()
         assert brief in prompt
         output = prompt.split(brief, 1)[1]
         for field in ('conflict_quote', 'loss_spans', 'action_changing'):
@@ -1042,7 +830,7 @@ def _score(out: Path) -> int:
     paths = {name: out / f'write_triage_v2_soak_{name}' for name in CORPUS_FILES}
     return score.main([
         '--items', str(paths['items.jsonl']), '--verdicts', str(paths['verdicts.jsonl']),
-        '--strata', str(paths['strata.json']),
+        '--strata', str(paths['strata.json']), '--rubric', 'v2.1',
     ])
 
 
@@ -1162,6 +950,7 @@ class TestTheRatingRounds:
             name = f'third_{index:02d}'
             assert {**key['shards'][name], 'items': len(key['shards'][name]['items'])} == {
                 'role': 'third', 'rater': f'opus-third-{index:02d}', 'round': 0, 'items': 1,
+                'brief_sha256': BRIEF_SHA256,
             }
             assert _shard_keyed(key, name) == {tied}
             _rate(bundle, overrides)
@@ -1189,6 +978,7 @@ class TestTheRatingRounds:
         key = bundle.key()
         assert {**key['shards']['third_00'], 'items': len(key['shards']['third_00']['items'])} == {
             'role': 'third', 'rater': 'opus-third-00', 'round': 0, 'items': 1,
+            'brief_sha256': BRIEF_SHA256,
         }
         assert _shard_keyed(key, 'third_00') == {open_pair}
 
@@ -1248,27 +1038,6 @@ class TestTheRatingRounds:
         }
 
         assert _score(out) == 0
-
-
-class TestRatingVolume:
-    def test_counts_distinct_pairs_per_basis_and_role(self) -> None:
-        def item(entry: str, basis: str = 'current') -> dict[str, str]:
-            return {'entry_id': entry, 'target_id': 'p1', 'basis': basis}
-
-        key = {
-            'shards': {
-                'primary_00': {'role': 'primary', 'items': ['a', 'b']},
-                'reask_01_primary': {'role': 'primary', 'items': ['c']},
-                'second_00': {'role': 'second', 'items': ['d']},
-                'attach_primary_00': {'role': 'primary', 'items': ['e']},
-                'third_00': {'role': 'third', 'items': ['f']},
-            },
-            'items': {'a': item('e1'), 'b': item('e2'), 'c': item('e1'), 'd': item('e1'),
-                      'e': item('e1', 'attach_time'), 'f': item('e2')},
-        }
-        assert _mod().rating_volume(key) == {
-            'current': {'primary': 2, 'second': 1, 'third': 1}, 'attach_time': {'primary': 1},
-        }
 
 
 class TestTheCli:

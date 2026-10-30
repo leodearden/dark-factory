@@ -26,18 +26,18 @@ Subcommands, run from ``fused-memory/``:
   lacks a primary or second answer.
 
 Rater output lives in ``<scratch>/ratings/<shard>.jsonl``, one line per item.
+The shards, re-asks and third rounds are ``write_triage_rating_rounds.py``'s
+protocol; this script adds the soak's draws, its v1 derived rows and its corpus.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
 import sqlite3
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -57,23 +57,19 @@ _SCRIPTS = Path(__file__).resolve().parent
 
 
 if TYPE_CHECKING:
+    import write_triage_rating_rounds as _rounds
     import write_triage_reader_rubric as _rubric
 else:
     _rubric = load_script(_SCRIPTS / 'write_triage_reader_rubric.py', 'write_triage_reader_rubric')
+    _rounds = load_script(_SCRIPTS / 'write_triage_rating_rounds.py', 'write_triage_rating_rounds')
 
 Binary = _rubric.Binary
 Answer = _rubric.Answer
 Basis = _rubric.Basis
 Role = _rubric.Role
 
-BRIEF_PATH = _SCRIPTS.parent / 'calibration' / 'write_triage_rater_brief_v2.md'
-TEXT_CAP = 4000
-SHARD_SIZE = 40
 SAMPLE_TOTAL = 100
 """How many restated and how many amended attaches the extended sample holds (R8)."""
-RATER_MODELS: Mapping[str, str] = MappingProxyType({
-    Role.PRIMARY: 'opus', Role.SECOND: 'opus', Role.THIRD: 'opus',
-})
 DERIVED_RATER = 'v1-soak-2026-10-19'
 DERIVED_BATCH = 'soak-2026-10-19-adjudications'
 
@@ -302,10 +298,6 @@ def _current_derivation(
     )
 
 
-_THIRD_ROUND_GAPS = frozenset({_rubric.GapKind.TIED, _rubric.GapKind.OPEN})
-"""The gaps a third rater answering the whole item can fill: a tie, or an open follow-up."""
-
-
 def third_round_pairs(
     items: Iterable[Mapping[str, Any]], verdicts: Iterable[Mapping[str, Any]],
 ) -> list[tuple[str, str]]:
@@ -315,48 +307,8 @@ def third_round_pairs(
     blocked by an unrated decisive binary is refused.
     """
     judgements = _rubric.resolve_judgements(verdicts)
-    blocked: list[tuple[str, str]] = []
-    for item in items:
-        derivation = _current_derivation(item, judgements)
-        if isinstance(derivation, _rubric.Incomplete):
-            unrated = [str(gap.binary) for gap in derivation.missing
-                       if gap.kind not in _THIRD_ROUND_GAPS]
-            if unrated:
-                raise ValueError(
-                    f'item {item["entry_id"]!r} has unrated decisive binaries {unrated};'
-                    ' a third rater fills only ties and open follow-ups'
-                )
-            blocked.append((item['entry_id'], item['target_id']))
-    return sorted(blocked)
-
-
-def attach_time_text(
-    history_db: Path, parent_id: str, child_created_at: str, current_text: str,
-) -> str | None:
-    """The parent's text when the child was written, from mem0's history table.
-
-    The old text of the earliest UPDATE after the child; the current text when
-    the parent was not edited after it; None when that UPDATE kept no old text.
-    """
-    child_at = datetime.fromisoformat(child_created_at)
-    with _read_only(history_db) as connection:
-        edits = connection.execute(
-            "SELECT old_memory, updated_at FROM history WHERE memory_id = ? AND event = 'UPDATE'",
-            (parent_id,),
-        ).fetchall()
-    later = [
-        (edited_at, old) for old, at in edits
-        if at and (edited_at := datetime.fromisoformat(at)) > child_at
-    ]
-    if not later:
-        return current_text
-    return min(later, key=lambda edit: edit[0])[1]
-
-
-def _read_only(database: Path) -> closing[sqlite3.Connection]:
-    connection = sqlite3.connect(f'{Path(database).resolve().as_uri()}?mode=ro', uri=True)
-    connection.execute('PRAGMA temp_store=MEMORY')
-    return closing(connection)
+    return _rounds.third_round_blockers(
+        (item['entry_id'], _current_derivation(item, judgements)) for item in items)
 
 
 def extend_sample(
@@ -373,130 +325,6 @@ def extend_sample(
     already = members & frozenset(sampled)
     unsampled = sorted(members - already)
     return random.Random(seed).sample(unsampled, len(unsampled))[:max(0, total - len(already))]
-
-
-@dataclass(frozen=True)
-class ShardEntry:
-    """One pair to rate: the write, the record it is read against, which text, and both texts."""
-
-    entry_id: str
-    target_id: str
-    basis: str
-    project: str
-    child_text: str
-    parent_text: str
-
-
-@dataclass(frozen=True)
-class Shard:
-    """A shard's text, and the key from each opaque item id back to its pair and basis."""
-
-    text: str
-    key: Mapping[str, Mapping[str, str]]
-
-
-def _entry_order(entry: ShardEntry) -> tuple[str, str, str]:
-    return (entry.entry_id, entry.target_id, entry.basis)
-
-
-def plan_shards(
-    entries: Iterable[ShardEntry], *, role: str, prefix: str, seed: int | str, first_index: int,
-) -> list[tuple[str, list[ShardEntry]]]:
-    """*entries* in a seeded per-role order, dealt into named shards of at most :data:`SHARD_SIZE`.
-
-    Shards are named ``<prefix><role>_<NN>``, numbered from *first_index*.
-    """
-    ordered = sorted(entries, key=_entry_order)
-    random.Random(f'{seed}:{prefix}{role}').shuffle(ordered)
-    count = math.ceil(len(ordered) / SHARD_SIZE)
-    return [(f'{prefix}{role}_{first_index + index:02d}', ordered[index::count])
-            for index in range(count)]
-
-
-def shard(entries: Sequence[ShardEntry], *, name: str) -> Shard:
-    """Render *entries*, in order, in the soak's shard layout."""
-    lines: list[str] = []
-    key: dict[str, Mapping[str, str]] = {}
-    for index, entry in enumerate(entries):
-        item_id = f'{name}-{index:03d}'
-        key[item_id] = MappingProxyType({
-            'entry_id': entry.entry_id, 'target_id': entry.target_id, 'basis': entry.basis,
-        })
-        lines += [
-            f'=== ITEM id={item_id} | project={entry.project} | basis={entry.basis}',
-            '--- PARENT:', _capped(entry.parent_text),
-            '--- CHILD:', _capped(entry.child_text),
-            '',
-        ]
-    return Shard(text='\n'.join(lines) + '\n', key=MappingProxyType(key))
-
-
-def _capped(text: str) -> str:
-    if len(text) <= TEXT_CAP:
-        return text
-    return text[:TEXT_CAP] + f'…[truncated, {len(text)} chars total]'
-
-
-def validate_rating(answer: Mapping[str, Any], child_text: str, parent_text: str) -> list[str]:
-    """Each piece of *answer*'s evidence not copied from the texts its rater saw; [] when none.
-
-    Quotes and spans are matched by ``quote_found``. A rater never gives DIGEST:
-    assembly computes it from the loss spans (R3).
-    """
-    problems = []
-    if Binary.DIGEST in answer:
-        problems.append(f'digest {answer[Binary.DIGEST]!r} is given; digest is computed from loss_spans')
-    quote = answer.get('conflict_quote')
-    if isinstance(quote, Mapping):
-        for side, text, shown_as in (('parent', parent_text, 'PARENT'), ('child', child_text, 'CHILD')):
-            if not _found(quote.get(side), text):
-                problems.append(f'conflict_quote.{side} {quote.get(side)!r} is not in {shown_as}')
-    for span in answer.get('loss_spans') or ():
-        if not _found(span, child_text):
-            problems.append(f'loss_spans {span!r} is not in CHILD')
-    return problems
-
-
-def _found(quote: object, text: str) -> bool:
-    return isinstance(quote, str) and _rubric.quote_found(quote, text)
-
-
-def rating_problems(row: Mapping[str, Any], child_text: str, parent_text: str) -> list[str]:
-    """Why an effective rater line must be asked again; [] when it need not.
-
-    A line breaking the rubric's row contract is named for that alone, since
-    :func:`validate_rating` presumes a line that keeps it; any other line gets
-    :func:`validate_rating`'s evidence problems.
-    """
-    violation = _contract_violation(row)
-    if violation is not None:
-        return [violation]
-    return validate_rating(row, child_text, parent_text)
-
-
-def _contract_violation(row: Mapping[str, Any]) -> str | None:
-    """The violation the rubric's ``resolve_judgements`` refuses *row* alone for; None if none."""
-    try:
-        _rubric.resolve_judgements([row])
-    except ValueError as exc:
-        return str(exc)
-    return None
-
-
-def effective_ratings(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Each rater's highest-``round`` line on each pair and basis, without its ``round``.
-
-    A re-ask round supersedes the rater's earlier line; two lines of one round are refused.
-    """
-    latest: dict[tuple[str, str, str, str], Mapping[str, Any]] = {}
-    for row in rows:
-        identity = (row['entry_id'], row['target_id'], row['basis'], row['rater'])
-        earlier = latest.get(identity)
-        if earlier is not None and earlier['round'] == row['round']:
-            raise ValueError(f'rater line {identity} appears twice in round {row["round"]}')
-        if earlier is None or row['round'] > earlier['round']:
-            latest[identity] = row
-    return [{key: value for key, value in row.items() if key != 'round'} for row in latest.values()]
 
 
 @dataclass(frozen=True)
@@ -565,14 +393,11 @@ def _assembled_rater_row(
     fixed: Mapping[tuple[str, str], Mapping[_rubric.Binary, StrEnum]],
     child_texts: Mapping[str, str],
 ) -> dict[str, Any]:
-    assembled = dict(row)
+    assembled = _rounds.with_digest(row, child_texts[row['entry_id']])
     if row['basis'] == Basis.CURRENT:
         derived = fixed.get((row['entry_id'], row['target_id']), {})
         if non_consumed := sorted(str(binary) for binary in derived if binary in row):
             assembled['non_consumed'] = non_consumed
-    if row.get(Binary.LOSS) == Answer.YES:
-        visible = _rubric.digest_visible(row['loss_spans'], child_texts[row['entry_id']])
-        assembled[str(Binary.DIGEST)] = str(Answer.YES if visible else Answer.NO)
     return assembled
 
 
@@ -596,8 +421,8 @@ class _SoakItem:
     def pair(self) -> tuple[str, str]:
         return (self.item['entry_id'], self.item['target_id'])
 
-    def entry(self, basis: str, parent_text: str | None = None) -> ShardEntry:
-        return ShardEntry(
+    def entry(self, basis: str, parent_text: str | None = None) -> _rounds.ShardEntry:
+        return _rounds.ShardEntry(
             entry_id=self.item['entry_id'], target_id=self.item['target_id'], basis=basis,
             project=self.item['project'], child_text=self.child_text,
             parent_text=self.parent_text if parent_text is None else parent_text,
@@ -697,7 +522,7 @@ def _draw_extension(
     """
     extension: dict[str, dict[str, Any]] = {}
     unrecoverable: list[dict[str, str]] = []
-    with _read_only(journal_db) as journal:
+    with _rounds.read_only(journal_db) as journal:
         for outcome, total in totals.items():
             drawn = extend_sample(bundle.population(outcome), bundle.adjudications, total,
                                   seed=f'{seed}:{outcome}')
@@ -712,7 +537,9 @@ def _draw_extension(
     return extension, sorted(unrecoverable, key=lambda row: row['intent_id'])
 
 
-def _rating_entries(soak: Sequence[_SoakItem], history_db: Path) -> tuple[list[ShardEntry], list[str]]:
+def _rating_entries(
+    soak: Sequence[_SoakItem], history_db: Path,
+) -> tuple[list[_rounds.ShardEntry], list[str]]:
     """Each item's current pair, its attach-time pair when its parent was edited after attach,
     and the entries whose attach-time text history does not keep."""
     entries = [soaked.entry(Basis.CURRENT) for soaked in soak]
@@ -720,8 +547,8 @@ def _rating_entries(soak: Sequence[_SoakItem], history_db: Path) -> tuple[list[S
     for soaked in soak:
         if not soaked.item['parent_edited_after_attach']:
             continue
-        text = attach_time_text(history_db, soaked.item['target_id'],
-                                soaked.child_created_at, soaked.parent_text)
+        text = _rounds.text_at(history_db, soaked.item['target_id'],
+                               datetime.fromisoformat(soaked.child_created_at), soaked.parent_text)
         if text is None:
             unrecoverable.append(soaked.item['entry_id'])
         else:
@@ -735,142 +562,20 @@ def _refuse_inside(parser: argparse.ArgumentParser, scratch: Path, bundle: Path)
         parser.error(f'--scratch {scratch} is inside the read-only --bundle {bundle}')
 
 
-def _keyed_order(item: Mapping[str, str]) -> tuple[str, str, str]:
-    """A key item's pair and basis, ordered as :func:`_entry_order` orders a shard entry."""
-    return (item['entry_id'], item['target_id'], item['basis'])
+def _soak_key(scratch: _rounds.RatingScratch) -> dict[str, Any]:
+    """The scratch key, with the soak's draw records empty until ``shards`` first writes them."""
+    return {'extension': {}, 'unrecoverable': [], 'attach_time_unrecoverable': [],
+            **scratch.load_key()}
 
 
-_SHARD_PREFIX: Mapping[str, str] = MappingProxyType({Basis.CURRENT: '', Basis.ATTACH_TIME: 'attach_'})
-_DOUBLE_RATED = (Role.PRIMARY, Role.SECOND)
-
-
-class _Scratch:
-    """The scratch directory: shards, the key, the texts raters saw, the rater prompt and the ratings."""
-
-    def __init__(self, root: Path) -> None:
-        self.root = root
-        self.key_path = root / 'key.json'
-
-    def load_key(self) -> dict[str, Any]:
-        if not self.key_path.exists():
-            return {'shards': {}, 'items': {}, 'extension': {}, 'unrecoverable': [],
-                    'attach_time_unrecoverable': []}
-        return _read_json(self.key_path)
-
-    def add_shards(self, key: dict[str, Any], entries: Sequence[ShardEntry], *, seed: int) -> list[str]:
-        """Shard each entry not yet keyed under each double-rating role; the new shards' names."""
-        keyed = {
-            (spec['role'], _keyed_order(key['items'][item]))
-            for spec in key['shards'].values() for item in spec['items']
-        }
-        added = []
-        for basis, prefix in _SHARD_PREFIX.items():
-            for role in _DOUBLE_RATED:
-                pending = [entry for entry in entries
-                           if entry.basis == basis and (role, _entry_order(entry)) not in keyed]
-                first = sum(name.startswith(f'{prefix}{role}_') for name in key['shards'])
-                for name, members in plan_shards(pending, role=role, prefix=prefix, seed=seed,
-                                                 first_index=first):
-                    self.write_shard(key, name, members, role=role,
-                                     rater=f'{RATER_MODELS[role]}-{role}', round=0)
-                    added.append(name)
-        return added
-
-    def write_shard(self, key: dict[str, Any], name: str, entries: Sequence[ShardEntry], *,
-                    role: str, rater: str, round: int) -> None:
-        rendered = shard(entries, name=name)
-        (self.root / 'shards').mkdir(parents=True, exist_ok=True)
-        (self.root / 'shards' / f'{name}.txt').write_text(rendered.text)
-        key['shards'][name] = {'role': role, 'rater': rater, 'round': round,
-                               'items': sorted(rendered.key)}
-        key['items'].update({item_id: dict(pair) for item_id, pair in rendered.key.items()})
-
-    def save_key(self, key: Mapping[str, Any]) -> None:
-        _write_json(self.key_path, key)
-
-    def save_texts(self, entries: Iterable[ShardEntry]) -> None:
-        _write_json(self.root / 'texts.json', [
-            {'entry_id': entry.entry_id, 'target_id': entry.target_id, 'basis': entry.basis,
-             'child_text': entry.child_text, 'parent_text': entry.parent_text}
-            for entry in sorted(entries, key=_entry_order)
-        ])
-
-    def entries(self, soak: Iterable[_SoakItem]) -> dict[tuple[str, str, str], ShardEntry]:
-        """Each keyed pair and basis as its raters saw it, from ``texts.json``."""
-        projects = {soaked.item['entry_id']: soaked.item['project'] for soaked in soak}
-        return {
-            _keyed_order(record): ShardEntry(**record, project=projects[record['entry_id']])
-            for record in _read_json(self.root / 'texts.json')
-        }
-
-    def ratings(self, key: Mapping[str, Any], entries: Mapping[tuple[str, str, str], ShardEntry],
-                ) -> _Rated:
-        """Every rater's effective lines, each checked by :func:`rating_problems`."""
-        lines: list[dict[str, Any]] = []
-        for name, spec in sorted(key['shards'].items()):
-            lines += self._shard_ratings(name, spec, key['items'])
-        rows = effective_ratings(lines)
-        item_ids = {
-            (name, *_keyed_order(key['items'][item_id])): item_id
-            for name, spec in key['shards'].items() for item_id in spec['items']
-        }
-        reask = []
-        for row in rows:
-            entry = entries[_keyed_order(row)]
-            if problems := rating_problems(row, entry.child_text, entry.parent_text):
-                item_id = item_ids[row['batch'], *_keyed_order(row)]
-                reask.append(_Reask(row, item_id, tuple(problems)))
-        return _Rated(rows=rows, reasked=len(lines) - len(rows), reask=reask)
-
-    def _shard_ratings(
-        self, name: str, spec: Mapping[str, Any], items: Mapping[str, Mapping[str, str]],
-    ) -> list[dict[str, Any]]:
-        path = self.root / 'ratings' / f'{name}.jsonl'
-        if not path.exists():
-            raise ValueError(f'{path}: shard {name} has no ratings yet')
-        rows, seen = [], Counter[str]()
-        for number, line in enumerate(path.read_text().splitlines(), start=1):
-            if not line.strip():
-                continue
-            answer = json.loads(line)
-            item_id = answer.pop('id', None)
-            if item_id not in spec['items']:
-                raise ValueError(f'{path}:{number}: id {item_id!r} is not an item of shard {name}')
-            seen[item_id] += 1
-            row = {**items[item_id], 'rater': spec['rater'], 'role': spec['role'], 'batch': name,
-                   **answer}
-            rows.append({**row, 'round': spec['round']})
-        wrong = sorted(item for item in spec['items'] if seen[item] != 1)
-        if wrong:
-            raise ValueError(f'{path}: items without exactly one line: {wrong}')
-        return rows
-
-
-@dataclass(frozen=True)
-class _Reask:
-    """An effective rater line to ask again, and why."""
-
-    row: Mapping[str, Any]
-    item_id: str
-    problems: tuple[str, ...]
-
-    def __str__(self) -> str:
-        return f'{self.row["batch"]} item {self.item_id}: {"; ".join(self.problems)}'
-
-
-@dataclass(frozen=True)
-class _Rated:
-    """The effective rater lines, how many earlier-round lines they superseded, and those to ask again."""
-
-    rows: list[dict[str, Any]]
-    reasked: int
-    reask: list[_Reask]
+def _projects(soak: Iterable[_SoakItem]) -> dict[str, str]:
+    return {soaked.item['entry_id']: soaked.item['project'] for soaked in soak}
 
 
 def _shards_command(args: argparse.Namespace) -> dict[str, Any]:
     bundle = _SoakBundle.read(args.bundle)
-    scratch = _Scratch(args.scratch)
-    key = scratch.load_key()
+    scratch = _rounds.RatingScratch(args.scratch, brief=args.brief)
+    key = _soak_key(scratch)
     totals = {OUTCOME_RESTATED: args.restated_total, OUTCOME_AMENDED: args.amended_total}
     extension, unrecoverable = _draw_extension(bundle, totals, args.seed, args.journal_db)
     dropped = sorted(set(key['extension']) - set(extension))
@@ -883,7 +588,7 @@ def _shards_command(args: argparse.Namespace) -> dict[str, Any]:
     added = scratch.add_shards(key, entries, seed=args.seed)
     scratch.save_key(key)
     scratch.save_texts(entries)
-    (args.scratch / 'rater_prompt.md').write_text(_rater_prompt())
+    (args.scratch / 'rater_prompt.md').write_text(_rounds.rater_prompt(args.brief))
     return {
         'items': len(soak),
         'extension': Counter(record['outcome'] for record in extension.values()),
@@ -898,33 +603,24 @@ def _shards_command(args: argparse.Namespace) -> dict[str, Any]:
 class _Corpus:
     """The scratch state of a fully rated soak, and its assembled verdict corpus."""
 
-    scratch: _Scratch
+    scratch: _rounds.RatingScratch
     key: dict[str, Any]
     bundle: _SoakBundle
     soak: list[_SoakItem]
-    entries: Mapping[tuple[str, str, str], ShardEntry]
-    rated: _Rated
+    entries: Mapping[tuple[str, str, str], _rounds.ShardEntry]
+    rated: _rounds.Rated
     assembly: Assembly
 
 
 def _corpus(args: argparse.Namespace) -> _Corpus:
     """The assembled corpus, refused while any line awaits a re-ask or any pair lacks a rater."""
     bundle = _SoakBundle.read(args.bundle)
-    scratch = _Scratch(args.scratch)
-    key = scratch.load_key()
+    scratch = _rounds.RatingScratch(args.scratch, brief=args.brief)
+    key = _soak_key(scratch)
     soak = bundle.keyed_items(key)
-    entries = scratch.entries(soak)
+    entries = scratch.entries(_projects(soak))
     rated = scratch.ratings(key, entries)
-    if rated.reask:
-        raise ValueError('rater lines break the row contract or quote evidence not in the texts'
-                         ' shown; run reask:\n' + '\n'.join(map(str, rated.reask)))
-    rated_roles = {(*_keyed_order(row), row['role']) for row in rated.rows}
-    lacking = sorted(
-        (*keyed, role) for keyed in entries for role in _DOUBLE_RATED
-        if (*keyed, role) not in rated_roles
-    )
-    if lacking:
-        raise ValueError(f'pairs and bases without an effective primary or second line: {lacking}')
+    _rounds.refuse_unfinished(rated, entries)
     assembly = assemble(
         {soaked.pair: soaked.adjudication for soaked in soak}, rated.rows,
         {soaked.item['entry_id']: soaked.child_text for soaked in soak},
@@ -933,38 +629,16 @@ def _corpus(args: argparse.Namespace) -> _Corpus:
 
 
 def _reask_command(args: argparse.Namespace) -> dict[str, Any]:
-    scratch = _Scratch(args.scratch)
-    key = scratch.load_key()
-    entries = scratch.entries(_SoakBundle.read(args.bundle).keyed_items(key))
-    reask_by_rater: defaultdict[str, list[_Reask]] = defaultdict(list)
-    for reask in scratch.ratings(key, entries).reask:
-        reask_by_rater[reask.row['rater']].append(reask)
-    last_round = max(spec['round'] for spec in key['shards'].values())
-    written = {}
-    for round_, (rater, lines) in enumerate(sorted(reask_by_rater.items()), start=last_round + 1):
-        role = lines[0].row['role']
-        name = f'reask_{round_:02d}_{role}'
-        scratch.write_shard(key, name, [entries[_keyed_order(line.row)] for line in lines],
-                            role=role, rater=rater, round=round_)
-        written[name] = len(lines)
-    if written:
-        scratch.save_key(key)
-    return {'lines': sum(written.values()), 'shards': written}
+    scratch = _rounds.RatingScratch(args.scratch, brief=args.brief)
+    key = _soak_key(scratch)
+    entries = scratch.entries(_projects(_SoakBundle.read(args.bundle).keyed_items(key)))
+    return _rounds.reask_round(scratch, key, entries)
 
 
 def _third_command(args: argparse.Namespace) -> dict[str, Any]:
     corpus = _corpus(args)
-    blocked = set(third_round_pairs([soaked.item for soaked in corpus.soak],
-                                    corpus.assembly.verdicts))
-    index = sum(spec['role'] == Role.THIRD for spec in corpus.key['shards'].values())
-    name = f'third_{index:02d}'
-    entries = [entry for (entry_id, target_id, basis), entry in sorted(corpus.entries.items())
-               if basis == Basis.CURRENT and (entry_id, target_id) in blocked]
-    if entries:
-        corpus.scratch.write_shard(corpus.key, name, entries, role=Role.THIRD,
-                                   rater=f'{RATER_MODELS[Role.THIRD]}-third-{index:02d}', round=0)
-        corpus.scratch.save_key(corpus.key)
-    return {'pairs': len(entries), 'shard': name if entries else None}
+    blocked = third_round_pairs([soaked.item for soaked in corpus.soak], corpus.assembly.verdicts)
+    return _rounds.third_round(corpus.scratch, corpus.key, corpus.entries, blocked)
 
 
 def _assemble_command(args: argparse.Namespace) -> dict[str, Any]:
@@ -977,7 +651,7 @@ def _assemble_command(args: argparse.Namespace) -> dict[str, Any]:
     _write_json(out / 'write_triage_v2_soak_strata.json', dict(STRATA))
     _write_json(out / 'write_triage_v2_soak_derivation.json', {
         **corpus.assembly.derivation,
-        'rating_volume': rating_volume(key),
+        'rating_volume': _rounds.rating_volume(key),
         'sample': _sample(corpus.bundle, key),
         'unrecoverable': key['unrecoverable'],
         'attach_time_unrecoverable': sorted(key['attach_time_unrecoverable']),
@@ -987,18 +661,6 @@ def _assemble_command(args: argparse.Namespace) -> dict[str, Any]:
                    for name, spec in sorted(key['shards'].items())},
     })
     return {'items': len(corpus.soak), 'verdicts': len(corpus.assembly.verdicts)}
-
-
-def rating_volume(key: Mapping[str, Any]) -> dict[str, dict[str, int]]:
-    """The distinct (entry, target) pairs the scratch *key*'s shards put before each role, by basis."""
-    pairs: defaultdict[str, defaultdict[str, set[tuple[str, str]]]] = defaultdict(
-        lambda: defaultdict(set))
-    for spec in key['shards'].values():
-        for item_id in spec['items']:
-            item = key['items'][item_id]
-            pairs[item['basis']][spec['role']].add((item['entry_id'], item['target_id']))
-    return {basis: {role: len(rated) for role, rated in sorted(by_role.items())}
-            for basis, by_role in sorted(pairs.items())}
 
 
 _SAMPLE_COUNTS = ('adjudicated', 'extension', 'unrecoverable')
@@ -1025,45 +687,6 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
 
 
-def _rater_prompt() -> str:
-    return '\n'.join([
-        '# Rater task (read one shard file, write one JSONL file)',
-        '',
-        'You are a blind rater. Read ONLY the shard file you are given and write ONLY the'
-        ' output file you are given. Do not open any other file (no key file, no repository'
-        ' file, no store), and do not call any memory or task tool.',
-        '',
-        '## The rubric (verbatim, fused-memory/calibration/write_triage_rater_brief_v2.md)',
-        '',
-        BRIEF_PATH.read_text(),
-        '## Output',
-        '',
-        'Each shard item starts with `=== ITEM id=<id> | project=<project> | basis=<basis>`'
-        ' and shows PARENT and CHILD. Write one JSON object per line, in item order, to the'
-        ' output file you are given:'
-        ' `{"id": "<item id>", "home": "YES|NO|UNCLEAR", "conflict": "YES|NO|UNCLEAR",'
-        ' "scope": "CENTRAL|SECONDARY|UNCLEAR", "action_changing": "YES|NO|UNCLEAR",'
-        ' "conflict_quote": {"parent": "<words from PARENT>", "child": "<words from CHILD>"},'
-        ' "loss": "YES|NO|UNCLEAR", "loss_spans": ["<words from CHILD>", ...],'
-        ' "unclear_reason": "...", "reason": "<one sentence naming both claims>"}`.',
-        '',
-        '- Give `scope`, `action_changing` and `conflict_quote` when, and only when,'
-        ' `conflict` is YES.',
-        '- Give `loss` when, and only when, `home` is YES and `conflict` is NO; give'
-        ' `loss_spans` when, and only when, `loss` is YES.',
-        '- Give `unclear_reason` with any UNCLEAR answer.',
-        '- Copy `conflict_quote.parent` verbatim from PARENT, and `conflict_quote.child` and'
-        ' every `loss_spans` entry verbatim from CHILD. A line that breaks these rules, or'
-        ' whose quote or span is not found in the text shown, is sent back to you to answer'
-        ' again.',
-        '',
-        'Append to the file after every batch of about 10 items, so partial progress'
-        ' survives. Every item in the shard gets exactly one line. When done, reply with'
-        ' only the number of lines written.',
-        '',
-    ])
-
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     commands = parser.add_subparsers(dest='command', required=True)
@@ -1072,6 +695,9 @@ def _build_parser() -> argparse.ArgumentParser:
         command.add_argument('--bundle', type=Path, required=True, metavar='DIR',
                              help="the soak bundle's correctness/ directory (read-only)")
         command.add_argument('--scratch', type=Path, required=True, metavar='DIR')
+        command.add_argument('--brief', type=Path, default=_rounds.BRIEF_PATH, metavar='PATH',
+                             help='the rater brief new shards are rendered for and record;'
+                                  ' default the committed brief (v2.1 is commit c7b682bcb9)')
     shards = commands.choices['shards']
     shards.add_argument('--history-db', type=Path, required=True, metavar='PATH',
                         help="mem0's history.db (read-only)")
