@@ -293,17 +293,21 @@ def _read_ledger(
     )
 
 
+def episode_bindings(episodes: Mapping[str, CommandRecord]) -> dict[tuple[str, str], str]:
+    """(command name, node) to the task each stored episode, live or ended, is bound to now."""
+    return {
+        (record.command, node): episode.covering_task_id
+        for record in episodes.values()
+        for node, episode in record.episodes.items()
+        if episode.covering_task_id is not None
+    }
+
+
 def _task_ids(window: Sequence[WindowPass], episodes: Mapping[str, CommandRecord], ledger: LedgerReads) -> list[str]:
-    """The ids the windowed effect blocks filed, the tasks the live episode records are or were bound to,
+    """The ids the windowed effect blocks filed, the tasks the stored episodes are bound to now,
     and the owners of the offered tests' debts."""
     filed = [task_id for p in window if p.effect is not None for task_id in p.effect.tasks_filed]
-    bound = [
-        task_id
-        for record in episodes.values()
-        for episode in record.episodes.values()
-        for task_id in (episode.covering_task_id, *episode.prior_task_ids)
-        if task_id is not None
-    ]
+    bound = episode_bindings(episodes).values()
     owners = [row.owner_task_id for row in ledger.debts.values() if row.owner_task_id is not None]
     return list(dict.fromkeys((*filed, *bound, *owners)))
 

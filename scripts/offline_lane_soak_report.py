@@ -38,6 +38,7 @@ from offline_lane_soak_inputs import (
     TaskReader,
     Unjudgeable,
     WindowPass,
+    episode_bindings,
     load_inputs,
     load_inputs_from_server,
 )
@@ -123,10 +124,12 @@ def _rules(settings: Settings) -> dict[Check, str]:
         Check.DEFLAKE_TASKS_CARRY_EVIDENCE: 'every owner task of a debt a windowed effect block offered, whose '
         'metadata says flake_debt_call_site offline_lane, carries a flake_debt_trigger and, in its description '
         "or details, the kind and first line of one of that test's failures in the command's pass records",
-        Check.NO_STRANDED_FILING: 'every test a windowed effect block lists in threshold_reached is covered by a '
-        'lane task (filed in a windowed effect block, or bound to its live episode), or its filing is due and '
-        "the command's stuck-filing record is pending; a filing due for less than "
-        f'{settings.recheck_secs:g}s is pending, not stranded',
+        Check.NO_STRANDED_FILING: 'a test listed in threshold_reached at pass P is owned when either of two lane '
+        'tasks reads back through get_task covering it: a task that a same-command effect block at or after P '
+        'lists in tasks_filed, or the task its episode (live or ended) is bound to now; it is also owned when its '
+        "filing is due and the command's stuck-filing record is pending; a task an earlier episode was bound to "
+        f'(prior_task_ids) owns nothing; a filing due for less than {settings.recheck_secs:g}s is pending, '
+        'not stranded',
         Check.OFFERED_DEBTS_OWNED_OR_DUE: 'every test a windowed effect block lists in debts_offered has a debt '
         'row with an owner task, or is still on the due list; due items older than '
         f'{DUE_ITEM_STALE_MINUTES} minutes are reported',
@@ -244,23 +247,10 @@ def _live_episodes(inputs: SoakInputs) -> Iterator[Episode]:
         yield from (episode for episode in record.episodes.values() if episode.live)
 
 
-def _known_lane_tasks(inputs: SoakInputs) -> dict[str, Mapping[str, Any]]:
-    """The tasks the windowed effect blocks filed, then those the live episodes are or were bound to, as read."""
-    filed = [task_id for _, effect in inputs.effects() for task_id in effect.tasks_filed]
-    bound = [
-        task_id
-        for episode in _live_episodes(inputs)
-        for task_id in (episode.covering_task_id, *episode.prior_task_ids)
-        if task_id is not None
-    ]
-    return {
-        task_id: task for task_id in dict.fromkeys((*filed, *bound)) if (task := inputs.tasks.get(task_id)) is not None
-    }
-
-
 @dataclass(frozen=True)
 class _Crossing:
-    """One (pass, test) entry of a windowed effect block's threshold_reached, and what the lane holds for it now."""
+    """One (pass, test) entry of a windowed effect block's threshold_reached, and the episode,
+    live or ended, and stuck-filing record state the lane holds for it now."""
 
     window_pass: WindowPass
     command: str
@@ -278,16 +268,33 @@ def _crossings(inputs: SoakInputs) -> Iterator[_Crossing]:
         stuck_id = held.stuck_filing_escalation_id
         state = None if stuck_id is None else inputs.escalations.stuck_filing_states.get(stuck_id)
         for node in dict.fromkeys(effect.threshold_reached):
-            episode = held.episodes.get(node)
-            yield _Crossing(window_pass, record.command, node, episode if episode and episode.live else None, state)
+            yield _Crossing(window_pass, record.command, node, held.episodes.get(node), state)
 
 
-def _owned(crossing: _Crossing, lane_tasks: Mapping[str, Mapping[str, Any]]) -> bool:
+def _lane_task_covers(inputs: SoakInputs, task_id: str, command: str, node: str) -> bool:
+    """Whether *task_id* reads back as a lane task covering *node* of *command*."""
+    task = inputs.tasks.get(task_id)
+    return task is not None and covering_lane_task({task_id: task}, command, node) == task_id
+
+
+def _owner_candidates(
+    inputs: SoakInputs, crossing: _Crossing, bindings: Mapping[tuple[str, str], str],
+) -> Iterator[str]:
+    """The tasks a same-command effect block at or after the crossing filed, then the episode's binding now."""
+    crossed = crossing.window_pass
+    for window_pass, effect in inputs.effects():
+        if window_pass.stored.command_key == crossed.stored.command_key and window_pass.started_at >= crossed.started_at:
+            yield from effect.tasks_filed
+    bound = bindings.get((crossing.command, crossing.node))
+    if bound is not None:
+        yield bound
+
+
+def _owned(inputs: SoakInputs, crossing: _Crossing, bindings: Mapping[tuple[str, str], str]) -> bool:
+    candidates = _owner_candidates(inputs, crossing, bindings)
+    if any(_lane_task_covers(inputs, task_id, crossing.command, crossing.node) for task_id in candidates):
+        return True
     episode = crossing.episode
-    if covering_lane_task(lane_tasks, crossing.command, crossing.node) is not None:
-        return True
-    if episode is not None and episode.covering_task_id is not None:
-        return True
     return episode is not None and episode.filing_due and crossing.stuck_record_state == PENDING_ESCALATION
 
 
@@ -300,13 +307,13 @@ def _due_within(crossing: _Crossing, now: datetime, recheck: timedelta) -> datet
 
 
 def _no_stranded_filing(inputs: SoakInputs, rule: str, settings: Settings) -> CheckResult:
-    lane_tasks = _known_lane_tasks(inputs)
+    bindings = episode_bindings(inputs.episodes)
     recheck = timedelta(seconds=settings.recheck_secs)
     crossings = list(_crossings(inputs))
     failures: list[str] = []
     notes: list[str] = []
     for crossing in crossings:
-        if _owned(crossing, lane_tasks):
+        if _owned(inputs, crossing, bindings):
             continue
         what = f'{crossing.command}: {crossing.node} (threshold reached at {_label(crossing.window_pass)})'
         due_since = _due_within(crossing, inputs.now, recheck)
