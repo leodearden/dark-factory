@@ -628,6 +628,29 @@ class TestNoVerdictArchive:
             assert str(path) in message
 
     @pytest.mark.asyncio
+    async def test_task_no_verdict_archives_the_worker_death_line(self, tmp_path: Path):
+        worktree = tmp_path / 'worktree'
+        worktree.mkdir()
+        executed = await _xdist_worker_death_result(worktree)
+        transport = _FakeTransport(ssh_stdout=result_to_json(executed), ssh_stderr='LAPTOP LOG')
+
+        with pytest.raises(RunnerUnavailable) as excinfo:
+            await _remote_runner(transport).run_task_verify(
+                _task_spec(), task_id='6667', archive_root=tmp_path / 'archive',
+            )
+
+        assert excinfo.value.kind == 'no_verdict'
+        task_dir = tmp_path / 'archive' / '6667'
+        test_log = _one(task_dir, 'attempt-4.remote-laptop.test-*.log').read_text()
+        assert f"crashed while running '{XDIST_IN_FLIGHT_NODEID}'" in test_log
+        assert _one(task_dir, 'attempt-4.remote-laptop-*.stderr.log').read_text() == 'LAPTOP LOG'
+        summary = json.loads(_one(task_dir, 'attempt-4.remote-laptop.summary-*.json').read_text())
+        assert summary['role'] == 'task'
+        message = str(excinfo.value)
+        for path in task_dir.iterdir():
+            assert str(path) in message
+
+    @pytest.mark.asyncio
     async def test_unwritable_archive_root_still_raises_no_verdict(self, tmp_path: Path):
         worktree = tmp_path / 'worktree'
         worktree.mkdir()
