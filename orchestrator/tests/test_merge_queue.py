@@ -62,7 +62,7 @@ from orchestrator.merge_lane.gates import (
     DropGuardResult,
     _check_plan_files_touched_in_branch,
 )
-from orchestrator.merge_lane.outcome_facts import MergeBlockCategory
+from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
 from orchestrator.merge_lane.ports import ProductionVerifier, VerifyPort
 from orchestrator.merge_lane.reverify_gate_decision import GateClearance
 from orchestrator.merge_lane.types import DiskGuardOutcome, QueuedBranch
@@ -12908,16 +12908,25 @@ class TestTrainLifecycleEvents:
             f"got: {derailed_data['derail_reason']!r}"
         )
 
+    @pytest.mark.parametrize(
+        ('listed', 'evidence'),
+        [
+            pytest.param(('trn-c.py',), ConflictEvidence(conflicted_paths=('trn-c.py',)), id='listed'),
+            pytest.param(None, None, id='unlisted'),
+        ],
+    )
     async def test_merge_conflict_records_conflicted_paths(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+        listed: tuple[str, ...] | None, evidence: ConflictEvidence | None,
     ) -> None:
         """A train whose tip merge conflicts records the conflicted paths on its
-        conflict ``merge_attempt`` row (task 7302)."""
+        conflict ``merge_attempt`` row and its blocked outcome alike (task 7302);
+        paths git could not list are left off both."""
         req = await _make_stacked_train(git_ops, config)
         event_store = EventStore(db_path=tmp_path / 'train_conflict.db', run_id='train-conflict-run')
         git_ops.merge_to_main = AsyncMock(return_value=MergeResult(
             success=False, conflicts=True,
-            details='Conflicting files:\ntrn-c.py\n', conflicted_paths=('trn-c.py',),
+            details='Conflicting files:\ntrn-c.py\n', conflicted_paths=listed,
         ))
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         lane = make_lane(git_ops, queue, event_store=event_store, clock=healthy_verify_clock())
@@ -12925,13 +12934,21 @@ class TestTrainLifecycleEvents:
         outcome = await merge_through_lane(lane, queue, req)
 
         assert outcome.status == 'blocked', outcome
+        assert outcome.conflict_evidence == evidence
+        # Filed as merge_error: the pre-7302 merge_ff_failed label came from
+        # the 'ff' substring inference matching the 'diff' in the details.
+        assert outcome.block_category is MergeBlockCategory.MERGE_ERROR
         conflict_rows = [
             row['data'] for row in event_store.fetch_events_by_type(EventType.merge_attempt)
             if row['data']['outcome'] == 'conflict'
         ]
         assert len(conflict_rows) == 1, conflict_rows
         assert conflict_rows[0]['train_id'] == req.train_id
-        assert conflict_rows[0]['conflicted_paths'] == ['trn-c.py']
+        recorded = {
+            key: value for key, value in conflict_rows[0].items()
+            if key in ('conflicted_paths', 'conflicted_paths_total')
+        }
+        assert recorded == ({} if evidence is None else evidence.to_event_payload())
 
     async def test_rebase_conflict_emits_train_derailed(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,

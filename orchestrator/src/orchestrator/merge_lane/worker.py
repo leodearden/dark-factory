@@ -6091,7 +6091,7 @@ async def classify_and_merge(
         # 4. Conflict → reject immediately (caller resolves outside queue).
         if merge_result.conflicts:
             logger.info('Task %s: merge conflicts detected', req.task_id)
-            evidence = ConflictEvidence(conflicted_paths=merge_result.conflicted_paths)
+            evidence = _conflict_evidence(merge_result)
             _emit_merge_attempt(
                 event_store, req.task_id, OutcomeKind.conflict,
                 duration_ms=_elapsed_ms(started_monotonic),
@@ -6915,6 +6915,13 @@ async def reconcile_landed_outbox(
     return report
 
 
+def _conflict_evidence(merge_result: MergeResult) -> ConflictEvidence | None:
+    """What a conflicted merge records; ``None`` when git could not name its paths."""
+    if merge_result.conflicted_paths is None:
+        return None
+    return ConflictEvidence(conflicted_paths=merge_result.conflicted_paths)
+
+
 def _emit_train_attempt(
     event_store: EventStore | None,
     req: GroupMergeRequest,
@@ -7513,12 +7520,13 @@ async def _do_train_merge(
             data={'derail_reason': reason},
         )
         if merge_result.conflicts:
+            evidence = _conflict_evidence(merge_result)
             _emit_train_attempt(
                 event_store, req, OutcomeKind.conflict, started_monotonic=t0,
-                conflict_evidence=ConflictEvidence(conflicted_paths=merge_result.conflicted_paths),
+                conflict_evidence=evidence,
             )
-        else:
-            _emit_train_attempt(event_store, req, OutcomeKind.merge_failed, started_monotonic=t0)
+            return MergeOutcome('blocked', reason=reason, conflict_evidence=evidence)
+        _emit_train_attempt(event_store, req, OutcomeKind.merge_failed, started_monotonic=t0)
         return MergeOutcome('blocked', reason=reason)
 
     # Enforce invariants explicitly — plain assert is stripped under python -O,

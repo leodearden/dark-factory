@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from _git_fixtures import seed_repo
@@ -23,7 +25,7 @@ from escalation.categories import EscalationCategory
 from orchestrator import verify_runner
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.git_ops import GitOps
+from orchestrator.git_ops import GitOps, MergeResult
 from orchestrator.merge_lane.outcome_facts import (
     MAX_RECORDED_CONFLICTED_PATHS,
     ConflictEvidence,
@@ -186,6 +188,85 @@ class TestMergeToMainReportsConflictedPaths:
         assert result.success is True
         assert result.conflicted_paths == ()
 
+    async def test_the_details_describe_the_recorded_paths(self, git_ops: GitOps) -> None:
+        # A non-ASCII name is what git's default core.quotePath would quote.
+        result = await _add_add_conflict(git_ops, 'clä sh.py')
+
+        assert result.conflicted_paths == ('clä sh.py',)
+        assert result.details.startswith('Conflicting files:\nclä sh.py\n'), result.details
+        assert '<<<<<<<' in result.details.split('--- clä sh.py ---\n', 1)[1], result.details
+
+    @pytest.mark.parametrize(
+        'listing',
+        [
+            pytest.param(lambda: AsyncMock(side_effect=RuntimeError('git diff failed')), id='fails'),
+            pytest.param(lambda: AsyncMock(return_value=()), id='names_nothing'),
+        ],
+    )
+    async def test_paths_git_cannot_name_are_reported_unknown(
+        self, git_ops: GitOps, listing: Callable[[], AsyncMock],
+    ) -> None:
+        result = await _add_add_conflict(git_ops, 'clash.py', unmerged_paths=listing())
+
+        assert result.conflicts is True
+        assert result.conflicted_paths is None
+        assert 'could not be listed' in result.details, result.details
+
+
+async def _add_add_conflict(
+    git_ops: GitOps, filename: str, unmerged_paths: AsyncMock | None = None,
+) -> MergeResult:
+    """Land one ADD of *filename*, then merge a second ADD of it cut from the same main.
+
+    *unmerged_paths*, when given, replaces the instance's listing for the
+    conflicting merge only.
+    """
+    worktree_a = await _commit_on_new_branch(git_ops, 'add-a', filename, 'x = 1\n')
+    worktree_b = await _commit_on_new_branch(git_ops, 'add-b', filename, 'x = 2\n')
+    landed = await git_ops.merge_to_main(worktree_a, 'add-a')
+    assert landed.merge_commit is not None and landed.merge_worktree is not None
+    await git_ops.advance_main(landed.merge_commit)
+    await git_ops.cleanup_merge_worktree(landed.merge_worktree)
+    if unmerged_paths is not None:
+        git_ops.unmerged_paths = unmerged_paths
+    result = await git_ops.merge_to_main(worktree_b, 'add-b')
+    assert result.merge_worktree is not None
+    await git_ops.cleanup_merge_worktree(result.merge_worktree)
+    return result
+
+
+async def _conflict_through_lane(
+    git_ops: GitOps, config: OrchestratorConfig, store: EventStore,
+) -> tuple[MergeOutcome, dict[str, object]]:
+    """Land conf-a, then finalize conf-b's add/add conflict; its outcome and conflict row data."""
+    queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    lane = make_lane(git_ops, queue, event_store=store, clock=healthy_verify_clock())
+    # Both cut before either lands, so each ADDS clash.py: an add/add conflict.
+    first = await _prepare(git_ops, config, 'conf-a', 'clash.py', 'x = 1\n')
+    second = await _prepare(git_ops, config, 'conf-b', 'clash.py', 'x = 2\n')
+    # With task/conf-b resolvable, the conflict graph would probe it against
+    # main and bounce it before it merged. Moving the ref away leaves the
+    # graph nothing to probe, so the conflict surfaces in merge_to_main's
+    # merge of the worktree HEAD (its absent-ref fallback).
+    subprocess.run(
+        ['git', 'branch', '-m', 'task/conf-b', 'parked/conf-b'],
+        cwd=second.worktree, check=True, capture_output=True,
+    )
+
+    async with running_lane(lane) as run:
+        await queue.put(first)
+        assert (await run.outcome(first)).status == 'done'
+        await queue.put(second)
+        outcome = await run.outcome(second)
+
+    assert outcome.status == 'conflict', outcome
+    conflict_rows = [
+        row for row in store.fetch_events_by_type(EventType.merge_attempt)
+        if row['task_id'] == 'conf-b' and row['data']['outcome'] == 'conflict'
+    ]
+    assert len(conflict_rows) == 1, conflict_rows
+    return outcome, conflict_rows[0]['data']
+
 
 @pytest.mark.asyncio
 class TestConflictFinalizationRecordsPaths:
@@ -193,34 +274,23 @@ class TestConflictFinalizationRecordsPaths:
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
         store = EventStore(tmp_path / 'runs.db', run_id='run-conflict-paths')
-        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, event_store=store, clock=healthy_verify_clock())
-        # Both cut before either lands, so each ADDS clash.py: an add/add conflict.
-        first = await _prepare(git_ops, config, 'conf-a', 'clash.py', 'x = 1\n')
-        second = await _prepare(git_ops, config, 'conf-b', 'clash.py', 'x = 2\n')
-        # With task/conf-b resolvable, the conflict graph would probe it against
-        # main and bounce it before it merged. Moving the ref away leaves the
-        # graph nothing to probe, so the conflict surfaces in merge_to_main's
-        # merge of the worktree HEAD (its absent-ref fallback).
-        subprocess.run(
-            ['git', 'branch', '-m', 'task/conf-b', 'parked/conf-b'],
-            cwd=second.worktree, check=True, capture_output=True,
-        )
 
-        async with running_lane(lane) as run:
-            await queue.put(first)
-            assert (await run.outcome(first)).status == 'done'
-            await queue.put(second)
-            outcome = await run.outcome(second)
+        outcome, data = await _conflict_through_lane(git_ops, config, store)
 
-        assert outcome.status == 'conflict', outcome
         assert outcome.conflict_evidence == ConflictEvidence(conflicted_paths=('clash.py',))
-        conflict_rows = [
-            row for row in store.fetch_events_by_type(EventType.merge_attempt)
-            if row['task_id'] == 'conf-b' and row['data']['outcome'] == 'conflict'
-        ]
-        assert len(conflict_rows) == 1, conflict_rows
-        data = conflict_rows[0]['data']
         assert data['conflicted_paths'] == ['clash.py']
         assert data['conflicted_paths_total'] == 1
         assert 'counterpart_task_ids' not in data
+
+    async def test_paths_git_cannot_list_are_left_unrecorded(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        # Absent keys mean "paths unknown"; an empty list would claim no path conflicted.
+        store = EventStore(tmp_path / 'runs.db', run_id='run-conflict-unlisted')
+        git_ops.unmerged_paths = AsyncMock(side_effect=RuntimeError('git diff failed'))
+
+        outcome, data = await _conflict_through_lane(git_ops, config, store)
+
+        assert outcome.conflict_evidence is None
+        assert 'conflicted_paths' not in data, data
+        assert 'conflicted_paths_total' not in data, data

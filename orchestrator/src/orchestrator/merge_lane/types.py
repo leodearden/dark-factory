@@ -1199,9 +1199,10 @@ class MergeOutcome:
     """The category the workflow files a generic ``blocked`` outcome under,
     stated by the producer rather than inferred from ``reason`` (task 7302)."""
     conflict_evidence: ConflictEvidence | None = None
-    """The paths a ``conflict`` outcome or a needs-rebase bounce conflicted on,
-    recorded into runs.db; ``None`` when no conflict was probed or the probe
-    failed open (task 7302)."""
+    """The paths a ``conflict`` outcome, a train whose tip merge conflicted, or
+    a needs-rebase bounce conflicted on, recorded into runs.db; ``None`` when
+    no conflict was probed, the probe failed open, or git could not name the
+    paths (task 7302)."""
 
 
 @dataclass

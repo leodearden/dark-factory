@@ -1062,8 +1062,8 @@ class MergeResult:
     already_up_to_date: bool = False
     # Set ONLY by :meth:`GitOps.merge_to_main`'s conflict arm (task 7302): the
     # merge worktree's unmerged paths, as data. ``()`` when the merge did not
-    # conflict or git could not list them.
-    conflicted_paths: tuple[str, ...] = ()
+    # conflict; ``None`` when it did but git could not name the paths.
+    conflicted_paths: tuple[str, ...] | None = ()
 
 
 class WarmBaseHealth(Enum):
@@ -12596,20 +12596,10 @@ class GitOps:
 
             if rc != 0:
                 if conflicts:
-                    conflict_details = await self.get_conflict_details(merge_wt)
-                    # The paths are a record only: failing to list them must
-                    # not turn this conflict into an exception.
-                    try:
-                        conflicted_paths = await self.unmerged_paths(merge_wt)
-                    except RuntimeError:
-                        logger.warning(
-                            'merge_to_main: could not list the unmerged paths in %s',
-                            merge_wt, exc_info=True,
-                        )
-                        conflicted_paths = ()
+                    conflicted_paths = await self._conflicted_paths_or_none(merge_wt)
                     return MergeResult(
                         success=False, conflicts=True,
-                        details=conflict_details,
+                        details=await self.get_conflict_details(merge_wt, conflicted_paths),
                         pre_merge_sha=pre_merge_sha,
                         merge_worktree=merge_wt,
                         conflicted_paths=conflicted_paths,
@@ -12795,7 +12785,9 @@ class GitOps:
         if rc != 0:
             # Capture BEFORE the abort — abort_merge clears the unmerged index.
             details = (
-                await self.get_conflict_details(worktree) if conflicts
+                await self.get_conflict_details(
+                    worktree, await self._conflicted_paths_or_none(worktree),
+                ) if conflicts
                 else f'{out}\n{err}'
             )
             # Abort on ANY rc != 0, not just the conflict arm: a failed
@@ -15865,18 +15857,35 @@ class GitOps:
             raise RuntimeError(f'git diff --diff-filter=U failed in {cwd} (rc={rc}): {err}')
         return tuple(dict.fromkeys(path for path in out.split('\0') if path))
 
-    async def get_conflict_details(self, cwd: Path) -> str:
-        """Parse conflict markers and return structured description."""
-        _, status, _ = await _run(['git', 'diff', '--name-only', '--diff-filter=U'], cwd=cwd)
-        if not status:
-            return 'No conflicting files detected'
+    async def _conflicted_paths_or_none(self, cwd: Path) -> tuple[str, ...] | None:
+        """The unmerged paths a conflicted merge left in *cwd*; ``None`` when git names none.
 
-        details = [f'Conflicting files:\n{status}\n']
-        for filepath in status.splitlines():
-            filepath = filepath.strip()
-            if filepath:
-                _, diff, _ = await _run(['git', 'diff', '--', filepath], cwd=cwd)
-                details.append(f'--- {filepath} ---\n{diff[:2000]}')
+        The conflict verdict is textual (:meth:`_run_no_ff_merge`), so an empty
+        listing is as unknown as a failed one: recording ``()`` would claim the
+        conflict touched no path. The paths are a record only, so failing to
+        list them never turns the conflict into an exception.
+        """
+        try:
+            paths = await self.unmerged_paths(cwd)
+        except RuntimeError:
+            logger.warning('Could not list the unmerged paths in %s', cwd, exc_info=True)
+            return None
+        if not paths:
+            logger.warning('git reported a merge conflict in %s but no unmerged path', cwd)
+            return None
+        return paths
+
+    async def get_conflict_details(
+        self, cwd: Path, conflicted_paths: tuple[str, ...] | None,
+    ) -> str:
+        """Describe *conflicted_paths*, each with its conflicted diff in *cwd*."""
+        if not conflicted_paths:
+            return 'Conflicting files could not be listed'
+
+        details = ['Conflicting files:\n' + '\n'.join(conflicted_paths) + '\n']
+        for filepath in conflicted_paths:
+            _, diff, _ = await _run(['git', 'diff', '--', filepath], cwd=cwd)
+            details.append(f'--- {filepath} ---\n{diff[:2000]}')
 
         return '\n'.join(details)
 
