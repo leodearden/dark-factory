@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _git_fixtures import RepoSeed, seed_repo
 from _orch_helpers import pydantic_spec
 from _workflow_helpers import FakeMetadataBackend, wire_metadata_backend
 from shared.cli_invoke import AgentResult
@@ -43,11 +44,26 @@ class _Fixture:
     event_emit: MagicMock
     build_architect_prompt: AsyncMock
     build_revalidation_prompt: AsyncMock
+    git_ops: MagicMock
     # Opt-in merge-faithful backend (task 3579); None unless the test passed one.
     metadata_backend: FakeMetadataBackend | None = None
 
 
 _FP_OF_D = task_text_fingerprint('d', None)
+
+_GIT_HEAD_SEED = RepoSeed(
+    files=(('.gitignore', '.task/\n'), ('README.md', '# Test\n')), message='Initial',
+)
+
+
+def _pending(step_id: str, step_type: str) -> dict:
+    return {'id': step_id, 'type': step_type, 'description': step_type,
+            'status': 'pending', 'commit': None}
+
+
+def _done(step_id: str, commit: str, step_type: str = 'impl') -> dict:
+    return {'id': step_id, 'type': step_type, 'description': step_type,
+            'status': 'done', 'commit': commit}
 
 
 def _make(
@@ -73,9 +89,17 @@ def _make(
     task_details: str | None = None,
     plan_text_fp: str | None = _FP_OF_D,
     plan_text_fp_gate_enabled: bool = True,
+    plan_steps: list[dict] | None = None,
+    git_head: bool = False,
 ) -> _Fixture:
     if plan_files is None:
         plan_files = ['mod_a/file.py']
+    if plan_steps is None:
+        plan_steps = [_pending('step-1', 'test'), _pending('step-2', 'impl')]
+    if git_head:
+        # A real HEAD, so TaskWorkflow._get_head_commit resolves and the
+        # done-step reconciler reaches git_ops instead of returning early.
+        seed_repo(worktree, _GIT_HEAD_SEED)
     if changed_files is None:
         changed_files = ['unrelated/other.py']
     if modules is None:
@@ -99,12 +123,7 @@ def _make(
         'analysis': 'analysis',
         'files': plan_files,
         'prerequisites': [],
-        'steps': [
-            {'id': 'step-1', 'type': 'test', 'description': 'test',
-             'status': 'pending', 'commit': None},
-            {'id': 'step-2', 'type': 'impl', 'description': 'impl',
-             'status': 'pending', 'commit': None},
-        ],
+        'steps': plan_steps,
         '_session_id': plan_session_id,
         '_created_at': (
             datetime.now(UTC) - timedelta(hours=plan_age_hours)
@@ -158,6 +177,11 @@ def _make(
     git_ops = MagicMock()
     git_ops.get_main_sha = get_main_sha
     git_ops.get_changed_files = get_changed_files
+    # The done-step reconciler's collaborators: every done commit reachable.
+    git_ops.is_ancestor = AsyncMock(return_value=True)
+    git_ops.get_commit_subjects = AsyncMock(return_value=[])
+    git_ops.find_equivalent_commit = AsyncMock(return_value=None)
+    git_ops.get_commit_changed_files = AsyncMock(return_value=[])
 
     briefing = MagicMock()
     briefing.build_revalidation_prompt = AsyncMock(return_value='revalidate-prompt')
@@ -202,6 +226,7 @@ def _make(
         event_emit=event_emit,
         build_architect_prompt=briefing.build_architect_prompt,
         build_revalidation_prompt=briefing.build_revalidation_prompt,
+        git_ops=git_ops,
         metadata_backend=metadata_backend,
     )
 
@@ -848,3 +873,109 @@ async def test_unconfirmed_revalidation_never_mints_a_fingerprint(
     assert f.artifacts.read_plan().get('_task_text_fp') == stale_fp
     assert _mirror_writes(f) == []
     assert 'plan_text_fp' not in f.wf.task['metadata']
+
+
+# ---------------------------------------------------------------------------
+# Task 4032: done-step commits are reconciled on the revalidation path.
+# ---------------------------------------------------------------------------
+
+_ORPHANED = 'a' * 40
+_REPLAYED = 'b' * 40
+
+
+def _orphan(f: _Fixture, remap: dict[str, str | None]) -> None:
+    """Commits in *remap* are unreachable from HEAD; each maps to its equivalent."""
+    async def is_ancestor(commit: str, _head: str) -> bool:
+        return commit not in remap
+
+    async def find_equivalent(_worktree, _base: str, commit: str) -> str | None:
+        return remap.get(commit)
+
+    f.git_ops.is_ancestor.side_effect = is_ancestor
+    f.git_ops.find_equivalent_commit.side_effect = find_equivalent
+
+
+def _commit_of(plan: dict, step_id: str) -> str | None:
+    return next(s for s in plan['steps'] if s['id'] == step_id)['commit']
+
+
+@pytest.mark.asyncio
+async def test_revalidation_skip_runs_reconcile_done_step_commits_before_trusting_done_steps(
+    tmp_path: Path,
+):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', git_head=True,
+        plan_steps=[_done('step-1', _ORPHANED, 'test'), _pending('step-2', 'impl')],
+    )
+    _orphan(f, {_ORPHANED: _REPLAYED})
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert f.invoke_called == []
+    assert _commit_of(f.artifacts.read_plan(), 'step-1') == _REPLAYED
+
+
+@pytest.mark.asyncio
+async def test_architect_revalidation_sees_reconciled_done_step_commits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', git_head=True,
+        changed_files=['mod_a/file.py'],
+        plan_steps=[_done('step-1', _ORPHANED, 'test'), _pending('step-2', 'impl')],
+    )
+    _orphan(f, {_ORPHANED: _REPLAYED})
+    _confirm_plan_architect(f, monkeypatch)
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    shown_plan = f.build_revalidation_prompt.call_args.args[1]
+    assert _commit_of(shown_plan, 'step-1') == _REPLAYED
+
+
+@pytest.mark.asyncio
+async def test_done_step_the_architect_re_marks_at_an_orphaned_commit_is_reconciled_before_beta(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    remarked, replayed = 'c' * 40, 'd' * 40
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', git_head=True,
+        changed_files=['mod_a/file.py'],
+    )
+    _orphan(f, {remarked: replayed})
+
+    async def _mark_then_confirm(_role, build_prompt, *args, **kwargs) -> AgentResult:
+        await build_prompt()
+        assert f.artifacts.mark_step_committed('step-2', remarked)
+        plan_path = f.artifacts.root / 'plan.json'
+        plan = json.loads(plan_path.read_text())
+        plan['_finalized_at'] = datetime.now(UTC).isoformat()
+        plan_path.write_text(json.dumps(plan))
+        return AgentResult(
+            success=True, output='confirmed', cost_usd=0.5, duration_ms=1_000, turns=3,
+        )
+
+    monkeypatch.setattr(f.wf, '_invoke', AsyncMock(side_effect=_mark_then_confirm))
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert _commit_of(f.artifacts.read_plan(), 'step-2') == replayed
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_done_step_commit_does_not_block_the_skip(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', git_head=True,
+        plan_steps=[_done('step-1', _ORPHANED, 'test'), _pending('step-2', 'impl')],
+    )
+    _orphan(f, {_ORPHANED: None})
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert f.invoke_called == []
+    assert _commit_of(f.artifacts.read_plan(), 'step-1') == _ORPHANED
+    f.git_ops.is_ancestor.assert_awaited()
