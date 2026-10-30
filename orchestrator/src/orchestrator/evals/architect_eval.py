@@ -44,6 +44,7 @@ from .measurement import (
 )
 from .metrics import (
     EvalMetrics,
+    RoleUnderTest,
     compose_cost_source,
     is_proxied_endpoint,
     read_decline_artifacts,
@@ -557,7 +558,7 @@ def assemble_metrics(
     ]
     return EvalMetrics(
         plan_quality=_plan_quality(plan, scoring, share),
-        role_under_test='architect',
+        role_under_test=RoleUnderTest.ARCHITECT,
         terminal_kind=resolve_terminal_kind(plan, attempt.declines),
         replay_frame=REPLAY_FRAME_ID,
         tests_pass=None,

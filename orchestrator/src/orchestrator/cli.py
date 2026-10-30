@@ -1568,7 +1568,7 @@ def _run_single_eval(
 ):
     """Run eval for a single task with one or all configs.
 
-    A candidate whose ``role == 'architect'`` (eval-revival θ) is dispatched to
+    A candidate whose role is ARCHITECT (eval-revival θ) is dispatched to
     ``run_architect_eval`` — the plan-only architect eval that scores the
     produced plan against the real landed diff and FREEZES every downstream
     role — and its per-fixture ``plan_quality`` score is surfaced (plus a
@@ -1577,6 +1577,7 @@ def _run_single_eval(
     """
     from orchestrator.evals.configs import EVAL_CONFIGS, get_config_by_name
     from orchestrator.evals.eval_gate import campaign_usage_gate
+    from orchestrator.evals.metrics import RoleUnderTest
     from orchestrator.evals.report import (
         build_plan_quality_report,
         format_invocation_errors,
@@ -1606,7 +1607,7 @@ def _run_single_eval(
         async with campaign_usage_gate(base_config) as gate:
             architect_results = []
             for cfg in configs:
-                if cfg.role == 'architect':
+                if cfg.role is RoleUnderTest.ARCHITECT:
                     # θ: plan-only architect eval — downstream roles frozen.
                     # run_architect_eval manages its own eval worktree at the
                     # fixture's pre_task_commit, so it takes no worktree_path.
@@ -1754,6 +1755,7 @@ def _emit_composite_report(results, price_table) -> None:
     architect rows emits the composite table alone, so the existing
     ``eval-matrix`` / ``eval-confirm`` end-to-end surfaces are unchanged.
     """
+    from orchestrator.evals.metrics import RoleUnderTest
     from orchestrator.evals.report import (
         build_composite_report,
         build_plan_quality_report,
@@ -1764,7 +1766,7 @@ def _emit_composite_report(results, price_table) -> None:
     report = build_composite_report(results, price_table=price_table)
     click.echo(format_composite_table(report))
 
-    if any(r.metrics.get('role_under_test') == 'architect' for r in results):
+    if any(r.metrics.get('role_under_test') == RoleUnderTest.ARCHITECT for r in results):
         click.echo('')
         click.echo(format_plan_quality_table(build_plan_quality_report(results)))
 
@@ -1802,14 +1804,15 @@ def _run_matrix_driver(
     (INCLUDING same-family diagonals) via ``configs.matrix_pairs``.
     """
     from orchestrator.evals.configs import matrix_pairs, ofat_candidates
+    from orchestrator.evals.metrics import RoleUnderTest
     from orchestrator.evals.report import build_pairwise_price_table
     from orchestrator.evals.runner import run_matrix_stage
 
     task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
     candidates = ofat_candidates()
     _require_zai_coding_plan(candidates)
-    arch_cfgs = [c for c in candidates if c.role == 'architect']
-    impl_cfgs = [c for c in candidates if c.role == 'implementer']
+    arch_cfgs = [c for c in candidates if c.role is RoleUnderTest.ARCHITECT]
+    impl_cfgs = [c for c in candidates if c.role is RoleUnderTest.IMPLEMENTER]
     results = asyncio.run(run_matrix_stage(
         task_paths, arch_cfgs, impl_cfgs, base_config,
         max_parallel=max_parallel, trials=trials, timeout_override=timeout,
@@ -1830,6 +1833,7 @@ def _run_confirm_driver(
 ) -> None:
     """Confirmation batch: the single winning ``(arch, impl)`` combo → composite (μ)."""
     from orchestrator.evals.configs import get_config_by_name
+    from orchestrator.evals.metrics import RoleUnderTest
     from orchestrator.evals.report import build_pairwise_price_table
     from orchestrator.evals.runner import run_confirm_stage
 
@@ -1843,13 +1847,13 @@ def _run_confirm_driver(
     # an IMPLEMENTER one. Swapping the flags otherwise resolves fine and silently
     # builds a nonsensical both-live combo (implementer pinned as the architect
     # and vice-versa) — reject the mismatch NAMING the offending flag + role.
-    if arch_cfg.role != 'architect':
+    if arch_cfg.role is not RoleUnderTest.ARCHITECT:
         click.echo(
             f'--arch: {arch!r} is a {arch_cfg.role} config, expected an architect',
             err=True,
         )
         sys.exit(1)
-    if impl_cfg.role != 'implementer':
+    if impl_cfg.role is not RoleUnderTest.IMPLEMENTER:
         click.echo(
             f'--impl: {impl!r} is a {impl_cfg.role} config, expected an implementer',
             err=True,

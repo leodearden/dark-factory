@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from orchestrator.config import default_price_table
 from orchestrator.shadow_types import CostBasis
 
+from .metrics import CANDIDATE_ROLES, RoleUnderTest
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,11 +33,11 @@ class EvalConfig:
     effort: str | None    # backend-specific effort/reasoning level
     # Which ROLE this candidate puts under test (eval-revival θ / C4 OFAT
     # methodology: each candidate varies exactly one role). Default
-    # ``'implementer'`` leaves every existing EVAL_CONFIGS entry byte-unchanged
-    # — the model/backend/effort above drive the IMPLEMENTER. ``'architect'``
+    # IMPLEMENTER leaves every existing EVAL_CONFIGS entry byte-unchanged
+    # — the model/backend/effort above drive the IMPLEMENTER. ARCHITECT
     # (ARCHITECT_EVAL_CONFIGS) reroutes them to drive the live architect in
     # ``run_architect_eval`` instead, freezing downstream roles.
-    role: str = 'implementer'
+    role: RoleUnderTest = RoleUnderTest.IMPLEMENTER
     max_budget_usd: float = 20.0
     env_overrides: dict[str, str] = field(default_factory=dict)
     # vLLM-only pod fields (None / 0 for non-vllm or workstation configs)
@@ -43,6 +45,13 @@ class EvalConfig:
     gpu_type: str | None = None           # RunPod GPU type id
     gpu_count: int = 1
     container_disk_gb: int = 50           # ~50 for baked images, 2.5× model size for :latest
+
+    def __post_init__(self) -> None:
+        if self.role not in CANDIDATE_ROLES:
+            raise ValueError(
+                f'EvalConfig {self.name!r}: role {self.role.value!r} is not a candidate '
+                f'role; expected one of {sorted(r.value for r in CANDIDATE_ROLES)}',
+            )
 
 
 def _vllm_config(
@@ -430,9 +439,9 @@ ALL_FINAL_CONFIG_NAMES = [c.name for c in FINAL_RUN_CONFIGS]
 # architect. These are the substrate the downstream μ OFAT/matrix driver
 # consumes to score the architect role.
 ARCHITECT_EVAL_CONFIGS = [
-    EvalConfig('architect-opus-high', 'claude', 'opus', 'high', role='architect'),
-    EvalConfig('architect-opus-max', 'claude', 'opus', 'max', role='architect'),
-    EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect'),
+    EvalConfig('architect-opus-high', 'claude', 'opus', 'high', role=RoleUnderTest.ARCHITECT),
+    EvalConfig('architect-opus-max', 'claude', 'opus', 'max', role=RoleUnderTest.ARCHITECT),
+    EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT),
     # eval-revival π: the architect-fable candidate (serves
     # fable-architect-eval-admission PRD τ1's hard-subset campaign gate).
     # run_ofat_stage's architect branch (task 2478) already handles any
@@ -444,7 +453,7 @@ ARCHITECT_EVAL_CONFIGS = [
     # 'architect-fable-max' below so fable-trial-v2 δ's stage-2 screen
     # (plans/eval-framework-revival-prd.md, plans/fable-architect-trial-v2-prd.md
     # §Θ1) can isolate the model delta with effort/role/backend held equal.
-    EvalConfig('architect-fable-high', 'claude', 'claude-fable-5', 'high', role='architect'),
+    EvalConfig('architect-fable-high', 'claude', 'claude-fable-5', 'high', role=RoleUnderTest.ARCHITECT),
     # eval-revival ρ: effort-matched to architect-opus-max above — only the
     # model axis varies. Config-only: run_ofat_stage's architect branch
     # (evals/runner.py, task 2478) already dispatches any role='architect'
@@ -453,7 +462,7 @@ ARCHITECT_EVAL_CONFIGS = [
     # this is a 5th architect candidate screened by EVERY OFAT run (not just
     # fable-trial-v2 δ's stage-2 screen) — one extra live architect invocation
     # per fixture/trial cell for any campaign that pulls the full candidate set.
-    EvalConfig('architect-fable-max', 'claude', 'claude-fable-5', 'max', role='architect'),
+    EvalConfig('architect-fable-max', 'claude', 'claude-fable-5', 'max', role=RoleUnderTest.ARCHITECT),
 ]
 
 
@@ -520,8 +529,8 @@ INCUMBENTS: dict[str, str] = {
 # early → worse diff; a too-strict one burns iterations → higher cost); no new
 # judge-verdict metric is added.
 JUDGE_EVAL_CONFIGS = [
-    EvalConfig('judge-sonnet', 'claude', 'sonnet', 'medium', role='judge'),
-    EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role='judge'),
+    EvalConfig('judge-sonnet', 'claude', 'sonnet', 'medium', role=RoleUnderTest.JUDGE),
+    EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role=RoleUnderTest.JUDGE),
 ]
 
 # The implementer held FIXED while a judge candidate varies the completion judge,
@@ -545,7 +554,7 @@ def _cloud_implementer_incumbents() -> list[EvalConfig]:
     """
     return [
         c for c in EVAL_CONFIGS
-        if c.role == 'implementer'
+        if c.role is RoleUnderTest.IMPLEMENTER
         and c.backend == 'claude'
         and c.model in ('opus', 'sonnet')
         and not c.env_overrides
@@ -813,18 +822,18 @@ def codex_pi_candidates() -> list[EvalConfig]:
     """
     return [
         EvalConfig(
-            'codex-gpt6-astra', 'codex', CODEX_ASTRA_MODEL, 'xhigh', role='implementer',
+            'codex-gpt6-astra', 'codex', CODEX_ASTRA_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
         ),
         EvalConfig(
-            'codex-gpt5.6-sol', 'codex', CODEX_SOL_MODEL, 'xhigh', role='implementer',
+            'codex-gpt5.6-sol', 'codex', CODEX_SOL_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
         ),
         EvalConfig(
-            'codex-gpt5.6-terra', 'codex', CODEX_TERRA_MODEL, 'xhigh', role='implementer',
+            'codex-gpt5.6-terra', 'codex', CODEX_TERRA_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
         ),
         # effort 'max' matches the claude-sonnet-max incumbent exactly (and is
         # a valid _pi_thinking level) — model+effort held constant, backend
         # varied, so any quality/cost delta attributes to harness effect.
         EvalConfig(
-            'pi-sonnet-control', 'pi', PI_CONTROL_MODEL, 'max', role='implementer',
+            'pi-sonnet-control', 'pi', PI_CONTROL_MODEL, 'max', role=RoleUnderTest.IMPLEMENTER,
         ),
     ]

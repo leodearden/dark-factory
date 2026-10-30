@@ -21,6 +21,7 @@ from .elo import (
 from .measurement import UnmeasuredCause
 from .metrics import (
     DECLINE_KINDS,
+    RoleUnderTest,
     _rate,
     blend_composite,
     terminal_kind_of,
@@ -193,8 +194,8 @@ def _summarize_cost_source(sources: set[str]) -> str:
 def _is_plan_only(metrics: dict[str, Any]) -> bool:
     """Is this trial a PLAN-ONLY cell (task 3099)?
 
-    ``run_architect_eval`` is the only producer of ``role_under_test ==
-    'architect'`` and is plan-only BY CONSTRUCTION — it freezes
+    ``run_architect_eval`` is the only producer of ARCHITECT cells and is
+    plan-only BY CONSTRUCTION — it freezes
     implementer/debugger/reviewer/verify, so the cell never runs a test and
     carries its quality in ``plan_quality`` rather than ``composite_score``.
 
@@ -206,7 +207,7 @@ def _is_plan_only(metrics: dict[str, Any]) -> bool:
     whole existing corpus, including the campaign this fix exists to make
     readable.
     """
-    return metrics.get('role_under_test') == 'architect'
+    return metrics.get('role_under_test') == RoleUnderTest.ARCHITECT
 
 
 def _has_plan_quality_score(metrics: dict[str, Any]) -> bool:
@@ -985,7 +986,7 @@ def select_survivors(
     composite_report: dict[str, Any],
     *,
     top_k: int,
-    roles: list[str],
+    roles: Sequence[str],
 ) -> dict[str, list[str]]:
     """The top-K config names per ``role_under_test`` — the μ OFAT survivor gate.
 
@@ -1369,7 +1370,7 @@ def _render_fixed_table(
 #
 # An ADDITIVE, interim per-(task_id, config_name) column distinct from the Elo
 # leaderboard above. It surfaces the ``recovery_score`` that
-# ``metrics.collect_metrics`` writes into ``EvalResult.metrics`` — a populated
+# ``runner.collect_metrics`` writes into ``EvalResult.metrics`` — a populated
 # float for adversarial fixtures, the ``None`` null sentinel otherwise. It does
 # NOT touch the Elo ``build_report`` / ``format_markdown`` schema: the full C4
 # per-config composite+cost+latency+recovery report row is owned by Phase-3
@@ -1453,7 +1454,7 @@ def format_recovery_table(report: dict[str, Any]) -> str:
 # distinct from the Elo leaderboard above — the architect-eval analogue of the
 # recovery_score surface. It surfaces the ``plan_quality`` that
 # ``run_architect_eval`` writes into ``EvalResult.metrics`` — a populated float
-# for architect runs (role_under_test=='architect'), the ``None`` null sentinel
+# for architect runs (role_under_test ARCHITECT), the ``None`` null sentinel
 # otherwise (ordinary implementer runs never invoke the plan judge). It does NOT
 # touch the Elo ``build_report`` / ``format_markdown`` schema: the full C4
 # per-config composite+cost+latency+plan_quality report row is owned by Phase-3
@@ -1530,7 +1531,7 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
 
     Each row carries ``task_id`` / ``config_name`` / ``role_under_test`` and the
     ``plan_quality`` pulled from ``EvalResult.metrics`` — a populated float for
-    architect runs (``role_under_test=='architect'``), ``None`` (the C4
+    architect runs (``role_under_test`` ARCHITECT), ``None`` (the C4
     ``plan_quality | null`` sentinel) otherwise. Both are read directly from the
     persisted metrics dict; a result predating the θ fields (no ``plan_quality``
     / ``role_under_test`` key) reads back as ``None`` for each, so old reports
@@ -1703,7 +1704,7 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     no_plan_declined: dict[str, int] = defaultdict(int)
     terminal_unmeasured: dict[str, int] = defaultdict(int)
     for row in rows:
-        if row['role_under_test'] != 'architect':
+        if row['role_under_test'] != RoleUnderTest.ARCHITECT:
             continue
         cfg = row['config_name']
         totals[cfg] += 1

@@ -17,6 +17,7 @@ Step map:
 from __future__ import annotations
 
 import functools
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -46,6 +47,7 @@ from _campaign_gate_helpers import (
 )
 
 from orchestrator.evals.configs import EvalConfig
+from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
 from orchestrator.evals.results import EvalResult, ResultStore
 from orchestrator.workflow import WorkflowOutcome
 
@@ -56,7 +58,25 @@ def _impl_cfg() -> EvalConfig:
 
 def _arch_cfg() -> EvalConfig:
     # model!='opus' and effort!='high' so both diverge from the hardcoded pin.
-    return EvalConfig('architect-sonnet-max', 'claude', 'sonnet', 'max', role='architect')
+    return EvalConfig('architect-sonnet-max', 'claude', 'sonnet', 'max', role=RoleUnderTest.ARCHITECT)
+
+
+def _judge_cfg() -> EvalConfig:
+    return EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role=RoleUnderTest.JUDGE)
+
+
+def _fake_collect_metrics(collect_side_effect: BaseException | None) -> AsyncMock:
+    """A collect_metrics stand-in that honours its role/replay_frame keywords."""
+
+    async def fake_collect(_wf, _wt, _task, *, role, replay_frame=None):
+        if collect_side_effect is not None:
+            raise collect_side_effect
+        return EvalMetrics(
+            composite_score=0.9, tests_pass=True,
+            role_under_test=role, replay_frame=replay_frame,
+        )
+
+    return AsyncMock(side_effect=fake_collect)
 
 
 # ---------------------------------------------------------------------------
@@ -207,9 +227,13 @@ async def test_run_eval_verify_pin_follows_project_root_not_worktree(
         raise _Sentinel
 
     monkeypatch.setattr(runner, 'build_eval_orch_config', _capture_build)
+    # run_eval checks its frozen plan before anything else, so the fixture has one.
     monkeypatch.setattr(
         runner, 'load_task',
-        lambda _p: {'id': 't', 'project_root': str(project_root)},
+        lambda _p: {
+            'id': 't', 'project_root': str(project_root),
+            'plan': {'steps': [{'id': 's1', 'status': 'pending'}]},
+        },
     )
 
     # worktree_path=wt short-circuits create_eval_worktree and binds the eval
@@ -326,7 +350,7 @@ class TestBuildEvalOrchConfigJudgeOverride:
 
         base = _base_config(tmp_path)
         # model!='sonnet' AND effort!='medium' so BOTH derived fields diverge.
-        judge = EvalConfig('judge-haiku-high', 'claude', 'haiku', 'high', role='judge')
+        judge = EvalConfig('judge-haiku-high', 'claude', 'haiku', 'high', role=RoleUnderTest.JUDGE)
         cfg = build_eval_orch_config(_impl_cfg(), {}, base, judge_config=judge)
 
         # The judge's model/effort now derive from the candidate (judge OFAT axis).
@@ -387,11 +411,15 @@ async def _run_eval_hermetic(
     injected_gate=_NO_INJECTED_GATE,
     run_side_effect: BaseException | None = None,
     collect_side_effect: BaseException | None = None,
+    worktree_path: Path | None = None,
 ):
     """Drive run_eval with the worktree/workflow/metrics boundaries mocked.
 
     Returns ``(result, captured)`` where ``captured['build_workflow']`` is the
-    kwargs dict build_workflow received (for asserting the threaded config).
+    kwargs dict build_workflow received (for asserting the threaded config) and
+    ``captured['create_wt']`` the worktree-creation mock (its return value is
+    the created ``(worktree, run_id)``). ``worktree_path=`` forwards to
+    run_eval's worktree-reuse parameter.
 
     The cell's gate builder is replaced UNCONDITIONALLY (task 4427): runner's
     ``owned_usage_gate`` is rebound to the real context manager with
@@ -416,9 +444,7 @@ async def _run_eval_hermetic(
     from orchestrator.evals import eval_gate, runner
 
     captured: dict = {}
-
-    async def fake_create_wt(*_a, **_k):
-        return Path('/fake/wt'), 'run-eval'
+    mock_create_wt = AsyncMock(return_value=(Path('/fake/wt'), 'run-eval'))
 
     fake_wf = MagicMock()
     fake_wf.run = AsyncMock(
@@ -429,13 +455,11 @@ async def _run_eval_hermetic(
         captured['build_workflow'] = kwargs
         return fake_wf
 
-    metrics_obj = MagicMock()
-    metrics_obj.to_dict.return_value = {'composite_score': 0.9, 'tests_pass': True}
-    mock_collect = AsyncMock(return_value=metrics_obj, side_effect=collect_side_effect)
+    mock_collect = _fake_collect_metrics(collect_side_effect)
     mock_store = MagicMock(spec=ResultStore)
     mock_build_gate = AsyncMock(return_value=gate)
 
-    monkeypatch.setattr(runner, 'create_eval_worktree', fake_create_wt)
+    monkeypatch.setattr(runner, 'create_eval_worktree', mock_create_wt)
     monkeypatch.setattr(runner, 'build_workflow', fake_build_workflow)
     monkeypatch.setattr(runner, 'collect_metrics', mock_collect)
     monkeypatch.setattr(runner, 'load_task', lambda _p: task)
@@ -446,13 +470,15 @@ async def _run_eval_hermetic(
     captured['build_gate'] = mock_build_gate
     captured['wf'] = fake_wf
     captured['save'] = mock_store.save
+    captured['collect'] = mock_collect
+    captured['create_wt'] = mock_create_wt
 
     extra: dict[str, Any] = (
         {} if injected_gate is _NO_INJECTED_GATE else {'usage_gate': injected_gate}
     )
     result = await runner.run_eval(
         Path('/fake/task.json'), config, base, judge_config=judge_config,
-        store=mock_store, **extra,
+        worktree_path=worktree_path, store=mock_store, **extra,
     )
     return result, captured
 
@@ -464,7 +490,7 @@ class TestRunEvalJudgeConfig:
     ):
         base = _base_config(tmp_path)
         impl = EvalConfig('claude-sonnet-max', 'claude', 'sonnet', 'max')
-        judge = EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role='judge')
+        judge = EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role=RoleUnderTest.JUDGE)
         result, captured = await _run_eval_hermetic(
             impl, base, _judge_task(tmp_path), monkeypatch, judge_config=judge,
         )
@@ -490,10 +516,10 @@ class TestRunEvalJudgeConfig:
         )
 
         # judge_config defaults None → label is the implementer config name, the
-        # judge stays the sonnet incumbent, and no role_under_test='judge' stamp.
+        # judge stays the sonnet incumbent, and the cell is an implementer cell.
         assert result.config_name == 'claude-sonnet-max'
         assert captured['build_workflow']['config'].models.judge == 'sonnet'
-        assert result.metrics.get('role_under_test') != 'judge'
+        assert result.metrics.get('role_under_test') == RoleUnderTest.IMPLEMENTER
 
 
 # ---------------------------------------------------------------------------
@@ -547,9 +573,7 @@ async def _run_end_to_end_hermetic(
     from orchestrator.evals import eval_gate, runner
 
     captured: dict = {}
-
-    async def fake_create_wt(*_a, **_k):
-        return Path('/fake/wt'), 'run-e2e'
+    mock_create_wt = AsyncMock(return_value=(Path('/fake/wt'), 'run-e2e'))
 
     fake_wf = MagicMock()
     fake_wf.run = AsyncMock(
@@ -560,13 +584,11 @@ async def _run_end_to_end_hermetic(
         captured['build_workflow'] = kwargs
         return fake_wf
 
-    metrics_obj = MagicMock()
-    metrics_obj.to_dict.return_value = {'composite_score': 0.9, 'tests_pass': True}
-    mock_collect = AsyncMock(return_value=metrics_obj, side_effect=collect_side_effect)
+    mock_collect = _fake_collect_metrics(collect_side_effect)
     mock_store = MagicMock(spec=ResultStore)
     mock_build_gate = AsyncMock(return_value=gate)
 
-    monkeypatch.setattr(runner, 'create_eval_worktree', fake_create_wt)
+    monkeypatch.setattr(runner, 'create_eval_worktree', mock_create_wt)
     monkeypatch.setattr(runner, 'build_workflow', fake_build_workflow)
     monkeypatch.setattr(runner, 'collect_metrics', mock_collect)
     monkeypatch.setattr(runner, 'load_task', lambda _p: task)
@@ -583,7 +605,7 @@ async def _run_end_to_end_hermetic(
     )
     return result, captured, {
         'collect': mock_collect, 'save': mock_store.save, 'wf': fake_wf,
-        'build_gate': mock_build_gate,
+        'build_gate': mock_build_gate, 'create_wt': mock_create_wt,
     }
 
 
@@ -695,6 +717,175 @@ class TestEndToEndCarriesReplayFrame:
             captured['build_workflow']['briefing'], ReplayFramedBriefingAssembler,
         )
         assert result.metrics.get('replay_frame') is None
+
+
+# ---------------------------------------------------------------------------
+# task 6738 — the workflow-cell executors through their public entry points.
+# Each adapter normalises to ``(result, captured)``, ``captured`` holding the
+# mocks (``save``, ``collect``, ``create_wt``) and ``build_workflow`` kwargs.
+# ---------------------------------------------------------------------------
+
+async def _cell_via_run_eval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **kw):
+    result, captured = await _run_eval_hermetic(
+        _impl_cfg(), _base_config(tmp_path), _judge_task(tmp_path), monkeypatch, **kw,
+    )
+    return result, captured
+
+
+async def _cell_via_judge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **kw):
+    result, captured = await _run_eval_hermetic(
+        _impl_cfg(), _base_config(tmp_path), _judge_task(tmp_path), monkeypatch,
+        judge_config=_judge_cfg(), **kw,
+    )
+    return result, captured
+
+
+async def _cell_via_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **kw):
+    result, captured, mocks = await _run_end_to_end_hermetic(
+        _arch_cfg(), _impl_cfg(), _base_config(tmp_path), _e2e_task(tmp_path),
+        monkeypatch, **kw,
+    )
+    return result, {**captured, **mocks}
+
+
+def _role_cells():
+    from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
+
+    return [
+        pytest.param(_cell_via_run_eval, RoleUnderTest.IMPLEMENTER, None, id='implementer'),
+        pytest.param(_cell_via_judge, RoleUnderTest.JUDGE, None, id='judge'),
+        pytest.param(
+            _cell_via_end_to_end, RoleUnderTest.END_TO_END, REPLAY_FRAME_ID,
+            id='end_to_end',
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+class TestExecutorsStampTheirRole:
+    """Each executor hands its role (and frame, when framed) to collect_metrics.
+
+    A cell whose collection raised still carries the stamps the executor knows.
+    """
+
+    async def test_run_eval_cell_is_an_implementer_cell(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        _result, captured = await _cell_via_run_eval(tmp_path, monkeypatch)
+
+        captured['collect'].assert_awaited_once()
+        assert captured['collect'].await_args.kwargs['role'] is RoleUnderTest.IMPLEMENTER
+        persisted = captured['save'].call_args.args[0]
+        assert persisted.metrics['role_under_test'] == RoleUnderTest.IMPLEMENTER
+
+    async def test_judge_cell_hands_the_judge_role_to_collection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        result, captured = await _cell_via_judge(tmp_path, monkeypatch)
+
+        assert captured['collect'].await_args.kwargs['role'] is RoleUnderTest.JUDGE
+        assert result.config_name == 'judge-haiku'
+        assert result.metrics['role_under_test'] == 'judge'
+
+    async def test_end_to_end_cell_hands_role_and_frame_to_collection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
+
+        _result, captured = await _cell_via_end_to_end(tmp_path, monkeypatch)
+
+        kwargs = captured['collect'].await_args.kwargs
+        assert kwargs['role'] is RoleUnderTest.END_TO_END
+        assert kwargs['replay_frame'] == REPLAY_FRAME_ID
+
+    @pytest.mark.parametrize(('drive', 'role', 'frame'), _role_cells())
+    async def test_role_survives_a_failed_collection(
+        self, drive, role: RoleUnderTest, frame: str | None,
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        _result, captured = await drive(
+            tmp_path, monkeypatch, collect_side_effect=RuntimeError('x'),
+        )
+
+        persisted = captured['save'].call_args.args[0]
+        assert persisted.metrics['role_under_test'] == role
+        assert persisted.metrics.get('replay_frame') == frame
+
+
+_CELL_EXECUTORS = [
+    pytest.param(_cell_via_run_eval, id='run_eval'),
+    pytest.param(_cell_via_end_to_end, id='run_end_to_end'),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('drive', _CELL_EXECUTORS)
+class TestWorkflowCellContract:
+    """What every workflow cell guarantees, whichever executor ran it."""
+
+    @pytest.mark.parametrize(
+        ('failure', 'outcome'),
+        [(TimeoutError(), 'timeout'), (RuntimeError('boom'), 'blocked')],
+        ids=['timed_out', 'raised'],
+    )
+    async def test_a_failed_workflow_persists_its_outcome(
+        self, drive, failure: BaseException, outcome: str,
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        result, captured = await drive(tmp_path, monkeypatch, run_side_effect=failure)
+
+        assert result.outcome == outcome
+        assert captured['save'].call_args.args[0].outcome == outcome
+
+    async def test_the_saved_cell_is_the_result_at_the_created_worktree(
+        self, drive, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        result, captured = await drive(tmp_path, monkeypatch)
+
+        worktree, run_id = captured['create_wt'].return_value
+        captured['save'].assert_called_once()
+        assert captured['save'].call_args.args[0] is result
+        assert result.run_id == run_id
+        assert result.worktree_path == str(worktree)
+        assert result.wall_clock_ms >= 0
+
+
+@pytest.mark.asyncio
+class TestRunEvalPlan:
+    async def test_a_planless_fixture_fails_before_any_worktree_exists(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.evals import runner
+
+        task = {k: v for k, v in _judge_task(tmp_path).items() if k != 'plan'}
+        with pytest.raises(ValueError, match='df_task_judge'):
+            await _run_eval_hermetic(_impl_cfg(), _base_config(tmp_path), task, monkeypatch)
+
+        create_wt = runner.create_eval_worktree
+        assert isinstance(create_wt, AsyncMock)
+        create_wt.assert_not_awaited()
+
+    async def test_a_reused_worktree_resumes_its_relocated_plan(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.workflow import _meta_root_for_worktree
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        resumed = {'steps': [{'id': 's1', 'status': 'done'}, {'id': 's2', 'status': 'pending'}]}
+        meta_root = _meta_root_for_worktree(wt)
+        meta_root.mkdir(parents=True)
+        (meta_root / 'plan.json').write_text(json.dumps(resumed))
+
+        result, captured = await _run_eval_hermetic(
+            _impl_cfg(), _base_config(tmp_path), _judge_task(tmp_path), monkeypatch,
+            worktree_path=wt,
+        )
+
+        captured['create_wt'].assert_not_awaited()
+        assert result.run_id == 'wt'
+        assert result.worktree_path == str(wt)
+        assert captured['build_workflow']['initial_plan'] == resumed
 
 
 # ---------------------------------------------------------------------------
@@ -890,7 +1081,7 @@ class TestRunOfatStage:
         t1.touch()
         t2.touch()
         impl_cfg = EvalConfig('claude-opus-high', 'claude', 'opus', 'high')
-        arch_cfg = EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect')
+        arch_cfg = EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT)
 
         eval_calls: list[tuple[str, str, int]] = []
         arch_calls: list[tuple[str, str, int]] = []
@@ -963,8 +1154,8 @@ class TestRunOfatStage:
         return [t1, t2], [
             EvalConfig('claude-opus-high', 'claude', 'opus', 'high'),
             EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high',
-                       role='architect'),
-            EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role='judge'),
+                       role=RoleUnderTest.ARCHITECT),
+            EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role=RoleUnderTest.JUDGE),
         ]
 
     def _stage(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probe, **kw):
@@ -1045,7 +1236,7 @@ class TestRunOfatStageJudge:
         t1.touch()
         # impl_cfg deliberately != the pin so the judge branch's pin is visible.
         impl_cfg = EvalConfig('claude-opus-high', 'claude', 'opus', 'high')
-        judge_cfg = EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role='judge')
+        judge_cfg = EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role=RoleUnderTest.JUDGE)
 
         # Records (fixture, config.name, judge_config.name|None, trial) per dispatch.
         eval_calls: list[tuple[str, str, str | None, int]] = []
@@ -1099,8 +1290,8 @@ class TestRunOfatStageJudge:
         t1 = tmp_path / 'df_task_a.json'
         t1.touch()
         impl_cfg = EvalConfig('claude-opus-high', 'claude', 'opus', 'high')
-        arch_cfg = EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect')
-        judge_cfg = EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role='judge')
+        arch_cfg = EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT)
+        judge_cfg = EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role=RoleUnderTest.JUDGE)
 
         eval_calls: list[tuple[str, str | None]] = []
         arch_calls: list[str] = []
@@ -1147,8 +1338,8 @@ class TestRunMatrixStage:
 
     def _invoke(self, runner, paths, base):
         arch_survivors = [
-            EvalConfig('arch-sonnet', 'claude', 'sonnet', 'high', role='architect'),
-            EvalConfig('arch-opus', 'claude', 'opus', 'high', role='architect'),
+            EvalConfig('arch-sonnet', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT),
+            EvalConfig('arch-opus', 'claude', 'opus', 'high', role=RoleUnderTest.ARCHITECT),
         ]
         impl_survivors = [EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high')]
 
@@ -1222,8 +1413,8 @@ class TestRunMatrixStage:
         # (arch-sonnet × impl-sonnet, arch-opus × impl-opus) are the same-family
         # diagonals the matrix must NOT skip.
         arch_survivors = [
-            EvalConfig('arch-sonnet', 'claude', 'sonnet', 'high', role='architect'),
-            EvalConfig('arch-opus', 'claude', 'opus', 'high', role='architect'),
+            EvalConfig('arch-sonnet', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT),
+            EvalConfig('arch-opus', 'claude', 'opus', 'high', role=RoleUnderTest.ARCHITECT),
         ]
         impl_survivors = [
             EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high'),
@@ -1275,7 +1466,7 @@ class TestRunMatrixStage:
         t1.touch()
 
         arch_survivors = [
-            EvalConfig('arch-sonnet', 'claude', 'sonnet', 'high', role='architect'),
+            EvalConfig('arch-sonnet', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT),
         ]
         impl_survivors = [
             EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high'),
@@ -1316,7 +1507,7 @@ class TestRunConfirmStage:
 
     def _invoke(self, runner, paths, base):
         arch_winner = EvalConfig('arch-opus', 'claude', 'opus', 'high',
-                                 role='architect')
+                                 role=RoleUnderTest.ARCHITECT)
         impl_winner = EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high')
 
         async def stage():
@@ -1385,7 +1576,7 @@ class TestRunConfirmStage:
         t1.touch()
         t2.touch()
 
-        arch_winner = EvalConfig('arch-opus', 'claude', 'opus', 'high', role='architect')
+        arch_winner = EvalConfig('arch-opus', 'claude', 'opus', 'high', role=RoleUnderTest.ARCHITECT)
         impl_winner = EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high')
 
         e2e_calls: list[tuple[str, str, str, int]] = []
@@ -1424,7 +1615,7 @@ class TestRunConfirmStage:
         t1 = tmp_path / 'df_task_a.json'
         t1.touch()
 
-        arch_winner = EvalConfig('arch-opus', 'claude', 'opus', 'high', role='architect')
+        arch_winner = EvalConfig('arch-opus', 'claude', 'opus', 'high', role=RoleUnderTest.ARCHITECT)
         impl_winner = EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high')
 
         async def fake_run_end_to_end(task_path, arch_config, impl_config, *_a, trial=1, **_k):
