@@ -34,6 +34,7 @@ from orchestrator.offline_lane_records import (
     ProbeResult,
     RunRecord,
     RunRecordStore,
+    StoredPass,
     classify_exit,
     command_key,
     is_well_formed,
@@ -602,6 +603,19 @@ class TestStoredPassesSince:
         assert all(item.started_at >= self.SINCE for item in stored)
         assert 'scratch' not in {item.pass_id for item in stored}
         assert len(stored) == 7
+
+    @pytest.mark.parametrize('with_record', [True, False])
+    def test_a_stored_pass_holds_exactly_one_of_record_or_problem_and_names_what_it_got(
+        self, store: RunRecordStore, clock: _Clock, with_record: bool
+    ) -> None:
+        pass_id = self._written_at(store, clock, self.SINCE, 'unit')
+        record = store.load_pass('unit', pass_id) if with_record else None
+        problem = 'record.json: unreadable' if with_record else None
+
+        with pytest.raises(ValueError, match='exactly one of record or problem') as raised:
+            StoredPass('unit', pass_id, self.SINCE, store.pass_directory('unit', pass_id), record, problem)
+
+        assert f'record is None={not with_record}, problem={problem!r}' in str(raised.value)
 
     def test_a_store_whose_root_does_not_exist_yields_nothing_and_creates_nothing(
         self, tmp_path: Path, clock: _Clock

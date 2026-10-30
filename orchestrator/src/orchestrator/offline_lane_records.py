@@ -297,7 +297,10 @@ class StoredPass:
 
     def __post_init__(self) -> None:
         if (self.record is None) == (self.problem is None):
-            raise ValueError(f'{self.directory}: a stored pass carries its record or its problem, not both')
+            raise ValueError(
+                f'{self.directory}: a stored pass carries exactly one of record or problem; '
+                f'got record is None={self.record is None}, problem={self.problem!r}',
+            )
 
 
 def _run_block(payload: Mapping[str, Any], phase: Phase) -> RunRecord | None:
