@@ -6,7 +6,8 @@ implementer marks steps done via ``mark_step_done`` and records where a
 step's text proved wrong via ``record_step_deviation``.  On revalidation
 (blast-radius requeue), the architect uses ``update_plan_metadata``,
 ``remove_plan_step``, ``replace_plan_step``, and ``confirm_plan`` to
-update an existing plan without recreating it from scratch.  All writes
+update an existing plan without recreating it from scratch, and
+``record_descoped_step`` when it genuinely drops a done step.  All writes
 go through ``TaskArtifacts`` methods, preserving ``_session_id`` and
 enforcing correct schema.
 
@@ -103,6 +104,7 @@ from shared.mcp_missing_arguments import MissingArgumentMiddleware
 from shared.plan_deviation import DeviationRecord, UnknownDeviationKind
 from shared.toolcall_markup import detect_for, repair
 
+from orchestrator import plan_descope
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import markup_journal, markup_sink, plan_markup_stamp
 
@@ -1081,8 +1083,9 @@ def _create_plan(
     #
     # THE BOOKKEEPING READ BELOW IS NOT A BREACH OF THAT INSTRUCTION. It goes
     # through a plain `artifacts.read_plan()` for the same reason, and it
-    # touches exactly ONE machine-written key — the guard's own
-    # `_markup_rejections` block — and no prose field at all. Do not "simplify"
+    # touches only the guard's own `_markup_rejections` block and the C4
+    # descope record (`plan_descope.DESCOPE_PLAN_KEYS`), whose prose already
+    # passed the inbound guard on `record_descoped_step`. Do not "simplify"
     # it onto `_read_plan_repaired`.
     files = _coerce_files(files)
     plan = {
@@ -1133,6 +1136,10 @@ def _create_plan(
         if carried is not None:
             plan[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY] = carried
         plan_markup_stamp.drain_pending(plan)
+        # The descope record is the one trace of a done step a revalidation
+        # dropped; a wholesale overwrite must not erase it.
+        if isinstance(existing, dict):
+            plan.update(plan_descope.descope_record_of(existing))
     except Exception:
         # BOOKKEEPING CAN NEVER FAIL A create_plan. The counter is a legibility
         # aid; the plan is the work. Losing the count is a cost an operator
@@ -1493,6 +1500,63 @@ def _record_step_deviation(
         )
     return _with_markup_repairs(
         {'status': 'ok', 'step_id': step_id, 'deviations': count}, markup_facts
+    )
+
+
+def _descope_refusal(exc: plan_descope.InvalidDescopeRecord) -> dict[str, Any]:
+    refusal: dict[str, Any] = {'status': 'error', 'message': str(exc), 'field': exc.field}
+    if exc.field == 'disposition':
+        refusal['allowed_dispositions'] = sorted(plan_descope.DESCOPE_DISPOSITIONS)
+    return refusal
+
+
+def _upsert_descoped_step(entries: object, entry: plan_descope.DescopedStep) -> list:
+    """*entries* without any record of the same ``(step_id, commit)``, then *entry*."""
+    def same_pair(old: object) -> bool:
+        return (
+            isinstance(old, dict)
+            and old.get('step_id') == entry.step_id
+            and isinstance(old.get('commit'), str)
+            and plan_descope.commits_match(old['commit'], entry.commit)
+        )
+
+    kept = [old for old in entries if not same_pair(old)] if isinstance(entries, list) else []
+    return [*kept, entry.to_dict()]
+
+
+@_plan_mutation
+def _record_descoped_step(
+    artifacts: TaskArtifacts,
+    step_id: str,
+    commit: str,
+    disposition: str,
+    authority: str,
+    note: str,
+) -> dict[str, Any]:
+    plan, markup_facts = _read_plan_repaired(artifacts)
+    if not plan:
+        return {'status': 'error', 'message': 'No plan exists.'}
+
+    try:
+        entry = plan_descope.DescopedStep(
+            step_id=step_id,
+            commit=commit,
+            disposition=disposition,
+            authority=authority,
+            note=note,
+        )
+    except plan_descope.InvalidDescopeRecord as exc:
+        return _with_markup_repairs(_descope_refusal(exc), markup_facts)
+
+    entries = _upsert_descoped_step(plan.get(plan_descope.DESCOPED_STEPS_KEY), entry)
+    plan[plan_descope.DESCOPED_STEPS_KEY] = entries
+    plan[plan_descope.RESCOPED_AT_KEY] = datetime.now(UTC).isoformat()
+    plan[plan_descope.RESCOPED_BY_KEY] = _session_identity_in_hand(artifacts, plan)
+    plan[plan_descope.RESCOPED_NOTE_KEY] = note
+    artifacts.write_plan(plan, mutex_held=True)
+    return _with_markup_repairs(
+        {'status': 'ok', 'step_id': step_id, 'commit': commit, 'descoped_steps': len(entries)},
+        markup_facts,
     )
 
 
@@ -2513,6 +2577,37 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             artifacts, step_id, kind, observed, expected, action_taken,
             prose_only, note,
         )
+
+    @mcp.tool()
+    @accepts_markup_override
+    def record_descoped_step(
+        step_id: str,
+        commit: str,
+        disposition: str,
+        authority: str,
+        note: str,
+    ) -> dict[str, Any]:
+        """Record a done step that this revalidation drops from the plan.
+
+        Use it when the revised plan genuinely no longer keeps a done step
+        with its commit (for example after ``create_plan`` replaced the
+        steps). A revalidation that drops a done step without this record is
+        refused. Recording the same ``(step_id, commit)`` again replaces the
+        earlier record.
+
+        Args:
+            step_id: The dropped step or prerequisite ID (e.g. "step-1").
+            commit: The commit the dropped step recorded.
+            disposition: One of ``orphan`` (the commit stays on the branch,
+                owned by no step), ``revert`` (the commit's change is to be
+                undone) or ``ride-along`` (the commit stays and ships as is).
+            authority: The escalation id or human ratification marker that
+                authorises the drop.
+            note: Why the step no longer belongs to the plan.
+        """
+        # Flat str parameters DELIBERATELY, as drop_plan_file: only flat
+        # strings get MarkupGuardMiddleware's inbound coverage.
+        return _record_descoped_step(artifacts, step_id, commit, disposition, authority, note)
 
     @mcp.tool()
     @accepts_markup_override

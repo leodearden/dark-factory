@@ -380,6 +380,10 @@ _PLAN_CREATOR_TOOLS = [
     # rely on. See tests/test_architect_all_committed_plan.py::
     # TestArchitectCanReachMarkStepCommitted.
     'mcp__plan-tools__mark_step_committed',
+    # A done step a revalidation genuinely drops is recorded here, with its
+    # disposition and authority, or the revalidation is refused
+    # (orchestrator/src/orchestrator/plan_descope.py::check_done_step_integrity).
+    'mcp__plan-tools__record_descoped_step',
 ]
 
 _PLAN_STATUS_TOOLS = [
