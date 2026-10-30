@@ -295,6 +295,13 @@ _UNDECODABLE_COMM_SLEEPER = (
     'time.sleep(30)\n'
 )
 
+#: ``python -c`` source that prints ``ready`` from its own code, then sleeps.
+_READY_SLEEPER = (
+    'import time\n'
+    "print('ready', flush=True)\n"
+    'time.sleep(30)\n'
+)
+
 
 class _ShellReadinessError(AssertionError):
     """An announced-readiness precondition was not observed.
@@ -1362,33 +1369,58 @@ class TestSnapshotProcessGroup:
             f'  pid={fake_pid} ppid=1 state=S wchan=�� comm=plain cmdline=?'
         ], rows
 
-    @pytest.mark.asyncio
+    def test_a_member_with_no_published_argv_reports_an_empty_cmdline_not_its_comm(
+        self, monkeypatch, tmp_path
+    ):
+        """An empty /proc/<pid>/cmdline means no argv is published (mid-exec or exiting).
+
+        The row must say so rather than repeat comm as if it were the argv.
+        """
+        target_pgid = 77777
+        fake_pid = 77778
+        proc_root = tmp_path / 'proc'
+        entry = proc_root / str(fake_pid)
+        entry.mkdir(parents=True)
+        (entry / 'stat').write_text(
+            _synthetic_stat_line(fake_pid, target_pgid, state='R', comm='sleep')
+        )
+        (entry / 'wchan').write_text('0\n')
+        (entry / 'cmdline').write_bytes(b'')
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
+
+        rows = snapshot_process_group(target_pgid).splitlines()
+
+        assert rows[1:] == [
+            f'  pid={fake_pid} ppid=1 state=R wchan=0 comm=sleep cmdline=(empty)'
+        ], rows
+
     @pytest.mark.timeout(10)
-    async def test_snapshot_includes_cmdline(self, tmp_path):
+    def test_snapshot_includes_cmdline(self):
         """Snapshot includes the full cmdline of each process, not just the 15-char comm.
 
-        Spawn a child with a DISTINCTIVE argv token ('31.4159') that cannot
-        appear in the 15-char comm field (which is just 'sleep').  Assert that
-        the token appears in the snapshot — it can only come from
-        /proc/<pid>/cmdline, proving the new field is captured.
+        The token '31.4159' rides in the child's argv, so it can come only from
+        /proc/<pid>/cmdline, never from comm.  The spawn returning proves only that
+        exec passed its point of no return, with comm already renamed, not that the
+        argv is published; so the test waits for the child's own ready line first.
         """
-        proc = await asyncio.create_subprocess_exec(
-            'sleep', '31.4159',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        with subprocess.Popen(
+            [sys.executable, '-c', _READY_SLEEPER, '31.4159'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             start_new_session=True,
-        )
-        pgid = proc.pid
-        try:
-            snapshot = snapshot_process_group(pgid)
-            assert snapshot, f'Expected non-empty snapshot for pgid={pgid}'
-            assert '31.4159' in snapshot, (
-                f"Expected distinctive arg '31.4159' (from /proc/cmdline) in snapshot; "
-                f"got:\n{snapshot}"
-            )
-        finally:
-            proc.kill()
-            await proc.wait()
+        ) as p:
+            pgid = p.pid
+            try:
+                assert p.stdout is not None
+                assert p.stdout.readline().strip() == b'ready'
+                snapshot = snapshot_process_group(pgid)
+                assert snapshot, f'Expected non-empty snapshot for pgid={pgid}'
+                assert '31.4159' in snapshot, (
+                    f"Expected distinctive arg '31.4159' (from /proc/cmdline) in snapshot; "
+                    f"got:\n{snapshot}"
+                )
+            finally:
+                _kill_group(pgid)
 
 
 class TestScanProcessGroupsUnderPath:
