@@ -1318,17 +1318,6 @@ async def _map_advance_failure(
             f'{f" (+{len(at_risk) - 20} more)" if len(at_risk) > 20 else ""}.'
             if at_risk else ''
         )
-        # WORDING CONSTRAINT — do not reintroduce the token 'ff' (as in
-        # "stood off") or the word 'advanced' anywhere in this reason.
-        # workflow.py's blocked path infers the merge-failure review category
-        # with a bare substring test
-        # (`'ff' in reason.lower() or 'advanced' in reason.lower()`
-        # -> category 'merge_ff_failed'), which then flows into
-        # `_write_merge_failure_review`, the merge_blocked event's
-        # data.category, and the signature-aware L1 dedup key.  "stood off"
-        # matched it, durably filing every index-lock stand-off as a
-        # fast-forward failure.  Pinned by
-        # test_reason_is_not_miscategorised_as_a_ff_failure.
         return MergeOutcome(
             'blocked',
             reason=(
