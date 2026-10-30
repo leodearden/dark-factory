@@ -1362,6 +1362,31 @@ class TestSnapshotProcessGroup:
             f'  pid={fake_pid} ppid=1 state=S wchan=�� comm=plain cmdline=?'
         ], rows
 
+    def test_a_member_with_no_published_argv_reports_an_empty_cmdline_not_its_comm(
+        self, monkeypatch, tmp_path
+    ):
+        """An empty /proc/<pid>/cmdline means no argv is published (mid-exec or exiting).
+
+        The row must say so rather than repeat comm as if it were the argv.
+        """
+        target_pgid = 77777
+        fake_pid = 77778
+        proc_root = tmp_path / 'proc'
+        entry = proc_root / str(fake_pid)
+        entry.mkdir(parents=True)
+        (entry / 'stat').write_text(
+            _synthetic_stat_line(fake_pid, target_pgid, state='R', comm='sleep')
+        )
+        (entry / 'wchan').write_text('0\n')
+        (entry / 'cmdline').write_bytes(b'')
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
+
+        rows = snapshot_process_group(target_pgid).splitlines()
+
+        assert rows[1:] == [
+            f'  pid={fake_pid} ppid=1 state=R wchan=0 comm=sleep cmdline=(empty)'
+        ], rows
+
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
     async def test_snapshot_includes_cmdline(self, tmp_path):
