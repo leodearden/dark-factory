@@ -62,6 +62,7 @@ from orchestrator.merge_lane.gates import (
     DropGuardResult,
     _check_plan_files_touched_in_branch,
 )
+from orchestrator.merge_lane.outcome_facts import MergeBlockCategory
 from orchestrator.merge_lane.ports import ProductionVerifier, VerifyPort
 from orchestrator.merge_lane.reverify_gate_decision import GateClearance
 from orchestrator.merge_lane.types import DiskGuardOutcome, QueuedBranch
@@ -12884,6 +12885,7 @@ class TestTrainLifecycleEvents:
 
         assert outcome is not None
         assert outcome.status == 'blocked', f'expected blocked, got: {outcome!r}'
+        assert outcome.block_category is MergeBlockCategory.POST_MERGE_VERIFY
 
         conn = sqlite3.connect(str(db_path))
         rows = conn.execute(
