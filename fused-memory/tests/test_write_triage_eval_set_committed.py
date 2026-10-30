@@ -135,6 +135,14 @@ class TestTheCommittedEvalSet:
         assert {row['role'] for row in _verdicts()} <= {'primary', 'second', 'third'}
         assert {row['basis'] for row in _verdicts()} == {'current'}
 
+    def test_the_verdicts_are_the_effective_lines_of_the_committed_ratings(self) -> None:
+        def order(row: dict[str, Any]) -> tuple[str, str, str, str]:
+            return (row['entry_id'], row['target_id'], row['basis'], row['rater'])
+
+        lines = _rounds().RatingScratch(CALIBRATION / f'{STEM}_rounds').effective_lines(_key())
+        verdicts = [{key: value for key, value in row.items() if key != 'digest'} for row in _verdicts()]
+        assert sorted(lines, key=order) == sorted(verdicts, key=order)
+
     def test_every_loss_yes_line_carries_digest(self) -> None:
         assert [row for row in _verdicts()
                 if row.get('loss') == 'YES' and row.get('digest') not in ('YES', 'NO')] == []

@@ -849,6 +849,39 @@ class TestTheBrief:
             (triple, role) for triple in ALL_TRIPLES for role in ('primary', 'second'))
 
 
+def _rate_every_unrated_shard(scratch: Any, entries: dict[Triple, Any]) -> None:
+    key = scratch.load_key()
+    ratings = scratch.root / 'ratings'
+    ratings.mkdir(exist_ok=True)
+    for name, spec in key['shards'].items():
+        path = ratings / f'{name}.jsonl'
+        if not path.exists():
+            path.write_text(''.join(
+                json.dumps({'id': item, **_honest(entries[_triple(key['items'][item])]), 'reason': 'r'})
+                + '\n' for item in spec['items']))
+
+
+class TestARerateRetiresThirdVotesOnItsPairsOnly:
+    def test_a_sibling_target_of_a_rerated_pair_keeps_its_third_vote(self, tmp_path: Path) -> None:
+        rounds = _mod()
+        entries = {(entry_id, target, 'current'): rounds.ShardEntry(
+            entry_id, target, 'current', 'df', f'child of {entry_id}', f'parent {target}')
+            for entry_id in ('w', 'x') for target in ('t1', 't2')}
+        scratch = rounds.RatingScratch(tmp_path / 'scratch')
+        key = scratch.load_key()
+        scratch.add_shards(key, list(entries.values()), seed=7)
+        scratch.save_key(key)
+        _rate_every_unrated_shard(scratch, entries)
+        rounds.third_round(scratch, scratch.load_key(), entries, {pair[:2] for pair in entries})
+        _rate_every_unrated_shard(scratch, entries)
+        rounds.rerate_round(scratch, scratch.load_key(), entries, [('w', 't1'), ('x', 't2')],
+                            version='v2.2')
+        _rate_every_unrated_shard(scratch, entries)
+        lines = scratch.effective_lines(scratch.load_key())
+        thirds = sorted((row['entry_id'], row['target_id']) for row in lines if row['role'] == 'third')
+        assert thirds == [('w', 't2'), ('x', 't1')]
+
+
 class TestTheRaterContract:
     def test_the_answer_contract_is_the_brief_verbatim_and_the_output_contract(self) -> None:
         rounds = _mod()
