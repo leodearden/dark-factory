@@ -639,7 +639,25 @@ def test_an_owner_of_a_debt_opened_at_another_call_site_is_not_examined(tmp_path
     code, report, _ = _report(project, capsys)
 
     assert code == 0
-    assert _check(report, 'deflake_tasks_carry_evidence')['examined'] == 1
+    check = _check(report, 'deflake_tasks_carry_evidence')
+    assert (check['examined'], check['notes']) == (1, [])
+
+
+def test_an_owner_filed_without_its_debt_context_is_reported_and_not_examined(tmp_path: Path, capsys):
+    project, _, owners = _debt_project(tmp_path)
+    metadata = project.tasks.tasks[owners[NODE_B]]['metadata']
+    for key in ('flake_debt_call_site', 'flake_debt_trigger', 'flake_debt_command'):
+        metadata.pop(key, None)
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    check = _check(report, 'deflake_tasks_carry_evidence')
+    assert (check['verdict'], check['examined']) == ('pass', 1)
+    (note,) = check['notes']
+    assert owners[NODE_B] in note
+    assert NODE_B in note
+    assert 'flake_debt_call_site' in note
 
 
 def test_a_debt_still_due_is_owed_and_has_no_owner_to_examine(tmp_path: Path, capsys):

@@ -123,7 +123,8 @@ def _rules(settings: Settings) -> dict[Check, str]:
         "observed at the pass's start (PRD 5.8); the unconfirmable pseudo-test and the unknown id are exempt",
         Check.DEFLAKE_TASKS_CARRY_EVIDENCE: 'every owner task of a debt a windowed effect block offered, whose '
         'metadata says flake_debt_call_site offline_lane, carries a flake_debt_trigger and, in its description '
-        "or details, the kind and first line of one of that test's failures in the command's pass records",
+        "or details, the kind and first line of one of that test's failures in the command's pass records; "
+        'an owner whose metadata names no flake_debt_call_site is reported',
         Check.NO_STRANDED_FILING: 'a test listed in threshold_reached at pass P is owned when either of two lane '
         'tasks reads back through get_task covering it: a task that a same-command effect block at or after P '
         'lists in tasks_filed, or the task its episode (live or ended) is bound to now; it is also owned when its '
@@ -351,21 +352,36 @@ def _evidence_problem(owner: Mapping[str, Any], failures: Sequence[FailureRecord
     return None
 
 
-def _deflake_tasks_carry_evidence(inputs: SoakInputs, rule: str, settings: Settings) -> CheckResult:
-    examined: dict[str, tuple[str, str]] = {}
+def _offered_owners(inputs: SoakInputs) -> Iterator[tuple[str, Mapping[str, Any], str, str]]:
+    """(owner id, owner task, command, node) for each debt a windowed effect block offered whose owner read back."""
     for _, record, debt in _offered(inputs):
         row = inputs.ledger.debts.get(debt.node)
-        owner = None if row is None or row.owner_task_id is None else inputs.tasks.get(row.owner_task_id)
-        if row is None or owner is None or _metadata(owner).get(DEBT_CALL_SITE_KEY) != FlakeCallSite.offline_lane:
-            continue
-        examined.setdefault(str(row.owner_task_id), (record.command, debt.node))
+        owner_id = None if row is None else row.owner_task_id
+        owner = None if owner_id is None else inputs.tasks.get(owner_id)
+        if owner is not None:
+            yield str(owner_id), owner, record.command, debt.node
+
+
+def _deflake_tasks_carry_evidence(inputs: SoakInputs, rule: str, settings: Settings) -> CheckResult:
+    examined: dict[str, tuple[Mapping[str, Any], str, str]] = {}
+    unplaced: dict[str, str] = {}
+    for owner_id, owner, command, node in _offered_owners(inputs):
+        call_site = _metadata(owner).get(DEBT_CALL_SITE_KEY)
+        if call_site == FlakeCallSite.offline_lane:
+            examined.setdefault(owner_id, (owner, command, node))
+        elif not call_site:
+            unplaced.setdefault(owner_id, node)
     failures = [
         f'owner task {owner_id} of {node}: {problem}'
-        for owner_id, (command, node) in examined.items()
-        if (owner := inputs.tasks.get(owner_id)) is not None
-        and (problem := _evidence_problem(owner, inputs.failures.get((command, node), ()))) is not None
+        for owner_id, (owner, command, node) in examined.items()
+        if (problem := _evidence_problem(owner, inputs.failures.get((command, node), ()))) is not None
     ]
-    return _judged(Check.DEFLAKE_TASKS_CARRY_EVIDENCE, rule, len(examined), failures)
+    notes = [
+        f'owner task {owner_id} of {node} carries no metadata.{DEBT_CALL_SITE_KEY}, so its trigger and evidence '
+        'are not examined'
+        for owner_id, node in unplaced.items()
+    ]
+    return _judged(Check.DEFLAKE_TASKS_CARRY_EVIDENCE, rule, len(examined), failures, notes)
 
 
 def _stale_notes(inputs: SoakInputs) -> list[str]:
