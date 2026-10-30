@@ -623,6 +623,9 @@ class TestNoVerdictArchive:
         }
         assert list(task_dir.glob('*pass-summary*')) == []
         assert transport.deleted_refs() == ['refs/merge-verify/fixed-id']
+        message = str(excinfo.value)
+        for path in task_dir.iterdir():
+            assert str(path) in message
 
     @pytest.mark.asyncio
     async def test_unwritable_archive_root_still_raises_no_verdict(self, tmp_path: Path):
@@ -640,6 +643,7 @@ class TestNoVerdictArchive:
             )
 
         assert excinfo.value.kind == 'no_verdict'
+        assert 'archived at' not in str(excinfo.value)
         assert runner.dispatch_in_flight is False
 
 
