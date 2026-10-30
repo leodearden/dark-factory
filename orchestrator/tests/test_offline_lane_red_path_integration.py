@@ -14,7 +14,9 @@ This module adds tests only: no production module changes with it.
 
 from __future__ import annotations
 
+import logging
 import signal
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -25,6 +27,7 @@ from _offline_lane_red_path_fixtures import (
     C,
     RedPathLane,
     Run,
+    StoreFault,
     W,
     effect_of,
     lane_test_timeout,
@@ -263,3 +266,214 @@ async def test_scenario_11_a_failing_id_holding_whitespace_is_unconfirmable(tmp_
     truncated = W.split(' ')[0]
     assert record.outcome == {'arm': 'unconfirmable', 'reason': 'id_failed_round_trip', 'detail': truncated}
     assert len(lane.stub.invocations()) == 1
+
+
+RED_A = Run(failed={A: 'AssertionError: a'})
+
+
+async def filed_lane(tmp_path, monkeypatch) -> tuple[RedPathLane, str, datetime]:
+    """A lane whose second spaced reproduction of A filed one task: the lane, the task id, the filing instant."""
+    lane = await RedPathLane.open(tmp_path, monkeypatch)
+    await lane.advance(RED_A, RED_A)
+    filing = await lane.advance(RED_A, RED_A)
+    [task_id] = effect_of(filing)['tasks_filed']
+    return lane, task_id, filing.started_at
+
+
+def nodes_of(task: dict) -> list[str]:
+    return task['metadata']['x_offline_lane']['nodes']
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=5))
+async def test_scenario_12_tests_crossing_together_share_a_task_and_a_later_crossing_gets_its_own(
+    tmp_path, monkeypatch,
+):
+    lane = await RedPathLane.open(tmp_path, monkeypatch)
+    red_ab = Run(failed={A: 'AssertionError: a', B: 'AssertionError: b'})
+    red_abc = Run(failed={A: 'AssertionError: a', B: 'AssertionError: b', C: 'AssertionError: c'})
+
+    await lane.advance(red_ab, red_ab)
+    await lane.advance(red_ab, red_ab)
+    assert [nodes_of(task) for task in lane.store.lane_tasks()] == [[A, B]]
+    await lane.advance(red_abc, red_abc)
+    await lane.advance(red_abc, red_abc)
+    assert [nodes_of(task) for task in lane.store.lane_tasks()] == [[A, B], [C]]
+    await lane.advance(red_abc, red_abc)
+
+    assert len(lane.store.lane_tasks()) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=12))
+async def test_scenario_13_a_persistent_red_under_an_open_task_escalates_once_at_24_hours(tmp_path, monkeypatch):
+    lane, task_id, filed_at = await filed_lane(tmp_path, monkeypatch)
+    raised_by: list[timedelta] = []
+
+    for _ in range(10):
+        record = await lane.advance(RED_A, RED_A, minutes=180)
+        since_filing = record.started_at - filed_at
+        unlanded = lane.unlanded()
+        assert len(lane.store.lane_tasks()) == 1
+        if since_filing < timedelta(hours=24):
+            assert unlanded == [], since_filing
+            continue
+        assert len(unlanded) == 1, since_filing
+        if not raised_by:
+            raised_by.append(since_filing)
+            assert f'{task_id} (pending)' in unlanded[0].summary
+
+    assert raised_by == [timedelta(hours=24)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=5))
+async def test_scenario_14_a_covered_test_green_then_red_files_no_new_task(tmp_path, monkeypatch):
+    lane, task_id, _filed_at = await filed_lane(tmp_path, monkeypatch)
+
+    await lane.advance(Run(passed=(A,)))
+    await lane.advance(RED_A, RED_A)
+    await lane.advance(RED_A, RED_A)
+
+    assert [task['id'] for task in lane.store.lane_tasks()] == [task_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=7))
+async def test_scenario_15_a_cancelled_covering_task_escalates_once_then_releases_a_refile(tmp_path, monkeypatch):
+    lane, first_id, filed_at = await filed_lane(tmp_path, monkeypatch)
+    lane.store.set_status(first_id, 'cancelled')
+
+    for hours_after_filing, raised in ((12, 0), (23, 0), (24, 1)):
+        gap = filed_at + timedelta(hours=hours_after_filing) - lane.clock()
+        record = await lane.advance(RED_A, RED_A, minutes=gap / timedelta(minutes=1))
+        assert record.started_at - filed_at == timedelta(hours=hours_after_filing)
+        assert len(lane.unlanded()) == raised
+        assert [task['id'] for task in lane.store.lane_tasks()] == [first_id]
+    [unlanded] = lane.unlanded()
+    lane.resolve(unlanded.id)
+
+    held = await lane.advance(RED_A, RED_A)
+    episode = lane.episode(A)
+    assert episode is not None
+    assert episode.counted_passes == (held.pass_id,)
+    assert [task['id'] for task in lane.store.lane_tasks()] == [first_id]
+    await lane.advance(RED_A, RED_A)
+
+    second = [task for task in lane.store.lane_tasks() if task['id'] != first_id]
+    assert len(second) == 1
+    assert second[0]['metadata']['x_offline_lane']['prior_task_ids'] == [first_id]
+    assert f'{A}: {first_id}' in second[0]['details']
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=5, extra_spawns=4))
+async def test_scenario_16_a_red_at_a_head_without_the_fix_has_no_effect(tmp_path, monkeypatch):
+    lane, first_id, _filed_at = await filed_lane(tmp_path, monkeypatch)
+    counted = lane.episode(A)
+    assert counted is not None
+    fix = await lane.side_commit()
+    lane.store.set_status(first_id, 'done', fix_commit=fix)
+
+    stale = await lane.advance(RED_A, RED_A)
+    assert effect_of(stale)['stale_heads'] == [A]
+    still = lane.episode(A)
+    assert still is not None
+    assert still.counted_passes == counted.counted_passes
+    assert [task['id'] for task in lane.store.lane_tasks()] == [first_id]
+
+    await lane.merge(fix)
+    restarted = await lane.advance(RED_A, RED_A)
+    episode = lane.episode(A)
+    assert episode is not None
+    assert episode.counted_passes == (restarted.pass_id,)
+    await lane.advance(RED_A, RED_A)
+
+    second = [task for task in lane.store.lane_tasks() if task['id'] != first_id]
+    assert len(second) == 1
+    assert second[0]['metadata']['x_offline_lane']['prior_task_ids'] == [first_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=5))
+async def test_scenario_17_a_done_task_without_a_fix_commit_is_contained_and_a_failed_ancestry_read_defers(
+    tmp_path, monkeypatch, caplog,
+):
+    lane, first_id, _filed_at = await filed_lane(tmp_path, monkeypatch)
+    lane.store.set_status(first_id, 'done')
+
+    held = await lane.advance(RED_A, RED_A)
+    episode = lane.episode(A)
+    assert episode is not None
+    assert episode.counted_passes == (held.pass_id,)
+    assert episode.prior_task_ids == (first_id,)
+    refiled = await lane.advance(RED_A, RED_A)
+    [second_id] = effect_of(refiled)['tasks_filed']
+    lane.store.set_status(second_id, 'done', fix_commit='f' * 40)
+
+    undecided = await lane.advance(RED_A, RED_A)
+
+    assert effect_of(undecided)['no_decision'] == [A]
+    assert {task['id'] for task in lane.store.lane_tasks()} == {first_id, second_id}
+    assert any(
+        record.levelno == logging.ERROR and f'whether head contains the fix of task {second_id}' in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=3))
+@pytest.mark.parametrize('fault', list(StoreFault))
+async def test_scenario_18_a_filing_the_store_refuses_stays_due_and_lands_on_a_tick(tmp_path, monkeypatch, fault):
+    lane = await RedPathLane.open(tmp_path, monkeypatch)
+    await lane.advance(RED_A, RED_A)
+    lane.store.degrade(fault)
+
+    await lane.advance(RED_A, RED_A)
+    due = lane.episode(A)
+    assert due is not None
+    assert due.filing_due is True
+    assert due.filing_failure is not None
+    assert due.covering_task_id is None
+    assert lane.store.lane_tasks() == []
+    invocations, passes = lane.stub.invocations(), lane.passes()
+
+    lane.store.restore()
+    assert await lane.tick(minutes=1) == []
+
+    [task] = lane.store.lane_tasks()
+    bound = lane.episode(A)
+    assert bound is not None
+    assert bound.covering_task_id == task['id']
+    assert bound.planning_committed is True
+    assert task['status'] == 'pending'
+    assert lane.stub.invocations() == invocations
+    assert lane.passes() == passes
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=3))
+async def test_scenario_19_a_restart_between_submit_and_commit_planning_commits_the_deferred_task(
+    tmp_path, monkeypatch,
+):
+    lane = await RedPathLane.open(tmp_path, monkeypatch)
+    await lane.advance(RED_A, RED_A)
+    lane.store.park_commits()
+
+    await lane.advance(RED_A, RED_A, until=lane.store.commit_reached)
+    [task] = lane.store.lane_tasks()
+    assert task['status'] == 'deferred'
+    parked = lane.episode(A)
+    assert parked is not None
+    assert parked.covering_task_id == task['id']
+    assert parked.planning_committed is False
+
+    lane.restart()
+    lane.store.release()
+    assert await lane.tick(minutes=1) == []
+
+    assert lane.store.task(task['id'])['status'] == 'pending'
+    committed = lane.episode(A)
+    assert committed is not None
+    assert committed.planning_committed is True
+    assert [name for name, _arguments in lane.store.calls].count('submit_task') == 1
