@@ -79,6 +79,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS,
     _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS,
     _FLAGGED_ITEMS_CHAR_BUDGET,
+    STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS,
     IntegrityCheck,
     TaskKnowledgeSync,
     _format_flagged,
@@ -89,6 +90,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _select_proactive_sample,
     _suppress_same_run_human_operator_dups,
     _sweep_stale_mem0_flag_for_stage2_markers,
+    _sweep_stale_mem0_flag_markers,
     queue_briefing_refresh_tasks,
     retire_flag_markers_for_terminal_task,
     select_tasks_needing_hint_attention,
@@ -9391,6 +9393,140 @@ class TestSweepStaleMem0FlagMarkers:
         messages = [rec.message for rec in scroll_cap_warnings]
         assert any("{'source': 'stage1_flag_marker'}" in m for m in messages)
         assert any("{'kind': 'stage1_flag_marker'}" in m for m in messages)
+
+
+_FOREIGN_KIND_NOW = datetime(2026, 10, 30, 12, 0, 0, tzinfo=UTC)
+_STAGE1_MARKER = 'stage1_flag_marker'
+
+
+def _stage1_member(mid: str, **metadata) -> dict:
+    """A stage1_flag_marker pool member far past the pool's age cutoff."""
+    age = timedelta(days=STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS + 30)
+    return {
+        'id': mid,
+        'created_at': (_FOREIGN_KIND_NOW - age).isoformat(),
+        'metadata': metadata,
+    }
+
+
+class TestSweepStaleMem0FlagMarkersWithholdsForeignKinds:
+    """The in-cycle stage1_flag_marker collector keeps foreign-kind records (task 6241).
+
+    A record declaring a kind other than ``stage1_flag_marker`` belongs to
+    another pool, whatever ``source`` it carries, so this collector and the
+    manual ``sweep_orphan_flag_markers.py`` agree on what the pool is.
+    """
+
+    @pytest.mark.asyncio
+    async def test_foreign_kind_is_kept_on_every_cycle_while_markers_drain(self):
+        pool = LiveFlagPool([
+            _stage1_member('canonical', source=_STAGE1_MARKER, kind=_STAGE1_MARKER),
+            _stage1_member('source-only', source=_STAGE1_MARKER),
+            _stage1_member('kind-only', kind=_STAGE1_MARKER),
+            _stage1_member(
+                'foreign', source=_STAGE1_MARKER, kind='unregistered_audit_log', task_id='452',
+            ),
+        ])
+
+        first = await _sweep_stale_mem0_flag_markers(
+            pool, 'dark_factory', 'r1', now=_FOREIGN_KIND_NOW,
+        )
+
+        assert first == 3
+        assert set(pool.deleted_ids()) == {'canonical', 'source-only', 'kind-only'}
+        assert 'foreign' in pool.members
+
+        second = await _sweep_stale_mem0_flag_markers(
+            pool, 'dark_factory', 'r2', now=_FOREIGN_KIND_NOW,
+        )
+
+        assert second == 0
+        assert len(pool.deleted_ids()) == 3
+        assert 'foreign' in pool.members
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kind', [[_STAGE1_MARKER], {'nested': 'x'}])
+    async def test_unhashable_kind_is_kept_without_raising(self, kind):
+        pool = LiveFlagPool([
+            _stage1_member('canonical', source=_STAGE1_MARKER, kind=_STAGE1_MARKER),
+            _stage1_member('odd-kind', source=_STAGE1_MARKER, kind=kind),
+        ])
+
+        result = await _sweep_stale_mem0_flag_markers(
+            pool, 'dark_factory', 'r1', now=_FOREIGN_KIND_NOW,
+        )
+
+        assert result == 1
+        assert pool.deleted_ids() == ['canonical']
+        assert 'odd-kind' in pool.members
+
+    @pytest.mark.asyncio
+    async def test_one_aggregate_warning_and_per_record_debug(self, caplog):
+        pool = LiveFlagPool([
+            _stage1_member('foreign-alpha', source=_STAGE1_MARKER, kind='alpha_log'),
+            _stage1_member('foreign-beta', source=_STAGE1_MARKER, kind='beta_log'),
+            _stage1_member('canonical', source=_STAGE1_MARKER, kind=_STAGE1_MARKER),
+        ])
+
+        with caplog.at_level(logging.DEBUG, logger=_TKS_LOGGER):
+            result = await _sweep_stale_mem0_flag_markers(
+                pool, 'dark_factory', 'r1', now=_FOREIGN_KIND_NOW,
+            )
+
+        assert result == 1
+        tks_records = [r for r in caplog.records if r.name == _TKS_LOGGER]
+        foreign_warnings = [
+            r for r in tks_records
+            if r.levelno == logging.WARNING and 'foreign kind' in r.getMessage()
+        ]
+        assert len(foreign_warnings) == 1
+        message = foreign_warnings[0].getMessage()
+        assert 'RETAINED 2 ' in message
+        assert 'alpha_log' in message
+        assert 'beta_log' in message
+        assert '_sweep_stale_mem0_flag_markers' in message
+        assert 'foreign-alpha' not in message
+        assert 'foreign-beta' not in message
+        assert 'protected audit' not in message
+
+        debug_ids = sorted(
+            r.__dict__['memory_id'] for r in tks_records
+            if r.levelno == logging.DEBUG and 'memory_id' in r.__dict__
+        )
+        assert debug_ids == ['foreign-alpha', 'foreign-beta']
+
+    @pytest.mark.asyncio
+    async def test_a_registered_audit_kind_is_attributed_as_audit_not_foreign(self, caplog):
+        pool = LiveFlagPool([
+            _stage1_member('audit', source=_STAGE1_MARKER, kind='cadence_check'),
+        ])
+
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            result = await _sweep_stale_mem0_flag_markers(
+                pool, 'dark_factory', 'r1', now=_FOREIGN_KIND_NOW,
+            )
+
+        assert result == 0
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno == logging.WARNING
+        ]
+        assert any('RETAINED 1 protected audit record(s)' in m for m in messages)
+        assert not any('foreign kind' in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_the_wide_relay_pool_does_not_opt_in(self):
+        """The flag_for_stage2 pool is drained by its closure gate, not by pool kind."""
+        pool = LiveFlagPool([
+            _relay_marker('relay', _STALE_DAYS, task_id='T', kind='stage1_flag'),
+        ])
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            pool, 'dark_factory', 'r1', terminal_task_ids={'T'}, now=_RETIRE_NOW,
+        )
+
+        assert result == 1
+        assert pool.deleted_ids() == ['relay']
 
 
 class TestSweepStaleMem0FlagForStage2Markers:
