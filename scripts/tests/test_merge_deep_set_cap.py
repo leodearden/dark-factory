@@ -238,18 +238,19 @@ def test_sigterm_while_the_landing_polls_cancels_it_and_tears_down(tmp_path, dep
     _assert_left_nothing_behind(repo, deploy_env)
 
 
-def test_rerunning_at_the_cap_main_carries_dies_before_any_request(tmp_path, deploy_env):
+RERUN_SEEDS = {
+    "block_last": "project_root: /nowhere\nmerge_deep:\n  chain_cap: 6\n",
+    "blank_line_after_block": SEEDS["block_present"].replace("chain_cap: 0", "chain_cap: 6"),
+}
+
+
+@pytest.mark.parametrize("seed", list(RERUN_SEEDS.values()), ids=list(RERUN_SEEDS))
+def test_rerunning_at_the_cap_main_carries_dies_before_any_request(tmp_path, deploy_env, seed):
     """Pins the documented non-idempotence: at the cap main already carries
     there is nothing to land, and the script dies before the server sees
-    anything.
-
-    The seed puts the merge_deep block LAST with no blank line after it on
-    purpose: step 1's editor drops a blank line FOLLOWING the block, so with
-    one there the re-run is not byte-identical and the no-op path this pins is
-    never exercised.
-    """
+    anything."""
     repo = init_repo(tmp_path)
-    config = commit_config(repo, "project_root: /nowhere\nmerge_deep:\n  chain_cap: 6\n")
+    config = commit_config(repo, seed)
     before = head(repo)
     queue = FakeMergeQueue(repo)
 
@@ -261,6 +262,50 @@ def test_rerunning_at_the_cap_main_carries_dies_before_any_request(tmp_path, dep
     assert f"nothing to land: main already carries {KNOB}=6" in proc.stderr, proc.stderr
     assert received == [], f"a no-op deploy reached the server: {received}"
     assert head(repo) == before
+    assert config.read_text() == seed
+    _assert_left_nothing_behind(repo, deploy_env)
+
+
+CAP_CHANGE_EDITS = {
+    "replace_keeps_separator": (
+        SEEDS["block_present"],
+        SEEDS["block_present"].replace("chain_cap: 0", "chain_cap: 6"),
+    ),
+    "insert_above_separator": (
+        "project_root: /nowhere\n"
+        "merge_deep:\n"
+        "  # canary\n"
+        "\n"
+        "review:\n"
+        "  enabled: true\n",
+        "project_root: /nowhere\n"
+        "merge_deep:\n"
+        "  # canary\n"
+        "  chain_cap: 6\n"
+        "\n"
+        "review:\n"
+        "  enabled: true\n",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("seed", "expected"), list(CAP_CHANGE_EDITS.values()), ids=list(CAP_CHANGE_EDITS)
+)
+def test_a_cap_change_edits_only_the_chain_cap_line(tmp_path, deploy_env, seed, expected):
+    """The yaml edit touches the chain_cap line and nothing else: a blank
+    separator after the block survives, and an inserted chain_cap lands
+    inside the block above that separator."""
+    config = commit_config(init_repo(tmp_path), seed)
+    repo = config.parent
+    queue = FakeMergeQueue(repo)
+
+    with _target(queue, reload_report(config_path=str(config), applied=APPLIED_6)) as server:
+        proc = _run(server, config, "6", env=deploy_env)
+
+    assert proc.returncode == 0, f"stdout={proc.stdout} stderr={proc.stderr}"
+    assert queue.has_landed()
+    assert git(repo, "show", f"main:{CONFIG}") == expected
     _assert_left_nothing_behind(repo, deploy_env)
 
 
