@@ -37,6 +37,7 @@ from _orch_helpers import (
     mcp_tool_envelope,
     required_timeout_secs,
 )
+from escalation.categories import EscalationCategory
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.task_statuses import TaskStatus
@@ -678,6 +679,33 @@ def merge_gate_suppression(test_id: str, index: int) -> FlakeSuppression:
     )
 
 
+STORM = EscalationCategory.MERGE_FLAKE_SUPPRESSION_STORM
+#: Far past the merge gate's storm window, whatever its size: a sync that has not seen
+#: the window fire by then never will.
+STORM_SYNC_BOUND = 100
+
+
+async def sync_storm_window(scratch_root: Path) -> None:
+    """Bring the merge gate's process-wide storm window to empty, through the public recorder only.
+
+    The window counts suppressions since it last fired, and resets when it fires, so
+    suppressions recorded into a scratch project and queue fire it and leave it empty.
+    """
+    queue = EscalationQueue(scratch_root / 'escalations')
+    for index in range(STORM_SYNC_BOUND):
+        await record_flake_observation(
+            merge_gate_suppression('tests/test_storm_sync.py::test_sync', index),
+            project_root=scratch_root,
+            project_id='storm-sync',
+            merge_sha='0' * 40,
+            task_id=None,
+            escalation_queue=queue,
+        )
+        if any(escalation.category == STORM for escalation in queue.get_pending()):
+            return
+    raise AssertionError(f'the merge gate storm window did not fire within {STORM_SYNC_BOUND} suppressions')
+
+
 class RedPathLane:
     """One real offline-lane worker over a seeded repo, a stub test runner, a fake task store, a real queue and a fake clock."""
 
@@ -868,6 +896,16 @@ class RedPathLane:
     def unlanded(self) -> list[Escalation]:
         return self.pending(UNLANDED_RED_CATEGORY)
 
+    def queued(self, *, category: str | None = None, task_id: str | None = None) -> list[Escalation]:
+        """The pending escalations in the lane's queue, of *category* and on *task_id* where given."""
+        return [
+            escalation for escalation in self.queue.get_pending()
+            if category in (None, escalation.category) and task_id in (None, escalation.task_id)
+        ]
+
+    def get(self, escalation_id: str) -> Escalation | None:
+        return self.queue.get(escalation_id)
+
     def resolve(self, escalation_id: str) -> None:
         """Resolve a record as a person would."""
         assert self.queue.resolve(escalation_id, 'resolved by hand', resolved_by='operator') is not None
@@ -886,6 +924,10 @@ class RedPathLane:
             escalation_queue=self.queue,
             clock=clock or wall_clock,
         )
+
+    async def drain_at(self, at: datetime) -> DrainPassReport:
+        """One drain pass whose clock reads *at* throughout; due items are stamped on the wall clock."""
+        return await self.drain(clock=lambda: at)
 
     async def record_merge_gate(self, suppression: FlakeSuppression, task_id: str | None) -> None:
         """Record *suppression* as the merge gate does, at main's head, into the lane's ledger and queue."""
