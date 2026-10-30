@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 import pytest
 import pytest_asyncio
-from _falkor_index_live import injected_driver, live_backends, scratch_graphs
+from _falkor_index_live import live_backends, scratch_graphs
 from _falkor_plans import explain, non_leaf_scans, spy_on_queries
 from _fm_helpers import await_index_operational, falkor_skipif
 from _query_recorder import IssuedQuery, recording_driver
@@ -174,7 +174,7 @@ async def seed_ring(scratch, live_backend_factory) -> Callable[[int], Awaitable[
         return SeededGraph(
             name=name,
             graph=graph,
-            driver=injected_driver(backend).clone(name),
+            driver=live_backend_factory.driver_of(backend).clone(name),
             entity_edges={edge.uuid: edge for edge in ring},
             off_label_edge=off_label_edge,
         )

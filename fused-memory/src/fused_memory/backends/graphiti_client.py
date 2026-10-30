@@ -19,6 +19,7 @@ from typing import Any, TypedDict, TypeVar, cast
 from urllib.parse import urlparse
 
 from graphiti_core import Graphiti
+from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.falkordb_driver import FalkorDriver
@@ -1604,6 +1605,43 @@ class GraphitiBackend:
         self._cross_encoder = None
         self._group_clients: dict[str, Graphiti] = {}
 
+    @classmethod
+    def with_driver(
+        cls,
+        config: FusedMemoryConfig,
+        driver: FalkorDriver,
+        *,
+        registered_graph_ids: Iterable[str],
+        llm_client: LLMClient | None = None,
+        embedder: EmbedderClient | None = None,
+        cross_encoder: CrossEncoderClient | None = None,
+    ) -> 'GraphitiBackend':
+        """A backend over *driver* and the given sub-clients, wired without ``initialize()``.
+
+        No provisioning sweep, identity scan or server-settings read runs, and no
+        base ``client`` is built: methods that need one raise until it is assigned.
+        The registry is required because the derived one names real project graphs.
+        The backend takes ownership: ``close()`` releases the driver and sub-clients.
+        """
+        backend = cls(config, registered_graph_ids=registered_graph_ids)
+        backend._attach(
+            driver, llm_client=llm_client, embedder=embedder, cross_encoder=cross_encoder,
+        )
+        return backend
+
+    def _attach(
+        self,
+        driver: FalkorDriver,
+        *,
+        llm_client: LLMClient | None,
+        embedder: EmbedderClient | None,
+        cross_encoder: CrossEncoderClient | None,
+    ) -> None:
+        self._driver = driver
+        self._llm_client = llm_client
+        self._embedder = embedder
+        self._cross_encoder = cross_encoder
+
     @property
     def registered_graph_ids(self) -> frozenset[str]:
         """The graphs this backend provisions — PRD D5, docs/prds/falkordb-index-provisioning.md."""
@@ -1655,9 +1693,9 @@ class GraphitiBackend:
         graphiti.py:889-890) — since that condition is never true for a
         per-group client, the shared-driver mutation race that misroutes
         concurrent cross-group writes is structurally unreachable here.
-        The llm_client/embedder/cross_encoder sub-clients are shared (hoisted
-        in ``initialize()``) across every per-group client and the base
-        ``self.client``.
+        The llm_client/embedder/cross_encoder sub-clients are shared (attached
+        by ``initialize()`` or ``with_driver()``) across every per-group client
+        and the base ``self.client``.
 
         ``_group_clients`` is unbounded and never evicted, mirroring
         ``_cloned_drivers``/``_identity_locks`` above — safe because
@@ -1882,14 +1920,11 @@ class GraphitiBackend:
         host = parsed.hostname or 'localhost'
         port = parsed.port or 6379
 
-        self._driver = _MultiTenantFalkorDriver(
+        driver = _MultiTenantFalkorDriver(
             host=host,
             port=port,
             password=falkor_cfg.password,
         )
-
-        self._llm_client = llm_client
-        self._embedder = embedder_client
 
         # --- Cross-encoder (reranker) ---
         # Shared across the base client and every per-group client (see
@@ -1916,13 +1951,16 @@ class GraphitiBackend:
                 api_key=reranker_provider.api_key,
                 base_url=reranker_provider.api_url,
             )
-        self._cross_encoder = OpenAIRerankerClient(config=reranker_config)
+        cross_encoder = OpenAIRerankerClient(config=reranker_config)
 
+        self._attach(
+            driver, llm_client=llm_client, embedder=embedder_client, cross_encoder=cross_encoder,
+        )
         self.client = Graphiti(
-            graph_driver=self._driver,
-            llm_client=self._llm_client,
-            embedder=self._embedder,
-            cross_encoder=self._cross_encoder,
+            graph_driver=driver,
+            llm_client=llm_client,
+            embedder=embedder_client,
+            cross_encoder=cross_encoder,
             max_coroutines=cfg.queue.graphiti_max_coroutines,
         )
 

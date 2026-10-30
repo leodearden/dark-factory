@@ -24,11 +24,6 @@ _NEIGHBOUR_UUID = 'bff81531-0000-4000-8000-000000000002'
 _EDGE_UUID = 'abcd1234-0000-4000-8000-000000000003'
 
 
-def _wire(backend, graph):
-    backend._driver._get_graph = MagicMock(return_value=graph)
-    return graph
-
-
 def _params_of(call) -> object:
     if len(call.args) > 1:
         return call.args[1]
@@ -42,14 +37,13 @@ def _cypher_of(call) -> str:
 class TestEntityUuidsWithPrefix:
     @pytest.mark.asyncio
     async def test_returns_uuid_name_pairs_deduped_with_none_name_as_empty(
-        self, mock_config, make_backend, make_graph_mock,
+        self, mock_config, make_backend, make_graph_driver, make_graph_mock,
     ):
-        backend = make_backend(mock_config)
-        _wire(backend, make_graph_mock([
+        backend = make_backend(mock_config, driver=make_graph_driver({'reify': make_graph_mock([
             [_NODE_UUID, 'Prefix resolver'],
             ['bff81530-70e5-4ab6-939e-000000000009', None],
             [_NODE_UUID, 'Prefix resolver'],
-        ]))
+        ])}))
 
         got = await backend.entity_uuids_with_prefix('bff81530', group_id='reify')
 
@@ -60,26 +54,25 @@ class TestEntityUuidsWithPrefix:
 
     @pytest.mark.asyncio
     async def test_reads_the_graph_of_the_given_group(
-        self, mock_config, make_backend, make_graph_mock,
+        self, mock_config, make_backend, make_graph_driver, make_graph_mock,
     ):
-        backend = make_backend(mock_config)
-        _wire(backend, make_graph_mock([]))
+        graph = make_graph_mock([])
+        backend = make_backend(mock_config, driver=make_graph_driver({'reify': graph}))
 
         await backend.entity_uuids_with_prefix('bff81530', group_id='reify')
 
-        backend._driver._get_graph.assert_called_with('reify')
+        graph.ro_query.assert_awaited()
 
 
 class TestEdgeUuidsWithPrefix:
     @pytest.mark.asyncio
     async def test_returns_uuid_fact_pairs_with_none_fact_as_empty(
-        self, mock_config, make_backend, make_graph_mock,
+        self, mock_config, make_backend, make_graph_driver, make_graph_mock,
     ):
-        backend = make_backend(mock_config)
-        _wire(backend, make_graph_mock([
+        backend = make_backend(mock_config, driver=make_graph_driver({'reify': make_graph_mock([
             [_EDGE_UUID, 'resolver reads the graph'],
             ['abcd1234-0000-4000-8000-000000000004', None],
-        ]))
+        ])}))
 
         got = await backend.edge_uuids_with_prefix('abcd1234', group_id='reify')
 
@@ -96,10 +89,10 @@ class TestPrefixIsBoundNeverInterpolated:
     @pytest.mark.parametrize('method', _READS)
     @pytest.mark.asyncio
     async def test_every_query_binds_the_prefix_as_a_parameter(
-        self, method, mock_config, make_backend, make_graph_mock,
+        self, method, mock_config, make_backend, make_graph_driver, make_graph_mock,
     ):
-        backend = make_backend(mock_config)
-        graph = _wire(backend, make_graph_mock([['deadbeef-0000-4000-8000-000000000001', 'x']]))
+        graph = make_graph_mock([['deadbeef-0000-4000-8000-000000000001', 'x']])
+        backend = make_backend(mock_config, driver=make_graph_driver({'reify': graph}))
 
         await getattr(backend, method)('deadbeef', group_id='reify')
 
@@ -117,12 +110,11 @@ class TestOutagePropagates:
     @pytest.mark.parametrize('error', [ConnectionError('falkordb down'), TimeoutError('slow')])
     @pytest.mark.asyncio
     async def test_a_failing_read_raises_rather_than_returning_empty(
-        self, method, error, mock_config, make_backend,
+        self, method, error, mock_config, make_backend, make_graph_driver,
     ):
-        backend = make_backend(mock_config)
         graph = MagicMock()
         graph.ro_query = AsyncMock(side_effect=error)
-        _wire(backend, graph)
+        backend = make_backend(mock_config, driver=make_graph_driver({'reify': graph}))
 
         with pytest.raises(type(error)):
             await getattr(backend, method)('bff81530', group_id='reify')
@@ -184,12 +176,11 @@ async def prefix_live_graph():
 class TestPrefixReadsLiveFalkorDB:
     @pytest.mark.asyncio
     async def test_starts_with_matches_exactly_the_prefixed_ids(
-        self, mock_config, make_backend, prefix_live_graph,
+        self, mock_config, make_backend, make_graph_driver, prefix_live_graph,
     ):
         graph = prefix_live_graph
         await _seed(graph)
-        backend = make_backend(mock_config)
-        _wire(backend, graph)
+        backend = make_backend(mock_config, driver=make_graph_driver({'test': graph}))
 
         assert await backend.entity_uuids_with_prefix('bff81530', group_id='test') == [
             (_NODE_UUID, 'first node'),
@@ -207,7 +198,7 @@ class TestPrefixReadsLiveFalkorDB:
     ])
     @pytest.mark.asyncio
     async def test_every_query_is_served_by_the_uuid_index(
-        self, method, prefix, mock_config, make_backend, prefix_live_graph,
+        self, method, prefix, mock_config, make_backend, make_graph_driver, prefix_live_graph,
     ):
         """A bare STARTS WITH is planned as a full label/node scan (measured on
         live reify: ~13ms nodes, ~110ms edges); the reads must reach the
@@ -216,8 +207,7 @@ class TestPrefixReadsLiveFalkorDB:
         graph = prefix_live_graph
         await _seed(graph)
         recorder = _RecordingGraph(graph)
-        backend = make_backend(mock_config)
-        _wire(backend, recorder)
+        backend = make_backend(mock_config, driver=make_graph_driver({'test': recorder}))
 
         await getattr(backend, method)(prefix, group_id='test')
 
