@@ -244,19 +244,14 @@ record marked). The window opens when the last of them is live, runs at least
 **Report-only:** M2 per outcome, M4 against 0.20, M5, M6, and harm per write
 under the provisional weights.
 
-**Which brief: open, for Leo.** This release condition was ratified under
-brief v2.1. M1 <= 0.15, and M3 population <= 0.35 (esc-7301-1, recorded on
-task 3131), were set against the v2.1 soak baseline (§8). v2.2 narrows LOSS,
-which can only lower the figures that rest on it (§8). The post-fix
-measurement must therefore do one of two things. It can rate under the v2.1
-text, by writing `git show
-c7b682bcb9:fused-memory/calibration/write_triage_rater_brief_v2.md` to a file
-and passing that file as `--brief PATH` to every round command. Each shard
-then records that brief's sha256, the rater prompt is rendered from it, and
-the result is scored with `--rubric v2.1`. Or it can wait for Leo to
-re-confirm the bounds against a v2.2 re-rate of the soak's LOSS-consuming
-pairs. Left without `--brief`, a run picks up v2.2 from the file. This is a
-choice for Leo; nothing here makes it.
+**Which brief: v2.2 (Leo, 2026-10-30).** The post-fix measurement rates under
+rater brief v2.2, the file's default, and is scored with `--rubric v2.2`. This
+release condition was first ratified under v2.1: M1 <= 0.15, and M3 population
+<= 0.35 (esc-7301-1, recorded on task 3131), were set against the v2.1 soak
+baseline (§8). v2.2 narrows LOSS, which can only lower the figures that rest on
+it (§8). So before the release condition is read, task 7812 re-rates the soak's
+LOSS-consuming pairs under v2.2 and Leo re-confirms the bounds in gate 7813, on
+which task 3131 depends. Those bounds stand until that gate rules.
 
 **After the embedder cutover (6807)** re-run the whole measurement: the band
 edges and every cosine-derived threshold move with the embedder.
