@@ -147,7 +147,7 @@ from orchestrator.merge_lane.landing_evidence import (
 )
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
-from orchestrator.plan_descope import DoneStepIntegrityVerdict
+from orchestrator.plan_descope import DoneStepIntegrityVerdict, check_done_step_integrity
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.recut_ruling import ruling_to_enforce
 from orchestrator.review_inputs import gather_review_subject, review_fork_point
@@ -5216,6 +5216,8 @@ class TaskWorkflow:
         # so the architect can confirm, update, or recreate the plan.
         revalidation = False
         revalidation_changed_files: list[str] = []
+        before_plan: dict | None = None
+        text_drift: TaskTextDrift | None = None
         build_prompt: PromptBuilder
         existing_plan = self.artifacts.read_plan()
         finalized_before_invoke = existing_plan.get('_finalized_at')
@@ -5251,6 +5253,7 @@ class TaskWorkflow:
             # Done-step commits a rebase orphaned are remapped before either
             # the skip or the architect trusts them (task 4032).
             existing_plan = await self._reconciled_plan()
+            before_plan = existing_plan
             current_main = await self.git_ops.get_main_sha()
             revalidation_changed_files = await self.git_ops.get_changed_files(
                 self._old_plan_base, current_main,
@@ -5597,9 +5600,12 @@ class TaskWorkflow:
                 ),
             )
 
-        if revalidation:
-            # A step the architect re-marked done is reconciled too (task 4032).
-            await self._reconciled_plan()
+        if before_plan is not None and (
+            outcome := await self._enforce_done_step_integrity(
+                before_plan, revalidation_changed_files, text_drift,
+            )
+        ):
+            return outcome
 
         if outcome := await self._validate_prerequisites_or_block('initial plan'):
             return outcome
@@ -5661,6 +5667,70 @@ class TaskWorkflow:
             f'{len(self.plan.get("steps", []))} steps'
         )
         return WorkflowOutcome.PLANNED
+
+    async def _enforce_done_step_integrity(
+        self, before: dict, changed_files: list[str], text_drift: TaskTextDrift | None,
+    ) -> WorkflowOutcome | None:
+        """The revalidation β check (``plans/task-amendment-delivery-prd.md`` C5).
+
+        ``None`` lets the revised plan proceed. A refused plan gets one remedy
+        architect pass; if it is still refused, *before* goes back on disk, so
+        the next dispatch revalidates again rather than fresh-planning over
+        the lost done steps.
+        """
+        verdict = check_done_step_integrity(before, await self._reconciled_plan())
+        if verdict.passed:
+            return None
+        try:
+            remedy_ran = await self._integrity_remedy_pass(verdict, changed_files, text_drift)
+        except BaseException:
+            self._restore_plan(before)
+            raise
+        if (task_verdict := await self._route_task_verdict_report()) is not None:
+            self._restore_plan(before)
+            return task_verdict
+        if remedy_ran:
+            verdict = check_done_step_integrity(before, await self._reconciled_plan())
+            if verdict.passed:
+                return None
+        return await self._refuse_done_step_integrity(before, verdict)
+
+    async def _integrity_remedy_pass(
+        self, verdict: DoneStepIntegrityVerdict, changed_files: list[str],
+        text_drift: TaskTextDrift | None,
+    ) -> bool:
+        """Show the architect *verdict* once more; whether its run succeeded."""
+        assert self.worktree is not None
+
+        async def build_prompt() -> str:
+            return await self.briefing.build_revalidation_prompt(
+                self.task, self._live_plan(), changed_files,
+                worktree=self.worktree, text_drift=text_drift,
+                integrity_refusal=verdict,
+            )
+
+        result = await self._invoke(ARCHITECT, build_prompt, self.worktree)
+        return result.success
+
+    async def _refuse_done_step_integrity(
+        self, before: dict, verdict: DoneStepIntegrityVerdict,
+    ) -> WorkflowOutcome:
+        self._restore_plan(before)
+        logger.warning('Task %s: revalidated plan refused — %s', self.task_id, verdict.reason())
+        if self.event_store:
+            self.event_store.emit(
+                EventType.done_step_integrity_refused, task_id=self.task_id, phase='plan',
+                data={**verdict.to_dict(), 'remedy_attempted': True},
+            )
+        return await self._handle_no_plan_failure(
+            f'Planning refused: {verdict.reason()}',
+            detail=json.dumps(verdict.to_dict(), indent=2),
+        )
+
+    def _restore_plan(self, plan: dict) -> None:
+        assert self.artifacts is not None
+        self.artifacts.write_plan(plan)
+        self.plan = plan
 
     def _current_task_text_fp(self) -> str:
         return task_text_fingerprint(self.task.get('description'), self.task.get('details'))
