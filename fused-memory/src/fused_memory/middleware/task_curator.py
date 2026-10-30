@@ -9,7 +9,8 @@ At task-creation time, the curator decides whether a candidate task should:
 - **create** — genuinely new work; proceed with task creation.
 
 The decision is made by an LLM against a layered corpus of existing tasks (review-chain
-anchor + module-lock pool + embedding neighbors + dependency neighbors). See
+anchor + the parent's other follow-ups for an agent-followup candidate + module-lock
+pool + embedding neighbors + dependency neighbors). See
 docs/reify-task-fragmentation-report-2026-04-11.txt for the motivating analysis.
 
 When the curator cannot judge a candidate it returns ``action="defer"``
@@ -33,7 +34,7 @@ Batch API (task 924)
 :meth:`TaskCurator.curate_batch` is the preferred entry point for the ticket worker:
 one ``invoke_with_cap_retry`` round-trip for up to ``CuratorConfig.batch_max`` candidates.
 Identical candidates in the same batch are short-circuited via pre-batch payload-hash
-dedup; each unique candidate gets its own four-stream pool.  See plan.json for task 924
+dedup; each unique candidate gets its own pool.  See plan.json for task 924
 for the full design rationale (batch prompt, schema, topo-sort dispatch, fallback).
 """
 
@@ -72,10 +73,12 @@ from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_artifacts_root
 from shared.streak import KeyedStreaks
+from shared.task_statuses import ACTIVE, TaskStatus
 from shared.transcript_archive import ArchiveBeforeDelete, archive_before_delete
 
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
+from fused_memory.backends.task_backend_types import MetadataLookupRow
 from fused_memory.mcp_tools.scheduler_state import effective_lock_depth
 from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
 from fused_memory.middleware.cancelled_premise_blocklist import (
@@ -2711,7 +2714,7 @@ class TaskCurator:
         project_id: str,
         project_root: str,
     ) -> tuple[list[PoolEntry], dict[str, int], PoolWithheld]:
-        """Assemble the four-stream pool for the LLM prompt.
+        """Assemble the candidate's pool for the LLM prompt, one stream per ``POOL_SOURCES`` entry.
 
         Returns ``(pool, pool_sizes, withheld)``. ``withheld`` is the
         :class:`PoolWithheld` census of everything the caps kept out, counted
@@ -2759,7 +2762,18 @@ class TaskCurator:
             except Exception as exc:
                 logger.debug('task_curator: anchor fetch failed: %s', exc)
 
-        # Stream 2: module-lock pool
+        # Stream 2: the parent's other follow-ups, for an agent-followup candidate
+        sibling_overflow_ids: list[str] = []
+        parent_id = _followup_parent_id(candidate)
+        if parent_id is not None:
+            sibling_entries, sibling_overflow_ids = await self._sibling_stream(
+                parent_id, project_root, lock_depth=lock_depth, exclude=seen_ids,
+            )
+            for entry in sibling_entries:
+                pool.append(entry)
+                seen_ids.add(entry.task_id)
+
+        # Stream 3: module-lock pool
         candidate_modules = set(
             files_to_modules(candidate.files_to_modify, depth=lock_depth),
         )
@@ -2794,14 +2808,14 @@ class TaskCurator:
         # The sort key is status+priority, NOT relevance, so the entries this
         # cap discards are not the least-similar ones — a genuinely
         # overlapping task can sit just past it. Which of them the POOL
-        # actually loses is not known yet: streams 3 and 4 can still admit
+        # actually loses is not known yet: streams 4 and 5 can still admit
         # one. Hold the ids and count the absent ones once, below.
         module_overflow_ids = [e.task_id for e in module_matches[module_cap:]]
         for entry in module_matches[:module_cap]:
             pool.append(entry)
             seen_ids.add(entry.task_id)
 
-        # Stream 3: embedding neighbors
+        # Stream 4: embedding neighbors
         embedding_matches: list[PoolEntry] = []
         embedding_unvisited_ids: list[str] = []
         embedding_window_full = False
@@ -2813,7 +2827,7 @@ class TaskCurator:
             )
             embedding = await embedder.create(text)
             client = await self._get_qdrant()
-            # Over-fetch so filtering out stream 1/2 overlaps still leaves K.
+            # Over-fetch so filtering out stream 1-3 overlaps still leaves K.
             overfetch = self._config.curator.pool_embedding_cap + 20
             results = await client.query_points(
                 collection_name=collection,
@@ -2865,7 +2879,7 @@ class TaskCurator:
             pool.append(entry)
             seen_ids.add(entry.task_id)
 
-        # Stream 4: dependency neighbors of the anchor
+        # Stream 5: dependency neighbors of the anchor
         dep_matches: list[PoolEntry] = []
         if anchor_entry is not None and all_tasks_flat:
             anchor_deps = _task_dependencies(
@@ -2901,6 +2915,7 @@ class TaskCurator:
         # keeps the stream counts and total_cap DISJOINT by construction: a
         # stream can only count ids that were never admitted, the trim only
         # ids that were, so `total` stays a count of distinct absent entries.
+        sibling_withheld = _count_absent(sibling_overflow_ids, seen_ids)
         module_withheld = _count_absent(module_overflow_ids, seen_ids)
         embedding_withheld = _count_absent(embedding_unvisited_ids, seen_ids)
         dependency_withheld = _count_absent(dep_overflow_ids, seen_ids)
@@ -2915,7 +2930,7 @@ class TaskCurator:
         }
         withheld = PoolWithheld(
             by_source={
-                'sibling': 0,
+                'sibling': sibling_withheld,
                 'module': module_withheld,
                 'embedding': embedding_withheld,
                 'dependency': dependency_withheld,
@@ -2932,6 +2947,57 @@ class TaskCurator:
         )
         return pool, pool_sizes, withheld
 
+    async def _sibling_stream(
+        self,
+        parent_id: str,
+        project_root: str,
+        *,
+        lock_depth: int,
+        exclude: set[str],
+    ) -> tuple[list[PoolEntry], list[str]]:
+        """The non-cancelled tasks sharing *parent_id* as ``spawned_from``, ranked and capped.
+
+        It runs ahead of the module, embedding and dependency streams, so a
+        sibling is never left to rank in by its files or its embedding.
+        Returns ``(entries, overflow_ids)``: the admitted entries, and the
+        ranked ids that ``pool_sibling_cap`` kept out.
+        """
+        taskmaster = self._taskmaster
+        cap = self._config.curator.pool_sibling_cap
+        if taskmaster is None or cap < 1:
+            return [], []
+        rows: dict[int, MetadataLookupRow] = {}
+        try:
+            for value in _sibling_lookup_values(parent_id):
+                page = await taskmaster.find_tasks_by_metadata(
+                    project_root, 'spawned_from', value,
+                    statuses=list(_SIBLING_LOOKUP_STATUSES), limit=_SIBLING_LOOKUP_PAGE,
+                )
+                rows.update((row['task_id'], row) for row in page['results'])
+        except Exception as exc:
+            logger.warning(
+                'task_curator: sibling lookup failed for parent %s: %s', parent_id, exc,
+            )
+            return [], []
+        ranked = sorted(
+            (row for row in rows.values() if str(row['task_id']) not in exclude),
+            key=_sibling_rank,
+        )
+        entries: list[PoolEntry] = []
+        overflow_ids: list[str] = []
+        for row in ranked:
+            tid = str(row['task_id'])
+            if len(entries) >= cap:
+                overflow_ids.append(tid)
+                continue
+            entry = await self._fetch_entry_for_neighbor(
+                tid, dict(row), source='sibling',
+                lock_depth=lock_depth, project_root=project_root,
+            )
+            if entry is not None:
+                entries.append(entry)
+        return entries, overflow_ids
+
     async def _fetch_entry_for_neighbor(
         self,
         tid: str,
@@ -2941,7 +3007,7 @@ class TaskCurator:
         lock_depth: int,
         project_root: str,
     ) -> PoolEntry | None:
-        """Fetch a full task for an embedding neighbor, fall back to payload.
+        """Fetch a full task for an embedding neighbour or a sibling, falling back to *payload*.
 
         ``get_task`` is called without a ``tag`` — it resolves to
         ``DEFAULT_TAG``. That does NOT match the Qdrant corpus's own scope:
@@ -2982,7 +3048,7 @@ class TaskCurator:
                 # to the cheap failure and keep the conservative thin entry
                 # built below, rather than risk dropping a live candidate.
                 pass
-        # Fallback: build a thin entry from the qdrant payload
+        # Fallback: build a thin entry from the qdrant payload or lookup row
         return PoolEntry(
             task_id=tid,
             title=str(payload.get('title', '')),
@@ -3350,13 +3416,48 @@ def _task_files(task: dict) -> list[str]:
     return [str(f) for f in files if f]
 
 
-def _task_metadata_spawned_from(task: dict) -> str | None:
-    meta = task.get('metadata') or {}
-    if isinstance(meta, dict):
-        v = meta.get('spawned_from')
-        if isinstance(v, str) and v:
-            return v
+_SIBLING_STREAM_SPAWN_CONTEXT = 'agent_followup'
+_SIBLING_LOOKUP_STATUSES: tuple[str, ...] = tuple(
+    sorted(status.value for status in TaskStatus if status is not TaskStatus.CANCELLED),
+)
+# One lookup page, far above the measured maximum of 11 siblings per parent;
+# rows past it are neither ranked nor counted.
+_SIBLING_LOOKUP_PAGE = 100
+
+
+def _spawned_from_id(value: object) -> str | None:
+    """The parent id a ``spawned_from`` value names, or ``None`` when it names none.
+
+    The live store holds str, int and dict values; only the first two name a task.
+    """
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
     return None
+
+
+def _followup_parent_id(candidate: CandidateTask) -> str | None:
+    """The parent whose follow-ups form *candidate*'s sibling stream, if it has one."""
+    if candidate.spawn_context != _SIBLING_STREAM_SPAWN_CONTEXT:
+        return None
+    return _spawned_from_id(candidate.spawned_from)
+
+
+def _sibling_lookup_values(parent_id: str) -> tuple[str | int, ...]:
+    """Every stored form of *parent_id*: the metadata lookup is type-strict."""
+    if parent_id.isdecimal():
+        return (parent_id, int(parent_id))
+    return (parent_id,)
+
+
+def _sibling_rank(row: MetadataLookupRow) -> tuple[bool, int, int]:
+    """Active before done, then by priority, then newest first."""
+    return (
+        row['status'] not in ACTIVE,
+        _PRIORITY_RANK.get(row['priority'], 99),
+        -row['task_id'],
+    )
 
 
 def _to_pool_entry(
