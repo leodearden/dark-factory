@@ -16,13 +16,13 @@ stateful task-store double and the queue.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-from _harness_escalation_link import drain_background_tasks, link_escalation_queue
 from _orch_helpers import wire_scheduler_liveness_mock
 from _task_store_doubles import TaskStoreDouble
 from escalation.models import Escalation
@@ -60,7 +60,8 @@ def harness(mock_orch_config, store: TaskStoreDouble, queue: EscalationQueue) ->
     wire_scheduler_liveness_mock(h.scheduler)
     store.wire_into(h.scheduler)
     h.is_workflow_active = lambda task_id: False  # type: ignore[method-assign]
-    link_escalation_queue(h, queue)
+    h._escalation_queue = queue
+    queue.set_resolve_callback(h._on_escalation_resolved)
     return h
 
 
@@ -88,7 +89,8 @@ async def _resolve(server, harness: Harness, **kwargs: Any) -> dict[str, Any]:
     tool = await server.get_tool('resolve_issue')
     assert isinstance(tool, FunctionTool)
     result = tool.fn(resolution='re-plan on current main', **kwargs)
-    await drain_background_tasks(harness)
+    while harness._background_tasks:
+        await asyncio.gather(*list(harness._background_tasks))
     return result
 
 
