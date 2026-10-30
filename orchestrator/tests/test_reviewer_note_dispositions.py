@@ -37,7 +37,6 @@ from orchestrator.config import (
 )
 from orchestrator.escalation_router import REVIEWER_LEG_ID, read_hold
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.git_ops import GitOps
 from orchestrator.mcp.verdict_tools import _envelope, _submit_review_verdict
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
@@ -263,7 +262,7 @@ class _FullRun:
         _init_repo(repo)
         config = _run_config(repo)
         self.workflow, _scheduler, self.queue = _build_workflow_with_escalation(
-            config, GitOps(config.git, config.project_root), _assignment(), stub, tmp_path,
+            config, _make_git_ops(config.project_root), _assignment(), stub, tmp_path,
         )
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
