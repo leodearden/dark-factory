@@ -26,7 +26,7 @@ import sys
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -42,8 +42,15 @@ from orchestrator.flake_ledger import (
     FlakeVerdict,
 )
 from orchestrator.offline_lane_confirm import Confirmed
-from orchestrator.offline_lane_episode_state import LanePolicy, OfferedDebt, unconfirmable_node
-from orchestrator.offline_lane_filing import LANE_METADATA_KEY
+from orchestrator.offline_lane_episode_state import (
+    CommandRecord,
+    Episode,
+    LanePolicy,
+    OfferedDebt,
+    unconfirmable_node,
+)
+from orchestrator.offline_lane_escalations import PENDING_ESCALATION
+from orchestrator.offline_lane_filing import LANE_METADATA_KEY, covering_lane_task
 from orchestrator.offline_lane_records import FailureRecord, PassRecord
 from shared.project_layout import default_project_root
 
@@ -131,12 +138,6 @@ def _verdict(examined: int, failures: Sequence[str]) -> Verdict:
 CheckFn = Callable[[SoakInputs, str, Settings], CheckResult]
 
 
-def _not_yet_judged(check: Check) -> CheckFn:
-    def judge(inputs: SoakInputs, rule: str, settings: Settings) -> CheckResult:
-        return _judged(check, rule, 0)
-    return judge
-
-
 def _label(window_pass: WindowPass) -> str:
     return f'{window_pass.stored.command_key}/{window_pass.pass_id}'
 
@@ -222,6 +223,84 @@ def _ledger_rows_per_pass(inputs: SoakInputs, rule: str, settings: Settings) -> 
     return _judged(Check.LEDGER_ROWS_PER_PASS, rule, examined, failures)
 
 
+def _live_episodes(inputs: SoakInputs) -> Iterator[Episode]:
+    for record in inputs.episodes.values():
+        yield from (episode for episode in record.episodes.values() if episode.live)
+
+
+def _known_lane_tasks(inputs: SoakInputs) -> dict[str, Mapping[str, Any]]:
+    """The tasks the windowed effect blocks filed, then those the live episodes are or were bound to, as read."""
+    filed = [task_id for _, effect in inputs.effects() for task_id in effect.tasks_filed]
+    bound = [
+        task_id
+        for episode in _live_episodes(inputs)
+        for task_id in (episode.covering_task_id, *episode.prior_task_ids)
+        if task_id is not None
+    ]
+    return {
+        task_id: task for task_id in dict.fromkeys((*filed, *bound)) if (task := inputs.tasks.get(task_id)) is not None
+    }
+
+
+@dataclass(frozen=True)
+class _Crossing:
+    """One (pass, test) entry of a windowed effect block's threshold_reached, and what the lane holds for it now."""
+
+    window_pass: WindowPass
+    command: str
+    node: str
+    episode: Episode | None
+    stuck_record_state: str | None
+
+
+def _crossings(inputs: SoakInputs) -> Iterator[_Crossing]:
+    for window_pass, effect in inputs.effects():
+        record = window_pass.stored.record
+        if record is None:
+            continue
+        held = inputs.episodes.get(record.command) or CommandRecord.empty(record.command)
+        stuck_id = held.stuck_filing_escalation_id
+        state = None if stuck_id is None else inputs.escalation_states.get(stuck_id)
+        for node in dict.fromkeys(effect.threshold_reached):
+            episode = held.episodes.get(node)
+            yield _Crossing(window_pass, record.command, node, episode if episode and episode.live else None, state)
+
+
+def _owned(crossing: _Crossing, lane_tasks: Mapping[str, Mapping[str, Any]]) -> bool:
+    episode = crossing.episode
+    if covering_lane_task(lane_tasks, crossing.command, crossing.node) is not None:
+        return True
+    if episode is not None and episode.covering_task_id is not None:
+        return True
+    return episode is not None and episode.filing_due and crossing.stuck_record_state == PENDING_ESCALATION
+
+
+def _due_within(crossing: _Crossing, now: datetime, recheck: timedelta) -> datetime | None:
+    """When the crossing's filing fell due, if that is less than *recheck* before *now*."""
+    episode = crossing.episode
+    if episode is None or not episode.filing_due or episode.filing_due_since is None:
+        return None
+    return episode.filing_due_since if now - episode.filing_due_since < recheck else None
+
+
+def _no_stranded_filing(inputs: SoakInputs, rule: str, settings: Settings) -> CheckResult:
+    lane_tasks = _known_lane_tasks(inputs)
+    recheck = timedelta(seconds=settings.recheck_secs)
+    crossings = list(_crossings(inputs))
+    failures: list[str] = []
+    notes: list[str] = []
+    for crossing in crossings:
+        if _owned(crossing, lane_tasks):
+            continue
+        what = f'{crossing.command}: {crossing.node} (threshold reached at {_label(crossing.window_pass)})'
+        due_since = _due_within(crossing, inputs.now, recheck)
+        if due_since is not None:
+            notes.append(f'pending: {what}, filing due since {due_since.isoformat()}')
+        else:
+            failures.append(f'{what} has no covering lane task and no pending stuck-filing record')
+    return _judged(Check.NO_STRANDED_FILING, rule, len(crossings), failures, notes)
+
+
 def _offered(inputs: SoakInputs) -> Iterator[tuple[WindowPass, PassRecord, OfferedDebt]]:
     for window_pass, effect in inputs.effects():
         record = window_pass.stored.record
@@ -289,12 +368,12 @@ def _offered_debts_owned_or_due(inputs: SoakInputs, rule: str, settings: Setting
 
 
 _CHECKS: dict[Check, CheckFn] = {
-    **{check: _not_yet_judged(check) for check in Check},
     Check.RECORDS_WELL_FORMED: _records_well_formed,
     Check.FILINGS_RESOLVE: _filings_resolve,
     Check.FILINGS_BOUNDED_BY_THRESHOLD: _filings_bounded_by_threshold,
     Check.LEDGER_ROWS_PER_PASS: _ledger_rows_per_pass,
     Check.DEFLAKE_TASKS_CARRY_EVIDENCE: _deflake_tasks_carry_evidence,
+    Check.NO_STRANDED_FILING: _no_stranded_filing,
     Check.OFFERED_DEBTS_OWNED_OR_DUE: _offered_debts_owned_or_due,
 }
 

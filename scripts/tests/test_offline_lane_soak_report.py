@@ -39,7 +39,11 @@ from orchestrator.offline_lane_confirm import (
     UnconfirmableReason,
 )
 from orchestrator.offline_lane_episode_state import CommandRecord, OfferedDebt, unconfirmable_node
-from orchestrator.offline_lane_escalations import StuckFiling, file_stuck_filing, resolve_stuck_filing
+from orchestrator.offline_lane_escalations import (
+    StuckFiling,
+    file_stuck_filing,
+    resolve_stuck_filing,
+)
 from orchestrator.offline_lane_filing import LANE_METADATA_KEY
 from orchestrator.offline_lane_records import LanePass, Phase, ProbeKind, ProbeResult
 from shared.project_layout import escalation_queue_dir

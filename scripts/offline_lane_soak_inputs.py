@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import _checkout as _checkout
+from escalation.queue import EscalationQueue
 from orchestrator.flake_ledger import (
     DUE_ITEM_STALE_AFTER,
     DebtRow,
@@ -37,6 +38,7 @@ from orchestrator.offline_lane_episode_state import (
     EpisodeStore,
     PassEffect,
 )
+from orchestrator.offline_lane_escalations import escalation_state
 from orchestrator.offline_lane_records import (
     FailureRecord,
     Phase,
@@ -120,7 +122,9 @@ class LedgerReads:
 @dataclass(frozen=True)
 class SoakInputs:
     """*tasks* maps each task read to its body, or None for a corroborated absence; *failures* maps
-    (command, test) to that test's failure records over every stored pass of the selected commands."""
+    (command, test) to that test's failure records over every stored pass of the selected commands;
+    *escalation_states* maps each escalation id the episode records name to its status, or None
+    when the queue holds no such record."""
 
     since: datetime
     now: datetime
@@ -130,6 +134,7 @@ class SoakInputs:
     tasks: Mapping[str, Mapping[str, Any] | None]
     ledger: LedgerReads
     failures: Mapping[tuple[str, str], tuple[FailureRecord, ...]]
+    escalation_states: Mapping[str, str | None]
 
     def effects(self) -> Iterator[tuple[WindowPass, PassEffect]]:
         """Each windowed pass that carries a readable effect block, with that block."""
@@ -245,6 +250,13 @@ def _task_ids(window: Sequence[WindowPass], episodes: Mapping[str, CommandRecord
     return list(dict.fromkeys((*filed, *bound, *owners)))
 
 
+def _stuck_filing_states(queue_dir: Path, episodes: Mapping[str, CommandRecord]) -> dict[str, str | None]:
+    """Each command's stuck-filing record and its status; *queue_dir* exists, so the queue makes nothing."""
+    queue = EscalationQueue(queue_dir)
+    ids = [r.stuck_filing_escalation_id for r in episodes.values() if r.stuck_filing_escalation_id is not None]
+    return {escalation_id: escalation_state(queue, escalation_id) for escalation_id in ids}
+
+
 async def _read_tasks(
     task_ids: Sequence[str], task_reader: TaskReader,
 ) -> dict[str, Mapping[str, Any] | None] | Unjudgeable:
@@ -301,4 +313,5 @@ async def load_inputs(
         tasks=tasks,
         ledger=ledger,
         failures=_failures(every_pass, selected),
+        escalation_states=_stuck_filing_states(stores.escalations, episodes),
     )
