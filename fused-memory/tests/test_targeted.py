@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -1826,6 +1827,41 @@ def _raising_escalation_queue_factory(stage: str):
     return _DiskFullQueue
 
 
+def _thread_recording_factory(threads: list[int]):
+    """An ``escalation_queue_factory`` over the real queue that appends the
+    calling thread's id to *threads* on every store touch: construction,
+    ``make_id``, ``submit`` and ``get_pending``."""
+    from escalation.queue import EscalationQueue
+
+    class _ThreadRecordingQueue(EscalationQueue):
+        def __init__(self, queue_dir: Path):
+            threads.append(threading.get_ident())
+            super().__init__(queue_dir)
+
+        def make_id(self, key: str) -> str:
+            threads.append(threading.get_ident())
+            return super().make_id(key)
+
+        def submit(self, escalation):
+            threads.append(threading.get_ident())
+            return super().submit(escalation)
+
+        def get_pending(self):
+            threads.append(threading.get_ident())
+            return super().get_pending()
+
+    return _ThreadRecordingQueue
+
+
+def _assert_store_io_off_the_loop(threads: list[int], loop_thread: int) -> None:
+    """INV-8: the escalation store was touched, and never on the event-loop thread."""
+    assert threads, 'Expected the injected escalation queue to be used'
+    assert loop_thread not in threads, (
+        f'Escalation-store I/O ran on the event-loop thread {loop_thread}; '
+        f'threads recorded: {threads}'
+    )
+
+
 class TestSweepCancelledDescendants:
     """Auto-sweep dep-tree on task cancellation."""
 
@@ -1967,6 +2003,8 @@ class TestSweepCancelledDescendants:
         assert payload['level'] == 1
         assert payload['severity'] == 'blocking'
         assert payload['category'] == 'scope_violation'
+        assert payload['agent_role'] == 'reconciler'
+        assert payload['suggested_action'] == 'expand_scope|abort_task'
 
         # And the action surfaces in the result
         escs = [a for a in result.get('actions', []) if a.get('type') == 'descendant_escalated']
@@ -2954,6 +2992,24 @@ class TestSweepCancelledDescendants:
         assert not (tmp_path / 'data' / 'escalations').exists(), (
             'Without the escalation package the queue dir must not be created'
         )
+
+    @pytest.mark.asyncio
+    async def test_escalate_queue_io_runs_off_the_event_loop(
+        self, make_reconciler, mock_taskmaster, mock_interceptor, monkeypatch, tmp_path,
+    ):
+        self._orchestrator_live(monkeypatch)
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._block_branch_tasks())
+        threads: list[int] = []
+        reconciler = make_reconciler(
+            escalation_queue_factory=_thread_recording_factory(threads),
+        )
+        reconciler.task_interceptor = mock_interceptor
+        loop_thread = threading.get_ident()
+
+        result = await self._sweep_cancelled_parent(reconciler, tmp_path)
+
+        assert len(self._descendant_actions(result, 'descendant_escalated')) == 1, result
+        _assert_store_io_off_the_loop(threads, loop_thread)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('tasks_key,orchestrator_live,action_type', [
@@ -6032,6 +6088,22 @@ async def test_unblock_sweep_scans_escalation_store_once_for_many_dependents(
 
 
 @pytest.mark.asyncio
+async def test_unblock_veto_reads_the_escalation_store_off_the_event_loop(
+    make_reconciler, mock_taskmaster, tmp_path,
+):
+    threads: list[int] = []
+    reconciler = make_reconciler(escalation_queue_factory=_thread_recording_factory(threads))
+    _wire_mock_interceptor(reconciler)
+    loop_thread = threading.get_ident()
+
+    result = await _unblock_sweep_over_blocked_task_2(reconciler, mock_taskmaster, str(tmp_path))
+
+    [action] = _dep_actions_for(result, '2')
+    assert action['type'] == 'dependent_unblock_applied', action
+    _assert_store_io_off_the_loop(threads, loop_thread)
+
+
+@pytest.mark.asyncio
 async def test_unblock_dependent_skipped_when_live_status_left_blocked(
     wired_reconciler, mock_taskmaster, tmp_path,
 ):
@@ -7165,6 +7237,26 @@ class TestContradictedEscalation:
         assert writes[0].kwargs['content'].startswith('Codebase evidence CONTRADICTS'), (
             f'Got {writes[0].kwargs["content"]!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_contradicted_escalation_queue_io_runs_off_the_event_loop(
+        self, make_reconciler, tmp_path,
+    ):
+        threads: list[int] = []
+        reconciler = make_reconciler(
+            escalation_queue_factory=_thread_recording_factory(threads),
+        )
+        reconciler.verifier.verify = AsyncMock(return_value=_contradicted_result())
+        loop_thread = threading.get_ident()
+
+        result = await _run_done_transition(reconciler, project_root=str(tmp_path))
+
+        escalated = [
+            a for a in result.get('actions', [])
+            if a['type'] == 'verification_contradicted_escalated'
+        ]
+        assert len(escalated) == 1, result.get('actions')
+        _assert_store_io_off_the_loop(threads, loop_thread)
 
     @pytest.mark.parametrize('result_kwargs, label', [
         ({'verdict': VerificationVerdict.confirmed}, 'confirmed'),
