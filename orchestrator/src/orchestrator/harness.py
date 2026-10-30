@@ -9599,6 +9599,14 @@ class Harness:
                 'will still attempt to file escalation',
                 task_id, exc_info=True,
             )
+        self._file_dispatch_gate_l1(
+            task_id, category=category, summary=summary, detail=detail,
+        )
+
+    def _file_dispatch_gate_l1(
+        self, task_id: str, *, category: str, summary: str, detail: str,
+    ) -> None:
+        """File one category-scoped L1 for *task_id*, unless one is already open."""
         if not self._escalation_queue:
             logger.warning(
                 'Dispatch-gate block for task %s — no escalation queue, skipping L1 file',
@@ -16860,6 +16868,9 @@ class Harness:
             self._action_teardown_and_set_status(
                 escalation.task_id, effect.target_status, action,
                 escalation_id=escalation.id,
+                recut_ruling_id=(
+                    self._recut_ruling_id(escalation) if action == 'restart' else None
+                ),
             ),
             label=(
                 f'action-teardown task {escalation.task_id} '
@@ -16874,16 +16885,25 @@ class Harness:
         action: str,
         *,
         escalation_id: str,
+        recut_ruling_id: str | None = None,
     ) -> None:
         """Async helper: execute a non-resume resolution action on a task.
 
         Implements C3.1 (status-precedes-kill) ordering:
           1. Terminal recheck — skip if the task is already done/cancelled.
           2. restart only: clear ``metadata.merge_retry_pending`` (task 3024).
-          3. Stamp ``_action_teardown_tasks`` (suppression, C3.2 / D9).
-          4. Write ``target_status`` via scheduler.
-          5. Kill live workflow if active (soft → grace → hard).
-          6. In the finally block, once the kill window closes: clear the
+          3. restart with ``recut_ruling_id`` only (task 5516): issue
+             ``metadata.recut_ruling`` so the next dispatch re-cuts the task
+             fresh off main (``orchestrator/recut_ruling.py``).  Written
+             before the status write, so any dispatch that reads 'pending'
+             also reads the ruling.  FAILS CLOSED: if the ruling cannot be
+             persisted, ``target_status`` becomes 'blocked' (the kill still
+             runs) and a RESTART_RECUT_UNRECORDED infra_issue L1 is filed,
+             rather than re-pending onto the stale plan and branch.
+          4. Stamp ``_action_teardown_tasks`` (suppression, C3.2 / D9).
+          5. Write ``target_status`` via scheduler.
+          6. Kill live workflow if active (soft → grace → hard).
+          7. In the finally block, once the kill window closes: clear the
              suppression stamp, then (restart only) re-run step 2's clear so a
              stamp resurrected by the dying workflow's own metadata write does
              not survive the restart.
@@ -16950,6 +16970,10 @@ class Harness:
         # window has closed (see there).
         if action == 'restart':
             await self._clear_merge_retry_pending_for_restart(task_id)
+        if recut_ruling_id is not None and not await self._issue_restart_recut_ruling(
+            task_id, recut_ruling_id, escalation_id=escalation_id,
+        ):
+            target_status = 'blocked'
 
         logger.info(
             'action-teardown %s: writing task %s → %s',
@@ -17157,6 +17181,53 @@ class Harness:
             task_id,
         )
 
+    async def _issue_restart_recut_ruling(
+        self, task_id: str, ruling_id: str, *, escalation_id: str,
+    ) -> bool:
+        """Persist a re-cut ruling for a restart; False (and an L1 filed) if it did not land."""
+        failure = await recut_ruling.issue_ruling(
+            recut_ruling.RecutRuling(ruling_id, datetime.now(UTC)),
+            persist=functools.partial(self.scheduler.update_task, task_id),
+        )
+        if failure is None:
+            logger.info('RECUT ISSUED: task %s ruling %s', task_id, ruling_id)
+            return True
+        logger.error(
+            'RECUT UNRECORDED: task %s ruling %s via %s: %s — holding the task blocked',
+            task_id, ruling_id, escalation_id, failure,
+        )
+        self._file_dispatch_gate_l1(
+            task_id,
+            category='infra_issue',
+            summary=(
+                f'RESTART_RECUT_UNRECORDED: task {task_id} restart via {escalation_id} '
+                'demanded a re-cut that could not be recorded'
+            ),
+            detail=(
+                f'Writing metadata.recut_ruling (ruling {ruling_id}) failed: {failure}.\n'
+                'The task is held blocked rather than re-pended onto its stale plan and '
+                'branch. Remedy: once the task store is healthy, re-issue '
+                "resolve_issue(action='restart', recut=True) on a fresh escalation."
+            ),
+        )
+        return False
+
+    def _cascade_parent(self, escalation) -> Escalation | None:
+        """The parent L2 of an ``l2-cascade:<id>`` member, or None."""
+        resolved_by = escalation.resolved_by
+        if not (isinstance(resolved_by, str) and resolved_by.startswith('l2-cascade:')):
+            return None
+        if self._escalation_queue is None:
+            return None
+        return self._escalation_queue.get(resolved_by.split(':', 1)[1])
+
+    def _recut_ruling_id(self, escalation) -> str | None:
+        """The id of the record whose resolution set ``recut``, or None."""
+        if escalation.recut:
+            return escalation.id
+        parent = self._cascade_parent(escalation)
+        return parent.id if parent is not None and parent.recut else None
+
     def _resolve_escalation_action(self, escalation) -> str:
         """Resolve the canonical action for a resolved/dismissed escalation.
 
@@ -17176,20 +17247,11 @@ class Harness:
         if escalation.resolution_action is not None:
             return escalation.resolution_action
 
-        # 2) Cascade member: inherit parent L2's action.
-        if (
-            isinstance(escalation.resolved_by, str)
-            and escalation.resolved_by.startswith('l2-cascade:')
-        ):
-            parent_id = escalation.resolved_by.split(':', 1)[1]
-            parent = (
-                self._escalation_queue.get(parent_id)
-                if self._escalation_queue is not None
-                else None
-            )
-            if parent is not None and parent.resolution_action is not None:
-                return parent.resolution_action
-            # Fall through to legacy map (parent also lacks resolution_action).
+        # 2) Cascade member: inherit parent L2's action.  Falls through to the
+        #    legacy map when there is no parent or it lacks resolution_action.
+        parent = self._cascade_parent(escalation)
+        if parent is not None and parent.resolution_action is not None:
+            return parent.resolution_action
 
         # 3) Legacy mapping.
         if escalation.status == 'dismissed':
