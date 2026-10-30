@@ -1238,6 +1238,37 @@ def _closure_permits_retirement(
     )
 
 
+def _warn_retained_foreign_kinds(
+    log_name: str,
+    source: str,
+    count: int,
+    kinds: set[str],
+    project_id: str,
+    run_id: str,
+) -> None:
+    """Emit the one fail-safe WARNING for foreign-kind records a sweep kept (task 6241)."""
+    try:
+        logger.warning(
+            'reconciliation.%s: RETAINED %d record(s) declaring a foreign kind '
+            '(kinds=%s) matched by this %s pool filter — not members of this pool, '
+            'never deleted by this sweep (task 6241). The pool\'s create path is '
+            'closed, so this is an anomaly: delete a dead record with the '
+            'fused-memory MCP delete_memory tool, or register a permanent audit '
+            'kind in mem0_tombstone.PROTECTED_AUDIT_KINDS. Per-record ids are '
+            'logged at DEBUG.',
+            log_name, count, ','.join(sorted(kinds)), source,
+            extra={'project_id': project_id, 'run_id': run_id, 'log_name': log_name},
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation.%s: foreign-kind diagnostic raised; skipping '
+            '(fail-safe, does not affect the sweep count).',
+            log_name,
+            exc_info=True,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+
+
 async def _sweep_stale_mem0_pool(
     memory_service,
     project_id: str,
@@ -1253,6 +1284,7 @@ async def _sweep_stale_mem0_pool(
     enum_filters: dict | Sequence[dict] | None = None,
     terminal_task_ids: Collection[str] | None = None,
     taskless_retirement: _TasklessRetirement | None = None,
+    pool_kind: str | None = None,
 ) -> int:
     """Shared age-GC skeleton for a single-source Mem0 marker pool.
 
@@ -1330,9 +1362,10 @@ async def _sweep_stale_mem0_pool(
     The ``None``-vs-``[]`` sentinel is load-bearing:
 
     - ``None`` (the default) means "NO gate requested" and leaves this
-      skeleton byte-for-byte as it was for the two age-only callers
-      (:func:`_sweep_stale_persistence_markers`,
-      :func:`_sweep_stale_mem0_flag_markers`), which are age-only by design.
+      skeleton byte-for-byte as it was for the two age-based callers with no
+      closure gate (:func:`_sweep_stale_persistence_markers`,
+      :func:`_sweep_stale_mem0_flag_markers`; the latter also withholds
+      foreign kinds through *pool_kind*).
     - An EMPTY collection means "gate active, nothing is terminal" and
       therefore retires no task-citing member this cycle.
       :func:`_resolve_terminal_task_ids` is explicitly fail-safe to ``[]`` on
@@ -1467,6 +1500,13 @@ async def _sweep_stale_mem0_pool(
             (default) keeps every such member. Has no effect when
             *terminal_task_ids* is ``None``, because then every age-stale
             member is already eligible.
+        pool_kind: Opt-in pool-membership arm (task 6241). When given, a
+            member for which
+            :func:`~fused_memory.reconciliation.mem0_tombstone.is_foreign_kind_record`
+            holds is kept at any age, checked after the two protected-record
+            guards and before the age test, and reported in one aggregate
+            WARNING per sweep. ``None`` (default) skips the arm, for a pool
+            whose filter is wide by design.
 
     Returns:
         Number of memories successfully deleted (0 if nothing is stale, on
@@ -1653,6 +1693,8 @@ async def _sweep_stale_mem0_pool(
     # to avoid. The per-member detail is not lost, only demoted to DEBUG.
     protected_audit = 0
     protected_audit_kinds: set[str] = set()
+    foreign_kind = 0
+    foreign_kinds: set[str] = set()
     for member in members:
         mid = member.get('id')
         if not mid:
@@ -1706,6 +1748,24 @@ async def _sweep_stale_mem0_pool(
                 '(kind=%s) — this pool filter matched a deliberately-permanent '
                 'audit-log record it must never delete; it is retained regardless '
                 'of age (task 4375).',
+                log_name, mid, kind,
+                extra={
+                    'project_id': project_id,
+                    'memory_id': mid,
+                    'run_id': run_id,
+                    'log_name': log_name,
+                },
+            )
+            continue
+
+        if pool_kind is not None and is_foreign_kind_record(member_metadata, pool_kind):
+            metadata = member_metadata if isinstance(member_metadata, dict) else {}
+            kind = metadata.get('kind')
+            foreign_kind += 1
+            foreign_kinds.add(kind if isinstance(kind, str) else repr(kind))
+            logger.debug(
+                'reconciliation.%s: SKIPPING foreign-kind record memory_id=%s '
+                '(kind=%r) — not a member of this pool (task 6241).',
                 log_name, mid, kind,
                 extra={
                     'project_id': project_id,
@@ -1784,6 +1844,11 @@ async def _sweep_stale_mem0_pool(
                 exc_info=True,
                 extra={'project_id': project_id, 'run_id': run_id},
             )
+
+    if foreign_kind > 0:
+        _warn_retained_foreign_kinds(
+            log_name, source, foreign_kind, foreign_kinds, project_id, run_id,
+        )
 
     if retained_unclosed > 0:
         # Retained-unclosed diagnostic (task 4375). The gate's KEEP direction
@@ -2014,6 +2079,13 @@ async def _sweep_stale_mem0_flag_markers(
     :func:`_sweep_stale_mem0_pool`'s docstring for the full all-variants-zero
     rule and why this is safe to fail open.
 
+    Withholds foreign-kind records (task 6241): a member declaring a ``kind``
+    other than ``stage1_flag_marker`` belongs to another pool and is kept at
+    any age, with one WARNING per sweep, so this collector and
+    ``fused-memory/scripts/sweep_orphan_flag_markers.py`` agree on what the
+    pool is. The decision and its accepted cost are recorded in
+    ``docs/flag-marker-sweep-recurring.md``.
+
     Args:
         memory_service: Service with ``get_memories_by_metadata``,
             ``delete_memory``, and ``count_memories_by_metadata``.
@@ -2042,6 +2114,7 @@ async def _sweep_stale_mem0_flag_markers(
         scroll_limit=scroll_limit,
         count_short_circuit=True,
         enum_filters=_STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS,
+        pool_kind=_STAGE1_FLAG_MARKER_MEM0_SOURCE,
     )
 
 
@@ -3760,7 +3833,7 @@ class TaskKnowledgeSync(BaseStage):
         # cycle, per-project, alongside the three sibling GC passes; explicit
         # value so downstream consumers never need a .get(..., 0) fallback.
         #
-        # Unlike the two age-only sibling sweeps above, retirement here is
+        # Unlike the two age-based sibling sweeps above, retirement here is
         # composite and gated on the terminal ids hoisted above (tasks 4375,
         # 4995); _sweep_stale_mem0_flag_for_stage2_markers' docstring owns the rule.
         report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'] = (
