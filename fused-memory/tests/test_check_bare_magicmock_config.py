@@ -1408,7 +1408,8 @@ class TestAllScannedTestDirsClean:
             'Remedy depends on the rule:\n'
             '  bare-magicmock        → mock_orch_config / MagicMock(spec_set=pydantic_spec(...))\n'
             '  bare-dataclass-double → fake_verify_result(...) / MagicMock(spec=VerifyResult)\n'
-            '  wall-clock-deadline   → wait_responsive(...) with a label= / bound derived from MERGE_RESULT_TIMEOUT\n'
+            '  wall-clock-deadline   → wait_responsive(...) with a label= / bound derived from MERGE_RESULT_TIMEOUT,\n'
+            '                          or, for a debt-baseline slack report, lower the named budget\n'
             f'Scanned: {present}\n'
             f'Violations:\n{result.stdout}\n'
             f'stderr:\n{result.stderr}'
@@ -2087,17 +2088,19 @@ class TestWallClockDeadlineDebtBaseline:
 
       * A sum-and-count pin (``len(debt) == 20 and sum(...) == 618``) was tried and
         REMOVED in task 4246's amendment pass. It restated in literals what the
-        exact-paths frozenset above and the two live-census tests in
-        TestWallClockDeadlineBaselineIntegrity already enforce against the real
-        repo — and it taxed the one workflow this whole design exists to enable:
-        migrating a single wait under orchestrator/tests then meant editing three
-        literals in another package's test file before the suite went green.
-      * The live-census tests themselves had no Rule B counterpart. That WAS a
-        scope escalation over the precedent, kept on purpose: Rule C's baseline is
-        a per-file BUDGET rather than Rule B's bare list, so slack above the
-        measurement is not inert — it silently licences that many new waits. The
-        cost is that an orchestrator-side edit can turn fused-memory RED, so those
-        failure messages lead with the exact edit to make, not with a diagnosis.
+        exact-paths frozenset above and the checker's own exact budget already
+        enforce against the real repo — and it taxed the one workflow this whole
+        design exists to enable: migrating a single wait under orchestrator/tests
+        then meant editing three literals in another package's test file before
+        the suite went green.
+      * The exact-budget guard has no Rule B counterpart. That WAS a scope
+        escalation over the precedent, kept on purpose: Rule C's baseline is a
+        per-file BUDGET rather than Rule B's bare list, so slack above the
+        measurement is not inert — it silently licences that many new waits. It
+        first lived as live-census tests in this module, so an orchestrator-side
+        removal turned fused-memory RED.  Task 6202 moved it into the checker's
+        own slack leg (TestWallClockDeadlineDebtSlack): the same removal now reds
+        orchestrator's own lint_command, naming the edit, not this suite.
 
     For the same reason as that removed pin, no test here is anchored to a real
     file's exact budget: the pure helpers take synthetic inputs, and the
@@ -2455,13 +2458,20 @@ class TestDebtBaselineIsolation:
 
 @pytest.mark.timeout(MAGICMOCK_REPO_SCAN_TEST_TIMEOUT)
 class TestWallClockDeadlineBaselineIntegrity:
-    """The Rule C baseline is a MEASUREMENT of the real repo, not a list of literals.
+    """The Rule C baseline names exactly the real files that carry Rule C debt.
 
     Every assertion here recomputes against the live source with the checker's own
     predicates.  A baseline asserted only from literals drifts silently: an entry
     whose file was deleted or renamed becomes a blanket suppression for a path
-    nothing occupies — which would grandfather a NEW file created there — and a
-    budget that drifted BELOW its file makes that package's lint_command red.
+    nothing occupies — which would grandfather a NEW file created there — and an
+    offending file the census missed is reported only as a wall of lint output.
+
+    The per-file comparison of count against budget does NOT live here: the
+    checker's own ``_apply_debt_budget`` makes it at every lint call site (and
+    TestAllScannedTestDirsClean runs that lint over every scanned dir), so a
+    removal reds the owning package's lint_command naming the edit (task 6202).
+    What a per-file lint cannot see is a debt file that no longer exists, which
+    is why the existence test stays.
     """
 
     def _live_count(self, path: Path, entry: str) -> int:
@@ -2485,60 +2495,6 @@ class TestWallClockDeadlineBaselineIntegrity:
             f'Rule C debt baseline entries no longer exist in the repo: {missing}. '
             'A stale entry silently suppresses Rule C for a path nothing occupies — '
             'and would grandfather a NEW file created at that path. Remove them.'
-        )
-
-    def test_recorded_budgets_are_not_below_the_live_per_file_census(self):
-        """Every recorded budget still covers what its file actually carries.
-
-        This is the shrink-only invariant measured against the real repo rather than
-        asserted from a literal. A budget that drifted BELOW its file would make
-        orchestrator's lint_command red; one far above would be silent slack.
-        """
-        overruns = []
-        for entry, budget in _checker._WALL_CLOCK_DEADLINE_DEBT.items():
-            path = _REPO_ROOT / entry
-            if not path.is_file():
-                continue  # covered by test_every_debt_entry_resolves_to_an_existing_file
-            actual = self._live_count(path, entry)
-            if actual > budget:
-                overruns.append(f'{entry}: recorded {budget}, found {actual}')
-        assert overruns == [], (
-            'Rule C debt budgets are below the live census, so these files are RED:\n  '
-            + '\n  '.join(overruns)
-            + '\nThe baseline is shrink-only: migrate the new site(s) onto '
-            'wait_responsive(...) with a label=, or derive the bound from '
-            'MERGE_RESULT_TIMEOUT, rather than raising the recorded number.'
-        )
-
-    def test_recorded_budgets_match_the_live_census_exactly(self):
-        """No entry carries silent slack above its file's live count.
-
-        Slack is not harmless: a budget of 10 on a file carrying 6 lets four new
-        wall-clock waits land without ever tripping the gate. The baseline is a
-        measurement, so it must equal the measurement.
-        """
-        slack = []
-        for entry, budget in _checker._WALL_CLOCK_DEADLINE_DEBT.items():
-            path = _REPO_ROOT / entry
-            if not path.is_file():
-                continue
-            actual = self._live_count(path, entry)
-            if actual < budget:
-                slack.append(
-                    f"lower _WALL_CLOCK_DEADLINE_DEBT['{entry}'] from {budget} to "
-                    f'{actual}'
-                )
-        assert slack == [], (
-            # Lead with the EDIT, not the diagnosis: this test fires for an author
-            # who just migrated or deleted a wait under orchestrator/tests and is
-            # now staring at a RED fused-memory suite naming no file they touched.
-            'Rule C debt budgets carry slack above the live census. Apply these edits '
-            'in fused-memory/scripts/check_bare_magicmock_config.py:\n  '
-            + '\n  '.join(slack)
-            + '\n(If a count reaches 0, drop the entry and its line in '
-            '_EXPECTED_WALL_CLOCK_DEBT_PATHS in this file.)\n'
-            'Why this is an error and not slack you can leave: a budget above the '
-            'measurement lets that many NEW wall-clock waits land silently.'
         )
 
     def test_no_scanned_file_outside_the_baseline_carries_a_violation(self):
