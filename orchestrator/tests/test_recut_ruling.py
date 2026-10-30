@@ -21,7 +21,9 @@ from orchestrator.recut_ruling import (
     carries_recut_ruling,
     enforce_recut_ruling,
     execution_record,
+    issue_ruling,
     read_recut_ruling,
+    ruling_patch,
     ruling_to_enforce,
 )
 
@@ -343,3 +345,60 @@ class TestEnforceRecutRuling:
         assert PARKED.parked_branch is not None
         assert PARKED.parked_branch in gate.reason
         assert 're-dispatch is safe' in gate.reason
+
+
+ISSUED = RecutRuling(ruling_id='esc-5516-3', ruled_at=datetime(2026, 10, 30, 9, 15, tzinfo=UTC))
+
+
+class TestRulingPatch:
+    def test_patch_reads_back_as_the_pending_ruling(self):
+        patch = ruling_patch(ISSUED)
+        assert list(patch) == [RECUT_RULING_KEY]
+        task = {'id': '5516', 'metadata': patch}
+        reading = read_recut_ruling(task)
+        assert reading.state is RecutState.PENDING
+        assert reading.ruling == ISSUED
+        assert reading.ruling is not None and reading.ruling.ruled_at.tzinfo is not None
+        assert ruling_to_enforce(task) == ISSUED
+
+    def test_patch_survives_json_round_trip(self):
+        metadata = json.loads(json.dumps(ruling_patch(ISSUED)))
+        assert ruling_to_enforce({'id': '5516', 'metadata': metadata}) == ISSUED
+
+    def test_execution_record_satisfies_the_issued_ruling(self):
+        metadata = {
+            **ruling_patch(ISSUED),
+            RECUT_EXECUTED_KEY: execution_record(ISSUED, None, EXECUTED_AT),
+        }
+        task = {'id': '5516', 'metadata': metadata}
+        assert read_recut_ruling(task).state is RecutState.SATISFIED
+        assert ruling_to_enforce(task) is None
+
+    def test_newer_issued_ruling_over_an_older_execution_is_pending(self):
+        older = RecutRuling(ruling_id='esc-5516-1', ruled_at=datetime(2026, 10, 1, tzinfo=UTC))
+        metadata = {
+            RECUT_EXECUTED_KEY: execution_record(older, PARKED, EXECUTED_AT),
+            **ruling_patch(ISSUED),
+        }
+        task = {'id': '5516', 'metadata': metadata}
+        assert read_recut_ruling(task).state is RecutState.PENDING
+        assert ruling_to_enforce(task) == ISSUED
+
+
+@pytest.mark.asyncio
+class TestIssueRuling:
+    async def test_durable_write_returns_none(self):
+        persist = AsyncMock(return_value=True)
+        assert await issue_ruling(ISSUED, persist=persist) is None
+        persist.assert_awaited_once_with(ruling_patch(ISSUED))
+
+    async def test_store_reporting_failure_returns_a_reason(self):
+        failure = await issue_ruling(ISSUED, persist=AsyncMock(return_value=False))
+        assert isinstance(failure, str) and failure
+
+    async def test_store_raising_returns_a_reason_naming_the_exception(self):
+        failure = await issue_ruling(
+            ISSUED, persist=AsyncMock(side_effect=RuntimeError('store down')),
+        )
+        assert isinstance(failure, str)
+        assert 'store down' in failure
