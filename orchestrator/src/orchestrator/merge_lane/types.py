@@ -27,6 +27,7 @@ from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_n
 from orchestrator.branch_stack import PreStackTip
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
+from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
 from orchestrator.merge_lane.reverify_gate_decision import GateClearance
 from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
@@ -1194,6 +1195,13 @@ class MergeOutcome:
     nothing emits no value at all rather than a ``0``.  See
     test_merge_queue_deep_landing.py, which asserts the encoding through a
     verbatim transcription of that predicate rather than restating it."""
+    block_category: MergeBlockCategory = MergeBlockCategory.MERGE_ERROR
+    """The category the workflow files a generic ``blocked`` outcome under,
+    stated by the producer rather than inferred from ``reason`` (task 7302)."""
+    conflict_evidence: ConflictEvidence | None = None
+    """The paths a ``conflict`` outcome or a needs-rebase bounce conflicted on,
+    recorded into runs.db; ``None`` when no conflict was probed or the probe
+    failed open (task 7302)."""
 
 
 @dataclass
