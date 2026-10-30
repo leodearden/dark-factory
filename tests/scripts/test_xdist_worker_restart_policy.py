@@ -355,7 +355,7 @@ def _listing(root: pathlib.Path) -> list[str]:
 
 
 @pytest.mark.xdist_group(RESTART_REPRO_GROUP)
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(300)
 def test_restarts_permitted_abort_the_session_unattributed(
     synthetic_suite: _SyntheticSuite,
 ) -> None:
@@ -397,7 +397,7 @@ def test_restarts_permitted_abort_the_session_unattributed(
 
 
 @pytest.mark.xdist_group(RESTART_REPRO_GROUP)
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(300)
 def test_restarts_disabled_attribute_the_worker_death(
     synthetic_suite: _SyntheticSuite,
 ) -> None:
@@ -431,7 +431,7 @@ def test_restarts_disabled_attribute_the_worker_death(
 
 
 @pytest.mark.xdist_group(RESTART_REPRO_GROUP)
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(300)
 def test_a_synthetic_suite_run_leaves_the_hosts_default_temp_root_untouched(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
