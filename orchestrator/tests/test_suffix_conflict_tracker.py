@@ -716,6 +716,49 @@ class TestBounceRecordsItsConflict:
             conflicted_paths=('shared.txt',), counterpart_task_ids=('frozen-task',),
         )
 
+    @pytest.mark.parametrize('change', ['grows_from_empty', 'shrinks'])
+    async def test_counterparts_are_the_frozen_prefix_whose_tip_was_probed(
+        self, git_ops, config, git_repo, change: Literal['grows_from_empty', 'shrinks'],
+    ):
+        frozen_sha = await _create_branch_editing(
+            git_repo, 'task/frozen', 'shared.txt', 'FROZEN\nline2\nline3\n',
+        )
+        await _create_branch_editing(
+            git_repo, 'task/suffix', 'shared.txt', 'SUFFIX\nline2\nline3\n',
+        )
+        req_a = _make_req('frozen-a', 'frozen-a', config, git_repo)
+        req_b = _make_req('frozen-b', 'frozen-b', config, git_repo)
+        suffix_req = _make_req('suffix-task', 'suffix', config, git_repo)
+        buffers = {'high': collections.deque(), 'normal': collections.deque([suffix_req])}
+        before, after = {
+            'grows_from_empty': ({'requests': (), 'tip': None},
+                                 {'requests': (req_b,), 'tip': frozen_sha}),
+            'shrinks': ({'requests': (req_a, req_b), 'tip': frozen_sha},
+                        {'requests': (req_b,), 'tip': frozen_sha}),
+        }[change]
+        live = dict(before)
+        tracker = _make_tracker(
+            git_ops, lane_buffers=lambda: buffers,
+            frozen_requests=lambda: live['requests'],
+            frozen_prefix_tip=lambda main_sha: live['tip'] or main_sha,
+        )
+        real_get_main_sha = git_ops.get_main_sha
+
+        async def _prefix_changes_while_awaiting():
+            live.update(after)
+            return await real_get_main_sha()
+
+        git_ops.get_main_sha = _prefix_changes_while_awaiting
+
+        await tracker.recompute()
+
+        assert tracker.graph.conflict_evidence[suffix_req.request_id] == ConflictEvidence(
+            conflicted_paths=('shared.txt',), counterpart_task_ids=('frozen-b',),
+        ), (
+            f'frozen prefix moved from {[r.task_id for r in before["requests"]]} '
+            f'to {[r.task_id for r in after["requests"]]} during recompute'
+        )
+
     async def test_fail_open_probe_records_no_evidence(self, git_ops, config, git_repo):
         await _create_branch_editing(
             git_repo, 'task/suffix', 'shared.txt', 'SUFFIX\nline2\nline3\n',
