@@ -3955,6 +3955,62 @@ class TestAggregateResultsKeepsWorkerDeathNote:
         assert verify.is_no_verdict_summary(agg.summary)
 
 
+async def _module_verify_result(worktree: Path, test_command: str, module: str | None) -> VerifyResult:
+    """*test_command* run for real as *module*'s test leg beside clean lint and
+    type legs; *module* None runs the same commands as an unscoped verify."""
+    config = OrchestratorConfig(
+        project_root=worktree,
+        test_command=test_command,
+        lint_command='true',
+        type_check_command='true',
+        verify_timeout_retries=0,
+    )
+    module_config = None if module is None else ModuleConfig(
+        prefix=module, test_command=test_command, lint_command='true', type_check_command='true',
+    )
+    return await run_verification(
+        worktree, config, module_config, allow_cold_cache=False, max_retries=0,
+    )
+
+
+def _worker_death_command(worktree: Path) -> str:
+    output = worktree / 'xdist.out'
+    output.write_text(XDIST_SESSION_ABORTED_OUTPUT)
+    return f'cat {shlex.quote(str(output))}; exit 1'
+
+
+class TestModuleScopedNoVerdictNoteNamesItsModule:
+    """END TO END through `run_verification` against real subprocesses: a
+    module-scoped verify's no-verdict note names the module whose leg died."""
+
+    @pytest.mark.asyncio
+    async def test_worker_death_note_names_the_module_and_the_crashed_nodeid(self, tmp_path: Path):
+        result = await _module_verify_result(tmp_path, _worker_death_command(tmp_path), 'orchestrator')
+        assert f'orchestrator test leg {WORKER_DEATH_SUMMARY_MARKER}' in result.summary, result.summary
+        assert f"worker died running '{XDIST_IN_FLIGHT_NODEID}'" in result.summary, result.summary
+
+    @pytest.mark.asyncio
+    async def test_aggregate_points_at_the_leg_that_died_not_a_sibling(self, tmp_path: Path):
+        scripts = await _module_verify_result(tmp_path, 'true', 'scripts')
+        orchestrator = await _module_verify_result(tmp_path, _worker_death_command(tmp_path), 'orchestrator')
+        agg = _aggregate_results([scripts, orchestrator])
+        assert 'orchestrator test leg' in agg.summary, agg.summary
+        assert 'scripts' not in agg.summary, agg.summary
+        assert verify.is_no_verdict_summary(agg.summary)
+
+    @pytest.mark.asyncio
+    async def test_signal_kill_note_names_the_module(self, tmp_path: Path):
+        result = await _module_verify_result(tmp_path, 'kill -9 $$', 'orchestrator')
+        assert 'orchestrator test leg killed by signal 9' in result.summary, result.summary
+
+    @pytest.mark.asyncio
+    async def test_unscoped_verify_names_no_module(self, tmp_path: Path):
+        """CONTROL: the same leg with no ModuleConfig keeps the unlabelled subject."""
+        result = await _module_verify_result(tmp_path, _worker_death_command(tmp_path), None)
+        note = result.summary.removeprefix('Failures: ')
+        assert note.startswith(f'test leg {WORKER_DEATH_SUMMARY_MARKER}'), result.summary
+
+
 class TestFailureReportNamesTheAbortedSession:
     """`VerifyResult.failure_report()` must LEAD with the truncation caveat.
 
