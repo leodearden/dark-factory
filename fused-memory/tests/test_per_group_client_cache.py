@@ -21,41 +21,14 @@ equals group_id and the upstream mutation branch is never taken.
 from __future__ import annotations
 
 import asyncio
-from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from graphiti_core import Graphiti
 from graphiti_core.cross_encoder.client import CrossEncoderClient
-from graphiti_core.embedder import EmbedderClient
-from graphiti_core.llm_client import LLMClient
 
 import fused_memory.backends.graphiti_client as graphiti_client_module
 from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
-
-
-class _SubClients(NamedTuple):
-    llm_client: LLMClient
-    embedder: EmbedderClient
-    cross_encoder: CrossEncoderClient
-
-
-def _sub_clients() -> _SubClients:
-    return _SubClients(
-        llm_client=MagicMock(spec=LLMClient),
-        embedder=MagicMock(spec=EmbedderClient),
-        cross_encoder=MagicMock(spec=CrossEncoderClient),
-    )
-
-
-def _base_driver() -> _MultiTenantFalkorDriver:
-    return _MultiTenantFalkorDriver(falkor_db=MagicMock(), database='__base__')
-
-
-def _backend_over(mock_config, driver, subs: _SubClients) -> GraphitiBackend:
-    return GraphitiBackend.with_driver(
-        mock_config, driver, registered_graph_ids=(), **subs._asdict(),
-    )
 
 # ---------------------------------------------------------------------------
 # step-1/2: GraphitiBackend.initialize() hoists shared sub-clients
@@ -109,33 +82,30 @@ class TestClientFor:
     already equals group_id — the KEY INVARIANT that makes upstream's
     add_episode driver-mutation branch structurally unreachable."""
 
-    def _make_backend(self, mock_config, subs: _SubClients | None = None):
-        return _backend_over(mock_config, _base_driver(), _sub_clients() if subs is None else subs)
+    @pytest.fixture
+    def wired(self, mock_config, make_wired_backend):
+        return make_wired_backend(mock_config)
 
-    def test_same_group_id_returns_same_cached_client(self, mock_config):
-        backend = self._make_backend(mock_config)
-        a = backend._client_for('g1')
-        b = backend._client_for('g1')
+    def test_same_group_id_returns_same_cached_client(self, wired):
+        a = wired.backend._client_for('g1')
+        b = wired.backend._client_for('g1')
         assert a is b
 
-    def test_different_group_ids_return_distinct_clients(self, mock_config):
-        backend = self._make_backend(mock_config)
-        a = backend._client_for('g1')
-        b = backend._client_for('g2')
+    def test_different_group_ids_return_distinct_clients(self, wired):
+        a = wired.backend._client_for('g1')
+        b = wired.backend._client_for('g2')
         assert a is not b
 
-    def test_each_client_driver_is_pinned_to_its_own_group(self, mock_config):
-        backend = self._make_backend(mock_config)
-        client_g1 = backend._client_for('g1')
-        client_g2 = backend._client_for('g2')
+    def test_each_client_driver_is_pinned_to_its_own_group(self, wired):
+        client_g1 = wired.backend._client_for('g1')
+        client_g2 = wired.backend._client_for('g2')
         assert client_g1.driver._database == 'g1'
         assert client_g2.driver._database == 'g2'
 
-    def test_sub_clients_are_shared_across_groups(self, mock_config):
-        subs = _sub_clients()
-        backend = self._make_backend(mock_config, subs)
-        client_g1 = backend._client_for('g1')
-        client_g2 = backend._client_for('g2')
+    def test_sub_clients_are_shared_across_groups(self, wired):
+        subs = wired.sub_clients
+        client_g1 = wired.backend._client_for('g1')
+        client_g2 = wired.backend._client_for('g2')
 
         for client in (client_g1, client_g2):
             assert client.llm_client is subs.llm_client
@@ -154,8 +124,10 @@ class TestAddEpisodeRoutesThroughClientFor:
     the entire point of the fix."""
 
     @pytest.mark.asyncio
-    async def test_add_episode_uses_per_group_client_not_shared_client(self, mock_config, monkeypatch):
-        backend = _backend_over(mock_config, _base_driver(), _sub_clients())
+    async def test_add_episode_uses_per_group_client_not_shared_client(
+        self, mock_config, make_wired_backend, monkeypatch,
+    ):
+        backend = make_wired_backend(mock_config).backend
         backend.client = MagicMock()
         backend.client.add_episode = AsyncMock()
         sentinel = object()
@@ -189,10 +161,11 @@ class TestAddEpisodeConcurrencyIsolation:
     own pre-pinned driver and the race is structurally unreachable."""
 
     @pytest.mark.asyncio
-    async def test_concurrent_cross_group_writes_do_not_bleed(self, mock_config, monkeypatch):
-        driver = _base_driver()
-        subs = _sub_clients()
-        backend = _backend_over(mock_config, driver, subs)
+    async def test_concurrent_cross_group_writes_do_not_bleed(
+        self, mock_config, make_wired_backend, make_graph_driver, monkeypatch,
+    ):
+        driver = make_graph_driver({})
+        backend, subs = make_wired_backend(mock_config, driver)
         backend.client = Graphiti(graph_driver=driver, **subs._asdict())
 
         observed: dict[str, str] = {}
@@ -302,13 +275,15 @@ class TestCloseAccountsForGroupClients:
     aliases an entry already closed via the _cloned_drivers loop."""
 
     @pytest.mark.asyncio
-    async def test_close_clears_group_clients_without_double_close(self, mock_config):
+    async def test_close_clears_group_clients_without_double_close(
+        self, mock_config, make_wired_backend,
+    ):
         base = MagicMock()
         base.close = AsyncMock()
         cloned = MagicMock(spec=_MultiTenantFalkorDriver)
         cloned.close = AsyncMock()
         base.clone.return_value = cloned
-        backend = _backend_over(mock_config, base, _sub_clients())
+        backend = make_wired_backend(mock_config, base).backend
         backend._client_for('A')
 
         await backend.close()

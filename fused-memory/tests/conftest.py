@@ -25,11 +25,14 @@ from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from graphiti_core.cross_encoder.client import CrossEncoderClient
+from graphiti_core.embedder import EmbedderClient
+from graphiti_core.llm_client import LLMClient
 
 # Make this file's directory importable by test modules so
 # `from _fm_helpers import ...` resolves regardless of whether pytest
@@ -557,6 +560,7 @@ def make_backend():
     make_backend_over_fake_graphiti.
 
     ``driver=`` replaces the default MagicMock driver; make_graph_driver builds one.
+    For a real driver and spec'd sub-clients, use make_wired_backend.
     """
     def _factory(config, *, registered_graph_ids=(), driver=None) -> GraphitiBackend:
         backend = GraphitiBackend.with_driver(
@@ -588,6 +592,45 @@ def make_graph_driver():
         falkor = MagicMock()
         falkor.select_graph.side_effect = _select
         return _MultiTenantFalkorDriver(falkor_db=falkor)
+
+    return _factory
+
+
+class SubClients(NamedTuple):
+    """Spec'd sub-client doubles, named as GraphitiBackend.with_driver's keywords."""
+
+    llm_client: LLMClient
+    embedder: EmbedderClient
+    cross_encoder: CrossEncoderClient
+
+
+class WiredBackend(NamedTuple):
+    backend: GraphitiBackend
+    sub_clients: SubClients
+
+
+@pytest.fixture
+def make_wired_backend(make_graph_driver):
+    """Factory fixture: returns a callable(config, driver=None) -> WiredBackend.
+
+    The backend is GraphitiBackend.with_driver over *driver* and fresh spec'd
+    sub-client doubles, returned beside it so a test can assert identity.  The
+    default driver is ``make_graph_driver({})``, which wires no graph.  Unlike
+    make_backend, it assigns no base ``client``.  The registry is empty.
+    """
+    def _factory(config, driver=None) -> WiredBackend:
+        sub_clients = SubClients(
+            llm_client=MagicMock(spec=LLMClient),
+            embedder=MagicMock(spec=EmbedderClient),
+            cross_encoder=MagicMock(spec=CrossEncoderClient),
+        )
+        backend = GraphitiBackend.with_driver(
+            config,
+            make_graph_driver({}) if driver is None else driver,
+            registered_graph_ids=(),
+            **sub_clients._asdict(),
+        )
+        return WiredBackend(backend, sub_clients)
 
     return _factory
 
