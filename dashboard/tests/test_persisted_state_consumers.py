@@ -2,11 +2,11 @@
 
 persisted_state.js owns the storage policy and the one copy of the
 ``usePersistedState`` / ``useOpenSet`` hooks; their behaviour is pinned under
-``node --test`` in ``tests/js/persisted_state.test.mjs``.  The consumers are
-``type="text/babel"`` with no render harness, so this module checks the
-structural half, one rule per test, over every consumer alike: each binds what
-it calls from the module, keeps no hook copy of its own, and neither reaches
-``localStorage`` nor swallows an error.
+``node --test`` in ``tests/js/persisted_state.test.mjs``.  This module checks
+the structural half, one rule per test, over every consumer alike: each binds
+what it calls from the module, keeps no hook copy of its own, and neither
+reaches ``localStorage`` nor swallows an error.  tab_tasks.jsx's persistence is
+also rendered, in ``tests/js/jsx_render.test.mjs`` (its "Decision 7" section).
 
 One place to change the policy, and one place a quota failure is observed: the
 hook copies this replaced each wrote through ``try { localStorage... } catch (e) {}``.
@@ -24,6 +24,7 @@ CONSUMERS = (
     'tab_escalations.jsx',
     'tab_escalation_analytics.jsx',
     'tab_memory_evals.jsx',
+    'tab_tasks.jsx',
 )
 _POLICY_EXPORTS = ('readPersisted', 'writePersisted', 'createPersistedHooks')
 _HOOKS = ('usePersistedState', 'useOpenSet')
