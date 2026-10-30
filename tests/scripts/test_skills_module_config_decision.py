@@ -234,6 +234,10 @@ SKILLS_CONSUMING_TESTS = (
 def _git_ls_files(*pathspecs: str) -> list[str]:
     """Tracked paths matching *pathspecs*, via real ``git ls-files``.
 
+    A broken git fails this guard rather than letting it pass vacuously (task
+    3554); ``git_listing.git`` raises and never skips (``git_listing.py``
+    module docstring).
+
     MEASURED, not assumed (in a throwaway repo at this base): the default
     pathspec matcher treats ``**`` as crossing ``/``, so
     ``skills/**/orchestrator.yaml`` really does match a nested
