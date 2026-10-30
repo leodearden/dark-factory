@@ -1368,6 +1368,9 @@ class TaskArtifacts:
     # files at most genuinely-new pairs.
     # ──────────────────────────────────────────────────────────────────
 
+    _RECONCILE_STATE_NAME = 'reconcile_state.json'
+    _EMITTED_STEP_ESCALATIONS_KEY = 'emitted_done_step_escalations'
+
     def read_emitted_step_escalations(self) -> set[tuple[str, str]]:
         """Return the set of ``(step_id, stale_commit)`` orphaned-done-step
         escalation keys already filed for this task, persisted across restarts.
@@ -1382,15 +1385,16 @@ class TaskArtifacts:
         field all return an empty ``set``, so a corrupt sidecar re-files
         rather than silently suppressing.
         """
-        name = 'reconcile_state.json'
+        name = self._RECONCILE_STATE_NAME
+        key = self._EMITTED_STEP_ESCALATIONS_KEY
         data = self._read_json_object(name)
         if data is None:
             return set()
-        entries = data.get('emitted_done_step_escalations', [])
+        entries = data.get(key, [])
         if not isinstance(entries, list):
             logger.warning(
-                'Malformed %s at %s: emitted_done_step_escalations is not a list',
-                name, self._read_path(name),
+                'Malformed %s at %s: %s is not a list',
+                name, self._read_path(name), key,
             )
             return set()
         result: set[tuple[str, str]] = set()
@@ -1429,9 +1433,9 @@ class TaskArtifacts:
             return
         keys.add((step_id, stale_commit))
         self._write_json(
-            self.root / 'reconcile_state.json',
+            self.root / self._RECONCILE_STATE_NAME,
             {
-                'emitted_done_step_escalations': sorted(
+                self._EMITTED_STEP_ESCALATIONS_KEY: sorted(
                     [k[0], k[1]] for k in keys
                 )
             },
