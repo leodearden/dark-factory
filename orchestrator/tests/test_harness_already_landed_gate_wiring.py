@@ -782,7 +782,10 @@ def _wired_content_harness(
     in TestAlreadyLandedDispatchGateAncestryGuards and
     test_landing_evidence.py. ``get_main_sha`` is wired but must NEVER be
     called — the silent ``citation or get_main_sha()`` fallback (task 2678)
-    is deleted.
+    is deleted. ``merge_base_with_main`` and ``find_equivalent_commit`` are
+    stubbed so the citation-miss content-equivalence fallback decides on its
+    own logic rather than on the TypeError a bare MagicMock auto-child
+    raises when awaited.
     """
     h = _build_harness(mock_orch_config)
     h.git_ops = MagicMock()
@@ -802,6 +805,8 @@ def _wired_content_harness(
     h.git_ops.find_merge_marker = AsyncMock(return_value=None)
     h.git_ops.find_task_citation_commit = AsyncMock(return_value=citation_sha)
     h.git_ops.branch_content_in_main = AsyncMock(return_value=content_in_main)
+    h.git_ops.merge_base_with_main = AsyncMock(return_value='8' * 40)
+    h.git_ops.find_equivalent_commit = AsyncMock(return_value=None)
     h.git_ops.get_main_sha = AsyncMock(return_value='c' * 40)
     h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=effect_present)
 
