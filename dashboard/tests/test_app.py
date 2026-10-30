@@ -375,7 +375,7 @@ def test_a_healthy_root_is_fresh_when_the_real_collector_measures_it(client, cap
     import logging
     from datetime import datetime
 
-    from test_task_snapshot import CannedMCP, _raw_row
+    from _canned_mcp import CannedMCP, _raw_row
 
     label = client.app.state.config.project_root.name
     pairs = ((1, 'in-progress'), (2, 'pending'), (3, 'done'))
@@ -425,7 +425,7 @@ def test_a_unit_another_render_refreshed_later_is_not_a_contract_break(client, c
     import logging
     from datetime import datetime, timedelta
 
-    from test_task_snapshot import CannedMCP, _raw_row
+    from _canned_mcp import CannedMCP, _raw_row
 
     import dashboard.data.task_snapshot as snapshot_mod
     from dashboard.data.utils import resolve_now
@@ -492,7 +492,7 @@ def test_a_snapshot_that_breaks_the_envelope_borrows_no_last_good(client, caplog
     from datetime import UTC, datetime, timedelta
 
     import httpx
-    from test_task_snapshot import CannedMCP, _raw_row
+    from _canned_mcp import CannedMCP, _raw_row
 
     import dashboard.data.task_snapshot as snapshot_mod
     from dashboard.data.datum import DatumInvariant
@@ -572,8 +572,8 @@ def test_the_snapshot_rows_on_the_wire_are_the_shaped_task_rows(client):
     """
     from datetime import UTC
 
+    from _canned_mcp import CannedMCP, _raw_row
     from shared.task_deferral import PlanningDeferral, record_to_json
-    from test_task_snapshot import CannedMCP, _raw_row
 
     label = client.app.state.config.project_root.name
     pairs = ((1, 'in-progress'), (2, 'pending'), (3, 'blocked'), (4, 'deferred'))
