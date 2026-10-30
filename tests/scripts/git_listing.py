@@ -29,7 +29,9 @@ Two things every such guard needs from git:
 IMPORT ME, DO NOT COPY ME.
 
 Importable from ``tests/scripts/test_*.py`` only because
-``tests/scripts/conftest.py`` puts this directory on ``sys.path``.
+``tests/scripts/conftest.py`` puts this directory on ``sys.path``, and from
+``tests/scripts/raw_envelope_literal_guard.py`` run as a script because Python
+puts the script's own directory there.
 """
 from __future__ import annotations
 
