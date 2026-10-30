@@ -881,4 +881,23 @@ test('tab_tasks.jsx::TasksTab folds a project on its first header click, and the
   assert.equal(projectHead(container).dataset.open, 'false', 'the stored fold did not seed the next mount');
   click(window, projectHead(container));
   assert.equal(projectHead(container).dataset.open, 'true', 'one header click did not unfold the project');
+  assert.ok(!storedKeys(window).includes('df.tasksOpen'), 'the project is back at its default-open, yet its key is still stored');
+});
+
+function groupingButton(container, label) {
+  const buttons = [...projectHead(container).querySelectorAll('.seg button')].filter(button => button.textContent === label);
+  assert.equal(buttons.length, 1, `expected one '${label}' grouping button`);
+  return buttons[0];
+}
+
+test('tab_tasks.jsx::TasksTab stores a project grouped by PRD, and removes the key when it is listed flat again', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const { container } = mountTasks(harness);
+  click(window, groupingButton(container, 'by PRD'));
+  assert.equal(JSON.parse(window.localStorage.getItem('df.tasksGroupByPrd'))?.[PROJECT], 'prd', 'the by-PRD grouping was not stored');
+
+  click(window, groupingButton(container, 'list'));
+  assert.ok(groupingButton(container, 'list').classList.contains('on'), 'the project did not return to the flat list');
+  assert.ok(!storedKeys(window).includes('df.tasksGroupByPrd'), 'the grouping is back at its default, yet its key is still stored');
 });

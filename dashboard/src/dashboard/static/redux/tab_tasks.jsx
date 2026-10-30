@@ -26,6 +26,14 @@ const {
 const { createPersistedHooks } = window.DF_PERSISTED_STATE;
 const { usePersistedState } = createPersistedHooks(React);
 
+// A per-project preference map holds only the projects that deviate from the
+// default (an undefined deviation), so a map with every project back at its
+// default is {} and usePersistedState removes its key.
+function withProjectDeviation(map, id, deviation) {
+  const { [id]: _previous, ...rest } = map;
+  return deviation === undefined ? rest : { ...rest, [id]: deviation };
+}
+
 // CSS accent per probe-status tone (runtime_format.js owns which tone each
 // status gets; this only translates a tone into a colour for the banner's
 // left rule). 'muted' means "expected, not a fault" — no accent at all.
@@ -650,13 +658,13 @@ function TaskDetail({ task, allTasks }) {
 function TasksTab({ projectFilter, search }) {
   // Open/closed per project, persisted
   const [openMap, setOpenMap] = usePersistedState('df.tasksOpen', {});
-  const toggle = (id) => setOpenMap(m => ({ ...m, [id]: m[id] === false }));
+  const toggle = (id) => setOpenMap(m => withProjectDeviation(m, id, m[id] === false ? undefined : false));
 
   // Per-project "group by PRD" view toggle, persisted (same per-project-id
   // map shape as openMap). Key absent/'flat' -> today's ungrouped view;
   // 'prd' -> the grouped-by-PRD view.
   const [groupByPrdMap, setGroupByPrdMap] = usePersistedState('df.tasksGroupByPrd', {});
-  const setGroupByPrd = (id, v) => setGroupByPrdMap(m => ({ ...m, [id]: v }));
+  const setGroupByPrd = (id, v) => setGroupByPrdMap(m => withProjectDeviation(m, id, v === 'prd' ? 'prd' : undefined));
 
   // Selected task (single, across all projects)
   const [selectedId, setSelectedId] = uS_T(null);
