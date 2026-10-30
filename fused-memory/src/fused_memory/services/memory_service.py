@@ -203,7 +203,8 @@ _SUBCLOSE_TIMEOUT = 3.0
 # They run after every durable-flush close and lose nothing if cut short.
 _POOL_RELEASE_TIMEOUT = 0.5
 
-# The overreach shadow's close cancels its judge jobs rather than draining them, so it needs no SQLite-flush budget.
+# The overreach shadow's close cancels its judge jobs rather than draining them, but its sidecar's close still runs a best-effort WAL checkpoint.
+# A cut at this budget abandons only that compaction; the connection still shuts (shared/src/shared/async_sqlite_base.py::AtomicConnection.close).
 _SHADOW_CLOSE_TIMEOUT = 0.5
 
 # The durable-queue group_id prefix that distinguishes a project's Mem0 writes

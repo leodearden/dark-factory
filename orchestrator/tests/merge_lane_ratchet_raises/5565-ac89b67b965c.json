@@ -1,0 +1,48 @@
+{
+  "task_id": "5565",
+  "reason": "Net-additive bug fix (task 5565): a warm-lane pool shrink stranded ASSIGNED lanes. warm_lane_pool.py gains over-cap lane recognition (_slot_index/_over_cap_slot/canonical_lane), admission in restore_assignment, drain-on-release, the reclaim_victim over-cap skip and the typed over_cap_report; git_ops.py gains _settle_branch_checkout (acquire settles a task branch already checked out elsewhere instead of FAULTing) and the warn_on_warm_lane_pool_shrink startup diagnostic. The 5 new test private reads are Harness._recover_crashed_tasks/_reconcile_lane_checkouts/_recovered_plans, which have no public seam (same pattern as test_lane_lifecycle_integration.py); _match_lane fell 7->4.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1483,
+      "current": 1497
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/warm_lane_pool.py",
+      "baseline": 55,
+      "current": 74
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/warm_lane_pool.py::WarmLanePool::reclaim_victim",
+      "baseline": 10,
+      "current": 11
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/warm_lane_pool.py::WarmLanePool::release",
+      "baseline": 4,
+      "current": 6
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/warm_lane_pool.py::WarmLanePool::restore_assignment",
+      "baseline": 1,
+      "current": 2
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5016,
+      "current": 5049
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6603,
+      "current": 6608
+    }
+  ]
+}

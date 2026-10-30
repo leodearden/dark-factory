@@ -4280,6 +4280,7 @@ class Harness:
         top_pool = self.git_ops.warm_lane_pool
         if top_pool is not None:
             top_pool.set_lane_lifecycle(self.git_ops._lane_lifecycle)
+        self.git_ops.warn_on_warm_lane_pool_shrink()
 
         for entry in worktree_base.iterdir():
             if not entry.is_dir():
@@ -4313,7 +4314,10 @@ class Harness:
             # `_merge-*` disposition; every other infra band is left to its
             # owner.  This subsumes the former dedicated `.lane-state`/
             # `.task-meta` (LANE_STATE_DIRNAME/TASK_META_DIRNAME) skip —
-            # both are `.`-prefixed => classified 'infra'.
+            # both are `.`-prefixed => classified 'infra'.  Over-cap lanes a
+            # pool shrink left behind are lanes too (see
+            # orchestrator/src/orchestrator/warm_lane_pool.py::WarmLanePool.canonical_lane),
+            # so they reach the lane branch below, not the C2 'infra' skip.
             if not is_lane:
                 worktree_class = classify_worktree_entry(entry.name)
                 if worktree_class == 'merge':

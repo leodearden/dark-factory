@@ -383,12 +383,17 @@ class _LLM:
         self.calls = 0
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
+        self.cancelled = False
 
     async def generate_response(self, messages, response_model=None, max_tokens=None, **kwargs):
         self.calls += 1
         self.entered.set()
         if self.block:
-            await self.release.wait()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
         if self.error is not None:
             raise self.error
         if self.reply is not None:
@@ -514,7 +519,8 @@ class TestRunner:
         runner = _runner(owned, llm=llm)
         runner.submit(JOB)
         await llm.entered.wait()
-        await asyncio.wait_for(runner.close(), 0.5)
+        await runner.close()
+        assert llm.cancelled
         with pytest.raises(RuntimeError):
             await owned.judged_episode('g', 'ep1')
         tasks_before = asyncio.all_tasks()

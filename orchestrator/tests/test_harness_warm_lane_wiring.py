@@ -2228,25 +2228,35 @@ class TestReconcileLaneCheckouts:
 
         return harness, git_ops, pool, lane5
 
-    async def test_control_no_reconcile_collides_on_reacquire(
+    async def test_no_reconcile_acquire_frees_ownerless_checkout(
         self, tmp_path: Path, caplog,
     ):
-        """CONTROL (documents the bug): with NO reconcile, a fresh acquire grabs
-        a different (first-free) lane and collides with the branch already
-        checked out at _lane-5."""
-        from orchestrator.git_ops import WarmLaneUnavailable
+        """With NO reconcile, the acquire itself detaches the ownerless _lane-5
+        checkout (task 5565), so it lands on another lane with the WIP intact
+        instead of colliding with "already used by worktree"."""
+        from orchestrator.git_ops import WorktreeInfo
+        from orchestrator.git_ops import _run as git_run
+        from orchestrator.warm_lane_pool import LaneState
 
-        _harness, git_ops, _pool, _lane5 = await self._make_fixture(tmp_path)
+        _harness, git_ops, pool, lane5 = await self._make_fixture(tmp_path)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
             result = await git_ops.acquire_warm_lane('3965', 'main')
 
-        assert result is WarmLaneUnavailable.FAULT, (
-            f'expected FAULT from the worktree-add collision, got {result!r}'
+        assert isinstance(result, WorktreeInfo), (
+            f'expected the acquire to succeed on another lane, got {result!r}'
         )
-        assert 'already used by worktree' in caplog.text, (
-            f'expected the git collision message in the log; got: {caplog.text!r}'
+        assert result.path != lane5
+        rc, out, _ = await git_run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=result.path)
+        assert rc == 0 and out.strip() == 'refs/heads/task/3965'
+        rc, out, _ = await git_run(
+            ['git', 'show', 'task/3965:wip.txt'], cwd=git_ops.project_root,
         )
+        assert rc == 0 and 'unmerged work' in out
+        rc, _, _ = await git_run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=lane5)
+        assert rc != 0, '_lane-5 must be detached'
+        assert pool.state(lane5) is LaneState.FREE
+        assert 'already used by worktree' not in caplog.text
 
     async def test_repin_on_live_status_reuses_original_lane(self, tmp_path: Path):
         """RE-PIN: a live (non-terminal) status re-pins the id to its ORIGINAL
