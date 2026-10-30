@@ -21,9 +21,11 @@ import re
 import sys
 import warnings
 import weakref
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -89,7 +91,10 @@ from df_pytest_isolation import (  # noqa: E402
     reject_unsafe_basetemp,
 )
 
-from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: E402
+from fused_memory.backends.graphiti_client import (  # noqa: E402
+    GraphitiBackend,
+    _MultiTenantFalkorDriver,
+)
 from fused_memory.config.schema import (  # noqa: E402
     EmbedderConfig,
     EmbedderProvidersConfig,
@@ -550,12 +555,39 @@ def make_backend():
 
     For a client that enforces graphiti_core's uuid= contract, use
     make_backend_over_fake_graphiti.
+
+    ``driver=`` replaces the default MagicMock driver; make_graph_driver builds one.
     """
-    def _factory(config, *, registered_graph_ids=()) -> GraphitiBackend:
-        backend = GraphitiBackend(config, registered_graph_ids=registered_graph_ids)
+    def _factory(config, *, registered_graph_ids=(), driver=None) -> GraphitiBackend:
+        backend = GraphitiBackend.with_driver(
+            config,
+            MagicMock() if driver is None else driver,
+            registered_graph_ids=registered_graph_ids,
+        )
         backend.client = MagicMock()
-        backend._driver = MagicMock()
         return backend
+
+    return _factory
+
+
+@pytest.fixture
+def make_graph_driver():
+    """Factory fixture: returns a callable(graphs) -> a real _MultiTenantFalkorDriver over *graphs*.
+
+    The driver runs over a FalkorDB double whose ``select_graph(name)`` answers
+    ``graphs[name]``; names are the canonical group ids the backend selects.  Pass
+    it as ``make_backend(config, driver=...)`` instead of assigning
+    ``backend._driver._get_graph``.
+    """
+    def _factory(graphs: Mapping[str, Any]) -> _MultiTenantFalkorDriver:
+        def _select(name: str) -> Any:
+            if name not in graphs:
+                raise KeyError(f'no graph wired for {name!r}; wired: {sorted(graphs)}')
+            return graphs[name]
+
+        falkor = MagicMock()
+        falkor.select_graph.side_effect = _select
+        return _MultiTenantFalkorDriver(falkor_db=falkor)
 
     return _factory
 
