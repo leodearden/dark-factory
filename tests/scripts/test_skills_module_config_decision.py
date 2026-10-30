@@ -134,7 +134,6 @@ from __future__ import annotations
 import pathlib
 import posixpath
 import shlex
-import subprocess
 
 # The skills/ ruff probe itself, imported so the DECIDING FACT can be asserted
 # against its RUNTIME target list rather than only against its path. Resolves
@@ -148,6 +147,7 @@ import test_root_lint_covers_nonmember_py as skills_ruff_probe
 # The shared command parser this file's helpers used to duplicate (task 3745),
 # resolving by the same conftest sys.path mechanism as the probe above.
 import verify_command_invariants as vci
+from git_listing import git
 from orchestrator.config import _discover_module_configs
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
@@ -258,20 +258,9 @@ def _git_ls_files(*pathspecs: str) -> list[str]:
     Adding the direct-child spellings (``skills/tests/**``, ``skills/test_*.py``,
     ``skills/*_test.py``) returns all six. Every caller here therefore passes
     both the nested and the direct-child spelling of each pattern.
-
-    No try/except-and-skip: a missing or broken ``git`` must fail the caller.
     """
-    proc = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "ls-files", "--", *pathspecs],
-        capture_output=True,
-        text=True,
-    )
-    assert proc.returncode == 0, (
-        f"`git ls-files -- {' '.join(pathspecs)}` exited {proc.returncode} "
-        f"(task 3554). A broken git must fail this guard rather than let it "
-        f"pass vacuously; stderr: {proc.stderr.strip()!r}"
-    )
-    return [line for line in proc.stdout.splitlines() if line]
+    listing = git(REPO_ROOT, "ls-files", "-z", "--", *pathspecs)
+    return [entry for entry in listing.split("\0") if entry]
 
 
 def test_no_skills_prefixed_module_config_is_registered() -> None:
