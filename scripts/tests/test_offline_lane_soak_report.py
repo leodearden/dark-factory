@@ -1020,12 +1020,47 @@ def test_an_escalation_file_the_scan_cannot_parse_is_reported_unread(tmp_path: P
     seeded = _seeded(tmp_path)
     corrupt = escalation_queue_dir(tmp_path) / 'esc-corrupt-1.json'
     corrupt.write_text('{"id": "esc-corrupt-1", ', encoding='utf-8')
+    not_an_object = escalation_queue_dir(tmp_path) / 'esc-corrupt-2.json'
+    not_an_object.write_text('[1, 2]', encoding='utf-8')
 
-    _, report, _ = _report(seeded.project, capsys)
+    code, report, _ = _report(seeded.project, capsys)
 
+    assert code == 0
     figure = _figure(report, 'regression_escalations')
     assert [e['id'] for e in figure['escalations']] == [seeded.regression]
-    assert figure['unread'] == [{'path': str(corrupt), 'reason': 'unparsable'}]
+    assert sorted(figure['unread'], key=lambda entry: entry['path']) == [
+        {'path': str(corrupt), 'reason': 'unparsable'},
+        {'path': str(not_an_object), 'reason': 'unparsable'},
+    ]
+
+
+def _overwrite_escalation(root: Path, escalation_id: str, contents: str) -> None:
+    """Replace *escalation_id*'s record file, in the queue root or, once released, the archive."""
+    next(escalation_queue_dir(root).rglob(f'{escalation_id}.json')).write_text(contents, encoding='utf-8')
+
+
+@pytest.mark.parametrize('contents', ['{"id": ', '[1, 2]'])
+def test_an_unreadable_outage_record_is_nothing_to_judge(tmp_path: Path, capsys, contents: str):
+    seeded = _seeded(tmp_path)
+    _overwrite_escalation(tmp_path, seeded.outage_escalation, contents)
+
+    code, report, err = _report(seeded.project, capsys)
+
+    _assert_nothing_to_judge(code, report, err, seeded.outage_escalation)
+
+
+def test_an_unreadable_stuck_filing_record_is_nothing_to_judge(tmp_path: Path, capsys):
+    project, first, crossing = _crossing_project(tmp_path)
+    escalation_id = _stuck_filing(project)
+    project.save_command(command_record(
+        UNIT, [episode(NODE_A, [first, crossing], filing_due_since=NOW - timedelta(hours=2))],
+        stuck_filing_escalation_id=escalation_id,
+    ))
+    _overwrite_escalation(tmp_path, escalation_id, '{"id": ')
+
+    code, report, err = _report(project, capsys)
+
+    _assert_nothing_to_judge(code, report, err, escalation_id)
 
 
 def test_outages_list_their_passes_probe_results_and_released_records(tmp_path: Path, capsys):
