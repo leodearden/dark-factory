@@ -217,6 +217,12 @@ class TestRating:
         resumed = _rate(out, _Ask(usage=costly), budget=100.0)
         assert (resumed['stopped'], resumed['remaining']) == (False, 0)
         assert resumed['spent_usd'] == pytest.approx(6.0)
+        runs = _mod().read_records(_mod().runs_path(out))
+        assert [(run['budget_usd'], run['stopped'], run['rated'], run['remaining']) for run in runs] == [
+            (5.0, True, 2, 1), (5.0, True, 0, 1), (100.0, False, 1, 0)]
+        assert [run['spent_usd'] for run in runs] == pytest.approx([4.0, 4.0, 6.0])
+        assert {(run['batch'], run['model'], run['effort']) for run in runs} == {
+            (BATCH, 'gpt-6.1-sol', 'high')}
 
 
 def _cross_records() -> list[dict[str, Any]]:
@@ -241,8 +247,14 @@ V1_ROWS = [{'entry_id': 'w1', 'target_id': 't1', 'verdict': 'RELATED'},
            {'entry_id': 'zz', 'target_id': 't', 'verdict': 'EXTENDS'}]
 
 
+RUNS = [{'batch': BATCH, 'model': 'gpt-6.1-sol', 'effort': 'high', 'budget_usd': 0.02,
+         'spent_usd': 0.02, 'rated': 2, 'remaining': 2, 'stopped': True},
+        {'batch': BATCH, 'model': 'gpt-6.1-sol', 'effort': 'high', 'budget_usd': 1.0,
+         'spent_usd': 0.04, 'rated': 2, 'remaining': 0, 'stopped': False}]
+
+
 def _report() -> dict[str, Any]:
-    return _mod().report(_cross_records(), _writes(), _verdicts(), V1_ROWS)
+    return _mod().report(_cross_records(), _writes(), _verdicts(), V1_ROWS, runs=RUNS)
 
 
 def _agreement(agree: int, n: int) -> dict[str, Any]:
@@ -268,6 +280,8 @@ class TestTheReport:
         assert report['coverage'] == {
             'discordant': {'selected': 2, 'rated': 2, 'failed': 0},
             'control': {'rated': 1, 'failed': 1},
+            'runs': 2,
+            'budget_stops': [{'batch': BATCH, 'budget_usd': 0.02, 'spent_usd': 0.02, 'remaining': 2}],
         }
         assert report['failures'] == [{'entry_id': 'c2', 'target_id': 't', 'failure': 'not JSON'}]
         assert report['raters'] == ['gpt-6.1-sol:high']
@@ -289,12 +303,14 @@ class TestTheReport:
         assert markdown == _mod().render_markdown(_report())
         block = report['agreement']['discordant']['home']['vs_second']
         assert f'| discordant | home | second | {block["n"]} | {block["agree"]} |' in markdown
+        assert '- Runs: 2; budget stops: 1 (at 0.02 USD with 2 pairs left).' in markdown
 
 
 class TestTheReportCommand:
     def test_writes_the_json_and_its_rendering(self, tmp_path: Path) -> None:
         records = tmp_path / 'cf.jsonl'
         records.write_text(''.join(json.dumps(record) + '\n' for record in _cross_records()))
+        _mod().runs_path(records).write_text(''.join(json.dumps(run) + '\n' for run in RUNS))
         writes, verdicts, v1 = (tmp_path / name for name in ('w.jsonl', 'v.jsonl', 'v1.jsonl'))
         for path, rows in ((writes, _writes()), (verdicts, _verdicts()), (v1, V1_ROWS)):
             path.write_text(''.join(json.dumps(row) + '\n' for row in rows))

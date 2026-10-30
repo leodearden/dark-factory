@@ -97,6 +97,11 @@ def _cross_records() -> list[dict[str, Any]]:
 
 
 @functools.cache
+def _cross_runs() -> list[dict[str, Any]]:
+    return _jsonl_rows(CALIBRATION / f'{STEM}_cross_family_runs.jsonl')
+
+
+@functools.cache
 def _cross_report() -> dict[str, Any]:
     return json.loads((CALIBRATION / f'{STEM}_cross_family.json').read_text())
 
@@ -259,21 +264,23 @@ class TestTheCommittedCrossFamilyRerate:
 
     def test_reporting_the_records_reproduces_the_committed_report(self) -> None:
         v1 = _jsonl_rows(CALIBRATION / 'write_triage_pair_verdicts.jsonl')
-        built = _cross().report(_cross_records(), _writes(), _verdicts(), v1)
+        built = _cross().report(_cross_records(), _writes(), _verdicts(), v1, runs=_cross_runs())
         assert json.loads(json.dumps(built)) == _cross_report()
 
     def test_the_markdown_is_the_rendered_report(self) -> None:
         rendered = _cross().render_markdown(_cross_report())
         assert (CALIBRATION / f'{STEM}_cross_family.md').read_text() == rendered
 
-    def test_every_discordant_pair_has_a_row_or_a_recorded_failure(self) -> None:
+    def test_every_discordant_pair_has_a_row_a_recorded_failure_or_a_budget_stop(self) -> None:
         cross = _cross()
         records = {(record['entry_id'], record['target_id']): record for record in _cross_records()}
         assert len(records) == len(_cross_records())
         discordant = set(cross.discordant_pairs(_writes(), _verdicts()))
-        assert discordant - set(records) == set()
+        unasked = discordant - set(records)
+        last_run = _cross_runs()[-1]
+        assert not unasked or (last_run['stopped'] and last_run['remaining'] >= len(unasked))
         assert {pair for pair, record in records.items()
-                if record['selection'] == cross.SELECTION_DISCORDANT} == discordant
+                if record['selection'] == cross.SELECTION_DISCORDANT} == discordant - unasked
         controls = [pair for pair, record in records.items()
                     if record['selection'] == cross.SELECTION_CONTROL]
         assert set(controls) <= set(cross.control_pairs(_writes(), _verdicts(), seed=7160))
