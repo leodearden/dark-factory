@@ -791,6 +791,9 @@ class BacklogPolicy:
         vice-versa (task 2920 (a)). The id prefix is derived from ``kind`` so a
         halt/wedge is never mis-filed as 'backlog'.
 
+        Everything past the rate-limit gate runs in one ``asyncio.to_thread``
+        hop (INV-8).
+
         The rate limit now bounds the FOLD cadence, not the mint cadence. Past
         the window a still-live condition routes through ``submit_or_dedupe``
         and lands on the pending record rather than beside it, so
@@ -847,6 +850,33 @@ class BacklogPolicy:
                 return None
             state.last_escalation_ts[kind] = now
 
+        return await asyncio.to_thread(
+            self._file_escalation,
+            project_id=project_id,
+            project_root=project_root,
+            backlog=backlog,
+            threshold=threshold,
+            kind=kind,
+            error_type=error_type,
+            summary=summary,
+            detail=detail,
+            suggested_action=suggested_action,
+        )
+
+    def _file_escalation(
+        self,
+        *,
+        project_id: str,
+        project_root: str,
+        backlog: int,
+        threshold: int,
+        kind: str,
+        error_type: str,
+        summary: str,
+        detail: str,
+        suggested_action: str,
+    ) -> Path | None:
+        """Runs on a worker thread; touches no ``_PolicyState`` or ``self._lock``."""
         # Every name is listed, not just one: only an identity check on the
         # name itself narrows an optionally-imported symbol, so a guard on
         # EscalationQueue alone would leave the other five typed ``... | None``
@@ -947,8 +977,8 @@ class BacklogPolicy:
         # is the only thing that names which hop failed.
         try:
             # Constructed only now: EscalationQueue.__init__ mkdirs, and the
-            # rate-limit gate above must keep returning before any directory
-            # work.
+            # rate-limit gate in the caller, _maybe_write_escalation, must keep
+            # returning before any directory work.
             queue = EscalationQueue(esc_dir)
             config = DedupeConfig(
                 infra_dedupe_enabled=True,
