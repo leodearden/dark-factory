@@ -208,6 +208,7 @@ def snapshot_process_group(pgid: int) -> str:
         return f'snapshot_process_group({pgid}): unexpected error — see logs'
 
 
+_UNREADABLE = '?'
 _NO_ARGV = '(empty)'
 _CMDLINE_DISPLAY_CHARS = 200
 
@@ -220,7 +221,7 @@ def _display_cmdline(entry: Path) -> str:
     try:
         argv = _read_proc_text(entry / 'cmdline').replace('\x00', ' ').strip()
     except OSError:
-        return '?'
+        return _UNREADABLE
     if not argv:
         return _NO_ARGV
     if len(argv) > _CMDLINE_DISPLAY_CHARS:
@@ -256,7 +257,7 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
         try:
             wchan = _read_proc_text(entry / 'wchan').strip()
         except OSError:
-            wchan = '?'
+            wchan = _UNREADABLE
 
         cmdline = _display_cmdline(entry)
 
