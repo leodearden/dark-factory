@@ -10,8 +10,20 @@ plans/verify-admission-fifo-prd.delta-decision.md.
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Hashable
+import json
+import sqlite3
+from collections.abc import Callable, Hashable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+# Copied from orchestrator/src/orchestrator/event_store.py::EventType.verify_admission_plan, not
+# imported: scripts/tests run under `uv run --project shared`, which installs no orchestrator.
+PLAN_EVENT_TYPE = 'verify_admission_plan'
+MEASURED_ORDER = 'arrival'
+MEASURED_OUTCOME = 'returned'
+SECS_PER_DAY = 86400.0
 
 
 @dataclass(frozen=True)
@@ -102,3 +114,65 @@ def avoidable_legs(plan: Plan, group: Grouping = BY_MODULE) -> tuple[AvoidableLe
         if cutoff is not None and leg.granted_at > cutoff:
             found.append(AvoidableLeg(leg=leg, cutoff=cutoff))
     return tuple(found)
+
+
+@dataclass(frozen=True)
+class Sample:
+    plans: tuple[Plan, ...]
+    window_start: str
+    window_end: str
+    window_days: float
+
+
+def _epoch(iso: str) -> float:
+    return datetime.fromisoformat(iso).timestamp()
+
+
+def _parse_leg(raw: Mapping[str, Any]) -> Leg:
+    return Leg(
+        module=raw['module'],
+        arrived_at=_epoch(raw['arrived_at']),
+        granted_at=_epoch(raw['granted_at']),
+        held_secs=float(raw['held_secs']),
+        red=raw['rc'] != 0 or bool(raw['timed_out']),
+    )
+
+
+def _is_measured(payload: Mapping[str, Any]) -> bool:
+    return (
+        payload.get('order') == MEASURED_ORDER
+        and payload.get('outcome') == MEASURED_OUTCOME
+        and bool(payload.get('legs'))
+    )
+
+
+def _plan_rows(db_path: Path) -> list[tuple[str, dict[str, Any]]]:
+    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    try:
+        rows = conn.execute(
+            'SELECT timestamp, data FROM events WHERE event_type = ? ORDER BY id', (PLAN_EVENT_TYPE,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [(timestamp, json.loads(data)) for timestamp, data in rows]
+
+
+def load_arrival_plans(db_path: Path) -> Sample:
+    kept = [(timestamp, payload) for timestamp, payload in _plan_rows(db_path) if _is_measured(payload)]
+    plans = tuple(
+        Plan(
+            plan_id=payload['plan_id'],
+            role=payload['role'],
+            legs=tuple(_parse_leg(raw) for raw in payload['legs']),
+        )
+        for _, payload in kept
+    )
+    if not kept:
+        return Sample(plans=plans, window_start='', window_end='', window_days=0.0)
+    start, end = kept[0][0], kept[-1][0]
+    return Sample(
+        plans=plans,
+        window_start=start,
+        window_end=end,
+        window_days=(_epoch(end) - _epoch(start)) / SECS_PER_DAY,
+    )
