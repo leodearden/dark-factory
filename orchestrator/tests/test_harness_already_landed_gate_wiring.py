@@ -842,6 +842,9 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         gate must NOT fabricate an anchor from main HEAD, must NOT mark
         done, and must file exactly one 'provenance_unattributed'
         escalation carrying the branch. get_main_sha must never be called.
+        The content-equivalence fallback (task 4862) runs and declines as
+        'unanchored' because main holds no patch-id twin, so the verdict
+        stays no_citation.
         """
         h = _wired_content_harness(
             mock_orch_config,
@@ -861,6 +864,8 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         assert esc.task_id == '42'
         assert 'task/42' in esc.detail
         assert 'no_citation' in esc.detail
+        assert "'content_fallback': 'unanchored'" in esc.detail
+        assert 'content_fallback_error' not in esc.detail
 
     async def test_content_equivalent_with_citation_and_effect_present_marks_done(
         self, mock_orch_config,
