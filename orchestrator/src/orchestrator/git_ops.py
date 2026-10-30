@@ -1060,6 +1060,10 @@ class MergeResult:
     # ``merge_to_main`` never sets it (its destination is a fresh
     # ``_merge-<hex8>`` at main HEAD, where the case cannot arise).
     already_up_to_date: bool = False
+    # Set ONLY by :meth:`GitOps.merge_to_main`'s conflict arm (task 7302): the
+    # merge worktree's unmerged paths, as data. ``()`` when the merge did not
+    # conflict or git could not list them.
+    conflicted_paths: tuple[str, ...] = ()
 
 
 class WarmBaseHealth(Enum):
@@ -12593,11 +12597,22 @@ class GitOps:
             if rc != 0:
                 if conflicts:
                     conflict_details = await self.get_conflict_details(merge_wt)
+                    # The paths are a record only: failing to list them must
+                    # not turn this conflict into an exception.
+                    try:
+                        conflicted_paths = await self.unmerged_paths(merge_wt)
+                    except RuntimeError:
+                        logger.warning(
+                            'merge_to_main: could not list the unmerged paths in %s',
+                            merge_wt, exc_info=True,
+                        )
+                        conflicted_paths = ()
                     return MergeResult(
                         success=False, conflicts=True,
                         details=conflict_details,
                         pre_merge_sha=pre_merge_sha,
                         merge_worktree=merge_wt,
+                        conflicted_paths=conflicted_paths,
                     )
                 # Non-conflict failure — clean up immediately
                 await self.cleanup_merge_worktree(merge_wt)
@@ -15831,6 +15846,24 @@ class GitOps:
             if 'U' in xy or xy in ('AA', 'DD'):
                 unmerged.append(path.strip())
         return sorted(unmerged)
+
+    async def unmerged_paths(self, cwd: Path) -> tuple[str, ...]:
+        """The paths left unmerged in *cwd*'s index by a conflicted merge.
+
+        ``-z`` with ``-c core.quotePath=false`` keeps every path byte-faithful,
+        as in :meth:`merge_tree_conflicts`. Raises ``RuntimeError`` when git
+        cannot list them.
+        """
+        rc, out, err = await _run(
+            [
+                'git', '-c', 'core.quotePath=false',
+                'diff', '--name-only', '--diff-filter=U', '-z',
+            ],
+            cwd=cwd,
+        )
+        if rc != 0:
+            raise RuntimeError(f'git diff --diff-filter=U failed in {cwd} (rc={rc}): {err}')
+        return tuple(dict.fromkeys(path for path in out.split('\0') if path))
 
     async def get_conflict_details(self, cwd: Path) -> str:
         """Parse conflict markers and return structured description."""

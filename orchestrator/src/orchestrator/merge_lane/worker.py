@@ -124,7 +124,7 @@ from orchestrator.merge_lane.liveness import (
 )
 from orchestrator.merge_lane.member_redrive import MemberRedriveOutcome, MemberRedriver
 from orchestrator.merge_lane.no_progress_abort import NoProgressAbort, emit_no_progress_abort
-from orchestrator.merge_lane.outcome_facts import MergeBlockCategory
+from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
 from orchestrator.merge_lane.ports import (
     ClockPort,
     ContainmentPredicate,
@@ -6091,9 +6091,11 @@ async def classify_and_merge(
         # 4. Conflict → reject immediately (caller resolves outside queue).
         if merge_result.conflicts:
             logger.info('Task %s: merge conflicts detected', req.task_id)
+            evidence = ConflictEvidence(conflicted_paths=merge_result.conflicted_paths)
             _emit_merge_attempt(
                 event_store, req.task_id, OutcomeKind.conflict,
                 duration_ms=_elapsed_ms(started_monotonic),
+                conflict_evidence=evidence,
             )
             if isinstance(worker, SpeculativeMergeWorker):
                 # ι=1894: record drift = main_position − base at merge-start.
@@ -6107,7 +6109,10 @@ async def classify_and_merge(
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
             return Decided(
-                MergeOutcome('conflict', conflict_details=merge_result.details),
+                MergeOutcome(
+                    'conflict', conflict_details=merge_result.details,
+                    conflict_evidence=evidence,
+                ),
                 merge_result=merge_result,
             )
 
@@ -6918,13 +6923,14 @@ def _emit_train_attempt(
     started_monotonic: float,
     attempt: int | None = None,
     gate_clearance: GateClearance | None = None,
+    conflict_evidence: ConflictEvidence | None = None,
 ) -> None:
     """Emit a ``merge_attempt`` for *req*'s train, tagged with its train id and members."""
     _emit_merge_attempt(
         event_store, req.task_id, outcome,
         attempt=attempt, duration_ms=_elapsed_ms(started_monotonic),
         train_id=req.train_id, member_task_ids=req.member_task_ids,
-        gate_clearance=gate_clearance,
+        gate_clearance=gate_clearance, conflict_evidence=conflict_evidence,
     )
 
 
@@ -7506,7 +7512,13 @@ async def _do_train_merge(
             member_task_ids=req.member_task_ids,
             data={'derail_reason': reason},
         )
-        _emit_train_attempt(event_store, req, OutcomeKind.conflict if merge_result.conflicts else OutcomeKind.merge_failed, started_monotonic=t0)
+        if merge_result.conflicts:
+            _emit_train_attempt(
+                event_store, req, OutcomeKind.conflict, started_monotonic=t0,
+                conflict_evidence=ConflictEvidence(conflicted_paths=merge_result.conflicted_paths),
+            )
+        else:
+            _emit_train_attempt(event_store, req, OutcomeKind.merge_failed, started_monotonic=t0)
         return MergeOutcome('blocked', reason=reason)
 
     # Enforce invariants explicitly — plain assert is stripped under python -O,

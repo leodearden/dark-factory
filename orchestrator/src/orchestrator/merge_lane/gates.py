@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Literal
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S, GitOps, _run
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
+from orchestrator.merge_lane.outcome_facts import ConflictEvidence
 from orchestrator.merge_lane.reverify_gate_decision import (
     MAX_LOGGED_OVERLAP_PATHS,
     GateClearance,
@@ -192,6 +193,7 @@ def _emit_merge_attempt(
     probe_host: Literal['local', 'remote'] | None = None,
     skew_evidence: SkewEvidence | None = None,
     gate_clearance: GateClearance | None = None,
+    conflict_evidence: ConflictEvidence | None = None,
 ) -> None:
     """Emit a ``merge_attempt`` event for the given outcome.
 
@@ -249,6 +251,12 @@ def _emit_merge_attempt(
     call site), no key is added -- existing callers' payloads stay
     byte-identical.
 
+    *conflict_evidence* is the conflicted paths of a ``conflict`` outcome
+    (task 7302), written through :meth:`ConflictEvidence.to_event_payload` so
+    this row spells them exactly as the workflow's ``merge_blocked`` row does.
+    When omitted (every non-conflict call site), no key is added -- existing
+    callers' payloads stay byte-identical.
+
     This helper is deliberately disposition-AGNOSTIC about evidence: it writes
     whatever bundle it is handed, and deciding *when* to emit at all is the
     caller's guard. That is what lets one code path serve both the
@@ -280,6 +288,8 @@ def _emit_merge_attempt(
                 # Recorded unconditionally: a reader never has to know the cap
                 # to tell a short citation from a truncated one.
                 data[f'{key}_total'] = len(items)
+        if conflict_evidence is not None:
+            data.update(conflict_evidence.to_event_payload())
         event_store.emit(
             EventType.merge_attempt, task_id=task_id, phase='merge',
             data=data, duration_ms=duration_ms,
