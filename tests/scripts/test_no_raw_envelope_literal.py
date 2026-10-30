@@ -18,12 +18,12 @@ from raw_envelope_literal_guard import (
     ESCAPED_BRACKET,
     LITERAL_OWNER,
     RAW_PREFIXES,
-    describe,
     guarded_sources,
     handles_envelope_markup,
     main,
     raw_literal_violations,
     raw_prefix_lines,
+    report,
 )
 from shared.toolcall_markup import ENVELOPE_LITERALS
 
@@ -41,13 +41,7 @@ def test_no_markup_handling_file_spells_a_raw_envelope_literal(
     repo_population: dict[str, str],
 ) -> None:
     violations = raw_literal_violations(repo_population)
-    assert not violations, (
-        'These files handle MCP envelope markup yet spell an envelope literal with a '
-        f'raw opening bracket (each prefix is shown escaped):\n{describe(violations)}\n'
-        f'Build the literal in code from {LITERAL_OWNER} constants or chr(60), or spell '
-        f'the bracket as {ESCAPED_BRACKET} in prose and strings. Why: the '
-        "'Sentinel-literal hazard' section of shared/src/shared/toolcall_markup.py."
-    )
+    assert not violations, report(violations)
 
 
 def test_this_guard_is_inside_its_own_population(repo_population: dict[str, str]) -> None:
@@ -212,9 +206,11 @@ def test_cli_scans_only_the_named_directory_by_path_component(
     code = main(['pkg'], root=scoped_repo)
     out = capsys.readouterr().out
     assert code == 1
-    assert all(line in out.splitlines() for line in PKG_REPORT_LINES), out
-    for outside in ('pkgextra/violator.py', 'tracked_violator.py', 'ignored/handler.py'):
-        assert outside not in out
+    reported = [line for line in out.splitlines() if line.startswith('  ')]
+    assert reported == list(PKG_REPORT_LINES), (
+        'only pkg/ files may be reported: not pkgextra/violator.py, the top-level '
+        f'tracked_violator.py or the gitignored ignored/handler.py; got\n{out}'
+    )
     assert 'Sentinel-literal hazard' in out
     _assert_no_raw_prefix(out)
 
