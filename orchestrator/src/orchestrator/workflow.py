@@ -616,10 +616,12 @@ class _BriefingLike(Protocol):
         self, reviewer_type: str, diff: str, context: str | None = ...,
         *, amendment_suggestions: list[dict] | None = ...,
         task: dict | None = ...,
+        open_info_notes: Sequence[Escalation] | None = ...,
     ) -> str: ...
     async def build_context_complete_reviewer_prompt(
         self, reviewer_type: str, subject: ReviewSubject, context: str | None = ...,
         *, amendment_suggestions: list[dict] | None = ...,
+        open_info_notes: Sequence[Escalation] | None = ...,
     ) -> str: ...
     async def build_merger_prompt(self, conflicts: str, task_intent: str) -> str: ...
     async def build_revalidation_prompt(

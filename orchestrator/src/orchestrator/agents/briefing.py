@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from escalation.models import Escalation
 from shared.briefing_queries import BriefingScope
 from shared.task_text_fingerprint import TaskTextDrift
 
@@ -27,6 +28,37 @@ logger = logging.getLogger(__name__)
 
 DIFF_ONLY_DIFF_CAP_CHARS = 50_000
 """Where the incumbent reviewer briefing cuts its diff; ``diff_cap_chars=0`` lifts the cut."""
+
+
+def _open_info_notes_section(notes: Sequence[Escalation], detail_chars: int) -> str:
+    """The reviewer's notes block (plans/info-l0-disposition-router-prd.md D2)."""
+    entries = '\n'.join(_open_info_note_entry(note, detail_chars) for note in notes)
+    return f"""\
+# Implementer notes (open info escalations)
+
+These info notes were filed against this task while it was worked. Disposition
+every id below in `submit_review_verdict`'s `note_dispositions`, each as
+`addressed`, `no_action` or `work` as your contract defines them.
+
+{entries}"""
+
+
+def _open_info_note_entry(note: Escalation, detail_chars: int) -> str:
+    detail = note.detail[:detail_chars]
+    quoted = '\n'.join(f'> {line}' for line in detail.splitlines()) or '> (none)'
+    if len(note.detail) > detail_chars:
+        quoted += f'\n[detail truncated at {detail_chars} characters]'
+    return f"""\
+## {note.id}
+
+- filed by: {note.agent_role}
+- filed at: {note.timestamp}
+- summary: {note.summary}
+- suggested action: {note.suggested_action or '(none)'}
+- detail:
+
+{quoted}
+"""
 
 COMMIT_BULLET_LIMIT = 40
 """Max commit bullets rendered in one briefing section (task 3033 amendment).
@@ -1186,6 +1218,7 @@ This task holds locks for the following modules:
         *, amendment_suggestions: list[dict] | None = None,
         task: dict | None = None,
         diff_cap_chars: int = DIFF_ONLY_DIFF_CAP_CHARS,
+        open_info_notes: Sequence[Escalation] | None = None,
     ) -> str:
         """Build prompt for a reviewer agent.
 
@@ -1207,6 +1240,9 @@ This task holds locks for the following modules:
 
         *diff_cap_chars* is where the diff is cut; ``0`` inlines it whole.
         Production callers leave the default.
+
+        *open_info_notes* lists the task's open info notes for the reviewer to
+        disposition; none leaves the prompt byte-identical.
         """
         if context is None:
             context = await self._get_memory_context(BriefingScope.from_task(task), 'reviewer')
@@ -1231,27 +1267,39 @@ This task holds locks for the following modules:
 
         if amendment_suggestions:
             prompt += '\n' + amendment_scope_section(amendment_suggestions)
+        if open_info_notes:
+            prompt += '\n' + _open_info_notes_section(
+                open_info_notes, self.config.info_l0_note_detail_chars,
+            )
 
         return prompt
 
     async def build_context_complete_reviewer_prompt(
         self, reviewer_type: str, subject: ReviewSubject, context: str | None = None,
         *, amendment_suggestions: list[dict] | None = None,
+        open_info_notes: Sequence[Escalation] | None = None,
     ) -> str:
         """Build the context-complete (D2) reviewer prompt for *subject*.
 
         Memory is scoped to the task exactly as :meth:`build_reviewer_prompt`
         scopes it; the rendering lives in ``agents/review_briefing.py``.
+        *open_info_notes* is appended exactly as :meth:`build_reviewer_prompt`
+        appends it.
         """
         if context is None:
             context = await self._get_memory_context(BriefingScope.from_task(subject.task), 'reviewer')
-        return render_context_complete_review(
+        prompt = render_context_complete_review(
             reviewer_type=reviewer_type,
             subject=subject,
             context=context,
             task_block=self._format_task(subject.task, include_test_strategy=True),
             amendment_suggestions=amendment_suggestions,
         )
+        if open_info_notes:
+            prompt += '\n' + _open_info_notes_section(
+                open_info_notes, self.config.info_l0_note_detail_chars,
+            )
+        return prompt
 
     async def build_completion_judge_prompt(
         self,

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
 from _orch_helpers import pydantic_spec, wire_scheduler_liveness_mock
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.cli_invoke import PromptBuilder
 from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
@@ -494,6 +495,7 @@ class FakeBriefing:
         self, reviewer_type: str, diff: str, context: str | None = None,
         *, amendment_suggestions: list[dict] | None = None,
         task: dict | None = None,
+        open_info_notes: Sequence[Escalation] | None = None,
     ) -> str:
         # `amendment_suggestions` is keyword-only in both the Protocol and
         # the production method; it was positional-or-keyword here, which is
@@ -504,6 +506,7 @@ class FakeBriefing:
     async def build_context_complete_reviewer_prompt(
         self, reviewer_type: str, subject: ReviewSubject, context: str | None = None,
         *, amendment_suggestions: list[dict] | None = None,
+        open_info_notes: Sequence[Escalation] | None = None,
     ) -> str:
         first_path = subject.change.files[0].path if subject.change.files else ''
         return f'Review-d2 ({reviewer_type}): {first_path}'
