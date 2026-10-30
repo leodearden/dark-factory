@@ -595,9 +595,10 @@ def _unwrap_dispatch_envelope(result: object) -> dict:
     — so a single step lands on the INNER RESULT, whose keys are
     ``content``/``structuredContent``/``isError`` and never the payload's own.
     A one-step unwrapper therefore returns a dict in which every payload key is
-    absent, which each parser above reads as a well-formed envelope that simply
-    does not carry its key: ``_extract_statuses_map`` returned an error on
-    EVERY successful production call.  Corroborated by
+    absent, which each parser over this seam reads as a well-formed envelope
+    that simply does not carry its key: :func:`_extract_task` would report no
+    task, and :func:`_extract_results_list` no results, for EVERY successful
+    production call, as ``_extract_statuses_map`` once did.  Corroborated by
     ``orchestrator/src/orchestrator/scheduler.py::SchedulerFacade.get_statuses``, which
     parses the very same ``dispatch_tool`` result with
     ``shared.mcp_envelope.parse_tool_result(result, 'statuses', dict)`` — a
@@ -716,8 +717,7 @@ def _extract_task(result: object) -> tuple[dict | None, Exception | None]:
     """Extract a ``get_task`` response's task from a ``dispatch_tool`` envelope (see
     :func:`_unwrap_dispatch_envelope`), as a ``(task, error)`` pair.
 
-    Beside :func:`_extract_statuses_map` and over the same seam, for the same reason:
-    one envelope policy for every parser.  Three readings, which
+    Three readings, which
     ``orchestrator/src/orchestrator/flake_ledger.py::resolve_debt`` must tell apart:
 
     - ``(task, None)`` — a dict carrying ``status``, after descending one ``data``
