@@ -178,7 +178,10 @@ function escalationViews(rows) {
 
 // The ESCALATIONS payload, as data/redux_api.py::shape_escalations serves it:
 // one orchestrator subsection per `{project, rows}`, none with skipped files,
-// and every count and view computed from the rows.
+// and every count and view computed from the rows. Those counts re-derive the
+// server's; boundary_wire_fixtures.test.mjs checks them against a served body
+// only for one pending row, so rows the server counts differently (archived,
+// non-pending) are not covered.
 export function escalationsPayload(subsections) {
   const allRows = subsections.flatMap(({ rows }) => rows);
   return {
