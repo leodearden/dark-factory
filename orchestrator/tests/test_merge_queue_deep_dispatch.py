@@ -61,8 +61,8 @@ from _merge_deep_scene import (
     _spy_post_merge_verify,
     _StubRemoteAllocator,
     _worktree_names,
-    git_repo,  # noqa: F401 — pytest fixture used by name, resolved from the shared deep scene
 )
+from _merge_deep_scene import git_repo as git_repo
 from _merge_lane_census import queued_in_lane, queued_request_ids
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 

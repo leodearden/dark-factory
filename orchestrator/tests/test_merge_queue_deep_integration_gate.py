@@ -309,8 +309,8 @@ from _merge_deep_scene import (
     _spy_advance_main,
     _spy_chain_lane_release,
     _StubRemoteAllocator,
-    git_repo,  # noqa: F401 — pytest fixture used by name, resolved from the shared deep scene
 )
+from _merge_deep_scene import git_repo as git_repo
 from _merge_lane_census import lanes_by_task, queued_in_lane
 
 # task 5333: Row 7 ALONE is sized by measurement (DEEP_GATE_SCENE_TEST_TIMEOUT);

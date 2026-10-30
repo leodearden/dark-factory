@@ -48,8 +48,8 @@ from _merge_deep_scene import (
     _rev_parse,
     _shared_txt_with,
     _worktree_names,
-    git_repo,  # noqa: F401 — pytest fixture used by name, resolved from the shared deep scene
 )
+from _merge_deep_scene import git_repo as git_repo
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 
 from orchestrator.config import OrchestratorConfig
