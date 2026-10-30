@@ -22,6 +22,7 @@ from orchestrator.recut_ruling import (
     enforce_recut_ruling,
     execution_record,
     issue_ruling,
+    issued_ruling_was_dropped,
     read_recut_ruling,
     ruling_patch,
     ruling_to_enforce,
@@ -402,3 +403,27 @@ class TestIssueRuling:
         )
         assert isinstance(failure, str)
         assert 'store down' in failure
+
+
+class TestIssuedRulingWasDropped:
+    def test_ruling_still_carried_is_not_dropped(self):
+        assert not issued_ruling_was_dropped({'metadata': ruling_patch(ISSUED)}, ISSUED)
+
+    def test_ruling_gone_without_its_execution_is_dropped(self):
+        assert issued_ruling_was_dropped({'metadata': {'files': ['a.py']}}, ISSUED)
+
+    def test_ruling_gone_after_its_execution_is_not_dropped(self):
+        metadata = {RECUT_EXECUTED_KEY: execution_record(ISSUED, PARKED, EXECUTED_AT)}
+        assert not issued_ruling_was_dropped({'metadata': metadata}, ISSUED)
+
+    def test_ruling_gone_after_an_older_execution_is_dropped(self):
+        older = RecutRuling(ruling_id='esc-5516-1', ruled_at=datetime(2026, 10, 1, tzinfo=UTC))
+        metadata = {RECUT_EXECUTED_KEY: execution_record(older, PARKED, EXECUTED_AT)}
+        assert issued_ruling_was_dropped({'metadata': metadata}, ISSUED)
+
+    def test_a_different_ruling_in_its_place_is_not_dropped(self):
+        newer = RecutRuling(ruling_id='esc-5516-9', ruled_at=datetime(2026, 10, 31, tzinfo=UTC))
+        assert not issued_ruling_was_dropped({'metadata': ruling_patch(newer)}, ISSUED)
+
+    def test_unreadable_metadata_is_not_read_as_dropped(self):
+        assert not issued_ruling_was_dropped({'metadata': 'not-json{'}, ISSUED)

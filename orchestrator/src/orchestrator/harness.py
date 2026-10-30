@@ -16868,8 +16868,8 @@ class Harness:
             self._action_teardown_and_set_status(
                 escalation.task_id, effect.target_status, action,
                 escalation_id=escalation.id,
-                recut_ruling_id=(
-                    self._recut_ruling_id(escalation) if action == 'restart' else None
+                recut=(
+                    self._restart_recut_ruling(escalation) if action == 'restart' else None
                 ),
             ),
             label=(
@@ -16885,28 +16885,30 @@ class Harness:
         action: str,
         *,
         escalation_id: str,
-        recut_ruling_id: str | None = None,
+        recut: recut_ruling.RecutRuling | None = None,
     ) -> None:
         """Async helper: execute a non-resume resolution action on a task.
 
         Implements C3.1 (status-precedes-kill) ordering:
           1. Terminal recheck — skip if the task is already done/cancelled.
-          2. restart only: clear ``metadata.merge_retry_pending`` (task 3024).
-          3. restart with ``recut_ruling_id`` only (task 5516): issue
+          2. restart with ``recut`` only (task 5516): issue
              ``metadata.recut_ruling`` so the next dispatch re-cuts the task
              fresh off main (``orchestrator/recut_ruling.py``).  Written
              before the status write, so any dispatch that reads 'pending'
              also reads the ruling.  FAILS CLOSED: if the ruling cannot be
-             persisted, ``target_status`` becomes 'blocked' (the kill still
-             runs) and a RESTART_RECUT_UNRECORDED infra_issue L1 is filed,
-             rather than re-pending onto the stale plan and branch.
+             persisted the restart does not proceed — ``target_status``
+             becomes 'blocked', no restart-only step below runs (the kill
+             still does), and a RESTART_RECUT_UNRECORDED infra_issue L1 is
+             filed, rather than re-pending onto the stale plan and branch.
+          3. restart only: clear ``metadata.merge_retry_pending`` (task 3024).
           4. Stamp ``_action_teardown_tasks`` (suppression, C3.2 / D9).
           5. Write ``target_status`` via scheduler.
           6. Kill live workflow if active (soft → grace → hard).
           7. In the finally block, once the kill window closes: clear the
-             suppression stamp, then (restart only) re-run step 2's clear so a
-             stamp resurrected by the dying workflow's own metadata write does
-             not survive the restart.
+             suppression stamp, then (restart only) re-run step 3's clear and
+             re-assert step 2's ruling, so neither a stamp resurrected nor a
+             ruling dropped by the dying workflow's own metadata write
+             survives the restart.
 
         Preconditions per action:
           - restart: task must be non-terminal (checked at step 1); target='pending'.
@@ -16953,6 +16955,12 @@ class Harness:
             )
             return
 
+        restarting = action == 'restart'
+        if recut is not None and not await self._issue_restart_recut_ruling(
+            task_id, recut, escalation_id=escalation_id,
+        ):
+            restarting, target_status = False, 'blocked'
+
         # restart means "run this task again from scratch", so void any durable
         # merge-retry obligation first (task 3024).  A surviving
         # metadata.merge_retry_pending stamp makes the re-dispatched workflow
@@ -16968,12 +16976,8 @@ class Harness:
         # the stamp with a metadata write of its own before the kill lands — so
         # an idempotent second clear runs in the finally block once the kill
         # window has closed (see there).
-        if action == 'restart':
+        if restarting:
             await self._clear_merge_retry_pending_for_restart(task_id)
-        if recut_ruling_id is not None and not await self._issue_restart_recut_ruling(
-            task_id, recut_ruling_id, escalation_id=escalation_id,
-        ):
-            target_status = 'blocked'
 
         logger.info(
             'action-teardown %s: writing task %s → %s',
@@ -17019,7 +17023,7 @@ class Harness:
             # runner re-fires the gate from scratch.  resume preserves stamps so
             # the runner's idempotency drives the gate to done instead (I2/B4/B5).
             # park/abandon/close_only are left untouched — stamps preserved.
-            if action == 'restart':
+            if restarting:
                 task = await self.scheduler.get_task(task_id)
                 if task is not None and Scheduler.is_deterministic(task):
                     await self.scheduler.update_task(
@@ -17090,8 +17094,12 @@ class Harness:
             # on the SetTaskStatusRejected early return (the task went terminal
             # mid-teardown), which is fine and mildly desirable: a done/cancelled
             # task should not carry a merge-retry obligation either.
-            if action == 'restart':
+            if restarting:
                 await self._clear_merge_retry_pending_for_restart(task_id)
+                if recut is not None:
+                    await self._reassert_restart_recut_ruling(
+                        task_id, recut, escalation_id=escalation_id,
+                    )
 
     async def _clear_merge_retry_pending_for_restart(self, task_id: str) -> None:
         """Drop ``metadata.merge_retry_pending`` so a restart re-plans from scratch.
@@ -17182,19 +17190,75 @@ class Harness:
         )
 
     async def _issue_restart_recut_ruling(
-        self, task_id: str, ruling_id: str, *, escalation_id: str,
+        self, task_id: str, ruling: recut_ruling.RecutRuling, *, escalation_id: str,
     ) -> bool:
-        """Persist a re-cut ruling for a restart; False (and an L1 filed) if it did not land."""
+        """Persist a restart's re-cut ruling; False (and an L1 filed) if it did not land."""
         failure = await recut_ruling.issue_ruling(
-            recut_ruling.RecutRuling(ruling_id, datetime.now(UTC)),
-            persist=functools.partial(self.scheduler.update_task, task_id),
+            ruling, persist=functools.partial(self.scheduler.update_task, task_id),
         )
         if failure is None:
-            logger.info('RECUT ISSUED: task %s ruling %s', task_id, ruling_id)
+            logger.info('RECUT ISSUED: task %s ruling %s', task_id, ruling.ruling_id)
             return True
+        self._file_restart_recut_unrecorded(
+            task_id, ruling, failure, escalation_id=escalation_id,
+            consequence=(
+                'The task is held blocked rather than re-pended onto its stale plan '
+                'and branch.'
+            ),
+        )
+        return False
+
+    async def _reassert_restart_recut_ruling(
+        self, task_id: str, ruling: recut_ruling.RecutRuling, *, escalation_id: str,
+    ) -> None:
+        """Re-issue *ruling* if a write landing in the kill window dropped it.
+
+        A dying workflow's replace-mode metadata write that read the task
+        before the ruling landed deletes it, which would silently degrade the
+        restart to a plain one. Re-issuing the same ruling cannot re-cut
+        twice: once ``recut_executed`` names it, it is neither re-issued nor
+        enforced again.
+        """
+        task = await self.scheduler.get_task(task_id)
+        if task is None:
+            logger.warning(
+                'RECUT RE-CHECK: could not read task %s; ruling %s may have been '
+                'dropped in the kill window',
+                task_id, ruling.ruling_id,
+            )
+            return
+        if not recut_ruling.issued_ruling_was_dropped(task, ruling):
+            return
+        failure = await recut_ruling.issue_ruling(
+            ruling, persist=functools.partial(self.scheduler.update_task, task_id),
+        )
+        if failure is None:
+            logger.warning(
+                'RECUT RE-ASSERTED: task %s ruling %s was dropped in the kill window',
+                task_id, ruling.ruling_id,
+            )
+            return
+        self._file_restart_recut_unrecorded(
+            task_id, ruling, failure, escalation_id=escalation_id,
+            consequence=(
+                'The ruling landed but was dropped in the kill window, and the task '
+                'is already re-pended, so its next dispatch may reuse its stale plan '
+                'and branch.'
+            ),
+        )
+
+    def _file_restart_recut_unrecorded(
+        self,
+        task_id: str,
+        ruling: recut_ruling.RecutRuling,
+        failure: str,
+        *,
+        escalation_id: str,
+        consequence: str,
+    ) -> None:
         logger.error(
-            'RECUT UNRECORDED: task %s ruling %s via %s: %s — holding the task blocked',
-            task_id, ruling_id, escalation_id, failure,
+            'RECUT UNRECORDED: task %s ruling %s via %s: %s %s',
+            task_id, ruling.ruling_id, escalation_id, failure, consequence,
         )
         self._file_dispatch_gate_l1(
             task_id,
@@ -17204,13 +17268,12 @@ class Harness:
                 'demanded a re-cut that could not be recorded'
             ),
             detail=(
-                f'Writing metadata.recut_ruling (ruling {ruling_id}) failed: {failure}.\n'
-                'The task is held blocked rather than re-pended onto its stale plan and '
-                'branch. Remedy: once the task store is healthy, re-issue '
-                "resolve_issue(action='restart', recut=True) on a fresh escalation."
+                f'Writing metadata.recut_ruling (ruling {ruling.ruling_id}) failed: '
+                f'{failure}.\n{consequence} Remedy: once the task store is healthy, '
+                "re-issue resolve_issue(action='restart', recut=True) on a fresh "
+                'escalation.'
             ),
         )
-        return False
 
     def _cascade_parent(self, escalation) -> Escalation | None:
         """The parent L2 of an ``l2-cascade:<id>`` member, or None."""
@@ -17220,6 +17283,13 @@ class Harness:
         if self._escalation_queue is None:
             return None
         return self._escalation_queue.get(resolved_by.split(':', 1)[1])
+
+    def _restart_recut_ruling(self, escalation) -> recut_ruling.RecutRuling | None:
+        """The re-cut ruling a restart resolution issues, ruled now, or None."""
+        ruling_id = self._recut_ruling_id(escalation)
+        if ruling_id is None:
+            return None
+        return recut_ruling.RecutRuling(ruling_id, datetime.now(UTC))
 
     def _recut_ruling_id(self, escalation) -> str | None:
         """The id of the record whose resolution set ``recut``, or None."""

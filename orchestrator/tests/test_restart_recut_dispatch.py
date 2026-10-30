@@ -5,7 +5,9 @@ writes ``'pending'``, so any dispatch that observes ``'pending'`` also
 observes the ruling, and the task-3154 dispatch gate
 (``orchestrator/src/orchestrator/recut_ruling.py``) re-cuts the task fresh off
 main. If the ruling cannot be persisted the teardown fails closed: the task is
-held ``'blocked'`` and one ``RESTART_RECUT_UNRECORDED`` infra_issue L1 is filed.
+held ``'blocked'``, none of the restart-only clears run, and one
+``RESTART_RECUT_UNRECORDED`` infra_issue L1 is filed. A ruling the dying
+workflow's metadata write drops in the kill window is re-asserted unchanged.
 
 Driven end to end through the real ``resolve_issue`` tool, a real
 ``EscalationQueue`` and the harness's resolve callback; observed through a
@@ -14,6 +16,7 @@ stateful task-store double and the queue.
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -172,3 +175,72 @@ class TestRestartRecutIssuesARuling:
         assert RECUT_RULING_KEY in metadata
         assert metadata['files'] == ['a.py', 'b.py']
         assert store.status('42') == 'pending'
+
+
+def _kill_lands_a_stale_replace_write(
+    harness: Harness, store: TaskStoreDouble, task_id: str, *,
+    then_refuse: frozenset[str] = frozenset(),
+) -> None:
+    """A live workflow whose dying metadata write replaces the record it read before the ruling."""
+    stale = copy.deepcopy(store.metadata(task_id))
+    active = {task_id}
+    harness.is_workflow_active = lambda tid: tid in active  # type: ignore[method-assign]
+
+    def _cancel(tid: str) -> None:
+        store.tasks[tid]['metadata'] = copy.deepcopy(stale)
+        store.refused_metadata_keys |= then_refuse
+        active.discard(tid)
+
+    harness.cancel_workflow = _cancel  # type: ignore[method-assign]
+
+
+class TestRulingDroppedDuringTheKillWindow:
+    async def test_the_same_ruling_is_re_asserted(self, server, harness, store, queue):
+        store.add('42', status='in-progress', metadata={'files': ['a.py']})
+        _kill_lands_a_stale_replace_write(harness, store, '42')
+        l1 = _file_l1(queue, '42')
+
+        await _resolve(server, harness, escalation_id=l1.id, action='restart', recut=True)
+
+        first, again = store.writes_of('42', RECUT_RULING_KEY)
+        assert store.calls[again][2] == store.calls[first][2]
+        assert store.metadata('42')[RECUT_RULING_KEY] == store.calls[first][2][RECUT_RULING_KEY]
+        ruling = ruling_to_enforce(store.tasks['42'])
+        assert ruling is not None and ruling.ruling_id == l1.id
+        assert store.status('42') == 'pending'
+
+    async def test_a_failed_re_assert_files_an_l1(self, server, harness, store, queue):
+        store.add('42', status='in-progress')
+        _kill_lands_a_stale_replace_write(
+            harness, store, '42', then_refuse=frozenset({RECUT_RULING_KEY}),
+        )
+        l1 = _file_l1(queue, '42')
+
+        await _resolve(server, harness, escalation_id=l1.id, action='restart', recut=True)
+
+        assert RECUT_RULING_KEY not in store.metadata('42')
+        filed = [
+            e for e in queue.get_by_task('42', status='pending', level=1)
+            if e.category == 'infra_issue'
+        ]
+        assert len(filed) == 1, filed
+        assert filed[0].summary.startswith('RESTART_RECUT_UNRECORDED')
+        assert l1.id in filed[0].detail
+
+
+class TestUnrecordedRulingUndoesNothing:
+    async def test_restart_only_clears_do_not_run(self, server, harness, store, queue):
+        held = {
+            'task_kind': 'deterministic',
+            'gate_escalated_at': '2026-10-30T09:00:00+00:00',
+            'before_done_ran_at': '2026-10-30T09:05:00+00:00',
+            'merge_retry_pending': {'attempt': 1},
+        }
+        store.add('42', metadata=held)
+        store.refused_metadata_keys.add(RECUT_RULING_KEY)
+        l1 = _file_l1(queue, '42')
+
+        await _resolve(server, harness, escalation_id=l1.id, action='restart', recut=True)
+
+        assert store.status('42') == 'blocked'
+        assert store.metadata('42') == held

@@ -193,6 +193,17 @@ async def issue_ruling(
     return await _persist_failure(persist, ruling_patch(ruling))
 
 
+def issued_ruling_was_dropped(task: dict[str, Any], ruling: RecutRuling) -> bool:
+    """True when *task* carries neither the issued *ruling* nor its execution.
+
+    Unreadable metadata reads False: nothing seen is nothing to restore.
+    """
+    metadata = coerce_task_metadata(task.get('metadata'))
+    if metadata is None or RECUT_RULING_KEY in metadata:
+        return False
+    return _executed_ruling_id(metadata) != ruling.ruling_id
+
+
 async def enforce_recut_ruling(
     task: dict[str, Any],
     *,
