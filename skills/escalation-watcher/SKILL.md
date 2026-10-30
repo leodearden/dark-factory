@@ -702,6 +702,15 @@ carries the brief. Check "Always ask — keyed on record content" below first: i
     it says to remove). Pass `done_provenance` naming the delivering task and commit. The task must
     have no branch commits and no pin. Any item not on main sends it to Leo (Leo, 2026-10-29,
     solar_challenge_platform esc-1556-2; precedents 1470, 1058, 683).
+13. Repairing a stale delivered check behind a `dependency_capability` record, then `resume` on
+    every record waiting on it. This is case 1 of that category's handler: the capability is on
+    main, and the check fails only because later landed work reshaped the code it greps (a moved
+    file, a renamed idiom, a refactor). Edit only the owner's sites: its `delivered_checks`, re-sent
+    whole, and its sidecar on main when `on_main` is `declares` (plus the `.md` twin if that quotes
+    the old form), as a docs-only commit. Verify yourself before the resume: the new check passes at
+    `main`, the owner's other checks still pass, and the new form still states what the check meant.
+    A capability missing from main is case 2 and still goes to Leo (Leo, 2026-10-30,
+    solar_challenge esc-224-3 and its six twins: "Always fix this sort of check breakage").
 
 Lines 11 and 12 are exceptions to the scope-change class below. Cancelling a task WITH dependents
 still goes to Leo.
@@ -2033,8 +2042,8 @@ fallback, the field meanings and why not `get_escalation` are in the "Investigat
 `record`" bullet above. Two cases, with opposite responses (`docs/task-authoring.md` §3.3):
 
 1. **The capability is on main and the check is stale or mis-authored.** An `AUTHORING DIAGNOSIS`
-   block, or your own `git grep` at `main` finding the capability elsewhere, shows this. Editing a
-   gate descriptor is a human call: put it to Leo with the owner's sites as the apply target.
+   block, or your own `git grep` at `main` finding the capability elsewhere, shows this. Fix the
+   check at the owner's sites yourself and report it under **Done** (self-execute item 13).
 2. **The capability is missing from main.** The gap is the owner's work. Put it to Leo with the
    owner named; do not touch any descriptor.
 
