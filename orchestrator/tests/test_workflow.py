@@ -46,6 +46,7 @@ from orchestrator.git_ops import WorktreeConflictError
 from orchestrator.merge_lane.gates import PlanFilesTouchedResult
 from orchestrator.merge_lane.worker import MergeOutcome, MergeRequest
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
+from orchestrator.rebase_drops import DroppedCommit
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import (
     StewardInterrupted,
@@ -199,10 +200,12 @@ class _CheckSequence:
     def __init__(self, results: list[PlanFilesTouchedResult]) -> None:
         self.results = list(results)
         self.calls = 0
+        self.call_kwargs: list[dict] = []
 
     async def __call__(self, *args, **kwargs) -> PlanFilesTouchedResult:
         idx = min(self.calls, len(self.results) - 1)
         self.calls += 1
+        self.call_kwargs.append(kwargs)
         return self.results[idx]
 
 
@@ -821,6 +824,72 @@ class TestSubmitToMergeQueueStalePathMessage:
         assert self._NEVER_TOUCHED_SENTENCE in reason
         assert 'has not delivered against the plan' in reason
         assert 'does not exist in the tree' not in reason.lower()
+
+
+@pytest.mark.asyncio
+class TestSubmitToMergeQueueRebaseDroppedMessage:
+    """A plan file a rebase dropped is not an implementation gap (task 4669).
+
+    ``git rebase`` drops a branch commit whose change main already carries
+    (the 3490 cache-buster bump), so the gate's ``base..HEAD`` read sees the
+    file untouched.  The gate is handed the branch, attributes the entry to
+    the dropped commit, and the block reason says so instead of claiming
+    "Implementation has not delivered".  Routing is unchanged.
+    """
+
+    _SHA = 'c2e8f8c14d' + '0' * 30
+    _SUBJECT = 'chore(3490): bump the redux cache-buster uniformly, 43 -> 44'
+
+    def _wire(self, wf, monkeypatch, results):
+        """Stub the gate with *results*; record its calls, events and the block."""
+        check_seq = _CheckSequence(results)
+        monkeypatch.setattr(
+            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
+            check_seq,
+        )
+
+        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+            return 0, 'fake_head_sha\n', ''
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+
+        events = _RecordingEventStore()
+        wf.event_store = events
+        wf._try_narrow_plan = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+        wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+        return check_seq, events, mark_blocked
+
+    async def test_dropped_entry_is_attributed_with_routing_unchanged(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        from orchestrator.merge_lane.gates import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.plan = {'files': ['index.html']}
+        result = PlanFilesTouchedResult(
+            not_touched=['index.html'],
+            dropped_by_rebase={'index.html': (
+                DroppedCommit(sha=self._SHA, subject=self._SUBJECT, paths=('index.html',)),
+            )},
+        )
+        check_seq, events, mark_blocked = self._wire(wf, monkeypatch, [result, result])
+
+        outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
+
+        mark_blocked.assert_awaited_once()
+        args, kwargs = mark_blocked.call_args
+        reason = args[0] if args else kwargs['reason']
+        assert reason.startswith(PLAN_FILES_NOT_TOUCHED_REASON_PREFIX)
+        assert 'c2e8f8c14d00' in reason
+        assert self._SUBJECT in reason
+        assert 'Implementation has not delivered' not in reason
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert 'plan_files_not_touched' in _merge_attempt_outcomes(events)
+        assert kwargs.get('escalate_to_human') is True
+        assert check_seq.call_kwargs, 'the gate was never called'
+        assert [kw.get('branch') for kw in check_seq.call_kwargs] == [
+            f'{wf.config.git.branch_prefix}2656',
+        ] * len(check_seq.call_kwargs)
 
 
 _PASSING_VERIFY_RESULT = VerifyResult(
