@@ -94,10 +94,7 @@ from df_pytest_isolation import (  # noqa: E402
     reject_unsafe_basetemp,
 )
 
-from fused_memory.backends.graphiti_client import (  # noqa: E402
-    GraphitiBackend,
-    _MultiTenantFalkorDriver,
-)
+from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: E402
 from fused_memory.config.schema import (  # noqa: E402
     EmbedderConfig,
     EmbedderProvidersConfig,
@@ -583,6 +580,8 @@ def make_graph_driver():
     it as ``make_backend(config, driver=...)`` instead of assigning
     ``backend._driver._get_graph``.
     """
+    from fused_memory.backends.graphiti_client import _MultiTenantFalkorDriver
+
     def _factory(graphs: Mapping[str, Any]) -> _MultiTenantFalkorDriver:
         def _select(name: str) -> Any:
             if name not in graphs:
