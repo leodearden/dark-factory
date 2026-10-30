@@ -2419,8 +2419,7 @@ SIGNAL_KILL_SUMMARY_MARKER = 'killed by signal'
 # truncated run reported ``1 failed, 728 passed, 1 skipped`` where a clean
 # re-run of the identical command reported ``19622 passed, 17 skipped``.
 #
-# Same CONSTRAINT ON PRODUCERS as above: a fragment bearing this marker must
-# not contain ', '.  See `_worker_death_leg_note`.
+# Same CONSTRAINT ON PRODUCERS as above.  See `_worker_death_leg_note`.
 WORKER_DEATH_SUMMARY_MARKER = 'session aborted after worker death'
 
 # Every marker that makes a summary fragment a no-verdict note.
@@ -2471,6 +2470,9 @@ def _killed_leg_note(
     )
 
 
+_MAX_NAMED_CRASHED_NODEIDS = 3
+
+
 def _worker_death_leg_note(
     label: str, *, module: str | None = None, crashed_nodeids: Iterable[str] = (),
 ) -> str:
@@ -2491,6 +2493,10 @@ def _worker_death_leg_note(
     quote the tally, and deliberately does not take a duration — the
     wall-clock time of a truncated run measures nothing anyone should act on.
 
+    The note travels into the bench reason and the escalation title, so it
+    names at most ``_MAX_NAMED_CRASHED_NODEIDS`` in-flight tests and counts
+    the rest.
+
     Clauses are separated by ``'; '``: the note must stay one fragment, per
     ``SIGNAL_KILL_SUMMARY_MARKER``'s producer constraint.  Pinned by
     test_verify.py::TestWorkerDeathLegSummary.
@@ -2500,7 +2506,10 @@ def _worker_death_leg_note(
     })
     clauses = [f'{_leg_name(label, module)} {WORKER_DEATH_SUMMARY_MARKER}']
     if in_flight:
-        clauses.append('worker died running ' + ' and '.join(f"'{nodeid}'" for nodeid in in_flight))
+        named = in_flight[:_MAX_NAMED_CRASHED_NODEIDS]
+        unnamed = len(in_flight) - len(named)
+        more = f' (+{unnamed} more)' if unnamed else ''
+        clauses.append('worker died running ' + ' and '.join(f"'{nodeid}'" for nodeid in named) + more)
     clauses += ['remaining tests never ran', 'tally is partial']
     return '; '.join(clauses)
 

@@ -3839,6 +3839,23 @@ class TestWorkerDeathLegNoteNamesWhoseLegDied:
             "worker died running 'tests/test_a.py::test_a' and 'tests/test_z.py::test_b'" in note
         ), note
 
+    def test_many_ids_name_the_first_few_and_count_the_rest(self):
+        """The note travels into the bench reason and the escalation title, so
+        a session that lost many workers must not grow it without bound."""
+        nodeids = [f'tests/test_x.py::test_p[case-{i}]' for i in range(6)]
+        note = _worker_death_leg_note('test', module='orchestrator', crashed_nodeids=nodeids)
+        named = verify._MAX_NAMED_CRASHED_NODEIDS
+        for nodeid in nodeids[:named]:
+            assert f"'{nodeid}'" in note, note
+        for nodeid in nodeids[named:]:
+            assert nodeid not in note, note
+        assert f'(+{len(nodeids) - named} more)' in note, note
+        assert note.split(', ') == [note]
+
+    def test_ids_within_the_cap_are_not_counted(self):
+        note = _worker_death_leg_note('test', crashed_nodeids={XDIST_IN_FLIGHT_NODEID})
+        assert 'more)' not in note, note
+
     def test_labelled_note_with_an_id_is_one_aggregation_fragment(self):
         """Exactly the parse `_aggregate_results` performs."""
         note = _worker_death_leg_note(
@@ -3991,12 +4008,19 @@ class TestModuleScopedNoVerdictNoteNamesItsModule:
 
     @pytest.mark.asyncio
     async def test_aggregate_points_at_the_leg_that_died_not_a_sibling(self, tmp_path: Path):
-        scripts = await _module_verify_result(tmp_path, 'true', 'scripts')
+        """A sibling that failed ORDINARILY keeps its verdict, and the
+        no-verdict note blames only the leg whose worker died."""
+        scripts = await _module_verify_result(
+            tmp_path, "echo 'FAILED tests/test_s.py::test_s'; exit 1", 'scripts',
+        )
         orchestrator = await _module_verify_result(tmp_path, _worker_death_command(tmp_path), 'orchestrator')
         agg = _aggregate_results([scripts, orchestrator])
-        assert 'orchestrator test leg' in agg.summary, agg.summary
-        assert 'scripts' not in agg.summary, agg.summary
-        assert verify.is_no_verdict_summary(agg.summary)
+        fragments = agg.summary.removeprefix('Failures: ').split(', ')
+        no_verdict_notes = [f for f in fragments if verify.is_no_verdict_summary(f)]
+        assert len(no_verdict_notes) == 1, agg.summary
+        assert no_verdict_notes[0].startswith('orchestrator test leg'), agg.summary
+        assert 'scripts test leg' not in agg.summary, agg.summary
+        assert 'tests failed' in fragments, agg.summary
 
     @pytest.mark.asyncio
     async def test_signal_kill_note_names_the_module(self, tmp_path: Path):
