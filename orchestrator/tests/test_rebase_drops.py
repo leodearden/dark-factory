@@ -12,15 +12,19 @@ orchestrator.git_ops._run, injected exactly as production injects it.
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 
 from orchestrator.git_ops import _run
 from orchestrator.rebase_drops import (
     REBASE_DROP_REF_NAMESPACE,
     DroppedCommit,
     RebaseDropLedger,
+    run_rebase_reporting_drops,
 )
 
 # ---------------------------------------------------------------------------
@@ -189,3 +193,220 @@ class TestRebaseDropLedger:
         ]
         assert warnings, caplog.text
         assert 'task/1' in warnings[0].getMessage()
+
+
+# ---------------------------------------------------------------------------
+# run_rebase_reporting_drops
+# ---------------------------------------------------------------------------
+
+_OWN_A = 'feat(1): own a (task 1)'
+_BUMP = 'chore(1): bump 43 -> 44 (task 1)'
+_OWN_B = 'test(1): own b (task 1)'
+
+
+async def _add_worktree(repo: Path, name: str, start_ref: str) -> Path:
+    """Create a linked worktree on new branch task/<name> at *start_ref*."""
+    wt = repo.parent / f'wt-{name}'
+    await _git(repo, 'worktree', 'add', '-b', f'task/{name}', str(wt), start_ref)
+    return wt
+
+
+def _module_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == 'orchestrator.rebase_drops' and r.levelno == logging.WARNING
+    ]
+
+
+async def _rebase_in_progress(wt: Path) -> bool:
+    rebase_dir = (await _git(wt, 'rev-parse', '--git-path', 'rebase-merge')).strip()
+    return (wt / rebase_dir).exists()
+
+
+@dataclass(frozen=True)
+class Shape3490:
+    """task/1 carries an own commit, a version bump, and another own commit."""
+
+    repo: Path
+    wt: Path
+    own_a: str
+    bump: str
+    own_b: str
+
+    @property
+    def bump_dropped(self) -> DroppedCommit:
+        return DroppedCommit(sha=self.bump, subject=_BUMP, paths=('index.html',))
+
+
+@pytest_asyncio.fixture
+async def shape(repo: Path) -> AsyncIterator[Shape3490]:
+    await _init_repo(repo)
+    await _commit(repo, 'base', {'index.html': 'v=43\n', 'a.txt': 'a\n'})
+    wt = await _add_worktree(repo, '1', 'main')
+    own_a = await _commit(wt, _OWN_A, {'a.txt': 'a\nown\n'})
+    bump = await _commit(wt, _BUMP, {'index.html': 'v=44\n'})
+    own_b = await _commit(wt, _OWN_B, {'b.txt': 'b\n'})
+    yield Shape3490(repo=repo, wt=wt, own_a=own_a, bump=bump, own_b=own_b)
+    if await _rebase_in_progress(wt):
+        await _git(wt, 'rebase', '--abort')
+
+
+async def _branch_subjects(s: Shape3490) -> list[str]:
+    out = await _git(s.repo, 'log', '--reverse', '--format=%s', 'main..task/1')
+    return out.splitlines()
+
+
+@pytest.mark.asyncio
+class TestRunRebaseReportingDrops:
+    async def test_a_commit_that_became_empty_is_reported_and_recorded(
+        self, shape: Shape3490, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        await _commit(shape.repo, 'main: bump and more', {
+            'index.html': 'v=44\n', 'm.txt': 'm\n',
+        })
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_drops'):
+            result = await run_rebase_reporting_drops(_run, shape.wt, onto='main')
+
+        assert result.ok
+        assert result.dropped == (shape.bump_dropped,)
+        assert await RebaseDropLedger(shape.repo, _run).dropped_of('task/1') == (
+            shape.bump_dropped,
+        )
+        warnings = _module_warnings(caplog)
+        assert len(warnings) == 1, warnings
+        assert 'task/1' in warnings[0]
+        assert shape.bump[:12] in warnings[0]
+        assert _BUMP in warnings[0]
+        assert await _branch_subjects(shape) == [_OWN_A, _OWN_B]
+
+    async def test_a_patch_identical_commit_is_reported_and_recorded(
+        self, shape: Shape3490,
+    ) -> None:
+        await _commit(shape.repo, 'main: the same bump', {'index.html': 'v=44\n'})
+
+        result = await run_rebase_reporting_drops(_run, shape.wt, onto='main')
+
+        assert result.ok
+        assert result.dropped == (shape.bump_dropped,)
+        assert await RebaseDropLedger(shape.repo, _run).dropped_of('task/1') == (
+            shape.bump_dropped,
+        )
+        assert await _branch_subjects(shape) == [_OWN_A, _OWN_B]
+
+    async def test_a_clean_rebase_reports_and_records_nothing(
+        self, shape: Shape3490, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        await _commit(shape.repo, 'main: unrelated', {'m.txt': 'm\n'})
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_drops'):
+            result = await run_rebase_reporting_drops(_run, shape.wt, onto='main')
+
+        assert result.ok
+        assert result.dropped == ()
+        assert await _dropped_refs(shape.repo) == []
+        assert _module_warnings(caplog) == []
+        assert await _branch_subjects(shape) == [_OWN_A, _BUMP, _OWN_B]
+
+    async def test_a_linearized_merge_commit_is_never_reported(
+        self, repo: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        await _init_repo(repo)
+        await _commit(repo, 'base', {'base.txt': 'base\n'})
+        wt = await _add_worktree(repo, '1', 'main')
+        await _git(wt, 'switch', '-c', 'side')
+        await _commit(wt, 'side: own s', {'s.txt': 's\n'})
+        await _git(wt, 'switch', 'task/1')
+        await _commit(wt, _OWN_A, {'a.txt': 'a\n'})
+        await _git(wt, 'merge', '--no-ff', 'side', '-m', 'merge side')
+        await _commit(repo, 'main: unrelated', {'m.txt': 'm\n'})
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_drops'):
+            result = await run_rebase_reporting_drops(_run, wt, onto='main')
+
+        assert result.ok
+        assert result.dropped == ()
+        assert await _dropped_refs(repo) == []
+        assert _module_warnings(caplog) == []
+
+    async def test_upstream_form_reports_only_the_replayed_range(
+        self, repo: Path,
+    ) -> None:
+        await _init_repo(repo)
+        await _commit(repo, 'base', {'index.html': 'v=43\n', 'a.txt': 'a\n'})
+        p_wt = await _add_worktree(repo, 'P', 'main')
+        p1 = await _commit(p_wt, 'feat(P): p1', {'p.txt': 'p\n'})
+        wt = await _add_worktree(repo, '1', p1)
+        await _commit(wt, _OWN_A, {'a.txt': 'a\nown\n'})
+        bump = await _commit(wt, _BUMP, {'index.html': 'v=44\n'})
+        main_sha = await _commit(repo, 'main: bump and more', {
+            'index.html': 'v=44\n', 'm.txt': 'm\n',
+        })
+
+        result = await run_rebase_reporting_drops(
+            _run, wt, onto=main_sha, upstream=p1,
+        )
+
+        assert result.ok
+        assert result.dropped == (
+            DroppedCommit(sha=bump, subject=_BUMP, paths=('index.html',)),
+        )
+        assert [c.sha for c in await RebaseDropLedger(repo, _run).dropped_of('task/1')] == [
+            bump,
+        ]
+        subjects = (await _git(repo, 'log', '--reverse', '--format=%s', 'main..task/1'))
+        assert subjects.splitlines() == [_OWN_A]
+
+    async def test_a_conflict_fails_without_aborting_and_records_nothing(
+        self, shape: Shape3490,
+    ) -> None:
+        await _commit(shape.repo, 'main: a differently', {'a.txt': 'a\nmain\n'})
+
+        result = await run_rebase_reporting_drops(_run, shape.wt, onto='main')
+
+        assert not result.ok
+        assert result.stderr.strip()
+        assert result.dropped == ()
+        assert await _rebase_in_progress(shape.wt)
+        assert await _dropped_refs(shape.repo) == []
+
+    async def test_a_detached_head_is_reported_but_not_recorded(
+        self, shape: Shape3490, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        await _commit(shape.repo, 'main: bump and more', {
+            'index.html': 'v=44\n', 'm.txt': 'm\n',
+        })
+        await _git(shape.wt, 'checkout', '--detach')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_drops'):
+            result = await run_rebase_reporting_drops(_run, shape.wt, onto='main')
+
+        assert result.ok
+        assert result.dropped == (shape.bump_dropped,)
+        warnings = _module_warnings(caplog)
+        assert len(warnings) == 1, warnings
+        assert 'detached HEAD' in warnings[0]
+        assert shape.bump[:12] in warnings[0]
+        assert _BUMP in warnings[0]
+        assert await _dropped_refs(shape.repo) == []
+
+    async def test_a_failed_measurement_never_changes_the_rebase_verdict(
+        self, shape: Shape3490, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        await _commit(shape.repo, 'main: bump and more', {
+            'index.html': 'v=44\n', 'm.txt': 'm\n',
+        })
+
+        async def log_fails(cmd: list[str], cwd: Path | None = None, **kwargs: object):
+            if cmd[:2] == ['git', 'log']:
+                return 128, '', 'fatal: simulated log failure'
+            return await _run(cmd, cwd=cwd)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_drops'):
+            result = await run_rebase_reporting_drops(log_fails, shape.wt, onto='main')
+
+        assert result.ok
+        assert result.dropped == ()
+        assert any('could not measure' in w.lower() for w in _module_warnings(caplog))
+        await _git(shape.repo, 'merge-base', '--is-ancestor', 'main', 'task/1')
+        assert await _dropped_refs(shape.repo) == []
