@@ -12,6 +12,9 @@
 // states; only 'unverified' is toned, because it is the state that changes
 // what the reader does next.
 //
+// A partial owner never renders as 'undefined': an owner naming no task or no
+// check gives null, and a sidecar's missing path or on_main shows as '—'.
+//
 // LOAD CONTRACT. It reads no window.DF_* global. index.html loads it before the
 // Babel JSX tags, so window.DF_ESCALATION_CHECK_OWNER exists before
 // tab_escalations.jsx destructures it at module scope (test_index_html.py pins
@@ -21,13 +24,26 @@
 
 const NO_CHECK_SIDECAR_CAPTION = 'no sidecar';
 const UNVERIFIED_CHECK_SIDECAR = 'unverified';
+const MISSING_CHECK_SIDECAR_TEXT = '—';
 
 function plainCheckOwnerObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : null;
 }
 
-function presentCheckOwnerId(value) {
+function presentCheckOwnerText(value) {
   return value === undefined || value === null || value === '' ? null : String(value);
+}
+
+// sidecarPath is null exactly when there is no sidecar: the sidebar renders
+// its sidecar branch on it.
+function checkSidecarSite(sidecar) {
+  if (!sidecar) return { sidecarPath: null, sidecarCaption: NO_CHECK_SIDECAR_CAPTION, sidecarTone: '' };
+  const onMain = presentCheckOwnerText(sidecar.on_main);
+  return {
+    sidecarPath: presentCheckOwnerText(sidecar.path) ?? MISSING_CHECK_SIDECAR_TEXT,
+    sidecarCaption: `on main: ${onMain ?? MISSING_CHECK_SIDECAR_TEXT}`,
+    sidecarTone: onMain === UNVERIFIED_CHECK_SIDECAR ? 'warn' : '',
+  };
 }
 
 // A function declaration, not a const: tab_escalations.jsx destructures this
@@ -35,15 +51,14 @@ function presentCheckOwnerId(value) {
 // share the classic scripts' scope with a `function` but not with a `const`.
 function checkOwnerPanel(row) {
   const owner = plainCheckOwnerObject(row && row.delivered_check_owner);
-  if (!owner) return null;
-  const sidecar = plainCheckOwnerObject(owner.sidecar);
+  const ownerTaskId = owner && presentCheckOwnerText(owner.task_id);
+  const checkName = owner && presentCheckOwnerText(owner.check_name);
+  if (!ownerTaskId || !checkName) return null;
   return {
-    ownerTaskId: String(owner.task_id),
-    checkName: String(owner.check_name),
-    dependentTaskId: presentCheckOwnerId(row.task_id),
-    sidecarPath: sidecar ? sidecar.path : null,
-    sidecarCaption: sidecar ? `on main: ${sidecar.on_main}` : NO_CHECK_SIDECAR_CAPTION,
-    sidecarTone: sidecar && sidecar.on_main === UNVERIFIED_CHECK_SIDECAR ? 'warn' : '',
+    ownerTaskId,
+    checkName,
+    dependentTaskId: presentCheckOwnerText(row.task_id),
+    ...checkSidecarSite(plainCheckOwnerObject(owner.sidecar)),
   };
 }
 

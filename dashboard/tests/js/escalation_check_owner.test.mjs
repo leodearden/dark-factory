@@ -122,6 +122,44 @@ test('on_main: only "unverified" is toned; every value, an unknown one included,
   }
 });
 
+// ── A partial owner ─────────────────────────────────────────────────────────
+// A hand-edited queue file, or a writer that leaves a key out, must never
+// render as 'T-undefined' or 'on main: undefined'.
+
+test('an owner with no task_id or no check_name names nothing to edit: null', () => {
+  const partials = [
+    { check_name: CHECK, sidecar: null },
+    { task_id: null, check_name: CHECK, sidecar: null },
+    { task_id: '', check_name: CHECK, sidecar: null },
+    { task_id: OWNER_TASK, sidecar: null },
+    { task_id: OWNER_TASK, check_name: '', sidecar: null },
+  ];
+  for (const partial of partials) {
+    assert.equal(checkOwnerPanel(row({ delivered_check_owner: partial })), null, JSON.stringify(partial));
+  }
+});
+
+test('a sidecar with no on_main says so with the "—" marker, untoned', () => {
+  for (const site of [{ path: SIDECAR_PATH }, { path: SIDECAR_PATH, on_main: null }, { path: SIDECAR_PATH, on_main: '' }]) {
+    const panel = checkOwnerPanel(row({ delivered_check_owner: owner(site) }));
+
+    assert.equal(panel.sidecarPath, SIDECAR_PATH);
+    assert.equal(panel.sidecarCaption, 'on main: —', JSON.stringify(site));
+    assert.equal(panel.sidecarTone, '');
+  }
+});
+
+test('a sidecar with no path is still a sidecar: its path is the "—" marker, never null', () => {
+  // The sidebar renders its sidecar branch exactly when sidecarPath is set,
+  // so a null here would read as the bare caption of no file at all.
+  for (const site of [{ on_main: 'declares' }, { path: null, on_main: 'declares' }, { path: '', on_main: 'declares' }]) {
+    const panel = checkOwnerPanel(row({ delivered_check_owner: owner(site) }));
+
+    assert.equal(panel.sidecarPath, '—', JSON.stringify(site));
+    assert.equal(panel.sidecarCaption, 'on main: declares');
+  }
+});
+
 // ── Edge shapes ─────────────────────────────────────────────────────────────
 
 test('a row with no task_id has no dependent; a numeric owner task_id comes back as a string', () => {

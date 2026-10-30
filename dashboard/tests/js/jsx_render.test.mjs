@@ -748,6 +748,18 @@ test("tab_escalations.jsx::EscalationSidebar renders checkOwnerPanel's no-sideca
   oneByTestId(dialog, 'esc-check-owner-owner');
 });
 
+test("tab_escalations.jsx::EscalationSidebar renders a sidecar with no path or on_main as a sidecar, in checkOwnerPanel's words", t => {
+  const harness = openWindow(t);
+  const row = checkOwnerRow(declaredCheckOwner({}));
+  const dialog = openSidebar(harness, row);
+
+  const panel = harness.window.DF_ESCALATION_CHECK_OWNER.checkOwnerPanel(row);
+  const sidecarSite = oneByTestId(dialog, 'esc-check-owner-sidecar');
+  assert.equal(sidecarSite.querySelector('.mono')?.textContent, panel.sidecarPath, 'a pathless sidecar must keep its path slot');
+  assert.ok(sidecarSite.textContent.includes(panel.sidecarCaption), sidecarSite.textContent);
+  assert.ok(!dialog.textContent.includes('undefined'), dialog.textContent);
+});
+
 test('tab_escalations.jsx::EscalationSidebar renders no check-owner section without an owner, the same for an absent key as for null', t => {
   const absentHarness = openWindow(t);
   const absent = checkOwnerRow(undefined);
