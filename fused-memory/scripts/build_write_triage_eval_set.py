@@ -16,7 +16,9 @@ not Incomplete; ``calibration/write_triage_eval_set_v2.md`` says why. Every
 pair is rated on the ``current`` basis: the text the judge was shown.
 
 Subcommands, run from ``fused-memory/``. Each takes ``--snapshot`` (read-only,
-the main checkout's frozen population), ``--live-slates`` and ``--scratch``:
+the main checkout's frozen population), ``--live-slates``, ``--scratch`` and
+``--brief`` (the brief new shards are rendered for and record; default the
+committed one). Each refuses inputs other than those the key records:
 
 - ``shards``: key every pair not yet keyed into one primary and one second
   shard, re-render any shard text missing from the scratch, and write
@@ -25,14 +27,15 @@ the main checkout's frozen population), ``--live-slates`` and ``--scratch``:
   evidence not in the texts shown; the later round supersedes it.
 - ``third``: shard the pairs a decisive tie or an open follow-up blocks, for a
   new third rater.
-- ``rerate --brief-version LABEL``: once every keyed shard is rated, key a new
-  round of both raters over every pair whose derivation reads LOSS, under the
-  brief as it now reads, retiring the earlier third votes on those pairs; then
+- ``rerate --brief-version LABEL``: once every keyed shard is rated and no pair
+  awaits a third rater, key a new round of both raters over every pair whose
+  derivation reads LOSS, under ``--brief``, retiring the earlier third votes on those pairs; then
   re-render any missing shard text and ``rater_prompt.md``. A rerun under a
   keyed label keys nothing new.
 - ``assemble``: write ``write_triage_eval_set_v2_{writes.jsonl,verdicts.jsonl,summary.json}``
-  into ``--out-dir``, refusing while any pair is not fully labelled. The summary
-  records each re-rate, so it says which pairs rest on which brief.
+  into ``--out-dir``, refusing while any pair is not fully labelled, or reads
+  LOSS outside the latest re-rate. The summary records each re-rate and each
+  shard's brief, so it says which pairs rest on which brief.
 
 ``split --eval-dir DIR`` freezes the assembled set's held-out split
 (:func:`freeze_split`) into ``write_triage_eval_set_v2_split.json`` beside it,
