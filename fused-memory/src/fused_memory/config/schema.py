@@ -2319,12 +2319,15 @@ class CuratorConfig(BaseModel):
     # 8 leaves headroom for harder combine-vs-create decisions.
     max_turns: int = Field(default=8, ge=3)
 
-    # Corpus caps — see design notes in shared/docs (the four-stream pool).
+    # Corpus caps — see design notes in shared/docs (the pool streams).
     #
-    # pool_total_cap is UNREACHABLE at these stock values, and that is worth
-    # knowing before tuning any of them: a maximal pool is anchor(<=1) + 15 +
-    # 10 + 3 = 29 <= 30, so ``_trim_pool``'s ``len(pool) <= total_cap``
-    # short-circuits on every call. The binding constraints are the three
+    # For a pool without siblings, pool_total_cap is UNREACHABLE at these
+    # stock values, and that is worth knowing before tuning any of them: a
+    # maximal such pool is anchor(<=1) + 15 + 10 + 3 = 29 <= 30, so
+    # ``_trim_pool``'s ``len(pool) <= total_cap`` short-circuits. An
+    # agent-followup candidate with two or more siblings does reach the trim
+    # at stock caps, and the trim then takes dependency entries first. The
+    # binding constraints are the three
     # STREAM caps, which is where a genuinely overlapping task is actually
     # lost — the module stream especially, since it is ordered by status and
     # priority rather than relevance (see the lock_depth note below).
@@ -2340,6 +2343,15 @@ class CuratorConfig(BaseModel):
     pool_embedding_cap: int = Field(default=10)
     pool_dependency_cap: int = Field(default=3)
     pool_total_cap: int = Field(default=30)
+    # Caps the sibling stream (task 6227): an agent-followup candidate's
+    # non-cancelled tasks that share its metadata.spawned_from. 10 comes from
+    # the live store, measured 2026-10-30: 1,406 agent_followup parents, 2,140
+    # follow-ups, 484 parents with more than one; non-cancelled per parent p90
+    # 3, p99 4, max 11; one parent exceeds 10. Siblings count toward
+    # pool_total_cap but are trimmed after every stream except the anchor, so
+    # none is ever cut while 1 + pool_sibling_cap <= pool_total_cap
+    # (``test_config_schema.py::TestCuratorSiblingCap``). 0 disables the stream.
+    pool_sibling_cap: int = Field(default=10, ge=0)
 
     # COARSE FALLBACK ONLY — this is not the depth the curator normally uses.
     # Module-pool keys must match the *scheduler's* lock_depth to be

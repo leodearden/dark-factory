@@ -1738,10 +1738,10 @@ class TestCuratorEntryCharCaps:
     def test_the_total_cap_is_unreachable_at_stock_stream_caps(self):
         """FINDING 1, as an executable invariant rather than a comment.
 
-        A maximal pool is anchor(<=1) + module + embedding + dependency. With
-        stock values that is 29 against a total cap of 30, so ``_trim_pool``
-        short-circuits on every call and the STREAM caps are the binding
-        constraints. This is pinned so a future cap edit that silently
+        A maximal pool without siblings is anchor(<=1) + module + embedding +
+        dependency. With stock values that is 29 against a total cap of 30, so
+        ``_trim_pool`` short-circuits on every call for such a pool and the
+        STREAM caps are the binding constraints. This is pinned so a future cap edit that silently
         re-strands or un-strands the final trim is caught here, at the config
         layer, rather than being discovered as a permanently-silent
         ``pool_truncated`` census.
