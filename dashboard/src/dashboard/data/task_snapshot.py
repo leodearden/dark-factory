@@ -763,8 +763,12 @@ async def acquire_terminal_window(
     *,
     now: datetime,
     terminal_total: int | None,
+    window: int = _TERMINAL_FETCH_WINDOW,
 ) -> Datum[list[dict]]:
-    """Read the newest :data:`_TERMINAL_FETCH_WINDOW` terminal rows, or say why not.
+    """Read the newest *window* terminal rows (default :data:`_TERMINAL_FETCH_WINDOW`), or say why not.
+
+    *window* is injectable so a caller (a test) can size it without touching
+    the module constant.
 
     Lives beside the unit because it is the same datum family read through the
     same access implementation, under the third slot of
@@ -805,7 +809,6 @@ async def acquire_terminal_window(
             FRESHNESS_BOUND_SECONDS,
         )
 
-    window = _TERMINAL_FETCH_WINDOW
     if terminal_total > window:
         logger.warning(
             'project root %s: %d terminal (done+cancelled) tasks exceed the '
