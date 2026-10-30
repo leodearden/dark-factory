@@ -161,22 +161,30 @@ No lane, metadata or diff-reachability proxy separates fixing verifies from doom
    - Measured (L2, L3, L6):
      - A cold `uv sync --all-packages --frozen --offline` takes 2–8 s, hardlinked from the uv cache. The lead measured 1.6 s and 2.1 s; the critic re-measured 7.6 s.
      - Run in parallel, the seven checks take **9.8 s wall warm** (load 120). In a freshly synced tree they take **44.7 s cold** (load 63), because every new venv compiles its imports to bytecode on first use.
-   - Where each screen runs, and so which cost it pays:
+   - **Lane screens run warm, in persistent screen lanes.** A cold screen would cost a host its idle time on every landing.
+     - Speculation permits release only at finalize (`_finalize_inflight`), and K = 1 + verify runners = 2 = hosts. So after each speculative landing, the freed host waits while the merger merges and screens the next item (critic K44).
+     - Cold, that is about 45–65 s per landing: roughly 2% of local and 6% of laptop host time. Once β removes most defects upstream, that cost would outweigh the screen's value.
+     - Neither existing tree is warm here. The ephemeral `_merge-*` worktree is fresh for every item. The chain lane is cold too: `merge_spec_warm_lane_pool` is off in this repo, so `GitOps.acquire_spec_lane` falls back to an ephemeral worktree.
+   - **α builds two persistent screen lanes,** on the `_merge-verify` precedent: reset in place to the screened sha (`GitOps.reset_persistent_merge_worktree`'s `git reset --hard` plus `git clean` with an exclusion), keeping their `.venv` and bytecode across resets.
 
-     | Screen | Tree | Cost |
-     |---|---|---|
-     | Per-item lane screen | freshly checked-out `_merge-*` worktree | cold |
-     | Chain screen | warm `_spec-*` lane | warm |
-     | Task-role screen | the task's own venv | warm after its first verify |
+     | Lane | Used by |
+     |---|---|
+     | merger lane | the per-item screen, its base re-runs, and γ1's F runs |
+     | chain lane | δ's chain screen; it checks the chain's link commits out by sha, since they are in the shared object store |
 
-     α owns reducing the cold start (open question 6).
+     Each lane is used serially by its own loop, so it needs no lock. Both get exact-name `PROTECTED_PREFIXES` entries.
+   - **The ephemeral worktree is the fallback,** used when a lane is unavailable. The fallback is counted on the `merge_screen` event.
+   - **The task-role screen** runs in the task's own venv, which is warm after its first verify.
+   - **α's acceptance criterion:** the per-item lane screen's median wall, over α's boundary runs and its first live day, is **≤ 20 s**, recorded in α's commit message. The basis is L3: 9.8 s for the seven run in parallel warm, plus a reset of a few seconds. Over the criterion, ζ judges whether the lane screen still pays.
 5. **The screen's verdict is structured data, never an exit code alone** (heuristic 12; INV-1; INV-2; INV-11).
    - **All seven checks are pytest node ids.** The ratchet runs as its own gate test, `scripts/tests/test_inline_suppression_ratchet.py::test_the_live_tree_passes_the_gate_once_the_baseline_is_seeded`, rather than as the bare scanner.
      - Pytest separates a failing test from a collection, import or usage error.
      - The bare scanner can't: under `python -I` an import failure exits 1, the scanner's own finding code (L1).
-   - **The lane runs the manifest through the shared node-id runner,** `verify.py::run_node_ids` (built by γ0; §4). It returns `pass`, `fail` or `error` per node id, from junit.
+   - **The lane runs the manifest through the shared node-id runner,** `verify.py::run_node_ids` (built by γ0; §4).
+     - It returns `pass`, `fail`, `error` or `skipped` per node id, from junit's failing and never-ran vectors.
+     - `screen.py` makes one `run_node_ids` call per check and runs the calls concurrently, as L3 did. The runner itself runs module groups serially.
      - A check is a `finding` when any of its ids fails.
-     - A check is an `error` when any of its ids errors or is not collected.
+     - A check is an `error` when any of its ids errors, is skipped or is not collected. SKIP is not ALLOW: the ratchet's node skips when its baseline is absent, and it must not read as green.
      - The finding text is the failure summary plus captured output. The ratchet test asserts on the scanner's stderr, so its output carries the `file:line` violations.
    - **The task role** gets the same ids in junit through its structured per-module runs (decision 2).
    - The orchestrator validates the manifest on load. An unknown key, an unregistered module, or an empty id list is an `error` for that check (INV-1).
@@ -273,7 +281,8 @@ Each assumed capability is either verified by reading main `07bd68fd99` or built
 | The verdict's probe sha and failing ids at confirmation | exists inside the probe; **exported here (γ1)** | `_build_main_health_outcome` is the one builder on both probe modes; `VerifyResult.failing_test_ids`; γ1 adds structured fields on the MAIN_RED outcome |
 | Run named pytest node ids on a given tree and report each one's result | **built here (γ0)** | `verify.py::confirm_isolated_rerun_verdict` takes a `VerifyResult` and returns a flake verdict per call-site policy. γ0 extracts its group → command → `run_verification` body into a public `verify.py::run_node_ids`, which both the discriminator and the screen call (INV-5) |
 | `OutcomeKind` and `ChainTruncationReason` are extendable | exists | `merge_lane/types.py` |
-| A throwaway worktree at any sha, for base screens and bare-main re-probes | exists | `GitOps.ephemeral_worktree(kind, sha)`. The new `WorktreeKind.MERGE_SCREEN` also needs its `git_ops.py::PROTECTED_PREFIXES` entry and its bash mirror in `orchestrator/scripts/warm-lane/lib_lane_state.sh::lane_protect_glob` |
+| A persistent worktree reset in place, keeping its venv | exists (pattern); **two screen lanes built here (α)** | `GitOps.reset_persistent_merge_worktree`, which serves the `_merge-verify` lane. The warm spec pool (`merge_spec_warm_lane_pool`) is off in this repo, so `acquire_spec_lane` is cold here |
+| A throwaway worktree at any sha, for the screen's cold fallback and bare-main re-probes | exists | `GitOps.ephemeral_worktree(kind, sha)`; `verify.py::_on_main_probe_worktree`. The new `WorktreeKind.MERGE_SCREEN` and the two persistent screen lanes also need `git_ops.py::PROTECTED_PREFIXES` entries and their bash mirror in `orchestrator/scripts/warm-lane/lib_lane_state.sh::lane_protect_glob` |
 | Provisioning a tree with `uv run` alone, without a cold-preprovision `npm ci` | exists, measured | `verify.py::run_verification` runs `_preprovision_shared_venv` only when `_is_verify_cold`, which is False without `.task/` (critic-verified); cost in L2 |
 | The ratchet as a pytest node | exists | `scripts/tests/test_inline_suppression_ratchet.py::test_the_live_tree_passes_the_gate_once_the_baseline_is_seeded` runs `inline_suppressions.main(['--check', …])` against the tree holding the test file. It skips while the baseline is absent |
 | Task-role base attribution for a red main | exists | the task-verify contagion guard: `workflow.py` calls `verify_failure_is_preexisting_on_main` on a failing task verify, then `_block_on_inherited_break` |
@@ -312,7 +321,7 @@ checks:
 
 # orchestrator/src/orchestrator/verify.py (extracted, shared with the isolated-rerun discriminator)
 async run_node_ids(tree: Path, config, module_configs, ids: Collection[str])
-    -> Mapping[str, Literal['pass', 'fail', 'error']]
+    -> Mapping[str, Literal['pass', 'fail', 'error', 'skipped']]
 
 # orchestrator/src/orchestrator/merge_lane/screen.py (new; imports nothing from worker.py)
 @dataclass(frozen=True) ScreenCheck   {id, status, findings: tuple[str, ...], duration_s}
@@ -420,7 +429,9 @@ The leaves:
     - `WorktreeKind.MERGE_SCREEN`, with its `PROTECTED_PREFIXES` entry and bash mirror;
     - the `failure_category` → review-category mapping in `workflow.py::_submit_to_merge_queue`;
     - the config block `merge_screen.{manifest, timeout_secs, chain_timeout_secs, error_streak_alarm}` (reloadable, default off), enabled in this repo's yaml. That is a shipped-config change, so the whole orchestrator suite runs first (the conftest pins `ORCH_CONFIG_PATH` to the shipped yaml).
-  - Adds a guard test that *collects* every manifest node id against the tree and fails if any is missing (INV-10): a renamed test must not silently empty the screen.
+  - Adds a guard test that *runs* every manifest node id on the pinned tree and fails if any is missing or skipped (INV-10): a renamed or skipping test must not silently empty the screen.
+  - Builds the two persistent screen lanes, each with an ephemeral fallback (decision 4).
+  - **Acceptance:** the per-item lane screen's median wall is ≤ 20 s (decision 4), recorded in the commit.
   - Modules: orchestrator, scripts, dashboard. ~1,100 LOC.
   - **Signal:** the boundary rows "own-defect bounce", "review category", "red base is not blamed", "instrument error fails open", "kill switch" and "declared train finding".
   - Live confirmation: a `merge_attempt outcome=screen_failed` row in runs.db with no `merge_verify` row for that request.
@@ -463,7 +474,8 @@ The leaves:
     - task-role catches, and task-role inherited-break blocks caused by a screen check red on main;
     - `error` streaks;
     - verdicts, holds, held-minutes, clears by reason, and fixers passed;
-    - chain truncations, if δ has landed.
+    - chain truncations, if δ has landed;
+    - per-item screen wall, and ephemeral-fallback counts.
   - It decides, or files a declined record for:
     - the 14–31 s check tier;
     - whether E3's L2 (fail-fast leg reordering) is still worth a measurement task;
@@ -495,8 +507,8 @@ INV-8 occupancy figures:
 
 | Loop | Added time |
 |---|---|
-| Serial merger | ~45 s per item cold (L6), ~10 s warm. With the queue busy this overlaps the running verify: the merger's look-ahead merge of item N+1 happens while N verifies for 12–45 min. So it costs latency only when the queue is near-empty. During a red episode the F run adds up to `f_screen_timeout_secs` per item, when only fixers can land and high-lane fixers are popped first |
-| Verifier loop | δ only: ~10 s per chain dispatch on the pass path; at worst (⌈log₂ links⌉ + 1) × `chain_timeout_secs` = 2 min at cap 6 and 30 s. No F run ever happens there |
+| Serial merger | ≤ 20 s per item warm (α's acceptance), against 45–65 s cold. With speculation depth = hosts = 2 and permits released at finalize, this is host idle on roughly every landing: at 20 s, about 1% of local and 3% of laptop host time. The ephemeral fallback pays the cold figure. During a red episode the F run adds up to `f_screen_timeout_secs` per item, when only fixers can land and high-lane fixers are popped first |
+| Verifier loop | δ only, in its warm lane: ~12 s per chain dispatch on the pass path; at worst (⌈log₂ links⌉ + 1) × `chain_timeout_secs` = 2 min at cap 6 and 30 s. No F run ever happens there |
 
 No waiver needed.
 
@@ -523,4 +535,4 @@ No waiver needed.
 | 3 | Culprit search in δ: bisect or a linear prefix walk? | The bound is the contract (C7); pick by chain-lane checkout cost | δ |
 | 4 | β's non-failing note | Needs a run shape the task-verify runner reports without failing; use `PlannedRun`'s existing fields | β |
 | 5 | Do held requests stay in `unfrozen_suffix` for the needs_rebase conflict graph? | They are already out of `chain_snapshot`. Either way, the twin test states the chosen relation | γ1 |
-| 6 | Cutting the per-item screen's cold start: 44.7 s cold against 9.8 s warm (L6, L3) | Options: a persistent screen environment, precompiled bytecode, or a warm-seeded merge worktree. Pick by measurement and record the warm and cold figures in α's commit | α |
+| 6 | Persistent screen lane details: the reset/clean exclusions, the venv sync after a `uv.lock` change, and the fallback trigger | Follow `reset_persistent_merge_worktree`; meet α's ≤ 20 s acceptance (decision 4) | α |
