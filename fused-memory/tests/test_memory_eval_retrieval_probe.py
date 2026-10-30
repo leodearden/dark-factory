@@ -2849,7 +2849,7 @@ class _ServiceDouble:
         self.search_kwargs: list[dict] = []
         """The remaining keyword arguments of each search, parallel to ``searches``."""
         self.count_calls: list[tuple[str, dict]] = []
-        self.initialized = False
+        self.opened_for_reads = False
         self.closed = False
 
     # -- the two read paths the probe is allowed to use --------------------
@@ -2865,13 +2865,19 @@ class _ServiceDouble:
         return self._counts.get(filters.get('category'), 0)
 
     # -- lifecycle ---------------------------------------------------------
-    async def initialize(self):
-        self.initialized = True
+    async def initialize_for_reads(self):
+        self.opened_for_reads = True
 
     async def close(self):
         self.closed = True
 
     # -- every write path is a tripwire ------------------------------------
+    async def initialize(self):
+        raise _ReadOnlyViolation(
+            'the probe took the full open, which starts the durable write queue '
+            'and runs Graphiti startup maintenance'
+        )
+
     async def add_memory(self, *a, **kw):
         raise _ReadOnlyViolation('the probe called add_memory')
 
@@ -3034,7 +3040,7 @@ class TestReadOnlyGuarantee:
         ])
 
         assert code == 0
-        assert double.initialized and double.closed
+        assert double.opened_for_reads and double.closed
         artifact = tmp_path / 'out' / 'e1-retrieval-health' / 'metrics-20260730T090000Z.json'
         assert artifact.exists()
 
@@ -3045,8 +3051,9 @@ class TestReadOnlyGuarantee:
         import asyncio  # noqa: PLC0415
 
         for name in (
-            'add_memory', 'add_episode', 'add_system_record', 'delete_memory',
-            'delete_episode', 'update_edge', 'merge_entities', 'delete_entity',
+            'initialize', 'add_memory', 'add_episode', 'add_system_record',
+            'delete_memory', 'delete_episode', 'update_edge', 'merge_entities',
+            'delete_entity',
         ):
             with pytest.raises(_ReadOnlyViolation):
                 asyncio.run(getattr(double, name)())
@@ -4025,7 +4032,7 @@ class TestRegistryLoadFailureIsFatal:
 
         m.main(['--registry', str(bad), '--out-root', str(tmp_path / 'out')])
 
-        assert not double.initialized
+        assert not double.opened_for_reads
 
 
 class TestEmptyProjectSelectionIsFatal:
@@ -4175,10 +4182,9 @@ class TestRunStampOverride:
 
 
 class _UnopenableStoreDouble(_ServiceDouble):
-    """A store whose open fails the way ``MemoryService.initialize`` measurably
-    does when it cannot create ``config.queue.data_dir``."""
+    """A store whose open raises an OSError."""
 
-    async def initialize(self):
+    async def initialize_for_reads(self):
         raise PermissionError(errno.EACCES, 'Permission denied', '/unwritable/queue-data')
 
 
