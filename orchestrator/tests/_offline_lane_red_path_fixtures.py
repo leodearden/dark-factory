@@ -23,7 +23,7 @@ import sys
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import StrEnum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -44,12 +44,24 @@ from shared.task_statuses import TaskStatus
 from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
 from orchestrator.config import GitConfig, LaneCommand, OrchestratorConfig
 from orchestrator.git_ops import GitOps
+from orchestrator.guard_state import guard_path
 from orchestrator.offline_lane import OfflineLaneWorker
-from orchestrator.offline_lane_episode_state import CommandRecord, Episode, EpisodeStore
+from orchestrator.offline_lane_episode_state import (
+    EPISODES_FILE,
+    CommandRecord,
+    Episode,
+    EpisodeStore,
+)
 from orchestrator.offline_lane_escalations import UNLANDED_RED_CATEGORY, sentinel_task_id
 from orchestrator.offline_lane_filing import SPAWN_CONTEXT
 from orchestrator.offline_lane_pass import PassOutcomeHook
-from orchestrator.offline_lane_records import PassRecord, RunRecordStore
+from orchestrator.offline_lane_records import (
+    LEGACY_INFRA_COMMAND,
+    LEGACY_NUMERIC_COMMAND,
+    PassRecord,
+    RunRecordStore,
+)
+from orchestrator.offline_lane_runs import RUN_ALL_INFRA_SCRIPT, RUN_OFFLINE_DEEP_SCRIPT
 from orchestrator.scheduler import Scheduler
 
 A = 'tests/test_a.py::test_one'
@@ -71,6 +83,23 @@ LANE_SEED = RepoSeed(
     ),
     message='seed the lane fixture project',
 )
+
+@dataclass(frozen=True)
+class LegacySetup:
+    """What switches a legacy leg on: its command name, its enabling knob, and the script it launches."""
+
+    command: str
+    knob: str
+    script: str
+
+
+class LegacyLeg(Enum):
+    NUMERIC = LegacySetup(LEGACY_NUMERIC_COMMAND, 'offline_lane_legacy_numeric_enabled', RUN_OFFLINE_DEEP_SCRIPT)
+    INFRA = LegacySetup(LEGACY_INFRA_COMMAND, 'offline_lane_infra_enabled', RUN_ALL_INFRA_SCRIPT)
+
+
+#: A legacy leg's script, committed executable: it hands its argv to the stub.
+LEGACY_SCRIPT = '#!/bin/sh\nexec lane-stub "$@"\n'
 
 ADVANCE_FILE = 'advance.txt'
 POLL_INTERVAL_SECS = 0.01
@@ -240,7 +269,7 @@ class LaneStub:
         self.ctl.mkdir(parents=True)
         self.runs_path = self.ctl / 'runs.json'
         self.invocations_path = self.ctl / 'invocations.jsonl'
-        for name in ('pytest', 'lane-suite'):
+        for name in ('pytest', 'lane-suite', 'lane-stub'):
             self.install(name)
 
     def install(self, name: str) -> None:
@@ -286,7 +315,7 @@ async def head(repo: Path) -> str:
     return await git(repo, 'rev-parse', 'HEAD')
 
 
-async def commit(repo: Path, files: Mapping[str, str], message: str) -> str:
+async def commit(repo: Path, files: Mapping[str, str], message: str, *, executable: bool = False) -> str:
     """Commit *files* to *repo*'s checked-out main, staging only them, and return the new head.
 
     Never ``add -A``: the lane's own worktree lives untracked under ``.worktrees``.
@@ -295,6 +324,8 @@ async def commit(repo: Path, files: Mapping[str, str], message: str) -> str:
         target = repo / relpath
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text)
+        if executable:
+            target.chmod(0o755)
     await git(repo, 'add', '--', *files)
     await git(repo, 'commit', '-m', message)
     return await head(repo)
@@ -544,7 +575,7 @@ class RedPathLane:
         store: FakeTaskStore,
         stub: LaneStub,
         clock: Clock,
-        command: LaneCommand,
+        command_name: str,
         lock_path: Path,
         hooks: Sequence[PassOutcomeHook],
     ) -> None:
@@ -554,7 +585,7 @@ class RedPathLane:
         self.store = store
         self.stub = stub
         self.clock = clock
-        self.command = command
+        self.command_name = command_name
         self.lock_path = lock_path
         self.hooks = tuple(hooks)
         self.advances = 0
@@ -569,16 +600,23 @@ class RedPathLane:
         command: LaneCommand = LANE_COMMAND,
         git_overrides: Mapping[str, Any] | None = None,
         hooks: Sequence[PassOutcomeHook] = (),
+        legacy: LegacyLeg | None = None,
     ) -> RedPathLane:
+        """A lane running *command*, or with *legacy* only that legacy leg, whose script is committed to main."""
         repo = seed_repo(tmp_path / 'repo', LANE_SEED)
         stub = LaneStub(tmp_path / 'stub')
         stub.put_on_path(monkeypatch)
-        git_config = GitConfig(
-            offline_lane_legacy_numeric_enabled=False,
-            offline_lane_commands=[command],
-            offline_lane_poll_interval_secs=POLL_INTERVAL_SECS,
-            **(git_overrides or {}),
-        )
+        settings: dict[str, Any] = {
+            'offline_lane_legacy_numeric_enabled': False,
+            'offline_lane_commands': [command],
+            'offline_lane_poll_interval_secs': POLL_INTERVAL_SECS,
+        }
+        command_name = command.name
+        if legacy is not None:
+            settings |= {legacy.value.knob: True, 'offline_lane_commands': []}
+            command_name = legacy.value.command
+            await commit(repo, {legacy.value.script: LEGACY_SCRIPT}, 'commit the legacy leg script', executable=True)
+        git_config = GitConfig(**{**settings, **(git_overrides or {})})
         return cls(
             config=OrchestratorConfig(project_root=repo, git=git_config),
             git_ops=MeteredGitOps(git_config, repo),
@@ -586,7 +624,7 @@ class RedPathLane:
             store=FakeTaskStore(),
             stub=stub,
             clock=Clock(start=datetime.now(UTC).replace(second=0, microsecond=0)),
-            command=command,
+            command_name=command_name,
             lock_path=tmp_path / 'offline_lane.lock',
             hooks=hooks,
         )
@@ -595,9 +633,12 @@ class RedPathLane:
     def project_root(self) -> Path:
         return self.config.project_root
 
-    @property
-    def command_name(self) -> str:
-        return self.command.name
+    def corrupt_episode_store(self) -> None:
+        """Overwrite the lane's episode file with bytes no JSON reader accepts."""
+        path = guard_path(self.project_root, EPISODES_FILE)
+        assert path is not None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'\x00{ this is not json')
 
     def restart(self) -> None:
         """A process restart: a fresh worker, holding nothing in memory, over the same stores, git, queue and clock."""
