@@ -38,6 +38,7 @@ from orchestrator.flake_ledger import (
     FlakeVerdict,
     ledger_db_path,
 )
+from orchestrator.guard_state import PersistentMap, guard_path
 from orchestrator.offline_lane_confirm import (
     Confirmed,
     ConfirmMode,
@@ -46,6 +47,8 @@ from orchestrator.offline_lane_confirm import (
     UnconfirmableReason,
 )
 from orchestrator.offline_lane_episode_state import (
+    EPISODE_RETENTION,
+    EPISODES_FILE,
     CommandRecord,
     EndedEpisode,
     EndReason,
@@ -153,6 +156,37 @@ def test_no_episode_store_is_nothing_to_judge(tmp_path: Path, capsys):
     code, report, err = _report(project, capsys)
 
     _assert_nothing_to_judge(code, report, err, 'episode store')
+
+
+def _episode_map(project: SoakProject) -> PersistentMap:
+    """The episode store's own map, which writes a row without the store's checks."""
+    return PersistentMap(guard_path(project.root, EPISODES_FILE), ttl=EPISODE_RETENTION, now=project.clock)
+
+
+def _truncated_episode_file(project: SoakProject) -> None:
+    path = guard_path(project.root, EPISODES_FILE)
+    assert path is not None
+    path.write_text('{"unit": {"value": ')
+
+
+def _malformed_record(project: SoakProject) -> None:
+    _episode_map(project)[UNIT] = {'command': UNIT}
+
+
+def _record_under_another_command(project: SoakProject) -> None:
+    _episode_map(project)[UNIT] = CommandRecord.empty(LINT).to_json()
+
+
+@pytest.mark.parametrize('corrupt', [_truncated_episode_file, _malformed_record, _record_under_another_command])
+def test_an_episode_store_the_lane_would_read_as_empty_is_nothing_to_judge(tmp_path: Path, capsys, corrupt):
+    project = SoakProject(tmp_path)
+    _red_pass(project)
+    project.provision(UNIT, LINT)
+    corrupt(project)
+
+    code, report, err = _report(project, capsys)
+
+    _assert_nothing_to_judge(code, report, err, 'episode store unreadable')
 
 
 def test_records_none_of_which_carries_an_effect_block_are_nothing_to_judge(tmp_path: Path, capsys):

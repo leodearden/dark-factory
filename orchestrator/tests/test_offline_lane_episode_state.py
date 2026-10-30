@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -184,6 +185,53 @@ def test_a_record_stored_under_another_command_loads_empty(tmp_path: Path, caplo
 
     assert record == CommandRecord.empty('other')
     assert any(r.levelno == logging.ERROR and repr(COMMAND) in r.getMessage() for r in caplog.records)
+
+
+def test_strict_records_are_every_live_record_and_leave_out_an_expired_one(tmp_path: Path):
+    clock = Clock()
+    store = EpisodeStore(tmp_path, clock=clock)
+    store.save(replace(CommandRecord.empty('expired'), episodes={C: _episode(C)}))
+    clock.at = T0 + SPACED
+    store.save(_full_record())
+    clock.at = T0 + EPISODE_RETENTION
+
+    assert set(json.loads(_episodes_path(tmp_path).read_text())) == {'expired', COMMAND}
+    assert EpisodeStore(tmp_path, clock=clock).strict_records() == {COMMAND: _full_record()}
+
+
+def test_strict_records_of_a_project_with_no_episode_file_are_none(tmp_path: Path):
+    assert EpisodeStore(tmp_path, clock=Clock()).strict_records() == {}
+
+
+@pytest.mark.parametrize(('contents', 'named'), [
+    ('{"integration": {"value": ', 'Expecting value'),
+    ('[]', 'JSON list'),
+    ('{"integration": {"value": {}}}', "['integration']"),
+])
+def test_strict_records_refuse_a_file_or_row_the_map_reads_as_absent(tmp_path: Path, contents: str, named: str):
+    _episodes_path(tmp_path).parent.mkdir(parents=True)
+    _episodes_path(tmp_path).write_text(contents)
+    store = EpisodeStore(tmp_path, clock=Clock())
+    assert store.commands() == []
+
+    with pytest.raises(ValueError, match=re.escape(named)):
+        store.strict_records()
+
+
+def test_strict_records_refuse_a_record_that_loads_empty(tmp_path: Path):
+    payload = _full_record().to_json()
+    payload['episodes'][0]['counted_passes'] = 'p0'
+    _stored_raw(tmp_path, COMMAND, payload)
+
+    with pytest.raises(ValueError, match=f'{COMMAND!r}.*counted_passes'):
+        EpisodeStore(tmp_path, clock=Clock()).strict_records()
+
+
+def test_strict_records_refuse_a_record_stored_under_another_command(tmp_path: Path):
+    _stored_raw(tmp_path, 'other', _full_record().to_json())
+
+    with pytest.raises(ValueError, match=f"'other' names {COMMAND!r}"):
+        EpisodeStore(tmp_path, clock=Clock()).strict_records()
 
 
 def test_one_save_is_one_file_write(tmp_path: Path):

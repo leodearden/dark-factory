@@ -261,9 +261,16 @@ def _cut_over(every_pass: Sequence[StoredPass]) -> datetime | None:
     )
 
 
-def _episodes(project_root: Path, now: datetime, commands: Sequence[str]) -> dict[str, CommandRecord]:
-    store = EpisodeStore(project_root, clock=lambda: now)
-    return {name: store.load(name) for name in store.commands() if command_key(name) in commands}
+def _episodes(
+    project_root: Path, episodes_file: Path, now: datetime, commands: Collection[str],
+) -> dict[str, CommandRecord] | Unjudgeable:
+    """The selected commands' records.  Every stored record is read strictly, so a store the lane
+    would read, in any part, as empty or absent leaves nothing to judge."""
+    try:
+        records = EpisodeStore(project_root, clock=lambda: now).strict_records()
+    except (OSError, ValueError) as exc:
+        return Unjudgeable(f'episode store unreadable: {episodes_file}: {exc}')
+    return {name: record for name, record in records.items() if command_key(name) in commands}
 
 
 def _failures(every_pass: Sequence[StoredPass], selected: Collection[str]) -> dict[tuple[str, str], tuple[FailureRecord, ...]]:
@@ -286,12 +293,11 @@ def _read_ledger(
     due_items = None if summary is None else read_due_items(db, now=_LATEST, limit=summary.size)
     if summary is None or due_items is None:
         return Unjudgeable(f'flake ledger unreadable: {db}')
-    return LedgerReads(
-        occurrences=tuple(read_occurrences(db, since=since.isoformat())),
-        debts=read_debt_many(db, offered),
-        due_summary=summary,
-        due_items=tuple(due_items),
-    )
+    occurrences = tuple(read_occurrences(db, since=since.isoformat()))
+    debts = read_debt_many(db, offered)
+    if read_call_sites_written(db) is None:
+        return Unjudgeable(f'flake ledger unreadable after its reads: {db}')
+    return LedgerReads(occurrences=occurrences, debts=debts, due_summary=summary, due_items=tuple(due_items))
 
 
 def episode_bindings(episodes: Mapping[str, CommandRecord]) -> dict[tuple[str, str], str]:
@@ -469,7 +475,9 @@ async def load_inputs(
     ledger = _read_ledger(stores.ledger, since=since, now=now, window=window)
     if isinstance(ledger, Unjudgeable):
         return ledger
-    episodes = _episodes(project_root, now, tuple(selected))
+    episodes = _episodes(project_root, stores.episodes, now, selected)
+    if isinstance(episodes, Unjudgeable):
+        return episodes
     tasks = await _read_tasks(_task_ids(window, episodes, ledger), task_reader)
     if isinstance(tasks, Unjudgeable):
         return tasks
