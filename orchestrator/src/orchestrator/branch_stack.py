@@ -16,7 +16,9 @@ The record is one git ref per stacked branch under
 shared by every worktree, and keeps a never-landed base reachable.
 
 Layering: this module sits BELOW ``orchestrator/src/orchestrator/git_ops.py``,
-which imports it.  The git runner is therefore injected, exactly as
+which imports it, and above ``orchestrator/src/orchestrator/rebase_drops.py``,
+which it imports so the un-stack rebase reports the commits it drops.  The
+git runner is therefore injected, exactly as
 ``orchestrator/src/orchestrator/rebase_recovery.py::guarded_abort`` receives
 its runner, and nothing here imports git_ops or merge_queue.
 """
@@ -29,6 +31,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
 
+from orchestrator.rebase_drops import run_rebase_reporting_drops
 from orchestrator.rebase_recovery import AbortRunner, guarded_abort
 
 logger = logging.getLogger(__name__)
@@ -322,15 +325,17 @@ async def rebase_own_delta(
 ) -> OwnDeltaRebase:
     """Replay the commits after *cut* onto *onto*, in *worktree*.
 
+    A commit the replay drops because *onto* already carries its change is
+    logged and recorded (see ``orchestrator/src/orchestrator/rebase_drops.py``).
     On failure the conflicted paths are collected BEFORE the guarded abort,
     because the abort erases them.
     """
-    rc, _, err = await run(['git', 'rebase', '--onto', onto, cut], cwd=worktree)
-    if rc == 0:
+    rebased = await run_rebase_reporting_drops(run, worktree, onto=onto, upstream=cut)
+    if rebased.ok:
         return OwnDeltaRebase(ok=True, conflicted_paths=(), stderr='')
     conflicted = await _conflicted_paths(run, worktree)
     await guarded_abort('rebase', worktree, run)
-    return OwnDeltaRebase(ok=False, conflicted_paths=conflicted, stderr=err)
+    return OwnDeltaRebase(ok=False, conflicted_paths=conflicted, stderr=rebased.stderr)
 
 
 async def _conflicted_paths(run: GitRunner, worktree: Path) -> tuple[str, ...]:

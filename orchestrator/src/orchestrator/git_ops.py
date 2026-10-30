@@ -116,6 +116,7 @@ from orchestrator.quarantine_provenance import (
     QuarantineOutcome,
     record_quarantine_provenance,
 )
+from orchestrator.rebase_drops import run_rebase_reporting_drops
 from orchestrator.recut_ruling import ParkedIncarnation, RecutRuling, RecutRulingViolation
 from orchestrator.script_warnings import log_warnings_despite_success
 from orchestrator.teardown import complete_despite_cancellation, path_confirmed_absent
@@ -10167,18 +10168,19 @@ class GitOps:
         Returns True on success.  On failure, ATTEMPTS a guarded abort and
         returns False — which does NOT imply a clean worktree: aborts fail.
 
+        A commit the rebase drops because the target already carries its
+        change is logged and recorded
+        (``orchestrator/src/orchestrator/rebase_drops.py::RebaseDropLedger``).
+
         Caller must NOT hold ``_merge_lock`` — this is designed to run
         outside the lock so multiple tasks can rebase concurrently in
         their own worktrees.
         """
         target = onto if onto is not None else self.config.main_branch
-        rc, _, err = await _run(
-            ['git', 'rebase', target],
-            cwd=worktree,
-        )
-        if rc != 0:
+        rebased = await run_rebase_reporting_drops(_run, worktree, onto=target)
+        if not rebased.ok:
             await rebase_recovery.guarded_abort('rebase', worktree, _run)
-            logger.info(f'Pre-merge rebase failed in {worktree}: {err}')
+            logger.info(f'Pre-merge rebase failed in {worktree}: {rebased.stderr}')
             return False
         return True
 
