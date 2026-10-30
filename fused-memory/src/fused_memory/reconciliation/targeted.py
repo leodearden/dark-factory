@@ -220,6 +220,45 @@ def _write_error_code(resp: object) -> str:
     return str(code) if code else 'unknown'
 
 
+def _file_reconciler_l1(
+    queue_factory: EscalationQueueFactory,
+    project_root: ProjectRoot,
+    *,
+    task_id: str,
+    severity: str,
+    category: str,
+    summary: str,
+    detail: str,
+    suggested_action: str,
+) -> str:
+    """File one reconciler-authored L1 escalation and return its id.
+
+    Blocking filesystem I/O: callers run it under ``asyncio.to_thread``
+    (INV-8). The queue is built here, only when a filing actually happens,
+    because ``EscalationQueue.__init__`` mkdirs: an eager build would leave
+    ``data/escalations/`` in every target project. Raises whatever the queue
+    raised; each caller owns its containment.
+    """
+    queue = queue_factory(escalation_queue_dir(project_root))
+    return queue.submit(Escalation(
+        id=queue.make_id(task_id),
+        task_id=task_id,
+        agent_role='reconciler',
+        severity=severity,
+        category=category,
+        summary=summary,
+        detail=detail,
+        suggested_action=suggested_action,
+        level=1,
+    ))
+
+
+def _pending_escalations(
+    queue_factory: EscalationQueueFactory, project_root: ProjectRoot,
+) -> list['Escalation']:
+    return queue_factory(escalation_queue_dir(project_root)).get_pending()
+
+
 class TargetedReconciler:
     """Lightweight reconciliation triggered by task state transitions."""
 
@@ -1790,19 +1829,15 @@ class TargetedReconciler:
         detail = '\n'.join(detail_lines)
 
         try:
-            queue = factory(escalation_queue_dir(project_root))
-            esc = Escalation(
-                id=queue.make_id(task_id),
+            esc_id = await asyncio.to_thread(
+                _file_reconciler_l1, factory, project_root,
                 task_id=task_id,
-                agent_role='reconciler',
                 severity='blocking',
                 category='scope_violation',
                 summary=summary,
                 detail=detail,
                 suggested_action='expand_scope|abort_task',
-                level=1,
             )
-            esc_id = queue.submit(esc)
         except Exception as e:
             logger.warning(
                 'sweep: L1 escalate failed for orphan %s (parent %s): %s',
@@ -1932,47 +1967,25 @@ class TargetedReconciler:
         ])
         detail = '\n'.join(detail_lines)
 
-        def _file() -> str:
-            # Constructed HERE, not hoisted: EscalationQueue.__init__ does
-            # mkdir(parents=True, exist_ok=True), so building it outside the
-            # contradicted branch would create data/escalations/ in every
-            # target project as a side effect of an unrelated done
-            # transition — the trap _escalation_pin_index_for documents.
-            queue = factory(escalation_queue_dir(project_root))
-            esc = Escalation(
-                id=queue.make_id(task_id),
+        # Offloaded (INV-8): _on_task_done runs on the shared event loop.
+        # Contained HERE, not at the call site, which sits inside
+        # _on_task_done's broad verify `except`: an escaping raise would skip
+        # the contradiction memory write, emit a spurious `post_verify_error`
+        # row (double-counting task 4343's verify census and blaming the
+        # verifier for a queue failure), and log the misleading generic
+        # 'Verification failed for task'.  A broken escalation store must cost
+        # the escalation and nothing else, yet stay visible to an operator —
+        # hence warn, never a silent `pass`.
+        try:
+            esc_id = await asyncio.to_thread(
+                _file_reconciler_l1, factory, project_root,
                 task_id=task_id,
-                agent_role='reconciler',
                 severity='info',
                 category='risk_identified',
                 summary=summary,
                 detail=detail,
                 suggested_action='reopen_task|create_followup_task|dismiss',
-                level=1,
             )
-            return queue.submit(esc)
-
-        # Offloaded because EscalationQueue is synchronous blocking filesystem
-        # I/O and _on_task_done runs on the shared fused-memory event loop
-        # (INV-8) — following _escalation_pin_index_for's precedent, not
-        # _sweep_escalate_l1's older un-offloaded inline call.
-        #
-        # Contained HERE rather than at the call site, and this placement is
-        # the whole point rather than a stylistic choice.  The call site sits
-        # inside _on_task_done's broad verify `except`, so an escaping raise
-        # would (a) skip the contradiction memory write entirely, costing the
-        # corpus its record over a filesystem outage, (b) emit a spurious
-        # `post_verify_error` row that both double-counts task 4343's verify
-        # census and blames the verifier for a queue failure, and (c) log the
-        # misleading generic 'Verification failed for task' message.  A broken
-        # escalation store must cost the escalation and nothing else — which is
-        # also why this is a warn-and-return-None arm (_sweep_escalate_l1's
-        # precedent) and not a silent `except Exception: pass`: the failure
-        # still has to be visible to an operator.
-        # asyncio.to_thread re-raises in the awaiting coroutine, so this one
-        # try covers construction, make_id and submit alike.
-        try:
-            esc_id = await asyncio.to_thread(_file)
         except Exception as e:
             logger.warning(
                 'verification_contradicted_escalate_failed task=%s project_root=%s: %s',
@@ -2100,9 +2113,9 @@ class TargetedReconciler:
         dependent: both read the same ``queue_dir/esc-*.json`` glob and apply
         the same ``status == 'pending'`` filter, so one scan plus a dict
         lookup is equivalent to D scans while turning a D x E parse into
-        1 x E. The scan runs in ``asyncio.to_thread`` because
-        ``EscalationQueue`` is synchronous blocking filesystem I/O and this
-        coroutine runs on the shared fused-memory event loop.
+        1 x E. Construction and scan run in one ``asyncio.to_thread`` hop
+        because ``EscalationQueue`` is synchronous blocking filesystem I/O and
+        this coroutine runs on the shared fused-memory event loop.
 
         Returns the index, or ``None`` when the store is unavailable -- there
         is no escalation-queue factory, construction raised, or the scan
@@ -2129,9 +2142,8 @@ class TargetedReconciler:
             return None
         index: dict[str, list[str]] | None
         try:
-            queue = factory(escalation_queue_dir(project_root))
             index = {}
-            for esc in await asyncio.to_thread(queue.get_pending):
+            for esc in await asyncio.to_thread(_pending_escalations, factory, project_root):
                 # str() both sides of what get_by_task compared with ==, so an
                 # int-typed task_id still pins its dependent rather than
                 # silently missing the lookup.
