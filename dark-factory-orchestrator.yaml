@@ -1805,3 +1805,5 @@ review:
 # since task 7279 (merge 58a69de6a5).
 merge_deep:
   chain_cap: 6
+  # No warm spec pool here, so builds are git-only (8 builds, max 31 s).
+  chain_build_timeout_secs: 300

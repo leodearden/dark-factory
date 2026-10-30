@@ -715,9 +715,9 @@ class TestDeepChainPlacementBuild:
         )
 
     async def test_build_is_wrapped_in_a_deadline_and_leaks_no_lane(
-        self, git_repo: Path, monkeypatch,
+        self, git_repo: Path, monkeypatch, caplog,
     ):
-        """A build that overruns ``CHAIN_BUILD_TIMEOUT_SECS`` degrades to today's path.
+        """A build that overruns ``merge_deep.chain_build_timeout_secs`` degrades to today's path.
 
         The REAL ``build_chain`` runs here (only the per-item merge is stalled),
         so the deadline genuinely cancels it mid-merge and its own
@@ -725,19 +725,18 @@ class TestDeepChainPlacementBuild:
         the lane.  Stubbing the builder wholesale would prove only that a stub
         does not leak.
         """
+        import logging
+
         from orchestrator.warm_lane_pool import LaneState
 
         git_ops, worker, item, _head, _cfg = await self._fixture(
             git_repo, chain_cap=6,
             queued=[('102', 'b.txt', 'edit-102\n'), ('103', 'c.txt', 'edit-103\n')],
         )
-        assert isinstance(merge_queue.CHAIN_BUILD_TIMEOUT_SECS, (int, float))
-        assert merge_queue.CHAIN_BUILD_TIMEOUT_SECS > 0
         # 2.0s, not a tighter value: the deadline starts at the `async with`,
         # so it also covers acquire_chain_build_lane's reset+clean+CoW seed.
         # Too tight and the cancel lands INSIDE the acquisition under parallel
         # load, testing a different path than the one this test names.
-        monkeypatch.setattr('orchestrator.merge_lane.worker.CHAIN_BUILD_TIMEOUT_SECS', 2.0)
         reached: list[str] = []
 
         async def _stalled_merge(_lane, branch):
@@ -746,9 +745,16 @@ class TestDeepChainPlacementBuild:
 
         monkeypatch.setattr(git_ops, 'merge_branch_into_worktree', _stalled_merge)
 
-        assert await worker._deep_chain_placement(item) is None
-        assert reached, 'the stall must be reached, so the cancel lands in the merge loop'
-        assert _lane_states(git_ops) == [LaneState.FREE], 'deadline must not strand a lane'
+        # The knob is read live off the dispatching request: a reload that
+        # changes it governs the NEXT dispatch, and the WARNING names it.
+        for secs in (2.0, 3.0):
+            item.request.config.merge_deep.chain_build_timeout_secs = secs
+            caplog.clear()
+            with caplog.at_level(logging.WARNING):
+                assert await worker._deep_chain_placement(item) is None
+            assert f'exceeded {secs:.0f}s' in caplog.text
+            assert reached, 'the stall must be reached, so the cancel lands in the merge loop'
+            assert _lane_states(git_ops) == [LaneState.FREE], 'deadline must not strand a lane'
 
     async def test_a_none_merge_commit_declines_before_any_build(
         self, git_repo: Path, monkeypatch,
@@ -851,7 +857,7 @@ class TestDeepChainPlacementBuild:
 
         The build is awaited INLINE on ``_verifier_loop``'s dispatch path, so
         for its whole duration no head can be finalized or landed and nothing
-        else can dispatch.  ``CHAIN_BUILD_TIMEOUT_SECS`` bounds that stall but
+        else can dispatch.  ``merge_deep.chain_build_timeout_secs`` bounds that stall but
         does not remove it, and the PRD's whole justification is throughput —
         so the cost has to reach telemetry (as ``chain_build_ms``) before ζ
         raises the cap.  Stamped by the CALLER, not by ``build_chain``, so it

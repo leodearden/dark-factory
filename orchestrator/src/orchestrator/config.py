@@ -1379,8 +1379,10 @@ class MergeDeepConfig(BaseModel):
     cap-staging plan live in the PRD, which is the ONE canonical narrative for
     both — deliberately not restated here, because β (task 3184, the chain
     builder) and γ (task 3185, the dispatch gate) are the consumers that
-    implement that contract and may change it. Nothing in the orchestrator reads
-    the knob yet.
+    implement that contract and may change it.
+
+    ``chain_build_timeout_secs`` bounds one chain build (lane acquisition plus
+    the merges) inside ``SpeculativeMergeWorker._deep_chain_placement``.
 
     ``chain_cap=0`` (the shipped default) is the KILL SWITCH: the gate can never
     open, so no chain code runs on any dispatch path and behaviour is
@@ -1407,6 +1409,17 @@ class MergeDeepConfig(BaseModel):
             'at load rather than reaching dispatch. No upper bound is imposed. '
             'See plans/deep-merge-ahead-prd.md for the dispatch contract this '
             'gates and for the cap-staging plan.'
+        ),
+    )
+    chain_build_timeout_secs: float = Field(
+        default=1800.0,
+        gt=0,
+        description=(
+            'Deadline in seconds for one deep-chain build: lane acquisition '
+            '(git reset/clean, the CoW re-seed of target/) plus the sequential '
+            'merges. On overrun the dispatch degrades to the adjacent verify. '
+            'The build blocks the verifier loop, so this is also the worst-case '
+            'stall on finalising a green head. Read live per dispatch; must be > 0.'
         ),
     )
 
