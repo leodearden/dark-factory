@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 from typing import Any
 
 import pytest
+from _serial_recovery_helpers import xdist_offenders
 
 
 def _sample(**overrides):
@@ -277,6 +279,14 @@ LIVE_TEST_COMMAND = (
     'uv run --directory orchestrator pytest tests/ --tb=short -q --timeout=300'
 )
 
+WORKER_COUNT_SPELLINGS = [
+    pytest.param('-n 8', id='short'),
+    pytest.param('--numprocesses 8', id='long'),
+    pytest.param('-n=8', id='short-attached'),
+    pytest.param('--numprocesses=8', id='long-attached'),
+    pytest.param('-n8', id='short-concatenated'),
+]
+
 
 class TestXdistWorkers:
     """``verify._xdist_workers(cmd, verify_env)`` — two facts, neither guessed.
@@ -330,11 +340,13 @@ class TestXdistWorkers:
 
         assert _xdist_workers('uv run pytest tests/ -n auto', {})['n_flag'] == 'auto'
 
-    @pytest.mark.parametrize(
-        'flag',
-        ['-n 8', '--numprocesses 8', '-n=8', '--numprocesses=8'],
-        ids=['short', 'long', 'short-attached', 'long-attached'],
-    )
+    def test_the_concatenated_auto_is_reported_verbatim(self):
+        """``-nauto`` is what the command SAYS, exactly as ``-n auto`` is."""
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        assert _xdist_workers('uv run pytest tests/ -nauto', {})['n_flag'] == 'auto'
+
+    @pytest.mark.parametrize('flag', WORKER_COUNT_SPELLINGS)
     def test_every_worker_count_spelling_is_read(self, flag):
         """The SPELLINGS are tested, not one literal.
 
@@ -343,11 +355,39 @@ class TestXdistWorkers:
         flag on argv, so addopts decided the count". That is a wrong fact,
         silently, in the corpus this deliverable exists to make trustworthy; no
         live config uses the long spelling today, so it was latent rather than
-        active. Both attached forms are here because argparse accepts both.
+        active. Both attached forms and the concatenated ``-n8`` are here
+        because argparse reads all three, and pytest-xdist accepts them.
         """
         from orchestrator.verify import _xdist_workers  # noqa: PLC0415
 
         assert _xdist_workers(f'uv run pytest tests/ {flag}', {})['n_flag'] == '8'
+
+    @pytest.mark.parametrize('flag', WORKER_COUNT_SPELLINGS)
+    def test_every_spelling_the_stamp_reads_is_one_serial_recovery_sheds(self, flag):
+        """The telemetry never claims a worker flag the serial strip would leave.
+
+        A spelling the stamp reads as a count but ``serial_pytest`` keeps on
+        argv is one the ``-p no:xdist`` re-run rejects as an unrecognized
+        argument: two disagreeing answers to "is this a worker flag".
+        """
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify_cmd import (  # noqa: PLC0415
+            parse_config_command,
+            render,
+            serial_pytest,
+        )
+
+        cmd = f'uv run pytest tests/ {flag}'
+        serial = render(serial_pytest(parse_config_command(cmd)))
+
+        assert _xdist_workers(cmd, {})['n_flag'] == '8'
+        assert xdist_offenders(shlex.split(serial)) == []
+
+    def test_a_concatenated_spelling_that_is_another_flags_value_is_not_a_count(self):
+        """``-k -n8`` binds ``-n8`` as ``-k``'s value; the walk steps over the pair."""
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        assert _xdist_workers('uv run pytest tests/ -k -n8', {})['n_flag'] is None
 
     @pytest.mark.parametrize(
         'cmd',
