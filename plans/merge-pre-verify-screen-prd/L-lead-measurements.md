@@ -54,3 +54,24 @@ The seven commands were started together (`&` … `wait`), each with `env -u VIR
 - Population: the rows of M1 Appendix A (147 distinct `merge_verify` ids) whose `kind` is not `train`, which leaves 129.
 - A row counts as caught when its `caught` column names any of C1, C8, C11, C14, C15, C18 or C20.
 - Minutes are the sum of the `dur` column over the caught rows.
+
+## L5. The ratchet as its pytest gate node
+
+Command: `env -u VIRTUAL_ENV uv run pytest "scripts/tests/test_inline_suppression_ratchet.py::test_the_live_tree_passes_the_gate_once_the_baseline_is_seeded" -n0 -q -p no:cacheprovider`, at the worktree root.
+
+| Run | Pytest's own time | Wall | Load average |
+|---|---|---|---|
+| first | 8.08 s | 33.92 s | 55 |
+| second | 7.62 s | 8.26 s | ~61 |
+| third | 7.59 s | 8.34 s | ~61 |
+| `--collect-only` | — | 0.87 s | ~61 |
+
+The first run pays about 26 s of cold start.
+
+## L6. The fast seven, cold, in a fresh tree
+
+Setup: a fresh `git clone --shared` of the main repo at `c8308465b2` (`/tmp/stream1-lead/cold`), then `uv sync --all-packages --frozen --offline -q`, which took 2.13 s.
+
+The seven checks were then started together, with C1 as its pytest node (L5) and the other six as in L3. All seven exited 0. **Wall from launch to the last exit: 44.66 s**, at load average 63 / 70 / 95.
+
+This is the cost a per-item screen pays in a freshly checked-out merge worktree. Every new venv compiles its imports to bytecode on first use. L3's 9.8 s is the warm figure.

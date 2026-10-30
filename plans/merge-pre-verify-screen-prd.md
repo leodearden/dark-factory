@@ -40,7 +40,7 @@ Measured over 2026-10-13T21:48Z → 2026-10-29T17:40Z (15.8 days, 630 merge veri
 | Screen set | Checks | Cost | Caught, all kinds | Caught, non-train (what recurs with coalescing off) |
 |---|---|---|---|---|
 | Ratchet only | `scripts/inline_suppressions.py --check` | 8 s CPU | 50 / 147 (34.0%), 24.7 h | 43 / 129 (33.3%), 17.6 h |
-| **Fast seven (this PRD)** | ratchet + six pytest selections, each < 10 s CPU | ~25 s CPU; **9.8 s wall in parallel** (L3) | **58 / 147 (39.5%), 28.9 h** | **48 / 129 (37.2%), 20.0 h** |
+| **Fast seven (this PRD)** | ratchet + six pytest selections, each < 10 s CPU | ~25 s CPU; in parallel **9.8 s wall warm (L3), 44.7 s cold in a fresh tree (L6)** | **58 / 147 (39.5%), 28.9 h** | **48 / 129 (37.2%), 20.0 h** |
 | Next tier (not now) | + seven 14–31 s checks | ~160 s CPU | 71 / 147 (48.3%), 34.3 h | 58 / 129 (45.0%) |
 
 "Caught" means failed on the item's own defect: the check is red on the verify's merge tree and green on its first parent. All 83 catches across the tiers reproduce that way. The hours are the verify time those failures spent, an upper bound on what the screen saves.
@@ -125,13 +125,17 @@ No lane, metadata or diff-reachability proxy separates fixing verifies from doom
    - **Re-merges on the verifier loop are not re-screened.** `SpeculativeMergeWorker._remerge` re-enters `classify_and_merge` after a head-failure cascade, a stale-main discard or a dead base. The item was screened at its first merge, and a re-screen there would occupy the loop that finalizes landings (INV-8).
    - **Admission screening was rejected because of the tree it sees.** At admission only the branch-level tree exists, and it goes stale while the item waits. The merge-time screen sees the exact tree the verify will run, and the task-role screen gives the branch-level verdict earlier (C1 §7, rows A and B).
 2. **The task-role verify runs the same screen** (Leo, 2026-10-29).
-   - `verify_plan.py::derive_verify_plan` adds the screen run to every task-role plan, whatever the diff scope.
+   - `verify_plan.py::derive_verify_plan` reads the screen manifest (decision 3) through its existing `worktree_reader`. It adds **one structured pytest `PlannedRun` per manifest module** to every task-role plan, whatever the diff scope. Each run takes that module's own `module_prefix`, cwd and `uv run` form from the module registry.
    - A finding fails the task verify, and the implementer sees it in its own verify–review loop.
-   - Base attribution reuses the existing task-verify contagion guard; no second tree is needed. A screen failure is an ordinary task-verify failure with standard pytest node ids (decision 5).
-     - The guard (`workflow.py` around `self._inherited_break_info`: `verify_failure_is_preexisting_on_main`, then `_block_on_inherited_break`) probes main.
-     - When the same ids fail there, the task blocks on the inherited break, with one deduped `preexisting_main_break` L1, no self-patching and no signature advance. That is what any red-main test a task verify runs gets today.
-     - β must emit node ids in the form main's baseline uses, so that the probe can match them.
-   - The cost, stated honestly: while main is red on a screen check, every task-role verify blocks on that one deduped L1. Today the same is true for the orchestrator whole-tree guard family, which runs in every orchestrator-touching task verify. A red main on one of these checks arrives only through a direct-to-main commit (M1 §2.5), and ζ counts these blocks.
+   - **Base attribution reuses the existing task-verify contagion guard;** no second tree is needed. The structured per-module runs are what make it connect:
+     - junit injection fires only for structured pytest commands (`verify.py::_with_junitxml_str`), and `VerifyResult.failing_test_ids` comes only from that junit;
+     - `failing_test_ids_by_module` is keyed per run;
+     - the ids are spelled `classname::name` under the module's own cwd, as in main's per-module baseline.
+
+     So the guard (`workflow.py`, around `self._inherited_break_info`: `verify_failure_is_preexisting_on_main`, then `_block_on_inherited_break`) takes its baseline fork, probes the red module on main, and finds the same ids. A wrapper command would produce no junit, push the guard onto its legacy signature path, and blame the task (critic K41).
+   - **What an inherited break costs.** Each task blocks on a `preexisting_main_break` **L0** that is folded into one shared parent across tasks, and its steward runs a cycle. There is no self-patching and no signature advance. Every red-main test a task verify runs gets this treatment today.
+   - **The blast radius is wider than today's.** The screen runs in **every** task-role plan, while the orchestrator whole-tree guard family reaches only orchestrator-touching task verifies (M1 §1.2).
+   - **How often it would have fired.** In the window, none of the seven was red on a main tip. The ratchet was red on 0 of 95 sampled lane-landed tips. The other base-red hits on failed verifies were speculative children of defective parents, not main (M1 §2.5). A red main on these checks can arrive by a direct-to-main commit, since hooks on main run none of them. ζ counts the blocks and their steward cycles.
 3. **What the screen runs: the fast seven** (Leo, 2026-10-29). M1 ids:
 
    | Id | Check |
@@ -144,20 +148,38 @@ No lane, metadata or diff-reachability proxy separates fixing verifies from doom
    | C18 | recovery-veto predicate collapse |
    | C20 | disjoint-skip / breadth yaml guards |
 
-   - The list lives once, in a project wrapper, `scripts/merge_screen.py` (heuristic 11, SPOT; INV-5).
-   - The orchestrator holds only the command that runs the wrapper, so its code stays project-agnostic (heuristic 9, deep module, narrow interface). Reify sets no command, so nothing changes there.
+   - The list lives once, in a project manifest in the screened tree, `scripts/merge_screen.yaml` (heuristic 11, SPOT; INV-5). Each entry gives:
+     - the check id;
+     - the module prefix, which must name a registered verify module;
+     - the pytest node ids.
+
+     The lane screen and the task-role screen both read it.
+   - The orchestrator holds only the manifest's path, `merge_screen.manifest`, and the node-id runner (decision 5), so its code stays project-agnostic (heuristic 9, deep module, narrow interface). Reify sets no path, so nothing changes there.
    - The next tier (14–31 s checks) waits for the readout (ζ).
 4. **The screen provisions its environment exactly as the verify does: `uv run` in the screened tree.**
    - Nothing is borrowed from the dispatcher (no interpreter, no `PYTHONPATH`), so there is no skew between dispatcher and tree.
-   - Measured (L2, L3): a cold `uv sync --all-packages --frozen --offline` takes 2–8 s, hardlinked from the uv cache. The lead measured 1.6 s; the critic re-measured 7.6 s in a shared clone. All seven checks pass in 9.8 s wall run in parallel, at load average 120.
+   - Measured (L2, L3, L6):
+     - A cold `uv sync --all-packages --frozen --offline` takes 2–8 s, hardlinked from the uv cache. The lead measured 1.6 s and 2.1 s; the critic re-measured 7.6 s.
+     - Run in parallel, the seven checks take **9.8 s wall warm** (load 120). In a freshly synced tree they take **44.7 s cold** (load 63), because every new venv compiles its imports to bytecode on first use.
+   - Where each screen runs, and so which cost it pays:
+
+     | Screen | Tree | Cost |
+     |---|---|---|
+     | Per-item lane screen | freshly checked-out `_merge-*` worktree | cold |
+     | Chain screen | warm `_spec-*` lane | warm |
+     | Task-role screen | the task's own venv | warm after its first verify |
+
+     α owns reducing the cold start (open question 6).
 5. **The screen's verdict is structured data, never an exit code alone** (heuristic 12; INV-1; INV-2; INV-11).
-   - The wrapper's `--json` mode prints a `merge-screen/1` report and exits 0 whenever it ran. The report has one entry per check: status `pass`, `finding` or `error`, the findings, and the duration.
-   - The orchestrator validates the shape on parse. An unknown schema or a malformed entry is an `error`.
-   - **All seven checks are pytest node selections.** The ratchet runs as its own gate test, `scripts/tests/test_inline_suppression_ratchet.py::test_the_live_tree_passes_the_gate_once_the_baseline_is_seeded`, rather than as the bare script.
-     - Pytest's exit codes separate a finding (1) from an error (a collection or import failure 2, usage 4, nothing collected 5). The bare scanner can't: under `python -I` an import failure exits 1, the scanner's own finding code (L1).
-     - The finding text is pytest's failure summary plus captured output, which for the ratchet includes the scanner's `file:line` lines.
-     - The task role gets standard output that its failing-id extraction and contagion guard already read (decision 2).
-     - The wrapper's default mode streams pytest's output and exits 0 when clean, 1 on a finding, 2 on an error.
+   - **All seven checks are pytest node ids.** The ratchet runs as its own gate test, `scripts/tests/test_inline_suppression_ratchet.py::test_the_live_tree_passes_the_gate_once_the_baseline_is_seeded`, rather than as the bare scanner.
+     - Pytest separates a failing test from a collection, import or usage error.
+     - The bare scanner can't: under `python -I` an import failure exits 1, the scanner's own finding code (L1).
+   - **The lane runs the manifest through the shared node-id runner,** `verify.py::run_node_ids` (built by γ0; §4). It returns `pass`, `fail` or `error` per node id, from junit.
+     - A check is a `finding` when any of its ids fails.
+     - A check is an `error` when any of its ids errors or is not collected.
+     - The finding text is the failure summary plus captured output. The ratchet test asserts on the scanner's stderr, so its output carries the `file:line` violations.
+   - **The task role** gets the same ids in junit through its structured per-module runs (decision 2).
+   - The orchestrator validates the manifest on load. An unknown key, an unregistered module, or an empty id list is an `error` for that check (INV-1).
 6. **Attribution is base-first.** A check that is red on the merged tree is re-run on the base, the merge commit's first parent. Base verdicts are cached per sha, so a base checkout happens only when an item is red.
    - **Red on the item only:** the item bounces.
    - **Red on both:** it is not the item's defect, and the item proceeds to its verify as today.
@@ -175,7 +197,7 @@ No lane, metadata or diff-reachability proxy separates fixing verifies from doom
      - Halving still sees only tip-verify results (decision 5).
      - The culprit is bounced later, at its own per-item screen, when it becomes the dispatching item.
 8. **An instrument failure fails open, loudly** (INV-4; INV-11).
-   - A wrapper crash, a sub-check `error` or a timeout never bounces an item and never fails a task verify. The verify proceeds as today.
+   - A manifest error, a check `error` or a timeout never bounces an item and never fails a task verify. The verify proceeds as today.
    - The lane emits a `merge_screen` event with status `error`.
    - A streak of `merge_screen.error_streak_alarm` consecutive errors files one info L1, `merge_screen_unavailable`. The next clean screen closes it.
 9. **S1.2 is an F-screen hold** (Leo, 2026-10-30).
@@ -205,7 +227,7 @@ No lane, metadata or diff-reachability proxy separates fixing verifies from doom
    - **How a hold is carried.** It takes the shape the operator-halt branch already uses:
      - `classify_and_merge` returns a held passthrough under the `Decided` permit protocol. The permit moves via `on_transfer_terminal()`, not `on_abort()`, so the dispatch leak guard balances. No look-ahead stacks on a held merge commit.
      - The verifier applies the hold at the dispatch pre-check exactly as the halt branch does: cleanup, `_requeue_request` (the single requeue chokepoint, which also ends the request's stuck-ledger episode), and `REQUEUED_PREDISPATCH`.
-     - `merge_status` and the lane snapshot report a held request as `held`, with the owner id, instead of `queued`. `_REGISTRY_STATE_TO_WIRE` gains the state, so MCP pollers such as `/merge-queue` and `/unblock-low-risk` can tell a hold from a queue wait.
+     - Held is a **mark**, not a lifecycle state. The registry state stays `LANE_BUFFERED`, which is in `_REQUEUED_STATES`, so the restart drain still ignores held requests. The lane snapshot and `cancel_request` consult the held set after the `_REGISTRY_STATE_TO_WIRE` map, and report `held` with the owner id instead of `queued`. MCP pollers such as `/merge-queue` and `/unblock-low-risk` can then tell a hold from a queue wait.
    - **Held requests stay out of rotation.** `_pop_next_pickable` skips them, and they never become chain links (`chain_snapshot` excludes them).
      - Cancel, relane and a needs_rebase bounce act on a held request as on any buffered one, and drop its held mark.
      - A declared train is marked held **before** `_stand_down_train` requeues it, and its train `merge_wt` is cleaned up. Unmarked, it would be popped again at once and loop through rebase, merge, screen and hold.
@@ -225,7 +247,7 @@ No lane, metadata or diff-reachability proxy separates fixing verifies from doom
      - A verdict with no test ids, or more than `max_failing_ids`, arms nothing.
      - The `compile_error` halt is unchanged.
      - A restart drops the verdict, and one to a few verifies fail before the probe re-arms it (INV-7: the hold expires coherently).
-   - **The hold depends on the screen.** Config validation rejects `merge_main_red_hold.enabled: true` when `merge_screen.command` is unset (INV-1).
+   - **The hold depends on the screen.** Config validation rejects `merge_main_red_hold.enabled: true` when `merge_screen.manifest` is unset (INV-1).
 10. **S1.3: one canonical ref, loud failure.**
     - `GitOps.get_changed_line_ranges` builds its ref with `merge_lane/types.py::QueuedBranch.parse(ref, branch_prefix).full_name`, the existing canonical parser (heuristic 11).
     - A non-zero rc raises a typed error naming the ref, the rc and stderr (INV-11). The rc check goes in a new helper, which keeps the method's ratchet measure at 0 (C2 B8 gotcha).
@@ -256,7 +278,7 @@ Each assumed capability is either verified by reading main `07bd68fd99` or built
 | The ratchet as a pytest node | exists | `scripts/tests/test_inline_suppression_ratchet.py::test_the_live_tree_passes_the_gate_once_the_baseline_is_seeded` runs `inline_suppressions.main(['--check', …])` against the tree holding the test file. It skips while the baseline is absent |
 | Task-role base attribution for a red main | exists | the task-verify contagion guard: `workflow.py` calls `verify_failure_is_preexisting_on_main` on a failing task verify, then `_block_on_inherited_break` |
 | Annotating an open escalation | exists | `escalation/queue.py::EscalationQueue.amend` |
-| A `held` wire state for `merge_status` | **built here (γ1)** | `merge_lane/worker.py::_REGISTRY_STATE_TO_WIRE` maps `LANE_BUFFERED` to `queued` today |
+| `held` reported in `merge_status` and the lane snapshot | **built here (γ1)** | `merge_lane/worker.py::_REGISTRY_STATE_TO_WIRE` maps `LANE_BUFFERED` to `queued` today; γ1 overrides it from the held set after the map, and adds no lifecycle state |
 | The operator halt surface | exists, extended here | `harness.py::Harness.get_merge_halt_status` → `{wired, halted, owner_esc_id}`; γ1 adds the verdict, the held requests and the oldest age |
 | The task-role plan seam | exists | `verify_plan.py::derive_verify_plan`, `PlannedRun` |
 | The canonical branch-ref parser | exists | `QueuedBranch.parse(...).full_name` |
@@ -274,19 +296,19 @@ Each assumed capability is either verified by reading main `07bd68fd99` or built
 | Verify-base guard ruling (3206, 3981) | distinct | γ1 judges base *health* (failing tests), not base *identity* (frozen prefix). The advisory-by-decision ruling is untouched | — |
 | `plans/orchestrator-atomic-train-merge-prd.md`; task 6755 (train verify parity) | consumes, coordinates | α screens at `_do_train_merge`: a finding is a blocked outcome *without* `TRAIN_VERIFY_FAILED_REASON_PREFIX`, so the tip workflow escalates to a human. A γ1 hold uses `_stand_down_train`. α adds a call; 6755 rebinds the verify. There is no edge between them: whichever lands second rebases | **this PRD** owns the screen call; 6755 owns the verify binding |
 | `verify.py` (12k lines) | γ0 edits it | `run_node_ids` is extracted from the isolated-rerun discriminator, which keeps working through it | γ0 |
-| INV-12 inline-suppression gate (5611) | consumes | the wrapper runs the gate's own test node and does not change its contract | INV-12 PRD |
+| INV-12 inline-suppression gate (5611) | consumes | the manifest names the gate's own test node and does not change its contract | INV-12 PRD |
 | task 5375 (former deployed with 0 events) | answers | the flip rides this PRD's carrier; code deletion stays with 5375 | 5375 |
 | task 7739 (coalesce off) | sequenced | 7739 has landed; the former flip sits after it on this PRD's branch (adjacent yaml lines) | 7739 |
 
 ## 6. Contract (B + H)
 
 ```
-# scripts/merge_screen.py (project-owned; the only list of screen checks)
-# all seven checks are pytest node selections; per-check status from pytest's exit code
-merge_screen.py --root <tree> --json            -> stdout: ScreenReport JSON, exit 0 if it ran
-merge_screen.py --root <tree> [--only <id>...]  -> streams pytest output; exit 0 clean, 1 finding, 2 error
-ScreenReport = {schema: "merge-screen/1",
-                checks: [{id, status: pass|finding|error, findings: [str], duration_s}]}
+# scripts/merge_screen.yaml (project-owned; the only list of screen checks)
+checks:
+  - id: inline_suppressions        # C1
+    module: scripts                # a registered verify module prefix
+    node_ids: [scripts/tests/test_inline_suppression_ratchet.py::test_the_live_tree_passes_the_gate_once_the_baseline_is_seeded]
+  - ...                            # C8 C11 C14 C15 C18 C20
 
 # orchestrator/src/orchestrator/verify.py (extracted, shared with the isolated-rerun discriminator)
 async run_node_ids(tree: Path, config, module_configs, ids: Collection[str])
@@ -295,7 +317,9 @@ async run_node_ids(tree: Path, config, module_configs, ids: Collection[str])
 # orchestrator/src/orchestrator/merge_lane/screen.py (new; imports nothing from worker.py)
 @dataclass(frozen=True) ScreenCheck   {id, status, findings: tuple[str, ...], duration_s}
 @dataclass(frozen=True) ScreenVerdict {tree_sha, checks: tuple[ScreenCheck, ...]}
-async run_screen(tree: Path, config, *, only: frozenset[str] | None = None) -> ScreenVerdict
+async run_screen(tree: Path, config, module_configs, *, only: frozenset[str] | None = None,
+                 extra_node_ids: MainRedFailingIds | None = None) -> ScreenVerdict
+    # reads <tree>/<merge_screen.manifest>; runs it through verify.run_node_ids
 async screen_item(merge_tree: Path, base_sha: str, main_sha: str, config,
                   verdict: MainRedVerdict | None) -> ScreenDecision
 ScreenDecision = Proceed | Bounce(outcome) | Hold(generation) | ProceedAndClear(generation)
@@ -313,7 +337,7 @@ class VerdictBook:
 
 Invariants:
 
-- **C1, kill switch.** `merge_screen.command` empty ⇒ no screen code path executes at any site, and behaviour is byte-identical to today (asserted by test). `merge_main_red_hold.enabled: false` ⇒ no verdict arms. The hold enabled without a screen is a config-load error.
+- **C1, kill switch.** `merge_screen.manifest` unset ⇒ no screen code path executes at any site, and behaviour is byte-identical to today (asserted by test). `merge_main_red_hold.enabled: false` ⇒ no verdict arms. The hold enabled without a screen is a config-load error.
 - **C2, attribution.** `Bounce` only when a static check is `finding` on the merged tree and `pass` on the base. `finding` on both is never a bounce. F never produces `Bounce`.
 - **C3, fail open.** Any `error` or timeout ⇒ `Proceed`, plus a `merge_screen` event with status `error`, plus a step on the error streak. Never `Bounce`, never `Hold`.
 - **C4, no verify on a bounce.** A `Bounce` request has no `merge_verify` row and no verify-host lease.
@@ -337,11 +361,11 @@ Invariants:
 | Own-defect bounce | branch adds an unbaselined `# type: ignore`; base clean | outcome `screen_failed`; reason names `file:line` and the check id; no `merge_verify` row; L0 detail carries the finding (workflow); MCP reason carries it |
 | Review category | the same bounce, workflow-submitted | `.task/reviews/merge.json` and the L0 carry category `merge_screen`, not `merge_ff_failed` |
 | Red base is not blamed | the same finding on base and item | no bounce; the item verifies; no verdict armed from the screen |
-| Instrument error fails open | wrapper crashes, times out, or prints an unknown schema | item verifies; `merge_screen` event with status `error`; K consecutive errors ⇒ one `merge_screen_unavailable` L1, closed by the next clean screen |
-| Kill switch | `merge_screen.command` unset | byte-identical dispatch (golden transcript); the hold enabled without a screen fails config load |
+| Instrument error fails open | a check errors, is not collected, or times out; or the manifest is malformed | item verifies; `merge_screen` event with status `error`; K consecutive errors ⇒ one `merge_screen_unavailable` L1, closed by the next clean screen |
+| Kill switch | `merge_screen.manifest` unset | byte-identical dispatch (golden transcript); the hold enabled without a screen fails config load |
 | Task-role catch | orchestrator-only diff with an unowned suppression | task verify fails with the scanner finding |
-| Task-role red main | screen check red on main as well as on the task tree | routed by the existing contagion guard: `_block_on_inherited_break`, one deduped `preexisting_main_break` L1, no self-patch, no signature advance |
-| Task-role screen error | wrapper error in a task-role verify | non-failing note; task verify not failed |
+| Task-role red main | a screen check red on main as well as on the task tree; the screen's two modules both run | the contagion guard takes its baseline fork, because junit ids are present for each module run; `_block_on_inherited_break` files a `preexisting_main_break` L0 folded into a shared parent; no self-patch; no signature advance |
+| Task-role screen error | a check uncollectable in a task-role verify | non-failing note; task verify not failed |
 | Fixer verifies at once | verdict armed (F = {t}, owner L1 open); item's tree passes t | verify starts; lands; re-probe at the advance passes t; verdict cleared; held items released; merger woken |
 | Doomed item is held | verdict armed; item fails t; bare main fails t | no verify, no outcome, status unchanged; `merge_held` event; listed with its age in `get_merge_halt_status`; not a chain link; no look-ahead stacked on it |
 | Item proves main green | verdict armed; item fails t; bare main passes t | verdict cleared (`item_proved_green`); item verifies; no bounce |
@@ -384,29 +408,29 @@ Rules for every leaf:
 
 The leaves:
 
-- **α, the screen and the per-item lane screen** (high).
-  - Builds `scripts/merge_screen.py` (the seven checks, `merge-screen/1`), `merge_lane/screen.py`, and the `classify_and_merge` (merger path) and `_do_train_merge` call sites.
+- **γ0, the shared node-id runner** (medium). No dependencies. It touches no `worker.py`, so it can start at once.
+  - Extracts `verify.py::run_node_ids` from the isolated-rerun discriminator (`confirm_isolated_rerun_verdict`), which then calls it. It groups ids by module, runs each group as a structured pytest command under the module's own cwd and `uv run` form, and reads junit.
+  - Modules: orchestrator (`verify.py` and the discriminator's tests). ~300 LOC.
+  - **Signal:** the discriminator's existing tests pass unchanged through the extracted runner. A new public-seam test runs `run_node_ids` on a real fixture tree with one passing, one failing and one uncollectable id, and gets `pass` / `fail` / `error`.
+- **α, the screen and the per-item lane screen** (high). Depends on γ0.
+  - Builds `scripts/merge_screen.yaml` (the seven checks), `merge_lane/screen.py` (manifest load and validation, plus `run_screen` over `run_node_ids`), and the `classify_and_merge` (merger path) and `_do_train_merge` call sites.
   - Adds:
     - `OutcomeKind.screen_failed` and its `dashboard/src/dashboard/data/outcome_colors.py::classify_outcome` family;
     - the `merge_screen` event and the error-streak L1;
     - `WorktreeKind.MERGE_SCREEN`, with its `PROTECTED_PREFIXES` entry and bash mirror;
     - the `failure_category` → review-category mapping in `workflow.py::_submit_to_merge_queue`;
-    - the config block `merge_screen.{command, timeout_secs, chain_timeout_secs, error_streak_alarm}` (reloadable, default off), enabled in this repo's yaml. That is a shipped-config change, so the whole orchestrator suite runs first (the conftest pins `ORCH_CONFIG_PATH` to the shipped yaml).
-  - Adds a guard test that *executes* each wrapper check's selection against the tree and fails if any selects nothing (INV-10): a renamed test must not silently empty the screen.
+    - the config block `merge_screen.{manifest, timeout_secs, chain_timeout_secs, error_streak_alarm}` (reloadable, default off), enabled in this repo's yaml. That is a shipped-config change, so the whole orchestrator suite runs first (the conftest pins `ORCH_CONFIG_PATH` to the shipped yaml).
+  - Adds a guard test that *collects* every manifest node id against the tree and fails if any is missing (INV-10): a renamed test must not silently empty the screen.
   - Modules: orchestrator, scripts, dashboard. ~1,100 LOC.
   - **Signal:** the boundary rows "own-defect bounce", "review category", "red base is not blamed", "instrument error fails open", "kill switch" and "declared train finding".
   - Live confirmation: a `merge_attempt outcome=screen_failed` row in runs.db with no `merge_verify` row for that request.
-- **β, the task-role screen** (high). Depends on α.
-  - `verify_plan.py::derive_verify_plan` adds the screen run to every task-role plan.
-    - Its failing node ids take the form main's baseline uses, so the existing contagion guard attributes a red main.
-    - An `error` is a non-failing note (decision 2, decision 8).
+- **β, the task-role screen** (high). Depends on α, for the manifest and its loader.
+  - `verify_plan.py::derive_verify_plan` adds one structured pytest `PlannedRun` per manifest module to every task-role plan, so junit, `failing_test_ids_by_module` and the contagion guard line up (decision 2).
+  - An `error` is a non-failing note (decision 8).
+  - It stays inside `verify_plan.py` and shares no file with γ0.
   - Modules: orchestrator. ~350 LOC.
   - **Signal:** the boundary rows "task-role catch", "task-role red main" and "task-role screen error".
   - Live confirmation: a task-role verify of an `orchestrator/`-only diff shows the screen run in its plan file (`data/verify-logs/<task>/attempt-*.plan-*.json`).
-- **γ0, the shared node-id runner** (medium). No dependencies; it touches no `worker.py`, so it runs in parallel with α.
-  - Extracts `verify.py::run_node_ids` from the isolated-rerun discriminator (`confirm_isolated_rerun_verdict`), which then calls it.
-  - Modules: orchestrator (`verify.py` and the discriminator's tests). ~300 LOC.
-  - **Signal:** the discriminator's existing tests pass unchanged through the extracted runner. A new public-seam test runs `run_node_ids` on a real fixture tree with one passing, one failing and one uncollectable id, and gets `pass` / `fail` / `error`.
 - **γ1, the main-red verdict and F-screen hold** (medium). Depends on α (same file) and γ0.
   - Builds `merge_lane/main_red_verdict.py`. The verdict is armed in `_auto_heal_main_health_deferred` after the owner path, using structured `probe_sha` and F from `_build_main_health_outcome`.
   - Wires the F run (through `run_node_ids`) into `screen.py`.
@@ -415,7 +439,7 @@ The leaves:
     - the dispatch pre-check;
     - `_pop_next_pickable` and `chain_snapshot`, with the twin test updated;
     - `_stand_down_train`, with the mark set before the requeue.
-  - Adds the `held` wire state to `_REGISTRY_STATE_TO_WIRE`.
+  - Reports `held`, with the owner, in the lane snapshot and `cancel_request` from the held set. This is a mark, not a lifecycle state.
   - Wires clearing through the tick (re-probe, `get_main_sha()` poll, the disable flag), owner resolution in `Harness._on_escalation_resolved`, and expiry, plus `_signal_resume()`. Degrades amend the owner L1. `_escalate_owned_main_break` returns the owner id.
   - Extends `get_merge_halt_status`.
   - Adds the config block `merge_main_red_hold.{enabled, reprobe_interval_secs, reprobe_error_streak, f_screen_timeout_secs, max_failing_ids, max_hold_secs}` (reloadable), validated against `merge_screen`, and enables it in this repo's yaml. That is a shipped-config change, so the whole orchestrator suite runs first.
@@ -453,11 +477,11 @@ The former-off flip is not a leaf. It rides this PRD's carrier (decision 11).
 
 | Invariant | How the design meets it |
 |---|---|
-| INV-1 | the `merge-screen/1` shape is validated on parse; the hold-without-screen config is rejected at load |
+| INV-1 | the manifest is validated on load; the hold-without-screen config is rejected at load |
 | INV-2 | bounces carry structured findings and check ids; verdict events carry sha, F and owner |
 | INV-3 | arming re-checks the probe sha against main; clearing is a fresh probe; holds key on real main |
 | INV-4 | the screen's error streak files an L1. The verdict's re-probe has its own streak, which degrades the verdict and amends the owner L1. Expiry does the same |
-| INV-5 / INV-9 | one check list (the wrapper); one node-id runner (`run_node_ids`); one verdict home (`VerdictBook`) |
+| INV-5 / INV-9 | one check list (the manifest), read by both screens; one node-id runner (`run_node_ids`) for the screen, the F run and the discriminator; one verdict home (`VerdictBook`) |
 | INV-6 | holds write no status |
 | INV-7 | each hold is owned (`owner_esc_id`), bounded (`max_hold_secs`, degrade), operator-exitable (`resolve_issue` on the owner, or the disable reload) and visible with its age; a restart drops it coherently |
 | INV-8 | every screen is an awaited subprocess with a timeout, so nothing blocks the loop thread |
@@ -471,7 +495,7 @@ INV-8 occupancy figures:
 
 | Loop | Added time |
 |---|---|
-| Serial merger | ~10 s per item; during a red episode, up to `f_screen_timeout_secs` per item, when only fixers can land and high-lane fixers are popped first |
+| Serial merger | ~45 s per item cold (L6), ~10 s warm. With the queue busy this overlaps the running verify: the merger's look-ahead merge of item N+1 happens while N verifies for 12–45 min. So it costs latency only when the queue is near-empty. During a red episode the F run adds up to `f_screen_timeout_secs` per item, when only fixers can land and high-lane fixers are popped first |
 | Verifier loop | δ only: ~10 s per chain dispatch on the pass path; at worst (⌈log₂ links⌉ + 1) × `chain_timeout_secs` = 2 min at cap 6 and 30 s. No F run ever happens there |
 
 No waiver needed.
@@ -499,3 +523,4 @@ No waiver needed.
 | 3 | Culprit search in δ: bisect or a linear prefix walk? | The bound is the contract (C7); pick by chain-lane checkout cost | δ |
 | 4 | β's non-failing note | Needs a run shape the task-verify runner reports without failing; use `PlannedRun`'s existing fields | β |
 | 5 | Do held requests stay in `unfrozen_suffix` for the needs_rebase conflict graph? | They are already out of `chain_snapshot`. Either way, the twin test states the chosen relation | γ1 |
+| 6 | Cutting the per-item screen's cold start: 44.7 s cold against 9.8 s warm (L6, L3) | Options: a persistent screen environment, precompiled bytecode, or a warm-seeded merge worktree. Pick by measurement and record the warm and cold figures in α's commit | α |
