@@ -875,10 +875,10 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
        ``eval worktree``) at ``min_phrase_hits=2``, so a note that merely
        named the eval worktree in both spellings scored 2 and was blocked
        with no plan-tools / venv / shadowing content in it at all. This is
-       the same defect class the no-nesting invariant test guards
-       (``test_no_seeded_phrase_nests_inside_another_in_the_same_cluster``)
+       the same defect class the one-occurrence invariant test guards
+       (``test_no_two_seeded_phrases_can_share_one_occurrence``)
        but it slips past that test, because the two spellings are siblings
-       rather than one nesting inside the other. The matcher-level fix --
+       that no single occurrence holds together. The matcher-level fix --
        counting spelling variants of one concept once -- is task 4179 and
        is deliberately NOT part of this seed.
 
@@ -1137,10 +1137,13 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # ("Default 2 so a single incidental keyword never triggers a
             # false block"). Omitting them costs zero coverage: every corpus
             # entry containing a flag-suffixed form also contains bare
-            # 'ruff format'. The hazard is generic to the matcher rather than
-            # special to this seed, so the guarding invariant test (no phrase
-            # nests inside another in the same cluster) is asserted over ALL
-            # seeded clusters, not just this one.
+            # 'ruff format'. The rule is wider than nesting: no two phrases
+            # may share one occurrence, which also covers one phrase's end
+            # overlapping another's start on a whole word: bare 'format-clean'
+            # beside 'ruff format' would let 'ruff format-clean' score 2 hits.
+            # The hazard is generic to the matcher rather than special to
+            # this seed, so test_no_two_seeded_phrases_can_share_one_occurrence
+            # asserts it over ALL seeded clusters, not just this one.
             #
             # GENERIC-TOKEN EXCLUSIONS (the venv-shadowing over-match lesson
             # -- see this module's seed docstring): 'lint_command',
@@ -1180,7 +1183,7 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
                 'ruff check',
                 'enforced gate',
                 'enforced lint gate',
-                'format-clean',
+                'not format-clean',
             ],
             min_phrase_hits=2,
             hint=(
@@ -1280,7 +1283,7 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # single occurrence would score three distinct hits and satisfy
             # min_phrase_hits alone. Same hazard as 'ruff format --check'
             # above; asserted over ALL clusters by
-            # test_no_seeded_phrase_nests_inside_another_in_the_same_cluster.
+            # test_no_two_seeded_phrases_can_share_one_occurrence.
             #
             # THREE ACCEPTED RESIDUALS, all PINNED by positive tests so a
             # future tuner can tell them from a regression:

@@ -1,5 +1,6 @@
 """Tests for config schema Literal type validation."""
 
+import itertools
 import json
 import os
 import re
@@ -35,6 +36,7 @@ from fused_memory.config.schema import (
 from fused_memory.server.near_duplicate_guard import (
     _TOPIC_CLUSTER_DEFAULT_HINT,
     build_topic_cluster_block,
+    can_share_one_occurrence,
     find_matching_topic_cluster,
 )
 from fused_memory.services.durable_queue import DEFAULT_TRANSIENT_ERROR_NAMES
@@ -2519,45 +2521,27 @@ class TestProceduralTopicGuardClustersDefault:
             assert cluster.phrases, f'{cluster.topic_id} has empty phrases'
             assert cluster.min_phrase_hits >= 1
 
-    def test_no_seeded_phrase_nests_inside_another_in_the_same_cluster(self):
+    def test_no_two_seeded_phrases_can_share_one_occurrence(self):
         """The invariant that keeps every cluster's ``min_phrase_hits`` meaningful.
 
         ``find_matching_topic_cluster`` counts DISTINCT phrases present as
-        plain substrings, so if one phrase nests inside another in the SAME
-        cluster, a SINGLE occurrence of the longer form scores two distinct
-        hits and satisfies ``min_phrase_hits=2`` on its own -- defeating that
-        field's stated purpose ("Default 2 so a single incidental keyword
-        never triggers a false block").
+        substrings, so two phrases that one occurrence can hold (one nesting
+        in the other, or 'ruff format' / 'format-clean' overlapping on a whole
+        word) score two hits from a single construction and defeat
+        ``min_phrase_hits=2``.
 
-        The hazard is generic to the matcher, not specific to any one seed:
-        the concrete temptations are 'ruff format --check' beside bare 'ruff
-        format' (ruff-format cluster, task 3435) and bare 'plan.json' beside
-        '.task/plan.json' (plan-revalidation cluster). So the guard is
-        asserted over EVERY seeded cluster rather than one, and holds for all
-        four today.
-
-        NOT sufficient on its own: the two RETIRED eval-worktree clusters
-        each carried 'eval-worktree' beside 'eval worktree' -- one concept,
-        two spelling-variant phrases, neither nesting inside the other --
-        which scored two distinct hits off a single mention and passed this
-        test cleanly. Sibling spelling variants are task 4179's matcher-level
-        fix, not this invariant's.
-
-        Compared by INDEX, not identity: two phrases that are accidentally
-        equal must fail here too (an exact duplicate is the degenerate
-        nesting case, and ``is not`` would silently skip it only when the
-        interpreter happens to intern both copies to one object).
+        Checked with ``can_share_one_occurrence``, the same definition
+        ``derive_topic_cluster`` enforces on machine-derived clusters.
+        Sibling spelling variants (the retired 'eval-worktree' /
+        'eval worktree' pair) are outside it: task 4179.
         """
         for cluster in ReconciliationConfig().procedural_knowledge_topic_guard_clusters:
-            phrases = [p.lower() for p in cluster.phrases]
-            for i, outer in enumerate(phrases):
-                for j, inner in enumerate(phrases):
-                    if i != j:
-                        assert inner not in outer, (
-                            f'{cluster.topic_id}: {inner!r} nests inside {outer!r} -- one '
-                            f'occurrence would score two distinct hits and defeat '
-                            f'min_phrase_hits'
-                        )
+            for first, second in itertools.combinations(cluster.phrases, 2):
+                assert not can_share_one_occurrence(first, second), (
+                    f'{cluster.topic_id}: {first!r} and {second!r} can share one '
+                    f'occurrence -- it would score two distinct hits and defeat '
+                    f'min_phrase_hits'
+                )
 
 
 class TestTopicClusterAutoseedEnabledLeaf:
@@ -3009,7 +2993,7 @@ class TestRuffFormatNotAnEnforcedGateCluster:
             'ruff check',
             'enforced gate',
             'enforced lint gate',
-            'format-clean',
+            'not format-clean',
         ]
         assert cluster.min_phrase_hits == 2
         assert '3342' in cluster.hint
@@ -3103,7 +3087,7 @@ class TestRuffFormatNotAnEnforcedGateCluster:
 
         Reviewer (test-proportionality): one case per distinct HIT-PROFILE,
         not one per corpus entry. 4ab1c78f is the 4-hit maximum and the sole
-        exerciser of 'format-clean'; d72c66dc carries 'enforced lint gate';
+        exerciser of 'not format-clean'; d72c66dc carries 'enforced lint gate';
         87a4982d sits exactly AT the threshold on the 'ruff format' +
         'ruff check' anchor pair alone, which is what makes 'ruff check'
         load-bearing for the half of the corpus that says nothing about
@@ -3134,6 +3118,10 @@ class TestRuffFormatNotAnEnforcedGateCluster:
                 'I ran ruff format on the file I created so my added lines are '
                 'clean.',
                 id='format-only-note-1-hit',
+            ),
+            pytest.param(
+                'This file is ruff format-clean after my edit.',
+                id='ruff-format-clean-one-construction-1-hit',
             ),
         ],
     )
