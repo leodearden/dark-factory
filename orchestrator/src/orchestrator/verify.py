@@ -7799,6 +7799,7 @@ async def run_verification(
         lint_duration=attempt.lint.duration_secs,
         type_duration=attempt.type.duration_secs,
         leg_categories=leg_categories,
+        module=module_prefix,
     )
     if timed_out:
         summary = f'Verification timed out after {max_retries} retries' if max_retries > 0 else 'Verification timed out'
@@ -7845,6 +7846,7 @@ async def run_verification(
             lint_duration=attempt.lint.duration_secs,
             type_duration=attempt.type.duration_secs,
             leg_categories=leg_categories,
+            module=module_prefix,
         )
         if timed_out:
             # Distinct wording from the first-pass timeout summary: this
