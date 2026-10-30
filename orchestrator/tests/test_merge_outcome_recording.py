@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -15,11 +16,13 @@ from _merge_lane_fakes import (
     lane_scene_config,
     make_lane,
     merge_through_lane,
+    running_lane,
 )
 from escalation.categories import EscalationCategory
 
 from orchestrator import verify_runner
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.outcome_facts import (
     MAX_RECORDED_CONFLICTED_PATHS,
@@ -146,3 +149,78 @@ class TestPostMergeVerifyBlocksAreTyped:
         assert outcome.status == 'blocked', outcome
         assert outcome.reason.startswith('Post-merge verification failed'), outcome.reason
         assert outcome.block_category is MergeBlockCategory.POST_MERGE_VERIFY
+
+
+async def _commit_on_new_branch(git_ops: GitOps, task_id: str, filename: str, content: str) -> Path:
+    worktree = (await git_ops.create_worktree(task_id)).path
+    (worktree / filename).write_text(content)
+    await git_ops.commit(worktree, f'{task_id}: add {filename}')
+    return worktree
+
+
+@pytest.mark.asyncio
+class TestMergeToMainReportsConflictedPaths:
+    async def test_a_conflicting_merge_names_its_unmerged_paths(self, git_ops: GitOps) -> None:
+        # Both branches are cut from the same main and each ADD clash.py: add/add.
+        worktree_a = await _commit_on_new_branch(git_ops, 'clash-a', 'clash.py', 'x = 1\n')
+        worktree_b = await _commit_on_new_branch(git_ops, 'clash-b', 'clash.py', 'x = 2\n')
+        landed = await git_ops.merge_to_main(worktree_a, 'clash-a')
+        assert landed.merge_commit is not None and landed.merge_worktree is not None
+        await git_ops.advance_main(landed.merge_commit)
+        await git_ops.cleanup_merge_worktree(landed.merge_worktree)
+
+        result = await git_ops.merge_to_main(worktree_b, 'clash-b')
+
+        assert result.merge_worktree is not None
+        await git_ops.cleanup_merge_worktree(result.merge_worktree)
+        assert result.conflicts is True
+        assert result.conflicted_paths == ('clash.py',)
+
+    async def test_a_clean_merge_names_no_paths(self, git_ops: GitOps) -> None:
+        worktree = await _commit_on_new_branch(git_ops, 'clean', 'clean.py', 'x = 1\n')
+
+        result = await git_ops.merge_to_main(worktree, 'clean')
+
+        assert result.merge_worktree is not None
+        await git_ops.cleanup_merge_worktree(result.merge_worktree)
+        assert result.success is True
+        assert result.conflicted_paths == ()
+
+
+@pytest.mark.asyncio
+class TestConflictFinalizationRecordsPaths:
+    async def test_the_conflict_outcome_and_its_merge_attempt_row_carry_the_paths(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        store = EventStore(tmp_path / 'runs.db', run_id='run-conflict-paths')
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        lane = make_lane(git_ops, queue, event_store=store, clock=healthy_verify_clock())
+        # Both cut before either lands, so each ADDS clash.py: an add/add conflict.
+        first = await _prepare(git_ops, config, 'conf-a', 'clash.py', 'x = 1\n')
+        second = await _prepare(git_ops, config, 'conf-b', 'clash.py', 'x = 2\n')
+        # With task/conf-b resolvable, the conflict graph would probe it against
+        # main and bounce it before it merged. Moving the ref away leaves the
+        # graph nothing to probe, so the conflict surfaces in merge_to_main's
+        # merge of the worktree HEAD (its absent-ref fallback).
+        subprocess.run(
+            ['git', 'branch', '-m', 'task/conf-b', 'parked/conf-b'],
+            cwd=second.worktree, check=True, capture_output=True,
+        )
+
+        async with running_lane(lane) as run:
+            await queue.put(first)
+            assert (await run.outcome(first)).status == 'done'
+            await queue.put(second)
+            outcome = await run.outcome(second)
+
+        assert outcome.status == 'conflict', outcome
+        assert outcome.conflict_evidence == ConflictEvidence(conflicted_paths=('clash.py',))
+        conflict_rows = [
+            row for row in store.fetch_events_by_type(EventType.merge_attempt)
+            if row['task_id'] == 'conf-b' and row['data']['outcome'] == 'conflict'
+        ]
+        assert len(conflict_rows) == 1, conflict_rows
+        data = conflict_rows[0]['data']
+        assert data['conflicted_paths'] == ['clash.py']
+        assert data['conflicted_paths_total'] == 1
+        assert 'counterpart_task_ids' not in data

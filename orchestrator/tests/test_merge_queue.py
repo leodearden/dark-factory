@@ -49,7 +49,7 @@ from test_merge_queue_concurrent_verify import HEAVY_BARRIER_TEST_TIMEOUT
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
-from orchestrator.event_store import EventStore
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import (
     AdvanceOutcome,
     AdvanceResult,
@@ -12907,6 +12907,31 @@ class TestTrainLifecycleEvents:
             f"Expected 'verif' (from 'verify' or 'verification') in derail_reason, "
             f"got: {derailed_data['derail_reason']!r}"
         )
+
+    async def test_merge_conflict_records_conflicted_paths(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """A train whose tip merge conflicts records the conflicted paths on its
+        conflict ``merge_attempt`` row (task 7302)."""
+        req = await _make_stacked_train(git_ops, config)
+        event_store = EventStore(db_path=tmp_path / 'train_conflict.db', run_id='train-conflict-run')
+        git_ops.merge_to_main = AsyncMock(return_value=MergeResult(
+            success=False, conflicts=True,
+            details='Conflicting files:\ntrn-c.py\n', conflicted_paths=('trn-c.py',),
+        ))
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        lane = make_lane(git_ops, queue, event_store=event_store, clock=healthy_verify_clock())
+
+        outcome = await merge_through_lane(lane, queue, req)
+
+        assert outcome.status == 'blocked', outcome
+        conflict_rows = [
+            row['data'] for row in event_store.fetch_events_by_type(EventType.merge_attempt)
+            if row['data']['outcome'] == 'conflict'
+        ]
+        assert len(conflict_rows) == 1, conflict_rows
+        assert conflict_rows[0]['train_id'] == req.train_id
+        assert conflict_rows[0]['conflicted_paths'] == ['trn-c.py']
 
     async def test_rebase_conflict_emits_train_derailed(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
