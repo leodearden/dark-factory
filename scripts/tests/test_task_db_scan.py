@@ -470,29 +470,26 @@ def test_connect_ro_connection_cannot_write_to_the_store(make_tasks_db):
     assert "readonly" in str(insert_refusal.value)
 
 
-_URI_SYNTAX_IN_PATH = pytest.mark.parametrize(
-    "dirname",
-    ["we?ird", "we#ird", "we%41ird"],
+@pytest.fixture(
+    params=["we?ird", "we#ird", "we%41ird"],
     ids=["question-mark", "hash", "percent-escape"],
 )
-
-
-@_URI_SYNTAX_IN_PATH
-def test_connect_ro_reads_a_store_whose_path_holds_uri_syntax(
-    make_tasks_db, tmp_path, dirname
-):
-    """A raw ``file:{path}`` URI reads '?' as the query and '#' as the
-    fragment, cutting the path short at 'we', and decodes '%41' to 'A', naming
-    a file that does not exist. Each case must still open the real store
-    (measured 2026-10-30: NO_TABLES, NO_TABLES, 'unable to open database')."""
-    store_dir = tmp_path / dirname
+def uri_syntax_store(request, make_tasks_db, tmp_path):
+    """A two-row store, alone in ``tmp_path``, under a directory whose name
+    holds URI syntax."""
+    store_dir = tmp_path / request.param
     store_dir.mkdir()
-    db = make_tasks_db(
+    return make_tasks_db(
         [{"id": 1, "status": "done"}, {"id": 2, "status": "pending"}],
         directory=store_dir,
     )
 
-    conn = connect_ro(db)
+
+def test_connect_ro_reads_a_store_whose_path_holds_uri_syntax(uri_syntax_store):
+    """A raw ``file:{path}`` URI reads '?' as the query and '#' as the
+    fragment, cutting the path short at 'we', and decodes '%41' to 'A', naming
+    a file that does not exist. Each case must still open the real store."""
+    conn = connect_ro(uri_syntax_store)
     try:
         rows = conn.execute("SELECT id, status FROM tasks ORDER BY id").fetchall()
     finally:
@@ -501,22 +498,14 @@ def test_connect_ro_reads_a_store_whose_path_holds_uri_syntax(
     assert rows == [(1, "done"), (2, "pending")]
 
 
-@_URI_SYNTAX_IN_PATH
 def test_connect_ro_of_a_uri_syntax_path_stays_read_only_and_creates_nothing(
-    make_tasks_db, tmp_path, dirname
+    uri_syntax_store, tmp_path
 ):
     """When the raw URI cuts the path short, ``mode=ro`` is dropped with the
     rest of it, so the truncated prefix is opened READ-WRITE and created as a
-    stray sibling of the store's directory (measured 2026-10-30). The encoded
-    open must keep ``mode=ro`` in force and write nothing beside the store."""
-    store_dir = tmp_path / dirname
-    store_dir.mkdir()
-    db = make_tasks_db(
-        [{"id": 1, "status": "done"}, {"id": 2, "status": "pending"}],
-        directory=store_dir,
-    )
-
-    conn = connect_ro(db)
+    stray sibling of the store's directory. The encoded open must keep
+    ``mode=ro`` in force and write nothing beside the store."""
+    conn = connect_ro(uri_syntax_store)
     try:
         with pytest.raises(sqlite3.OperationalError) as update_refusal:
             conn.execute("UPDATE tasks SET status = 'cancelled'")
@@ -524,7 +513,7 @@ def test_connect_ro_of_a_uri_syntax_path_stays_read_only_and_creates_nothing(
         conn.close()
 
     assert "readonly" in str(update_refusal.value)
-    assert sorted(p.name for p in tmp_path.iterdir()) == [dirname]
+    assert list(tmp_path.iterdir()) == [uri_syntax_store.parent]
 
 
 def test_connect_ro_returns_a_plain_connection_not_a_wrapper(make_tasks_db):
