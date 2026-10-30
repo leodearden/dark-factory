@@ -11,9 +11,12 @@ in a background thread, so a whole-dir copy taken then races those unlinks.
 So the server is driven to a fresh rewrite first: wait until it is idle,
 require the AOF on, BGSAVE, then BGREWRITEAOF, which leaves a manifest newer
 than dump.rdb by construction. Only dump.rdb, the manifest and the base/incr
-files the copied manifest names are then copied, mtimes kept. The source is the
-container's own data mount, never an argument, so a worktree's copy of the
-export cannot flush the live server and then copy an empty dir. Stdlib only.
+files the copied manifest names are then copied, mtimes kept, between two INFO
+reads that must show no save or rewrite landing in between. A raced copy is
+not retried: it means something still writes FalkorDB, which a silent second
+attempt would hide. The source is the container's own data mount, never an
+argument, so a worktree's copy of the export cannot flush the live server and
+then copy an empty dir. Stdlib only.
 """
 
 import argparse
@@ -40,6 +43,7 @@ from falkordb_aof_gate import (
 
 RDB_FILE = "dump.rdb"
 STARTED_REPLY_PREFIX = "Background"
+STILL_WRITING = "something is still writing to FalkorDB: stop it, then re-run the export"
 
 
 class ExportFailed(Exception):
@@ -178,8 +182,8 @@ def export(docker: Docker, args: argparse.Namespace,
     config = ServerAofConfig.read(docker, container_id)
     _require_aof(config, server.wait_until(lambda s: s.idle, "the server to be idle"))
     _flush(server, SAVE)
-    state = _flush(server, REWRITE)
-    copied = _copy_restore_set(host_dir, config, args.dest)
+    _flush(server, REWRITE)
+    copied, state = _bracketed_copy(server, host_dir, config, args.dest)
     return (f"copied {RDB_FILE}, {config.manifest_name} and {copied} base/incr file(s) "
             f"to {args.dest} at aof_rewrites:{state.aof_rewrites}")
 
@@ -225,6 +229,32 @@ def _flush(server: Server, flush: Flush) -> SaveState:
         raise ExportFailed(f"{flush.command} failed: {flush.status}:{flush.outcome(after)}")
     log(f"{flush.command} done: {flush.counter} {flush.count(before)}→{flush.count(after)}")
     return after
+
+
+def _bracketed_copy(server: Server, host_dir: Path, config: ServerAofConfig, dest: Path) -> tuple[int, SaveState]:
+    before = server.info()
+    try:
+        copied = _copy_restore_set(host_dir, config, dest)
+    except OSError as exc:
+        raise ExportFailed(
+            f"copying the restore set failed ({exc}); a named file that vanished means a rewrite replaced it "
+            f"mid-copy, so {STILL_WRITING}"
+        ) from exc
+    after = server.info()
+    _require_steady(before, after)
+    return copied, after
+
+
+def _require_steady(before: SaveState, after: SaveState) -> None:
+    problems = [
+        f"{flush.counter} {flush.count(before)}→{flush.count(after)}"
+        for flush in (SAVE, REWRITE) if flush.count(before) != flush.count(after)
+    ]
+    for when, state in (("before", before), ("after", after)):
+        if not state.idle or state.aof_last_write_status != "ok":
+            problems.append(f"{when} the copy: {state.describe()}")
+    if problems:
+        raise ExportFailed(f"the copy is not one consistent snapshot ({'; '.join(problems)}); {STILL_WRITING}")
 
 
 def _copy_restore_set(host_dir: Path, config: ServerAofConfig, dest: Path) -> int:
