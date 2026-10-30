@@ -183,7 +183,7 @@ done
 # ---------------------------------------------------------------------------
 # 3. Python workspace — uv sync --all-packages
 # ---------------------------------------------------------------------------
-info "Syncing Python subprojects"
+info "Syncing Python workspace (all members)"
 
 # A member-scoped sync is exact and prunes the other members from the shared .venv; see scripts/sync-orchestrator-env.sh.
 (cd "$REPO_ROOT" && uv sync --all-packages --quiet)

@@ -827,7 +827,9 @@ def test_every_policy_row_is_declared_in_its_familys_template():
     """
     import systemd_unit_parity
 
-    specs = {spec.family: spec for spec in _units().values()}
+    specs = {
+        spec.family: spec for spec in _units().values() if spec.family is not None
+    }
     for row in systemd_unit_parity.ENV_POLICY.rows:
         template = specs[row.unit_family].template
         declared = systemd_unit_parity.environment_map(

@@ -712,10 +712,9 @@ The same failures are WARNING lines in the unit's journal.
 #### The isolation check
 
 The isolation gate is ζ's `client-feed/tests/test_isolation.py` (task 6973;
-PRD §10 row ζ, B1, B2, B15 and B22). It lands with ζ and was not yet on main
-on 2026-10-29. The deployment canary is the portal repository's
-`deploy/README.md` §"Check": step 4 (the portal account cannot list
-`/home/leo`) and step 7 (the canary feed).
+PRD §10 row ζ, B1, B2, B15 and B22). The deployment canary is the portal
+repository's `deploy/README.md` §"Check": step 4 (the portal account cannot
+list `/home/leo`) and step 7 (the canary feed).
 
 #### What evidence exists
 
