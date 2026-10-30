@@ -56,6 +56,8 @@ When `recompute_suffix_conflict_graph()` detects a textual conflict between two 
 
 Constant: `NEEDS_REBASE_REASON_PREFIX = 'Suffix item needs rebase onto frozen-prefix tip'`
 
+**What a bounce records (task 7302):** both escalation arms (real conflict, cap exceeded) resolve the request `blocked` with `block_category = merge_needs_rebase`, which the workflow files as-is; before task 7302 it inferred the category from reason substrings and mislabelled every bounce `merge_ff_failed`. The `merge_blocked` row in runs.db also carries `conflicted_paths` / `conflicted_paths_total` (from the merge-tree probe of the item against the frozen-prefix tip) and `counterpart_task_ids` (the frozen-prefix task ids at probe time; `[]` = conflicted against main itself). The three keys are absent when that probe failed open, i.e. the paths are unknown. `merge_attempt` rows with `outcome = conflict` carry `conflicted_paths` / `conflicted_paths_total` too. The field names are spelled in one place: `orchestrator/src/orchestrator/merge_lane/outcome_facts.py::ConflictEvidence.to_event_payload`.
+
 ---
 
 ## 4. Conflict-clique aging order and disjoint throughput bypass (ζ=1891)
@@ -369,7 +371,7 @@ This module stayed OUTSIDE the `orchestrator/merge_lane/` package (task 5036).
 
 Unlike α–γ's pure function/type extractions, this module also introduces a NEW owning class.
 `SuffixConflictTracker` takes five narrow re-reading accessor callables — `git_ops`,
-`lane_buffers`, `frozen_prefix`, `frozen_prefix_tip`, `retire_item` — instead of a worker
+`lane_buffers`, `frozen_requests`, `frozen_prefix_tip`, `retire_item` — instead of a worker
 reference, so it is fully unit-testable without a `SpeculativeMergeWorker`. A bounce escalation
 removes the request from the lane buffer it was found in and retires it from the worker's
 lifecycle registry through the required `retire_item` (wired to
@@ -394,7 +396,7 @@ any top-level import of the worker (which would be a cycle, since the worker imp
 |--------|----------|--------------|
 | `SuffixConflictGraph` | suffix_graph.py | Immutable conflict graph over the unfrozen suffix (moved verbatim from the monolith, now `merge_lane/worker.py`) |
 | `EMPTY_SUFFIX_CONFLICT_GRAPH` | suffix_graph.py | Sentinel empty `SuffixConflictGraph` for the default/zero-suffix case (moved verbatim) |
-| `SuffixConflictTracker` | suffix_graph.py | Owns `graph` / `signature` / `last_known_main_sha` / `bounce_registry`; constructed with `git_ops`/`lane_buffers`/`frozen_prefix`/`frozen_prefix_tip`/`retire_item` callables |
+| `SuffixConflictTracker` | suffix_graph.py | Owns `graph` / `signature` / `last_known_main_sha` / `bounce_registry`; constructed with `git_ops`/`lane_buffers`/`frozen_requests`/`frozen_prefix_tip`/`retire_item` callables |
 | `SuffixConflictTracker.recompute()` | suffix_graph.py | Recompute and store the conflict graph over the unfrozen suffix (debounced, fail-open); `SpeculativeMergeWorker.recompute_suffix_conflict_graph()` delegates here |
 | `SuffixConflictTracker.bounce_conflicting_suffix_items()` | suffix_graph.py | Graph-time disk-free bounce of the younger conflicting item (cap/escalation/TOCTOU); an escalation retires the item via `retire_item`; `SpeculativeMergeWorker._bounce_conflicting_suffix_items()` delegates here |
 
