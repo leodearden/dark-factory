@@ -6,7 +6,9 @@ that prior incarnation aside and starts on a branch freshly cut from main.
 The marker lives in the TASK record's metadata under ``recut_ruling``, since
 a ruling is a human-issued, task-lifetime fact. It is satisfied only by the
 explicit ``recut_executed`` record naming the same ruling id. Provenance:
-esc-2896-8, task 3154.
+esc-2896-8, task 3154. A ruling is issued by a restart resolution with
+``recut=True`` (``harness.py::Harness._action_teardown_and_set_status``), or
+by hand.
 
 Dependency-light (stdlib + ``shared.task_metadata_wire``), like
 ``cross_repo_gate``: git_ops, harness and workflow import this module, never
@@ -170,6 +172,25 @@ def execution_record(
         'quarantined_worktree': parked.quarantined_worktree,
         'relocated_meta_roots': list(parked.relocated_meta_roots),
     }
+
+
+def ruling_patch(ruling: RecutRuling) -> dict[str, Any]:
+    """The metadata patch that issues *ruling*; ``_parse_ruling`` reads it back."""
+    return {
+        RECUT_RULING_KEY: {
+            'ruling_id': ruling.ruling_id,
+            'ruled_at': ruling.ruled_at.isoformat(),
+        },
+    }
+
+
+async def issue_ruling(
+    ruling: RecutRuling,
+    *,
+    persist: Callable[[dict[str, Any]], Awaitable[bool]],
+) -> str | None:
+    """Persist *ruling*; the failure reason, or None once it is durable."""
+    return await _persist_failure(persist, ruling_patch(ruling))
 
 
 async def enforce_recut_ruling(
