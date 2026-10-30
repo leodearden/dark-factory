@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -30,24 +30,8 @@ from fused_memory.reconciliation.degenerate_task_node_sweep import (
     extract_terminal_task_ids,
     sweep_degenerate_task_nodes,
 )
-from fused_memory.reconciliation.flag_dedup import (
-    EntityStandingSuppressionResult,
-    acknowledge_resolved_flags,
-    compute_marker_signature,
-    dedup_flags,
-    filter_accounted_cluster_growth_flags,
-    filter_already_recorded_caveat_flags,
-    filter_already_tracked_systemic_patterns,
-    filter_entity_standing_decisions,
-    filter_false_absence_flags,
-    filter_stale_bulk_get_statuses_flags,
-    filter_stale_count_snapshot_corrections,
-    filter_style_only_authorship_flags,
-    filter_terminal_metadata_flags,
-)
+from fused_memory.reconciliation.flag_dedup import EntityStandingSuppressionResult
 from fused_memory.reconciliation.gate_owned_finding_phrasing import (
-    extract_human_gated_task_ids,
-    normalize_gate_owned_suggested_actions,
     stamp_curator_gate_sweep_provenance,
 )
 from fused_memory.reconciliation.live_workflow_citation_guard import check_live_workflow_citations
@@ -69,6 +53,7 @@ from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.recon_pool_map import (
     STAGE1_CYCLE_SUMMARY_RECON_POOL as _STAGE1_CYCLE_SUMMARY_RECON_POOL,
 )
+from fused_memory.reconciliation.stage1_flag_chain import FlagChainContext, run_stage1_flag_chain
 from fused_memory.reconciliation.stage1_payload_format import (
     append_note,
     format_context_items,
@@ -103,15 +88,11 @@ from fused_memory.reconciliation.standing_decision_constants import (
     SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
 )
 from fused_memory.reconciliation.standing_decision_storm_escape import (
-    maybe_escalate_suppression_storm,
     maybe_escalate_suppression_streak,
     update_suppression_streaks,
 )
 from fused_memory.reconciliation.summary_pool import (
     write_cycle_summary,
-)
-from fused_memory.reconciliation.sweep_deletion_guard import (
-    filter_benign_sweep_deletion_flags,
 )
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
@@ -737,390 +718,19 @@ class MemoryConsolidator(BaseStage):
         report.items_flagged = (report.items_flagged or []) + list(unlanded.flags)
         report.stats.update(unlanded.stats())
 
-        # Always present (task-2029 amendment): downstream consumers that read this
-        # stat symmetrically with stats['stage2_flag_markers_acknowledged'] (which is
-        # unconditionally set) should never need a .get(..., 0) fallback.  Overwritten
-        # below when there is anything to acknowledge; stays 0 when items_flagged is
-        # empty/falsy.
+        # Always present (task-2029 amendment), symmetric with Stage 2's
+        # stage2_flag_markers_acknowledged; the chain overwrites it on a cycle with flags.
         report.stats['stage1_flag_markers_acknowledged'] = 0
-        # Hook A reassigns this inside the block below; a cycle that flagged
-        # nothing keeps the empty batch, which is the same observation.
-        _esd_result = EntityStandingSuppressionResult.empty_batch()
+        standing_decision_result = EntityStandingSuppressionResult.empty_batch()
         if report.items_flagged:
-            # Snapshot before the filter chain (task-2029): used below to compute
-            # which flags the chain dropped for a MOOT reason — terminal task,
-            # false-absence, or stale-snapshot correction — so any persisted
-            # stage1_flag_marker for a now-moot flag can be reclaimed instead of
-            # waiting for the 14-day age-GC or a recurrence.  Flags dropped by
-            # dedup_flags' own suppression gate (filter_suppressed) are identified
-            # separately below and deliberately EXCLUDED from acknowledgment: a
-            # suppression means the issue is intentionally hidden, not resolved, so
-            # acknowledging it would erase recurrence history for when the
-            # suppression is later lifted.
-            # Taken BELOW the preservation-specimen guard (task 4223) on purpose:
-            # that guard's drops are a suppression, not a resolution, and their
-            # absence from this snapshot is what keeps their stage1_flag_marker
-            # alive.  Moving this above the guard would need the same explicit
-            # signature exclusion Hook A does below.
-            _pre_filter_flags = list(report.items_flagged)
+            outcome = await run_stage1_flag_chain(
+                report.items_flagged, self._flag_chain_context(events, run_id),
+            )
+            report.items_flagged = outcome.kept_flags
+            report.stats.update(outcome.stats)
+            standing_decision_result = outcome.standing_decision_result
 
-            # ── Stale count-snapshot correction filter (task-1786): drop false ────
-            # 'off-by-N correction' findings on stale-by-design task-count snapshot
-            # edges BEFORE dedup_flags so no stage1_flag_marker churn occurs.
-            # Pure, sync — no I/O needed (reads only the flag's own text fields).
-            # Surfaces dropped count as report.stats['stale_count_snapshot_corrections_dropped'].
-            _before_snapshot_filter = len(report.items_flagged)
-            report.items_flagged = filter_stale_count_snapshot_corrections(
-                report.items_flagged,
-            )
-            report.stats['stale_count_snapshot_corrections_dropped'] = (
-                _before_snapshot_filter - len(report.items_flagged)
-            )
-            # ── Terminal-metadata guard (task-1725): drop stale_metadata flags for ──
-            # cancelled/done tasks BEFORE dedup_flags so no marker write/delete churn
-            # occurs.  Fail-safe: only drops on positively-confirmed terminal status.
-            report.items_flagged = await filter_terminal_metadata_flags(
-                taskmaster=self.taskmaster,
-                project_root=self.project_root,
-                flags=report.items_flagged,
-            )
-            # ── Stale bulk get_statuses guard (task-3007): drop ───────────────────
-            # stale_bulk_get_statuses_recurrence flags whose alleged bulk-vs-scoped
-            # census divergence does NOT reproduce on a fresh LIVE A/B read.  The
-            # recurrence is a misdiagnosis of the harness's frozen cycle-start
-            # unscoped census compared against live reads minutes later (not a
-            # backend defect — the read path is provably write-synchronous-fresh);
-            # dropping the phantom flag before dedup_flags stops the per-cycle
-            # marker churn AND the phantom backend-investigation task each
-            # recurrence would otherwise mint.  Fail-safe: only drops on
-            # positively-confirmed live agreement; a reproduced divergence, a
-            # missing/None cited status, or a read error KEEP the flag so a genuine
-            # regression is never silenced.  Surfaces the dropped count as
-            # report.stats['stale_bulk_get_statuses_flags_dropped'] (mirrors the
-            # stale_count_snapshot_corrections_dropped before/after idiom above).
-            _before_stale_bulk_get_statuses_filter = len(report.items_flagged)
-            report.items_flagged = await filter_stale_bulk_get_statuses_flags(
-                taskmaster=self.taskmaster,
-                project_root=self.project_root,
-                flags=report.items_flagged,
-            )
-            report.stats['stale_bulk_get_statuses_flags_dropped'] = (
-                _before_stale_bulk_get_statuses_filter - len(report.items_flagged)
-            )
-            # ── Already-tracked systemic-pattern guard (task-2416): drop ──────────
-            # systemic_pattern "never tracked" findings BEFORE dedup_flags so a
-            # dropped finding never writes a stage1 flag marker.  Hardens against
-            # the e61b38f9/1938 false-positive incident: Stage 1 asserted an idea
-            # was never converted to a tracked task despite a done dark_factory
-            # task already implementing it (which spawned duplicate task 2412).
-            # The whole cross-project routing map is handed over (task 4381):
-            # the filter fans one get_tasks out per known project and matches on
-            # TEXT coverage, where a same-project match is genuine evidence — so
-            # unlike dedup_flags' foreign-only cited-task gate below, ALL known
-            # projects are queried.  It naturally no-ops when known_projects is
-            # empty.  Uses get_tasks(statuses=...) rather than the semantic
-            # search_tasks named in the task description: search_tasks lives only
-            # on TaskInterceptor/the MCP wrapper, not on TaskBackendProtocol, so it
-            # is unreachable from self.taskmaster (a raw SqliteTaskBackend) here —
-            # see design_decisions in .task/plan.json for the full rationale.
-            _before_already_tracked_filter = len(report.items_flagged)
-            report.items_flagged = await filter_already_tracked_systemic_patterns(
-                taskmaster=self.taskmaster,
-                known_projects=self.known_projects,
-                flags=report.items_flagged,
-            )
-            report.stats['systemic_pattern_already_tracked_dropped'] = (
-                _before_already_tracked_filter - len(report.items_flagged)
-            )
-            # ── Style-only authorship guard (task 3138): drop ─────────────────────
-            # injection/fabrication flags whose cited entries turn out to have been
-            # written by our OWN agents.  Closes reify esc-5564-1, in which Stage 1
-            # flagged its own earlier consolidator output (agent_id
-            # recon-stage-memory_consolidator) as "possibly injected/fabricated"
-            # purely because the imperative writing style looked foreign — it never
-            # read the stored agent_id.  Provenance comes from
-            # memory.get_memory_by_id, whose metadata is the raw Qdrant payload and
-            # so still carries the top-level agent_id that mem0 promotes out of
-            # metadata on the search/get paths.  Fail-safe: drops only on
-            # positively-confirmed wholly-house authorship; foreign, missing, mixed
-            # or unresolvable provenance all KEEP the flag (and get annotated with
-            # the agent_ids actually checked).  Surfaces the dropped count as
-            # report.stats['style_only_authorship_flags_dropped'].
-            #
-            # Placement before dedup_flags is load-bearing: it is what routes a
-            # dropped flag through the marker-reclaim tail below, so its Stage-2
-            # disposition marker is acknowledged rather than stranded.
-            _before_authorship_filter = len(report.items_flagged)
-            report.items_flagged = await filter_style_only_authorship_flags(
-                memory_service=self.memory,
-                project_id=self.project_id,
-                flags=report.items_flagged,
-            )
-            report.stats['style_only_authorship_flags_dropped'] = (
-                _before_authorship_filter - len(report.items_flagged)
-            )
-            # ── Accounted duplicate-cluster-growth guard (task 3476): drop ────────
-            # "cluster has grown beyond what gate task N tracks" findings whose
-            # cited memory UUIDs are ALREADY written into that task's CURRENT
-            # description body.  Stage 1 diffs the candidate UUID against a
-            # title-derived / remembered COUNT, so an addendum appended to the body
-            # since the title was written reads as unaccounted growth: in run
-            # df364849-21e9-4f54-b802-a126a49eba97 (finding 96a14765) 2 of 3 such
-            # flags were FALSE POSITIVES — task 3417's title still reads "(3
-            # primary + 3 secondary entries)" while its body already lists the
-            # "new" UUID verbatim as primary entry #3 of 3, and task 3468's
-            # "Cluster UUIDs (mem0)" list has the same shape.  Fail-safe: drops
-            # only when SOME single candidate task's body contains EVERY cited
-            # UUID; partial presence, a lookup error, a body-less result or no
-            # resolvable task id all KEEP the flag, so a genuine growth signal is
-            # never silenced.  project_root=, not the known_projects= that
-            # filter_already_tracked_systemic_patterns switched to under task 4381:
-            # this filter resolves ids in the RUNNING project's root only.
-            # Surfaces the dropped count as
-            # report.stats['accounted_cluster_growth_flags_dropped'].
-            #
-            # Position is load-bearing in both directions: before dedup_flags so a
-            # dropped flag never writes a stage1_flag_marker, and after the
-            # _pre_filter_flags snapshot above so drops join the task-2029
-            # flag-marker acknowledgment diff below for free.
-            _before_accounted_cluster_growth_filter = len(report.items_flagged)
-            report.items_flagged = await filter_accounted_cluster_growth_flags(
-                taskmaster=self.taskmaster,
-                project_root=self.project_root,
-                flags=report.items_flagged,
-            )
-            report.stats['accounted_cluster_growth_flags_dropped'] = (
-                _before_accounted_cluster_growth_filter - len(report.items_flagged)
-            )
-            # ── Already-recorded caveat guard (task 5271): drop ──────────────────
-            # "task N's metadata still lacks the caveat" findings whose cited
-            # caveat-source memory id the task's LIVE metadata already records.
-            # Fail-KEEP; rationale in filter_already_recorded_caveat_flags'
-            # docstring.  After the _pre_filter_flags snapshot and before
-            # dedup_flags, so a drop writes no stage1_flag_marker and is
-            # acknowledged as resolved by the task-2029 diff below.
-            _before_already_recorded_caveat_filter = len(report.items_flagged)
-            report.items_flagged = await filter_already_recorded_caveat_flags(
-                taskmaster=self.taskmaster,
-                project_root=self.project_root,
-                flags=report.items_flagged,
-            )
-            report.stats['already_recorded_caveat_flags_dropped'] = (
-                _before_already_recorded_caveat_filter - len(report.items_flagged)
-            )
-            # ── Benign sweep-deletion guard (task 5271): drop ─────────────────────
-            # evidentiary-anchor deletion-pattern findings whose every swept id
-            # carries a documented recon sweep's tombstone (a designed trim, not
-            # an anomaly).  Reads this cycle's buffered `events` for deletions
-            # that left no tombstone.  Fail-KEEP; rationale in the
-            # sweep_deletion_guard module docstring.  After the _pre_filter_flags
-            # snapshot and before dedup_flags, so a drop writes no
-            # stage1_flag_marker and is acknowledged as resolved below.
-            _before_benign_sweep_deletion_filter = len(report.items_flagged)
-            report.items_flagged = await filter_benign_sweep_deletion_flags(
-                memory_service=self.memory,
-                project_id=self.project_id,
-                flags=report.items_flagged,
-                events=events,
-            )
-            report.stats['benign_sweep_deletion_flags_dropped'] = (
-                _before_benign_sweep_deletion_filter - len(report.items_flagged)
-            )
-            # ── Entity-standing-decision suppression (task 2896 γ, Hook A) ────────
-            # Drop flags already adjudicated by an ACTIVE entity_standing_decision
-            # ledger row BEFORE dedup_flags so a suppressed flag never writes a
-            # stage1_flag_marker.  Whole-batch fail-open (ledger unavailable or read
-            # error → no suppression this cycle; a read failure must never hide a
-            # finding).  Suppression is NOT resolution: the dropped flags' signatures
-            # are collected here and unioned into suppressed_signatures below so they
-            # are EXCLUDED from acknowledge_resolved_flags — preserving recurrence
-            # history for when the decision is later lifted.
-            _pre_esd_flags = list(report.items_flagged)
-            _esd_result = await filter_entity_standing_decisions(
-                memory_service=self.memory,
-                project_id=self.project_id,
-                flags=report.items_flagged,
-            )
-            report.items_flagged = _esd_result.kept_flags
-            report.stats['entity_standing_decision_suppressed'] = sum(
-                _esd_result.suppressed_by_decision.values()
-            )
-            esd_suppressed_signatures = _marker_signatures(
-                _pre_esd_flags, project_id=self.project_id
-            ) - _marker_signatures(report.items_flagged, project_id=self.project_id)
-            # Per-cycle "storm escape": one active decision suppressing more than the
-            # threshold in a single cycle is a signal it may be over-broad or the
-            # entity's situation changed — file one L1 recon escalation for that
-            # entity (best-effort; recurrences fold onto it by content fingerprint).
-            # Skipped when no escalation queue is wired (nothing would consume the
-            # escalation).  Its cross-cycle streak arm runs after this block.
-            if self._escalation_queue is not None:
-                await maybe_escalate_suppression_storm(
-                    escalation_queue=self._escalation_queue,
-                    project_id=self.project_id,
-                    run_id=run_id,
-                    result=_esd_result,
-                    threshold=SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
-                )
-            # Snapshot immediately before dedup_flags, which internally applies the
-            # suppression gate (filter_suppressed) as its first step, so suppression
-            # drops can be isolated below and excluded from acknowledgment.
-            _pre_dedup_flags = list(report.items_flagged)
-            _dedup_stats: dict[str, int] = {}
-            report.items_flagged = await dedup_flags(
-                memory_service=self.memory,
-                project_id=self.project_id,
-                run_id=run_id,
-                flags=report.items_flagged,
-                # Cross-project fix-task suppression (task 4381): without BOTH
-                # of these, dedup_flags' HIT-path gate degrades to a silent
-                # no-op by design.
-                taskmaster=self.taskmaster,
-                known_projects=self.known_projects,
-                # Out-dict for dedup_flags' own drop counters (task 4381
-                # amendment) — see the report.stats publication below.
-                stats=_dedup_stats,
-            )
-            # Every sibling filter in this chain publishes its drop count; the
-            # cross-project gate now does too, so an operator reading a cycle
-            # report can tell "a foreign fix task resolved this" apart from "a
-            # stage1_flag_suppression record hid this" — two very different
-            # signals that the signature diff below deliberately merges.
-            report.stats['stage1_flag_cross_project_fix_task_suppressed'] = int(
-                _dedup_stats.get('cross_project_fix_task_suppressed', 0)
-            )
-            # Findings whose cited fix task is already done yet which keep
-            # recurring: suppression EXPIRED and they were surfaced again
-            # (dedup_flags logs each at WARNING).  A non-zero value here means
-            # a landed fix did not stop its finding.
-            report.stats['stage1_flag_cross_project_fix_task_suppression_exhausted'] = int(
-                _dedup_stats.get('cross_project_fix_task_suppression_exhausted', 0)
-            )
-            # One-time completion markers dedup_flags emitted-then-self-deleted this
-            # cycle (task-2312) — counts flags annotated completion_marker_self_deleted
-            # by the flag_for_stage2=False branch; 0 when none were present.
-            report.stats['stage1_completion_markers_self_deleted'] = sum(
-                1 for f in report.items_flagged
-                if f.get('completion_marker_self_deleted') is True
-            )
-            # Signatures dropped INSIDE dedup_flags: present before, absent
-            # after.  As of task 4381 dedup_flags drops for TWO reasons — its
-            # filter_suppressed gate, and a ledger HIT whose cited_tasks resolve
-            # to a live, non-cancelled fix task in a FOREIGN known project — so
-            # this diff no longer isolates suppression alone.  Both causes are
-            # deliberately folded into `suppressed_signatures` here, and are
-            # therefore EXCLUDED from acknowledge_resolved_flags below.  That is
-            # correct for the same reason the existing suppression carve-out is:
-            # a cross-project fix task that has been FILED has not yet LANDED, so
-            # the marker must retain its recurrence history for the day that task
-            # is cancelled or closed without landing the fix — exactly like "a
-            # suppression means the issue is intentionally hidden, not resolved".
-            # The two causes cannot be told apart by this diff — dedup_flags
-            # returns only a list — so the cross-project count is reported
-            # separately above, out of dedup_flags' `stats` out-dict, alongside
-            # the `reconciliation.stage1_flag_cross_project_fix_task_suppressed`
-            # INFO log that names the specific fix task behind each drop.
-            suppressed_signatures = _marker_signatures(
-                _pre_dedup_flags, project_id=self.project_id
-            ) - _marker_signatures(report.items_flagged, project_id=self.project_id)
-            # Fold in the entity-standing-decision drops (task 2896 γ): they are a
-            # suppression, not a resolution, so — exactly like dedup_flags' own
-            # suppression drops above — their signatures are excluded from
-            # acknowledge_resolved_flags so the persisted stage1_flag_marker (and thus
-            # recurrence history) survives until the standing decision is lifted.
-            suppressed_signatures |= esd_suppressed_signatures
-            # ── Deletion guard: drop absence-type flags that cannot be confirmed absent ──
-            # filter_false_absence_flags is fail-closed: keeps an absence-asserting flag
-            # ONLY when get_task POSITIVELY confirms the task does not exist.  Present or
-            # inconclusive → drop to prevent irreversible delete_memory ops on real tasks.
-            report.items_flagged = await filter_false_absence_flags(
-                taskmaster=self.taskmaster,
-                project_root=self.project_root,
-                flags=report.items_flagged,
-            )
-
-            # ── Flag-marker acknowledgment (task-2029 scenario a) ──────────────────
-            # Flags DROPPED anywhere in the chain above (e.g. terminal task, false-absence,
-            # stale-snapshot correction, or already-tracked systemic-pattern) have a
-            # moot requested action; reclaim any persisted stage1_flag_marker for them
-            # best-effort.  Computed as a
-            # signature diff against the survivors rather than threading a "dropped"
-            # list through each filter, so none of the filters' contracts change.
-            # suppressed_signatures (computed above) is explicitly subtracted out —
-            # suppression is not the same as resolved; see the snapshot comment above.
-            surviving_signatures = _marker_signatures(
-                report.items_flagged, project_id=self.project_id
-            )
-            dropped_flags = [
-                f for f in _pre_filter_flags
-                if _marker_signatures([f], project_id=self.project_id)
-                - surviving_signatures - suppressed_signatures
-            ]
-            report.stats['stage1_flag_markers_acknowledged'] = await acknowledge_resolved_flags(
-                memory_service=self.memory,
-                project_id=self.project_id,
-                run_id=run_id,
-                resolved_flags=dropped_flags,
-                mode='delete',
-            )
-
-            # ── Gate-owned suggested_action normalization (task 4814) ─────────
-            # The deterministic half of the gate-owned phrasing fix; the
-            # Stage-1 prompt norm quoting the same constant is the
-            # probabilistic half.  Rationale, evidence and the sweep carve-out
-            # live in one place: gate_owned_finding_phrasing.py's module
-            # docstring.  Corrects the STRUCTURED-REPORT channel only —
-            # report.items_flagged, which Stage 2 reads through
-            # task_knowledge_sync.py::_format_flagged (via assemble_payload's
-            # combined_flags, the same path that makes the new
-            # gate_owned_action_normalized key visible to Stage 2 at all).
-            # The mem0_active_query marker relay assemble_payload merges into
-            # that same list is NOT corrected here; see the module docstring.
-            #
-            # PLACEMENT — last in the block, after the acknowledgment diff, on
-            # three grounds:
-            #
-            # 1. It never DROPS, so normalizing a flag a later filter would
-            #    discard is wasted work.  Running last means it only ever
-            #    touches survivors.
-            # 2. It must sit after the curator-gate sweep that appends the
-            #    carved-out flags, so the carve-out is genuinely exercised in
-            #    production rather than only in tests.
-            # 3. Running after the acknowledgment diff makes the safety
-            #    STRUCTURAL rather than argued: surviving_signatures and
-            #    dropped_flags are already computed above and provably cannot
-            #    observe this rewrite.
-            #
-            # Running after dedup_flags is separately safe, and that argument
-            # is kept because ground 3 covers only the acknowledgment diff:
-            # compute_flag_signature reads ONLY task_id/flag_type/cited_tasks,
-            # none of which this touches, and compute_content_fingerprint_signature
-            # (the only path that hashes finding TEXT) returns None the moment a
-            # flag has a task_id or any cited_tasks task id — which a gate-owned
-            # finding, selected BY its cited task, structurally always has.
-            #
-            # The durable recon_report row deliberately keeps the LLM's
-            # verbatim self-report (the more faithful audit trail of what the
-            # stage produced); the gate_owned_action_normalized=True marker on
-            # each corrected flag makes that divergence explicit and greppable.
-            #
-            # Pure and sync — deliberately NOT try/except-wrapped, matching its
-            # pure sibling filter_stale_count_snapshot_corrections at the head
-            # of this same chain.
-            if self.filtered_task_tree is not None:
-                _gate_task_ids = extract_human_gated_task_ids(
-                    self.filtered_task_tree.active_tasks,
-                )
-                if _gate_task_ids:
-                    report.items_flagged, _normalized = (
-                        normalize_gate_owned_suggested_actions(
-                            report.items_flagged, _gate_task_ids,
-                            project_id=self.project_id,
-                        )
-                    )
-                    report.stats['gate_owned_suggested_actions_normalized'] = _normalized
-
-        await self._account_suppression_streaks(run_id, _esd_result, report)
+        await self._account_suppression_streaks(run_id, standing_decision_result, report)
 
         # ── Census inconsistency detection ────────────────────────────────────
         # Compare task IDs referenced in this cycle's events against the census
@@ -1460,6 +1070,25 @@ class MemoryConsolidator(BaseStage):
         report.stats['stage1_cycle_summary_ledger_written'] = 1 if ledger_written else 0
 
         return report
+
+    def _flag_chain_context(
+        self, events: list[ReconciliationEvent], run_id: str,
+    ) -> FlagChainContext:
+        return FlagChainContext(
+            memory_service=self.memory,
+            taskmaster=self.taskmaster,
+            escalation_queue=self._escalation_queue,
+            project_id=self.project_id,
+            project_root=self.project_root,
+            known_projects=self.known_projects,
+            run_id=run_id,
+            events=events,
+            active_tasks=(
+                self.filtered_task_tree.active_tasks
+                if self.filtered_task_tree is not None
+                else None
+            ),
+        )
 
     async def _account_suppression_streaks(
         self,
@@ -1998,14 +1627,3 @@ This is a focused remediation run. Address ONLY the specific findings listed abo
 
 {_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}
 """
-
-
-def _marker_signatures(
-    flags: Iterable[dict[str, Any]], *, project_id: str
-) -> set[tuple[str, str]]:
-    """The ``stage1_flag_marker`` identities of *flags*, so every diff in
-    :meth:`MemoryConsolidator.run` compares keys from one identity space."""
-    return {
-        sig for f in flags
-        if (sig := compute_marker_signature(f, project_id=project_id)) is not None
-    }
