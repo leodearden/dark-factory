@@ -1975,6 +1975,7 @@ _DEPENDENCY_FREE_MODULES = {
         'tabs.jsx',
         'tab_escalations.jsx',
         'tab_escalation_analytics.jsx',
+        'tab_tasks.jsx',
     ),
     'render_failure.js': ('app.jsx',),
 }

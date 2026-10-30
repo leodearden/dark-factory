@@ -773,3 +773,131 @@ test('tab_escalations.jsx::EscalationSidebar renders no check-owner section with
 
   assert.equal(nullDialog.innerHTML, absentDialog.innerHTML);
 });
+
+// ── Decision 8: the Tasks tab's preferences go through persisted_state.js ──
+// A key exists only while its value differs from its default, and a write the
+// browser refuses is reported on console.warn rather than swallowed.
+
+const TASKS_PREFERENCE_KEYS = ['df.tasksOpen', 'df.tasksGroupByPrd', 'df.tasks.views'];
+
+function storedKeys(window) {
+  const { localStorage } = window;
+  return Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i));
+}
+
+function viewButton(window, container, key) {
+  const { label } = window.DF_TASK_SNAPSHOT.CENSUS_VIEWS.find(view => view.key === key);
+  const buttons = [...container.querySelectorAll('.seg button')].filter(button => button.textContent === label);
+  assert.equal(buttons.length, 1, `expected one '${label}' view button`);
+  return buttons[0];
+}
+
+function mountTasks(harness) {
+  const task = inProgressTask(false);
+  seedOneTask(harness.window, task);
+  const handle = harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
+  assert.ok(graphNode(handle.container, task), 'the seeded task never reached the graph');
+  return handle;
+}
+
+function projectHead(container) {
+  const heads = [...container.querySelectorAll('.proj-head')].filter(head => head.querySelector('.name')?.textContent === PROJECT);
+  assert.equal(heads.length, 1, `expected one header for project ${PROJECT}`);
+  return heads[0];
+}
+
+// Fills storage until jsdom's own quota refuses a single character more, and
+// returns the error that refusal threw.
+function fillStorageToQuota(storage) {
+  let refusal = null;
+  let written = 0;
+  for (let size = 1 << 20; size >= 1; size >>= 1) {
+    const chunk = 'x'.repeat(size);
+    for (;;) {
+      try {
+        storage.setItem(`fill.${written}`, chunk);
+        written += 1;
+      } catch (error) {
+        refusal = error;
+        break;
+      }
+    }
+  }
+  return refusal;
+}
+
+test('tab_tasks.jsx::TasksTab stores none of its preferences while each is at its default', t => {
+  const harness = openWindow(t);
+  mountTasks(harness);
+
+  const stored = storedKeys(harness.window);
+  assert.deepEqual(TASKS_PREFERENCE_KEYS.filter(key => stored.includes(key)), []);
+});
+
+test('tab_tasks.jsx::TasksTab reports a preference it cannot store on console.warn, and the view still flips', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const refusal = fillStorageToQuota(window.localStorage);
+  assert.equal(refusal?.name, 'QuotaExceededError', 'the fill did not reach the storage quota');
+  const warnings = [];
+  window.console.warn = (...args) => warnings.push(args);
+
+  const { container } = mountTasks(harness);
+  click(window, viewButton(window, container, 'terminal'));
+
+  assert.ok(viewButton(window, container, 'terminal').classList.contains('on'), 'the terminal view did not flip on');
+  assert.ok(
+    warnings.some(([message, error]) => String(message).includes('df.tasks.views') && error?.name === 'QuotaExceededError'),
+    `no console.warn named 'df.tasks.views' with its QuotaExceededError: ${JSON.stringify(warnings.map(([message]) => String(message)))}`,
+  );
+});
+
+test('tab_tasks.jsx::TasksTab stores a flipped view, seeds the next mount with it, and removes the key when flipped back', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const first = mountTasks(harness);
+  click(window, viewButton(window, first.container, 'terminal'));
+  assert.equal(JSON.parse(window.localStorage.getItem('df.tasks.views'))?.terminal, true, 'the flipped view was not stored');
+  first.unmount();
+
+  const { container } = mountTasks(harness);
+  assert.ok(viewButton(window, container, 'terminal').classList.contains('on'), 'the stored view did not seed the next mount');
+  click(window, viewButton(window, container, 'terminal'));
+  assert.ok(!storedKeys(window).includes('df.tasks.views'), 'the view is back at its default, yet its key is still stored');
+});
+
+test('tab_tasks.jsx::TasksTab folds a project on its first header click, and the fold seeds the next mount', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const first = mountTasks(harness);
+  assert.equal(projectHead(first.container).dataset.open, 'true', 'a project with no stored flag did not start open');
+  click(window, projectHead(first.container));
+  assert.equal(projectHead(first.container).dataset.open, 'false', 'one header click did not fold the project');
+  assert.ok(storedKeys(window).includes('df.tasksOpen'), 'the fold was not stored');
+  first.unmount();
+
+  // A folded project renders no graph, so this mount cannot go through mountTasks.
+  const { container } = harness.mount(window.DF_TASKS.TasksTab, TAB_PROPS);
+  assert.equal(projectHead(container).dataset.open, 'false', 'the stored fold did not seed the next mount');
+  click(window, projectHead(container));
+  assert.equal(projectHead(container).dataset.open, 'true', 'one header click did not unfold the project');
+  assert.ok(!storedKeys(window).includes('df.tasksOpen'), 'the project is back at its default-open, yet its key is still stored');
+});
+
+function groupingButton(container, label) {
+  const buttons = [...projectHead(container).querySelectorAll('.seg button')].filter(button => button.textContent === label);
+  assert.equal(buttons.length, 1, `expected one '${label}' grouping button`);
+  return buttons[0];
+}
+
+test('tab_tasks.jsx::TasksTab stores a project grouped by PRD, and removes the key when it is listed flat again', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const { container } = mountTasks(harness);
+  click(window, groupingButton(container, 'by PRD'));
+  assert.equal(JSON.parse(window.localStorage.getItem('df.tasksGroupByPrd'))?.[PROJECT], 'prd', 'the by-PRD grouping was not stored');
+
+  click(window, groupingButton(container, 'list'));
+  assert.ok(groupingButton(container, 'list').classList.contains('on'), 'the project did not return to the flat list');
+  assert.ok(!storedKeys(window).includes('df.tasksGroupByPrd'), 'the grouping is back at its default, yet its key is still stored');
+});
