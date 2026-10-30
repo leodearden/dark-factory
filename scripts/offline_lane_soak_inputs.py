@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
-from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 import _checkout as _checkout
 import httpx
@@ -58,7 +58,8 @@ from shared.project_layout import escalation_queue_dir
 _BEGINNING = datetime.min.replace(tzinfo=UTC)
 _LATEST = datetime.max.replace(tzinfo=UTC)
 _LANE_REENTRY_REF = call_site_evidence(FlakeCallSite.offline_lane, observed_at='')['ref']
-_SCAN_PARSE_ERRORS = (KeyError, TypeError, ValueError)
+_SCAN_PARSE_ERRORS = (AttributeError, KeyError, TypeError, ValueError)
+_Read = TypeVar('_Read')
 
 
 @dataclass(frozen=True)
@@ -344,22 +345,70 @@ def _scan_regressions(queue_dir: Path, since: datetime) -> tuple[list[Escalation
     return found, unread
 
 
-def _read_escalations(
-    queue_dir: Path, *, since: datetime, episodes: Mapping[str, CommandRecord], window: Sequence[WindowPass],
-) -> EscalationReads:
-    """*queue_dir* exists, so the queue built over it makes nothing."""
-    queue = EscalationQueue(queue_dir)
-    stuck = [r.stuck_filing_escalation_id for r in episodes.values() if r.stuck_filing_escalation_id is not None]
-    raised = [
+def _lane_record(
+    read: Callable[[str], _Read | None], escalation_id: str, unread: Sequence[tuple[str, str]],
+) -> _Read | None | Unjudgeable:
+    """What *read* answers for *escalation_id*: None only for a genuine absence.
+
+    ``EscalationQueue.get`` answers None for an unparsable record too, so while any
+    queue file is unread a None cannot say the record is absent.
+    """
+    try:
+        found = read(escalation_id)
+    except (OSError, *_SCAN_PARSE_ERRORS) as exc:
+        return Unjudgeable(f'escalation queue unreadable: {escalation_id}: {exc!r}')
+    if found is None and unread:
+        path, reason = unread[0]
+        return Unjudgeable(
+            f'escalation queue unreadable: {escalation_id} reads as absent while {len(unread)} queue '
+            f'file(s) are unread, the first {path} ({reason})',
+        )
+    return found
+
+
+def _lane_records(
+    read: Callable[[str], _Read | None], escalation_ids: Iterable[str], unread: Sequence[tuple[str, str]],
+) -> dict[str, _Read | None] | Unjudgeable:
+    """Each id to what :func:`_lane_record` reads for it; the first :class:`Unjudgeable` wins."""
+    records: dict[str, _Read | None] = {}
+    for escalation_id in escalation_ids:
+        found = _lane_record(read, escalation_id, unread)
+        if isinstance(found, Unjudgeable):
+            return found
+        records[escalation_id] = found
+    return records
+
+
+def _stuck_filing_ids(episodes: Mapping[str, CommandRecord]) -> list[str]:
+    return [r.stuck_filing_escalation_id for r in episodes.values() if r.stuck_filing_escalation_id is not None]
+
+
+def _outage_ids(window: Sequence[WindowPass]) -> list[str]:
+    """The records the windowed outage passes raised."""
+    return [
         escalation_id
         for p in window
         if isinstance(p.outcome, Outage) and p.effect is not None
         for escalation_id in p.effect.escalations_raised
     ]
+
+
+def _read_escalations(
+    queue_dir: Path, *, since: datetime, episodes: Mapping[str, CommandRecord], window: Sequence[WindowPass],
+) -> EscalationReads | Unjudgeable:
+    """*queue_dir* exists, so the queue built over it makes nothing.  The scan runs first, so a
+    lane-referenced record that reads as absent while a queue file is unread leaves nothing to judge."""
     regressions, unread = _scan_regressions(queue_dir, since)
+    queue = EscalationQueue(queue_dir)
+    stuck = _lane_records(lambda i: escalation_state(queue, i), _stuck_filing_ids(episodes), unread)
+    if isinstance(stuck, Unjudgeable):
+        return stuck
+    outages = _lane_records(queue.get, _outage_ids(window), unread)
+    if isinstance(outages, Unjudgeable):
+        return outages
     return EscalationReads(
-        stuck_filing_states={escalation_id: escalation_state(queue, escalation_id) for escalation_id in stuck},
-        outages={escalation_id: queue.get(escalation_id) for escalation_id in raised},
+        stuck_filing_states=stuck,
+        outages=outages,
         regressions=tuple(regressions),
         unread=tuple(unread),
     )
@@ -424,6 +473,9 @@ async def load_inputs(
     tasks = await _read_tasks(_task_ids(window, episodes, ledger), task_reader)
     if isinstance(tasks, Unjudgeable):
         return tasks
+    escalations = _read_escalations(stores.escalations, since=since, episodes=episodes, window=window)
+    if isinstance(escalations, Unjudgeable):
+        return escalations
     return SoakInputs(
         since=since,
         now=now,
@@ -433,7 +485,7 @@ async def load_inputs(
         tasks=tasks,
         ledger=ledger,
         failures=_failures(every_pass, selected),
-        escalations=_read_escalations(stores.escalations, since=since, episodes=episodes, window=window),
+        escalations=escalations,
         record_bytes=_directory_bytes(stores.records),
     )
 
