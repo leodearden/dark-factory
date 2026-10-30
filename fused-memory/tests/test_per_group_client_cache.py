@@ -21,6 +21,7 @@ equals group_id and the upstream mutation branch is never taken.
 from __future__ import annotations
 
 import asyncio
+from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -31,6 +32,30 @@ from graphiti_core.llm_client import LLMClient
 
 import fused_memory.backends.graphiti_client as graphiti_client_module
 from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
+
+
+class _SubClients(NamedTuple):
+    llm_client: LLMClient
+    embedder: EmbedderClient
+    cross_encoder: CrossEncoderClient
+
+
+def _sub_clients() -> _SubClients:
+    return _SubClients(
+        llm_client=MagicMock(spec=LLMClient),
+        embedder=MagicMock(spec=EmbedderClient),
+        cross_encoder=MagicMock(spec=CrossEncoderClient),
+    )
+
+
+def _base_driver() -> _MultiTenantFalkorDriver:
+    return _MultiTenantFalkorDriver(falkor_db=MagicMock(), database='__base__')
+
+
+def _backend_over(mock_config, driver, subs: _SubClients) -> GraphitiBackend:
+    return GraphitiBackend.with_driver(
+        mock_config, driver, registered_graph_ids=(), **subs._asdict(),
+    )
 
 # ---------------------------------------------------------------------------
 # step-1/2: GraphitiBackend.initialize() hoists shared sub-clients
@@ -84,13 +109,8 @@ class TestClientFor:
     already equals group_id — the KEY INVARIANT that makes upstream's
     add_episode driver-mutation branch structurally unreachable."""
 
-    def _make_backend(self, mock_config):
-        backend = GraphitiBackend(mock_config)
-        backend._driver = _MultiTenantFalkorDriver(falkor_db=MagicMock(), database='__base__')
-        backend._llm_client = MagicMock(spec=LLMClient)
-        backend._embedder = MagicMock(spec=EmbedderClient)
-        backend._cross_encoder = MagicMock(spec=CrossEncoderClient)
-        return backend
+    def _make_backend(self, mock_config, subs: _SubClients | None = None):
+        return _backend_over(mock_config, _base_driver(), _sub_clients() if subs is None else subs)
 
     def test_same_group_id_returns_same_cached_client(self, mock_config):
         backend = self._make_backend(mock_config)
@@ -112,17 +132,15 @@ class TestClientFor:
         assert client_g2.driver._database == 'g2'
 
     def test_sub_clients_are_shared_across_groups(self, mock_config):
-        backend = self._make_backend(mock_config)
+        subs = _sub_clients()
+        backend = self._make_backend(mock_config, subs)
         client_g1 = backend._client_for('g1')
         client_g2 = backend._client_for('g2')
 
-        assert client_g1.llm_client is backend._llm_client
-        assert client_g1.embedder is backend._embedder
-        assert client_g1.cross_encoder is backend._cross_encoder
-        assert client_g2.llm_client is backend._llm_client
-        assert client_g2.embedder is backend._embedder
-        assert client_g2.cross_encoder is backend._cross_encoder
-        assert client_g1.cross_encoder is client_g2.cross_encoder
+        for client in (client_g1, client_g2):
+            assert client.llm_client is subs.llm_client
+            assert client.embedder is subs.embedder
+            assert client.cross_encoder is subs.cross_encoder
 
 
 # ---------------------------------------------------------------------------
@@ -136,21 +154,25 @@ class TestAddEpisodeRoutesThroughClientFor:
     the entire point of the fix."""
 
     @pytest.mark.asyncio
-    async def test_add_episode_uses_per_group_client_not_shared_client(self, mock_config, make_backend):
-        backend = make_backend(mock_config)
-        sentinel = object()
-        per_group = MagicMock()
-        per_group.add_episode = AsyncMock(return_value=sentinel)
-        backend._client_for = MagicMock(return_value=per_group)
+    async def test_add_episode_uses_per_group_client_not_shared_client(self, mock_config, monkeypatch):
+        backend = _backend_over(mock_config, _base_driver(), _sub_clients())
+        backend.client = MagicMock()
         backend.client.add_episode = AsyncMock()
+        sentinel = object()
+        written_to: list[str] = []
+
+        async def fake_add_episode(self, **kwargs):
+            written_to.append(self.driver._database)
+            return sentinel
+
+        monkeypatch.setattr(Graphiti, 'add_episode', fake_add_episode)
 
         result = await backend.add_episode(name='e', content='c', group_id='A')
 
         # task 2269 (CGL-γ): add_episode now canonicalizes group_id at entry.
-        backend._client_for.assert_called_once_with('a')
-        per_group.add_episode.assert_awaited_once()
-        backend.client.add_episode.assert_not_awaited()
         assert result is sentinel
+        assert written_to == ['a']
+        backend.client.add_episode.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -168,17 +190,10 @@ class TestAddEpisodeConcurrencyIsolation:
 
     @pytest.mark.asyncio
     async def test_concurrent_cross_group_writes_do_not_bleed(self, mock_config, monkeypatch):
-        backend = GraphitiBackend(mock_config)
-        backend._driver = _MultiTenantFalkorDriver(falkor_db=MagicMock(), database='__base__')
-        backend._llm_client = MagicMock(spec=LLMClient)
-        backend._embedder = MagicMock(spec=EmbedderClient)
-        backend._cross_encoder = MagicMock(spec=CrossEncoderClient)
-        backend.client = Graphiti(
-            graph_driver=backend._driver,
-            llm_client=backend._llm_client,
-            embedder=backend._embedder,
-            cross_encoder=backend._cross_encoder,
-        )
+        driver = _base_driver()
+        subs = _sub_clients()
+        backend = _backend_over(mock_config, driver, subs)
+        backend.client = Graphiti(graph_driver=driver, **subs._asdict())
 
         observed: dict[str, str] = {}
 
@@ -287,16 +302,18 @@ class TestCloseAccountsForGroupClients:
     aliases an entry already closed via the _cloned_drivers loop."""
 
     @pytest.mark.asyncio
-    async def test_close_clears_group_clients_without_double_close(self, mock_config, make_backend):
-        backend = make_backend(mock_config)
-        backend._driver = MagicMock()
-        backend._driver.close = AsyncMock()
-        cloned = MagicMock()
+    async def test_close_clears_group_clients_without_double_close(self, mock_config):
+        base = MagicMock()
+        base.close = AsyncMock()
+        cloned = MagicMock(spec=_MultiTenantFalkorDriver)
         cloned.close = AsyncMock()
-        backend._cloned_drivers = {'A': cloned}
-        backend._group_clients = {'A': MagicMock()}
+        base.clone.return_value = cloned
+        backend = _backend_over(mock_config, base, _sub_clients())
+        backend._client_for('A')
 
         await backend.close()
 
-        assert backend._group_clients == {}
         cloned.close.assert_awaited_once()
+        base.close.assert_awaited_once()
+        with pytest.raises(RuntimeError):
+            backend._client_for('A')
