@@ -600,6 +600,25 @@ def test_the_sweep_actually_finds_a_shadow_it_should_report(
     )
 
 
+def test_a_deleted_tracked_file_yields_no_probe_path_and_no_shadow(
+    tmp_path: pathlib.Path,
+) -> None:
+    root = _hostile_fixture_repo(tmp_path)
+    _write(root, 'gone/old.py', 'x = 1\n')
+    _write(root, 'tooling/ruff.toml', 'line-length = 120\n')
+    _git(root, 'add', 'gone/old.py', 'tooling/ruff.toml')
+    (root / 'gone/old.py').unlink()
+    (root / 'tooling/ruff.toml').unlink()
+
+    reason = (
+        'ruff resolves config from DISK, so a path git still tracks but that is gone '
+        'from the working tree shadows nothing and leaves no Python to lint; reporting '
+        'it fails the guard for a reason no operator can act on.'
+    )
+    assert f'gone/{PROBE_BASENAME}' not in _nonmember_probe_paths(root=root), reason
+    assert 'tooling/ruff.toml' not in _shadowing_configs(root=root), reason
+
+
 def test_root_ruff_config_matches_every_workspace_member() -> None:
     """The DECLARED root config must equal every member's, and nothing may shadow it."""
     root_toml = _root_pyproject()
