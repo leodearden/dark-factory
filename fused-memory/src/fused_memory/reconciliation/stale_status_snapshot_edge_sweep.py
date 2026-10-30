@@ -1265,15 +1265,16 @@ _BARE_DIGIT_RE: re.Pattern[str] = re.compile(r'\b\d+\b')
 # The clause-ish boundary that closes a colon-introduced list segment (which
 # has no closing delimiter of its own) and backstops an unterminated bracket
 # segment is task_filter.STRICT_CLAUSE_BOUNDARY_RE — the fail-safe-STRICT
-# alphabet [.;\n!?], NOT task_filter.WIDE_CLAUSE_BOUNDARY_RE, which narrowed its dot
-# to '\.(?!\w)' at task 3403 so dotted technical tokens stop shattering a
-# sentence. The two started out identical; the canonical rationale for keeping
-# them apart lives next to STRICT_CLAUSE_BOUNDARY_RE. This module's stake in
-# it: the segment closed here is one from which BARE DIGITS are harvested as
-# task ids, and that path ends in memory_service.update_edge(invalid_at=...) —
-# a real Graphiti edge retirement. A longer segment absorbs more incidental
-# digits, i.e. over-selection, which this module's docstring explicitly
-# forbids: under-selection self-heals next cycle or is caught by Stage 2,
+# alphabet [.;\n!?], NOT task_filter.WIDE_CLAUSE_BOUNDARY_RE, which narrowed
+# its dot to '\.(?!\w)' at task 3403 so dotted technical tokens stop
+# shattering a sentence. The two started out identical; the canonical
+# rationale for keeping them apart lives next to STRICT_CLAUSE_BOUNDARY_RE.
+# This module's stake in it: the segment closed here is one from which BARE
+# DIGITS are harvested as task ids, and that path ends in
+# memory_service.update_edge(invalid_at=...) — a real Graphiti edge
+# retirement. A longer segment absorbs more incidental digits, i.e.
+# over-selection, which this module's docstring explicitly forbids:
+# under-selection self-heals next cycle or is caught by Stage 2,
 # over-selection wrongly retires true facts. Copying the widening for symmetry
 # would trade a bounded soft-block for a permanent wrong invalidation.
 def _list_segment(text: str, start: int, open_char: str) -> str:
