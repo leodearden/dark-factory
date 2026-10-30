@@ -208,12 +208,16 @@ class SoakProject:
         if confirm is not None:
             self._run(lane_pass, Phase.CONFIRM, confirm, None)
         if blocks:
-            self.records.set_pass_blocks(
-                lane_pass,
-                outcome=None if outcome is None else outcome_to_json(outcome),
-                effect=None if effect is None else effect.to_json(),
-            )
+            self.set_blocks(lane_pass, outcome=outcome, effect=effect)
         return lane_pass
+
+    def set_blocks(self, lane_pass: LanePass, *, outcome: PassOutcome | None, effect: PassEffect | None) -> None:
+        """The outcome and effect blocks, as ``offline_lane_pass.run_pass`` writes them at the end of a pass."""
+        self.records.set_pass_blocks(
+            lane_pass,
+            outcome=None if outcome is None else outcome_to_json(outcome),
+            effect=None if effect is None else effect.to_json(),
+        )
 
     def pass_record(self, lane_pass: LanePass) -> PassRecord:
         record = self.records.load_pass(lane_pass.command, lane_pass.pass_id)

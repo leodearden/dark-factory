@@ -13,8 +13,10 @@ from typing import Any
 import offline_lane_soak_report as soak_report
 import pytest
 from offline_lane_soak_fixtures import LINT, T0, UNIT, SoakProject, effect, failure
-from orchestrator.flake_ledger import ledger_db_path
+from orchestrator.flake_ledger import FlakeVerdict, ledger_db_path
+from orchestrator.offline_lane_confirm import Confirmed, ConfirmMode
 from orchestrator.offline_lane_episode_state import CommandRecord
+from orchestrator.offline_lane_filing import LANE_METADATA_KEY
 from orchestrator.offline_lane_records import LanePass, Phase
 from shared.project_layout import escalation_queue_dir
 
@@ -258,3 +260,135 @@ def test_passes_per_command_per_day_count_by_utc_date(tmp_path: Path, capsys):
         LINT: {'2026-10-20': 1},
         UNIT: {'2026-10-20': 3, '2026-10-21': 1},
     }
+
+
+# --- (b) filings_resolve and (c) filings_bounded_by_threshold --------------------------
+
+NODE_A = 'tests/test_a.py::test_a'
+NODE_B = 'tests/test_b.py::test_b'
+
+
+def _reproduced(*nodes: str) -> Confirmed:
+    return Confirmed(ConfirmMode.NARROWED, nodes, (), ())
+
+
+def _red(project: SoakProject, at: datetime, *nodes: str, **effect_fields: Any) -> LanePass:
+    """A confirmed red pass of *nodes* with its ledger rows; its effect counts them."""
+    lane_pass = project.add_pass(
+        UNIT, at=at, detect=[failure(node) for node in nodes], confirm=[failure(node) for node in nodes],
+        outcome=_reproduced(*nodes), effect=effect(tests_counted=nodes, **effect_fields),
+    )
+    project.occurrence(lane_pass, nodes, FlakeVerdict.fails_in_isolation)
+    return lane_pass
+
+
+def _filing_project(tmp_path: Path, *nodes: str) -> tuple[SoakProject, LanePass, tuple[str, ...]]:
+    """*nodes* reproduced on two passes, each filed on the second: one fix task per node."""
+    project = SoakProject(tmp_path)
+    project.provision(UNIT)
+    first = _red(project, T0, *nodes, episodes_started=nodes)
+    second = project.add_pass(
+        UNIT, at=T0 + timedelta(hours=1), detect=[failure(node) for node in nodes],
+        confirm=[failure(node) for node in nodes], blocks=False,
+    )
+    project.occurrence(second, nodes, FlakeVerdict.fails_in_isolation)
+    filed = tuple(project.file_fix_task(UNIT, [node], [first, second]) for node in nodes)
+    project.set_blocks(second, outcome=_reproduced(*nodes), effect=effect(
+        tests_counted=nodes, episodes_extended=nodes, threshold_reached=nodes, tasks_filed=filed,
+    ))
+    return project, second, filed
+
+
+def test_every_filed_task_resolves_with_its_digest_and_lane_metadata(tmp_path: Path, capsys):
+    project, _, filed = _filing_project(tmp_path, NODE_A, NODE_B)
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    check = _check(report, 'filings_resolve')
+    assert (check['verdict'], check['examined']) == ('pass', len(filed))
+
+
+def test_a_filed_task_the_store_answers_absent_fails_naming_it_and_its_pass(tmp_path: Path, capsys):
+    project, filing_pass, (task_id,) = _filing_project(tmp_path, NODE_A)
+    project.tasks.answer_absent(task_id)
+
+    code, report, err = _report(project, capsys)
+
+    assert code == 1
+    assert '[FAIL] filings_resolve: examined 1;' in err
+    (failure_line,) = _check(report, 'filings_resolve')['failures']
+    assert task_id in failure_line
+    assert filing_pass.pass_id in failure_line
+
+
+def test_a_filed_task_with_empty_details_fails(tmp_path: Path, capsys):
+    project, _, (task_id,) = _filing_project(tmp_path, NODE_A)
+    project.tasks.tasks[task_id]['details'] = ''
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 1
+    (failure_line,) = _check(report, 'filings_resolve')['failures']
+    assert task_id in failure_line
+    assert 'details' in failure_line
+
+
+def test_a_filed_task_without_lane_metadata_fails(tmp_path: Path, capsys):
+    project, _, (task_id,) = _filing_project(tmp_path, NODE_A)
+    del project.tasks.tasks[task_id]['metadata'][LANE_METADATA_KEY]
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 1
+    (failure_line,) = _check(report, 'filings_resolve')['failures']
+    assert task_id in failure_line
+    assert LANE_METADATA_KEY in failure_line
+
+
+def test_a_task_read_that_fails_is_nothing_to_judge(tmp_path: Path, capsys):
+    project, _, (task_id,) = _filing_project(tmp_path, NODE_A)
+    project.tasks.fail(task_id)
+
+    code, report, err = _report(project, capsys)
+
+    _assert_nothing_to_judge(code, report, err, 'task store')
+    assert task_id in report['unjudgeable']
+
+
+def test_filings_within_the_threshold_crossings_pass_and_report_both_counts(tmp_path: Path, capsys):
+    project, _, _ = _filing_project(tmp_path, NODE_A, NODE_B)
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    check = _check(report, 'filings_bounded_by_threshold')
+    assert check['verdict'] == 'pass'
+    assert check['notes'] == ['2 distinct task(s) filed; 2 (pass, test) threshold crossing(s)']
+
+
+def test_more_filings_than_crossings_fail_naming_both_counts(tmp_path: Path, capsys):
+    project, filing_pass, (task_id,) = _filing_project(tmp_path, NODE_A)
+    extra = project.file_fix_task(UNIT, [NODE_A], [filing_pass])
+    project.set_blocks(filing_pass, outcome=_reproduced(NODE_A), effect=effect(
+        tests_counted=(NODE_A,), episodes_extended=(NODE_A,), threshold_reached=(NODE_A,),
+        tasks_filed=(task_id, extra),
+    ))
+
+    code, report, err = _report(project, capsys)
+
+    assert code == 1
+    assert '[FAIL] filings_bounded_by_threshold:' in err
+    assert _check(report, 'filings_bounded_by_threshold')['failures'] == [
+        '2 distinct task(s) filed; 1 (pass, test) threshold crossing(s)',
+    ]
+
+
+def test_a_window_with_no_filing_and_no_crossing_has_no_data_to_bound(tmp_path: Path, capsys):
+    project, _ = _green_project(tmp_path)
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    for name in ('filings_resolve', 'filings_bounded_by_threshold'):
+        assert (_check(report, name)['verdict'], _check(report, name)['examined']) == ('no_data', 0)
