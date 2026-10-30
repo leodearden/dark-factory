@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import copy
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,7 @@ from orchestrator.flake_ledger import (
 from orchestrator.offline_lane_confirm import PassOutcome, outcome_to_json
 from orchestrator.offline_lane_episode_state import (
     CommandRecord,
+    Episode,
     EpisodeStore,
     PassEffect,
     PassObservation,
@@ -71,6 +73,50 @@ FAILURE_LINE = 'AssertionError: expected 3, got 4'
 
 def failure(node: str, *, kind: str = 'failed', first_line: str = FAILURE_LINE) -> FailureRecord:
     return FailureRecord(node=node, kind=kind, first_line=first_line)
+
+
+def episode(
+    node: str,
+    passes: Sequence[LanePass],
+    *,
+    covering_task_id: str | None = None,
+    filing_due_since: datetime | None = None,
+    prior_task_ids: Sequence[str] = (),
+) -> Episode:
+    """A live episode of *node* counted on *passes*: bound to *covering_task_id*, or due since *filing_due_since*."""
+    last = passes[-1]
+    return Episode(
+        node=node,
+        kind='failed',
+        counted_passes=tuple(p.pass_id for p in passes),
+        last_counted_started_at=last.started_at,
+        first_red_head=passes[0].head,
+        reproduced_heads=tuple(dict.fromkeys(p.head for p in passes)),
+        last_green_head=None,
+        had_outage_pass=False,
+        covering_task_id=covering_task_id,
+        planning_committed=covering_task_id is not None,
+        filed_at=last.started_at if covering_task_id is not None else None,
+        filing_due=filing_due_since is not None,
+        filing_due_since=filing_due_since,
+        escalation_id=None,
+        notes=(),
+        prior_task_ids=tuple(prior_task_ids),
+        ended_at=None,
+        last_refreshed_at=last.started_at,
+        reproduce=None if filing_due_since is None else 'pytest tests',
+    )
+
+
+def command_record(command: str, episodes: Sequence[Episode], **fields: Any) -> CommandRecord:
+    """*command*'s episode record holding *episodes*, after a generic-leg pass, with *fields* replaced."""
+    return replace(
+        CommandRecord.empty(command),
+        leg=Leg.GENERIC.value,
+        fix_task_priority='medium',
+        episodes={e.node: e for e in episodes},
+        **fields,
+    )
 
 
 def effect(**fields: Any) -> PassEffect:
