@@ -11,12 +11,13 @@ in a background thread, so a whole-dir copy taken then races those unlinks.
 So the server is driven to a fresh rewrite first: wait until it is idle,
 require the AOF on, BGSAVE, then BGREWRITEAOF, which leaves a manifest newer
 than dump.rdb by construction. Only dump.rdb, the manifest and the base/incr
-files the copied manifest names are then copied, mtimes kept, between two INFO
-reads that must show no save or rewrite landing in between. A raced copy is
-not retried: it means something still writes FalkorDB, which a silent second
-attempt would hide. The source is the container's own data mount, never an
-argument, so a worktree's copy of the export cannot flush the live server and
-then copy an empty dir. Stdlib only.
+files the copied manifest names are then copied, mtimes kept, between the INFO
+read that saw the rewrite finish and one taken after the copy, which must show
+no save or rewrite landing in between. A raced copy is not retried: it means
+something still writes FalkorDB, which a silent second attempt would hide. The
+source is the container's own data mount, never an argument, so a worktree's
+copy of the export cannot flush the live server and then copy an empty dir.
+Stdlib only.
 """
 
 import argparse
@@ -182,8 +183,8 @@ def export(docker: Docker, args: argparse.Namespace,
     config = ServerAofConfig.read(docker, container_id)
     _require_aof(config, server.wait_until(lambda s: s.idle, "the server to be idle"))
     _flush(server, SAVE)
-    _flush(server, REWRITE)
-    copied, state = _bracketed_copy(server, host_dir, config, args.dest)
+    rewritten = _flush(server, REWRITE)
+    copied, state = _bracketed_copy(server, rewritten, host_dir, config, args.dest)
     return (f"copied {RDB_FILE}, {config.manifest_name} and {copied} base/incr file(s) "
             f"to {args.dest} at aof_rewrites:{state.aof_rewrites}")
 
@@ -231,8 +232,9 @@ def _flush(server: Server, flush: Flush) -> SaveState:
     return after
 
 
-def _bracketed_copy(server: Server, host_dir: Path, config: ServerAofConfig, dest: Path) -> tuple[int, SaveState]:
-    before = server.info()
+def _bracketed_copy(
+    server: Server, before: SaveState, host_dir: Path, config: ServerAofConfig, dest: Path,
+) -> tuple[int, SaveState]:
     try:
         copied = _copy_restore_set(host_dir, config, dest)
     except OSError as exc:

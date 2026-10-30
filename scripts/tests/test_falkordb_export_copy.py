@@ -12,7 +12,7 @@ dump.rdb, plus a stray temp-1.rdb.
 
 import json
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -69,7 +69,7 @@ class FakeFalkorDB:
     that many INFO reads, ``stuck`` names a child that never finishes, ``fails`` one that ends with
     status err, ``rejects`` a command answered with an error reply, and ``exec_fails`` makes every
     ``docker exec`` fail as on a container that went away. ``races`` names a save or rewrite that
-    lands on the first INFO read made once ``copy_dest`` holds the manifest, i.e. during the copy;
+    lands on the first INFO read made once ``race_when()`` holds;
     ``drops_incr`` makes a rewrite delete the incr file its manifest names."""
 
     def __init__(
@@ -86,7 +86,7 @@ class FakeFalkorDB:
         rejects: tuple[str, ...] | None = None,
         exec_fails: bool = False,
         races: str | None = None,
-        copy_dest: Path | None = None,
+        race_when: Callable[[], bool] | None = None,
         drops_incr: bool = False,
         **info: str,
     ):
@@ -101,7 +101,7 @@ class FakeFalkorDB:
         self.rejects = rejects
         self.exec_fails = exec_fails
         self.races = races
-        self.copy_dest = copy_dest
+        self.race_when = race_when
         self.drops_incr = drops_incr
         self.info = {
             "loading": "1" if loading_polls else "0",
@@ -215,7 +215,7 @@ class FakeFalkorDB:
         self._child, self._child_polls = field, CHILD_POLLS
 
     def _tick(self) -> None:
-        if self.races and self.copy_dest and (self.copy_dest / MANIFEST).exists():
+        if self.races and self.race_when and self.race_when():
             race, self.races = self.races, None
             if race == "rdb_saves":
                 self._finish_save()
@@ -415,7 +415,7 @@ def test_a_container_that_is_not_running_fails_the_export(data_dir, dest, capsys
     ("counter", "before", "after"), [("aof_rewrites", 1, 2), ("rdb_saves", 201, 202)],
 )
 def test_a_save_or_rewrite_that_lands_during_the_copy_fails_the_export(data_dir, dest, capsys, counter, before, after):
-    fake = FakeFalkorDB(data_dir, races=counter, copy_dest=dest)
+    fake = FakeFalkorDB(data_dir, races=counter, race_when=(dest / MANIFEST).exists)
 
     assert _export(fake, dest) == 1
 
@@ -423,6 +423,17 @@ def test_a_save_or_rewrite_that_lands_during_the_copy_fails_the_export(data_dir,
     err = capsys.readouterr().err
     assert f"{counter} {before}→{after}" in err
     assert "still writing to FalkorDB" in err
+
+
+def test_a_save_landing_just_after_the_rewrite_fails_the_export(data_dir, dest, capsys):
+    """The copy's opening read is the rewrite's last one, so no save can slip in between unseen."""
+    rewritten = data_dir / "appendonlydir" / "appendonly.aof.2.base.rdb"
+    fake = FakeFalkorDB(data_dir, races="rdb_saves", race_when=rewritten.exists)
+
+    assert _export(fake, dest) == 1
+
+    assert fake.races is None, "the race never fired"
+    assert "rdb_saves 201\u2192202" in capsys.readouterr().err
 
 
 def test_a_copy_whose_named_file_vanished_fails_the_export(data_dir, dest, capsys):
