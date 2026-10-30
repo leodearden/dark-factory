@@ -1055,6 +1055,33 @@ class TestEmittedStepEscalations:
         restarted = TaskArtifacts(worktree)
         assert restarted.read_emitted_step_escalations() == {('step-1', 'abc123')}
 
+    @pytest.mark.parametrize(
+        'field_value',
+        [
+            pytest.param(None, id='null'),
+            pytest.param(3, id='int'),
+            pytest.param(True, id='bool'),
+            pytest.param({'x': 1}, id='dict'),
+            pytest.param('ab', id='string'),
+        ],
+    )
+    def test_non_list_field_reads_as_empty_set_and_warns(
+        self, artifacts: TaskArtifacts, caplog, field_value
+    ):
+        (artifacts.root / 'reconcile_state.json').write_text(
+            json.dumps({'emitted_done_step_escalations': field_value})
+        )
+
+        with caplog.at_level('WARNING'):
+            assert artifacts.read_emitted_step_escalations() == set()
+
+        assert any(
+            record.name == 'orchestrator.artifacts'
+            and record.levelname == 'WARNING'
+            and 'reconcile_state.json' in record.getMessage()
+            for record in caplog.records
+        )
+
 
 class TestVerdicts:
     """Verdict artifacts written by the verdict-tools MCP server (task 2481)."""
