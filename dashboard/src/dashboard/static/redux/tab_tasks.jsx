@@ -688,7 +688,7 @@ function TasksTab({ projectFilter, search }) {
   // The census views, in-flight and backlog on by default. A new key, not
   // 'df.tasksFilters': an old {active, pending, ...} object would read as
   // "nothing selected" under the view keys.
-  const [filterMap, setFilterMap] = usePersistedState('df.tasks.views', { in_flight: true, backlog: true });
+  const [filterMap, setFilterMap] = usePersistedState('df.tasks.views', { in_flight: true, backlog: true, terminal: false });
   const filter = Object.fromEntries(CENSUS_VIEWS_T.map(v => [v.key, !!(filterMap || {})[v.key]]));
   const flipFilter = (key) => setFilterMap({ ...filter, [key]: !filter[key] });
 
