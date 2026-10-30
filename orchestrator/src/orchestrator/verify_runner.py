@@ -1954,13 +1954,17 @@ class RemoteRunner:
     def _no_verdict_unavailable(
         self, outcome: _DispatchOutcome, sha: str, archive: _RemoteArchiveTarget | None,
     ) -> RunnerUnavailable:
-        """The RunnerUnavailable('no_verdict') for *outcome*, archived to *archive* first."""
-        if archive is not None:
-            self._archive_no_verdict(archive, outcome, sha)
-        return RunnerUnavailable(
-            f'{self.name!r} returned no verdict: {outcome.result.summary}',
-            kind='no_verdict',
-        )
+        """The RunnerUnavailable('no_verdict') for *outcome*, archived to *archive* first.
+
+        Its one-line message names every archived path: it becomes the bench
+        entry's reason, so the hosts block, the verify_host_skew event and the
+        L1 all lead to the output.
+        """
+        archived = self._archive_no_verdict(archive, outcome, sha) if archive is not None else []
+        message = f'{self.name!r} returned no verdict: {outcome.result.summary}'
+        if archived:
+            message += '; output archived at ' + ', '.join(str(path) for path in archived)
+        return RunnerUnavailable(message, kind='no_verdict')
 
     def _archive_no_verdict(
         self, archive: _RemoteArchiveTarget, outcome: _DispatchOutcome, sha: str,
