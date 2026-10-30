@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import json
 import sys
+from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -32,7 +33,7 @@ from typing import Any
 
 import _checkout as _checkout
 from migrate_metadata_modules_to_files import DEFAULT_SERVER
-from offline_lane_soak_inputs import SoakInputs, TaskReader, Unjudgeable, load_inputs
+from offline_lane_soak_inputs import SoakInputs, TaskReader, Unjudgeable, WindowPass, load_inputs
 from orchestrator.flake_ledger import DUE_ITEM_STALE_MINUTES
 from orchestrator.offline_lane_episode_state import LanePolicy
 from orchestrator.offline_lane_filing import LANE_METADATA_KEY
@@ -123,7 +124,29 @@ def _not_yet_judged(check: Check) -> CheckFn:
     return judge
 
 
-_CHECKS: dict[Check, CheckFn] = {check: _not_yet_judged(check) for check in Check}
+def _label(window_pass: WindowPass) -> str:
+    return f'{window_pass.stored.command_key}/{window_pass.pass_id}'
+
+
+def _interrupted(window_pass: WindowPass) -> bool:
+    """A header with no sub-run, or sub-runs and no effect block: a restart cut the pass short."""
+    record = window_pass.stored.record
+    return record is not None and (record.detect is None or record.effect is None)
+
+
+def _records_well_formed(inputs: SoakInputs, rule: str, settings: Settings) -> CheckResult:
+    failures = [f'{_label(p)}: {problem}' for p in inputs.passes for problem in p.problems]
+    failures += [
+        f'{_label(p)}: the {phase} sub-run output file is missing' for p in inputs.passes for phase in p.missing_outputs
+    ]
+    notes = [f'interrupted: {_label(p)}' for p in inputs.passes if _interrupted(p)]
+    return _judged(Check.RECORDS_WELL_FORMED, rule, len(inputs.passes), failures, notes)
+
+
+_CHECKS: dict[Check, CheckFn] = {
+    **{check: _not_yet_judged(check) for check in Check},
+    Check.RECORDS_WELL_FORMED: _records_well_formed,
+}
 
 
 def run_checks(inputs: SoakInputs | Unjudgeable, settings: Settings) -> tuple[CheckResult, ...]:
@@ -133,10 +156,36 @@ def run_checks(inputs: SoakInputs | Unjudgeable, settings: Settings) -> tuple[Ch
     return tuple(_CHECKS[check](inputs, rules[check], settings) for check in Check)
 
 
+def _passes_per_command_per_day(inputs: SoakInputs) -> Figure:
+    days: dict[str, Counter[str]] = defaultdict(Counter)
+    for p in inputs.passes:
+        days[p.stored.command_key][p.started_at.date().isoformat()] += 1
+    return Figure(
+        'passes_per_command_per_day',
+        'pass directories in the window by command key and the UTC date of their pass-id start; '
+        "completeness against an independent count is the resolver's judgment",
+        {command: dict(sorted(count.items())) for command, count in sorted(days.items())},
+    )
+
+
+def _interrupted_passes(inputs: SoakInputs) -> Figure:
+    return Figure(
+        'interrupted_passes',
+        'passes in the window with a header and no detect record, or sub-runs and no effect block',
+        [{'command': p.stored.command_key, 'pass_id': p.pass_id} for p in inputs.passes if _interrupted(p)],
+    )
+
+
+_FIGURES: tuple[Callable[[SoakInputs], Figure], ...] = (
+    _passes_per_command_per_day,
+    _interrupted_passes,
+)
+
+
 def figures(inputs: SoakInputs | Unjudgeable) -> tuple[Figure, ...]:
     if isinstance(inputs, Unjudgeable):
         return ()
-    return ()
+    return tuple(figure(inputs) for figure in _FIGURES)
 
 
 def exit_code(inputs: SoakInputs | Unjudgeable, results: Sequence[CheckResult]) -> int:
