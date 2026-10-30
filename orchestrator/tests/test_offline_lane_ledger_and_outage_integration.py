@@ -22,16 +22,26 @@ import pytest
 from _offline_lane_red_path_fixtures import (
     COMMIT_SPAWNS,
     NINE,
+    PROBED_COMMAND,
     A,
     C,
     LegacyLeg,
+    ProbeAnswer,
     RedPathLane,
     Run,
+    effect_of,
     lane_test_timeout,
     merge_gate_suppression,
 )
+from shared.lane_probe import OUTAGE_EXIT_STATUS
 
-from orchestrator.flake_ledger import UNKNOWN_TEST_ID, FlakeOccurrenceRow
+from orchestrator.flake_ledger import (
+    UNKNOWN_TEST_ID,
+    DebtTrigger,
+    DueRow,
+    FlakeOccurrenceRow,
+    due_item_context,
+)
 from orchestrator.offline_lane_episode_state import unconfirmable_node
 from orchestrator.offline_lane_ledger import NUMERIC_UNNAMED_CLEAR
 from orchestrator.offline_lane_records import PassRecord
@@ -39,6 +49,8 @@ from orchestrator.offline_lane_records import PassRecord
 pytestmark = [pytest.mark.usefixtures('code_default_config')]
 
 RED_A = Run(failed={A: 'AssertionError: a'})
+CLEARS_A = (RED_A, Run(passed=(A,)))
+GREEN_A = Run(passed=(A,))
 NUMERIC_IDS = ('numeric_suite::case_1', 'numeric_suite::case_2')
 
 
@@ -48,6 +60,20 @@ def detail_of(row: FlakeOccurrenceRow) -> dict:
 
 def pass_directory(lane: RedPathLane, record: PassRecord) -> Path:
     return lane.project_root / 'data' / 'orchestrator' / 'offline-lane' / 'lane-fixture' / record.pass_id
+
+
+def ended(record: PassRecord) -> list[tuple[str, str]]:
+    return [(episode['node'], episode['reason']) for episode in effect_of(record)['episodes_ended']]
+
+
+def offered(record: PassRecord) -> list[tuple[str, str]]:
+    return [(debt['node'], debt['trigger']) for debt in effect_of(record)['debts_offered']]
+
+
+def trigger_of(item: DueRow) -> DebtTrigger:
+    context = due_item_context(item)
+    assert context is not None, f'due item {item.id} carries no context'
+    return context.trigger
 
 
 @pytest.mark.asyncio
@@ -201,3 +227,132 @@ async def test_scenario_29_nine_clears_in_one_pass_call_no_store_and_drain_to_ni
     await lane.drain()
     assert sorted(task['metadata']['flake_debt_test'] for task in lane.store.deflake_tasks()) == sorted(NINE)
     assert all(lane.debt(node) is not None for node in NINE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=2))
+async def test_scenario_27a_a_held_test_green_on_its_recheck_at_the_same_head_owes_recovered_debt(
+    tmp_path, monkeypatch,
+):
+    lane = await RedPathLane.open(tmp_path, monkeypatch)
+    held = await lane.advance(RED_A, RED_A)
+
+    [recheck] = await lane.tick(GREEN_A, minutes=30)
+
+    assert recheck.head == held.head
+    assert (A, 'passed') in ended(recheck)
+    [item] = lane.due()
+    assert (item.test_id, item.head, trigger_of(item)) == (A, held.head, DebtTrigger.recovered)
+    assert [(row.verdict, row.merge_sha) for row in lane.rows(A)] == [('fails_in_isolation', held.head)]
+    await lane.drain()
+    [task] = lane.store.deflake_tasks()
+    assert 'recovered on the offline lane (lane-fixture)' in task['title']
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=3))
+async def test_scenario_27b_a_test_green_then_red_at_one_head_owes_recovered_debt_at_that_head(tmp_path, monkeypatch):
+    lane = await RedPathLane.open(tmp_path, monkeypatch)
+    green = await lane.advance(GREEN_A)
+    red = await lane.rerun(RED_A, RED_A)
+    assert red.head == green.head
+
+    advanced = await lane.advance(GREEN_A)
+
+    assert advanced.head != green.head
+    [item] = lane.due()
+    assert (item.test_id, item.head, trigger_of(item)) == (A, green.head, DebtTrigger.recovered)
+    await lane.drain()
+    debt = lane.debt(A)
+    assert debt is not None
+    assert [task['id'] for task in lane.store.deflake_tasks()] == [debt.owner_task_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=2))
+async def test_scenario_28_a_test_red_at_one_head_and_green_at_the_next_owes_no_debt(tmp_path, monkeypatch):
+    lane = await RedPathLane.open(tmp_path, monkeypatch)
+    await lane.advance(RED_A, RED_A)
+
+    passed = await lane.advance(GREEN_A)
+
+    assert (A, 'passed') in ended(passed)
+    assert lane.due() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=2))
+async def test_scenario_28_an_expired_episode_owes_no_debt(tmp_path, monkeypatch):
+    lane = await RedPathLane.open(tmp_path, monkeypatch)
+    await lane.advance(RED_A, RED_A)
+
+    expired = await lane.advance(Run(passed=(C,)), minutes=25 * 60)
+
+    assert (A, 'expired') in ended(expired)
+    assert lane.due() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=3))
+async def test_scenario_28_a_test_green_after_an_outage_pass_owes_no_debt(tmp_path, monkeypatch):
+    lane = await RedPathLane.open(tmp_path, monkeypatch, command=PROBED_COMMAND)
+    held = await lane.advance(RED_A, RED_A)
+    lane.stub.probe(ProbeAnswer(exit=OUTAGE_EXIT_STATUS, stdout='qdrant: down'))
+
+    outage = await lane.rerun(RED_A)
+    green = await lane.rerun(GREEN_A)
+
+    assert outage.outcome is not None
+    assert outage.outcome['arm'] == 'outage'
+    assert green.head == held.head
+    assert (A, 'passed') in ended(green)
+    assert lane.due() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=4))
+async def test_scenario_33_a_clear_under_an_open_fix_task_owes_no_debt_until_the_task_is_done(tmp_path, monkeypatch):
+    lane = await RedPathLane.open(tmp_path, monkeypatch)
+    await lane.advance(RED_A, RED_A)
+    filing = await lane.advance(RED_A, RED_A)
+    [fix_task_id] = effect_of(filing)['tasks_filed']
+
+    covered = await lane.advance(*CLEARS_A)
+    assert offered(covered) == []
+    assert lane.due() == []
+    lane.store.set_status(fix_task_id, 'done')
+    owed = await lane.advance(*CLEARS_A)
+
+    assert offered(owed) == [(A, 'cleared')]
+    assert [item.test_id for item in lane.due()] == [A]
+    await lane.drain()
+    debt = lane.debt(A)
+    assert debt is not None
+    assert debt.owner_task_id is not None
+    assert debt.owner_task_id != fix_task_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=3))
+async def test_scenario_34_a_restart_between_the_ledger_write_and_the_episode_save_files_one_owner(
+    tmp_path, monkeypatch,
+):
+    lane = await RedPathLane.open(tmp_path, monkeypatch)
+    held = await lane.advance(RED_A, RED_A)
+
+    with lane.fail_episode_saves() as save_attempted:
+        await lane.rerun(GREEN_A, until=save_attempted)
+    [item] = lane.due()
+    assert (item.test_id, item.head) == (A, held.head)
+    live = lane.episode(A)
+    assert live is not None
+    assert live.ended_at is None
+
+    lane.restart()
+    await lane.drain()
+    [owner] = lane.store.deflake_tasks()
+    await lane.rerun(GREEN_A)
+    await lane.drain()
+
+    assert [task['id'] for task in lane.store.deflake_tasks()] == [owner['id']]
+    assert lane.due() == []
