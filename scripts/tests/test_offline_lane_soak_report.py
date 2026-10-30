@@ -12,9 +12,10 @@ from typing import Any
 
 import offline_lane_soak_report as soak_report
 import pytest
-from offline_lane_soak_fixtures import T0, UNIT, SoakProject, effect, failure
+from offline_lane_soak_fixtures import LINT, T0, UNIT, SoakProject, effect, failure
 from orchestrator.flake_ledger import ledger_db_path
 from orchestrator.offline_lane_episode_state import CommandRecord
+from orchestrator.offline_lane_records import LanePass, Phase
 from shared.project_layout import escalation_queue_dir
 
 NOW = T0 + timedelta(days=7)
@@ -127,3 +128,133 @@ def test_no_pass_since_the_cut_is_nothing_to_judge(tmp_path: Path, capsys):
     code, report, err = _report(project, capsys, '--since', (T0 + timedelta(days=1)).isoformat())
 
     _assert_nothing_to_judge(code, report, err, 'no pass record since')
+
+
+# --- (a) records_well_formed -----------------------------------------------------------
+
+
+def _check(report: dict[str, Any], name: str) -> dict[str, Any]:
+    return next(check for check in report['checks'] if check['name'] == name)
+
+
+def _figure(report: dict[str, Any], name: str) -> Any:
+    return next(figure['value'] for figure in report['figures'] if figure['name'] == name)
+
+
+def _green_project(tmp_path: Path) -> tuple[SoakProject, list[LanePass]]:
+    """Three green unit passes and one green lint pass, every store present: nothing for the other checks."""
+    project = SoakProject(tmp_path)
+    project.provision(UNIT, LINT)
+    passes = [project.add_pass(UNIT, at=T0 + timedelta(hours=hours), effect=effect()) for hours in (0, 1, 2)]
+    passes.append(project.add_pass(LINT, at=T0 + timedelta(hours=1, minutes=30), effect=effect()))
+    return project, passes
+
+
+def test_well_formed_records_pass_and_the_run_exits_zero(tmp_path: Path, capsys):
+    project, _ = _green_project(tmp_path)
+
+    code, report, err = _report(project, capsys)
+
+    assert code == 0
+    assert report['unjudgeable'] is None
+    assert (_check(report, 'records_well_formed')['verdict'], _check(report, 'records_well_formed')['examined']) == (
+        'pass', 4,
+    )
+    assert '[PASS] records_well_formed: examined 4; rule: ' in err
+
+
+def test_a_record_overwritten_with_non_json_fails_naming_the_pass(tmp_path: Path, capsys):
+    project, passes = _green_project(tmp_path)
+    passes[2].record_path.write_text('{truncated', encoding='utf-8')
+
+    code, report, err = _report(project, capsys)
+
+    assert code == 1
+    assert '[FAIL] records_well_formed: examined 4;' in err
+    (failure_line,) = _check(report, 'records_well_formed')['failures']
+    assert passes[2].pass_id in failure_line
+    assert 'no readable run record' in failure_line
+
+
+def test_an_effect_block_its_reader_rejects_fails_naming_the_pass(tmp_path: Path, capsys):
+    project, passes = _green_project(tmp_path)
+    project.records.set_pass_blocks(passes[2], effect={'tasks_filed': 3})
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 1
+    (failure_line,) = _check(report, 'records_well_formed')['failures']
+    assert passes[2].pass_id in failure_line
+    assert 'effect block' in failure_line
+
+
+def test_a_finished_sub_run_whose_output_is_gone_fails_naming_the_pass_and_phase(tmp_path: Path, capsys):
+    project, passes = _green_project(tmp_path)
+    passes[1].output_path(Phase.DETECT).unlink()
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 1
+    (failure_line,) = _check(report, 'records_well_formed')['failures']
+    assert passes[1].pass_id in failure_line
+    assert 'detect' in failure_line
+
+
+def test_interrupted_passes_are_counted_and_do_not_fail(tmp_path: Path, capsys):
+    project, _ = _green_project(tmp_path)
+    header_only = project.add_pass(UNIT, at=T0 + timedelta(hours=3), detect=None, blocks=False)
+    no_effect = project.add_pass(UNIT, at=T0 + timedelta(hours=4), detect=(failure('tests/test_a.py::test_a'),),
+                                 blocks=False)
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    check = _check(report, 'records_well_formed')
+    assert (check['verdict'], check['examined'], check['failures']) == ('pass', 6, [])
+    assert [note for note in check['notes'] if 'interrupted' in note] == [
+        f'interrupted: {UNIT}/{header_only.pass_id}', f'interrupted: {UNIT}/{no_effect.pass_id}',
+    ]
+    assert _figure(report, 'interrupted_passes') == [
+        {'command': UNIT, 'pass_id': header_only.pass_id}, {'command': UNIT, 'pass_id': no_effect.pass_id},
+    ]
+
+
+def test_a_pass_from_before_the_cut_over_is_outside_the_default_window(tmp_path: Path, capsys):
+    project, _ = _green_project(tmp_path)
+    project.add_pass(UNIT, at=T0 - timedelta(hours=1), detect=(failure('tests/test_a.py::test_a'),), blocks=False)
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    check = _check(report, 'records_well_formed')
+    assert (check['examined'], check['notes']) == (4, [])
+    assert report['since'] == T0.isoformat()
+
+
+def test_command_restricts_the_examined_passes(tmp_path: Path, capsys):
+    project, _ = _green_project(tmp_path)
+
+    _, report, _ = _report(project, capsys, '--command', LINT)
+
+    assert _check(report, 'records_well_formed')['examined'] == 1
+    assert report['commands'] == [LINT]
+
+
+def test_since_excludes_earlier_passes(tmp_path: Path, capsys):
+    project, _ = _green_project(tmp_path)
+
+    _, report, _ = _report(project, capsys, '--since', (T0 + timedelta(hours=1)).isoformat())
+
+    assert _check(report, 'records_well_formed')['examined'] == 3
+
+
+def test_passes_per_command_per_day_count_by_utc_date(tmp_path: Path, capsys):
+    project, _ = _green_project(tmp_path)
+    project.add_pass(UNIT, at=T0 + timedelta(hours=20), effect=effect())
+
+    _, report, _ = _report(project, capsys)
+
+    assert _figure(report, 'passes_per_command_per_day') == {
+        LINT: {'2026-10-20': 1},
+        UNIT: {'2026-10-20': 3, '2026-10-21': 1},
+    }
