@@ -909,14 +909,17 @@ _GATED_SCAN = "SELECT id, v FROM items WHERE scan_gate(flag) = 'live'"
 _COLLIDING_UPDATE = "UPDATE items SET v = 'owner' WHERE id = 'live'"
 
 
-class _ScanGate:
-    """The ``scan_gate(value)`` SQL function: parks the first row until released.
+class _WorkerGate:
+    """Parks the connection's worker thread inside SQLite until released.
 
-    It runs on the connection's worker thread in the middle of
-    ``sqlite3_step``, so the read's snapshot stays pinned while it is parked.
-    Every call comes from that one thread, so ``_has_parked`` needs no lock.
-    Registered with ``set_trace_callback`` instead, it parks the first traced
-    statement.
+    Every call blocks until :meth:`release`; the first one also sets
+    ``parked``.  Every call comes from the one worker thread, so
+    ``_has_parked`` needs no lock.  Two registrations use it:
+
+    - as the ``scan_gate(value)`` SQL function, it parks the first row in the
+      middle of ``sqlite3_step``, so the read's snapshot stays pinned;
+    - as a ``set_trace_callback``, it parks the first traced statement as it
+      starts.
     """
 
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -930,7 +933,7 @@ class _ScanGate:
             self._has_parked = True
             self._loop.call_soon_threadsafe(self.parked.set)
         if not self._released.wait(timeout=_GATE_HANG_GUARD_SECS):
-            raise TimeoutError('scan_gate was never released')
+            raise TimeoutError('worker gate was never released')
         return value
 
     async def wait_parked(self) -> None:
@@ -942,7 +945,7 @@ class _ScanGate:
 
 async def _open_collision_pair(
     open_conn: Callable[[Path], Awaitable[aiosqlite.Connection]], db_path: Path
-) -> tuple[aiosqlite.Connection, aiosqlite.Connection, _ScanGate]:
+) -> tuple[aiosqlite.Connection, aiosqlite.Connection, _WorkerGate]:
     """Open ``owner`` (with ``scan_gate`` registered) and ``foreign`` on one seeded file."""
     owner = await open_conn(db_path)
     foreign = await open_conn(db_path)
@@ -950,7 +953,7 @@ async def _open_collision_pair(
     await owner.execute("INSERT INTO items VALUES ('live', 'live', '0')")
     await owner.execute("INSERT INTO items VALUES ('foreign', 'dead', '0')")
     await owner.commit()
-    gate = _ScanGate(asyncio.get_running_loop())
+    gate = _WorkerGate(asyncio.get_running_loop())
     await owner.create_function('scan_gate', 1, gate)
     return owner, foreign, gate
 
@@ -972,7 +975,7 @@ async def _raw_colliding_write(conn: aiosqlite.Connection) -> None:
 
 async def _collide_with_a_pinned_read(
     foreign: aiosqlite.Connection,
-    gate: _ScanGate,
+    gate: _WorkerGate,
     *,
     read: Callable[[], Coroutine[Any, Any, list[aiosqlite.Row]]],
     write: Callable[[], Awaitable[None]],
@@ -1473,7 +1476,7 @@ class TestAtomicConnectionClose:
         assert row['v'] == '1'
 
     @staticmethod
-    async def _cancel_close_in_its_checkpoint(access: AtomicConnection, gate: _ScanGate) -> None:
+    async def _cancel_close_in_its_checkpoint(access: AtomicConnection, gate: _WorkerGate) -> None:
         closing = asyncio.create_task(access.close())
         await gate.wait_parked()
         closing.cancel()
@@ -1488,7 +1491,7 @@ class TestAtomicConnectionClose:
         conn = await open_conn(tmp_path / 'cut.db')
         access = AtomicConnection(conn)
         worker = _worker_thread(conn)
-        gate = _ScanGate(asyncio.get_running_loop())
+        gate = _WorkerGate(asyncio.get_running_loop())
         await conn.set_trace_callback(gate)
 
         try:
@@ -1507,7 +1510,7 @@ class TestAtomicConnectionClose:
         conn = await open_conn(tmp_path / 'recut.db')
         access = AtomicConnection(conn)
         worker = _worker_thread(conn)
-        gate = _ScanGate(asyncio.get_running_loop())
+        gate = _WorkerGate(asyncio.get_running_loop())
         await conn.set_trace_callback(gate)
 
         try:
@@ -1516,5 +1519,40 @@ class TestAtomicConnectionClose:
         finally:
             gate.release()
 
+        await asyncio.to_thread(worker.join, _GATE_HANG_GUARD_SECS)
+        assert not worker.is_alive()
+
+    async def test_a_close_cancelled_while_queued_on_the_lock_leaves_the_store_closable(
+        self, tmp_path, open_conn
+    ):
+        """A close cancelled before it takes the lock never started, so it must
+        not mark the store closed: a later close still shuts the connection."""
+        conn = await open_conn(tmp_path / 'queued.db')
+        access = AtomicConnection(conn)
+        worker = _worker_thread(conn)
+        unit_holds_the_lock = asyncio.Event()
+        end_the_unit = asyncio.Event()
+
+        async def unit() -> None:
+            async with access.write():
+                unit_holds_the_lock.set()
+                await end_the_unit.wait()
+
+        writing = asyncio.create_task(unit())
+        try:
+            await unit_holds_the_lock.wait()
+            closing = asyncio.create_task(access.close())
+            await asyncio.sleep(0)
+            closing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await closing
+        finally:
+            end_the_unit.set()
+            await writing
+
+        await asyncio.wait_for(access.close(), timeout=_GATE_HANG_GUARD_SECS)
+
+        with pytest.raises(ValueError):
+            await conn.execute('SELECT 1')
         await asyncio.to_thread(worker.join, _GATE_HANG_GUARD_SECS)
         assert not worker.is_alive()
