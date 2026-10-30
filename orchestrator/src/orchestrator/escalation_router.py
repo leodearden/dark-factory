@@ -5,7 +5,9 @@ pure and lives in escalation/src/escalation/disposition.py::route_info_l0; this
 module performs what a decision means: queue writes, curator tickets, the D9
 hold a ticket leaves on its record, and the per-sweep aggregates.  Its three
 callers (the workflow exit finalizer, the orphan reaper and the startup
-amnesty) only wire it.
+amnesty) only wire it.  A fourth consumer, the reviewer leg (D2), is applied
+here too: the reviewer's verdict dispositions its own task's notes mid-run,
+at no exit, through ``apply_reviewer_disposition``.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from enum import StrEnum
 from typing import Literal, Protocol, assert_never
 
 from escalation.categories import EscalationCategory
-from escalation.classify import INFO_L0_MECHANICAL_ROLES
+from escalation.classify import INFO_L0_MECHANICAL_ROLES, info_l0_mechanical_class
 from escalation.disposition import (
     Addressed,
     ConvertViaCurator,
@@ -31,6 +33,7 @@ from escalation.disposition import (
     ObservationConsumed,
     PromoteReason,
     PromoteWithHint,
+    ReviewerDisposition,
     StatusInfo,
     route_info_l0,
 )
@@ -46,11 +49,13 @@ from shared.task_submit import (
 )
 
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.review_payload import NoteDisposition
 from orchestrator.workflow_types import WorkflowOutcome
 
 logger = logging.getLogger(__name__)
 
 ROUTER_ID = 'info-l0-router'
+REVIEWER_LEG_ID = 'reviewer-comprehensive/workflow'
 AGGREGATE_ROLE = 'harness-info-l0-router'
 FALLBACK_ACTION = 'convert_to_task'
 AGGREGATE_CATEGORY = 'risk_identified'
@@ -207,7 +212,7 @@ class RouteContext:
 
 
 class Outcome(StrEnum):
-    """What ``apply`` did to one record."""
+    """What ``apply`` or ``apply_reviewer_disposition`` did to one record."""
 
     CLOSED = 'closed'
     ALREADY_TERMINAL = 'already-terminal'
@@ -215,6 +220,7 @@ class Outcome(StrEnum):
     PROMOTED = 'promoted'
     DEFERRED = 'defer'
     ROUTER_ERROR = 'router-error'
+    REJECTED = 'rejected_disposition'
 
 
 DISPATCH_TIMEOUT_SECS = 15.0
@@ -287,7 +293,7 @@ async def _apply(
             },
         )
         applied = _recover(action, record, ports, context)
-    _emit(applied, record, ports, context)
+    _emit(applied, record.task_id, ports, by=context.by, exit_kind=context.exit_kind)
     return applied
 
 
@@ -320,13 +326,25 @@ def _close(
     record: Escalation, resolution_class: str, note: str, ports: RouterPorts,
     context: RouteContext,
 ) -> Applied:
-    ports.queue.resolve(
-        record.id,
-        f'{resolution_class} — closed by the info-L0 router ({context.by}, exit '
-        f'{context.exit_kind}){note}',
-        dismiss=True, resolved_by=ROUTER_ID, resolution_class=resolution_class,
+    return _write_close(
+        ports, record.id, resolution_class,
+        resolution=(
+            f'{resolution_class} — closed by the info-L0 router ({context.by}, exit '
+            f'{context.exit_kind}){note}'
+        ),
+        resolved_by=ROUTER_ID,
     )
-    return Applied(record.id, Outcome.CLOSED, resolution_class=resolution_class)
+
+
+def _write_close(
+    ports: RouterPorts, record_id: str, resolution_class: str, *, resolution: str,
+    resolved_by: str,
+) -> Applied:
+    ports.queue.resolve(
+        record_id, resolution,
+        dismiss=True, resolved_by=resolved_by, resolution_class=resolution_class,
+    )
+    return Applied(record_id, Outcome.CLOSED, resolution_class=resolution_class)
 
 
 async def _convert(
@@ -499,27 +517,125 @@ def _recover(
         return Applied(record.id, Outcome.ROUTER_ERROR, reason=str(PromoteReason.ROUTER_ERROR))
 
 
-def _emit(applied: Applied, record: Escalation, ports: RouterPorts, context: RouteContext) -> None:
+def _emit(
+    applied: Applied, task_id: str, ports: RouterPorts, *, by: str, exit_kind: ExitKind | None,
+) -> None:
     if ports.event_store is None:
         return
     try:
         ports.event_store.emit(
             EventType.info_l0_dispositioned,
-            task_id=record.task_id,
+            task_id=task_id,
             data={
-                'escalation_id': record.id,
+                'escalation_id': applied.escalation_id,
                 'class': applied.event_class,
-                'by': context.by,
-                'exit_kind': str(context.exit_kind),
+                'by': by,
+                'exit_kind': None if exit_kind is None else str(exit_kind),
                 'ticket': applied.ticket,
-                'task_id': record.task_id,
+                'task_id': task_id,
                 'decided_at': datetime.now(UTC).isoformat(),
                 'reason': applied.reason,
                 'promoted_to': applied.promoted_to,
             },
         )
     except Exception:
-        logger.warning('info-l0-router: event emit failed for %s', record.id, exc_info=True)
+        logger.warning(
+            'info-l0-router: event emit failed for %s', applied.escalation_id, exc_info=True,
+        )
+
+
+def reviewer_note_refusal(record: Escalation | None, *, task_id: str, enabled: bool) -> str | None:
+    """Why the reviewer of *task_id* may not see or disposition *record*, or None when it may.
+
+    The one eligibility rule for the reviewer leg (D2): the briefing lists
+    exactly the notes it admits, and a disposition of any other is rejected.
+    """
+    if record is None:
+        return 'no such escalation'
+    if record.task_id != task_id:
+        return f'filed for task {record.task_id!r}, not the reviewed task {task_id!r}'
+    if record.status != 'pending':
+        return f'status is {record.status!r}, not pending'
+    if not router_owns(record, enabled=enabled):
+        return (
+            f'not an info L0 the router owns (severity {record.severity!r}, level '
+            f'{record.level}, router {"enabled" if enabled else "disabled"}, eval lane '
+            f'{eval_lane_provenance(record.task_id, record.worktree)!r})'
+        )
+    mechanical_class = info_l0_mechanical_class(record)
+    if mechanical_class is not None:
+        return f'a mechanical {mechanical_class!r} notice, which the exit router closes'
+    hold = read_hold(record)
+    if hold is not None:
+        return f'held by the router on curator ticket {hold.ticket}'
+    return None
+
+
+def reviewer_notes(queue: EscalationQueue, *, task_id: str, enabled: bool) -> list[Escalation]:
+    """The open info notes the reviewer of *task_id* is shown and may disposition."""
+    return [
+        record for record in queue.get_by_task(task_id, status='pending', level=0)
+        if reviewer_note_refusal(record, task_id=task_id, enabled=enabled) is None
+    ]
+
+
+def apply_reviewer_disposition(
+    note: NoteDisposition, ports: RouterPorts, *, task_id: str, enabled: bool,
+) -> Applied:
+    """Perform the reviewer's verdict on one of its task's notes (D2).  Never raises.
+
+    Only a close writes; on every other path the note stays pending, and the
+    exit router remains its backstop.
+    """
+    try:
+        applied = _apply_reviewer(note, ports, task_id=task_id, enabled=enabled)
+    except Exception as exc:
+        logger.exception(
+            'info-l0-router: applying the reviewer disposition %s to %s failed (task %s); '
+            'it stays pending for the exit router',
+            note.disposition, note.escalation_id, task_id,
+            extra={
+                'escalation_id': note.escalation_id, 'disposition': str(note.disposition),
+                'by': REVIEWER_LEG_ID,
+            },
+        )
+        applied = Applied(
+            note.escalation_id, Outcome.ROUTER_ERROR, reason=f'{type(exc).__name__}: {exc}',
+        )
+    _emit(applied, task_id, ports, by=REVIEWER_LEG_ID, exit_kind=None)
+    return applied
+
+
+def _apply_reviewer(
+    note: NoteDisposition, ports: RouterPorts, *, task_id: str, enabled: bool,
+) -> Applied:
+    refusal = reviewer_note_refusal(
+        ports.queue.get(note.escalation_id), task_id=task_id, enabled=enabled,
+    )
+    if refusal is not None:
+        logger.warning(
+            'info-l0-router: rejected the reviewer disposition %s of %s (task %s): %s',
+            note.disposition, note.escalation_id, task_id, refusal,
+            extra={
+                'escalation_id': note.escalation_id, 'disposition': str(note.disposition),
+                'by': REVIEWER_LEG_ID, 'reason': refusal,
+            },
+        )
+        return Applied(note.escalation_id, Outcome.REJECTED, reason=refusal)
+    match note.disposition:
+        case ReviewerDisposition.ADDRESSED:
+            resolution_class = Addressed.resolution_class
+        case ReviewerDisposition.NO_ACTION:
+            resolution_class = ObservationConsumed.resolution_class
+        case ReviewerDisposition.WORK:
+            return Applied(note.escalation_id, Outcome.DEFERRED, reason=str(note.disposition))
+        case _:
+            assert_never(note.disposition)
+    return _write_close(
+        ports, note.escalation_id, resolution_class,
+        resolution=f'{resolution_class} — dispositioned by the reviewer: {note.rationale}',
+        resolved_by=REVIEWER_LEG_ID,
+    )
 
 
 class InfoL0Sweep:
