@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from fused_memory.reconciliation.flag_dedup import EntityStandingSuppressionResult
 from fused_memory.reconciliation.stage1_flag_chain import (
     FlagChainContext,
     FlagChainOutcome,
@@ -137,6 +138,38 @@ async def test_resolving_drops_are_acknowledged_and_dedup_suppressions_are_not()
     assert kept not in acknowledged
     assert outcome.stats['stage1_flag_markers_acknowledged'] == 7
     assert outcome.kept_flags == [kept]
+
+
+@pytest.mark.asyncio
+async def test_hook_a_suppressions_are_not_acknowledged():
+    resolved = _flag('3438', 'task_absent')
+    held = _flag('200', 'missing_deliverable')
+    kept = _flag('100', 'missing_deliverable')
+
+    async def hook_a_holding_back_held(**kwargs) -> EntityStandingSuppressionResult:
+        return EntityStandingSuppressionResult(
+            kept_flags=[f for f in kwargs['flags'] if f['task_id'] != held['task_id']],
+            suppressed_by_decision={'decision-entity': 1},
+            grounds_by_decision={'decision-entity': 'standing decision covers task 200'},
+            suppression_evaluated=True,
+        )
+
+    acknowledge = AsyncMock(return_value=1)
+    with (
+        patch(f'{CHAIN}.filter_entity_standing_decisions', new=hook_a_holding_back_held),
+        patch(f'{CHAIN}.acknowledge_resolved_flags', new=acknowledge),
+    ):
+        outcome = await _run(
+            [resolved, held, kept], _context(_taskmaster_returning(PRESENT_TASK)),
+        )
+
+    assert acknowledge.await_args is not None
+    acknowledged = acknowledge.await_args.kwargs['resolved_flags']
+    assert resolved in acknowledged
+    assert held not in acknowledged
+    assert kept not in acknowledged
+    assert outcome.stats['entity_standing_decision_suppressed'] == 1
+    assert [f['task_id'] for f in outcome.kept_flags] == [kept['task_id']]
 
 
 @pytest.mark.asyncio
