@@ -14,6 +14,28 @@ survives restarts, and keeps the dropped commit reachable after the reflog
 that once held it expires.  It is the same convention as
 ``orchestrator/src/orchestrator/branch_stack.py::StackBaseLedger``.
 
+:func:`run_rebase_reporting_drops` runs a task-branch rebase and detects its
+drops without reading git's stderr, whose wording varies across versions.  It
+lists the replayed range before the rebase and ``<onto>..HEAD`` after it, and
+matches the two as a multiset on the identity a rebase preserves: author name,
+author email, raw author date and subject.  Merge commits are left out, since
+a rebase linearizes them by design, and post-rebase commits with no
+pre-rebase match are ignored, so a target that moved mid-rebase cannot
+fabricate a drop.
+
+Accepted residuals:
+
+1. A drop on a DETACHED HEAD is logged but not recorded: there is no branch
+   to key the record on.
+2. Records of a deleted branch are pruned on the next record anywhere, so a
+   branch deleted and re-created before then inherits them.
+3. Records of a rebase the caller later reverts (``BranchResetError`` in
+   ``GitOps.rebase_preserving_task_commits``) remain.
+
+Records are only consulted for a plan file the branch did NOT touch, so none
+of these can make a passing gate fail, and every message that cites a record
+names its sha and subject for a reader to judge.
+
 Layering: this module sits BELOW ``orchestrator/src/orchestrator/branch_stack.py``
 and ``orchestrator/src/orchestrator/git_ops.py``, which both import it.  The
 git runner is injected, exactly as
@@ -24,13 +46,17 @@ its runner, and nothing here imports git_ops or merge_lane.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Sequence
+from collections import Counter
+from collections.abc import Awaitable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple, TypeVar
 
 from orchestrator.rebase_recovery import AbortRunner
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar('_T')
 
 REBASE_DROP_REF_NAMESPACE = 'refs/dark-factory/rebase-dropped/'
 _BRANCH_REF_NAMESPACE = 'refs/heads/'
@@ -138,6 +164,136 @@ def _orphaned_records(refnames: set[str]) -> dict[str, str]:
         if f'{_BRANCH_REF_NAMESPACE}{full_branch}' not in refnames:
             orphans[refname] = full_branch
     return orphans
+
+
+class RebaseRun(NamedTuple):
+    """A rebase's verdict, its stderr, and the commits it dropped."""
+
+    ok: bool
+    stderr: str
+    dropped: tuple[DroppedCommit, ...]
+
+
+class _ReplayedCommit(NamedTuple):
+    sha: str
+    identity: tuple[str, ...]
+
+
+class _Baseline(NamedTuple):
+    onto_sha: str
+    replayed: tuple[_ReplayedCommit, ...]
+
+
+_REPLAYED_FORMAT = '%H%x1f%an%x1f%ae%x1f%ad%x1f%s'
+
+
+async def run_rebase_reporting_drops(
+    run: GitRunner, worktree: Path, *, onto: str, upstream: str | None = None,
+) -> RebaseRun:
+    """Run ``git rebase [--onto <onto> <upstream> | <onto>]`` in *worktree*,
+    and report every commit it dropped because *onto* already carried it.
+
+    Each drop is logged as a WARNING and, when a branch is checked out,
+    recorded in :class:`RebaseDropLedger`.  A failed rebase is returned as
+    is, NOT aborted: the caller owns the abort.  Measuring the drops never
+    raises and never changes ``ok``; a measurement that fails is logged and
+    reports no drops.
+    """
+    baseline = await _measured(_read_baseline(run, worktree, onto, upstream), worktree)
+    argv = ['git', 'rebase', onto] if upstream is None else [
+        'git', 'rebase', '--onto', onto, upstream,
+    ]
+    rc, _, err = await run(argv, cwd=worktree)
+    if rc != 0:
+        return RebaseRun(ok=False, stderr=err, dropped=())
+    dropped = None
+    if baseline is not None:
+        dropped = await _measured(_report_drops(run, worktree, baseline), worktree)
+    return RebaseRun(ok=True, stderr=err, dropped=dropped or ())
+
+
+async def _measured(measurement: Awaitable[_T], worktree: Path) -> _T | None:
+    try:
+        return await measurement
+    except Exception as exc:
+        logger.warning('Could not measure rebase drops in %s: %s', worktree, exc)
+        return None
+
+
+async def _read_baseline(
+    run: GitRunner, worktree: Path, onto: str, upstream: str | None,
+) -> _Baseline:
+    onto_sha = (await _git_out(
+        run, worktree, 'rev-parse', '--verify', f'{onto}^{{commit}}',
+    )).strip()
+    start = onto_sha if upstream is None else upstream
+    return _Baseline(onto_sha, await _replayed(run, worktree, f'{start}..HEAD'))
+
+
+async def _replayed(
+    run: GitRunner, worktree: Path, revision_range: str,
+) -> tuple[_ReplayedCommit, ...]:
+    out = await _git_out(
+        run, worktree, 'log', '--no-merges', '--reverse', '-z', '--date=raw',
+        f'--format={_REPLAYED_FORMAT}', revision_range,
+    )
+    fields = (record.split('\x1f', 4) for record in out.split('\x00') if record.strip())
+    return tuple(_ReplayedCommit(f[0].strip(), tuple(f[1:])) for f in fields)
+
+
+def _lost(
+    before: Sequence[_ReplayedCommit], after: Sequence[_ReplayedCommit],
+) -> list[str]:
+    """Shas of *before* with no identity match left in *after*, in order."""
+    surviving = Counter(commit.identity for commit in after)
+    lost: list[str] = []
+    for commit in before:
+        if surviving[commit.identity] > 0:
+            surviving[commit.identity] -= 1
+        else:
+            lost.append(commit.sha)
+    return lost
+
+
+async def _report_drops(
+    run: GitRunner, worktree: Path, baseline: _Baseline,
+) -> tuple[DroppedCommit, ...]:
+    after = await _replayed(run, worktree, f'{baseline.onto_sha}..HEAD')
+    lost = _lost(baseline.replayed, after)
+    if not lost:
+        return ()
+    dropped = await _read_dropped_commits(run, worktree, lost)
+    branch = await _checked_out_branch(run, worktree)
+    _warn_dropped(worktree, branch, baseline.onto_sha, dropped)
+    if branch is not None:
+        ledger = RebaseDropLedger(worktree, run)
+        await ledger.prune_orphans()
+        await ledger.record(branch, lost)
+    return dropped
+
+
+async def _checked_out_branch(run: GitRunner, worktree: Path) -> str | None:
+    """The branch checked out in *worktree*, or None on a detached HEAD."""
+    command = ('git', 'symbolic-ref', '--quiet', 'HEAD')
+    rc, out, err = await run(list(command), cwd=worktree)
+    if rc == 1:
+        return None
+    if rc != 0:
+        raise _GitReadError(command, err)
+    return out.strip().removeprefix(_BRANCH_REF_NAMESPACE)
+
+
+def _warn_dropped(
+    worktree: Path, branch: str | None, onto_sha: str,
+    dropped: Sequence[DroppedCommit],
+) -> None:
+    where = branch if branch is not None else 'detached HEAD (not recorded)'
+    commits = '; '.join(f'{c.sha[:12]} "{c.subject}"' for c in dropped)
+    logger.warning(
+        'Rebase of %s in %s onto %s dropped %d commit(s) because the target '
+        'already carried each change: %s',
+        where, worktree, onto_sha[:12], len(dropped), commits,
+    )
 
 
 async def _read_dropped_commits(
