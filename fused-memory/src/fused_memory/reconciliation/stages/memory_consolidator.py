@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -16,6 +16,7 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
+from fused_memory.reconciliation.child_memory_link import render_parent_link
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE1_DISALLOWED,
 )
@@ -119,7 +120,6 @@ from fused_memory.reconciliation.unlanded_path_check import (
     UnlandedPathCheckResult,
     check_unlanded_path_claims,
 )
-from fused_memory.server.grouped_read import PARENT_ID_KEY, _parent_id_in_meta
 from fused_memory.utils.clip_disclosure import clip_note, elide_text, fetch_cap_note
 
 if TYPE_CHECKING:
@@ -2111,14 +2111,6 @@ def _format_episodes(episodes: list[dict]) -> tuple[str, int]:
     return '\n'.join(lines), total_stripped
 
 
-def _parent_link(meta: Mapping[str, Any]) -> str:
-    """Render a child's parent link for prompts/stage1.py::CHILD_MEMORY_AUTHORITY_RULE."""
-    parent_id = _parent_id_in_meta(meta)
-    if parent_id is None:
-        return ''
-    return f' {PARENT_ID_KEY}={parent_id} kind={meta["kind"]}'
-
-
 def _format_memories(memories: list[dict]) -> tuple[str, int]:
     if not memories:
         return 'No memories.', 0
@@ -2131,7 +2123,7 @@ def _format_memories(memories: list[dict]) -> tuple[str, int]:
         content = elide_text(cleaned, _RECORD_BODY_CHARS, field='content').text
         meta = m.get('metadata', {}) or {}
         cat = meta.get('category', '?')
-        lines.append(f'- [{m.get("id", "?")}]{_parent_link(meta)} ({cat}): {content}')
+        lines.append(f'- [{m.get("id", "?")}]{render_parent_link(meta)} ({cat}): {content}')
     return '\n'.join(lines), total_stripped
 
 
