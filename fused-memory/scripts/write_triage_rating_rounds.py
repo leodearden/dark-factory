@@ -57,6 +57,8 @@ Basis = _rubric.Basis
 Role = _rubric.Role
 
 BRIEF_PATH = _SCRIPTS.parent / 'calibration' / 'write_triage_rater_brief_v2.md'
+BRIEF_V2_1_SHA256 = 'b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f'
+"""The sha256 of rater brief v2.1 (``git show c7b682bcb9:fused-memory/calibration/write_triage_rater_brief_v2.md``)."""
 TEXT_CAP = 4000
 SHARD_SIZE = 40
 RATER_MODELS: Mapping[str, str] = MappingProxyType({
@@ -163,6 +165,9 @@ def validate_rating(answer: Mapping[str, Any], child_text: str, parent_text: str
     problems = []
     if Binary.DIGEST in answer:
         problems.append(f'digest {answer[Binary.DIGEST]!r} is given; digest is computed from loss_spans')
+    if 'non_consumed' in answer:
+        problems.append(f'non_consumed {answer["non_consumed"]!r} is given; only assembly marks'
+                        ' an answer non_consumed, beside the derived row that fixes it')
     quote = answer.get('conflict_quote')
     if isinstance(quote, Mapping):
         for side, text, shown_as in (('parent', parent_text, 'PARENT'), ('child', child_text, 'CHILD')):
@@ -402,13 +407,29 @@ class RatingScratch:
         return added
 
     def write_shard(self, key: dict[str, Any], name: str, entries: Sequence[ShardEntry], *,
-                    role: str, rater: str, round: int) -> None:
-        """Render *entries* as shard *name* and record it in *key*; the caller saves the key."""
+                    role: str, rater: str, round: int, introduces_brief: bool = False) -> None:
+        """Render *entries* as shard *name* and record it in *key*; the caller saves the key.
+
+        Refused, before anything is written, when the scratch's brief is not
+        admissible (:func:`admissible_briefs`) for every pair of *entries*. The
+        first round-0 double shards set the round-0 brief; only a re-rate passes
+        *introduces_brief* to key a new one.
+        """
+        sha = brief_sha256(self.brief)
+        sets_round_0 = round == 0 and role in DOUBLE_RATED and round_0_brief(key) is None
+        if not (introduces_brief or sets_round_0):
+            barred = sorted({(entry.entry_id, entry.target_id) for entry in entries
+                             if sha not in admissible_briefs(key, (entry.entry_id, entry.target_id))})
+            if barred:
+                raise ValueError(
+                    f'shard {name}: brief {self.brief} (sha256 {sha}) is not admissible for'
+                    f' {len(barred)} of its pairs, which admit only the round-0 brief'
+                    f' {round_0_brief(key)} or a covering re-rate\'s: {barred}')
         rendered = shard(entries, name=name)
         self._shard_path(name).parent.mkdir(parents=True, exist_ok=True)
         self._shard_path(name).write_text(rendered.text)
         key['shards'][name] = {'role': role, 'rater': rater, 'round': round,
-                               'items': sorted(rendered.key), 'brief_sha256': brief_sha256(self.brief)}
+                               'items': sorted(rendered.key), 'brief_sha256': sha}
         key['items'].update({item_id: dict(pair) for item_id, pair in rendered.key.items()})
 
     def render_missing(self, key: Mapping[str, Any], entries: Mapping[Triple, ShardEntry]) -> list[str]:
@@ -562,33 +583,53 @@ def brief_sha256(brief: Path = BRIEF_PATH) -> str:
     return hashlib.sha256(brief.read_bytes()).hexdigest()
 
 
-def refuse_foreign_briefs(key: Mapping[str, Any], rows: Iterable[Mapping[str, Any]]) -> None:
-    """Refuse a line whose shard was rated under neither the round-0 brief nor a covering re-rate's.
+def round_0_brief(key: Mapping[str, Any]) -> str | None:
+    """The brief sha256 the round-0 primary and second shards share; None before any is keyed.
 
-    The round-0 double shards must record one brief between them. A shard that
-    records no brief is refused by name.
+    Refused when they record more than one, or a shard of *key* records none.
     """
     shards = key['shards']
     unrecorded = sorted(name for name, spec in shards.items() if 'brief_sha256' not in spec)
     if unrecorded:
-        raise ValueError(f'shards record no brief_sha256: {unrecorded}')
+        raise ValueError(
+            f'shards record no brief_sha256: {unrecorded}; record on each the sha256 of the'
+            ' brief it was rated under; a v2.1 soak scratch was rated under'
+            f' {BRIEF_V2_1_SHA256} (rater brief v2.1, commit c7b682bcb9)')
     base = {spec['brief_sha256'] for spec in shards.values()
             if spec['round'] == 0 and spec['role'] in DOUBLE_RATED}
-    if len(base) != 1:
+    if len(base) > 1:
         raise ValueError(f'the round-0 primary and second shards record {len(base)} briefs,'
                          f' not one: {sorted(base)}')
-    covering: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
-    for rerate in key.get('rerates', ()):
-        for entry_id, target_id in rerate['pairs']:
-            covering[entry_id, target_id].add(rerate['brief_sha256'])
-    foreign = [
-        f'{row["batch"]} {row["entry_id"]} {row["target_id"]}: {shards[row["batch"]]["brief_sha256"]}'
-        for row in rows
-        if shards[row['batch']]['brief_sha256'] not in base | covering[row['entry_id'], row['target_id']]
-    ]
+    return next(iter(base), None)
+
+
+def admissible_briefs(key: Mapping[str, Any], pair: tuple[str, str]) -> set[str]:
+    """The brief sha256s a line on (entry, target) *pair* may be rated under.
+
+    The round-0 brief, and the brief of every re-rate whose pairs include *pair*.
+    """
+    base = round_0_brief(key)
+    return ({base} if base is not None else set()) | {
+        rerate['brief_sha256'] for rerate in key.get('rerates', ()) if list(pair) in rerate['pairs']}
+
+
+def refuse_foreign_briefs(key: Mapping[str, Any], rows: Iterable[Mapping[str, Any]]) -> None:
+    """Refuse a line whose shard's brief is not admissible for its pair (:func:`admissible_briefs`)."""
+    shards = key['shards']
+    if round_0_brief(key) is None and shards:
+        raise ValueError('no round-0 primary or second shard is keyed, so no brief is admissible')
+    admissible: dict[tuple[str, str], set[str]] = {}
+    foreign = []
+    for row in rows:
+        pair = (row['entry_id'], row['target_id'])
+        if pair not in admissible:
+            admissible[pair] = admissible_briefs(key, pair)
+        sha = shards[row['batch']]['brief_sha256']
+        if sha not in admissible[pair]:
+            foreign.append(f'{row["batch"]} {row["entry_id"]} {row["target_id"]}: {sha}')
     if foreign:
         raise ValueError('rater lines rated under a brief that is neither the round-0 brief'
-                         f' {base.pop()} nor that of a re-rate covering their pair:\n'
+                         f' {round_0_brief(key)} nor that of a re-rate covering their pair:\n'
                          + '\n'.join(sorted(foreign)))
 
 
@@ -630,7 +671,8 @@ def rerate_round(
     for role in DOUBLE_RATED:
         for name, dealt in plan_shards(members, role=role, prefix=f'rerate_{round_:02d}_',
                                        seed=version, first_index=0):
-            scratch.write_shard(key, name, dealt, role=role, rater=_double_rater(role), round=round_)
+            scratch.write_shard(key, name, dealt, role=role, rater=_double_rater(role), round=round_,
+                                introduces_brief=True)
             names.append(name)
     rerate = {
         'version': version, 'round': round_, 'brief_sha256': brief_sha256(scratch.brief),
