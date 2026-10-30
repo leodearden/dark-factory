@@ -2966,21 +2966,9 @@ class TaskCurator:
         cap = self._config.curator.pool_sibling_cap
         if taskmaster is None or cap < 1:
             return [], []
-        rows: dict[int, MetadataLookupRow] = {}
-        try:
-            for value in _sibling_lookup_values(parent_id):
-                page = await taskmaster.find_tasks_by_metadata(
-                    project_root, 'spawned_from', value,
-                    statuses=list(_SIBLING_LOOKUP_STATUSES), limit=_SIBLING_LOOKUP_PAGE,
-                )
-                rows.update((row['task_id'], row) for row in page['results'])
-        except Exception as exc:
-            logger.warning(
-                'task_curator: sibling lookup failed for parent %s: %s', parent_id, exc,
-            )
-            return [], []
+        rows = await self._sibling_lookup_rows(taskmaster, parent_id, project_root)
         ranked = sorted(
-            (row for row in rows.values() if str(row['task_id']) not in exclude),
+            (row for row in rows if str(row['task_id']) not in exclude),
             key=_sibling_rank,
         )
         entries: list[PoolEntry] = []
@@ -2997,6 +2985,32 @@ class TaskCurator:
             if entry is not None:
                 entries.append(entry)
         return entries, overflow_ids
+
+    @staticmethod
+    async def _sibling_lookup_rows(
+        taskmaster: TaskBackendProtocol, parent_id: str, project_root: str,
+    ) -> list[MetadataLookupRow]:
+        """The tasks naming *parent_id* in any stored form; a form whose lookup fails is skipped.
+
+        Each form is looked up on its own, so one failure keeps the rows the
+        other forms returned. A decimal id past SQLite's INTEGER range is one
+        such failure: its int form is refused before the store is read.
+        """
+        rows: dict[int, MetadataLookupRow] = {}
+        for value in _sibling_lookup_values(parent_id):
+            try:
+                page = await taskmaster.find_tasks_by_metadata(
+                    project_root, 'spawned_from', value,
+                    statuses=list(_SIBLING_LOOKUP_STATUSES), limit=_SIBLING_LOOKUP_PAGE,
+                )
+            except Exception as exc:
+                logger.warning(
+                    'task_curator: sibling lookup failed for parent %s as %r: %s',
+                    parent_id, value, exc,
+                )
+                continue
+            rows.update((row['task_id'], row) for row in page['results'])
+        return list(rows.values())
 
     async def _fetch_entry_for_neighbor(
         self,

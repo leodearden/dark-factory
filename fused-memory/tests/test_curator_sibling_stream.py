@@ -37,6 +37,9 @@ _FOLLOWUP = 'agent_followup'
 _CANDIDATE_FILE = 'pkg_a/sub/lms_slate_run.py'
 _MODULE_FILE = 'pkg_a/sub/neighbour.py'
 _SIBLING_FILE = 'pkg_b/sub/lms_slate.py'
+_SIBLING_TITLE_PREFIX = 'sibling '
+# Wider than SQLite's INTEGER, so only its text form can be looked up.
+_PARENT_ID_PAST_SQLITE_INTEGER = str(2**64)
 
 
 @dataclass(frozen=True)
@@ -61,7 +64,7 @@ class SiblingStack:
         return str(added['id'])
 
     async def seed_sibling(self, parent_id: str | int, *, status: str = 'pending') -> str:
-        return await self.seed(f'sibling {next(self._serial)}', status=status, metadata={
+        return await self.seed(f'{_SIBLING_TITLE_PREFIX}{next(self._serial)}', status=status, metadata={
             'spawned_from': parent_id,
             'spawn_context': _FOLLOWUP,
             'files': [_SIBLING_FILE],
@@ -81,6 +84,23 @@ class SiblingStack:
 class _LookupFailsBackend(SqliteTaskBackend):
     async def find_tasks_by_metadata(self, *args: Any, **kwargs: Any) -> Any:
         raise RuntimeError('metadata lookup unavailable')
+
+
+class _TextLookupFailsBackend(SqliteTaskBackend):
+    async def find_tasks_by_metadata(
+        self, project_root: str, key: str, value: str | int | None = None, **kwargs: Any,
+    ) -> Any:
+        if isinstance(value, str):
+            raise RuntimeError('text metadata lookup unavailable')
+        return await super().find_tasks_by_metadata(project_root, key, value, **kwargs)
+
+
+class _SiblingFetchFailsBackend(SqliteTaskBackend):
+    async def get_task(self, task_id: str, project_root: str, tag: str | None = None) -> dict:
+        task = await super().get_task(task_id, project_root, tag)
+        if str(task.get('title', '')).startswith(_SIBLING_TITLE_PREFIX):
+            raise RuntimeError('task store unavailable')
+        return task
 
 
 @asynccontextmanager
@@ -278,3 +298,57 @@ async def test_a_failed_sibling_lookup_leaves_the_rest_of_the_pool(failing_looku
         and 'sibling' in record.getMessage()
         for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_a_zero_sibling_cap_disables_the_stream(stack):
+    stack.config.curator.pool_sibling_cap = 0
+    parent_id = await stack.seed('parent')
+    sibling_id = await stack.seed_sibling(parent_id)
+
+    prepared = await stack.prepare(_followup(parent_id))
+
+    assert _entries(prepared.pool, sibling_id) == []
+    assert prepared.pool_sizes['sibling'] == 0
+    assert prepared.withheld is not None
+    assert prepared.withheld.caps['sibling'] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_parent_id_too_wide_for_an_integer_still_pools_its_text_stored_siblings(stack):
+    sibling_id = await stack.seed_sibling(_PARENT_ID_PAST_SQLITE_INTEGER)
+
+    prepared = await stack.prepare(_followup(_PARENT_ID_PAST_SQLITE_INTEGER))
+
+    assert _ids_from(prepared.pool, 'sibling') == {sibling_id}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_text_lookup_keeps_the_integer_stored_siblings(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger='fused_memory.middleware.task_curator')
+    async with _open_stack(tmp_path / 'project', _TextLookupFailsBackend) as stack:
+        parent_id = await stack.seed('parent')
+        sibling_id = await stack.seed_sibling(int(parent_id))
+
+        prepared = await stack.prepare(_followup(parent_id))
+
+    assert _ids_from(prepared.pool, 'sibling') == {sibling_id}
+    assert any(
+        record.levelno == logging.WARNING and repr(parent_id) in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_sibling_whose_full_fetch_fails_is_pooled_thin_from_its_lookup_row(tmp_path):
+    async with _open_stack(tmp_path / 'project', _SiblingFetchFailsBackend) as stack:
+        parent_id = await stack.seed('parent')
+        sibling_id = await stack.seed_sibling(parent_id)
+
+        prepared = await stack.prepare(_followup(parent_id))
+
+    [entry] = _entries(prepared.pool, sibling_id)
+    assert entry.source == 'sibling'
+    assert entry.title.startswith(_SIBLING_TITLE_PREFIX)
+    assert entry.status == 'unknown'
+    assert entry.combine_eligible is False
