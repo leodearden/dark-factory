@@ -8,6 +8,7 @@ dispositions its verdict carries.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -15,6 +16,7 @@ import pytest
 from _curator_fake import FakeCurator
 from _workflow_helpers import (
     AgentStub,
+    FakeBriefing,
     _build_workflow_with_escalation,
     _init_repo,
     _make_git_ops,
@@ -27,40 +29,53 @@ from escalation.queue import EscalationQueue
 from shared.cli_invoke import AgentResult
 from test_info_l0_router_workflow import _reaper_l1s_after_aging
 
-from orchestrator.agents.review_briefing import ChangedFile, ReviewChange, ReviewSubject
-from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE
+from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import (
     GitConfig,
     OrchestratorConfig,
+    ReviewConfig,
     SandboxConfig,
     TimeoutsConfig,
     UnblockAutoConfig,
 )
 from orchestrator.escalation_router import REVIEWER_LEG_ID, read_hold
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.mcp.verdict_tools import _envelope, _submit_review_verdict
+from orchestrator.mcp.verdict_tools import _envelope
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow import WorkflowOutcome
 
 TASK_ID = '42'
-REVIEWER = REVIEWER_COMPREHENSIVE.name
 STARVATION = 'orchestrator-starvation-watchdog'
+UNKNOWN_ID = 'esc-42-999'
+PASSED = VerifyResult(
+    passed=True, test_output='', lint_output='', type_output='', summary='All checks passed',
+)
 
 
-def _config(project_root: Path, *, router_enabled: bool = True) -> OrchestratorConfig:
+def _run_config(
+    project_root: Path, *, briefing: ReviewBriefing, router_enabled: bool,
+) -> OrchestratorConfig:
     return OrchestratorConfig(
         project_root=project_root,
         max_concurrent_tasks=1,
+        max_execute_iterations=5,
+        max_verify_attempts=3,
+        max_review_cycles=2,
+        judge_after_each_iteration=False,
+        max_amendment_rounds=1,
+        reviewer_stagger_secs=0.0,
         steward_completion_timeout=0.25,
         timeouts=TimeoutsConfig(steward=0.25),
         unblock_auto=UnblockAutoConfig(enabled=False),
         info_l0_router_enabled=router_enabled,
+        review=ReviewConfig(reviewer_briefing=briefing),
         git=GitConfig(
             main_branch='main', branch_prefix='task/', remote='origin',
             worktree_dir='.worktrees',
         ),
+        sandbox=SandboxConfig(enabled=False),
     )
 
 
@@ -87,140 +102,6 @@ def _file_note(
     )
     queue.submit(note)
     return note
-
-
-def _subject() -> ReviewSubject:
-    return ReviewSubject(
-        task={'id': TASK_ID, 'title': 'X', 'description': 'Y'},
-        plan=None,
-        plan_absent_reason='no plan in this test',
-        change=ReviewChange(
-            base_sha='0123456789abcdef0123456789abcdef01234567',
-            diff='+x = 1\n',
-            files=(ChangedFile('lib/x.py', 1, 0),),
-        ),
-        conventions=(),
-    )
-
-
-class _Briefed:
-    """A workflow wired for ``_run_reviewer`` whose briefing records what it was given."""
-
-    def __init__(self, tmp_path: Path, *, router_enabled: bool = True) -> None:
-        config = _config(tmp_path, router_enabled=router_enabled)
-        workflow, _scheduler, queue = _build_workflow_with_escalation(
-            config, _make_git_ops(config.project_root), _assignment(), AgentStub(), tmp_path,
-            spawn_merge_worker=False,
-        )
-        worktree = tmp_path / 'wt'
-        worktree.mkdir()
-        artifacts = TaskArtifacts(worktree)
-        artifacts.init(TASK_ID, 'X', 'Y')
-        workflow.worktree, workflow.artifacts = worktree, artifacts
-        briefing = workflow.briefing
-        self.diff_only = AsyncMock(side_effect=briefing.build_reviewer_prompt)
-        self.context_complete = AsyncMock(
-            side_effect=briefing.build_context_complete_reviewer_prompt,
-        )
-        briefing.build_reviewer_prompt = self.diff_only
-        briefing.build_context_complete_reviewer_prompt = self.context_complete
-        workflow._invoke = AsyncMock(side_effect=self._invoke_passing_reviewer)
-        self.workflow: TaskWorkflow = workflow
-        self.queue = queue
-        self.artifacts = artifacts
-
-    async def _invoke_passing_reviewer(self, _role, build_prompt, *args, **kwargs) -> AgentResult:
-        await build_prompt()
-        _submit_review_verdict(self.artifacts, REVIEWER, 'sid', REVIEWER, 'PASS', [], 's')
-        return AgentResult(success=True, output='')
-
-
-def _briefed_ids(build: AsyncMock) -> list[str]:
-    assert build.await_args is not None
-    return [note.id for note in build.await_args.kwargs['open_info_notes']]
-
-
-@pytest.mark.asyncio
-class TestReviewerIsBriefedWithItsNotes:
-    async def test_the_diff_only_reviewer_sees_exactly_the_eligible_notes(self, tmp_path):
-        briefed = _Briefed(tmp_path)
-        eligible = _file_note(briefed.queue)
-        _file_note(briefed.queue, severity='blocking')
-        _file_note(briefed.queue, agent_role=STARVATION)
-        _file_note(briefed.queue, task_id='99')
-
-        payload = await briefed.workflow._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
-
-        assert payload['verdict'] == 'PASS'
-        assert _briefed_ids(briefed.diff_only) == [eligible.id]
-
-    async def test_the_context_complete_reviewer_sees_the_same_notes(self, tmp_path):
-        briefed = _Briefed(tmp_path)
-        eligible = _file_note(briefed.queue)
-        _file_note(briefed.queue, agent_role=STARVATION)
-
-        await briefed.workflow._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff', subject=_subject())
-
-        assert _briefed_ids(briefed.context_complete) == [eligible.id]
-        briefed.diff_only.assert_not_awaited()
-
-    async def test_a_disabled_router_briefs_no_notes(self, tmp_path):
-        briefed = _Briefed(tmp_path, router_enabled=False)
-        _file_note(briefed.queue)
-
-        await briefed.workflow._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
-
-        assert _briefed_ids(briefed.diff_only) == []
-
-    async def test_a_queue_fault_costs_the_notes_not_the_review(
-        self, tmp_path, monkeypatch, caplog,
-    ):
-        briefed = _Briefed(tmp_path)
-        _file_note(briefed.queue)
-
-        def get_by_task(*_args, **_kwargs):
-            raise OSError('disk unreadable')
-
-        monkeypatch.setattr(briefed.queue, 'get_by_task', get_by_task)
-        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
-            payload = await briefed.workflow._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
-
-        assert payload['verdict'] == 'PASS'
-        assert _briefed_ids(briefed.diff_only) == []
-        assert any(
-            record.levelno == logging.WARNING and 'disk unreadable' in record.getMessage()
-            for record in caplog.records
-        )
-
-
-# ---------------------------------------------------------------------------
-# Full runs: the review loop applies the verdict's dispositions
-# (boundary rows #1, #2 first half, #17)
-# ---------------------------------------------------------------------------
-
-UNKNOWN_ID = 'esc-42-999'
-
-
-def _run_config(project_root: Path) -> OrchestratorConfig:
-    return OrchestratorConfig(
-        project_root=project_root,
-        max_concurrent_tasks=1,
-        max_execute_iterations=5,
-        max_verify_attempts=3,
-        max_review_cycles=2,
-        judge_after_each_iteration=False,
-        max_amendment_rounds=1,
-        reviewer_stagger_secs=0.0,
-        steward_completion_timeout=0.25,
-        timeouts=TimeoutsConfig(steward=0.25),
-        unblock_auto=UnblockAutoConfig(enabled=False),
-        info_l0_router_enabled=True,
-        git=GitConfig(
-            main_branch='main', branch_prefix='task/', remote='origin',
-            worktree_dir='.worktrees',
-        ),
-        sandbox=SandboxConfig(enabled=False),
-    )
 
 
 def _disposition(esc_id: str, disposition: str) -> dict:
@@ -257,26 +138,75 @@ class _LostVerdictStub(_DispositioningStub):
         return AgentResult(success=True, output='')
 
 
+class _NoteRecordingBriefing(FakeBriefing):
+    """Canned prompts that also record which notes each reviewer briefing listed."""
+
+    def __init__(self) -> None:
+        self.briefed: list[tuple[ReviewBriefing, list[str]]] = []
+
+    async def build_reviewer_prompt(
+        self, reviewer_type: str, diff: str, context: str | None = None,
+        *, amendment_suggestions: list[dict] | None = None,
+        task: dict | None = None,
+        open_info_notes: Sequence[Escalation] | None = None,
+    ) -> str:
+        self._record(ReviewBriefing.DIFF_ONLY, open_info_notes)
+        return await super().build_reviewer_prompt(reviewer_type, diff, context)
+
+    async def build_context_complete_reviewer_prompt(
+        self, reviewer_type: str, subject: ReviewSubject, context: str | None = None,
+        *, amendment_suggestions: list[dict] | None = None,
+        open_info_notes: Sequence[Escalation] | None = None,
+    ) -> str:
+        self._record(ReviewBriefing.CONTEXT_COMPLETE, open_info_notes)
+        return await super().build_context_complete_reviewer_prompt(reviewer_type, subject, context)
+
+    def _record(self, generation: ReviewBriefing, notes: Sequence[Escalation] | None) -> None:
+        self.briefed.append((generation, [note.id for note in notes or ()]))
+
+
 class _FullRun:
-    def __init__(self, tmp_path: Path, monkeypatch, stub: _DispositioningStub) -> None:
+    def __init__(
+        self, tmp_path: Path, monkeypatch, stub: _DispositioningStub, *,
+        briefing: ReviewBriefing = ReviewBriefing.DIFF_ONLY, router_enabled: bool = True,
+    ) -> None:
         repo = tmp_path / 'repo'
         repo.mkdir()
         _init_repo(repo)
-        config = _run_config(repo)
+        config = _run_config(repo, briefing=briefing, router_enabled=router_enabled)
         self.workflow, _scheduler, self.queue = _build_workflow_with_escalation(
             config, _make_git_ops(config.project_root), _assignment(), stub, tmp_path,
         )
+        self.briefing = _NoteRecordingBriefing()
+        self.workflow.briefing = self.briefing
+        self._monkeypatch = monkeypatch
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
-            'orchestrator.workflow.run_scoped_verification',
-            AsyncMock(return_value=VerifyResult(
-                passed=True, test_output='', lint_output='', type_output='',
-                summary='All checks passed',
-            )),
+            'orchestrator.workflow.run_scoped_verification', AsyncMock(return_value=PASSED),
         )
         self.workflow.event_store = EventStore(tmp_path / 'runs.db', run_id='run-test')
         self.curator = FakeCurator()
         self.workflow.scheduler.dispatch_tool = self.curator
+
+    def fail_the_first_queue_read_after_verification(self) -> None:
+        """The reviewer's note read is the first queue read once verification passes."""
+        armed = False
+        read = self.queue.get_by_task
+
+        def get_by_task(*args, **kwargs):
+            nonlocal armed
+            if armed:
+                armed = False
+                raise OSError('disk unreadable')
+            return read(*args, **kwargs)
+
+        async def verify(*_args, **_kwargs) -> VerifyResult:
+            nonlocal armed
+            armed = True
+            return PASSED
+
+        self._monkeypatch.setattr(self.queue, 'get_by_task', get_by_task)
+        self._monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify)
 
     async def run(self) -> WorkflowOutcome:
         return (await self.workflow.run()).outcome
@@ -293,6 +223,66 @@ class _FullRun:
             row['data'] for row in store.fetch_events_by_type(EventType.info_l0_dispositioned)
             if row['data']['escalation_id'] == esc_id
         ]
+
+
+@pytest.mark.asyncio
+class TestReviewerIsBriefedWithItsNotes:
+    async def test_the_diff_only_reviewer_sees_exactly_the_eligible_notes(
+        self, tmp_path, monkeypatch,
+    ):
+        run = _FullRun(tmp_path, monkeypatch, _DispositioningStub())
+        eligible = _file_note(run.queue)
+        _file_note(run.queue, severity='blocking')
+        _file_note(run.queue, agent_role=STARVATION)
+        _file_note(run.queue, task_id='99')
+
+        assert await run.run() == WorkflowOutcome.DONE
+
+        assert run.briefing.briefed == [(ReviewBriefing.DIFF_ONLY, [eligible.id])]
+
+    async def test_the_context_complete_reviewer_sees_the_same_notes(
+        self, tmp_path, monkeypatch,
+    ):
+        run = _FullRun(
+            tmp_path, monkeypatch, _DispositioningStub(),
+            briefing=ReviewBriefing.CONTEXT_COMPLETE,
+        )
+        eligible = _file_note(run.queue)
+        _file_note(run.queue, agent_role=STARVATION)
+
+        assert await run.run() == WorkflowOutcome.DONE
+
+        assert run.briefing.briefed == [(ReviewBriefing.CONTEXT_COMPLETE, [eligible.id])]
+
+    async def test_a_disabled_router_briefs_no_notes(self, tmp_path, monkeypatch):
+        run = _FullRun(tmp_path, monkeypatch, _DispositioningStub(), router_enabled=False)
+        _file_note(run.queue)
+
+        assert await run.run() == WorkflowOutcome.DONE
+
+        assert run.briefing.briefed == [(ReviewBriefing.DIFF_ONLY, [])]
+
+    async def test_a_queue_fault_costs_the_notes_not_the_review(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        run = _FullRun(tmp_path, monkeypatch, _DispositioningStub())
+        _file_note(run.queue)
+        run.fail_the_first_queue_read_after_verification()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
+            assert await run.run() == WorkflowOutcome.DONE
+
+        assert run.briefing.briefed == [(ReviewBriefing.DIFF_ONLY, [])]
+        assert any(
+            record.levelno == logging.WARNING and 'disk unreadable' in record.getMessage()
+            for record in caplog.records
+        )
+
+
+# ---------------------------------------------------------------------------
+# The review loop applies the verdict's dispositions
+# (boundary rows #1, #2 first half, #17)
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
