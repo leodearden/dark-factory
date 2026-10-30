@@ -7,6 +7,8 @@ over every file git lists.
 """
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,7 @@ from raw_envelope_literal_guard import (
     describe,
     guarded_sources,
     handles_envelope_markup,
+    main,
     raw_literal_violations,
     raw_prefix_lines,
 )
@@ -178,3 +181,101 @@ def test_raw_literal_violations_reports_tracked_and_untracked_violators(
         'tracked_violator.py': {'\\x3c/': (2,)},
         'pkg/untracked_violator.py': {'\\x3cparameter': (4,)},
     }
+
+
+@pytest.fixture
+def scoped_repo(synthetic_repo: Path) -> Path:
+    """``synthetic_repo`` plus the files the CLI's directory scoping turns on."""
+    _plant(synthetic_repo, 'pkg/sub/nested_violator.py', 'LT = chr(60)\nX = "' + _LT + '/invoke>"\n')
+    _plant(synthetic_repo, 'pkgextra/violator.py', 'LT = chr(60)\n\nX = "' + _LT + '/content>"\n')
+    _plant(synthetic_repo, 'clean/clean_handler.py', 'from shared.toolcall_markup import closer_for\n')
+    _plant(synthetic_repo, 'clean/html_fixture.py', 'PAGE = "' + _LT + 'p>hi' + _LT + '/p>"\n')
+    return synthetic_repo
+
+
+PKG_REPORT_LINES = (
+    "  pkg/sub/nested_violator.py: \\x3c/ on line(s) [2]",
+    "  pkg/untracked_violator.py: \\x3cparameter on line(s) [4]",
+)
+PKGEXTRA_REPORT_LINE = "  pkgextra/violator.py: \\x3c/ on line(s) [3]"
+
+
+def _assert_no_raw_prefix(text: str) -> None:
+    assert not any(prefix in text for prefix in RAW_PREFIXES), (
+        'the report must name each prefix by its escaped spelling only'
+    )
+
+
+def test_cli_scans_only_the_named_directory_by_path_component(
+    scoped_repo: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(['pkg'], root=scoped_repo)
+    out = capsys.readouterr().out
+    assert code == 1
+    assert all(line in out.splitlines() for line in PKG_REPORT_LINES), out
+    for outside in ('pkgextra/violator.py', 'tracked_violator.py', 'ignored/handler.py'):
+        assert outside not in out
+    assert 'Sentinel-literal hazard' in out
+    _assert_no_raw_prefix(out)
+
+
+def test_cli_passes_silently_on_a_directory_without_violations(
+    scoped_repo: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(['clean'], root=scoped_repo)
+    captured = capsys.readouterr()
+    assert (code, captured.out, captured.err) == (0, '', '')
+
+
+def test_cli_scans_the_union_of_several_directories(
+    scoped_repo: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(['pkg', 'clean', 'pkgextra'], root=scoped_repo)
+    out = capsys.readouterr().out
+    assert code == 1
+    reported = [line for line in out.splitlines() if line.startswith('  ')]
+    assert reported == [*PKG_REPORT_LINES, PKGEXTRA_REPORT_LINE]
+    _assert_no_raw_prefix(out)
+
+
+@pytest.mark.parametrize(
+    'directory',
+    [
+        pytest.param('no_such_dir', id='missing'),
+        pytest.param('tracked_violator.py', id='a-file'),
+        pytest.param('..', id='outside-root'),
+    ],
+)
+def test_cli_refuses_a_directory_argument_that_is_not_a_directory_under_root(
+    scoped_repo: Path, capsys: pytest.CaptureFixture[str], directory: str,
+) -> None:
+    code = main(['clean', directory], root=scoped_repo)
+    captured = capsys.readouterr()
+    assert code == 2
+    assert repr(directory) in captured.err
+    assert captured.out == ''
+
+
+def test_cli_reports_a_git_failure_as_a_usage_error_not_a_violation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / 'broken'
+    _plant(root, '.git', f'gitdir: {tmp_path / "nowhere"}\n')
+    _plant(root, 'pkg/handler.py', 'LT = chr(60)\n')
+    code = main(['pkg'], root=root)
+    captured = capsys.readouterr()
+    assert code == 2
+    assert 'git' in captured.err
+    assert captured.out == ''
+
+
+def test_cli_runs_as_a_script_under_bare_python_from_the_checkout_root() -> None:
+    script = Path(raw_envelope_literal_guard.__file__).resolve()
+    proc = subprocess.run(
+        [sys.executable, '-S', '-E', str(script), 'tests/scripts'],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, (
+        f'the lint-leg invocation exited {proc.returncode}; '
+        f'stdout: {proc.stdout!r}; stderr: {proc.stderr!r}'
+    )
