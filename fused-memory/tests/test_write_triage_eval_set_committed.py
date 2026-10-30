@@ -237,17 +237,10 @@ class TestTheCommittedRerates:
         assert earlier == []
 
     def test_every_pair_that_reads_loss_was_rerated_under_the_latest_brief(self) -> None:
-        rubric = _rubric()
         rerates = _key().get('rerates', ())
         if not rerates:
             pytest.skip('no re-rate is keyed')
-        reads_loss = {
-            pair for pair, derivation in _derivations().items()
-            if isinstance(derivation, rubric.Decided)
-            and any(binary == rubric.Binary.LOSS for _, binary in derivation.consumed)
-            or isinstance(derivation, rubric.Unclear)
-            and any(binary == rubric.Binary.LOSS for _, binary in derivation.binaries)
-        }
+        reads_loss = _build().pairs_reading_loss(_derivations())
         assert reads_loss - {tuple(pair) for pair in rerates[-1]['pairs']} == set()
 
     def test_no_retired_third_rater_votes_on_a_rerated_pair(self) -> None:

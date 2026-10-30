@@ -265,6 +265,11 @@ class TestRatingProblems:
         assert len(problems) == 1
         assert 'conflict_quote.child' in problems[0]
 
+    def test_a_line_giving_non_consumed_is_asked_again(self) -> None:
+        line = {**_rated('e1', home='NO', conflict='NO'), 'non_consumed': ['home']}
+        problems = self._problems(line)
+        assert len(problems) == 1 and 'non_consumed' in problems[0]
+
     def test_a_cross_family_line_is_checked_against_the_same_contract(self) -> None:
         line = {**_rated('e1', home='YES', conflict='NO'), 'role': 'cross_family'}
         assert ['lacks loss' in problem for problem in self._problems(line)] == [True]
@@ -811,25 +816,75 @@ class TestTheBrief:
         scratch.add_shards(key, _scratch_entries(), seed=7)
         assert {spec['brief_sha256'] for spec in key['shards'].values()} == {_sha(old_brief)}
 
-    def test_a_line_under_a_brief_neither_round_0s_nor_a_covering_rerates_is_refused(
+    def test_a_round_keyed_under_a_brief_not_admissible_for_its_pairs_is_refused_before_writing(
         self, tmp_path: Path, old_brief: Path,
     ) -> None:
         rounds = _Rounds(tmp_path)
         rounds.rate()
+        key_bytes, shard_files = (rounds.root / 'key.json').read_bytes(), rounds.shard_files()
         other = _mod().RatingScratch(rounds.root, brief=old_brief)
-        _mod().third_round(other, rounds.key(), rounds.entries(), {('e0', 'p1')})
-        rounds.rate()
-        with pytest.raises(ValueError, match=r'third_00 e0 p1'):
-            rounds.scratch.effective_lines(rounds.key())
-        with pytest.raises(ValueError, match=r'third_00 e0 p1'):
-            rounds.scratch.ratings(rounds.key(), rounds.entries())
+        with pytest.raises(ValueError, match=rf"third_00.*{_sha(old_brief)}.*\('e0', 'p1'\)"):
+            _mod().third_round(other, rounds.key(), rounds.entries(), {('e0', 'p1')})
+        assert (rounds.root / 'key.json').read_bytes() == key_bytes
+        assert rounds.shard_files() == shard_files
 
-    def test_a_shard_recording_no_brief_is_refused_naming_it(self, tmp_path: Path) -> None:
+    def test_new_round_0_shards_must_share_the_existing_round_0_brief(
+        self, tmp_path: Path, old_brief: Path,
+    ) -> None:
+        rounds = _Rounds(tmp_path)
+        other = _mod().RatingScratch(rounds.root, brief=old_brief)
+        extra = _mod().ShardEntry('e9', 'p1', 'current', 'df', 'child of e9', 'parent of e9')
+        key = rounds.key()
+        with pytest.raises(ValueError, match='not admissible'):
+            other.add_shards(key, [*_scratch_entries(), extra], seed=7)
+
+    def test_a_line_whose_keyed_brief_is_not_admissible_is_refused_at_use(
+        self, tmp_path: Path,
+    ) -> None:
+        rounds = _Rounds(tmp_path)
+        rounds.rate()
+        _mod().third_round(rounds.scratch, rounds.key(), rounds.entries(), {('e0', 'p1')})
+        rounds.rate()
+        key = rounds.key()
+        key['shards']['third_00']['brief_sha256'] = '1' * 64
+        with pytest.raises(ValueError, match=r'third_00 e0 p1'):
+            rounds.scratch.effective_lines(key)
+        with pytest.raises(ValueError, match=r'third_00 e0 p1'):
+            rounds.scratch.ratings(key, rounds.entries())
+
+    def test_a_rerates_brief_admits_only_the_pairs_it_covers(
+        self, tmp_path: Path, old_brief: Path,
+    ) -> None:
+        rounds = _mod()
+        entries = {(entry_id, 'p1', 'current'): rounds.ShardEntry(
+            entry_id, 'p1', 'current', 'df', f'child of {entry_id}', f'parent of {entry_id}')
+            for entry_id in ('w', 'x')}
+        first = rounds.RatingScratch(tmp_path / 'scratch', brief=old_brief)
+        key = first.load_key()
+        first.add_shards(key, list(entries.values()), seed=7)
+        first.save_key(key)
+        _rate_every_unrated_shard(first, entries)
+        revised = rounds.RatingScratch(first.root)
+        rounds.rerate_round(revised, revised.load_key(), entries, [('w', 'p1')], version='v2.2')
+        _rate_every_unrated_shard(revised, entries)
+        key = revised.load_key()
+        assert rounds.admissible_briefs(key, ('w', 'p1')) == {_sha(old_brief), _sha(rounds.BRIEF_PATH)}
+        assert rounds.admissible_briefs(key, ('x', 'p1')) == {_sha(old_brief)}
+        rounds.third_round(revised, key, entries, {('w', 'p1')})
+        with pytest.raises(ValueError, match=r"\('x', 'p1'\)|third_01 x p1"):
+            rounds.third_round(revised, revised.load_key(), entries, {('x', 'p1')})
+            _rate_every_unrated_shard(revised, entries)
+            revised.effective_lines(revised.load_key())
+
+    def test_a_shard_recording_no_brief_is_refused_naming_it_and_the_remedy(
+        self, tmp_path: Path,
+    ) -> None:
         rounds = _Rounds(tmp_path)
         rounds.rate()
         key = rounds.key()
         del key['shards']['second_00']['brief_sha256']
-        with pytest.raises(ValueError, match='second_00'):
+        with pytest.raises(ValueError, match=r"(?s)\['second_00'\].*record.*brief.*rated under.*"
+                                             'b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f'):
             rounds.scratch.effective_lines(key)
 
     def test_round_0_must_record_one_brief(self, tmp_path: Path) -> None:

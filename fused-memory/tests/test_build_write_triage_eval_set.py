@@ -614,6 +614,22 @@ class TestTheRerate:
             rerated.assemble()
         assert not rerated.out.exists()
 
+    def test_assemble_reads_the_latest_rerate_not_the_union_of_all(self, rerated: _EvalSet) -> None:
+        dropped = ['l1', 'f']
+        rerated.rate()
+        assert rerated.run('rerate', '--brief-version', 'v2.3') == 0
+        key = rerated.key()
+        second = key['rerates'][1]
+        second['pairs'].remove(dropped)
+        for name in second['shards']:
+            key['shards'][name]['items'] = [
+                item for item in key['shards'][name]['items']
+                if list(_triple(key['items'][item])[:2]) != dropped]
+        (rerated.scratch / 'key.json').write_text(json.dumps(key))
+        rerated.rate()
+        with pytest.raises(ValueError, match=r'(?s)latest re-rate \(v2.3\).*l1 f'):
+            rerated.assemble()
+
     def test_refuses_a_brief_changed_since_its_rerate_was_keyed(self, rerated: _EvalSet) -> None:
         key = rerated.key()
         key['rerates'][0]['brief_sha256'] = '0' * 64
