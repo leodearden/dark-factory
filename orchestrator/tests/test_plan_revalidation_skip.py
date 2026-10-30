@@ -12,6 +12,7 @@ the fingerprint of the task's current description/details.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -1028,8 +1029,19 @@ def _confirm(a: TaskArtifacts) -> None:
     _ok(_confirm_plan(a))
 
 
+def _crash(exc: BaseException) -> ArchitectAction:
+    def act(_a: TaskArtifacts) -> None:
+        raise exc
+    return act
+
+
+def _bare_string_prerequisite(a: TaskArtifacts) -> None:
+    a.write_plan({**a.read_plan(), 'prerequisites': ['install the fixture']})
+
+
 def _scripted_architect(
     f: _Fixture, monkeypatch: pytest.MonkeyPatch, passes: list[list[ArchitectAction]],
+    *, success: bool = True,
 ) -> AsyncMock:
     """Invocation n runs ``passes[n]``'s actions against the live artifacts."""
     remaining = list(passes)
@@ -1039,7 +1051,7 @@ def _scripted_architect(
         for action in remaining.pop(0):
             action(f.artifacts)
         return AgentResult(
-            success=True, output='revised', cost_usd=0.5, duration_ms=1_000, turns=3,
+            success=success, output='revised', cost_usd=0.5, duration_ms=1_000, turns=3,
         )
 
     invoke = AsyncMock(side_effect=run)
@@ -1069,6 +1081,12 @@ def _no_plan_counter_writes(f: _Fixture) -> list[int]:
 
 def _step(plan: dict, step_id: str) -> dict:
     return next(s for s in plan['steps'] if s['id'] == step_id)
+
+
+def _assert_restored(f: _Fixture, before: dict) -> None:
+    after = f.artifacts.read_plan()
+    assert after == before
+    assert (_step(after, 'step-1')['commit'], after['_session_id']) == (_A, 'prior-session-aaa')
 
 
 @pytest.mark.asyncio
@@ -1183,3 +1201,74 @@ async def test_remedy_pass_that_records_the_disposition_proceeds(
     assert invoke.await_count == 2
     assert _refusals(f) == []
     assert _no_plan_counter_writes(f) == []
+
+
+# A revalidation exit taken before beta and the prerequisite check accept the
+# revision must put the BEFORE plan back: an unstamped wipe left on disk would
+# send the next dispatch to the completion pass or the fresh-plan branch,
+# where beta never runs.
+
+_STEP_1_DONE_STEP_2_PENDING = [_done('step-1', _A, 'test'), _pending('step-2', 'impl')]
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_create_plan_wipe_is_restored_and_the_next_dispatch_revalidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    f = _beta_fixture(tmp_path, _STEP_1_DONE_STEP_2_PENDING)
+    _scripted_architect(f, monkeypatch, [[_wipe_to('step-1', 'step-2')], [_confirm]])
+    before = f.artifacts.read_plan()
+
+    first = await f.wf._plan()
+
+    assert first == WorkflowOutcome.BLOCKED
+    assert _no_plan_counter_writes(f) == [1]
+    _assert_restored(f, before)
+
+    second = await f.wf._plan()
+
+    assert second == WorkflowOutcome.PLANNED
+    assert f.build_revalidation_prompt.await_count == 2
+    step_1 = _step(f.artifacts.read_plan(), 'step-1')
+    assert (step_1['status'], step_1['commit']) == ('done', _A)
+
+
+@pytest.mark.parametrize(('passes', 'success'), [
+    pytest.param([[_wipe_to('step-1', 'step-2')]], False, id='capped'),
+    pytest.param([[_wipe_to()], []], True, id='stepless'),
+    pytest.param(
+        [[_wipe_to('step-1', 'step-2'), _mark('step-1', _A), _confirm,
+          _bare_string_prerequisite]],
+        True, id='invalid_prerequisites',
+    ),
+])
+@pytest.mark.asyncio
+async def test_revalidation_exit_before_the_revision_is_accepted_restores_the_done_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    passes: list[list[ArchitectAction]], success: bool,
+):
+    f = _beta_fixture(tmp_path, _STEP_1_DONE_STEP_2_PENDING)
+    f.wf.briefing.build_plan_schema_repair_prompt = AsyncMock(return_value='repair')
+    _scripted_architect(f, monkeypatch, passes, success=success)
+    before = f.artifacts.read_plan()
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    _assert_restored(f, before)
+
+
+@pytest.mark.asyncio
+async def test_revalidation_cancelled_mid_revision_restores_the_done_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    f = _beta_fixture(tmp_path, _STEP_1_DONE_STEP_2_PENDING)
+    _scripted_architect(f, monkeypatch, [
+        [_wipe_to('step-1', 'step-2'), _crash(asyncio.CancelledError())],
+    ])
+    before = f.artifacts.read_plan()
+
+    with pytest.raises(asyncio.CancelledError):
+        await f.wf._plan()
+
+    _assert_restored(f, before)
