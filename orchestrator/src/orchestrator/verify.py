@@ -2622,6 +2622,7 @@ def _summarize_checks(
     lint_duration: float | None = None,
     type_duration: float | None = None,
     leg_categories: Mapping[LegSlot, FailureCategory] | None = None,
+    module: str | None = None,
 ) -> tuple[bool, str, str, str, list[str]]:
     """Classify the three checks into (passed, category, cause_hint, summary,
     failing_leg_categories).
@@ -2698,6 +2699,9 @@ def _summarize_checks(
     same legs, for a caller that also reads one leg's category: classifying
     scans the leg's whole output, so ``run_verification`` classifies once and
     its env-recovery gate reads the test slot. Omitted, it is computed here.
+
+    ``module`` is the verify's module prefix, named in each no-verdict note;
+    ``None`` for a single-module caller.
     """
     passed = test_rc == 0 and lint_rc == 0 and type_rc == 0
     if passed:
@@ -2734,11 +2738,13 @@ def _summarize_checks(
         # killed leg's captured output can itself carry a bailout marker, and
         # task 3173's wording for that case must not regress.
         if is_external_kill_rc(rc):
-            parts.append(_killed_leg_note(label, rc, duration))
+            parts.append(_killed_leg_note(label, rc, duration, module=module))
         elif label is LegSlot.TEST and _is_worker_death_truncated_session(out):
             if _first_surviving_failure_line(out) is not None:
                 parts.append(tool_verdict)
-            parts.append(_worker_death_leg_note(label))
+            parts.append(_worker_death_leg_note(
+                label, module=module, crashed_nodeids=_crash_attributed_nodeids(out),
+            ))
         else:
             parts.append(tool_verdict)
     summary = f'Failures: {_SUMMARY_FRAGMENT_SEPARATOR.join(parts)}'
@@ -8149,8 +8155,8 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         # verify silently degraded to a bare 'Failures: ' with no parts at
         # all — erasing the one fact that says the run produced no verdict.
         # Carry every distinct no-verdict note through verbatim, in child
-        # order, de-duplicated (two subprojects killed identically must not
-        # stutter the same sentence twice).
+        # order, de-duplicated: only identical notes collapse (such as two
+        # unlabelled children), since each module's note names its module.
         for r in results:
             for fragment in r.summary.removeprefix('Failures: ').split(_SUMMARY_FRAGMENT_SEPARATOR):
                 if is_no_verdict_summary(fragment) and fragment not in parts:
