@@ -13,14 +13,21 @@ from typing import Any
 import offline_lane_soak_report as soak_report
 import pytest
 from offline_lane_soak_fixtures import LINT, T0, UNIT, SoakProject, effect, failure
-from orchestrator.flake_ledger import FlakeVerdict, ledger_db_path
-from orchestrator.offline_lane_confirm import Confirmed, ConfirmMode
-from orchestrator.offline_lane_episode_state import CommandRecord
+from orchestrator.flake_ledger import UNKNOWN_TEST_ID, FlakeCallSite, FlakeVerdict, ledger_db_path
+from orchestrator.offline_lane_confirm import (
+    Confirmed,
+    ConfirmMode,
+    Outage,
+    Unconfirmable,
+    UnconfirmableReason,
+)
+from orchestrator.offline_lane_episode_state import CommandRecord, unconfirmable_node
 from orchestrator.offline_lane_filing import LANE_METADATA_KEY
-from orchestrator.offline_lane_records import LanePass, Phase
+from orchestrator.offline_lane_records import LanePass, Phase, ProbeKind, ProbeResult
 from shared.project_layout import escalation_queue_dir
 
 NOW = T0 + timedelta(days=7)
+OUTAGE_PROBE = ProbeResult(ProbeKind.OUTAGE, 75, 'qdrant', 'qdrant: get collections: ConnectError', 1.5)
 CHECKS = (
     'records_well_formed',
     'filings_resolve',
@@ -392,3 +399,95 @@ def test_a_window_with_no_filing_and_no_crossing_has_no_data_to_bound(tmp_path: 
     assert code == 0
     for name in ('filings_resolve', 'filings_bounded_by_threshold'):
         assert (_check(report, name)['verdict'], _check(report, name)['examined']) == ('no_data', 0)
+
+
+# --- (d) ledger_rows_per_pass ----------------------------------------------------------
+
+
+def _reproduced_and_cleared(project: SoakProject, at: datetime, *, cleared_row: FlakeCallSite | None) -> LanePass:
+    """A confirmed pass reproducing NODE_A and clearing NODE_B, with NODE_A's row and, at *cleared_row*, NODE_B's."""
+    lane_pass = project.add_pass(
+        UNIT, at=at, detect=[failure(NODE_A), failure(NODE_B)], confirm=[failure(NODE_A)],
+        outcome=Confirmed(ConfirmMode.NARROWED, (NODE_A,), (NODE_B,), ()), effect=effect(tests_counted=(NODE_A,)),
+    )
+    project.occurrence(lane_pass, [NODE_A], FlakeVerdict.fails_in_isolation)
+    if cleared_row is not None:
+        project.occurrence(lane_pass, [NODE_B], FlakeVerdict.passes_in_isolation, call_site=cleared_row)
+    return lane_pass
+
+
+def _ledger_project(tmp_path: Path, *, last_cleared_row: FlakeCallSite | None) -> tuple[SoakProject, LanePass]:
+    project = SoakProject(tmp_path)
+    project.provision(UNIT)
+    _reproduced_and_cleared(project, T0, cleared_row=FlakeCallSite.offline_lane)
+    last = _reproduced_and_cleared(project, T0 + timedelta(hours=1), cleared_row=last_cleared_row)
+    return project, last
+
+
+def test_every_reproduced_and_cleared_test_with_its_row_passes(tmp_path: Path, capsys):
+    project, _ = _ledger_project(tmp_path, last_cleared_row=FlakeCallSite.offline_lane)
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    check = _check(report, 'ledger_rows_per_pass')
+    assert (check['verdict'], check['examined']) == ('pass', 4)
+
+
+def test_a_missing_row_fails_naming_the_pass_and_the_test(tmp_path: Path, capsys):
+    project, last = _ledger_project(tmp_path, last_cleared_row=None)
+
+    code, report, err = _report(project, capsys)
+
+    assert code == 1
+    assert '[FAIL] ledger_rows_per_pass: examined 4;' in err
+    (failure_line,) = _check(report, 'ledger_rows_per_pass')['failures']
+    assert last.pass_id in failure_line
+    assert NODE_B in failure_line
+
+
+def test_a_row_at_another_call_site_does_not_count(tmp_path: Path, capsys):
+    project, last = _ledger_project(tmp_path, last_cleared_row=FlakeCallSite.merge_gate)
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 1
+    (failure_line,) = _check(report, 'ledger_rows_per_pass')['failures']
+    assert last.pass_id in failure_line
+    assert NODE_B in failure_line
+
+
+def test_the_unconfirmable_pseudo_test_and_the_unknown_id_are_never_required(tmp_path: Path, capsys):
+    project = SoakProject(tmp_path)
+    project.provision(UNIT)
+    lane_pass = project.add_pass(
+        UNIT, at=T0, detect=[failure(NODE_A)], confirm=[failure(NODE_A)],
+        outcome=_reproduced(NODE_A, UNKNOWN_TEST_ID, unconfirmable_node(UNIT)), effect=effect(),
+    )
+    project.occurrence(lane_pass, [NODE_A], FlakeVerdict.fails_in_isolation)
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    check = _check(report, 'ledger_rows_per_pass')
+    assert (check['verdict'], check['examined']) == ('pass', 1)
+
+
+def test_unconfirmable_outage_and_green_passes_examine_nothing(tmp_path: Path, capsys):
+    project = SoakProject(tmp_path)
+    project.provision(UNIT)
+    project.add_pass(UNIT, at=T0, effect=effect())
+    project.add_pass(
+        UNIT, at=T0 + timedelta(hours=1), detect=[failure(NODE_A)],
+        outcome=Unconfirmable(UnconfirmableReason.DETECT_RED_NAMED_NO_TEST, 'exit 1 naming no test'), effect=effect(),
+    )
+    project.add_pass(
+        UNIT, at=T0 + timedelta(hours=2), detect=[failure(NODE_A)], probe=OUTAGE_PROBE,
+        outcome=Outage(OUTAGE_PROBE), effect=effect(),
+    )
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    check = _check(report, 'ledger_rows_per_pass')
+    assert (check['verdict'], check['examined']) == ('no_data', 0)
