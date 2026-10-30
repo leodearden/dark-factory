@@ -16324,9 +16324,12 @@ class TaskWorkflow:
         proceeds. The shared landing ladder runs only when neither the
         worktree HEAD nor the ref carries commits beyond main and the
         worktree is clean; its outcome is returned when it stamps one. Every
-        other case (an empty branch whose worktree holds uncommitted work, a
-        ladder miss, a worktree HEAD on main while the branch is ahead)
-        blocks behind an L1 with ``root_cause='merge-refused:<kind>'``.
+        other case blocks behind an L1 with ``root_cause='merge-refused:<kind>'``:
+        a ladder miss, a worktree HEAD on main while the branch is ahead, and
+        an empty branch whose worktree holds uncommitted work. That last one
+        is refused even on a landed-outbox journal hit, because stamping it
+        done would strand the work; the L1 detail names the journalled
+        ``advanced_sha``.
         """
         assert self.worktree is not None
         state = await read_branch_state(
@@ -16338,7 +16341,14 @@ class TaskWorkflow:
         if kind in (Mergeability.MERGEABLE, Mergeability.UNREADABLE):
             return None
         verdict: str | None = None
-        if kind is Mergeability.BRANCH_EMPTY and not state.worktree_dirty:
+        if kind is Mergeability.BRANCH_EMPTY and state.worktree_dirty:
+            row = MergeProvenance.lookup(self.task_id)
+            if row is not None:
+                verdict = (
+                    f'landed-outbox journal row at advanced_sha {row.advanced_sha}, '
+                    'not stamped: the worktree holds uncommitted changes'
+                )
+        elif kind is Mergeability.BRANCH_EMPTY:
             landed = await self._recover_landed_branch(
                 state.landing_anchor, main_sha, guard=guard,
             )
@@ -16369,30 +16379,22 @@ class TaskWorkflow:
 
         Journal-first (MP-1): a :meth:`MergeProvenance.lookup` hit is
         authoritative and short-circuits before ``is_ancestor`` or the legacy
-        heuristic are ever consulted. A miss falls back to the same
-        stale-branch-point guard as the pre-EXECUTE check: if *branch_head*
-        is an ancestor of main but :meth:`_has_prior_implementation` (called
-        WITHOUT ``wt_head`` — see that method's docstring) finds no
-        implementation entries, this is a spurious merge signal (e.g. an
-        empty branch whose base commit trivially satisfies the ancestor
-        check) and the caller should proceed with the real merge rather than
-        short-circuit.
+        heuristic are ever consulted. A miss falls back to
+        :meth:`_branch_work_landed_on_main`, whose
+        :meth:`_has_prior_implementation` runs WITHOUT ``wt_head`` (see that
+        method's docstring).
 
         Returns ``WorkflowOutcome.DONE`` (via the shared
         :meth:`_finalise_recovery_done` chokepoint, MP-2) when the branch is
         already merged AND there is prior implementation work AND the landing
         is attributable to this task (:meth:`_discovered_landing_sha`, whose
         citation is the stamped sha — task 4704; an unrelated main tip was
-        stamped here for task 3269). Returns
-        ``None`` in all other cases (not an ancestor, a spurious merge
-        signal, no attributable landing — the merge then runs, and a
-        sha-less success surfaces an L1 from :meth:`_finalise_without_merge_sha`
-        — or — task 3057
-        — the chokepoint withholding the recovery
-        because the task's declared ``metadata.delivered_checks`` are not
-        verifiably present on main) so the caller proceeds with the
-        merge-retry loop, which is already how ``_run_merge_phase`` reads a
-        ``None`` result.
+        stamped here for task 3269). Returns ``None`` in all other cases (not
+        landed with recorded work, no attributable landing, or — task 3057 —
+        the chokepoint withholding the recovery because the task's declared
+        ``metadata.delivered_checks`` are not verifiably present on main) so
+        the caller proceeds with the merge-retry loop, which is already how
+        ``_run_merge_phase`` reads a ``None`` result.
         """
         recovered = await self._recover_landed_branch(
             branch_head, main_sha, guard='pre-MERGE',

@@ -10,6 +10,9 @@ merge-queue submission stubbed (its side effect plays the steward), and check
 that each shape is refused by name, that a genuine landing still closes, and
 that a worktree HEAD carrying new work past a ref that already landed still
 merges (the pre-enqueue rebind makes the queue land HEAD, not the stale ref).
+An empty branch is refused with the landing ladder's verdict when the ladder
+misses, and with the journalled sha when the landed-outbox journal has a row
+but the worktree holds uncommitted work.
 
 This file imports no merge-lane module, so ``scripts/merge_lane_metrics.py``
 does not measure its private reads (see
@@ -27,7 +30,8 @@ from unittest.mock import AsyncMock
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
 from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
-from _workflow_helpers import _Fixture, _make, _make_git_ops
+from _workflow_helpers import _bind_landed_row, _Fixture, _make, _make_git_ops
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.workflow import WorkflowOutcome
@@ -116,12 +120,14 @@ class _Scene:
     async def merge(self) -> WorkflowOutcome:
         return await self.wf._merge_and_finalise(BRANCH)
 
-    def pending_root_causes(self) -> list[str]:
+    def pending_l1s(self) -> list[Escalation]:
         return [
-            esc.root_cause
-            for esc in self.queue.get_by_task(TASK_ID, status='pending')
+            esc for esc in self.queue.get_by_task(TASK_ID, status='pending')
             if esc.level == 1
         ]
+
+    def pending_root_causes(self) -> list[str]:
+        return [esc.root_cause for esc in self.pending_l1s()]
 
 
 @pytest.fixture
@@ -164,6 +170,40 @@ async def test_an_empty_branch_at_merge_entry_is_refused_before_enqueue(
 
     assert outcome == WorkflowOutcome.BLOCKED
     assert scene.pending_root_causes() == ['merge-refused:branch_empty']
+    scene.submit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_clean_empty_branch_the_ladder_misses_is_refused_with_its_verdict(
+    scene: _Scene,
+) -> None:
+    _git(scene.wt, 'reset', '--hard', 'main')
+
+    outcome = await scene.merge()
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    (refusal,) = scene.pending_l1s()
+    assert refusal.root_cause == 'merge-refused:branch_empty'
+    assert 'landing_verdict: journal miss;' in refusal.detail
+    scene.fixture.mark_done.assert_not_awaited()
+    scene.submit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_journalled_landing_with_uncommitted_work_is_refused_naming_its_sha(
+    scene: _Scene, tmp_path: Path,
+) -> None:
+    advanced_sha = 'a' * 40
+    _bind_landed_row(tmp_path, task_id=TASK_ID, advanced_sha=advanced_sha)
+    scene.reset_branch_to_main_keeping_work_staged()
+
+    outcome = await scene.merge()
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    (refusal,) = scene.pending_l1s()
+    assert refusal.root_cause == 'merge-refused:branch_empty'
+    assert f'advanced_sha {advanced_sha}' in refusal.detail
+    scene.fixture.mark_done.assert_not_awaited()
     scene.submit.assert_not_awaited()
 
 
