@@ -2018,7 +2018,7 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
 })
 
 # A SYNTHETIC debt mapping for the path-matching tests, which drive the pure
-# _debt_budget helper with it.  It names no real file, so no migration can ever
+# _debt_entry helper with it.  It names no real file, so no migration can ever
 # shrink it out from under them.
 _SYNTHETIC_DEBT_ENTRY = 'orchestrator/tests/test_synthetic_rule_c_debt.py'
 _SYNTHETIC_RULE_C_DEBT = {_SYNTHETIC_DEBT_ENTRY: 2}
@@ -2042,8 +2042,9 @@ def _live_rule_c_debt_entry() -> tuple[str, int]:
         pytest.fail(
             'the Rule C debt baseline is empty: every file is migrated. Retire the '
             'debt machinery in this same change: _WALL_CLOCK_DEADLINE_DEBT, '
-            '_debt_budget, _apply_debt_budget and _wall_clock_overrun_msg in '
-            'check_bare_magicmock_config.py, and the tests that call '
+            '_debt_entry, _DebtEntry, _apply_debt_budget, _wall_clock_overrun_msg '
+            'and _wall_clock_slack_msg in check_bare_magicmock_config.py, and the '
+            'tests that call '
             '_live_rule_c_debt_entry here'
         )
     return max(debt.items(), key=lambda item: item[1])
@@ -2056,7 +2057,11 @@ def _against_a_budget_of_1(copies: int) -> list:
         f'_RULE_C_ONE_HIT must yield exactly one raw hit per copy; got {found!r}'
     )
     return _checker._apply_debt_budget(
-        found, 1, build_overrun_msg=_checker._wall_clock_overrun_msg
+        found,
+        _checker._DebtEntry(_SYNTHETIC_DEBT_ENTRY, 1),
+        filename=_NON_DEBT_FILE,
+        build_overrun_msg=_checker._wall_clock_overrun_msg,
+        build_slack_msg=_checker._wall_clock_slack_msg,
     )
 
 
@@ -2149,9 +2154,9 @@ class TestWallClockDeadlineDebtBaseline:
         The nine call sites pass repo-relative paths; pytest passes absolutes. Both
         must reach the same verdict or the baseline would be invisible to one caller.
         """
-        assert _checker._debt_budget(_SYNTHETIC_DEBT_ENTRY, _SYNTHETIC_RULE_C_DEBT) == 2
+        assert _checker._debt_entry(_SYNTHETIC_DEBT_ENTRY, _SYNTHETIC_RULE_C_DEBT).budget == 2
         absolute = str(_REPO_ROOT / _SYNTHETIC_DEBT_ENTRY)
-        assert _checker._debt_budget(absolute, _SYNTHETIC_RULE_C_DEBT) == 2, (
+        assert _checker._debt_entry(absolute, _SYNTHETIC_RULE_C_DEBT).budget == 2, (
             f'an absolute path to a debt file must resolve to its budget; '
             f'filename={absolute!r}'
         )
@@ -2166,16 +2171,16 @@ class TestWallClockDeadlineDebtBaseline:
 
     def test_matching_is_path_component_aware_not_substring(self):
         """Trailing-COMPONENT matching: a substring match must not grandfather an unrelated file."""
-        assert _checker._debt_budget('evil/' + _SYNTHETIC_DEBT_ENTRY, _SYNTHETIC_RULE_C_DEBT) == 2, (
+        assert _checker._debt_entry('evil/' + _SYNTHETIC_DEBT_ENTRY, _SYNTHETIC_RULE_C_DEBT).budget == 2, (
             'a path whose real trailing components are a debt entry resolves to its budget'
         )
         substring = 'orchestrator/tests/not_test_synthetic_rule_c_debt.py'
-        assert _checker._debt_budget(substring, _SYNTHETIC_RULE_C_DEBT) is None, (
+        assert _checker._debt_entry(substring, _SYNTHETIC_RULE_C_DEBT) is None, (
             f'{substring} merely CONTAINS a debt filename as a substring; a substring '
             'match must not grandfather it'
         )
         bare = 'test_synthetic_rule_c_debt.py'
-        assert _checker._debt_budget(bare, _SYNTHETIC_RULE_C_DEBT) is None, (
+        assert _checker._debt_entry(bare, _SYNTHETIC_RULE_C_DEBT) is None, (
             'a bare basename at another root shares only ONE trailing component and '
             'must not be grandfathered'
         )
@@ -2258,23 +2263,45 @@ class TestWallClockDeadlineDebtBaseline:
                 f'Rule C overrun message must not offer {foreign!r}: {message!r}'
             )
 
-    def test_the_overrun_builder_is_required_and_keyword_only(self):
+    def test_against_a_budget_of_1_with_no_hits_reports_one_file_level_slack(self):
+        """Below budget the pure arithmetic yields ONE violation at line 1, not per site."""
+        slack = _against_a_budget_of_1(0)
+        assert [v.lineno for v in slack] == [1], (
+            f'0 hits against a budget of 1 must report exactly one file-level slack '
+            f'violation at line 1; got {slack!r}'
+        )
+
+    def test_both_budget_builders_are_required_and_keyword_only(self):
         """A future Rule D must not be able to inherit another rule's remedy by omission.
 
-        The parameter briefly carried ``= None`` falling back to Rule B's own
+        The overrun parameter briefly carried ``= None`` falling back to Rule B's own
         builder. Both call sites passed it, so the fallback was dead — but a
         fourth rule calling ``_apply_debt_budget(found, budget)`` would have
         silently prescribed a mock-double remedy for a wall-clock overrun, with
-        no type error and no failing test. Requiredness is the whole guard, so it
-        is pinned here rather than trusted.
+        no type error and no failing test. The slack builder (task 6202) carries the
+        same guard. Requiredness is the whole guard, so it is pinned here rather
+        than trusted.
         """
-        # Omitting the builder must fail: no default to fall back on.
-        with pytest.raises(TypeError):
-            _checker._apply_debt_budget([], 1)  # type: ignore[call-arg]
-        # Passing it positionally must fail too: keyword-only, so a stray
-        # positional argument can never land in it by accident.
-        with pytest.raises(TypeError):
-            _checker._apply_debt_budget([], 1, _checker._wall_clock_overrun_msg)  # type: ignore[misc]
+        entry = _checker._DebtEntry(_SYNTHETIC_DEBT_ENTRY, 1)
+        builders = {
+            'build_overrun_msg': _checker._wall_clock_overrun_msg,
+            'build_slack_msg': _checker._wall_clock_slack_msg,
+        }
+        # The complete call is accepted, so each TypeError below has one cause.
+        assert len(
+            _checker._apply_debt_budget([], entry, filename=_NON_DEBT_FILE, **builders)
+        ) == 1
+        for name, builder in builders.items():
+            others = {k: v for k, v in builders.items() if k != name}
+            # Omitting the builder must fail: no default to fall back on.
+            with pytest.raises(TypeError):
+                _checker._apply_debt_budget([], entry, filename=_NON_DEBT_FILE, **others)
+            # Passing it positionally must fail too: keyword-only, so a stray
+            # positional argument can never land in it by accident.
+            with pytest.raises(TypeError):
+                _checker._apply_debt_budget(
+                    [], entry, builder, filename=_NON_DEBT_FILE, **others
+                )
 
 
 class TestWallClockDeadlineDebtSlack:
