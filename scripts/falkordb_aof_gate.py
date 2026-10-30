@@ -39,13 +39,14 @@ LOADED_MANIFEST_TYPES = ("b", "i")
 STOPPED_STATES = ("created", "exited")
 COMMAND_TIMEOUT_SECS = 240
 RUNBOOK = 'OPERATIONS.md "FalkorDB settings and the recreate gate"'
+ENABLE_AOF_STEPS = (
+    "run `docker exec docker-falkordb-1 redis-cli CONFIG SET appendonly yes`, wait until "
+    "`redis-cli INFO persistence` shows aof_rewrite_in_progress:0"
+)
 
 
 class Remedy(enum.Enum):
-    ENABLE_AOF = (
-        "run `docker exec docker-falkordb-1 redis-cli CONFIG SET appendonly yes`, wait until "
-        "`redis-cli INFO persistence` shows aof_rewrite_in_progress:0, then restart fused-memory"
-    )
+    ENABLE_AOF = f"{ENABLE_AOF_STEPS}, then restart fused-memory"
     WAIT = (
         "wait until `docker exec docker-falkordb-1 redis-cli INFO persistence` shows loading:0 and "
         "aof_rewrite_in_progress:0, then restart fused-memory"
@@ -188,8 +189,11 @@ class ServerAofConfig:
 
     @classmethod
     def parse(cls, config_json: str) -> "ServerAofConfig":
-        config = json.loads(config_json)
-        return cls(*(str(config[name]) for name in AOF_CONFIG_KEYS))
+        try:
+            config = json.loads(config_json)
+            return cls(*(str(config[name]) for name in AOF_CONFIG_KEYS))
+        except (ValueError, LookupError, TypeError) as exc:
+            raise ValueError(f"CONFIG GET {' '.join(AOF_CONFIG_KEYS)} replied: {config_json.strip()}") from exc
 
     @classmethod
     def read(cls, docker: Docker, container_id: str) -> "ServerAofConfig":

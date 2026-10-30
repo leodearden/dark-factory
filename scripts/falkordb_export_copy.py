@@ -13,7 +13,11 @@ require the AOF on, BGSAVE, then BGREWRITEAOF, which leaves a manifest newer
 than dump.rdb by construction. Only dump.rdb, the manifest and the base/incr
 files the copied manifest names are then copied, mtimes kept, between the INFO
 read that saw the rewrite finish and one taken after the copy, which must show
-no save or rewrite landing in between. A raced copy is not retried: it means
+no save or rewrite landing in between. The destination's manifest is removed
+before the copy and written last, from the text the file list was read from;
+any failure after that removes it again, so a failed export, or a failed re-run
+over an earlier one, holds no manifest and import-data.sh refuses it. A raced
+copy is not retried: it means
 something still writes FalkorDB, which a silent second attempt would hide. The
 source is the container's own data mount, never an argument, so a worktree's
 copy of the export cannot flush the live server and then copy an empty dir.
@@ -30,10 +34,10 @@ from pathlib import Path
 
 from falkordb_aof_gate import (
     DATA_DIR_IN_CONTAINER,
+    ENABLE_AOF_STEPS,
     Container,
     Docker,
     ProbeFailed,
-    Remedy,
     Runner,
     ServerAofConfig,
     loaded_aof_file_names,
@@ -96,30 +100,31 @@ class SaveState:
 
 @dataclass(frozen=True)
 class Flush:
+    """A background flush: the INFO field counting its completions and the one reporting its outcome,
+    each named for messages and read through a typed accessor."""
+
     command: str
     counter: str
+    count: Callable[[SaveState], int]
     status: str
-
-    def count(self, state: SaveState) -> int:
-        return getattr(state, self.counter)
-
-    def outcome(self, state: SaveState) -> str:
-        return getattr(state, self.status)
+    outcome: Callable[[SaveState], str]
 
 
-SAVE = Flush("BGSAVE", "rdb_saves", "rdb_last_bgsave_status")
-REWRITE = Flush("BGREWRITEAOF", "aof_rewrites", "aof_last_bgrewrite_status")
+SAVE = Flush("BGSAVE", "rdb_saves", lambda s: s.rdb_saves,
+             "rdb_last_bgsave_status", lambda s: s.rdb_last_bgsave_status)
+REWRITE = Flush("BGREWRITEAOF", "aof_rewrites", lambda s: s.aof_rewrites,
+                "aof_last_bgrewrite_status", lambda s: s.aof_last_bgrewrite_status)
 
 
 class Server:
     """The running falkordb container's redis, read and driven through ``docker exec``."""
 
-    def __init__(self, docker: Docker, container_id: str, args: argparse.Namespace,
+    def __init__(self, docker: Docker, container_id: str, *, timeout_secs: float, poll_secs: float,
                  sleep: Callable[[float], None], clock: Callable[[], float]):
         self._docker = docker
         self._container_id = container_id
-        self._timeout_secs: float = args.timeout_secs
-        self._poll_secs: float = args.poll_secs
+        self._timeout_secs = timeout_secs
+        self._poll_secs = poll_secs
         self._sleep = sleep
         self._clock = clock
 
@@ -173,14 +178,19 @@ def main(
     except (ExportFailed, ProbeFailed) as exc:
         log(f"FAILED: {exc}")
         return 1
+    except (ValueError, LookupError, TypeError) as exc:
+        log(f"FAILED: docker or redis-cli gave a reply this helper cannot read ({type(exc).__name__}: {exc})")
+        return 1
     return 0
 
 
 def export(docker: Docker, args: argparse.Namespace,
            sleep: Callable[[float], None], clock: Callable[[], float]) -> str:
     container_id, host_dir = _running_falkordb(docker)
-    server = Server(docker, container_id, args, sleep, clock)
+    server = Server(docker, container_id, timeout_secs=args.timeout_secs, poll_secs=args.poll_secs,
+                    sleep=sleep, clock=clock)
     config = ServerAofConfig.read(docker, container_id)
+    _require_mounted_dir(config, container_id, host_dir)
     _require_aof(config, server.wait_until(lambda s: s.idle, "the server to be idle"))
     _flush(server, SAVE)
     rewritten = _flush(server, REWRITE)
@@ -201,18 +211,27 @@ def _running_falkordb(docker: Docker) -> tuple[str, Path]:
     return container.id, Path(container.data_mount)
 
 
+def _require_mounted_dir(config: ServerAofConfig, container_id: str, host_dir: Path) -> None:
+    if config.dir != DATA_DIR_IN_CONTAINER:
+        raise ExportFailed(
+            f"the server writes to {config.dir}, but {host_dir} is mounted at {DATA_DIR_IN_CONTAINER}, so the "
+            f"files there are not the ones it saves. Nothing was flushed or copied. REMEDY: inspect "
+            f"`docker exec {container_id} redis-cli CONFIG GET dir` and `docker inspect {container_id}` by hand; "
+            "files saved outside the mount may exist only inside the container, so copy them out before "
+            "recreating it, then re-run the export"
+        )
+
+
 def _require_aof(config: ServerAofConfig, state: SaveState) -> None:
     problems = []
     if config.appendonly != "yes":
         problems.append(f"appendonly is {config.appendonly}")
     if state.aof_enabled != "1":
         problems.append(f"aof_enabled:{state.aof_enabled}")
-    if config.dir != DATA_DIR_IN_CONTAINER:
-        problems.append(f"the server writes to {config.dir}, not the mounted {DATA_DIR_IN_CONTAINER}")
     if problems:
         raise ExportFailed(
             f"{'; '.join(problems)}. Nothing was flushed or copied: import-data.sh would refuse an export "
-            f"without a current AOF. REMEDY: {Remedy.ENABLE_AOF.value}, then re-run the export"
+            f"without a current AOF. REMEDY: {ENABLE_AOF_STEPS}, then re-run the export"
         )
 
 
@@ -235,15 +254,16 @@ def _flush(server: Server, flush: Flush) -> SaveState:
 def _bracketed_copy(
     server: Server, before: SaveState, host_dir: Path, config: ServerAofConfig, dest: Path,
 ) -> tuple[int, SaveState]:
+    copied_manifest = dest / config.appenddirname / config.manifest_name
     try:
+        copied_manifest.unlink(missing_ok=True)
         copied = _copy_restore_set(host_dir, config, dest)
-    except OSError as exc:
-        raise ExportFailed(
-            f"copying the restore set failed ({exc}); a named file that vanished means a rewrite replaced it "
-            f"mid-copy, so {STILL_WRITING}"
-        ) from exc
-    after = server.info()
-    _require_steady(before, after)
+        after = server.info()
+        _require_steady(before, after)
+    except BaseException:
+        copied_manifest.unlink(missing_ok=True)
+        log(f"left no {config.manifest_name} under {dest}, so import-data.sh refuses this partial export")
+        raise
     return copied, after
 
 
@@ -261,13 +281,21 @@ def _require_steady(before: SaveState, after: SaveState) -> None:
 
 def _copy_restore_set(host_dir: Path, config: ServerAofConfig, dest: Path) -> int:
     manifest = Path(config.appenddirname) / config.manifest_name
-    (dest / config.appenddirname).mkdir(parents=True, exist_ok=True)
-    if (host_dir / RDB_FILE).exists():
-        shutil.copy2(host_dir / RDB_FILE, dest / RDB_FILE)
-    shutil.copy2(host_dir / manifest, dest / manifest)
-    names = loaded_aof_file_names((dest / manifest).read_text())
-    for name in names:
-        shutil.copy2(host_dir / config.appenddirname / name, dest / config.appenddirname / name)
+    try:
+        manifest_bytes = (host_dir / manifest).read_bytes()
+        names = loaded_aof_file_names(manifest_bytes.decode())
+        (dest / config.appenddirname).mkdir(parents=True, exist_ok=True)
+        if (host_dir / RDB_FILE).exists():
+            shutil.copy2(host_dir / RDB_FILE, dest / RDB_FILE)
+        for name in names:
+            shutil.copy2(host_dir / config.appenddirname / name, dest / config.appenddirname / name)
+        (dest / manifest).write_bytes(manifest_bytes)
+        shutil.copystat(host_dir / manifest, dest / manifest)
+    except OSError as exc:
+        raise ExportFailed(
+            f"copying the restore set failed ({exc}); a named file that vanished means a rewrite replaced it "
+            f"mid-copy, so {STILL_WRITING}"
+        ) from exc
     return len(names)
 
 

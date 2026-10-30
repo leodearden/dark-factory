@@ -4,7 +4,8 @@ FakeFalkorDB answers the helper's docker and redis-cli commands from a small
 stateful model of one redis server whose host data dir is a tmp dir. BGSAVE and
 BGREWRITEAOF start a child that finishes a few INFO polls later and writes real
 files with strictly increasing mtimes. Like redis-cli 8.6.2 (measured), an error
-reply arrives on stdout with exit 0. FakeClock stands in for time.
+reply arrives on stdout with exit 0, as ``error:"..."`` under ``--json``.
+FakeClock stands in for time.
 
 The seeded data dir is the measured live state: an AOF manifest OLDER than
 dump.rdb, plus a stray temp-1.rdb.
@@ -36,6 +37,10 @@ CHILD_STATUS = {
     "rdb_bgsave_in_progress": "rdb_last_bgsave_status",
     "aof_rewrite_in_progress": "aof_last_bgrewrite_status",
 }
+CONFIG_ERROR_REPLY = (
+    'error:"ERR unknown command \'CONFIG\', with args beginning with: '
+    "'GET' 'appendonly' 'dir' 'appenddirname' 'appendfilename' \""
+)
 MODULE_FORK_REPLY = (
     "ERR Another child process is active (AOF?): can't BGSAVE right now. "
     "Use BGSAVE SCHEDULE in order to schedule a BGSAVE whenever possible."
@@ -70,13 +75,16 @@ class FakeFalkorDB:
     status err, ``rejects`` a command answered with an error reply, and ``exec_fails`` makes every
     ``docker exec`` fail as on a container that went away. ``races`` names a save or rewrite that
     lands on the first INFO read made once ``race_when()`` holds;
-    ``drops_incr`` makes a rewrite delete the incr file its manifest names."""
+    ``drops_incr`` makes a rewrite delete the incr file its manifest names. ``server_dir`` is the
+    ``dir`` CONFIG GET reports, and ``config_reply`` replaces CONFIG GET's whole reply."""
 
     def __init__(
         self,
         data_dir: Path,
         *,
         appendonly: str = "yes",
+        server_dir: str = DATA_DIR_IN_CONTAINER,
+        config_reply: str | None = None,
         listed: bool = True,
         status: str = "running",
         in_flight: str | None = None,
@@ -93,6 +101,8 @@ class FakeFalkorDB:
         self.data_dir = data_dir
         self.aof_dir = data_dir / "appendonlydir"
         self.appendonly = appendonly
+        self.server_dir = server_dir
+        self.config_reply = config_reply
         self.listed = listed
         self.status = status
         self.loading_polls = loading_polls
@@ -156,10 +166,12 @@ class FakeFalkorDB:
             return CommandResult(0, json.dumps([self._inspect()]), "")
         if command[:3] == ("docker", "exec", CONTAINER) and self.exec_fails:
             return CommandResult(1, "", f"Error response from daemon: container {CONTAINER} is not running")
+        if command == CONFIG_GET and self.config_reply is not None:
+            return CommandResult(0, self.config_reply + "\n", "")
         if command == CONFIG_GET:
             config = {
                 "appendonly": self.appendonly,
-                "dir": DATA_DIR_IN_CONTAINER,
+                "dir": self.server_dir,
                 "appenddirname": "appendonlydir",
                 "appendfilename": "appendonly.aof",
             }
@@ -276,6 +288,23 @@ def _files_under(root: Path) -> set[str]:
     return {str(path.relative_to(root)) for path in root.rglob("*") if path.is_file()}
 
 
+def _a_manifest_was_copied(dest: Path) -> Callable[[], bool]:
+    """Holds once the copy has written a manifest anywhere beside *dest*, wherever it stages it."""
+    return lambda: any(dest.parent.rglob(Path(MANIFEST).name))
+
+
+def _seed_earlier_export(dest: Path) -> None:
+    earlier = {
+        "dump.rdb": b"dump-earlier",
+        MANIFEST: _manifest(7, None).encode(),
+        "appendonlydir/appendonly.aof.7.base.rdb": b"base-7",
+        "appendonlydir/appendonly.aof.7.incr.aof": b"incr-7",
+    }
+    for name, data in earlier.items():
+        (dest / name).parent.mkdir(parents=True, exist_ok=True)
+        (dest / name).write_bytes(data)
+
+
 def test_a_running_server_is_saved_then_rewritten_then_copied(data_dir, dest):
     fake = FakeFalkorDB(data_dir)
     manifest_before = (data_dir / MANIFEST).stat().st_mtime_ns
@@ -310,12 +339,25 @@ def test_only_the_restore_set_is_copied(data_dir, dest):
     assert "temp-1.rdb" not in copied
 
 
+AOF_OFF_REMEDY = ("import-data.sh would refuse", "CONFIG SET appendonly yes", "then re-run the export")
+
+
 @pytest.mark.parametrize(
-    ("server", "field"),
-    [({"appendonly": "no"}, "appendonly"), ({"aof_enabled": "0"}, "aof_enabled")],
-    ids=["config-appendonly-no", "info-aof-enabled-0"],
+    ("server", "findings", "misleads"),
+    [
+        ({"appendonly": "no"}, ("appendonly is no", *AOF_OFF_REMEDY), "restart fused-memory"),
+        ({"aof_enabled": "0"}, ("aof_enabled:0", *AOF_OFF_REMEDY), "restart fused-memory"),
+        (
+            {"server_dir": "/data"},
+            ("writes to /data", f"mounted at {DATA_DIR_IN_CONTAINER}", f"{CONTAINER} redis-cli CONFIG GET dir"),
+            "appendonly",
+        ),
+    ],
+    ids=["config-appendonly-no", "info-aof-enabled-0", "dir-outside-the-mount"],
 )
-def test_a_server_with_the_aof_off_is_refused_before_anything_is_written(data_dir, dest, capsys, server, field):
+def test_a_server_not_persisting_into_the_mounted_aof_is_refused_before_anything_is_written(
+    data_dir, dest, capsys, server, findings, misleads,
+):
     fake = FakeFalkorDB(data_dir, **server)
 
     assert _export(fake, dest) == 1
@@ -323,8 +365,21 @@ def test_a_server_with_the_aof_off_is_refused_before_anything_is_written(data_di
     assert fake.sent == []
     assert not dest.exists()
     err = capsys.readouterr().err
-    assert field in err
-    assert "import-data.sh" in err and "refuse" in err
+    for finding in findings:
+        assert finding in err, finding
+    assert misleads not in err
+
+
+def test_an_error_reply_to_config_get_fails_the_export_without_a_traceback(data_dir, dest, capsys):
+    fake = FakeFalkorDB(data_dir, config_reply=CONFIG_ERROR_REPLY)
+
+    assert _export(fake, dest) == 1
+
+    assert fake.sent == []
+    assert not dest.exists()
+    err = capsys.readouterr().err
+    assert "FAILED" in err and CONFIG_ERROR_REPLY in err
+    assert "Traceback" not in err
 
 
 @pytest.mark.parametrize("in_flight", ["rdb_bgsave_in_progress", "aof_rewrite_in_progress"])
@@ -415,7 +470,7 @@ def test_a_container_that_is_not_running_fails_the_export(data_dir, dest, capsys
     ("counter", "before", "after"), [("aof_rewrites", 1, 2), ("rdb_saves", 201, 202)],
 )
 def test_a_save_or_rewrite_that_lands_during_the_copy_fails_the_export(data_dir, dest, capsys, counter, before, after):
-    fake = FakeFalkorDB(data_dir, races=counter, race_when=(dest / MANIFEST).exists)
+    fake = FakeFalkorDB(data_dir, races=counter, race_when=_a_manifest_was_copied(dest))
 
     assert _export(fake, dest) == 1
 
@@ -423,6 +478,7 @@ def test_a_save_or_rewrite_that_lands_during_the_copy_fails_the_export(data_dir,
     err = capsys.readouterr().err
     assert f"{counter} {before}→{after}" in err
     assert "still writing to FalkorDB" in err
+    assert not (dest / MANIFEST).exists()
 
 
 def test_a_save_landing_just_after_the_rewrite_fails_the_export(data_dir, dest, capsys):
@@ -444,3 +500,16 @@ def test_a_copy_whose_named_file_vanished_fails_the_export(data_dir, dest, capsy
     err = capsys.readouterr().err
     assert str(data_dir / "appendonlydir" / "appendonly.aof.2.incr.aof") in err
     assert "Traceback" not in err
+    assert not (dest / MANIFEST).exists()
+
+
+def test_a_failed_export_over_an_earlier_one_leaves_no_manifest(data_dir, dest, capsys):
+    """A re-run into the same export dir must not leave the earlier manifest beside a newer dump.rdb."""
+    _seed_earlier_export(dest)
+    fake = FakeFalkorDB(data_dir, drops_incr=True)
+
+    assert _export(fake, dest) == 1
+
+    assert (dest / "dump.rdb").read_bytes() == b"dump-201"
+    assert not (dest / MANIFEST).exists()
+    assert "import-data.sh refuses this partial export" in capsys.readouterr().err
