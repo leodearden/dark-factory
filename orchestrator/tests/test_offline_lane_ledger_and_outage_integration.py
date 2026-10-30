@@ -15,28 +15,35 @@ This module adds tests only: no production module changes with it.
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _flake_golden import merge_gate_deflake_description
 from _offline_lane_red_path_fixtures import (
     COMMIT_SPAWNS,
     NINE,
     PROBED_COMMAND,
     A,
+    B,
     C,
     LegacyLeg,
     ProbeAnswer,
     RedPathLane,
     Run,
+    StoreFault,
     effect_of,
     lane_test_timeout,
     merge_gate_suppression,
+    sync_storm_window,
 )
+from escalation.categories import EscalationCategory
 from shared.lane_probe import OUTAGE_EXIT_STATUS
 
+from orchestrator.flake_debt_drain import STALE_DUE_ESCALATION_SENTINEL
 from orchestrator.flake_ledger import (
     UNKNOWN_TEST_ID,
+    DebtRow,
     DebtTrigger,
     DueRow,
     FlakeOccurrenceRow,
@@ -52,6 +59,8 @@ RED_A = Run(failed={A: 'AssertionError: a'})
 CLEARS_A = (RED_A, Run(passed=(A,)))
 GREEN_A = Run(passed=(A,))
 NUMERIC_IDS = ('numeric_suite::case_1', 'numeric_suite::case_2')
+STORM = EscalationCategory.MERGE_FLAKE_SUPPRESSION_STORM
+REGRESSED = EscalationCategory.REGRESSED_AFTER_RESOLUTION
 
 
 def detail_of(row: FlakeOccurrenceRow) -> dict:
@@ -356,3 +365,179 @@ async def test_scenario_34_a_restart_between_the_ledger_write_and_the_episode_sa
 
     assert [task['id'] for task in lane.store.deflake_tasks()] == [owner['id']]
     assert lane.due() == []
+
+
+def debt_of(lane: RedPathLane, test_id: str) -> DebtRow:
+    debt = lane.debt(test_id)
+    assert debt is not None, f'{test_id} owes no flake debt'
+    return debt
+
+
+async def owned_clear(lane: RedPathLane) -> str:
+    """A cleared, then drained to its de-flake owner; the owner's id."""
+    await lane.advance(*CLEARS_A)
+    await lane.drain()
+    owner = debt_of(lane, A).owner_task_id
+    assert owner is not None
+    return owner
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=6))
+async def test_scenario_30_lane_clears_never_count_toward_the_merge_gates_storm_window(tmp_path, monkeypatch):
+    await sync_storm_window(tmp_path / 'scratch')
+    lane = await RedPathLane.open(tmp_path, monkeypatch)
+    storms: list[int] = []
+
+    for index, node in enumerate(NINE[:6]):
+        await lane.advance(Run(failed={node: 'AssertionError: n'}), Run(passed=(node,)))
+        storms.append(len(lane.queued(category=STORM)))
+        if index < 5:
+            await lane.record_merge_gate(merge_gate_suppression(B, index), task_id='42')
+            storms.append(len(lane.queued(category=STORM)))
+
+    assert storms == [0] * 9 + [1, 1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=2))
+async def test_scenario_31_a_clear_after_the_fix_landed_escalates_a_regression_and_files_cycle_2(
+    tmp_path, monkeypatch,
+):
+    lane = await RedPathLane.open(tmp_path, monkeypatch)
+    first_owner = await owned_clear(lane)
+    lane.store.set_status(first_owner, 'done', fix_commit=await lane.head())
+
+    await lane.advance(*CLEARS_A)
+    await lane.drain()
+
+    [regression] = lane.queued(category=REGRESSED)
+    assert 'an offline-lane clear' in regression.detail
+    assert A in regression.summary
+    debt = debt_of(lane, A)
+    assert debt.open_count == 2
+    assert debt.owner_task_id not in (None, first_owner)
+    assert debt.owner_task_id is not None
+    assert 'cycle 2' in lane.store.task(debt.owner_task_id)['title']
+    await lane.drain()
+    assert len(lane.queued(category=REGRESSED)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=0))
+async def test_scenario_32_the_merge_gates_own_suppressions_storm_and_file_its_worded_owner(tmp_path, monkeypatch):
+    await sync_storm_window(tmp_path / 'scratch')
+    lane = await RedPathLane.open(tmp_path, monkeypatch)
+    test_id = 'tests/test_m.py::test_merge'
+
+    for index in range(5):
+        await lane.record_merge_gate(merge_gate_suppression(test_id, index), task_id='42')
+    await lane.drain()
+
+    assert [(row.verdict, row.call_site, row.detail) for row in lane.rows(test_id)] == [
+        ('passes_in_isolation', 'merge_gate', '{}'),
+    ] * 5
+    debt = debt_of(lane, test_id)
+    assert debt.owner_task_id is not None
+    [storm] = lane.queued(category=STORM)
+    assert (storm.severity, storm.level) == ('critical', 2)
+    [task] = lane.store.deflake_tasks()
+    assert task['id'] == debt.owner_task_id
+    assert task['title'] == (
+        f'Flake debt: {test_id} — passes_in_isolation after a merge-gate red was suppressed, cycle 1'
+    )
+    assert task['description'] == merge_gate_deflake_description(debt)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=3, extra_spawns=4))
+async def test_scenario_40a_a_clear_at_a_head_without_the_fix_is_dropped_and_one_with_it_regresses(
+    tmp_path, monkeypatch,
+):
+    lane = await RedPathLane.open(tmp_path, monkeypatch)
+    first_owner = await owned_clear(lane)
+    fix = await lane.side_commit()
+    lane.store.set_status(first_owner, 'done', fix_commit=fix)
+
+    await lane.advance(*CLEARS_A)
+    await lane.drain()
+    assert len(lane.rows(A)) == 2
+    assert debt_of(lane, A).open_count == 1
+    assert lane.queued(category=REGRESSED) == []
+    assert [task['id'] for task in lane.store.deflake_tasks()] == [first_owner]
+
+    await lane.merge(fix)
+    await lane.advance(*CLEARS_A)
+    await lane.drain()
+
+    debt = debt_of(lane, A)
+    assert debt.open_count == 2
+    assert len(lane.queued(category=REGRESSED)) == 1
+    assert debt.owner_task_id is not None
+    assert debt.owner_task_id != first_owner
+    assert 'cycle 2' in lane.store.task(debt.owner_task_id)['title']
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=2, extra_spawns=1))
+async def test_scenario_40b_an_item_due_before_its_owner_finished_with_a_fix_it_lacks_is_dropped(
+    tmp_path, monkeypatch,
+):
+    lane = await RedPathLane.open(tmp_path, monkeypatch)
+    first_owner = await owned_clear(lane)
+    fix = await lane.side_commit()
+    await lane.advance(*CLEARS_A)
+    assert [item.test_id for item in lane.due()] == [A]
+
+    lane.store.set_status(first_owner, 'done', fix_commit=fix)
+    await lane.drain()
+
+    assert lane.due() == []
+    assert debt_of(lane, A).open_count == 1
+    assert lane.queued(category=REGRESSED) == []
+    assert [task['id'] for task in lane.store.deflake_tasks()] == [first_owner]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=1))
+async def test_scenario_41_a_store_outage_leaves_both_call_sites_items_due_backed_off_and_surfaced(
+    tmp_path, monkeypatch,
+):
+    lane = await RedPathLane.open(tmp_path, monkeypatch)
+    lane.store.degrade(StoreFault.TRANSPORT_DOWN)
+    mark = len(lane.store.calls)
+    await lane.advance(*CLEARS_A)
+    assert lane.store.calls_since(mark) == []
+    await lane.record_merge_gate(merge_gate_suppression(B, 0), task_id='42')
+    assert lane.store.calls_since(mark) == []
+    t0 = datetime.now(UTC)
+
+    attempts = {A: 0, B: 0}
+    delays: dict[str, list[timedelta]] = {A: [], B: []}
+    for minutes in (0, 1, 6, 7):
+        at = t0 + timedelta(minutes=minutes)
+        await lane.drain_at(at)
+        due = lane.due()
+        assert sorted(item.test_id for item in due) == [A, B]
+        for item in due:
+            if item.attempts > attempts[item.test_id]:
+                attempts[item.test_id] = item.attempts
+                delays[item.test_id].append(datetime.fromisoformat(item.next_attempt_at) - at)
+    assert min(attempts.values()) >= 2
+    for test_id in (A, B):
+        assert delays[test_id][1] > delays[test_id][0], test_id
+    assert lane.queued(task_id=STALE_DUE_ESCALATION_SENTINEL) == []
+
+    await lane.drain_at(t0 + timedelta(minutes=31))
+    [stale] = lane.queued(task_id=STALE_DUE_ESCALATION_SENTINEL)
+    assert A in stale.detail
+    assert B in stale.detail
+
+    lane.store.restore()
+    settle_at = max(datetime.fromisoformat(item.next_attempt_at) for item in lane.due()) + timedelta(minutes=1)
+    await lane.drain_at(settle_at)
+    assert all(debt_of(lane, test_id).owner_task_id is not None for test_id in (A, B))
+    await lane.drain_at(settle_at + timedelta(minutes=1))
+    resolved = lane.get(stale.id)
+    assert resolved is not None
+    assert resolved.status == 'resolved'
