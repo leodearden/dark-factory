@@ -7,6 +7,10 @@ floats; a leg ends at granted_at + held_secs.
 """
 from __future__ import annotations
 
+import sqlite3
+from datetime import datetime
+
+import pytest
 import verify_admission_cancel_on_red_census as mod
 
 
@@ -110,3 +114,99 @@ def test_a_none_module_is_a_sibling_of_a_named_module():
     named = _leg('a', 41.0, 10.0)
 
     assert mod.avoidable_legs(_plan(whole_project, named)) == (mod.AvoidableLeg(leg=named, cutoff=40.0),)
+
+
+def _epoch(iso):
+    return datetime.fromisoformat(iso).timestamp()
+
+
+def _leg_payload(plan_id, module, arrived_at, granted_at, held_secs, *, rc=0, timed_out=False, order='arrival'):
+    return {
+        'plan_id': plan_id, 'module': module, 'scope_kind': 'full_suite', 'order': order,
+        'arrived_at': arrived_at, 'granted_at': granted_at, 'waited_secs': 1.0, 'depth_at_arrival': 0,
+        'slot_held': True, 'flock_wait_secs': 0.01, 'held_secs': held_secs, 'rc': rc, 'timed_out': timed_out,
+    }
+
+
+def _plan_event(timestamp, plan_id, legs, *, role='task', order='arrival', outcome='returned'):
+    return {
+        'timestamp': timestamp, 'event_type': 'verify_admission_plan', 'task_id': '42', 'phase': 'verify',
+        'role': role,
+        'data': {
+            'plan_id': plan_id, 'task_id': '42', 'role': role, 'outcome': outcome, 'order': order,
+            'plan_arrival_at': timestamp, 'completed_at': timestamp, 'legs': legs,
+        },
+    }
+
+
+ARRIVED = '2026-10-17T06:00:00+00:00'
+GRANTED = '2026-10-17T06:00:10+00:00'
+
+
+@pytest.fixture
+def mixed_runs_db(make_runs_db):
+    return make_runs_db([
+        _plan_event('2026-10-16T20:00:00+00:00', 'old', [
+            _leg_payload('old', 'a', ARRIVED, GRANTED, 5.0, order='unordered'),
+        ], order='unordered'),
+        _plan_event('2026-10-17T06:07:41+00:00', 'first', [
+            _leg_payload('first', 'a', ARRIVED, GRANTED, 30.5, rc=1),
+            _leg_payload('first', 'b', ARRIVED, '2026-10-17T06:00:41+00:00', 1200.0, rc=0, timed_out=True),
+            _leg_payload('first', 'c', ARRIVED, '2026-10-17T06:20:41+00:00', 7.0),
+        ]),
+        _plan_event('2026-10-18T00:00:00+00:00', 'raised', [], order=None, outcome='raised'),
+        {'timestamp': '2026-10-18T00:00:01+00:00', 'event_type': 'workflow_verify', 'data': {'passed': True}},
+        _plan_event('2026-10-19T06:07:41+00:00', 'second', [
+            _leg_payload('second', None, ARRIVED, GRANTED, 2.0),
+        ], role='background'),
+    ])
+
+
+def test_loader_keeps_only_returned_arrival_plans_in_row_order(mixed_runs_db):
+    sample = mod.load_arrival_plans(mixed_runs_db)
+
+    assert [(plan.plan_id, plan.role) for plan in sample.plans] == [('first', 'task'), ('second', 'background')]
+
+
+def test_loader_parses_legs_to_epoch_floats_and_a_red_flag(mixed_runs_db):
+    first = mod.load_arrival_plans(mixed_runs_db).plans[0]
+
+    assert first.legs == (
+        mod.Leg(module='a', arrived_at=_epoch(ARRIVED), granted_at=_epoch(GRANTED), held_secs=30.5, red=True),
+        mod.Leg(
+            module='b', arrived_at=_epoch(ARRIVED), granted_at=_epoch('2026-10-17T06:00:41+00:00'),
+            held_secs=1200.0, red=True,
+        ),
+        mod.Leg(
+            module='c', arrived_at=_epoch(ARRIVED), granted_at=_epoch('2026-10-17T06:20:41+00:00'),
+            held_secs=7.0, red=False,
+        ),
+    )
+
+
+def test_loader_window_spans_the_first_and_last_kept_rows(mixed_runs_db):
+    sample = mod.load_arrival_plans(mixed_runs_db)
+
+    assert (sample.window_start, sample.window_end, sample.window_days) == (
+        '2026-10-17T06:07:41+00:00', '2026-10-19T06:07:41+00:00', 2.0,
+    )
+
+
+def test_loader_opens_read_only_so_a_missing_db_is_an_error_not_a_new_file(tmp_path):
+    missing = tmp_path / 'absent.db'
+
+    with pytest.raises(sqlite3.OperationalError):
+        mod.load_arrival_plans(missing)
+    assert not missing.exists()
+
+
+def test_loader_on_a_store_without_arrival_rows_returns_an_empty_window(make_runs_db):
+    db = make_runs_db([
+        _plan_event('2026-10-16T20:00:00+00:00', 'old', [
+            _leg_payload('old', 'a', ARRIVED, GRANTED, 5.0, order='unordered'),
+        ], order='unordered'),
+    ])
+
+    sample = mod.load_arrival_plans(db)
+
+    assert (sample.plans, sample.window_days) == ((), 0.0)
