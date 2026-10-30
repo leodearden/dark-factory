@@ -166,7 +166,7 @@ def hung_mcp(monkeypatch, tmp_path, client):
     monkeypatch.setattr(task_snapshot, 'PER_CALL_TIMEOUT', _TINY_BUDGET)
 
     def _clear_caches() -> None:
-        task_snapshot._snapshot_cache_clear()
+        task_snapshot.clear_snapshot_cache()
         task_lookup._lookup_cache_clear()
         escalation_corpus._corpus_cache_clear()
         _esc._analytics_memo_clear()

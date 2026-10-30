@@ -94,6 +94,7 @@ from dashboard.data.task_snapshot import (
     SnapshotFailure,
     TaskSnapshot,
     acquire_snapshot,
+    clear_snapshot_cache,
     measured_status_map,
     unmeasured_snapshot,
     withhold_rows,
@@ -288,18 +289,21 @@ TASKS_BUDGET = TasksBudget(
 
 # Admission-order rotation offset for `collect_tasks_with_counts`, advanced by
 # one slot per render. Module state, like the `_*_cache` objects elsewhere in
-# this package, with a matching `_reset_root_rotation()` test hook.
+# this package, reset by `reset_task_snapshot_state()`.
 _root_rotation_offset: int = 0
 
 
-def _reset_root_rotation() -> None:
-    """Reset the admission-order rotation. Test hook.
+def reset_task_snapshot_state() -> None:
+    """The ONE reset of the task-snapshot collectors' per-process state.
 
-    Same shape as the ``_*_cache_clear`` hooks in ``tasks.py``: rotation is
-    module state, so a test that asserts an ORDER has to be able to start from
-    a known offset rather than inherit whatever the previous test left.
+    That state is the unit cache, the last-good store and the admission
+    rotation. It is for tests and admin use; tests reach it through
+    ``dashboard/tests/conftest.py::fresh_task_snapshot_state``. A test that
+    asserts an ORDER or a cold read must start from a known state rather
+    than inherit whatever the previous test left.
     """
     global _root_rotation_offset
+    clear_snapshot_cache()
     _root_rotation_offset = 0
 
 

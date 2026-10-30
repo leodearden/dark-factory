@@ -303,12 +303,12 @@ class _LastGood:
 _last_good: dict[str, dict[str, _LastGood]] = {}
 
 
-def _snapshot_cache_clear() -> None:
-    """Clear the snapshot unit cache AND the last-good store (test/admin hook).
+def clear_snapshot_cache() -> None:
+    """Clear the snapshot unit cache AND the last-good store.
 
     Both, because a test that clears only the TTL would still be served the
     previous test's values as ``stale`` — the one thing a clear hook exists to
-    prevent.
+    prevent. ``active_tasks.reset_task_snapshot_state`` composes it.
     """
     _snapshot_cache.clear()
     _last_good.clear()

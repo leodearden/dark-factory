@@ -341,12 +341,12 @@ def _render_through_the_real_collector(client, canned):
     """
     import dashboard.data.task_snapshot as snapshot_mod
 
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
     try:
         with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
             return client.get('/api/v2/dashboard/tasks')
     finally:
-        snapshot_mod._snapshot_cache_clear()
+        snapshot_mod.clear_snapshot_cache()
 
 
 def test_a_healthy_root_is_fresh_when_the_real_collector_measures_it(client, caplog):
@@ -443,7 +443,7 @@ def test_a_unit_another_render_refreshed_later_is_not_a_contract_break(client, c
     def b_clock(now):
         return next(instants, None) or resolve_now(now)
 
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
     try:
         with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
             render_a = client.get('/api/v2/dashboard/tasks')
@@ -459,7 +459,7 @@ def test_a_unit_another_render_refreshed_later_is_not_a_contract_break(client, c
             ):
                 resp = client.get('/api/v2/dashboard/tasks')
     finally:
-        snapshot_mod._snapshot_cache_clear()
+        snapshot_mod.clear_snapshot_cache()
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -515,7 +515,7 @@ def test_a_snapshot_that_breaks_the_envelope_borrows_no_last_good(client, caplog
         healthy,
         census=replace(healthy.census, as_of=datetime.now(UTC) + timedelta(hours=1)),
     )
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
     try:
         with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
             asyncio.run(_measure_earlier())
@@ -526,7 +526,7 @@ def test_a_snapshot_that_breaks_the_envelope_borrows_no_last_good(client, caplog
         ), caplog.at_level(logging.WARNING):
             resp = client.get('/api/v2/dashboard/tasks')
     finally:
-        snapshot_mod._snapshot_cache_clear()
+        snapshot_mod.clear_snapshot_cache()
 
     assert resp.status_code == 200, resp.text
     entry = resp.json()['TASKS_SNAPSHOT'][label]
@@ -1322,7 +1322,7 @@ def escalation_caches():
     def _clear() -> None:
         escalation_corpus._corpus_cache_clear()
         escalation_routes._analytics_memo_clear()
-        task_snapshot._snapshot_cache_clear()
+        task_snapshot.clear_snapshot_cache()
         task_lookup._lookup_cache_clear()
 
     _clear()
