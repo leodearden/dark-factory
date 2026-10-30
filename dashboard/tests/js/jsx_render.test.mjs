@@ -876,7 +876,8 @@ test('tab_tasks.jsx::TasksTab folds a project on its first header click, and the
   assert.ok(storedKeys(window).includes('df.tasksOpen'), 'the fold was not stored');
   first.unmount();
 
-  const { container } = mountTasks(harness);
+  // A folded project renders no graph, so this mount cannot go through mountTasks.
+  const { container } = harness.mount(window.DF_TASKS.TasksTab, TAB_PROPS);
   assert.equal(projectHead(container).dataset.open, 'false', 'the stored fold did not seed the next mount');
   click(window, projectHead(container));
   assert.equal(projectHead(container).dataset.open, 'true', 'one header click did not unfold the project');

@@ -650,7 +650,7 @@ function TaskDetail({ task, allTasks }) {
 function TasksTab({ projectFilter, search }) {
   // Open/closed per project, persisted
   const [openMap, setOpenMap] = usePersistedState('df.tasksOpen', {});
-  const toggle = (id) => setOpenMap(m => ({ ...m, [id]: !m[id] }));
+  const toggle = (id) => setOpenMap(m => ({ ...m, [id]: m[id] === false }));
 
   // Per-project "group by PRD" view toggle, persisted (same per-project-id
   // map shape as openMap). Key absent/'flat' -> today's ungrouped view;
