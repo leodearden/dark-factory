@@ -22,6 +22,8 @@ from starlette.testclient import TestClient
 
 from dashboard.data.metrics import METRICS_SCHEMA
 
+pytestmark = pytest.mark.usefixtures('samplers_off')
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -64,7 +66,12 @@ def _make_config(tmp_path: Path, *, fused_memory_urls=None, known_project_roots=
 
 @contextmanager
 def _override_client(config):
-    """Context manager: yield a TestClient with app.state.config overridden."""
+    """Context manager: yield a TestClient with app.state.config overridden.
+
+    Its lifespan starts no sampler because this module's ``pytestmark``
+    requests conftest's ``samplers_off`` (task 5826): the metrics sampler
+    dials ``dashboard.data.metrics.mcp_tool_call``, the seam these tests patch.
+    """
     from dashboard.app import app
 
     with TestClient(app) as c:
