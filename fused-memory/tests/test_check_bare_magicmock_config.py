@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import inspect
 import re
 import shutil
 import subprocess
@@ -2018,14 +2019,9 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'shared/tests/test_cli_invoke.py',
 })
 
-# A SYNTHETIC debt mapping for the path-matching tests, which drive the pure
-# _debt_entry helper with it.  It names no real file, so no migration can ever
-# shrink it out from under them.
-_SYNTHETIC_DEBT_ENTRY = 'orchestrator/tests/test_synthetic_rule_c_debt.py'
-_SYNTHETIC_RULE_C_DEBT = {_SYNTHETIC_DEBT_ENTRY: 2}
-
 # Exactly ONE Rule C violation (bare wait_for; the bound is derived, not written),
-# so N copies produce N violations and the arithmetic in the budget tests is exact.
+# so N copies produce N violations, copy i on line i, and the arithmetic in the
+# budget tests is exact.
 _RULE_C_ONE_HIT = 'asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)\n'
 
 
@@ -2049,21 +2045,6 @@ def _live_rule_c_debt_entry() -> tuple[str, int]:
             '_live_rule_c_debt_entry here'
         )
     return max(debt.items(), key=lambda item: item[1])
-
-
-def _against_a_budget_of_1(copies: int) -> list:
-    """Run *copies* raw Rule C hits through the pure budget arithmetic, budget 1."""
-    found = _rule_c(_RULE_C_ONE_HIT * copies)
-    assert len(found) == copies, (
-        f'_RULE_C_ONE_HIT must yield exactly one raw hit per copy; got {found!r}'
-    )
-    return _checker._apply_debt_budget(
-        found,
-        _checker._DebtEntry(_SYNTHETIC_DEBT_ENTRY, 1),
-        filename=_NON_DEBT_FILE,
-        build_overrun_msg=_checker._wall_clock_overrun_msg,
-        build_slack_msg=_checker._wall_clock_slack_msg,
-    )
 
 
 class TestWallClockDeadlineDebtBaseline:
@@ -2103,8 +2084,8 @@ class TestWallClockDeadlineDebtBaseline:
         orchestrator's own lint_command, naming the edit, not this suite.
 
     For the same reason as that removed pin, no test here is anchored to a real
-    file's exact budget: the pure helpers take synthetic inputs, and the
-    find_violations legs pick a live entry at runtime.
+    file's exact budget: every leg drives find_violations against a live entry
+    picked at runtime and keeps its arithmetic relative to that entry's budget.
     """
 
     def test_debt_baseline_holds_exactly_the_measured_census_paths(self):
@@ -2152,21 +2133,16 @@ class TestWallClockDeadlineDebtBaseline:
         )
 
     def test_suppression_works_for_absolute_paths(self):
-        """An absolute path ending in the debt components resolves to the budget too.
+        """An absolute path ending in the debt components gets the budget too.
 
         The nine call sites pass repo-relative paths; pytest passes absolutes. Both
         must reach the same verdict or the baseline would be invisible to one caller.
         """
-        assert _checker._debt_entry(_SYNTHETIC_DEBT_ENTRY, _SYNTHETIC_RULE_C_DEBT).budget == 2
-        absolute = str(_REPO_ROOT / _SYNTHETIC_DEBT_ENTRY)
-        assert _checker._debt_entry(absolute, _SYNTHETIC_RULE_C_DEBT).budget == 2, (
-            f'an absolute path to a debt file must resolve to its budget; '
-            f'filename={absolute!r}'
-        )
-
         entry, budget = _live_rule_c_debt_entry()
+        at_budget = _RULE_C_ONE_HIT * budget
+        assert _rule_c(at_budget, entry) == []
         live_absolute = str(_REPO_ROOT / entry)
-        assert _rule_c(_RULE_C_ONE_HIT * budget, live_absolute) == [], (
+        assert _rule_c(at_budget, live_absolute) == [], (
             'find_violations must hand an absolute filename to the baseline lookup '
             f'unchanged, so a debt file is suppressed for pytest callers too; '
             f'filename={live_absolute!r}'
@@ -2174,27 +2150,23 @@ class TestWallClockDeadlineDebtBaseline:
 
     def test_matching_is_path_component_aware_not_substring(self):
         """Trailing-COMPONENT matching: a substring match must not grandfather an unrelated file."""
-        assert _checker._debt_entry('evil/' + _SYNTHETIC_DEBT_ENTRY, _SYNTHETIC_RULE_C_DEBT).budget == 2, (
-            'a path whose real trailing components are a debt entry resolves to its budget'
+        entry, budget = _live_rule_c_debt_entry()
+        at_budget = _RULE_C_ONE_HIT * budget
+        prefixed = 'evil/' + entry
+        assert _rule_c(at_budget, prefixed) == [], (
+            f'{prefixed} has {entry} as its real trailing components and gets its budget'
         )
-        substring = 'orchestrator/tests/not_test_synthetic_rule_c_debt.py'
-        assert _checker._debt_entry(substring, _SYNTHETIC_RULE_C_DEBT) is None, (
-            f'{substring} merely CONTAINS a debt filename as a substring; a substring '
-            'match must not grandfather it'
-        )
-        bare = 'test_synthetic_rule_c_debt.py'
-        assert _checker._debt_entry(bare, _SYNTHETIC_RULE_C_DEBT) is None, (
-            'a bare basename at another root shares only ONE trailing component and '
-            'must not be grandfathered'
-        )
-
-        entry, _budget = _live_rule_c_debt_entry()
         live = PurePosixPath(entry)
         live_substring = str(live.with_name('not_' + live.name))
-        flagged = _rule_c(_RULE_C_SOURCE, live_substring)
-        assert len(flagged) == 2, (
-            f'through find_violations, {live_substring} merely CONTAINS the debt '
-            f'filename {live.name} and must be reported in full; got {flagged!r}'
+        flagged = _rule_c(at_budget, live_substring)
+        assert len(flagged) == budget, (
+            f'{live_substring} merely CONTAINS the debt filename {live.name} as a '
+            f'substring and must be reported in full; got {flagged!r}'
+        )
+        flagged_bare = _rule_c(at_budget, live.name)
+        assert len(flagged_bare) == budget, (
+            f'a bare basename {live.name} at another root shares only ONE trailing '
+            f'component with {entry} and must be reported in full; got {flagged_bare!r}'
         )
 
     def test_debt_file_is_silent_at_budget_and_reports_the_overrun_above_it(self):
@@ -2204,23 +2176,27 @@ class TestWallClockDeadlineDebtBaseline:
         wall-clock wait added to an actively-developed debt file would be
         invisible to the gate forever.
         """
-        at_budget = _against_a_budget_of_1(1)
+        entry, budget = _live_rule_c_debt_entry()
+        at_budget = _rule_c(_RULE_C_ONE_HIT * budget, entry)
         assert at_budget == [], (
-            'a debt file carrying exactly its recorded 1 violation must stay silent — '
-            f'that is the grandfathering the baseline exists for; got {at_budget!r}'
+            f'{entry} carrying exactly its recorded {budget} violations must stay '
+            f'silent — that is the grandfathering the baseline exists for; got {at_budget!r}'
         )
 
-        over_budget = _against_a_budget_of_1(3)
+        over_budget = _rule_c(_RULE_C_ONE_HIT * (budget + 2), entry)
         assert len(over_budget) == 2, (
             'a debt file that GROWS past its recorded budget must report exactly the '
-            f'overrun (3 - budget 1 = 2); got {over_budget!r}'
+            f'overrun ({budget + 2} - budget {budget} = 2); got {over_budget!r}'
         )
 
     def test_reported_overrun_sites_are_the_last_in_source_order(self):
         """The anchor is positional and deterministic, not a claim about which site is new."""
-        over_budget = _against_a_budget_of_1(4)
-        assert [v.lineno for v in over_budget] == [2, 3, 4], (
-            f'expected the LAST 3 of 4 sites (budget 1); got {[v.lineno for v in over_budget]}'
+        entry, budget = _live_rule_c_debt_entry()
+        over_budget = _rule_c(_RULE_C_ONE_HIT * (budget + 3), entry)
+        last_three = [budget + 1, budget + 2, budget + 3]
+        assert [v.lineno for v in over_budget] == last_three, (
+            f'expected the LAST 3 of {budget + 3} sites (budget {budget}); '
+            f'got {[v.lineno for v in over_budget]}'
         )
 
     def test_overrun_message_names_the_budget_and_forbids_raising_it(self):
@@ -2230,8 +2206,14 @@ class TestWallClockDeadlineDebtBaseline:
         wait_responsive", an overrun says "you added debt to a file that may only
         shrink". Conflating them invites the reader to fix it by editing the number.
         """
-        message = _against_a_budget_of_1(2)[0].message
-        for needle in ('debt baseline', 'budget of 1', '2 were found', 'Do NOT raise'):
+        entry, budget = _live_rule_c_debt_entry()
+        message = _rule_c(_RULE_C_ONE_HIT * (budget + 1), entry)[0].message
+        for needle in (
+            'debt baseline',
+            f'budget of {budget}',
+            f'{budget + 1} were found',
+            'Do NOT raise',
+        ):
             assert needle in message, (
                 f'the overrun message must name {needle!r} so the reader fixes the debt '
                 f'rather than the baseline; got {message!r}'
@@ -2266,14 +2248,6 @@ class TestWallClockDeadlineDebtBaseline:
                 f'Rule C overrun message must not offer {foreign!r}: {message!r}'
             )
 
-    def test_against_a_budget_of_1_with_no_hits_reports_one_file_level_slack(self):
-        """Below budget the pure arithmetic yields ONE violation at line 1, not per site."""
-        slack = _against_a_budget_of_1(0)
-        assert [v.lineno for v in slack] == [1], (
-            f'0 hits against a budget of 1 must report exactly one file-level slack '
-            f'violation at line 1; got {slack!r}'
-        )
-
     def test_both_budget_builders_are_required_and_keyword_only(self):
         """A future Rule D must not be able to inherit another rule's remedy by omission.
 
@@ -2284,27 +2258,21 @@ class TestWallClockDeadlineDebtBaseline:
         no type error and no failing test. The slack builder (task 6202) carries the
         same guard. Requiredness is the whole guard, so it is pinned here rather
         than trusted.
+
+        Read off the signature rather than exercised, so this pin names only the
+        extension point and its two parameters, and retires with them.
         """
-        entry = _checker._DebtEntry(_SYNTHETIC_DEBT_ENTRY, 1)
-        builders = {
-            'build_overrun_msg': _checker._wall_clock_overrun_msg,
-            'build_slack_msg': _checker._wall_clock_slack_msg,
-        }
-        # The complete call is accepted, so each TypeError below has one cause.
-        assert len(
-            _checker._apply_debt_budget([], entry, filename=_NON_DEBT_FILE, **builders)
-        ) == 1
-        for name, builder in builders.items():
-            others = {k: v for k, v in builders.items() if k != name}
-            # Omitting the builder must fail: no default to fall back on.
-            with pytest.raises(TypeError):
-                _checker._apply_debt_budget([], entry, filename=_NON_DEBT_FILE, **others)
-            # Passing it positionally must fail too: keyword-only, so a stray
-            # positional argument can never land in it by accident.
-            with pytest.raises(TypeError):
-                _checker._apply_debt_budget(
-                    [], entry, builder, filename=_NON_DEBT_FILE, **others
-                )
+        parameters = inspect.signature(_checker._apply_debt_budget).parameters
+        for name in ('build_overrun_msg', 'build_slack_msg'):
+            parameter = parameters[name]
+            assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, (
+                f'{name} must be keyword-only, so a stray positional argument can '
+                f'never land in it; got {parameter.kind}'
+            )
+            assert parameter.default is inspect.Parameter.empty, (
+                f'{name} must have no default, so a rule that omits it fails at the '
+                f'call; got default {parameter.default!r}'
+            )
 
 
 class TestWallClockDeadlineDebtSlack:
@@ -2372,6 +2340,9 @@ class TestWallClockDeadlineDebtSlack:
         assert len(slack) == 1, (
             f'a debt file with no Rule C violations left must report one slack '
             f'violation; got {slack!r}'
+        )
+        assert (slack[0].lineno, slack[0].col_offset) == (1, 0), (
+            f'the at-zero slack violation is file-level and anchors at 1:0; got {slack[0]!r}'
         )
         message = slack[0].message
         for needle in (
