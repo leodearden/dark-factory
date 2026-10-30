@@ -187,6 +187,11 @@ class Run:
         }
 
 
+RED_A = Run(failed={A: 'AssertionError: a'})
+#: The ids a legacy numeric leg's confirm prints, one per line.
+NUMERIC_IDS = ('numeric_suite::case_1', 'numeric_suite::case_2')
+
+
 _STUB_BODY = r'''
 import json
 import os
@@ -395,6 +400,16 @@ def effect_of(record: PassRecord) -> dict[str, Any]:
     """The effect block every completed pass record carries."""
     assert isinstance(record.effect, dict), f'pass {record.pass_id} has no effect block'
     return record.effect
+
+
+def ended(record: PassRecord) -> list[tuple[str, str]]:
+    """The ``(node, reason)`` of every episode the pass ended."""
+    return [(episode['node'], episode['reason']) for episode in effect_of(record)['episodes_ended']]
+
+
+def offered(record: PassRecord) -> list[tuple[str, str]]:
+    """The ``(node, trigger)`` of every flake debt the pass offered the ledger."""
+    return [(debt['node'], debt['trigger']) for debt in effect_of(record)['debts_offered']]
 
 
 async def git(repo: Path, *args: str) -> str:
@@ -837,19 +852,25 @@ class RedPathLane:
         return await self.head()
 
     async def drive(self, reads: int = 1, until: asyncio.Event | None = None) -> None:
-        """Run the worker until it parks on the read after *reads* head reads, or until *until* is set."""
+        """Run the worker until it parks on the read after *reads* head reads, or until *until* is set.
+
+        A run loop that raises surfaces its exception here at once; one that returns fails the drive.
+        """
         self.git.allow(reads)
         stop = self.git.parked if until is None else until
         failures = RunLoopFailures(stop)
         with failures.attached():
             task = asyncio.create_task(self.worker.run())
+            run_ended = asyncio.Event()
+            task.add_done_callback(lambda _done: run_ended.set())
             try:
-                await first_set((stop, failures.raised), DRIVE_BOUND_SECS, 'offline-lane drive')
+                await first_set((stop, failures.raised, run_ended), DRIVE_BOUND_SECS, 'offline-lane drive')
             finally:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
         assert failures.messages == [], f'the worker run loop failed a pass: {failures.messages}'
+        assert stop.is_set(), 'the worker run loop returned before the drive ended'
 
     async def advance(self, *runs: Run, minutes: float = 30, until: asyncio.Event | None = None) -> PassRecord:
         """Advance the clock and main, then drive the pass the merge trigger starts; *runs* are its sub-runs.
@@ -887,9 +908,16 @@ class RedPathLane:
         assert self.stub.unanswered() == [], 'the tick left scripted probe answers unanswered'
         return self.passes(started)
 
+    @property
+    def run_records(self) -> RunRecordStore:
+        return RunRecordStore(self.project_root, clock=self.clock)
+
     def passes(self, since: datetime = EPOCH) -> list[PassRecord]:
-        store = RunRecordStore(self.project_root, clock=self.clock)
-        return list(store.passes_since(self.command_name, since))
+        return list(self.run_records.passes_since(self.command_name, since))
+
+    def pass_directory(self, record: PassRecord) -> Path:
+        """Where the lane keeps *record* and its sub-runs' output."""
+        return self.run_records.pass_directory(self.command_name, record.pass_id)
 
     def record(self) -> CommandRecord:
         return EpisodeStore(self.project_root, clock=self.clock).load(self.command_name)

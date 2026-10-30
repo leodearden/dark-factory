@@ -24,7 +24,9 @@ from _flake_golden import merge_gate_deflake_description
 from _offline_lane_red_path_fixtures import (
     COMMIT_SPAWNS,
     NINE,
+    NUMERIC_IDS,
     PROBED_COMMAND,
+    RED_A,
     A,
     B,
     C,
@@ -34,8 +36,10 @@ from _offline_lane_red_path_fixtures import (
     Run,
     StoreFault,
     effect_of,
+    ended,
     lane_test_timeout,
     merge_gate_suppression,
+    offered,
     probed_command,
     promote_to_level_2,
     reload_git,
@@ -63,32 +67,17 @@ from orchestrator.offline_lane_escalations import (
     sentinel_task_id,
 )
 from orchestrator.offline_lane_ledger import NUMERIC_UNNAMED_CLEAR
-from orchestrator.offline_lane_records import PassRecord
 
 pytestmark = [pytest.mark.usefixtures('code_default_config')]
 
-RED_A = Run(failed={A: 'AssertionError: a'})
-CLEARS_A = (RED_A, Run(passed=(A,)))
 GREEN_A = Run(passed=(A,))
-NUMERIC_IDS = ('numeric_suite::case_1', 'numeric_suite::case_2')
+CLEARS_A = (RED_A, GREEN_A)
 STORM = EscalationCategory.MERGE_FLAKE_SUPPRESSION_STORM
 REGRESSED = EscalationCategory.REGRESSED_AFTER_RESOLUTION
 
 
 def detail_of(row: FlakeOccurrenceRow) -> dict:
     return json.loads(row.detail)
-
-
-def pass_directory(lane: RedPathLane, record: PassRecord) -> Path:
-    return lane.project_root / 'data' / 'orchestrator' / 'offline-lane' / 'lane-fixture' / record.pass_id
-
-
-def ended(record: PassRecord) -> list[tuple[str, str]]:
-    return [(episode['node'], episode['reason']) for episode in effect_of(record)['episodes_ended']]
-
-
-def offered(record: PassRecord) -> list[tuple[str, str]]:
-    return [(debt['node'], debt['trigger']) for debt in effect_of(record)['debts_offered']]
 
 
 def trigger_of(item: DueRow) -> DebtTrigger:
@@ -118,7 +107,7 @@ async def test_scenario_25_scenario_4s_reproductions_write_fails_in_isolation_ro
     for row, record, line in zip(rows, (first, second), detected, strict=True):
         evidence = detail_of(row)['evidence']
         assert (evidence['kind'], evidence['first_line']) == ('failed', line)
-        assert Path(evidence['record_dir']) == pass_directory(lane, record)
+        assert Path(evidence['record_dir']) == lane.pass_directory(record)
 
 
 @pytest.mark.asyncio
@@ -283,6 +272,7 @@ async def test_scenario_27b_a_test_green_then_red_at_one_head_owes_recovered_deb
     assert advanced.head != green.head
     [item] = lane.due()
     assert (item.test_id, item.head, trigger_of(item)) == (A, green.head, DebtTrigger.recovered)
+    assert [(row.verdict, row.merge_sha) for row in lane.rows(A)] == [('fails_in_isolation', red.head)]
     await lane.drain()
     debt = lane.debt(A)
     assert debt is not None
@@ -372,9 +362,10 @@ async def test_scenario_34_a_restart_between_the_ledger_write_and_the_episode_sa
     lane.restart()
     await lane.drain()
     [owner] = lane.store.deflake_tasks()
-    await lane.rerun(GREEN_A)
+    ending = await lane.rerun(GREEN_A)
     await lane.drain()
 
+    assert (A, 'passed') in ended(ending)
     assert [task['id'] for task in lane.store.deflake_tasks()] == [owner['id']]
     assert lane.due() == []
 
@@ -649,12 +640,15 @@ async def test_scenario_36_a_level_2_holding_another_member_is_amended_not_resol
     assert await promote_to_level_2(lane.queue, PROBED_SENTINEL, other) == l2
 
     await lane.tick(minutes=30)
+    amended = lane.get(l2)
     await lane.tick(minutes=1)
 
     holder = lane.get(l2)
+    assert amended is not None
     assert holder is not None
     assert holder.status == 'pending'
     assert len([a for a in holder.amendments if f'closed its record {l1.id}' in a['detail']]) == 1
+    assert holder.amendments == amended.amendments, 'a tick after the close amended the level-2 again'
     for escalation_id, status in ((other, 'pending'), (l1.id, 'resolved')):
         member = lane.get(escalation_id)
         assert member is not None
