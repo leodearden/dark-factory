@@ -1139,10 +1139,8 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # entry containing a flag-suffixed form also contains bare
             # 'ruff format'. The rule is wider than nesting: no two phrases
             # may share one occurrence, which also covers one phrase's end
-            # overlapping another's start on a whole word. Bare
-            # 'format-clean' was replaced by 'not format-clean' for that
-            # reason: 'ruff format' ends on the word that begins it, so the
-            # one construction 'ruff format-clean' scored 2 hits (task 5933).
+            # overlapping another's start on a whole word: bare 'format-clean'
+            # beside 'ruff format' would let 'ruff format-clean' score 2 hits.
             # The hazard is generic to the matcher rather than special to
             # this seed, so test_no_two_seeded_phrases_can_share_one_occurrence
             # asserts it over ALL seeded clusters, not just this one.
