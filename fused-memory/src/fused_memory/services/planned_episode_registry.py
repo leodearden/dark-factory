@@ -11,6 +11,7 @@ visible in normal searches.  This happens when a task is marked done.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,6 +24,8 @@ from shared.async_sqlite_base import (
 )
 
 logger = logging.getLogger(__name__)
+
+_DB_FILENAME = 'planned_episodes.db'
 
 _CREATE_TABLE = """\
 CREATE TABLE IF NOT EXISTS planned_episodes (
@@ -66,7 +69,7 @@ class PlannedEpisodeRegistry:
         if self._access is not None:
             return
         self._data_dir.mkdir(parents=True, exist_ok=True)
-        db_path = self._data_dir / 'planned_episodes.db'
+        db_path = self._data_dir / _DB_FILENAME
         conn = await connect_daemon(str(db_path))
         await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
         self._access = AtomicConnection(conn)
@@ -74,6 +77,17 @@ class PlannedEpisodeRegistry:
             await db.execute(_CREATE_TABLE)
             await db.execute(_CREATE_INDEX)
         logger.info('PlannedEpisodeRegistry initialized at %s', db_path)
+
+    @classmethod
+    async def open_read_only(cls, data_dir: str | Path) -> PlannedEpisodeRegistry:
+        """A read-only view that never creates the file; writes through it raise."""
+        path = Path(data_dir) / _DB_FILENAME
+        if not await asyncio.to_thread(path.is_file):
+            raise FileNotFoundError(f'no planned episode registry at {path}')
+        conn = await connect_daemon(f'{path.resolve().as_uri()}?mode=ro', uri=True)
+        registry = cls(data_dir)
+        registry._access = AtomicConnection(conn)
+        return registry
 
     def _require_access(self) -> AtomicConnection:
         if self._access is None:
