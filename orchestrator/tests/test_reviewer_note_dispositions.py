@@ -12,18 +12,36 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
-from _workflow_helpers import AgentStub, _build_workflow_with_escalation, _make_git_ops
+from _curator_fake import FakeCurator
+from _workflow_helpers import (
+    AgentStub,
+    _build_workflow_with_escalation,
+    _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see its docstring
+    _init_repo,
+    _make_git_ops,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.cli_invoke import AgentResult
+from test_info_l0_router_workflow import _reaper_l1s_after_aging
 
 from orchestrator.agents.review_briefing import ChangedFile, ReviewChange, ReviewSubject
 from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import GitConfig, OrchestratorConfig, TimeoutsConfig, UnblockAutoConfig
-from orchestrator.mcp.verdict_tools import _submit_review_verdict
+from orchestrator.config import (
+    GitConfig,
+    OrchestratorConfig,
+    SandboxConfig,
+    TimeoutsConfig,
+    UnblockAutoConfig,
+)
+from orchestrator.escalation_router import REVIEWER_LEG_ID, read_hold
+from orchestrator.event_store import EventStore, EventType
+from orchestrator.git_ops import GitOps
+from orchestrator.mcp.verdict_tools import _envelope, _submit_review_verdict
 from orchestrator.scheduler import TaskAssignment
-from orchestrator.workflow import TaskWorkflow
+from orchestrator.verify import VerifyResult
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 TASK_ID = '42'
 REVIEWER = REVIEWER_COMPREHENSIVE.name
@@ -172,3 +190,188 @@ class TestReviewerIsBriefedWithItsNotes:
             record.levelno == logging.WARNING and 'disk unreadable' in record.getMessage()
             for record in caplog.records
         )
+
+
+# ---------------------------------------------------------------------------
+# Full runs: the review loop applies the verdict's dispositions
+# (boundary rows #1, #2 first half, #17)
+# ---------------------------------------------------------------------------
+
+UNKNOWN_ID = 'esc-42-999'
+
+
+def _run_config(project_root: Path) -> OrchestratorConfig:
+    return OrchestratorConfig(
+        project_root=project_root,
+        max_concurrent_tasks=1,
+        max_execute_iterations=5,
+        max_verify_attempts=3,
+        max_review_cycles=2,
+        judge_after_each_iteration=False,
+        max_amendment_rounds=1,
+        reviewer_stagger_secs=0.0,
+        steward_completion_timeout=0.25,
+        timeouts=TimeoutsConfig(steward=0.25),
+        unblock_auto=UnblockAutoConfig(enabled=False),
+        info_l0_router_enabled=True,
+        git=GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees',
+        ),
+        sandbox=SandboxConfig(enabled=False),
+    )
+
+
+def _disposition(esc_id: str, disposition: str) -> dict:
+    return {'escalation_id': esc_id, 'disposition': disposition, 'rationale': f'{disposition} rationale'}
+
+
+class _DispositioningStub(AgentStub):
+    """A reviewer whose PASS verdict carries *note_dispositions*."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.note_dispositions: list[dict] = []
+
+    def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
+        result = super()._reviewer(role, output_schema)
+        assert result.structured_output is not None
+        result.structured_output['note_dispositions'] = self.note_dispositions
+        return result
+
+
+class _LostVerdictStub(_DispositioningStub):
+    """A reviewer that writes an envelope the workflow discards (an off-contract verdict)."""
+
+    async def invoke_agent(self, prompt: str, system_prompt: str, cwd: Path, **kwargs) -> AgentResult:
+        role = self._detect_role(system_prompt)
+        if not role.startswith('reviewer'):
+            return await super().invoke_agent(prompt, system_prompt, cwd, **kwargs)
+        self.calls.append(role)
+        artifacts = TaskArtifacts(cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name))
+        artifacts.write_verdict(role, _envelope(role, 'sid', {
+            'reviewer': role, 'verdict': 'MAYBE', 'issues': [], 'summary': 's',
+            'note_dispositions': self.note_dispositions,
+        }))
+        return AgentResult(success=True, output='')
+
+
+class _FullRun:
+    def __init__(self, tmp_path: Path, monkeypatch, stub: _DispositioningStub) -> None:
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_repo(repo)
+        config = _run_config(repo)
+        self.workflow, _scheduler, self.queue = _build_workflow_with_escalation(
+            config, GitOps(config.git, config.project_root), _assignment(), stub, tmp_path,
+        )
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='',
+                summary='All checks passed',
+            )),
+        )
+        self.workflow.event_store = EventStore(tmp_path / 'runs.db', run_id='run-test')
+        self.curator = FakeCurator()
+        self.workflow.scheduler.dispatch_tool = self.curator
+
+    async def run(self) -> WorkflowOutcome:
+        return (await self.workflow.run()).outcome
+
+    def current(self, note: Escalation) -> Escalation:
+        current = self.queue.get(note.id)
+        assert current is not None
+        return current
+
+    def rows(self, esc_id: str) -> list[dict]:
+        store = self.workflow.event_store
+        assert store is not None
+        return [
+            row['data'] for row in store.fetch_events_by_type(EventType.info_l0_dispositioned)
+            if row['data']['escalation_id'] == esc_id
+        ]
+
+
+@pytest.mark.asyncio
+class TestReviewLoopAppliesDispositions:
+    @pytest.mark.parametrize(('disposition', 'resolution_class'), [
+        ('addressed', 'addressed'),
+        ('no_action', 'observation-consumed'),
+    ])
+    async def test_a_closing_disposition_closes_the_note_before_the_exit(
+        self, tmp_path, monkeypatch, mock_orch_config, disposition, resolution_class,
+    ):
+        stub = _DispositioningStub()
+        run = _FullRun(tmp_path, monkeypatch, stub)
+        note = _file_note(run.queue)
+        stub.note_dispositions = [_disposition(note.id, disposition)]
+
+        assert await run.run() == WorkflowOutcome.DONE
+
+        closed = run.current(note)
+        assert (closed.resolution_class, closed.resolved_by) == (resolution_class, REVIEWER_LEG_ID)
+        (row,) = run.rows(note.id)
+        assert (row['by'], row['class'], row['exit_kind']) == (
+            REVIEWER_LEG_ID, resolution_class, None,
+        )
+        assert run.curator.calls_named('submit_task') == []
+        assert await _reaper_l1s_after_aging(mock_orch_config, run.queue) == []
+
+    async def test_work_leaves_the_note_for_the_exit_router_to_convert(
+        self, tmp_path, monkeypatch,
+    ):
+        stub = _DispositioningStub()
+        run = _FullRun(tmp_path, monkeypatch, stub)
+        note = _file_note(run.queue)
+        stub.note_dispositions = [_disposition(note.id, 'work')]
+
+        assert await run.run() == WorkflowOutcome.DONE
+
+        reviewer_row, finalizer_row = run.rows(note.id)
+        assert (reviewer_row['by'], reviewer_row['class'], reviewer_row['reason']) == (
+            REVIEWER_LEG_ID, 'defer', 'work',
+        )
+        assert (finalizer_row['by'], finalizer_row['class'], finalizer_row['exit_kind']) == (
+            'workflow-finalizer', 'convert-pending', 'done',
+        )
+        hold = read_hold(run.current(note))
+        assert hold is not None and hold.ticket == 'tkt_1'
+        assert len(run.curator.calls_named('submit_task')) == 1
+
+    async def test_a_disposition_of_a_note_the_reviewer_was_not_shown_is_rejected(
+        self, tmp_path, monkeypatch,
+    ):
+        stub = _DispositioningStub()
+        run = _FullRun(tmp_path, monkeypatch, stub)
+        foreign = _file_note(run.queue, task_id='99')
+        stub.note_dispositions = [
+            _disposition(UNKNOWN_ID, 'addressed'), _disposition(foreign.id, 'no_action'),
+        ]
+
+        assert await run.run() == WorkflowOutcome.DONE
+
+        after = run.current(foreign)
+        assert (after.status, after.triaged_by, after.resolution) == ('pending', None, None)
+        for esc_id in (UNKNOWN_ID, foreign.id):
+            (row,) = run.rows(esc_id)
+            assert (row['by'], row['class'], row['task_id']) == (
+                REVIEWER_LEG_ID, 'rejected_disposition', TASK_ID,
+            )
+
+    async def test_a_lost_verdict_carries_no_dispositions_and_the_exit_router_routes_the_note(
+        self, tmp_path, monkeypatch,
+    ):
+        stub = _LostVerdictStub()
+        run = _FullRun(tmp_path, monkeypatch, stub)
+        note = _file_note(run.queue)
+        stub.note_dispositions = [_disposition(note.id, 'addressed')]
+
+        assert await run.run() == WorkflowOutcome.BLOCKED
+
+        rows = run.rows(note.id)
+        assert [row['by'] for row in rows] == ['workflow-finalizer']
+        assert (rows[0]['class'], rows[0]['exit_kind']) == ('convert-pending', 'blocked')
+        hold = read_hold(run.current(note))
+        assert hold is not None and hold.ticket == 'tkt_1'
