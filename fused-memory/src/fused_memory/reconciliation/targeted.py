@@ -955,15 +955,9 @@ class TargetedReconciler:
                         )
                         if esc_action is not None:
                             result['actions'].append(esc_action)
-                        # Deliberately NO add_run_action(run_id, 'verify',
-                        # 'codebase', ...) row here: task 4343's contract is
-                        # exactly ONE outcome row per invocation of this
-                        # branch, which is what makes the operator census
-                        # truthful by construction.  A second verify row would
-                        # double-count it.  The escalation's durable records
-                        # are its own JSON file plus the outcome row already
-                        # written above; the run-level signal is the
-                        # result['actions'] entry.
+                        # _escalate_contradicted_l1 journals the escalation as
+                        # a write|skip escalation/submit row, never as a verify
+                        # row, so task 4343's one-outcome-row census holds.
                     written = await self._fenced_add_memory(
                         content=_VERDICT_MEMORY_TEMPLATES[verification.verdict].format(
                             title=title, summary=verification.summary,
@@ -1924,7 +1918,9 @@ class TargetedReconciler:
           preferred over silently dropping the finding.
 
         Returns the action dict for `result['actions']`, or None when the
-        escalation package is unavailable.
+        escalation package is unavailable or the filing failed.  A filing is
+        journaled as a write|skip escalation/submit row, symmetric with
+        :meth:`_sweep_escalate_l1`; an unavailable package stays journal-silent.
         """
         factory = self._escalation_queue_factory
         if factory is None:
@@ -1991,7 +1987,25 @@ class TargetedReconciler:
                 'verification_contradicted_escalate_failed task=%s project_root=%s: %s',
                 task_id, project_root, e,
             )
+            await self.journal.add_run_action(
+                run_id, 'skip', 'escalation', 'submit',
+                {
+                    'task_id': task_id,
+                    'type': 'verification_contradicted_escalated',
+                    'error': str(e)[:200],
+                },
+                causation_id=run_id,
+            )
             return None
+        await self.journal.add_run_action(
+            run_id, 'write', 'escalation', 'submit',
+            {
+                'task_id': task_id,
+                'type': 'verification_contradicted_escalated',
+                'escalation_id': esc_id,
+            },
+            causation_id=run_id,
+        )
         return {
             'type': 'verification_contradicted_escalated',
             'task_id': task_id,
