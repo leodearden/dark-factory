@@ -484,7 +484,7 @@ before this prefix may be used, and for the three traps a naive version misses.
 
 ALREADY_LANDED_CITATION_PATTERN: str = (
     r'^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
-    r'\(#?{tid}\)!?:'
+    r'\(#?{tid}([ ,/][^)]*)?\)!?:'
     r'|^Merge task/{tid} into '
 )
 r"""STRICTER citation template for :func:`_resolve_already_landed_branch`.
@@ -501,15 +501,22 @@ wrong for THIS question, which is "is this commit this task's own delivery":
 and both touch exactly the paths the original landing touched, so signal 3
 (coverage) passes too and the branch is declared already-landed on a commit
 that is the OPPOSITE of its delivery.  Requiring the id in the
-conventional-commit SCOPE position — ``impl(3717):`` — is what separates an
-AUTHORED delivery from a commit that merely mentions the id.
+conventional-commit SCOPE position is what separates an AUTHORED delivery
+from a commit that merely mentions the id.  The id may close the scope
+(``impl(3717):``) or be followed by a qualifier (``impl(3717 step-8):``,
+``feat(3717/step-2):``); a qualifier is still scope position, so the reading
+holds, and only the scope's LEADING id attributes (``fix(4200/3717):`` is
+4200's).  Why the qualifier separator class is closed to ``[ ,/]`` (no dot,
+no hyphen) is stated once, in the doc comment of
+``orchestrator/src/orchestrator/git_ops.py::DEFAULT_COMMIT_CITATION_PATTERN``;
+``orchestrator/tests/test_already_landed_citation_pattern.py`` pins that the
+two templates agree on scope-position subjects.
 
-Measured before narrowing, on this repo's last 4000 main commits: 1298
-subjects match this strict form, and exactly ONE subject matched only the
-dropped arms (itself a body-line false-cite, not a real citation).  So the
-narrowing costs no real attribution and removes the whole false-cite class.
-Anything it does miss falls through to the UNCHANGED
-``plan_files_not_touched`` path — fail-closed, per this predicate's contract.
+The narrowing trades recall for precision: a delivery cited only outside
+scope position, as in ``fix(git_ops): ... (task 3717)``, is not attributed
+here (census: the task-6221 commit message).  Anything this template misses
+falls through to the UNCHANGED ``plan_files_not_touched`` path —
+fail-closed, per this predicate's contract.
 
 Valid as both a git ``--extended-regexp`` pattern and a Python ``re``, which
 ``find_task_citation_commit`` requires of any override.
