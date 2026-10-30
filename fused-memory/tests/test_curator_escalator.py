@@ -1453,37 +1453,37 @@ class TestPersistStateConcurrency:
         and must not corrupt or lose any burst-log entry."""
         import asyncio
         import json
+        import os
+        import time
 
         state_path = tmp_path / 'curator_escalator_state.json'
         handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
         try:
             escalator = CuratorEscalator(cooldown_secs=3600.0, state_path=state_path)
 
-            # ── Instrumentation ─────────────────────────────────────────────────
+            # ── Instrumentation: count writers landing on the state file ────────
             in_flight = 0
             max_in_flight = 0
-            real_to_thread = asyncio.to_thread
+            counter_lock = threading.Lock()
+            real_replace = os.replace
 
-            async def _patched_to_thread(func, *args, **kwargs):
+            def _counting_replace(src, dst, *args, **kwargs):
                 nonlocal in_flight, max_in_flight
-                if func in (
-                    curator_escalator.is_orchestrator_lock_held,
-                    curator_escalator._file_curator_escalation,
-                ):
-                    # Neither the liveness probe's hop nor the queue filing's is a state write.
-                    return await real_to_thread(func, *args, **kwargs)
-                in_flight += 1
-                if in_flight > max_in_flight:
-                    max_in_flight = in_flight
-                # Widen the interleave window so concurrent coroutines can enter
-                # before the first one returns — exposes the race without the lock.
-                await asyncio.sleep(0.02)
+                if os.fspath(dst) != os.fspath(state_path):
+                    return real_replace(src, dst, *args, **kwargs)
+                with counter_lock:
+                    in_flight += 1
+                    max_in_flight = max(max_in_flight, in_flight)
                 try:
-                    return await real_to_thread(func, *args, **kwargs)
+                    # Widen the overlap window so unserialised writers would
+                    # land here together — exposes the race without the lock.
+                    time.sleep(0.02)
+                    return real_replace(src, dst, *args, **kwargs)
                 finally:
-                    in_flight -= 1
+                    with counter_lock:
+                        in_flight -= 1
 
-            monkeypatch.setattr(asyncio, 'to_thread', _patched_to_thread)
+            monkeypatch.setattr(os, 'replace', _counting_replace)
 
             # ── Fire 5 concurrent report_failure calls ───────────────────────
             # Same project_id, DISTINCT subtypes → independent _failure_log keys
