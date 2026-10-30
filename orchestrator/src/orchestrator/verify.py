@@ -88,6 +88,7 @@ from orchestrator.verify_cmd import (
     ChainSegment,
     ToolKind,
     VerifyCmd,
+    _split_xdist_option,
     _unspliceable_pytest_spans,
     apply_pytest_numprocesses,
     cargo_scope,
@@ -11227,6 +11228,26 @@ def _loadavg1_or_none(loadavg: Callable[[], tuple[float, float, float]]) -> 'flo
 _XDIST_N_FLAGS = frozenset({'-n', '--numprocesses'})
 
 
+def _named_worker_count(flags: tuple[str, ...]) -> str | None:
+    """The worker count pytest *flags* name, or ``None`` when they name none.
+
+    Each token's spelling is split by ``verify_cmd._split_xdist_option``; a
+    value flag's adjacent value is stepped over, so a ``-k -n8`` is never
+    read as a count. An EMPTY attached value (``--numprocesses=``) names no
+    count — pytest rejects that command outright — so it reads as absent
+    rather than as a worker count of ``''``.
+    """
+    i = 0
+    while i < len(flags):
+        match _split_xdist_option(flags[i]):
+            case (option, attached) if option in _XDIST_N_FLAGS and attached:
+                return attached
+            case (option, None) if option in _XDIST_N_FLAGS and i + 1 < len(flags):
+                return flags[i + 1]
+        i += 2 if flags[i] in _PYTEST_VALUE_FLAGS and i + 1 < len(flags) else 1
+    return None
+
+
 def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
     """The xdist worker facts for *cmd*, as two independently-nullable fields.
 
@@ -11252,17 +11273,15 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
 
       SPELLINGS, tested rather than assumed equal to one literal: both ``-n 8``
       and its long form ``--numprocesses 8`` (``_XDIST_N_FLAGS``), each also in
-      the attached one-token form (``--numprocesses=8``, ``-n=8`` — argparse
-      accepts both). A set that bound ``-n`` alone would report ``n_flag: null``
-      for a module config using the long spelling, which the census reads as
-      "no flag on argv, so addopts decided the count" — a wrong fact, silently,
-      in the corpus this deliverable exists to make trustworthy. No live config
-      uses the long spelling today, so that was latent rather than active.
-
-      The CONCATENATED short form (``-n8``) is reported as absent. The serial
-      recovery's strip (``verify_cmd._is_xdist_option``) does shed it, because
-      there a surviving xdist token is a hard usage error; here the miss only
-      under-reports, and no live config uses that spelling.
+      the attached one-token form (``--numprocesses=8``, ``-n=8``), and the
+      concatenated short form (``-n8``, ``-nauto``) — argparse reads all of
+      them. The spelling grammar is ``verify_cmd._split_xdist_option``'s, the
+      same one the serial recovery's strip sheds by, so the stamp never reads
+      a worker flag that strip would leave on argv. A set that bound ``-n``
+      alone would report ``n_flag: null`` for a module config using the long
+      spelling, which the census reads as "no flag on argv, so addopts decided
+      the count" — a wrong fact, silently, in the corpus this deliverable
+      exists to make trustworthy.
     - ``auto_num_workers`` — ``PYTEST_XDIST_AUTO_NUM_WORKERS`` as this command's
       own subprocess will see it, or ``None`` when nothing sets it. Resolved by
       asking ``_target_subprocess_env`` — the SAME builder ``_run_cmd`` spawns
@@ -11298,28 +11317,7 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
         ).get('PYTEST_XDIST_AUTO_NUM_WORKERS')
         parsed = parse_config_command(cmd)
         if parsed.tool is ToolKind.PYTEST and parsed.raw is None:
-            flags = parsed.base_flags
-            i = 0
-            while i < len(flags):
-                # One partition covers both spellings of "this flag's value":
-                # attached (`--numprocesses=8` -> sep is '=') or the adjacent
-                # token (`-n 8`), which `_PYTEST_VALUE_FLAGS` has already bound
-                # next to its flag. An attached form with an EMPTY value
-                # (`--numprocesses=`) names no count — pytest rejects that
-                # command outright — so it falls through and reports absent
-                # rather than recording `''` as a worker count.
-                head, sep, attached = flags[i].partition('=')
-                if head in _XDIST_N_FLAGS:
-                    if sep and attached:
-                        n_flag = attached
-                        break
-                    if not sep and i + 1 < len(flags):
-                        n_flag = flags[i + 1]
-                        break
-                if flags[i] in _PYTEST_VALUE_FLAGS and i + 1 < len(flags):
-                    i += 2
-                else:
-                    i += 1
+            n_flag = _named_worker_count(parsed.base_flags)
     except Exception:
         logger.warning(
             '_xdist_workers: could not read the worker facts off %r; '
