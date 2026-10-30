@@ -156,6 +156,14 @@ def _load_cell(path: Path) -> EvalResult:
     return dataclasses.replace(result, metrics=normalize_legacy_metrics(result.metrics))
 
 
+def load_result(path: Path) -> EvalResult:
+    """The cell persisted at *path*; one that cannot be read raises ResultLoadError naming it."""
+    try:
+        return _load_cell(path)
+    except (ValueError, OSError, TypeError, AttributeError) as e:
+        raise ResultLoadError(path, f'{type(e).__name__}: {e}') from e
+
+
 def _read_raw_cell(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text())
@@ -235,10 +243,4 @@ class ResultStore:
             raise MissingResultsDirError(
                 self.directory, 'results dir not found (or is not a directory)'
             )
-        results = []
-        for path in self.cell_paths():
-            try:
-                results.append(_load_cell(path))
-            except (ValueError, OSError, TypeError, AttributeError) as e:
-                raise ResultLoadError(path, f'{type(e).__name__}: {e}') from e
-        return results
+        return [load_result(path) for path in self.cell_paths()]

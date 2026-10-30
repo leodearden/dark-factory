@@ -825,8 +825,9 @@ Resolved at decompose on 2026-09-11 are struck through with their resolution; th
 4. **Settle-deadline default.** 168 h assumes production lands within a week; long
    `merge-deferred` holds may exceed it. **Suggested resolution:** keep 168 h, count
    `expired` in the report, revisit after κ2.
-5. **Cross-project report aggregation.** Each orchestrator writes its own runs.db;
-   `eval-shadow report --project-root` per project vs a merged view. Decide in θ1.
+5. ~~**Cross-project report aggregation.**~~ **RESOLVED** in θ1, task 5389: per-project
+   `orchestrator eval-shadow report --config <project yaml>`, no merged view; the reasoning
+   is in the θ1 CLI commit message.
 6. **Consequence leg 2 reviewer.** Whether leg 2 runs the reviewer (adds cost, gives
    `review_blocking_issues`) or stops at verify. **Suggested resolution:** run it —
    review outcome is half the signal for "better plan". Decide in ζ.

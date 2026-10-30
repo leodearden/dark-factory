@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 from _merge_lane_fakes import FakeVerifier, VerifyScript
 from _orch_helpers import make_placeholder_future
+from _verify_result_doubles import real_verify_result
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -108,17 +109,6 @@ def _make_request(config: OrchestratorConfig, worktree: Path) -> MergeRequest:
     )
 
 
-def _mock_verify_result(passed: bool) -> VerifyResult:
-    return VerifyResult(
-        passed=passed,
-        test_output='ok' if passed else 'FAILED',
-        lint_output='',
-        type_output='',
-        summary='ok' if passed else 'fail',
-        category='' if passed else 'test_failure',
-    )
-
-
 class _LeaseObservingVerifier(FakeVerifier):
     """A ``VerifyPort`` that records the lease holder pgid at dispatch time.
 
@@ -136,7 +126,7 @@ class _LeaseObservingVerifier(FakeVerifier):
     """
 
     def __init__(self, worktree_base: Path) -> None:
-        super().__init__(default=VerifyScript(result=_mock_verify_result(True)))
+        super().__init__(default=VerifyScript(result=real_verify_result(True)))
         self._worktree_base = worktree_base
         self.holder_at_dispatch: list[int | None] = []
 
