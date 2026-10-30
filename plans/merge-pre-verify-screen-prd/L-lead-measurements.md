@@ -18,6 +18,7 @@ The screen does not depend on the no-venv property, because it runs under `uv ru
 |---|---|---|
 | cold | 1.62 s | 65 MB max RSS; the resulting `.venv` is 306 MB apparent size, hardlinked from the uv cache |
 | immediate re-run | 0.14 s | |
+| critic re-measure (`git clone --shared` at the same sha, different load) | 7.60 s | 66 MB max RSS, `.venv` 258 MB. A single sample each, so the PRD states "2–8 s" |
 
 ## L3. The fast seven in parallel
 
