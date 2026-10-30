@@ -1770,6 +1770,24 @@ class TestCuratorEntryCharCaps:
             CuratorConfig(**{field: value})
 
 
+class TestCuratorSiblingCap:
+    """The cap on an agent-followup candidate's same-parent sibling stream (task 6227)."""
+
+    def test_a_sibling_is_never_trimmed_at_stock_caps(self):
+        cfg = CuratorConfig()
+        assert 1 + cfg.pool_sibling_cap <= cfg.pool_total_cap, (
+            f'anchor(1) + pool_sibling_cap ({cfg.pool_sibling_cap}) exceeds '
+            f'pool_total_cap ({cfg.pool_total_cap}). _trim_pool cuts siblings '
+            f'only after every other stream except the anchor, so this '
+            f'inequality is what keeps a sibling from ever being cut.'
+        )
+
+    def test_a_negative_sibling_cap_is_refused_at_load(self):
+        """A cap of 0 is legal and disables the stream; a negative one is refused."""
+        with pytest.raises(ValidationError, match='pool_sibling_cap'):
+            CuratorConfig(pool_sibling_cap=-1)
+
+
 class TestCuratorConfigBudgetRaise:
     """Regression guard: TaskCurator per-call budget is a durable flat $2.00 (task 1980).
 
