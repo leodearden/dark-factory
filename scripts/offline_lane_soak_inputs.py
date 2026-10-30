@@ -8,11 +8,11 @@ provision what they open, so each store's existence is tested before its reader 
 """
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import _checkout as _checkout
 from orchestrator.flake_ledger import ledger_db_path, read_call_sites_written
@@ -98,6 +98,13 @@ class SoakInputs:
     commands: tuple[str, ...]
     passes: tuple[WindowPass, ...]
     episodes: Mapping[str, CommandRecord]
+    tasks: Mapping[str, Mapping[str, Any] | None]
+
+    def effects(self) -> Iterator[tuple[WindowPass, PassEffect]]:
+        """Each windowed pass that carries a readable effect block, with that block."""
+        for window_pass in self.passes:
+            if window_pass.effect is not None:
+                yield window_pass, window_pass.effect
 
 
 def _outcome(stored: StoredPass) -> tuple[PassOutcome | None, str | None]:
@@ -164,6 +171,32 @@ def _episodes(project_root: Path, now: datetime, commands: Sequence[str]) -> dic
     return {name: store.load(name) for name in store.commands() if command_key(name) in commands}
 
 
+def _lane_task_ids(window: Sequence[WindowPass], episodes: Mapping[str, CommandRecord]) -> list[str]:
+    """The ids the windowed effect blocks filed, then the tasks the live episode records are or were bound to."""
+    filed = [task_id for p in window if p.effect is not None for task_id in p.effect.tasks_filed]
+    bound = [
+        task_id
+        for record in episodes.values()
+        for episode in record.episodes.values()
+        for task_id in (episode.covering_task_id, *episode.prior_task_ids)
+        if task_id is not None
+    ]
+    return list(dict.fromkeys((*filed, *bound)))
+
+
+async def _read_tasks(
+    task_ids: Sequence[str], task_reader: TaskReader,
+) -> dict[str, Mapping[str, Any] | None] | Unjudgeable:
+    """Each task as read, None for a corroborated absence; a failed read leaves nothing to judge."""
+    tasks: dict[str, Mapping[str, Any] | None] = {}
+    for task_id in task_ids:
+        task, error = await task_reader.get_task(task_id)
+        if error is not None:
+            return Unjudgeable(f'task store unreadable: {task_id}: {error}')
+        tasks[task_id] = task
+    return tasks
+
+
 async def load_inputs(
     project_root: Path,
     *,
@@ -191,10 +224,15 @@ async def load_inputs(
     window = tuple(_window_pass(p) for p in in_window if p.command_key in selected)
     if not window:
         return Unjudgeable(f'no pass record since {since.isoformat()}')
+    episodes = _episodes(project_root, now, tuple(selected))
+    tasks = await _read_tasks(_lane_task_ids(window, episodes), task_reader)
+    if isinstance(tasks, Unjudgeable):
+        return tasks
     return SoakInputs(
         since=since,
         now=now,
         commands=tuple(sorted(selected)),
         passes=window,
-        episodes=_episodes(project_root, now, tuple(selected)),
+        episodes=episodes,
+        tasks=tasks,
     )

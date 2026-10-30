@@ -24,7 +24,7 @@ import asyncio
 import json
 import sys
 from collections import Counter, defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -143,9 +143,46 @@ def _records_well_formed(inputs: SoakInputs, rule: str, settings: Settings) -> C
     return _judged(Check.RECORDS_WELL_FORMED, rule, len(inputs.passes), failures, notes)
 
 
+def _filing_problem(task: Mapping[str, Any] | None) -> str | None:
+    if task is None:
+        return 'get_task found no such task'
+    details = task.get('details')
+    if not isinstance(details, str) or not details.strip():
+        return 'its details digest is empty'
+    metadata = task.get('metadata')
+    if not isinstance(metadata, Mapping) or not isinstance(metadata.get(LANE_METADATA_KEY), Mapping):
+        return f'it carries no metadata.{LANE_METADATA_KEY}'
+    return None
+
+
+def _filings_resolve(inputs: SoakInputs, rule: str, settings: Settings) -> CheckResult:
+    filed_by: dict[str, str] = {}
+    for window_pass, effect in inputs.effects():
+        for task_id in effect.tasks_filed:
+            filed_by.setdefault(task_id, _label(window_pass))
+    failures = [
+        f'task {task_id} (filed by {label}): {problem}'
+        for task_id, label in filed_by.items()
+        if (problem := _filing_problem(inputs.tasks.get(task_id))) is not None
+    ]
+    return _judged(Check.FILINGS_RESOLVE, rule, len(filed_by), failures)
+
+
+def _filings_bounded_by_threshold(inputs: SoakInputs, rule: str, settings: Settings) -> CheckResult:
+    blocks = [effect for _, effect in inputs.effects() if effect.tasks_filed or effect.threshold_reached]
+    filed = len({task_id for effect in blocks for task_id in effect.tasks_filed})
+    crossings = sum(len(set(effect.threshold_reached)) for effect in blocks)
+    counts = f'{filed} distinct task(s) filed; {crossings} (pass, test) threshold crossing(s)'
+    if filed > crossings:
+        return _judged(Check.FILINGS_BOUNDED_BY_THRESHOLD, rule, len(blocks), failures=[counts])
+    return _judged(Check.FILINGS_BOUNDED_BY_THRESHOLD, rule, len(blocks), notes=[counts])
+
+
 _CHECKS: dict[Check, CheckFn] = {
     **{check: _not_yet_judged(check) for check in Check},
     Check.RECORDS_WELL_FORMED: _records_well_formed,
+    Check.FILINGS_RESOLVE: _filings_resolve,
+    Check.FILINGS_BOUNDED_BY_THRESHOLD: _filings_bounded_by_threshold,
 }
 
 
