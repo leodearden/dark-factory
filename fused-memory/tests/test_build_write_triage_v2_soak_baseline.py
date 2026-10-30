@@ -422,6 +422,38 @@ class TestAssemble:
             {'entry_id': 's1', 'target_id': 'p1', 'basis': 'current', 'binary': 'loss'},
         ]
 
+    def test_held_rows_are_decided_by_the_checked_rows(self) -> None:
+        adjudications: dict[tuple[str, str], dict[str, Any] | None] = {
+            (f'u{index}', 'p1'): _adjudication('UNRELATED', child_memory_id=f'u{index}')
+            for index in range(10)
+        }
+        rated = [_rated(f'u{index}', role=role, home='YES', conflict='NO', loss='NO')
+                 for index in range(10) for role in ('primary', 'second')]
+        checked = [_rated(f'u{index}', role=role, home='NO', conflict='NO')
+                   for index in range(10) for role in ('primary', 'second')]
+        child_texts = {entry_id: LONG_CHILD for entry_id, _ in adjudications}
+        builder = _mod()
+        assembly = builder.assemble(adjudications, rated, child_texts, checked_rows=checked)
+
+        derivation = assembly.derivation
+        assert derivation['held_rows'] == [
+            'related_unrelated_home_no', 'same_subsumed_unrelated_conflict_no']
+        derived = {row['entry_id']: (row['home'], row['conflict'])
+                   for row in assembly.verdicts if row['role'] == 'derived'}
+        assert derived == {f'u{index}': ('NO', 'NO') for index in range(10)}
+        assert {tuple(row['non_consumed']) for row in assembly.verdicts
+                if row['role'] != 'derived'} == {('conflict', 'home')}
+        home_no = {'binary': 'home', 'n_items': 10, 'n_compared': 20, 'retired': False}
+        assert derivation['rows']['related_unrelated_home_no'] == {
+            **home_no, 'agree': 20, 'held': True}
+        assert derivation['effective_lines_check']['related_unrelated_home_no'] == {
+            **home_no, 'agree': 0, 'held': False}
+        assert set(derivation['effective_lines_check']) == set(derivation['rows'])
+
+        unchecked = builder.assemble(adjudications, rated, child_texts).derivation
+        assert unchecked['held_rows'] == ['same_subsumed_unrelated_conflict_no']
+        assert unchecked['rows'] == unchecked['effective_lines_check']
+
 
 CREATED = '2026-10-10T00:00:00+00:00'
 
@@ -823,14 +855,15 @@ def _primary_shard_of(key: dict[str, Any], keyed: tuple[str, str, str]) -> str:
 CORPUS_FILES = ('items.jsonl', 'verdicts.jsonl', 'strata.json', 'derivation.json')
 
 
-def _score(out: Path) -> int:
-    """The scorer's exit code over the corpus ``assemble`` wrote into *out*."""
+def _score(out: Path, *, verdicts: str = 'verdicts.jsonl', rubric: str = 'v2.1') -> int:
+    """The scorer's exit code over the corpus ``assemble`` wrote into *out*, its verdicts
+    read from ``write_triage_v2_soak_<verdicts>``."""
     score = load_script_module(SCRIPTS / 'score_write_triage_reader.py',
                                mod_name='score_write_triage_reader')
-    paths = {name: out / f'write_triage_v2_soak_{name}' for name in CORPUS_FILES}
+    paths = {name: out / f'write_triage_v2_soak_{name}' for name in ('items.jsonl', verdicts, 'strata.json')}
     return score.main([
-        '--items', str(paths['items.jsonl']), '--verdicts', str(paths['verdicts.jsonl']),
-        '--strata', str(paths['strata.json']), '--rubric', 'v2.1',
+        '--items', str(paths['items.jsonl']), '--verdicts', str(paths[verdicts]),
+        '--strata', str(paths['strata.json']), '--rubric', rubric,
     ])
 
 
@@ -1016,8 +1049,12 @@ class TestTheRatingRounds:
         derivation = json.loads(paths['derivation.json'].read_text())
         assert set(derivation) == {
             'check', 'rows', 'held_rows', 'unreached_follow_ups', 'rating_volume', 'sample',
-            'unrecoverable', 'attach_time_unrecoverable', 'reasked', 'shards',
+            'unrecoverable', 'attach_time_unrecoverable', 'reasked', 'shards', 'rerates',
+            'effective_lines_check',
         }
+        assert derivation['check']['brief_sha256'] == BRIEF_SHA256
+        assert derivation['rerates'] == []
+        assert derivation['effective_lines_check'] == derivation['rows']
         assert derivation['held_rows'] == []
         assert derivation['unreached_follow_ups'] == []
         assert derivation['rating_volume'] == {
@@ -1033,11 +1070,167 @@ class TestTheRatingRounds:
         assert derivation['reasked'] == 0
         assert derivation['shards'] == {
             name: {'rater': spec['rater'], 'role': spec['role'], 'round': spec['round'],
-                   'items': len(spec['items'])}
+                   'items': len(spec['items']), 'brief_sha256': BRIEF_SHA256}
             for name, spec in key['shards'].items()
         }
 
         assert _score(out) == 0
+
+
+RERATED = _current('i-r0')
+"""The one pair whose derivation reads LOSS when every line follows HONEST."""
+V2_2_CORPUS = ('items.jsonl', 'strata.json', 'verdicts_v2_2.jsonl', 'derivation_v2_2.json')
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class TestTheRerate:
+    @pytest.fixture
+    def bundle(self, tmp_path: Path) -> _Bundle:
+        bundle = _Bundle(tmp_path)
+        assert bundle.shards() == 0
+        return bundle
+
+    @pytest.fixture
+    def brief(self, tmp_path: Path) -> Path:
+        path = tmp_path / 'brief_v2_2.md'
+        path.write_text('# Rater brief v2.2 (test copy)\n\nAnswer LOSS the revised way.\n')
+        assert _sha(path) != BRIEF_SHA256
+        return path
+
+    @pytest.fixture
+    def rerated(self, bundle: _Bundle, brief: Path) -> _Bundle:
+        _rate(bundle)
+        assert self._rerate(bundle, brief) == 0
+        return bundle
+
+    @staticmethod
+    def _rerate(bundle: _Bundle, brief: Path) -> int:
+        return bundle.run('rerate', '--brief', str(brief), '--brief-version', 'v2.2')
+
+    @staticmethod
+    def _assemble(bundle: _Bundle, out: Path, brief: Path) -> int:
+        return bundle.run('assemble', '--out-dir', str(out), '--brief', str(brief))
+
+    def test_keys_one_round_of_both_raters_over_the_pairs_reading_loss(
+        self, rerated: _Bundle, brief: Path,
+    ) -> None:
+        key = rerated.key()
+        [rerate] = key['rerates']
+        assert rerate == {
+            'version': 'v2.2', 'round': 1, 'brief_sha256': _sha(brief), 'pairs': [list(RERATED[:2])],
+            'shards': ['rerate_01_primary_00', 'rerate_01_second_00'], 'retires_third_raters': [],
+        }
+        for name in rerate['shards']:
+            spec = key['shards'][name]
+            assert (spec['rater'], spec['round'], spec['brief_sha256']) == (
+                f'opus-{spec["role"]}', 1, _sha(brief))
+            assert _shard_keyed(key, name) == {RERATED}
+        assert (rerated.scratch / 'rater_prompt.md').read_text() == _rounds().rater_prompt(brief)
+
+    def test_the_rerated_pairs_are_those_the_assembled_corpus_reads_loss_on(
+        self, bundle: _Bundle, brief: Path, tmp_path: Path,
+    ) -> None:
+        _rate(bundle)
+        before = tmp_path / 'before'
+        assert bundle.run('assemble', '--out-dir', str(before)) == 0
+        derivations = _mod().current_derivations(
+            _jsonl(before / 'write_triage_v2_soak_items.jsonl'),
+            _jsonl(before / 'write_triage_v2_soak_verdicts.jsonl'))
+        assert _rounds().pairs_reading_loss(derivations) == {RERATED[:2]}
+        assert self._rerate(bundle, brief) == 0
+        assert bundle.key()['rerates'][0]['pairs'] == [list(RERATED[:2])]
+
+    def test_refuses_while_a_keyed_shard_has_no_ratings(self, bundle: _Bundle, brief: Path) -> None:
+        with pytest.raises(ValueError, match='no ratings'):
+            self._rerate(bundle, brief)
+        assert 'rerates' not in bundle.key()
+
+    def test_refuses_while_a_reask_is_pending(self, bundle: _Bundle, brief: Path) -> None:
+        _rate(bundle, {('primary', RERATED): _lacks_loss})
+        with pytest.raises(ValueError, match='reask'):
+            self._rerate(bundle, brief)
+        assert 'rerates' not in bundle.key()
+
+    def test_refuses_while_a_pair_awaits_a_third_rater(self, bundle: _Bundle, brief: Path) -> None:
+        _rate(bundle, {('primary', RERATED): _conflict_yes})
+        with pytest.raises(ValueError, match=r"run third.*\('c-i-r0', 'p-i-r0'\)"):
+            self._rerate(bundle, brief)
+        assert 'rerates' not in bundle.key()
+
+    def test_a_rerun_keys_nothing_new_and_renders_a_deleted_shard_again(
+        self, rerated: _Bundle, brief: Path,
+    ) -> None:
+        key_bytes, shard_files = (rerated.scratch / 'key.json').read_bytes(), rerated.shard_files()
+        (rerated.scratch / 'shards' / 'rerate_01_second_00.txt').unlink()
+        assert self._rerate(rerated, brief) == 0
+        assert (rerated.scratch / 'key.json').read_bytes() == key_bytes
+        assert rerated.shard_files() == shard_files
+
+    def test_assemble_writes_the_v2_2_verdicts_and_derivation_beside_the_base_items_and_strata(
+        self, rerated: _Bundle, brief: Path, tmp_path: Path,
+    ) -> None:
+        _rate(rerated)
+        out = tmp_path / 'out'
+        assert self._assemble(rerated, out, brief) == 0
+        assert sorted(path.name for path in out.iterdir()) == sorted(
+            f'write_triage_v2_soak_{name}' for name in V2_2_CORPUS)
+
+        key = rerated.key()
+        [rerate] = key['rerates']
+        verdicts = _jsonl(out / 'write_triage_v2_soak_verdicts_v2_2.jsonl')
+        batches = {row['rater']: row['batch'] for row in verdicts if _triple(row) == RERATED}
+        assert batches == {'opus-primary': 'rerate_01_primary_00', 'opus-second': 'rerate_01_second_00'}
+        derivation = json.loads((out / 'write_triage_v2_soak_derivation_v2_2.json').read_text())
+        assert derivation['rerates'] == [
+            {'version': 'v2.2', 'round': 1, 'pairs': 1, 'brief_sha256': _sha(brief)}]
+        assert {name: spec['brief_sha256'] for name, spec in derivation['shards'].items()} == {
+            name: _sha(brief) if name in rerate['shards'] else BRIEF_SHA256 for name in key['shards']}
+        assert derivation['check']['brief_sha256'] == BRIEF_SHA256
+        assert _score(out, verdicts='verdicts_v2_2.jsonl', rubric='v2.2') == 0
+
+    def test_assemble_refuses_a_pair_reading_loss_outside_the_latest_rerate(
+        self, rerated: _Bundle, brief: Path, tmp_path: Path,
+    ) -> None:
+        key = rerated.key()
+        rerate = key['rerates'][0]
+        rerate['pairs'].remove(list(RERATED[:2]))
+        for name in rerate['shards']:
+            key['shards'][name]['items'] = []
+        (rerated.scratch / 'key.json').write_text(json.dumps(key))
+        _rate(rerated)
+        out = tmp_path / 'out'
+        with pytest.raises(ValueError, match=r'(?s)latest re-rate \(v2\.2\).*c-i-r0 p-i-r0'):
+            self._assemble(rerated, out, brief)
+        assert not out.exists()
+
+    def test_a_tie_on_a_rerated_pair_goes_to_a_fresh_third_rater_under_the_new_brief(
+        self, bundle: _Bundle, brief: Path, tmp_path: Path,
+    ) -> None:
+        tie = {('primary', RERATED): _conflict_yes, ('third', RERATED): _loss_yes}
+        _rate(bundle, tie)
+        assert bundle.run('third') == 0
+        _rate(bundle, tie)
+        assert self._rerate(bundle, brief) == 0
+        [rerate] = bundle.key()['rerates']
+        assert (rerate['pairs'], rerate['retires_third_raters']) == ([list(RERATED[:2])], ['opus-third-00'])
+
+        _rate(bundle, tie)
+        assert bundle.run('third', '--brief', str(brief)) == 0
+        key = bundle.key()
+        fresh = {name: spec for name, spec in key['shards'].items()
+                 if spec['role'] == 'third' and spec['rater'] != 'opus-third-00'}
+        assert [(spec['rater'], spec['brief_sha256']) for spec in fresh.values()] == [
+            ('opus-third-01', _sha(brief))]
+        assert {keyed for name in fresh for keyed in _shard_keyed(key, name)} == {RERATED}
+
+        _rate(bundle, tie)
+        out = tmp_path / 'out'
+        assert self._assemble(bundle, out, brief) == 0
+        assert {row['rater'] for row in _jsonl(out / 'write_triage_v2_soak_verdicts_v2_2.jsonl')
+                if _triple(row) == RERATED} == {'opus-primary', 'opus-second', 'opus-third-01'}
 
 
 class TestTheCli:
@@ -1073,3 +1266,26 @@ class TestThirdRoundPairs:
     def test_an_unrated_decisive_binary_is_refused(self) -> None:
         with pytest.raises(ValueError, match="'unrated-item'"):
             _mod().third_round_pairs([_item(entry_id='unrated-item')], [])
+
+
+class TestCurrentDerivations:
+    def test_maps_each_item_pair_to_its_current_basis_derivation(self) -> None:
+        rubric = _rubric()
+        items = [_item(entry_id='kept', outcome='restated'), _item(entry_id='tied'),
+                 _item(entry_id='misfiled', outcome='amended')]
+        verdicts = [
+            *(_rated('kept', role=role, home='YES', conflict='NO', loss='NO')
+              for role in ('primary', 'second')),
+            _rated('kept', role='primary', basis='attach_time', home='NO', conflict='NO'),
+            _rated('tied', role='primary', home='YES', conflict='YES', scope='CENTRAL',
+                   action_changing='YES'),
+            _rated('tied', role='second', home='YES', conflict='NO', loss='NO'),
+            *(_rated('misfiled', role=role, home='NO', conflict='NO') for role in ('primary', 'second')),
+        ]
+        derivations = _mod().current_derivations(items, verdicts)
+        assert set(derivations) == {('kept', 'p1'), ('tied', 'p1'), ('misfiled', 'p1')}
+        assert ('p1', rubric.Binary.LOSS) in derivations['kept', 'p1'].consumed
+        assert isinstance(derivations['misfiled', 'p1'], rubric.Decided)
+        assert [(str(gap.binary), str(gap.kind)) for gap in derivations['tied', 'p1'].missing] == [
+            ('conflict', 'tied')]
+        assert _rounds().pairs_reading_loss(derivations) == {('kept', 'p1')}
