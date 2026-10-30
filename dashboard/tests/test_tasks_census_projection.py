@@ -13,6 +13,7 @@ so the real ``fetch_tasks`` / ``fetch_statuses`` / unit cache run underneath.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
@@ -232,16 +233,17 @@ class TestCollectCensusSnapshots:
             assert census[label].census.value == full[label].census.value
 
     async def test_a_root_past_its_budget_is_degraded_exactly_as_the_full_collector_says(
-        self, two_roots, dummy_client, no_runtime, monkeypatch,
+        self, two_roots, dummy_client, no_runtime,
     ):
         """The same per-root budget routes the same root to the same banner.
 
-        The budget is squeezed through the module constant, the idiom
-        ``test_active_tasks.py`` uses to cut off a real acquisition without
-        waiting out the shipped 14 s budget.
+        Both collectors are handed the same budget with a small per-project
+        share, so a real acquisition is cut off without waiting out the
+        shipped 14 s one.
         """
         import dashboard.data.task_snapshot as snapshot_mod
         from dashboard.data.active_tasks import (
+            TASKS_BUDGET,
             collect_census_snapshots,
             collect_tasks_with_counts,
         )
@@ -250,11 +252,15 @@ class TestCollectCensusSnapshots:
         async def _hangs(client, url, tool, args, **kwargs):
             await asyncio.Event().wait()
 
-        monkeypatch.setattr('dashboard.data.active_tasks._TASKS_PER_PROJECT_BUDGET', 0.05)
+        budget = replace(TASKS_BUDGET, per_project=0.05)
         with patch('dashboard.data.tasks.mcp_tool_call', new=_hangs):
-            census = await collect_census_snapshots(dummy_client, two_roots, now=NOW)
+            census = await collect_census_snapshots(
+                dummy_client, two_roots, now=NOW, budget=budget,
+            )
             snapshot_mod._snapshot_cache_clear()
-            _rows, full = await collect_tasks_with_counts(dummy_client, two_roots, now=NOW)
+            _rows, full = await collect_tasks_with_counts(
+                dummy_client, two_roots, now=NOW, budget=budget,
+            )
 
         assert set(census) == set(full) == {'alpha', 'beta'}
         for label in full:

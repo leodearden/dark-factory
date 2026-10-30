@@ -546,10 +546,10 @@ class TestTerminalWindow:
         The roster names three bounded OPERATIONS and the default render spends
         two; this render spends the third. The arithmetic
         ``PER_CALL_TIMEOUT * len(PER_PROJECT_MCP_CALLS) <=
-        _TASKS_PER_PROJECT_BUDGET`` is what makes that affordable, and the
+        TASKS_BUDGET.per_project`` is what makes that affordable, and the
         ``timeout=`` at the wire is what makes it true rather than aspirational.
         """
-        from dashboard.data.active_tasks import _TASKS_PER_PROJECT_BUDGET
+        from dashboard.data.active_tasks import TASKS_BUDGET
         from dashboard.data.task_snapshot import (
             PER_CALL_TIMEOUT,
             PER_PROJECT_MCP_CALLS,
@@ -570,7 +570,7 @@ class TestTerminalWindow:
             'the roster must name the slot this read spends, or the budget '
             f'arithmetic is not about it: {PER_PROJECT_MCP_CALLS}'
         )
-        assert PER_CALL_TIMEOUT * len(PER_PROJECT_MCP_CALLS) <= _TASKS_PER_PROJECT_BUDGET
+        assert PER_CALL_TIMEOUT * len(PER_PROJECT_MCP_CALLS) <= TASKS_BUDGET.per_project
 
     def test_the_real_client_applies_the_window_this_endpoint_serves(
         self, client, monkeypatch, tmp_path
