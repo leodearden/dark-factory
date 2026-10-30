@@ -1413,30 +1413,32 @@ class TestScoperTrailingClausePreservation:
         """The task's headline case, as a full literal golden.
 
         The ruff clause is narrowed to the one touched file (its unscoped
-        ``src/ tests/`` targets are gone); both sibling checkers survive
+        ``src/ tests/`` targets are gone); every sibling checker survives
         byte-identically, still pointed at the whole ``fused-memory/tests``
-        directory they assert an invariant over.
+        or ``fused-memory`` tree it asserts an invariant over.
         """
         scoped = _scope_to_keyword(FM_LINT_COMMAND, 'ruff check', self._FILES)
         assert scoped == (
             'uv run --project fused-memory ruff check fused-memory/tests/test_harness.py'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
             ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
+            ' && python3 tests/scripts/raw_envelope_literal_guard.py fused-memory'
         )
         assert 'src/ tests/' not in scoped
         for checker in (
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests',
             '&& python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests',
+            '&& python3 tests/scripts/raw_envelope_literal_guard.py fused-memory',
         ):
             assert checker in scoped, f'{checker!r} must survive verbatim'
             assert checker in FM_LINT_COMMAND, 'the slice asserted above must be verbatim'
 
     def test_dashboard_lint_chain_scopes_ruff_and_keeps_both_checkers(self):
-        """The second 3-segment chain (task 4485), as a full literal golden.
+        """The second 4-segment chain (tasks 4485 and 6230), as a full literal golden.
 
         Same shape as the fused-memory case above: the ruff clause narrows
-        to the touched file while both sibling checkers survive verbatim,
-        still pointed at the whole ``dashboard/tests`` directory.
+        to the touched file while every sibling checker survives verbatim,
+        still pointed at the whole ``dashboard/tests`` or ``dashboard`` tree.
         """
         files = ['dashboard/tests/test_index_html.py']
         scoped = _scope_to_keyword(DASHBOARD_LINT_COMMAND, 'ruff check', files)
@@ -1444,11 +1446,13 @@ class TestScoperTrailingClausePreservation:
             'uv run --project dashboard ruff check dashboard/tests/test_index_html.py'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py dashboard/tests'
             ' && python3 fused-memory/scripts/check_module_local_testclient.py dashboard/tests'
+            ' && python3 tests/scripts/raw_envelope_literal_guard.py dashboard'
         )
         assert 'src/ tests/' not in scoped
         for checker in (
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py dashboard/tests',
             '&& python3 fused-memory/scripts/check_module_local_testclient.py dashboard/tests',
+            '&& python3 tests/scripts/raw_envelope_literal_guard.py dashboard',
         ):
             assert checker in scoped, f'{checker!r} must survive verbatim'
             assert checker in DASHBOARD_LINT_COMMAND, 'the slice asserted above must be verbatim'
@@ -2432,15 +2436,15 @@ _FM_TEST_FILE = 'fused-memory/tests/test_harness.py'
 _SWEEP_TEST_FILE = 'orchestrator/tests/test_sweep.py'
 
 _SWEEP_MODULE_CONFIGS: list[tuple[str, ModuleConfig]] = [
-    # The live 2-segment chained lint + the root's cd-chained pyright/pytest.
+    # The live 3-segment chained lint + the root's cd-chained pyright/pytest.
     ('real-chained', ModuleConfig(
         prefix='orchestrator',
         lint_command=MODULE_LINT_COMMANDS['orchestrator'],
         type_check_command=ROOT_TYPE_CHECK_COMMAND,
         test_command=ROOT_TEST_COMMAND,
     )),
-    # The only 3-segment chain in the live configs (two sibling checkers).
-    ('fm-three-segment-lint', ModuleConfig(
+    # A live 4-segment chain (three sibling checkers).
+    ('fm-four-segment-lint', ModuleConfig(
         prefix='orchestrator',
         lint_command=FM_LINT_COMMAND,
         type_check_command='npx pyright',
