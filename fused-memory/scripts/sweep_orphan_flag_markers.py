@@ -220,6 +220,7 @@ from typing import Any
 
 from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
 from fused_memory.reconciliation.mem0_tombstone import (
+    is_foreign_kind_record,
     is_protected_audit_record,
     is_protected_mirror_record,
     record_mem0_deletion_tombstones,
@@ -594,10 +595,7 @@ def protection_reason(metadata: Any) -> ProtectionReason | None:
         return ProtectionReason.CYCLE_SUMMARY_MIRROR
     if is_protected_audit_record(metadata):
         return ProtectionReason.PROTECTED_AUDIT_KIND
-    if not isinstance(metadata, dict):
-        return None
-    kind = metadata.get('kind')
-    if kind is not None and kind != MARKER_KIND:
+    if is_foreign_kind_record(metadata, MARKER_KIND):
         return ProtectionReason.FOREIGN_KIND
     return None
 

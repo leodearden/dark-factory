@@ -61,6 +61,7 @@ from fused_memory.reconciliation.live_workflow_section import (
     render_live_workflow_section,
 )
 from fused_memory.reconciliation.mem0_tombstone import (
+    is_foreign_kind_record,
     is_protected_audit_record,
     is_protected_mirror_record,
     record_mem0_deletion_tombstones,
@@ -1198,13 +1199,7 @@ class _TasklessRetirement(NamedTuple):
     marker_kind: str
 
     def permits(self, metadata, created_at: datetime, now: datetime) -> bool:
-        # The kind arm mirrors
-        # fused-memory/scripts/sweep_orphan_flag_markers.py::protection_reason (task 5286);
-        # == rather than set membership, so an unhashable kind cannot raise.
-        if not isinstance(metadata, dict):
-            return False
-        kind = metadata.get('kind')
-        if kind is not None and kind != self.marker_kind:
+        if not isinstance(metadata, dict) or is_foreign_kind_record(metadata, self.marker_kind):
             return False
         return created_at < now - timedelta(days=self.max_age_days)
 
