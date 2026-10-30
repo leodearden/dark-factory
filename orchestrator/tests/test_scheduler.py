@@ -24,6 +24,12 @@ from orchestrator.config import (
 from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
 from orchestrator.fm_retry import fm_retry_backoffs
+from orchestrator.pause_policy import (
+    HaltNotPermittedError,
+    PauseClass,
+    PausePolicy,
+    policy_for,
+)
 from orchestrator.scheduler import (
     BlastRadiusResult,
     ExternalResolverError,
@@ -8273,15 +8279,70 @@ class TestSchedulerPause:
         return scheduler
 
     def test_pause_sets_is_paused_and_reason(self, scheduler: Scheduler):
-        scheduler.pause('parked-threshold')
+        scheduler.pause('parked-threshold', PauseClass.PARK_STOP)
         assert scheduler.is_paused is True
         assert scheduler.pause_reason == 'parked-threshold'
 
     def test_resume_clears_pause(self, scheduler: Scheduler):
-        scheduler.pause('parked-threshold')
+        scheduler.pause('parked-threshold', PauseClass.PARK_STOP)
         scheduler.resume()
         assert scheduler.is_paused is False
         assert scheduler.pause_reason is None
+
+    def test_pause_records_its_class(self, scheduler: Scheduler):
+        scheduler.pause('cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
+        assert scheduler.is_paused is True
+        assert scheduler.pause_class is PauseClass.COST_CEILING
+
+    def test_resume_clears_the_class(self, scheduler: Scheduler):
+        scheduler.pause('cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
+        scheduler.resume()
+        assert scheduler.pause_class is None
+
+    def test_second_pause_keeps_the_original_class(self, scheduler: Scheduler):
+        scheduler.pause('cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
+        scheduler.pause('operator halt', PauseClass.OPERATOR)
+        assert scheduler.pause_class is PauseClass.COST_CEILING
+        assert scheduler.pause_reason == 'cost_ceiling_orch_exceeded'
+
+    def test_snapshot_reports_the_pause_class(self, scheduler: Scheduler):
+        scheduler.pause('cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
+        assert scheduler.get_state_snapshot().pause_class == 'cost_ceiling'
+        scheduler.resume()
+        assert scheduler.get_state_snapshot().pause_class is None
+
+    @staticmethod
+    def _refusing_ewa_rate(pause_class: PauseClass) -> PausePolicy:
+        policy = policy_for(pause_class)
+        if pause_class is PauseClass.EWA_RATE:
+            return dataclasses.replace(policy, may_halt=False)
+        return policy
+
+    def test_a_class_the_policy_refuses_is_never_held(self):
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            pause_policy_lookup=self._refusing_ewa_rate,
+        )
+
+        with pytest.raises(HaltNotPermittedError, match='ewa_rate'):
+            scheduler.pause('digest halt', PauseClass.EWA_RATE)
+
+        assert scheduler.is_paused is False
+        assert scheduler.pause_reason is None
+        assert scheduler.pause_class is None
+
+    def test_a_refused_class_is_refused_even_over_an_existing_hold(self):
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            pause_policy_lookup=self._refusing_ewa_rate,
+        )
+        scheduler.pause('operator halt', PauseClass.OPERATOR)
+
+        with pytest.raises(HaltNotPermittedError):
+            scheduler.pause('digest halt', PauseClass.EWA_RATE)
+
+        assert scheduler.pause_class is PauseClass.OPERATOR
+        assert scheduler.pause_reason == 'operator halt'
 
     @pytest.mark.asyncio
     async def test_acquire_next_returns_none_when_paused(self, scheduler: Scheduler):
@@ -8303,7 +8364,7 @@ class TestSchedulerPause:
         scheduler.release('1')
 
         # Now pause and confirm acquire_next returns None.
-        scheduler.pause('test')
+        scheduler.pause('test', PauseClass.OPERATOR)
         result_paused = await scheduler.acquire_next()
         assert result_paused is None, (
             f'Expected None while paused; got {result_paused}'
@@ -8334,7 +8395,7 @@ class TestSchedulerPause:
 
         # After pause — snapshot must reflect the paused state.
         reason = 'park-stop: 3 tasks parked in 1h'
-        scheduler.pause(reason)
+        scheduler.pause(reason, PauseClass.PARK_STOP)
         snap_paused = scheduler.get_state_snapshot()
         assert snap_paused.is_paused is True, (
             f"Expected is_paused=True after pause; got {snap_paused.is_paused!r}"
@@ -8546,10 +8607,10 @@ class TestParkStopTrip:
         scheduler = Scheduler(config)
         scheduler.finish_startup()
 
-        callback_args: list[str] = []
+        callback_args: list[tuple[str, PauseClass]] = []
 
-        async def recording_callback(reason: str) -> None:
-            callback_args.append(reason)
+        async def recording_callback(reason: str, pause_class: PauseClass) -> None:
+            callback_args.append((reason, pause_class))
 
         scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=recording_callback)
         mock = AsyncMock(return_value={})
@@ -8564,8 +8625,10 @@ class TestParkStopTrip:
         assert len(callback_args) == 1, (
             f'Expected callback called once; got {len(callback_args)}'
         )
+        assert scheduler.pause_class is PauseClass.PARK_STOP
+        reason, pause_class = callback_args[0]
+        assert pause_class is PauseClass.PARK_STOP
         # Reason must reference the trip parameters.
-        reason = callback_args[0]
         assert re.search(r'3', reason), f'Reason must mention threshold count: {reason!r}'
         assert re.search(r'1\.0', reason), f'Reason must mention window hours: {reason!r}'
 
@@ -8583,7 +8646,7 @@ class TestParkStopTrip:
 
         callback_count = [0]
 
-        async def counting_callback(reason: str) -> None:
+        async def counting_callback(reason: str, pause_class: PauseClass) -> None:
             callback_count[0] += 1
 
         scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=counting_callback)
@@ -8593,7 +8656,7 @@ class TestParkStopTrip:
         # Pause manually before the third transition reaches the threshold.
         await scheduler.set_task_status('1', 'blocked')
         await scheduler.set_task_status('2', 'blocked')
-        scheduler.pause('manual')  # already paused; trip check should be suppressed
+        scheduler.pause('manual', PauseClass.OPERATOR)  # already paused; trip check should be suppressed
         await scheduler.set_task_status('3', 'blocked')
         await asyncio.sleep(0)
 
@@ -8625,7 +8688,7 @@ class TestParkStopTrip:
 
         callback_count = [0]
 
-        async def counting_callback(reason: str) -> None:
+        async def counting_callback(reason: str, pause_class: PauseClass) -> None:
             callback_count[0] += 1
 
         scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=counting_callback)
@@ -8671,10 +8734,10 @@ class TestParkStopTrip:
 
         callback_args: list[str] = []
 
-        async def recording_callback(reason: str) -> None:
+        async def recording_callback(reason: str, pause_class: PauseClass) -> None:
             # Mirror harness.pause_scheduler shape: call scheduler.pause()
             # so any concurrent guard check sees _paused=True immediately.
-            scheduler.pause(reason)
+            scheduler.pause(reason, pause_class)
             callback_args.append(reason)
 
         scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=recording_callback)
@@ -8721,11 +8784,11 @@ class TestParkStopTrip:
 
         callback_count = [0]
 
-        async def trip_callback(reason: str) -> None:
+        async def trip_callback(reason: str, pause_class: PauseClass) -> None:
             callback_count[0] += 1
             # Mirror harness.pause_scheduler — scheduler.pause is idempotent
             # because the synchronous latch already set _paused=True.
-            scheduler.pause(reason)
+            scheduler.pause(reason, pause_class)
 
         scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=trip_callback)
         mock = AsyncMock(return_value={})
@@ -8775,7 +8838,7 @@ class TestParkStopDisabled:
 
         callback_count = [0]
 
-        async def recording_callback(reason: str) -> None:
+        async def recording_callback(reason: str, pause_class: PauseClass) -> None:
             callback_count[0] += 1
 
         scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=recording_callback)

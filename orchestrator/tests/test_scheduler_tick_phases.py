@@ -20,6 +20,7 @@ from shared.psi import PsiSample
 from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig, apply_reload
 from orchestrator.event_store import EventStore
 from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
+from orchestrator.pause_policy import PauseClass
 from orchestrator.scheduler import _CONTINUE, PsiHold, Scheduler, TickContext, TickOutcome
 
 
@@ -1040,7 +1041,7 @@ class TestTickTelemetry:
         """
         event_store = _RecordingEventStore()
         scheduler.event_store = event_store  # type: ignore[assignment]
-        scheduler.pause('test-pause')
+        scheduler.pause('test-pause', PauseClass.OPERATOR)
         scheduler.get_tasks = AsyncMock(return_value=[])
 
         result = await scheduler.acquire_next()

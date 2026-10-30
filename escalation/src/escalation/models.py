@@ -24,6 +24,11 @@ Structured-evidence field (default-empty; task 2558):
   evidence:   list of EvidenceEntry {observation, measured_at, ref} raw
               OBSERVATIONS backing the escalation (not causal diagnoses)
 
+Pause-detector trip facts (default None; task 4686):
+  ewa_rate_trip / park_stop_trip:
+              EwaRateTripFacts / ParkStopTripFacts carried by the escalation
+              a non-halting pause detector files instead of halting
+
 Incoming-framing amendments (default-empty; task 3997):
   amendments: append-only list of Amendment entries -- the framing
               (root_cause/summary/detail/options) a fold carried in, preserved
@@ -194,6 +199,41 @@ class IndexHealthState(TypedDict):
     missing: list[list[str]]       # expected-but-absent specs, sorted
     unexpected: list[list[str]]    # present-but-unexpected specs (reported, never acted on)
     expected_total: int            # size of the expected set this was diffed against
+
+
+class EwaRateTripFacts(TypedDict):
+    """The EWA submission-rate detector's facts at the moment it tripped.
+
+    Carried as FIRST-CLASS FIELDS so no consumer scrapes prose for a fact the
+    detector already had in a variable (INV-2;
+    plans/scheduler-pause-halt-retirement-prd.md §6 invariant 5).
+
+    TypedDict at runtime is a plain dict; existing from_dict / to_dict /
+    asdict() paths are unaffected — round-trip fidelity is unchanged.
+    """
+
+    ewa: float                 # the EWA of submissions per done that tripped
+    threshold: float           # the configured trip threshold
+    ratio: float               # this step's submissions / max(dones, 1)
+    window_secs: float         # the digest window the ratio was measured over
+    dones_in_window: int       # tasks that reached done in that window
+    submissions_in_step: int   # tasks submitted in that step
+
+
+class ParkStopTripFacts(TypedDict):
+    """The park-stop detector's facts at the moment it tripped.
+
+    Carried as FIRST-CLASS FIELDS so no consumer scrapes prose for a fact the
+    detector already had in a variable (INV-2;
+    plans/scheduler-pause-halt-retirement-prd.md §6 invariant 5).
+
+    TypedDict at runtime is a plain dict; existing from_dict / to_dict /
+    asdict() paths are unaffected — round-trip fidelity is unchanged.
+    """
+
+    blocked_in_window: int     # tasks that transitioned to blocked in the window
+    window_secs: float         # the sliding window those transitions were counted in
+    threshold: int             # the configured trip threshold
 
 
 class EvidenceEntry(TypedDict):
@@ -757,6 +797,12 @@ class Escalation:
     # this flag, via note_to_file_class_conflict.  Zero migration via the
     # from_dict filter.
     note_to_file: bool = False
+    # Trip facts from the EWA-rate detector (task 4687) and the park-stop
+    # detector (task 4688) when they escalate instead of halting.  None for
+    # every other escalation; zero migration via the from_dict
+    # __dataclass_fields__ filter.
+    ewa_rate_trip: EwaRateTripFacts | None = None
+    park_stop_trip: ParkStopTripFacts | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

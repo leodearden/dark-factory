@@ -43,6 +43,7 @@ from orchestrator.harness import (
     _WATCHER_TIMEOUT_GRACE_SECS,
     Harness,
 )
+from orchestrator.pause_policy import PauseClass
 
 # ---------------------------------------------------------------------------
 # step-3: Config field presence and defaults
@@ -1426,15 +1427,15 @@ class TestWatcherCrashloopTrip:
         })
 
         rotation_calls = 0
-        pause_calls: list[str] = []
+        pause_calls: list[tuple[str, PauseClass]] = []
 
         async def fake_rotation() -> AgentResult:
             nonlocal rotation_calls
             rotation_calls += 1
             return AgentResult(success=False, output='')
 
-        async def fake_pause_scheduler(reason: str) -> None:
-            pause_calls.append(reason)
+        async def fake_pause_scheduler(reason: str, pause_class: PauseClass) -> None:
+            pause_calls.append((reason, pause_class))
 
         async def fake_sleep(duration: float) -> None:
             pass  # instant, no blocking
@@ -1450,7 +1451,7 @@ class TestWatcherCrashloopTrip:
             await h._watcher_supervisor_loop()
 
         # pause_scheduler called exactly once with the crashloop reason
-        assert pause_calls == ['watcher_crashloop'], (
+        assert pause_calls == [('watcher_crashloop', PauseClass.WATCHER_GUARD)], (
             f'Expected pause_scheduler("watcher_crashloop") once; got {pause_calls}'
         )
         # Loop exited (returned) — no further rotations after the trip
@@ -1472,7 +1473,7 @@ class TestWatcherCrashloopTrip:
         })
 
         rotation_calls = 0
-        pause_calls: list[str] = []
+        pause_calls: list[tuple[str, PauseClass]] = []
 
         async def fake_rotation() -> AgentResult:
             nonlocal rotation_calls
@@ -1481,8 +1482,8 @@ class TestWatcherCrashloopTrip:
                 raise asyncio.CancelledError()
             return AgentResult(success=False, output='')
 
-        async def fake_pause_scheduler(reason: str) -> None:
-            pause_calls.append(reason)
+        async def fake_pause_scheduler(reason: str, pause_class: PauseClass) -> None:
+            pause_calls.append((reason, pause_class))
 
         h._run_watcher_rotation = fake_rotation          # type: ignore[method-assign]
         h.pause_scheduler = fake_pause_scheduler         # type: ignore[method-assign]
@@ -1510,7 +1511,7 @@ class TestWatcherCrashloopTrip:
             'watcher_subprocess_restart_backoff_secs': 0.0,
         })
 
-        pause_calls: list[str] = []
+        pause_calls: list[tuple[str, PauseClass]] = []
         rotation_calls = 0
 
         # Monotonic clock advances to put first exits outside the window.
@@ -1532,8 +1533,8 @@ class TestWatcherCrashloopTrip:
                 raise asyncio.CancelledError()
             return AgentResult(success=False, output='')
 
-        async def fake_pause_scheduler(reason: str) -> None:
-            pause_calls.append(reason)
+        async def fake_pause_scheduler(reason: str, pause_class: PauseClass) -> None:
+            pause_calls.append((reason, pause_class))
 
         h._run_watcher_rotation = fake_rotation          # type: ignore[method-assign]
         h.pause_scheduler = fake_pause_scheduler         # type: ignore[method-assign]
@@ -1579,7 +1580,7 @@ class TestWatcherCrashloopTrip:
         })
 
         rotation_calls = 0
-        pause_calls: list[str] = []
+        pause_calls: list[tuple[str, PauseClass]] = []
 
         async def fake_rotation() -> AgentResult:
             nonlocal rotation_calls
@@ -1590,8 +1591,8 @@ class TestWatcherCrashloopTrip:
                 raise asyncio.CancelledError()
             return AgentResult(success=False, output='')
 
-        async def raising_pause_scheduler(reason: str) -> None:
-            pause_calls.append(reason)
+        async def raising_pause_scheduler(reason: str, pause_class: PauseClass) -> None:
+            pause_calls.append((reason, pause_class))
             raise RuntimeError('pause failed')
 
         h._run_watcher_rotation = fake_rotation              # type: ignore[method-assign]
@@ -1608,7 +1609,7 @@ class TestWatcherCrashloopTrip:
             await h._watcher_supervisor_loop()
 
         # pause_scheduler was called exactly once with the crashloop reason
-        assert pause_calls == ['watcher_crashloop'], (
+        assert pause_calls == [('watcher_crashloop', PauseClass.WATCHER_GUARD)], (
             f'Expected pause_scheduler("watcher_crashloop") once; got {pause_calls}'
         )
         # No 4th rotation after the failing trip (supervisor stopped)
@@ -1739,7 +1740,7 @@ class TestWatcherMisconfiguredGuard:
         })
 
         rotation_calls = 0
-        pause_calls: list[str] = []
+        pause_calls: list[tuple[str, PauseClass]] = []
 
         # All rotations are fast-clean (duration 1s < 120s).
         # Guard: cancel after max_misconfig * 2 rotations to prevent an infinite loop
@@ -1753,8 +1754,8 @@ class TestWatcherMisconfiguredGuard:
                 raise asyncio.CancelledError()
             return AgentResult(success=True, output='', timed_out=False)
 
-        async def fake_pause_scheduler(reason: str) -> None:
-            pause_calls.append(reason)
+        async def fake_pause_scheduler(reason: str, pause_class: PauseClass) -> None:
+            pause_calls.append((reason, pause_class))
 
         h._run_watcher_rotation = fake_rotation          # type: ignore[method-assign]
         h.pause_scheduler = fake_pause_scheduler         # type: ignore[method-assign]
@@ -1777,7 +1778,7 @@ class TestWatcherMisconfiguredGuard:
             # Loop should exit after max_misconfig fast-clean exits (no CancelledError)
             await h._watcher_supervisor_loop()
 
-        assert pause_calls == ['watcher_misconfigured'], (
+        assert pause_calls == [('watcher_misconfigured', PauseClass.WATCHER_GUARD)], (
             f'Expected pause_scheduler("watcher_misconfigured") once; got {pause_calls}'
         )
         assert rotation_calls == max_misconfig, (
@@ -1812,7 +1813,7 @@ class TestWatcherMisconfiguredGuard:
             'watcher_max_crashloop_restarts': 99,  # disable crashloop trip
         })
 
-        pause_calls: list[str] = []
+        pause_calls: list[tuple[str, PauseClass]] = []
         rotation_calls = 0
 
         # Drive 2 fast-clean exits at old_time, then jump past window,
@@ -1852,8 +1853,8 @@ class TestWatcherMisconfiguredGuard:
                 raise asyncio.CancelledError()
             return AgentResult(success=True, output='', timed_out=False)
 
-        async def fake_pause_scheduler(reason: str) -> None:
-            pause_calls.append(reason)
+        async def fake_pause_scheduler(reason: str, pause_class: PauseClass) -> None:
+            pause_calls.append((reason, pause_class))
 
         h._run_watcher_rotation = fake_rotation          # type: ignore[method-assign]
         h.pause_scheduler = fake_pause_scheduler         # type: ignore[method-assign]
@@ -1911,7 +1912,7 @@ class TestWatcherMisconfiguredGuard:
         })
 
         rotation_calls = 0
-        pause_calls: list[str] = []
+        pause_calls: list[tuple[str, PauseClass]] = []
 
         # Guard: cancel after max_misconfig * 2 iterations to prevent an infinite
         # loop when the defensive wrapper is absent (makes failure fast).
@@ -1922,8 +1923,8 @@ class TestWatcherMisconfiguredGuard:
                 raise asyncio.CancelledError()
             return AgentResult(success=True, output='', timed_out=False)
 
-        async def raising_pause_scheduler(reason: str) -> None:
-            pause_calls.append(reason)
+        async def raising_pause_scheduler(reason: str, pause_class: PauseClass) -> None:
+            pause_calls.append((reason, pause_class))
             raise RuntimeError('pause failed')
 
         h._run_watcher_rotation = fake_rotation              # type: ignore[method-assign]
@@ -1945,7 +1946,7 @@ class TestWatcherMisconfiguredGuard:
             # Supervisor must return even though pause_scheduler raises.
             await h._watcher_supervisor_loop()
 
-        assert pause_calls == ['watcher_misconfigured'], (
+        assert pause_calls == [('watcher_misconfigured', PauseClass.WATCHER_GUARD)], (
             f'Expected pause_scheduler("watcher_misconfigured") once; got {pause_calls}'
         )
         assert rotation_calls == max_misconfig, (
@@ -2086,10 +2087,10 @@ class TestWatcherMisconfiguredGuard:
             'watcher_max_crashloop_restarts': 99,  # disable crashloop trip
         })
 
-        pause_calls: list[str] = []
+        pause_calls: list[tuple[str, PauseClass]] = []
 
-        async def fake_pause_scheduler(reason: str) -> None:
-            pause_calls.append(reason)
+        async def fake_pause_scheduler(reason: str, pause_class: PauseClass) -> None:
+            pause_calls.append((reason, pause_class))
 
         h.pause_scheduler = fake_pause_scheduler  # type: ignore[method-assign]
 
@@ -2099,7 +2100,7 @@ class TestWatcherMisconfiguredGuard:
             h, [1.0, 1.0, 1.0], expect_cancelled=False
         )
 
-        assert pause_calls == ['watcher_misconfigured'], (
+        assert pause_calls == [('watcher_misconfigured', PauseClass.WATCHER_GUARD)], (
             f'Expected pause_scheduler("watcher_misconfigured") once; got {pause_calls}'
         )
         # Key assertion: floor sequence proves pre-guard increment ordering.
@@ -2897,7 +2898,7 @@ class TestCheckWatcherGuardFilesL2Outage:
         )
 
         assert tripped is True, 'Guard should have tripped'
-        h.pause_scheduler.assert_awaited_once_with('watcher_crashloop')
+        h.pause_scheduler.assert_awaited_once_with('watcher_crashloop', PauseClass.WATCHER_GUARD)
 
         l2s = [e for e in queue.get_pending() if e.level == 2]
         assert len(l2s) == 1, (
@@ -3022,7 +3023,9 @@ class TestEnforceCostCeilingsFilesL2:
 
         await h._enforce_cost_ceilings()
 
-        h.pause_scheduler.assert_awaited_once_with('cost_ceiling_watcher_exceeded')
+        h.pause_scheduler.assert_awaited_once_with(
+            'cost_ceiling_watcher_exceeded', PauseClass.COST_CEILING,
+        )
 
         l2s = [e for e in queue.get_pending() if e.level == 2]
         assert len(l2s) == 1, (

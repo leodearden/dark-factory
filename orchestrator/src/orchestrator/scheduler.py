@@ -67,6 +67,7 @@ from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call, tool
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+from orchestrator.pause_policy import PauseClass, PausePolicy, policy_for
 from orchestrator.pending_age import AnchorReading, read_pending_age
 from orchestrator.pin_reservation import (
     Blocker,
@@ -714,7 +715,7 @@ class SchedulerCallbacks:
     for a ``park_blocked`` firing, which only a human or the holder can clear.
     """
 
-    on_park_stop_trip: Callable[[str], Any] | None = None
+    on_park_stop_trip: Callable[[str, PauseClass], Any] | None = None
     on_external_dep_block: Callable[..., Any] | None = None
     on_delivered_check_block: Callable[..., Any] | None = None
     on_starvation_warn: Callable[..., Any] | None = None
@@ -2365,6 +2366,7 @@ class Scheduler:
         jitter_source: Callable[[float, float], float] | None = None,
         branch_work_reader: Callable[[], Mapping[str, BranchWork]] | None = None,
         eligibility_clock_store: EligibilityClockStore | None = None,
+        pause_policy_lookup: Callable[[PauseClass], PausePolicy] | None = None,
     ):
         self.config = config
         # Constructor-injected Harness callback bundle (task 2235).  Omitting
@@ -2386,6 +2388,11 @@ class Scheduler:
         # Production leaves it None and gets ``random.uniform``.
         self._jitter_source: Callable[[float, float], float] = (
             jitter_source if jitter_source is not None else random.uniform
+        )
+        # Injectable so a test can drive a halt the policy refuses (PRD §6
+        # invariant 1) without patching the module table.
+        self._pause_policy_lookup: Callable[[PauseClass], PausePolicy] = (
+            pause_policy_lookup if pause_policy_lookup is not None else policy_for
         )
         # Monotonic clock source for the park-stop rolling-window transition
         # recorder.  time.monotonic avoids false-trip / stale-entry artefacts
@@ -2648,6 +2655,7 @@ class Scheduler:
         # --- Park-and-stop pause state (task 1322) ---
         self._paused: bool = False
         self._pause_reason: str | None = None
+        self._pause_class: PauseClass | None = None
         # Rolling deque of (task_id, monotonic_timestamp) pairs for each
         # successful blocked transition.  Entries older than
         # park_stop_parked_window_hours * 3600s are lazily evicted on each
@@ -2944,6 +2952,11 @@ class Scheduler:
         return self._pause_reason
 
     @property
+    def pause_class(self) -> PauseClass | None:
+        """The class of the current pause, or None if not paused."""
+        return self._pause_class
+
+    @property
     def parked_live_count(self) -> int:
         """Count of task_ids currently in the park-stop sliding window (de-duped).
 
@@ -2963,23 +2976,33 @@ class Scheduler:
         """
         return len(self._blocked_transitions)
 
-    def pause(self, reason: str) -> None:
+    def pause(self, reason: str, pause_class: PauseClass) -> None:
         """Pause the scheduler.  acquire_next() will return None until resume().
 
-        Idempotent: if already paused, the original reason is kept and a DEBUG
-        log is emitted.  The pause state is in-memory only; callers that need
-        persistence (e.g. Harness.pause_scheduler) must persist separately.
+        Every halt passes through here, so this is where a class whose policy
+        forbids halting is refused (PRD §6 invariant 1).
+
+        Idempotent: if already paused, the original reason and class are kept
+        and a DEBUG log is emitted.  The pause state is in-memory only; callers
+        that need persistence (e.g. Harness.pause_scheduler) must persist
+        separately.
+
+        Raises:
+            HaltNotPermittedError: *pause_class* may not halt.
         """
+        self._pause_policy_lookup(pause_class).require_may_halt()
         if self._paused:
             logger.debug(
                 'Scheduler.pause() called while already paused '
-                '(existing reason=%r, new reason=%r) — keeping original',
-                self._pause_reason, reason,
+                '(existing reason=%r class=%s, new reason=%r class=%s) '
+                '— keeping original',
+                self._pause_reason, self._pause_class, reason, pause_class,
             )
             return
         self._paused = True
         self._pause_reason = reason
-        logger.info('Scheduler paused: %s', reason)
+        self._pause_class = pause_class
+        logger.info('Scheduler paused (%s): %s', pause_class, reason)
 
     def resume(self) -> None:
         """Resume the scheduler.  Next acquire_next() tick will dispatch normally.
@@ -3000,6 +3023,7 @@ class Scheduler:
             return
         self._paused = False
         self._pause_reason = None
+        self._pause_class = None
         self._blocked_transitions.clear()
         self._blocked_task_ids_in_window.clear()
         logger.info('Scheduler resumed')
@@ -3014,8 +3038,9 @@ class Scheduler:
           4. Count < threshold — not yet.
 
         When all guards pass, this method:
-          a. SYNCHRONOUSLY calls self.pause(reason) — the latch step.  This
-             immediately sets _paused=True so any concurrent coroutine that has
+          a. SYNCHRONOUSLY calls self.pause(reason, PauseClass.PARK_STOP) —
+             the latch step.  This immediately sets _paused=True so any
+             concurrent coroutine that has
              already appended its timestamp but hasn't yet called
              _maybe_fire_park_stop_trip will see _paused=True and return at
              guard 1 without scheduling a duplicate callback.  This prevents the
@@ -3027,8 +3052,8 @@ class Scheduler:
           b. Formats a human-readable reason string and logs a WARNING.
           c. Schedules the full callback (harness.pause_scheduler) via
              asyncio.ensure_future() — fire-and-forget so the status write is
-             never delayed.  The callback's own scheduler.pause(reason) call
-             becomes a no-op because _paused is already True (idempotent).
+             never delayed.  The callback receives (reason,
+             PauseClass.PARK_STOP); its own scheduler.pause call becomes a no-op because _paused is already True (idempotent).
              Persistence (run_store) and event emission still fire exactly once.
 
         The synchronous latch is the key invariant: pause() BEFORE ensure_future.
@@ -3065,10 +3090,12 @@ class Scheduler:
         # coroutines see the paused state before the async callback runs.
         # This must happen before asyncio.ensure_future to close the race
         # window between "trip detected" and "callback sets _paused".
-        self.pause(reason)
+        self.pause(reason, PauseClass.PARK_STOP)
         logger.warning('Park-stop trip: %s — pausing scheduler', reason)
         try:
-            t = asyncio.ensure_future(self._callbacks.on_park_stop_trip(reason))
+            t = asyncio.ensure_future(
+                self._callbacks.on_park_stop_trip(reason, PauseClass.PARK_STOP)
+            )
             # Attach a done-callback so exceptions inside harness.pause_scheduler
             # (e.g. RunStore write failure, EventStore emit failure) are logged
             # immediately rather than surfacing as GC-collected Task warnings
@@ -8692,6 +8719,7 @@ class Scheduler:
             lock_depth=self.config.lock_depth,
             is_paused=self.is_paused,
             pause_reason=self.pause_reason,
+            pause_class=self.pause_class.value if self.pause_class else None,
             requeue_cooldowns=dict(self._requeue_cooldown_meta),
             snapshot_at=datetime.now(UTC),
         )

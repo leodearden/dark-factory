@@ -11136,7 +11136,7 @@ def create_mcp_server(
             project_root: Absolute path to project root.
 
         Returns:
-            Every SchedulerStateSnapshot field (13 keys). ``snapshot_at`` is
+            Every SchedulerStateSnapshot field. ``snapshot_at`` is
             null when no orchestrator has written a snapshot yet.
         """
         _normalized = _normalize_project_root(project_root)

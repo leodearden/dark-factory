@@ -9082,3 +9082,25 @@ class TestLateResolutionBounds:
         assert record.late_resolutions_chars_elided == 3 * overshoot, (
             f'expected a running total: {record.late_resolutions_chars_elided!r}'
         )
+
+
+class TestTripFactsPersistence:
+    """A pause detector's structured trip facts survive the real queue writer."""
+
+    def test_ewa_rate_trip_round_trips_through_disk(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-orchestrator-1', task_id='orchestrator')
+        esc.ewa_rate_trip = {
+            'ewa': 73.59,
+            'threshold': 24.6,
+            'ratio': 82.0,
+            'window_secs': 3600.0,
+            'dones_in_window': 1,
+            'submissions_in_step': 82,
+        }
+
+        esc_id = queue.submit(esc)
+
+        stored = queue.get(esc_id)
+        assert stored is not None
+        assert stored.ewa_rate_trip == esc.ewa_rate_trip

@@ -22,12 +22,13 @@ import asyncio
 import dataclasses
 import time
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 from _workflow_helpers import FakeScheduler
 
 from orchestrator.config import OrchestratorConfig, StarvationWatchdogConfig
+from orchestrator.pause_policy import PauseClass
 from orchestrator.scheduler import Scheduler, SchedulerCallbacks
 
 
@@ -74,7 +75,7 @@ class TestSchedulerConstructorCallbacks:
     """(b) Scheduler(config, callbacks=...) construction with/without callbacks."""
 
     def test_constructs_with_callbacks(self):
-        async def on_trip(reason: str) -> None:
+        async def on_trip(reason: str, pause_class: PauseClass) -> None:
             pass
 
         callbacks = SchedulerCallbacks(on_park_stop_trip=on_trip)
@@ -117,7 +118,7 @@ class TestConstructorInjectedHooksFire:
         # Yield to the event loop so the ensure_future'd callback can execute.
         await asyncio.sleep(0)
 
-        spy.assert_called_once()
+        spy.assert_called_once_with(ANY, PauseClass.PARK_STOP)
 
     @pytest.mark.asyncio
     async def test_suppress_blocked_write_consulted(self):

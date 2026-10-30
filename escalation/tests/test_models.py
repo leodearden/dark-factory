@@ -17,8 +17,10 @@ from escalation.models import (
     DeliveredCheckOwner,
     Escalation,
     EvidenceEntry,
+    EwaRateTripFacts,
     IndexHealthState,
     LateResolution,
+    ParkStopTripFacts,
     TrainState,
     max_severity,
     normalised_severity,
@@ -543,6 +545,84 @@ class TestEscalationDeliveredCheckOwnerField:
         del payload['delivered_check_owner']
         restored = Escalation.from_json(json.dumps(payload))
         assert restored.delivered_check_owner is None
+
+
+_EWA_RATE_TRIP: EwaRateTripFacts = {
+    'ewa': 73.59,
+    'threshold': 24.6,
+    'ratio': 82.0,
+    'window_secs': 3600.0,
+    'dones_in_window': 1,
+    'submissions_in_step': 82,
+}
+
+_PARK_STOP_TRIP: ParkStopTripFacts = {
+    'blocked_in_window': 15,
+    'window_secs': 3600.0,
+    'threshold': 15,
+}
+
+
+class TestEscalationTripFactsFields:
+    """A non-halting pause detector's escalation carries its trip facts as fields.
+
+    PRD scheduler-pause-halt-retirement §6 invariant 5 (INV-2): no consumer
+    scrapes prose for a number the detector held in a variable.
+    """
+
+    def _make_base_esc(self, **kwargs) -> Escalation:
+        base: dict[str, Any] = {
+            'id': 'esc-orchestrator-0001',
+            'task_id': 'orchestrator',
+            'agent_role': 'orchestrator',
+            'severity': 'blocking',
+            'category': 'task_failure',
+            'summary': 'pause detector tripped',
+        }
+        base.update(kwargs)
+        return Escalation(**base)
+
+    def test_both_default_to_none_and_serialise_as_none(self):
+        esc = self._make_base_esc()
+
+        assert esc.ewa_rate_trip is None
+        assert esc.park_stop_trip is None
+        d = esc.to_dict()
+        assert d['ewa_rate_trip'] is None
+        assert d['park_stop_trip'] is None
+
+    def test_ewa_rate_trip_round_trips_with_numeric_types(self):
+        esc = self._make_base_esc(ewa_rate_trip=_EWA_RATE_TRIP)
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.ewa_rate_trip == _EWA_RATE_TRIP
+        assert restored.ewa_rate_trip is not None
+        assert type(restored.ewa_rate_trip['dones_in_window']) is int
+        assert type(restored.ewa_rate_trip['submissions_in_step']) is int
+        assert type(restored.ewa_rate_trip['window_secs']) is float
+        assert type(restored.ewa_rate_trip['ewa']) is float
+
+    def test_park_stop_trip_round_trips_with_numeric_types(self):
+        esc = self._make_base_esc(park_stop_trip=_PARK_STOP_TRIP)
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.park_stop_trip == _PARK_STOP_TRIP
+        assert restored.park_stop_trip is not None
+        assert type(restored.park_stop_trip['blocked_in_window']) is int
+        assert type(restored.park_stop_trip['threshold']) is int
+        assert type(restored.park_stop_trip['window_secs']) is float
+
+    def test_legacy_json_without_either_key_reads_none(self):
+        legacy = self._make_base_esc().to_dict()
+        del legacy['ewa_rate_trip']
+        del legacy['park_stop_trip']
+
+        restored = Escalation.from_json(json.dumps(legacy))
+
+        assert restored.ewa_rate_trip is None
+        assert restored.park_stop_trip is None
 
 
 class TestEscalationResolutionAction:
