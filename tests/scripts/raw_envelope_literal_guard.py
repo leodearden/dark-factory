@@ -20,7 +20,8 @@ prints a raw literal back into an agent's context.
 RUN AS A SCRIPT, ``python3 tests/scripts/raw_envelope_literal_guard.py DIR...``
 scans the files under the named directories of the checkout holding this file:
 exit 0 silently when clean, 1 with a report on violations, and 2 when a
-directory is not a directory under the checkout or git discovery fails. Each
+directory is not a directory under the checkout, git discovery fails, or a
+listed file cannot be read as UTF-8, since then the scan is incomplete. Each
 module's ``lint_command`` runs it over that module's own tree. Standard library
 only, and ``git_listing`` beside it, because that leg runs under plain
 ``python3`` with no virtualenv.
@@ -33,7 +34,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from git_listing import listed_files
+from git_listing import GitCommandFailed, listed_files
 
 CHECKOUT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -85,6 +86,17 @@ def raw_prefix_lines(source: str) -> dict[str, tuple[int, ...]]:
     return {key: numbers for key, numbers in hits.items() if numbers}
 
 
+class UnreadableSource(Exception):
+    """A listed ``.py`` file that could not be read as UTF-8 text."""
+
+
+def _read_source(path: Path) -> str:
+    try:
+        return path.read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError) as exc:
+        raise UnreadableSource(f'{path}: {exc}') from exc
+
+
 def guarded_sources(root: Path, *directories: str) -> dict[str, str]:
     """Repo-relative posix path -> source, for each ``.py`` file that handles envelope markup.
 
@@ -92,7 +104,7 @@ def guarded_sources(root: Path, *directories: str) -> dict[str, str]:
     path component, or the whole of *root* when none is named.
     """
     pathspecs = [f'{Path(directory).as_posix()}/*.py' for directory in directories] or ['*.py']
-    read = ((path, path.read_text(encoding='utf-8')) for path in listed_files(root, *pathspecs))
+    read = ((path, _read_source(path)) for path in listed_files(root, *pathspecs))
     return {
         path.relative_to(root).as_posix(): source
         for path, source in read
@@ -146,8 +158,11 @@ def main(argv: Sequence[str], *, root: Path = CHECKOUT_ROOT) -> int:
         return 2
     try:
         population = guarded_sources(root, *directories)
-    except AssertionError as exc:
+    except GitCommandFailed as exc:
         print(f'git discovery failed, so nothing was scanned: {exc}', file=sys.stderr)
+        return 2
+    except UnreadableSource as exc:
+        print(f'could not read a listed file, so the scan is incomplete: {exc}', file=sys.stderr)
         return 2
     violations = raw_literal_violations(population)
     if not violations:

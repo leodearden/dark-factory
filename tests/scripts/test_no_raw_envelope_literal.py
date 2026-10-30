@@ -7,8 +7,11 @@ over every file git lists.
 """
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -25,6 +28,7 @@ from raw_envelope_literal_guard import (
     raw_prefix_lines,
     report,
 )
+from shared.python_env import without_python_env_selection
 from shared.toolcall_markup import ENVELOPE_LITERALS
 
 REPO_ROOT = Path(__file__).parents[2]
@@ -252,26 +256,85 @@ def test_cli_refuses_a_directory_argument_that_is_not_a_directory_under_root(
     assert captured.out == ''
 
 
-def test_cli_reports_a_git_failure_as_a_usage_error_not_a_violation(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+def test_cli_reports_an_unreadable_source_as_a_usage_error_not_a_violation(
+    scoped_repo: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
+    (scoped_repo / 'pkg' / 'not_utf8.py').write_bytes(b'LT = chr(60)\n# caf\xe9\n')
+    code = main(['pkg'], root=scoped_repo)
+    captured = capsys.readouterr()
+    assert code == 2
+    assert 'not_utf8.py' in captured.err
+    assert captured.out == ''
+
+
+@pytest.fixture
+def broken_checkout(tmp_path: Path) -> Path:
+    """A checkout whose ``.git`` points nowhere, so every git call in it fails."""
     root = tmp_path / 'broken'
     _plant(root, '.git', f'gitdir: {tmp_path / "nowhere"}\n')
     _plant(root, 'pkg/handler.py', 'LT = chr(60)\n')
-    code = main(['pkg'], root=root)
+    return root
+
+
+def test_cli_reports_a_git_failure_as_a_usage_error_not_a_violation(
+    broken_checkout: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(['pkg'], root=broken_checkout)
     captured = capsys.readouterr()
     assert code == 2
     assert 'git' in captured.err
     assert captured.out == ''
 
 
-def test_cli_runs_as_a_script_under_bare_python_from_the_checkout_root() -> None:
+_RUN_MAIN_ON_ROOT = (
+    'import pathlib, sys, raw_envelope_literal_guard as guard; '
+    'sys.exit(guard.main(sys.argv[2:], root=pathlib.Path(sys.argv[1])))'
+)
+
+
+def test_cli_reports_a_git_failure_with_assertions_stripped(broken_checkout: Path) -> None:
+    proc = subprocess.run(
+        [sys.executable, '-O', '-S', '-E', '-c', _RUN_MAIN_ON_ROOT, str(broken_checkout), 'pkg'],
+        cwd=Path(raw_envelope_literal_guard.__file__).parent,
+        capture_output=True, text=True, check=False,
+    )
+    assert (proc.returncode, proc.stdout) == (2, ''), proc.stderr
+    assert 'git discovery failed' in proc.stderr
+
+
+def _lint_leg_env(environ: Mapping[str, str]) -> dict[str, str]:
+    """*environ* with no Python environment selected and no venv's ``bin`` on PATH."""
+    env = without_python_env_selection(environ)
+    env['PATH'] = os.pathsep.join(
+        entry for entry in env.get('PATH', '').split(os.pathsep)
+        if entry and not (Path(entry).parent / 'pyvenv.cfg').is_file()
+    )
+    return env
+
+
+LINT_LEG_ENV = _lint_leg_env(os.environ)
+LINT_LEG_PYTHON3 = shutil.which('python3', path=LINT_LEG_ENV['PATH'])
+
+
+@pytest.mark.parametrize(
+    'interpreter',
+    [
+        pytest.param(sys.executable, id='this-venv'),
+        pytest.param(LINT_LEG_PYTHON3, id='lint-leg-python3'),
+    ],
+)
+def test_cli_runs_as_a_script_under_bare_python_from_the_checkout_root(
+    interpreter: str | None,
+) -> None:
+    """The lint leg runs PATH's ``python3`` outside any venv, older than this venv's on this host."""
+    if interpreter is None:
+        pytest.skip('no python3 on PATH outside a venv')
     script = Path(raw_envelope_literal_guard.__file__).resolve()
     proc = subprocess.run(
-        [sys.executable, '-S', '-E', str(script), 'tests/scripts'],
-        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+        [interpreter, '-S', '-E', str(script), 'tests/scripts'],
+        cwd=REPO_ROOT, env=LINT_LEG_ENV, capture_output=True, text=True, check=False,
     )
     assert proc.returncode == 0, (
-        f'the lint-leg invocation exited {proc.returncode}; '
+        f'the lint-leg invocation under {interpreter} exited {proc.returncode}; '
         f'stdout: {proc.stdout!r}; stderr: {proc.stderr!r}'
     )

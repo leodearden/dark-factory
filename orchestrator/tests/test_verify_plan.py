@@ -1409,7 +1409,7 @@ class TestScoperTrailingClausePreservation:
 
     _FILES = ['fused-memory/tests/test_harness.py']
 
-    def test_fused_memory_lint_chain_scopes_ruff_and_keeps_both_checkers(self):
+    def test_fused_memory_lint_chain_scopes_ruff_and_keeps_every_checker(self):
         """The task's headline case, as a full literal golden.
 
         The ruff clause is narrowed to the one touched file (its unscoped
@@ -1433,7 +1433,7 @@ class TestScoperTrailingClausePreservation:
             assert checker in scoped, f'{checker!r} must survive verbatim'
             assert checker in FM_LINT_COMMAND, 'the slice asserted above must be verbatim'
 
-    def test_dashboard_lint_chain_scopes_ruff_and_keeps_both_checkers(self):
+    def test_dashboard_lint_chain_scopes_ruff_and_keeps_every_checker(self):
         """The second 4-segment chain (tasks 4485 and 6230), as a full literal golden.
 
         Same shape as the fused-memory case above: the ruff clause narrows
