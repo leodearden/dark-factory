@@ -619,3 +619,114 @@ def test_a_stale_due_item_is_reported_and_alone_does_not_fail(tmp_path: Path, ca
     check = _check(report, 'offered_debts_owned_or_due')
     assert check['verdict'] == 'pass'
     assert [note for note in check['notes'] if NODE_B in note and 'stale' in note]
+
+
+# --- (f) no_stranded_filing ------------------------------------------------------------
+
+
+def _crossing_project(tmp_path: Path) -> tuple[SoakProject, LanePass, LanePass]:
+    """NODE_A reproduced at T0 and again at T0+1h, where it reaches the threshold; nothing filed in any effect."""
+    project = SoakProject(tmp_path)
+    project.provision(UNIT)
+    first = _red(project, T0, NODE_A, episodes_started=(NODE_A,))
+    crossing = _red(project, T0 + timedelta(hours=1), NODE_A, episodes_extended=(NODE_A,), threshold_reached=(NODE_A,))
+    return project, first, crossing
+
+
+def _stuck_filing(project: SoakProject) -> str:
+    stuck = StuckFiling(command=UNIT, nodes=(NODE_A,), due_since=NOW - timedelta(hours=2), reason='submit_task failed')
+    return file_stuck_filing(project.escalations(), stuck)
+
+
+def _stranded(report: dict[str, Any]) -> dict[str, Any]:
+    return _check(report, 'no_stranded_filing')
+
+
+def test_a_crossing_covered_by_a_task_its_effect_filed_is_owned(tmp_path: Path, capsys):
+    project, _, _ = _filing_project(tmp_path, NODE_A)
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    assert (_stranded(report)['verdict'], _stranded(report)['examined']) == ('pass', 1)
+
+
+def test_a_crossing_covered_by_a_task_only_its_live_episode_names_is_owned(tmp_path: Path, capsys):
+    project, first, crossing = _crossing_project(tmp_path)
+    task_id = project.file_fix_task(UNIT, [NODE_A], [first, crossing])
+    project.save_command(command_record(UNIT, [episode(NODE_A, [first, crossing], covering_task_id=task_id)]))
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    assert (_stranded(report)['verdict'], _stranded(report)['examined']) == ('pass', 1)
+
+
+def test_a_due_filing_with_a_pending_stuck_record_is_owned(tmp_path: Path, capsys):
+    project, first, crossing = _crossing_project(tmp_path)
+    escalation_id = _stuck_filing(project)
+    project.save_command(command_record(
+        UNIT, [episode(NODE_A, [first, crossing], filing_due_since=NOW - timedelta(hours=2))],
+        stuck_filing_escalation_id=escalation_id,
+    ))
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    assert _stranded(report)['verdict'] == 'pass'
+
+
+def test_a_filing_due_for_less_than_recheck_is_pending_not_stranded(tmp_path: Path, capsys):
+    project, first, crossing = _crossing_project(tmp_path)
+    project.save_command(command_record(
+        UNIT, [episode(NODE_A, [first, crossing], filing_due_since=NOW - timedelta(minutes=10))],
+    ))
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    assert _stranded(report)['verdict'] == 'pass'
+    assert [note for note in _stranded(report)['notes'] if 'pending' in note and NODE_A in note]
+
+
+def test_a_shorter_recheck_makes_the_same_due_filing_stranded(tmp_path: Path, capsys):
+    project, first, crossing = _crossing_project(tmp_path)
+    project.save_command(command_record(
+        UNIT, [episode(NODE_A, [first, crossing], filing_due_since=NOW - timedelta(minutes=10))],
+    ))
+
+    code, report, _ = _report(project, capsys, '--recheck-secs', '300')
+
+    assert code == 1
+    assert '300s' in _stranded(report)['rule']
+
+
+def test_a_crossing_with_neither_a_covering_task_nor_an_open_stuck_record_is_stranded(tmp_path: Path, capsys):
+    project, first, crossing = _crossing_project(tmp_path)
+    project.save_command(command_record(
+        UNIT, [episode(NODE_A, [first, crossing], filing_due_since=NOW - timedelta(hours=2))],
+    ))
+
+    code, report, err = _report(project, capsys)
+
+    assert code == 1
+    assert '[FAIL] no_stranded_filing: examined 1;' in err
+    (failure_line,) = _stranded(report)['failures']
+    assert UNIT in failure_line
+    assert NODE_A in failure_line
+    assert crossing.pass_id in failure_line
+
+
+def test_a_resolved_stuck_record_does_not_own_the_filing(tmp_path: Path, capsys):
+    project, first, crossing = _crossing_project(tmp_path)
+    escalation_id = _stuck_filing(project)
+    resolve_stuck_filing(project.escalations(), escalation_id)
+    project.save_command(command_record(
+        UNIT, [episode(NODE_A, [first, crossing], filing_due_since=NOW - timedelta(hours=2))],
+        stuck_filing_escalation_id=escalation_id,
+    ))
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 1
+    assert _stranded(report)['verdict'] == 'fail'
