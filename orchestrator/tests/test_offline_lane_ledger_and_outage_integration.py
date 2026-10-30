@@ -15,6 +15,7 @@ This module adds tests only: no production module changes with it.
 from __future__ import annotations
 
 import json
+import signal
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -35,6 +36,9 @@ from _offline_lane_red_path_fixtures import (
     effect_of,
     lane_test_timeout,
     merge_gate_suppression,
+    probed_command,
+    promote_to_level_2,
+    reload_git,
     sync_storm_window,
 )
 from escalation.categories import EscalationCategory
@@ -50,6 +54,14 @@ from orchestrator.flake_ledger import (
     due_item_context,
 )
 from orchestrator.offline_lane_episode_state import unconfirmable_node
+from orchestrator.offline_lane_escalations import (
+    LANE_ESCALATION_ROLE,
+    OUTAGE_CATEGORY,
+    PROBE_BROKEN_CATEGORY,
+    UnlandedRed,
+    file_unlanded_red,
+    sentinel_task_id,
+)
 from orchestrator.offline_lane_ledger import NUMERIC_UNNAMED_CLEAR
 from orchestrator.offline_lane_records import PassRecord
 
@@ -541,3 +553,177 @@ async def test_scenario_41_a_store_outage_leaves_both_call_sites_items_due_backe
     resolved = lane.get(stale.id)
     assert resolved is not None
     assert resolved.status == 'resolved'
+
+
+OUTAGE = ProbeAnswer(exit=OUTAGE_EXIT_STATUS, stdout='qdrant: down')
+PROBED_SENTINEL = sentinel_task_id(PROBED_COMMAND.name)
+
+
+async def in_outage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> RedPathLane:
+    """A probed lane holding A from a pass whose probe answered up, then two spaced passes in an outage."""
+    lane = await RedPathLane.open(tmp_path, monkeypatch, command=PROBED_COMMAND)
+    await lane.advance(RED_A, RED_A)
+    for _ in range(2):
+        lane.stub.probe(OUTAGE)
+        await lane.advance(RED_A)
+    return lane
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=3))
+async def test_scenario_35_outage_passes_skip_the_confirm_leave_the_episode_and_keep_one_record(
+    tmp_path, monkeypatch,
+):
+    lane = await RedPathLane.open(tmp_path, monkeypatch, command=PROBED_COMMAND)
+    await lane.advance(RED_A, RED_A)
+    held = lane.episode(A)
+    assert held is not None
+    rows = lane.rows()
+    opened: list[str] = []
+
+    for _ in range(2):
+        invocations = len(lane.stub.invocations())
+        lane.stub.probe(OUTAGE)
+        record = await lane.advance(RED_A)
+        assert record.outcome is not None
+        assert record.outcome['arm'] == 'outage'
+        assert len(lane.stub.invocations()) == invocations + 1
+        [outage] = lane.pending(OUTAGE_CATEGORY)
+        opened.append(outage.id)
+
+    assert opened[0] == opened[1]
+    assert (outage.agent_role, outage.level) == (LANE_ESCALATION_ROLE, 1)
+    assert 'qdrant: down' in outage.detail
+    assert outage.amendments == []
+    episode = lane.episode(A)
+    assert episode is not None
+    assert episode.had_outage_pass is True
+    for name in ('counted_passes', 'last_counted_started_at', 'ended_at'):
+        assert getattr(episode, name) == getattr(held, name), name
+    assert lane.rows() == rows
+    assert lane.due() == []
+    assert lane.store.lane_tasks() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=6))
+async def test_scenario_36_the_idle_probe_loop_follows_a_reload_and_an_up_closes_the_record_and_its_level_2(
+    tmp_path, monkeypatch,
+):
+    lane = await in_outage(tmp_path, monkeypatch)
+    [l1] = lane.pending(OUTAGE_CATEGORY)
+    probes, invocations = len(lane.stub.probe_invocations()), len(lane.stub.invocations())
+
+    lane.stub.probe(OUTAGE)
+    assert await lane.tick(minutes=30) == []
+    assert len(lane.stub.probe_invocations()) == probes + 1
+    assert len(lane.stub.invocations()) == invocations
+    l2 = await promote_to_level_2(lane.queue, PROBED_SENTINEL, l1.id)
+    report = reload_git(lane, offline_lane_recheck_secs=600)
+    assert 'git.offline_lane_recheck_secs' in report['applied']
+    lane.stub.probe(OUTAGE)
+    assert await lane.tick(minutes=10) == []
+    assert len(lane.stub.probe_invocations()) == probes + 2
+
+    [recheck] = await lane.tick(GREEN_A, minutes=10)
+
+    assert recheck.started_at == lane.clock()
+    assert len(lane.stub.probe_invocations()) == probes + 3
+    for escalation_id in (l1.id, l2):
+        closed = lane.get(escalation_id)
+        assert closed is not None
+        assert (closed.status, closed.resolved_by) == ('resolved', LANE_ESCALATION_ROLE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=5))
+async def test_scenario_36_a_level_2_holding_another_member_is_amended_not_resolved_when_the_probe_passes(
+    tmp_path, monkeypatch,
+):
+    lane = await in_outage(tmp_path, monkeypatch)
+    [l1] = lane.pending(OUTAGE_CATEGORY)
+    other = file_unlanded_red(
+        lane.queue, UnlandedRed(PROBED_COMMAND.name, '9001', 'pending', (A,), lane.clock(), ()),
+    )
+    l2 = await promote_to_level_2(lane.queue, PROBED_SENTINEL, l1.id)
+    assert await promote_to_level_2(lane.queue, PROBED_SENTINEL, other) == l2
+
+    await lane.tick(minutes=30)
+    await lane.tick(minutes=1)
+
+    holder = lane.get(l2)
+    assert holder is not None
+    assert holder.status == 'pending'
+    assert len([a for a in holder.amendments if f'closed its record {l1.id}' in a['detail']]) == 1
+    for escalation_id, status in ((other, 'pending'), (l1.id, 'resolved')):
+        member = lane.get(escalation_id)
+        assert member is not None
+        assert member.status == status, escalation_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=5))
+async def test_scenario_37_a_hand_resolved_outage_record_is_replaced_by_the_next_failing_pass_not_the_tick(
+    tmp_path, monkeypatch,
+):
+    lane = await in_outage(tmp_path, monkeypatch)
+    [old] = lane.pending(OUTAGE_CATEGORY)
+    lane.resolve(old.id)
+    probes = len(lane.stub.probe_invocations())
+
+    lane.stub.probe(OUTAGE)
+    await lane.tick(minutes=30)
+    assert len(lane.stub.probe_invocations()) == probes + 1
+    assert lane.pending(OUTAGE_CATEGORY) == []
+    lane.stub.probe(OUTAGE)
+    record = await lane.advance(RED_A)
+
+    assert record.outcome is not None
+    assert record.outcome['arm'] == 'outage'
+    [new] = lane.pending(OUTAGE_CATEGORY)
+    assert new.id != old.id
+
+
+BROKEN_PROBES = {
+    'killed': (ProbeAnswer(signal=signal.SIGKILL), None),
+    'another exit code': (ProbeAnswer(exit=3), None),
+    'the outage exit printing nothing': (ProbeAnswer(exit=OUTAGE_EXIT_STATUS, stdout=''), None),
+    'past its timeout': (ProbeAnswer(sleep_secs=5), 1),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=1))
+@pytest.mark.parametrize(('answer', 'timeout_secs'), BROKEN_PROBES.values(), ids=list(BROKEN_PROBES))
+async def test_scenario_38_a_broken_probe_is_confirmed_as_if_none_were_declared_under_one_record(
+    tmp_path, monkeypatch, answer, timeout_secs,
+):
+    lane = await RedPathLane.open(tmp_path, monkeypatch, command=probed_command(timeout_secs))
+    lane.stub.probe(answer)
+
+    record = await lane.advance(RED_A, RED_A)
+
+    assert record.outcome == {
+        'arm': 'confirmed', 'mode': 'narrowed', 'reproduced': [A], 'cleared': [], 'inconclusive': [],
+    }
+    assert len(lane.stub.invocations()) == 2
+    assert len(lane.stub.probe_invocations()) == 1
+    episode = lane.episode(A)
+    assert episode is not None
+    assert episode.counted_passes == (record.pass_id,)
+    [broken] = lane.pending(PROBE_BROKEN_CATEGORY)
+    assert broken.level == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=1))
+async def test_scenario_38_a_command_with_no_probe_is_confirmed_and_keeps_no_probe_record(tmp_path, monkeypatch):
+    lane = await RedPathLane.open(tmp_path, monkeypatch)
+
+    record = await lane.advance(RED_A, RED_A)
+
+    assert record.outcome is not None
+    assert record.outcome['reproduced'] == [A]
+    assert len(lane.stub.invocations()) == 2
+    assert lane.stub.probe_invocations() == []
+    assert lane.pending(PROBE_BROKEN_CATEGORY) == []
