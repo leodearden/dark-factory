@@ -800,6 +800,12 @@ function mountTasks(harness) {
   return handle;
 }
 
+function projectHead(container) {
+  const heads = [...container.querySelectorAll('.proj-head')].filter(head => head.querySelector('.name')?.textContent === PROJECT);
+  assert.equal(heads.length, 1, `expected one header for project ${PROJECT}`);
+  return heads[0];
+}
+
 // Fills storage until jsdom's own quota refuses a single character more, and
 // returns the error that refusal threw.
 function fillStorageToQuota(storage) {
@@ -858,4 +864,20 @@ test('tab_tasks.jsx::TasksTab stores a flipped view, seeds the next mount with i
   assert.ok(viewButton(window, container, 'terminal').classList.contains('on'), 'the stored view did not seed the next mount');
   click(window, viewButton(window, container, 'terminal'));
   assert.ok(!storedKeys(window).includes('df.tasks.views'), 'the view is back at its default, yet its key is still stored');
+});
+
+test('tab_tasks.jsx::TasksTab folds a project on its first header click, and the fold seeds the next mount', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const first = mountTasks(harness);
+  assert.equal(projectHead(first.container).dataset.open, 'true', 'a project with no stored flag did not start open');
+  click(window, projectHead(first.container));
+  assert.equal(projectHead(first.container).dataset.open, 'false', 'one header click did not fold the project');
+  assert.ok(storedKeys(window).includes('df.tasksOpen'), 'the fold was not stored');
+  first.unmount();
+
+  const { container } = mountTasks(harness);
+  assert.equal(projectHead(container).dataset.open, 'false', 'the stored fold did not seed the next mount');
+  click(window, projectHead(container));
+  assert.equal(projectHead(container).dataset.open, 'true', 'one header click did not unfold the project');
 });
