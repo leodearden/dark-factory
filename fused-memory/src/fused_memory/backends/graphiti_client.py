@@ -1906,6 +1906,26 @@ class GraphitiBackend:
         # --- Embedder ---
         embedder_client = embedder if embedder is not None else build_embedder(cfg)
 
+        # --- FalkorDB driver ---
+        # The driver is created with a placeholder database.  Actual graph
+        # selection happens per-request via _driver_for() / _graph_for().
+        falkor_cfg = cfg.graphiti.falkordb
+        if falkor_cfg.database is not None:
+            logger.warning(
+                'graphiti.falkordb.database=%r is ignored — graph name is '
+                'derived from group_id at request time',
+                falkor_cfg.database,
+            )
+        parsed = urlparse(falkor_cfg.uri)
+        host = parsed.hostname or 'localhost'
+        port = parsed.port or 6379
+
+        driver = _MultiTenantFalkorDriver(
+            host=host,
+            port=port,
+            password=falkor_cfg.password,
+        )
+
         # --- Cross-encoder (reranker) ---
         # Shared across the base client and every per-group client (see
         # _client_for). Mirror the llm_client/embedder_client guard so a
@@ -1932,26 +1952,6 @@ class GraphitiBackend:
                 base_url=reranker_provider.api_url,
             )
         cross_encoder = OpenAIRerankerClient(config=reranker_config)
-
-        # --- FalkorDB driver ---
-        # The driver is created with a placeholder database.  Actual graph
-        # selection happens per-request via _driver_for() / _graph_for().
-        falkor_cfg = cfg.graphiti.falkordb
-        if falkor_cfg.database is not None:
-            logger.warning(
-                'graphiti.falkordb.database=%r is ignored — graph name is '
-                'derived from group_id at request time',
-                falkor_cfg.database,
-            )
-        parsed = urlparse(falkor_cfg.uri)
-        host = parsed.hostname or 'localhost'
-        port = parsed.port or 6379
-
-        driver = _MultiTenantFalkorDriver(
-            host=host,
-            port=port,
-            password=falkor_cfg.password,
-        )
 
         self._attach(
             driver, llm_client=llm_client, embedder=embedder_client, cross_encoder=cross_encoder,
