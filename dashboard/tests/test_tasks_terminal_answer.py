@@ -575,10 +575,11 @@ class TestAcquireTerminalWindow:
         assert page[0]['args'].get('statuses') == ['cancelled', 'done']
         assert page[0]['args'].get('page_size') == 3
         assert page[0]['args'].get('offset') == 7, 'max(0, n_terminal - window)'
+        assert datum.state is DatumState.LOWER_BOUND
+        assert datum.value is not None, 'a window that was read carries its rows'
         assert sorted(int(row['id']) for row in datum.value) == [107, 108, 109], (
             f'the window must reach the high-id end, got {datum.value}'
         )
-        assert datum.state is DatumState.LOWER_BOUND
         disclosed = [int(number) for number in re.findall(r'\d+', datum.reason or '')]
         assert 3 in disclosed and 10 in disclosed, (
             'the reason must disclose the window and the population it was cut '
@@ -596,6 +597,7 @@ class TestAcquireTerminalWindow:
             )
 
         assert _terminal_get_tasks(calls)[0]['args'].get('offset') == 0
+        assert datum.value is not None, 'a window that was read carries its rows'
         assert len(datum.value) == 6
         assert self._task_snapshot_warnings(caplog) == [], (
             'no truncation WARNING may fire when the population fits the window'
