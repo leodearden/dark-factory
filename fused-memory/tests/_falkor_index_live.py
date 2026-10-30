@@ -2,9 +2,10 @@
 
 The live counterpart of ``_falkor_index_doubles``.  Every suite that drives
 ``GraphitiBackend``'s index provisioning against a real FalkorDB needs the same
-three things: throwaway graphs, a backend over a real driver, and the production
-expected-set check.  The first two carry the HAZARD rules below, so they live
-here once; a hazard fix made to one private copy would never reach the others.
+three things: throwaway graphs, a backend over a real driver, and a normalized
+reading of the indices a graph lists, with the production expected-set check
+built on it.  The first two carry the HAZARD rules below, so they live here
+once; a hazard fix made to one private copy would never reach the others.
 
 HAZARD rules, enforced here so no caller can forget one:
 
@@ -99,7 +100,12 @@ def injected_driver(backend: GraphitiBackend) -> _MultiTenantFalkorDriver:
     return driver
 
 
+async def listed_index_specs(backend: GraphitiBackend, group_id: str) -> set[IndexSpec]:
+    """The specs ``CALL db.indexes()`` LISTS, normalized: listed, not necessarily OPERATIONAL or serving."""
+    return normalize_index_records(await backend.list_indices(group_id=group_id))
+
+
 async def missing_production_indices(backend: GraphitiBackend, group_id: str) -> list[IndexSpec]:
     """Expected-but-absent specs, judged by the reader and summarizer δ's detector uses."""
-    actual = normalize_index_records(await backend.list_indices(group_id=group_id))
-    return summarize_index_health(actual, expected_index_set())['missing']
+    listed = await listed_index_specs(backend, group_id)
+    return summarize_index_health(listed, expected_index_set())['missing']
