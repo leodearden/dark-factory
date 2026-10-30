@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 
 import pytest
+
 from orchestrator.plan_descope import (
     DESCOPE_DISPOSITIONS,
     DESCOPED_STEPS_KEY,
@@ -238,8 +239,9 @@ def test_out_of_vocabulary_disposition_names_field_value_and_allowed_set():
 
 @pytest.mark.parametrize('field', ['step_id', 'commit', 'authority', 'note'])
 def test_blank_required_field_is_refused(field):
+    entry = {**_descope('step-1', '309c22ab6f'), field: ' '}
     with pytest.raises(InvalidDescopeRecord) as excinfo:
-        DescopedStep(**_descope('step-1', '309c22ab6f', **{field: ' '}))
+        DescopedStep(**entry)
     assert excinfo.value.field == field
     assert field in str(excinfo.value)
 
