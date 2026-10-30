@@ -566,11 +566,11 @@ class TestStoredPassesSince:
     ) -> None:
         seeded = self._seeded(store, clock)
 
-        stored = {item.pass_id: item for item in store.stored_passes_since(self.SINCE)}
+        stored = {(item.command_key, item.pass_id): item for item in store.stored_passes_since(self.SINCE)}
 
         for command in ('unit', 'lint'):
             for offset, pass_id in zip((10, 20), seeded[f'good_{command}'], strict=True):
-                item = stored[pass_id]
+                item = stored[(command_key(command), pass_id)]
                 assert item.problem is None
                 assert item.record == store.load_pass(command, pass_id)
                 assert item.directory == store.pass_directory(command, pass_id)
@@ -583,10 +583,10 @@ class TestStoredPassesSince:
         seeded = self._seeded(store, clock)
 
         with caplog.at_level(logging.DEBUG, logger='orchestrator.offline_lane_records'):
-            stored = {item.pass_id: item for item in store.stored_passes_since(self.SINCE)}
+            stored = {(item.command_key, item.pass_id): item for item in store.stored_passes_since(self.SINCE)}
 
-        for pass_id in seeded['bad']:
-            item = stored[pass_id]
+        for key in zip(('unit', 'unit', 'lint'), seeded['bad'], strict=True):
+            item = stored[key]
             assert item.record is None
             assert item.problem
             assert str(item.directory / 'record.json') in item.problem
