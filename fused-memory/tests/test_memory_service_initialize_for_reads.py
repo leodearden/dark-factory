@@ -1,0 +1,78 @@
+"""MemoryService.initialize_for_reads opens only what the read paths need.
+
+The pins are the service's public attributes and the real filesystem under
+``queue.data_dir``; nothing the method constructs is patched.
+"""
+
+from __future__ import annotations
+
+import logging
+import sqlite3
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+import pytest_asyncio
+
+from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
+
+
+@pytest_asyncio.fixture
+async def svc(mock_config):
+    service = MemoryService(mock_config)
+    service.graphiti = MagicMock()
+    service.graphiti.initialize = AsyncMock()
+    service.graphiti.close = AsyncMock()
+    service.mem0 = MagicMock()
+    service.mem0.close = AsyncMock()
+    yield service
+    await service.close()
+
+
+async def _seed_planned_registry(data_dir: Path) -> None:
+    writer = PlannedEpisodeRegistry(data_dir=data_dir)
+    await writer.initialize()
+    await writer.register('ep-1', 'proj')
+    await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_graph_maintenance_is_skipped(svc):
+    await svc.initialize_for_reads()
+
+    svc.graphiti.initialize.assert_awaited_once_with(skip_maintenance=True)
+
+
+@pytest.mark.asyncio
+async def test_no_queue_dir_state_is_created_when_none_exists(svc, mock_config, caplog):
+    data_dir = Path(mock_config.queue.data_dir)
+    assert not data_dir.exists()
+
+    with caplog.at_level(logging.WARNING):
+        await svc.initialize_for_reads()
+
+    assert svc.durable_queue is None
+    assert svc.overreach_shadow is None
+    assert svc.planned_episode_registry is None
+    assert not data_dir.exists()
+    assert any(
+        record.levelno == logging.WARNING and str(data_dir) in record.getMessage()
+        for record in caplog.records
+    ), [record.getMessage() for record in caplog.records]
+
+
+@pytest.mark.asyncio
+async def test_a_populated_queue_dir_gains_no_queue_or_sidecar(svc, mock_config):
+    data_dir = Path(mock_config.queue.data_dir)
+    await _seed_planned_registry(data_dir)
+
+    await svc.initialize_for_reads()
+
+    assert sorted(p.name for p in data_dir.glob('*.db')) == ['planned_episodes.db']
+    assert svc.durable_queue is None
+    registry = svc.planned_episode_registry
+    assert registry is not None
+    assert await registry.get_planned_uuids('proj') == {'ep-1'}
+    with pytest.raises(sqlite3.OperationalError):
+        await registry.register('ep-2', 'proj')
