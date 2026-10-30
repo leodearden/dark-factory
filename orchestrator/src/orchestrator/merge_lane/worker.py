@@ -124,6 +124,7 @@ from orchestrator.merge_lane.liveness import (
 )
 from orchestrator.merge_lane.member_redrive import MemberRedriveOutcome, MemberRedriver
 from orchestrator.merge_lane.no_progress_abort import NoProgressAbort, emit_no_progress_abort
+from orchestrator.merge_lane.outcome_facts import MergeBlockCategory
 from orchestrator.merge_lane.ports import (
     ClockPort,
     ContainmentPredicate,
@@ -3467,7 +3468,9 @@ async def _run_post_merge_verify(
                     dry_run_handles, req, reason, detail,
                     event_store=event_store, verifier=verifier,
                 )
-            return MergeOutcome('blocked', reason=reason)
+            return MergeOutcome(
+                'blocked', reason=reason, block_category=MergeBlockCategory.POST_MERGE_VERIFY,
+            )
 
         # Persistent ENOSPC after the prune-and-retry → transient infra.
         if _verify_hit_enospc(verify):
@@ -3681,6 +3684,7 @@ async def _run_post_merge_verify(
             disposition=disposition,
             failure_diagnostic=failure_diagnostic,
             skew_evidence=skew_evidence,
+            block_category=MergeBlockCategory.POST_MERGE_VERIFY,
         )
 
     # Task 2823 (gate-hole #3/3): a config-only merge (no .py/.rs in the diff)
@@ -6955,6 +6959,7 @@ def _derail_on_train_verify_failure(
             reason=reason,
             failure_category=verify_outcome.failure_category,
             failure_cause_hint=verify_outcome.failure_cause_hint,
+            block_category=verify_outcome.block_category,
         )
     logger.info('Train %s: verify gate blocked: %s', req.train_id, reason)
     _emit_train_event(
