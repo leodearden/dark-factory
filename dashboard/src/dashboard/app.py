@@ -63,7 +63,12 @@ from dashboard.data.costs import (
 )
 from dashboard.data.datum import unknown_datum
 from dashboard.data.db import DbPool
-from dashboard.data.escalation_corpus import acquire_corpus, corpus_queues, reconciliation_queue
+from dashboard.data.escalation_corpus import (
+    CORPUS_FRESHNESS_BOUND_SECONDS,
+    acquire_corpus,
+    corpus_queues,
+    reconciliation_queue,
+)
 from dashboard.data.load import get_load_metrics
 from dashboard.data.mcp_fanout import (
     FANOUT_FAILURE_EXCEPTIONS,
@@ -1595,8 +1600,9 @@ async def api_memory_evals(request: Request) -> JSONResponse:
     limits/verdicts artifacts) runs in a worker thread via asyncio.to_thread
     behind a ~60s single-flight TTL cache, so a cold scan never blocks the
     event loop and repeated polls within the window are free. Each rebuild
-    resolves `now` once via resolve_now (the sanctioned clock site) and stamps
-    both the escalation corpus walk and the payload with it.
+    resolves `now` once via resolve_now (the sanctioned clock site); it stamps
+    the payload, and stamps the escalation corpus walk only if this rebuild
+    triggers one.
 
     A scan that never REACHED the tree is served but NOT cached (cache_ok=
     root_scan_succeeded): an absent root and an unwalkable one are both O(1) to
@@ -1625,7 +1631,9 @@ async def api_memory_evals(request: Request) -> JSONResponse:
     tab reads, so a linked alarm and its escalation row cannot disagree. The
     queue joined and the queue id the payload names (MEMORY_EVALS.
     escalation_queue, the key the client's links resolve under) both come from
-    that one QueueRef, so they cannot disagree either.
+    that one QueueRef, so they cannot disagree either. A corpus walk that
+    raises is joined as an unknown corpus, an unreadable_escalations issue on a
+    payload cached like any degraded row, never a 500.
     """
     config: DashboardConfig = request.app.state.config
     memory_evals_dir = config.memory_evals_dir
@@ -1634,7 +1642,14 @@ async def api_memory_evals(request: Request) -> JSONResponse:
 
     async def _refresh() -> dict:
         now = resolve_now(None)
-        corpus = await acquire_corpus(corpus_queues(config), now=now)
+        try:
+            corpus = await acquire_corpus(corpus_queues(config), now=now)
+        except Exception as exc:
+            logger.exception('memory-evals: escalation corpus walk failed; joining no escalations')
+            corpus = unknown_datum(
+                f'the escalation corpus walk failed: {type(exc).__name__}: {exc}',
+                CORPUS_FRESHNESS_BOUND_SECONDS,
+            )
         return await asyncio.to_thread(
             build_memory_evals, memory_evals_dir, corpus, queue.id, now=now,
         )

@@ -28,14 +28,15 @@ from __future__ import annotations
 import builtins
 import json
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from dashboard.config import DashboardConfig
 from dashboard.data.datum import Datum
-from dashboard.data.escalation_corpus import EscalationCorpus, QueueKind, QueueRef, measure_corpus
+from dashboard.data.escalation_corpus import EscalationCorpus, measure_corpus, reconciliation_queue
 
 # The real committed exemplar tree (3207), consumed read-only by the
 # consumer-side boundary test.  dashboard/tests/ -> dashboard/ -> <repo root>.
@@ -272,17 +273,14 @@ def _write_escalation(
     return _dump(esc_dir / f'{esc_id}.json', body)
 
 
-_RECON_QUEUE = 'reconciliation'
+_RECON_QUEUE_REF = reconciliation_queue(_make_config(_FIXTURE_ROOT))
+_RECON_QUEUE = _RECON_QUEUE_REF.id
 _CORPUS_WALKED_AT = datetime(2026, 8, 1, 12, 0, 0, tzinfo=UTC)
 
 
 def _corpus(esc_dir: Path) -> Datum[EscalationCorpus]:
-    """The escalation corpus over one reconciliation queue at *esc_dir*, as the route acquires it."""
-    queue = QueueRef(
-        id=_RECON_QUEUE, label='fused-memory', kind=QueueKind.RECONCILIATION,
-        directory=esc_dir, runs_db=None,
-    )
-    return measure_corpus((queue,), now=_CORPUS_WALKED_AT)
+    """The corpus over the production reconciliation queue, re-pointed at *esc_dir*."""
+    return measure_corpus((replace(_RECON_QUEUE_REF, directory=esc_dir),), now=_CORPUS_WALKED_AT)
 
 
 # ---------------------------------------------------------------------------
@@ -3730,6 +3728,24 @@ def _route_tree(tmp_path: Path) -> DashboardConfig:
     return config
 
 
+def _served_escalations(client) -> dict[str, Any]:
+    """The ESCALATIONS payload the Escalations tab is served, over an empty task substrate."""
+    from _canned_mcp import CannedMCP
+
+    with patch('dashboard.data.tasks.mcp_tool_call', new=CannedMCP(status_page_size=2000)):
+        resp = client.get('/api/v2/dashboard/escalations')
+    assert resp.status_code == 200
+    return resp.json()['ESCALATIONS']
+
+
+def _served_subsection(client, queue_id: str) -> dict[str, Any]:
+    """The one ESCALATIONS subsection serving *queue_id*."""
+    (subsection,) = (
+        sub for sub in _served_escalations(client)['subsections'] if sub['id'] == queue_id
+    )
+    return subsection
+
+
 def _payload(**overrides: Any) -> dict[str, Any]:
     """A healthy builder-shaped payload, overridable one key at a time.
 
@@ -4089,10 +4105,6 @@ class TestMemoryEvalsEndpoint:
         (``escalation_focus.js::findEscalationRow``), so this pins the contract
         that lookup relies on across the two payloads, not a literal.
         """
-        from unittest.mock import patch
-
-        from _canned_mcp import CannedMCP
-
         from dashboard.app import _memory_evals_cache_clear
         from dashboard.data import escalation_corpus
 
@@ -4102,12 +4114,9 @@ class TestMemoryEvalsEndpoint:
         escalation_corpus._corpus_cache_clear()
 
         queue = client.get(_ROUTE_URL).json()['MEMORY_EVALS']['escalation_queue']
-        with patch('dashboard.data.tasks.mcp_tool_call', new=CannedMCP(status_page_size=2000)):
-            resp = client.get('/api/v2/dashboard/escalations')
+        subsections = _served_escalations(client)['subsections']
         escalation_corpus._corpus_cache_clear()
 
-        assert resp.status_code == 200
-        subsections = resp.json()['ESCALATIONS']['subsections']
         named = [sub for sub in subsections if sub['id'] == queue]
         assert len(named) == 1, (
             f'MEMORY_EVALS.escalation_queue={queue!r} names '
@@ -4187,11 +4196,11 @@ class TestMemoryEvalsEndpoint:
     def test_the_join_reads_the_corpus_walk_the_escalations_tab_reads(
         self, client, tmp_path: Path,
     ) -> None:
-        """A memory-evals rebuild joins the cached corpus walk, not a second read of the queue.
+        """A memory-evals rebuild joins the walk the Escalations tab is served, not a second read.
 
-        Clearing only the memory-evals cache rebuilds the payload over the same
-        walk the Escalations tab is served from, so a queue change the corpus
-        has not yet walked is invisible to both surfaces alike.
+        Clearing only the memory-evals cache rebuilds the payload over the
+        cached corpus walk, so a queue change that walk predates is invisible
+        to both surfaces alike, and the next walk shows it to both.
         """
         from dashboard.app import _memory_evals_cache_clear
         from dashboard.data import escalation_corpus
@@ -4202,19 +4211,51 @@ class TestMemoryEvalsEndpoint:
         escalation_corpus._corpus_cache_clear()
 
         client.get(_ROUTE_URL)
-        _corrupt(config.reconciliation_escalations_dir / 'esc-eval-1.json')
+        corrupted = _corrupt(config.reconciliation_escalations_dir / 'esc-eval-1.json')
         _memory_evals_cache_clear()
         cached_walk = client.get(_ROUTE_URL).json()['MEMORY_EVALS']
+        cached_tab = _served_subsection(client, cached_walk['escalation_queue'])
 
         _memory_evals_cache_clear()
         escalation_corpus._corpus_cache_clear()
         fresh_walk = client.get(_ROUTE_URL).json()['MEMORY_EVALS']
+        fresh_tab = _served_subsection(client, fresh_walk['escalation_queue'])
         escalation_corpus._corpus_cache_clear()
 
         assert _only(cached_walk['evals'][0]['metrics'], 'dangling-pointers')['parity'] == 'alarmed_open'
         assert cached_walk['issue_count'] == 0
+        assert [row['id'] for row in cached_tab['escalations']] == ['esc-eval-1']
+        assert cached_tab['skipped'] == []
+
         assert _only(fresh_walk['evals'][0]['metrics'], 'dangling-pointers')['parity'] == 'alarmed_unlinked'
         assert 'unreadable_escalation_file' in {i['kind'] for i in fresh_walk['issues']}
+        assert fresh_tab['escalations'] == []
+        assert [skip['path'] for skip in fresh_tab['skipped']] == [str(corrupted)]
+
+    def test_a_corpus_walk_that_raises_degrades_the_join_and_never_500s(
+        self, client, monkeypatch, tmp_path: Path,
+    ) -> None:
+        """The route acquires the corpus outside the builder's never-raise guard.
+
+        A walk failure still reaches the payload as the builder's unknown-corpus
+        issue, every eval row intact and the alarm degraded to unlinked.
+        """
+        import dashboard.app as app_module
+        from dashboard.app import _memory_evals_cache_clear
+
+        client.app.state.config = _route_tree(tmp_path)
+        monkeypatch.setattr(app_module, 'acquire_corpus', _raiser(OSError('queue volume went away')))
+        _memory_evals_cache_clear()
+
+        resp = client.get(_ROUTE_URL)
+
+        assert resp.status_code == 200
+        payload = resp.json()['MEMORY_EVALS']
+        assert payload['evals'][0]['run_stamps'] == list(_ROUTE_RUNS)
+        assert _only(payload['evals'][0]['metrics'], 'dangling-pointers')['parity'] == 'alarmed_unlinked'
+        (issue,) = payload['issues']
+        assert issue['kind'] == 'unreadable_escalations'
+        assert 'OSError: queue volume went away' in issue['detail']
 
     def test_ttl_cache_single_flights_the_scan(self, client, tmp_path: Path) -> None:
         """Within the TTL window the disk is not re-scanned.
