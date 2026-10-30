@@ -340,11 +340,23 @@ def _write_close(
     ports: RouterPorts, record_id: str, resolution_class: str, *, resolution: str,
     resolved_by: str,
 ) -> Applied:
+    """Dismiss *record_id*; ALREADY_TERMINAL when another writer closed it first."""
+    closure = _resolve_outcome()
     ports.queue.resolve(
         record_id, resolution,
         dismiss=True, resolved_by=resolved_by, resolution_class=resolution_class,
+        outcome=closure,
     )
+    if not closure['applied']:
+        return Applied(record_id, Outcome.ALREADY_TERMINAL)
     return Applied(record_id, Outcome.CLOSED, resolution_class=resolution_class)
+
+
+def _resolve_outcome() -> ResolveOutcome:
+    return {
+        'applied': False, 'prior_status': None, 'prior_resolved_by': None,
+        'late_resolution_captured': False, 'resolution_class_corrected': None,
+    }
 
 
 async def _convert(
@@ -448,10 +460,7 @@ def _promote(
         level=1,
         filing_claimant_run_id=ports.filing_claimant_run_id,
     )
-    dismissal: ResolveOutcome = {
-        'applied': False, 'prior_status': None, 'prior_resolved_by': None,
-        'late_resolution_captured': False, 'resolution_class_corrected': None,
-    }
+    dismissal = _resolve_outcome()
     ports.queue.resolve(
         record.id,
         f'Promoted by the info-L0 router ({context.by}) to {l1.id}: {reason}',

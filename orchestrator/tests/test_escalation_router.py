@@ -305,6 +305,18 @@ def _break_resolve(
     monkeypatch.setattr(queue, 'resolve', resolve)
 
 
+def _steward_closes_first(queue: EscalationQueue, monkeypatch, *, loser: str) -> None:
+    """Let a steward close the record just before *loser*'s own ``resolve`` lands."""
+    real_resolve = queue.resolve
+
+    def steward_wins(escalation_id, *args, **kwargs):
+        if kwargs.get('resolved_by') == loser:
+            real_resolve(escalation_id, 'steward fixed it', resolved_by='claude-task-42-steward')
+        return real_resolve(escalation_id, *args, **kwargs)
+
+    monkeypatch.setattr(queue, 'resolve', steward_wins)
+
+
 def _convert(record: Escalation) -> ConvertViaCurator:
     return ConvertViaCurator(CuratorCandidate(
         title=record.summary, description=f'Escalation: {record.id}',
@@ -365,6 +377,21 @@ class TestApplyCloses:
         after = _current(queue, record.id)
         assert (after.status, after.resolved_by) == ('resolved', 'claude-task-42-steward')
         assert _dispositions(events) == []
+
+    @pytest.mark.asyncio
+    async def test_a_record_closed_between_its_read_and_its_close_reports_already_terminal(
+        self, queue, events, ports, monkeypatch,
+    ):
+        record = _seed(queue)
+        _steward_closes_first(queue, monkeypatch, loser=ROUTER_ID)
+
+        applied = await apply(Addressed(), record, ports, CONTEXT)
+
+        assert applied.outcome is Outcome.ALREADY_TERMINAL
+        after = _current(queue, record.id)
+        assert (after.status, after.resolved_by) == ('resolved', 'claude-task-42-steward')
+        (row,) = _dispositions(events)
+        assert row['data']['class'] == 'already-terminal'
 
 
 class TestApplyConverts:
@@ -483,14 +510,7 @@ class TestApplyPromotes:
         self, queue, events, ports, monkeypatch,
     ):
         record = _seed(queue)
-        real_resolve = queue.resolve
-
-        def steward_wins(escalation_id, *args, **kwargs):
-            if kwargs.get('resolved_by') == ROUTER_ID:
-                real_resolve(escalation_id, 'steward fixed it', resolved_by='claude-task-42-steward')
-            return real_resolve(escalation_id, *args, **kwargs)
-
-        monkeypatch.setattr(queue, 'resolve', steward_wins)
+        _steward_closes_first(queue, monkeypatch, loser=ROUTER_ID)
         applied = await apply(PromoteWithHint(PromoteReason.CONVERSION_CAP), record, ports, CONTEXT)
 
         assert applied.outcome is Outcome.ALREADY_TERMINAL
@@ -1068,6 +1088,20 @@ class TestApplyReviewerDisposition:
         assert _router_l1s(queue, '42') == []
         (row,) = _dispositions(events)
         assert row['data']['class'] == 'router-error'
+
+    def test_a_note_closed_between_its_check_and_its_close_reports_already_terminal(
+        self, queue, events, ports, monkeypatch,
+    ):
+        record = _seed(queue)
+        _steward_closes_first(queue, monkeypatch, loser=REVIEWER_LEG_ID)
+
+        applied = _apply_review(ports, _review_note(record.id, ReviewerDisposition.ADDRESSED))
+
+        assert applied.outcome is Outcome.ALREADY_TERMINAL
+        after = _current(queue, record.id)
+        assert (after.status, after.resolved_by) == ('resolved', 'claude-task-42-steward')
+        (row,) = _dispositions(events)
+        assert (row['data']['class'], row['data']['by']) == ('already-terminal', REVIEWER_LEG_ID)
 
     def test_without_an_event_store_the_disposition_still_applies(self, queue, curator):
         record = _seed(queue)
