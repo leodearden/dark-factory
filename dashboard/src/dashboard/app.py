@@ -63,7 +63,7 @@ from dashboard.data.costs import (
 )
 from dashboard.data.datum import unknown_datum
 from dashboard.data.db import DbPool
-from dashboard.data.escalation_corpus import reconciliation_queue
+from dashboard.data.escalation_corpus import acquire_corpus, corpus_queues, reconciliation_queue
 from dashboard.data.load import get_load_metrics
 from dashboard.data.mcp_fanout import (
     FANOUT_FAILURE_EXCEPTIONS,
@@ -1592,12 +1592,11 @@ async def api_memory_evals(request: Request) -> JSONResponse:
     """MEMORY_EVALS — metric trends, verdicts, limits provenance and escalation parity.
 
     The artifact scan (every metrics-*.json across every eval dir, plus the
-    limits/verdicts artifacts and the escalation queue) runs in a worker thread
-    via asyncio.to_thread behind a ~60s single-flight TTL cache, so a cold scan
-    never blocks the event loop and repeated polls within the window are free.
-    No clock read here — the aggregator resolves `now` once internally via
-    resolve_now (clock-discipline guard scans dashboard/data/*.py + app.py;
-    resolve_now is the sanctioned site).
+    limits/verdicts artifacts) runs in a worker thread via asyncio.to_thread
+    behind a ~60s single-flight TTL cache, so a cold scan never blocks the
+    event loop and repeated polls within the window are free. Each rebuild
+    resolves `now` once via resolve_now (the sanctioned clock site) and stamps
+    both the escalation corpus walk and the payload with it.
 
     A scan that never REACHED the tree is served but NOT cached (cache_ok=
     root_scan_succeeded): an absent root and an unwalkable one are both O(1) to
@@ -1621,20 +1620,24 @@ async def api_memory_evals(request: Request) -> JSONResponse:
 
     The escalation source is the reconciliation queue
     (escalation_corpus.py::reconciliation_queue): memory-eval regressions are
-    filed onto the 8103 recon queue (memory-eval-program.md M3), which is the
-    same queue the Escalations tab renders — so a linked alarm and its
-    escalation cannot disagree. The directory read and the queue id the payload
-    names (MEMORY_EVALS.escalation_queue, the key the client's links resolve
-    under) both come from that one QueueRef, so they cannot disagree either.
+    filed onto the 8103 recon queue (memory-eval-program.md M3). It is read
+    through the escalation corpus' one walk and cache, the same the Escalations
+    tab reads, so a linked alarm and its escalation row cannot disagree. The
+    queue joined and the queue id the payload names (MEMORY_EVALS.
+    escalation_queue, the key the client's links resolve under) both come from
+    that one QueueRef, so they cannot disagree either.
     """
     config: DashboardConfig = request.app.state.config
     memory_evals_dir = config.memory_evals_dir
     queue = reconciliation_queue(config)
-    escalations_dir = queue.directory
-    key = f'{memory_evals_dir}|{escalations_dir}'
+    key = f'{memory_evals_dir}|{queue.directory}'
 
     async def _refresh() -> dict:
-        return await asyncio.to_thread(build_memory_evals, memory_evals_dir, escalations_dir)
+        now = resolve_now(None)
+        corpus = await acquire_corpus(corpus_queues(config), now=now)
+        return await asyncio.to_thread(
+            build_memory_evals, memory_evals_dir, corpus, queue.id, now=now,
+        )
 
     result = await _memory_evals_cache.get_or_refresh(key, _refresh, cache_ok=root_scan_succeeded)
     return JSONResponse(redux_api.shape_memory_evals(**result, escalation_queue=queue.id))
