@@ -8,7 +8,8 @@ provision what they open, so each store's existence is tested before its reader 
 """
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections import defaultdict
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,10 +17,17 @@ from typing import Any, Protocol
 
 import _checkout as _checkout
 from orchestrator.flake_ledger import (
+    DUE_ITEM_STALE_AFTER,
+    DebtRow,
+    DueRow,
+    DueSummary,
     FlakeOccurrenceRow,
     ledger_db_path,
     read_call_sites_written,
+    read_debt_many,
+    read_due_items,
     read_occurrences,
+    summarize_due,
 )
 from orchestrator.guard_state import guard_path
 from orchestrator.offline_lane_confirm import PassOutcome, outcome_from_json
@@ -30,6 +38,7 @@ from orchestrator.offline_lane_episode_state import (
     PassEffect,
 )
 from orchestrator.offline_lane_records import (
+    FailureRecord,
     Phase,
     RunRecordStore,
     StoredPass,
@@ -39,6 +48,7 @@ from orchestrator.offline_lane_records import (
 from shared.project_layout import escalation_queue_dir
 
 _BEGINNING = datetime.min.replace(tzinfo=UTC)
+_LATEST = datetime.max.replace(tzinfo=UTC)
 
 
 @dataclass(frozen=True)
@@ -97,14 +107,29 @@ class WindowPass:
 
 
 @dataclass(frozen=True)
+class LedgerReads:
+    """The flake ledger as the window sees it: occurrence rows since its start, the debt rows of the
+    tests the windowed passes offered, and the whole due list."""
+
+    occurrences: tuple[FlakeOccurrenceRow, ...]
+    debts: Mapping[str, DebtRow]
+    due_summary: DueSummary
+    due_items: tuple[DueRow, ...]
+
+
+@dataclass(frozen=True)
 class SoakInputs:
+    """*tasks* maps each task read to its body, or None for a corroborated absence; *failures* maps
+    (command, test) to that test's failure records over every stored pass of the selected commands."""
+
     since: datetime
     now: datetime
     commands: tuple[str, ...]
     passes: tuple[WindowPass, ...]
     episodes: Mapping[str, CommandRecord]
     tasks: Mapping[str, Mapping[str, Any] | None]
-    occurrences: tuple[FlakeOccurrenceRow, ...]
+    ledger: LedgerReads
+    failures: Mapping[tuple[str, str], tuple[FailureRecord, ...]]
 
     def effects(self) -> Iterator[tuple[WindowPass, PassEffect]]:
         """Each windowed pass that carries a readable effect block, with that block."""
@@ -177,8 +202,37 @@ def _episodes(project_root: Path, now: datetime, commands: Sequence[str]) -> dic
     return {name: store.load(name) for name in store.commands() if command_key(name) in commands}
 
 
-def _lane_task_ids(window: Sequence[WindowPass], episodes: Mapping[str, CommandRecord]) -> list[str]:
-    """The ids the windowed effect blocks filed, then the tasks the live episode records are or were bound to."""
+def _failures(every_pass: Sequence[StoredPass], selected: Collection[str]) -> dict[tuple[str, str], tuple[FailureRecord, ...]]:
+    found: dict[tuple[str, str], list[FailureRecord]] = defaultdict(list)
+    for stored in every_pass:
+        record = stored.record
+        if record is None or stored.command_key not in selected:
+            continue
+        for run in (record.detect, record.confirm):
+            for failure in () if run is None else run.failures:
+                found[(record.command, failure.node)].append(failure)
+    return {key: tuple(failures) for key, failures in found.items()}
+
+
+def _read_ledger(
+    db: Path, *, since: datetime, now: datetime, window: Sequence[WindowPass],
+) -> LedgerReads | Unjudgeable:
+    offered = dict.fromkeys(debt.node for p in window if p.effect is not None for debt in p.effect.debts_offered)
+    summary = summarize_due(db, stale_before=now - DUE_ITEM_STALE_AFTER)
+    due_items = None if summary is None else read_due_items(db, now=_LATEST, limit=summary.size)
+    if summary is None or due_items is None:
+        return Unjudgeable(f'flake ledger unreadable: {db}')
+    return LedgerReads(
+        occurrences=tuple(read_occurrences(db, since=since.isoformat())),
+        debts=read_debt_many(db, offered),
+        due_summary=summary,
+        due_items=tuple(due_items),
+    )
+
+
+def _task_ids(window: Sequence[WindowPass], episodes: Mapping[str, CommandRecord], ledger: LedgerReads) -> list[str]:
+    """The ids the windowed effect blocks filed, the tasks the live episode records are or were bound to,
+    and the owners of the offered tests' debts."""
     filed = [task_id for p in window if p.effect is not None for task_id in p.effect.tasks_filed]
     bound = [
         task_id
@@ -187,7 +241,8 @@ def _lane_task_ids(window: Sequence[WindowPass], episodes: Mapping[str, CommandR
         for task_id in (episode.covering_task_id, *episode.prior_task_ids)
         if task_id is not None
     ]
-    return list(dict.fromkeys((*filed, *bound)))
+    owners = [row.owner_task_id for row in ledger.debts.values() if row.owner_task_id is not None]
+    return list(dict.fromkeys((*filed, *bound, *owners)))
 
 
 async def _read_tasks(
@@ -230,8 +285,11 @@ async def load_inputs(
     window = tuple(_window_pass(p) for p in in_window if p.command_key in selected)
     if not window:
         return Unjudgeable(f'no pass record since {since.isoformat()}')
+    ledger = _read_ledger(stores.ledger, since=since, now=now, window=window)
+    if isinstance(ledger, Unjudgeable):
+        return ledger
     episodes = _episodes(project_root, now, tuple(selected))
-    tasks = await _read_tasks(_lane_task_ids(window, episodes), task_reader)
+    tasks = await _read_tasks(_task_ids(window, episodes, ledger), task_reader)
     if isinstance(tasks, Unjudgeable):
         return tasks
     return SoakInputs(
@@ -241,5 +299,6 @@ async def load_inputs(
         passes=window,
         episodes=episodes,
         tasks=tasks,
-        occurrences=tuple(read_occurrences(stores.ledger, since=since.isoformat())),
+        ledger=ledger,
+        failures=_failures(every_pass, selected),
     )

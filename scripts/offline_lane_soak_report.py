@@ -24,7 +24,7 @@ import asyncio
 import json
 import sys
 from collections import Counter, defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -35,16 +35,22 @@ import _checkout as _checkout
 from migrate_metadata_modules_to_files import DEFAULT_SERVER
 from offline_lane_soak_inputs import SoakInputs, TaskReader, Unjudgeable, WindowPass, load_inputs
 from orchestrator.flake_ledger import (
+    DUE_ITEM_STALE_AFTER,
     DUE_ITEM_STALE_MINUTES,
     UNKNOWN_TEST_ID,
     FlakeCallSite,
     FlakeVerdict,
 )
 from orchestrator.offline_lane_confirm import Confirmed
-from orchestrator.offline_lane_episode_state import LanePolicy, unconfirmable_node
+from orchestrator.offline_lane_episode_state import LanePolicy, OfferedDebt, unconfirmable_node
 from orchestrator.offline_lane_filing import LANE_METADATA_KEY
-from orchestrator.offline_lane_records import PassRecord
+from orchestrator.offline_lane_records import FailureRecord, PassRecord
 from shared.project_layout import default_project_root
+
+# The de-flake owner's metadata keys, by their PRD section 5.6 names: flake_ledger spells them
+# inline (orchestrator/src/orchestrator/flake_ledger.py::_deflake_metadata) with no public constant.
+DEBT_CALL_SITE_KEY = 'flake_debt_call_site'
+DEBT_TRIGGER_KEY = 'flake_debt_trigger'
 
 
 class Verdict(StrEnum):
@@ -188,7 +194,7 @@ def _filings_bounded_by_threshold(inputs: SoakInputs, rule: str, settings: Setti
 def _lane_rows(inputs: SoakInputs) -> set[tuple[str, datetime, str]]:
     return {
         (row.test_id, datetime.fromisoformat(row.observed_at), row.verdict)
-        for row in inputs.occurrences
+        for row in inputs.ledger.occurrences
         if row.call_site == FlakeCallSite.offline_lane
     }
 
@@ -216,12 +222,80 @@ def _ledger_rows_per_pass(inputs: SoakInputs, rule: str, settings: Settings) -> 
     return _judged(Check.LEDGER_ROWS_PER_PASS, rule, examined, failures)
 
 
+def _offered(inputs: SoakInputs) -> Iterator[tuple[WindowPass, PassRecord, OfferedDebt]]:
+    for window_pass, effect in inputs.effects():
+        record = window_pass.stored.record
+        if record is not None:
+            for debt in effect.debts_offered:
+                yield window_pass, record, debt
+
+
+def _metadata(task: Mapping[str, Any]) -> Mapping[str, Any]:
+    metadata = task.get('metadata')
+    return metadata if isinstance(metadata, Mapping) else {}
+
+
+def _text(task: Mapping[str, Any]) -> str:
+    return '\n'.join(value for key in ('description', 'details') if isinstance(value := task.get(key), str))
+
+
+def _evidence_problem(owner: Mapping[str, Any], failures: Sequence[FailureRecord]) -> str | None:
+    trigger = _metadata(owner).get(DEBT_TRIGGER_KEY)
+    if not isinstance(trigger, str) or not trigger:
+        return f'it carries no metadata.{DEBT_TRIGGER_KEY}'
+    text = _text(owner)
+    if not any(failure.kind in text and failure.first_line in text for failure in failures):
+        return "its text carries no failure kind and first line of the test from the lane's pass records"
+    return None
+
+
+def _deflake_tasks_carry_evidence(inputs: SoakInputs, rule: str, settings: Settings) -> CheckResult:
+    examined: dict[str, tuple[str, str]] = {}
+    for _, record, debt in _offered(inputs):
+        row = inputs.ledger.debts.get(debt.node)
+        owner = None if row is None or row.owner_task_id is None else inputs.tasks.get(row.owner_task_id)
+        if row is None or owner is None or _metadata(owner).get(DEBT_CALL_SITE_KEY) != FlakeCallSite.offline_lane:
+            continue
+        examined.setdefault(str(row.owner_task_id), (record.command, debt.node))
+    failures = [
+        f'owner task {owner_id} of {node}: {problem}'
+        for owner_id, (command, node) in examined.items()
+        if (owner := inputs.tasks.get(owner_id)) is not None
+        and (problem := _evidence_problem(owner, inputs.failures.get((command, node), ()))) is not None
+    ]
+    return _judged(Check.DEFLAKE_TASKS_CARRY_EVIDENCE, rule, len(examined), failures)
+
+
+def _stale_notes(inputs: SoakInputs) -> list[str]:
+    stale_before = inputs.now - DUE_ITEM_STALE_AFTER
+    return [
+        f'stale due item: {item.test_id} at {item.call_site}, enqueued {item.enqueued_at}, '
+        f'{item.attempts} attempt(s), last error: {item.last_error or "none"}'
+        for item in inputs.ledger.due_items
+        if datetime.fromisoformat(item.enqueued_at) <= stale_before
+    ]
+
+
+def _offered_debts_owned_or_due(inputs: SoakInputs, rule: str, settings: Settings) -> CheckResult:
+    pending = inputs.ledger.due_summary.pending_since
+    offered = list(_offered(inputs))
+    failures = [
+        f'{_label(window_pass)}: {debt.node} ({debt.trigger.value}) has no debt owner and is not on the due list'
+        for window_pass, _, debt in offered
+        if debt.node not in pending
+        and ((row := inputs.ledger.debts.get(debt.node)) is None or row.owner_task_id is None)
+    ]
+    return _judged(Check.OFFERED_DEBTS_OWNED_OR_DUE, rule, len(offered), failures, _stale_notes(inputs))
+
+
 _CHECKS: dict[Check, CheckFn] = {
     **{check: _not_yet_judged(check) for check in Check},
     Check.RECORDS_WELL_FORMED: _records_well_formed,
     Check.FILINGS_RESOLVE: _filings_resolve,
     Check.FILINGS_BOUNDED_BY_THRESHOLD: _filings_bounded_by_threshold,
     Check.LEDGER_ROWS_PER_PASS: _ledger_rows_per_pass,
+    Check.DEFLAKE_TASKS_CARRY_EVIDENCE: _deflake_tasks_carry_evidence,
+    Check.OFFERED_DEBTS_OWNED_OR_DUE: _offered_debts_owned_or_due,
 }
 
 
