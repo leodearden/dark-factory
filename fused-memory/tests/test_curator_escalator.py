@@ -14,13 +14,16 @@ that suppresses spam from a stuck curator.
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import logging
+import threading
 from typing import IO, Any, Literal, overload
 
 import pytest
-from _fm_helpers import LoopFreedomProbe
+from _escalation_queue_probe import probe_escalation_queue_io
+from _fm_helpers import LOOP_FREEDOM_CEILING_SECONDS, LoopFreedomProbe
 from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
 
@@ -448,6 +451,31 @@ class TestZeroOutputTimeoutEscalation:
             )
         finally:
             handle.close()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_batch_bisect_files_one_record_and_hands_every_sibling_its_id(
+        self, tmp_path, monkeypatch,
+    ):
+        """The barrier releases every sibling's liveness probe together, before any window check."""
+        n = 4
+        barrier = threading.Barrier(n)
+
+        def _all_siblings_clear_the_probe_together(project_root):
+            barrier.wait(timeout=LOOP_FREEDOM_CEILING_SECONDS)
+            return True
+
+        monkeypatch.setattr(
+            curator_escalator, 'is_orchestrator_lock_held', _all_siblings_clear_the_probe_together,
+        )
+        escalator = CuratorEscalator()
+
+        ids = await asyncio.gather(
+            *(escalator.report_failure(**_zot_report(tmp_path)) for _ in range(n)),
+        )
+
+        [record] = _pending_records(tmp_path)
+        assert record['dedupe_count'] == 0
+        assert ids == [record['id']] * n
 
     # Recurrence folding, per Leo's 2026-08-27 ACCEPT-AND-RETUNE ruling on
     # esc-task-curator-17. A SEPARATE CuratorEscalator per report stands in for
@@ -1091,60 +1119,60 @@ class TestBackendBinaryUnresolvableEscalation:
         assert any('claude' in r.getMessage() for r in errors)
 
 
+_EVERY_ROUTE = [
+    pytest.param(
+        'report_failure',
+        dict(justification='max_turns exhausted', candidate_title='T'),
+        id='failure',
+    ),
+    pytest.param(
+        'report_failure',
+        dict(
+            justification='denied', candidate_title='T',
+            schema_tool_denied=True,
+        ),
+        id='schema-tool-denied',
+    ),
+    pytest.param(
+        'report_failure',
+        dict(
+            justification='ZOT', candidate_title='T',
+            zero_output_timeout=True, timed_out=True,
+            duration_ms=181_966, transcript_turns=0, tools_used=(),
+        ),
+        id='zero-output-timeout',
+    ),
+    pytest.param(
+        'report_zot_duplicate',
+        dict(
+            finding=_FINDING, candidate_title='T',
+            zot_escalation_id='esc-curator-41', stamped=True,
+        ),
+        id='zot-duplicate',
+    ),
+    pytest.param(
+        'report_consecutive_degraded',
+        dict(
+            streak=5, threshold=5, last_justification='j',
+            candidate_title='T',
+        ),
+        id='consecutive-degraded',
+    ),
+    pytest.param(
+        'report_backend_binary_unresolvable',
+        dict(binary_spec='claude', search_path='/usr/bin'),
+        id='backend-binary-unresolvable',
+    ),
+]
+
+
 class TestEveryRouteFilesUnderItsAnchor:
     """The value filed must be the constant that
     tests/test_folded_escalation.py::TestNoTwoFilersShareAnAnchor sweeps, or a
     site with a diverging literal escapes the collision check."""
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ('method_name', 'kwargs'),
-        [
-            pytest.param(
-                'report_failure',
-                dict(justification='max_turns exhausted', candidate_title='T'),
-                id='failure',
-            ),
-            pytest.param(
-                'report_failure',
-                dict(
-                    justification='denied', candidate_title='T',
-                    schema_tool_denied=True,
-                ),
-                id='schema-tool-denied',
-            ),
-            pytest.param(
-                'report_failure',
-                dict(
-                    justification='ZOT', candidate_title='T',
-                    zero_output_timeout=True, timed_out=True,
-                    duration_ms=181_966, transcript_turns=0, tools_used=(),
-                ),
-                id='zero-output-timeout',
-            ),
-            pytest.param(
-                'report_zot_duplicate',
-                dict(
-                    finding=_FINDING, candidate_title='T',
-                    zot_escalation_id='esc-curator-41', stamped=True,
-                ),
-                id='zot-duplicate',
-            ),
-            pytest.param(
-                'report_consecutive_degraded',
-                dict(
-                    streak=5, threshold=5, last_justification='j',
-                    candidate_title='T',
-                ),
-                id='consecutive-degraded',
-            ),
-            pytest.param(
-                'report_backend_binary_unresolvable',
-                dict(binary_spec='claude', search_path='/usr/bin'),
-                id='backend-binary-unresolvable',
-            ),
-        ],
-    )
+    @pytest.mark.parametrize(('method_name', 'kwargs'), _EVERY_ROUTE)
     async def test_the_filed_task_id_is_the_anchor_constant(
         self, tmp_path, method_name: str, kwargs: dict[str, Any],
     ):
@@ -1156,6 +1184,49 @@ class TestEveryRouteFilesUnderItsAnchor:
 
             [record] = _pending_records(tmp_path)
             assert record['task_id'] == curator_escalator._ANCHOR_TASK_ID
+        finally:
+            handle.close()
+
+
+class TestQueueFilingRunsOffTheEventLoop:
+    """Every route mints its id and submits off the loop, and survives a queue that cannot mint."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('method_name', 'kwargs'), _EVERY_ROUTE)
+    async def test_every_route_mints_and_submits_off_the_event_loop(
+        self, tmp_path, monkeypatch, method_name: str, kwargs: dict[str, Any],
+    ):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            probe = LoopFreedomProbe()
+            probe_escalation_queue_io(monkeypatch, probe)
+
+            await getattr(CuratorEscalator(), method_name)(
+                project_root=str(tmp_path), project_id='proj-x', **kwargs,
+            )
+
+            probe.assert_loop_stayed_free()
+            [record] = _pending_records(tmp_path)
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('method_name', 'kwargs'), _EVERY_ROUTE)
+    async def test_every_route_swallows_a_queue_that_cannot_mint_an_id(
+        self, tmp_path, monkeypatch, method_name: str, kwargs: dict[str, Any],
+    ):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            def _unmintable(self, key):
+                raise OSError('counter unwritable')
+
+            monkeypatch.setattr(EscalationQueue, 'make_id', _unmintable)
+
+            await getattr(CuratorEscalator(), method_name)(
+                project_root=str(tmp_path), project_id='proj-x', **kwargs,
+            )
+
+            assert _pending_records(tmp_path) == []
         finally:
             handle.close()
 
