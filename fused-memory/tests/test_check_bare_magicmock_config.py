@@ -1258,7 +1258,7 @@ class TestRuleBIsUnconditional:
         single site through: only a count that exceeds any plausible leftover budget
         distinguishes "no suppression" from "suppressed just under the wire".
         """
-        violations = find_violations(_RULE_B_SOURCE * 3, path)
+        violations = _rule_b(_RULE_B_SOURCE * 3, path)
         assert len(violations) == 3, (
             f'{path} must report every Rule B site in full — {why}; got {violations}'
         )
@@ -2129,15 +2129,16 @@ class TestWallClockDeadlineDebtBaseline:
     def test_same_source_opposite_verdicts_by_filename(self):
         """The identical offending source is suppressed in a debt file and flagged elsewhere."""
         entry, budget = _live_rule_c_debt_entry()
-        assert budget >= 2, (
-            f'this leg drives a two-violation source and expects silence under {entry}, '
-            f'so it needs a budget of at least 2; got {budget}'
+        assert budget >= 1, (
+            f'this leg drives {entry} at exactly its budget and expects the same source '
+            f'to flag elsewhere, so it needs a budget of at least 1; got {budget}'
         )
-        assert _rule_c(_RULE_C_SOURCE, entry) == [], (
-            'Rule C must be suppressed in a debt-listed file'
+        source = _RULE_C_ONE_HIT * budget
+        assert _rule_c(source, entry) == [], (
+            'Rule C must be suppressed in a debt-listed file at its recorded budget'
         )
-        flagged = _rule_c(_RULE_C_SOURCE, _NON_DEBT_FILE)
-        assert len(flagged) == 2, (
+        flagged = _rule_c(source, _NON_DEBT_FILE)
+        assert len(flagged) == budget, (
             'the SAME source in a non-debt file must still flag — otherwise the '
             f'baseline is not a baseline but a global off switch; got {flagged!r}'
         )
@@ -2156,12 +2157,8 @@ class TestWallClockDeadlineDebtBaseline:
         )
 
         entry, budget = _live_rule_c_debt_entry()
-        assert budget >= 2, (
-            f'the find_violations leg drives a two-violation source and expects silence '
-            f'under {entry}, so it needs a budget of at least 2; got {budget}'
-        )
         live_absolute = str(_REPO_ROOT / entry)
-        assert _rule_c(_RULE_C_SOURCE, live_absolute) == [], (
+        assert _rule_c(_RULE_C_ONE_HIT * budget, live_absolute) == [], (
             'find_violations must hand an absolute filename to the baseline lookup '
             f'unchanged, so a debt file is suppressed for pytest callers too; '
             f'filename={live_absolute!r}'
@@ -2280,6 +2277,136 @@ class TestWallClockDeadlineDebtBaseline:
             _checker._apply_debt_budget([], 1, _checker._wall_clock_overrun_msg)  # type: ignore[misc]
 
 
+class TestWallClockDeadlineDebtSlack:
+    """A debt file carrying FEWER violations than its budget is reported by the lint itself.
+
+    Slack above the measurement silently licences that many new wall-clock waits, so
+    the budget must stay exact.  Task 6202 moved that check out of a fused-memory-only
+    census test and into the checker: the red now lands in the owning package's own
+    lint_command (and the pre-commit hook), naming the one-line edit, instead of in
+    another package's suite after merge.
+    """
+
+    @staticmethod
+    def _live_entry_of_at_least_2() -> tuple[str, int]:
+        entry, budget = _live_rule_c_debt_entry()
+        assert budget >= 2, (
+            f'the slack legs drive budget-1 hits under {entry} and need that to be at '
+            f'least 1, so they need a budget of at least 2; got {budget}'
+        )
+        return entry, budget
+
+    def test_a_debt_file_below_its_budget_reports_one_file_level_slack_violation(self):
+        """Slack has no site — the removed wait is gone — so it is ONE violation at 1:0."""
+        entry, budget = self._live_entry_of_at_least_2()
+        slack = _rule_c(_RULE_C_ONE_HIT * (budget - 1), entry)
+        assert len(slack) == 1, (
+            f'{budget - 1} hits against {entry} (budget {budget}) must report exactly one '
+            f'file-level slack violation; got {slack!r}'
+        )
+        assert (slack[0].lineno, slack[0].col_offset) == (1, 0), (
+            f'the slack violation is file-level and anchors at 1:0; got {slack[0]!r}'
+        )
+
+    def test_the_slack_message_names_the_exact_edit(self):
+        """The message leads the author to the one-line budget edit, and nowhere else."""
+        entry, budget = self._live_entry_of_at_least_2()
+        message = _rule_c(_RULE_C_ONE_HIT * (budget - 1), entry)[0].message
+        for needle in (
+            f"_WALL_CLOCK_DEADLINE_DEBT['{entry}']",
+            f'from {budget} to {budget - 1}',
+            'fused-memory/scripts/check_bare_magicmock_config.py',
+            'wall-clock-deadline',
+        ):
+            assert needle in message, (
+                f'the slack message must name {needle!r}; got {message!r}'
+            )
+        # No per-site suppression can fix slack, and no Rule A/B remedy applies.
+        for foreign in (
+            'mock_orch_config',
+            'pydantic_spec',
+            'fake_verify_result',
+            'spec=VerifyResult',
+            'bare-magicmock',
+            'bare-dataclass-double',
+            '# noqa',
+        ):
+            assert foreign not in message, (
+                f'the slack message must not offer {foreign!r}: {message!r}'
+            )
+
+    def test_a_debt_file_at_zero_is_told_to_drop_its_entry(self):
+        """A fully migrated debt file must leave the baseline, not sit at a budget of 0."""
+        entry, _budget = self._live_entry_of_at_least_2()
+        slack = _rule_c('', entry)
+        assert len(slack) == 1, (
+            f'a debt file with no Rule C violations left must report one slack '
+            f'violation; got {slack!r}'
+        )
+        message = slack[0].message
+        for needle in (
+            f"_WALL_CLOCK_DEADLINE_DEBT['{entry}']",
+            '_EXPECTED_WALL_CLOCK_DEBT_PATHS',
+            'fused-memory/tests/test_check_bare_magicmock_config.py',
+        ):
+            assert needle in message, (
+                f'the at-zero slack message must name {needle!r}; got {message!r}'
+            )
+
+    def test_a_debt_file_at_exactly_its_budget_is_silent(self):
+        """Exactly the recorded number is the grandfathering the baseline exists for."""
+        entry, budget = self._live_entry_of_at_least_2()
+        assert _rule_c(_RULE_C_ONE_HIT * budget, entry) == []
+
+    def test_slack_quotes_the_baseline_key_not_the_scanned_filename(self):
+        """pytest passes absolute paths; only the dict KEY is an edit the author can apply."""
+        entry, budget = self._live_entry_of_at_least_2()
+        absolute = str(_REPO_ROOT / entry)
+        slack = _rule_c(_RULE_C_ONE_HIT * (budget - 1), absolute)
+        assert len(slack) == 1, slack
+        message = slack[0].message
+        assert f"['{entry}']" in message, (
+            f'the slack message must quote the baseline key {entry!r}; got {message!r}'
+        )
+        assert absolute not in message, (
+            f'the slack message must not quote the scanned filename {absolute!r}; '
+            f'got {message!r}'
+        )
+
+    def test_a_removal_reds_the_owning_packages_own_lint_command_naming_the_edit(
+        self, tmp_path: Path
+    ):
+        """DONE-WHEN (task 6202): the red lands in the author's own package lint.
+
+        Scans ``<tmp>/<pkg>/tests`` exactly as a package lint_command scans its tests
+        dir.  Removing one wait without the budget edit exits 1 naming the edit;
+        applying the count the edit records exits 0.
+        """
+        entry, budget = self._live_entry_of_at_least_2()
+        debt_file = tmp_path / entry
+        debt_file.parent.mkdir(parents=True)
+        package_tests_dir = tmp_path.joinpath(*PurePosixPath(entry).parts[:2])
+        command = [sys.executable, str(SCRIPT_PATH), str(package_tests_dir)]
+
+        debt_file.write_text(_RULE_C_ONE_HIT * (budget - 1))
+        removed = subprocess.run(command, capture_output=True, text=True)
+        assert removed.returncode == 1, (
+            f'a removal without the budget edit must red the package lint; '
+            f'stdout={removed.stdout!r} stderr={removed.stderr!r}'
+        )
+        edit = f"_WALL_CLOCK_DEADLINE_DEBT['{entry}'] from {budget} to {budget - 1}"
+        assert edit in removed.stdout, (
+            f'the package lint must name the edit {edit!r}; got {removed.stdout!r}'
+        )
+
+        debt_file.write_text(_RULE_C_ONE_HIT * budget)
+        exact = subprocess.run(command, capture_output=True, text=True)
+        assert exact.returncode == 0, (
+            f'a debt file at exactly its budget must leave the package lint green; '
+            f'stdout={exact.stdout!r} stderr={exact.stderr!r}'
+        )
+
+
 class TestDebtBaselineIsolation:
     """Rule C's baseline is Rule C's alone: its debt entries suppress no other rule.
 
@@ -2289,7 +2416,9 @@ class TestDebtBaselineIsolation:
     def test_rule_a_is_reported_in_full_in_a_rule_c_debt_file(self):
         """The Rule C baseline grandfathers wall-clock debt, not all test-quality discipline."""
         entry, _budget = _live_rule_c_debt_entry()
-        violations = find_violations(_RULE_A_SOURCE, entry)
+        violations = [
+            v for v in find_violations(_RULE_A_SOURCE, entry) if 'bare-magicmock' in v.message
+        ]
         assert len(violations) == 1, (
             'a bare config MagicMock in a Rule-C-debt file is still a Rule A '
             f'violation; got {violations}'
