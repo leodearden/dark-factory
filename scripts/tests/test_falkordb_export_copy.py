@@ -68,7 +68,9 @@ class FakeFalkorDB:
     """Knobs: ``in_flight`` starts a child before the export, ``loading_polls`` keeps loading:1 for
     that many INFO reads, ``stuck`` names a child that never finishes, ``fails`` one that ends with
     status err, ``rejects`` a command answered with an error reply, and ``exec_fails`` makes every
-    ``docker exec`` fail as on a container that went away."""
+    ``docker exec`` fail as on a container that went away. ``races`` names a save or rewrite that
+    lands on the first INFO read made once ``copy_dest`` holds the manifest, i.e. during the copy;
+    ``drops_incr`` makes a rewrite delete the incr file its manifest names."""
 
     def __init__(
         self,
@@ -83,6 +85,9 @@ class FakeFalkorDB:
         fails: str | None = None,
         rejects: tuple[str, ...] | None = None,
         exec_fails: bool = False,
+        races: str | None = None,
+        copy_dest: Path | None = None,
+        drops_incr: bool = False,
         **info: str,
     ):
         self.data_dir = data_dir
@@ -95,6 +100,9 @@ class FakeFalkorDB:
         self.fails = fails
         self.rejects = rejects
         self.exec_fails = exec_fails
+        self.races = races
+        self.copy_dest = copy_dest
+        self.drops_incr = drops_incr
         self.info = {
             "loading": "1" if loading_polls else "0",
             "aof_enabled": "1",
@@ -207,6 +215,12 @@ class FakeFalkorDB:
         self._child, self._child_polls = field, CHILD_POLLS
 
     def _tick(self) -> None:
+        if self.races and self.copy_dest and (self.copy_dest / MANIFEST).exists():
+            race, self.races = self.races, None
+            if race == "rdb_saves":
+                self._finish_save()
+            else:
+                self._finish_rewrite()
         if self.loading_polls:
             self.loading_polls -= 1
             self.info["loading"] = "1" if self.loading_polls else "0"
@@ -235,6 +249,8 @@ class FakeFalkorDB:
         self._write(self.aof_dir / f"appendonly.aof.{self._seq}.incr.aof", f"incr-{self._seq}".encode())
         self._write(self.aof_dir / "appendonly.aof.manifest", _manifest(self._seq, previous).encode())
         self.info["aof_rewrites"] = str(int(self.info["aof_rewrites"]) + 1)
+        if self.drops_incr:
+            (self.aof_dir / f"appendonly.aof.{self._seq}.incr.aof").unlink()
 
 
 @pytest.fixture
@@ -393,3 +409,27 @@ def test_a_container_that_is_not_running_fails_the_export(data_dir, dest, capsys
     assert fake.execs == []
     assert finding in capsys.readouterr().err
     assert not dest.exists()
+
+
+@pytest.mark.parametrize(
+    ("counter", "before", "after"), [("aof_rewrites", 1, 2), ("rdb_saves", 201, 202)],
+)
+def test_a_save_or_rewrite_that_lands_during_the_copy_fails_the_export(data_dir, dest, capsys, counter, before, after):
+    fake = FakeFalkorDB(data_dir, races=counter, copy_dest=dest)
+
+    assert _export(fake, dest) == 1
+
+    assert fake.races is None, "the race never fired"
+    err = capsys.readouterr().err
+    assert f"{counter} {before}→{after}" in err
+    assert "still writing to FalkorDB" in err
+
+
+def test_a_copy_whose_named_file_vanished_fails_the_export(data_dir, dest, capsys):
+    fake = FakeFalkorDB(data_dir, drops_incr=True)
+
+    assert _export(fake, dest) == 1
+
+    err = capsys.readouterr().err
+    assert str(data_dir / "appendonlydir" / "appendonly.aof.2.incr.aof") in err
+    assert "Traceback" not in err
