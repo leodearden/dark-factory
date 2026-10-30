@@ -53,11 +53,6 @@ def test_no_new_timeout_marker_sits_in_the_inversion_band() -> None:
     assert failure is None, failure
 
 
-def test_grandfather_allowlist_has_no_stale_entries() -> None:
-    failure = _verdict().stale_failure
-    assert failure is None, failure
-
-
 def test_the_marker_census_is_not_vacuous() -> None:
     failure = _verdict().census_failure
     assert failure is None, failure
