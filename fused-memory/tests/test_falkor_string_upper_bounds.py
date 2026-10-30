@@ -35,6 +35,17 @@ _WINDOW_START = '2026-10-01T00:00:00Z'
 _WINDOW_END = '2026-10-10T00:00:00Z'
 
 
+def _backend_over(mock_config, driver: _MultiTenantFalkorDriver) -> GraphitiBackend:
+    return GraphitiBackend.with_driver(
+        mock_config,
+        driver,
+        registered_graph_ids=(),
+        llm_client=MagicMock(spec=LLMClient),
+        embedder=MagicMock(spec=EmbedderClient),
+        cross_encoder=MagicMock(spec=CrossEncoderClient),
+    )
+
+
 class TestExactStringUpperBound:
     def test_inclusive_bound_is_a_concatenated_less_or_equal(self):
         assert exact_string_upper_bound('e.valid_at', 'end', inclusive=True) == (
@@ -63,6 +74,11 @@ class LiveGraph(NamedTuple):
     client: FalkorDB
     graph: Any
     name: str
+
+
+def _live_driver(live: LiveGraph) -> _MultiTenantFalkorDriver:
+    """A driver over the fixture's shared client; never closed, since that would aclose the client the fixture owns."""
+    return _MultiTenantFalkorDriver(falkor_db=live.client, database=live.name)
 
 
 @pytest_asyncio.fixture
@@ -151,15 +167,14 @@ class TestExactStringUpperBoundLiveFalkorDB:
 class TestQueryEdgesByTimeRangeLiveFalkorDB:
     @pytest.mark.asyncio
     async def test_returns_exactly_the_edges_in_the_window(
-        self, mock_config, make_backend, string_bound_live_graph,
+        self, mock_config, string_bound_live_graph,
     ):
         live = string_bound_live_graph
         seeded = await _seed_window_edges(live.graph)
-        backend = make_backend(mock_config)
-        backend._driver._get_graph = MagicMock(return_value=live.graph)
+        backend = _backend_over(mock_config, _live_driver(live))
 
         edges = await backend.query_edges_by_time_range(
-            _WINDOW_START, _WINDOW_END, group_id='test',
+            _WINDOW_START, _WINDOW_END, group_id=live.name,
         )
 
         assert {e['uuid'] for e in edges} == _in_window(seeded, _WINDOW_START, _WINDOW_END)
@@ -167,16 +182,15 @@ class TestQueryEdgesByTimeRangeLiveFalkorDB:
 
     @pytest.mark.asyncio
     async def test_both_bounds_are_inclusive(
-        self, mock_config, make_backend, string_bound_live_graph,
+        self, mock_config, string_bound_live_graph,
     ):
         live = string_bound_live_graph
         seeded = await _seed_window_edges(live.graph)
-        backend = make_backend(mock_config)
-        backend._driver._get_graph = MagicMock(return_value=live.graph)
+        backend = _backend_over(mock_config, _live_driver(live))
         start = '2026-10-01T12:00:00+00:00'
         end = '2026-10-05T12:00:00+00:00'
 
-        edges = await backend.query_edges_by_time_range(start, end, group_id='test')
+        edges = await backend.query_edges_by_time_range(start, end, group_id=live.name)
 
         assert sorted(e['valid_at'] for e in edges) == [
             f'2026-10-{day:02d}T12:00:00+00:00' for day in range(1, 6)
@@ -187,15 +201,6 @@ class TestQueryEdgesByTimeRangeLiveFalkorDB:
 # ---------------------------------------------------------------------------
 # graphiti-core's previous-episode read, on add_episode's per-group client
 # ---------------------------------------------------------------------------
-
-
-def _backend_over(mock_config, driver: _MultiTenantFalkorDriver) -> GraphitiBackend:
-    backend = GraphitiBackend(mock_config, registered_graph_ids=())
-    backend._driver = driver
-    backend._llm_client = MagicMock(spec=LLMClient)
-    backend._embedder = MagicMock(spec=EmbedderClient)
-    backend._cross_encoder = MagicMock(spec=CrossEncoderClient)
-    return backend
 
 
 def _per_group_client(mock_config, records: list[dict]):
@@ -315,8 +320,7 @@ async def _seed_episodes(live: LiveGraph) -> None:
 
 
 async def _previous_episode_names(mock_config, live: LiveGraph, reference_time: datetime) -> list[str]:
-    driver = _MultiTenantFalkorDriver(falkor_db=live.client, database=live.name)
-    client = _backend_over(mock_config, driver)._client_for(live.name)
+    client = _backend_over(mock_config, _live_driver(live))._client_for(live.name)
     episodes = await client.retrieve_episodes(
         reference_time, last_n=3, group_ids=[live.name], source=EpisodeType.text,
     )
