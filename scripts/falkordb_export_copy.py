@@ -28,6 +28,7 @@ from falkordb_aof_gate import (
     DATA_DIR_IN_CONTAINER,
     Container,
     Docker,
+    ProbeFailed,
     Remedy,
     Runner,
     ServerAofConfig,
@@ -38,6 +39,7 @@ from falkordb_aof_gate import (
 )
 
 RDB_FILE = "dump.rdb"
+STARTED_REPLY_PREFIX = "Background"
 
 
 class ExportFailed(Exception):
@@ -163,7 +165,7 @@ def main(
     docker = Docker(run, args.compose_file)
     try:
         log(export(docker, args, sleep, clock))
-    except ExportFailed as exc:
+    except (ExportFailed, ProbeFailed) as exc:
         log(f"FAILED: {exc}")
         return 1
     return 0
@@ -174,10 +176,9 @@ def export(docker: Docker, args: argparse.Namespace,
     container_id, host_dir = _running_falkordb(docker)
     server = Server(docker, container_id, args, sleep, clock)
     config = ServerAofConfig.read(docker, container_id)
-    state = server.wait_until(lambda s: s.idle, "the server to be idle")
-    _require_aof(config, state)
-    state = _flush(server, SAVE, state)
-    state = _flush(server, REWRITE, state)
+    _require_aof(config, server.wait_until(lambda s: s.idle, "the server to be idle"))
+    _flush(server, SAVE)
+    state = _flush(server, REWRITE)
     copied = _copy_restore_set(host_dir, config, args.dest)
     return (f"copied {RDB_FILE}, {config.manifest_name} and {copied} base/incr file(s) "
             f"to {args.dest} at aof_rewrites:{state.aof_rewrites}")
@@ -210,10 +211,16 @@ def _require_aof(config: ServerAofConfig, state: SaveState) -> None:
         )
 
 
-def _flush(server: Server, flush: Flush, before: SaveState) -> SaveState:
-    log(f"{flush.command}: {server.send(flush.command)}")
+def _flush(server: Server, flush: Flush) -> SaveState:
+    before = server.wait_until(lambda s: s.idle, f"the server to be idle before {flush.command}")
+    reply = server.send(flush.command)
+    if not reply.startswith(STARTED_REPLY_PREFIX):
+        raise ExportFailed(f"{flush.command} was refused: {reply}")
+    log(f"{flush.command}: {reply}")
     after = server.wait_until(
-        lambda s: s.idle and flush.count(s) > flush.count(before), f"{flush.command} to finish")
+        lambda s: s.idle and (flush.count(s) > flush.count(before) or flush.outcome(s) != "ok"),
+        f"{flush.command} to finish",
+    )
     if flush.outcome(after) != "ok":
         raise ExportFailed(f"{flush.command} failed: {flush.status}:{flush.outcome(after)}")
     log(f"{flush.command} done: {flush.counter} {flush.count(before)}→{flush.count(after)}")
