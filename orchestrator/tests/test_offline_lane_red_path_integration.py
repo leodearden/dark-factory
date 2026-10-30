@@ -21,10 +21,12 @@ from pathlib import Path
 
 import pytest
 from _offline_lane_red_path_fixtures import (
+    COMMIT_SPAWNS,
     OPAQUE_COMMAND,
     A,
     B,
     C,
+    LegacyLeg,
     RedPathLane,
     Run,
     StoreFault,
@@ -33,8 +35,8 @@ from _offline_lane_red_path_fixtures import (
     lane_test_timeout,
 )
 
-from orchestrator.offline_lane_episode_state import unconfirmable_node
-from orchestrator.offline_lane_filing import HEAD_PREFIX_CHARS, SPAWN_CONTEXT
+from orchestrator.offline_lane_episode_state import EPISODES_FILE, unconfirmable_node
+from orchestrator.offline_lane_filing import HEAD_PREFIX_CHARS, SPAWN_CONTEXT, EvidenceNote
 
 pytestmark = [pytest.mark.usefixtures('code_default_config')]
 
@@ -477,3 +479,109 @@ async def test_scenario_19_a_restart_between_submit_and_commit_planning_commits_
     assert committed is not None
     assert committed.planning_committed is True
     assert [name for name, _arguments in lane.store.calls].count('submit_task') == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=6))
+async def test_scenario_20_main_idle_one_recheck_per_head_and_a_never_extended_episode_expires(
+    tmp_path, monkeypatch,
+):
+    lane = await RedPathLane.open(tmp_path, monkeypatch)
+    red_ab = Run(failed={A: 'AssertionError: a', B: 'AssertionError: b'})
+    first = await lane.advance(red_ab, red_ab)
+    invocations = len(lane.stub.invocations())
+
+    assert await lane.tick(minutes=29) == []
+    assert len(lane.stub.invocations()) == invocations
+    [recheck] = await lane.tick(
+        Run(failed={A: 'AssertionError: a'}, skipped=(B,)), Run(failed={A: 'AssertionError: a'}), minutes=1,
+    )
+
+    assert recheck.head == first.head
+    assert recheck.started_at - first.started_at == timedelta(minutes=30)
+    assert effect_of(recheck)['tests_counted'] == [A]
+    [task] = lane.store.lane_tasks()
+    assert effect_of(recheck)['tasks_filed'] == [task['id']]
+    assert nodes_of(task) == [A]
+    assert await lane.tick(minutes=90) == []
+    assert await lane.tick(minutes=600) == []
+    expiring = await lane.advance(Run(passed=(C,)), minutes=13 * 60)
+    assert expiring.started_at - first.started_at > timedelta(hours=24)
+    assert (B, 'expired') in [(ended['node'], ended['reason']) for ended in effect_of(expiring)['episodes_ended']]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=4))
+async def test_scenario_21_an_unreadable_episode_store_files_at_most_one_duplicate(tmp_path, monkeypatch, caplog):
+    lane, first_id, _filed_at = await filed_lane(tmp_path, monkeypatch)
+
+    lane.corrupt_episode_store()
+    lane.restart()
+    await lane.advance(RED_A, RED_A)
+    await lane.advance(RED_A, RED_A)
+
+    assert any(
+        record.levelno >= logging.WARNING and EPISODES_FILE in record.getMessage() for record in caplog.records
+    )
+    assert len(lane.store.lane_tasks()) <= 2
+    episode = lane.episode(A)
+    assert episode is not None
+    assert episode.covering_task_id == first_id
+
+
+NUMERIC_IDS = ('numeric_suite::case_1', 'numeric_suite::case_2')
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=3, extra_spawns=COMMIT_SPAWNS))
+async def test_scenario_22a_the_numeric_legs_confirm_exit_decides_its_outcome(tmp_path, monkeypatch):
+    lane = await RedPathLane.open(tmp_path, monkeypatch, legacy=LegacyLeg.NUMERIC)
+    detect = Run(exit=1, printed=('numeric suite: 2 failures',), complete=False, junit=False)
+
+    printed = await lane.advance(detect, Run(printed=NUMERIC_IDS, exit=100, complete=False, junit=False))
+    clean = await lane.advance(detect, Run(exit=0, complete=False, junit=False))
+    failed = await lane.advance(detect, Run(exit=64, complete=False, junit=False))
+
+    assert printed.outcome == {
+        'arm': 'confirmed', 'mode': 'leg_native', 'reproduced': list(NUMERIC_IDS), 'cleared': [], 'inconclusive': [],
+    }
+    assert clean.outcome == {
+        'arm': 'confirmed', 'mode': 'leg_native', 'reproduced': [], 'cleared': [], 'inconclusive': [],
+    }
+    assert failed.outcome == {'arm': 'unconfirmable', 'reason': 'numeric_exit', 'detail': '64'}
+    assert lane.stub.invocations()[1]['argv'] == ['--test-threads=1', '--confirm-failed']
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=1, extra_spawns=COMMIT_SPAWNS))
+async def test_scenario_22b_an_infra_crash_naming_no_test_is_unconfirmable(tmp_path, monkeypatch):
+    lane = await RedPathLane.open(tmp_path, monkeypatch, legacy=LegacyLeg.INFRA)
+
+    record = await lane.advance(Run(exit=2, printed=('run_all.sh: crashed',), complete=False, junit=False))
+
+    assert record.outcome == {'arm': 'unconfirmable', 'reason': 'detect_red_named_no_test', 'detail': '2'}
+    assert len(lane.stub.invocations()) == 1
+
+
+async def note_hook(command, head, outcome, run_records) -> tuple[EvidenceNote, ...]:
+    return (EvidenceNote(source='scenario-23', node=A, text='hook note for A'),)
+
+
+async def raising_hook(command, head, outcome, run_records) -> tuple[EvidenceNote, ...]:
+    raise RuntimeError('scenario 23: this hook always raises')
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=2))
+@pytest.mark.parametrize(('hooks', 'noted'), [((note_hook, raising_hook), True), ((raising_hook,), False)])
+async def test_scenario_23_a_hooks_note_reaches_the_task_and_a_raising_hook_loses_only_its_own(
+    tmp_path, monkeypatch, hooks, noted,
+):
+    lane = await RedPathLane.open(tmp_path, monkeypatch, hooks=hooks)
+
+    await lane.advance(RED_A, RED_A)
+    await lane.advance(RED_A, RED_A)
+
+    [task] = lane.store.lane_tasks()
+    assert nodes_of(task) == [A]
+    assert ('hook note for A' in task['details']) is noted
