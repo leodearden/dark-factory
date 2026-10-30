@@ -19,7 +19,7 @@ from shared.plan_deviation import DeviationRecord
 
 from orchestrator import file_mutex
 from orchestrator.config import TASK_META_DIRNAME
-from orchestrator.review_payload import Verdict, normalize_review
+from orchestrator.review_payload import NoteDisposition, Verdict, normalize_review
 
 logger = logging.getLogger(__name__)
 
@@ -297,6 +297,7 @@ class ReviewAggregation:
     suggestions: list[dict]
     reviews: dict[str, dict]
     reviewer_errors: list[str] = field(default_factory=list)
+    note_dispositions: tuple[NoteDisposition, ...] = ()
 
     @property
     def all_reviewers_errored(self) -> bool:
@@ -1107,11 +1108,13 @@ class TaskArtifacts:
         blocking = []
         suggestions = []
         errors = []
+        note_dispositions: list[NoteDisposition] = []
 
         for reviewer_name, review in reviews.items():
             payload = normalize_review(review)
             if payload.verdict is Verdict.ERROR:
                 errors.append(reviewer_name)
+            note_dispositions.extend(payload.note_dispositions)
             blocking.extend(
                 {**issue, 'reviewer': reviewer_name} for issue in payload.blocking_issues
             )
@@ -1126,6 +1129,7 @@ class TaskArtifacts:
             suggestions=suggestions,
             reviews=clean,
             reviewer_errors=errors,
+            note_dispositions=tuple(note_dispositions),
         )
 
     def validate_plan_prerequisites(self) -> None:
