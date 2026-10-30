@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import aiosqlite
 import pytest
 import pytest_asyncio
+from _fm_held_writes import HeldWrites
 from _fm_helpers import poll_until
 from shared.async_sqlite_base import CheckpointResult
 
@@ -3075,3 +3077,92 @@ class TestDeadByOperation:
                 )
         finally:
             await q.close()
+
+
+class TestEarliestExecutingStart:
+    """earliest_executing_start: when the oldest write still inside execute_write began."""
+
+    @staticmethod
+    async def _enqueue(queue: DurableWriteQueue, name: str) -> None:
+        await queue.enqueue(
+            group_id='proj1', operation='add_episode',
+            payload={'content': name, 'group_id': 'proj1', 'name': name},
+        )
+
+    @staticmethod
+    async def _wait_entered(held: HeldWrites, name: str) -> None:
+        await poll_until(
+            lambda: name in held.entered_at,
+            message=f'write {name} never entered execute_write',
+        )
+
+    @staticmethod
+    async def _wait_completed(queue: DurableWriteQueue, count: int) -> None:
+        async def _completed():
+            stats = await queue.get_stats()
+            return stats['counts'].get('completed', 0) >= count
+
+        await poll_until(_completed, message=f'fewer than {count} writes completed')
+
+    @pytest.mark.asyncio
+    async def test_idle_queue_reports_none(self, queue):
+        assert queue.earliest_executing_start('proj1') is None
+
+    @pytest.mark.asyncio
+    async def test_executing_write_reports_its_start_for_its_own_group_only(
+        self, queue, mock_execute,
+    ):
+        held = HeldWrites()
+        mock_execute.side_effect = held.execute
+        before = datetime.now(UTC)
+        try:
+            await self._enqueue(queue, 'A')
+            await self._wait_entered(held, 'A')
+
+            start = queue.earliest_executing_start('proj1')
+            assert start is not None
+            assert before <= start <= held.entered_at['A']
+            assert queue.earliest_executing_start('proj2') is None
+        finally:
+            held.release_all()
+
+    @pytest.mark.asyncio
+    async def test_reports_the_oldest_write_still_executing(self, queue, mock_execute):
+        held = HeldWrites()
+        mock_execute.side_effect = held.execute
+        try:
+            await self._enqueue(queue, 'A')
+            await self._wait_entered(held, 'A')
+            first = queue.earliest_executing_start('proj1')
+            assert first is not None
+
+            await self._enqueue(queue, 'B')
+            await self._wait_entered(held, 'B')
+            assert queue.earliest_executing_start('proj1') == first
+
+            held.release('A')
+            await self._wait_completed(queue, 1)
+            after_a = queue.earliest_executing_start('proj1')
+            assert after_a is not None
+            assert first < after_a <= held.entered_at['B']
+
+            held.release('B')
+            await self._wait_completed(queue, 2)
+            assert queue.earliest_executing_start('proj1') is None
+        finally:
+            held.release_all()
+
+    @pytest.mark.asyncio
+    async def test_failed_write_leaves_nothing_executing(self, queue, mock_execute):
+        held = HeldWrites(fail_on_release=True)
+        mock_execute.side_effect = held.execute
+        try:
+            await self._enqueue(queue, 'A')
+            await self._wait_entered(held, 'A')
+            assert queue.earliest_executing_start('proj1') is not None
+
+            held.release('A')
+            await _poll_until_dead(queue, expected_dead=1)
+            assert queue.earliest_executing_start('proj1') is None
+        finally:
+            held.release_all()

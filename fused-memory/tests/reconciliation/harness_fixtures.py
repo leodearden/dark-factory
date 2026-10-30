@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -64,6 +64,7 @@ def make_memory_service() -> AsyncMock:
     service.get_memories_by_metadata = AsyncMock(return_value=[])
     service.mem0 = AsyncMock()
     service.mem0.get_all = AsyncMock(return_value={'results': []})
+    service.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
     return service
 
 
