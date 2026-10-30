@@ -198,10 +198,12 @@ _KIND_CYCLE_SUMMARY: str = CYCLE_SUMMARY_KIND
 # as long as its task stays open. All 40 measured victims would have survived
 # on that arm alone (task 452 is ``deferred``, which is not terminal). This
 # denylist is defence in depth for the residual intersection only: a permanent
-# audit record whose cited task LATER goes terminal. The manual sweep's primary
-# arm is instead its foreign-kind arm
-# (``fused-memory/scripts/sweep_orphan_flag_markers.py::protection_reason``),
-# because its ``--terminal-drain`` inverts the terminal gate.
+# audit record whose cited task LATER goes terminal. That gate is the
+# flag_for_stage2 collector's primary arm. Both stage1_flag_marker collectors —
+# the in-cycle ``_sweep_stale_mem0_flag_markers`` and the manual
+# ``fused-memory/scripts/sweep_orphan_flag_markers.py::protection_reason``,
+# whose ``--terminal-drain`` inverts the terminal gate — use
+# :func:`is_foreign_kind_record` as theirs (tasks 5286, 6241).
 PROTECTED_AUDIT_KINDS: frozenset[str] = frozenset({'cadence_check'})
 
 # Identifying victim keys copied into a tombstone payload. Deliberately an

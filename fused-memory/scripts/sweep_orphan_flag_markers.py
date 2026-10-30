@@ -176,14 +176,15 @@ boundary: the two surviving reasons are each independently sufficient.
 Task 5286 ported the THIRD guard ``_sweep_stale_mem0_pool`` applies —
 ``mem0_tombstone.is_protected_audit_record`` / ``PROTECTED_AUDIT_KINDS`` (task
 4375), added after the age-only rule destroyed the 40 ``kind='cadence_check'``
-audit records described above — and added a primary arm of this script's own,
-the FOREIGN-KIND arm (:func:`protection_reason`): a record declaring any
-``kind`` other than ``MARKER_KIND`` belongs to another pool and is never
-deleted here. The denylist alone is not enough in this script, because
-``find_orphan_markers`` nominates every foreign-kind record on the first run at
-any age, and ``--terminal-drain`` inverts the terminal-task-closure gate that
-is the in-cycle collector's primary defence. The decision record is
-``docs/flag-marker-sweep-recurring.md``.
+audit records described above — and added a primary arm, the FOREIGN-KIND arm
+(:func:`protection_reason`): a record declaring any ``kind`` other than
+``MARKER_KIND`` belongs to another pool and is never deleted here. Task 6241
+gave the in-cycle collector the same arm; both call
+``mem0_tombstone.is_foreign_kind_record``. The denylist alone is not enough in
+this script, because ``find_orphan_markers`` nominates every foreign-kind
+record on the first run at any age, and ``--terminal-drain`` inverts the
+terminal-task-closure gate that is the ``flag_for_stage2`` collector's primary
+defence. The decision record is ``docs/flag-marker-sweep-recurring.md``.
 
 SINGLE SOURCE OF TRUTH for the dated census (which filter matched how many
 records, in which project, when), for the full censused-never-deleted
@@ -576,15 +577,15 @@ def protection_reason(metadata: Any) -> ProtectionReason | None:
       (task 3041/4435).
     - ``PROTECTED_AUDIT_KIND`` — ``mem0_tombstone.is_protected_audit_record``,
       the ``PROTECTED_AUDIT_KINDS`` denylist (task 4375).
-    - ``FOREIGN_KIND`` — this sweep's PRIMARY arm (task 5286): a ``kind`` that
-      is present and is not :data:`MARKER_KIND`. The legacy pool's shape is
-      exactly "kind absent or MARKER_KIND", so a declared different kind is
-      positive evidence that the record belongs to another pool. The arm is
-      structurally opt-in: an UNREGISTERED audit kind is protected without
+    - ``FOREIGN_KIND`` — this sweep's PRIMARY arm (task 5286):
+      ``mem0_tombstone.is_foreign_kind_record`` against :data:`MARKER_KIND`,
+      shared with the in-cycle collector (task 6241). The legacy pool's shape
+      is exactly "kind absent or MARKER_KIND", so a declared different kind
+      is positive evidence that the record belongs to another pool. The arm
+      is structurally opt-in: an UNREGISTERED audit kind is protected without
       anyone editing ``PROTECTED_AUDIT_KINDS``. It does not consult task
       status, so ``--terminal-drain``, which inverts the in-cycle
-      terminal-closure gate, cannot weaken it. It compares with ``!=``, never
-      set membership, so a list- or dict-valued ``kind`` cannot raise.
+      terminal-closure gate, cannot weaken it.
 
     The order IS the attribution: a mirror or audit record is reported under
     its specific reason, never as merely foreign.
@@ -623,8 +624,9 @@ def find_protected_markers(members: list[dict]) -> list[dict]:
 
     Restores parity with the in-cycle collector
     ``stages/task_knowledge_sync.py::_sweep_stale_mem0_pool`` on its two
-    denylist guards, and adds the foreign-kind arm that collector does not
-    need. The decision record is ``docs/flag-marker-sweep-recurring.md``.
+    denylist guards. Both collectors also apply the foreign-kind arm, through
+    ``mem0_tombstone.is_foreign_kind_record`` (task 6241). The decision
+    record is ``docs/flag-marker-sweep-recurring.md``.
 
     The two ``mem0_tombstone`` predicates are deliberately IMPORTED rather
     than copied here, and stay separate predicates there. A local copy would
