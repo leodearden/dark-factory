@@ -146,6 +146,18 @@ class TestChainCapBoundValidation:
         assert MergeDeepConfig(chain_cap=good_value).chain_cap == good_value
 
 
+class TestChainBuildTimeout:
+    """``chain_build_timeout_secs``: shipped default 1800, strictly positive."""
+
+    def test_default_is_1800(self):
+        assert MergeDeepConfig().chain_build_timeout_secs == 1800.0
+
+    @pytest.mark.parametrize('bad_value', [0, -1, -1800.0])
+    def test_non_positive_rejected(self, bad_value):
+        with pytest.raises(ValidationError):
+            MergeDeepConfig(chain_build_timeout_secs=bad_value)
+
+
 class TestMergeDeepReloadDisposition:
     """PRD decision #7: the knob is green-tier, so enable/retune/kill never needs
     a process restart. Mirrors TestPsiAdmissionReloadDisposition

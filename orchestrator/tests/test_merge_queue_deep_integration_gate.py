@@ -273,7 +273,7 @@ HARNESS NOTES
     test_merge_queue_reachback_patch_guard.py freezes the
     ``orchestrator.merge_lane.worker.<private>`` reach-back surface.  The sanctioned
     module-level exceptions are ``build_chain``, ``_run_post_merge_verify``,
-    ``release_chain_build_lane`` and ``CHAIN_BUILD_TIMEOUT_SECS``.
+    ``release_chain_build_lane``.
   * ``fused-memory/scripts/check_bare_magicmock_config.py`` forbids a bare
     ``MagicMock()`` bound to a config-named variable — use ``_make_config(...)``.
   * No new pytest marker is introduced, so ``orchestrator/pyproject.toml`` stays
@@ -2070,7 +2070,7 @@ async def _make_gate_scene(
     Module-level monkeypatching is confined to (a) the four
     ``orchestrator.merge_lane.worker`` names test_merge_queue_reachback_patch_guard.py
     sanctions — ``build_chain``, ``_run_post_merge_verify``,
-    ``release_chain_build_lane`` and ``CHAIN_BUILD_TIMEOUT_SECS`` — and (b)
+    ``release_chain_build_lane`` — and (b)
     ``orchestrator.verify._run_cmd`` (:func:`_capture_verify_timeouts`), a
     public name one layer BELOW the port that no ``VerifyPort`` leg covers.
     The scoped verdict itself is NOT patched at all any more: both seams that
@@ -2293,8 +2293,8 @@ class TestDeepScaleBuild:
 # The ONE boundary row with zero coverage anywhere in the tree: a repo-wide
 # search for the merge-verify cold budget, for a 16-item chain, or for a
 # verify timeout on a deep round returns nothing in either upstream deep
-# module.  The only build-side deadline that IS tested is the 120 s
-# CHAIN_BUILD_TIMEOUT_SECS, and only as a unit.
+# module.  The only build-side deadline that IS tested is
+# merge_deep.chain_build_timeout_secs, and only as a unit.
 #
 # The row's claim, stated as three separate ones so a failure names WHICH:
 #
@@ -2427,13 +2427,13 @@ class TestRow11TimeoutMargin:
     async def test_the_sixteen_item_build_finishes_far_inside_its_deadline(
         self, git_repo: Path, tmp_path: Path, monkeypatch,
     ) -> None:
-        """(b) A real 15-link build costs milliseconds against a 120 s deadline.
+        """(b) A real 15-link build costs milliseconds against the 1800 s deadline.
 
-        ``CHAIN_BUILD_TIMEOUT_SECS`` bounds the WHOLE build, and the build is a
+        ``merge_deep.chain_build_timeout_secs`` bounds the WHOLE build, and the build is a
         synchronous stall on the dispatch path — no other item can dispatch
         while it runs — so the margin is the claim, not the wall clock.  The
         assertion is deliberately an ORDER-OF-MAGNITUDE one (30 s against a
-        120 s deadline, for a build the replay study measured at ~1–2 s per
+        1800 s deadline, for a build the replay study measured at ~1–2 s per
         6-chain): a tight bound here would be a flake generator on a loaded
         box, while a loose one still catches the regression that matters — a
         build that went superlinear in depth and started eating the deadline.
@@ -2454,16 +2454,15 @@ class TestRow11TimeoutMargin:
             f'expected a 15-link build, got '
             f'{None if chain is None else len(chain.links)}'
         )
-        assert merge_queue.CHAIN_BUILD_TIMEOUT_SECS == 120.0, (
-            f'the build deadline moved: {merge_queue.CHAIN_BUILD_TIMEOUT_SECS!r}'
-        )
+        deadline = scene.config.merge_deep.chain_build_timeout_secs
+        assert deadline == 1800.0, f'the build deadline moved: {deadline!r}'
         assert isinstance(chain.build_ms, int) and chain.build_ms > 0, (
             f'a real build must stamp a positive integer build_ms, got '
             f'{chain.build_ms!r}'
         )
         assert chain.build_ms < 30_000, (
             f'a 15-link build took {chain.build_ms} ms against a '
-            f'{merge_queue.CHAIN_BUILD_TIMEOUT_SECS} s deadline — the margin '
+            f'{deadline} s deadline — the margin '
             f'this row asserts is gone'
         )
 

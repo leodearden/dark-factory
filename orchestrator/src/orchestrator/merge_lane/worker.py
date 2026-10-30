@@ -6224,7 +6224,7 @@ async def build_chain(
     :meth:`SpeculativeMergeWorker._deep_chain_placement` — the slot-2 deep
     gate — is the only thing that calls this, and it bounds the call the way
     the caller-cost note below requires: one ``asyncio.timeout``
-    (:data:`CHAIN_BUILD_TIMEOUT_SECS`) wrapped around the whole invocation,
+    (``MergeDeepConfig.chain_build_timeout_secs``) wrapped around the whole invocation,
     with a timeout, an unexpected exception, an unavailable lane and a
     zero-link result all mapped to "no chain this round" (today's adjacent
     verify) rather than to a failure.  The gate ALSO hoists α's kill switch
@@ -6265,7 +6265,7 @@ async def build_chain(
     reaches the merge loop logs ``elapsed_ms`` on its one-line summary.
 
     γ took the SECOND option (``_deep_chain_placement`` wraps this in
-    ``asyncio.timeout(CHAIN_BUILD_TIMEOUT_SECS)``), which BOUNDS the dispatch
+    ``asyncio.timeout(chain_build_timeout_secs)``), which BOUNDS the dispatch
     stall but does not remove it: the build is still awaited inline, so for its
     duration ``_verifier_loop`` cannot run FINALIZE-HEAD.  The residual stall is
     therefore MEASURED rather than assumed — ``_deep_chain_placement`` stamps
@@ -9033,27 +9033,6 @@ def select_probe_depth(
 # speculative verify.  build_chain()'s own `cap`/`target_depth` are in the
 # different "additional links BEYOND the dispatching item" unit, which is why
 # _deep_chain_placement passes `cap - 1` / `d - 1` (see its docstring).
-
-
-# γ's bound on β's unbounded builder.  ``build_chain``'s Caller-cost note
-# (see its docstring above) is explicit that it carries NO internal deadline
-# BY DESIGN -- an internal timeout would abandon a half-built lane mid-``git
-# merge`` -- and that "the honest bound belongs to the policy layer".  This is
-# that bound: one lane acquisition (``git reset --hard`` + ``git clean -xfd``
-# + a CoW seed) plus up to ``chain_cap`` sequential real ``git merge``
-# subprocesses, all of it blocking the verifier's dispatch path.
-#
-# Imposing the deadline from OUTSIDE is what makes it safe: build_chain's
-# ``except BaseException`` arm releases the lane on cancellation, so an
-# overrun returns the lane to the pool and _deep_chain_placement degrades to
-# "no chain this round" -- today's adjacent verify -- rather than stranding a
-# lane in ASSIGNED.
-#
-# 120s is deliberately generous against a staged cap of a handful of items
-# (a wedged lane is the failure this catches, not a merely slow one) while
-# still being an order of magnitude below the verify it precedes, so a stall
-# here can never masquerade as a slow verify.
-CHAIN_BUILD_TIMEOUT_SECS: float = 120.0
 
 
 def select_chain_depth(
@@ -13239,9 +13218,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # than assert: this is the OPTIONAL deep path, and it must never be
             # the thing that crashes a dispatch.
             return None
+        # Bound on the whole build: lane acquisition (git reset/clean, the CoW
+        # re-seed of target/) plus the merges; no cargo. The 1800 s default sits
+        # above reify's measured whole-process p99 (seeds, n=401 over
+        # 2026-10-15..30: p99 899 s, last 7 d 1003 s, week 44 1168 s, max 1272 s;
+        # plus <=28 s reset/clean, <=30 s lock wait, ~0.5 s per merge). The build
+        # blocks _verifier_loop for its whole duration, so this is also the
+        # worst-case stall on finalising a green head. A cancel during
+        # acquisition is task 7721's fix, not covered here.
+        chain_build_timeout_secs = item.request.config.merge_deep.chain_build_timeout_secs
         _build_t0 = self._clock.monotonic()
         try:
-            async with asyncio.timeout(CHAIN_BUILD_TIMEOUT_SECS):
+            async with asyncio.timeout(chain_build_timeout_secs):
                 result = await build_chain(
                     self._git_ops,
                     snapshot,
@@ -13251,13 +13239,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
         except TimeoutError:
             # FAIL-OPEN. An overrun is not a merge fault, so it must not fail
-            # the dispatch -- it degrades to today's adjacent verify. Safe to
-            # impose from out here because build_chain's own `except
-            # BaseException` arm releases the lane on cancellation, so nothing
-            # is left ASSIGNED. WARNING, not INFO: a build that cannot finish
-            # inside CHAIN_BUILD_TIMEOUT_SECS means a wedged lane or a
-            # pathological repo, and a silent degrade is exactly what the
-            # no-silent-fail-soft design invariant forbids.
+            # the dispatch -- it degrades to today's adjacent verify. WARNING, not
+            # INFO: a build that cannot finish inside chain_build_timeout_secs
+            # means a wedged lane or a pathological repo, and a silent degrade is
+            # exactly what the no-silent-fail-soft design invariant forbids.
             #
             # DELIBERATELY NARROW -- `asyncio.CancelledError` is NOT caught
             # here, and must not be added. `asyncio.timeout` converts its OWN
@@ -13282,7 +13267,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             logger.warning(
                 'deep chain build exceeded %.0fs for %s (target_depth=%d) -- '
                 'falling back to the adjacent verify',
-                CHAIN_BUILD_TIMEOUT_SECS, item.request.task_id, d,
+                chain_build_timeout_secs, item.request.task_id, d,
             )
             return None
         except Exception:
@@ -13309,7 +13294,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # build was awaited INLINE on `_verifier_loop`'s dispatch path, so for
         # its whole duration the loop could not run FINALIZE-HEAD -- an
         # already-green slot-1 head verify could not be finalized or landed, and
-        # no other item could dispatch. `CHAIN_BUILD_TIMEOUT_SECS` BOUNDS that
+        # no other item could dispatch. `merge_deep.chain_build_timeout_secs` BOUNDS that
         # stall but does not remove it, and since the PRD's whole justification
         # is throughput the cost has to be MEASURABLE before ζ raises the cap.
         # So stamp the wall clock onto the result and emit it as
@@ -22690,7 +22675,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # release them.  The §5.3 guard's own comment (trap 2, below) already
         # warned that a bare `return None` in this region leaks the lease; the
         # window then widened from a ~ms `get_main_sha()` to a whole chain build
-        # bounded only by CHAIN_BUILD_TIMEOUT_SECS, and `_deep_chain_placement`
+        # bounded only by merge_deep.chain_build_timeout_secs, and `_deep_chain_placement`
         # deliberately lets an external CancelledError PROPAGATE (review fix 2).
         # The caller's own containment does not cover this: `_verifier_loop`
         # re-raises CancelledError/KeyboardInterrupt without releasing anything,

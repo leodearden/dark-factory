@@ -674,6 +674,8 @@ git:
 # cap-staging plan: plans/deep-merge-ahead-prd.md.
 merge_deep:
   chain_cap: 0
+  # Chain-build deadline (s); above reify's measured whole-process build p99 (~1230 s).
+  chain_build_timeout_secs: 1800
 
 # Chronic pool-infra flake auto-file detector (task 2358). Gated OFF until
 # reify task 5142's flaky-ledger.jsonl + CHRONIC-FLAKY marker substrate is
