@@ -13,6 +13,7 @@ the fingerprint of the task's current description/details.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -28,6 +29,12 @@ from shared.task_text_fingerprint import TaskTextDrift, task_text_fingerprint
 from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
+from orchestrator.mcp.plan_tools import (
+    _add_plan_step,
+    _confirm_plan,
+    _create_plan,
+    _record_descoped_step,
+)
 from orchestrator.scheduler import BlastRadiusResult, files_to_modules
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
@@ -979,3 +986,200 @@ async def test_unresolvable_done_step_commit_does_not_block_the_skip(tmp_path: P
     assert f.invoke_called == []
     assert _commit_of(f.artifacts.read_plan(), 'step-1') == _ORPHANED
     f.git_ops.is_ancestor.assert_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Task 4032 (beta): a revalidation may not silently drop or alias done steps.
+# The architect stand-ins call the real plan-tools impls, so plan.json is
+# written exactly as production writes it.
+# ---------------------------------------------------------------------------
+
+_A = 'e' * 40
+
+ArchitectAction = Callable[[TaskArtifacts], object]
+
+
+def _ok(envelope: dict) -> None:
+    assert envelope.get('status') == 'ok', envelope
+
+
+def _wipe_to(*step_ids: str) -> ArchitectAction:
+    """create_plan() over the existing plan, then fresh pending steps."""
+    def act(a: TaskArtifacts) -> None:
+        _ok(_create_plan(a, '101', 'T', 'analysis', ['mod_a/file.py']))
+        for step_id in step_ids:
+            _ok(_add_plan_step(a, step_id, 'impl', f'{step_id} again'))
+    return act
+
+
+def _record_drop(step_id: str, commit: str, authority: str) -> ArchitectAction:
+    return lambda a: _ok(_record_descoped_step(
+        a, step_id, commit, 'orphan', authority, 'superseded by the ratified scope',
+    ))
+
+
+def _mark(step_id: str, commit: str) -> ArchitectAction:
+    def act(a: TaskArtifacts) -> None:
+        assert a.mark_step_committed(step_id, commit)
+    return act
+
+
+def _confirm(a: TaskArtifacts) -> None:
+    _ok(_confirm_plan(a))
+
+
+def _scripted_architect(
+    f: _Fixture, monkeypatch: pytest.MonkeyPatch, passes: list[list[ArchitectAction]],
+) -> AsyncMock:
+    """Invocation n runs ``passes[n]``'s actions against the live artifacts."""
+    remaining = list(passes)
+
+    async def run(_role, build_prompt, *args, **kwargs) -> AgentResult:
+        await build_prompt()
+        for action in remaining.pop(0):
+            action(f.artifacts)
+        return AgentResult(
+            success=True, output='revised', cost_usd=0.5, duration_ms=1_000, turns=3,
+        )
+
+    invoke = AsyncMock(side_effect=run)
+    monkeypatch.setattr(f.wf, '_invoke', invoke)
+    return invoke
+
+
+def _beta_fixture(tmp_path: Path, plan_steps: list[dict]) -> _Fixture:
+    return _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', git_head=True,
+        changed_files=['mod_a/file.py'], plan_steps=plan_steps,
+    )
+
+
+def _refusals(f: _Fixture) -> list[dict]:
+    return _events(f, EventType.done_step_integrity_refused)
+
+
+def _no_plan_counter_writes(f: _Fixture) -> list[int]:
+    return [
+        c.kwargs['metadata']['retry_ledger']['consecutive_no_plan_failures']
+        for c in f.update_task.call_args_list
+        if isinstance(c.kwargs.get('metadata'), dict)
+        and 'retry_ledger' in c.kwargs['metadata']
+    ]
+
+
+def _step(plan: dict, step_id: str) -> dict:
+    return next(s for s in plan['steps'] if s['id'] == step_id)
+
+
+@pytest.mark.asyncio
+async def test_silent_create_plan_wipe_of_done_step_is_refused_naming_step_and_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    f = _beta_fixture(tmp_path, [_done('step-1', _A, 'test'), _pending('step-2', 'impl')])
+    wipe = [_wipe_to('step-1', 'step-2'), _confirm]
+    invoke = _scripted_architect(f, monkeypatch, [wipe, wipe])
+
+    outcome = await f.wf._plan()
+
+    assert invoke.await_count == 2
+    remedy_call = f.build_revalidation_prompt.call_args_list[1]
+    assert remedy_call.kwargs['integrity_refusal'].undisposed_drops == (('step-1', _A),)
+    [refusal] = _refusals(f)
+    assert refusal['undisposed_drops'] == [{'step_id': 'step-1', 'commit': _A}]
+    plan = f.artifacts.read_plan()
+    assert _step(plan, 'step-1')['status'] == 'done'
+    assert _step(plan, 'step-1')['commit'] == _A
+    assert plan['_session_id'] == 'prior-session-aaa'
+    assert _no_plan_counter_writes(f) == [1]
+    assert outcome == WorkflowOutcome.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_recorded_descope_proceeds_2971_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    dropped, kept = '309c22ab6f', 'c0609049a7'
+    f = _beta_fixture(tmp_path, [_done('step-1', dropped, 'test'), _pending('step-2', 'impl')])
+    invoke = _scripted_architect(f, monkeypatch, [[
+        _wipe_to('step-1'),
+        _mark('step-1', kept),
+        _record_drop('step-1', dropped, 'esc-2971-6'),
+        _confirm,
+    ]])
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert invoke.await_count == 1
+    plan = f.artifacts.read_plan()
+    for key in ('_rescoped_at', '_rescoped_by', '_rescoped_note'):
+        assert key in plan
+    assert [(d['step_id'], d['commit']) for d in plan['_descoped_steps']] == [
+        ('step-1', dropped),
+    ]
+    assert _refusals(f) == []
+
+
+@pytest.mark.asyncio
+async def test_phantom_done_wipe_proceeds_3143_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    phantoms = [_done(f'step-{n}', f'{n:02d}'.ljust(40, 'f')) for n in range(1, 20)]
+    f = _beta_fixture(tmp_path, phantoms)
+    _orphan(f, {step['commit']: None for step in phantoms})
+    records = [_record_drop(step['id'], step['commit'], 'esc-3143-4') for step in phantoms]
+    _scripted_architect(f, monkeypatch, [[_wipe_to('step-1'), *records, _confirm]])
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert len(f.artifacts.read_plan()['_descoped_steps']) == 19
+    assert _refusals(f) == []
+
+
+@pytest.mark.asyncio
+async def test_duplicate_done_step_sha_introduced_by_revalidation_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    f = _beta_fixture(tmp_path, [_done('step-1', _A, 'test'), _pending('step-2', 'impl')])
+    _scripted_architect(f, monkeypatch, [[_mark('step-2', _A), _confirm], [_confirm]])
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    [refusal] = _refusals(f)
+    assert refusal['introduced_duplicates'] == [{'commit': _A, 'step_ids': ['step-1', 'step-2']}]
+    assert _step(f.artifacts.read_plan(), 'step-2')['status'] == 'pending'
+
+
+@pytest.mark.asyncio
+async def test_duplicate_done_step_sha_already_on_the_plan_is_not_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    f = _beta_fixture(tmp_path, [
+        _done('step-1', _A, 'test'), _done('step-2', _A), _pending('step-3', 'impl'),
+    ])
+    _scripted_architect(f, monkeypatch, [[_confirm]])
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert _refusals(f) == []
+
+
+@pytest.mark.asyncio
+async def test_remedy_pass_that_records_the_disposition_proceeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    f = _beta_fixture(tmp_path, [_done('step-1', _A, 'test'), _pending('step-2', 'impl')])
+    invoke = _scripted_architect(f, monkeypatch, [
+        [_wipe_to('step-1', 'step-2'), _confirm],
+        [_record_drop('step-1', _A, 'esc-4032-1'), _confirm],
+    ])
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert invoke.await_count == 2
+    assert _refusals(f) == []
+    assert _no_plan_counter_writes(f) == []
