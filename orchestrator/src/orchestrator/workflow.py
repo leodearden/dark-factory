@@ -5248,6 +5248,9 @@ class TaskWorkflow:
             and existing_plan.get('_session_id')
             and self._old_plan_base
         ):
+            # Done-step commits a rebase orphaned are remapped before either
+            # the skip or the architect trusts them (task 4032).
+            existing_plan = await self._reconciled_plan()
             current_main = await self.git_ops.get_main_sha()
             revalidation_changed_files = await self.git_ops.get_changed_files(
                 self._old_plan_base, current_main,
@@ -5311,9 +5314,10 @@ class TaskWorkflow:
             # already-implemented steps via mark_step_committed instead of
             # re-planning them as pending.  Scoped to THIS branch of _plan by
             # design decision — the completion-pass and revalidation branches
-            # above are deliberately left unchanged (both already carry
-            # done-step semantics and explicit "do NOT remove or replace steps
-            # with status done" instructions).  Inert on the common path: on a
+            # above are deliberately left unchanged (both already show the
+            # architect its done steps, and the revalidation branch enforces
+            # their integrity via plan_descope.check_done_step_integrity,
+            # task 4032).  Inert on the common path: on a
             # truly-fresh first dispatch HEAD == base_commit, so the detector
             # returns [] and the briefing is byte-identical to today's.
             #
@@ -5592,6 +5596,10 @@ class TaskWorkflow:
                     'a later session will resume and finish it.'
                 ),
             )
+
+        if revalidation:
+            # A step the architect re-marked done is reconciled too (task 4032).
+            await self._reconciled_plan()
 
         if outcome := await self._validate_prerequisites_or_block('initial plan'):
             return outcome
@@ -9689,6 +9697,14 @@ class TaskWorkflow:
             return None
 
         return verdict
+
+    async def _reconciled_plan(self) -> dict:
+        """plan.json after :meth:`_reconcile_done_step_commits` has run on it."""
+        assert self.artifacts is not None
+        self.plan = self.artifacts.read_plan()
+        await self._reconcile_done_step_commits()
+        self.plan = self.artifacts.read_plan()
+        return self.plan
 
     async def _reconcile_done_step_commits(self) -> None:
         """Re-point a done step's ``commit`` when a rebase orphaned it.
