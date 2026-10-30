@@ -125,13 +125,12 @@ _STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
 _T = TypeVar('_T')
 
 # (stat key, sweep result key) for each full-cycle sweep, in publication order.
-# 'flags_emitted' is not a sweep result key; _with_flag_count derives it.
 _StatMap = tuple[tuple[str, str], ...]
 _CURATOR_GATE_SWEEP_STATS: _StatMap = (
     ('curator_gate_resolution_scanned', 'scanned'),
-    ('curator_gate_resolution_flags_emitted', 'flags_emitted'),
     ('curator_gate_resolution_errors', 'errors'),
 )
+_CURATOR_GATE_FLAGS_EMITTED_STAT = 'curator_gate_resolution_flags_emitted'
 _ORPHAN_SWEEP_STATS: _StatMap = (
     ('orphaned_recon_escalations_scanned', 'scanned'),
     ('orphaned_recon_escalations_terminal', 'terminal'),
@@ -140,8 +139,8 @@ _ORPHAN_SWEEP_STATS: _StatMap = (
     ('orphaned_recon_escalations_ambiguous', 'ambiguous'),
     ('orphaned_recon_escalations_unresolvable', 'unresolvable'),
     ('orphaned_recon_escalations_errors', 'errors'),
-    ('orphaned_recon_escalations_flags_emitted', 'flags_emitted'),
 )
+_ORPHAN_FLAGS_EMITTED_STAT = 'orphaned_recon_escalations_flags_emitted'
 _DEGENERATE_SWEEP_STATS: _StatMap = (
     ('degenerate_task_nodes_swept', 'deleted'),
     ('degenerate_task_nodes_scanned', 'scanned'),
@@ -364,12 +363,14 @@ class MemoryConsolidator(BaseStage):
         """Publish, at its default, every stat key a Stage 1 report always carries.
 
         Stage 1's stats blob is serialized verbatim into Stage 2's prompt
-        (``stages/task_knowledge_sync.py::_format_report``), so no key may be
-        conditionally absent. Every key set here, above the remediation
-        early-return, is on every report; the full-cycle steps overwrite
-        their own. ``stage1_cycle_summary_ledger_written`` reflects only the
-        ledger upsert, never the Mem0 mirror that ``write_cycle_summary``
-        also attempts.
+        (``stages/task_knowledge_sync.py::_format_report``), so each key
+        published here is present on every report, remediation passes
+        included; the full-cycle steps overwrite their own. Other keys stay
+        absent until the step that observes them publishes them, because a
+        default there would claim an observation that never happened;
+        ``_run_graph_sweeps`` states the case. ``stage1_cycle_summary_ledger_written``
+        reflects only the ledger upsert, never the Mem0 mirror that
+        ``write_cycle_summary`` also attempts.
         """
         report.stats.update({
             'entity_summary_snapshot_lines_stripped': self._entity_summary_snapshot_lines_stripped,
@@ -383,7 +384,9 @@ class MemoryConsolidator(BaseStage):
             'stage1_completion_markers_self_deleted': 0,
             'stage1_cycle_summary_ledger_written': 0,
             **_zeroed(_CURATOR_GATE_SWEEP_STATS),
+            _CURATOR_GATE_FLAGS_EMITTED_STAT: 0,
             **_zeroed(_ORPHAN_SWEEP_STATS),
+            _ORPHAN_FLAGS_EMITTED_STAT: 0,
             **UnlandedPathCheckResult.empty().stats(),
             'entity_standing_decision_suppressed': 0,
             'entity_standing_decision_max_suppression_streak': 0,
@@ -487,7 +490,8 @@ class MemoryConsolidator(BaseStage):
         report.items_flagged = (report.items_flagged or []) + (
             stamp_curator_gate_sweep_provenance(gate_sweep['flags'])
         )
-        _publish_sweep_stats(report, _CURATOR_GATE_SWEEP_STATS, _with_flag_count(gate_sweep))
+        _publish_sweep_stats(report, _CURATOR_GATE_SWEEP_STATS, gate_sweep)
+        report.stats[_CURATOR_GATE_FLAGS_EMITTED_STAT] = len(gate_sweep['flags'])
 
     async def _run_auto_consolidation(self, report: StageReport, run_id: str) -> None:
         """The auto-consolidation executor (task 5240); contract: plans/memory-auto-consolidation-prd.md C4."""
@@ -533,7 +537,8 @@ class MemoryConsolidator(BaseStage):
         if orphan_sweep is None:
             return
         report.items_flagged = (report.items_flagged or []) + orphan_sweep['flags']
-        _publish_sweep_stats(report, _ORPHAN_SWEEP_STATS, _with_flag_count(orphan_sweep))
+        _publish_sweep_stats(report, _ORPHAN_SWEEP_STATS, orphan_sweep)
+        report.stats[_ORPHAN_FLAGS_EMITTED_STAT] = len(orphan_sweep['flags'])
 
     async def _append_unlanded_path_flags(
         self, report: StageReport, events: list[ReconciliationEvent],
@@ -1317,10 +1322,6 @@ async def _await_best_effort(
 
 def _zeroed(stat_map: _StatMap) -> dict[str, int]:
     return dict.fromkeys((stat_key for stat_key, _ in stat_map), 0)
-
-
-def _with_flag_count(sweep_result: Mapping[str, Any]) -> dict[str, Any]:
-    return {**sweep_result, 'flags_emitted': len(sweep_result['flags'])}
 
 
 def _publish_sweep_stats(
