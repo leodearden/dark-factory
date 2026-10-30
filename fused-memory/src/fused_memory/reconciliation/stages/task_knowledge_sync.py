@@ -1238,32 +1238,36 @@ def _closure_permits_retirement(
     )
 
 
-def _warn_retained_foreign_kinds(
+def _warn_retained_by_kind(
     log_name: str,
     source: str,
+    *,
+    cohort: str,
     count: int,
     kinds: set[str],
+    disposition: str,
     project_id: str,
     run_id: str,
 ) -> None:
-    """Emit the one fail-safe WARNING for foreign-kind records a sweep kept (task 6241)."""
+    """Emit one aggregate WARNING for a *cohort* of records a sweep kept.
+
+    Carries the distinct *kinds* because they are the actionable part: they
+    name the vocabulary the pool filter collided with. Fail-safe: it never
+    raises into the sweep and never alters the sweep's count.
+    """
     try:
         logger.warning(
-            'reconciliation.%s: RETAINED %d record(s) declaring a foreign kind '
-            '(kinds=%s) matched by this %s pool filter — not members of this pool, '
-            'never deleted by this sweep (task 6241). The pool\'s create path is '
-            'closed, so this is an anomaly: delete a dead record with the '
-            'fused-memory MCP delete_memory tool, or register a permanent audit '
-            'kind in mem0_tombstone.PROTECTED_AUDIT_KINDS. Per-record ids are '
-            'logged at DEBUG.',
-            log_name, count, ','.join(sorted(kinds)), source,
+            'reconciliation.%s: RETAINED %d %s (kinds=%s) matched by this %s pool '
+            'filter — %s Per-record ids are logged at DEBUG.',
+            log_name, count, cohort, ','.join(sorted(kinds)) or '<none>', source,
+            disposition,
             extra={'project_id': project_id, 'run_id': run_id, 'log_name': log_name},
         )
     except Exception:
         logger.warning(
-            'reconciliation.%s: foreign-kind diagnostic raised; skipping '
-            '(fail-safe, does not affect the sweep count).',
-            log_name,
+            'reconciliation.%s: %s diagnostic raised; skipping (fail-safe, does '
+            'not affect the sweep count).',
+            log_name, cohort,
             exc_info=True,
             extra={'project_id': project_id, 'run_id': run_id},
         )
@@ -1759,8 +1763,7 @@ async def _sweep_stale_mem0_pool(
             continue
 
         if pool_kind is not None and is_foreign_kind_record(member_metadata, pool_kind):
-            metadata = member_metadata if isinstance(member_metadata, dict) else {}
-            kind = metadata.get('kind')
+            kind = member_metadata.get('kind')
             foreign_kind += 1
             foreign_kinds.add(kind if isinstance(kind, str) else repr(kind))
             logger.debug(
@@ -1813,41 +1816,35 @@ async def _sweep_stale_mem0_pool(
             stale_members.append(member)
 
     if protected_audit > 0:
-        # Protected-audit-record diagnostic (task 4375 amendment pass). Same
-        # shape and same fail-safe wrapper as the two other aggregate
-        # diagnostics in this function: emitted ONCE per sweep, purely
-        # informational, and it must never alter `members` or the returned
-        # count. The distinct kinds are carried because they are the actionable
-        # part — they say WHICH audit vocabulary this pool's filter is
-        # colliding with, which is what a filter fix would have to target.
-        try:
-            logger.warning(
-                'reconciliation.%s: RETAINED %d protected audit record(s) '
-                '(kinds=%s) matched by this %s pool filter — deliberately-'
-                'permanent audit-log records, kept regardless of age (task '
-                '4375). Expected and recurring: this pool filter is wide by '
-                'design, so a steady count here is healthy, not a failure. '
-                'Per-record ids are logged at DEBUG.',
-                log_name, protected_audit,
-                ','.join(sorted(protected_audit_kinds)) or '<none>', source,
-                extra={
-                    'project_id': project_id,
-                    'run_id': run_id,
-                    'log_name': log_name,
-                },
-            )
-        except Exception:
-            logger.warning(
-                'reconciliation.%s: protected-audit-record diagnostic raised; '
-                'skipping (fail-safe, does not affect the sweep count).',
-                log_name,
-                exc_info=True,
-                extra={'project_id': project_id, 'run_id': run_id},
-            )
+        _warn_retained_by_kind(
+            log_name, source,
+            cohort='protected audit record(s)',
+            count=protected_audit,
+            kinds=protected_audit_kinds,
+            disposition=(
+                'deliberately-permanent audit-log records, kept regardless of '
+                'age (task 4375). Expected and recurring: this pool filter is '
+                'wide by design, so a steady count here is healthy, not a '
+                'failure.'
+            ),
+            project_id=project_id,
+            run_id=run_id,
+        )
 
     if foreign_kind > 0:
-        _warn_retained_foreign_kinds(
-            log_name, source, foreign_kind, foreign_kinds, project_id, run_id,
+        _warn_retained_by_kind(
+            log_name, source,
+            cohort='record(s) declaring a foreign kind',
+            count=foreign_kind,
+            kinds=foreign_kinds,
+            disposition=(
+                'not members of this pool, never deleted by this sweep (task '
+                '6241). Each stays until removed by hand: delete a dead record '
+                'with the fused-memory MCP delete_memory tool, or register a '
+                'permanent audit kind in mem0_tombstone.PROTECTED_AUDIT_KINDS.'
+            ),
+            project_id=project_id,
+            run_id=run_id,
         )
 
     if retained_unclosed > 0:

@@ -112,6 +112,7 @@ import json
 import logging
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from typing import TypeGuard
 
 from fused_memory.reconciliation.recon_ledger import (
     RECORD_KIND_MEM0_TOMBSTONE,
@@ -301,7 +302,7 @@ def is_protected_audit_record(metadata) -> bool:
     return isinstance(kind, str) and kind in PROTECTED_AUDIT_KINDS
 
 
-def is_foreign_kind_record(metadata, pool_kind: str) -> bool:
+def is_foreign_kind_record(metadata, pool_kind: str) -> TypeGuard[dict]:
     """Return True when *metadata* declares a ``kind`` other than *pool_kind*.
 
     A marker pool's members carry either no ``kind`` or the pool's own marker

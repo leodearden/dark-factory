@@ -9491,7 +9491,7 @@ class TestSweepStaleMem0FlagMarkersWithholdsForeignKinds:
 
         debug_ids = sorted(
             r.__dict__['memory_id'] for r in tks_records
-            if r.levelno == logging.DEBUG and 'memory_id' in r.__dict__
+            if r.levelno == logging.DEBUG and 'foreign-kind' in r.getMessage()
         )
         assert debug_ids == ['foreign-alpha', 'foreign-beta']
 
