@@ -53,6 +53,7 @@ from orchestrator.verify import (
     _run_cmd,
     _scope_fallback_tool_to_subproject,
     _single_subproject_prefix,
+    _worker_death_leg_note,
     run_full_verification,
     run_scoped_verification,
     run_verification,
@@ -3760,6 +3761,63 @@ class TestWorkerDeathLegSummary:
         assert len(fragments) == 2, f'Unexpected summary: {summary!r}'
         assert fragments[0] == 'tests failed', f'Unexpected summary: {summary!r}'
         assert WORKER_DEATH_SUMMARY_MARKER in fragments[1], f'Unexpected summary: {summary!r}'
+
+
+class TestWorkerDeathLegNoteNamesWhoseLegDied:
+    """The note names the module whose leg died and the test its worker had in flight."""
+
+    def test_unlabelled_note_without_ids_is_byte_identical(self):
+        """A single-module caller passes neither and keeps today's sentence."""
+        assert _worker_death_leg_note('test') == (
+            'test leg session aborted after worker death; remaining tests never ran; tally is partial'
+        )
+
+    def test_module_names_the_leg(self):
+        note = _worker_death_leg_note('test', module='orchestrator')
+        assert note.startswith(f'orchestrator test leg {WORKER_DEATH_SUMMARY_MARKER}'), note
+        assert verify.is_no_verdict_summary(note)
+
+    def test_crashed_nodeid_follows_the_marker_clause(self):
+        note = _worker_death_leg_note('test', crashed_nodeids={XDIST_IN_FLIGHT_NODEID})
+        clause = f"worker died running '{XDIST_IN_FLIGHT_NODEID}'"
+        assert clause in note, note
+        assert (
+            note.index(WORKER_DEATH_SUMMARY_MARKER)
+            < note.index(clause)
+            < note.index('remaining tests never ran')
+        ), note
+
+    def test_parametrized_id_with_the_separator_stays_one_fragment(self):
+        note = _worker_death_leg_note(
+            'test', module='orchestrator', crashed_nodeids={'tests/test_x.py::test_p[a, b]'},
+        )
+        assert ', ' not in note, note
+        assert WORKER_DEATH_SUMMARY_MARKER in note, note
+        assert 'tests/test_x.py::test_p[a,b]' in note, note
+
+    def test_hostile_module_stays_one_fragment(self):
+        note = _worker_death_leg_note('test', module='a, b', crashed_nodeids={XDIST_IN_FLIGHT_NODEID})
+        assert ', ' not in note, note
+
+    def test_xdist_group_suffix_is_stripped(self):
+        note = _worker_death_leg_note('test', crashed_nodeids={'tests/test_x.py::test_y@grp'})
+        assert "'tests/test_x.py::test_y'" in note, note
+        assert '@grp' not in note, note
+
+    def test_several_ids_render_sorted(self):
+        note = _worker_death_leg_note(
+            'test', crashed_nodeids=['tests/test_z.py::test_b', 'tests/test_a.py::test_a'],
+        )
+        assert (
+            "worker died running 'tests/test_a.py::test_a' and 'tests/test_z.py::test_b'" in note
+        ), note
+
+    def test_labelled_note_with_an_id_is_one_aggregation_fragment(self):
+        """Exactly the parse `_aggregate_results` performs."""
+        note = _worker_death_leg_note(
+            'test', module='orchestrator', crashed_nodeids={XDIST_IN_FLIGHT_NODEID},
+        )
+        assert note.split(', ') == [note]
 
 
 def _test_leg_result(test_output: str) -> VerifyResult:
@@ -12055,6 +12113,10 @@ class TestKillNoteIsOneAggregationFragment:
     and `_aggregate_results`, so a kill note must never contain ', '."""
 
     @pytest.mark.parametrize(
+        'module', [None, 'orchestrator', 'foo/bar', 'a, b'],
+        ids=['unlabelled', 'plain', 'nested', 'hostile'],
+    )
+    @pytest.mark.parametrize(
         ('label', 'rc', 'duration'),
         [
             ('test', -9, 900.5),
@@ -12064,13 +12126,26 @@ class TestKillNoteIsOneAggregationFragment:
             ('type', -1, 12.5),
         ],
     )
-    def test_note_never_contains_the_fragment_separator(self, label, rc, duration):
-        note = _killed_leg_note(label, rc, duration)
+    def test_note_never_contains_the_fragment_separator(self, label, rc, duration, module):
+        note = _killed_leg_note(label, rc, duration, module=module)
         assert ', ' not in note, (
             f'a comma+space in the note splits it across `.split(", ")` in '
             f'_aggregate_results and only the {SIGNAL_KILL_SUMMARY_MARKER!r} '
             f'half survives; use "; " to separate clauses. Got: {note!r}'
         )
+
+    def test_module_names_the_killed_leg(self):
+        note = _killed_leg_note('lint', -9, 0.31, module='scripts')
+        assert note.startswith('scripts lint leg killed by signal 9 after 0.31s'), note
+
+    def test_unlabelled_note_is_byte_identical(self):
+        """A single-module caller passes no module and keeps today's sentence."""
+        assert _killed_leg_note('lint', -9, 0.31) == (
+            'lint leg killed by signal 9 after 0.31s; no diagnostics produced; verdict indeterminate'
+        )
+
+    def test_labelled_note_is_still_a_no_verdict_summary(self):
+        assert verify.is_no_verdict_summary(_killed_leg_note('lint', -9, 0.31, module='scripts'))
 
     def test_note_round_trips_through_the_consumer_split_intact(self):
         """Exactly the parse `_aggregate_results` performs, run against the
