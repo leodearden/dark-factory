@@ -17,8 +17,10 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import _checkout as _checkout
+import httpx
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue, iter_all_escalation_paths, read_escalation_for_scan
+from migrate_metadata_modules_to_files import FusedMemoryClient, write_failure_reason
 from orchestrator.flake_debt_drain import REGRESSED_AFTER_RESOLUTION, call_site_evidence
 from orchestrator.flake_ledger import (
     DUE_ITEM_STALE_AFTER,
@@ -69,6 +71,40 @@ class TaskReader(Protocol):
     ``(None, None)`` a corroborated absence, ``(None, error)`` a failed read."""
 
     async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]: ...
+
+
+class ToolClient(Protocol):
+    """The slice of ``migrate_metadata_modules_to_files.FusedMemoryClient`` a task read uses."""
+
+    async def call_tool(self, name: str, arguments: dict, *, timeout: float | None = None) -> dict: ...
+
+
+_TASK_NOT_FOUND = 'TaskNotFoundError'
+
+
+class FusedMemoryTaskReader:
+    """:class:`TaskReader` over the fused-memory ``get_task`` tool.
+
+    A ``TaskNotFoundError`` reply is a corroborated absence.  Any other reply that
+    ``write_failure_reason`` reads as a failure, and any exception the call raises,
+    is a failed read: the reader never raises.
+    """
+
+    def __init__(self, client: ToolClient, project_root: str) -> None:
+        self._client = client
+        self._project_root = project_root
+
+    async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]:
+        try:
+            reply: Any = await self._client.call_tool('get_task', {'id': task_id, 'project_root': self._project_root})
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            return None, exc
+        if isinstance(reply, dict) and reply.get('error') and reply.get('error_type') == _TASK_NOT_FOUND:
+            return None, None
+        problem = write_failure_reason(reply)
+        if problem is not None:
+            return None, RuntimeError(f'get_task {task_id}: {problem}')
+        return reply, None
 
 
 @dataclass(frozen=True)
@@ -396,3 +432,26 @@ async def load_inputs(
         escalations=_read_escalations(stores.escalations, since=since, episodes=episodes, window=window),
         record_bytes=_directory_bytes(stores.records),
     )
+
+
+async def load_inputs_from_server(
+    project_root: Path,
+    *,
+    server_url: str,
+    since: datetime | None,
+    commands: Sequence[str],
+    now: datetime,
+) -> SoakInputs | Unjudgeable:
+    """:func:`load_inputs` reading tasks from the fused-memory server at *server_url*.
+
+    The reader returns every failed read, so an HTTP error escaping the client's
+    block came from opening or closing the client: the task store is unreachable.
+    """
+    try:
+        async with FusedMemoryClient(server_url) as client:
+            return await load_inputs(
+                project_root, since=since, commands=commands, now=now,
+                task_reader=FusedMemoryTaskReader(client, str(project_root)),
+            )
+    except httpx.HTTPError as exc:
+        return Unjudgeable(f'task store unreachable: {server_url}: {exc!r}')

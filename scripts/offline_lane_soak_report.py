@@ -33,7 +33,14 @@ from typing import Any
 
 import _checkout as _checkout
 from migrate_metadata_modules_to_files import DEFAULT_SERVER
-from offline_lane_soak_inputs import SoakInputs, TaskReader, Unjudgeable, WindowPass, load_inputs
+from offline_lane_soak_inputs import (
+    SoakInputs,
+    TaskReader,
+    Unjudgeable,
+    WindowPass,
+    load_inputs,
+    load_inputs_from_server,
+)
 from orchestrator.flake_debt_drain import REGRESSED_AFTER_RESOLUTION
 from orchestrator.flake_ledger import (
     DUE_ITEM_STALE_AFTER,
@@ -703,7 +710,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--command', action='append', default=[], dest='commands',
                         help='a lane command name to judge; repeatable (default: every command with records)')
     parser.add_argument('--json', action='store_true', help='print the full report as JSON on stdout')
-    parser.add_argument('--server-url', default=DEFAULT_SERVER, help='fused-memory MCP server for task reads')
+    parser.add_argument('--server-url', default=DEFAULT_SERVER,
+                        help=f'fused-memory MCP server for task reads (default: {DEFAULT_SERVER})')
     parser.add_argument('--recheck-secs', type=float, default=LanePolicy().recheck_secs,
                         help="how long a due filing may stay due before it is stranded (default: the lane's)")
     return parser
@@ -712,16 +720,17 @@ def _parser() -> argparse.ArgumentParser:
 def main(
     argv: Sequence[str] | None = None, *, task_reader: TaskReader | None = None, now: datetime | None = None,
 ) -> int:
-    parser = _parser()
-    args = parser.parse_args(argv)
-    if task_reader is None:
-        parser.error('no task reader')
+    args = _parser().parse_args(argv)
     now = now or datetime.now(UTC)
     project_root: Path = args.project_root or default_project_root()
     settings = Settings(recheck_secs=args.recheck_secs)
-    inputs = asyncio.run(load_inputs(
-        project_root, since=args.since, commands=args.commands, now=now, task_reader=task_reader,
-    ))
+    if task_reader is None:
+        loading = load_inputs_from_server(
+            project_root, server_url=args.server_url, since=args.since, commands=args.commands, now=now,
+        )
+    else:
+        loading = load_inputs(project_root, since=args.since, commands=args.commands, now=now, task_reader=task_reader)
+    inputs = asyncio.run(loading)
     results = run_checks(inputs, settings)
     shown = figures(inputs)
     if isinstance(inputs, Unjudgeable):
