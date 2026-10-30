@@ -1848,7 +1848,7 @@ def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
     return ''.join(out)
 
 
-def _split_xdist_option(token: str) -> tuple[str, str | None] | None:
+def split_xdist_option(token: str) -> tuple[str, str | None] | None:
     """The xdist option *token* names and the value attached in it, or ``None``.
 
     THE one grammar of an xdist token's spellings, read by the structured
@@ -1879,8 +1879,8 @@ def _split_xdist_option(token: str) -> tuple[str, str | None] | None:
 
 
 def _is_xdist_option(token: str) -> bool:
-    """``_split_xdist_option`` as a predicate, for the strip and the raw refusal screen."""
-    return _split_xdist_option(token) is not None
+    """``split_xdist_option`` as a predicate, for the strip and the raw refusal screen."""
+    return split_xdist_option(token) is not None
 
 
 def _strip_xdist_options(base_flags: tuple[str, ...]) -> tuple[str, ...]:

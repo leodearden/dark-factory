@@ -88,7 +88,6 @@ from orchestrator.verify_cmd import (
     ChainSegment,
     ToolKind,
     VerifyCmd,
-    _split_xdist_option,
     _unspliceable_pytest_spans,
     apply_pytest_numprocesses,
     cargo_scope,
@@ -99,6 +98,7 @@ from orchestrator.verify_cmd import (
     serial_pytest,
     split_and_chain_segments,
     split_chain_tail,
+    split_xdist_option,
     with_junitxml,
     with_pytest_timeout,
 )
@@ -11231,7 +11231,7 @@ _XDIST_N_FLAGS = frozenset({'-n', '--numprocesses'})
 def _named_worker_count(flags: tuple[str, ...]) -> str | None:
     """The worker count pytest *flags* name, or ``None`` when they name none.
 
-    Each token's spelling is split by ``verify_cmd._split_xdist_option``; a
+    Each token's spelling is split by ``verify_cmd.split_xdist_option``; a
     value flag's adjacent value is stepped over, so a ``-k -n8`` is never
     read as a count. An EMPTY attached value (``--numprocesses=``) names no
     count — pytest rejects that command outright — so it reads as absent
@@ -11239,7 +11239,7 @@ def _named_worker_count(flags: tuple[str, ...]) -> str | None:
     """
     i = 0
     while i < len(flags):
-        match _split_xdist_option(flags[i]):
+        match split_xdist_option(flags[i]):
             case (option, attached) if option in _XDIST_N_FLAGS and attached:
                 return attached
             case (option, None) if option in _XDIST_N_FLAGS and i + 1 < len(flags):
@@ -11275,7 +11275,7 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
       and its long form ``--numprocesses 8`` (``_XDIST_N_FLAGS``), each also in
       the attached one-token form (``--numprocesses=8``, ``-n=8``), and the
       concatenated short form (``-n8``, ``-nauto``) — argparse reads all of
-      them. The spelling grammar is ``verify_cmd._split_xdist_option``'s, the
+      them. The spelling grammar is ``verify_cmd.split_xdist_option``'s, the
       same one the serial recovery's strip sheds by, so the stamp never reads
       a worker flag that strip would leave on argv. A set that bound ``-n``
       alone would report ``n_flag: null`` for a module config using the long
