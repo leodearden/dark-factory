@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
-from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol, TypeVar
+from typing import Any, Protocol
 
 import _checkout as _checkout
 import httpx
@@ -44,7 +44,6 @@ from orchestrator.offline_lane_episode_state import (
     EpisodeStore,
     PassEffect,
 )
-from orchestrator.offline_lane_escalations import escalation_state
 from orchestrator.offline_lane_records import (
     FailureRecord,
     Phase,
@@ -59,7 +58,6 @@ _BEGINNING = datetime.min.replace(tzinfo=UTC)
 _LATEST = datetime.max.replace(tzinfo=UTC)
 _LANE_REENTRY_REF = call_site_evidence(FlakeCallSite.offline_lane, observed_at='')['ref']
 _SCAN_PARSE_ERRORS = (AttributeError, KeyError, TypeError, ValueError)
-_Read = TypeVar('_Read')
 
 
 @dataclass(frozen=True)
@@ -81,14 +79,18 @@ class ToolClient(Protocol):
 
 
 _TASK_NOT_FOUND = 'TaskNotFoundError'
+_FAILED_CALL_ERRORS = (httpx.HTTPError, RuntimeError, ValueError, AttributeError, KeyError, TypeError)
 
 
 class FusedMemoryTaskReader:
     """:class:`TaskReader` over the fused-memory ``get_task`` tool.
 
     A ``TaskNotFoundError`` reply is a corroborated absence.  Any other reply that
-    ``write_failure_reason`` reads as a failure, and any exception the call raises,
-    is a failed read: the reader never raises.
+    ``write_failure_reason`` reads as a failure is a failed read.  So is a call that raises
+    what ``FusedMemoryClient.call_tool`` raises for a reply it cannot read: a transport
+    failure, a JSON-RPC error (RuntimeError), a body that is not JSON (ValueError), or one
+    that is not a JSON-RPC object (AttributeError, KeyError or TypeError, from reading it as
+    one).  Any other exception propagates.
     """
 
     def __init__(self, client: ToolClient, project_root: str) -> None:
@@ -98,7 +100,7 @@ class FusedMemoryTaskReader:
     async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]:
         try:
             reply: Any = await self._client.call_tool('get_task', {'id': task_id, 'project_root': self._project_root})
-        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+        except _FAILED_CALL_ERRORS as exc:
             return None, exc
         if isinstance(reply, dict) and reply.get('error') and reply.get('error_type') == _TASK_NOT_FOUND:
             return None, None
@@ -328,12 +330,20 @@ def _is_lane_regression(escalation: Escalation, since: datetime) -> bool:
     return (filed_at if filed_at.tzinfo else filed_at.replace(tzinfo=UTC)) >= since
 
 
-def _scan_regressions(queue_dir: Path, since: datetime) -> tuple[list[Escalation], list[tuple[str, str]]]:
-    """The offline_lane regression records filed since *since*, and every file the scan could not read.
+@dataclass(frozen=True)
+class _QueueScan:
+    """One read of every queue file: each record read, by id with the root copy first; the offline_lane
+    regression records filed since the window start; and every file the scan could not read, with why."""
 
-    A file archived between the listing and its read ('vanished') is routine, not unread.
-    """
-    found: list[Escalation] = []
+    records: Mapping[str, Escalation]
+    regressions: tuple[Escalation, ...]
+    unread: tuple[tuple[str, str], ...]
+
+
+def _scan_queue(queue_dir: Path, since: datetime) -> _QueueScan:
+    """A file archived between the listing and its read ('vanished') is routine, not unread."""
+    records: dict[str, Escalation] = {}
+    regressions: list[Escalation] = []
     unread: list[tuple[str, str]] = []
     for path in iter_all_escalation_paths(queue_dir):
         escalation, reason = read_escalation_for_scan(
@@ -343,42 +353,43 @@ def _scan_regressions(queue_dir: Path, since: datetime) -> tuple[list[Escalation
             if reason != 'vanished':
                 unread.append((str(path), reason))
             continue
+        records.setdefault(escalation.id, escalation)
         try:
             if _is_lane_regression(escalation, since):
-                found.append(escalation)
+                regressions.append(escalation)
         except ValueError as exc:
             unread.append((str(path), f'timestamp: {exc}'))
-    return found, unread
+    return _QueueScan(records, tuple(regressions), tuple(unread))
 
 
-def _lane_record(
-    read: Callable[[str], _Read | None], escalation_id: str, unread: Sequence[tuple[str, str]],
-) -> _Read | None | Unjudgeable:
-    """What *read* answers for *escalation_id*: None only for a genuine absence.
+def _lane_record(escalation_id: str, scan: _QueueScan, queue: EscalationQueue) -> Escalation | None | Unjudgeable:
+    """The record *escalation_id* names, None only for a genuine absence.
 
-    ``EscalationQueue.get`` answers None for an unparsable record too, so while any
-    queue file is unread a None cannot say the record is absent.
+    A record the scan did not read is absent or was archived between its listing and its read,
+    which the queue's own read re-locates.  While any queue file is unread, it may be that file.
     """
-    try:
-        found = read(escalation_id)
-    except (OSError, *_SCAN_PARSE_ERRORS) as exc:
-        return Unjudgeable(f'escalation queue unreadable: {escalation_id}: {exc!r}')
-    if found is None and unread:
-        path, reason = unread[0]
+    found = scan.records.get(escalation_id)
+    if found is not None:
+        return found
+    if scan.unread:
+        path, reason = scan.unread[0]
         return Unjudgeable(
-            f'escalation queue unreadable: {escalation_id} reads as absent while {len(unread)} queue '
+            f'escalation queue unreadable: {escalation_id} reads as absent while {len(scan.unread)} queue '
             f'file(s) are unread, the first {path} ({reason})',
         )
-    return found
+    try:
+        return queue.get(escalation_id)
+    except OSError as exc:
+        return Unjudgeable(f'escalation queue unreadable: {escalation_id}: {exc!r}')
 
 
 def _lane_records(
-    read: Callable[[str], _Read | None], escalation_ids: Iterable[str], unread: Sequence[tuple[str, str]],
-) -> dict[str, _Read | None] | Unjudgeable:
+    escalation_ids: Iterable[str], scan: _QueueScan, queue: EscalationQueue,
+) -> dict[str, Escalation | None] | Unjudgeable:
     """Each id to what :func:`_lane_record` reads for it; the first :class:`Unjudgeable` wins."""
-    records: dict[str, _Read | None] = {}
+    records: dict[str, Escalation | None] = {}
     for escalation_id in escalation_ids:
-        found = _lane_record(read, escalation_id, unread)
+        found = _lane_record(escalation_id, scan, queue)
         if isinstance(found, Unjudgeable):
             return found
         records[escalation_id] = found
@@ -402,21 +413,21 @@ def _outage_ids(window: Sequence[WindowPass]) -> list[str]:
 def _read_escalations(
     queue_dir: Path, *, since: datetime, episodes: Mapping[str, CommandRecord], window: Sequence[WindowPass],
 ) -> EscalationReads | Unjudgeable:
-    """*queue_dir* exists, so the queue built over it makes nothing.  The scan runs first, so a
-    lane-referenced record that reads as absent while a queue file is unread leaves nothing to judge."""
-    regressions, unread = _scan_regressions(queue_dir, since)
+    """*queue_dir* exists, so the queue built over it makes nothing.  The lane's records are read
+    from the scan, so a record it could not read leaves nothing to judge rather than raising."""
+    scan = _scan_queue(queue_dir, since)
     queue = EscalationQueue(queue_dir)
-    stuck = _lane_records(lambda i: escalation_state(queue, i), _stuck_filing_ids(episodes), unread)
+    stuck = _lane_records(_stuck_filing_ids(episodes), scan, queue)
     if isinstance(stuck, Unjudgeable):
         return stuck
-    outages = _lane_records(queue.get, _outage_ids(window), unread)
+    outages = _lane_records(_outage_ids(window), scan, queue)
     if isinstance(outages, Unjudgeable):
         return outages
     return EscalationReads(
-        stuck_filing_states=stuck,
+        stuck_filing_states={i: None if record is None else record.status for i, record in stuck.items()},
         outages=outages,
-        regressions=tuple(regressions),
-        unread=tuple(unread),
+        regressions=scan.regressions,
+        unread=scan.unread,
     )
 
 

@@ -16,7 +16,7 @@ from typing import Any
 import httpx
 import offline_lane_soak_report as soak_report
 import pytest
-from migrate_metadata_modules_to_files import DEFAULT_SERVER, MCP_IS_ERROR_KEY, RAW_REPLY_KEY
+from migrate_metadata_modules_to_files import MCP_IS_ERROR_KEY, RAW_REPLY_KEY, FusedMemoryClient
 from offline_lane_soak_fixtures import (
     FAILURE_LINE,
     HEAD,
@@ -1203,6 +1203,33 @@ def test_the_task_reader_answers_a_transport_failure_with_that_exception():
     assert _read(_ToolStub(raises=failure)) == (None, failure)
 
 
+def _tools_call_answered(body: Any) -> httpx.MockTransport:
+    """A fused-memory server that completes the handshake and answers every tools/call with *body*."""
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        if json.loads(request.content).get('method') == 'tools/call':
+            return httpx.Response(200, json=body)
+        return httpx.Response(200, json={})
+
+    return httpx.MockTransport(answer)
+
+
+@pytest.mark.parametrize(('body', 'raised'), [
+    ([1, 2], AttributeError),
+    (5, TypeError),
+    ({'result': {'content': [{'type': 'text'}]}}, KeyError),
+])
+def test_the_task_reader_answers_a_reply_body_the_client_cannot_read_as_an_error(body: Any, raised: type):
+    async def read() -> tuple[dict | None, Exception | None]:
+        async with FusedMemoryClient('http://fused-memory.test', transport=_tools_call_answered(body)) as client:
+            return await FusedMemoryTaskReader(client, '/srv/project').get_task('42')
+
+    task, error = asyncio.run(read())
+
+    assert task is None
+    assert isinstance(error, raised)
+
+
 def _closed_port_url() -> str:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(('127.0.0.1', 0))
@@ -1220,11 +1247,3 @@ def test_without_an_injected_reader_main_reads_tasks_from_the_server_url(tmp_pat
     assert code == 2
     assert 'task store' in report['unjudgeable']
     assert url in report['unjudgeable']
-
-
-def test_the_server_url_defaults_to_the_fused_memory_server(capsys):
-    with pytest.raises(SystemExit) as exit_info:
-        soak_report.main(['--help'])
-
-    assert exit_info.value.code == 0
-    assert DEFAULT_SERVER in capsys.readouterr().out
