@@ -8,7 +8,9 @@ environment-only failure on a green main is filed as a red main: with no
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
 
@@ -28,8 +30,9 @@ from orchestrator.main_tip_sweep_cadence import SweepSeedMode
 from orchestrator.verify import VerifyResult
 
 PROVISIONED = '.provisioned'
-# Stands in for the deployed `uv sync --all-packages && npm ci`.
-PROVISION = f'touch {PROVISIONED}'
+# Stands in for the deployed `uv sync --all-packages && npm ci`, and records
+# the verify role it was provisioned under.
+PROVISION = f'printf %s "$DF_VERIFY_ROLE" > {PROVISIONED}'
 
 PASSING_RESULT = VerifyResult(
     passed=True, test_output='', lint_output='', type_output='', summary='ok',
@@ -54,6 +57,12 @@ def _head(repo: Path) -> str:
     ).stdout.strip()
 
 
+def _provisioned_role(tree: Path) -> str | None:
+    """The verify role *tree* was provisioned under, or None if it never was."""
+    marker = tree / PROVISIONED
+    return marker.read_text() if marker.exists() else None
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     return make_seed_test_repo(tmp_path)
@@ -61,16 +70,16 @@ def repo(tmp_path: Path) -> Path:
 
 async def _sweep(
     repo: Path, *, provision: str = PROVISION, **sweep_kwargs,
-) -> tuple[str, object, list[tuple[bool, bool]]]:
-    """Run the sweep at HEAD; return (head, result, (provisioned, seeded) per verify)."""
+) -> tuple[str, object, list[tuple[str | None, bool]]]:
+    """Run the sweep at HEAD; return (head, result, (provisioned role, seeded) per verify)."""
     await commit_seed_script(repo, CURRENT_LOCKING_SEED_SCRIPT)
     git_ops = GitOps(warm_pool_git_config(), repo)
     head = _head(repo)
-    seen: list[tuple[bool, bool]] = []
+    seen: list[tuple[str | None, bool]] = []
 
     async def _fake_full_verification(project_root: Path, cfg, **kwargs):
         seen.append((
-            (project_root / PROVISIONED).exists(),
+            _provisioned_role(project_root),
             (project_root / 'target' / 'seeded.bin').exists(),
         ))
         return PASSING_RESULT
@@ -90,16 +99,29 @@ class TestMainTipSweepProvisionedEnv:
     async def test_cold_sweep_verifies_a_provisioned_unseeded_tree(self, repo: Path):
         head, result, seen = await _sweep(repo, seed_mode=SweepSeedMode.COLD)
 
-        assert seen == [(True, False)], (
-            'the cold sweep must verify a provisioned tree that is still unseeded: '
-            'its ground truth is about target/, not about the lockfile install'
+        assert seen == [('background', False)], (
+            'the cold sweep must verify a tree provisioned under its own background '
+            'role that is still unseeded: its ground truth is about target/, not '
+            'about the lockfile install'
         )
         assert result == (head, PASSING_RESULT)
 
     async def test_warm_sweep_verifies_a_tree_both_seeded_and_provisioned(self, repo: Path):
         _, _, seen = await _sweep(repo, seed_mode=SweepSeedMode.WARM)
 
-        assert seen == [(True, True)]
+        assert seen == [('background', True)]
+
+    async def test_the_sweep_log_reports_what_provisioning_cost(
+        self, repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        with caplog.at_level(logging.INFO, logger='orchestrator.verify'):
+            await _sweep(repo)
+
+        assert any(
+            r.name == 'orchestrator.verify'
+            and re.search(r'pre-provision finished in \d+\.\ds \(rc=0\)', r.getMessage())
+            for r in caplog.records
+        ), caplog.text
 
     async def test_a_failed_provision_still_yields_the_sweep_verdict_and_says_so(
         self, repo: Path, caplog: pytest.LogCaptureFixture,
@@ -110,7 +132,7 @@ class TestMainTipSweepProvisionedEnv:
         assert result == (head, PASSING_RESULT), (
             'a failed provision must be neither a None no-signal nor a red'
         )
-        assert seen == [(False, False)]
+        assert seen == [(None, False)]
         assert any(
             r.name == 'orchestrator.verify'
             and r.levelno == logging.WARNING
@@ -136,8 +158,17 @@ def _confirm_repo(tmp_path: Path) -> Path:
     return repo
 
 
-async def _confirm(tmp_path: Path, *, passes_when_provisioned: bool) -> tuple[bool, list[bool]]:
-    """Run the confirm gate on FAILING_RESULT; return (verdict, provisioned per re-run)."""
+async def _confirm(
+    tmp_path: Path,
+    *,
+    rerun_passes: Callable[[str | None], bool],
+    provision: str = PROVISION,
+) -> tuple[bool, list[str | None]]:
+    """Run the confirm gate on FAILING_RESULT; return (verdict, provisioned role per re-run).
+
+    Each isolated re-run passes iff *rerun_passes* holds for the role its tree
+    was provisioned under (None: never provisioned).
+    """
     repo = _confirm_repo(tmp_path)
     config = OrchestratorConfig(
         project_root=repo,
@@ -145,15 +176,15 @@ async def _confirm(tmp_path: Path, *, passes_when_provisioned: bool) -> tuple[bo
             main_branch='main', branch_prefix='task/', remote='origin',
             worktree_dir='.worktrees', push_after_advance=False,
         ),
-        verify_cold_preprovision_command=PROVISION,
+        verify_cold_preprovision_command=provision,
     )
     git_ops = GitOps(config.git, repo)
-    seen: list[bool] = []
+    seen: list[str | None] = []
 
     async def _fake_run_verification(worktree: Path, cfg, module_config=None, **kwargs):
-        provisioned = (worktree / PROVISIONED).exists()
-        seen.append(provisioned)
-        return PASSING_RESULT if provisioned and passes_when_provisioned else FAILING_RESULT
+        role = _provisioned_role(worktree)
+        seen.append(role)
+        return PASSING_RESULT if rerun_passes(role) else FAILING_RESULT
 
     with patch.object(verify_module, 'run_verification', side_effect=_fake_run_verification):
         verdict = await verify_module.confirm_main_tip_failure_is_real(
@@ -167,17 +198,27 @@ class TestConfirmGateProvisionedEnv:
     async def test_an_environment_only_failure_is_suppressed_once_the_confirm_tree_is_provisioned(
         self, tmp_path: Path,
     ):
-        verdict, seen = await _confirm(tmp_path, passes_when_provisioned=True)
+        verdict, seen = await _confirm(tmp_path, rerun_passes=lambda role: role is not None)
 
         assert verdict is False
-        assert seen == [True]
+        assert seen == ['task'], 'the confirm tree is provisioned under the task role'
 
     async def test_a_failure_that_survives_provisioning_still_files_the_alarm(
         self, tmp_path: Path,
     ):
-        verdict, seen = await _confirm(tmp_path, passes_when_provisioned=False)
+        verdict, seen = await _confirm(tmp_path, rerun_passes=lambda role: False)
 
         assert verdict is True, 'the confirm gate must never mask a real red'
-        assert seen and all(seen), (
+        assert seen and all(role == 'task' for role in seen), (
             'every isolated re-run must see the provisioned tree'
+        )
+
+    async def test_a_failed_provision_is_not_itself_an_alarm(self, tmp_path: Path):
+        verdict, seen = await _confirm(
+            tmp_path, rerun_passes=lambda role: True, provision='exit 3',
+        )
+
+        assert seen == [None], 'a failed provision fails open into the re-run'
+        assert verdict is False, (
+            'the re-run, not the failed provision, decides the verdict'
         )

@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from shared.psi import PsiSample
 
     from orchestrator.event_store import EventStore
-    from orchestrator.git_ops import WorktreeKind
+    from orchestrator.git_ops import GitOps, WorktreeKind
 
 from shared.proc_group import terminate_process_group
 from shared.psi import cpu_some10_or_none, read_psi_sample
@@ -6960,7 +6960,12 @@ async def _preprovision_shared_venv(
         if done_at is not None and time.monotonic() - done_at < _PREPROVISION_DONE_TTL:
             return
         logger.info('Cold-verify shared-venv pre-provision: running %r in %s', cmd, worktree)
+        started = time.monotonic()
         rc, out, _ = await _run_cmd(cmd, worktree, timeout, env=verify_env or None)
+        logger.info(
+            'Cold-verify shared-venv pre-provision finished in %.1fs (rc=%d) in %s',
+            time.monotonic() - started, rc, worktree,
+        )
         if rc != 0:
             # Fail-open + loud (honours the loud-over-silent-degradation norm;
             # mirrors the _govern_cpu_str fail-open convention).  A SUCCESSFUL
@@ -7011,7 +7016,7 @@ async def _provision_main_tip_worktree(
 @contextlib.asynccontextmanager
 async def _provisioned_ephemeral_worktree(
     config: OrchestratorConfig,
-    git_ops: object,
+    git_ops: 'GitOps',
     kind: 'WorktreeKind',
     sha: str,
     *,
@@ -7020,10 +7025,12 @@ async def _provisioned_ephemeral_worktree(
 ) -> AsyncIterator[Path]:
     """``GitOps.ephemeral_worktree``, provisioned before the body runs.
 
-    Provisioning follows any warm seed: the seed fills ``target/``, provisioning
-    fills the venv and ``node_modules``.
+    Every ``WorktreeKind`` is a main-tip kind, so each takes
+    ``_provision_main_tip_worktree``'s policy; a kind that is not would need
+    its own. Provisioning follows any warm seed: the seed fills ``target/``,
+    provisioning fills the venv and ``node_modules``.
     """
-    async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
+    async with git_ops.ephemeral_worktree(
         kind, sha, warm_seed=warm_seed,
     ) as worktree:
         await _provision_main_tip_worktree(worktree, config, role=role)
@@ -9942,7 +9949,7 @@ async def verify_failure_is_preexisting_on_main(
 
 async def run_main_tip_sweep(
     config: 'OrchestratorConfig',
-    git_ops: object,
+    git_ops: 'GitOps',
     *,
     main_sha: str | None = None,
     seed_mode: SweepSeedMode = SweepSeedMode.COLD,
@@ -10058,7 +10065,7 @@ async def run_main_tip_sweep(
         # gate and the worktree pin (both now use the same resolved value).
         if main_sha is None:
             try:
-                main_sha = await git_ops.get_main_sha()  # type: ignore[union-attr]
+                main_sha = await git_ops.get_main_sha()
             except Exception:
                 logger.debug('run_main_tip_sweep: get_main_sha failed', exc_info=True)
                 return None
