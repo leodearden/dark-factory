@@ -13332,6 +13332,25 @@ class Harness:
             key=lambda record: record[0],
         )
 
+    @staticmethod
+    def _cite_open_stale_l0_strand_records(
+        open_records: list[tuple[str, str | None]],
+    ) -> str:
+        """The detail paragraph citing earlier open strand records; empty when there are none."""
+        if not open_records:
+            return ''
+        cited = '\n'.join(
+            f'  - {l1_id}' if l2_id is None
+            else f'  - {l1_id} (clustered under pending L2 {l2_id})'
+            for l1_id, l2_id in open_records
+        )
+        return (
+            f'Earlier stale-L0 strand records are still open:\n{cited}\n'
+            f'Triage this sweep\'s strands alongside them (fold this record into '
+            f'the same L2) rather than closing it as a duplicate: it names only '
+            f'the strands this sweep dismissed, which no earlier record lists.\n\n'
+        )
+
     def _file_stale_l0_strand_escalation(self, strands: list[dict[str, Any]]) -> None:
         """File ONE level-1 escalation for the strands this restart destroyed.
 
@@ -13370,19 +13389,7 @@ class Harness:
                 f'agent_role={s["agent_role"]}'
                 for s in strands
             )
-            earlier = ''
-            if open_records:
-                cited = '\n'.join(
-                    f'  - {l1_id}' if l2_id is None
-                    else f'  - {l1_id} (clustered under pending L2 {l2_id})'
-                    for l1_id, l2_id in open_records
-                )
-                earlier = (
-                    f'Earlier stale-L0 strand records are still open:\n{cited}\n'
-                    f'Triage this sweep\'s strands alongside them (fold this record into '
-                    f'the same L2) rather than closing it as a duplicate: it names only '
-                    f'the strands this sweep dismissed, which no earlier record lists.\n\n'
-                )
+            earlier = self._cite_open_stale_l0_strand_records(open_records)
             detail = (
                 f'The startup L0 sweep dismissed {len(strands)} escalation(s) that had '
                 f'already been pending longer than the '
