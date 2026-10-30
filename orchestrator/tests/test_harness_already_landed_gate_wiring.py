@@ -872,19 +872,27 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         assert "'content_fallback': 'unanchored'" in esc.detail
         assert 'content_fallback_error' not in esc.detail
 
-    async def test_content_equivalent_with_citation_and_effect_present_marks_done(
-        self, mock_orch_config,
+    @pytest.mark.parametrize(
+        ('citation_sha', 'twin_sha', 'evidence_sha'),
+        [
+            pytest.param('d' * 40, None, 'd' * 40, id='cited'),
+            pytest.param(None, '7' * 40, '7' * 40, id='uncited-patch-id-twin'),
+        ],
+    )
+    async def test_content_equivalent_attributed_landing_marks_done_on_its_evidence(
+        self, mock_orch_config, citation_sha, twin_sha, evidence_sha,
     ) -> None:
-        """branch_content_in_main True, a citation commit is present on
-        main AND its effect is present at main HEAD -> the citation sha
-        anchors the flip, not main HEAD; no escalation filed.
+        """A content-equivalent branch is stamped done anchored on the
+        evidence that attributes it: the citation when main has one, else
+        the tip's patch-id twin on main (task 4862's fallback; esc-4881-8
+        shape), never main HEAD. No escalation is filed.
         """
-        citation_sha = 'd' * 40
         h = _wired_content_harness(
             mock_orch_config,
             citation_sha=citation_sha,
             content_in_main=True,
             effect_present=True,
+            twin_sha=twin_sha,
         )
 
         result = await h._already_landed_dispatch_gate('42')
@@ -894,7 +902,7 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         call_args = cast(AsyncMock, h._mark_in_progress_done).await_args
         assert call_args is not None
         assert call_args.args[0] == '42'
-        assert call_args.args[1] == citation_sha
+        assert call_args.args[1] == evidence_sha
         assert call_args.args[3] == 'dispatch-gate-content-equivalent'
         cast(MagicMock, h._escalation_queue).submit.assert_not_called()
 
