@@ -40,10 +40,12 @@ from _orch_helpers import (
 from escalation.categories import EscalationCategory
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from escalation.server import create_server
+from fastmcp import Client
 from shared.task_statuses import TaskStatus
 
 from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
-from orchestrator.config import GitConfig, LaneCommand, OrchestratorConfig
+from orchestrator.config import GitConfig, LaneCommand, OrchestratorConfig, apply_reload
 from orchestrator.flake_debt_drain import DrainPassReport, run_drain_pass
 from orchestrator.flake_ledger import (
     DebtRow,
@@ -92,6 +94,14 @@ LANE_COMMAND = LaneCommand(name='lane-fixture', command='pytest -m integration t
 OPAQUE_COMMAND = LaneCommand(name='lane-opaque', command='lane-suite tests', cwd=FIXTURE_DIR)
 #: The lane command declaring an outage probe; ``lane-probe`` plays back the stub's scripted ``ProbeAnswer``s.
 PROBED_COMMAND = LANE_COMMAND.model_copy(update={'outage_probe': 'lane-probe'})
+
+
+def probed_command(timeout_secs: int | None = None) -> LaneCommand:
+    """``PROBED_COMMAND``, its probe bounded at *timeout_secs* where given."""
+    if timeout_secs is None:
+        return PROBED_COMMAND
+    return PROBED_COMMAND.model_copy(update={'outage_probe_timeout_secs': timeout_secs})
+
 
 #: The junit resolver maps a report's classnames to node ids only through module files that exist under the cwd.
 LANE_SEED = RepoSeed(
@@ -862,6 +872,7 @@ class RedPathLane:
         await self.worker.on_post_merge('lane-fixture-merge', '', '')
         await self.drive(until=until)
         assert self.stub.unconsumed() == [], 'the pass left scripted sub-runs unconsumed'
+        assert self.stub.unanswered() == [], 'the pass left scripted probe answers unanswered'
         started_passes = self.passes(started)
         assert started_passes, 'the triggered drive started no pass'
         return started_passes[-1]
@@ -873,6 +884,7 @@ class RedPathLane:
         started = self.clock()
         await self.drive()
         assert self.stub.unconsumed() == [], 'the tick left scripted sub-runs unconsumed'
+        assert self.stub.unanswered() == [], 'the tick left scripted probe answers unanswered'
         return self.passes(started)
 
     def passes(self, since: datetime = EPOCH) -> list[PassRecord]:
@@ -954,3 +966,28 @@ class RedPathLane:
 
     def report(self, now: datetime) -> FlakeLedgerReport:
         return build_report(self.ledger, now=now)
+
+
+#: The role the auto-watcher promotes as.
+WATCHER_ROLE = 'orchestrator-escalation-watcher-auto'
+
+
+async def promote_to_level_2(queue: EscalationQueue, task_id: str, *member_ids: str) -> str:
+    """Promote *member_ids* into a level-2 hold on *task_id* as the auto-watcher does, through the server's tool; its id."""
+    async with Client(create_server(queue, startup_sweep=False)) as client:
+        result = await client.call_tool('promote_to_l2', {
+            'task_id': task_id,
+            'agent_role': WATCHER_ROLE,
+            'member_ids': list(member_ids),
+            'root_cause': 'offline lane outage: qdrant unreachable',
+            'evidence': 'the lane filed an infra_issue outage record',
+            'options': ['wait for the lane to close it'],
+            'summary': 'qdrant is down for the offline lane',
+        })
+    return result.data['id']
+
+
+def reload_git(lane: RedPathLane, **knobs: Any) -> dict[str, Any]:
+    """Hot-reload *knobs* of the lane's ``git`` config as the operator's reload does; the reload report."""
+    fresh = lane.config.model_copy(update={'git': lane.config.git.model_copy(update=knobs)})
+    return apply_reload(lane.config, fresh)
