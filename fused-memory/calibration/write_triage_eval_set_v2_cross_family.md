@@ -3,6 +3,7 @@
 - Raters: gpt-6.1-sol:high; calls 320; spend 4.05 USD at list price.
 - Discordant pairs: 220 selected, 220 rated, 0 failed.
 - Control pairs: 100 rated, 0 failed.
+- Runs: 3; budget stops: 2 (at 0.25 USD with 302 pairs left; at 3.00 USD with 102 pairs left).
 
 | selection | binary | versus | n | agree | rate | wilson95 | kappa |
 |---|---|---|---|---|---|---|---|

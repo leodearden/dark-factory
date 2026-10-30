@@ -307,6 +307,20 @@
   },
   "calls": 320,
   "coverage": {
+    "budget_stops": [
+      {
+        "batch": "cross-family-2026-10-29",
+        "budget_usd": 0.25,
+        "remaining": 302,
+        "spent_usd": 0.22294399999999998
+      },
+      {
+        "batch": "cross-family-2026-10-29",
+        "budget_usd": 3.0,
+        "remaining": 102,
+        "spent_usd": 2.955337999999999
+      }
+    ],
     "control": {
       "failed": 0,
       "rated": 100
@@ -315,7 +329,8 @@
       "failed": 0,
       "rated": 220,
       "selected": 220
-    }
+    },
+    "runs": 3
   },
   "failures": [],
   "raters": [
