@@ -8,6 +8,7 @@ provision what they open, so each store's existence is tested before its reader 
 """
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -16,12 +17,15 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import _checkout as _checkout
-from escalation.queue import EscalationQueue
+from escalation.models import Escalation
+from escalation.queue import EscalationQueue, iter_all_escalation_paths, read_escalation_for_scan
+from orchestrator.flake_debt_drain import REGRESSED_AFTER_RESOLUTION, call_site_evidence
 from orchestrator.flake_ledger import (
     DUE_ITEM_STALE_AFTER,
     DebtRow,
     DueRow,
     DueSummary,
+    FlakeCallSite,
     FlakeOccurrenceRow,
     ledger_db_path,
     read_call_sites_written,
@@ -31,7 +35,7 @@ from orchestrator.flake_ledger import (
     summarize_due,
 )
 from orchestrator.guard_state import guard_path
-from orchestrator.offline_lane_confirm import PassOutcome, outcome_from_json
+from orchestrator.offline_lane_confirm import Outage, PassOutcome, outcome_from_json
 from orchestrator.offline_lane_episode_state import (
     EPISODES_FILE,
     CommandRecord,
@@ -51,6 +55,8 @@ from shared.project_layout import escalation_queue_dir
 
 _BEGINNING = datetime.min.replace(tzinfo=UTC)
 _LATEST = datetime.max.replace(tzinfo=UTC)
+_LANE_REENTRY_REF = call_site_evidence(FlakeCallSite.offline_lane, observed_at='')['ref']
+_SCAN_PARSE_ERRORS = (KeyError, TypeError, ValueError)
 
 
 @dataclass(frozen=True)
@@ -120,11 +126,26 @@ class LedgerReads:
 
 
 @dataclass(frozen=True)
+class EscalationReads:
+    """The escalation queue as the window sees it.
+
+    *stuck_filing_states* maps each command's stuck-filing record id to its status, and
+    *outages* each record id an outage pass raised to that record, None when the queue holds
+    no such record.  *regressions* are the offline_lane re-entries of a resolved flake debt
+    filed in the window; *unread* the queue files the scan could not read, with the reason.
+    """
+
+    stuck_filing_states: Mapping[str, str | None]
+    outages: Mapping[str, Escalation | None]
+    regressions: tuple[Escalation, ...]
+    unread: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
 class SoakInputs:
     """*tasks* maps each task read to its body, or None for a corroborated absence; *failures* maps
     (command, test) to that test's failure records over every stored pass of the selected commands;
-    *escalation_states* maps each escalation id the episode records name to its status, or None
-    when the queue holds no such record."""
+    *record_bytes* is the size of every file under the run-record root."""
 
     since: datetime
     now: datetime
@@ -134,7 +155,8 @@ class SoakInputs:
     tasks: Mapping[str, Mapping[str, Any] | None]
     ledger: LedgerReads
     failures: Mapping[tuple[str, str], tuple[FailureRecord, ...]]
-    escalation_states: Mapping[str, str | None]
+    escalations: EscalationReads
+    record_bytes: int
 
     def effects(self) -> Iterator[tuple[WindowPass, PassEffect]]:
         """Each windowed pass that carries a readable effect block, with that block."""
@@ -250,11 +272,69 @@ def _task_ids(window: Sequence[WindowPass], episodes: Mapping[str, CommandRecord
     return list(dict.fromkeys((*filed, *bound, *owners)))
 
 
-def _stuck_filing_states(queue_dir: Path, episodes: Mapping[str, CommandRecord]) -> dict[str, str | None]:
-    """Each command's stuck-filing record and its status; *queue_dir* exists, so the queue makes nothing."""
+def _is_lane_regression(escalation: Escalation, since: datetime) -> bool:
+    if escalation.category != REGRESSED_AFTER_RESOLUTION:
+        return False
+    if not any(entry.get('ref') == _LANE_REENTRY_REF for entry in escalation.evidence):
+        return False
+    filed_at = datetime.fromisoformat(escalation.timestamp)
+    return (filed_at if filed_at.tzinfo else filed_at.replace(tzinfo=UTC)) >= since
+
+
+def _scan_regressions(queue_dir: Path, since: datetime) -> tuple[list[Escalation], list[tuple[str, str]]]:
+    """The offline_lane regression records filed since *since*, and every file the scan could not read.
+
+    A file archived between the listing and its read ('vanished') is routine, not unread.
+    """
+    found: list[Escalation] = []
+    unread: list[tuple[str, str]] = []
+    for path in iter_all_escalation_paths(queue_dir):
+        escalation, reason = read_escalation_for_scan(
+            path, context='offline_lane_soak_inputs', parse_errors=_SCAN_PARSE_ERRORS,
+        )
+        if escalation is None:
+            if reason != 'vanished':
+                unread.append((str(path), reason))
+            continue
+        try:
+            if _is_lane_regression(escalation, since):
+                found.append(escalation)
+        except ValueError as exc:
+            unread.append((str(path), f'timestamp: {exc}'))
+    return found, unread
+
+
+def _read_escalations(
+    queue_dir: Path, *, since: datetime, episodes: Mapping[str, CommandRecord], window: Sequence[WindowPass],
+) -> EscalationReads:
+    """*queue_dir* exists, so the queue built over it makes nothing."""
     queue = EscalationQueue(queue_dir)
-    ids = [r.stuck_filing_escalation_id for r in episodes.values() if r.stuck_filing_escalation_id is not None]
-    return {escalation_id: escalation_state(queue, escalation_id) for escalation_id in ids}
+    stuck = [r.stuck_filing_escalation_id for r in episodes.values() if r.stuck_filing_escalation_id is not None]
+    raised = [
+        escalation_id
+        for p in window
+        if isinstance(p.outcome, Outage) and p.effect is not None
+        for escalation_id in p.effect.escalations_raised
+    ]
+    regressions, unread = _scan_regressions(queue_dir, since)
+    return EscalationReads(
+        stuck_filing_states={escalation_id: escalation_state(queue, escalation_id) for escalation_id in stuck},
+        outages={escalation_id: queue.get(escalation_id) for escalation_id in raised},
+        regressions=tuple(regressions),
+        unread=tuple(unread),
+    )
+
+
+def _directory_bytes(root: Path) -> int:
+    """The size of every file under *root*; a file pruned during the walk counts nothing."""
+    total = 0
+    for directory, _, names in os.walk(root):
+        for name in names:
+            try:
+                total += (Path(directory) / name).stat().st_size
+            except FileNotFoundError:
+                continue
+    return total
 
 
 async def _read_tasks(
@@ -313,5 +393,6 @@ async def load_inputs(
         tasks=tasks,
         ledger=ledger,
         failures=_failures(every_pass, selected),
-        escalation_states=_stuck_filing_states(stores.escalations, episodes),
+        escalations=_read_escalations(stores.escalations, since=since, episodes=episodes, window=window),
+        record_bytes=_directory_bytes(stores.records),
     )

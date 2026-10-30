@@ -947,10 +947,24 @@ def test_held_reds_ended_elsewhere_are_flagged_by_their_recovered_offer(tmp_path
 def test_regression_escalations_are_the_offline_lane_ones_filed_in_the_window(tmp_path: Path, capsys):
     seeded, report = _seeded_report(tmp_path, capsys)
 
-    (regression,) = _figure(report, 'regression_escalations')
+    figure = _figure(report, 'regression_escalations')
+    (regression,) = figure['escalations']
     assert regression['id'] == seeded.regression
     assert regression['status'] == 'pending'
     assert regression['timestamp'] == (T0 + timedelta(hours=5)).isoformat()
+    assert figure['unread'] == []
+
+
+def test_an_escalation_file_the_scan_cannot_parse_is_reported_unread(tmp_path: Path, capsys):
+    seeded = _seeded(tmp_path)
+    corrupt = escalation_queue_dir(tmp_path) / 'esc-corrupt-1.json'
+    corrupt.write_text('{"id": "esc-corrupt-1", ', encoding='utf-8')
+
+    _, report, _ = _report(seeded.project, capsys)
+
+    figure = _figure(report, 'regression_escalations')
+    assert [e['id'] for e in figure['escalations']] == [seeded.regression]
+    assert figure['unread'] == [{'path': str(corrupt), 'reason': 'unparsable'}]
 
 
 def test_outages_list_their_passes_probe_results_and_released_records(tmp_path: Path, capsys):

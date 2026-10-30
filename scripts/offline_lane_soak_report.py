@@ -34,16 +34,19 @@ from typing import Any
 import _checkout as _checkout
 from migrate_metadata_modules_to_files import DEFAULT_SERVER
 from offline_lane_soak_inputs import SoakInputs, TaskReader, Unjudgeable, WindowPass, load_inputs
+from orchestrator.flake_debt_drain import REGRESSED_AFTER_RESOLUTION
 from orchestrator.flake_ledger import (
     DUE_ITEM_STALE_AFTER,
     DUE_ITEM_STALE_MINUTES,
     UNKNOWN_TEST_ID,
+    DebtTrigger,
     FlakeCallSite,
     FlakeVerdict,
 )
-from orchestrator.offline_lane_confirm import Confirmed
+from orchestrator.offline_lane_confirm import Confirmed, Outage
 from orchestrator.offline_lane_episode_state import (
     CommandRecord,
+    EndReason,
     Episode,
     LanePolicy,
     OfferedDebt,
@@ -169,14 +172,20 @@ def _filing_problem(task: Mapping[str, Any] | None) -> str | None:
     return None
 
 
-def _filings_resolve(inputs: SoakInputs, rule: str, settings: Settings) -> CheckResult:
-    filed_by: dict[str, str] = {}
+def _first_filings(inputs: SoakInputs) -> dict[str, WindowPass]:
+    """Each task id the windowed effect blocks list in tasks_filed, and the first pass that lists it."""
+    filed_by: dict[str, WindowPass] = {}
     for window_pass, effect in inputs.effects():
         for task_id in effect.tasks_filed:
-            filed_by.setdefault(task_id, _label(window_pass))
+            filed_by.setdefault(task_id, window_pass)
+    return filed_by
+
+
+def _filings_resolve(inputs: SoakInputs, rule: str, settings: Settings) -> CheckResult:
+    filed_by = _first_filings(inputs)
     failures = [
-        f'task {task_id} (filed by {label}): {problem}'
-        for task_id, label in filed_by.items()
+        f'task {task_id} (filed by {_label(window_pass)}): {problem}'
+        for task_id, window_pass in filed_by.items()
         if (problem := _filing_problem(inputs.tasks.get(task_id))) is not None
     ]
     return _judged(Check.FILINGS_RESOLVE, rule, len(filed_by), failures)
@@ -260,7 +269,7 @@ def _crossings(inputs: SoakInputs) -> Iterator[_Crossing]:
             continue
         held = inputs.episodes.get(record.command) or CommandRecord.empty(record.command)
         stuck_id = held.stuck_filing_escalation_id
-        state = None if stuck_id is None else inputs.escalation_states.get(stuck_id)
+        state = None if stuck_id is None else inputs.escalations.stuck_filing_states.get(stuck_id)
         for node in dict.fromkeys(effect.threshold_reached):
             episode = held.episodes.get(node)
             yield _Crossing(window_pass, record.command, node, episode if episode and episode.live else None, state)
@@ -405,9 +414,228 @@ def _interrupted_passes(inputs: SoakInputs) -> Figure:
     )
 
 
+def _by_count(counter: Counter[int]) -> dict[str, int]:
+    return {str(count): counter[count] for count in sorted(counter)}
+
+
+def _episodes_by_length(inputs: SoakInputs) -> Figure:
+    ended: dict[str, Counter[int]] = defaultdict(Counter)
+    for _, effect in inputs.effects():
+        for episode in effect.episodes_ended:
+            ended[episode.reason][episode.counted_passes] += 1
+    live = Counter(len(episode.counted_passes) for episode in _live_episodes(inputs))
+    return Figure(
+        'episodes_by_length',
+        'ended: the episodes_ended of windowed effect blocks, by reason and counted passes; '
+        'live: the live episodes of the selected commands, by counted passes',
+        {'ended': {reason: _by_count(counts) for reason, counts in sorted(ended.items())}, 'live': _by_count(live)},
+    )
+
+
+def _episode_start(
+    inputs: SoakInputs, filing: WindowPass, task_id: str, task: Mapping[str, Any] | None,
+) -> WindowPass | None:
+    """The latest pass of the filing's command, at or before it, that started an episode the task covers."""
+    record = filing.stored.record
+    if task is None or record is None:
+        return None
+    covers = {task_id: task}
+    starts = [
+        window_pass
+        for window_pass, effect in inputs.effects()
+        if window_pass.stored.command_key == filing.stored.command_key
+        and window_pass.started_at <= filing.started_at
+        and any(covering_lane_task(covers, record.command, node) == task_id for node in effect.episodes_started)
+    ]
+    return max(starts, key=lambda window_pass: window_pass.started_at, default=None)
+
+
+def _filing_delay(inputs: SoakInputs) -> Figure:
+    rows = []
+    for task_id, filing in _first_filings(inputs).items():
+        start = _episode_start(inputs, filing, task_id, inputs.tasks.get(task_id))
+        rows.append({
+            'task_id': task_id,
+            'command': filing.stored.command_key,
+            'episode_pass': None if start is None else start.pass_id,
+            'filing_pass': filing.pass_id,
+            'delay_secs': None if start is None else (filing.started_at - start.started_at).total_seconds(),
+        })
+    return Figure(
+        'filing_delay',
+        'per filed task, from the start of the latest windowed pass at or before its filing pass whose '
+        'episodes_started holds a test the task covers, to the start of the filing pass (None: no such pass)',
+        rows,
+    )
+
+
+def _lane_debts(inputs: SoakInputs) -> Figure:
+    rows = []
+    for window_pass, _, debt in _offered(inputs):
+        row = inputs.ledger.debts.get(debt.node)
+        owner = None if row is None else row.owner_task_id
+        task = None if owner is None else inputs.tasks.get(owner)
+        rows.append({
+            'pass_id': window_pass.pass_id,
+            'test': debt.node,
+            'trigger': debt.trigger.value,
+            'evidence_head': debt.head,
+            'owner': owner,
+            'owner_status': None if task is None else task.get('status'),
+        })
+    return Figure(
+        'lane_debts',
+        "each debt a windowed effect block offered, with its debt row's owner task and that task's status now",
+        rows,
+    )
+
+
+def _due_list(inputs: SoakInputs) -> Figure:
+    items = [
+        {
+            'test': item.test_id,
+            'call_site': item.call_site,
+            'age_secs': (inputs.now - datetime.fromisoformat(item.enqueued_at)).total_seconds(),
+            'attempts': item.attempts,
+            'last_error': item.last_error,
+        }
+        for item in inputs.ledger.due_items
+    ]
+    return Figure(
+        'due_list',
+        f'every item on the flake ledger due list, with its age; stale: items older than {DUE_ITEM_STALE_MINUTES} '
+        'minutes',
+        {'items': items, 'stale': inputs.ledger.due_summary.stale},
+    )
+
+
+def _undecided_tests(inputs: SoakInputs) -> Figure:
+    return Figure(
+        'undecided_tests',
+        'per windowed pass, the tests its effect block lists in debts_undecided',
+        [
+            {'command': window_pass.stored.command_key, 'pass_id': window_pass.pass_id,
+             'tests': list(effect.debts_undecided)}
+            for window_pass, effect in inputs.effects()
+            if effect.debts_undecided
+        ],
+    )
+
+
+def _due_offers_per_pass(inputs: SoakInputs) -> Figure:
+    return Figure(
+        'due_offers_per_pass',
+        'how many windowed effect blocks offered each number of debts',
+        _by_count(Counter(len(effect.debts_offered) for _, effect in inputs.effects())),
+    )
+
+
+def _clearing_passes_per_day(inputs: SoakInputs) -> Figure:
+    days: dict[str, Counter[str]] = defaultdict(Counter)
+    for p in inputs.passes:
+        if isinstance(p.outcome, Confirmed) and p.outcome.cleared:
+            days[p.stored.command_key][p.started_at.date().isoformat()] += 1
+    return Figure(
+        'clearing_passes_per_day',
+        'windowed passes whose confirmed outcome cleared a test, by command key and UTC date',
+        {command: dict(sorted(count.items())) for command, count in sorted(days.items())},
+    )
+
+
+def _held_reds_ended_elsewhere(inputs: SoakInputs) -> Figure:
+    rows = []
+    for window_pass, effect in inputs.effects():
+        record = window_pass.stored.record
+        if record is None:
+            continue
+        recovered = {debt.node for debt in effect.debts_offered if debt.trigger is DebtTrigger.recovered}
+        rows += [
+            {
+                'command': window_pass.stored.command_key,
+                'pass_id': window_pass.pass_id,
+                'test': ended.node,
+                'head': record.head,
+                'recovered_debt_offered': ended.node in recovered,
+            }
+            for ended in effect.episodes_ended
+            if ended.reason == EndReason.PASSED and record.head not in ended.reproduced_heads
+        ]
+    return Figure(
+        'held_reds_ended_elsewhere',
+        "episodes a windowed pass ended as passed on a head that never reproduced them, and whether "
+        'that pass offered a recovered debt for the test',
+        rows,
+    )
+
+
+def _regression_escalations(inputs: SoakInputs) -> Figure:
+    return Figure(
+        'regression_escalations',
+        f'{REGRESSED_AFTER_RESOLUTION} escalations filed in the window whose evidence names call site '
+        'offline_lane; unread: escalation files the scan could not read',
+        {
+            'escalations': [
+                {'id': e.id, 'task_id': e.task_id, 'status': e.status, 'timestamp': e.timestamp, 'summary': e.summary}
+                for e in inputs.escalations.regressions
+            ],
+            'unread': [{'path': path, 'reason': reason} for path, reason in inputs.escalations.unread],
+        },
+    )
+
+
+def _outage_records(inputs: SoakInputs, outage_passes: Sequence[WindowPass]) -> list[dict[str, Any]]:
+    rows = []
+    for window_pass in outage_passes:
+        for escalation_id in () if window_pass.effect is None else window_pass.effect.escalations_raised:
+            escalation = inputs.escalations.outages.get(escalation_id)
+            rows.append({
+                'id': escalation_id,
+                'command': window_pass.stored.command_key,
+                'pass_id': window_pass.pass_id,
+                'status': None if escalation is None else escalation.status,
+                'resolved_by': None if escalation is None else escalation.resolved_by,
+                'resolution': None if escalation is None else escalation.resolution,
+            })
+    return rows
+
+
+def _outages(inputs: SoakInputs) -> Figure:
+    outage_passes = [p for p in inputs.passes if isinstance(p.outcome, Outage)]
+    probes: dict[str, Counter[str]] = defaultdict(Counter)
+    for p in inputs.passes:
+        detect = None if p.stored.record is None else p.stored.record.detect
+        if detect is not None and detect.probe is not None:
+            probes[p.stored.command_key][detect.probe.result] += 1
+    return Figure(
+        'outages',
+        "windowed outage passes; probe results by kind per command from the detect records' probe; and each "
+        'record an outage pass raised, with its status, resolver and resolution (None: not in the queue)',
+        {
+            'passes': [{'command': p.stored.command_key, 'pass_id': p.pass_id} for p in outage_passes],
+            'probe_results': {command: dict(sorted(count.items())) for command, count in sorted(probes.items())},
+            'escalations': _outage_records(inputs, outage_passes),
+        },
+    )
+
+
+def _record_directory_bytes(inputs: SoakInputs) -> Figure:
+    return Figure('record_directory_bytes', 'the size of every file under the run-record root', inputs.record_bytes)
+
+
 _FIGURES: tuple[Callable[[SoakInputs], Figure], ...] = (
     _passes_per_command_per_day,
+    _episodes_by_length,
+    _filing_delay,
+    _lane_debts,
+    _due_list,
+    _undecided_tests,
+    _due_offers_per_pass,
+    _clearing_passes_per_day,
+    _held_reds_ended_elsewhere,
+    _regression_escalations,
+    _outages,
     _interrupted_passes,
+    _record_directory_bytes,
 )
 
 
