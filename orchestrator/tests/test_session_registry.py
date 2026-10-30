@@ -4995,7 +4995,6 @@ def _assert_age_between_clock_reads(
 ) -> None:
     """lease-show's age is its own clock read, taken somewhere in [before, after], minus an mtime of before - backdated_by.
 
-    Bracket it there rather than in a fixed window: a loaded host stalls the call, not the arithmetic (task 6019).
     The 1 s of upper slack covers filesystem mtime granularity.
     """
     reported = timedelta(seconds=int(reported_secs))
