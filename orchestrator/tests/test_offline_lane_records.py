@@ -517,6 +517,102 @@ class TestPassesSince:
         assert [p.pass_id for p in store.passes_since('Unit Tests', T0)] == [spaced]
 
 
+class TestStoredPassesSince:
+    SINCE = T0 + timedelta(hours=1)
+
+    def _written_at(self, store: RunRecordStore, clock: _Clock, when: datetime, command: str) -> str:
+        clock.current = when
+        lane_pass = store.allocate_pass(command, Leg.GENERIC, HEAD)
+        store.write_run(lane_pass, _record(command))
+        store.set_pass_blocks(lane_pass, outcome=None, effect={'tests_counted': []})
+        return lane_pass.pass_id
+
+    def _seeded(self, store: RunRecordStore, clock: _Clock) -> dict[str, list[str]]:
+        """Two well-formed passes per command in the window, three bad ones, and what must not be yielded."""
+        self._written_at(store, clock, T0, 'unit')
+        good = {
+            command: [
+                self._written_at(store, clock, self.SINCE + timedelta(minutes=offset, microseconds=250), command)
+                for offset in (10, 20)
+            ]
+            for command in ('unit', 'lint')
+        }
+        not_json = self._written_at(store, clock, self.SINCE + timedelta(minutes=30), 'unit')
+        store.pass_directory('unit', not_json).joinpath('record.json').write_text('{truncated')
+        no_effect = self._written_at(store, clock, self.SINCE + timedelta(minutes=40), 'unit')
+        record_path = store.pass_directory('unit', no_effect) / 'record.json'
+        payload = json.loads(record_path.read_text())
+        del payload['effect']
+        record_path.write_text(json.dumps(payload))
+        deleted = self._written_at(store, clock, self.SINCE + timedelta(minutes=50), 'lint')
+        store.pass_directory('lint', deleted).joinpath('record.json').unlink()
+        (store.root / 'unit' / 'scratch').mkdir()
+        return {'good_unit': good['unit'], 'good_lint': good['lint'], 'bad': [not_json, no_effect, deleted]}
+
+    def test_every_pass_directory_in_the_window_is_yielded_once_in_order(
+        self, store: RunRecordStore, clock: _Clock
+    ) -> None:
+        seeded = self._seeded(store, clock)
+
+        stored = list(store.stored_passes_since(self.SINCE))
+
+        assert [(item.command_key, item.pass_id) for item in stored] == [
+            *[('lint', pass_id) for pass_id in (*seeded['good_lint'], seeded['bad'][2])],
+            *[('unit', pass_id) for pass_id in (*seeded['good_unit'], *seeded['bad'][:2])],
+        ]
+
+    def test_a_well_formed_pass_carries_its_record_and_no_problem(
+        self, store: RunRecordStore, clock: _Clock
+    ) -> None:
+        seeded = self._seeded(store, clock)
+
+        stored = {item.pass_id: item for item in store.stored_passes_since(self.SINCE)}
+
+        for command in ('unit', 'lint'):
+            for offset, pass_id in zip((10, 20), seeded[f'good_{command}'], strict=True):
+                item = stored[pass_id]
+                assert item.problem is None
+                assert item.record == store.load_pass(command, pass_id)
+                assert item.directory == store.pass_directory(command, pass_id)
+                assert item.started_at == self.SINCE + timedelta(minutes=offset)
+                assert item.command_key == command_key(command)
+
+    def test_a_malformed_or_unreadable_record_is_reported_not_skipped(
+        self, store: RunRecordStore, clock: _Clock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        seeded = self._seeded(store, clock)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.offline_lane_records'):
+            stored = {item.pass_id: item for item in store.stored_passes_since(self.SINCE)}
+
+        for pass_id in seeded['bad']:
+            item = stored[pass_id]
+            assert item.record is None
+            assert item.problem
+            assert str(item.directory / 'record.json') in item.problem
+        assert caplog.records == []
+
+    def test_a_pass_before_the_cut_and_a_stray_directory_are_not_yielded(
+        self, store: RunRecordStore, clock: _Clock
+    ) -> None:
+        self._seeded(store, clock)
+
+        stored = list(store.stored_passes_since(self.SINCE))
+
+        assert all(item.started_at >= self.SINCE for item in stored)
+        assert 'scratch' not in {item.pass_id for item in stored}
+        assert len(stored) == 7
+
+    def test_a_store_whose_root_does_not_exist_yields_nothing_and_creates_nothing(
+        self, tmp_path: Path, clock: _Clock
+    ) -> None:
+        absent = tmp_path / 'absent'
+        store = RunRecordStore(absent, clock=clock)
+
+        assert list(store.stored_passes_since(T0)) == []
+        assert not absent.exists()
+
+
 class TestRetention:
     def _allocate_aged(self, store: RunRecordStore, clock: _Clock, now: datetime, days: int) -> str:
         clock.current = now - timedelta(days=days)
