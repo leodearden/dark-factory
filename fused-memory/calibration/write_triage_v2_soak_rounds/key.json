@@ -8487,6 +8487,36 @@
       "basis": "current",
       "entry_id": "85c91566-7979-42c3-adbd-b37243d06530",
       "target_id": "83bd116c-2378-452c-afba-5ba9b6347b70"
+    },
+    "third_03-000": {
+      "basis": "current",
+      "entry_id": "199a198a-4c17-45c9-abb4-7e53a566a9f6",
+      "target_id": "3bdfde1b-d0e8-4ca1-81dd-915e80e54f73"
+    },
+    "third_03-001": {
+      "basis": "current",
+      "entry_id": "4281bc49-5186-4510-827f-601b742b4e20",
+      "target_id": "14a8f37b-4c10-4a9a-bce8-599fdc410aed"
+    },
+    "third_03-002": {
+      "basis": "current",
+      "entry_id": "6227d163-4124-4d2a-ad5f-566c90d7191c",
+      "target_id": "31b0877a-3fbb-41ec-b673-561c87df47e9"
+    },
+    "third_03-003": {
+      "basis": "current",
+      "entry_id": "6267c407-6a28-4e67-91b1-a3cfa7bd8668",
+      "target_id": "159710b7-6f2f-4033-8af2-e3c5258d22d2"
+    },
+    "third_03-004": {
+      "basis": "current",
+      "entry_id": "7778aaaf-3aa9-4666-9a1f-affe0b0cf92e",
+      "target_id": "05ba0405-af7b-4ca5-9232-316420676af5"
+    },
+    "third_03-005": {
+      "basis": "current",
+      "entry_id": "dfb6eb8d-a38d-4bd4-98c6-9385d43fb25d",
+      "target_id": "d361e166-5631-43dc-8dd2-7c148301774c"
     }
   },
   "rerates": [
@@ -10810,6 +10840,20 @@
         "third_02-001"
       ],
       "rater": "opus-third-02",
+      "role": "third",
+      "round": 0
+    },
+    "third_03": {
+      "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
+      "items": [
+        "third_03-000",
+        "third_03-001",
+        "third_03-002",
+        "third_03-003",
+        "third_03-004",
+        "third_03-005"
+      ],
+      "rater": "opus-third-03",
       "role": "third",
       "round": 0
     }
