@@ -68,7 +68,7 @@ class TestSchedulerCallbacksDataclass:
     def test_is_frozen(self):
         callbacks = SchedulerCallbacks()
         with pytest.raises(dataclasses.FrozenInstanceError):
-            callbacks.on_park_stop_trip = lambda reason, pause_class: None  # type: ignore[misc]
+            callbacks.on_park_stop_trip = lambda reason: None  # type: ignore[misc]
 
 
 class TestSchedulerConstructorCallbacks:
