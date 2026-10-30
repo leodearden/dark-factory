@@ -27,10 +27,15 @@ import os
 import subprocess
 from pathlib import Path
 
+_KEPT_GIT_ENV = frozenset({'GIT_CEILING_DIRECTORIES'})
+
 
 def run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """``git *args`` run in *cwd*, whatever its exit code."""
-    env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    env = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith('GIT_') or key in _KEPT_GIT_ENV
+    }
     command = ['git', *args]
     try:
         return subprocess.run(
