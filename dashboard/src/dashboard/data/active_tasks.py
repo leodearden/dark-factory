@@ -78,7 +78,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -254,6 +254,37 @@ _TASKS_TOTAL_BUDGET = 20.0
 # 5128 tasks, reify 7279) and seven that finish in under 0.1 s — in
 # ``ceil(9/4) = 3`` waves. ``test_tasks_budget.py`` (f) holds it in (1, 8].
 _TASKS_ROOT_CONCURRENCY = 4
+
+
+@dataclass(frozen=True, slots=True)
+class TasksBudget:
+    """The three bounds the per-root fan-out runs under.
+
+    Both collectors take one as ``budget=``. Every bound must be able to serve
+    a root: a non-positive time bound serves nothing, and a zero-width
+    semaphore admits no root and hangs the walk.
+    """
+
+    per_project: float
+    total: float
+    root_concurrency: int
+
+    def __post_init__(self) -> None:
+        for name, seconds in (('per_project', self.per_project), ('total', self.total)):
+            if not seconds > 0:
+                raise ValueError(f'TasksBudget.{name} must be positive, got {seconds!r}')
+        if self.root_concurrency < 1:
+            raise ValueError(
+                f'TasksBudget.root_concurrency must be at least 1, got {self.root_concurrency!r}'
+            )
+
+
+TASKS_BUDGET = TasksBudget(
+    per_project=_TASKS_PER_PROJECT_BUDGET,
+    total=_TASKS_TOTAL_BUDGET,
+    root_concurrency=_TASKS_ROOT_CONCURRENCY,
+)
+"""The shipped budget; ``dashboard/tests/test_tasks_budget.py`` checks its constants' mutual constraints."""
 
 # Admission-order rotation offset for `collect_tasks_with_counts`, advanced by
 # one slot per render. Module state, like the `_*_cache` objects elsewhere in
@@ -783,8 +814,9 @@ async def _serve_roots_within_budget(
     *,
     now: datetime,
     deadline: float,
+    budget: TasksBudget,
 ) -> list[tuple[Path, list[dict], TaskSnapshot]]:
-    """Run *share* for every configured root inside the Tasks budget.
+    """Run *share* for every configured root inside the Tasks *budget*.
 
     THE budgeted per-root fan-out, shared by every collector of the snapshot
     units so they honour the same invariants: one bad root must not blank the
@@ -813,7 +845,7 @@ async def _serve_roots_within_budget(
     # Admission control, not a work queue: the coroutines are all created up
     # front and the semaphore decides how many shares are running at once.
     # See _TASKS_ROOT_CONCURRENCY for why the width is bounded.
-    slots = asyncio.Semaphore(_TASKS_ROOT_CONCURRENCY)
+    slots = asyncio.Semaphore(budget.root_concurrency)
 
     def _unreached(
         root: Path, reason: str, failure: SnapshotFailure,
@@ -854,7 +886,7 @@ async def _serve_roots_within_budget(
                 # invisible failure the fan-out logging policy was raised to
                 # WARNING to close.
                 reason = (
-                    f'skipped — the {_TASKS_TOTAL_BUDGET:.1f}s Tasks budget was '
+                    f'skipped — the {budget.total:.1f}s Tasks budget was '
                     'already spent before this project was reached'
                 )
                 logger.warning(
@@ -865,12 +897,12 @@ async def _serve_roots_within_budget(
                 return _unreached(root, reason, SnapshotFailure.BUDGET)
             try:
                 return await asyncio.wait_for(
-                    share(root), timeout=min(remaining, _TASKS_PER_PROJECT_BUDGET),
+                    share(root), timeout=min(remaining, budget.per_project),
                 )
             except TimeoutError:
                 reason = (
-                    f'exceeded its {_TASKS_PER_PROJECT_BUDGET:.1f}s share of the '
-                    f'{_TASKS_TOTAL_BUDGET:.1f}s Tasks budget '
+                    f'exceeded its {budget.per_project:.1f}s share of the '
+                    f'{budget.total:.1f}s Tasks budget '
                     f'({remaining:.1f}s remained)'
                 )
                 logger.warning(
@@ -939,6 +971,7 @@ async def collect_tasks_with_counts(
     *,
     resolve_external: bool = False,
     now: datetime | None = None,
+    budget: TasksBudget = TASKS_BUDGET,
 ) -> tuple[list[dict], dict[str, TaskSnapshot]]:
     """Aggregate every root's active rows and its task snapshot in one pass.
 
@@ -970,17 +1003,17 @@ async def collect_tasks_with_counts(
     ``value is None``, because ``[]`` would claim a measured zero.
 
     **Bounded as a whole, not merely per call.**  A ``loop.time()`` deadline
-    (``_TASKS_TOTAL_BUDGET``) is taken up front and each project is run under
-    ``asyncio.wait_for`` at ``min(remaining, _TASKS_PER_PROJECT_BUDGET)``,
+    (``budget.total``) is taken up front and each project is run under
+    ``asyncio.wait_for`` at ``min(remaining, budget.per_project)``,
     copying ``app.healthz``'s loop shape rather than inventing one.
 
     **Concurrent at a bounded width.**  The walk used to be SEQUENTIAL, which
     made this function's worst case the SUM of every project's worst case —
     so at the 9 roots of the 2026-08-27 incident the total budget could not
     fit them all and the trailing roots degraded on every render.  Roots are
-    now admitted through an ``asyncio.Semaphore(_TASKS_ROOT_CONCURRENCY)``, so
-    the worst case is roughly ``ceil(roots / _TASKS_ROOT_CONCURRENCY) *
-    _TASKS_PER_PROJECT_BUDGET``.  The deadline is still what BOUNDS it —
+    now admitted through an ``asyncio.Semaphore(budget.root_concurrency)``, so
+    the worst case is roughly ``ceil(roots / budget.root_concurrency) *
+    budget.per_project``.  The deadline is still what BOUNDS it —
     concurrency changes the cost, not the guarantee.  The width is bounded
     rather than unbounded because the fan-out targets a single fused-memory
     server (where the requests serialise server-side regardless) over the
@@ -1040,13 +1073,16 @@ async def collect_tasks_with_counts(
     stamped with one instant, so the skew between them is measured and
     reported (``snapshot.skew_seconds``) rather than implied by two caches at
     different TTLs. That skew used to be up to ~15 s and undisclosed.
+
+    *budget* bounds the walk; production callers pass none and get the
+    shipped :data:`TASKS_BUDGET`.
     """
     effective_now = resolve_now(now)
     # The deadline is taken BEFORE the runtime fan-out, so that fan-out is
     # inside the budget too rather than being free time the projects then pay
     # for. Same shape as app.healthz's whole-handler deadline.
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + _TASKS_TOTAL_BUDGET
+    deadline = loop.time() + budget.total
     labels = config.project_labels
     runtime_by_label = await fetch_task_runtime(client, config.escalation_urls)
 
@@ -1060,7 +1096,7 @@ async def collect_tasks_with_counts(
     all_active: list[dict] = []
     snapshots: dict[str, TaskSnapshot] = {}
     served = await _serve_roots_within_budget(
-        config, _share, now=effective_now, deadline=deadline,
+        config, _share, now=effective_now, deadline=deadline, budget=budget,
     )
     # This is the only place the shared accumulators are written, in the
     # canonical root order the fan-out hands back.
@@ -1091,7 +1127,7 @@ async def collect_tasks_with_counts(
                 'external dep statuses skipped for %d id(s) — the %.1fs Tasks '
                 'budget was spent by the per-project walk; every external dep '
                 "keeps its 'unknown' sentinel for this render",
-                len(dep_ids), _TASKS_TOTAL_BUDGET,
+                len(dep_ids), budget.total,
             )
         elif dep_ids:
             # BOUNDED, not merely deadline-checked. The check above only
@@ -1114,7 +1150,7 @@ async def collect_tasks_with_counts(
                     'external dep statuses for %d id(s) exceeded the %.1fs '
                     'remaining of the %.1fs Tasks budget — every external dep '
                     "keeps its 'unknown' sentinel for this render",
-                    len(dep_ids), ext_remaining, _TASKS_TOTAL_BUDGET,
+                    len(dep_ids), ext_remaining, budget.total,
                 )
                 status_map = {}
             map_offline = bool(status_map.get('offline'))
@@ -1135,6 +1171,7 @@ async def collect_census_snapshots(
     config: DashboardConfig,
     *,
     now: datetime | None = None,
+    budget: TasksBudget = TASKS_BUDGET,
 ) -> dict[str, TaskSnapshot]:
     """Every root's task snapshot with its rows WITHHELD: the census-only render.
 
@@ -1154,16 +1191,18 @@ async def collect_census_snapshots(
     which carries the whole ``metadata`` blob, can reach the wire through a
     caller forgetting to strip it. An unmeasured half keeps its producer's
     reason.
+
+    *budget* bounds the walk exactly as it does for the full collector.
     """
     effective_now = resolve_now(now)
-    deadline = asyncio.get_running_loop().time() + _TASKS_TOTAL_BUDGET
+    deadline = asyncio.get_running_loop().time() + budget.total
 
     async def _share(root: Path) -> tuple[list[dict], TaskSnapshot]:
         snapshot = await acquire_snapshot(client, config, root, now=effective_now)
         return [], withhold_rows(snapshot)
 
     served = await _serve_roots_within_budget(
-        config, _share, now=effective_now, deadline=deadline,
+        config, _share, now=effective_now, deadline=deadline, budget=budget,
     )
     labels = config.project_labels
     return {labels.of(root): snapshot for root, _rows, snapshot in served}
