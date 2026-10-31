@@ -923,14 +923,10 @@ class TestSessionCaptureLifecycle:
         journal.clear_run_session.assert_awaited_once_with('run-sc2')
 
     @pytest.mark.asyncio
-    async def test_preserves_session_snapshot_on_cancel(self, tmp_path):
-        """On asyncio.CancelledError from the runner (a restart interrupting an
-        in-flight stage), the session snapshot is PRESERVED — clear_run_session
-        is NOT called — so the interrupted run row retains session_id +
-        stage_cursor for the startup adopt-and-resume pass (task σ).
-
-        Contrast test_clear_runs_even_when_runner_raises: a NON-cancel exception
-        still clears (only a genuine cancellation preserves the snapshot)."""
+    async def test_clears_session_snapshot_on_cancel(self, tmp_path):
+        """A cancellation from the runner (a restart or the cycle deadline)
+        clears the session snapshot like any other exit, so the run row shows a
+        session only while a stage is in flight, and still propagates."""
         stage, journal = self._make_stage_with_real_journal_dir(tmp_path)
         watermark = Watermark(project_id='test_project')
 
@@ -940,11 +936,8 @@ class TestSessionCaptureLifecycle:
         ), pytest.raises(asyncio.CancelledError):
             await stage.run([], watermark, [], run_id='run-cancel')
 
-        # Mint-before-spawn happened...
         journal.record_run_session.assert_awaited_once()
-        # ...but clear_run_session was NOT called on cancellation — the snapshot
-        # survives on the interrupted run row for the resume pass.
-        journal.clear_run_session.assert_not_awaited()
+        journal.clear_run_session.assert_awaited_once_with('run-cancel')
 
     @pytest.mark.asyncio
     async def test_clear_called_exactly_once_on_normal_return(self, tmp_path):
@@ -1140,8 +1133,8 @@ class TestStageTranscriptArchival:
 
     @pytest.mark.asyncio
     async def test_archival_runs_even_when_the_stage_is_cancelled(self, tmp_path):
-        """Interrupted runs skip the harness gc, so here the producer hook is the
-        ONLY archival; the cancel-preserves-snapshot contract is untouched."""
+        """A cancelled stage still archives its transcript, and clears its
+        session snapshot."""
         stage, journal = self._make_archiving_stage(tmp_path)
         captured: dict = {}
 
@@ -1155,7 +1148,7 @@ class TestStageTranscriptArchival:
 
         archived = self._archived(tmp_path, 'run-a3', captured['session_id'])
         assert archived.read_bytes() == self.TRANSCRIPT
-        journal.clear_run_session.assert_not_awaited()
+        journal.clear_run_session.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_archival_runs_when_clear_run_session_fails(self, tmp_path):
