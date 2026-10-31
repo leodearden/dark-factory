@@ -1,9 +1,11 @@
 """Tests for memory_eval_retrieval_probe.py — the E1 retrieval-health probe.
 
-The script is loaded via importlib so it can be tested without sys.path
+The registry contract and the pure metric math are imported from
+``fused_memory.eval.topic_registry`` and ``fused_memory.eval.retrieval_probe``.
+The derivation, report and runner bands still live in the script, which is
+loaded lazily via importlib (``_mod()``) so it can be tested without sys.path
 pollution — mirrors the pattern in test_calibrate_write_triage.py and
-test_audit_duplicate_memories.py. The loader is invoked lazily (``_mod()``)
-so the committed-fixture contract tests stay runnable independently.
+test_audit_duplicate_memories.py.
 
 **Lane discipline.** Every test in this file except the single seeded
 induced-regression test is free of network, Qdrant, OPENAI_API_KEY and any
@@ -1932,6 +1934,7 @@ class TestBuildSeries:
     def test_tripwire_items_are_one_per_topic_keyed_by_slug(self):
         """(d) The item_key shape alpha's grandfather set persists."""
         tripwire = {m.metric_id: m for m in _build().metrics}['topic-canonical-present']
+        assert tripwire.items is not None
         keys = {item.item_key for item in tripwire.items}
 
         assert keys == {'t-alpha-topic', 't-beta-topic'}
@@ -1945,6 +1948,7 @@ class TestBuildSeries:
         """
         series = _build(_observations(miss_held_out=('beta-topic',)))
         tripwire = {m.metric_id: m for m in series.metrics}['topic-canonical-present']
+        assert tripwire.items is not None
         passed = {item.item_key: item.passed for item in tripwire.items}
 
         assert passed['t-alpha-topic']
@@ -1988,6 +1992,7 @@ class TestBuildSeries:
         for metric in _build().metrics:
             if metric.kind != 'proportion':
                 continue
+            assert metric.denominator is not None
             successes = metric.value * metric.denominator
             assert abs(successes - round(successes)) < 1e-9, metric.metric_id
 
@@ -2126,7 +2131,7 @@ class TestBuildSeries:
 
         assert by_id['canonical-in-top-5'].denominator == 2
         tripwire = by_id['topic-canonical-present']
-        assert [item.passed for item in tripwire.items] == [True]
+        assert [item.passed for item in tripwire.items or []] == [True]
 
     def test_a_metric_with_no_scored_trials_is_absent_not_zero(self):
         """An absent proportion is honest; a 0/0 one would be a fabricated trial."""
@@ -3548,7 +3553,7 @@ class TestTripwireCensusSplit:
 
         assert {
             f'{topic_registry.TRIPWIRE_ITEM_PREFIX}{t.topic}': t.passed for t in split.topics
-        } == {item.item_key: item.passed for item in _tripwire(series).items}
+        } == {item.item_key: item.passed for item in _tripwire(series).items or []}
 
     def test_an_all_degraded_topic_is_in_no_class(self, tmp_path):
         split = self._split(tmp_path)
