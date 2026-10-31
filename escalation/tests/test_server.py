@@ -28,6 +28,7 @@ from shared.merge_state import MergeReason
 from escalation import server as escalation_server
 from escalation.canonical import canonical_root_cause
 from escalation.dedupe import DedupeConfig, summary_dedupe_key
+from escalation.grant_delivery import GrantDelivery
 from escalation.merge_status_answer import hint_for
 from escalation.models import Escalation
 from escalation.queue import _MAX_AMENDMENTS, EscalationQueue
@@ -1579,6 +1580,164 @@ class TestResolveIssueGrantedFiles:
         record = queue.get(esc.id)
         assert record is not None
         assert record.granted_files == []
+
+
+_GRANT_TASK = 't-grant-delivery'
+_GRANTED = ['pkg/b.py']
+
+
+def _probe_harness(blocker: GrantDelivery | None) -> types.SimpleNamespace:
+    return types.SimpleNamespace(granted_files_delivery_blocker=lambda _task_id: blocker)
+
+
+def _raising_probe_harness() -> types.SimpleNamespace:
+    def _probe(_task_id: str) -> GrantDelivery | None:
+        raise RuntimeError('probe exploded')
+
+    return types.SimpleNamespace(granted_files_delivery_blocker=_probe)
+
+
+def _assert_shortfall(result: dict[str, Any], expected: GrantDelivery) -> None:
+    assert result['granted_files_delivery'] == expected
+    reason = result['granted_files_delivery_reason']
+    assert _GRANT_TASK in reason
+    for path in _GRANTED:
+        assert path in reason
+
+
+class TestResolveIssueGrantedFilesDelivery:
+    """Every success return of resolve_issue says what became of granted_files (task 5650).
+
+    ``granted_files_delivery`` is always present, mirroring
+    ``late_resolution_captured``: the returned record looks identically
+    healthy whether or not the grant will land.
+    """
+
+    def _seed(self, queue: EscalationQueue) -> Escalation:
+        return seed_escalation(queue, level=0, task_id=_GRANT_TASK)
+
+    @pytest.mark.asyncio
+    async def test_no_grant_is_none_granted(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='fixed', action='resume',
+        )
+
+        assert result['granted_files_delivery'] == GrantDelivery.NONE_GRANTED
+        assert 'granted_files_delivery_reason' not in result
+
+    @pytest.mark.asyncio
+    async def test_an_unblocked_resume_grant_is_scheduled(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        assert result['granted_files_delivery'] == GrantDelivery.SCHEDULED
+        assert 'granted_files_delivery_reason' not in result
+
+    @pytest.mark.asyncio
+    async def test_no_harness_is_no_orchestrator(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.NO_ORCHESTRATOR)
+
+    @pytest.mark.asyncio
+    async def test_a_probe_blocker_is_reported(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue, harness=_probe_harness(GrantDelivery.NO_PLAN_TO_WIDEN),
+        )
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.NO_PLAN_TO_WIDEN)
+
+    @pytest.mark.asyncio
+    async def test_a_close_only_grant_does_not_apply(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='closed', action='close_only',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.ACTION_DOES_NOT_APPLY_GRANTS)
+
+    @pytest.mark.asyncio
+    async def test_a_park_grant_is_reported_and_discarded(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='parked', action='park',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.ACTION_DOES_NOT_APPLY_GRANTS)
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.granted_files == [], 'park discards the grant outright'
+
+    @pytest.mark.asyncio
+    async def test_a_grant_on_an_already_closed_record_is_record_not_open(
+        self, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+        await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='closed', action='close_only',
+        )
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.RECORD_NOT_OPEN)
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.granted_files == []
+
+    @pytest.mark.asyncio
+    async def test_a_raising_probe_still_resolves_and_reports_scheduled(
+        self, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_raising_probe_harness())
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        assert result['granted_files_delivery'] == GrantDelivery.SCHEDULED
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'resolved'
 
 
 # ---------------------------------------------------------------------------
