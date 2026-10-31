@@ -12,7 +12,7 @@ import pytest
 from _git_fixtures import seed_repo
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, GitQueryFailed, _run
 
 
 async def _git(repo: Path, *args: str) -> str:
@@ -66,13 +66,16 @@ def repo(tmp_path: Path) -> Path:
     return seed_repo(tmp_path / 'repo')
 
 
-@pytest.fixture
-def git_ops(repo: Path) -> GitOps:
-    config = GitConfig(
+def _git_config() -> GitConfig:
+    return GitConfig(
         main_branch='main', branch_prefix='task/', remote='origin',
         worktree_dir='.worktrees', push_after_advance=False,
     )
-    return GitOps(config, repo)
+
+
+@pytest.fixture
+def git_ops(repo: Path) -> GitOps:
+    return GitOps(_git_config(), repo)
 
 
 @pytest.mark.asyncio
@@ -141,3 +144,24 @@ class TestResolveRebasedCitation:
         assert result is not None
         assert result['landed'] == landed.s1_landed
         assert result['method'] == 'patch-id'
+
+
+@pytest.mark.asyncio
+class TestCommitsNamed:
+    async def test_maps_each_commit_token_to_its_full_sha_and_drops_the_rest(
+        self, repo, git_ops,
+    ):
+        head = await _git(repo, 'rev-parse', 'HEAD')
+        tree = await _git(repo, 'rev-parse', 'HEAD^{tree}')
+        tokens = [
+            head, head[:10], tree, '20261023', '3f2a9c1e', '5c8d0b7f1a33', '9c1e7b4d5a609e21',
+        ]
+
+        assert await git_ops.commits_named(tokens) == {head: head, head[:10]: head}
+
+    async def test_a_directory_that_is_not_a_repository_raises(self, tmp_path):
+        plain = tmp_path / 'plain'
+        plain.mkdir()
+
+        with pytest.raises(GitQueryFailed):
+            await GitOps(_git_config(), plain).commits_named(['abc1234'])
