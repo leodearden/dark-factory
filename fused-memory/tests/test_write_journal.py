@@ -1617,7 +1617,7 @@ async def test_record_terminal_outcome_returns_false_and_logs_on_db_error(
 # ------------------------------------------------------------------
 # write_ops retention (task 3212 item 4)
 #
-# Unlike its two siblings this prune runs against a table measured at
+# Unlike its single-DELETE siblings this prune runs against a table measured at
 # 35.4M rows / 16 GB on 2026-09-11, so it is BATCHED and doubly bounded —
 # by a row budget and by a wall-clock deadline. Both bounds are asserted
 # here, because an unbounded startup DELETE would hold the write lock past
