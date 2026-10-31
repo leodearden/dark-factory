@@ -23,16 +23,19 @@ from _lane_episode_fakes import (
     HEAD1,
     HEAD2,
     HEAD3,
+    T0,
     A,
     B,
     C,
     Lane,
+    _episode,
     _episodes_path,
+    _record,
 )
 from escalation.queue import EscalationQueue
 from shared.task_submit import SubmitFailed, SubmittedTask, SubmittedTicket
 
-from orchestrator.offline_lane_episode_state import unconfirmable_node
+from orchestrator.offline_lane_episode_state import EpisodeStore, unconfirmable_node
 from orchestrator.offline_lane_episodes import TickResult
 from orchestrator.offline_lane_escalations import (
     STUCK_FILING_CATEGORY,
@@ -1107,3 +1110,34 @@ async def test_r14_an_unlistable_run_record_directory_seeds_nothing_and_the_pass
         r.levelno == logging.ERROR and 'run records unreadable, no history seeded' in r.getMessage()
         for r in caplog.records
     )
+
+
+# --- R15: a command whose tick raises is logged and skipped, the other commands go on --------
+
+BROKEN = 'broken'
+
+
+def _plant_broken(lane: Lane) -> None:
+    """A stored record whose due filing has no counted pass, so every tick of it raises in the filing's
+    evidence check; planted before any other command's pass, so it comes first in the store's commands."""
+    broken = _episode(A, counted_passes=(), filing_due=True, filing_due_since=T0, reproduce='pytest -m integration tests')
+    EpisodeStore(lane.tmp_path, clock=lane.clock).save(replace(_record(broken), command=BROKEN))
+    lane.restarted()
+
+
+@pytest.mark.asyncio
+async def test_one_command_whose_record_makes_its_tick_raise_leaves_the_other_commands_ticked(tmp_path, caplog):
+    lane = Lane(tmp_path)
+    _plant_broken(lane)
+    await lane.red()
+    lane.clock.advance(minutes=30)
+
+    with caplog.at_level(logging.ERROR, logger='orchestrator.offline_lane_episodes'):
+        tick = await lane.tick()
+
+    assert tick.commands_due == (COMMAND,)
+    assert any(
+        r.levelno == logging.ERROR and all(text in r.getMessage() for text in (BROKEN, 'ValueError', 'counted pass'))
+        for r in caplog.records
+    )
+    assert lane.stored(BROKEN).episodes[A].filing_due is True
