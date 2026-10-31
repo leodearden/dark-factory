@@ -34,7 +34,7 @@ def _gate_magicmock_test_dirs(lint_command: str) -> list[str]:
     phantom target, and an undeclared option fails the gate itself. If
     ``run_cli`` gains a value-taking option, pass a set naming it here.
     """
-    label ="dark-factory-orchestrator.yaml lint_command (task 6308)"
+    label = "dark-factory-orchestrator.yaml lint_command (task 6308)"
     segment = vci.required_segment(lint_command, _MAGICMOCK_CHECKER, label=label)
     return vci.positional_targets(segment, _MAGICMOCK_CHECKER, path_anchor=True, label=label)
 

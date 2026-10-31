@@ -50,7 +50,7 @@ def _gate_ruff_targets(lint_command: str) -> list[str]:
     ``verify_command_invariants`` beside ``RUFF``, as task 6172 did for
     ``PYTEST_VALUE_FLAGS``.
     """
-    label ="dark-factory-orchestrator.yaml lint_command (task 5338)"
+    label = "dark-factory-orchestrator.yaml lint_command (task 5338)"
     segment = vci.required_segment(lint_command, vci.RUFF, label=label)
     return vci.positional_targets(segment, vci.RUFF, label=label)
 
