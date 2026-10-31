@@ -209,8 +209,8 @@ class UnitSpec:
     # value-comparing them would report drift on every machine that is not
     # this one — a gate that fires unconditionally is a gate that gets
     # switched off. Their MEANINGFUL content is still reached, just not by
-    # string equality: exec_start_flags compares the uvicorn flags inside
-    # ExecStart individually, ignoring the host-specific prefix.
+    # string equality: exec_start_flags and exec_start_switches compare the
+    # options inside ExecStart individually, ignoring the host-specific prefix.
     present_only: tuple[tuple[str, str], ...] = ()
     # Section whose Environment= directives are compared by variable-NAME set
     # (values compared only for names off DIVERGENCE_ALLOWLIST). None disables
@@ -222,8 +222,9 @@ class UnitSpec:
     # side alone is reported, which is the whole point on a unit that should
     # declare none at all.
     environment_section: str | None = None
-    # Bare uvicorn flag names (no leading '--') compared INSIDE [Service]
-    # ExecStart. This is how a presence-only ExecStart still gets its
+    # Bare names (no leading '--') of options that TAKE an argument on the
+    # [Service] ExecStart command line, uv's as well as uvicorn's, compared by
+    # that argument. This is how a presence-only ExecStart still gets its
     # meaningful content checked: the host-specific `uv` path and repo-root
     # prefix are ignored, while a stale --timeout-graceful-shutdown is not.
     exec_start_flags: tuple[str, ...] = ()
@@ -809,7 +810,7 @@ UNITS: dict[str, UnitSpec] = {
         present_only=(
             # All three carry absolute host paths (/home/leo/.local/bin/uv,
             # the repo root). Presence only; ExecStart's content is reached
-            # via exec_start_flags.
+            # via exec_start_flags and exec_start_switches.
             ("Unit", "Documentation"),
             ("Service", "ExecStart"),
             ("Service", "WorkingDirectory"),
@@ -849,6 +850,17 @@ UNITS: dict[str, UnitSpec] = {
             # can reach.
             "host",
             "port",
+            # `--project dashboard` is relative (resolved against
+            # WorkingDirectory=) and host-invariant in both the template and
+            # the committed unit, so it is value-comparable.
+            "project",
+        ),
+        exec_start_switches=(
+            # Task 5553 (commit 93e62a6c8f) put `uv run --no-sync` on every
+            # committed uv-run unit: only --no-sync stops a process start from
+            # re-syncing the shared root .venv. On 2026-10-05 the installed
+            # copy lacked it while this gate reported parity.
+            "no-sync",
         ),
     ),
     "dark-factory-dashboard-watchdog.service": UnitSpec(
