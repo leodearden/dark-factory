@@ -1820,7 +1820,7 @@ class TestTheDiscardedJudgeScoreIsLoggedNotSwallowed:
     these also exercise the `where=` plumbing that exists solely to serve it.
     """
 
-    _LOGGER = 'orchestrator.evals.report'
+    _LOGGER = 'orchestrator.evals.cell_admission'
 
     @staticmethod
     def _floor_records(caplog):
