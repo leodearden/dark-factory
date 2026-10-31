@@ -1118,13 +1118,14 @@ def test_exec_start_flag_lookup_ignores_the_comment_block():
     spec = _flag_spec(mod, "timeout-keep-alive")
 
     # The repo copy really runs the flag; the installed copy only MENTIONS it
-    # in the comment block, having dropped it from the command.
+    # in the comment block, having dropped it from the command. Both carry
+    # --log-level, so that unregistered option compares equal by presence.
     installed = _exec_unit("/usr/bin/uv", "/opt/df", "--log-level info")
     assert "--timeout-keep-alive" in installed, "fixture must retain the prose mention"
 
     drifts = mod.compare_unit(
         spec,
-        _exec_unit("/usr/bin/uv", "/opt/df", "--timeout-keep-alive 5"),
+        _exec_unit("/usr/bin/uv", "/opt/df", "--timeout-keep-alive 5 \\\n  --log-level info"),
         installed,
     )
 
@@ -1144,21 +1145,87 @@ def test_exec_start_flags_absent_from_both_is_not_drift():
     assert mod.compare_unit(spec, text, text) == []
 
 
-def test_exec_start_flag_helper_reads_the_parsed_value():
-    """_exec_start_flag returns the raw token, or None when the flag is absent.
+def test_read_exec_start_options_reads_each_option_by_its_kind():
+    """A flag reads as its raw argument, a switch as its token, an absent option as None.
 
-    Raw token, not int: --host 127.0.0.1 must work as well as --port 8080.
+    Raw token, not int: --host 127.0.0.1 must work as well as --port 8080. An
+    option the spec does not register reads as its token, by presence.
     """
     mod = _load_checker()
+    spec = mod.UnitSpec(
+        name="fixture.service",
+        repo_relpath="dashboard/fixture.service",
+        exec_start_flags=("host", "port", "timeout-keep-alive", "workers"),
+        exec_start_switches=("no-sync", "frozen"),
+    )
     parsed = systemd_unit_parity.parse_unit_directives(
-        _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS)
+        _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS, run_options=_NO_SYNC_RUN)
     )["Service"]
 
-    assert mod._exec_start_flag(parsed, "host") == "127.0.0.1"
-    assert mod._exec_start_flag(parsed, "port") == "8080"
-    assert mod._exec_start_flag(parsed, "timeout-keep-alive") == "5"
-    assert mod._exec_start_flag(parsed, "workers") is None
-    assert mod._exec_start_flag({}, "host") is None
+    readings = spec.read_exec_start_options(parsed)
+
+    assert readings["host"] == "127.0.0.1"
+    assert readings["port"] == "8080"
+    assert readings["timeout-keep-alive"] == "5"
+    assert readings["workers"] is None
+    assert readings["no-sync"] == "--no-sync"
+    assert readings["frozen"] is None
+    assert readings["project"] == "--project"
+    assert spec.read_exec_start_options({}) == dict.fromkeys(
+        ("host", "port", "timeout-keep-alive", "workers", "no-sync", "frozen")
+    )
+
+
+def test_flag_present_without_an_argument_reads_as_no_argument():
+    """A flag followed by another option, ending the command, or spelled `--flag=`.
+
+    Each is present but carries no argument, so it reads as NO_ARGUMENT —
+    never as the next option's token, and never as absent.
+    """
+    mod = _load_checker()
+    spec = _flag_spec(mod, "project", "timeout-keep-alive")
+
+    followed_or_last = systemd_unit_parity.parse_unit_directives(
+        _exec_unit(
+            "/usr/bin/uv", "/opt/df", "--timeout-keep-alive", run_options="--project --no-sync"
+        )
+    )["Service"]
+    readings = spec.read_exec_start_options(followed_or_last)
+    assert readings["project"] == mod.NO_ARGUMENT
+    assert readings["timeout-keep-alive"] == mod.NO_ARGUMENT
+
+    empty_equals = systemd_unit_parity.parse_unit_directives(
+        _exec_unit("/usr/bin/uv", "/opt/df", "--timeout-keep-alive=")
+    )["Service"]
+    assert spec.read_exec_start_options(empty_equals)["timeout-keep-alive"] == mod.NO_ARGUMENT
+
+
+def test_exec_start_flag_that_lost_its_argument_is_drift_naming_no_argument():
+    """`--project --no-sync` on the installed copy is an argument drift on --project.
+
+    The installed value is NO_ARGUMENT, not `--no-sync`: the report says the
+    argument is missing instead of naming the neighbouring option as its value.
+    """
+    mod = _load_checker()
+    spec = mod.UnitSpec(
+        name="fixture.service",
+        repo_relpath="dashboard/fixture.service",
+        exec_start_flags=("project",),
+        exec_start_switches=("no-sync",),
+    )
+
+    drifts = mod.compare_unit(
+        spec,
+        _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS, run_options=_NO_SYNC_RUN),
+        _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS, run_options="--project --no-sync"),
+    )
+
+    assert len(drifts) == 1, drifts
+    (drift,) = drifts
+    assert drift.key == "ExecStart --project"
+    assert drift.repo_value == "dashboard"
+    assert drift.installed_value == mod.NO_ARGUMENT
+    assert "argument differs" in drift.reason, drift.reason
 
 
 def _switch_spec(mod: types.ModuleType, *switches: str):
@@ -1293,6 +1360,85 @@ def test_exec_start_switch_does_not_disturb_flag_reading():
     assert drift.installed_value == "other"
 
 
+# An option the registry never names is still compared, by presence. The
+# completeness guard further down holds the COMMITTED command's options
+# registered; these tests cover an option that exists on one copy only, which
+# that guard cannot see when the copy is the installed one.
+
+_RELOAD_TAIL = f"{_BOTH_FLAGS} \\\n  --reload"
+
+
+def test_unregistered_option_only_on_the_installed_command_is_drift():
+    """A hand-added installed-only option is drift, though no registry entry names it."""
+    mod = _load_checker()
+    spec = _flag_spec(mod, "timeout-keep-alive")
+
+    drifts = mod.compare_unit(
+        spec,
+        _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS),
+        _exec_unit("/usr/bin/uv", "/opt/df", _RELOAD_TAIL),
+    )
+
+    assert len(drifts) == 1, drifts
+    (drift,) = drifts
+    assert drift.key == "ExecStart --reload"
+    assert drift.section == "Service"
+    assert drift.repo_value == systemd_unit_parity.ABSENT
+    assert drift.installed_value == "--reload"
+    assert "absent from the repo command" in drift.reason, drift.reason
+
+
+def test_unregistered_option_only_on_the_repo_command_is_drift():
+    """Presence is compared symmetrically for an unregistered option too."""
+    mod = _load_checker()
+    spec = _flag_spec(mod, "timeout-keep-alive")
+
+    drifts = mod.compare_unit(
+        spec,
+        _exec_unit("/usr/bin/uv", "/opt/df", _RELOAD_TAIL),
+        _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS),
+    )
+
+    assert len(drifts) == 1, drifts
+    (drift,) = drifts
+    assert drift.key == "ExecStart --reload"
+    assert drift.repo_value == "--reload"
+    assert drift.installed_value == systemd_unit_parity.ABSENT
+    assert "absent from the installed command" in drift.reason, drift.reason
+
+
+def test_unregistered_option_on_both_commands_is_compared_by_presence_only():
+    """An unregistered option's argument is not compared: registering it is what does that."""
+    mod = _load_checker()
+    spec = _flag_spec(mod, "timeout-keep-alive")
+
+    drifts = mod.compare_unit(
+        spec,
+        _exec_unit("/usr/bin/uv", "/opt/df", f"{_BOTH_FLAGS} \\\n  --log-level info"),
+        _exec_unit("/usr/bin/uv", "/opt/df", f"{_BOTH_FLAGS} \\\n  --log-level=debug"),
+    )
+
+    assert drifts == [], drifts
+
+
+def test_waived_option_is_not_compared_even_by_presence():
+    """unchecked_exec_start_options means NOT compared, by argument or by presence."""
+    mod = _load_checker()
+    spec = mod.UnitSpec(
+        name="fixture.service",
+        repo_relpath="dashboard/fixture.service",
+        unchecked_exec_start_options=(("reload", "fixture reason"),),
+    )
+
+    drifts = mod.compare_unit(
+        spec,
+        _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS),
+        _exec_unit("/usr/bin/uv", "/opt/df", _RELOAD_TAIL),
+    )
+
+    assert drifts == [], drifts
+
+
 # ---------------------------------------------------------------------------
 # The UNITS registry and its staleness guard  (step-11 / step-12)
 # ---------------------------------------------------------------------------
@@ -1356,26 +1502,22 @@ def _committed_service(spec) -> dict[str, list[str]]:
     ).get("Service", {})
 
 
-def _flags_reading_an_option(mod: types.ModuleType, spec, service) -> list[str]:
-    """Registered flags of *spec* whose argument, read from *service*, is itself an option.
+def _flags_missing_their_argument(mod: types.ModuleType, spec, service) -> list[str]:
+    """Registered flags of *spec* that read as NO_ARGUMENT on *service*.
 
-    A switch mis-registered on exec_start_flags reads the NEXT option as its
-    value: `--no-sync --project dashboard` hands no-sync the argument
-    `--project`, so the comparison would track the wrong token entirely.
-    Shared by the guard and its proof, as _unregistered_directives is.
+    A switch mis-registered on exec_start_flags has no argument to read:
+    `--no-sync --project dashboard` follows no-sync with another option. Shared
+    by the guard and its proof, as _unregistered_directives is.
     """
-    return [
-        flag
-        for flag in spec.exec_start_flags
-        if (mod._exec_start_flag(service, flag) or "").startswith("-")
-    ]
+    readings = spec.read_exec_start_options(service)
+    return [flag for flag in spec.exec_start_flags if readings[flag] == mod.NO_ARGUMENT]
 
 
 def test_registry_exec_start_flags_are_really_on_the_committed_command():
     """STALENESS GUARD, flag edition: each registered flag is on the real command.
 
-    And each one reads a real ARGUMENT, not the next option — the shape a
-    switch registered on the wrong field takes.
+    And each one reads a real ARGUMENT, not NO_ARGUMENT — the shape a switch
+    registered on the wrong field takes.
     """
     mod = _load_checker()
 
@@ -1383,17 +1525,18 @@ def test_registry_exec_start_flags_are_really_on_the_committed_command():
         if not spec.exec_start_flags:
             continue
         service = _committed_service(spec)
+        readings = spec.read_exec_start_options(service)
         for flag in spec.exec_start_flags:
-            assert mod._exec_start_flag(service, flag) is not None, (
+            assert readings[flag] is not None, (
                 f"{name}: registry compares --{flag}, but it is absent from the "
                 f"committed ExecStart in {spec.repo_relpath} — the entry checks nothing."
             )
-        misread = _flags_reading_an_option(mod, spec, service)
+        misread = _flags_missing_their_argument(mod, spec, service)
         assert misread == [], (
             f"{name}: exec_start_flags registers {misread}, but on the committed "
-            f"ExecStart in {spec.repo_relpath} each is followed by another option, "
-            "so its 'argument' is that option. An argument-less option belongs on "
-            "exec_start_switches."
+            f"ExecStart in {spec.repo_relpath} each is followed by another option "
+            "or ends the command, so it takes no argument. An argument-less option "
+            "belongs on exec_start_switches."
         )
 
 
@@ -1406,8 +1549,8 @@ def test_flag_guard_fires_on_a_switch_registered_as_a_flag():
     )
     service = _committed_service(registered)
 
-    assert _flags_reading_an_option(mod, misregistered, service) == ["no-sync"]
-    assert _flags_reading_an_option(mod, registered, service) == []
+    assert _flags_missing_their_argument(mod, misregistered, service) == ["no-sync"]
+    assert _flags_missing_their_argument(mod, registered, service) == []
 
 
 def test_registry_exec_start_switches_are_really_on_the_committed_command():
@@ -1415,9 +1558,9 @@ def test_registry_exec_start_switches_are_really_on_the_committed_command():
     mod = _load_checker()
 
     for name, spec in mod.UNITS.items():
-        service = _committed_service(spec)
+        readings = spec.read_exec_start_options(_committed_service(spec))
         for switch in spec.exec_start_switches:
-            assert mod._exec_start_switch(service, switch) is not None, (
+            assert readings[switch] is not None, (
                 f"{name}: registry compares --{switch}, but it is absent from the "
                 f"committed ExecStart in {spec.repo_relpath} — the entry checks nothing."
             )

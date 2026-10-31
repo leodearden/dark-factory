@@ -59,6 +59,8 @@ are split by CLASS, because one rule cannot fit all of them:
   ``--timeout-graceful-shutdown`` is not.  Argument-taking flags are compared
   by value, argument-less switches (``--no-sync``) by presence, and every long
   option on the committed command must be compared or waived with a reason.
+  A long option the registry does not name is still compared by presence, so
+  an option on one copy only (a hand-added installed ``--reload``) is drift.
 - **Environment=** — compared by variable-NAME set (a dropped variable is
   always drift), with values compared only for names off
   ``DIVERGENCE_ALLOWLIST``.  That allowlist exists because the one measured
@@ -141,7 +143,7 @@ import argparse
 import dataclasses
 import pathlib
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Final
 
 from systemd_unit_parity import (
@@ -329,13 +331,40 @@ class UnitSpec:
         return frozenset(covered)
 
     def covered_exec_start_options(self) -> frozenset[str]:
-        """Every ExecStart long option a compare_unit branch checks, by bare name.
+        """Every ExecStart long option registered by kind (flag or switch), by bare name.
 
         The option-level counterpart of covered_directives(), read by
         ``__post_init__`` and by
         tests/scripts/test_check_dashboard_unit_parity.py::test_every_committed_exec_start_option_is_compared_or_explicitly_unchecked.
         """
         return frozenset((*self.exec_start_flags, *self.exec_start_switches))
+
+    def read_exec_start_options(
+        self, service_directives: dict[str, list[str]]
+    ) -> dict[str, str | None]:
+        """How each long option reads on one parsed [Service] ExecStart, by bare name.
+
+        A flag reads as its argument (or ``NO_ARGUMENT``), a switch as its own
+        ``--name`` token, and a registered option the command lacks as None.
+        Every other long option on the command that is not waived reads as its
+        token too, so an option the registry never names is still compared by
+        presence: the completeness guard holds only the COMMITTED command's
+        options registered, and cannot see one that exists on the installed
+        copy alone. compare_unit diffs two of these readings.
+        """
+        readings: dict[str, str | None] = {
+            **{flag: _exec_start_flag(service_directives, flag) for flag in self.exec_start_flags},
+            **{
+                switch: _exec_start_switch(service_directives, switch)
+                for switch in self.exec_start_switches
+            },
+        }
+        waived = {option for option, _reason in self.unchecked_exec_start_options}
+        unregistered = (
+            exec_start_option_names(service_directives) - self.covered_exec_start_options() - waived
+        )
+        readings.update((name, f"--{name}") for name in sorted(unregistered))
+        return readings
 
     def __post_init__(self) -> None:
         """Reject a registry entry that contradicts itself or could never run.
@@ -416,13 +445,18 @@ def _render(values: list[str] | None) -> str:
     return " | ".join(values)
 
 
+# How a flag present on the command with no argument reads: followed by another
+# long option, ending the command, or spelled ``--flag=``.
+NO_ARGUMENT: Final = "<no argument>"
+
+
 def _exec_start_argv(service_directives: dict[str, list[str]]) -> tuple[str, ...]:
     """The whitespace-split parsed [Service] ExecStart; ``_exec_start_flag`` says why parsed."""
     return tuple(" ".join(service_directives.get("ExecStart", [])).split())
 
 
 def _exec_start_flag(service_directives: dict[str, list[str]], flag: str) -> str | None:
-    """Return the argument of ``--<flag>`` in ExecStart, or None if absent.
+    """Return the argument of ``--<flag>`` in ExecStart, ``NO_ARGUMENT``, or None if absent.
 
     Reads the ALREADY-JOINED ExecStart value out of a parsed section — never
     the raw file text.  That scoping is load-bearing, and the hazard is real
@@ -438,17 +472,23 @@ def _exec_start_flag(service_directives: dict[str, list[str]], flag: str) -> str
     uvicorn's parser treats them identically, so rejecting one would report a
     reformatted-but-correct command as a missing flag.
 
-    Returns the RAW token, not an int (unlike ``_uvicorn_int_flag`` in
-    tests/scripts/test_dashboard_service_template.py, whose idiom this
-    borrows), so non-numeric flags like ``--host 127.0.0.1`` work too.
+    Returns the RAW token, not an int, so non-numeric flags like
+    ``--host 127.0.0.1`` work too.
+
+    A flag present with no argument reads as ``NO_ARGUMENT``: never as the next
+    option's token, and never as absent.  So an installed ``--project
+    --no-sync`` is reported as a missing argument rather than as the argument
+    ``--no-sync``, and a switch registered here by mistake still compares by
+    presence.
     """
     option = f"--{flag}"
     argv = _exec_start_argv(service_directives)
     for index, token in enumerate(argv):
         if token == option:
-            return argv[index + 1] if index + 1 < len(argv) else None
+            argument = argv[index + 1] if index + 1 < len(argv) else ""
+            return NO_ARGUMENT if not argument or argument.startswith("--") else argument
         if token.startswith(f"{option}="):
-            return token.removeprefix(f"{option}=") or None
+            return token.removeprefix(f"{option}=") or NO_ARGUMENT
     return None
 
 
@@ -467,7 +507,8 @@ def exec_start_option_names(service_directives: dict[str, list[str]]) -> frozens
 
     ``--name=value`` yields ``name``; a bare ``--`` is skipped. Long options
     only: short options (``-m``) and positionals (the app target) are not
-    reached. This is the enumeration the option completeness guard reads.
+    reached. This is the enumeration the option completeness guard reads, and
+    the one ``UnitSpec.read_exec_start_options`` finds unregistered options in.
     """
     names = (
         token[2:].partition("=")[0]
@@ -477,31 +518,25 @@ def exec_start_option_names(service_directives: dict[str, list[str]]) -> frozens
     return frozenset(name for name in names if name)
 
 
-_OptionReader = Callable[[dict[str, list[str]], str], str | None]
-
-
 def _compare_exec_start_options(
     spec: UnitSpec,
     repo: dict[str, dict[str, list[str]]],
     installed: dict[str, dict[str, list[str]]],
 ) -> list[Drift]:
-    """Compare ``spec.exec_start_flags`` by argument and ``exec_start_switches`` by presence.
+    """Diff ``spec.read_exec_start_options`` of the two copies, option by option.
 
-    Both kinds share one drift-building loop; only the reader differs, and a
-    switch's reader can only yield its token or None, so a switch never reaches
-    the argument-differs reason.
+    Flags compare by argument; switches and unregistered options by presence,
+    since each reads as its own token or None, so only a flag can reach the
+    argument-differs reason.
     """
     drifts: list[Drift] = []
-    repo_service = repo.get("Service", {})
-    installed_service = installed.get("Service", {})
-    options: list[tuple[str, _OptionReader]] = [
-        *((flag, _exec_start_flag) for flag in spec.exec_start_flags),
-        *((switch, _exec_start_switch) for switch in spec.exec_start_switches),
-    ]
+    repo_readings = spec.read_exec_start_options(repo.get("Service", {}))
+    installed_readings = spec.read_exec_start_options(installed.get("Service", {}))
+    names = [*repo_readings, *sorted(installed_readings.keys() - repo_readings.keys())]
 
-    for name, read in options:
-        repo_value = read(repo_service, name)
-        installed_value = read(installed_service, name)
+    for name in names:
+        repo_value = repo_readings.get(name)
+        installed_value = installed_readings.get(name)
         if repo_value == installed_value:
             continue
         if repo_value is None:
