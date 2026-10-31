@@ -4613,14 +4613,13 @@ class TestInfoL0RouterConfig:
 class TestReviewerBriefingConfig:
     """``review.reviewer_briefing`` selects the reviewer generation (task 5369).
 
-    Default diff-only, so every project keeps today's reviewer until an
-    operator flips it; green-tier, like every other review.* knob, so the
-    flip and its kill switch are a reload_config away.
+    Default d2 across the fleet (task 7972); green-tier, like every other
+    review.* knob, so its kill switch is a reload_config away.
     """
 
     @pytest.mark.usefixtures('code_default_config')
-    def test_the_default_is_diff_only(self):
-        assert OrchestratorConfig().review.reviewer_briefing is ReviewBriefing.DIFF_ONLY
+    def test_the_default_is_d2(self):
+        assert OrchestratorConfig().review.reviewer_briefing is ReviewBriefing.CONTEXT_COMPLETE
 
     def test_d2_parses_to_context_complete(self):
         config = OrchestratorConfig.model_validate({'review': {'reviewer_briefing': 'd2'}})
