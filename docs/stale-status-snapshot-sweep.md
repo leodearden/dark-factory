@@ -7,9 +7,14 @@ This doc is the single home for the design rationale of Reconciliation Stage
 retires VALID (`invalid_at IS NULL`) Graphiti edges that assert a task is
 active/pending/blocked/stalled/in-progress once that assertion is
 contradicted by the task's live status. The code keeps contracts and points
-here as `docs/stale-status-snapshot-sweep.md §"<heading>"`. Measured figures
-live in the `plans/*-report.md` artifacts cited below, never here. Edit the
+here as `docs/stale-status-snapshot-sweep.md §"<heading>"`. Edit the
 rationale in this doc, not in the code.
+
+Figures that move as the corpus grows, such as corpus sizes, read costs and
+recall censuses, live in the `plans/` artifacts cited below, never here.
+Refresh them there. The few figures quoted here are point-in-time history: the
+result of a past run, or a timing of code that no longer exists. Each is
+labelled with its run or task, and none is ever refreshed.
 
 Stage 1 (`MemoryConsolidator`) had no deterministic sweep keeping these edges
 in sync with the tasks they describe. Once a task reached a terminal status
@@ -414,11 +419,14 @@ elements in (len(run) + 1) distinct ways. Under `_ENUM_IDS_ALT`'s `+`
 repetition that is (w + 1) ** n parses, and ALL of them get explored whenever
 the overall match ultimately FAILS. That is the common case, since most
 enumerations in prose are not followed by a copula and a status marker.
-Measured before the fix on a non-matching fact: 6.1 s for 20 ids at ', ', and
-16.6 s for only NINE ids at ',\n    '. The base scales with whitespace-run
-WIDTH, so a newline-indented list wedges the sweep at a much lower id count
-than a flat 2**n reading suggests. After the fix all shapes parse in about
-0.1 ms.
+Task 3079 timed the code before the fix on a non-matching fact. A list of 20
+ids separated by ', ' took seconds, and one of only NINE ids separated by
+',\n    ' took longer still. The base scales with whitespace-run WIDTH, so a
+newline-indented list wedges the sweep at a much lower id count than a flat
+2**n reading suggests. After the fix every shape parses in well under a
+millisecond. The pre-fix timings and the current regression budget sit beside
+the test that pins them:
+`fused-memory/tests/reconciliation/test_status_snapshot_extraction.py::TestPluralEnumerationPerformance`.
 
 Possessiveness is safe here because it changes only HOW a span is parsed,
 never WHETHER it matches. Every possessive element is followed by something
@@ -608,8 +616,8 @@ measured false. Two mechanisms, both in `_ids_within_union`:
    attributed to a subject the fact never made a claim about.
 2. **Intersection at the seam.** The narrower family's ids are intersected
    with the union family's. With threading in place this is MEASURED to be a
-   no-op across the whole 800-fact `_SUBSET_PROPERTY_CORPUS`, so it is NOT the
-   fix. It makes the containment true BY CONSTRUCTION rather than by
+   no-op across the whole generated `_SUBSET_PROPERTY_CORPUS` (the counts sit
+   beside that constant in the extraction suite), so it is NOT the fix. It makes the containment true BY CONSTRUCTION rather than by
    argument, at the cost of one set intersection on the small minority of
    edges that clear the `_BLOCKED_MARKER_RE` pre-gate. It exists because the
    original "the marker alternations nest, therefore the results nest"
@@ -1187,10 +1195,9 @@ extraction regexes carry performance tests (task 3079).
 
 The corpus keeps growing, and the task-4340 pagination removed a truncation
 that had hidden about half of it, so the argument only gets STRONGER over
-time. The read that feeds it was timed on 2026-08-18 at about 3.3 s per full
-enumeration on dark_factory (about 3.7 s on reify): bounded, and roughly
-+2.6 s per cycle over the old truncated read. See the MEASURED COST section
-of `plans/falkordb-resultset-cap-audit.md`. (task 4340)
+time. The read that feeds it is bounded. Its cost per full enumeration, and
+what it adds to each cycle over the old truncated read, are in the MEASURED
+COST section of `plans/falkordb-resultset-cap-audit.md`. (task 4340)
 
 Adding the second (blocked) pattern family did NOT add a second per-edge pass
 (task 3037). The per-edge extraction is exactly ONE entry into the pipeline:
