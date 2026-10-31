@@ -11,8 +11,10 @@ plans/verify-admission-fifo-prd.delta-decision.md.
 from __future__ import annotations
 
 import json
+import math
+import random
 import sqlite3
-from collections.abc import Callable, Hashable, Mapping
+from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +26,10 @@ PLAN_EVENT_TYPE = 'verify_admission_plan'
 MEASURED_ORDER = 'arrival'
 MEASURED_OUTCOME = 'returned'
 SECS_PER_DAY = 86400.0
+SECS_PER_HOUR = 3600.0
+TASK_ROLE = 'task'
+BACKGROUND_ROLE = 'background'
+INTERVAL_QUANTILES = (0.025, 0.975)
 
 
 @dataclass(frozen=True)
@@ -88,6 +94,10 @@ class Unit:
     @property
     def ended_at(self) -> float:
         return self.final.ended_at
+
+    @property
+    def retried_attempts(self) -> tuple[Leg, ...]:
+        return self.attempts[:-1]
 
 
 def plan_units(plan: Plan, group: Grouping = BY_MODULE) -> dict[Hashable, Unit]:
@@ -175,4 +185,194 @@ def load_arrival_plans(db_path: Path) -> Sample:
         window_start=start,
         window_end=end,
         window_days=(_epoch(end) - _epoch(start)) / SECS_PER_DAY,
+    )
+
+
+@dataclass(frozen=True)
+class PlanCounts:
+    total: int
+    task: int
+    background: int
+
+
+@dataclass(frozen=True)
+class CostSide:
+    """What a cancel-on-red would have thrown away, over the headline (task-role, BY_MODULE) legs."""
+
+    avoidable_legs: int
+    avoidable_legs_queued_at_red: int
+    avoidable_modules_red: int
+    plans_losing_a_red: int
+
+
+@dataclass(frozen=True)
+class TimeoutRetries:
+    """The non-final attempts of every role's modules: timed-out attempts verify retried."""
+
+    attempts: int
+    held_secs: float
+    share_of_busy: float
+    modules: int
+    modules_final_green: int
+
+
+@dataclass(frozen=True)
+class Measurement:
+    project: str
+    window_start: str
+    window_end: str
+    window_days: float
+    plans: PlanCounts
+    multi_module_red_plans: int
+    busy_secs: float
+    avoidable_secs: float
+    avoidable_share: float
+    share_interval: tuple[float, float]
+    avoidable_hours_per_day: float
+    literal_avoidable_secs: float
+    literal_avoidable_share: float
+    background_avoidable_secs: float
+    imposed_wait_secs: float
+    cost: CostSide
+    timeout_retries: TimeoutRetries
+
+
+Contribution = tuple[float, float]
+
+
+def _ratio(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else 0.0
+
+
+def _busy_secs(plan: Plan) -> float:
+    return math.fsum(leg.held_secs for leg in plan.legs)
+
+
+def _avoidable_secs(plan: Plan, group: Grouping = BY_MODULE) -> float:
+    return math.fsum(item.leg.held_secs for item in avoidable_legs(plan, group))
+
+
+def _contribution(plan: Plan) -> Contribution:
+    """(slot-busy seconds, headline avoidable seconds) of one plan; only task plans enter the numerator."""
+    return _busy_secs(plan), (_avoidable_secs(plan) if plan.role == TASK_ROLE else 0.0)
+
+
+def _share(contributions: Iterable[Contribution]) -> float:
+    pairs = list(contributions)
+    return _ratio(math.fsum(avoidable for _, avoidable in pairs), math.fsum(busy for busy, _ in pairs))
+
+
+def _percentile(ordered: Sequence[float], q: float) -> float:
+    position = q * (len(ordered) - 1)
+    low = math.floor(position)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
+
+
+def _bootstrap_interval(contributions: Sequence[Contribution], resamples: int, seed: int) -> tuple[float, float]:
+    if resamples < 1:
+        raise ValueError(f'resamples must be at least 1, got {resamples}')
+    if not contributions:
+        return 0.0, 0.0
+    rng = random.Random(seed)
+    n = len(contributions)
+    shares = sorted(
+        _share(contributions[i] for i in rng.choices(range(n), k=n)) for _ in range(resamples)
+    )
+    low_q, high_q = INTERVAL_QUANTILES
+    return _percentile(shares, low_q), _percentile(shares, high_q)
+
+
+def _covered_secs(span: tuple[float, float], intervals: Iterable[tuple[float, float]]) -> float:
+    """Measure of the union of *intervals*, clipped to *span*."""
+    start, end = span
+    clipped = sorted(
+        (max(low, start), min(high, end)) for low, high in intervals if min(high, end) > max(low, start)
+    )
+    covered, reach = 0.0, start
+    for low, high in clipped:
+        if high > reach:
+            covered += high - max(low, reach)
+            reach = high
+    return covered
+
+
+def _imposed_wait_secs(plans: Sequence[Plan]) -> float:
+    """Seconds of headline avoidable holds during which at least one OTHER plan's leg was waiting."""
+    waits = [(index, (leg.arrived_at, leg.granted_at)) for index, plan in enumerate(plans) for leg in plan.legs]
+    total = 0.0
+    for index, plan in enumerate(plans):
+        if plan.role != TASK_ROLE:
+            continue
+        others = [wait for owner, wait in waits if owner != index]
+        for item in avoidable_legs(plan):
+            total += _covered_secs((item.leg.granted_at, item.leg.ended_at), others)
+    return total
+
+
+def _is_multi_module_red(plan: Plan) -> bool:
+    units = plan_units(plan).values()
+    return len(units) >= 2 and any(unit.red for unit in units)
+
+
+def _cost_side(task_plans: Iterable[Plan]) -> CostSide:
+    legs = queued = modules_red = plans_losing = 0
+    for plan in task_plans:
+        found = avoidable_legs(plan)
+        units = plan_units(plan)
+        red_modules = {item.leg.module for item in found if units[item.leg.module].red}
+        legs += len(found)
+        queued += sum(item.queued_at_red for item in found)
+        modules_red += len(red_modules)
+        plans_losing += bool(red_modules)
+    return CostSide(
+        avoidable_legs=legs,
+        avoidable_legs_queued_at_red=queued,
+        avoidable_modules_red=modules_red,
+        plans_losing_a_red=plans_losing,
+    )
+
+
+def _timeout_retries(plans: Iterable[Plan], busy_secs: float) -> TimeoutRetries:
+    retried = [unit for plan in plans for unit in plan_units(plan).values() if unit.retried_attempts]
+    held = math.fsum(leg.held_secs for unit in retried for leg in unit.retried_attempts)
+    return TimeoutRetries(
+        attempts=sum(len(unit.retried_attempts) for unit in retried),
+        held_secs=held,
+        share_of_busy=_ratio(held, busy_secs),
+        modules=len(retried),
+        modules_final_green=sum(not unit.red for unit in retried),
+    )
+
+
+def measure(project: str, sample: Sample, *, resamples: int, seed: int) -> Measurement:
+    task_plans = [plan for plan in sample.plans if plan.role == TASK_ROLE]
+    contributions = [_contribution(plan) for plan in sample.plans]
+    busy = math.fsum(busy for busy, _ in contributions)
+    avoidable = math.fsum(avoidable for _, avoidable in contributions)
+    literal = math.fsum(_avoidable_secs(plan, BY_LEG) for plan in task_plans)
+    return Measurement(
+        project=project,
+        window_start=sample.window_start,
+        window_end=sample.window_end,
+        window_days=sample.window_days,
+        plans=PlanCounts(
+            total=len(sample.plans),
+            task=len(task_plans),
+            background=sum(plan.role == BACKGROUND_ROLE for plan in sample.plans),
+        ),
+        multi_module_red_plans=sum(_is_multi_module_red(plan) for plan in task_plans),
+        busy_secs=busy,
+        avoidable_secs=avoidable,
+        avoidable_share=_ratio(avoidable, busy),
+        share_interval=_bootstrap_interval(contributions, resamples, seed),
+        avoidable_hours_per_day=_ratio(avoidable / SECS_PER_HOUR, sample.window_days),
+        literal_avoidable_secs=literal,
+        literal_avoidable_share=_ratio(literal, busy),
+        background_avoidable_secs=math.fsum(
+            _avoidable_secs(plan) for plan in sample.plans if plan.role == BACKGROUND_ROLE
+        ),
+        imposed_wait_secs=_imposed_wait_secs(sample.plans),
+        cost=_cost_side(task_plans),
+        timeout_retries=_timeout_retries(sample.plans, busy),
     )

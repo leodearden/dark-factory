@@ -128,7 +128,7 @@ def _leg_payload(plan_id, module, arrived_at, granted_at, held_secs, *, rc=0, ti
     }
 
 
-def _plan_event(timestamp, plan_id, legs, *, role='task', order='arrival', outcome='returned'):
+def _plan_event(timestamp, plan_id, legs, *, role='task', order: str | None = 'arrival', outcome='returned'):
     return {
         'timestamp': timestamp, 'event_type': 'verify_admission_plan', 'task_id': '42', 'phase': 'verify',
         'role': role,
