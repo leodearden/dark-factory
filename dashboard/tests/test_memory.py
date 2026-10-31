@@ -367,6 +367,28 @@ class TestMcpToolCallInvalidatesOnHang:
             'an escaping builtin TimeoutError must evict the session too'
         )
 
+    async def test_httpx_timeout_evicts_the_session_so_the_next_call_reinitialises(self):
+        """An httpx per-request expiry is hang-shaped. An outer ``wait_for``
+        sized by ``memory.py::enclosing_deadline`` lets it arrive un-pre-empted,
+        so the guard must evict on it just as it evicts on a cancellation.
+        """
+        from dashboard.data.memory import mcp_tool_call
+
+        url = 'http://localhost:8000'
+        handler = _SessionAwareHandler(error_on_tool=httpx.ReadTimeout(''))
+        transport = httpx.MockTransport(handler)
+
+        async with httpx.AsyncClient(transport=transport) as client:
+            for _ in range(2):
+                with pytest.raises(httpx.ReadTimeout):
+                    await mcp_tool_call(client, url, 'get_status', {})
+
+        handshakes = [c['method'] for c in handler.calls].count('initialize')
+        assert handshakes == 2, (
+            'a session whose tools/call timed out must be evicted, so the next '
+            f'call re-runs the handshake; saw {handshakes} initialize request(s)'
+        )
+
     async def test_http_status_error_propagates_WITHOUT_invalidating(self):
         """Negative control: the guard stays narrow, never `except BaseException`.
 
