@@ -1196,15 +1196,14 @@ async def api_curator(request: Request) -> JSONResponse:
         # Bounded on BOTH layers, like every other probe in task 3871: the
         # budget bounds each individual HTTP request (including pool
         # acquisition), wait_for bounds the whole operation because a cold
-        # session is three posts across up to N urls. Previously this leg took
-        # neither, so /curator could block for roughly N x 3 x 10s during a
-        # fused-memory outage while its fan-out sibling honoured 5s.
-        # TimeoutError lands in safe_gather_result below as the offline state.
+        # session is three posts across up to N urls. The outer bound is
+        # derived via memory.py::enclosing_deadline — see its docstring for
+        # why it must exceed the per-request budget.
         asyncio.wait_for(
             memory_data.get_curator_state(
                 http_client, config, timeout=_CURATOR_ENDPOINT_TIMEOUT_SECONDS,
             ),
-            timeout=_CURATOR_ENDPOINT_TIMEOUT_SECONDS,
+            timeout=memory_data.enclosing_deadline(_CURATOR_ENDPOINT_TIMEOUT_SECONDS),
         ),
         return_exceptions=True,
     )

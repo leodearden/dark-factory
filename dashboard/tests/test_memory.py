@@ -496,6 +496,13 @@ class TestMcpToolCallTimeoutBudget:
         )
 
 
+def test_enclosing_deadline_headroom_dwarfs_scheduling_jitter():
+    """Merely positive headroom would still let the outer timer win the race."""
+    from dashboard.data.memory import enclosing_deadline
+
+    assert all(enclosing_deadline(b) - b >= 0.5 for b in (0.05, 5.0))
+
+
 class TestAggregateTimeoutBudget:
     """The two multi-URL aggregates must thread a budget to every post.
 
