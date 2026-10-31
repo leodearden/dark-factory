@@ -22627,20 +22627,6 @@ def _promote_like_orphan_reaper(queue, esc_id) -> str:
     return promoted_id
 
 
-def _dismiss_as_covered_like_orphan_reaper(queue, esc_id) -> None:
-    """Simulate the `has_open_l1` dismiss branch of `orchestrator/harness.py::Harness._reap_orphan_l0_escalations`.
-
-    orchestrator is not a fused-memory dependency, hence the simulation.
-    """
-    esc = queue.get(esc_id)
-    queue.resolve(
-        esc_id,
-        f'Dismissed by orphan reaper — open L1 already covers this task (task_id={esc.task_id})',
-        dismiss=True,
-        resolved_by='harness-orphan-reaper',
-    )
-
-
 def test_file_finding_task_escalation_lands_a_record_on_the_real_task(
     journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
 ):
@@ -22892,6 +22878,42 @@ def test_unrelated_pending_record_on_the_same_task_does_not_suppress_the_filing(
     assert [e.id for e in filed] == [esc_id]
 
 
+def test_routed_record_behind_an_unrelated_open_l1_is_not_dismissed_and_folds_next_cycle(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """The reaper's coverage rule (`escalation/queue.py::EscalationQueue.dismiss_if_covered`, task 5223) is category-scoped like the filer's (test (c)).
+
+    So an unrelated L1 dismisses nothing and the next cycle folds onto the
+    surviving L0 (task 6341). With the info-L0 router on, the router owns the
+    record instead: see `orchestrator/tests/test_info_l0_router_harness.py::TestReaperRoutesInfoOrphans::test_an_open_l1_of_another_category_does_not_swallow_an_info_note`.
+    """
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+    queue = EscalationQueue(queue_dir)
+    queue.submit(Escalation(
+        id=queue.make_id('4458'),
+        task_id='4458',
+        agent_role='steward',
+        severity='blocking',
+        category='scope_violation',
+        summary='Escalated by a human to L1',
+        level=1,
+    ))
+
+    first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+    assert first
+
+    assert queue.dismiss_if_covered(queue.get(first), resolver='harness-orphan-reaper') == []
+    assert queue.get(first).status == 'pending'
+
+    second = harness._file_finding_task_escalation('test-project', 'run-2', _orch_finding(), 5)
+    assert second is None, f'the next cycle must fold onto the surviving L0, got {second!r}'
+    assert [e.id for e in _routed_records(queue_dir)] == [first]
+
+
 def test_promoted_record_folds_the_next_cycle(
     journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
 ):
@@ -23010,7 +23032,7 @@ def test_reaper_dismissed_sibling_is_not_refiled_while_the_routed_l1_is_open(
     assert a and b and a != b, (a, b)
 
     promoted = _promote_like_orphan_reaper(queue, a)
-    _dismiss_as_covered_like_orphan_reaper(queue, b)
+    assert queue.dismiss_if_covered(queue.get(b), resolver='harness-orphan-reaper') == [promoted]
 
     assert harness._file_finding_task_escalation(
         'test-project', 'run-2', _orch_finding(), 5,
