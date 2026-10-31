@@ -113,7 +113,7 @@ from fused_memory.backends.graphiti_client import (  # noqa: E402
 )
 
 # The shipped regex and the guard whose recall this probe measures.
-from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (  # noqa: E402
+from fused_memory.reconciliation.status_snapshot_extraction import (  # noqa: E402
     _ENUM_PREP_WORD_RE,
     PLURAL_ENUM_SNAPSHOT_RE,
     _enumeration_is_prepositional_complement,
@@ -398,7 +398,7 @@ CANDIDATE_NAMES: tuple[str, ...] = ('shipped', 'a', 'b')
 def extract_plural_ids(fact: str, *, candidate: str = 'shipped') -> set[int]:
     """Ids the PLURAL path yields for *fact* under the named guard.
 
-    Delegates to the sweep module's own ``_plural_enum_ids``, passing the
+    Delegates to the extraction module's own ``_plural_enum_ids``, passing the
     candidate guard in — it does NOT re-implement the arm. That is the same
     argument the import block at the top of this file makes about the regex
     and the guard, applied one step further out: a hand-copied arm keeps
