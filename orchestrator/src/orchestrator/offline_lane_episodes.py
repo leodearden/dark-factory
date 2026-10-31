@@ -49,7 +49,9 @@ Rules the engine and its pure rules keep beyond the PRD's text:
   head from the command's run records before the pass, so a cutover or a lost store
   keeps a green pass on record.
 - R15 a command whose tick raises is logged and skipped: it adds nothing to the tick's
-  result, and the other commands' ticks go on.
+  result, and the other commands' ticks go on.  ``TICK_FAILURES_BEFORE_ESCALATION``
+  failures in a row keep one level-1 record on the command's sentinel, which the lane
+  resolves at the command's first clean tick; the run of failures is kept in memory only.
 """
 
 from __future__ import annotations
@@ -106,17 +108,21 @@ from orchestrator.offline_lane_escalations import (
     PENDING_ESCALATION,
     ProbeReport,
     StuckFiling,
+    TickFailure,
     UnlandedRed,
     amend_outage,
     amend_probe_broken,
     amend_stuck_filing,
+    amend_tick_failure,
     escalation_state,
     file_outage,
     file_probe_broken,
     file_stuck_filing,
+    file_tick_failure,
     file_unlanded_red,
     release_lane_record,
     resolve_stuck_filing,
+    resolve_tick_failure,
 )
 from orchestrator.offline_lane_filing import (
     SPAWN_CONTEXT,
@@ -160,6 +166,7 @@ CLOSED_ESCALATION_STATES = frozenset({'resolved', 'dismissed'})
 DEFERRED_STATUS = 'deferred'
 _NO_TASK_CLIENT = 'no task client'
 _OPEN_STATUSES = tuple(sorted(s.value for s in TaskStatus if owner_liveness(s) is OwnerLiveness.OPEN))
+TICK_FAILURES_BEFORE_ESCALATION = 3
 
 
 def _utc_now() -> datetime:
@@ -234,16 +241,47 @@ class _TickFailures:
         self._runs: dict[str, _FailedTicks] = {}
 
     async def failed(self, command: str, exc: Exception) -> None:
-        run = self._runs.get(command)
-        run = _FailedTicks(since=self._now(), count=1) if run is None else replace(run, count=run.count + 1)
+        run = self._next(self._runs.get(command))
         self._runs[command] = run
         logger.error(
             'offline-lane: %s: tick failed (%d in a row); the other commands go on: %s: %s',
             command, run.count, type(exc).__name__, exc, exc_info=exc if run.count == 1 else None,
         )
+        if run.count >= TICK_FAILURES_BEFORE_ESCALATION and self._queue is not None:
+            failure = TickFailure(command, run.since, f'{type(exc).__name__}: {exc}')
+            self._runs[command] = await self._escalated(self._queue, run, failure)
+
+    def _next(self, run: _FailedTicks | None) -> _FailedTicks:
+        """*run* one failure longer; a new run starts now and keeps the record a failed resolve left."""
+        if run is None or run.count == 0:
+            return _FailedTicks(since=self._now(), count=1, escalation_id=None if run is None else run.escalation_id)
+        return replace(run, count=run.count + 1)
+
+    async def _escalated(self, queue: EscalationQueue, run: _FailedTicks, failure: TickFailure) -> _FailedTicks:
+        """*run* with its record amended while pending, else filed; unchanged when the queue fails."""
+        try:
+            current = run.escalation_id
+            if current is not None and await asyncio.to_thread(escalation_state, queue, current) == PENDING_ESCALATION:
+                await asyncio.to_thread(amend_tick_failure, queue, current, failure)
+                return run
+            escalation_id = await asyncio.to_thread(file_tick_failure, queue, failure)
+        except Exception:
+            logger.exception('offline-lane: %s: tick-failure escalation not maintained; retried next tick',
+                             failure.command)
+            return run
+        return replace(run, escalation_id=escalation_id)
 
     async def cleared(self, command: str) -> None:
-        self._runs.pop(command, None)
+        run = self._runs.pop(command, None)
+        if run is None or run.escalation_id is None or self._queue is None:
+            return
+        try:
+            if await asyncio.to_thread(escalation_state, self._queue, run.escalation_id) == PENDING_ESCALATION:
+                await asyncio.to_thread(resolve_tick_failure, self._queue, run.escalation_id)
+        except Exception:
+            logger.exception('offline-lane: %s: tick-failure record %s not resolved; retried next clean tick',
+                             command, run.escalation_id)
+            self._runs[command] = replace(run, count=0)
 
 
 @dataclass(frozen=True)
