@@ -179,11 +179,14 @@ function noticeText(path, entry, now, failures) {
 }
 
 /**
- * Which staleness notices the given tab should render.
+ * Which staleness notices the open tab should render.
  *
- * Returns `[{kind: 'stale', path, text}]`, one per endpoint of that tab that
+ * The input is `{paths, stale, now}`, where `paths` is the endpoint paths the
+ * open tab renders; app.jsx passes that tab's entry.
+ *
+ * Returns `[{kind: 'stale', path, text}]`, one per endpoint of `paths` that
  * has failed at least STALE_FAILURE_THRESHOLD consecutive polls — empty when
- * everything the tab renders is current, when the tab is unknown, or when
+ * everything the tab renders is current, when `paths` is missing, or when
  * nothing has been polled yet.
  *
  * PER-ENDPOINT, NOT GLOBAL. The 19.8h wedge hit the tasks fan-out while other
@@ -197,7 +200,7 @@ function noticeText(path, entry, now, failures) {
  */
 function staleNoticesForTab(input) {
   const s = input || {}
-  const paths = TAB_ENDPOINTS[s.tab]
+  const paths = s.paths
   if (!Array.isArray(paths)) return []
 
   // `now` is Date.now() from app.jsx. Falling back rather than trusting a
@@ -221,9 +224,12 @@ function staleNoticesForTab(input) {
 }
 
 /**
- * The one "still loading" notice the given tab should render, or null.
+ * The one "still loading" notice the open tab should render, or null.
  *
- * Returns `{kind: 'loading', paths, text}` naming every endpoint of that tab
+ * The input is `{paths, receipt, stale}`, where `paths` is the endpoint paths
+ * the open tab renders; app.jsx passes that tab's entry.
+ *
+ * Returns `{kind: 'loading', paths, text}` naming every endpoint of `paths`
  * that has not delivered a response since this page loaded — read off
  * `receipt`, data.js's success-only `DF_DATA.__receipt` map. A tab opened for
  * the first time asks for its endpoints at once, and until they answer its
@@ -243,7 +249,7 @@ function staleNoticesForTab(input) {
  */
 function loadingNoticeForTab(input) {
   const s = input || {}
-  const paths = TAB_ENDPOINTS[s.tab]
+  const paths = s.paths
   if (!Array.isArray(paths)) return null
   if (!s.receipt || typeof s.receipt !== 'object') return null
 

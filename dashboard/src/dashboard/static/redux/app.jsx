@@ -6,7 +6,7 @@ const { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab, Esca
 const { TasksTab } = window.DF_TASKS;
 const { CuratorTab } = window.DF_CURATOR;
 const { SchedulerTab } = window.DF_SCHEDULER;
-const { staleNoticesForTab, loadingNoticeForTab } = window.DF_ENDPOINT_STALENESS;
+const { staleNoticesForTab, loadingNoticeForTab, TAB_ENDPOINTS: TAB_POLL_PATHS } = window.DF_ENDPOINT_STALENESS;
 const { scopePollingToTab } = window.DF_DATA_LOADER;
 const { reconRunCounts, reconAttentionCount } = window.DF_RECON_STATUS;
 const { censusOver, runningOfInFlight, inFlightCount: inFlightCountReading } = window.DF_TASK_SNAPSHOT;
@@ -201,8 +201,8 @@ function App() {
   // TAB_ENDPOINTS plus CHROME_ENDPOINTS now also decide what is POLLED, so a
   // tab opened for the first time may show its pre-fetch seed until its
   // endpoints answer: the one loading notice names every path with no receipt yet.
-  const staleNotices = staleNoticesForTab({ tab, stale: DD.__stale || {}, now: Date.now() });
-  const loadingNotice = loadingNoticeForTab({ tab, receipt: DD.__receipt || {}, stale: DD.__stale || {} });
+  const staleNotices = staleNoticesForTab({ paths: TAB_POLL_PATHS[tab], stale: DD.__stale || {}, now: Date.now() });
+  const loadingNotice = loadingNoticeForTab({ paths: TAB_POLL_PATHS[tab], receipt: DD.__receipt || {}, stale: DD.__stale || {} });
 
   function renderTab() {
     switch (tab) {
