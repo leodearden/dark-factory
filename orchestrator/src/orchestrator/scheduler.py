@@ -3726,11 +3726,13 @@ class Scheduler:
         return status if status_err is None else None
 
     async def get_task(self, task_id: str) -> dict | None:
-        """Fetch the full task dict (including metadata) from fused-memory.
+        """Return the task dict with metadata normalised, or ``None`` on failure or absence.
 
-        Used by the workflow's bypass-detection path to inspect
-        ``metadata.done_provenance`` after a ``terminal_exit_rejected``
-        rejection. Returns ``None`` on failure or absence.
+        A fused-memory error reply (``{'error', 'error_type'}``:
+        TaskNotFoundError for a deleted task, INVALID_TASK_ID for a
+        non-numeric id, server faults) is never a task row. Callers that must
+        tell absence from failure read through
+        ``orchestrator/src/orchestrator/chronic_flake.py::SchedulerChronicFlakeTaskClient.get_task``.
         """
         try:
             result = await self.dispatch_tool(
@@ -3744,32 +3746,13 @@ class Scheduler:
                 task_id, type(e).__name__, e,
             )
             return None
-        # The MCP tool returns the task wrapped in {data: {...}}; unwrap via
-        # the same text-block parser used by get_status.
-        if not isinstance(result, dict):
+        task, _ = parse_tool_result(result, None, dict)
+        if task is None:
             return None
-        for block in result.get('result', {}).get('content', []) or []:
-            if isinstance(block, dict) and block.get('type') == 'text':
-                try:
-                    data = json.loads(block.get('text') or '')
-                except (ValueError, TypeError):
-                    return None
-                if isinstance(data, dict):
-                    inner = (
-                        data.get('data')
-                        if isinstance(data.get('data'), dict)
-                        else data
-                    )
-                    if isinstance(inner, dict):
-                        # Normalise metadata at the boundary so all callers
-                        # receive task['metadata'] as a dict — consistent with
-                        # get_tasks / acquire_next which already do this via
-                        # _normalize_task_metadata.
-                        self._normalize_task_metadata(inner)
-                        return inner
-                    return None
-                return None
-        return None
+        if 'error' in task:
+            return None
+        self._normalize_task_metadata(task)
+        return task
 
     async def submit_task(self, arguments: dict, *, timeout: float = 30) -> SubmitOutcome:
         """Submit one task to fused-memory and return its typed outcome.
