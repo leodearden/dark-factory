@@ -24,7 +24,9 @@
 # the queue's own landing syncs it. The landing waits for a full merge verify:
 # MERGE_QUEUE_LANDING_TIMEOUT_SECS bounds it (default
 # _merge_queue_landing.py::DEFAULT_LANDING_TIMEOUT_SECS), and a calling task's
-# before_done.timeout_secs must exceed it. The reload goes through
+# before_done.timeout_secs must be at least that ceiling plus 300 s, because
+# calls in flight at the ceiling, the cancel and the reload run past it
+# (OPERATIONS.md, "Deploying a knob flip"). The reload goes through
 # scripts/_config_reload_gate.py, which handshakes: the escalation MCP is
 # STATEFUL, so a single-shot `tools/call` POST is rejected at the TRANSPORT
 # layer — `Bad Request: Missing session ID`, HTTP 400, measured live on

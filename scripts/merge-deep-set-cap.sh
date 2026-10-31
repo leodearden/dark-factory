@@ -26,7 +26,9 @@
 # The landing waits for the target's merge verify, which runs the full gate:
 # minutes to hours.  MERGE_QUEUE_LANDING_TIMEOUT_SECS bounds the wait (default
 # _merge_queue_landing.py::DEFAULT_LANDING_TIMEOUT_SECS); a calling task's
-# before_done.timeout_secs must exceed it.  A request still in flight at that
+# before_done.timeout_secs must be at least that ceiling plus 300 s, because
+# calls in flight at the ceiling, the cancel and the reload run past it
+# (OPERATIONS.md, "Deploying a knob flip").  A request still in flight at that
 # ceiling, or at SIGTERM/SIGINT, is cancelled before the script exits.
 #
 # Usage: merge-deep-set-cap.sh <cap> <config_yaml_path> <escalation_port>
