@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
+from fused_memory.eval import topic_registry
 from shared.briefing_queries import QUERY_SPECS
 from shared.memory_eval_metrics import (
     load_metric_series,
@@ -141,7 +142,7 @@ class TestEachBriefingTopicIsAdjudicatedIndividually:
 
     def test_the_census_split_names_every_failing_item(self):
         section = _census_split_lines(_the_run()[1].read_text(encoding='utf-8'))
-        prefix = _mod().TRIPWIRE_ITEM_PREFIX
+        prefix = topic_registry.TRIPWIRE_ITEM_PREFIX
 
         for item_key, passed in _tripwire_items().items():
             if not passed:

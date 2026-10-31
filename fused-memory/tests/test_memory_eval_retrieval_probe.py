@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
+from fused_memory.eval import topic_registry
 from shared.cli_boundary import EXIT_STDOUT_FAILED, run_cli
 from shared.testing_streams import closed_pipe_stdout
 
@@ -104,7 +105,7 @@ class TestLoadTopicRegistry:
         path = _write_registry(tmp_path, _registry_payload(
             _entry_payload('briefing-assembler-queries', project_id='reify'),
         ))
-        registry = _mod().load_topic_registry(path)
+        registry = topic_registry.load_topic_registry(path)
 
         assert len(registry.entries) == 1
         entry = registry.entries[0]
@@ -127,7 +128,7 @@ class TestLoadTopicRegistry:
         path = _write_registry(tmp_path, _registry_payload(
             _entry_payload('alpha-topic'), _entry_payload('beta-topic'),
         ))
-        registry = _mod().load_topic_registry(path)
+        registry = topic_registry.load_topic_registry(path)
 
         assert registry.topics == {'alpha-topic', 'beta-topic'}
         assert registry.by_topic['alpha-topic'].topic == 'alpha-topic'
@@ -138,7 +139,7 @@ class TestLoadTopicRegistry:
                 {'superseded_hash': 'c' * 16, 'successor_hash': 'd' * 16},
             ],
         )))
-        entry = _mod().load_topic_registry(path).entries[0]
+        entry = topic_registry.load_topic_registry(path).entries[0]
 
         assert len(entry.supersedes_pairs) == 1
         assert entry.supersedes_pairs[0].superseded_hash == 'c' * 16
@@ -152,8 +153,8 @@ class TestLoadTopicRegistry:
         del bad[missing]
         path = _write_registry(tmp_path, _registry_payload(bad))
 
-        with pytest.raises(_mod().RegistryError) as exc:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
         assert 'offending-slug' in str(exc.value)
         assert missing in str(exc.value)
 
@@ -162,8 +163,8 @@ class TestLoadTopicRegistry:
         del bad['topic']
         path = _write_registry(tmp_path, _registry_payload(bad))
 
-        with pytest.raises(_mod().RegistryError) as exc:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
         assert 'topic' in str(exc.value)
 
     def test_duplicate_topic_slug_names_the_topic(self, tmp_path):
@@ -171,8 +172,8 @@ class TestLoadTopicRegistry:
             _entry_payload('dup-slug'), _entry_payload('dup-slug'),
         ))
 
-        with pytest.raises(_mod().RegistryError) as exc:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
         assert 'dup-slug' in str(exc.value)
         assert 'duplicate' in str(exc.value).lower()
 
@@ -183,8 +184,8 @@ class TestLoadTopicRegistry:
             _entry_payload('fold-me'), _entry_payload('fold_me'),
         ))
 
-        with pytest.raises(_mod().RegistryError) as exc:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
         assert 'fold-me' in str(exc.value)
         assert 'fold_me' in str(exc.value)
         assert 'duplicate' in str(exc.value).lower()
@@ -194,8 +195,8 @@ class TestLoadTopicRegistry:
             _entry_payload('empty-phrasings', phrasings=[]),
         ))
 
-        with pytest.raises(_mod().RegistryError) as exc:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
         assert 'empty-phrasings' in str(exc.value)
 
     def test_no_held_out_phrasing_names_the_topic(self, tmp_path):
@@ -207,8 +208,8 @@ class TestLoadTopicRegistry:
             ],
         )))
 
-        with pytest.raises(_mod().RegistryError) as exc:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
         assert 'no-heldout' in str(exc.value)
         assert 'held_out' in str(exc.value)
 
@@ -217,8 +218,8 @@ class TestLoadTopicRegistry:
             'bad-canonical', canonical={'content_prefix': 'no hash here'},
         )))
 
-        with pytest.raises(_mod().RegistryError) as exc:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
         assert 'bad-canonical' in str(exc.value)
         assert 'content_hash' in str(exc.value)
 
@@ -227,14 +228,14 @@ class TestLoadTopicRegistry:
             _entry_payload('bad-provenance', derived_from='telepathy'),
         ))
 
-        with pytest.raises(_mod().RegistryError) as exc:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
         assert 'bad-provenance' in str(exc.value)
         assert 'telepathy' in str(exc.value)
 
     def test_missing_file_raises_registry_error(self, tmp_path):
-        with pytest.raises(_mod().RegistryError):
-            _mod().load_topic_registry(tmp_path / 'does-not-exist.json')
+        with pytest.raises(topic_registry.RegistryError):
+            topic_registry.load_topic_registry(tmp_path / 'does-not-exist.json')
 
     # -- forward-compat: additive-tolerant (3201 widens derivation later) --
 
@@ -242,7 +243,7 @@ class TestLoadTopicRegistry:
         path = _write_registry(tmp_path, _registry_payload(_entry_payload(
             'forward-compat', future_field_from_3201={'kind': 'gotcha'},
         )))
-        entry = _mod().load_topic_registry(path).entries[0]
+        entry = topic_registry.load_topic_registry(path).entries[0]
 
         assert entry.topic == 'forward-compat'
         assert entry.extra['future_field_from_3201'] == {'kind': 'gotcha'}
@@ -252,7 +253,7 @@ class TestLoadTopicRegistry:
         payload['derived_at'] = '2026-07-30T00:00:00Z'
         path = _write_registry(tmp_path, payload)
 
-        assert len(_mod().load_topic_registry(path).entries) == 1
+        assert len(topic_registry.load_topic_registry(path).entries) == 1
 
     # -- the version check runs BEFORE the entry shapes it does not understand --
 
@@ -270,8 +271,8 @@ class TestLoadTopicRegistry:
         payload['schema_version'] = 2
         path = _write_registry(tmp_path, payload)
 
-        with pytest.raises(_mod().RegistryError) as excinfo:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as excinfo:
+            topic_registry.load_topic_registry(path)
 
         message = str(excinfo.value)
         assert 'schema_version' in message
@@ -285,14 +286,14 @@ class TestLoadTopicRegistry:
         payload['_disclosures'] = {'census_topics_skipped_singleton': 303}
         path = _write_registry(tmp_path, payload)
 
-        registry = _mod().load_topic_registry(path)
+        registry = topic_registry.load_topic_registry(path)
 
         assert registry.disclosures == {'census_topics_skipped_singleton': 303}
 
     def test_an_absent_disclosures_block_is_legal(self, tmp_path):
         path = _write_registry(tmp_path, _registry_payload())
 
-        assert _mod().load_topic_registry(path).disclosures == {}
+        assert topic_registry.load_topic_registry(path).disclosures == {}
 
     @pytest.mark.parametrize('value', ['41', 41.5, None, True, ['41']])
     def test_a_non_integer_disclosure_is_a_named_failure_not_a_silent_drop(
@@ -311,8 +312,8 @@ class TestLoadTopicRegistry:
         payload['_disclosures'] = {'census_topics_skipped_singleton': value}
         path = _write_registry(tmp_path, payload)
 
-        with pytest.raises(_mod().RegistryError) as excinfo:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as excinfo:
+            topic_registry.load_topic_registry(path)
 
         assert 'census_topics_skipped_singleton' in str(excinfo.value)
 
@@ -321,8 +322,8 @@ class TestLoadTopicRegistry:
         payload['_disclosures'] = ['census_topics_skipped_singleton']
         path = _write_registry(tmp_path, payload)
 
-        with pytest.raises(_mod().RegistryError) as excinfo:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as excinfo:
+            topic_registry.load_topic_registry(path)
 
         assert '_disclosures' in str(excinfo.value)
 
@@ -351,7 +352,7 @@ topic's pooled rate is never a single coin flip."""
 
 @pytest.fixture(scope='module')
 def registry():
-    return _mod().load_topic_registry(REGISTRY_PATH)
+    return topic_registry.load_topic_registry(REGISTRY_PATH)
 
 
 def _guard_cluster_phrases() -> set[str]:
@@ -369,14 +370,14 @@ class TestCommittedRegistryFixture:
 
     def test_fixture_exists_and_parses(self, registry):
         assert REGISTRY_PATH.is_file()
-        assert registry.schema_version == _mod().REGISTRY_SCHEMA_VERSION
+        assert registry.schema_version == topic_registry.REGISTRY_SCHEMA_VERSION
         assert registry.entries
 
     def test_topic_slugs_are_unique_and_slug_shaped(self, registry):
         topics = [e.topic for e in registry.entries]
         assert len(topics) == len(set(topics))
         for topic in topics:
-            assert _mod()._SLUG_RE.match(topic), f'{topic!r} is not slug-shaped'
+            assert topic_registry.TOPIC_SLUG_RE.match(topic), f'{topic!r} is not slug-shaped'
 
     def test_breadth_floor(self, registry):
         assert len(registry.entries) >= MIN_TOPICS
@@ -448,7 +449,7 @@ class TestCommittedRegistryFixture:
 
     def test_derived_from_is_in_the_closed_set(self, registry):
         for entry in registry.entries:
-            assert entry.derived_from in _mod().DERIVED_FROM_VALUES, entry.topic
+            assert entry.derived_from in topic_registry.DERIVED_FROM_VALUES, entry.topic
 
     def test_supersedes_pairs_reference_distinct_hashes(self, registry):
         for entry in registry.entries:
@@ -769,7 +770,7 @@ class TestDeriveFromCensus:
         d = result.disclosures
         assert kept_or_dropped(d) == kept_or_dropped(baseline) + len(multi_entry_rows)
         assert kept_or_dropped(d) - d['slug_collisions_dropped'] == len(result.candidates)
-        folded = {m.normalize_topic(c['topic']) for c in result.candidates}
+        folded = {topic_registry.normalize_topic(c['topic']) for c in result.candidates}
         assert len(folded) == len(result.candidates)
 
     @pytest.mark.parametrize(('payload', 'named_location'), [
@@ -858,7 +859,7 @@ class TestDeriveFromGuardClusters:
 
         [kept] = [
             c for c in result.candidates
-            if m.normalize_topic(c['topic']) == m.normalize_topic(slug)
+            if topic_registry.normalize_topic(c['topic']) == topic_registry.normalize_topic(slug)
         ]
         assert kept['derived_from'] == 'topic_guard_cluster'
         assert kept['topic'] == slug
@@ -946,7 +947,7 @@ class TestDerivationIsPure:
         path = tmp_path / 'derived.json'
         path.write_text(json.dumps(payload), encoding='utf-8')
 
-        registry = _mod().load_topic_registry(path)
+        registry = topic_registry.load_topic_registry(path)
         assert len(registry.entries) == len(payload['entries'])
 
 
@@ -978,16 +979,16 @@ class _R:
 def _entry(topic='t', content='the canonical text', last_known_id: str | None = 'ID-1', **kw):
     """Build a real RegistryEntry whose canonical hashes *content*."""
     m = _mod()
-    return m.RegistryEntry(
+    return topic_registry.RegistryEntry(
         topic=topic,
         project_id=kw.pop('project_id', 'dark_factory'),
         derived_from=kw.pop('derived_from', 'hand'),
-        canonical=m.Canonical(
+        canonical=topic_registry.Canonical(
             content_hash=kw.pop('content_hash', m.content_key(content)),
             content_prefix=content[:80],
             last_known_id=last_known_id,
         ),
-        phrasings=kw.pop('phrasings', (m.Phrasing('q', False), m.Phrasing('h', True))),
+        phrasings=kw.pop('phrasings', (topic_registry.Phrasing('q', False), topic_registry.Phrasing('h', True))),
         **kw,
     )
 
@@ -1098,7 +1099,7 @@ class TestObservationBuilder:
         m = _mod()
         entry = _entry(topic='my-topic', content=CANON)
         obs = m.observe_phrasing(
-            [_R(content=CANON, id='ID-1')], entry, m.Phrasing('some query', False), 5,
+            [_R(content=CANON, id='ID-1')], entry, topic_registry.Phrasing('some query', False), 5,
         )
 
         assert obs.topic == 'my-topic'
@@ -1110,15 +1111,15 @@ class TestObservationBuilder:
     def test_held_out_phrasings_are_tagged(self):
         m = _mod()
         entry = _entry(content=CANON)
-        tuned = m.observe_phrasing([], entry, m.Phrasing('tuned', False), 5)
-        held = m.observe_phrasing([], entry, m.Phrasing('fresh', True), 5)
+        tuned = m.observe_phrasing([], entry, topic_registry.Phrasing('tuned', False), 5)
+        held = m.observe_phrasing([], entry, topic_registry.Phrasing('fresh', True), 5)
 
         assert not tuned.held_out
         assert held.held_out
 
     def test_observation_is_not_degraded_by_default(self):
         m = _mod()
-        obs = m.observe_phrasing([], _entry(content=CANON), m.Phrasing('q', False), 5)
+        obs = m.observe_phrasing([], _entry(content=CANON), topic_registry.Phrasing('q', False), 5)
         assert not obs.degraded
 
 
@@ -1129,14 +1130,14 @@ class TestObservationBuilder:
 def _pair_entry(topic='sup', old='old text', new='new text'):
     m = _mod()
     base = _entry(topic=topic, content=new)
-    return m.RegistryEntry(
+    return topic_registry.RegistryEntry(
         topic=base.topic,
         project_id=base.project_id,
         derived_from=base.derived_from,
         canonical=base.canonical,
         phrasings=base.phrasings,
         supersedes_pairs=(
-            m.SupersedesPair(
+            topic_registry.SupersedesPair(
                 superseded_hash=m.content_key(old),
                 successor_hash=m.content_key(new),
             ),
@@ -1182,13 +1183,13 @@ class TestSupersededInversions:
     def test_several_pairs_are_counted_independently(self):
         m = _mod()
         base = _entry(topic='multi', content='c1')
-        entry = m.RegistryEntry(
+        entry = topic_registry.RegistryEntry(
             topic=base.topic, project_id=base.project_id,
             derived_from=base.derived_from, canonical=base.canonical,
             phrasings=base.phrasings,
             supersedes_pairs=(
-                m.SupersedesPair(m.content_key('o1'), m.content_key('c1')),
-                m.SupersedesPair(m.content_key('o2'), m.content_key('c2')),
+                topic_registry.SupersedesPair(m.content_key('o1'), m.content_key('c1')),
+                topic_registry.SupersedesPair(m.content_key('o2'), m.content_key('c2')),
             ),
         )
         results = [
@@ -1282,14 +1283,14 @@ class TestComparablePairs:
         """The invariant that makes it a valid denominator: events <= exposure."""
         m = _mod()
         base = _entry(topic='multi', content='c1')
-        entry = m.RegistryEntry(
+        entry = topic_registry.RegistryEntry(
             topic=base.topic, project_id=base.project_id,
             derived_from=base.derived_from, canonical=base.canonical,
             phrasings=base.phrasings,
             supersedes_pairs=(
-                m.SupersedesPair(m.content_key('o1'), m.content_key('c1')),
-                m.SupersedesPair(m.content_key('o2'), m.content_key('c2')),
-                m.SupersedesPair(m.content_key('o3'), m.content_key('c3')),
+                topic_registry.SupersedesPair(m.content_key('o1'), m.content_key('c1')),
+                topic_registry.SupersedesPair(m.content_key('o2'), m.content_key('c2')),
+                topic_registry.SupersedesPair(m.content_key('o3'), m.content_key('c3')),
             ),
         )
         results = [_R(content='o1'), _R(content='c1'), _R(content='o2'), _R(content='c2')]
@@ -1422,7 +1423,7 @@ class TestContentKey:
 # ---------------------------------------------------------------------------
 
 def _claim(query, *needles):
-    return _mod().ClaimQuery(query=query, needles=tuple(needles))
+    return topic_registry.ClaimQuery(query=query, needles=tuple(needles))
 
 
 CLAIM_TEXT = (
@@ -1583,8 +1584,7 @@ class TestClaimRecalled:
 
 def _mini_registry(*topics):
     """A TopicRegistry over bare topic slugs (only the slugs matter here)."""
-    m = _mod()
-    return m.TopicRegistry(
+    return topic_registry.TopicRegistry(
         schema_version=1,
         entries=tuple(_entry(topic=t, content=f'canonical for {t}') for t in topics),
     )
@@ -2288,15 +2288,14 @@ def _healthy(results=()):
 
 def _probe_entry(topic='alpha-topic', content=CANON, **kw):
     """A registry entry with one tuned and one held-out phrasing plus a claim."""
-    m = _mod()
     base = _entry(topic=topic, content=content, **kw)
-    return m.RegistryEntry(
+    return topic_registry.RegistryEntry(
         topic=base.topic,
         project_id=base.project_id,
         derived_from=base.derived_from,
         canonical=base.canonical,
-        phrasings=(m.Phrasing('tuned query', False), m.Phrasing('held out query', True)),
-        claim_queries=(m.ClaimQuery(query='claim query', needles=('canonical text',)),),
+        phrasings=(topic_registry.Phrasing('tuned query', False), topic_registry.Phrasing('held out query', True)),
+        claim_queries=(topic_registry.ClaimQuery(query='claim query', needles=('canonical text',)),),
     )
 
 
@@ -2317,7 +2316,7 @@ class TestDegradedSearchDisclosure:
     async def test_a_degraded_query_marks_every_observation_it_produced(self):
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
         observations = m.ProbeObservations()
         search = _search_returning({'tuned query': _degraded()})
 
@@ -2331,7 +2330,7 @@ class TestDegradedSearchDisclosure:
     async def test_degraded_queries_are_recorded_with_stores_and_diagnostics(self):
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
         observations = m.ProbeObservations()
         search = _search_returning({'tuned query': _degraded(
             stores=('mem0', 'graphiti'),
@@ -2352,7 +2351,7 @@ class TestDegradedSearchDisclosure:
         """(a) The exclusion, end to end through build_series."""
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
         observations = m.ProbeObservations()
         search = _search_returning(
             {'tuned query': _degraded()},
@@ -2400,7 +2399,7 @@ class TestDegradedSearchDisclosure:
         """
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
         observations = m.ProbeObservations()
 
         await m.probe_topic(
@@ -2423,7 +2422,7 @@ class TestDegradedSearchDisclosure:
 
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
         observations = m.ProbeObservations()
 
         await m.probe_topic(
@@ -2443,7 +2442,7 @@ class TestDegradedSearchDisclosure:
         """(a)+(c)+(d): the prose has to say what the numbers cannot."""
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
         observations = m.ProbeObservations()
 
         await m.probe_topic(
@@ -2470,7 +2469,7 @@ class TestDegradedSearchDisclosure:
         """The band's happy path: phrasings, claims, contamination, inversions."""
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
         observations = m.ProbeObservations()
         search = _search_returning(
             {}, default_factory=lambda: _healthy([_R(content=CANON, id='ID-1')]),
@@ -2490,7 +2489,7 @@ class TestDegradedSearchDisclosure:
     async def test_a_degraded_claim_query_is_excluded_too(self):
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
         observations = m.ProbeObservations()
         search = _search_returning(
             {'claim query': _degraded()},
@@ -2510,7 +2509,7 @@ class TestDegradedSearchDisclosure:
         embedding spend and could return two different result lists."""
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
         seen: list[tuple[str, int]] = []
 
         async def search(query, limit):
@@ -2803,7 +2802,7 @@ class TestProbeReport:
     def test_the_report_carries_the_registry_composition(self):
         """(d) step-5: what derivation covered, and what it left out."""
         m = _mod()
-        registry = m.TopicRegistry(
+        registry = topic_registry.TopicRegistry(
             schema_version=1,
             entries=(_entry(topic='alpha-topic'), _entry(topic='beta-topic')),
             disclosures={'census_topics_skipped_singleton': 41},
@@ -2988,21 +2987,21 @@ def _scoped_entry(topic, *, project_id='dark_factory'):
     """
     m = _mod()
     content = f'the {topic} canonical text'
-    return m.RegistryEntry(
+    return topic_registry.RegistryEntry(
         topic=topic,
         project_id=project_id,
         derived_from='hand',
-        canonical=m.Canonical(
+        canonical=topic_registry.Canonical(
             content_hash=m.content_key(content),
             content_prefix=content,
             last_known_id=f'ID-{topic}',
         ),
         phrasings=(
-            m.Phrasing(f'{topic} tuned', False),
-            m.Phrasing(f'{topic} held out', True),
+            topic_registry.Phrasing(f'{topic} tuned', False),
+            topic_registry.Phrasing(f'{topic} held out', True),
         ),
-        claim_queries=(m.ClaimQuery(query=f'{topic} claim', needles=('canonical text',)),),
-        supersedes_pairs=(m.SupersedesPair(
+        claim_queries=(topic_registry.ClaimQuery(query=f'{topic} claim', needles=('canonical text',)),),
+        supersedes_pairs=(topic_registry.SupersedesPair(
             superseded_hash=m.content_key(_superseded_text(topic)),
             successor_hash=m.content_key(content),
         ),),
@@ -3016,8 +3015,7 @@ def _superseded_text(topic: str) -> str:
 
 def _probe_registry(*, project_id='dark_factory'):
     """A two-topic registry whose canonicals are findable in the canned results."""
-    m = _mod()
-    return m.TopicRegistry(schema_version=1, entries=(
+    return topic_registry.TopicRegistry(schema_version=1, entries=(
         _scoped_entry('alpha-topic', project_id=project_id),
         _scoped_entry('beta-topic', project_id=project_id),
     ))
@@ -3190,7 +3188,7 @@ class TestReadOnlyGuarantee:
 
     def test_the_search_is_scoped_to_each_entrys_project(self, tmp_path):
         m = _mod()
-        registry = m.TopicRegistry(schema_version=1, entries=(
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(
             _scoped_entry('alpha-topic', project_id='dark_factory'),
             _scoped_entry('beta-topic', project_id='reify'),
         ))
@@ -3218,7 +3216,7 @@ class TestReadOnlyGuarantee:
     ):
         """No silent caps: a narrowed run must say what it did not probe."""
         m = _mod()
-        registry = m.TopicRegistry(schema_version=1, entries=(
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(
             _scoped_entry('alpha-topic', project_id='dark_factory'),
             _scoped_entry('beta-topic', project_id='reify'),
         ))
@@ -3258,7 +3256,7 @@ class TestRegistrySearchScope:
         path = _write_registry(tmp_path, _registry_payload(_entry_payload(
             'scoped-topic', search_scope=BRIEFING_CONVENTIONS_SCOPE,
         )))
-        entry = _mod().load_topic_registry(path).entries[0]
+        entry = topic_registry.load_topic_registry(path).entries[0]
 
         assert entry.search_scope.stores == ('mem0',)
         assert entry.search_scope.categories == (
@@ -3272,7 +3270,7 @@ class TestRegistrySearchScope:
             _entry_payload('unscoped-topic'),
             _entry_payload('scoped-topic', search_scope=BRIEFING_CONVENTIONS_SCOPE),
         ))
-        by_topic = _mod().load_topic_registry(path).by_topic
+        by_topic = topic_registry.load_topic_registry(path).by_topic
 
         assert by_topic['unscoped-topic'].search_scope is None
         assert 'search_scope' not in by_topic['unscoped-topic'].extra
@@ -3297,8 +3295,8 @@ class TestRegistrySearchScope:
             'bad-scope', search_scope=scope,
         )))
 
-        with pytest.raises(_mod().RegistryError) as exc:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
         assert 'bad-scope' in str(exc.value)
         assert 'search_scope' in str(exc.value)
 
@@ -3311,13 +3309,13 @@ class TestRegistrySearchScope:
         m = _mod()
         scoped = replace(
             _scoped_entry('scoped-topic'),
-            search_scope=m.SearchScope(
+            search_scope=topic_registry.SearchScope(
                 stores=('mem0',),
                 categories=('preferences_and_norms', 'procedural_knowledge'),
             ),
         )
         unscoped = _scoped_entry('unscoped-topic')
-        registry = m.TopicRegistry(schema_version=1, entries=(scoped, unscoped))
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(scoped, unscoped))
         double = _ServiceDouble(by_query=_canned_hits(registry))
 
         asyncio.run(m.run_probe(
@@ -3418,7 +3416,6 @@ def _split_obs(topic, phrasing, *, k=5, hit=False, rank=None, matched_by=None,
 def _split_registry():
     from dataclasses import replace  # noqa: PLC0415
 
-    m = _mod()
     entries = []
     for topic in sorted((
         RANKED_LOW, RANKED_WELL, STAMPED_NOWHERE, SPELLED_OTHERWISE,
@@ -3426,9 +3423,9 @@ def _split_registry():
     )):
         entry = _scoped_entry(topic)
         if topic == BRIEFING_SURFACE:
-            entry = replace(entry, derived_from=m.QUERY_SURFACE_DERIVATION)
+            entry = replace(entry, derived_from=topic_registry.QUERY_SURFACE_DERIVATION)
         entries.append(entry)
-    return m.TopicRegistry(schema_version=1, entries=tuple(entries))
+    return topic_registry.TopicRegistry(schema_version=1, entries=tuple(entries))
 
 
 def _split_observations():
@@ -3589,12 +3586,11 @@ class TestTripwireCensusSplit:
     def test_the_split_agrees_with_the_emitted_tripwire(self, tmp_path):
         """Same items, same verdicts: the split qualifies the tripwire, it does
         not re-derive it."""
-        m = _mod()
         split = self._split(tmp_path)
         series = _build(_split_observations(), ks=(5, 10))
 
         assert {
-            f'{m.TRIPWIRE_ITEM_PREFIX}{t.topic}': t.passed for t in split.topics
+            f'{topic_registry.TRIPWIRE_ITEM_PREFIX}{t.topic}': t.passed for t in split.topics
         } == {item.item_key: item.passed for item in _tripwire(series).items}
 
     def test_an_all_degraded_topic_is_in_no_class(self, tmp_path):
@@ -3884,22 +3880,22 @@ class TestCorpusCounting:
 
         expected = {c.value for c in (GRAPHITI_PRIMARY | MEM0_PRIMARY)}
 
-        assert set(_mod().corpus_categories()) == expected
+        assert set(topic_registry.corpus_categories()) == expected
 
     def test_one_count_call_per_category_keyed_by_category_only(self, tmp_path):
         double, _ = self._run_counts(tmp_path, {})
 
         assert [pid for pid, _ in double.count_calls] == (
-            ['dark_factory'] * len(_mod().corpus_categories())
+            ['dark_factory'] * len(topic_registry.corpus_categories())
         )
         assert all(set(f) == {'category'} for _, f in double.count_calls)
         assert (
             sorted(f['category'] for _, f in double.count_calls)
-            == sorted(_mod().corpus_categories())
+            == sorted(topic_registry.corpus_categories())
         )
 
     def test_the_counts_reach_the_corpus(self, tmp_path):
-        categories = _mod().corpus_categories()
+        categories = topic_registry.corpus_categories()
         counts = {c: i + 1 for i, c in enumerate(categories)}
         _, outcome = self._run_counts(tmp_path, counts)
 
@@ -4024,11 +4020,10 @@ class TestRegistryLoadFailureIsFatal:
         ``{"entries": []}``. Accepting it produces `"metrics": []` at exit 0 —
         the exact silent artifact RegistryError exists to prevent.
         """
-        m = _mod()
         path = _write_registry(tmp_path, _registry_payload(entries_override=[]))
 
-        with pytest.raises(m.RegistryError) as exc:
-            m.load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
 
         assert 'zero entries' in str(exc.value)
 
@@ -4113,7 +4108,7 @@ class TestEmptyProjectSelectionIsFatal:
         import asyncio  # noqa: PLC0415
 
         m = _mod()
-        empty = m.TopicRegistry(schema_version=1, entries=())
+        empty = topic_registry.TopicRegistry(schema_version=1, entries=())
 
         with pytest.raises(m.EmptySelectionError):
             asyncio.run(m.run_probe(
@@ -4425,22 +4420,22 @@ def _flip_registry(project_id: str, *, last_known_id: str | None = None):
     m = _mod()
 
     def entry(topic, canonical, *, known_id=None):
-        return m.RegistryEntry(
+        return topic_registry.RegistryEntry(
             topic=topic,
             project_id=project_id,
             derived_from='hand',
-            canonical=m.Canonical(
+            canonical=topic_registry.Canonical(
                 content_hash=m.content_key(canonical),
                 content_prefix=canonical[:80],
                 last_known_id=known_id,
             ),
             phrasings=(
-                m.Phrasing(f'what does the {topic} say', False),
-                m.Phrasing(f'summarise everything known about {topic}', True),
+                topic_registry.Phrasing(f'what does the {topic} say', False),
+                topic_registry.Phrasing(f'summarise everything known about {topic}', True),
             ),
         )
 
-    return m.TopicRegistry(schema_version=1, entries=(
+    return topic_registry.TopicRegistry(schema_version=1, entries=(
         entry(FLIP_TOPIC, FLIP_CANONICAL, known_id=last_known_id),
         entry(FOREIGN_TOPIC, FOREIGN_CANONICAL),
     ))
@@ -4667,12 +4662,12 @@ def _seeded_briefing_registry(project_id: str):
     from dataclasses import replace  # noqa: PLC0415
 
     m = _mod()
-    committed = m.load_topic_registry(REGISTRY_PATH).by_topic
-    return m.TopicRegistry(schema_version=1, entries=tuple(
+    committed = topic_registry.load_topic_registry(REGISTRY_PATH).by_topic
+    return topic_registry.TopicRegistry(schema_version=1, entries=tuple(
         replace(
             committed[topic],
             project_id=project_id,
-            canonical=m.Canonical(content_hash=m.content_key(text), content_prefix=text[:80]),
+            canonical=topic_registry.Canonical(content_hash=m.content_key(text), content_prefix=text[:80]),
             claim_queries=(),
         )
         for topic, (text, _) in sorted(BRIEFING_SEEDS.items())
@@ -4765,7 +4760,7 @@ class TestStoresServedDisclosure:
         entry = _entry(content=CANON)
         results = [_stored(CANON, 'mem0', 'ID-1'), _stored('other', 'graphiti', 'G1')]
 
-        obs = m.observe_phrasing(results, entry, m.Phrasing('q', False), 5)
+        obs = m.observe_phrasing(results, entry, topic_registry.Phrasing('q', False), 5)
 
         assert obs.stores_served == ('graphiti', 'mem0')
 
@@ -4774,7 +4769,7 @@ class TestStoresServedDisclosure:
         m = _mod()
         entry = _entry(content=CANON)
 
-        obs = m.observe_phrasing([_R(content=CANON, id='ID-1')], entry, m.Phrasing('q'), 5)
+        obs = m.observe_phrasing([_R(content=CANON, id='ID-1')], entry, topic_registry.Phrasing('q'), 5)
 
         assert obs.stores_served == ('unknown',)
 
@@ -4784,7 +4779,7 @@ class TestStoresServedDisclosure:
         results = [*[_stored('f', 'mem0', f'M{i}') for i in range(5)],
                    _stored('g', 'graphiti', 'G1')]
 
-        assert m.observe_phrasing(results, entry, m.Phrasing('q'), 5).stores_served == ('mem0',)
+        assert m.observe_phrasing(results, entry, topic_registry.Phrasing('q'), 5).stores_served == ('mem0',)
 
     def test_the_report_breaks_observations_down_by_serving_store(self):
         m = _mod()
@@ -4964,16 +4959,16 @@ class TestStoresServedDisclosure:
 
         m = _mod()
         base = _probe_entry()
-        entry = m.RegistryEntry(
+        entry = topic_registry.RegistryEntry(
             topic=base.topic, project_id=base.project_id,
             derived_from=base.derived_from, canonical=base.canonical,
-            phrasings=(m.Phrasing('tuned query', False), m.Phrasing('held out query', True)),
+            phrasings=(topic_registry.Phrasing('tuned query', False), topic_registry.Phrasing('held out query', True)),
             supersedes_pairs=(
-                m.SupersedesPair(m.content_key('came back'), m.content_key(CANON)),
-                m.SupersedesPair(m.content_key('never returned'), m.content_key('nor this')),
+                topic_registry.SupersedesPair(m.content_key('came back'), m.content_key(CANON)),
+                topic_registry.SupersedesPair(m.content_key('never returned'), m.content_key('nor this')),
             ),
         )
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
         observations = m.ProbeObservations()
         search = _search_returning(
             {},
@@ -4994,7 +4989,7 @@ class TestStoresServedDisclosure:
 
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
         observations = m.ProbeObservations()
         search = _search_returning({
             'tuned query': _healthy([_stored(CANON, 'mem0', 'ID-1')]),
@@ -5220,7 +5215,7 @@ class TestObservationDepthIsHonest:
     def _observe(self, ks):
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
         observations = m.ProbeObservations()
         search = _search_returning(
             {}, default_factory=lambda: _healthy(_filler(10)),
@@ -5270,7 +5265,7 @@ class TestInversionFamilyIsPinnedToScoredDepth:
     def _observe(self, *, superseded_rank, successor_rank, ks=(10,), total=10):
         m = _mod()
         entry = _pair_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
         observations = m.ProbeObservations()
         results = _filler(total)
         results[superseded_rank - 1] = _R(content='old text', id='OLD')
