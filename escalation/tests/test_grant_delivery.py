@@ -11,7 +11,6 @@ import pytest
 
 from escalation.action_effects import ACTION_EFFECTS, WORKFLOW_RESUME
 from escalation.grant_delivery import (
-    GRANT_NOT_DELIVERED_MARKER,
     GrantDelivery,
     grant_delivery_for,
     shortfall_reason,
@@ -126,12 +125,3 @@ class TestShortfallReason:
         assert _TASK_ID in reason
         for path in _GRANT:
             assert path in reason
-
-    def test_write_failed_is_a_member(self):
-        assert GrantDelivery.WRITE_FAILED in set(GrantDelivery)
-
-
-class TestMarker:
-    def test_marker_is_a_non_empty_string(self):
-        assert isinstance(GRANT_NOT_DELIVERED_MARKER, str)
-        assert GRANT_NOT_DELIVERED_MARKER.strip()
