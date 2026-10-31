@@ -32,7 +32,7 @@ from dashboard.data.chart_utils import ChartData
 from dashboard.data.datum import Datum, DatumState, unknown_datum
 from dashboard.data.db import with_db
 from dashboard.data.mcp_fanout import describe_exc
-from dashboard.data.memory import mcp_tool_call
+from dashboard.data.memory import enclosing_deadline, mcp_tool_call
 from dashboard.data.stats_utils import percentile
 from dashboard.data.task_lookup import FETCHED_ROW_FRESHNESS_BOUND_SECONDS, TaskRef
 from dashboard.data.utils import parse_utc, resolve_now, safe_gather_result
@@ -892,16 +892,19 @@ async def _probe_live_one(
     connect/read/write *and pool acquisition* on the shared client), while
     the enclosing ``asyncio.wait_for`` still bounds the operation as a whole
     — a cold session performs three posts, so the per-request layer alone
-    would permit roughly 3x *timeout*.
+    would permit roughly 3x *timeout*. That enclosing bound sits at
+    ``memory.py::enclosing_deadline(timeout)``, strictly above the
+    per-request budget, so the transport's own exception is not pre-empted.
     """
     try:
         result = await asyncio.wait_for(
             mcp_tool_call(client, base_url, 'get_merge_queue', {}, timeout=timeout),
-            timeout=timeout,
+            timeout=enclosing_deadline(timeout),
         )
     except (TimeoutError, httpx.HTTPError, OSError, ValueError) as exc:
-        logger.debug('get_merge_queue failed for %s: %s', base_url, exc)
-        return {'entries': [], 'reachable': False, 'error': str(exc), 'metrics': None}
+        detail = describe_exc(exc)
+        logger.debug('get_merge_queue failed for %s: %s', base_url, detail)
+        return {'entries': [], 'reachable': False, 'error': detail, 'metrics': None}
     # Guard against unexpected non-dict results (e.g. a list)
     if not isinstance(result, dict):
         return {'entries': [], 'reachable': False, 'error': 'unexpected result type', 'metrics': None}
