@@ -1777,7 +1777,7 @@ def _run_ofat_driver(
 ) -> None:
     """OFAT screen: ``run_ofat_stage`` over ``ofat_candidates()`` → composite (μ)."""
     from orchestrator.evals.configs import ofat_candidates
-    from orchestrator.evals.report import build_price_table
+    from orchestrator.evals.prices import build_price_table
     from orchestrator.evals.runner import run_ofat_stage
 
     task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
@@ -1805,7 +1805,7 @@ def _run_matrix_driver(
     """
     from orchestrator.evals.configs import matrix_pairs, ofat_candidates
     from orchestrator.evals.metrics import RoleUnderTest
-    from orchestrator.evals.report import build_pairwise_price_table
+    from orchestrator.evals.prices import build_pairwise_price_table
     from orchestrator.evals.runner import run_matrix_stage
 
     task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
@@ -1834,7 +1834,7 @@ def _run_confirm_driver(
     """Confirmation batch: the single winning ``(arch, impl)`` combo → composite (μ)."""
     from orchestrator.evals.configs import get_config_by_name
     from orchestrator.evals.metrics import RoleUnderTest
-    from orchestrator.evals.report import build_pairwise_price_table
+    from orchestrator.evals.prices import build_pairwise_price_table
     from orchestrator.evals.runner import run_confirm_stage
 
     arch_cfg = get_config_by_name(arch)
