@@ -36,7 +36,7 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.task_submit import SubmitFailed, SubmittedTask, SubmittedTicket
 
-from orchestrator.offline_lane_episode_state import EpisodeStore, unconfirmable_node
+from orchestrator.offline_lane_episode_state import EPISODE_RETENTION, EpisodeStore, unconfirmable_node
 from orchestrator.offline_lane_episodes import TICK_FAILURES_BEFORE_ESCALATION, TickResult
 from orchestrator.offline_lane_escalations import (
     STUCK_FILING_CATEGORY,
@@ -1298,3 +1298,16 @@ async def test_a_failure_run_after_a_failed_resolve_amends_the_record_the_resolv
     await lane.tick()
     assert escalation_state(queue, record.id) == 'resolved'
 
+
+@pytest.mark.asyncio
+async def test_a_failing_command_whose_record_expires_from_the_store_has_its_tick_failure_record_resolved(tmp_path):
+    lane = Lane(tmp_path)
+    assert lane.queue is not None
+    _plant_broken(lane)
+    record = await _ticked_to_its_tick_failure_record(lane)
+
+    lane.clock.advance(seconds=EPISODE_RETENTION.total_seconds() + 60)
+    await lane.tick()
+
+    assert BROKEN not in EpisodeStore(lane.tmp_path, clock=lane.clock).commands()
+    assert escalation_state(lane.queue, record.id) == 'resolved'

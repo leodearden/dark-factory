@@ -51,14 +51,16 @@ Rules the engine and its pure rules keep beyond the PRD's text:
 - R15 a command whose tick raises is logged and skipped: it adds nothing to the tick's
   result, and the other commands' ticks go on.  ``TICK_FAILURES_BEFORE_ESCALATION``
   failures in a row keep one level-1 record on the command's sentinel, which the lane
-  resolves at the command's first clean tick; the run of failures is kept in memory only.
+  resolves at the command's first clean tick, or at the first tick after its record has
+  left the store (a failing tick may save nothing, so the record can expire); the run of
+  failures is kept in memory only.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -282,6 +284,11 @@ class _TickFailures:
             logger.exception('offline-lane: %s: tick-failure record %s not resolved; retried next clean tick',
                              command, run.escalation_id)
             self._runs[command] = replace(run, count=0)
+
+    async def cleared_unless_in(self, commands: Collection[str]) -> None:
+        """Clear the run of every command not in *commands*: a command with no record in the store has no tick to fail."""
+        for command in [command for command in self._runs if command not in commands]:
+            await self.cleared(command)
 
 
 @dataclass(frozen=True)
@@ -709,7 +716,8 @@ class LaneEngine:
         due: list[str] = []
         filed: list[str] = []
         open_tasks = _OpenLaneTaskLookup(self._open_lane_tasks)
-        for command in await asyncio.to_thread(self._store.commands):
+        commands = await asyncio.to_thread(self._store.commands)
+        for command in commands:
             try:
                 due_now, tasks = await self._command_ticked(command, head, policy, open_tasks)
             except Exception as exc:
@@ -719,6 +727,7 @@ class LaneEngine:
             filed.extend(tasks)
             if due_now:
                 due.append(command)
+        await self._tick_failures.cleared_unless_in(commands)
         return TickResult(tuple(due), tuple(filed))
 
     async def _command_ticked(

@@ -113,7 +113,7 @@ def _tick_failure_detail(failure: TickFailure) -> str:
         f'Last error: {failure.error}\n\n'
         "The first failure's traceback is in the orchestrator.offline_lane_episodes log. "
         "The lane closes this record itself at the command's first clean tick in the same "
-        'orchestrator process.'
+        "orchestrator process, or once the command has no record left in the lane's store."
     )
 
 
@@ -246,7 +246,8 @@ def amend_tick_failure(queue: EscalationQueue, escalation_id: str, failure: Tick
 def resolve_tick_failure(queue: EscalationQueue, escalation_id: str) -> None:
     queue.resolve(
         escalation_id,
-        "This command's tick ran clean again; the lane closed its own record.",
+        "This command's tick no longer fails: it ran clean again, or the command has no record "
+        "left in the lane's store to tick. The lane closed its own record.",
         resolved_by=LANE_ESCALATION_ROLE,
     )
 
