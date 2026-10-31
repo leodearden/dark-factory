@@ -1200,13 +1200,21 @@ class TaskInterceptor:
         advisory = amendment_advisory(task_id, written.get('updated_task'), fields_changed)
         if advisory is None:
             return None
-        await self._journal(
-            self._make_event(
-                EventType.task_text_amended,
-                project_root,
-                {**advisory, 'writer_source': writer_source.value, 'agent_id': agent_id},
+        try:
+            await self._journal(
+                self._make_event(
+                    EventType.task_text_amended,
+                    project_root,
+                    {**advisory, 'writer_source': writer_source.value, 'agent_id': agent_id},
+                )
             )
-        )
+        except Exception:
+            logger.warning(
+                'task_text_amended: journalling the amendment of task %s by %s failed',
+                task_id,
+                writer_source.value,
+                exc_info=True,
+            )
         return advisory
 
     @staticmethod
