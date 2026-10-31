@@ -29,7 +29,6 @@ EXEMPT_LOADERS = frozenset(
     {
         # Same policy as load_script; migration owned by pending task 6569.
         ('normalize_topic_slugs.py', 'load_census_module'),
-        ('local_memory_models_eval/harness.py', 'load_probe_module'),
         # Different policy; migration owned by pending task 7123.
         # Reuses the cache only when it has a FusedMemoryClient attribute.
         ('normalize_topic_slugs.py', 'load_mcp_client_module'),
