@@ -1959,7 +1959,7 @@ def test_spend_readings_js_load_order(
 
 # ---------------------------------------------------------------------------
 # Regression guard: dependency-free classic modules are served, versioned, and
-# load before every .jsx that reads them (task 5743)
+# load before every consumer that reads them (task 5743)
 #
 # A module in this table reads no window.DF_* global, so its only load-order
 # edges are to its consumers, each of which destructures the module's global
@@ -1978,6 +1978,7 @@ _DEPENDENCY_FREE_MODULES = {
         'tab_tasks.jsx',
     ),
     'render_failure.js': ('app.jsx',),
+    'poll_scope.js': ('data.js', 'app.jsx'),
 }
 _DEPENDENCY_FREE_CONSUMER_CASES = [
     (module, consumer)

@@ -65,6 +65,7 @@ const EXPECTED_WINDOW_GLOBALS = {
   'burndown_bands.js': 'DF_BURNDOWN_BANDS',
   'pins_recovery.js': 'DF_PINS_RECOVERY',
   'endpoint_staleness.js': 'DF_ENDPOINT_STALENESS',
+  'poll_scope.js': 'DF_POLL_SCOPE',
   'recon_status.js': 'DF_RECON_STATUS',
   'task_vocab.js': 'DF_TASK_VOCAB',
   'task_snapshot.js': 'DF_TASK_SNAPSHOT',

@@ -30,13 +30,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
+import pollScope from '../../src/dashboard/static/redux/poll_scope.js';
 
 import { loadDataJs } from './_data_loader.mjs';
 
 const {
   STALE_FAILURE_THRESHOLD,
-  TAB_ENDPOINTS,
-  CHROME_ENDPOINTS,
   staleEntryFor,
   formatAge,
   staleNoticesForTab,
@@ -50,6 +49,7 @@ const REDUX_DIR = path.resolve(
 
 // A representative endpoint that only ONE tab consumes, so a notice for it
 // can never be confused with a different tab's fan-in.
+const DASH = '/api/v2/dashboard';
 const MERGE_PATH = '/api/v2/dashboard/merge-queue';
 const TASKS_PATH = '/api/v2/dashboard/tasks';
 const ESC_PATH = '/api/v2/dashboard/escalations';
@@ -81,7 +81,12 @@ test('module exposes its documented surface', () => {
   assert.equal(typeof STALE_FAILURE_THRESHOLD, 'number');
   assert.ok(Number.isInteger(STALE_FAILURE_THRESHOLD) && STALE_FAILURE_THRESHOLD >= 2,
     `threshold must be an integer >= 2 so a single blip cannot trip it, got ${STALE_FAILURE_THRESHOLD}`);
-  assert.equal(typeof TAB_ENDPOINTS, 'object');
+  assert.equal(staleness.TAB_ENDPOINTS, undefined,
+    'TAB_ENDPOINTS lives in poll_scope.js, its one home; a second export here ' +
+    'would be a second copy of what the dashboard polls');
+  assert.equal(staleness.CHROME_ENDPOINTS, undefined,
+    'CHROME_ENDPOINTS lives in poll_scope.js, its one home; a second export here ' +
+    'would be a second copy of what the dashboard polls');
 });
 
 // ── (a) healthy tab ────────────────────────────────────────────────────────
@@ -209,52 +214,7 @@ test('an endpoint that never succeeded says NEVER, not "0s ago"', () => {
   }
 });
 
-// ── (e) the tab->endpoint map is machine-checked against the real sources ──
-
-// app.jsx is `type="text/babel"` and cannot be imported here, so the tab ids
-// are read out of its source — the same source-text contract idiom the Python
-// suite uses for .jsx (see test_tab_escalation_analytics.py).
-function appTabIds() {
-  const src = fs.readFileSync(path.join(REDUX_DIR, 'app.jsx'), 'utf8');
-  const block = src.match(/const tabs = \[([\s\S]*?)\];/);
-  assert.ok(block, 'could not locate the `const tabs = [...]` block in app.jsx');
-  return [...block[1].matchAll(/id:\s*'([^']+)'/g)].map(m => m[1]);
-}
-
-test('every mapped endpoint is a real endpointsFor() path', () => {
-  // A map that silently stops matching a renamed endpoint is a check that
-  // quietly stops checking: it would report "healthy" forever.
-  const { endpointsFor, pollKey } = loadDataJs().api;
-  const real = new Set(Object.keys(endpointsFor('24h')).map(pollKey));
-
-  for (const [tab, paths] of Object.entries(TAB_ENDPOINTS)) {
-    assert.ok(Array.isArray(paths) && paths.length > 0,
-      `tab ${tab} must map to a non-empty array of endpoint paths`);
-    for (const p of paths) {
-      assert.ok(real.has(p),
-        `TAB_ENDPOINTS[${tab}] names ${p}, which is not a pollKey of any ` +
-        `endpointsFor('24h') key: ${[...real].join(', ')}`);
-    }
-  }
-});
-
-test('every mapped tab id is one of app.jsx\'s tab ids', () => {
-  const ids = appTabIds();
-  assert.equal(ids.length, 13, `expected app.jsx's 13 tabs, got ${ids.length}: ${ids.join(', ')}`);
-  for (const tab of Object.keys(TAB_ENDPOINTS)) {
-    assert.ok(ids.includes(tab),
-      `TAB_ENDPOINTS has tab id ${tab}, which app.jsx does not render: ${ids.join(', ')}`);
-  }
-});
-
-test('every app.jsx tab is mapped — a tab with no entry is silently unmonitored', () => {
-  const ids = appTabIds();
-  for (const tab of ids) {
-    assert.ok(Object.prototype.hasOwnProperty.call(TAB_ENDPOINTS, tab),
-      `app.jsx renders tab ${tab} but TAB_ENDPOINTS has no entry for it, so ` +
-      'a wedge behind that tab would show no indicator at all');
-  }
-});
+// ── (e) missing or malformed paths ─────────────────────────────────────────
 
 test('missing or non-array paths yield no notice rather than throwing', () => {
   const wedged = staleMap({ [MERGE_PATH]: { failures: 99, lastSuccessAt: 0 } });
@@ -407,62 +367,6 @@ test('data.js prefers THIS module\'s threshold over its own fallback', async () 
   );
 });
 
-// ── CHROME_ENDPOINTS: what the rail, topbar and toolbar read on EVERY tab ───
-//
-// data.js polls CHROME_ENDPOINTS ∪ TAB_ENDPOINTS[activeTab] (task 5825), so
-// both maps now decide what is FETCHED, not merely what is monitored.
-
-const DASH = '/api/v2/dashboard';
-
-test('CHROME_ENDPOINTS is an exported, frozen, duplicate-free array', () => {
-  assert.ok(Array.isArray(CHROME_ENDPOINTS), `got ${typeof CHROME_ENDPOINTS}`);
-  assert.ok(Object.isFrozen(CHROME_ENDPOINTS), 'CHROME_ENDPOINTS must be frozen');
-  assert.equal(new Set(CHROME_ENDPOINTS).size, CHROME_ENDPOINTS.length,
-    `CHROME_ENDPOINTS has a duplicate: ${CHROME_ENDPOINTS.join(', ')}`);
-});
-
-test('every CHROME_ENDPOINTS entry is a real endpointsFor() path', () => {
-  const { endpointsFor, pollKey } = loadDataJs().api;
-  const real = new Set(Object.keys(endpointsFor('24h')).map(pollKey));
-  for (const p of CHROME_ENDPOINTS) {
-    assert.ok(real.has(p),
-      `CHROME_ENDPOINTS names ${p}, which is not a pollKey of any ` +
-      `endpointsFor('24h') key: ${[...real].join(', ')}`);
-  }
-});
-
-test('CHROME_ENDPOINTS is exactly the chrome\'s seven endpoints', () => {
-  // A literal, not a derivation: test_app_poll_scope.py proves the chrome
-  // READS exactly this set; this pins the set itself.
-  assert.deepEqual(
-    [...CHROME_ENDPOINTS].sort(),
-    [
-      `${DASH}/orchestrators`, `${DASH}/tasks`, `${DASH}/recon`, `${DASH}/merge-queue`,
-      `${DASH}/escalations`, `${DASH}/memory`, `${DASH}/costs`,
-    ].sort(),
-  );
-});
-
-// ── the two TAB_ENDPOINTS gaps that become silent freezes once the map polls ─
-
-const WEDGED = { failures: 3, lastSuccessAt: NOW - 120_000 };
-
-test('the Orchestrators tab watches /scheduler — its Deps/Locks cells read DF.SCHEDULER', () => {
-  const notices = staleNoticesForTab({
-    paths: TAB_ENDPOINTS.orch, stale: staleMap({ [`${DASH}/scheduler`]: WEDGED }), now: NOW,
-  });
-  assert.equal(notices.length, 1, JSON.stringify(notices));
-  assert.equal(notices[0].path, `${DASH}/scheduler`);
-});
-
-test('the Overview tab watches /merge-queue — its LiveFeed reads MERGE_QUEUE', () => {
-  const notices = staleNoticesForTab({
-    paths: TAB_ENDPOINTS.overview, stale: staleMap({ [MERGE_PATH]: WEDGED }), now: NOW,
-  });
-  assert.equal(notices.length, 1, JSON.stringify(notices));
-  assert.equal(notices[0].path, MERGE_PATH);
-});
-
 // ── loadingNoticeForTab: the tab paths that have never delivered since page load ─
 
 test('loadingNoticeForTab is ONE notice naming every tab path with no receipt yet', () => {
@@ -514,6 +418,10 @@ test('loadingNoticeForTab tolerates every missing input', () => {
 });
 
 // ── loadingNoticeForTab over the real data.js ──────────────────────────────
+//
+// These hand each tab the paths app.jsx would: its poll_scope.js entry.
+
+const { TAB_ENDPOINTS } = pollScope;
 
 function liveLoadingNotices(win) {
   return Object.fromEntries(Object.keys(TAB_ENDPOINTS).map(tab => [
