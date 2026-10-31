@@ -63,7 +63,8 @@ If a grandchild calls ``setsid()`` on its own it will escape into a new
 session and process group, making it invisible to ``killpg``.  This is
 acceptable for the current codebase because cargo/rustc do not call
 ``setsid``.  ``shared.git_async``'s children are group-killed through
-``sigkill_process_group`` when interrupted (task 4155).
+``sigkill_process_group`` when interrupted (task 4155), through a leader
+pidfd held from spawn (task 6251).
 """
 
 from __future__ import annotations
