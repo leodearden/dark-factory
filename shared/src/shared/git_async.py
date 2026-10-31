@@ -62,7 +62,7 @@ this away. A caller whose child must see the caller's own environment (for
 example, a child that forwards the locale onward) passes
 ``pin_c_locale=False``.
 
-CANCELLATION SAFETY (tasks 2608, 4155, 6346). If the ``communicate()`` await is
+CANCELLATION SAFETY (tasks 2608, 4155, 6346, 6251). If the ``communicate()`` await is
 interrupted — a caller-side ``asyncio.wait_for``, an outer cancellation, or
 this module's own ``timeout`` — the spawned child would otherwise keep
 running as an orphan holding its stdout/stderr pipes open. For a
@@ -72,9 +72,15 @@ SIGKILLs the child's whole process group, so helpers a script forked die with
 it (task 2608 killed only the direct child), then best-effort reaps the child.
 An interruption during the spawn itself, after the fork but before a Process
 exists, is covered too: the spawn is shielded, then its group is killed (task
-6346). The accepted residual: if the child has already exited and been reaped — a
-script that backgrounded a pipe-holding helper and exited — no signal is sent,
-since its pid may have been recycled (``shared.proc_group``'s house trade-off).
+6346). A script that already exited, leaving a pipe-holding helper, still has
+its group SIGKILLed, through a pidfd held from spawn
+(``shared/src/shared/proc_group.py::open_leader_pidfd``), which names the group
+itself and not its recyclable pgid number (task 6251). The accepted residual:
+(i) a leader that exits and is reaped before ``create_subprocess_exec``
+returns, since asyncio's child watcher can reap it inside the spawn's own pipe
+handshake, and (ii) kernels older than Linux 6.9 or without pidfd support. In
+both cases no signal is sent, since the pid may have been recycled
+(``shared/src/shared/proc_group.py::sigkill_process_group``'s house trade-off).
 
 Each child leads a new session, so it has no controlling terminal: a git
 credential or ssh-passphrase prompt fails fast instead of blocking on a tty.
@@ -98,7 +104,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from weakref import WeakKeyDictionary
 
-from shared.proc_group import sigkill_process_group
+from shared.proc_group import open_leader_pidfd, sigkill_process_group
 
 logger = logging.getLogger(__name__)
 
@@ -155,9 +161,11 @@ def _semaphore_for_running_loop() -> asyncio.Semaphore:
     return sem
 
 
-async def _kill_and_reap(proc: asyncio.subprocess.Process, pgid: int) -> None:
+async def _kill_and_reap(
+    proc: asyncio.subprocess.Process, pgid: int, *, leader_pidfd: int | None = None,
+) -> None:
     """Best-effort group kill + reap of an interrupted child. Never raises."""
-    sigkill_process_group(proc, pgid)
+    sigkill_process_group(proc, pgid, leader_pidfd=leader_pidfd)
     with contextlib.suppress(BaseException):
         await proc.wait()  # reap is best-effort; never let it mask the original error
 
@@ -268,6 +276,20 @@ async def _spawn_and_communicate(
         cmd, cwd, pipe_stdin=input_text is not None, pin_c_locale=pin_c_locale,
     )
     pgid = proc.pid  # frozen at spawn: see shared.proc_group's module docstring (task 845)
+    with open_leader_pidfd(proc) as leader_pidfd:
+        return await _communicate_or_kill(proc, pgid, leader_pidfd, cmd, cwd, input_text, timeout)
+
+
+async def _communicate_or_kill(
+    proc: asyncio.subprocess.Process,
+    pgid: int,
+    leader_pidfd: int | None,
+    cmd: Sequence[str],
+    cwd: Path | str | None,
+    input_text: str | None,
+    timeout: float | None,
+) -> GitResult:
+    """Feed and drain *proc*; an interrupted await kills its whole group, then reaps it."""
     communicate = proc.communicate(
         input=input_text.encode() if input_text is not None else None,
     )
@@ -281,7 +303,7 @@ async def _spawn_and_communicate(
         # the child is still alive: kill + reap it before degrading. This
         # branch DEGRADES (returns a result), so it logs loudly — a silent
         # timeout is indistinguishable from a clean negative answer.
-        await _kill_and_reap(proc, pgid)
+        await _kill_and_reap(proc, pgid, leader_pidfd=leader_pidfd)
         logger.warning(
             'git_async.timeout cmd=%s cwd=%s timeout=%.3fs rc=%s '
             '(child killed and reaped; returning fail-open timed-out result)',
@@ -299,7 +321,7 @@ async def _spawn_and_communicate(
         # Kill + reap so the child's group does not leak (tasks 2608/4155),
         # then propagate the original exception unchanged. No log here: this
         # path re-raises, so it is not a silent fallthrough.
-        await _kill_and_reap(proc, pgid)
+        await _kill_and_reap(proc, pgid, leader_pidfd=leader_pidfd)
         raise
     return GitResult(
         returncode=proc.returncode if proc.returncode is not None else 1,
