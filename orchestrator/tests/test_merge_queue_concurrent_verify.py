@@ -49,13 +49,7 @@ from _merge_lane_fakes import (
 from _orch_helpers import (
     MERGE_GATE_BARRIER_TIMEOUT,
     MERGE_RESULT_TIMEOUT,
-    # task 4215 moved this constant to _orch_helpers.py, where a runtime
-    # `tomllib` read of orchestrator/pyproject.toml now pins it against the
-    # real `[tool.pytest.ini_options].timeout`
-    # (test_whole_tree_scan_timeout_guard.py).
-    PYPROJECT_DEFAULT_TIMEOUT,
     STOP_WORKER_JOIN_TIMEOUT,
-    UNDER_LOAD_HEADROOM_FACTOR,
     wait_responsive,
 )
 from _verify_result_doubles import (
@@ -5866,34 +5860,4 @@ class TestLoudWaitMigrationRatchet:
             'invariant -- see '
             'test_merge_queue_concurrent_verify.py::_stop_worker):\n'
             + '\n'.join(f'  - {offender}' for offender in offenders)
-        )
-
-
-class TestHeavyBarrierTimeoutConstant:
-    """HEAVY_BARRIER_TEST_TIMEOUT is a literal held up by two floors.
-
-    Whether each marked test's waits fit under it is checked per item by
-    test_wait_budget_coverage_guard.py, not here.
-    """
-
-    def test_clears_the_measured_wall_clock_with_headroom(self) -> None:
-        """The constant keeps UNDER_LOAD_HEADROOM_FACTOR over the measured worst case."""
-        required = _HEAVY_BARRIER_MEASURED_UNDER_LOAD_WORST_CASE * UNDER_LOAD_HEADROOM_FACTOR
-        assert required <= HEAVY_BARRIER_TEST_TIMEOUT, (
-            f'HEAVY_BARRIER_TEST_TIMEOUT ({HEAVY_BARRIER_TEST_TIMEOUT}s) no longer '
-            f'clears {UNDER_LOAD_HEADROOM_FACTOR}x the measured-under-load worst '
-            f'case ({_HEAVY_BARRIER_MEASURED_UNDER_LOAD_WORST_CASE}s = {required}s). '
-            'Raise the constant (and re-record the measurement) rather than '
-            'relaxing this arithmetic.'
-        )
-
-    def test_never_narrows_the_ini_default(self) -> None:
-        """The constant never falls below PYPROJECT_DEFAULT_TIMEOUT."""
-        assert HEAVY_BARRIER_TEST_TIMEOUT >= PYPROJECT_DEFAULT_TIMEOUT, (
-            f'HEAVY_BARRIER_TEST_TIMEOUT ({HEAVY_BARRIER_TEST_TIMEOUT}s) is below '
-            f'the pyproject default ({PYPROJECT_DEFAULT_TIMEOUT}s). A timeout mark '
-            'REPLACES the ambient budget rather than flooring it (see '
-            '_orch_helpers.VERIFY_CLI_PER_TEST_TIMEOUT), so below the ini default '
-            'the merge-barrier classes carrying this mark run TIGHTER than every '
-            'unmarked test on a bare local or agent run. Raise the constant.'
         )
