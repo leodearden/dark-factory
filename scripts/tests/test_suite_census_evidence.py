@@ -201,6 +201,29 @@ class TestPytestDefinitionScopes:
             oc.TestId('tests', 'tests/test_d.py::test_root_only'),
         ]
 
+    def test_an_inherited_method_resolves_through_in_file_and_unknown_bases(self, tmp_path):
+        source = (
+            'from contracts import Contract\n\n\n'
+            'class _Harness:\n    def test_h(self):\n        pass\n\n\n'
+            'class TestChild(_Harness):\n    pass\n\n\n'
+            'class TestGrandchild(TestChild):\n    pass\n\n\n'
+            'class TestSplice(Contract):\n    pass\n\n\n'
+            'class TestLoopA(TestLoopB):\n    pass\n\n\n'
+            'class TestLoopB(TestLoopA):\n    pass\n'
+        )
+        resolved, unresolved = _resolve(tmp_path, {D: source}, [
+            ('tests.test_d.TestChild', 'test_h'),
+            ('tests.test_d.TestGrandchild', 'test_h'),
+            ('tests.test_d.TestSplice', 'test_contract'),
+            ('tests.test_d.TestChild', 'test_absent'),
+            ('tests.test_d.TestLoopA', 'test_h'),
+        ])
+        assert resolved == {
+            f'{D}::TestChild::test_h', f'{D}::TestGrandchild::test_h',
+            f'{D}::TestSplice::test_contract',
+        }
+        assert unresolved == {'tests.test_d.TestChild::test_absent', 'tests.test_d.TestLoopA::test_h'}
+
 
 ALPHA = oc.TestId('tests/infra', 'tests/infra/test_alpha.sh')
 BETA = oc.TestId('tests/infra', 'tests/infra/test_beta.sh')
