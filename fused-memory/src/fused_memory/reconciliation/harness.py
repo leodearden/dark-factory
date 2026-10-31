@@ -188,7 +188,7 @@ one spelling: a drifted literal would silently stop folding."""
 #     queue with a different reader.  Unlike BacklogPolicy, this filer does not
 #     close its own records either.  Level 0 keeps them off the orchestrator's
 #     level-1-only has_open_l1 guard surface; an unattended one still reaches
-#     L1 on its own, promoted by Harness._reap_orphan_l0_escalations once it
+#     a consumer on its own (the orphan reaper and its info-L0 router) once it
 #     ages past orphan_l0_timeout_secs with no live workflow on the task.
 #   See ReconciliationHarness._escalate() docstring for per-call-site details.
 _RECON_DEDUP_CONFIG = (
@@ -2991,8 +2991,8 @@ class ReconciliationHarness:
         on this task", so an L1 here would turn a passive observation into a
         gate on dispatch.  See the `FINDING_TASK_ESCALATION_LEVEL` comment block in
         `finding_task_escalation.py` for the full guard-site population and for
-        why an unattended record still reaches L1 (via
-        `Harness._reap_orphan_l0_escalations`) without this filer asserting it.
+        why an unattended record still reaches a consumer (the orphan reaper and
+        its info-L0 router) without this filer asserting it.
 
         FAIL-SAFE: a queue hiccup is logged and swallowed — a reconciliation
         cycle is never aborted by a failed filing (mirroring

@@ -90,15 +90,17 @@ FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
 #     `::Harness._block_and_escalate_substrate_flip`, each of which SUPPRESSES
 #     its own human-facing L1 and downgrades to a WARNING log when one is
 #     already open;
-#   - `orchestrator/harness.py::Harness._reap_orphan_l0_escalations`, which
-#     DISMISSES a pending orphan L0 on the task rather than promoting it when
-#     an L1 is open;
 #   - `orchestrator/workflow.py::TaskWorkflow._wait_for_resolution`, which
 #     raises `_StewardReescalated` and diverts the workflow on the strength of
 #     an open L1;
 #   - `orchestrator/workflow.py::TaskWorkflow._await_steward_completion`, the
 #     requeue-diversion override, which holds a requeue-producing steward
 #     outcome back when an L1 is already open.
+#
+# The orphan-L0 reaper (`orchestrator/harness.py::Harness._reap_orphan_l0_escalations`)
+# is not a reader: since task 5223 its coverage rule is
+# `escalation/queue.py::EscalationQueue.dismiss_if_covered`, scoped to the L0's
+# own category, so an L1 of another category cannot hijack it.
 #
 # BOTH workflow.py sites are uncategorized, and an earlier revision of this
 # block listed only the first. That was a measurement error, corrected here
@@ -128,18 +130,29 @@ FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
 # `orchestrator/harness.py::_file_starvation_info` and
 # `::_file_warm_base_hard_down_notice`, which claim level-0 records "do NOT
 # auto-promote", this one does not: `Harness._reap_orphan_l0_escalations` DOES
-# promote a pending L0 to L1 once it is older than
-# `config.orphan_l0_timeout_secs`, gated on the task having no running workflow
-# (`_escalation_events`), not being `scheduler.is_actively_held`, and having no
-# already-open L1 — in which last case it DISMISSES the L0 instead, as a
-# duplicate of the record the human is already handling.
+# act on a pending L0 once it is older than `config.orphan_l0_timeout_secs` and
+# the incarnation that filed it is gone (its liveness gate reads
+# `_escalation_events` and `scheduler.is_actively_held`).  Such a routed L0 goes
+# one of two ways:
+#
+#   - with `info_l0_router_enabled` (default on), the info-L0 router owns it,
+#     because it is info severity at level 0
+#     (`orchestrator/escalation_router.py::router_owns`).  The router converts it
+#     to a task through the curator, or promotes it to an L1 carrying the
+#     conversion hint;
+#   - with the router off, the reaper promotes it verbatim to L1 unless an open
+#     L1 of its OWN category covers it, in which case it is dismissed as a
+#     duplicate (`escalation/queue.py::EscalationQueue.dismiss_if_covered`).
+#
+# An unrelated open L1 suppresses neither path.
 #
 # The consequence is the good one, and it is why no escalate-if-unattended
-# behaviour needs asserting here: an unattended routed finding reaches L1 on
-# its own, delivered by the component that OWNS strand-detection semantics
-# (liveness, hold state, duplicate suppression), while an attended one is
-# correctly folded away.  Re-deriving any of that at this filer would mean
-# re-deriving all three signals from a process that cannot see them.
+# behaviour needs asserting here: an unattended routed finding reaches a
+# consumer on its own, delivered by the component that OWNS strand-detection
+# semantics (liveness, hold state, duplicate suppression), while one an L1 of
+# its own category already covers is folded away.  Re-deriving any of that at
+# this filer would mean re-deriving all three signals from a process that
+# cannot see them.
 #
 # PUBLIC (and in `__all__`), like `FINDING_TASK_ESCALATION_CATEGORY` above:
 # the level a routed record is filed at is part of this module's CROSS-MODULE
@@ -149,7 +162,7 @@ FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
 # `test_routed_record_is_invisible_to_the_orchestrator_l1_guards` all reason
 # about.  A leading underscore would have signalled module-local and invited a
 # future reader to inline the literal — and, worse, to weaken it without
-# noticing the seven guard sites enumerated above.
+# noticing the guard sites enumerated above.
 FINDING_TASK_ESCALATION_LEVEL = 0
 
 # `severity='info'`, NOT the 'blocking' used by the `_sweep_escalate_l1`
@@ -439,17 +452,18 @@ def routed_record_covers_finding(
     every run.
 
     A record ABOVE ``FINDING_TASK_ESCALATION_LEVEL`` covers EVERY finding.  It
-    is a routed finding a human already holds, and
-    ``orchestrator/harness.py::Harness._reap_orphan_l0_escalations`` dismisses
-    any L0 on a task with an open L1 as covered, so filing one would only start
-    a file-dismiss-refile loop each cycle.  Promotion builds a new record that
-    keeps ``detail`` (with a suffix appended) but not ``dedupe_fingerprint``,
-    which is why the level alone decides here.
+    is a routed finding a human already holds, so a refile would only churn.
+    With the info-L0 router off,
+    ``escalation/queue.py::EscalationQueue.dismiss_if_covered`` folds any L0 of
+    this category into an open L1 of this category, so a refile would be folded
+    every cycle; with the router on, a refile would go to the curator again
+    every cycle.  Promotion builds a new record that keeps ``detail`` (with a
+    suffix appended) but not ``dedupe_fingerprint``, which is why the level
+    alone decides here.
 
-    That closes the loop for a ROUTED L1 only.  The reaper's ``has_open_l1``
-    read ignores category, so an UNRELATED open L1 still dismisses each routed
-    L0 and the next cycle refiles it.  Folding behind any L1 would give up the
-    task-2757 property above; task 6341 owns that decision.
+    An L1 of another category covers nothing, here or in the reaper: both apply
+    the task-2757 category scope, so a routed L0 behind an unrelated L1 stays
+    pending and the next cycle folds onto it (task 6341).
 
     The caller passes PENDING records only, so a finding reaches the ladder
     again once the covering record is adjudicated.
