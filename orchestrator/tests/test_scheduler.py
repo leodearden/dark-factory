@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _orch_helpers import HermeticMcpSession
 from _recording_event_store import _RecordingEventStore
 from shared.locking import directory_locks
 from shared.task_metadata_wire import coerce_task_metadata
@@ -4850,7 +4851,11 @@ class TestBlastRadiusRefinement:
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1, lock_depth=4)
         event_store = _RecordingEventStore()
-        sched = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        sched = Scheduler(
+            config,
+            event_store=event_store,  # type: ignore[arg-type]
+            mcp_session=HermeticMcpSession(),
+        )
         sched.finish_startup()
         return sched
 
@@ -11161,7 +11166,7 @@ class TestAcquireNextDepBackfillFromGetStatuses:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        scheduler = Scheduler(config)
+        scheduler = Scheduler(config, mcp_session=HermeticMcpSession())
         scheduler.finish_startup()
         return scheduler
 
