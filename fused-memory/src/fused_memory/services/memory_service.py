@@ -10177,9 +10177,10 @@ class MemoryService:
         verdict, so a combined ``fact`` + ``clear_invalid_at`` call is
         ``verified`` only when *both* readbacks confirm. A pure
         ``invalid_at=<timestamp>`` supersede (no fact, no clear) is not
-        readback-verified — it persists reliably via the same write path
-        used for ``fact``. There is a small TOCTOU window between each save
-        and its readback — if a concurrent writer updates the same edge in
+        readback-verified — it is the same targeted ``SET e.invalid_at``
+        write the clear uses, only without a readback. There is a small
+        TOCTOU window between each save and its readback — if a concurrent
+        writer updates the same edge in
         that window (another reconciliation cycle, an interactive agent, or
         a retry) the readback may return a different value and ``verified``
         will be ``False`` even though *our* save did persist.  This is a
@@ -10189,7 +10190,7 @@ class MemoryService:
         behaviour is intentional.  Both readbacks (``get_edge_text`` and
         ``get_edge_invalid_at``) resolve their Cypher through the same
         per-``group_id`` graph object (``GraphitiBackend._graph_for``) that
-        the backend's explicit ``clear_invalid_at`` write uses, so
+        the backend's targeted ``invalid_at`` write uses, so
         read-after-write consistency for *our own* write is expected within
         that connection — the TOCTOU risk above is about a *different*
         writer racing us, not about our own write lagging its readback.
