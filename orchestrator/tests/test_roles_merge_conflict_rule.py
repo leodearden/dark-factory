@@ -19,6 +19,7 @@ from __future__ import annotations
 from escalation.categories import EscalationCategory
 
 from orchestrator.agents.merge_conflict_guidance import STEWARD_MERGE_CONFLICT_RULE
+from orchestrator.agents.roles import MERGE_HALT_SAFETY_RULE, ROLES, STEWARD
 
 
 def test_merge_conflict_rule_is_nonempty() -> None:
@@ -43,4 +44,33 @@ def test_merge_conflict_rule_names_the_rebase_bounce_category() -> None:
         f'STEWARD_MERGE_CONFLICT_RULE does not name `{category}`, the category '
         'the merge queue files a rebase bounce under, so a steward handed one '
         'cannot tell the rule applies to it.'
+    )
+
+
+def test_merge_conflict_rule_follows_rule_6_in_steward_prompt() -> None:
+    """THE SPLICE: the rule reaches the steward, directly after Rule 6.
+
+    One containment check of the two named constants together proves both
+    that the role handling merge bounces carries the rule and that the Rules
+    list numbering stays contiguous.
+    """
+    assert MERGE_HALT_SAFETY_RULE + STEWARD_MERGE_CONFLICT_RULE in STEWARD.system_prompt, (
+        "STEWARD's system_prompt does not carry STEWARD_MERGE_CONFLICT_RULE "
+        'directly after MERGE_HALT_SAFETY_RULE. The steward handles merge '
+        'bounces; without this rule it has no prohibition against rewriting '
+        'the queued branch, and its Rules list stops being numbered 6 then 7.'
+    )
+
+
+def test_only_the_steward_carries_the_merge_conflict_rule() -> None:
+    carriers = [
+        name for name, role in ROLES.items()
+        if STEWARD_MERGE_CONFLICT_RULE in role.system_prompt
+    ]
+    assert carriers == ['steward'], (
+        f'STEWARD_MERGE_CONFLICT_RULE is carried by {carriers}, expected only '
+        "['steward']. The rule's `escalate_blocker(..., level=1)` recourse is "
+        "the steward's route; the escalation-ladder tests forbid level=1 to "
+        'every other role (see '
+        'orchestrator/tests/test_roles_escalation_ladder.py::_L1_FILER_ROLES).'
     )
