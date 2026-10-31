@@ -460,6 +460,10 @@ def _wire_two_snapshots(
     """``get_task`` returns *early* until the re-block guard's ``update_task``
     lands, then *late* — and every scheduler call is appended to one ordered log.
 
+    Only the guard's own charge (a ``reblock_guard`` payload) switches the
+    snapshot: the granted-files fold's ``files`` write precedes the whole
+    re-pend (task 5650), and must not stand in for the guard.
+
     Modelling the skew this way, rather than as a positional ``side_effect``
     list, keeps the fixture independent of HOW MANY ``get_task`` round-trips the
     gate path happens to make (today: the infra pre-gate's, then the guard's).
@@ -481,7 +485,9 @@ def _wire_two_snapshots(
     async def _update_task(*args, **kwargs):
         nonlocal guard_written
         order.append('update_task')
-        guard_written = True
+        updates = args[1] if len(args) > 1 else kwargs.get('updates', {})
+        if 'reblock_guard' in updates:
+            guard_written = True
         return True
 
     async def _set_task_status(*args, **kwargs):
@@ -1423,16 +1429,16 @@ class TestGrantedFilesFoldOnRepend:
             '3438" would be satisfied by an unrelated warning from the drive'
         )
 
-    async def test_a_withheld_flip_performs_no_fold(
+    async def test_a_withheld_flip_still_delivers_the_grant(
         self, harness: Harness, tmp_path: Path
     ):
-        """Nothing was re-pended, so nothing may be widened.
+        """The re-block guard withholds the re-pend, not the grant (task 5650).
 
-        The re-block guard withholding the flip means this task is NOT going
-        back to dispatch on this resolution.  Widening its scope anyway would
-        persist a grant against a task parked for human attention, and the
-        widened ``metadata.files`` would change the locks it competes for the
-        moment an operator does resume it.
+        This used to assert the opposite — "nothing was re-pended, so nothing
+        may be widened". But a grant is additive and durable: a widen without a
+        re-pend is complete, and the widened scope is exactly what the task
+        needs when an operator does resume it. Withholding the grant because
+        the re-pend was withheld is the silent no-op task 5650 closes.
         """
         esc = _esc(
             task_id='3438', category='scope_violation',
@@ -1440,10 +1446,8 @@ class TestGrantedFilesFoldOnRepend:
         )
         _wire_queue(harness, tmp_path, esc)
         plan_path = _seed_plan(harness, files=['pkg/a.py'])
-        before = plan_path.read_text()
         # Drive the guard to its threshold end-to-end (same signature, count
-        # already at the limit) rather than stubbing _check_reblock_guard —
-        # the ordering contract is "fold AFTER the guard returns True".
+        # already at the limit) rather than stubbing _check_reblock_guard.
         _wire(harness, _row(
             'in-progress', claimant=None, heartbeat=None,
             metadata={'reblock_guard': {
@@ -1456,21 +1460,20 @@ class TestGrantedFilesFoldOnRepend:
         await _drive(harness, esc)
 
         harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
-        assert plan_path.read_text() == before, 'a withheld flip must not widen'
-        assert _files_updates(harness) == []
+        assert json.loads(plan_path.read_text())['files'] == ['pkg/a.py', 'pkg/b.py']
+        assert len(_files_updates(harness)) == 1
 
-    async def test_a_late_aborted_flip_performs_no_fold(
+    async def test_a_late_aborted_flip_still_delivers_the_grant(
         self, harness: Harness, tmp_path: Path
     ):
-        """A resume the corroborating read aborts must leave NO partial widen.
+        """A resume the corroborating read aborts still delivers the grant (task 5650).
 
-        The fold is a read-modify-write of two DURABLE artifacts (plan.json and
-        ``metadata.files``), so it has to be gated by the same authorisation as
-        the status write — otherwise the abort path advertises "skipping the
-        write" while having already mutated both. It matters most in exactly
-        the case this test drives: a claimant appeared, which means a freshly
-        dispatched ``TaskWorkflow`` now owns that plan in memory, and a fold
-        landing underneath it is two writers racing over one file.
+        This used to assert that an aborted resume leaves NO widen behind. The
+        grant does not depend on the flip: it is additive and durable, and the
+        claimant that appeared needs the widened scope as much as a re-pended
+        task would. Gating it on the flip is the silent no-op task 5650 closes.
+        The fold now precedes the whole re-pend and holds ``plan_mutex`` across
+        its read-modify-write, so it does not race a workflow's plan writes.
         """
         esc = _esc(
             task_id='3438', category='scope_violation',
@@ -1478,7 +1481,6 @@ class TestGrantedFilesFoldOnRepend:
         )
         _wire_queue(harness, tmp_path, esc)
         plan_path = _seed_plan(harness, files=['pkg/a.py'])
-        before = plan_path.read_text()
         # Early snapshot authorises the flip; the late one shows a workflow
         # claimed the row between the gate and the write.
         _wire_two_snapshots(
@@ -1490,14 +1492,75 @@ class TestGrantedFilesFoldOnRepend:
 
         await _drive(harness, esc)
 
+        assert _guard_charges(harness), (
+            'the gate must have authorised the flip, so the abort is the '
+            "corroborating read's, not the liveness fork's"
+        )
         harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
-        assert plan_path.read_text() == before, (
-            'an aborted resume must not have widened plan.json — the write it '
-            'declined to make is the same write the widen was FOR'
+        assert json.loads(plan_path.read_text())['files'] == ['pkg/a.py', 'pkg/b.py']
+        assert len(_files_updates(harness)) == 1
+
+    async def test_a_live_claimant_skip_still_delivers_the_grant(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """The falsified worktree=null hypothesis's shape: an orphan-routed
+        resolution whose row has a heartbeating claimant (task 5650)."""
+        esc = _esc(
+            task_id='3438', category='scope_violation',
+            granted_files=['pkg/b.py'], resolved_by='steward',
         )
-        assert _files_updates(harness) == [], (
-            'an aborted resume must not have widened metadata.files either'
+        _wire_queue(harness, tmp_path, esc)
+        plan_path = _seed_plan(harness, files=['pkg/a.py'])
+        _wire(harness, _row('in-progress', claimant=LIVE_CLAIMANT, heartbeat='fresh'))
+        harness._escalation_events.pop('3438', None)
+
+        await _drive(harness, esc)
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        assert json.loads(plan_path.read_text())['files'] == ['pkg/a.py', 'pkg/b.py']
+        assert len(_files_updates(harness)) == 1
+
+    async def test_a_non_rependable_status_still_delivers_the_grant(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """A status outside ``_RESUME_REPEND_STATUSES`` skips the flip, not the
+        grant (task 5650)."""
+        esc = _esc(
+            task_id='3438', category='scope_violation',
+            granted_files=['pkg/b.py'], resolved_by='steward',
         )
+        _wire_queue(harness, tmp_path, esc)
+        plan_path = _seed_plan(harness, files=['pkg/a.py'])
+        _wire(harness, _row('review', claimant=None, heartbeat=None))
+        harness._escalation_events.pop('3438', None)
+
+        await _drive(harness, esc)
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        assert json.loads(plan_path.read_text())['files'] == ['pkg/a.py', 'pkg/b.py']
+        assert len(_files_updates(harness)) == 1
+
+    async def test_an_infra_held_resume_delivers_the_grant(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """The infra-hold A1 arm re-pends without ever reaching the old fold
+        site; the grant must land on it too (task 5650)."""
+        esc = _esc(
+            task_id='3438', category='scope_violation',
+            granted_files=['pkg/b.py'], resolved_by='steward',
+        )
+        _wire_queue(harness, tmp_path, esc)
+        plan_path = _seed_plan(harness, files=['pkg/a.py'])
+        _wire(harness, _row('infra-hold', claimant=None, heartbeat=None))
+        harness._escalation_events.pop('3438', None)
+
+        await _drive(harness, esc)
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '3438', _resume_target(esc)
+        )
+        assert json.loads(plan_path.read_text())['files'] == ['pkg/a.py', 'pkg/b.py']
+        assert len(_files_updates(harness)) == 1
 
     async def test_a_resolution_granting_nothing_never_scans_the_queue(
         self, harness: Harness, tmp_path: Path
