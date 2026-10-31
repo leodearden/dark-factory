@@ -7,15 +7,19 @@ slot time a "cancel a plan's still-waiting legs once a sibling is red" change
 would have avoided. This is plans/verify-admission-fifo-prd.md task δ. The
 definitions, the decision and its rationale live in
 plans/verify-admission-fifo-prd.delta-decision.md.
+
+  verify_admission_cancel_on_red_census.py --db dark_factory=data/orchestrator/runs.db [--db NAME=PATH ...]
 """
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import random
 import sqlite3
+import sys
 from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -401,3 +405,43 @@ def verdict(m: Measurement) -> Verdict:
     if _side_of_decision_share(low) is _side_of_decision_share(high):
         return _side_of_decision_share(low)
     return Verdict.THIN_DATA
+
+
+def _named_db(value: str) -> tuple[str, Path]:
+    name, sep, path = value.partition('=')
+    if not sep or not name or not path:
+        raise argparse.ArgumentTypeError(f'expected NAME=PATH, got {value!r}')
+    return name, Path(path)
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f'expected a positive integer, got {value!r}')
+    return number
+
+
+def _report(name: str, db_path: Path, resamples: int, seed: int) -> dict[str, Any]:
+    m = measure(name, load_arrival_plans(db_path), resamples=resamples, seed=seed)
+    return {**asdict(m), 'verdict': verdict(m).value}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--db', type=_named_db, action='append', required=True, metavar='NAME=PATH')
+    parser.add_argument('--resamples', type=_positive_int, default=2000)
+    parser.add_argument('--seed', type=int, default=5630)
+    args = parser.parse_args(argv)
+    reports = []
+    for name, db_path in args.db:
+        try:
+            reports.append(_report(name, db_path, args.resamples, args.seed))
+        except sqlite3.OperationalError as exc:
+            print(f'{db_path}: {exc}', file=sys.stderr)
+            return 1
+    print(json.dumps(reports, indent=2))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
