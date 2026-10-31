@@ -739,7 +739,7 @@ check ran in. Single normative statement of the rule:
   re-derive it live. **Run from the project root** — `--queue-dir` defaults to
   the relative `./data/reconciliation/escalations`, so the cwd is what decides
   which queue is read; from anywhere else the script refuses with
-  `TargetStoreMissing` rather than manufacturing an empty queue and reporting a
+  `TargetStoreUnpopulated` rather than manufacturing an empty queue and reporting a
   false clean run (see
   `fused-memory/src/fused_memory/utils/target_store_preflight.py`). Pass an
   absolute `--queue-dir` if you cannot control the cwd.
