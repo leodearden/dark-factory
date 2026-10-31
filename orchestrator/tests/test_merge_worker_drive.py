@@ -14,7 +14,13 @@ from _merge_worker_drive import (
     make_real_merge_item,
     stop_merge_worker,
 )
-from _orch_helpers import PYPROJECT_DEFAULT_TIMEOUT, UNDER_LOAD_HEADROOM_FACTOR
+from _orch_helpers import (
+    PYPROJECT_DEFAULT_TIMEOUT,
+    STOP_WORKER_JOIN_TIMEOUT,
+    UNDER_LOAD_HEADROOM_FACTOR,
+)
+from _wait_budget_audit import item_wait_budgets
+from _wait_hygiene_scan import unguarded_worker_teardown_items
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps
@@ -104,6 +110,57 @@ class TestStopMergeWorker:
 
         assert run_task.done()
         assert isinstance(run_task.exception(), RuntimeError)
+
+
+class TestScannersRecogniseTheTeardownHelper:
+    """Both wait scanners match the teardown helper by name, so each source
+    here spells it through ``stop_merge_worker.__name__``: renaming the helper
+    reddens this class instead of silently disabling the two guards.
+    """
+
+    def test_wait_budget_audit_bills_the_default_join(self) -> None:
+        source = f'''
+class TestDefaultJoin:
+    async def test_it(self):
+        await {stop_merge_worker.__name__}(worker, worker_task)
+'''
+        budgets = item_wait_budgets(source)
+
+        assert budgets == {'TestDefaultJoin::test_it': STOP_WORKER_JOIN_TIMEOUT}
+
+    def test_wait_budget_audit_bills_an_explicit_join_timeout(self) -> None:
+        source = f'''
+class TestExplicitJoin:
+    async def test_it(self):
+        await {stop_merge_worker.__name__}(worker, worker_task, join_timeout=20.0)
+'''
+        budgets = item_wait_budgets(source)
+
+        assert budgets == {'TestExplicitJoin::test_it': 20.0}
+
+    def test_teardown_scan_reports_a_straight_line_call(self) -> None:
+        source = f'''
+class TestUnguarded:
+    async def test_it(self):
+        await wait_responsive(fut, timeout=5.0, label='x')
+        await {stop_merge_worker.__name__}(worker, worker_task)
+'''
+        offenders = unguarded_worker_teardown_items(source)
+
+        assert offenders == ['TestUnguarded::test_it']
+
+    def test_teardown_scan_accepts_a_call_in_finally(self) -> None:
+        source = f'''
+class TestGuarded:
+    async def test_it(self):
+        try:
+            await wait_responsive(fut, timeout=5.0, label='x')
+        finally:
+            await {stop_merge_worker.__name__}(worker, worker_task)
+'''
+        offenders = unguarded_worker_teardown_items(source)
+
+        assert offenders == []
 
 
 class TestHeavyBarrierTimeoutConstant:

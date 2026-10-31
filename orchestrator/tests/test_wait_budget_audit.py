@@ -572,13 +572,13 @@ class TestWaitResponsiveUnknownNominal:
         )
 
     def test_stop_worker_bills_its_hidden_default_join(self) -> None:
-        """`_stop_worker(worker, worker_task)` joins the worker task for up
-        to its hidden default (5.0s), so a teardown through it is billed.
+        """`stop_merge_worker(worker, worker_task)` joins the worker task for
+        up to its hidden default (5.0s), so a teardown through it is billed.
         """
         source = '''
 class TestStopWorkerDefault:
     async def test_it(self):
-        await _stop_worker(worker, worker_task)
+        await stop_merge_worker(worker, worker_task)
 '''
         budgets = item_wait_budgets(source)
 
@@ -591,7 +591,7 @@ class TestStopWorkerDefault:
         source = '''
 class TestStopWorkerExplicit:
     async def test_it(self):
-        await _stop_worker(worker, worker_task, join_timeout=20.0)
+        await stop_merge_worker(worker, worker_task, join_timeout=20.0)
 '''
         budgets = item_wait_budgets(source)
 
@@ -607,7 +607,7 @@ class TestStopWorkerExplicit:
         source = '''
 class TestStopWorkerUnknownJoin:
     async def test_it(self):
-        await _stop_worker(worker, worker_task, join_timeout=some_var)
+        await stop_merge_worker(worker, worker_task, join_timeout=some_var)
 '''
         budgets = item_wait_budgets(source)
 
