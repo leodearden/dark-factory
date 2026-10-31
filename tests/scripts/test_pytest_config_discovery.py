@@ -76,10 +76,10 @@ def test_discovering_fewer_than_the_floor_fails_loudly(tmp_path: pathlib.Path) -
     _write_pyproject(tmp_path / 'alpha', '[project]\nname = "alpha"\n')
 
     with pytest.raises(AssertionError) as refused:
-        discovered_pytest_configs(tmp_path, min_expected=2)
+        discovered_pytest_configs(tmp_path, min_expected=7)
 
     message = str(refused.value)
-    assert re.search(r'\b2\b', message), message
+    assert re.search(r'\b7\b', message), message
     assert str([ROOT_CONFIG_NAME]) in message, message
 
 
