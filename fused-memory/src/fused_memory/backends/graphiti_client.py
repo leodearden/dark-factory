@@ -2311,27 +2311,28 @@ class GraphitiBackend:
         invalid_at: datetime | None = None,
         clear_invalid_at: bool = False,
     ) -> dict[str, Any]:
-        """Update an existing edge's fact text and/or invalidate it.
+        """Update an existing edge's fact text and/or its ``invalid_at``.
 
         At least one of ``fact``, ``invalid_at``, or ``clear_invalid_at`` must
-        be provided. When ``fact`` is set, the edge's fact text is replaced and
-        its embedding is regenerated. When ``invalid_at`` is set, the edge is
-        marked superseded as of that timestamp (no re-embedding needed). Both
-        may be combined.
+        be provided; each dimension has its own write:
 
-        When ``clear_invalid_at=True``, the edge's ``invalid_at`` field is
-        reset to ``None``, restoring it to an active (non-superseded) state.
-        This takes precedence over ``invalid_at`` if both are supplied.
-        Compatible with ``fact`` (update text and un-supersede in one call).
-        Because graphiti's FalkorDB map-based ``edge.save()`` (``MERGE ... SET
-        e = $edge_data``) does not reliably clear a null-valued property, the
-        clear is force-persisted by an explicit direct-Cypher
-        ``SET e.invalid_at = NULL`` write, issued after ``edge.save()`` and
-        before the endpoint summary refresh below (so the restored edge is
-        counted valid by that refresh's ``WHERE e.invalid_at IS NULL`` filter).
+        - ``fact`` replaces the fact text through graphiti's full-map
+          ``edge.save`` with a regenerated embedding.
+        - ``invalid_at`` / ``clear_invalid_at`` is one targeted
+          ``SET e.invalid_at`` write that touches no other property;
+          ``clear_invalid_at`` wins when both are given.
 
-        After saving, both source and target entity node summaries are rebuilt
-        from their current valid edges so they stay consistent.
+        A call carrying both ``fact`` and an invalidity change is two
+        independent writes, not one transaction: if the invalidity write
+        fails, the new fact is already stored.
+
+        graphiti's ``get_by_uuid`` projection omits ``fact_embedding``, so a
+        full-map save without a regenerated embedding would write
+        ``vecf32(null)``.  ``tests/test_graphiti_update_edge.py`` pins this.
+
+        Both writes land before the endpoint summaries are rebuilt, so a
+        restored edge is counted by the refresh's ``WHERE e.invalid_at IS NULL``
+        filter.
         """
         if fact is None and invalid_at is None and not clear_invalid_at:
             raise ValueError('update_edge requires fact, invalid_at, or clear_invalid_at to be set')
@@ -2339,25 +2340,11 @@ class GraphitiBackend:
         edge = await EntityEdge.get_by_uuid(driver, edge_uuid)
         if fact is not None:
             edge.fact = fact
-            embedder = self._require_client().embedder
-            await edge.generate_embedding(embedder)
-        if invalid_at is not None:
-            edge.invalid_at = invalid_at
-        if clear_invalid_at:
-            edge.invalid_at = None
-        await self._timed_write(edge.save(driver), 'update_edge.save')
-
-        if clear_invalid_at:
-            # edge.save()'s map-based SET does not reliably clear a
-            # null-valued property on FalkorDB — force it deterministically.
-            graph = self._graph_for(group_id)
-            await self._timed_write(
-                graph.query(
-                    'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
-                    'SET e.invalid_at = NULL',
-                    {'uuid': edge_uuid},
-                ),
-                'update_edge.clear_invalid_at',
+            await edge.generate_embedding(self._require_client().embedder)
+            await self._timed_write(edge.save(driver), 'update_edge.save')
+        if clear_invalid_at or invalid_at is not None:
+            await self._write_edge_invalid_at(
+                edge_uuid, None if clear_invalid_at else invalid_at, group_id=group_id,
             )
 
         # Deterministically refresh both endpoint entity summaries so they
@@ -2378,6 +2365,21 @@ class GraphitiBackend:
             'fact': edge.fact,
             'refreshed_nodes': refreshed,
         }
+
+    async def _write_edge_invalid_at(
+        self, edge_uuid: str, invalid_at: datetime | None, *, group_id: str,
+    ) -> None:
+        """Set one RELATES_TO edge's ``invalid_at``, or remove it for ``None``; nothing else changes."""
+        await self._timed_write(
+            self._graph_for(group_id).query(
+                'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() SET e.invalid_at = $invalid_at',
+                {
+                    'uuid': edge_uuid,
+                    'invalid_at': None if invalid_at is None else invalid_at.isoformat(),
+                },
+            ),
+            'update_edge.invalid_at',
+        )
 
     @_canonicalize_group_args
     async def reassign_edge(
