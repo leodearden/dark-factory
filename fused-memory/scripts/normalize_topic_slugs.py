@@ -294,11 +294,10 @@ def load_census_module() -> Any:
     """Load ``census_memory_metadata`` by path.
 
     ``scripts/`` is not a package, so a plain import cannot reach it.  Same
-    importlib idiom — including the ``sys.modules``-first lookup — that
-    ``census_memory_metadata.py::_load_probe_module`` and
-    ``retro_stamp_topics.py::_load_probe_module`` already established for
-    exactly this cross-script reuse: that slot may already hold a module
-    another by-path loader executed, and re-executing would hand back
+    policy — the ``sys.modules``-first lookup, and the slot popped when exec
+    fails — that ``fused-memory/src/fused_memory/utils/script_loader.py::load_script``
+    states once for every cross-script reuse: that slot may already hold a
+    module another by-path loader executed, and re-executing would hand back
     DIFFERENT class objects, silently breaking identity across the seam.
 
     Memoized because the load is not free and because the identity above is

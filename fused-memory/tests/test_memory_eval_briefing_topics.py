@@ -16,8 +16,9 @@ import json
 from pathlib import Path
 
 import pytest
-from fused_memory.eval import topic_registry
 from shared.briefing_queries import QUERY_SPECS, BriefingScope, queries_for
+
+from fused_memory.eval import topic_registry
 
 REGISTRY_PATH = Path(__file__).parent / 'fixtures' / 'memory_eval_topic_registry.json'
 
