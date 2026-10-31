@@ -214,6 +214,8 @@ mutations, overstating one is still drift.
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import json
 import shutil
 import sys
@@ -2115,6 +2117,32 @@ def audit_recall_over_labeled_fixture(
         'unrelated': _negatives(pair_sets['unrelated_pairs']),
         'paraphrase_exemplars': exemplars,
     }
+
+
+_AUDIT_RECALL_BY_CONTENT: dict[tuple[str, float], dict[str, Any]] = {}
+
+
+def memoized_audit_recall(
+    records: list[dict[str, Any]],
+    threshold: float | None = None,
+) -> dict[str, Any]:
+    """:func:`audit_recall_over_labeled_fixture`, computed once per process per content.
+
+    The audit is an O(n^2) sweep over the WHOLE alpha fixture that
+    ``cluster_limit`` does not shrink.  Keyed on the records actually audited
+    (plus the resolved threshold), and every caller gets its own deep copy.
+    """
+    if threshold is None:
+        threshold = resolve_audit_threshold()
+    content = hashlib.sha256(
+        json.dumps(records, sort_keys=True, ensure_ascii=False).encode(),
+    ).hexdigest()
+    key = (content, threshold)
+    if key not in _AUDIT_RECALL_BY_CONTENT:
+        _AUDIT_RECALL_BY_CONTENT[key] = audit_recall_over_labeled_fixture(
+            records, threshold,
+        )
+    return copy.deepcopy(_AUDIT_RECALL_BY_CONTENT[key])
 
 
 # ---------------------------------------------------------------------------
@@ -4160,8 +4188,6 @@ def corpus_fingerprint(records: list[ArmRecord]) -> str:
     ``json.dumps(sort_keys=True)`` rather than ``str(dict)`` so the digest
     does not depend on metadata insertion order either.
     """
-    import hashlib  # noqa: PLC0415
-
     digest = hashlib.sha256()
     for record_id, content, metadata in sorted(
         (
@@ -4196,8 +4222,6 @@ def fixture_digests(paths: list[str | Path]) -> list[dict[str, Any]]:
     absolute home-directory checkout is neither reproducible nor readable by
     anyone else.
     """
-    import hashlib  # noqa: PLC0415
-
     rows: list[dict[str, Any]] = []
     for raw in paths:
         path = Path(raw).resolve()
@@ -5810,9 +5834,7 @@ async def run_bake_off(
 
     return build_report(
         arms=arms,
-        audit_recall=audit_recall_over_labeled_fixture(
-            load_labeled_fixture(alpha_fixture),
-        ),
+        audit_recall=memoized_audit_recall(load_labeled_fixture(alpha_fixture)),
         regrowth=regrowth_block,
         protocol={
             'blind_authoring': BLIND_AUTHORING_PROTOCOL,
@@ -6008,9 +6030,7 @@ async def _replay_bake_off(
 
     return build_report(
         arms=arms,
-        audit_recall=audit_recall_over_labeled_fixture(
-            load_labeled_fixture(alpha_fixture),
-        ),
+        audit_recall=memoized_audit_recall(load_labeled_fixture(alpha_fixture)),
         regrowth=regrowth_block,
         protocol={
             'blind_authoring': BLIND_AUTHORING_PROTOCOL,
