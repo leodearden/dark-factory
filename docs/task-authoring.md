@@ -2156,23 +2156,29 @@ first.
 When a task is planned, the orchestrator stamps a fingerprint of its
 description and details into `metadata.plan_text_fp`, with the plan's time
 in `metadata.plan_authored_at`. An `update_task` that supplies `title`,
-`description`, `details` or `prompt` is compared against that stamp. If the
-fingerprint of the post-write description and details no longer matches, the
-result carries `amendment_advisory`:
+`description`, `details` or `prompt` is compared against that stamp. So is
+a reconciliation write whose audit-trail rotation (§10) rewrote the
+description. If the fingerprint of the post-write description and details
+no longer matches, the result carries `amendment_advisory`:
 
 | Field | Meaning |
 |---|---|
 | `task_id` | the amended task |
 | `plan_authored_at` | when the current plan was written |
-| `fields_changed` | the text fields this write supplied |
+| `fields_changed` | the text fields this write supplied, plus `description` when the rotation rewrote it |
 | `will_replan` | False for a `done` or `cancelled` task, whose amendment reaches no work |
 | `plan_text_fp_before` | the stamped plan fingerprint |
 | `task_text_fp_after` | the fingerprint of the text now stored |
 
-A task with no stamp, a metadata-only write, and a whitespace-only reflow
-get no advisory. The running agent of an `in-progress` task does not see
-the amendment. Its next dispatch takes the revalidation path (task 4031)
-and re-plans against the new text.
+A task with no stamp, a metadata-only write that rotates nothing, and a
+whitespace-only reflow get no advisory. The running agent of an
+`in-progress` task does not see the amendment. Its next dispatch takes the
+revalidation path (task 4031) and re-plans against the new text.
+
+`will_replan` True is a prediction, not an observation. It assumes the
+orchestrator's default `plan_text_fp_gate_enabled: true`, which fused-memory
+cannot read, and a later dispatch. An `in-progress` task whose running agent
+marks it done first never gets one.
 
 Every such amendment also journals a `task_text_amended` reconciliation
 event carrying the advisory plus `writer_source` (`update_task` or
