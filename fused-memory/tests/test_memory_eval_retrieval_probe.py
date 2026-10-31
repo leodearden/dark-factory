@@ -27,9 +27,10 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
-from fused_memory.eval import topic_registry
 from shared.cli_boundary import EXIT_STDOUT_FAILED, run_cli
 from shared.testing_streams import closed_pipe_stdout
+
+from fused_memory.eval import topic_registry
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_retrieval_probe.py'
 REGISTRY_PATH = Path(__file__).parent / 'fixtures' / 'memory_eval_topic_registry.json'
@@ -3258,9 +3259,9 @@ class TestRegistrySearchScope:
         )))
         entry = topic_registry.load_topic_registry(path).entries[0]
 
-        assert entry.search_scope.stores == ('mem0',)
-        assert entry.search_scope.categories == (
-            'preferences_and_norms', 'procedural_knowledge',
+        assert entry.search_scope == topic_registry.SearchScope(
+            stores=('mem0',),
+            categories=('preferences_and_norms', 'procedural_knowledge'),
         )
 
     def test_an_entry_without_a_scope_has_none_and_leaks_nothing_into_extra(
