@@ -159,6 +159,36 @@ class ProjectionStack:
         with contextlib.closing(sqlite3.connect(tasks_db(self.root))) as conn, conn:
             conn.execute('UPDATE tasks SET metadata = ? WHERE id = ?', (raw, int(task_id)))
 
+    async def bulk_seed(self, n: int) -> list[tuple[str, str]]:
+        """Seed ``n`` tasks cycling over ``_BULK_STATUS_CYCLE``; return their (id, status).
+
+        Only the first goes through ``add_task``, which creates the store's own
+        schema; the rest are INSERTed into that store file for volume.
+        """
+        statuses = [_BULK_STATUS_CYCLE[i % len(_BULK_STATUS_CYCLE)] for i in range(n)]
+        first = int(await self.seed(statuses[0], _bulk_metadata(0)))
+        rows = [
+            (
+                first + i, f'bulk task {i}', status,
+                json.dumps(_bulk_metadata(i)) if _bulk_metadata(i) is not None else None,
+            )
+            for i, status in enumerate(statuses) if i > 0
+        ]
+        with contextlib.closing(sqlite3.connect(tasks_db(self.root))) as conn, conn:
+            conn.executemany(
+                "INSERT INTO tasks (tag, id, title, status, metadata, updated_at)"
+                " VALUES ('master', ?, ?, ?, ?, '2026-10-22T00:00:00Z')",
+                rows,
+            )
+        return [(str(first + i), status) for i, status in enumerate(statuses)]
+
+
+_BULK_STATUS_CYCLE = ('done', 'pending', 'cancelled')
+
+
+def _bulk_metadata(i: int) -> dict[str, Any] | None:
+    return {'prd_path': f'plans/{i}.md'} if i % 2 == 0 else None
+
 
 @pytest_asyncio.fixture
 async def projection_stack(tmp_path: Path) -> AsyncIterator[ProjectionStack]:
@@ -277,3 +307,106 @@ async def test_none_fields_returns_the_unprojected_rows(projection_stack):
     omitted = await projection_stack.interceptor.get_tasks(projection_stack.root)
 
     assert explicit == omitted
+
+
+# ── MCP tool face: boundary rows 1–3 (plans/dashboard-prd-lanes-prd.md §6) ──
+
+_REQUESTED = ['id', 'metadata.prd_path', 'metadata.spawned_from']
+
+
+@pytest.mark.asyncio
+async def test_row1_the_tool_projects_each_row_to_id_and_requested_metadata(projection_stack):
+    seeded = {
+        await projection_stack.seed('pending', {'prd_path': 'plans/a.md', 'other': 1}): {
+            'prd_path': 'plans/a.md',
+        },
+        await projection_stack.seed('done', {
+            'prd_path': 'plans/b.md', 'spawned_from': '41', 'unrelated': [1, 2],
+        }): {'prd_path': 'plans/b.md', 'spawned_from': '41'},
+        await projection_stack.seed('pending', {'unrelated': 'x'}): {},
+        await projection_stack.seed('blocked', None): {},
+    }
+
+    result = await projection_stack.call(fields=_REQUESTED)
+
+    assert {row['id']: row['metadata'] for row in result['tasks']} == seeded
+    assert all(set(row) == {'id', 'metadata'} for row in result['tasks'])
+    assert result['project_root'] == projection_stack.root
+    assert 'project_id' in result
+    assert 'pagination' not in result
+
+
+@pytest.mark.asyncio
+async def test_row1_none_fields_is_byte_identical_to_omitting_it(projection_stack):
+    await projection_stack.seed('pending', {'prd_path': 'plans/a.md'})
+    await projection_stack.seed('done', None)
+
+    explicit = await projection_stack.call(fields=None)
+    omitted = await projection_stack.call()
+    unprojected = await projection_stack.backend.get_tasks(projection_stack.root)
+
+    assert json.dumps(explicit, sort_keys=False) == json.dumps(omitted, sort_keys=False)
+    assert explicit['tasks'] == unprojected['tasks']
+    assert all(tuple(row) == TASK_ROW_KEYS for row in explicit['tasks'])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('entry', ['foo', 'metadata.a-b'])
+async def test_row2_an_invalid_entry_is_a_validation_error_naming_it(projection_stack, entry):
+    await projection_stack.seed('pending')
+
+    result = await projection_stack.call(fields=[entry])
+
+    assert set(result) == {'error', 'error_type', 'field', 'allowed'}
+    assert result['error_type'] == 'ValidationError'
+    assert result['field'] == entry
+    assert result['allowed'] == list(ALLOWED_FIELDS)
+    assert entry in result['error']
+
+
+@pytest.mark.asyncio
+async def test_row2_a_bare_string_is_a_validation_error_not_a_pydantic_one(projection_stack):
+    await projection_stack.seed('pending')
+
+    result = await projection_stack.call(fields='id')
+
+    assert result['error_type'] == 'ValidationError'
+    assert result['field'] == 'id'
+    assert result['allowed'] == list(ALLOWED_FIELDS)
+
+
+async def _walk_pages(
+    stack: ProjectionStack, **args: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    envelopes: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        page = await stack.call(statuses=['done', 'pending'], page_size=2000, offset=offset, **args)
+        rows.extend(page['tasks'])
+        envelopes.append(page['pagination'])
+        if not page['pagination']['has_more']:
+            return rows, envelopes
+        offset += page['pagination']['page_size']
+
+
+@pytest.mark.asyncio
+async def test_row3_projected_pages_tile_the_filtered_population(projection_stack):
+    seeded = await projection_stack.bulk_seed(4500)
+    expected_ids = [task_id for task_id, status in seeded if status in ('done', 'pending')]
+
+    rows, envelopes = await _walk_pages(
+        projection_stack, fields=['id', 'status', 'metadata.prd_path'],
+    )
+    _, unprojected_envelopes = await _walk_pages(projection_stack)
+
+    assert len(expected_ids) == 3000
+    assert [row['id'] for row in rows] == expected_ids
+    assert len(envelopes) == 2
+    assert all(
+        set(envelope) == {'total', 'offset', 'page_size', 'returned', 'has_more'}
+        for envelope in envelopes
+    )
+    assert envelopes == unprojected_envelopes
+    assert all(set(row) <= {'id', 'status', 'metadata'} for row in rows)
+    assert all(row['status'] in ('done', 'pending') for row in rows)
