@@ -207,7 +207,7 @@ timeout_method = "signal"
 # the worker's stderr, which the verify log carries. Kept under verify's CLI
 # --timeout=300 so the dump lands before the cap fails an unmarked test. It is
 # the ONLY witness for a main thread stuck in a C call, which signal cannot
-# interrupt. Why stderr:
+# interrupt. Why stderr, and why below the cap:
 # test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants, which pins it.
 faulthandler_timeout = 240
 # Parallelise the 2183-test orchestrator suite. ``-n auto`` picks worker

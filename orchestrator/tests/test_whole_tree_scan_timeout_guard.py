@@ -149,17 +149,27 @@ def _pytest_ini_options() -> dict[str, object]:
 class TestTimeoutConstants:
     """The two constants this guard's remediation advice depends on."""
 
-    def test_a_hung_test_dumps_its_stacks_before_any_kill_can_reach_it(self) -> None:
+    def test_a_hung_test_dumps_its_stacks_below_the_verify_cap(self) -> None:
         """``faulthandler_timeout`` must fire below the tightest cap a test meets.
 
-        Under ``timeout_method = "signal"`` a breach fails the test with its own
-        traceback.  What signal cannot interrupt is a main thread blocked in a C
-        call that never returns: the cap never fires, the worker hangs until
-        verify's outer kill, and this dump is the only witness.  It goes to
-        STDERR, which an xdist worker inherits from the controller, and verify
-        merges stderr into its log.  The dump must land before the cap fails a
-        test that is merely slow, and the tightest cap an UNMARKED test can
-        meet is verify's CLI ``--timeout=300``, not this file's ini default.
+        The dump writes every thread's stack to STDERR, which an xdist worker
+        inherits from the controller, and verify merges stderr into its log.
+        The bound serves two hangs.
+
+        A main thread blocked in a C call that never returns is one that
+        ``timeout_method = "signal"`` cannot interrupt: the cap never fires,
+        the worker hangs until verify's outer kill, and this dump is the only
+        witness.  Any positive value below the cap lands it well inside the
+        verify run.
+
+        A hang the cap DOES interrupt (a main thread waiting on a deadlocked
+        peer, say) fails with the main thread's traceback alone.
+        pytest-timeout writes the other threads' stacks to the terminal, and
+        on an xdist worker that is stdout, which execnet points at /dev/null.
+        pytest also cancels the pending dump when the test ends.  So the peer's
+        stack reaches the verify log only if this dump fires before the cap,
+        and the tightest cap an UNMARKED test can meet is verify's CLI
+        ``--timeout=300``, not this file's ini default.
         """
         ini_options = _pytest_ini_options()
 
@@ -169,8 +179,10 @@ class TestTimeoutConstants:
         )
         assert 0 < dump_after < VERIFY_CLI_PER_TEST_TIMEOUT, (
             f'faulthandler_timeout ({dump_after}) must be positive and below '
-            f'VERIFY_CLI_PER_TEST_TIMEOUT ({VERIFY_CLI_PER_TEST_TIMEOUT}), or the '
-            'cap fails a hung test before its stacks reach the verify log'
+            f'VERIFY_CLI_PER_TEST_TIMEOUT ({VERIFY_CLI_PER_TEST_TIMEOUT}), or a '
+            "hang the cap interrupts fails without its other threads' stacks: "
+            "pytest-timeout writes those to the xdist worker's discarded stdout, "
+            'and the pending dump is cancelled with the test'
         )
 
     def test_pyproject_default_timeout_mirrors_pyproject(self) -> None:
