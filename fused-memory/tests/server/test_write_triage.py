@@ -30,7 +30,7 @@ from fused_memory.server.grouped_read import (
     CHILD_KINDS,
     CONTESTED_METADATA_KEY,
     PARENT_ID_KEY,
-    _parent_id_in_meta,
+    child_parent_id,
 )
 from fused_memory.server.write_triage import (
     _DEFAULT_CANDIDATE_K,
@@ -662,7 +662,7 @@ class TestDecideBand:
     def test_a_child_with_a_malformed_parent_id_does_not_hoist(
         self, label, extra,
     ) -> None:
-        """Matches `_parent_id_in_meta`'s exact rule, so the two cannot disagree.
+        """Matches `child_parent_id`'s exact rule, so the two cannot disagree.
 
         A child kind whose parent link is unusable is treated as an ordinary
         candidate rather than hoisted to a nonsense target: `parent_id` must
@@ -697,12 +697,12 @@ class TestDecideBand:
         decides where a child is displayed. If those two disagree about what
         counts as a child, the write lands somewhere the read cannot fold it
         from — a child that exists but never groups. Asserting equivalence
-        against the landed `_parent_id_in_meta` means a future tightening of
+        against the landed `child_parent_id` means a future tightening of
         the rule in either module cannot silently re-open this hole in the
         other.
         """
         result = _result('own-id', 0.97, extra_metadata=extra)
-        expected = _parent_id_in_meta(result.metadata) or 'own-id'
+        expected = child_parent_id(result.metadata) or 'own-id'
         assert canonical_id_of(result) == expected
 
 

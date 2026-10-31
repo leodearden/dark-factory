@@ -392,8 +392,11 @@ async def _read_grouped_document(
     return block
 
 
-def _parent_id_in_meta(meta: Mapping[str, Any] | None) -> str | None:
+def child_parent_id(meta: Mapping[str, Any] | None) -> str | None:
     """The parent id *meta* points at, or ``None`` when it is not a child's.
+
+    THE single definition of child-ness: every module that asks "is this Mem0
+    record a child, and of what?" calls this rather than restating the rule.
 
     A child is identified STRICTLY by ``metadata.parent_id`` plus a child
     ``kind`` (D5): a shared ``topic`` is not a grouping key, and two entries
@@ -409,8 +412,8 @@ def _parent_id_in_meta(meta: Mapping[str, Any] | None) -> str | None:
 
 
 def _child_parent_id(result: Any) -> str | None:
-    """:func:`_parent_id_in_meta` for a search hit."""
-    return _parent_id_in_meta(getattr(result, 'metadata', None))
+    """:func:`child_parent_id` for a search hit."""
+    return child_parent_id(getattr(result, 'metadata', None))
 
 
 def _is_mem0(result: Any) -> bool:
@@ -834,7 +837,7 @@ async def group_memory_document(
     satisfy D6 — a child's content is never unreachable — one by keeping the
     child, the other by surfacing the group.
     """
-    parent_id = _parent_id_in_meta(record.get('metadata'))
+    parent_id = child_parent_id(record.get('metadata'))
     if parent_id is None:
         return await build_grouped_document(service, project_id, memory_id)
     # Independent reads, so issued together: the parent's grouping and the

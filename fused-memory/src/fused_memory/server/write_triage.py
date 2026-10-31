@@ -516,7 +516,7 @@ def declares_attach_keys(metadata: Any) -> bool:
     Likewise ANY ``parent_id``, well-formed or not: a malformed link is a
     caller bug for ``memory_metadata`` validation to report, and quietly
     converting it into a triage attach would hide it. Contrast
-    ``grouped_read._parent_id_in_meta``, which requires both keys well-formed
+    ``grouped_read.child_parent_id``, which requires both keys well-formed
     because it answers a different question — "does this record group?" rather
     than "did the caller set something an attach would overwrite?".
     """

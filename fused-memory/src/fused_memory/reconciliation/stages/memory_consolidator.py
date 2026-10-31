@@ -119,7 +119,7 @@ from fused_memory.reconciliation.unlanded_path_check import (
     UnlandedPathCheckResult,
     check_unlanded_path_claims,
 )
-from fused_memory.server.grouped_read import PARENT_ID_KEY, _parent_id_in_meta
+from fused_memory.server.grouped_read import PARENT_ID_KEY, child_parent_id
 from fused_memory.utils.clip_disclosure import clip_note, elide_text, fetch_cap_note
 
 if TYPE_CHECKING:
@@ -2113,7 +2113,7 @@ def _format_episodes(episodes: list[dict]) -> tuple[str, int]:
 
 def _parent_link(meta: Mapping[str, Any]) -> str:
     """Render a child's parent link for prompts/stage1.py::CHILD_MEMORY_AUTHORITY_RULE."""
-    parent_id = _parent_id_in_meta(meta)
+    parent_id = child_parent_id(meta)
     if parent_id is None:
         return ''
     return f' {PARENT_ID_KEY}={parent_id} kind={meta["kind"]}'
