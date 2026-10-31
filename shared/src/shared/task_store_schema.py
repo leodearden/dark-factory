@@ -1,8 +1,9 @@
 """The DDL a fresh task store (``shared.project_layout.tasks_db``) is created with.
 
 The task store executes it on every connection open, before its migrations; indexes
-that migrations add (``ux_tasks_candidate_key``) are not here. It imports nothing, so
-stdlib-only consumers such as the script suites can build the production shape.
+that migrations add (``ux_tasks_candidate_key``) are not here. It imports only the
+standard library, so stdlib-only consumers such as the script suites can build the
+production shape.
 """
 
 from typing import Final
