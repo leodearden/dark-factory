@@ -3287,6 +3287,87 @@ class TestAuditRecallOverTheCommittedFixture:
         assert first == second
 
 
+import copy  # noqa: E402
+import uuid  # noqa: E402
+
+
+def _count_detector_calls(monkeypatch, mod) -> list:
+    """Every call the real audit detector receives, appended as it happens.
+
+    ``functools.wraps`` is load-bearing: ``resolve_audit_threshold`` reads the
+    detector's default through ``inspect.signature``, which follows
+    ``__wrapped__``.
+    """
+    audit = mod.load_audit_script()
+    detector = audit.find_near_duplicate_memory_groups
+    calls: list = []
+
+    @functools.wraps(detector)
+    def _counted(*args, **kwargs):
+        calls.append(args)
+        return detector(*args, **kwargs)
+
+    monkeypatch.setattr(audit, 'find_near_duplicate_memory_groups', _counted)
+    return calls
+
+
+def _corpus_no_other_test_has_audited() -> list[dict]:
+    """The memo is process-wide and shared by every test on an xdist worker,
+    so each test audits content of its own."""
+    corpus = copy.deepcopy(_SYNTHETIC_CORPUS)
+    corpus[-1]['content'] += f' {uuid.uuid4().hex}'
+    return corpus
+
+
+class TestAuditRecallIsComputedOncePerContent:
+    """`memoized_audit_recall` pays the O(n^2) sweep once per distinct input."""
+
+    def test_equal_records_run_the_detector_once(self, monkeypatch):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        calls = _count_detector_calls(monkeypatch, mod)
+
+        first = mod.memoized_audit_recall(records, 0.85)
+        second = mod.memoized_audit_recall(copy.deepcopy(records), 0.85)
+
+        assert len(calls) == 1
+        assert first == second == mod.audit_recall_over_labeled_fixture(
+            records, 0.85,
+        )
+
+    def test_a_changed_record_is_audited_afresh(self, monkeypatch):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        calls = _count_detector_calls(monkeypatch, mod)
+        changed = copy.deepcopy(records)
+        changed[0]['content'] += ' (edited)'
+
+        mod.memoized_audit_recall(records, 0.85)
+        mod.memoized_audit_recall(changed, 0.85)
+
+        assert len(calls) == 2
+
+    def test_a_different_threshold_is_audited_afresh(self, monkeypatch):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        calls = _count_detector_calls(monkeypatch, mod)
+
+        mod.memoized_audit_recall(records, 0.85)
+        mod.memoized_audit_recall(records, 0.5)
+
+        assert len(calls) == 2
+
+    def test_mutating_a_result_does_not_reach_the_next_caller(self):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        first = mod.memoized_audit_recall(records, 0.85)
+        pristine = copy.deepcopy(first)
+
+        first['true_dup']['pairs'] = -1
+
+        assert mod.memoized_audit_recall(records, 0.85) == pristine
+
+
 # ===========================================================================
 # step-17 — the report: build_report + render_markdown
 # ===========================================================================
@@ -4232,7 +4313,6 @@ class TestFixtureProvenance:
 # markers PER-TEST.  Everything here runs in the merge lane.
 
 import asyncio  # noqa: E402
-import copy  # noqa: E402
 
 
 class _FakeConfig(types.SimpleNamespace):
@@ -5131,6 +5211,23 @@ class TestRunBakeOffWiring:
                 assert metric in report['arms'][arm]
         assert report['protocol']['distractor_slab_size'] == 12
         assert report['protocol']['embedder_model'] == 'text-embedding-3-small'
+
+    async def test_a_second_run_does_not_re_audit_the_same_alpha_fixture(
+        self, monkeypatch,
+    ):
+        """cluster_limit does not shrink the audit: it sweeps the whole alpha
+        fixture, so every run of the same fixture would otherwise repay it.
+        At most one call, because an earlier test on this worker may already
+        have audited it."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        calls = _count_detector_calls(monkeypatch, mod)
+
+        first = await mod.run_bake_off(**_SIX_ARM_RUN)
+        second = await mod.run_bake_off(**_SIX_ARM_RUN)
+
+        assert len(calls) <= 1
+        assert first['audit_recall'] == second['audit_recall']
 
 
 # ===========================================================================
