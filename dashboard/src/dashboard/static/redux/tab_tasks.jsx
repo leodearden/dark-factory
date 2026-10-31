@@ -64,10 +64,8 @@ function DeferralHold({ task }) {
 // The detail pane's lock chips. Whether anything is known about the project's
 // locks is locksCellState's answer, drawn as tabs.jsx::LocksCell draws it.
 function ModuleLocksSection({ task }) {
-  const { buildSchedLockInfo, disambiguateLabels } = window.DF_SCHED_UTILS || {};
-  const lockInfo = buildSchedLockInfo
-    ? buildSchedLockInfo(task, DF_T.SCHEDULER)
-    : { rawTaskId: String(task.id).split('/T-').pop(), lockSet: [], moduleByPath: new Map() };
+  const { buildSchedLockInfo, disambiguateLabels, lockChipStateFor } = window.DF_SCHED_UTILS;
+  const lockInfo = buildSchedLockInfo(task, DF_T.SCHEDULER);
   const cell = locksCellState(schedulerLocksDatum(DF_T.SCHEDULER, task.project, DF_T.__receipt), lockInfo);
   if (cell.placeholder) {
     return (<>
@@ -77,15 +75,15 @@ function ModuleLocksSection({ task }) {
   }
   const { rawTaskId, lockSet, moduleByPath } = lockInfo;
   if (!lockSet.length) return null;
-  const labelMap = disambiguateLabels ? disambiguateLabels(lockSet) : null;
+  const labelMap = disambiguateLabels(lockSet);
   return (<>
     <div className="section-lbl">Module locks ({lockSet.length})</div>
     <div className="chips column">
       {lockSet.map(modPath => {
-        const { cls, ownerLabel } = window.DF_SCHED_UTILS.lockChipStateFor(moduleByPath.get(modPath), rawTaskId, task.project);
+        const { cls, ownerLabel } = lockChipStateFor(moduleByPath.get(modPath), rawTaskId, task.project);
         return (
           <span key={modPath} className={`chip ${cls}`} title={modPath}>
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{labelMap ? labelMap.get(modPath) : modPath}</span>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{labelMap.get(modPath)}</span>
             {cls === 'lock-parked' && <span className="holder">⏸ {ownerLabel}</span>}
             {cls === 'lock-taken' && <span className="holder">⊘ {ownerLabel}</span>}
           </span>
