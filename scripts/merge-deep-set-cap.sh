@@ -34,7 +34,7 @@
 # Usage: merge-deep-set-cap.sh <cap> <config_yaml_path> <escalation_port>
 #   <cap>              non-negative integer, no leading zero (0 = kill switch)
 #   <config_yaml_path> absolute path to the target dark-factory-orchestrator.yaml
-#   <escalation_port>  the target orchestrator's escalation MCP port
+#   <escalation_port>  the target orchestrator's escalation MCP port, 1-65535
 #
 # Exit 0 = knob landed on the target's main, reloaded, and observed in
 # `applied`.  Non-zero = a failure the caller (a deterministic deploy task)
@@ -65,8 +65,9 @@ CAP="$1"; CONFIG="$2"; PORT="$3"
 # Canonical spelling only: the yaml edit, commit message and applied check must agree.
 [[ "$CAP" =~ ^(0|[1-9][0-9]*)$ ]] \
     || die invalid_cap "cap must be a non-negative integer with no leading zero (YAML reads 010 as octal 8), got: $CAP"
-[[ "$PORT" =~ ^[0-9]+$ ]] || die invalid_port "port must be an integer, got: $PORT"
-[ -f "$CONFIG" ]          || die config_not_found "config not found: $CONFIG"
+[[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT <= 65535 )) \
+    || die invalid_port "escalation_port must be a TCP port in 1-65535, got: $PORT"
+[ -f "$CONFIG" ] || die config_not_found "config not found: $CONFIG"
 
 # One interpreter, resolved once, runs both python steps.  Step 3's landing and
 # reload import a non-stdlib transport from the SCRIPT's checkout, never from
