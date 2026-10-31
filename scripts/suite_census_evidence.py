@@ -133,22 +133,43 @@ def _join(base: str, relative: str) -> str:
 
 @dataclass(frozen=True)
 class _Scope:
-    """The functions and classes defined directly in one module or class body."""
+    """The functions and classes defined directly in one module or class body, and a
+    class's bases: each a bare name, or None for any other expression."""
 
     functions: frozenset[str]
     classes: MappingProxyType[str, _Scope]
+    bases: tuple[str | None, ...] = ()
 
     @classmethod
-    def of(cls, body: Sequence[ast.stmt]) -> _Scope:
+    def of(cls, body: Sequence[ast.stmt], bases: tuple[str | None, ...] = ()) -> _Scope:
         return cls(
             functions=frozenset(
                 node.name for node in body
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             ),
-            classes=MappingProxyType(
-                {node.name: cls.of(node.body) for node in body if isinstance(node, ast.ClassDef)}
-            ),
+            classes=MappingProxyType({
+                node.name: cls.of(node.body, tuple(_base_name(base) for base in node.bases))
+                for node in body if isinstance(node, ast.ClassDef)
+            }),
+            bases=bases,
         )
+
+
+def _base_name(base: ast.expr) -> str | None:
+    return base.id if isinstance(base, ast.Name) else None
+
+
+def _supplies(module: _Scope, scope: _Scope, function: str, seen: frozenset[str]) -> bool:
+    """Whether *scope*, a class in *module*, defines or inherits *function*. A base the
+    file does not define may supply any function; an in-file base cycle supplies none."""
+    if function in scope.functions:
+        return True
+    for base in scope.bases:
+        if base is None or base not in module.classes:
+            return True
+        if base not in seen and _supplies(module, module.classes[base], function, seen | {base}):
+            return True
+    return False
 
 
 class _Definitions:
@@ -159,12 +180,12 @@ class _Definitions:
         self._cache: dict[str, _Scope] = {}
 
     def defines(self, path: str, classes: Sequence[str], function: str) -> bool:
-        scope = self._module(path)
+        module = scope = self._module(path)
         for name in classes:
             if name not in scope.classes:
                 return False
             scope = scope.classes[name]
-        return function in scope.functions
+        return _supplies(module, scope, function, frozenset())
 
     def _module(self, path: str) -> _Scope:
         if path not in self._cache:
