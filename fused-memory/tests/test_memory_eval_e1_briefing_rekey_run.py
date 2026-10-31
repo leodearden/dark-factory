@@ -25,13 +25,14 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
-from fused_memory.eval import topic_registry
 from shared.briefing_queries import QUERY_SPECS
 from shared.memory_eval_metrics import (
     load_metric_series,
     parse_metric_series,
     serialize_metric_series,
 )
+
+from fused_memory.eval import retrieval_probe, topic_registry
 
 REPO_ROOT = Path(__file__).parents[2]
 RUN_ROOT = REPO_ROOT / 'plans' / 'memory-eval-e1-briefing-rekey-run'
@@ -59,7 +60,7 @@ def _tripwire_items() -> dict[str, bool]:
     """``{item_key: passed}`` of the frozen run's topic-canonical-present metric."""
     series = load_metric_series(_the_run()[0])
     (tripwire,) = [
-        m for m in series.metrics if m.metric_id == _mod().METRIC_TOPIC_CANONICAL_PRESENT
+        m for m in series.metrics if m.metric_id == retrieval_probe.METRIC_TOPIC_CANONICAL_PRESENT
     ]
     return {item.item_key: item.passed for item in tripwire.items or []}
 
