@@ -22905,8 +22905,11 @@ def test_routed_record_behind_an_unrelated_open_l1_is_not_dismissed_and_folds_ne
     first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
     assert first
 
-    assert queue.dismiss_if_covered(queue.get(first), resolver='harness-orphan-reaper') == []
-    assert queue.get(first).status == 'pending'
+    routed = queue.get(first)
+    assert routed is not None
+    assert queue.dismiss_if_covered(routed, resolver='harness-orphan-reaper') == []
+    survivor = queue.get(first)
+    assert survivor is not None and survivor.status == 'pending'
 
     second = harness._file_finding_task_escalation('test-project', 'run-2', _orch_finding(), 5)
     assert second is None, f'the next cycle must fold onto the surviving L0, got {second!r}'
@@ -23031,7 +23034,9 @@ def test_reaper_dismissed_sibling_is_not_refiled_while_the_routed_l1_is_open(
     assert a and b and a != b, (a, b)
 
     promoted = _promote_like_orphan_reaper(queue, a)
-    assert queue.dismiss_if_covered(queue.get(b), resolver='harness-orphan-reaper') == [promoted]
+    sibling = queue.get(b)
+    assert sibling is not None
+    assert queue.dismiss_if_covered(sibling, resolver='harness-orphan-reaper') == [promoted]
 
     assert harness._file_finding_task_escalation(
         'test-project', 'run-2', _orch_finding(), 5,
