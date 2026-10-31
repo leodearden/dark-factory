@@ -537,7 +537,7 @@ def _hermetic_environ() -> dict[str, str]:
     # worker's clean systemd unit never does, hiding the leak from CI.
     # Prefix-generic by design (3rd point-fix of this class; the set keeps
     # growing) -- sibling mechanism for the orchestrator suite:
-    # orchestrator/tests/test_session_hooks.py::_clear_claude_spawn_env
+    # orchestrator/tests/_session_hook_fixtures.py::isolate_hook_env
     # (task 2643).
     for key in [k for k in env if k.startswith("CLAUDE_SPAWN_")]:
         env.pop(key, None)
@@ -698,9 +698,9 @@ def test_base_env_scrubs_every_claude_spawn_var(
 
     Sets the four vars spawn-claude.sh itself splices into a spawned
     session (SESSION_ID, PARENT_ID, WM_TITLE, RESULT_FILE), the three the
-    orchestrator adds on top (ROLE, PROJECT, TASK_ID -- see task 2940's
-    extension to
-    orchestrator/tests/test_session_hooks.py::_clear_claude_spawn_env), and
+    orchestrator adds on top (ROLE, PROJECT, TASK_ID -- see task 2940; the
+    orchestrator side now scrubs by prefix too, in
+    orchestrator/tests/_session_hook_fixtures.py::isolate_hook_env), and
     a synthetic CLAUDE_SPAWN_FUTURE_KNOB that exists nowhere in the
     codebase. The synthetic one is the whole point: it is the only
     assertion that can distinguish a prefix-generic scrub from a fourth
@@ -4020,8 +4020,9 @@ def test_sanitization_preserves_launcher_stamped_record_identity(
 
     Stripping them is in fact corrective: a leaked inherited identity used
     to resolve as ``implementer:<project>#<id>`` on an unrelated session --
-    the same leak orchestrator/tests/test_session_hooks.py::_clear_claude_
-    spawn_env exists to defend against.
+    the same leak
+    orchestrator/tests/_session_hook_fixtures.py::isolate_hook_env exists
+    to defend against.
     """
     bin_dir = _make_bin_dir(tmp_path)
     capture_file = tmp_path / "captured_env.bin"
