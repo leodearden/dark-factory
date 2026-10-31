@@ -2641,31 +2641,31 @@ def test_trailer_asks_for_a_checkpoint_outcome_and_reflect(tmp_path: pathlib.Pat
     assert "/reflect" in after_exit_clause
 
 
-@pytest.mark.parametrize("lane", ["xterm", "tmux"])
+@pytest.mark.parametrize("backend", ["wm", "tmux"])
 @pytest.mark.parametrize(("self_exit", "expected"), [
     (None, True), ("", True), ("true", True), ("1", True), ("0", False),
 ])
 def test_self_exit_input_stamps_the_record_and_gates_the_marker_instruction(
-    tmp_path: pathlib.Path, lane: str, self_exit: str | None, expected: bool,
+    tmp_path: pathlib.Path, backend: str, self_exit: str | None, expected: bool,
 ) -> None:
     bin_dir = _make_bin_dir(tmp_path)
     prompt_file = tmp_path / "captured_prompt.txt"
     env_file = tmp_path / "captured_env.bin"
+    tmux_used = tmp_path / "tmux_used"
     _write_fake_claude_obeying_exit_marker(bin_dir, prompt_file, env_file)
     _write_foreground_terminal(bin_dir, "xterm")
     env = _base_env(bin_dir, "xterm")
-    if lane == "tmux":
-        _write_fake_tmux(bin_dir, tmp_path / "tmux_used")
-        env["CLAUDE_SPAWN_BACKEND"] = "tmux"
+    env["CLAUDE_SPAWN_BACKEND"] = backend
+    if backend == "tmux":
+        _write_fake_tmux(bin_dir, tmux_used)
         env["CLAUDE_SPAWN_PROJECT"] = "proj"
-    else:
-        env["CLAUDE_SPAWN_BACKEND"] = "wm"
     if self_exit is not None:
         env["CLAUDE_SPAWN_SELF_EXIT"] = self_exit
 
     result = _run_spawn(env, tmp_path)
 
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    assert tmux_used.exists() is (backend == "tmux")
     record_path = _find_one_record(pathlib.Path(env["CLAUDE_FLEET_ROOT"]))
     record = session_registry.SessionRecord.from_json(record_path.read_text())
     assert record.self_exit is expected
@@ -5264,10 +5264,15 @@ def test_t3_lane_self_exit_asks_the_thread_to_archive_itself(tmp_path: pathlib.P
     assert "exit-requested" not in prompt
 
 
-def test_t3_lane_leaves_self_exit_off_when_the_input_is_unset(tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize("self_exit", [None, "", "true", "0"])
+def test_t3_lane_leaves_self_exit_off_unless_the_input_is_exactly_1(
+    tmp_path: pathlib.Path, self_exit: str | None,
+) -> None:
     lane = _T3Lane(tmp_path)
     lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
     lane.env.pop("CLAUDE_SPAWN_SELF_EXIT", None)
+    if self_exit is not None:
+        lane.env["CLAUDE_SPAWN_SELF_EXIT"] = self_exit
 
     result = lane.run()
 
