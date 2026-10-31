@@ -3,12 +3,13 @@
 The I/O rim of ``suite_census_outcomes``. Each artefact format -- archived and
 live junit, pytest logs, nextest status and run_all lines, the flaky ledger, the
 runs.db ``flake_occurrence`` table -- is parsed once, here, into Observation /
-Unresolved values. An artefact that cannot be
-read or attributed to a tracked test becomes an Unresolved record, so it is
+Unresolved values. An artefact that cannot be read, or a test id naming no test
+function the measured tree defines, becomes an Unresolved record, so it is
 counted rather than dropped (INV-11).
 """
 from __future__ import annotations
 
+import ast
 import gzip
 import json
 import re
@@ -49,6 +50,7 @@ _LIVE_NAME = re.compile(r'^report(?:\.(?P<infix>.+))?\.xml$')
 _FUNCTION = re.compile(r'[A-Za-z_]\w*')
 _LOG_FAILURE = re.compile(r'^(?:FAILED|ERROR) (?P<nodeid>\S.*?)(?: - .*)?$')
 _UNREADABLE_JUNIT = (OSError, EOFError, zlib.error, ET.ParseError)
+_UNPARSEABLE_SOURCE = (SyntaxError, ValueError, OSError)
 
 
 def _utc(moment: datetime) -> str:
@@ -130,11 +132,57 @@ def _join(base: str, relative: str) -> str:
 
 
 @dataclass(frozen=True)
+class _Scope:
+    """The functions and classes defined directly in one module or class body."""
+
+    functions: frozenset[str]
+    classes: MappingProxyType[str, _Scope]
+
+    @classmethod
+    def of(cls, body: Sequence[ast.stmt]) -> _Scope:
+        return cls(
+            functions=frozenset(
+                node.name for node in body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ),
+            classes=MappingProxyType(
+                {node.name: cls.of(node.body) for node in body if isinstance(node, ast.ClassDef)}
+            ),
+        )
+
+
+class _Definitions:
+    """What each .py file of the measured tree defines, parsed once, on first ask."""
+
+    def __init__(self, tree_root: Path) -> None:
+        self._tree_root = tree_root
+        self._cache: dict[str, _Scope] = {}
+
+    def defines(self, path: str, classes: Sequence[str], function: str) -> bool:
+        scope = self._module(path)
+        for name in classes:
+            if name not in scope.classes:
+                return False
+            scope = scope.classes[name]
+        return function in scope.functions
+
+    def _module(self, path: str) -> _Scope:
+        if path not in self._cache:
+            try:
+                body = ast.parse((self._tree_root / path).read_bytes()).body
+            except _UNPARSEABLE_SOURCE:
+                body = []
+            self._cache[path] = _Scope.of(body)
+        return self._cache[path]
+
+
+@dataclass(frozen=True)
 class _PytestTree:
-    """The tracked .py files of the measured tree and its verify modules, by infix."""
+    """The measured tree's tracked .py files, its verify modules by infix, and what each file defines."""
 
     tracked: frozenset[str]
     module_by_infix: MappingProxyType[str, str]
+    definitions: _Definitions
 
     @classmethod
     def of(cls, tree_root: Path) -> _PytestTree:
@@ -146,6 +194,7 @@ class _PytestTree:
             module_by_infix=MappingProxyType(
                 {d.replace('/', '_').replace(' ', '_'): d for d in dirs}
             ),
+            definitions=_Definitions(tree_root),
         )
 
     def module_of(self, infix: str | None) -> str | None:
@@ -159,25 +208,34 @@ class _PytestTree:
             return (*sorted(self.module_by_infix.values()), '')
         return (module, '')
 
-    def resolve_classname(self, classname: str, bases: Sequence[str]) -> tuple[str, tuple[str, ...]] | None:
+    def _defines(self, path: str, classes: Sequence[str], function: str) -> bool:
+        return path in self.tracked and self.definitions.defines(path, classes, function)
+
+    def resolve_classname(self, classname: str, function: str, bases: Sequence[str]) -> TestId | None:
+        """The test a junit classname and function name: the first base and cut whose file defines it."""
         parts = classname.split('.')
         for base in bases:
             for cut in range(len(parts), 0, -1):
-                path = _join(base, '/'.join(parts[:cut]) + '.py')
-                if path in self.tracked:
-                    return path, tuple(parts[cut:])
+                path, classes = _join(base, '/'.join(parts[:cut]) + '.py'), parts[cut:]
+                if self._defines(path, classes, function):
+                    return _test_id(path, classes, function)
         return None
 
     def resolve_nodeid(self, nodeid: str, bases: Sequence[str], *, every: bool) -> list[TestId]:
-        """The tests a pytest node id names: the first base's, or *every* base's when ambiguous."""
+        """The tests a pytest node id names: the first defining base's test, or *every*
+        defining base's when ambiguous."""
         parts = nodeid.split('[', 1)[0].split('::')
-        function = _FUNCTION.match(parts[-1]) if len(parts) > 1 else None
-        if function is None:
+        matched = _FUNCTION.match(parts[-1]) if len(parts) > 1 else None
+        if matched is None:
             return []
-        paths = [path for base in bases if (path := _join(base, parts[0])) in self.tracked]
+        function, classes = matched.group(), parts[1:-1]
+        paths = [
+            path for base in bases
+            if self._defines(path := _join(base, parts[0]), classes, function)
+        ]
         if not every:
             paths = paths[:1]
-        return [_test_id(path, parts[1:-1], function.group()) for path in paths]
+        return [_test_id(path, classes, function) for path in paths]
 
 
 def _junit_outcome(case: ET.Element) -> Outcome:
@@ -245,8 +303,9 @@ class _JunitReader:
     def _test(self, module: str | None, classname: str, function: str) -> TestId | None:
         key = (module, classname, function)
         if key not in self._ids:
-            resolved = self._tree.resolve_classname(classname, self._tree.bases(module))
-            self._ids[key] = resolved and _test_id(resolved[0], resolved[1], function)
+            self._ids[key] = self._tree.resolve_classname(
+                classname, function, self._tree.bases(module),
+            )
         return self._ids[key]
 
 
