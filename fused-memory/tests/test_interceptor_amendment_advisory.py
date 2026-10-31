@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,10 @@ NEW_DETAILS = 'Touch writer.py and its test.'
 AUTHORED_AT = '2026-10-01T00:00:00+00:00'
 STAMP = task_text_fingerprint(ORIG, DETAILS)
 AGENT = 'claude-test'
+RECON_AGENT = 'recon-stage-task_knowledge_sync'
+AUDIT_TRAIL = '\n\n'.join(
+    [ORIG, *(f'Cycle {n:02d} relay.\n' + 'evidence unchanged; ' * 60 for n in range(20))],
+)
 
 
 @dataclass
@@ -188,6 +193,48 @@ async def test_a_metadata_write_on_an_already_drifted_task_is_not_advised(
     assert result['updated'] is True, result
     assert 'amendment_advisory' not in result
     assert await stack.amended_events() == []
+
+
+class VerbatimArchive:
+    """An audit-trail archive that reads back exactly what it stored."""
+
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+
+    async def write(self, *, project_id: str, content: str, metadata: dict[str, Any]) -> str:
+        memory_id = str(uuid.uuid4())
+        self.store[memory_id] = content
+        return memory_id
+
+    async def read(self, *, project_id: str, memory_id: str) -> str | None:
+        return self.store.get(memory_id)
+
+    async def discard(self, *, project_id: str, memory_id: str) -> None:
+        self.store.pop(memory_id, None)
+
+
+@pytest.mark.asyncio
+async def test_a_recon_metadata_write_whose_rotation_rewrote_the_description_is_advised(
+    build_stack: BuildStack,
+) -> None:
+    stack = await build_stack()
+    stack.interceptor.set_audit_trail_archive(VerbatimArchive())
+    task_id = await stack.seed(description=AUDIT_TRAIL)
+
+    result = await stack.call(
+        'update_task', id=task_id, metadata={'x_note': 'cycle 21'}, agent_id=RECON_AGENT,
+    )
+
+    assert result['audit_trail_rotation']['description_rewritten'] is True, result
+    committed = await stack.backend.get_task(task_id, stack.root)
+    expected = advisory_for(
+        task_id, fields_changed=['description'], description=committed['description'],
+    )
+    assert result['amendment_advisory'] == expected
+    [event] = await stack.amended_events()
+    assert payload_of(event) == {
+        **expected, 'writer_source': 'update_task', 'agent_id': RECON_AGENT,
+    }
 
 
 @pytest.mark.asyncio

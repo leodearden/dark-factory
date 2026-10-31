@@ -7,11 +7,7 @@ import json
 import pytest
 from shared.task_text_fingerprint import task_text_fingerprint
 
-from fused_memory.middleware.amendment_advisory import (
-    TASK_TEXT_FIELDS,
-    amendment_advisory,
-    text_fields_written,
-)
+from fused_memory.middleware.amendment_advisory import amendment_advisory, text_fields_written
 
 ORIG = 'Add a retry loop around the flush.'
 NEW = 'Add a bounded retry loop around the flush, capped at three attempts.'
@@ -38,9 +34,6 @@ def written(
 
 
 class TestTextFieldsWritten:
-    def test_the_field_set_in_order(self) -> None:
-        assert TASK_TEXT_FIELDS == ('prompt', 'title', 'description', 'details')
-
     def test_returns_supplied_text_fields_in_field_order(self) -> None:
         write = {'details': 'd', 'title': 't', 'prompt': 'p', 'description': 'x'}
         assert text_fields_written(write) == ('prompt', 'title', 'description', 'details')
