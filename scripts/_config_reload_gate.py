@@ -74,7 +74,7 @@ def die(prog: str, message: str) -> NoReturn:
 
 
 def load_transport():
-    """The reload transport's two modules, `(census_trigger, httpx)`, or
+    """The MCP transport's two modules, `(census_trigger, httpx)`, or
     ImportError when this interpreter cannot run it.
 
     httpx is imported here, up front, because census_trigger imports it only
@@ -87,16 +87,19 @@ def load_transport():
 
 
 def transport_not_importable_remedy(exc: ImportError) -> str:
-    """The operator's next step when this interpreter cannot import the MCP
-    transport: what failed, where it looked, and how to get a venv that has
-    it."""
+    """The operator's next step when this interpreter cannot import a module
+    an MCP call needs (the transport, or the landing's merge-state
+    vocabulary): which one, where it looked, and how to get a venv that has
+    them all."""
     scripts_dir = Path(__file__).parent
     checkout = scripts_dir.parent
     return (
-        f"the MCP reload transport is not importable under {sys.executable}: {exc}\n"
-        f"  looked for legibility/ under: {scripts_dir}\n"
+        f"a module the MCP calls need is not importable under {sys.executable}: {exc}\n"
+        f"  looked for legibility/ under {scripts_dir}, and for httpx, pydantic and shared\n"
+        f"  in that interpreter's environment\n"
         f"  remedy: run `uv sync --all-packages` in {checkout} so {checkout / '.venv'}\n"
-        f"  provides httpx and pydantic, or re-run this script under `uv run --project shared`"
+        f"  provides httpx, pydantic and shared, or re-run this script under "
+        f"`uv run --project shared`"
     )
 
 
