@@ -637,9 +637,9 @@ def test_the_locks_datum_is_decided_by_scheduler_locks_datum(census_bodies):
 # the four copies are all correct today, which is exactly when a drift guard is
 # worth installing.
 #
-# THE SAME GUARD ALREADY EXISTS ONE LAYER DOWN.  endpoint_staleness.js carries
-# its own copy of this path list and endpoint_staleness.test.mjs:222 ("every
-# mapped endpoint is a real endpointsFor() path") pins it against the registry.
+# THE SAME GUARD ALREADY EXISTS ONE LAYER DOWN.  poll_scope.js carries its own
+# copy of this path list and poll_scope.test.mjs ("every mapped endpoint is a
+# real endpointsFor() path") pins it against the registry.
 # This is that test's JSX analogue; the registry stays the one place a path is
 # declared (heuristic 11, SPOT).
 # ---------------------------------------------------------------------------

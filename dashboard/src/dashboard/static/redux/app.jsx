@@ -186,8 +186,8 @@ function App() {
   // Per-endpoint staleness for the ACTIVE tab (task 4884, #4791).
   //
   // ONE render site, not thirteen: the tab -> endpoint mapping lives in
-  // endpoint_staleness.js::TAB_ENDPOINTS, so adding a tab is a one-line edit
-  // there, and endpoint_staleness.test.mjs fails loudly if a mapped endpoint
+  // poll_scope.js::TAB_ENDPOINTS, so adding a tab is a one-line edit
+  // there, and poll_scope.test.mjs fails loudly if a mapped endpoint
   // stops existing or a tab id goes unmapped. The per-tab toolbar config map
   // further down this function is the sibling per-tab map; keep the two
   // tab-id lists in step. (Spelled out rather than naming that binding,

@@ -758,9 +758,10 @@ let currentWin = '24h';
 
 // Module-scope tab — announced by app.jsx through scopePollingToTab(tab).
 //
-// THE POLL SET IS CHROME_ENDPOINTS ∪ TAB_ENDPOINTS[tab] (pollSetFor): the open
-// tab's own endpoints in full, plus the always-on chrome, with /tasks narrowed
-// to ?projection=census whenever the tab itself does not list it.
+// THE POLL SET IS CHROME_ENDPOINTS ∪ TAB_ENDPOINTS[tab] (pollSetFor), both
+// declared in poll_scope.js: the open tab's own endpoints in full, plus the
+// always-on chrome, with /tasks narrowed to ?projection=census whenever the
+// tab itself does not list it.
 //
 // UNTIL A TAB IS NAMED, OR FOR A TAB ID WITH NO TAB_ENDPOINTS ENTRY, EVERY
 // ENDPOINT IS POLLED. The script-load first poll runs before the text/babel
