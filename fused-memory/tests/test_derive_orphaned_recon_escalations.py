@@ -521,7 +521,7 @@ class TestDeriveOrphanedReconEscalations:
         json.dumps(report)
 
 
-class TestMissingQueueDirRefusal:
+class TestUnpopulatedQueueDirRefusal:
     """The task-4319 preflight: a queue dir that is missing or empty is REFUSED.
 
     ``EscalationQueue.__init__`` mkdirs its ``queue_dir``, so without the guard
@@ -613,7 +613,7 @@ class TestMissingQueueDirRefusal:
         finally:
             _sys.argv = old_argv
 
-        assert code == _mod.EXIT_QUEUE_DIR_MISSING
+        assert code == _mod.EXIT_QUEUE_DIR_UNPOPULATED
         assert code != 0
         captured = capsys.readouterr()
         assert str(target) in captured.err
@@ -675,7 +675,7 @@ class TestMainExitCodes:
     def test_every_exit_code_is_distinct_and_avoids_the_argparse_usage_code(self):
         """2 is argparse's usage-error code; reusing it would conflate the two."""
         codes = [
-            _mod.EXIT_OK, _mod.EXIT_QUEUE_DIR_MISSING,
+            _mod.EXIT_OK, _mod.EXIT_QUEUE_DIR_UNPOPULATED,
             _mod.EXIT_CENSUS_ERRORS, _mod.EXIT_UNRESOLVABLE,
         ]
 
