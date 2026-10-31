@@ -29,12 +29,12 @@ from fastapi.testclient import TestClient
 from shared.locking import files_to_modules
 from shared.task_statuses import TaskStatus
 
-import dashboard.data.active_tasks as active_tasks_mod
 import dashboard.data.task_snapshot as snapshot_mod
 from dashboard.api.escalations import _analytics_memo_clear
 from dashboard.app import app
 from dashboard.config import DashboardConfig
 from dashboard.data import escalation_corpus
+from dashboard.data.active_tasks import reset_task_snapshot_state
 from dashboard.data.burndown import BURNDOWN_SCHEMA, collect_snapshot
 from dashboard.data.scheduler import _scheduler_cache_clear
 
@@ -261,8 +261,7 @@ def _canned_roots(
     for root in roots:
         root.mkdir(parents=True)
     app.state.config = DashboardConfig(project_root=roots[0], known_project_roots=roots[1:])
-    snapshot_mod._snapshot_cache_clear()
-    active_tasks_mod._reset_root_rotation()
+    reset_task_snapshot_state()
 
     def render(at: datetime) -> dict[str, Any]:
         with patch('dashboard.api.tasks.resolve_now', new=lambda _now: at):
@@ -276,7 +275,7 @@ def _canned_roots(
         ):
             yield render
     finally:
-        snapshot_mod._snapshot_cache_clear()
+        reset_task_snapshot_state()
 
 
 def _census_family(client: TestClient, workdir: Path) -> dict[str, Any]:

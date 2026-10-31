@@ -309,9 +309,11 @@ Reversing this decision means updating this section, `CLAUDE.md` and
     script's Rule C docstring. Pre-existing debt, across four packages, is
     grandfathered in the script's `_WALL_CLOCK_DEADLINE_DEBT` baseline — the
     last surviving baseline, and **shrink-only** and opt-out, so a new
-    offending file fails the gate by default. It is a **budget** rather than a bare list: a listed file is
-    silent at or under its recorded count and reports its overrun above it, so
-    a number may only be lowered, never raised.
+    offending file fails the gate by default. It is an **exact budget** rather than a bare list: a listed file is
+    silent only at EXACTLY its recorded count. Above it the checker reports the
+    overrun; below it the checker reports the slack, naming the one-line edit,
+    in the owning package's own `lint_command`. So a number must be lowered in
+    the same change that removes a site, and is never raised.
 - **Formatting**: this repo runs `ruff check` only. **`ruff format` is not part
   of the toolchain** and is not enforced anywhere — not in `hooks/pre-commit`,
   not in any `orchestrator.yaml` `lint_command`, not in verify. There is no CI.

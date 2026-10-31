@@ -6870,7 +6870,7 @@ def _probe_over_the_pool(tmp_path, fake_claude_cli, pool_roster, by_name):
     return result, gate
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(300)
 def test_the_headroom_probe_fails_over_past_a_capped_account(
     tmp_path, fake_claude_cli, pool_roster, sentinel_login,
 ):
@@ -6884,7 +6884,7 @@ def test_the_headroom_probe_fails_over_past_a_capped_account(
     ]
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(300)
 def test_the_headroom_probe_defers_only_when_no_pool_account_has_headroom(
     tmp_path, fake_claude_cli, pool_roster, sentinel_login,
 ):

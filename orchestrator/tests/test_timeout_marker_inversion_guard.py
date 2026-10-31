@@ -22,10 +22,9 @@ the judgement with its messages (``judge_inversion_band``) live in
 ``shared.testing_timeout_markers``.  This module instantiates them for
 ``orchestrator/tests`` with an empty allowlist and adds the orchestrator-only
 pins: the sanctioned-name mirrors, the deep-gate and deep-landing spellings,
-and the spawn budgets.  fused-memory and shared instantiate the same guard in
-their own ``tests/test_timeout_marker_inversion_guard.py``.  tests/,
-scripts/tests and escalation remain unguarded: follow-up ticket
-tkt_0RVDQ4R6X8T1H3EAEG855VPGCT.
+and the spawn budgets.  fused-memory, shared and escalation instantiate the
+same guard in their own ``tests/test_timeout_marker_inversion_guard.py``, and
+tests/scripts and scripts/tests do too, in their own directory (task 6338).
 
 WHAT THIS DOES NOT DUPLICATE.  test_whole_tree_scan_timeout_guard.py polices a
 per-FILE family invariant using MODULE-LEVEL marks only; test_marker_

@@ -4,23 +4,32 @@ The default render reads no terminal row at all. A client that wants them
 asks with ``?terminal=<project>`` and is answered with ONE ``Datum`` in the
 ``lower_bound`` state, under the flat key ``TASKS_TERMINAL:<project>``.
 
-Every test drives the real handler over the shared substrate fake
-(``tests/_canned_mcp.py``), patched at ``dashboard.data.tasks.mcp_tool_call``,
-so the real ``fetch_tasks`` / ``fetch_task_page`` / ``fetch_statuses`` / unit
-cache run underneath and every read is asserted at the wire. The tab's half
-of the contract, which projects it asks for, is
-``test_tab_tasks_terminal_window.py``.
+Every test runs over the shared substrate fake (``tests/_canned_mcp.py``),
+patched at ``dashboard.data.tasks.mcp_tool_call``, so the real
+``fetch_tasks`` / ``fetch_task_page`` / ``fetch_statuses`` / unit cache run
+underneath and every read is asserted at the wire. Most drive the real
+handler; ``TestAcquireTerminalWindow`` drives ``acquire_terminal_window``
+directly, with an explicit window size. The tab's half of the contract, which
+projects it asks for, is ``test_tab_tasks_terminal_window.py``.
 """
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
+import logging
+import re
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from _canned_mcp import CannedMCP
 from _dashboard_helpers import bug_warnings, node_path
 from shared.task_statuses import TERMINAL
+
+from dashboard.data.datum import DatumState
+
+pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')
 
 # ---------------------------------------------------------------------------
 # /api/v2/dashboard/tasks?terminal=<project> — the on-demand window (task 5587)
@@ -59,34 +68,26 @@ def _install_terminal_roots(client, tmp_path, labels):
 
 @contextlib.contextmanager
 def _over_the_substrate(monkeypatch, canned):
-    """Requests made inside run with only ``mcp_tool_call`` canned, from a cold unit.
+    """Requests made inside run with only ``mcp_tool_call`` canned.
 
     Everything above the substrate is real: the handler, the collectors,
     ``acquire_snapshot`` and its cache. Requests made inside one block share
     that cache, as two renders inside one TTL do. The runtime probe is stubbed
     empty because the default render's full collector runs it, and it must
-    dial no orchestrator. The unit cache and the root rotation start, and are
-    left, empty.
+    dial no orchestrator. Each test enters one block, and the module's
+    ``fresh_task_snapshot_state`` fixture is what starts it from a cold unit
+    cache and root rotation.
     """
-    import dashboard.data.active_tasks as active_tasks_mod
-    import dashboard.data.task_snapshot as snapshot_mod
-
     monkeypatch.setattr(
         'dashboard.data.active_tasks.fetch_task_runtime', AsyncMock(return_value={}),
     )
-    snapshot_mod._snapshot_cache_clear()
-    active_tasks_mod._reset_root_rotation()
-    try:
-        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
-            yield
-    finally:
-        snapshot_mod._snapshot_cache_clear()
-        active_tasks_mod._reset_root_rotation()
+    with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+        yield
 
 
 def _terminal_render(
     client, monkeypatch, tmp_path, *, terminal, labels=('dark-factory',),
-    terminal_rows=(), window=None, count_unknown=(),
+    terminal_rows=(), count_unknown=(),
 ):
     """``GET /tasks?terminal=<terminal>`` over the canned substrate; ``(body, calls)``.
 
@@ -101,10 +102,6 @@ def _terminal_render(
     for is observable nowhere else. ``conftest.py::client`` runs with the
     samplers off, so the call log holds only this request's own reads.
     """
-    import dashboard.data.task_snapshot as snapshot_mod
-
-    if window is not None:
-        monkeypatch.setattr(snapshot_mod, '_TERMINAL_FETCH_WINDOW', window)
     _install_terminal_roots(client, tmp_path, labels)
     canned = CannedMCP(
         rows=terminal_rows,
@@ -203,7 +200,8 @@ class TestTerminalWindow:
     ``TestShapeOneProjectNarrowing`` terminal cases protected — the window
     reaches the HIGH-id end, it goes through ``fetch_task_page``, truncation
     WARNS rather than capping silently, and an unpositionable window is not
-    fetched at all — has to hold HERE or it holds nowhere.
+    fetched at all — has to hold here or in ``TestAcquireTerminalWindow``, or
+    it holds nowhere.
     """
 
     def test_the_answer_carries_only_the_window_and_its_receipt(
@@ -216,8 +214,6 @@ class TestTerminalWindow:
         project's snapshot and every banner list used to ride along with it:
         task 5598 measured 3.38 MB for this request, 0.32 MB of it the window.
         """
-        from datetime import datetime
-
         body, _calls = _terminal_render(
             client, monkeypatch, tmp_path, terminal='dark-factory',
             labels=('dark-factory', 'other'),
@@ -302,15 +298,12 @@ class TestTerminalWindow:
     ):
         """(a) The disclosure IS the state: a windowed read under-reports, and says so.
 
-        The window size is parsed OUT of ``reason`` and compared to the module
-        constant rather than matched against a fixed string, so a reworded
-        message cannot silently change the bound the payload discloses.
+        The terminal total is parsed OUT of ``reason`` rather than matched
+        against a fixed string. It is the census-measured total, so finding it
+        there proves end to end that the handler positioned the window from
+        the census. That the reason also names the window size is
+        ``TestAcquireTerminalWindow``'s to pin, with a window it chose.
         """
-        import re
-        from datetime import datetime
-
-        from dashboard.data.task_snapshot import _TERMINAL_FETCH_WINDOW
-
         body, _calls = _terminal_render(
             client, monkeypatch, tmp_path, terminal='dark-factory',
             terminal_rows=[_terminal_row(i) for i in range(100, 110)],
@@ -333,41 +326,12 @@ class TestTerminalWindow:
             'as_of must name one moment, not a local-clock reading'
         )
         assert as_of <= datetime.fromisoformat(body['served_at'])
-        assert _TERMINAL_FETCH_WINDOW in [
+        assert 10 in [
             int(number) for number in re.findall(r'\d+', entry['reason'] or '')
         ], (
-            'the reason must disclose the window the rows were read under, so '
-            'a consumer can tell "these are all of them" from "these are the '
-            f'newest {_TERMINAL_FETCH_WINDOW}"; got {entry["reason"]!r}'
-        )
-
-    def test_the_window_reaches_the_high_id_end(
-        self, client, monkeypatch, tmp_path
-    ):
-        """(b) ``offset`` must select the NEWEST terminal rows, not the oldest.
-
-        Relocated from ``TestShapeOneProjectNarrowing``. ``page_size``/
-        ``offset`` slice an ASCENDING-id list, so a naive ``offset=0`` returns
-        the oldest terminal rows — the opposite of what the tab renders.
-        """
-        body, calls = _terminal_render(
-            client, monkeypatch, tmp_path, terminal='dark-factory',
-            terminal_rows=[_terminal_row(i) for i in range(100, 110)],
-            window=3,
-        )
-
-        page = _terminal_get_tasks(calls)
-        assert len(page) == 1, f'exactly one windowed read, got {page}'
-        assert page[0]['args'].get('statuses') == ['cancelled', 'done']
-        assert page[0]['args'].get('page_size') == 3
-        assert page[0]['args'].get('offset') == 7, 'max(0, n_terminal - window)'
-
-        emitted = sorted(
-            int(row['id'].rsplit('T-', 1)[-1])
-            for row in body['TASKS_TERMINAL:dark-factory']['value']
-        )
-        assert emitted == [107, 108, 109], (
-            f'the window must reach the high-id end, got {emitted}'
+            'the reason must disclose the census-measured terminal total the '
+            'window was positioned from, so a consumer can tell "these are all '
+            f'of them" from "these are the newest N of 10"; got {entry["reason"]!r}'
         )
 
     def test_the_terminal_window_goes_through_fetch_task_page(
@@ -381,89 +345,31 @@ class TestTerminalWindow:
         read — and ``fetch_tasks``, the whole-set read, must not be asked for
         a terminal row on this path. The unit's ACTIVE read is a whole-set
         read of its own, and may go through it.
+
+        Asserted at the MCP wire, where the two reads differ: only a
+        ``fetch_task_page`` read carries ``page_size`` and ``offset``
+        (``tasks.py::_TasksRead.wire_arguments``).
         """
-        import dashboard.data.task_snapshot as snapshot_mod
-
-        whole: list[dict] = []
-        paged: list[dict] = []
-
-        async def _whole_set(client_, config, project_root, **kwargs):
-            whole.append(kwargs)
-            return []
-
-        async def _one_page(client_, config, project_root, **kwargs):
-            paged.append(kwargs)
-            return []
-
-        monkeypatch.setattr(snapshot_mod, 'fetch_tasks', _whole_set)
-        monkeypatch.setattr(snapshot_mod, 'fetch_task_page', _one_page)
-
-        _terminal_render(
+        _body, calls = _terminal_render(
             client, monkeypatch, tmp_path, terminal='dark-factory',
             terminal_rows=[_terminal_row(i) for i in range(100, 110)],
         )
 
-        assert len(paged) == 1, f'exactly one windowed read, got {paged}'
-        assert paged[0]['statuses'] == sorted(TERMINAL)
-        assert paged[0]['page_size'] == snapshot_mod._TERMINAL_FETCH_WINDOW
-        assert paged[0]['offset'] == max(
-            0, 10 - snapshot_mod._TERMINAL_FETCH_WINDOW
-        )
-        terminal_whole = [
-            kwargs for kwargs in whole if _reads_terminal_rows(kwargs.get('statuses'))
-        ]
-        assert terminal_whole == [], (
+        terminal_reads = _terminal_get_tasks(calls)
+        whole_set = [call for call in terminal_reads if 'page_size' not in call['args']]
+        assert whole_set == [], (
             'the terminal window is a PARTIAL read and must not borrow the '
-            f'whole-set read to make it, got {terminal_whole}'
+            f'whole-set read to make it, got {whole_set}'
         )
-
-    def test_no_truncation_warning_when_the_population_fits(
-        self, client, monkeypatch, tmp_path, caplog
-    ):
-        """(c) n_terminal <= window → offset 0, every terminal row, no WARNING."""
-        import logging
-
-        body, calls = _terminal_render(
-            client, monkeypatch, tmp_path, terminal='dark-factory',
-            terminal_rows=[_terminal_row(i) for i in range(100, 106)],
-            window=10,
+        assert len(terminal_reads) == 1, f'exactly one windowed read, got {terminal_reads}'
+        args = terminal_reads[0]['args']
+        assert args.get('statuses') == sorted(TERMINAL)
+        assert 'offset' in args, f'a page read names WHICH page it reads: {args}'
+        assert args['offset'] == max(0, 10 - args['page_size']), (
+            'the offset must be the window arithmetic over the 10 terminal rows '
+            '(at the shipped window this is 0, so the high-id positioning itself '
+            f'is pinned by TestAcquireTerminalWindow): {args}'
         )
-
-        assert _terminal_get_tasks(calls)[0]['args'].get('offset') == 0
-        assert len(body['TASKS_TERMINAL:dark-factory']['value']) == 6
-        assert not [
-            record for record in caplog.records
-            if record.name == 'dashboard.data.task_snapshot'
-            and record.levelno >= logging.WARNING
-        ], 'no truncation WARNING may fire when the population fits the window'
-
-    def test_truncation_warns_naming_project_and_counts(
-        self, client, monkeypatch, tmp_path, caplog
-    ):
-        """(c) n_terminal > window → a WARNING naming project, count and window.
-
-        Relocated from ``TestShapeOneProjectNarrowing``. No silent cap: the
-        window selects by descending id while a reader expects recency, so
-        when the gap can bite it has to be visible in the log.
-        """
-        import logging
-
-        with caplog.at_level(logging.WARNING, logger='dashboard.data.task_snapshot'):
-            _terminal_render(
-                client, monkeypatch, tmp_path, terminal='dark-factory',
-                terminal_rows=[_terminal_row(i) for i in range(100, 112)],
-                window=3,
-            )
-
-        messages = [
-            record.getMessage() for record in caplog.records
-            if record.name == 'dashboard.data.task_snapshot'
-            and record.levelno >= logging.WARNING
-        ]
-        assert any(
-            'dark-factory' in message and '12' in message and '3' in message
-            for message in messages
-        ), f'expected a truncation WARNING naming project/count/window, got {messages}'
 
     def test_an_unpositionable_window_is_unknown_not_the_oldest_rows(
         self, client, monkeypatch, tmp_path
@@ -480,7 +386,7 @@ class TestTerminalWindow:
         body, calls = _terminal_render(
             client, monkeypatch, tmp_path, terminal='dark-factory',
             terminal_rows=[_terminal_row(i) for i in range(100, 110)],
-            count_unknown=['dark-factory'], window=3,
+            count_unknown=['dark-factory'],
         )
 
         entry = body['TASKS_TERMINAL:dark-factory']
@@ -546,10 +452,10 @@ class TestTerminalWindow:
         The roster names three bounded OPERATIONS and the default render spends
         two; this render spends the third. The arithmetic
         ``PER_CALL_TIMEOUT * len(PER_PROJECT_MCP_CALLS) <=
-        _TASKS_PER_PROJECT_BUDGET`` is what makes that affordable, and the
+        TASKS_BUDGET.per_project`` is what makes that affordable, and the
         ``timeout=`` at the wire is what makes it true rather than aspirational.
         """
-        from dashboard.data.active_tasks import _TASKS_PER_PROJECT_BUDGET
+        from dashboard.data.active_tasks import TASKS_BUDGET
         from dashboard.data.task_snapshot import (
             PER_CALL_TIMEOUT,
             PER_PROJECT_MCP_CALLS,
@@ -570,7 +476,7 @@ class TestTerminalWindow:
             'the roster must name the slot this read spends, or the budget '
             f'arithmetic is not about it: {PER_PROJECT_MCP_CALLS}'
         )
-        assert PER_CALL_TIMEOUT * len(PER_PROJECT_MCP_CALLS) <= _TASKS_PER_PROJECT_BUDGET
+        assert PER_CALL_TIMEOUT * len(PER_PROJECT_MCP_CALLS) <= TASKS_BUDGET.per_project
 
     def test_the_real_client_applies_the_window_this_endpoint_serves(
         self, client, monkeypatch, tmp_path
@@ -611,6 +517,115 @@ class TestTerminalWindow:
         )
 
 
+
+class TestAcquireTerminalWindow:
+    """``acquire_terminal_window`` over the canned substrate, at a window it is handed.
+
+    The positioning facts — the high-id offset, the truncation WARNING, no
+    warning when the population fits, a reason naming the window — are this
+    function's own contract, so they are pinned here with a small explicit
+    window rather than through the handler at the shipped one.
+    """
+
+    NOW = datetime(2026, 10, 30, 12, 0, 0, tzinfo=UTC)
+
+    async def _acquire(self, monkeypatch, dummy_client, dashboard_config, *, ids, window):
+        """The window over terminal rows *ids*, its census total ``len(ids)``; ``(datum, calls)``."""
+        from dashboard.data.task_snapshot import acquire_terminal_window
+
+        rows = [_terminal_row(i) for i in ids]
+        canned = CannedMCP(
+            rows=rows, status_map={int(row['id']): row['status'] for row in rows},
+        )
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', canned)
+        datum = await acquire_terminal_window(
+            dummy_client, dashboard_config, dashboard_config.project_root,
+            now=self.NOW, terminal_total=len(rows), window=window,
+        )
+        return datum, canned.calls
+
+    @staticmethod
+    def _task_snapshot_warnings(caplog):
+        return [
+            record.getMessage() for record in caplog.records
+            if record.name == 'dashboard.data.task_snapshot'
+            and record.levelno >= logging.WARNING
+        ]
+
+    async def test_a_small_window_reaches_the_high_id_end(
+        self, monkeypatch, dummy_client, dashboard_config,
+    ):
+        """``offset`` selects the NEWEST terminal rows, and the reason names the window.
+
+        ``page_size``/``offset`` slice an ASCENDING-id list, so a naive
+        ``offset=0`` returns the oldest terminal rows — the opposite of what
+        the tab renders. The numbers are parsed OUT of ``reason`` rather than
+        matched against a fixed string, so a reworded message cannot silently
+        drop the bound the payload discloses.
+        """
+        datum, calls = await self._acquire(
+            monkeypatch, dummy_client, dashboard_config, ids=range(100, 110), window=3,
+        )
+
+        page = _terminal_get_tasks(calls)
+        assert len(page) == 1, f'exactly one windowed read, got {page}'
+        assert page[0]['args'].get('statuses') == ['cancelled', 'done']
+        assert page[0]['args'].get('page_size') == 3
+        assert page[0]['args'].get('offset') == 7, 'max(0, n_terminal - window)'
+        assert datum.state is DatumState.LOWER_BOUND
+        assert datum.value is not None, 'a window that was read carries its rows'
+        assert sorted(int(row['id']) for row in datum.value) == [107, 108, 109], (
+            f'the window must reach the high-id end, got {datum.value}'
+        )
+        disclosed = [int(number) for number in re.findall(r'\d+', datum.reason or '')]
+        assert 3 in disclosed and 10 in disclosed, (
+            'the reason must disclose the window and the population it was cut '
+            'from, so a consumer can tell "these are all of them" from "these '
+            f'are the newest 3 of 10"; got {datum.reason!r}'
+        )
+
+    async def test_a_population_that_fits_is_read_whole_without_a_warning(
+        self, monkeypatch, dummy_client, dashboard_config, caplog,
+    ):
+        """n_terminal <= window → offset 0, every terminal row, no WARNING."""
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.task_snapshot'):
+            datum, calls = await self._acquire(
+                monkeypatch, dummy_client, dashboard_config, ids=range(100, 106), window=10,
+            )
+
+        assert _terminal_get_tasks(calls)[0]['args'].get('offset') == 0
+        assert datum.value is not None, 'a window that was read carries its rows'
+        assert len(datum.value) == 6
+        assert self._task_snapshot_warnings(caplog) == [], (
+            'no truncation WARNING may fire when the population fits the window'
+        )
+
+    async def test_truncation_warns_naming_the_root_and_the_counts(
+        self, monkeypatch, dummy_client, dashboard_config, caplog,
+    ):
+        """n_terminal > window → a WARNING naming the root, the count and the window.
+
+        No silent cap: the window selects by descending id while a reader
+        expects recency, so when the gap can bite it has to be visible in the
+        log.
+        """
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.task_snapshot'):
+            await self._acquire(
+                monkeypatch, dummy_client, dashboard_config, ids=range(100, 112), window=3,
+            )
+
+        messages = self._task_snapshot_warnings(caplog)
+        root = str(dashboard_config.project_root)
+
+        def names_the_counts(message: str) -> bool:
+            numbers = {int(n) for n in re.findall(r'\d+', message.replace(root, ''))}
+            return {12, 3} <= numbers
+
+        assert any(
+            root in message and names_the_counts(message) for message in messages
+        ), f'expected a truncation WARNING naming {root}, 12 and 3, got {messages}'
+
+
 def test_a_terminal_window_that_breaks_the_envelope_is_unknown_not_a_500(
     client, monkeypatch, tmp_path, caplog,
 ):
@@ -619,10 +634,7 @@ def test_a_terminal_window_that_breaks_the_envelope_is_unknown_not_a_500(
     A ``lower_bound`` datum with no reason breaks the envelope. The key still
     answers, as an explained unknown, with its receipt.
     """
-    import logging
-    from datetime import UTC, datetime
-
-    from dashboard.data.datum import Datum, DatumInvariant, DatumState
+    from dashboard.data.datum import Datum, DatumInvariant
     from dashboard.data.task_snapshot import FRESHNESS_BOUND_SECONDS
 
     label = 'p0'
@@ -656,8 +668,6 @@ def test_a_bug_in_the_window_read_is_unknown_not_a_500(
     an exception that reaches the handler is a bug. The key still answers, as
     an explained unknown with its receipt, and the bug is logged as one.
     """
-    import logging
-
     label = 'p0'
     _install_terminal_roots(client, tmp_path, [label])
     canned = CannedMCP()

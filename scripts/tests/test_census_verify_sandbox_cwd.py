@@ -33,7 +33,7 @@ from legibility import account_pool, census_trigger, session_runner, synthesis
 
 import config as config_mod
 
-pytestmark = pytest.mark.timeout(120)
+pytestmark = pytest.mark.timeout(300)
 
 _VERDICT = '{"verified": true, "reason": "observed"}'
 _REAL_OPEN_POOLED_RUNNER = session_runner.open_pooled_runner

@@ -228,7 +228,7 @@ def _run_probe(probe: pathlib.Path) -> subprocess.CompletedProcess[str]:
         )
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(300)
 def test_root_bound_run_resolves_a_per_test_timeout(root_bound_probe: pathlib.Path) -> None:
     """RUN pytest from the repo root and ask the session what cap it resolved.
 
@@ -242,10 +242,11 @@ def test_root_bound_run_resolves_a_per_test_timeout(root_bound_probe: pathlib.Pa
 
     The explicit ``@pytest.mark.timeout`` is not decoration. This guard is about
     the suite's default per-test budget, so it must never be able to SIT on that
-    default — 120s TIGHTENS rather than raises (the scripts verify leg passes
-    ``--timeout=300``), and a probe that runs one trivial test has no business
-    taking two minutes even behind a pytest startup on a loaded 32-core host.
-    Same reasoning as ``test_merge_gate_parallelism_config.py``'s probes.
+    default. What fails a wedged probe fast is ``PROBE_SUBPROCESS_TIMEOUT_SECS``,
+    which surfaces a ``TimeoutExpired`` carrying the child's output. The marker
+    equals verify's own ``--timeout=300`` so it does not invert that budget and
+    clamp the merge-gating leg; why is in
+    ``shared/src/shared/testing_timeout_markers.py``.
 
     MEASURED RED at base ``832d6faf16``: the probe resolved
     ``inipath=<repo>/pyproject.toml`` with ``getini('timeout') == ''`` and
@@ -313,7 +314,7 @@ def _listing(root: pathlib.Path) -> list[str]:
     return sorted(str(p.relative_to(root)) for p in root.rglob('*'))
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(300)
 def test_the_root_bound_probe_leaves_the_hosts_default_temp_root_untouched(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -11,8 +11,6 @@ import pytest
 import yaml
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
-import dashboard.data.active_tasks as active_tasks
-import dashboard.data.task_snapshot as task_snapshot
 from dashboard.config import DashboardConfig
 from dashboard.data import escalation_corpus, redux_api
 from dashboard.data.active_tasks import (
@@ -31,17 +29,10 @@ from dashboard.data.task_snapshot import (
 )
 from dashboard.project_labels import ProjectLabels
 
+pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')
+
 A_LABEL = 'a/proj'
 B_LABEL = 'b/proj'
-
-
-@pytest.fixture(autouse=True)
-def _fresh_collector_state():
-    active_tasks._reset_root_rotation()
-    task_snapshot._snapshot_cache_clear()
-    yield
-    active_tasks._reset_root_rotation()
-    task_snapshot._snapshot_cache_clear()
 
 
 @pytest.fixture
