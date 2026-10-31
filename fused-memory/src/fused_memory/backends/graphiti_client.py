@@ -2322,6 +2322,10 @@ class GraphitiBackend:
           ``SET e.invalid_at`` write that touches no other property;
           ``clear_invalid_at`` wins when both are given.
 
+        A call carrying both ``fact`` and an invalidity change is two
+        independent writes, not one transaction: if the invalidity write
+        fails, the new fact is already stored.
+
         graphiti's ``get_by_uuid`` projection omits ``fact_embedding``, so a
         full-map save without a regenerated embedding would write
         ``vecf32(null)``.  ``tests/test_graphiti_update_edge.py`` pins this.

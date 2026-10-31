@@ -137,7 +137,7 @@ _WRITES = (
         'update_edge.invalid_at',
         lambda b: _all_of(
             patch.object(
-                EntityEdge, 'get_by_uuid', AsyncMock(return_value=MagicMock(save=AsyncMock())),
+                EntityEdge, 'get_by_uuid', AsyncMock(return_value=MagicMock()),
             ),
             _graph_hanging_on('query')(b),
         ),
@@ -148,7 +148,7 @@ _WRITES = (
         'update_edge.invalid_at',
         lambda b: _all_of(
             patch.object(
-                EntityEdge, 'get_by_uuid', AsyncMock(return_value=MagicMock(save=AsyncMock())),
+                EntityEdge, 'get_by_uuid', AsyncMock(return_value=MagicMock()),
             ),
             _graph_hanging_on('query')(b),
         ),
