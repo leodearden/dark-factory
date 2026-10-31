@@ -4,7 +4,7 @@ schema_version: 1
 signal_leaves: ["α", "β", "γ1"]
 tasks:
   - label: "γ0"
-    task_id: null
+    task_id: 7918
     title: "Extract a shared node-id runner (verify.run_node_ids) from the isolated-rerun discriminator"
     capabilities:
       - name: "run-node-ids-delivered"
@@ -16,7 +16,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/verify.py"]
           expect: present
   - label: "α"
-    task_id: null
+    task_id: 7919
     title: "Merge pre-verify screen: manifest, warm screen lanes, per-item and declared-train lane screen"
     capabilities:
       - name: "screen-manifest-committed"
@@ -48,7 +48,7 @@ tasks:
           kind: manual
           reason: "a measured timing recorded in α's commit, not greppable"
   - label: "β"
-    task_id: null
+    task_id: 7920
     title: "Task-role verify runs the merge screen as per-module structured pytest runs"
     capabilities:
       - name: "task-plan-reads-screen-manifest"
@@ -60,7 +60,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/verify_plan.py"]
           expect: present
   - label: "γ1"
-    task_id: null
+    task_id: 7921
     title: "Main-red verdict and F-screen hold: hold doomed merge items in the lane, verify fixers at once"
     capabilities:
       - name: "verdict-module-exists"
@@ -79,7 +79,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/merge_lane/"]
           expect: present
   - label: "δ"
-    task_id: null
+    task_id: 7922
     title: "Chain-tip merge screen: truncate a deep chain before a defective link"
     capabilities:
       - name: "chain-truncated-before-defective-link"
@@ -89,7 +89,7 @@ tasks:
           kind: manual
           reason: "no in-batch dependent; the boundary row 'chain link defect' is the signal"
   - label: "ε"
-    task_id: null
+    task_id: 7923
     title: "get_changed_line_ranges: canonical branch ref and loud failure on a git error"
     capabilities:
       - name: "canonical-ref-and-typed-raise"
@@ -99,7 +99,7 @@ tasks:
           kind: manual
           reason: "no in-batch dependent; the boundary row 'S1.3 ref' is the signal"
   - label: "ζ"
-    task_id: null
+    task_id: 7924
     title: "Merge-screen and main-red-hold 14-day readout and tier decisions"
     capabilities:
       - name: "readout-committed-with-decisions"
