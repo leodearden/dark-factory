@@ -1365,7 +1365,9 @@ class TestGrantedFilesFoldOnRepend:
         await _drive(harness, esc)
 
         assert len(_files_updates(harness)) == 1, 'fixture premise: the grant landed'
-        assert GRANT_NOT_DELIVERED_MARKER not in (queue.get(esc.id).resolution or '')
+        stored = queue.get(esc.id)
+        assert stored is not None, f'fixture premise: {esc.id} is still in the queue'
+        assert GRANT_NOT_DELIVERED_MARKER not in (stored.resolution or '')
 
     async def test_plan_write_failure_does_not_block_the_flip(
         self, harness: Harness, tmp_path: Path, caplog
