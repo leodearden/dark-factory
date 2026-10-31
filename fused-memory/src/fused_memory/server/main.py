@@ -26,6 +26,7 @@ from functools import partial  # noqa: E402
 from shared.mcp_markup_middleware import RepairPolicy  # noqa: E402
 from shared.systemd_listeners import take_systemd_listeners  # noqa: E402
 
+from fused_memory.config.checkout_anchor import anchor_at_checkout  # noqa: E402
 from fused_memory.config.schema import (  # noqa: E402
     DedupOutageDetectorConfig,
     FusedMemoryConfig,
@@ -600,8 +601,7 @@ async def run_server():
     from fused_memory.services.write_journal import WriteJournal
     from fused_memory.services.write_ops_retention import run_periodic_write_ops_prune
 
-    wj_data_dir = Path(config.reconciliation.data_dir) if config.reconciliation else Path('./data')
-    write_journal = WriteJournal(wj_data_dir)
+    write_journal = WriteJournal(resolve_data_dir(config))
     await write_journal.initialize()
     memory_service.set_write_journal(write_journal)
 
@@ -773,7 +773,7 @@ async def run_server():
         from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
         from fused_memory.reconciliation.targeted import TargetedReconciler
 
-        recon_journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
+        recon_journal = ReconciliationJournal(resolve_data_dir(config))
         await recon_journal.initialize()
         recon_journal.set_write_journal(write_journal)
         # Read-only runs-table source for get_cycle_summary_presence (task
@@ -784,10 +784,10 @@ async def run_server():
         memory_service.set_recon_journal(recon_journal)
 
         if config.reconciliation.recon_ledger_enabled:
-            recon_ledger = await _build_recon_ledger_store(Path(config.reconciliation.data_dir))
+            recon_ledger = await _build_recon_ledger_store(resolve_data_dir(config))
             memory_service.set_recon_ledger(recon_ledger)
 
-        db_path = Path(config.reconciliation.data_dir) / 'reconciliation.db'
+        db_path = resolve_data_dir(config) / 'reconciliation.db'
         assert memory_service.durable_queue is not None  # set by initialize()
         event_buffer = EventBuffer(
             db_path=db_path,
@@ -807,16 +807,12 @@ async def run_server():
         # the background with retry on OperationalError.
         event_queue = EventQueue(
             event_buffer,
-            dead_letter_path=(
-                Path(config.reconciliation.data_dir) / 'event_dead_letter.jsonl'
-            ),
+            dead_letter_path=resolve_data_dir(config) / 'event_dead_letter.jsonl',
             # Durable-at-enqueue write-ahead log (task 2709): persists each event
             # synchronously at enqueue so a hard kill between enqueue and drain
             # cannot drop it; start() replays unprocessed rows. The constructor
             # default is None (off) — this is the single production enable-site.
-            journal_path=(
-                Path(config.reconciliation.data_dir) / 'event_journal.db'
-            ),
+            journal_path=resolve_data_dir(config) / 'event_journal.db',
             maxsize=config.reconciliation.event_queue_capacity,
             retry_initial_seconds=config.reconciliation.event_queue_retry_initial_seconds,
             retry_max_seconds=config.reconciliation.event_queue_retry_max_seconds,
@@ -895,7 +891,7 @@ async def run_server():
             ),
         )
 
-        ticket_store = await _build_ticket_store(Path(config.reconciliation.data_dir))
+        ticket_store = await _build_ticket_store(resolve_data_dir(config))
         task_interceptor = TaskInterceptor(
             taskmaster, targeted, event_buffer,
             config=config, escalator=curator_escalator,
@@ -994,8 +990,7 @@ async def run_server():
 
         event_buffer = EventBuffer(db_path=None)
         await event_buffer.initialize()
-        _disabled_data_dir = Path(config.reconciliation.data_dir) if config.reconciliation else Path('./data')
-        ticket_store = await _build_ticket_store(_disabled_data_dir)
+        ticket_store = await _build_ticket_store(resolve_data_dir(config))
         task_interceptor = TaskInterceptor(
             taskmaster, None, event_buffer,
             config=config, escalator=curator_escalator,
@@ -1015,7 +1010,7 @@ async def run_server():
     # and never gated on reconciliation.enabled or the autoseed leaf: both of
     # its consumers (consolidate_memories and the add_memory guard) run either
     # way, and the leaf is read live at each of them.
-    topic_cluster_store = build_topic_cluster_store(wj_data_dir)
+    topic_cluster_store = build_topic_cluster_store(resolve_data_dir(config))
 
     # Create MCP server with both memory and task tools
     mcp = create_mcp_server(
@@ -1881,6 +1876,11 @@ async def _build_task_backend(taskmaster_config, task_metadata_config):
     )
 
 
+def resolve_data_dir(config: FusedMemoryConfig) -> Path:
+    """The absolute directory every server-side store lives in: ``reconciliation.data_dir`` when reconciliation is configured, else ``<checkout>/data``."""
+    return Path(anchor_at_checkout(config.reconciliation.data_dir if config.reconciliation else 'data'))
+
+
 async def _build_ticket_store(data_dir: Path) -> TicketStore:
     """Construct and initialise a :class:`TicketStore` for the given data directory.
 
@@ -1934,34 +1934,13 @@ async def _build_recon_ledger_store(data_dir: Path) -> ReconLedgerStore:
 
 
 def _resolve_curator_cost_store_path(config: FusedMemoryConfig) -> Path:
-    """Return the SQLite path for the curator CostStore.
-
-    Mirrors the WriteJournal fallback convention at run_server:317-318:
-    ``<reconciliation.data_dir>/curator_events.db`` when reconciliation is
-    configured, ``./data/curator_events.db`` otherwise.
-
-    Extracted as a module-level helper so it can be tested in isolation
-    without spinning up a full server.
-    """
-    if config.reconciliation:
-        return Path(config.reconciliation.data_dir) / 'curator_events.db'
-    return Path('./data/curator_events.db')
+    """Return the SQLite path for the curator CostStore, under :func:`resolve_data_dir`."""
+    return resolve_data_dir(config) / 'curator_events.db'
 
 
 def _resolve_curator_escalator_state_path(config: FusedMemoryConfig) -> Path:
-    """Return the JSON state-file path for the CuratorEscalator burst log.
-
-    Mirrors _resolve_curator_cost_store_path: places the file under
-    ``<reconciliation.data_dir>/curator_escalator_state.json`` when
-    reconciliation is configured, ``./data/curator_escalator_state.json``
-    otherwise.  Isolated from the CostStore SQLite file so there is no
-    schema coupling between the two.
-
-    Extracted as a module-level helper so it can be tested in isolation.
-    """
-    if config.reconciliation:
-        return Path(config.reconciliation.data_dir) / 'curator_escalator_state.json'
-    return Path('./data/curator_escalator_state.json')
+    """Return the CuratorEscalator burst-log JSON path, under :func:`resolve_data_dir`, apart from the CostStore file."""
+    return resolve_data_dir(config) / 'curator_escalator_state.json'
 
 
 def _build_ticket_janitor(
@@ -2304,9 +2283,7 @@ def _build_recon_report_components(
     # keeps fresh in-process runs byte-identical — persistence is a total no-op.
     recon_report_store = None
     if config.reconciliation.enabled and config.reconciliation.recon_report_persist_enabled:
-        recon_report_store = ReconReportStore(
-            Path(config.reconciliation.data_dir) / 'recon_report_state.db'
-        )
+        recon_report_store = ReconReportStore(resolve_data_dir(config) / 'recon_report_state.db')
     state = ReconReportState(
         ttl_seconds=ttl,
         memory_service=memory_service,
