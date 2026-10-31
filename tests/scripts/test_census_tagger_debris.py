@@ -81,6 +81,8 @@ from census_tagger_debris import (
     write_artifacts,
 )
 from shared.project_id import project_id_for_root
+from shared.task_store_schema import TASK_STORE_DDL
+from tasks_db_schema import columns_outside, introspect
 
 from shared import project_layout
 
@@ -670,6 +672,17 @@ def _make_tasks_db(dir_path: Path, rows: list[dict]) -> Path:
     finally:
         conn.close()
     return db_path
+
+
+def test_make_tasks_db_declares_only_columns_production_declares(tmp_path):
+    fixture_conn = sqlite3.connect(_make_tasks_db(tmp_path, []))
+    production_conn = sqlite3.connect(":memory:")
+    try:
+        production_conn.executescript(TASK_STORE_DDL)
+        assert columns_outside(introspect(fixture_conn), introspect(production_conn)) == ()
+    finally:
+        fixture_conn.close()
+        production_conn.close()
 
 
 def _make_runs_db(dir_path: Path, events: list[dict]) -> Path:
