@@ -1577,7 +1577,14 @@ merge_verify_breadth: "full"
 # marks, this leg's segments and the flag in step.
 merge_gate_history_pure: true
 merge_gate_history_test_command: "uv run --directory fused-memory pytest tests/ -m 'reads_git_history and not integration' --tb=short -q --timeout=300 && uv run --directory orchestrator pytest tests/ -m 'reads_git_history and not warm_lane_bash' --tb=short -q --timeout=300 && uv run --directory dashboard pytest tests/ -m reads_git_history --tb=short -q --timeout=300"
-merge_train_former_enabled: true
+# Workflow-side train former OFF (Leo's ruling, 2026-10-29). It is the same
+# opportunistic batching as coalescing and formed no trains in 399k events
+# (task 5375); deep merge-ahead chains batch queued singles instead. Its
+# get_changed_line_ranges screen is fixed separately, as hygiene, by
+# plans/merge-pre-verify-screen-prd.md (ε). Not in RELOADABLE_FIELDS: goes live
+# at the next fleet restart. Declared atomic trains (task-authored
+# metadata.train) never read this flag and are unaffected.
+merge_train_former_enabled: false
 # Retroactive coalescing OFF (Leo's ruling, 2026-10-29). Deep merge-ahead chains
 # (merge_deep.chain_cap below) already batch queued singles from any submitter,
 # MCP included, and need no train membership contract. Coalescing competed with
