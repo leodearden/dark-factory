@@ -24,7 +24,7 @@ import pytest
 
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
-from dashboard.data import task_runtime
+from dashboard.data import merge_halt, task_runtime
 from dashboard.data.metrics import METRICS_SCHEMA, collect_metrics_snapshot
 
 _SATURATED_URL = 'http://saturated-pool.test'
@@ -186,4 +186,24 @@ async def test_task_runtime_probe_names_pool_timeout_in_the_dashboard_fault_doma
     probe = _warnings(caplog, _TASK_RUNTIME_LOGGER)
     assert any('deadline_exceeded' in m and 'PoolTimeout' in m for m in probe), (
         f'no task_runtime WARNING named PoolTimeout; got {probe}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_halt_probe_names_pool_timeout():
+    memory_data.reset_sessions()
+    try:
+        async with httpx.AsyncClient(transport=_SaturatedPoolTransport()) as client:
+            result = await merge_halt.get_merge_halt_status(
+                client,
+                {'saturated': f'{_SATURATED_URL}/mcp'},
+                per_call_timeout=_FAST_BUDGET_SECONDS,
+            )
+    finally:
+        memory_data.reset_sessions()
+
+    entry = result['saturated']
+    assert entry['offline'] is True
+    assert 'PoolTimeout' in entry['error'], (
+        f'the halt probe error must name pool saturation; got {entry["error"]!r}'
     )
