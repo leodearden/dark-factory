@@ -82,13 +82,7 @@ function ModuleLocksSection({ task }) {
     <div className="section-lbl">Module locks ({lockSet.length})</div>
     <div className="chips column">
       {lockSet.map(modPath => {
-        const m = moduleByPath.get(modPath);
-        const holder = m && m.holder;
-        const holderProject = m && m.holder_project;
-        const parkedBy = m && m.parked_by;
-        const parkedOwnerLive = m && m.parked_owner_live;
-        const isMine = holder === rawTaskId && (holderProject || task.project) === task.project;
-        const { cls, ownerLabel } = window.DF_SCHED_UTILS.lockChipState({ holder, isMine, parkedBy, parkedOwnerLive });
+        const { cls, ownerLabel } = window.DF_SCHED_UTILS.lockChipStateFor(moduleByPath.get(modPath), rawTaskId, task.project);
         return (
           <span key={modPath} className={`chip ${cls}`} title={modPath}>
             <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{labelMap ? labelMap.get(modPath) : modPath}</span>
