@@ -499,12 +499,10 @@ def test_every_pytest_config_declares_a_supported_timeout_method() -> None:
     and for the ROOT config that is every root-bound invocation in the repo.
 
     Which method each config declares is deliberately NOT asserted: `signal` and
-    `thread` are a live trade with measured evidence on both sides
-    (``fused-memory/pyproject.toml`` records signal proving unreliable under
-    xdist workers; ``escalation/pyproject.toml`` records signal measured green
-    under the identical flags), and pinning a winner here would settle that trade
-    by guard rather than by measurement. This asserts only that the declared
-    value is one pytest-timeout will accept.
+    `thread` are a trade owned, with its measurement, by
+    ``tests/scripts/test_timeout_method_policy.py``, and pinning a winner here
+    would settle that trade by guard rather than by measurement. This asserts
+    only that the declared value is one pytest-timeout will accept.
     """
     declared = {
         name: ini_options['timeout_method']
