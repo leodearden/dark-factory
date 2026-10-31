@@ -3750,6 +3750,11 @@ class Scheduler:
         if task is None:
             return None
         if 'error' in task:
+            logger.warning(
+                'get_task(%s): fused-memory answered with an error reply, not a task row '
+                '(error_type=%s): %.200s — returning None',
+                task_id, task.get('error_type'), task.get('error'),
+            )
             return None
         self._normalize_task_metadata(task)
         return task
