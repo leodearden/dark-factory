@@ -40,7 +40,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from _config_reload_gate import die, load_transport, transport_not_importable_remedy
 
@@ -443,31 +443,23 @@ def _tear_down(repo: Path, scratch: Path, branch: str) -> None:
 # The merge queue
 # ---------------------------------------------------------------------------
 
-class _ToolCall(Protocol):
-    """`legibility.census_trigger.post_mcp_tool_call`'s signature."""
-
-    def __call__(self, url: str, tool_name: str, arguments: dict, *,
-                 timeout: float = ...) -> dict: ...
-
-
 @dataclass(frozen=True)
 class _MergeQueue:
     """The target's merge queue, reached through its escalation MCP.
 
-    The MCP is STATEFUL, so every call goes through the shared transport
-    (`legibility.census_trigger.post_mcp_tool_call`), as reload_config's does.
-    *reply_lost* are the transport faults after which the request may have
-    reached the tool.
+    The MCP is STATEFUL, so every call opens a `shared.mcp_session`
+    `SyncMcpSession`, as reload_config's does. *reply_lost* are the transport
+    faults after which the request may have reached the tool.
     """
 
-    url: str
-    post: _ToolCall
+    base_url: str
+    session: Any
     reply_lost: tuple[type[Exception], ...]
 
     @classmethod
     def connect(cls, port: str) -> _MergeQueue:
         try:
-            census_trigger, httpx = load_transport()
+            mcp_session, httpx = load_transport()
         except ImportError as exc:
             raise _not_importable(exc) from exc
         if _MERGE_STATE_UNAVAILABLE is not None:
@@ -477,7 +469,7 @@ class _MergeQueue:
         # fault in the handshake reads the same, so it is treated the same:
         # asking the queue afterwards costs one poll.
         reply_lost = (httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError)
-        return cls(f"http://127.0.0.1:{port}/mcp", census_trigger.post_mcp_tool_call, reply_lost)
+        return cls(f"http://127.0.0.1:{port}", mcp_session.SyncMcpSession, reply_lost)
 
     def submit(self, deploy: _DeployBranch, *, description: str) -> dict:
         return self._call("merge_request", {
@@ -506,18 +498,20 @@ class _MergeQueue:
 
     def _call(self, tool: str, arguments: dict, *, timeout: float) -> dict:
         try:
-            return self.post(self.url, tool, arguments, timeout=timeout)
-        except self.reply_lost as exc:
-            raise _ReplyLost(
-                f"{tool} sent to {self.url} got no reply, so it may have run: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
+            with self.session(
+                self.base_url, client_name="merge-queue-landing", timeout=timeout,
+            ) as session:
+                return session.call_tool(tool, arguments)
         except Exception as exc:
             # Broad on purpose, as in _config_reload_gate: every transport
             # fault leaves the queue's answer unknown.
+            if isinstance(exc.__cause__, self.reply_lost):
+                raise _ReplyLost(
+                    f"{tool} sent to {self.base_url} got no reply, so it may have run: {exc}"
+                ) from exc
             raise LandingNotConfirmed(
                 LandingFailure.TRANSPORT_FAILED,
-                f"{tool} never reached the tool at {self.url}: {type(exc).__name__}: {exc}",
+                f"{tool} never reached the tool at {self.base_url}: {type(exc).__name__}: {exc}",
             ) from exc
 
 

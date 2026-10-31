@@ -58,14 +58,16 @@ from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
+    arm_leaked_drain_process_guard,
     reject_unsafe_basetemp,
 )
 from starlette.testclient import TestClient  # noqa: E402
 
 
 def pytest_configure(config):
-    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
+    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3); arm the drain-leak guard."""
     reject_unsafe_basetemp(config)
+    arm_leaked_drain_process_guard(config)
 
 
 @pytest.fixture(scope='session', autouse=True)
@@ -118,6 +120,21 @@ def dashboard_config(tmp_path):
 async def dummy_client():
     async with httpx.AsyncClient() as c:
         yield c
+
+
+@pytest.fixture()
+def fresh_task_snapshot_state():
+    """A test using this starts and leaves the task-snapshot collectors' state empty.
+
+    That per-process state is the snapshot unit cache, the last-good store
+    and the root rotation. Modules opt in with
+    ``pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')``.
+    """
+    from dashboard.data.active_tasks import reset_task_snapshot_state
+
+    reset_task_snapshot_state()
+    yield
+    reset_task_snapshot_state()
 
 
 @pytest.fixture()
@@ -301,44 +318,6 @@ def reconciliation_db(tmp_path):
             'idle',
             (now - timedelta(hours=1)).isoformat(),
             None,
-        ),
-    )
-
-    # Journal entries for run-001
-    conn.execute(
-        """INSERT INTO journal_entries
-           (id, run_id, stage, timestamp, operation, target_system,
-            before_state, after_state, reasoning, evidence)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            'je-001',
-            'run-001',
-            'memory_consolidation',
-            (now - timedelta(hours=1, minutes=55)).isoformat(),
-            'consolidate',
-            'mem0',
-            '{"count": 5}',
-            '{"count": 3}',
-            'Merged duplicate memories',
-            '[{"source": "mem0", "id": "m-1"}]',
-        ),
-    )
-    conn.execute(
-        """INSERT INTO journal_entries
-           (id, run_id, stage, timestamp, operation, target_system,
-            before_state, after_state, reasoning, evidence)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            'je-002',
-            'run-001',
-            'task_knowledge_sync',
-            (now - timedelta(hours=1, minutes=50)).isoformat(),
-            'sync',
-            'graphiti',
-            None,
-            '{"entities": 2}',
-            '',
-            '[]',
         ),
     )
 

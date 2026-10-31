@@ -18,15 +18,17 @@ from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
 from escalation.disposition import ObservationConsumed
 from escalation.models import NOTE_TO_FILE_CLASS, Escalation
+from legibility import alarm, nightly, state_docs, trickle_state
 from legibility import config as config_mod
-from legibility import nightly, state_docs, trickle_state
 from legibility import plan_deviation_census as mod
 from shared.plan_deviation import DEVIATION_KINDS, DeviationRecord
+from shared.testing_mcp_stub import StubMcpServer
 
 _LOGGER = 'legibility.plan_deviation_census'
 
@@ -771,6 +773,50 @@ def test_run_positive_control_files_one_blocking_escalation(tmp_path, caplog):
     assert records[0].levelno == logging.INFO
 
 
+def test_run_files_through_the_escalation_server_on_the_configured_port(tmp_path):
+    """No call_tool injected: the default one reaches the escalation server
+    named by cfg.escalation_port and files exactly one escalate_info."""
+    _write_positive_control(tmp_path)
+    answers = {
+        'get_pending_escalations': {'result': []},
+        'escalate_info': {'id': MINTED_ID, 'status': 'queued', 'level': 0},
+    }
+
+    with StubMcpServer(stateful=True, tools=lambda name, arguments: answers[name]) as server:
+        port = int(server.url.rsplit(':', 1)[1])
+        cfg = _load_cfg(tmp_path).model_copy(update={'escalation_port': port})
+        with alarm.own_endpoint():
+            line = mod.run(cfg, now=NOW)
+
+    calls = [
+        (request.body['params']['name'], request.body['params']['arguments'])
+        for request in server.requests
+        if request.http_method == 'POST' and request.body.get('method') == 'tools/call'
+    ]
+    assert [name for name, _ in calls] == ['get_pending_escalations', 'escalate_info']
+    assert calls[1][1]['task_id'] == SYNTHETIC_TASK_ID
+    assert line.startswith(_FIRE_PREFIX)
+    assert MINTED_ID in line
+
+
+def test_run_under_pytest_reaches_no_escalation_server_it_did_not_declare_its_own(tmp_path):
+    """No call_tool injected and no own_endpoint() declared: the default
+    call_tool refuses inside pytest, so a FIRE files nothing anywhere."""
+    _write_positive_control(tmp_path)
+
+    with StubMcpServer(stateful=True) as server:
+        port = int(server.url.rsplit(':', 1)[1])
+        cfg = _load_cfg(tmp_path).model_copy(update={'escalation_port': port})
+        line = mod.run(cfg, now=NOW)
+        requests = server.requests
+
+    assert requests == ()
+    assert line.startswith(_FIRE_PREFIX)
+    assert 'RealPostRefusedUnderTest' in line
+    assert 'not filed' in line
+    assert not mod.default_state_path(PROJECT_ID).exists()
+
+
 def test_run_negative_control_files_nothing(tmp_path, caplog):
     caplog.set_level(logging.DEBUG, logger=_LOGGER)
     _write_daily_plans(tmp_path, baseline_per_day=3, recent_per_day=3)
@@ -962,7 +1008,9 @@ def _never_invoked(prompt, model):
     raise AssertionError('the coder must not be reached on a red night')
 
 
-def _run_red_night(tmp_path: Path, *, pass_kind: nightly.PassKind) -> nightly.NightlyResult:
+def _run_red_night(
+    tmp_path: Path, *, pass_kind: nightly.PassKind, **seams: Any,
+) -> nightly.NightlyResult:
     projects_root = tmp_path / 'projects'
     projects_root.mkdir()
     posted: list[tuple[str, dict]] = []
@@ -975,6 +1023,7 @@ def _run_red_night(tmp_path: Path, *, pass_kind: nightly.PassKind) -> nightly.Ni
         status_fetcher=lambda: {'statuses': {}},
         poster=lambda url, envelope: posted.append((url, envelope)),
         pass_kind=pass_kind,
+        **seams,
     )
 
 
@@ -982,35 +1031,35 @@ def _crashed_extractor(selected, **kwargs):
     return [], [('session-1', 'boom')]
 
 
-def test_nightly_red_night_early_return_still_runs_the_census(tmp_path, monkeypatch, caplog):
+def test_nightly_red_night_early_return_still_runs_the_census(tmp_path, caplog):
     caplog.set_level(logging.INFO, logger=_LOGGER)
-    monkeypatch.setattr(nightly, 'build_digests', _crashed_extractor)
 
-    result = _run_red_night(tmp_path, pass_kind=nightly.PassKind.MANUAL)
+    result = _run_red_night(
+        tmp_path, pass_kind=nightly.PassKind.MANUAL, digest_builder=_crashed_extractor,
+    )
 
     assert result.exit_code == 1
     assert len(_census_records(caplog)) == 1
 
 
-def test_nightly_unexpected_raise_still_runs_the_census(tmp_path, monkeypatch, caplog):
+def test_nightly_unexpected_raise_still_runs_the_census(tmp_path, caplog):
     caplog.set_level(logging.INFO, logger=_LOGGER)
 
     def _raise(*args, **kwargs):
         raise RuntimeError('sampler exploded')
 
-    monkeypatch.setattr(nightly, 'select_digest_sessions', _raise)
-
-    result = _run_red_night(tmp_path, pass_kind=nightly.PassKind.MANUAL)
+    result = _run_red_night(tmp_path, pass_kind=nightly.PassKind.MANUAL, selector=_raise)
 
     assert result.exit_code == 1
     assert len(_census_records(caplog)) == 1
 
 
-def test_nightly_retry_pass_does_not_run_the_census(tmp_path, monkeypatch, caplog):
+def test_nightly_retry_pass_does_not_run_the_census(tmp_path, caplog):
     caplog.set_level(logging.INFO, logger=_LOGGER)
-    monkeypatch.setattr(nightly, 'build_digests', _crashed_extractor)
 
-    result = _run_red_night(tmp_path, pass_kind=nightly.PassKind.RETRY)
+    result = _run_red_night(
+        tmp_path, pass_kind=nightly.PassKind.RETRY, digest_builder=_crashed_extractor,
+    )
 
     assert result.exit_code == 1
     assert _census_records(caplog) == []

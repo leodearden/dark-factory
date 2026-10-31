@@ -2592,7 +2592,7 @@ class TaskInterceptor:
         """Run the FILES-CERTAIN path-scope check and return its verdict.
 
         Classifies concrete ``metadata.files`` entries via the exact
-        ``registry.project_for_path`` lookup (:func:`check_files_for_scope`)
+        ``registry.attributed_owner`` lookup (:func:`check_files_for_scope`)
         — the CERTAIN counterpart to the heuristic regex-over-prose
         :meth:`_path_guard_check`.  A rejection here is definitive: the
         file is either owned by a known other project or it isn't, so
@@ -2836,7 +2836,7 @@ class TaskInterceptor:
 
         * ROUTING OVERRIDE — a deliberate operator bypass.  Spending an LLM
           call there would defeat the override.
-        * FILES-CERTAIN reject — ``project_for_path`` is exact.  A file's
+        * FILES-CERTAIN reject — ``attributed_owner`` is exact.  A file's
           owner is either known and different or it isn't; there is nothing
           to adjudicate.
         * CROSS-REPO allow-and-tag (task 3004) — already tagged
@@ -2844,7 +2844,7 @@ class TaskInterceptor:
           result.
         * PROSE-ADVISORY SUPPRESSED BY LOCAL ATTRIBUTION (task 3106) — a
           deliberate attribution decision reached with the CERTAIN
-          ``project_for_path`` classifier over declared deliverables, whose
+          ``attributed_owner`` classifier over declared deliverables, whose
           stated purpose is REMOVING operator-queue noise.  Re-adjudicating
           it would spend an LLM call to second-guess a certain classifier
           with an uncertain one and re-raise precisely the noise 3106

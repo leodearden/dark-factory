@@ -333,6 +333,35 @@ def test_b14_a_free_file_is_granted_without_spending(hostile: Project) -> None:
     assert newest_tree(hostile).budget.spent_lines == 0
 
 
+def test_b14_a_free_file_is_granted_after_follow_head_overspends_the_budget(tmp_path: Path) -> None:
+    project = make_project(
+        tmp_path,
+        {
+            'src/a.py': numbered('a', 200),
+            'src/b.py': numbered('b', 800),
+            'tests/test_a.py': 'def test_a():\n    assert True\n',
+        },
+        reveal_proportion=0.25,
+        reveal_floor_lines=50,
+    )
+    write_engagement(project.in_dir, project_id=PROJECT)
+    request(project, 'src/a.py')
+    project.run(minutes=60)
+    project.repo.write('src/a.py', numbered('a', 1000))
+    project.repo.commit('grow a', when=at(61))
+    request(project, 'tests/test_a.py', minutes=62)
+
+    got = pass_answers(project, minutes=63)
+
+    assert [(event.type, event.path) for event in got] == [
+        ('file_revealed', 'src/a.py'),
+        ('file_revealed', 'tests/test_a.py'),
+    ]
+    budget = newest_tree(project).budget
+    assert (budget.spent_lines, budget.budget_lines) == (1000, 450)
+    assert 'tests/test_a.py' in revealed_paths(project)
+
+
 HOSTILE_REQUESTS = [
     ('../x', RefusalReason.NOT_IN_TREE),
     ('/etc/passwd', RefusalReason.NOT_IN_TREE),
@@ -683,6 +712,51 @@ def test_b16_without_reveals_head_a_changed_revealed_file_is_still_re_emitted_on
 
     assert summary(pass_answers(followed, minutes=70)) == [('src/a.py', c2, None, False, 30)]
     assert pass_answers(followed, minutes=71) == []
+
+
+def test_a_request_repeated_in_one_inbox_read_reveals_the_file_once(hostile: Project) -> None:
+    request(hostile, 'src/a.py', 'src/a.py')
+
+    hostile.run()
+
+    assert [(line.type, line.path) for line in answers(hostile)] == [('file_revealed', 'src/a.py')]
+    assert newest_tree(hostile).budget.spent_lines == 200
+
+
+def _main_stays(repo: Repo) -> None:
+    """main stays where pass 1 left it."""
+
+
+def _main_moves_past_the_file(repo: Repo) -> None:
+    repo.write('src/e.py', numbered('e', 401))
+    repo.commit('touch e only', when=at(61))
+
+
+@pytest.mark.parametrize('between', [_main_stays, _main_moves_past_the_file], ids=['same-head', 'later-head'])
+def test_a_retry_for_an_unchanged_revealed_file_appends_no_answer(
+    followed: Project, between: Callable[[Repo], None]
+) -> None:
+    granted_at = followed.repo.rev('main')
+    spent = newest_tree(followed).budget.spent_lines
+    between(followed.repo)
+    request(followed, 'src/a.py', minutes=62)
+
+    assert pass_answers(followed, minutes=63) == []
+    assert [file.commit for file in state_of(followed).revealed if file.path == 'src/a.py'] == [granted_at]
+    assert newest_tree(followed).budget.spent_lines == spent
+
+
+def test_a_retry_for_a_changed_revealed_file_adds_nothing_to_its_follow_head_re_emit(
+    followed: Project,
+) -> None:
+    repo = followed.repo
+    repo.write('src/a.py', numbered('a', 25))
+    c2 = repo.commit('c2', when=at(65))
+    request(followed, 'src/a.py', minutes=66)
+
+    got = pass_answers(followed, minutes=70)
+
+    assert summary(got) == [('src/a.py', c2, None, False, 25)]
 
 
 def test_a_crash_between_append_and_cursor_neither_re_answers_nor_drops_a_request(

@@ -60,6 +60,7 @@ from orchestrator.workflow import (
     WorkflowOutcome,
     WorkflowState,
 )
+from orchestrator.workflow_types import DryRunSpawn
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -158,7 +159,7 @@ def git_repo(tmp_path: Path) -> Path:
     """A bare-minimum git repo with an initial commit."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return repo
 
 
@@ -3128,17 +3129,16 @@ class TestMarkBlockedFalseDoneGuard:
         self, config, git_ops, task_assignment, tmp_path
     ):
         """A POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX outcome must call
-        _mark_blocked with spawn_dry_run=True so a sha-anchored dry-run
-        proposal is captured for the B3 low-risk auto-unblock gate.
+        _mark_blocked with dry_run_spawn=DryRunSpawn.POST_MERGE_RED_MAIN so a
+        sha-anchored dry-run proposal is captured for the B3 low-risk
+        auto-unblock gate.
 
         Spies on ``_mark_blocked`` (so the real hook never fires — no dry-run
         marker needed) and asserts the three kwargs that matter:
         - escalate_to_human=True  (L1-direct, not steward)
         - merge_phase=True        (status-transition suppressed)
-        - spawn_dry_run=True      (the new opt-in that captures the proposal)
-
-        RED today: the POST_MERGE_PYRIGHT branch at workflow.py doesn't yet
-        pass spawn_dry_run=True.
+        - dry_run_spawn=POST_MERGE_RED_MAIN (the opt-in that captures the
+          proposal)
         """
         from unittest.mock import AsyncMock, patch
 
@@ -3193,8 +3193,9 @@ class TestMarkBlockedFalseDoneGuard:
             'merge_phase flag must be threaded through to _mark_blocked; '
             f'got kwargs={kwargs!r}'
         )
-        assert kwargs.get('spawn_dry_run') is True, (
-            'post_merge_pyright must pass spawn_dry_run=True so a dry-run '
+        assert kwargs.get('dry_run_spawn') is DryRunSpawn.POST_MERGE_RED_MAIN, (
+            'post_merge_pyright must pass '
+            'dry_run_spawn=DryRunSpawn.POST_MERGE_RED_MAIN so a dry-run '
             'proposal is captured for the B3 auto-unblock gate; '
             f'got kwargs={kwargs!r}'
         )
@@ -5835,7 +5836,7 @@ class TestAmendmentUncommittedWorkGuard:
         # actual repo (the guard commits the dirty tree for real).
         wt = tmp_path / 'wt'
         wt.mkdir()
-        await _init_repo(wt)
+        _init_repo(wt)
         workflow.worktree = wt
         workflow.event_store = _RecordingEventStore()  # type: ignore[assignment]
 
@@ -6053,7 +6054,7 @@ class TestStaleL1DoesNotSinkRun:
 
         # Initialise a real git repo inside wt so the implementer's
         # git commits work (AgentStub._implementer runs `git add`/commit).
-        await _init_repo(wt)
+        _init_repo(wt)
 
         # Disable inter-iteration rebase to avoid main-branch lookups.
         workflow.config.inter_iteration_rebase = False
@@ -6173,7 +6174,7 @@ class TestBornAtL2GatesPostImplementer:
         workflow.artifacts.stamp_plan_provenance(workflow.session_id)
 
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
-        await _init_repo(wt)
+        _init_repo(wt)
         workflow.config.inter_iteration_rebase = False
 
         outcome = await workflow._execute_iterations()
@@ -6235,7 +6236,7 @@ class TestBornAtL2GatesPostDebugger:
         workflow.artifacts.stamp_plan_provenance(workflow.session_id)
 
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
-        await _init_repo(wt)
+        _init_repo(wt)
 
         # Mock run_scoped_verification to return a failing result (non-infra_timeout
         # so the opaque-timeout fast-fail does not trigger before the debugger runs).

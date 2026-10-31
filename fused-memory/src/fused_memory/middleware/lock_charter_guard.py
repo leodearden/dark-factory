@@ -96,20 +96,10 @@ tests:
 
 from __future__ import annotations
 
-import json
-import logging
 from typing import Any
 
-from shared.task_metadata import parse_metadata
-
-logger = logging.getLogger(__name__)
-
-# SchemaWarning codes (shared.task_metadata) that mean the WHOLE metadata
-# value was discarded — parse_metadata could not produce any dict at all.
-# Only these are loud here; 'unknown_key'/'invalid_field'/'invalid_submodel'
-# etc. are expected on legitimate curator-internal metadata and belong to
-# the write boundary (W3-β), not this read-path guard.
-_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
+from fused_memory.middleware.deterministic_task_guard import DETERMINISTIC_ROUTING_HINT
+from fused_memory.middleware.metadata_dict import raw_metadata_dict
 
 # ---------------------------------------------------------------------------
 # Canonical extension allowlist — kept in sync with shared.locking.FILE_EXTENSIONS.
@@ -328,56 +318,85 @@ def extract_files(metadata: str | dict[str, Any] | None) -> list[str]:
         across module boundaries.
 
     Rules:
-    - ``None`` → []
-    - ``dict`` → use directly
-    - ``str`` → ``json.loads``; on failure or non-dict result → []
+    - *metadata* resolves to a dict through
+      :func:`fused_memory.middleware.metadata_dict.raw_metadata_dict`, so
+      absent metadata is empty and unreadable metadata is empty and logged.
     - If the resolved dict has no ``files`` key → []
     - If ``files`` is not a list → []
     - Return only the string entries of the list.
-
-    The ``str`` branch delegates its malformed-input policy to
-    :func:`shared.task_metadata.parse_metadata` (``direction='read'``) and
-    emits a ``task_metadata.schema_warning`` WARNING when *metadata* cannot
-    be resolved to a JSON object at all (unparseable JSON / non-object) — I4:
-    this replaces a silent ``[]`` coercion. The dict-path extraction below is
-    untouched, so mixed-type-list filtering and non-list-``files`` behaviour
-    are unchanged.
     """
-    if metadata is None:
-        return []
-
-    parsed: dict[str, Any] | None = None
-    if isinstance(metadata, dict):
-        parsed = metadata
-    elif isinstance(metadata, str) and not metadata:
-        # Empty string is benign-absent, not a discard — mirrors the
-        # pre-collapse `isinstance(raw, str) and raw` guard.
-        return []
-    elif isinstance(metadata, str):
-        _, warnings = parse_metadata(metadata, direction='read')
-        discard = [w for w in warnings if w.code in _DISCARD_CODES]
-        if discard:
-            reason = '; '.join(w.message for w in discard) or 'unrecognised shape'
-            logger.warning(
-                'task_metadata.schema_warning source=lock_charter_guard.extract_files '
-                'error=%s (type=%s); metadata discarded',
-                reason,
-                type(metadata).__name__,
-            )
-            return []
-        # parse_metadata already confirmed this parses to a JSON object —
-        # reparse independently for the raw dict (see docstring above: never
-        # model_dump()).
-        parsed = json.loads(metadata)
-
-    if parsed is None:
-        return []
-
+    parsed = raw_metadata_dict(metadata, source='lock_charter_guard.extract_files')
     files = parsed.get('files')
     if not isinstance(files, list):
         return []
 
     return [f for f in files if isinstance(f, str)]
+
+
+def _allowlist_lockstep(vector: str, reify_var: str, reify_flag: str, test_vector: str) -> str:
+    """Name every home of the allowlist *vector*, which must all change together."""
+    return (
+        f'{vector} in BOTH shared/src/shared/locking.py and '
+        'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, '
+        f'AND to reify scripts/lock-charter-guard.sh {reify_var} (all three '
+        f'must agree — the Tier-2 {reify_flag} drift guard goes RED '
+        f'otherwise), plus the {test_vector} vector in both test copies.'
+    )
+
+
+_DIRECTORY_HINT = (
+    'Replace each directory with the specific file paths it contains, '
+    'or use files=[] (the defer-to-architect value) to leave scope '
+    'unspecified. Directory strings in metadata.files are rejected '
+    'because they create over-wide lock charters that block unrelated '
+    'work in the same directory. '
+    'Note: extension matching is case-sensitive against a lowercase '
+    'allowlist (e.g. "README.MD" or "config.YAML" is classified as a '
+    'directory — use lowercase extensions like "README.md" instead). '
+    'If the offending path has NO extension at all, "replace it with '
+    'the files it contains" may be unfollowable because it IS a file '
+    '(e.g. "hooks/project-checks"): an extension-less final segment '
+    'counts as a file only when its exact name is listed in '
+    'EXTENSIONLESS_FILENAMES. If it is a genuinely new extension-less '
+    'tracked file, add its name to '
+    + _allowlist_lockstep(
+        'EXTENSIONLESS_FILENAMES', '_EXTLESS', '--list-extensionless', '_CANONICAL_EXTENSIONLESS',
+    )
+)
+
+
+def _has_unrecognised_extension(path: str) -> bool:
+    """True iff *path* is not slash-terminated and its final segment's extension is unlisted in any case."""
+    segment = path.rsplit('/', 1)[-1]
+    return (
+        not path.endswith('/')
+        and '.' in segment
+        and segment.rsplit('.', 1)[1].lower() not in FILE_EXTENSIONS
+    )
+
+
+def _unrecognised_extension_error(paths: list[str]) -> str:
+    path_list = ', '.join(repr(p) for p in paths)
+    return (
+        f' {path_list} may instead be a FILE whose extension is not on the '
+        'allowlist; if it is gitignored, files=[] will not help, because a '
+        "task_kind='normal' task cannot deliver a gitignored file — file such "
+        "work as task_kind='deterministic' (see hint)."
+    )
+
+
+def _unrecognised_extension_hint(paths: list[str]) -> str:
+    path_list = ', '.join(repr(p) for p in paths)
+    return (
+        f' {path_list} may be a FILE whose extension is not on the '
+        'FILE_EXTENSIONS allowlist. A gitignored file can never be committed, '
+        "so a task_kind='normal' task cannot deliver it, and files=[] only "
+        f'hands the same failure to the architect. {DETERMINISTIC_ROUTING_HINT} '
+        'Whatever the task_kind, leave a gitignored path out of '
+        'metadata.files: this check classifies it as a directory either way. '
+        'If it is instead a TRACKED file, add its extension to '
+        + _allowlist_lockstep('FILE_EXTENSIONS', '_EXTS', '--list-extensions', '_CANONICAL_EXTENSIONS')
+    )
 
 
 def lock_charter_error(
@@ -387,7 +406,8 @@ def lock_charter_error(
     """Return a structured LockCharterViolation error dict.
 
     Shape mirrors ``_done_gate_error`` / ``PathGuardVerdict.to_error_dict``
-    so MCP callers handle it uniformly.
+    so MCP callers handle it uniformly.  ``unrecognised_extension_paths``
+    lists the rejected paths whose extension is unlisted in any case, i.e. may be files.
 
     Args:
         directories: The offending directory-like path strings.
@@ -396,35 +416,21 @@ def lock_charter_error(
     """
     task_clause = f' (task {task_id})' if task_id else ''
     dir_list = ', '.join(repr(d) for d in directories)
+    unrecognised = [d for d in directories if _has_unrecognised_extension(d)]
+    error = (
+        f'metadata.files contains directory declarations{task_clause}: '
+        f'{dir_list}. '
+        f'Declare individual file paths (e.g. "src/foo.py") or use '
+        f'files=[] to defer scope to the architect.'
+    )
+    hint = _DIRECTORY_HINT
+    if unrecognised:
+        error += _unrecognised_extension_error(unrecognised)
+        hint += _unrecognised_extension_hint(unrecognised)
     return {
-        'error': (
-            f'metadata.files contains directory declarations{task_clause}: '
-            f'{dir_list}. '
-            f'Declare individual file paths (e.g. "src/foo.py") or use '
-            f'files=[] to defer scope to the architect.'
-        ),
+        'error': error,
         'error_type': 'LockCharterViolation',
         'directory_paths': directories,
-        'hint': (
-            'Replace each directory with the specific file paths it contains, '
-            'or use files=[] (the defer-to-architect value) to leave scope '
-            'unspecified. Directory strings in metadata.files are rejected '
-            'because they create over-wide lock charters that block unrelated '
-            'work in the same directory. '
-            'Note: extension matching is case-sensitive against a lowercase '
-            'allowlist (e.g. "README.MD" or "config.YAML" is classified as a '
-            'directory — use lowercase extensions like "README.md" instead). '
-            'If the offending path has NO extension at all, "replace it with '
-            'the files it contains" may be unfollowable because it IS a file '
-            '(e.g. "hooks/project-checks"): an extension-less final segment '
-            'counts as a file only when its exact name is listed in '
-            'EXTENSIONLESS_FILENAMES. If it is a genuinely new extension-less '
-            'tracked file, add its name to EXTENSIONLESS_FILENAMES in BOTH '
-            'shared/src/shared/locking.py and '
-            'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, '
-            'AND to reify scripts/lock-charter-guard.sh _EXTLESS (all three '
-            'must agree — the Tier-2 --list-extensionless drift guard goes RED '
-            'otherwise), plus the _CANONICAL_EXTENSIONLESS vector in both test '
-            'copies.'
-        ),
+        'unrecognised_extension_paths': unrecognised,
+        'hint': hint,
     }

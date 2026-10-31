@@ -55,7 +55,6 @@ Scenario → test class map:
 
 from __future__ import annotations
 
-import asyncio
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -99,7 +98,7 @@ def git_repo(tmp_path: Path) -> Path:
     """A bare-minimum git repo with an initial commit."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return repo
 
 

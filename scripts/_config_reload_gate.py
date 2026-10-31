@@ -24,10 +24,11 @@ The calling script's side of the contract:
 * Every input reaches the heredoc by ARGV, never a pipe: `python3 -` reads its
   PROGRAM from stdin and the heredoc IS stdin, so a pipe into it is silently
   discarded (task 5398).
-* The heredoc puts the script's own directory on sys.path, so this module and
-  `legibility` both resolve from the SCRIPT's checkout, never the config's.
+* The heredoc puts the script's own directory on sys.path, so this module
+  resolves from the SCRIPT's checkout, never the config's, and binds `shared`
+  from that same checkout.
 * The heredoc runs under `<scripts>/../.venv/bin/python3` when that exists,
-  else `python3`. The transport is not stdlib (httpx, pydantic), so this
+  else `python3`. The transport, `shared.mcp_session`, needs httpx, so this
   module imports only stdlib at load time and turns a missing transport into
   a remedy naming that venv, never a traceback.
 """
@@ -74,16 +75,17 @@ def die(prog: str, message: str) -> NoReturn:
 
 
 def load_transport():
-    """The MCP transport's two modules, `(census_trigger, httpx)`, or
+    """The reload transport's two modules, `(shared.mcp_session, httpx)`, or
     ImportError when this interpreter cannot run it.
 
-    httpx is imported here, up front, because census_trigger imports it only
-    lazily, at send time, where its absence would masquerade as a transport
-    fault.
+    httpx is imported first, so an interpreter without it is known before
+    `shared` is bound to this script's own checkout.
     """
     import httpx
-    from legibility import census_trigger
-    return census_trigger, httpx
+    if (shared_src := str(Path(__file__).resolve().parents[1] / "shared" / "src")) not in sys.path:
+        sys.path.insert(0, shared_src)
+    from shared import mcp_session
+    return mcp_session, httpx
 
 
 def transport_not_importable_remedy(exc: ImportError) -> str:
@@ -91,15 +93,13 @@ def transport_not_importable_remedy(exc: ImportError) -> str:
     an MCP call needs (the transport, or the landing's merge-state
     vocabulary): which one, where it looked, and how to get a venv that has
     them all."""
-    scripts_dir = Path(__file__).parent
-    checkout = scripts_dir.parent
+    checkout = Path(__file__).resolve().parents[1]
     return (
         f"a module the MCP calls need is not importable under {sys.executable}: {exc}\n"
-        f"  looked for legibility/ under {scripts_dir}, and for httpx, pydantic and shared\n"
-        f"  in that interpreter's environment\n"
+        f"  looked for shared/ under {checkout / 'shared' / 'src'}, and for httpx in\n"
+        f"  that interpreter's environment\n"
         f"  remedy: run `uv sync --all-packages` in {checkout} so {checkout / '.venv'}\n"
-        f"  provides httpx, pydantic and shared, or re-run this script under "
-        f"`uv run --project shared`"
+        f"  provides httpx, or re-run this script under `uv run --project shared`"
     )
 
 
@@ -134,44 +134,36 @@ def fetch_reload_report(
 
 def _call_reload_config(port: str, *, committed_as: str, timeout: float) -> dict:
     """reload_config's unwrapped result, or ReloadNotConfirmed naming why the
-    transport could not deliver it.
-
-    The escalation MCP is STATEFUL: a single-shot `tools/call` POST is a
-    transport-level 400 before any tool runs. So the call goes through
-    `legibility.census_trigger.post_mcp_tool_call`, the one transport every
-    consumer of the server shares (task 3644): the session handshake, SSE
-    decoding, raising on a JSON-RPC `error` and on `result.isError`, and the
-    session-terminating DELETE.
-    """
+    transport could not deliver it."""
     try:
-        census_trigger, httpx = load_transport()
+        mcp_session, httpx = load_transport()
     except ImportError as exc:
         raise ReloadNotConfirmed(
             ReloadFailure.TRANSPORT_NOT_IMPORTABLE, transport_not_importable_remedy(exc),
         ) from exc
 
-    url = f"http://127.0.0.1:{port}/mcp"
+    base_url = f"http://127.0.0.1:{port}"
     try:
-        return census_trigger.post_mcp_tool_call(url, "reload_config", {}, timeout=timeout)
-    except httpx.ReadTimeout as exc:
+        with mcp_session.SyncMcpSession(
+            base_url, client_name="config-reload-gate", timeout=timeout,
+        ) as session:
+            return session.call_tool("reload_config", {})
+    except mcp_session.McpCallError as exc:
         # Only a READ timeout follows a completely sent request. A connect,
         # write or pool timeout leaves the server no complete request to run,
-        # so those fall through to the branch below.
-        raise ReloadNotConfirmed(
-            ReloadFailure.REPLY_TIMED_OUT,
-            f"no reply from {url} within {timeout}s to a request already sent; the transport "
-            f"cannot tell whether that was the session handshake or reload_config itself, so "
-            f"the tool may have run and applied the change, and the live config is unknown "
-            f"(committed as {committed_as}; re-run to converge, or the value lands at the next restart)",
-        ) from exc
-    except Exception as exc:
-        # Broad on purpose: census_trigger raises StatusFetchUnavailable for a
-        # malformed or error envelope, RuntimeError for a failed handshake, and
-        # httpx its own exceptions for a dead socket -- each leaves the live
-        # config UNKNOWN, and a deploy gate must not pass on an unknown.
+        # so those are a reload that never reached the tool. Either way the
+        # live config is UNKNOWN, and a deploy gate must not pass on an unknown.
+        if isinstance(exc.__cause__, httpx.ReadTimeout):
+            raise ReloadNotConfirmed(
+                ReloadFailure.REPLY_TIMED_OUT,
+                f"no reply from {base_url} within {timeout}s to a request already sent; the transport "
+                f"cannot tell whether that was the session handshake or reload_config itself, so "
+                f"the tool may have run and applied the change, and the live config is unknown "
+                f"(committed as {committed_as}; re-run to converge, or the value lands at the next restart)",
+            ) from exc
         raise ReloadNotConfirmed(
             ReloadFailure.NO_RELOAD_REPORT,
-            f"reload_config never reached the tool at {url}: {type(exc).__name__}: {exc} "
+            f"reload_config never reached the tool at {base_url}: {exc.kind}: {exc} "
             f"(committed as {committed_as}; the value lands at the next restart)",
         ) from exc
 

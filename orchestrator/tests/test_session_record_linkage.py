@@ -551,6 +551,99 @@ class TestRefreshEventsStampPointer:
         assert sr.resolve_session_slug_for_pid(spawner_pid, root=tmp_path) == spawner_slug
 
 
+_T3_SESSION_ID = 'sess-t3'
+_T3_HOOK_INPUT = {'session_id': _T3_SESSION_ID, 'cwd': _CWD}
+
+
+def _pre_pointer_record(root: Path, env: Mapping[str, str], *, owner: int = _DEAD_PID) -> str:
+    """Seed *env*'s record bound to ``_T3_SESSION_ID`` by an earlier *owner*, with no pointers."""
+    slug = sh.hook_session_slug(
+        _T3_HOOK_INPUT, env, root=root, process_tree=claude_process_tree(None)
+    )
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.IDLE,
+            cwd=_CWD,
+            claude_session_id=_T3_SESSION_ID,
+            claude_owner_pid=owner,
+        ),
+        root=root,
+    )
+    return slug
+
+
+_DISOWNED_SPAWNER = 'session-cockpit-7614001'
+
+
+def _hand_launched_env(root: Path) -> dict[str, str]:
+    return {}
+
+
+def _forked_inheritor_env(root: Path) -> dict[str, str]:
+    """Seed a spawner bound to another session, so the inherited ``CLAUDE_SPAWN_SESSION_ID`` is disowned."""
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=_DISOWNED_SPAWNER,
+            status=sr.Status.RUNNING,
+            claude_session_id='uuid-spawner',
+        ),
+        root=root,
+    )
+    return {'CLAUDE_SPAWN_SESSION_ID': _DISOWNED_SPAWNER, 'CLAUDE_SPAWN_ROLE': 'watcher'}
+
+
+class TestResumedSessionIdKeyedRecordIsRelinked:
+    _RESUMED = 7_614_102
+
+    @pytest.mark.parametrize(
+        'lane_env',
+        [_hand_launched_env, _forked_inheritor_env],
+        ids=['hand-launched', 'forked-inheritor'],
+    )
+    @pytest.mark.parametrize(
+        ('handler', 'hook_input'),
+        [
+            (sh.run_session_start, {**_T3_HOOK_INPUT, 'source': 'resume'}),
+            (sh.run_notification, _T3_HOOK_INPUT),
+            (sh.run_stop, _T3_HOOK_INPUT),
+        ],
+        ids=['session-start', 'notification', 'stop'],
+    )
+    def test_the_resumed_process_reclaims_the_dead_owner_and_gets_both_pointers(
+        self,
+        tmp_path: Path,
+        handler: Callable[..., object],
+        hook_input: Mapping[str, object],
+        lane_env: Callable[[Path], Mapping[str, str]],
+    ) -> None:
+        env = lane_env(tmp_path)
+        slug = _pre_pointer_record(tmp_path, env)
+        records_before = sorted(sr.sessions_dir(tmp_path).iterdir())
+
+        handler(hook_input, env, root=tmp_path, process_tree=claude_process_tree(self._RESUMED))
+
+        assert sr.read_record(slug, root=tmp_path).claude_owner_pid == self._RESUMED
+        assert sr.resolve_session_slug_for_pid(self._RESUMED, root=tmp_path) == slug
+        assert (
+            sr.resolve_session_slug_for_claude_session_id(_T3_SESSION_ID, root=tmp_path) == slug
+        )
+        assert sorted(sr.sessions_dir(tmp_path).iterdir()) == records_before
+
+    def test_a_live_recorded_owner_is_left_in_place(self, tmp_path: Path) -> None:
+        slug = _pre_pointer_record(tmp_path, {}, owner=os.getpid())
+
+        sh.run_stop(
+            _T3_HOOK_INPUT,
+            {},
+            root=tmp_path,
+            process_tree=claude_process_tree(self._RESUMED, os.getpid()),
+        )
+
+        assert sr.read_record(slug, root=tmp_path).claude_owner_pid == os.getpid()
+        assert sr.resolve_session_slug_for_pid(self._RESUMED, root=tmp_path) is None
+
+
 _T0 = datetime(2026, 9, 25, 12, 0, 0, tzinfo=UTC)
 
 
@@ -1148,9 +1241,26 @@ def _registry(root: Path) -> dict[str, sr.SessionRecord]:
     return {record.session_slug: record for record in records}
 
 
+def _leave_claude_pid_unset(monkeypatch: pytest.MonkeyPatch, root: Path, pid: int) -> None:
+    monkeypatch.delenv('CLAUDE_PID', raising=False)
+
+
+def _set_claude_pid_without_a_pointer(monkeypatch: pytest.MonkeyPatch, root: Path, pid: int) -> None:
+    monkeypatch.setenv('CLAUDE_PID', str(pid))
+
+
+def _set_claude_pid_with_an_unvouched_pointer(
+    monkeypatch: pytest.MonkeyPatch, root: Path, pid: int
+) -> None:
+    monkeypatch.setenv('CLAUDE_PID', str(pid))
+    sr.write_record(_record('another-sessions-record', owner_pid=pid + 1), root=root)
+    sr.write_session_pointer(pid, 'another-sessions-record', root=root)
+
+
 class TestWriteDecisionRecordSlug:
     _PID = 4_237_600
     _RESTARTED_PID = 4_237_700
+    _RESUMED = 7_614_700
     _ID = 'esc-4237-1'
     _FILED_ID = sr.qualify_decision_id('dark_factory', _ID)
 
@@ -1182,35 +1292,50 @@ class TestWriteDecisionRecordSlug:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         _link_pid(self._PID, 'watcher-own-record', tmp_path)
         monkeypatch.setenv('CLAUDE_PID', str(self._PID))
+        caplog.set_level(logging.DEBUG)
 
         _, decision = self._file(tmp_path, capsys)
 
         assert decision.record_slug == 'watcher-own-record'
         assert decision.session_id == f'watcher-df-{self._PID}'
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
-    @pytest.mark.parametrize('claude_pid', [None, str(_PID)], ids=['unset', 'no-pointer'])
-    def test_an_unresolvable_record_slug_still_files_blank_and_quiet(
+    @pytest.mark.parametrize(
+        ('arrange', 'names_the_pid'),
+        [
+            (_leave_claude_pid_unset, False),
+            (_set_claude_pid_without_a_pointer, True),
+            (_set_claude_pid_with_an_unvouched_pointer, True),
+        ],
+        ids=['unset', 'no-pointer', 'unvouched-pointer'],
+    )
+    def test_an_unresolvable_record_slug_still_files_blank_and_warns(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
         caplog: pytest.LogCaptureFixture,
-        claude_pid: str | None,
+        arrange: Callable[[pytest.MonkeyPatch, Path, int], None],
+        names_the_pid: bool,
     ) -> None:
-        if claude_pid is None:
-            monkeypatch.delenv('CLAUDE_PID', raising=False)
-        else:
-            monkeypatch.setenv('CLAUDE_PID', claude_pid)
+        arrange(monkeypatch, tmp_path, self._PID)
         caplog.set_level(logging.DEBUG)
 
         out, decision = self._file(tmp_path, capsys)
 
         assert out == f'{self._FILED_ID}\n'
         assert decision.record_slug == ''
-        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+        [warning] = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warning.name == sr.logger.name
+        message = warning.getMessage()
+        assert message.startswith(f'write-decision --id {self._ID} ')
+        assert 'BLANK record_slug' in message
+        assert sr.SESSION_PID_ENV in message
+        assert str(self._PID) in message or not names_the_pid
 
     def test_a_hand_launched_watchers_decision_links_to_its_registry_record(
         self,
@@ -1231,6 +1356,23 @@ class TestWriteDecisionRecordSlug:
 
         assert decision.linked_session_slug in sessions_by_slug
         assert decision.session_id not in sessions_by_slug
+
+    def test_a_resumed_hand_launched_watchers_decision_links_to_its_registry_record(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        slug = _pre_pointer_record(tmp_path, {})
+        sh.run_stop(
+            _T3_HOOK_INPUT, {}, root=tmp_path, process_tree=claude_process_tree(self._RESUMED)
+        )
+        monkeypatch.setenv('CLAUDE_PID', str(self._RESUMED))
+
+        _, decision = self._file(tmp_path, capsys, session_id=f'watcher-df-{self._RESUMED}')
+
+        assert decision.record_slug == slug
+        assert decision.linked_session_slug in _registry(tmp_path)
 
     def test_a_cross_queue_filing_fills_a_blank_record_slug(
         self,

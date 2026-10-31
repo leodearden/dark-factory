@@ -1,0 +1,25 @@
+import os,subprocess,time
+W='/home/leo/src/warm-lanes/worktrees';c=[]
+for n in os.listdir(W):
+    if n.startswith(('_mainprobe-','_mainsweep-')):
+        p=f'{W}/{n}/target'
+        if os.path.isdir(p):
+            b=int(subprocess.run(['stat','-c','%W',p],capture_output=True,text=True).stdout or 0)
+            c.append((b,n))
+c.sort();c=[x for x in c if x[0]>=1792300000]
+print('candidates',len(c),[time.strftime('%m-%d',time.gmtime(x[0])) for x in c])
+step=max(1,len(c)//6)
+for b,n in c[::step][:7]:
+    p=subprocess.Popen(['find',f'{W}/{n}/target','-xdev','-printf','%y %T@ %P\n'],stdout=subprocess.PIPE,text=True,errors='replace')
+    tot=fu=dwo=dd=rel=later=fpe=0
+    for l in p.stdout:
+        y,m,q=l.rstrip('\n').split(' ',2)
+        if float(m)>=b:later+=1;continue
+        tot+=1;a=q.split('/')
+        if len(a)>=3 and a[1]=='.fingerprint':
+            fpe+=1
+            if len(a)==3 and y=='d':fu+=1
+        if q.endswith('.dwo'):dwo+=1
+        if len(a)>=3 and a[0]=='debug' and a[1]=='deps':dd+=1
+        if a[0]=='release':rel+=1
+    print(n,time.strftime('%m-%d %H:%M',time.gmtime(b)),'older_entries',tot,'fp_entries',fpe,'fp_units',fu,'dwo',dd and dwo,'debug_deps',dd,'release',rel,'| own',later,flush=True)

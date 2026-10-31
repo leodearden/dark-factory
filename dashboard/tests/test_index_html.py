@@ -1969,12 +1969,15 @@ def test_spend_readings_js_load_order(
 
 _DEPENDENCY_FREE_MODULES = {
     'escalation_focus.js': ('tab_escalations.jsx',),
+    'escalation_check_owner.js': ('tab_escalations.jsx',),
     'persisted_state.js': (
         'tab_memory_evals.jsx',
         'tabs.jsx',
         'tab_escalations.jsx',
         'tab_escalation_analytics.jsx',
+        'tab_tasks.jsx',
     ),
+    'render_failure.js': ('app.jsx',),
 }
 _DEPENDENCY_FREE_CONSUMER_CASES = [
     (module, consumer)

@@ -5148,22 +5148,15 @@ class _RoutingMcpSession:
     while returning ``''`` for every real ``submit_task`` — the exact seam defect the
     class was written to catch.  Wrapping is the DEFAULT so a future test cannot
     reintroduce the substitution by omission.
-
-    ``raw=True`` opts out, for the tests that drive a DELIBERATELY MALFORMED response —
-    there the response shape itself is the fixture and wrapping it would destroy the
-    thing under test.
     """
 
     def __init__(
         self,
         responses: dict[str, object],
         raises: BaseException | None = None,
-        *,
-        raw: bool = False,
     ):
         self.responses = responses
         self.raises = raises
-        self.raw = raw
         self.calls: list[tuple[str, dict]] = []
 
     async def call_tool(self, name: str, arguments: dict, timeout: float = 30) -> Any:
@@ -5174,8 +5167,7 @@ class _RoutingMcpSession:
             # An unconfigured tool answers with nothing at all — not an envelope
             # carrying ``null``, which would assert a shape no test set up.
             return None
-        payload = self.responses[name]
-        return payload if self.raw else mcp_tool_envelope(payload)
+        return mcp_tool_envelope(self.responses[name])
 
     @property
     def dispatched(self) -> list[str]:
@@ -5203,13 +5195,14 @@ class TestOpenDebtOverTheRealAdapter:
     LATER = datetime(2026, 8, 6, 13, 0, tzinfo=UTC)
     TEST_ID = 'tests/test_a.py::test_one'
 
-    # Every envelope shape that reaches the adapter without carrying a readable
-    # `statuses` mapping.  Each one used to become `{}` — the corroborated-absence
-    # value — one seam away.
+    # Session responses under which `get_statuses` answers without a readable
+    # `statuses` mapping: a payload missing the key, a payload whose `statuses` is not
+    # a dict, and no body at all (an unconfigured tool answers None).  Each one used to
+    # become `{}` — the corroborated-absence value — one seam away.
     UNREADABLE = [
-        {'unexpected': 'shape'},
-        {'statuses': ['not', 'a', 'dict']},
-        None,
+        {'get_statuses': {'unexpected': 'shape'}},
+        {'get_statuses': {'statuses': ['not', 'a', 'dict']}},
+        {},
     ]
 
     def _client(self, session: _RoutingMcpSession):
@@ -5258,9 +5251,9 @@ class TestOpenDebtOverTheRealAdapter:
         assert _owner(db_path, self.TEST_ID) == 'task-901'
         assert row is not None and row.owner_task_id == 'task-901'
 
-    @pytest.mark.parametrize('envelope', UNREADABLE, ids=['unrecognised', 'non_dict', 'none'])
+    @pytest.mark.parametrize('responses', UNREADABLE, ids=['unrecognised', 'non_dict', 'no_body'])
     async def test_an_unreadable_envelope_keeps_the_owner_and_files_nothing(
-        self, tmp_path: Path, envelope: object
+        self, tmp_path: Path, responses: dict[str, object]
     ) -> None:
         """(b) The half a raise-only fix would miss.  Nothing raised here — the
         scheduler answered — but the answer carried no readable ``statuses``, so it is
@@ -5269,7 +5262,7 @@ class TestOpenDebtOverTheRealAdapter:
 
         db_path = tmp_path / 'runs.db'
         await self._seed(db_path)
-        session = _RoutingMcpSession({'get_statuses': envelope}, raw=True)
+        session = _RoutingMcpSession(responses)
 
         await open_debt(
             db_path,

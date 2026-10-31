@@ -63,12 +63,14 @@ def _cell(
     that needs the pre-σ shape must therefore ask for it with
     ``drop_metrics=_PRE_SIGMA``. Do not pass the same key in both.
     """
-    from orchestrator.evals.metrics import EvalMetrics
+    from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
     from orchestrator.evals.results import EvalResult
 
     m = EvalMetrics(
         plan_quality=plan_quality,
-        role_under_test=role_under_test,
+        role_under_test=(
+            RoleUnderTest(role_under_test) if role_under_test is not None else None
+        ),
         plan_steps=plan_steps,
         cost_usd=cost_usd,
         judge_cost_usd=judge_cost_usd,
@@ -482,12 +484,15 @@ def test_marker_present_counts_per_candidate():
 
 
 def test_only_architect_cells_are_counted():
-    """An implementer cell carrying the marker is ignored, even under the same config.
+    """An implementer or end_to_end cell carrying the marker is ignored, even under the same config.
 
-    An implementer run never invokes the plan judge, so it cannot have been
-    judged without a reference; counting it would inflate the very number that
-    bounds how far ``plan_quality`` may be trusted.
+    Neither run invokes the plan judge, so it cannot have been judged without a
+    reference; counting it would inflate the very number that bounds how far
+    ``plan_quality`` may be trusted. An enum-valued architect cell counts like a
+    string-valued one.
     """
+    from orchestrator.evals.metrics import RoleUnderTest
+
     results = [
         _cell('f1', 'A', plan_quality=0.8, plan_steps=5,
               extra_metrics={'judged_without_reference': False}),
@@ -495,11 +500,15 @@ def test_only_architect_cells_are_counted():
               extra_metrics={'judged_without_reference': False}),
         _cell('f3', 'A', role_under_test='implementer',
               extra_metrics={'judged_without_reference': True}),
+        _cell('f4', 'A', role_under_test=RoleUnderTest.ARCHITECT, plan_quality=0.8,
+              plan_steps=5, extra_metrics={'judged_without_reference': True}),
+        _cell('f5', 'A', role_under_test=RoleUnderTest.END_TO_END,
+              extra_metrics={'judged_without_reference': True}),
     ]
 
     rows = {r['config_name']: r for r in mod.summarize_candidates(results)}
 
-    assert {name: row[mod.MARKER_KEY] for name, row in rows.items()} == {'A': 0}
+    assert {name: row[mod.MARKER_KEY] for name, row in rows.items()} == {'A': 1}
 
 
 def test_rendered_table_marks_unmeasured_loudly():

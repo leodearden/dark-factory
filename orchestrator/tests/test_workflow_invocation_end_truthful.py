@@ -26,6 +26,7 @@ import pytest
 from _orch_helpers import pydantic_spec
 from _recording_event_store import _RecordingEventStore
 from _workflow_helpers import fixed_prompt
+from shared.process_cost import ProcessCostBasis
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import IMPLEMENTER
@@ -341,6 +342,43 @@ class TestInvocationRecordsModelIdAndCeilingKills:
         assert data['capped_reason'] is None
         assert save_kw['capped'] is False
         assert save_kw['capped_reason'] is None
+
+
+@pytest.mark.asyncio
+class TestInvocationEndRecordsCostBasis:
+    """``_invoke``'s ``invocation_end`` says how ``cost_usd`` was derived
+    (task 5818), with both keys PRESENT on an ordinary run so analyses can
+    filter on them."""
+
+    async def _invocation_end_data(self, tmp_path: Path, result: AgentResult) -> dict:
+        rec = _RecordingEventStore()
+        wf = _make_workflow(event_store=rec, cost_store=_recording_cost_store())
+        with (
+            patch('orchestrator.workflow.invoke_with_cap_retry', new=AsyncMock(return_value=result)),
+            patch.object(wf, '_build_agent_env', return_value=None),
+        ):
+            await wf._invoke(IMPLEMENTER, build_prompt=fixed_prompt('p'), cwd=tmp_path)
+        entries = [entry for (etype, entry) in rec.events if etype == EventType.invocation_end]
+        assert len(entries) == 1, f'expected exactly one invocation_end event; got {rec.events!r}'
+        return entries[0]['data']
+
+    async def test_clamped_usage_estimate_is_recorded(self, tmp_path: Path) -> None:
+        data = await self._invocation_end_data(
+            tmp_path,
+            AgentResult(
+                success=True, output='ok', cost_usd=1.25,
+                cost_basis=ProcessCostBasis.USAGE_ESTIMATE, cost_delta_clamped=True,
+            ),
+        )
+        assert data['cost_basis'] == 'usage_estimate'
+        assert data['cost_delta_clamped'] is True
+
+    async def test_default_reported_cost_is_recorded_not_omitted(self, tmp_path: Path) -> None:
+        data = await self._invocation_end_data(
+            tmp_path, AgentResult(success=True, output='ok'),
+        )
+        assert data['cost_basis'] == 'reported'
+        assert data['cost_delta_clamped'] is False
 
 
 @pytest.mark.asyncio

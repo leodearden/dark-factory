@@ -3,7 +3,7 @@
 
 # Verification commands
 # bare-MagicMock config gate (also runs in merge-queue verify; see hooks/project-checks)
-lint_command: "uv run --directory shared ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests"
+lint_command: "uv run --directory shared ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests && python3 tests/scripts/raw_envelope_literal_guard.py shared"
 test_command: "uv run --directory shared pytest tests/ --tb=short -q --timeout=300"
 # --threads 8 (task 5408). THE CANONICAL RATIONALE for this flag across the
 # workspace — sampler/orchestrator.yaml carries the same flag and points here,

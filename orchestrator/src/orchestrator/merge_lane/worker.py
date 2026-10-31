@@ -49,7 +49,11 @@ from orchestrator.branch_stack import UnstackOutcome
 from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
 from orchestrator.deployed_sha import DeployedSha
-from orchestrator.dry_run_unblock import run_dry_run_unblock
+from orchestrator.dry_run_unblock import (
+    investigation_in_flight,
+    investigation_task_name,
+    run_dry_run_unblock,
+)
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.flake_recorder import (
     record_flake_observation,
@@ -120,6 +124,7 @@ from orchestrator.merge_lane.liveness import (
 )
 from orchestrator.merge_lane.member_redrive import MemberRedriveOutcome, MemberRedriver
 from orchestrator.merge_lane.no_progress_abort import NoProgressAbort, emit_no_progress_abort
+from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
 from orchestrator.merge_lane.ports import (
     ClockPort,
     ContainmentPredicate,
@@ -166,6 +171,7 @@ from orchestrator.merge_lane.types import (
     InflightStatus,
     InflightVerifyResult,
     ItemLifecycleState,
+    LandingCandidate,
     MainHealthAutoHealRegistry,
     MergeBounceRegistry,
     MergeCancelRefusal,
@@ -177,6 +183,7 @@ from orchestrator.merge_lane.types import (
     MergeRequest,
     OperatorMergeCancel,
     OutcomeKind,
+    PendingGate,
     QueuedBranch,
     RealMergeItem,
     RelaneOutcome,
@@ -1137,11 +1144,10 @@ def _spawn_merge_verify_dry_run(
     None-safe: no-ops when *handles* is ``None`` or ``handles.scheduler`` is
     ``None`` — the solo-reverify and train module-level
     ``_run_post_merge_verify`` callers pass no handles.  Also no-ops when
-    ``req.config.unblock_auto.enabled`` is falsy, when a not-done
-    investigation task is already registered in ``handles.background_tasks``
-    under this task's name (mirrors ``workflow._spawn_dry_run_unblock``'s
-    enablement and in-flight-dedup guards), or when ``req.worktree`` is
-    missing/nonexistent.
+    ``req.config.unblock_auto.enabled`` is falsy, when an investigation for
+    this task is already running anywhere on the event loop (mirrors
+    ``workflow._spawn_dry_run_unblock``'s enablement and in-flight-dedup
+    guards), or when ``req.worktree`` is missing/nonexistent.
 
     The investigation always reads ``req.worktree`` — the task's OWN retained
     worktree — rather than the ephemeral merge worktree: by the time this
@@ -1162,16 +1168,7 @@ def _spawn_merge_verify_dry_run(
     ua = getattr(req.config, 'unblock_auto', None)
     if not ua or not ua.enabled:
         return
-    task_name = f'unblock-auto-{req.task_id}'
-    # Skip if an investigation for this task is already running (e.g. rapid
-    # re-blocks across successive merge-verify retries).  Duplicate proposals
-    # are unhelpful and would multiply budget spend up to the investigation's
-    # own timeout ceiling per re-block (mirrors
-    # workflow._spawn_dry_run_unblock's dedup guard).
-    if any(
-        t.get_name() == task_name and not t.done()
-        for t in handles.background_tasks
-    ):
+    if investigation_in_flight(req.task_id):
         logger.debug(
             'Task %s: merge-verify dry-run investigation already in '
             'progress, skipping duplicate spawn',
@@ -1199,7 +1196,7 @@ def _spawn_merge_verify_dry_run(
                 cost_store=handles.cost_store,
                 block_class=BlockClass.MERGE_VERIFY_RED,
             ),
-            name=task_name,
+            name=investigation_task_name(req.task_id),
         )
         handles.background_tasks.add(task)
         task.add_done_callback(handles.background_tasks.discard)
@@ -2538,7 +2535,9 @@ async def _run_post_merge_verify(
             this snapshot is taken are not protected by prunes triggered inside
             this call — they rely on the heartbeat mtime / grace-period
             mechanism to avoid premature removal in the residual window between
-            snapshot capture and prune execution.
+            snapshot capture and prune execution.  The gate re-verify passes
+            the live ledger instead (task 6155): dispatch continues while it
+            runs, so each prune reads the ledger as it stands at that moment.
         escalation_queue: Live escalation queue or ``None`` (default).  Used
             solely to file a born-at-L2 escalation (task 2307 β) when
             *verify* is the distinguished flock-worktree-contention outcome
@@ -3469,7 +3468,9 @@ async def _run_post_merge_verify(
                     dry_run_handles, req, reason, detail,
                     event_store=event_store, verifier=verifier,
                 )
-            return MergeOutcome('blocked', reason=reason)
+            return MergeOutcome(
+                'blocked', reason=reason, block_category=MergeBlockCategory.POST_MERGE_VERIFY,
+            )
 
         # Persistent ENOSPC after the prune-and-retry → transient infra.
         if _verify_hit_enospc(verify):
@@ -3683,6 +3684,7 @@ async def _run_post_merge_verify(
             disposition=disposition,
             failure_diagnostic=failure_diagnostic,
             skew_evidence=skew_evidence,
+            block_category=MergeBlockCategory.POST_MERGE_VERIFY,
         )
 
     # Task 2823 (gate-hole #3/3): a config-only merge (no .py/.rs in the diff)
@@ -6089,9 +6091,11 @@ async def classify_and_merge(
         # 4. Conflict → reject immediately (caller resolves outside queue).
         if merge_result.conflicts:
             logger.info('Task %s: merge conflicts detected', req.task_id)
+            evidence = _conflict_evidence(merge_result)
             _emit_merge_attempt(
                 event_store, req.task_id, OutcomeKind.conflict,
                 duration_ms=_elapsed_ms(started_monotonic),
+                conflict_evidence=evidence,
             )
             if isinstance(worker, SpeculativeMergeWorker):
                 # ι=1894: record drift = main_position − base at merge-start.
@@ -6105,7 +6109,10 @@ async def classify_and_merge(
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
             return Decided(
-                MergeOutcome('conflict', conflict_details=merge_result.details),
+                MergeOutcome(
+                    'conflict', conflict_details=merge_result.details,
+                    conflict_evidence=evidence,
+                ),
                 merge_result=merge_result,
             )
 
@@ -6226,7 +6233,7 @@ async def build_chain(
     :meth:`SpeculativeMergeWorker._deep_chain_placement` — the slot-2 deep
     gate — is the only thing that calls this, and it bounds the call the way
     the caller-cost note below requires: one ``asyncio.timeout``
-    (:data:`CHAIN_BUILD_TIMEOUT_SECS`) wrapped around the whole invocation,
+    (``MergeDeepConfig.chain_build_timeout_secs``) wrapped around the whole invocation,
     with a timeout, an unexpected exception, an unavailable lane and a
     zero-link result all mapped to "no chain this round" (today's adjacent
     verify) rather than to a failure.  The gate ALSO hoists α's kill switch
@@ -6267,7 +6274,7 @@ async def build_chain(
     reaches the merge loop logs ``elapsed_ms`` on its one-line summary.
 
     γ took the SECOND option (``_deep_chain_placement`` wraps this in
-    ``asyncio.timeout(CHAIN_BUILD_TIMEOUT_SECS)``), which BOUNDS the dispatch
+    ``asyncio.timeout(chain_build_timeout_secs)``), which BOUNDS the dispatch
     stall but does not remove it: the build is still awaited inline, so for its
     duration ``_verifier_loop`` cannot run FINALIZE-HEAD.  The residual stall is
     therefore MEASURED rather than assumed — ``_deep_chain_placement`` stamps
@@ -6908,6 +6915,13 @@ async def reconcile_landed_outbox(
     return report
 
 
+def _conflict_evidence(merge_result: MergeResult) -> ConflictEvidence | None:
+    """What a conflicted merge records; ``None`` when git could not name its paths."""
+    if merge_result.conflicted_paths is None:
+        return None
+    return ConflictEvidence(conflicted_paths=merge_result.conflicted_paths)
+
+
 def _emit_train_attempt(
     event_store: EventStore | None,
     req: GroupMergeRequest,
@@ -6916,13 +6930,14 @@ def _emit_train_attempt(
     started_monotonic: float,
     attempt: int | None = None,
     gate_clearance: GateClearance | None = None,
+    conflict_evidence: ConflictEvidence | None = None,
 ) -> None:
     """Emit a ``merge_attempt`` for *req*'s train, tagged with its train id and members."""
     _emit_merge_attempt(
         event_store, req.task_id, outcome,
         attempt=attempt, duration_ms=_elapsed_ms(started_monotonic),
         train_id=req.train_id, member_task_ids=req.member_task_ids,
-        gate_clearance=gate_clearance,
+        gate_clearance=gate_clearance, conflict_evidence=conflict_evidence,
     )
 
 
@@ -6957,6 +6972,7 @@ def _derail_on_train_verify_failure(
             reason=reason,
             failure_category=verify_outcome.failure_category,
             failure_cause_hint=verify_outcome.failure_cause_hint,
+            block_category=verify_outcome.block_category,
         )
     logger.info('Train %s: verify gate blocked: %s', req.train_id, reason)
     _emit_train_event(
@@ -7503,7 +7519,14 @@ async def _do_train_merge(
             member_task_ids=req.member_task_ids,
             data={'derail_reason': reason},
         )
-        _emit_train_attempt(event_store, req, OutcomeKind.conflict if merge_result.conflicts else OutcomeKind.merge_failed, started_monotonic=t0)
+        if merge_result.conflicts:
+            evidence = _conflict_evidence(merge_result)
+            _emit_train_attempt(
+                event_store, req, OutcomeKind.conflict, started_monotonic=t0,
+                conflict_evidence=evidence,
+            )
+            return MergeOutcome('blocked', reason=reason, conflict_evidence=evidence)
+        _emit_train_attempt(event_store, req, OutcomeKind.merge_failed, started_monotonic=t0)
         return MergeOutcome('blocked', reason=reason)
 
     # Enforce invariants explicitly — plain assert is stripped under python -O,
@@ -9037,27 +9060,6 @@ def select_probe_depth(
 # _deep_chain_placement passes `cap - 1` / `d - 1` (see its docstring).
 
 
-# γ's bound on β's unbounded builder.  ``build_chain``'s Caller-cost note
-# (see its docstring above) is explicit that it carries NO internal deadline
-# BY DESIGN -- an internal timeout would abandon a half-built lane mid-``git
-# merge`` -- and that "the honest bound belongs to the policy layer".  This is
-# that bound: one lane acquisition (``git reset --hard`` + ``git clean -xfd``
-# + a CoW seed) plus up to ``chain_cap`` sequential real ``git merge``
-# subprocesses, all of it blocking the verifier's dispatch path.
-#
-# Imposing the deadline from OUTSIDE is what makes it safe: build_chain's
-# ``except BaseException`` arm releases the lane on cancellation, so an
-# overrun returns the lane to the pool and _deep_chain_placement degrades to
-# "no chain this round" -- today's adjacent verify -- rather than stranding a
-# lane in ASSIGNED.
-#
-# 120s is deliberately generous against a staged cap of a handful of items
-# (a wedged lane is the failure this catches, not a merely slow one) while
-# still being an order of magnitude below the verify it precedes, so a stall
-# here can never masquerade as a slow verify.
-CHAIN_BUILD_TIMEOUT_SECS: float = 120.0
-
-
 def select_chain_depth(
     chain_cap: int,
     queue_len: int,
@@ -10108,12 +10110,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # graph over the unfrozen suffix, debounce signature, cached main SHA,
         # per-branch bounce counter) now live on a SuffixConflictTracker
         # (orchestrator.suffix_graph), owned here as self._suffix_tracker.
-        # git_ops/lane_buffers/frozen_prefix/frozen_prefix_tip/retire_item are ALL injected
+        # git_ops/lane_buffers/frozen_requests/frozen_prefix_tip/retire_item are ALL injected
         # as narrow callables that RE-READ the live attribute on `self` on
         # every call (not `self` itself, and not a value/bound-method
         # snapshot captured once here) so the tracker is unit-testable
         # without a worker AND stays correct if this worker's `_git_ops` /
-        # `frozen_prefix` / `frozen_prefix_tip` is ever reassigned after
+        # `frozen_prefix_requests` / `frozen_prefix_tip` is ever reassigned after
         # construction (amend: reviewer robustness_stale_reference +
         # consistency — previously git_ops was a direct snapshot and
         # frozen_prefix/frozen_prefix_tip were bound-method snapshots, an
@@ -10129,7 +10131,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._suffix_tracker = SuffixConflictTracker(
             git_ops=lambda: self._git_ops,
             lane_buffers=lambda: self._lane_buffers,
-            frozen_prefix=lambda: self.frozen_prefix(),
+            frozen_requests=lambda: self.frozen_prefix_requests(),
             frozen_prefix_tip=lambda main_sha: self.frozen_prefix_tip(main_sha),
             retire_item=lambda rid: self._retire_item(rid),
         )
@@ -10794,7 +10796,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ``_finalize_inflight``). The ordering invariant (at most one entry
         mid-finalize at a time) makes this uniquely identifiable: the sole
         ``_live_items`` ``InflightEntry`` whose request_id is absent from the
-        ``_inflight`` deque.
+        ``_inflight`` deque.  A head parked on its gate re-verify (task 6155)
+        is back at the front of the deque between its finalize calls, so it
+        is found there rather than here while its gate runs.
 
         task 3082: that window is now bounded on EVERY exit, not just the ones
         that finalize — ``_finalize_inflight``'s DROPPED and REQUEUED sentinel
@@ -12368,11 +12372,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         Definition (§5.3):
           frozen = (self._finalizing_head_entry() if its phase is a verify/finalize phase)
                    + [e for e in self._occupying_inflight_entries()
-                      if e.verify_task is not None]
+                      if e.in_verify_frontier]
 
         Passthroughs (verify_task=None: conflict/already_merged/skip) are NOT
         frozen — they carry no merge_commit and are not part of the verify
-        frontier.
+        frontier.  A head parked on its gate re-verify is, even one adopted
+        on tip authority, whose verify_task is None (task 6155).
 
         Pure/synchronous — mirrors _pop_next_pickable.
 
@@ -12389,7 +12394,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ):
             entries.append(_fh_entry)
         for e in self._occupying_inflight_entries():
-            if e.verify_task is not None:
+            if e.in_verify_frontier:
                 entries.append(e)
         return entries
 
@@ -12411,7 +12416,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Pure/synchronous (no await).
         """
-        return tuple(e.item.request.request_id for e in self._frozen_inflight_entries())
+        return tuple(req.request_id for req in self.frozen_prefix_requests())
+
+    def frozen_prefix_requests(self) -> tuple[MergeRequest, ...]:
+        """Return the frozen prefix as request OBJECTS, in submission order.
+
+        The :class:`MergeRequest`-typed twin of :meth:`frozen_prefix`, as
+        :meth:`chain_snapshot` is of :meth:`unfrozen_suffix`.
+
+        Pure/synchronous (no await).
+        """
+        return tuple(e.item.request for e in self._frozen_inflight_entries())
 
     def unfrozen_suffix(self) -> tuple[str, ...]:
         """Return request_ids of the unfrozen suffix in pick order (ε=1890).
@@ -12524,8 +12539,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         A commit passed here was failed/ejected/superseded/re-merged, so any
         speculative item whose ``base_sha`` points at it has a BROKEN chain
         (see :meth:`_chain_dead_link`).  Called at every invalidation site
-        (head-failure cascade, dispatch chain-invalidation discard,
-        RUNNER_UNAVAILABLE re-merge, rebased landing) so a built-awaiting-host
+        (head-failure cascade, dispatch chain-invalidation discard, adoption-time
+        void, RUNNER_UNAVAILABLE re-merge, rebased landing) so a built-awaiting-host
         straggler that the cascade missed is still caught at its next dispatch.
 
         Bounded FIFO (cap ``self._dead_base_commits_cap``): past the cap the
@@ -12544,6 +12559,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             while len(self._dead_base_order) > self._dead_base_commits_cap:
                 evicted = self._dead_base_order.popleft()
                 self._dead_base_commits.discard(evicted)
+
+    def _record_item_commit_dead(self, item: SpeculativeItem) -> None:
+        """Record *item*'s own merge commit as a dead base; a DecidedItem built none."""
+        if isinstance(item, RealMergeItem):
+            self._record_dead_base(item.merge_result.merge_commit or '')
 
     def _chain_dead_link(self, item: SpeculativeItem, main_sha: str) -> str | None:
         """Return the dead base link iff *item*'s chain is BROKEN, else None (INV-3).
@@ -13233,9 +13253,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # than assert: this is the OPTIONAL deep path, and it must never be
             # the thing that crashes a dispatch.
             return None
+        # Bound on the whole build: lane acquisition (git reset/clean, the CoW
+        # re-seed of target/) plus the merges; no cargo. The 1800 s default sits
+        # above reify's measured whole-process p99 (seeds, n=401 over
+        # 2026-10-15..30: p99 899 s, last 7 d 1003 s, week 44 1168 s, max 1272 s;
+        # plus <=28 s reset/clean, <=30 s lock wait, ~0.5 s per merge). The build
+        # blocks _verifier_loop for its whole duration, so this is also the
+        # worst-case stall on finalising a green head. A cancel during
+        # acquisition is task 7721's fix, not covered here.
+        chain_build_timeout_secs = item.request.config.merge_deep.chain_build_timeout_secs
         _build_t0 = self._clock.monotonic()
         try:
-            async with asyncio.timeout(CHAIN_BUILD_TIMEOUT_SECS):
+            async with asyncio.timeout(chain_build_timeout_secs):
                 result = await build_chain(
                     self._git_ops,
                     snapshot,
@@ -13245,13 +13274,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
         except TimeoutError:
             # FAIL-OPEN. An overrun is not a merge fault, so it must not fail
-            # the dispatch -- it degrades to today's adjacent verify. Safe to
-            # impose from out here because build_chain's own `except
-            # BaseException` arm releases the lane on cancellation, so nothing
-            # is left ASSIGNED. WARNING, not INFO: a build that cannot finish
-            # inside CHAIN_BUILD_TIMEOUT_SECS means a wedged lane or a
-            # pathological repo, and a silent degrade is exactly what the
-            # no-silent-fail-soft design invariant forbids.
+            # the dispatch -- it degrades to today's adjacent verify. WARNING, not
+            # INFO: a build that cannot finish inside chain_build_timeout_secs
+            # means a wedged lane or a pathological repo, and a silent degrade is
+            # exactly what the no-silent-fail-soft design invariant forbids.
             #
             # DELIBERATELY NARROW -- `asyncio.CancelledError` is NOT caught
             # here, and must not be added. `asyncio.timeout` converts its OWN
@@ -13276,7 +13302,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             logger.warning(
                 'deep chain build exceeded %.0fs for %s (target_depth=%d) -- '
                 'falling back to the adjacent verify',
-                CHAIN_BUILD_TIMEOUT_SECS, item.request.task_id, d,
+                chain_build_timeout_secs, item.request.task_id, d,
             )
             return None
         except Exception:
@@ -13303,7 +13329,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # build was awaited INLINE on `_verifier_loop`'s dispatch path, so for
         # its whole duration the loop could not run FINALIZE-HEAD -- an
         # already-green slot-1 head verify could not be finalized or landed, and
-        # no other item could dispatch. `CHAIN_BUILD_TIMEOUT_SECS` BOUNDS that
+        # no other item could dispatch. `merge_deep.chain_build_timeout_secs` BOUNDS that
         # stall but does not remove it, and since the PRD's whole justification
         # is throughput the cost has to be MEASURABLE before ζ raises the cap.
         # So stamp the wall clock onto the result and emit it as
@@ -15565,6 +15591,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # inside self._verifier_task) finish naturally and resolve its TRUE
         # outcome within the `asyncio.wait(tasks_to_wait, timeout)` shutdown
         # window a few lines down.
+        #
+        # A head parked at _inflight[0] on its gate re-verify (task 6155) is
+        # neither sub-case: its gate can run for an hour, past that window.
+        # It is detached and resolved first, still before any await, so the
+        # block below pre-empts the NEXT head if that one is VERIFYING; the
+        # parked gate is torn down right after the block.
+        _parked_head = self._detach_parked_gate_head()
         _fh_entry = self._finalizing_head_entry()
         if _fh_entry is None and self._inflight:
             _fh_entry = self._inflight[0]
@@ -15601,6 +15634,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     _fh_entry.lease = None
             if _fh_entry.permit is not None:
                 self._speculation_ledger.release(_fh_entry.permit)
+        if _parked_head is not None:
+            await self._release_parked_gate_head(_parked_head)
 
         # Drain per-lane buffers (items already removed from _queue by the merger)
         # Intentionally mutates _lane_buffers directly (not via
@@ -15709,9 +15744,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     _ie.lease, _ie.verify_task, _ie_req.task_id,
                     shutdown_defensive=True,
                 )
-            if _ie.merge_wt is not None:
-                with contextlib.suppress(BaseException):
-                    await self._cleanup_owned_merge_worktree(_ie.merge_wt)
+            await self._release_drained_worktrees(_ie)
             if _ie.lease is not None and self._host_allocator is not None:
                 with contextlib.suppress(BaseException):
                     await self._cancel_and_release_tracked(_ie.lease)
@@ -17275,6 +17308,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._assert_single_writer(self._verifier_task, '_inflight')
         return self._inflight.popleft()
 
+    def _inflight_appendleft(self, entry: InflightEntry) -> None:
+        """Put a popped head parked on its gate back at the front of ``self._inflight``
+        (verifier-owned single-writer choke point, task 6155).
+
+        See :meth:`_inflight_append`.  No lifecycle transition: the entry stays
+        at GATE_REVERIFY.
+        """
+        self._assert_single_writer(self._verifier_task, '_inflight')
+        self._inflight.appendleft(entry)
+
     def _inflight_clear(self) -> None:
         """Clear ``self._inflight`` (verifier-owned single-writer choke point).
 
@@ -17294,16 +17337,116 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ``asyncio.Queue.get()`` takes its item only after its await returns.
         A DONE getter is left in place for stop() to harvest -- it holds an
         item whose merge() Future stop() must resolve.
+
+        A cancelled loop also pre-empts a head parked on its gate re-verify
+        (task 6155), as stop() does, since no loop is left to resume it.  Any
+        other exit leaves the gate running on the deque, for a restarted loop
+        to resume.
         """
         try:
             await self._verifier_loop()
-        except BaseException:
+        except BaseException as exc:
             getter = self._pending_verifier_get
             if getter is not None and not getter.done():
                 self._pending_verifier_get = None
                 getter.cancel()
                 await asyncio.gather(getter, return_exceptions=True)
+            if isinstance(exc, asyncio.CancelledError):
+                await self._preempt_parked_gate_head()
             raise
+
+    async def _preempt_parked_gate_head(self) -> None:
+        """End a head parked on its gate re-verify with the shutdown outcome
+        (task 6155): :meth:`_detach_parked_gate_head`, then
+        :meth:`_release_parked_gate_head`."""
+        head = self._detach_parked_gate_head()
+        if head is not None:
+            await self._release_parked_gate_head(head)
+
+    def _detach_parked_gate_head(self) -> InflightEntry | None:
+        """Pop the head parked on its gate re-verify and resolve it with the
+        shutdown outcome, without awaiting (task 6155).
+
+        Resolved before any await, the merge can no longer land: the journal
+        keeps the record and the merge is re-enqueued on the next boot.  Popped,
+        nothing else meets the head again to release its warm lane or lease
+        twice.  None when the head is not parked on a gate.
+        """
+        if not self._inflight or self._inflight[0].gate is None:
+            return None
+        head = self._inflight_popleft()
+        req = head.item.request
+        if not req.result.done():
+            req.result.set_result(
+                MergeOutcome('blocked', reason=MERGE_WORKER_SHUTDOWN_REASON),
+            )
+        self._retire_item(req.request_id)
+        return head
+
+    async def _release_parked_gate_head(self, head: InflightEntry) -> None:
+        """Tear down a detached head's gate, then release its lease, speculation
+        permit and drift base."""
+        await self._teardown_parked_gate(head)
+        with contextlib.suppress(BaseException):
+            await self._cancel_and_release_tracked(head.lease)
+        head.lease = None
+        if head.permit is not None:
+            self._speculation_ledger.release(head.permit)
+        self._drift_base.pop(head.item.request.request_id, None)
+
+    async def _teardown_parked_gate(self, entry: InflightEntry) -> Path | None:
+        """Cancel and reap *entry*'s parked gate re-verify and return its worktree.
+
+        Returns that worktree, already released (warm or cold, as the
+        candidate says), so no caller disposes of it a second time; None when
+        *entry* has no parked gate.
+
+        No lease is passed to the teardown: a remote gate is aborted on its
+        host by its own reap in :func:`_run_verify_reaped` while it is live.
+        ``entry.gate`` stays set, so a later finalize of the entry re-raises
+        the cancellation rather than taking a fresh CAS during shutdown.
+        """
+        gate = entry.gate
+        if gate is None:
+            return None
+        await self._teardown_verify_task(
+            None, gate.task, entry.item.request.task_id, shutdown_defensive=True,
+        )
+        with contextlib.suppress(BaseException):
+            await self._release_or_cleanup(
+                gate.candidate.merge_wt, spec_warm=gate.candidate.spec_warm,
+            )
+        return gate.candidate.merge_wt
+
+    async def _release_drained_worktrees(self, entry: InflightEntry) -> None:
+        """Return the worktrees of an entry stop() drains from ``_inflight``.
+
+        A next head the loop finalized during stop()'s awaits can be parked on
+        its own gate re-verify by then (task 6155): that gate's worktree goes
+        first, and the entry's own merge worktree is cold-removed only when it
+        is a different path, so a warm lane is never released and then removed.
+        """
+        gate_wt = await self._teardown_parked_gate(entry)
+        if entry.merge_wt is not None and entry.merge_wt != gate_wt:
+            with contextlib.suppress(BaseException):
+                await self._cleanup_owned_merge_worktree(entry.merge_wt)
+
+    async def _finalize_passthrough(self, entry: InflightEntry) -> None:
+        """``_finalize_inflight`` an entry with no verify to wait on, off the
+        head of line.
+
+        Such an entry returns before the CAS, so it never parks on a gate
+        re-verify (task 6155).  Nothing here would resume one that did, so the
+        gate is torn down and the park raised as a finalize error, for the
+        caller's handler to resolve and release the entry.
+        """
+        await self._finalize_inflight(entry)
+        if entry.gate is not None:
+            await self._teardown_parked_gate(entry)
+            raise RuntimeError(
+                f'task {entry.item.request.task_id}: a passthrough finalize '
+                'parked on a gate re-verify',
+            )
 
     async def _verifier_loop(self) -> None:
         """Verify and CAS-advance for each SpeculativeItem from the Merger.
@@ -17317,7 +17460,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
           (b) FINALIZE-HEAD: wait on the head's verify in VERIFY_ABANDON_POLL_SECS
               slices with the head still on the deque, going back to (a) whenever
               a host is free for ready work; once the verify is done, popleft()
-              and _finalize_inflight, advancing main in submission order.  If
+              and _finalize_inflight, advancing main in submission order.  A head
+              whose CAS rebased comes back with its gate re-verify parked on it:
+              it goes back on the front of the deque and is waited on the same
+              way, then finalized again to resume its CAS (task 6155).  If
               _inflight is empty, poll for a host while _redispatch holds a
               parked item and the queue is empty, else block on
               _verifier_queue.get().
@@ -17382,7 +17528,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # STILL RUNNING (not done) AND a host slot is free, race the
                         # next queue item against the running verifies so dispatch-
                         # fill launches N+1 to the free slot while N verifies — but a
-                        # verify *completing* must ALSO wake us so FINALIZE-HEAD runs.
+                        # verify *completing*, or a parked head's gate re-verify
+                        # completing (task 6155), must ALSO wake us so FINALIZE-HEAD
+                        # runs.
                         # Otherwise the last item of a merge burst would hang: its
                         # verify finishes in the background but FINALIZE-HEAD is never
                         # reached, so _finalize_inflight() never runs and the merge()
@@ -17394,7 +17542,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # they are done the head needs to be finalized, not more
                         # items fetched.
                         _has_running_inflight = any(
-                            e.verify_task is not None and not e.verify_task.done()
+                            e.pending_task is not None and not e.pending_task.done()
                             for e in self._inflight
                         )
                         if (
@@ -17409,9 +17557,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                     self._verifier_queue.get()
                                 )
                             _running = {
-                                e.verify_task for e in self._inflight
-                                if e.verify_task is not None
-                                and not e.verify_task.done()
+                                e.pending_task for e in self._inflight
+                                if e.pending_task is not None
+                                and not e.pending_task.done()
                             }
                             await asyncio.wait(
                                 {self._pending_verifier_get, *_running},
@@ -17434,7 +17582,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 is_from_verifier_queue = True
                                 # Fall through with item (None handled below).
                             else:
-                                # A verify finished first, or stop() was requested
+                                # A verify or a parked gate finished first, or stop() was requested
                                 # (it harvests a done getter) → stop filling and
                                 # proceed to FINALIZE-HEAD.  The getter persists to
                                 # the next DISPATCH-FILL iteration so no queue item
@@ -17450,6 +17598,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     while self._inflight:
                         head = self._inflight_popleft()
                         await self._finalize_inflight(head)
+                        if head.gate is not None:
+                            self._inflight_appendleft(head)
                     return
 
                 # Dispatch the item (applies Mechanism 1, abandon/halt/passthrough/
@@ -17523,7 +17673,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # No consumer depends on strict cross-item Future-delivery ordering.
                 if entry.verify_task is None:
                     try:
-                        await self._finalize_inflight(entry)
+                        await self._finalize_passthrough(entry)
                     except (asyncio.CancelledError, KeyboardInterrupt):
                         raise
                     except BaseException as exc:
@@ -17564,8 +17714,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 #   3. the QueueEmpty branch, which only blocks when
                 #      _has_running_inflight and a host is free -- and then
                 #      races a persistent getter against the running verify
-                #      tasks via asyncio.wait(..., FIRST_COMPLETED), so a
-                #      verify completing first always ends the wait and falls
+                #      and parked-gate tasks via asyncio.wait(...,
+                #      FIRST_COMPLETED), so a verify or gate completing
+                #      first always ends the wait and falls
                 #      through to FINALIZE-HEAD (the esc-1735-5 anti-block
                 #      property); otherwise (no running inflight, or no free
                 #      host) the else there breaks straight to FINALIZE-HEAD.
@@ -17614,6 +17765,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         head, MergeOutcome('blocked', reason=f'Verifier error: {exc}'),
                         chain_failed=True,
                     )
+                if head.gate is not None:
+                    # Its gate re-verify is running: keep it the head, as a
+                    # head verify is kept, and go back to DISPATCH-FILL.
+                    self._inflight_appendleft(head)
+                    continue
 
                 # HEAD-FAILURE CASCADE (γ step-20): when the head fails, abort
                 # all downstream in-flight verifies, re-merge each item onto
@@ -17641,8 +17797,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # (enforcement (a)) instead of verifying against it.  Each
                     # downstream entry's OLD commit is recorded below, just before
                     # its own _remerge replaces the item.
-                    if isinstance(head.item, RealMergeItem):
-                        self._record_dead_base(head.item.merge_result.merge_commit or '')
+                    self._record_item_commit_dead(head.item)
 
                     # Detect whether the head failure was due to operator halt
                     # (REQUEUED sentinel).  In that case downstream tasks will
@@ -17798,10 +17953,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             # is about to be re-merged away, so a straggler stacked
                             # on it now has a dangling successor edge.  Recording it
                             # dead makes that straggler catchable at dispatch.
-                            if isinstance(_entry.item, RealMergeItem):
-                                self._record_dead_base(
-                                    _entry.item.merge_result.merge_commit or ''
-                                )
+                            self._record_item_commit_dead(_entry.item)
                             _rid = _entry.item.request.request_id
                             _from_state = self._lifecycle.current(_rid)
                             if _from_state is not None:
@@ -17955,7 +18107,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # on a verify task) then restart the outer loop.
                 if entry.verify_task is None:
                     try:
-                        await self._finalize_inflight(entry)
+                        await self._finalize_passthrough(entry)
                     except (asyncio.CancelledError, KeyboardInterrupt):
                         raise
                     except BaseException as exc:
@@ -17977,23 +18129,25 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 continue  # restart outer loop
 
     async def _await_head_verify_or_refill(self) -> bool:
-        """Wait on the deque head's running verify in VERIFY_ABANDON_POLL_SECS slices.
+        """Wait on the deque head's running verify, or the gate re-verify parked
+        on it (task 6155), in VERIFY_ABANDON_POLL_SECS slices.
 
         True sends the loop back to DISPATCH-FILL with the head still on the
         deque: the deque changed under the wait (stop() drains it), or
         :meth:`_dispatch_opportunity_exists`.  Keeping the head on the deque is
         what keeps ``_dispatch_item``'s ``_has_inflight_verify`` gate true, so a
         dispatch here is the same one the QueueEmpty fill-ahead race makes.
-        False means the head's verify is done and it is ready to finalize.
-        A raw cancel of the loop leaves the head's verify running, owned by the
-        deque.
+        False means the head's verify (or gate) is done and it is ready to
+        finalize.  A raw cancel of the loop leaves the head's verify running,
+        owned by the deque; a parked gate is pre-empted by
+        :meth:`_run_verifier_loop`.
         """
         head = self._inflight[0]
-        while (verify := head.verify_task) is not None and not verify.done():
-            await asyncio.wait({verify}, timeout=self.VERIFY_ABANDON_POLL_SECS)
+        while (task := head.pending_task) is not None and not task.done():
+            await asyncio.wait({task}, timeout=self.VERIFY_ABANDON_POLL_SECS)
             if next(iter(self._inflight), None) is not head:
                 return True
-            if not verify.done() and self._dispatch_opportunity_exists():
+            if not task.done() and self._dispatch_opportunity_exists():
                 return True
         return False
 
@@ -18434,13 +18588,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """THE cancel-release chokepoint: release the lease, RECORD a strand.
 
         Sole caller of ``HostAllocator.cancel_and_release`` — enforced by
-        :class:`TestCancelAndReleaseChokepoint`'s AST ratchet.  Its seven call
+        :class:`TestCancelAndReleaseChokepoint`'s AST ratchet.  Its eight call
         sites are the two ``stop()`` drains (finalizing head and ``_inflight``),
         the head-failure cascade's in-body release,
         :meth:`_resolve_and_release` with ``cancel_lease=True``,
         :meth:`_finalize_inflight`'s ``_cancel_release`` path,
-        :meth:`_vacate_inflight_entry` (task 4582), and an aborted train's
-        lease (``_TrainVerifyHost.release``, task 6160).
+        :meth:`_vacate_inflight_entry` (task 4582), an aborted train's
+        lease (``_TrainVerifyHost.release``, task 6160), and a pre-empted
+        parked gate's head (:meth:`_release_parked_gate_head`, task 6155).
 
         MECHANISM (task 3043, reify 2026-07-25).  Against an unreachable host
         ``cancel_verify()`` returns rc != 0 and all ``max_attempts``
@@ -18536,7 +18691,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         The sole caller of BOTH steps — :meth:`_abort_remote_verify` and
         ``verify_task.cancel()`` — enforced by
         test_merge_queue_concurrent_verify.py's
-        ``TestVerifyTeardownChokepoint``. Its EIGHT callers are the two
+        ``TestVerifyTeardownChokepoint``. Its NINE callers are the two
         ``stop()`` drain paths (finalizing head and ``_inflight``), the
         head-failure cascade, the three ``_run_inflight_verify`` abort triggers
         (sole-waiter abandon, operator halt, dead-verify no-progress),
@@ -18545,7 +18700,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         do not cover (in practice: external cancellation), and the reap of a
         verify interrupted mid-run in :func:`_run_verify_reaped`, serving a
         train's verify (``_TrainVerifyHost.run_verify``, task 6160) and a
-        remote gate re-verify (``_gate_reverify_on_head_host``, task 6278).
+        remote gate re-verify (``_gate_reverify_on_head_host``, task 6278),
+        and :meth:`_teardown_parked_gate` (task 6155), which passes no lease
+        because that gate's own reap aborts its remote.
 
         ORDER IS LOAD-BEARING, and sole-callership is what now guarantees it.
         The remote cancel must fire while ``_inflight_request_id`` is still
@@ -20449,7 +20606,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         non-None result of :meth:`_chain_dead_link`) describes a tree that will
         never be on main, so it is neither adopted as a task block NOR advanced
         onto main.  Clean the verified worktree, emit ``verdict_voided`` naming
-        *dead_link*, re-merge the item against real main, and re-park it on
+        *dead_link*, record the voided verdict's own merge commit dead (so a
+        follower stacked on it is caught at its next dispatch even when no
+        head-failure cascade runs; parity with the dispatch-time void, task
+        2885), re-merge the item against real main, and re-park it on
         ``_redispatch`` for a fresh verify.  The request is left UNRESOLVED — a
         dead-base FAIL never blocks the task, and (because the re-merge resets
         base_sha to live real-main, not in the dead set) a subsequent GENUINE
@@ -20477,6 +20637,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             req.request_id, ItemLifecycleState.FINALIZING,
             ItemLifecycleState.MERGING, live_obj=entry,
         )
+        self._record_item_commit_dead(item)
         # §5.3 re-merge carve-out, consumer 2/5 — INV-3 adoption-time void
         # (PRD §5.3).  This site is also the reason §5.3 needs no dispatch-time
         # enforcement: it is where a verdict built on a known-dead base is
@@ -21155,6 +21316,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Returns True iff main was advanced successfully, False otherwise.
 
+        PARKED GATE (task 6155): when the CAS rebases, the gate re-verify is
+        launched onto ``entry.gate`` and this returns False with nothing
+        released.  The caller re-parks the entry at the front of ``_inflight``
+        and calls again once ``entry.pending_task`` is done; that call resumes
+        the CAS without re-running anything above it.
+
         warm_results are taken from vr.warm_results (the per-test map returned
         by _run_inflight_verify) and threaded into _maybe_schedule_shadow_compare,
         restoring the same-candidate warm-vs-cold shadow compare (PRD §10 invariant
@@ -21170,6 +21337,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         _n_failed_val = None      # None → defer to 'not advanced' in finally (PASS path)
 
         try:
+            # ── Resume a head parked on its gate re-verify (task 6155) ───────
+            # The prelude below already ran when the head parked, so the
+            # resume goes straight back to the CAS.  An interrupted gate leaves
+            # through the cancel-release, as it did when it was awaited inline.
+            if entry.gate is not None:
+                gate, entry.gate = entry.gate, None
+                _cancel_release = True
+                cleared = await gate.task
+                _cancel_release = False
+                candidate = await self._candidate_after_gate(entry, gate, cleared)
+                if candidate is None:
+                    return False
+                advanced = await self._advance_candidate(entry, candidate)
+                return advanced
+
             # Finalize-head observability while we await entry.verify_task:
             # MQ-reliability kappa-b (task 2435) deleted the self._finalizing_head
             # field entirely — no assignment is needed here at all.  `entry` was
@@ -21356,13 +21538,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # dispatch/verify/finalize AT ALL — `_buffer_owned_request`
             # (see `_coalesce_reentrant_drain` below) now coalesces it at
             # the drain chokepoint, before it is ever buffered, dispatched,
-            # or given its own InflightEntry. A literal second call to
-            # `_finalize_inflight` for the SAME entry object is likewise not
-            # a reachable call pattern today: every call site (the shutdown
-            # drain, the passthrough-inline branch, and FINALIZE-HEAD) pops
-            # the entry off its container immediately before the one call it
-            # makes. Should a future change introduce a path that invokes
-            # this method twice for one request_id, the downstream hops
+            # or given its own InflightEntry. A second call to
+            # `_finalize_inflight` for the SAME entry object happens only for
+            # a head parked on its gate re-verify (task 6155), and that call
+            # resumes at the CAS, below every hop here, so each still fires
+            # once per entry. Should a future change introduce a path that
+            # re-runs this prelude for one request_id, the downstream hops
             # would need the same tolerate-aware treatment as this one —
             # flagged here explicitly rather than silently assumed safe.
             if (
@@ -21502,8 +21683,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # record it dead so a straggler stacked on it is caught at
                 # dispatch (parity with the head-failure cascade + Mechanism-2
                 # discard remerge sites).
-                if isinstance(entry.item, RealMergeItem):
-                    self._record_dead_base(entry.item.merge_result.merge_commit or '')
+                self._record_item_commit_dead(entry.item)
                 self._note_transition(
                     req.request_id, ItemLifecycleState.FINALIZING,
                     ItemLifecycleState.MERGING, live_obj=entry,
@@ -21707,351 +21887,425 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 return False
 
             # ── Step 5: CAS advance_main ──────────────────────────────────
-            current_sha = merge_commit
-            while True:
-                # Write-ahead (PRD WA-1): record a LandedRow into the durable
-                # outbox BEFORE advancing main — single-sourced via the shared
-                # helper (task β).  Re-recorded each loop iteration so a
-                # rebased retry's current_sha stays in sync (idempotent
-                # last-write-wins, WA-2).
-                adv_outcome = await _journal_landed_then_advance(
-                    self._landed_outbox, self._git_ops,
-                    task_id=req.task_id,
-                    branch_tip_sha=item.merged_branch_tip,
-                    advanced_sha=current_sha,
-                    merge_wt=merge_wt,
-                    branch=req.branch.full_name,
-                    max_attempts=req.config.max_advance_attempts,
-                    expected_main=item.base_sha,
-                    reverify_on_rebase=True,
-                )
-                result = adv_outcome.result
-
-                if result == 'advanced':
-                    self._gate_retries.pop(req.task_id, None)
-                    await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
-                    outcome = await _finalize_advanced_merge(
-                        self._git_ops, req, self._event_store,
-                        merge_commit_fallback=merge_commit,
-                        base_sha=item.base_sha,
-                        started_monotonic=item.started_monotonic,
-                        cas_retries=self._cas_retries,
-                        timeouts=self._post_merge_verify_timeouts,
-                        enospc_retries=self._post_merge_verify_enospc_retries,
-                        log_label=' (speculative)',
-                        chain_ctx=_GenerationChainContext(
-                            queue=self._queue,
-                            counts=self._generation_chain_counts,
-                            max_auto_generations=MAX_AUTO_CHAINED_GENERATIONS,
-                            maybe_auto_chain_generation=_maybe_auto_chain_generation,
-                        ),
-                        merged_branch_tip=item.merged_branch_tip,
-                        advanced_sha=adv_outcome.advanced_sha,
-                    )
-                    # ── task 3186 (PRD δ): the head IS chain item #1 ────────
-                    # Stamped BEFORE the resolve, because the resolve is what
-                    # fires `_on_finalized` and therefore what freezes the
-                    # `merge_finalized` payload η1 reads.  ONE per landed item
-                    # (never the chain size k, never a position) — the unit is
-                    # pinned by the committed consumer, see
-                    # MergeOutcome.landed_via_chain's docstring.  Gated on a
-                    # NON-EMPTY chain so an ordinary sequential landing keeps
-                    # the field absent and falls out of the canary's filter.
-                    if entry.chain is not None and entry.chain.links:
-                        outcome = dataclasses.replace(outcome, landed_via_chain=1)
-                    self._resolve_or_drop_abandoned(req, outcome)
-                    if outcome.status == 'done':
-                        # ι=1894: record clean landing, pop drift base for this req
-                        self._note_merge_landing(req.request_id)
-                        # Task 2357 DEFECT 2: refresh the observation-only
-                        # _last_known_main_sha cache here too — this land IS the
-                        # new main tip.  Without this, an idle merger (blocked in
-                        # _acquire_next_request, the cache's only other write
-                        # site) leaves snapshot()'s two_layer_invariants() fed a
-                        # stale SHA while the verifier keeps landing, producing
-                        # false §5.3 verify-base⊄frozen-tip positives.
-                        if outcome.merge_sha is not None:
-                            self._last_known_main_sha = outcome.merge_sha
-                        if (
-                            outcome.merge_sha is not None
-                            and self._on_merge_landed is not None
-                        ):
-                            try:
-                                # PRIMARY in-process trigger for the offline
-                                # deep-test lane: harness._note_merge_all fans
-                                # out to _note_offline_lane (task 1951, β1).
-                                # See the constructor comment above for the
-                                # FALLBACK (orchestrator-down landings).
-                                await self._on_merge_landed(
-                                    req.task_id, item.base_sha, outcome.merge_sha
-                                )
-                            except Exception:
-                                logger.warning(
-                                    'on_merge_landed hook raised for task %s; ignoring (fail-open)',
-                                    req.task_id,
-                                    exc_info=True,
-                                )
-                        await _maybe_schedule_shadow_compare(
-                            self, self._git_ops, req, merge_commit,
-                            warm_results=_warm_results,
-                            escalation_queue=self._escalation_queue,
-                            event_store=self._event_store,
-                            verifier=self._verifier,
-                        )
-                        await _maybe_run_drift_check(
-                            self, self._git_ops, req, merge_commit,
-                            verifier=self._verifier,
-                        )
-                        # D10 promote-provenance: advance the rolling warm base
-                        # from the _merge-verify lane's target (the just-landed
-                        # commit's warm build).  Gated on the warm worktree name
-                        # so the refresh only fires when the verify ran in the
-                        # persistent _merge-verify lane (knob on, safety-valve
-                        # not due) — i.e. the source is the post-CAS confirmed
-                        # head.  On the cold/ephemeral round the base stays at
-                        # H-1 (benign-degrading, never blocks dispatch).
-                        # refresh_warm_base is best-effort and never raises.
-                        if merge_wt.name == PERSISTENT_MERGE_WORKTREE_NAME:
-                            await self._git_ops.refresh_warm_base()
-                    # ── task 3186 (PRD δ): THE IN-ORDER CAS WALK ────────────
-                    # Chain item #1 (this entry) is now on main; I2..Ik follow,
-                    # in order, on the SAME tip verdict's authority.  Placed
-                    # after the head's whole success block so the walk can
-                    # never run against a head that did not actually land, and
-                    # inside the `result == 'advanced'` arm so a CAS-failed
-                    # head takes the retry loop untouched.
-                    #
-                    # `entry.chain` is read HERE for the first time — γ wrote
-                    # the field (merge_queue.py:20265) and left it write-only
-                    # precisely for this consumer (merge_types.py:1458-1464).
-                    await self._land_chain_prefix(
-                        entry, adv_outcome.advanced_sha or merge_commit,
-                    )
-                    advanced = True
-                    return True
-
-                if result == 'rebased_pending_reverify':
-                    rebased_sha, rebased_from, rebased_onto = _rebased_tip(adv_outcome, req.task_id)
-                    if await self._git_ops.is_ancestor_checked(current_sha, rebased_onto) is True:
-                        await self._finalize_landed_by_successor(
-                            item, merge_wt, spec_warm=_vr_spec_warm,
-                            landed_sha=current_sha, main_sha=rebased_onto,
-                        )
-                        advanced = True
-                        return True
-                    # INV-3 (task 6273): the rebase superseded current_sha; it will never be on main.
-                    self._record_dead_base(current_sha)
-                    # ι=1894: count this as a merge retry — main advanced under the
-                    # request, so a fresh re-verify is required.  Both cas_failed and
-                    # rebased_pending_reverify are included in retries_per_landing (see
-                    # _note_merge_retry docstring for the rationale).
-                    self._note_merge_retry()
-
-                    self._note_transition(
-                        req.request_id, ItemLifecycleState.FINALIZING,
-                        ItemLifecycleState.GATE_REVERIFY, live_obj=entry,
-                    )
-                    _cancel_release = True
-                    gate = await _reverify_rebased_tree(
-                        self._git_ops, req, merge_wt,
-                        verified_merge_sha=current_sha,
-                        rebased_from=rebased_from,
-                        rebased_onto=rebased_onto,
-                        timeouts=self._post_merge_verify_timeouts,
-                        enospc_retries=self._post_merge_verify_enospc_retries,
-                        max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
-                        max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
-                        merge_sha=rebased_sha,
-                        keep_worktrees=set(self._owned_merge_worktrees),
-                        run_post_merge_verify=functools.partial(
-                            self._gate_reverify_on_head_host, entry.lease,
-                        ),
-                        event_store=self._event_store,
-                    )
-                    _cancel_release = False
-                    if isinstance(gate, MergeOutcome):
-                        # task 2604: route through the unified terminal
-                        # chokepoint so _retire_item fires (mirrors the three
-                        # converted sites and the FAIL/skip branch). A raw
-                        # req.result.set_result() here left the registry entry
-                        # non-terminal (GATE_REVERIFY) in _live_items forever —
-                        # a ghost 'gate_reverify' item surfaced by
-                        # _finalizing_head_entry()/snapshot() whenever a rebased
-                        # request failed its post-rebase reverify gate. The
-                        # chokepoint already performs the not-done guard.
-                        self._resolve_or_drop_abandoned(req, gate)
-                        return False
-                    if self._request_abandoned(req):
-                        # Cancelled during the re-verify: main has not moved and
-                        # no CAS is in flight, so it leaves as a failed gate does.
-                        self._gate_retries.pop(req.task_id, None)
-                        await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
-                        self._retire_item(req.request_id)
-                        return False
-
-                    current_sha = rebased_sha
-                    gate_total = self._gate_retries.get(req.task_id, 0) + 1
-                    self._gate_retries[req.task_id] = gate_total
-                    if gate_total > self.MAX_CAS_RETRIES:
-                        self._gate_retries.pop(req.task_id, None)
-                        logger.warning(
-                            'Task %s: gate retry limit exhausted after gate '
-                            'cleared (%d attempts)',
-                            req.task_id, self.MAX_CAS_RETRIES,
-                        )
-                        _emit_merge_attempt(
-                            self._event_store, req.task_id, OutcomeKind.cas_exhausted,
-                            attempt=gate_total,
-                            duration_ms=_elapsed_ms(item.started_monotonic),
-                        )
-                        await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
-                        # task 2604: route through the unified terminal
-                        # chokepoint so _retire_item fires — a raw
-                        # req.result.set_result() here left the registry entry
-                        # non-terminal in _live_items forever (ghost entry seen
-                        # by _finalizing_head_entry()/snapshot()).
-                        self._resolve_or_drop_abandoned(req, MergeOutcome(
-                            'blocked',
-                            reason=(
-                                f'Gate retry limit exhausted after '
-                                f'{self.MAX_CAS_RETRIES} attempts for task '
-                                f'{req.task_id}'
-                            ),
-                        ))
-                        return False
-
-                    # I3 (task 1990): replace-only rebuild — dataclasses.replace
-                    # copies EVERY field except base_sha, so this can no longer
-                    # silently drop one (the task-1928 bug class this guards
-                    # against; merged_branch_tip was the field 1928 had to add
-                    # back by hand).  Re-invokes __post_init__, re-validating
-                    # the rebuilt REAL item.
-                    #
-                    # remerge_recovery is the ONE field deliberately not
-                    # copied (task 3206): this rebuild RE-ANCHORS the item onto
-                    # a fresh base, so the §5.3 carve-out — which exempts an
-                    # item because _remerge deliberately based it on real main
-                    # — no longer applies to the base it now carries.  Leaving
-                    # it set would suppress §5.3 reporting for the rest of the
-                    # request's life, a silent false negative for the one class
-                    # the guard still exists to catch.
-                    item = dataclasses.replace(
-                        item, base_sha=rebased_onto, remerge_recovery=False,
-                    )
-                    logger.info(
-                        'Task %s: gate cleared (%s); '
-                        'advancing with rebased SHA %s (gate attempt %d/%d)',
-                        req.task_id, gate, rebased_sha[:8],
-                        gate_total, self.MAX_CAS_RETRIES,
-                    )
-                    _emit_merge_attempt(
-                        self._event_store, req.task_id, OutcomeKind.gate_retry,
-                        attempt=gate_total,
-                        duration_ms=_elapsed_ms(item.started_monotonic),
-                        gate_clearance=gate,
-                    )
-                    self._note_transition(
-                        req.request_id, ItemLifecycleState.GATE_REVERIFY,
-                        ItemLifecycleState.FINALIZING, live_obj=entry,
-                    )
-                    continue
-
-                if result in _HALT_ADVANCE_RESULTS and self._request_abandoned(req):
-                    await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
-                    if result in (
-                        'unmerged_state', 'pop_conflict_no_advance', 'stash_failed',
-                    ):
-                        self._cas_retries.pop(req.task_id, None)
-                        self._gate_retries.pop(req.task_id, None)
-                    return False
-                if result != 'cas_failed':
-                    self._gate_retries.pop(req.task_id, None)
-                    await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
-                    outcome = await _map_advance_failure(
-                        self._git_ops, result,
-                        task_id=req.task_id,
-                        merge_commit_fallback=merge_commit,
-                        halt=self.halt_for_wip,
-                        unhalt=self.unhalt_wip,
-                        cas_retries=self._cas_retries,
-                        advanced_sha=adv_outcome.advanced_sha,
-                    )
-                    # task 2604: route through the unified terminal chokepoint
-                    # so _retire_item fires (mirrors the 'advanced' and
-                    # FAIL/skip branches) — a raw set_result() left the registry
-                    # entry non-terminal in _live_items forever.
-                    self._resolve_or_drop_abandoned(req, outcome)
-                    return False
-
-                # result == 'cas_failed' — transient, retry with limit
-                # ι=1894: count CAS retry
-                self._note_merge_retry()
-                total = self._cas_retries.get(req.task_id, 0) + 1
-                self._cas_retries[req.task_id] = total
-                if total > self.MAX_CAS_RETRIES:
-                    self._cas_retries.pop(req.task_id, None)
-                    self._gate_retries.pop(req.task_id, None)
-                    logger.warning(
-                        f'Task {req.task_id}: CAS retry limit exhausted '
-                        f'({self.MAX_CAS_RETRIES} attempts)'
-                    )
-                    _emit_merge_attempt(self._event_store, req.task_id, OutcomeKind.cas_exhausted, attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
-                    await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
-                    # task 2604: route through the unified terminal chokepoint
-                    # so _retire_item fires — a raw set_result() left the
-                    # registry entry non-terminal in _live_items forever.
-                    self._resolve_or_drop_abandoned(req, MergeOutcome(
-                        'blocked',
-                        reason=(
-                            f'CAS retry limit exhausted after '
-                            f'{self.MAX_CAS_RETRIES} attempts for task {req.task_id}'
-                        ),
-                    ))
-                    return False
-
-                # Update base_sha to current main for retry.
-                # I3 (task 1990): replace-only rebuild — see the
-                # rebased_pending_reverify rebuild above for rationale,
-                # including why remerge_recovery is cleared on re-anchor
-                # (task 3206 §5.3).
-                item = dataclasses.replace(
-                    item,
-                    base_sha=await self._git_ops.get_main_sha(),
-                    remerge_recovery=False,
-                )
-                logger.info(
-                    f'Task {req.task_id}: CAS failed (attempt {total}/'
-                    f'{self.MAX_CAS_RETRIES}), retrying'
-                )
-                _emit_merge_attempt(self._event_store, req.task_id, OutcomeKind.cas_retry, attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
+            advanced = await self._advance_candidate(entry, LandingCandidate(
+                item=item, sha=merge_commit, merge_wt=merge_wt,
+                spec_warm=_vr_spec_warm, warm_results=_warm_results,
+                verified_commit=merge_commit,
+            ))
+            return advanced
 
         finally:
-            # Always: release the host lease (unless passthrough / already skipped),
-            # release the speculation permit iff one was threaded, and update
-            # _n_failed.
-            if not _skip_release and entry.lease is not None and self._host_allocator is not None:
-                if _cancel_release:
-                    await self._cancel_and_release_tracked(entry.lease)
-                else:
-                    await self._host_allocator.release(entry.lease)
-            # η: release THROUGH the ledger, guarded by the threaded token
-            # rather than was_speculative — ledger.release(None) would
-            # AttributeError on `.released`.
-            if entry.permit is not None:
-                self._speculation_ledger.release(entry.permit)
-            # _n_failed_val is set by non-PASS branches; None means use 'not advanced'
-            # (the PASS-path semantics: True when CAS failed, False when advanced).
-            self._n_failed = _n_failed_val if _n_failed_val is not None else not advanced
-            # MQ-reliability kappa-b (task 2435): no finalize-head clear needed
-            # here (self._finalizing_head field deleted) — _finalizing_head_entry()
-            # stops finding `entry` the moment a caller retires it from
-            # `_live_items` (or, for the RUNNER_UNAVAILABLE re-merge path above,
-            # once it transitions off VERIFYING/GATE_REVERIFY/FINALIZING).
-            # ι=1894 amend: defensive _drift_base cleanup — idempotent pop that covers
-            # all terminal exit paths (blocked/error/halt/wip_halted/cas-exhausted/
-            # rebased-gate-failure).  _note_merge_landing and _note_conflict_detected
-            # both use pop(key, None), so re-popping an already-cleared entry is a no-op.
-            self._drift_base.pop(req.request_id, None)
+            # A head parked on its gate keeps its lease, permit, chain flag
+            # and drift base until the call that resumes it ends.
+            if entry.gate is None:
+                # Always: release the host lease (unless passthrough / already skipped),
+                # release the speculation permit iff one was threaded, and update
+                # _n_failed.
+                if not _skip_release and entry.lease is not None and self._host_allocator is not None:
+                    if _cancel_release:
+                        await self._cancel_and_release_tracked(entry.lease)
+                    else:
+                        await self._host_allocator.release(entry.lease)
+                # η: release THROUGH the ledger, guarded by the threaded token
+                # rather than was_speculative — ledger.release(None) would
+                # AttributeError on `.released`.
+                if entry.permit is not None:
+                    self._speculation_ledger.release(entry.permit)
+                # _n_failed_val is set by non-PASS branches; None means use 'not advanced'
+                # (the PASS-path semantics: True when CAS failed, False when advanced).
+                self._n_failed = _n_failed_val if _n_failed_val is not None else not advanced
+                # MQ-reliability kappa-b (task 2435): no finalize-head clear needed
+                # here (self._finalizing_head field deleted) — _finalizing_head_entry()
+                # stops finding `entry` the moment a caller retires it from
+                # `_live_items` (or, for the RUNNER_UNAVAILABLE re-merge path above,
+                # once it transitions off VERIFYING/GATE_REVERIFY/FINALIZING).
+                # ι=1894 amend: defensive _drift_base cleanup — idempotent pop that covers
+                # all terminal exit paths (blocked/error/halt/wip_halted/cas-exhausted/
+                # rebased-gate-failure).  _note_merge_landing and _note_conflict_detected
+                # both use pop(key, None), so re-popping an already-cleared entry is a no-op.
+                self._drift_base.pop(req.request_id, None)
+
+    async def _advance_candidate(
+        self, entry: InflightEntry, candidate: LandingCandidate,
+    ) -> bool:
+        """CAS-advance main onto *candidate*, retrying a transiently failed CAS.
+
+        Returns True iff main now holds the candidate.  False with
+        ``entry.gate`` set means the CAS rebased and the gate re-verify is
+        parked on the entry; the next ``_finalize_inflight(entry)`` resumes
+        from it with the rebased candidate.
+        """
+        item = candidate.item
+        req = item.request
+        merge_wt = candidate.merge_wt
+        merge_commit = candidate.verified_commit
+        _vr_spec_warm = candidate.spec_warm
+        while True:
+            # Write-ahead (PRD WA-1): record a LandedRow into the durable
+            # outbox BEFORE advancing main — single-sourced via the shared
+            # helper (task β).  Re-recorded each loop iteration so a
+            # rebased candidate's sha stays in sync (idempotent
+            # last-write-wins, WA-2).
+            adv_outcome = await _journal_landed_then_advance(
+                self._landed_outbox, self._git_ops,
+                task_id=req.task_id,
+                branch_tip_sha=item.merged_branch_tip,
+                advanced_sha=candidate.sha,
+                merge_wt=merge_wt,
+                branch=req.branch.full_name,
+                max_attempts=req.config.max_advance_attempts,
+                expected_main=item.base_sha,
+                reverify_on_rebase=True,
+            )
+            result = adv_outcome.result
+
+            if result == 'advanced':
+                await self._land_advanced_candidate(
+                    entry, candidate, adv_outcome.advanced_sha,
+                )
+                return True
+
+            if result == 'rebased_pending_reverify':
+                return await self._land_rebased_or_park_gate(entry, candidate, adv_outcome)
+
+            if result in _HALT_ADVANCE_RESULTS and self._request_abandoned(req):
+                await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
+                if result in (
+                    'unmerged_state', 'pop_conflict_no_advance', 'stash_failed',
+                ):
+                    self._cas_retries.pop(req.task_id, None)
+                    self._gate_retries.pop(req.task_id, None)
+                return False
+            if result != 'cas_failed':
+                self._gate_retries.pop(req.task_id, None)
+                await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
+                outcome = await _map_advance_failure(
+                    self._git_ops, result,
+                    task_id=req.task_id,
+                    merge_commit_fallback=merge_commit,
+                    halt=self.halt_for_wip,
+                    unhalt=self.unhalt_wip,
+                    cas_retries=self._cas_retries,
+                    advanced_sha=adv_outcome.advanced_sha,
+                )
+                # task 2604: route through the unified terminal chokepoint
+                # so _retire_item fires (mirrors the 'advanced' and
+                # FAIL/skip branches) — a raw set_result() left the registry
+                # entry non-terminal in _live_items forever.
+                self._resolve_or_drop_abandoned(req, outcome)
+                return False
+
+            # result == 'cas_failed' — transient, retry with limit
+            # ι=1894: count CAS retry
+            self._note_merge_retry()
+            total = self._cas_retries.get(req.task_id, 0) + 1
+            self._cas_retries[req.task_id] = total
+            if total > self.MAX_CAS_RETRIES:
+                self._cas_retries.pop(req.task_id, None)
+                self._gate_retries.pop(req.task_id, None)
+                logger.warning(
+                    f'Task {req.task_id}: CAS retry limit exhausted '
+                    f'({self.MAX_CAS_RETRIES} attempts)'
+                )
+                _emit_merge_attempt(self._event_store, req.task_id, OutcomeKind.cas_exhausted, attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
+                await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
+                # task 2604: route through the unified terminal chokepoint
+                # so _retire_item fires — a raw set_result() left the
+                # registry entry non-terminal in _live_items forever.
+                self._resolve_or_drop_abandoned(req, MergeOutcome(
+                    'blocked',
+                    reason=(
+                        f'CAS retry limit exhausted after '
+                        f'{self.MAX_CAS_RETRIES} attempts for task {req.task_id}'
+                    ),
+                ))
+                return False
+
+            # Update base_sha to current main for retry.
+            # I3 (task 1990): replace-only rebuild — see
+            # _candidate_after_gate's rebuild for rationale,
+            # including why remerge_recovery is cleared on re-anchor
+            # (task 3206 §5.3).
+            item = dataclasses.replace(
+                item,
+                base_sha=await self._git_ops.get_main_sha(),
+                remerge_recovery=False,
+            )
+            candidate = candidate.reanchored(item, candidate.sha)
+            logger.info(
+                f'Task {req.task_id}: CAS failed (attempt {total}/'
+                f'{self.MAX_CAS_RETRIES}), retrying'
+            )
+            _emit_merge_attempt(self._event_store, req.task_id, OutcomeKind.cas_retry, attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
+
+    async def _land_advanced_candidate(
+        self, entry: InflightEntry, candidate: LandingCandidate, advanced_sha: str | None,
+    ) -> None:
+        """Finish a *candidate* the CAS has just put on main: resolve its request,
+        run the post-landing hooks, then land the rest of its chain in order."""
+        item = candidate.item
+        req = item.request
+        merge_wt = candidate.merge_wt
+        merge_commit = candidate.verified_commit
+        _vr_spec_warm = candidate.spec_warm
+        _warm_results = dict(candidate.warm_results)
+        self._gate_retries.pop(req.task_id, None)
+        await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
+        outcome = await _finalize_advanced_merge(
+            self._git_ops, req, self._event_store,
+            merge_commit_fallback=merge_commit,
+            base_sha=item.base_sha,
+            started_monotonic=item.started_monotonic,
+            cas_retries=self._cas_retries,
+            timeouts=self._post_merge_verify_timeouts,
+            enospc_retries=self._post_merge_verify_enospc_retries,
+            log_label=' (speculative)',
+            chain_ctx=_GenerationChainContext(
+                queue=self._queue,
+                counts=self._generation_chain_counts,
+                max_auto_generations=MAX_AUTO_CHAINED_GENERATIONS,
+                maybe_auto_chain_generation=_maybe_auto_chain_generation,
+            ),
+            merged_branch_tip=item.merged_branch_tip,
+            advanced_sha=advanced_sha,
+        )
+        # ── task 3186 (PRD δ): the head IS chain item #1 ────────
+        # Stamped BEFORE the resolve, because the resolve is what
+        # fires `_on_finalized` and therefore what freezes the
+        # `merge_finalized` payload η1 reads.  ONE per landed item
+        # (never the chain size k, never a position) — the unit is
+        # pinned by the committed consumer, see
+        # MergeOutcome.landed_via_chain's docstring.  Gated on a
+        # NON-EMPTY chain so an ordinary sequential landing keeps
+        # the field absent and falls out of the canary's filter.
+        if entry.chain is not None and entry.chain.links:
+            outcome = dataclasses.replace(outcome, landed_via_chain=1)
+        self._resolve_or_drop_abandoned(req, outcome)
+        if outcome.status == 'done':
+            # ι=1894: record clean landing, pop drift base for this req
+            self._note_merge_landing(req.request_id)
+            # Task 2357 DEFECT 2: refresh the observation-only
+            # _last_known_main_sha cache here too — this land IS the
+            # new main tip.  Without this, an idle merger (blocked in
+            # _acquire_next_request, the cache's only other write
+            # site) leaves snapshot()'s two_layer_invariants() fed a
+            # stale SHA while the verifier keeps landing, producing
+            # false §5.3 verify-base⊄frozen-tip positives.
+            if outcome.merge_sha is not None:
+                self._last_known_main_sha = outcome.merge_sha
+            if (
+                outcome.merge_sha is not None
+                and self._on_merge_landed is not None
+            ):
+                try:
+                    # PRIMARY in-process trigger for the offline
+                    # deep-test lane: harness._note_merge_all fans
+                    # out to _note_offline_lane (task 1951, β1).
+                    # See the constructor comment above for the
+                    # FALLBACK (orchestrator-down landings).
+                    await self._on_merge_landed(
+                        req.task_id, item.base_sha, outcome.merge_sha
+                    )
+                except Exception:
+                    logger.warning(
+                        'on_merge_landed hook raised for task %s; ignoring (fail-open)',
+                        req.task_id,
+                        exc_info=True,
+                    )
+            await _maybe_schedule_shadow_compare(
+                self, self._git_ops, req, merge_commit,
+                warm_results=_warm_results,
+                escalation_queue=self._escalation_queue,
+                event_store=self._event_store,
+                verifier=self._verifier,
+            )
+            await _maybe_run_drift_check(
+                self, self._git_ops, req, merge_commit,
+                verifier=self._verifier,
+            )
+            # D10 promote-provenance: advance the rolling warm base
+            # from the _merge-verify lane's target (the just-landed
+            # commit's warm build).  Gated on the warm worktree name
+            # so the refresh only fires when the verify ran in the
+            # persistent _merge-verify lane (knob on, safety-valve
+            # not due) — i.e. the source is the post-CAS confirmed
+            # head.  On the cold/ephemeral round the base stays at
+            # H-1 (benign-degrading, never blocks dispatch).
+            # refresh_warm_base is best-effort and never raises.
+            if merge_wt.name == PERSISTENT_MERGE_WORKTREE_NAME:
+                await self._git_ops.refresh_warm_base()
+        # ── task 3186 (PRD δ): THE IN-ORDER CAS WALK ────────────
+        # Chain item #1 (this entry) is now on main; I2..Ik follow,
+        # in order, on the SAME tip verdict's authority.  Placed
+        # after the head's whole success block so the walk can
+        # never run against a head that did not actually land.
+        # Only `_advance_candidate`'s 'advanced' arm calls this
+        # method, so a CAS-failed head never reaches the walk.
+        #
+        # `entry.chain` is read HERE for the first time — γ wrote
+        # the field (in `_dispatch_item`) and left it write-only
+        # precisely for this consumer (`types.py::InflightEntry`).
+        await self._land_chain_prefix(
+            entry, advanced_sha or merge_commit,
+        )
+
+    async def _land_rebased_or_park_gate(
+        self, entry: InflightEntry, candidate: LandingCandidate, adv_outcome: AdvanceOutcome,
+    ) -> bool:
+        """The CAS rebased *candidate* onto a main that moved under it.
+
+        True when a successor already carried the candidate onto main.
+        Otherwise the rebased tree's gate re-verify is launched and parked on
+        ``entry.gate``, and this returns False with no await after the park,
+        so the caller sees the gate the moment this returns.
+        """
+        item = candidate.item
+        req = item.request
+        current_sha = candidate.sha
+        rebased_sha, rebased_from, rebased_onto = _rebased_tip(adv_outcome, req.task_id)
+        if await self._git_ops.is_ancestor_checked(current_sha, rebased_onto) is True:
+            await self._finalize_landed_by_successor(
+                item, candidate.merge_wt, spec_warm=candidate.spec_warm,
+                landed_sha=current_sha, main_sha=rebased_onto,
+            )
+            return True
+        # INV-3 (task 6273): the rebase superseded current_sha; it will never be on main.
+        self._record_dead_base(current_sha)
+        # ι=1894: count this as a merge retry — main advanced under the
+        # request, so a fresh re-verify is required.  Both cas_failed and
+        # rebased_pending_reverify are included in retries_per_landing (see
+        # _note_merge_retry docstring for the rationale).
+        self._note_merge_retry()
+
+        self._note_transition(
+            req.request_id, ItemLifecycleState.FINALIZING,
+            ItemLifecycleState.GATE_REVERIFY, live_obj=entry,
+        )
+        entry.gate = PendingGate(
+            task=asyncio.create_task(
+                _reverify_rebased_tree(
+                    self._git_ops, req, candidate.merge_wt,
+                    verified_merge_sha=current_sha,
+                    rebased_from=rebased_from,
+                    rebased_onto=rebased_onto,
+                    timeouts=self._post_merge_verify_timeouts,
+                    enospc_retries=self._post_merge_verify_enospc_retries,
+                    max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+                    max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+                    merge_sha=rebased_sha,
+                    # The live ledger, not a copy: dispatch keeps registering
+                    # worktrees while this gate runs, and a disk-pressure prune
+                    # must spare them.
+                    keep_worktrees=self._owned_merge_worktrees,
+                    run_post_merge_verify=functools.partial(
+                        self._gate_reverify_on_head_host, entry.lease,
+                    ),
+                    event_store=self._event_store,
+                ),
+                name=f'merge-gate-{req.task_id}',
+            ),
+            candidate=candidate,
+            rebased_sha=rebased_sha,
+            rebased_onto=rebased_onto,
+        )
+        return False
+
+    async def _candidate_after_gate(
+        self, entry: InflightEntry, gate: PendingGate, cleared: MergeOutcome | GateClearance,
+    ) -> LandingCandidate | None:
+        """Turn a finished gate re-verify into the rebased candidate to land.
+
+        None when the request is already resolved: the gate failed, the
+        request was cancelled while it ran, or the gate-retry cap is spent.
+        """
+        candidate = gate.candidate
+        item = candidate.item
+        req = item.request
+        if isinstance(cleared, MergeOutcome):
+            # task 2604: route through the unified terminal
+            # chokepoint so _retire_item fires (mirrors the three
+            # converted sites and the FAIL/skip branch). A raw
+            # req.result.set_result() here left the registry entry
+            # non-terminal (GATE_REVERIFY) in _live_items forever —
+            # a ghost 'gate_reverify' item surfaced by
+            # _finalizing_head_entry()/snapshot() whenever a rebased
+            # request failed its post-rebase reverify gate. The
+            # chokepoint already performs the not-done guard.
+            self._resolve_or_drop_abandoned(req, cleared)
+            return None
+        if self._request_abandoned(req):
+            # Cancelled during the re-verify: main has not moved and
+            # no CAS is in flight, so it leaves as a failed gate does.
+            self._gate_retries.pop(req.task_id, None)
+            await self._release_or_cleanup(candidate.merge_wt, spec_warm=candidate.spec_warm)
+            self._retire_item(req.request_id)
+            return None
+
+        gate_total = self._gate_retries.get(req.task_id, 0) + 1
+        self._gate_retries[req.task_id] = gate_total
+        if gate_total > self.MAX_CAS_RETRIES:
+            self._gate_retries.pop(req.task_id, None)
+            logger.warning(
+                'Task %s: gate retry limit exhausted after gate '
+                'cleared (%d attempts)',
+                req.task_id, self.MAX_CAS_RETRIES,
+            )
+            _emit_merge_attempt(
+                self._event_store, req.task_id, OutcomeKind.cas_exhausted,
+                attempt=gate_total,
+                duration_ms=_elapsed_ms(item.started_monotonic),
+            )
+            await self._release_or_cleanup(candidate.merge_wt, spec_warm=candidate.spec_warm)
+            # task 2604: route through the unified terminal
+            # chokepoint so _retire_item fires — a raw
+            # req.result.set_result() here left the registry entry
+            # non-terminal in _live_items forever (ghost entry seen
+            # by _finalizing_head_entry()/snapshot()).
+            self._resolve_or_drop_abandoned(req, MergeOutcome(
+                'blocked',
+                reason=(
+                    f'Gate retry limit exhausted after '
+                    f'{self.MAX_CAS_RETRIES} attempts for task '
+                    f'{req.task_id}'
+                ),
+            ))
+            return None
+
+        # I3 (task 1990): replace-only rebuild — dataclasses.replace
+        # copies EVERY field except base_sha, so this can no longer
+        # silently drop one (the task-1928 bug class this guards
+        # against; merged_branch_tip was the field 1928 had to add
+        # back by hand).  Re-invokes __post_init__, re-validating
+        # the rebuilt REAL item.
+        #
+        # remerge_recovery is the ONE field deliberately not
+        # copied (task 3206): this rebuild RE-ANCHORS the item onto
+        # a fresh base, so the §5.3 carve-out — which exempts an
+        # item because _remerge deliberately based it on real main
+        # — no longer applies to the base it now carries.  Leaving
+        # it set would suppress §5.3 reporting for the rest of the
+        # request's life, a silent false negative for the one class
+        # the guard still exists to catch.
+        item = dataclasses.replace(
+            item, base_sha=gate.rebased_onto, remerge_recovery=False,
+        )
+        logger.info(
+            'Task %s: gate cleared (%s); '
+            'advancing with rebased SHA %s (gate attempt %d/%d)',
+            req.task_id, cleared, gate.rebased_sha[:8],
+            gate_total, self.MAX_CAS_RETRIES,
+        )
+        _emit_merge_attempt(
+            self._event_store, req.task_id, OutcomeKind.gate_retry,
+            attempt=gate_total,
+            duration_ms=_elapsed_ms(item.started_monotonic),
+            gate_clearance=cleared,
+        )
+        self._note_transition(
+            req.request_id, ItemLifecycleState.GATE_REVERIFY,
+            ItemLifecycleState.FINALIZING, live_obj=entry,
+        )
+        return candidate.reanchored(item, gate.rebased_sha)
 
     async def _dispatch_item(
         self,
@@ -22207,7 +22461,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # and stays valid at its use below: the only intervening mutation is the
         # dead-base _remerge, which sets _dead_base_remerged=True and thereby
         # short-circuits the Mechanism-2 gate regardless of this value.
-        _has_inflight_verify = any(e.verify_task is not None for e in self._inflight)
+        _has_inflight_verify = any(e.in_verify_frontier for e in self._inflight)
         _needs_main_sha = bool(self._dead_base_commits) or (
             not _has_inflight_verify
             and not item.speculative
@@ -22249,11 +22503,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # caught by this same dispatch-time re-check.  Parity with the three
             # other invalidation sites (head-failure cascade, RUNNER_UNAVAILABLE,
             # and the Mechanism-2 staleness discard just below), all of which
-            # record the old commit dead for the identical reason.  item is a
-            # RealMergeItem here (_chain_dead_link returned non-None), guarded
-            # for type-safety.
-            if isinstance(item, RealMergeItem):
-                self._record_dead_base(item.merge_result.merge_commit or '')
+            # record the old commit dead for the identical reason.
+            self._record_item_commit_dead(item)
             # §5.3 re-merge carve-out, consumer 4/5 — dead-base straggler at
             # dispatch (PRD §5.3).  This site is the CIRCULARITY argument in the
             # flesh: it exists to ESCAPE a base known dead, and
@@ -22387,11 +22638,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # INV-3 dangling-edge fix (task 2885 step-10, enforcement (c)):
                 # this stale merge is about to be re-merged away — record its
                 # now-orphaned commit dead so a straggler stacked on it is caught
-                # by the dispatch-time dead-base re-check.  item is always a
-                # RealMergeItem here (a DecidedItem returned via the passthrough
-                # above), guarded for type-safety.
-                if isinstance(item, RealMergeItem):
-                    self._record_dead_base(item.merge_result.merge_commit or '')
+                # by the dispatch-time dead-base re-check.
+                self._record_item_commit_dead(item)
                 # §5.3 re-merge carve-out, consumer 5/5 — Mechanism-2
                 # staleness / chain-invalidation: targets real main, not
                 # frozen_prefix_tip().  PRD §5.3.
@@ -22462,7 +22710,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # release them.  The §5.3 guard's own comment (trap 2, below) already
         # warned that a bare `return None` in this region leaks the lease; the
         # window then widened from a ~ms `get_main_sha()` to a whole chain build
-        # bounded only by CHAIN_BUILD_TIMEOUT_SECS, and `_deep_chain_placement`
+        # bounded only by merge_deep.chain_build_timeout_secs, and `_deep_chain_placement`
         # deliberately lets an external CancelledError PROPAGATE (review fix 2).
         # The caller's own containment does not cover this: `_verifier_loop`
         # re-raises CancelledError/KeyboardInterrupt without releasing anything,

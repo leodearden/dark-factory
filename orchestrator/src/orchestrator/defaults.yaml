@@ -522,6 +522,29 @@ config_key_census:
 #     regardless of skip_count (see idle_only_secs below).
 # Auto-resolves when the task finally dispatches.  Set enabled: false to silence.
 #
+# PREDICATE RETUNE (task 3821, esc-4851-3): age alone NEVER fires.  The
+# idle-only backstop below fired on age alone, so in a deep backlog every
+# low/medium task crossed 72h and the watchdog filed hundreds of alarms with
+# skip_count=0.  Every gate now needs the eligibility-age floor AND a stuck
+# signal seen while the task was a dispatch candidate:
+#   - dual         — skip_threshold top-skips AND age >= idle_secs.
+#   - lock_refused — skip_threshold scans in which the task was refused its
+#                    locks while a LOWER-ranked candidate dispatched, AND
+#                    age >= idle_only_secs.  Replaces the idle-only backstop;
+#                    idle_only_secs keeps its name as this gate's age floor.
+#   - park_blocked — the task's live park has a module held by another task
+#                    for park_blocked_age_secs.  Takes precedence; never pins.
+# The age is measured from a DURABLE anchor stamped at first dispatch
+# candidacy (data/orchestrator/scheduler_eligibility.db).  It survives
+# restarts and transient candidacy gaps, so a restart no longer stamps the
+# whole backlog into one cohort that fires 72h later.
+# Consequence: dual / lock_refused auto-pin the task when it has no overrides
+# row (source starvation_watchdog, ttl auto_pin_ttl_secs), at most
+# auto_pin_max_concurrent at once; firings beyond the cap share ONE level-1
+# escalation instead of one each.  park_blocked files a level-1 escalation
+# naming the blocking holder.  Every firing emits a starvation_detected event.
+# Watchdog escalations no longer feed the digest's EWA numerator.
+#
 # idle_secs default raised to 259200 (72h) — task 2631, owner decision (Leo
 # 2026-07-15): archive analysis of 209 prior firings found max starving
 # duration 5.8h and legitimate sibling-project lock waits of ~48h, so 72h
@@ -544,11 +567,16 @@ config_key_census:
 # violates the idle_only_secs >= idle_secs validator and FAILS config load AND
 # hot-reload (both knobs are green-tier reloadable).  This is loud-over-silent by
 # design — bump BOTH knobs together whenever you push idle_secs past 259200.
+# Task 3821 retains that validator: idle_only_secs is now the lock_refused
+# gate's age floor, and the coupling still holds.
 starvation_watchdog:
   enabled: true
   skip_threshold: 50
   idle_secs: 259200.0
   idle_only_secs: 259200.0
+  park_blocked_age_secs: 14400.0
+  auto_pin_max_concurrent: 3
+  auto_pin_ttl_secs: 86400.0
 
 # Warm-lane base hard-down watchdog (task 2061).
 #
@@ -646,6 +674,8 @@ git:
 # cap-staging plan: plans/deep-merge-ahead-prd.md.
 merge_deep:
   chain_cap: 0
+  # Chain-build deadline (s); above reify's measured whole-process build p99 (~1230 s).
+  chain_build_timeout_secs: 1800
 
 # Chronic pool-infra flake auto-file detector (task 2358). Gated OFF until
 # reify task 5142's flaky-ledger.jsonl + CHRONIC-FLAKY marker substrate is

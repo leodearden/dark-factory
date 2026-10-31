@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 from _fm_helpers import load_script_module
 
+from fused_memory.backends.falkor_read_only import PagedQuery
 from fused_memory.models.enums import MemoryCategory
 from fused_memory.reconciliation import task_filter
 from fused_memory.services import completion_claim_gate, overreach_guard
@@ -863,7 +864,7 @@ class TestDetectorCatch:
 # --------------------------------------------------------------------------- #
 
 _SKIP_LIMIT_RE = re.compile(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', re.IGNORECASE)
-_CENSUS_RE = re.compile(r'RETURN\s+count\((\*|r)\)\s*$', re.IGNORECASE)
+_CENSUS_RE = re.compile(r'RETURN\s+count\(([*\w]+)\)\s*$', re.IGNORECASE)
 
 
 class _FakeResult:
@@ -889,6 +890,7 @@ class _FakeGraph:
         self.truncate_at = truncate_at or {}
         self.cap = cap
         self.queries: list[str] = []
+        self.write_calls: list[str] = []
 
     def _census(self, which: str, counted: str) -> int:
         corpus = self.corpora[which]
@@ -909,6 +911,7 @@ class _FakeGraph:
         return _FakeResult(corpus[skip: skip + limit][: self.cap])
 
     async def query(self, cypher: str, params: dict | None = None):
+        self.write_calls.append(cypher)
         raise AssertionError('the instrument is read-only: it may never issue query()')
 
 
@@ -1005,10 +1008,24 @@ class TestGraphReader:
         assert read.expected_rows == len(EDGE_ROWS)
 
     def test_the_edge_read_never_projects_the_embedding_or_filters_liveness(self) -> None:
-        assert 'fact_embedding' not in mod.EDGE_PAGE_CYPHER
-        assert 'invalid_at IS NULL' not in mod.EDGE_PAGE_CYPHER
-        assert 'ORDER BY r.uuid' in mod.EDGE_PAGE_CYPHER
-        assert 'ORDER BY e.uuid' in mod.EPISODE_PAGE_CYPHER
+        assert isinstance(mod.EDGE_READ, PagedQuery)
+        assert isinstance(mod.EPISODE_READ, PagedQuery)
+        edge_page = mod.EDGE_READ.page_template
+        assert 'fact_embedding' not in edge_page
+        assert 'invalid_at IS NULL' not in edge_page
+        assert 'ORDER BY r.uuid' in edge_page
+        assert 'ORDER BY e.uuid' in mod.EPISODE_READ.page_template
+
+    @pytest.mark.asyncio
+    async def test_the_writable_query_is_never_issued(self) -> None:
+        """Behavioural, not merely structural: the double records and raises if it is."""
+        graph = _FakeGraph(EPISODE_ROWS, EDGE_ROWS)
+        reader = mod.GraphReader(graph=graph, graph_name='dark_factory', page_size=2,
+                                 resultset_size=5)
+        await reader.fetch_episodes()
+        await reader.fetch_edges()
+        assert graph.queries
+        assert graph.write_calls == []
 
 
 class TestRun:

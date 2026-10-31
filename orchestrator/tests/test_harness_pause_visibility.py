@@ -29,6 +29,7 @@ import orchestrator.harness as harness_mod
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
+from orchestrator.pause_policy import PauseClass
 from orchestrator.run_store import RunStore
 
 
@@ -316,7 +317,7 @@ async def _pause_with_overdue_l1_and_repend(rig: _DigestRig) -> tuple[str, str]:
         rig.queue, Harness._SCHEDULER_PAUSE_SENTINEL,
         category='scheduler_paused', level=1, timestamp=_hours_ago(3),
     )
-    await rig.harness.pause_scheduler(PAUSE_REASON)
+    await rig.harness.pause_scheduler(PAUSE_REASON, PauseClass.EWA_RATE)
     assert len(rig.queue.get_pending()) == 1
     repend_esc_id = await _resolve_stranded(rig.harness, rig.queue)
     return pause_esc_id, repend_esc_id
@@ -421,9 +422,11 @@ def _runs_db(tmp_path: Path) -> Path:
     return db_dir / 'runs.db'
 
 
-async def _pause_and_repend_in_first_process(rig: _DigestRig, reason: str) -> None:
+async def _pause_and_repend_in_first_process(
+    rig: _DigestRig, reason: str, pause_class: PauseClass,
+) -> None:
     rig.harness._run_store = RunStore(_runs_db(rig.tmp_path))
-    await rig.harness.pause_scheduler(reason, file_escalation=False)
+    await rig.harness.pause_scheduler(reason, pause_class, file_escalation=False)
     await _resolve_stranded(rig.harness, rig.queue)
 
 
@@ -447,11 +450,13 @@ class TestPauseEndedByRestart:
     async def test_declined_restore_does_not_carry_repends_into_the_next_pause(
         self, digest_rig: _DigestRig, cost_store: CostStore,
     ) -> None:
-        await _pause_and_repend_in_first_process(digest_rig, PAUSE_REASON)
+        await _pause_and_repend_in_first_process(digest_rig, PAUSE_REASON, PauseClass.EWA_RATE)
 
         restarted = await _restart_second_process(digest_rig, cost_store)
         assert restarted.harness.scheduler.is_paused is False
-        await restarted.harness.pause_scheduler('park_stop_trip: later', file_escalation=False)
+        await restarted.harness.pause_scheduler(
+            'park_stop_trip: later', PauseClass.PARK_STOP, file_escalation=False,
+        )
         section = _paused_waiting(await _write_digest(restarted))
 
         assert 'Paused with 0 re-pended tasks waiting' in section
@@ -460,7 +465,9 @@ class TestPauseEndedByRestart:
     async def test_reasserted_restore_keeps_the_waiting_task(
         self, digest_rig: _DigestRig, cost_store: CostStore,
     ) -> None:
-        await _pause_and_repend_in_first_process(digest_rig, 'park_stop_trip: test')
+        await _pause_and_repend_in_first_process(
+            digest_rig, 'park_stop_trip: test', PauseClass.PARK_STOP,
+        )
 
         restarted = await _restart_second_process(digest_rig, cost_store)
         assert restarted.harness.scheduler.is_paused is True

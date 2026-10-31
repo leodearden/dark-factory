@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from fused_memory.models.reconciliation import (
@@ -52,10 +51,10 @@ HINT_QUERIES_EXECUTED = 3
 #: read from an agent-originated one without re-deriving it from `operation`.
 _HINT_JOURNAL_SOURCE = 'reconciliation_hint'
 
-#: Per-item render caps. Budget-relevant: ContextItem derives token_estimate from
-#: the clipped text, so raising either spends token_budget that buys whole events.
-_TASK_DESC_CHARS = 300
-_MEMORY_BODY_CHARS = 500
+#: Per-item render caps from the 2026-10 corpus measurement; reconciliation.token_budget is sized to
+#: hold a measured backlog chunk at these values, so they change together (plans/recon-evidence-caps-measurement-2026-10.md).
+_TASK_DESC_CHARS = 4_000
+_MEMORY_BODY_CHARS = 2_000
 
 
 def estimate_tokens(text: str) -> int:
@@ -138,9 +137,6 @@ class ContextAssembler:
         chunk_events: list[ReconciliationEvent] = []
         context_items: dict[str, ContextItem] = {}
 
-        # Compute effective watermark: align context window with event batch
-        effective_wm = self._compute_effective_watermark(events, watermark)
-
         # Process events in batches for parallelized context fetching
         event_idx = 0
         budget_reached = False
@@ -205,27 +201,8 @@ class ContextAssembler:
             context_items=context_items,
             total_tokens=used,
             events_remaining=events_remaining,
-            effective_watermark=effective_wm,
             token_budget=budget,
         )
-
-    def _compute_effective_watermark(
-        self,
-        events: list[ReconciliationEvent],
-        watermark: Watermark,
-    ) -> datetime:
-        """Effective watermark = min(last_run_completed, earliest_event.timestamp).
-
-        Ensures the context window covers the period the events are about.
-        """
-        candidates: list[datetime] = []
-        if watermark.last_full_run_completed:
-            candidates.append(watermark.last_full_run_completed)
-        if events:
-            candidates.append(min(e.timestamp for e in events))
-        if not candidates:
-            return datetime.now(UTC)
-        return min(candidates)
 
     async def _fetch_context(
         self,

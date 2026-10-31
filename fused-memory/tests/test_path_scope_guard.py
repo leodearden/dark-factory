@@ -14,15 +14,19 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from _filer_first_layout import FILER_PROJECT, TASK_27_FILES, stale_snapshot_registry
+
 from fused_memory.middleware.curator_types import CandidateTask
 from fused_memory.middleware.path_scope_guard import (
     _RIGHT_CONTEXT,
     PathGuardVerdict,
+    all_files_foreign_owner,
     check_candidate_for_scope,
     check_files_for_scope,
     check_text_for_scope,
     find_paths,
     is_routing_override,
+    local_attesting_signals,
 )
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
 
@@ -1469,3 +1473,43 @@ class TestIsRoutingOverride:
     def test_reason_with_leading_trailing_whitespace_is_true(self):
         """A reason that is non-empty after stripping is valid."""
         assert is_routing_override('  owner confirmed  ') is True
+
+
+# ---------------------------------------------------------------------------
+# Filer-first attribution (task 7515): a relative path under the filing
+# project's own top-level dir is the filer's, even when the global table
+# collision-dropped that dir or credits it to another project (stale snapshot).
+# ---------------------------------------------------------------------------
+
+
+class TestFilerFirstAttribution:
+    PROSE = 'Record into sessions/recorded/x/session.toml and corpus/fixtures/a.trace.toml'
+
+    def test_task_27_files_pass_the_certain_check(self, tmp_path):
+        reg = stale_snapshot_registry(tmp_path)
+        assert check_files_for_scope(TASK_27_FILES, FILER_PROJECT, reg).outcome == 'ok'
+
+    def test_task_27_files_are_not_a_cross_repo_deliverable(self, tmp_path):
+        reg = stale_snapshot_registry(tmp_path)
+        assert all_files_foreign_owner(TASK_27_FILES, FILER_PROJECT, reg) is None
+
+    def test_task_27_files_attest_local_work(self, tmp_path):
+        reg = stale_snapshot_registry(tmp_path)
+        assert local_attesting_signals(
+            TASK_27_FILES, FILER_PROJECT, reg) == TASK_27_FILES
+
+    def test_prose_citing_own_dirs_is_not_a_mismatch(self, tmp_path):
+        reg = stale_snapshot_registry(tmp_path)
+        assert find_paths(self.PROSE, reg.all_prefixes()) == ['sessions/', 'corpus/']
+        assert check_text_for_scope(self.PROSE, FILER_PROJECT, reg).is_rejection is False
+        verdict = check_candidate_for_scope(
+            _candidate(description=self.PROSE), FILER_PROJECT, reg)
+        assert verdict.is_rejection is False
+
+    def test_dir_only_another_project_has_stays_foreign(self, tmp_path):
+        reg = stale_snapshot_registry(tmp_path)
+        assert all_files_foreign_owner(
+            ['orchestrator/src/x.py'], FILER_PROJECT, reg) == 'dark_factory'
+        verdict = check_text_for_scope('see orchestrator/src/x.py', FILER_PROJECT, reg)
+        assert verdict.is_rejection
+        assert verdict.suggested_project == 'dark_factory'

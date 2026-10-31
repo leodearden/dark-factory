@@ -1420,13 +1420,13 @@ def root_scan_succeeded(payload: dict[str, Any]) -> bool:
 
     A TOP-LEVEL ``internal_error`` is not free to recompute, and declining it
     is still right: unlike the ordinary-but-incomplete states
-    :func:`~dashboard.data.escalation_analytics.archive_scan_succeeded`
-    deliberately keeps cacheable, a bug is never a steady state — it is an
-    emergency with no known trigger — so the walk it costs is bounded by how
-    long the bug lives, and pinning a payload that is blank for reasons the
-    operator cannot see or fix is the worse trade.  How much of the tree that
-    payload is missing is also unknown, which is what makes it unlike the case
-    below.
+    :func:`~dashboard.data.escalation_corpus.acquire_corpus`'s
+    ``reached_any`` cache gate deliberately keeps cacheable, a bug is never a
+    steady state — it is an emergency with no known trigger — so the walk it
+    costs is bounded by how long the bug lives, and pinning a payload that is
+    blank for reasons the operator cannot see or fix is the worse trade.  How
+    much of the tree that payload is missing is also unknown, which is what
+    makes it unlike the case below.
 
     A PER-EVAL ``internal_error`` (``eval_id`` set to the eval dir basename,
     emitted inside :func:`_build_payload`'s per-eval loop) is a degraded ROW,

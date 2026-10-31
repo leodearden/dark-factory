@@ -183,7 +183,8 @@ def snapshot_process_group(pgid: int) -> str:
     function the process is currently blocked in), comm (executable name, capped
     at 15 chars by the kernel), and cmdline (full argv from ``/proc/<pid>/cmdline``,
     truncated to ~200 chars — identifies the culprit process by name and arguments
-    rather than just the short comm).
+    rather than just the short comm).  cmdline reads ``(empty)`` when the kernel
+    publishes no argv (a member mid-exec, or exiting), and ``?`` when it is unreadable.
 
     Designed to be called from ``_run_subprocess``'s ``TimeoutError`` handler
     **before** ``proc.terminate()`` / ``terminate_process_group`` — at that
@@ -205,6 +206,27 @@ def snapshot_process_group(pgid: int) -> str:
         # permissions, or unexpected exception), return a diagnostic string
         # rather than propagating.
         return f'snapshot_process_group({pgid}): unexpected error — see logs'
+
+
+_UNREADABLE = '?'
+_NO_ARGV = '(empty)'
+_CMDLINE_DISPLAY_CHARS = 200
+
+
+def _display_cmdline(entry: Path) -> str:
+    """``<entry>/cmdline`` as a space-joined, truncated argv.
+
+    ``?`` when the file is unreadable; ``(empty)`` when no argv is published.
+    """
+    try:
+        argv = _read_proc_text(entry / 'cmdline').replace('\x00', ' ').strip()
+    except OSError:
+        return _UNREADABLE
+    if not argv:
+        return _NO_ARGV
+    if len(argv) > _CMDLINE_DISPLAY_CHARS:
+        return argv[:_CMDLINE_DISPLAY_CHARS] + '…'
+    return argv
 
 
 def _snapshot_process_group_unsafe(pgid: int) -> str:
@@ -235,21 +257,9 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
         try:
             wchan = _read_proc_text(entry / 'wchan').strip()
         except OSError:
-            wchan = '?'
+            wchan = _UNREADABLE
 
-        # Read /proc/<pid>/cmdline (NUL-separated argv → spaces) for the full
-        # command-line.  Kernel threads have an empty cmdline; fall back to
-        # comm so the field is always populated.  Truncate to ~200 chars for
-        # log friendliness.  Mirrors the wchan try/except idiom so
-        # snapshot_process_group never raises (module invariant).
-        try:
-            cmdline = _read_proc_text(entry / 'cmdline').replace('\x00', ' ').strip()
-            if not cmdline:
-                cmdline = fields.comm  # kernel thread — fall back to short comm
-            if len(cmdline) > 200:
-                cmdline = cmdline[:200] + '…'
-        except OSError:
-            cmdline = '?'
+        cmdline = _display_cmdline(entry)
 
         rows.append(
             f'  pid={pid} ppid={fields.ppid} state={fields.state} wchan={wchan} '
@@ -333,9 +343,11 @@ async def _group_terminated_within(
 ) -> bool:
     """True iff *proc* exits and none of its group *pgid* still runs within *timeout*.
 
-    Each /proc walk costs tens of milliseconds of a worker thread, so the walks
+    Each /proc walk reads every host pid's stat on a worker thread and can cost
+    hundreds of milliseconds, or over a second on a loaded host, so the walks
     back off from ``_SURVIVOR_POLL_FIRST_SECS``, doubling up to
-    ``_SURVIVOR_POLL_MAX_SECS``, and never sleep past the deadline.
+    ``_SURVIVOR_POLL_MAX_SECS``, and never sleep past the deadline.  A walk
+    started before the deadline can still end well after it.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -396,7 +408,10 @@ async def terminate_process_group(
     4. If anything still runs, SIGKILL it: through :func:`sigkill_process_group`
        while the leader is unreaped, and once it is reaped only while a running
        survivor pins the pgid (:func:`_killable_survivors_of_reaped_leader`).  Then wait
-       another *grace_secs*.
+       another *grace_secs*.  Returning does not mean *proc* was reaped: this
+       SIGKILL leg is bounded by *grace_secs* as well, so ``proc.returncode``
+       may still be ``None``, and a caller that needs the exit status must
+       reap *proc* itself.
 
     No ``killpg`` failure propagates, because the group may vanish between our
     liveness check and the signal dispatch.

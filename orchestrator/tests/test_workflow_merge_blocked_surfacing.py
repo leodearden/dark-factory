@@ -22,14 +22,17 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from _merge_lane_fakes import drive_merge
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
+from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
 from orchestrator.merge_lane.worker import MergeOutcome
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
@@ -93,6 +96,39 @@ def _make_routing_workflow(
     return workflow
 
 
+def _surface_blocked(
+    tmp_path: Path, outcome: MergeOutcome,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Surface *outcome* through ``_submit_to_merge_queue``'s blocked path.
+
+    Returns the ``merge_blocked`` rows the real EventStore recorded and the
+    keyword arguments ``_mark_blocked`` was called with. A REAL queue carries
+    the request, so the REAL enqueue path runs; nothing drains it, so
+    ``drive_merge`` plays the merger and resolves the request with *outcome*.
+    """
+    config = _make_routing_config(tmp_path)
+    worktree = tmp_path / 'task-wt'
+    worktree.mkdir()
+    store = EventStore(tmp_path / 'runs.db', run_id='run-mb')
+    workflow = _make_routing_workflow(config, worktree, event_store=store)
+
+    mark_blocked_mock = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+    workflow._mark_blocked = mark_blocked_mock  # type: ignore[method-assign]
+    workflow._write_merge_failure_review = MagicMock()
+    queue: asyncio.Queue = asyncio.Queue()
+    workflow.merge_queue = queue
+
+    driven = asyncio.run(drive_merge(
+        workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=True),
+        queue,
+        outcome,
+    ))
+
+    assert driven.result == WorkflowOutcome.BLOCKED
+    mark_blocked_mock.assert_called_once()
+    return store.fetch_events_by_type(EventType.merge_blocked), mark_blocked_mock.call_args[1]
+
+
 class TestGenericMergeBlockedSurfacing:
     """The generic (non-short-circuit) blocked fall-through in
     ``_submit_to_merge_queue`` must emit exactly one ``EventType.merge_blocked``
@@ -103,45 +139,18 @@ class TestGenericMergeBlockedSurfacing:
     def test_generic_blocked_emits_merge_blocked_and_threads_category(
         self, tmp_path: Path,
     ) -> None:
-        config = _make_routing_config(tmp_path)
-        worktree = tmp_path / 'task-wt'
-        worktree.mkdir()
-        store = EventStore(tmp_path / 'runs.db', run_id='run-mb')
-        workflow = _make_routing_workflow(config, worktree, event_store=store)
-
-        # reason contains 'verification failed' -> category resolves to
-        # 'post_merge_verify' (workflow.py:7307-7308); default INDETERMINATE
-        # disposition + a reason not matching any earlier short-circuit prefix
-        # -> generic fall-through.
+        # Default INDETERMINATE disposition + a reason not matching any earlier
+        # short-circuit prefix -> generic fall-through.
         generic_outcome = MergeOutcome(
             'blocked',
             reason='Post-merge verification failed: pytest failed',
             failure_category='test_failure',
+            block_category=MergeBlockCategory.POST_MERGE_VERIFY,
         )
 
-        mark_blocked_mock = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
-        workflow._mark_blocked = mark_blocked_mock  # type: ignore[method-assign]
-        workflow._write_merge_failure_review = MagicMock()
-
-        # A REAL queue, so the REAL enqueue path runs and the blocked outcome
-        # this test surfaces is delivered to the request the production code
-        # actually enqueued. Nothing drains the queue, so the test plays the
-        # merger: take the request off, resolve it, let the submit finish.
-        queue: asyncio.Queue = asyncio.Queue()
-        workflow.merge_queue = queue
-
-        driven = asyncio.run(drive_merge(
-            workflow._submit_to_merge_queue(
-                'task/42', pre_rebased=False, merge_phase=True,
-            ),
-            queue,
-            generic_outcome,
-        ))
-
-        assert driven.result == WorkflowOutcome.BLOCKED
+        rows, call_kwargs = _surface_blocked(tmp_path, generic_outcome)
 
         # (a) exactly one merge_blocked row, carrying reason/category/failure_category.
-        rows = store.fetch_events_by_type(EventType.merge_blocked)
         assert len(rows) == 1, f'expected exactly one merge_blocked row; got {rows}'
         assert rows[0]['task_id'] == '42'
         data = rows[0]['data']
@@ -151,8 +160,6 @@ class TestGenericMergeBlockedSurfacing:
 
         # (b) _mark_blocked threaded the REAL category (not the default
         # 'task_failure') and forwarded merge_phase=True.
-        mark_blocked_mock.assert_called_once()
-        call_kwargs = mark_blocked_mock.call_args[1]
         assert call_kwargs.get('category') == 'post_merge_verify', (
             f'Expected category=post_merge_verify threaded into _mark_blocked; '
             f'got {call_kwargs}'
@@ -160,6 +167,82 @@ class TestGenericMergeBlockedSurfacing:
         assert call_kwargs.get('merge_phase') is True, (
             f'Expected merge_phase=True forwarded; got {call_kwargs}'
         )
+
+
+#: Copied verbatim from the runs.db merge_blocked row for task 5861 at
+#: 2026-10-30T01:49:25Z, which the reason-substring inference filed as
+#: merge_ff_failed because 'Suffix' contains 'ff'.
+_RECORDED_BOUNCE_REASON = (
+    "Suffix item needs rebase onto frozen-prefix tip: branch '5861' has a real "
+    "rebase conflict onto frozen tip '1c7d61e180b95ee59af3ce08462f75e1292e6c80' "
+    "(bounce escalation #3 of tracker 775d1d1b)"
+)
+
+_FORMER_TRIGGER_REASON = 'Merge stood off: the diff no longer applies, main advanced past the Suffix head'
+
+
+class TestBlockedCategoryIsTyped:
+    """The workflow files a generic blocked outcome under the category its
+    producer stated, never one inferred from the reason prose (task 7302), and
+    records any conflict evidence the outcome carries in the merge_blocked row."""
+
+    @pytest.mark.parametrize(
+        ('outcome', 'expected_data'),
+        [
+            pytest.param(
+                MergeOutcome(
+                    'blocked',
+                    reason=_RECORDED_BOUNCE_REASON,
+                    block_category=MergeBlockCategory.MERGE_NEEDS_REBASE,
+                    conflict_evidence=ConflictEvidence(
+                        conflicted_paths=('orchestrator/src/orchestrator/workflow.py',),
+                        counterpart_task_ids=('7202',),
+                    ),
+                ),
+                {
+                    'reason': _RECORDED_BOUNCE_REASON,
+                    'category': 'merge_needs_rebase',
+                    'failure_category': '',
+                    'cause_hint': '',
+                    'conflicted_paths': ['orchestrator/src/orchestrator/workflow.py'],
+                    'conflicted_paths_total': 1,
+                    'counterpart_task_ids': ['7202'],
+                },
+                id='recorded-bounce-replay',
+            ),
+            pytest.param(
+                MergeOutcome('blocked', reason=_FORMER_TRIGGER_REASON),
+                {
+                    'reason': _FORMER_TRIGGER_REASON,
+                    'category': 'merge_error',
+                    'failure_category': '',
+                    'cause_hint': '',
+                },
+                id='unstamped-reason-with-former-triggers',
+            ),
+            pytest.param(
+                MergeOutcome(
+                    'blocked',
+                    reason='Train union gate refused the tip',
+                    block_category=MergeBlockCategory.POST_MERGE_VERIFY,
+                ),
+                {
+                    'reason': 'Train union gate refused the tip',
+                    'category': 'post_merge_verify',
+                    'failure_category': '',
+                    'cause_hint': '',
+                },
+                id='category-from-the-field-not-the-prose',
+            ),
+        ],
+    )
+    def test_merge_blocked_row_and_mark_blocked_carry_the_stated_category(
+        self, tmp_path: Path, outcome: MergeOutcome, expected_data: dict[str, Any],
+    ) -> None:
+        rows, call_kwargs = _surface_blocked(tmp_path, outcome)
+
+        assert [row['data'] for row in rows] == [expected_data]
+        assert call_kwargs['category'] == expected_data['category']
 
 
 class TestEnsureL1EscalationSignatureAware:

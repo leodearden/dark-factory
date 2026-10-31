@@ -26,12 +26,15 @@ import contextlib
 import importlib.util
 import json
 import logging
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _mem0_intent_fixtures import seed_mem0_intent
 
 from fused_memory.memory_metadata import TRIAGE_CONTESTED_METADATA_KEY
-from fused_memory.models.enums import MemoryCategory
+from fused_memory.models.enums import MemoryCategory, SourceStore
+from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.prompts import (
     FLAG_FOR_STAGE2_MARKER_KIND,
     STAGE2_SUPPRESS_GUARD_KIND,
@@ -60,6 +63,8 @@ from fused_memory.server.write_triage import (
     TriageFailOpenCounter,
 )
 from fused_memory.services.memory_service import SearchResults
+from fused_memory.services.supersession_mark import SUPERSESSION_ACK_KEY
+from fused_memory.services.write_journal import Mem0IntentStatus, WriteJournal
 from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY, TruncationFact
 from server.write_triage_harness import (
     T_HIGH,
@@ -1088,6 +1093,11 @@ def _filed_escalations(root) -> list[dict]:
     ]
 
 
+class _UncountableJournal(WriteJournal):
+    async def count_mem0_intents_by_status(self, *, since: datetime) -> dict[str, int]:
+        raise RuntimeError('database is locked')
+
+
 @pytest.mark.skipif(
     importlib.util.find_spec('escalation') is None,
     reason='the escalation package is not installed in this environment',
@@ -1113,9 +1123,10 @@ class TestTheFailOpenStormReachesAnOperator:
     ) -> None:
         """The crossing write carries the filed id; the ones before it do not.
 
-        And every write in the burst still LANDS — that is the whole claim the
-        escalation makes on the operator's behalf ("no write was lost or
-        blocked"), so it is asserted here rather than taken on trust.
+        And no write in the burst is BLOCKED — contract C1, which the
+        escalation states on the operator's behalf ("no write was blocked"),
+        so it is asserted here rather than taken on trust. Whether each write's
+        Mem0 leg landed is the journal's to say, not this harness's.
         """
         _install_counter(monkeypatch)
         root = tmp_path / 'dark_factory'
@@ -1161,6 +1172,87 @@ class TestTheFailOpenStormReachesAnOperator:
         )
         assert after[ROUTED_KEY] == OUTCOME_STORED, f'{after!r}'
         assert len(_filed_escalations(root)) == 1, 'and files it exactly once'
+
+    @staticmethod
+    def _storm_server(root, monkeypatch, write_journal: WriteJournal | None = None):
+        _install_counter(monkeypatch)
+        mock_service = AsyncMock()
+        configure_triage_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.side_effect = RuntimeError('mem0 unreachable')
+        return create_mcp_server(
+            mock_service,
+            known_projects={_PROJECT_ID: str(root)},
+            write_journal=write_journal,
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_record_counts_the_mem0_intents_created_in_its_window(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        root = tmp_path / 'dark_factory'
+        root.mkdir()
+        journal = WriteJournal(tmp_path / 'wj')
+        await journal.initialize()
+        try:
+            for status in (
+                Mem0IntentStatus.COMPLETED,
+                Mem0IntentStatus.COMPLETED,
+                Mem0IntentStatus.RETRYING,
+                Mem0IntentStatus.FAILED,
+            ):
+                await seed_mem0_intent(journal, status=status)
+            await seed_mem0_intent(
+                journal,
+                status=Mem0IntentStatus.COMPLETED,
+                created_at=datetime.now(UTC) - timedelta(hours=2),
+            )
+            server = self._storm_server(root, monkeypatch, write_journal=journal)
+
+            for _ in range(_FAIL_OPEN_STORM_THRESHOLD):
+                await _call(server)
+        finally:
+            await journal.close()
+
+        (record,) = _filed_escalations(root)
+        assert (
+            "mem0_intents_in_window={'completed': 2, 'failed': 1, 'retrying': 1}"
+            in record['detail']
+        ), record['detail']
+
+    @pytest.mark.asyncio
+    async def test_without_a_journal_the_record_says_the_counts_are_unavailable(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        root = tmp_path / 'dark_factory'
+        root.mkdir()
+        server = self._storm_server(root, monkeypatch)
+
+        for _ in range(_FAIL_OPEN_STORM_THRESHOLD):
+            await _call(server)
+
+        (record,) = _filed_escalations(root)
+        assert 'mem0_intents_in_window=None' in record['detail'], record['detail']
+
+    @pytest.mark.asyncio
+    async def test_a_failing_count_degrades_to_none_and_never_blocks_the_write(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        root = tmp_path / 'dark_factory'
+        root.mkdir()
+        journal = _UncountableJournal(tmp_path / 'wj')
+        await journal.initialize()
+        try:
+            server = self._storm_server(root, monkeypatch, write_journal=journal)
+            acks = [await _call(server) for _ in range(_FAIL_OPEN_STORM_THRESHOLD)]
+        finally:
+            await journal.close()
+
+        for ack in acks:
+            assert 'error' not in ack, f'{ack!r}'
+        assert FAIL_OPEN_ESCALATION_ID_KEY in acks[-1], f'{acks[-1]!r}'
+        (record,) = _filed_escalations(root)
+        assert 'mem0_intents_in_window=None' in record['detail'], record['detail']
 
     @pytest.mark.asyncio
     async def test_every_project_in_the_window_gets_the_alarm(
@@ -1354,6 +1446,61 @@ class TestAnAttachThatDidNotLandIsNotAcked:
 
         assert result[ROUTED_KEY] == OUTCOME_RESTATED, f'{result!r}'
         assert result[CANONICAL_ID_KEY] == 'm1', f'{result!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_child_pending_mem0_retry_is_still_acked_as_an_attach(
+        self, monkeypatch,
+    ) -> None:
+        """The queued intent carries the triage-stamped parent link, so the retry
+        creates exactly the child the ack names. A provider outage is not a
+        triage fail-open."""
+        counter = _install_counter(monkeypatch)
+        mock_service = AsyncMock()
+        configure_triage_config(mock_service, enabled=True)
+        mock_service.add_memory.return_value = _pending_retry_response()
+        mock_service.search.return_value = [search_candidate('m1', 0.97)]
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server)
+
+        assert result[ROUTED_KEY] == OUTCOME_RESTATED, f'{result!r}'
+        assert result[CANONICAL_ID_KEY] == 'm1', f'{result!r}'
+        assert result['stores_pending_retry'] == ['mem0'], f'{result!r}'
+        assert counter.live_count() == 0
+
+
+def _pending_retry_response() -> AddMemoryResponse:
+    return AddMemoryResponse(
+        memory_ids=[],
+        stores_written=[],
+        stores_pending_retry=[SourceStore.mem0],
+        category=MemoryCategory.procedural_knowledge,
+        message='Memory queued for [] [mem0_pending_retry: rate_limited: RateLimitError: 429]',
+    )
+
+
+class TestAPendingWriteClaimsNoSupersessionMark:
+    """A write's supersedes targets are marked with its Mem0 id, which a write
+    pending server-side retry does not have yet (task 7156's seam)."""
+
+    @pytest.mark.asyncio
+    async def test_the_targets_are_reported_unmarked(self, monkeypatch) -> None:
+        _install_counter(monkeypatch)
+        mock_service = AsyncMock()
+        configure_triage_config(mock_service, enabled=True)
+        mock_service.add_memory.return_value = _pending_retry_response()
+        superseded = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server, metadata={'supersedes': [superseded]})
+
+        assert result['stores_pending_retry'] == ['mem0'], f'{result!r}'
+        supersession = result[SUPERSESSION_ACK_KEY]
+        assert supersession['marked'] == [], f'{supersession!r}'
+        (unmarked,) = supersession['unmarked']
+        assert unmarked['id'] == superseded
+        assert unmarked['reason'] == 'no_superseding_mem0_record'
+        mock_service.update_memory.assert_not_awaited()
 
 
 class TestEveryWiredAttachKindReachesThePersistedChild:

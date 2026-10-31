@@ -17,6 +17,9 @@ Contents
   module without a cycle — validates through the identical rule.  See
   that module's docstring for the measured ``ImportError`` behind the
   split.
+* ``is_canonical`` — the one strict reading of the ``canonical`` marker,
+  defined in ``canonical_marker.py::is_canonical`` and re-exported here as
+  the same object.
 * ``normalize_supersedes`` — PRD D2's scalar/list/None normalizer.
 * ``render_metadata_vocabulary_guidance`` — the writer-facing statement of
   this vocabulary that the writing reconciliation stage prompts interpolate.
@@ -61,7 +64,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from shared.memory_supersession import SUPERSEDED_BY_METADATA_KEY
+
 from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
+
+# Re-exported as the same object, like the topic_slug names below.
+from fused_memory.canonical_marker import is_canonical
 
 # Re-exported, NOT redefined (task 3198, leaf ε).  These are bound to the
 # *same objects* the leaf module defines, so this registry remains the
@@ -98,11 +106,13 @@ __all__ = [
     'ParentHasChildrenError',
     'RESERVED_VOCABULARY_KEYS',
     'SERVER_STAMPED_KEYS',
+    'SUPERSEDED_BY_METADATA_KEY',
     'TOPIC_SLUG_MAX_LEN',
     'TOPIC_SLUG_RE',
     'TRIAGE_CONTESTED_METADATA_KEY',
     'check_canonical_routing',
     'classify_unknown_keys',
+    'is_canonical',
     'is_orchestrator_completion_record',
     'is_valid_topic_slug',
     'normalize_supersedes',
@@ -145,8 +155,12 @@ def normalize_supersedes(value: Any) -> list[Any]:
     tolerance for the legacy scalar stays.  The readers are
     ``reconciliation.targeted._is_authoritative_resolution`` (truthiness
     discriminator, which tests ``any()`` of the normalized members — see
-    ITS docstring for why member-level and not container truthiness) and
-    leaf 3112's closure predicate.  Both go through this helper — INV-5:
+    ITS docstring for why member-level and not container truthiness),
+    leaf 3112's closure predicate,
+    ``server/write_triage.py::declares_supersession`` (a declaration
+    force-stores the write instead of triaging it) and
+    ``services/supersession_mark.py::mark_superseded`` (which marks each
+    declared record superseded).  All go through this helper — INV-5:
     never a second ``supersedes`` parser.
 
     Accepts ``None`` (→ ``[]``), a scalar (→ single-element list), or any
@@ -1094,15 +1108,14 @@ def validate_memory_metadata(
                 f'truthiness, so 1/0 do not pass as True/False',
                 fatal=True,
             ))
-        # `is True`, not truthiness — for the reason 2b already documents
-        # above (`1 == True`), and so a non-bool value reports only the TYPE
-        # defect rather than being double-counted here.
+        # Read through is_canonical, so a non-bool value reports only the
+        # TYPE defect above rather than being double-counted here.
         #
         # Only the `topic` KEY's presence is tested: when it is present but
         # malformed, 2a's invalid_topic_slug already describes that defect,
         # and emitting both would report one defect twice while implying the
         # writer forgot a key they did supply.
-        elif canonical is True and 'topic' not in meta:
+        elif is_canonical(meta) and 'topic' not in meta:
             violations.append(_violation(
                 'canonical',
                 'canonical_without_topic',
@@ -1277,11 +1290,10 @@ def check_canonical_routing(
         default would let a future write path skip the check silently,
         which is the exact silence this rule removes.
     """
-    # `is True`, not truthiness — the same discipline rule 2b documents
-    # above (`1 == True`).  The int form is `invalid_canonical_type`'s
+    # Read through is_canonical: the int form is `invalid_canonical_type`'s
     # defect and is reported there; catching it here too would render one
     # mistake as two.
-    if meta.get('canonical') is not True or reaches_mem0:
+    if not is_canonical(meta) or reaches_mem0:
         return []
 
     return [_violation(

@@ -26,10 +26,10 @@ from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server import write_triage_judge
 from fused_memory.server.write_triage_judge import (
-    _ELIDED_MARKER,
     resolve_judge_field_chars,
     resolve_judge_timeout,
 )
+from fused_memory.utils.clip_disclosure import elision_marker
 
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
 
@@ -228,7 +228,7 @@ class TestTheWire:
         _judge(client, _arm('gpt-4o-mini@5'))
         rendered = client.responses.create.call_args.kwargs['input']
         for field in ('y' * 5_000, 'x' * 5_000):
-            assert field[:cap] + _ELIDED_MARKER in rendered
+            assert field[:cap] + elision_marker(len(field) - cap) in rendered
             assert field[:cap + 1] not in rendered
 
     def test_only_the_openai_provider_is_judged(self) -> None:

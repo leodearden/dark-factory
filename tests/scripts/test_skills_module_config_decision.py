@@ -97,10 +97,12 @@ WHERE each now lives is the load-bearing half of that claim:
   * ``--directory`` base resolution — STAYS HERE, in
     ``_pytest_collected_dirs``. It scans the whole token list on purpose, since
     ``uv run --directory X pytest ...`` puts the flag PRE-anchor.
-  * ``_PYTEST_VALUE_FLAGS`` consumption — the flag SET stays here as this
-    guard's policy and is passed explicitly; only the consume-next loop is
-    shared. Its two ruff siblings deliberately pass nothing and keep the naive
-    ``-``-prefix filter, so passing the set is exactly what preserves the gap.
+  * value-flag consumption — the flag SET is
+    ``verify_command_invariants.PYTEST_VALUE_FLAGS`` (task 6172), a fact about
+    pytest's CLI shared with the fallback guard; PASSING it stays this guard's
+    choice and is explicit. Its two ruff siblings deliberately pass nothing and
+    keep the naive ``-``-prefix filter, so passing the set is exactly what
+    preserves the gap.
   * the target-EXISTS assertion — STAYS HERE. It is a decision about module
     configs, not a fact about shell syntax.
   * the ``None``-not-assert contract for a non-pytest command — moved into
@@ -132,7 +134,6 @@ from __future__ import annotations
 import pathlib
 import posixpath
 import shlex
-import subprocess
 
 # The skills/ ruff probe itself, imported so the DECIDING FACT can be asserted
 # against its RUNTIME target list rather than only against its path. Resolves
@@ -146,6 +147,7 @@ import test_root_lint_covers_nonmember_py as skills_ruff_probe
 # The shared command parser this file's helpers used to duplicate (task 3745),
 # resolving by the same conftest sys.path mechanism as the probe above.
 import verify_command_invariants as vci
+from git_listing import git
 from orchestrator.config import _discover_module_configs
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
@@ -158,7 +160,8 @@ DF_CONFIG_NAME = "dark-factory-orchestrator.yaml"
 
 # Aliased from the shared parser rather than restated as a literal (task 3745):
 # the keyword is what selects that parser's anchor, so it belongs to the shared
-# contract, while _PYTEST_VALUE_FLAGS below is this guard's own policy.
+# contract. So does vci.PYTEST_VALUE_FLAGS (task 6172); passing it, in
+# _pytest_collected_dirs, is this guard's own policy.
 _PYTEST = vci.PYTEST
 
 # The probe that actually runs ruff over skills/**/*.py. Named as a path
@@ -219,8 +222,8 @@ SKILLS_CONSUMING_TESTS = (
     # test_every_enumeration_site_is_pinned and the citation-drift checks —
     # the single broadest skills/ consumer in the repo (task 4941).
     "scripts/tests/test_design_invariants_consistency.py",
-    # Reads skills/reflect/SKILL.md and skills/orchestrate/SKILL.md to execute
-    # their `entities=` examples against the live entities_gate (tasks 3675, 5555).
+    # Reads the skills/ docs named in its _GUARDED_DOCS to execute their
+    # `entities=` examples against the live entities_gate (tasks 3675, 5555, 5866).
     "fused-memory/tests/test_referent_declaration_examples.py",
     # EXECUTES every merge-marker search in skills/**/*.md against a shadowed
     # fixture history (task 5774).
@@ -230,6 +233,10 @@ SKILLS_CONSUMING_TESTS = (
 
 def _git_ls_files(*pathspecs: str) -> list[str]:
     """Tracked paths matching *pathspecs*, via real ``git ls-files``.
+
+    A broken git fails this guard rather than letting it pass vacuously (task
+    3554); ``git_listing.git`` raises and never skips (``git_listing.py``
+    module docstring).
 
     MEASURED, not assumed (in a throwaway repo at this base): the default
     pathspec matcher treats ``**`` as crossing ``/``, so
@@ -255,20 +262,9 @@ def _git_ls_files(*pathspecs: str) -> list[str]:
     Adding the direct-child spellings (``skills/tests/**``, ``skills/test_*.py``,
     ``skills/*_test.py``) returns all six. Every caller here therefore passes
     both the nested and the direct-child spelling of each pattern.
-
-    No try/except-and-skip: a missing or broken ``git`` must fail the caller.
     """
-    proc = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "ls-files", "--", *pathspecs],
-        capture_output=True,
-        text=True,
-    )
-    assert proc.returncode == 0, (
-        f"`git ls-files -- {' '.join(pathspecs)}` exited {proc.returncode} "
-        f"(task 3554). A broken git must fail this guard rather than let it "
-        f"pass vacuously; stderr: {proc.stderr.strip()!r}"
-    )
-    return [line for line in proc.stdout.splitlines() if line]
+    listing = git(REPO_ROOT, "ls-files", "-z", "--", *pathspecs)
+    return [entry for entry in listing.split("\0") if entry]
 
 
 def test_no_skills_prefixed_module_config_is_registered() -> None:
@@ -474,20 +470,6 @@ def _pytest_segment(cmd: str) -> str | None:
     return vci.optional_token_segment(cmd, _PYTEST)
 
 
-# pytest flags whose VALUE is a SEPARATE token. Only the space-separated form
-# needs listing: the ``=`` form (``--timeout=300``) is already dropped whole by
-# the ``-``-prefix filter. Without this, ``-k some_expr`` and ``--timeout 300``
-# donate ``some_expr`` and ``300`` to the target list as phantom paths — and a
-# phantom target can only ever satisfy ``_is_collected`` spuriously, never
-# break it, so the failure direction is the SILENT one (a false PASS).
-_PYTEST_VALUE_FLAGS = frozenset({
-    "-c", "-k", "-m", "-n", "-o", "-p", "-r", "-W",
-    "--basetemp", "--color", "--deselect", "--dist", "--durations",
-    "--ignore", "--ignore-glob", "--import-mode", "--junitxml",
-    "--log-level", "--maxfail", "--rootdir", "--tb", "--timeout",
-})
-
-
 def _pytest_collected_dirs(cmd: str) -> list[str]:
     """Repo-relative paths *cmd*'s pytest segment collects; ``[]`` if not pytest.
 
@@ -506,10 +488,13 @@ def _pytest_collected_dirs(cmd: str) -> list[str]:
        ``pytest`` token drops the ``--project shared`` argument (it precedes
        ``pytest``), and the ``-``-prefix filter drops ``--tb=short``, ``-q``
        and ``--timeout=300``. What the ``-``-prefix filter does NOT drop is a
-       space-separated flag VALUE, so ``_PYTEST_VALUE_FLAGS`` is consulted and
-       the following token skipped. Note ``--ignore``/``--ignore-glob`` are in
-       that set for a second reason beyond parsing: an ignored path is
-       precisely NOT collected, so admitting its value as a target would
+       space-separated flag VALUE (``-k some_expr``, ``--timeout 300``), so
+       ``verify_command_invariants.PYTEST_VALUE_FLAGS`` is passed and the
+       following token skipped. Here an unconsumed value is the SILENT
+       failure direction: a phantom target can only ever satisfy
+       ``_is_collected`` spuriously, never break it, so it reads as a false
+       PASS. ``--ignore``/``--ignore-glob`` matter twice over: an ignored path
+       is precisely NOT collected, so admitting its value as a target would
        invert the meaning.
 
        WHAT THIS GUARANTEES, stated no more strongly than it holds: every
@@ -567,9 +552,9 @@ def _pytest_collected_dirs(cmd: str) -> list[str]:
 
     # Only the positional extraction is shared (task 3745). The --directory scan
     # above, the normpath join below and assertion (3) stay HERE: they are this
-    # guard's policy, not command parsing, and _PYTEST_VALUE_FLAGS is passed in
-    # for the same reason — its two ruff siblings deliberately pass nothing.
-    targets = vci.positional_targets(segment, _PYTEST, value_flags=_PYTEST_VALUE_FLAGS)
+    # guard's policy, not command parsing, and so is passing vci.PYTEST_VALUE_FLAGS
+    # — its two ruff siblings deliberately pass nothing.
+    targets = vci.positional_targets(segment, _PYTEST, value_flags=vci.PYTEST_VALUE_FLAGS)
 
     resolved = [posixpath.normpath(posixpath.join(base, t)) for t in targets]
     for target in resolved:
@@ -579,7 +564,8 @@ def _pytest_collected_dirs(cmd: str) -> list[str]:
             f"config carries a stale target — which makes pytest exit "
             f"non-zero on every verify that runs it — or this parser admitted "
             f"a value-taking flag's VALUE as a positional target, in which "
-            f"case add that flag to _PYTEST_VALUE_FLAGS. A phantom target can "
+            f"case add that flag to verify_command_invariants.PYTEST_VALUE_FLAGS. "
+            f"A phantom target can "
             f"only ever satisfy _is_collected spuriously, so this is asserted "
             f"rather than filtered out."
         )

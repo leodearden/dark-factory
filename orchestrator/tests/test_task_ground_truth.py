@@ -32,7 +32,13 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from escalation.models import Escalation
-from escalation.pins import PinRecord, _norm_id, classify_pins
+from escalation.pins import (
+    ClusterPinRecord,
+    PinRecord,
+    _norm_id,
+    classify_pins,
+    pinned_only_by_human_parked,
+)
 from escalation.queue import EscalationQueue
 from shared.deploy_state import DeployPhase
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, compose_claimant_run_id
@@ -174,6 +180,14 @@ class TestEscalationRefSatisfiesPinRecord:
         record: PinRecord = EscalationRef(id='esc-1-1', level=0, severity='blocking')
         assert record.id == 'esc-1-1'
         assert record.filing_claimant_run_id is None
+
+    def test_escalation_ref_is_structurally_a_cluster_pin_record(self) -> None:
+        """Checked statically by pyright too: the members-carrying sub-protocol
+        ``pinned_only_by_human_parked`` reads (task 7709)."""
+        record: ClusterPinRecord = EscalationRef(
+            id='esc-1-1', level=2, severity='blocking', members=('esc-1-2',),
+        )
+        assert record.members == ('esc-1-2',)
 
     def test_real_refs_classify_into_the_three_buckets(self) -> None:
         refs = [
@@ -1553,6 +1567,32 @@ class TestDeriveTruthRemainingFields:
             'the filing time must survive the JSON round-trip (task 3535)'
         )
 
+    async def test_refs_round_trip_members_via_real_queue(self, tmp_path: Path) -> None:
+        """Task 7709: the L2's members survive JSON, the atomic write and
+        from_dict, so the reconcile sweep's predicate sees the promoted hold."""
+        queue = self._real_queue(tmp_path)
+        queue.submit(Escalation(
+            id='esc-40-1', task_id='40', agent_role='implementer',
+            severity='blocking', category='infra_issue', summary='s1', level=1,
+        ))
+        queue.submit(Escalation(
+            id='esc-40-2', task_id='40', agent_role='escalation-watcher-auto',
+            severity='blocking', category='infra_issue', summary='s2', level=2,
+            members=['esc-40-1'],
+        ))
+        resolver = _make_ground_truth(escalation_queue=queue)
+
+        report = await resolver.derive_truth('40')
+
+        refs = sorted(report.open_escalations, key=lambda r: r.id)
+        assert [(ref.id, ref.members) for ref in refs] == [
+            ('esc-40-1', ()),
+            ('esc-40-2', ('esc-40-1',)),
+        ]
+        assert pinned_only_by_human_parked(
+            classify_pins('40', refs, live_claimant=False), refs,
+        ) is True
+
     async def test_legacy_on_disk_record_without_filing_identity_resolves_to_none(
         self, tmp_path: Path,
     ) -> None:
@@ -1873,6 +1913,14 @@ class TestEscalationRefCreatedAt:
     def test_created_at_is_carried_verbatim(self):
         ref = EscalationRef(id='esc-1', level=1, created_at='2026-08-10T12:00:00+00:00')
         assert ref.created_at == '2026-08-10T12:00:00+00:00'
+
+
+class TestEscalationRefMembers:
+    """``members`` names the ids an L2's cluster holds (task 7709)."""
+
+    def test_members_defaults_to_holding_nothing(self):
+        """Defaulted, so every existing construction site keeps working."""
+        assert EscalationRef(id='esc-1', level=1).members == ()
 
 
 class TestTruthReportStoreUnavailable:

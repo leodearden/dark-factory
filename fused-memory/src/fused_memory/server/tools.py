@@ -11,7 +11,7 @@ import time
 import uuid as uuid_mod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -49,7 +49,10 @@ from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
 )
-from fused_memory.memory_metadata import TRIAGE_CONTESTED_METADATA_KEY
+from fused_memory.memory_metadata import (
+    SUPERSEDED_BY_METADATA_KEY,
+    TRIAGE_CONTESTED_METADATA_KEY,
+)
 from fused_memory.middleware.deferral_gate import StatusWriteScope
 from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
@@ -197,8 +200,9 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     ROUTED_KEY,
     TriageFailOpenCounter,
-    attach_write_landed,
+    attach_write_durable,
     declares_attach_keys,
+    declares_supersession,
     emit_triage_fail_open_storm_escalation,
     resolve_write_triage_enabled,
     triage_write,
@@ -234,6 +238,7 @@ from fused_memory.services.read_telemetry import (
     summarize_search_query,
     summarize_search_results,
 )
+from fused_memory.services.supersession_mark import mark_superseded
 from fused_memory.utils.clip_disclosure import truncation_fields
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
@@ -284,12 +289,38 @@ CREATE TABLE IF NOT EXISTS overrides (
     ttl_until     TEXT,
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
+    source        TEXT NOT NULL DEFAULT 'operator',
     PRIMARY KEY (project_root, task_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_overrides_pinned
     ON overrides(project_root, pinned, pin_order);
-"""  # Source of truth: orchestrator/src/orchestrator/overrides.py:33-49
+"""  # Source of truth: orchestrator/src/orchestrator/overrides.py::_SCHEMA
+
+# Mirrors orchestrator/src/orchestrator/overrides.py::_migrate_add_source_column.
+# Every write through these tools is an operator write, so it stamps this value
+# and takes ownership of the row from the starvation watchdog.
+_OPERATOR_SOURCE = 'operator'
+
+
+async def _migrate_overrides_source_column(db: aiosqlite.Connection) -> None:
+    """Add ``source`` to a pre-ownership overrides table, idempotently.
+
+    The orchestrator migrates the same file, so losing the race to its ALTER
+    ('duplicate column name') is success, not failure.
+    """
+    cursor = await db.execute('PRAGMA table_info(overrides)')
+    columns = {row[1] for row in await cursor.fetchall()}
+    if 'source' in columns:
+        return
+    try:
+        await db.execute(
+            'ALTER TABLE overrides ADD COLUMN source TEXT NOT NULL '
+            f"DEFAULT '{_OPERATOR_SOURCE}'"
+        )
+    except aiosqlite.OperationalError as exc:
+        if 'duplicate column name' not in str(exc):
+            raise
 
 # Mirrors orchestrator/src/orchestrator/config.py PRIORITY_RANK keys.
 # Source of truth: orchestrator/src/orchestrator/config.py:27.
@@ -345,6 +376,7 @@ async def _open_overrides_db(
     busy_ms = 30000 if autocommit else 5000
     await apply_full_durability_pragmas(db, busy_timeout_ms=busy_ms)
     await db.executescript(_OVERRIDE_SCHEMA)
+    await _migrate_overrides_source_column(db)
     return db
 
 
@@ -1468,13 +1500,17 @@ def create_mcp_server(
         ``add_memory`` path, so the cheap hop is worth taking.
         """
         esc_id = None
+        storm_with_counts = {
+            **storm,
+            'mem0_intents_in_window': await _mem0_intents_in_window(storm),
+        }
         # `or [project_id]`: a burst whose labels were all unresolvable still
         # deserves an alarm somewhere, and this call's own project is the only
         # queue we can name.
         for pid in storm.get('projects') or [project_id]:
             try:
                 filed = await asyncio.to_thread(
-                    emit_triage_fail_open_storm_escalation, _kp.get(pid), storm,
+                    emit_triage_fail_open_storm_escalation, _kp.get(pid), storm_with_counts,
                 )
             except Exception:  # pragma: no cover — defensive only
                 logger.exception(
@@ -1486,6 +1522,22 @@ def create_mcp_server(
             if filed is not None and esc_id is None:
                 esc_id = filed
         return esc_id
+
+    async def _mem0_intents_in_window(storm: dict) -> dict[str, int] | None:
+        """Mem0 intent counts by status over the storm's window; None when unavailable."""
+        if write_journal is None:
+            return None
+        since = datetime.now(UTC) - timedelta(seconds=float(storm.get('window_seconds') or 0))
+        try:
+            return await write_journal.count_mem0_intents_by_status(since=since)
+        except Exception as exc:
+            logger.warning(
+                'write_triage: could not count mem0_intents for the fail-open storm '
+                'record (%s: %s); it will say the counts are unavailable',
+                type(exc).__name__,
+                exc,
+            )
+            return None
 
     def _known_project_gate(project_id: str) -> dict | None:
         """Return an error dict if project_id is absent from the known_projects registry."""
@@ -3597,6 +3649,13 @@ def create_mcp_server(
         overwrite. No agent class is force-stored (task 3134).
         Your own classification of a record is not triage's to replace.
 
+        To correct a memory, write the correction as a new memory with
+        ``metadata={'supersedes': [<id>]}``: it is always stored standalone
+        (never attached under the record it replaces), and each superseded
+        record is marked with ``metadata.x_superseded_by=<the new id>``, which
+        ``search`` and ``get_memory_by_id`` return, briefings render as
+        ``superseded by <id>``, and the ack's ``supersession`` key reports.
+
         Optionally DECLARE what the memory is about with `entities`. A
         declaration outranks the referents scanned out of the content, so it is
         how you correct a body whose prose names a task ambiguously or not at
@@ -3646,6 +3705,15 @@ def create_mcp_server(
         pattern list and the rationale; the literals themselves are enumerated
         once, in :mod:`shared.toolcall_markup`, and nothing in this package
         spells them.
+
+        If the embedding provider fails transiently (429, 5xx, connection), the
+        Mem0 leg is NOT dropped: the ack carries stores_pending_retry=['mem0'],
+        memory_ids is empty, the message says mem0_pending_retry, and the
+        server retries the write for as long as its failures stay transient. A
+        later non-transient failure dead-letters it (status 'dead' in the
+        write journal's mem0_intents, logged at ERROR). Do NOT re-submit the
+        same content (that would duplicate it). The Mem0 leg has landed only
+        when the ack lists mem0 in stores_written and memory_ids is non-empty.
 
         Args:
             content: The memory itself (a fact, preference, procedure, etc.)
@@ -3825,6 +3893,7 @@ def create_mcp_server(
         # for why ANY `kind` counts (not just the child kinds) and what that
         # costs in coverage.
         caller_owns_attach_keys = declares_attach_keys(metadata)
+        caller_declares_supersession = declares_supersession(metadata)
         # Write triage (task 3127, PRD leaf beta) SUPERSEDES the two reject
         # guards below rather than layering on top of them (D2: redirect
         # supersedes reject). The two paths are mutually exclusive: when triage
@@ -3856,12 +3925,13 @@ def create_mcp_server(
                 # transport error, timeout and unparseable output, and that
                 # `except` arm counts it and returns `stored`.
                 judge=judge_write,
-                # Both predicates are already derived above, from the metadata
+                # The predicates are already derived above, from the metadata
                 # and agent_id this body holds. Passed IN rather than
                 # recomputed inside triage_write: a second derivation is a
                 # second place for the two to disagree about who is exempt.
                 allow_near_duplicate=allow_near_duplicate,
                 caller_owns_attach_keys=caller_owns_attach_keys,
+                caller_declares_supersession=caller_declares_supersession,
             )
         # DEFERRED, DELIBERATELY: the topic-cluster signal contributes nothing
         # to triage routing in this leaf. The PRD's band rule (§Bands) is
@@ -4027,6 +4097,8 @@ def create_mcp_server(
             # Only the contested attach below may write this, so no caller can
             # make a hand-declared contest look triage-written.
             cleaned_meta.pop(TRIAGE_CONTESTED_METADATA_KEY, None)
+            # Only services/supersession_mark.py::mark_superseded may write this.
+            cleaned_meta.pop(SUPERSEDED_BY_METADATA_KEY, None)
         # An ATTACH outcome reroutes this same write into a child of the memory
         # it restates: same content, same category, same agent, plus the parent
         # link. It does NOT touch the canonical — triage issues no
@@ -4185,14 +4257,17 @@ def create_mcp_server(
                 # Kept for the same reason: the pre-triage write carried the tag.
                 **claim_kwargs,
             )
-        if attached_to is not None and not attach_write_landed(result):
+        if attached_to is not None and not attach_write_durable(result):
             # A RAISE IS ONLY HALF THE FAILURE SURFACE — and the smaller half,
             # the same asymmetry `triage_write` handles for retrieval.
             # `MemoryService.add_memory` does NOT raise when a store fails: it
             # catches the Graphiti/Mem0 exception into `_graphiti_error` /
             # `_mem0_error`, folds it into `message`, and returns an ordinary
-            # AddMemoryResponse with NO memory_ids. So a child write that died
-            # at the store never reaches the `except` arm above, and the ack
+            # AddMemoryResponse with NO memory_ids (a Mem0 leg durably queued
+            # for server-side retry is not such a failure: it lists mem0 under
+            # `stores_pending_retry`, and the retry lands the child the ack
+            # names). So a child write that died at the store never reaches
+            # the `except` arm above, and the ack
             # would otherwise announce `restated` + canonical_id for a link
             # that was never persisted — precisely the "ack claiming an attach
             # that did not happen" the comment below calls worse than no ack.
@@ -4214,7 +4289,21 @@ def create_mcp_server(
             )
             _triage_fail_open_counter.record(project=project_id)
             attached_to = None
+        # Marks each record this write supersedes, now that the new id exists.
+        # Not a triage event; see services/supersession_mark.py.
+        supersession = await mark_superseded(
+            memory_service,
+            metadata=metadata,
+            written=result,
+            project_id=project_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            source=source,
+        )
         ack = result.model_dump()
+        if supersession is not None:
+            ack.update(supersession.to_ack())
         if unverified_flag is not None:
             ack[UNVERIFIED_CLAIM_TAG] = _report_unverified_claims(
                 unverified_flag, agent_id, project_id,
@@ -10765,8 +10854,8 @@ def create_mcp_server(
                         """
                         INSERT INTO overrides
                             (project_root, task_id, boost_tier, pinned, pin_order,
-                             reserve_now, ttl_until, created_at, updated_at)
-                        VALUES (?, ?, ?, COALESCE(?, 0), ?, COALESCE(?, 0), ?, ?, ?)
+                             reserve_now, ttl_until, created_at, updated_at, source)
+                        VALUES (?, ?, ?, COALESCE(?, 0), ?, COALESCE(?, 0), ?, ?, ?, ?)
                         ON CONFLICT(project_root, task_id) DO UPDATE SET
                             boost_tier  = COALESCE(?, boost_tier),
                             pinned      = COALESCE(?, pinned),
@@ -10774,7 +10863,8 @@ def create_mcp_server(
                                                ELSE COALESCE(?, pin_order) END,
                             reserve_now = COALESCE(?, reserve_now),
                             ttl_until   = COALESCE(?, ttl_until),
-                            updated_at  = ?
+                            updated_at  = ?,
+                            source      = ?
                         """,
                         (
                             # INSERT values
@@ -10787,6 +10877,7 @@ def create_mcp_server(
                             ttl_until_iso,
                             now_iso,
                             now_iso,
+                            _OPERATOR_SOURCE,
                             # UPDATE SET values
                             boost_tier,
                             pinned_int,
@@ -10795,6 +10886,7 @@ def create_mcp_server(
                             reserve_now_int,
                             ttl_until_iso,
                             now_iso,
+                            _OPERATOR_SOURCE,
                         ),
                     )
                     await db.execute('COMMIT')
@@ -10991,7 +11083,10 @@ def create_mcp_server(
 
         Returns:
             ``{'pin_queue': [{'task_id': ..., 'boost_tier': ..., 'pinned': ...,
-            'pin_order': ..., 'reserve_now': ..., 'ttl_until': ...}, ...]}``
+            'pin_order': ..., 'reserve_now': ..., 'ttl_until': ...,
+            'source': ...}, ...]}`` where ``source`` is ``'operator'`` or
+            ``'starvation_watchdog'`` (a watchdog auto-pin, which carries a
+            ``ttl_until``).
         """
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
@@ -11000,7 +11095,8 @@ def create_mcp_server(
         db = await _open_overrides_db(project_root)
         try:
             cursor = await db.execute(
-                'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, ttl_until '
+                'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, '
+                'ttl_until, source '
                 'FROM overrides '
                 'WHERE project_root=? AND pinned=1 '
                 'ORDER BY pin_order ASC',
@@ -11015,6 +11111,7 @@ def create_mcp_server(
                     'pin_order': r[3],
                     'reserve_now': bool(r[4]),
                     'ttl_until': r[5],
+                    'source': r[6],
                 }
                 for r in rows
             ]
@@ -11039,7 +11136,7 @@ def create_mcp_server(
             project_root: Absolute path to project root.
 
         Returns:
-            Every SchedulerStateSnapshot field (13 keys). ``snapshot_at`` is
+            Every SchedulerStateSnapshot field. ``snapshot_at`` is
             null when no orchestrator has written a snapshot yet.
         """
         _normalized = _normalize_project_root(project_root)

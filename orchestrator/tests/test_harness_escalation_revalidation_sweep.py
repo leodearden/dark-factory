@@ -56,6 +56,7 @@ def test_config_defaults_escalation_revalidation() -> None:
     assert config.escalation_revalidation_enabled is True
 
 
+@pytest.mark.usefixtures("code_default_config")
 def test_config_defaults_escalation_revalidation_allowlist() -> None:
     """OrchestratorConfig exposes escalation_revalidation_allowlist (task 2724),
     a frozenset defaulting to the two categories where a terminal subject task

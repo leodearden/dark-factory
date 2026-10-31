@@ -102,8 +102,11 @@ class TestRatioScore:
 
 def _cfg(name, model, role='implementer'):
     from orchestrator.evals.configs import EvalConfig
+    from orchestrator.evals.metrics import RoleUnderTest
 
-    return EvalConfig(name=name, backend='claude', model=model, effort='high', role=role)
+    return EvalConfig(
+        name=name, backend='claude', model=model, effort='high', role=RoleUnderTest(role),
+    )
 
 
 class TestBuildPriceTable:
@@ -248,7 +251,7 @@ def _mresult(
     ``plan_quality`` without the step count it came from is itself the
     self-contradictory shape this task removes.
     """
-    from orchestrator.evals.metrics import EvalMetrics
+    from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
     from orchestrator.evals.results import EvalResult
 
     m = EvalMetrics(
@@ -259,7 +262,9 @@ def _mresult(
         composite_score=quality,          # the PURE quality (compute_composite)
         recovery_score=recovery_score,
         plan_quality=plan_quality,
-        role_under_test=role_under_test,
+        role_under_test=(
+            RoleUnderTest(role_under_test) if role_under_test is not None else None
+        ),
         plan_steps=plan_steps,
         judge_invocations=judge_invocations,
         judge_cost_usd=judge_cost_usd,

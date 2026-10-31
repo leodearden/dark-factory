@@ -193,29 +193,26 @@ both fakes parse argv and discard the unit token outright: the name never
 reaches the factory, only the real subprocess.  That divergence is deliberate;
 do not "fix" it back into line with the others.
 
-WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO, and why the rest are
-deliberately not.  Nine conftests import from this module; the git ceiling and
-the deploy-clock guard are in all nine.  ``_df_no_leaked_drain_processes`` is
-wired only into the ROOT conftest (covering ``tests/``) and
-``scripts/tests/conftest.py`` — exactly the two rootdirs that spawn the drain
-script, and the two the incident came from.  Task 3799's
-``_df_fleet_dir_redirect`` / ``_df_no_synthetic_heartbeats_in_live_fleet``
-started on those same two and gained a THIRD in task 3951:
-``orchestrator/tests/conftest.py``, which is the fleet heartbeat's PRODUCER
-rootdir rather than a drain-script spawner (see the next two paragraphs).  Of
-the seven subproject rootdirs (``cockpit``, ``dashboard``, ``escalation``,
-``fused-memory``, ``orchestrator``, ``sampler``, ``shared``) that run as their
-own pytest sessions from their own venvs, ``orchestrator`` therefore now carries
-the fleet-dir pair and the remaining six carry neither; none carries the
-drain-process guard, so the root conftest does not reach them: no token is
-stamped, and ``leaked_drain_processes`` fails CLOSED on an absent token, so
-those sessions report all-clear unconditionally rather than falsely.  That is a
-real gap, not a proof of safety: ``orchestrator`` was the one to watch, since
-``orchestrator/src/orchestrator/service_restart.py`` is the PRODUCTION caller of
-the drain script and its tests today only assert on config strings.  Widening
-the drain-process wiring is a mechanical edit to those seven files and is out of
-task 3798's locked scope; until then, read a green subproject run as
-"unmeasured", never as "no leak".
+WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO.  Ten conftests
+import from this module; the git ceiling and the deploy-clock guard are in
+all ten.  ``_df_no_leaked_drain_processes`` is armed in nine: bound by
+import in the ROOT conftest (covering ``tests/``) and
+``scripts/tests/conftest.py`` — the two rootdirs that spawn the drain
+script — and armed by :func:`arm_leaked_drain_process_guard` in the seven
+subproject rootdirs (``cockpit``, ``dashboard``, ``escalation``,
+``fused-memory``, ``orchestrator``, ``sampler``, ``shared``), each of which
+runs as its own pytest session and so stamps its own token.  In those nine a
+green run means the teardown sweep ran; see ``_df_no_leaked_drain_processes``
+for its detection window.  The tenth, ``client-feed``, does not arm this
+guard, so no sweep runs there and a green ``client-feed`` run is unmeasured.
+
+Task 3799's ``_df_fleet_dir_redirect`` / ``_df_no_synthetic_heartbeats_in_live_fleet``
+pair is a SEPARATE defence, bound in three rootdirs: root ``tests/``,
+``scripts/tests/`` and ``orchestrator/tests/``.  The last is the fleet
+heartbeat's PRODUCER rootdir rather than a drain-script spawner (see the next
+two paragraphs).  The other six subproject rootdirs above carry neither; that
+gap is still open and is out of this module's scope to close, since none of
+those six subprojects drives the fleet heartbeat producer path.
 
 THE WRITE-SIDE GAP IN THAT RATIONALE, stated explicitly rather than left to be
 rediscovered.  "The rootdirs that spawn the drain script" is the right criterion
@@ -1927,13 +1924,14 @@ def read_proc_state(pid: int, *, _proc_root: Path = Path('/proc')) -> ProcState 
     ``OSError`` and a malformed one ``ValueError``, rather than reading as gone.
     Parsed after the LAST ``') '`` exactly as
     :func:`orchestrator.verify_cancel.read_ppid_map` does, since ``comm`` may
-    hold spaces or parens.  A stdlib port of
+    hold spaces or parens, and decoded with replacement as ``comm`` is arbitrary
+    bytes.  A stdlib port of
     ``shared/src/shared/proc_group.py::read_stat_fields`` (see the module
     docstring's import constraint); ``_proc_root`` is a test seam.
     """
     stat = _proc_root / str(pid) / 'stat'
     try:
-        raw = stat.read_text()
+        raw = stat.read_bytes().decode('utf-8', 'replace')
     except (FileNotFoundError, ProcessLookupError):
         return None
     try:
@@ -2245,6 +2243,25 @@ def _df_no_leaked_drain_processes():
                 with contextlib.suppress(OSError):
                     os.kill(pid, signal.SIGKILL)
             pytest.fail(reason, pytrace=False)
+
+
+_LEAKED_DRAIN_GUARD_PLUGIN = 'df-leaked-drain-process-guard'
+
+
+class _LeakedDrainProcessGuardPlugin:
+    """The plugin :func:`arm_leaked_drain_process_guard` registers: that guard alone."""
+
+    _df_no_leaked_drain_processes = _df_no_leaked_drain_processes
+
+
+def arm_leaked_drain_process_guard(config: pytest.Config) -> None:
+    """Arm :func:`_df_no_leaked_drain_processes` for this session, from ``pytest_configure``.
+
+    Idempotent, because a session that collects several test roots runs each
+    root's ``pytest_configure``.
+    """
+    if not config.pluginmanager.has_plugin(_LEAKED_DRAIN_GUARD_PLUGIN):
+        config.pluginmanager.register(_LeakedDrainProcessGuardPlugin, _LEAKED_DRAIN_GUARD_PLUGIN)
 
 
 # ---------------------------------------------------------------------------

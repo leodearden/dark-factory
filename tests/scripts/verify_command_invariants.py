@@ -54,16 +54,21 @@ module does not have, add a PARAMETER here rather than a variant there —
 THIS MODULE PARSES; IT DOES NOT DECIDE. The five call sites deliberately do not
 agree on semantics, and unifying them would be a behaviour change at four of
 them. So everything that is POLICY stays with its caller and arrives as an
-argument: which flags consume the following token (``_RUFF_FLAGS_TAKING_A_VALUE``
-in the CONTRIBUTING guard, ``_PYTEST_VALUE_FLAGS`` in the skills guard, none in
-the other three), which flag prefixes narrow a target set
+argument: whether to pass a value-flag set, and which one
+(``_RUFF_FLAGS_TAKING_A_VALUE`` in the CONTRIBUTING guard, the shared
+``PYTEST_VALUE_FLAGS`` at two pytest parses, ``test_scripts_module_config.py``'s
+own deliberately narrow set at a third; :func:`positional_targets`' census
+lists every site), which flag prefixes narrow a target set
 (``_NARROWING_FLAGS``), whether flag scanning covers the whole segment or only
 the checker's own post-anchor arguments, and the skills guard's
 ``--directory`` base resolution / ``posixpath.normpath`` / target-EXISTS layer.
-What is shared is only the mechanics of reading a shell command. ``path_anchor``
-is NOT an exception to this: it records how the checker was SPELLED on the
-command line, which is a fact about the text being parsed, not a policy about
-the checker.
+What is shared is only the mechanics of reading a shell command and the facts
+those mechanics need. ``PYTEST_VALUE_FLAGS`` is such a fact — which pytest
+options take a SEPARATE value token is a property of pytest's CLI, so it lives
+here beside the ``PYTEST`` keyword (task 6172) — while PASSING it stays the
+caller's choice. ``path_anchor`` is NOT an exception to this either: it records
+how the checker was SPELLED on the command line, which is a fact about the text
+being parsed, not a policy about the checker.
 
 Importable from ``tests/scripts/test_*.py`` only because
 ``tests/scripts/conftest.py`` puts this directory on ``sys.path`` — pytest's
@@ -101,6 +106,18 @@ from orchestrator import verify_cmd
 RUFF = "ruff check"
 PYRIGHT = "pyright"
 PYTEST = "pytest"
+
+# The pytest options whose value is a SEPARATE token, so a parser handed this set
+# does not read that value as a target. A fact about pytest's CLI, not a policy;
+# callers still choose whether to pass it. The ``--flag=value`` spelling needs no
+# entry. Keep it CLOSED to value-taking flags: a boolean listed here would
+# swallow the real target that follows it.
+PYTEST_VALUE_FLAGS = frozenset({
+    "-c", "-k", "-m", "-n", "-o", "-p", "-r", "-W",
+    "--basetemp", "--color", "--deselect", "--dist", "--durations", "--ignore",
+    "--ignore-glob", "--import-mode", "--junitxml", "--log-level", "--maxfail",
+    "--rootdir", "--tb", "--timeout",
+})
 
 
 def _where(label: str | None, fallback: str) -> str:
@@ -330,9 +347,9 @@ def positional_targets(
       * ``test_contributing_lint_command_drift.py::_ruff_targets`` —
         ``_RUFF_FLAGS_TAKING_A_VALUE``; each EXISTS.
       * ``test_skills_module_config_decision.py::_pytest_collected_dirs`` —
-        its own ``_PYTEST_VALUE_FLAGS``; each EXISTS.
-      * ``test_fallback_verify_config.py::_fleet_pytest_suite_names`` — its
-        own ``_PYTEST_VALUE_FLAGS``; the suite keys EQUAL its measured tables.
+        ``PYTEST_VALUE_FLAGS``; each EXISTS.
+      * ``test_fallback_verify_config.py::_fleet_pytest_suite_names`` —
+        ``PYTEST_VALUE_FLAGS``; the suite keys EQUAL its measured tables.
       * ``test_member_scripts_type_gate.py``'s one inline call —
         ``_PYRIGHT_VALUE_FLAGS``; COVERAGE via :func:`covers`.
 

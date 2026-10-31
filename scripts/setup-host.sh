@@ -154,7 +154,10 @@ info "Starting backing stores (FalkorDB + Qdrant)"
 mkdir -p "$REPO_ROOT/fused-memory/data/falkordb"
 mkdir -p "$REPO_ROOT/fused-memory/data/qdrant"
 
-docker compose -f "$COMPOSE_FILE" up -d falkordb qdrant
+# Through the AOF gate, never a bare compose-up: on a host that already has a
+# falkordb container, a compose-up recreates it onto whatever AOF is on disk
+# (task 6330). The gate creates it on a fresh host and refuses over stale data.
+python3 "$REPO_ROOT/scripts/falkordb_aof_gate.py" --compose-file "$COMPOSE_FILE"
 
 # Wait for healthy
 for i in $(seq 1 30); do
@@ -178,14 +181,13 @@ for i in $(seq 1 30); do
 done
 
 # ---------------------------------------------------------------------------
-# 3. Python subprojects — uv sync (dependency order)
+# 3. Python workspace — uv sync --all-packages
 # ---------------------------------------------------------------------------
-info "Syncing Python subprojects"
+info "Syncing Python workspace (all members)"
 
-for proj in shared escalation fused-memory orchestrator dashboard; do
-  (cd "$REPO_ROOT/$proj" && uv sync --quiet)
-  ok "$proj"
-done
+# A member-scoped sync is exact and prunes the other members from the shared .venv; see scripts/sync-orchestrator-env.sh.
+(cd "$REPO_ROOT" && uv sync --all-packages --quiet)
+ok "Python workspace synced (every member, client-feed included)"
 
 # ---------------------------------------------------------------------------
 # 4. Systemd user unit for fused-memory
@@ -1108,6 +1110,26 @@ else
   warn "Dashboard watchdog units installed; the dashboard SERVICE unit was NOT"
   warn "  rendered — see the FAIL lines above. Whatever copy this host already"
   warn "  had is untouched and still enabled; a bare host has none."
+fi
+
+# ---------------------------------------------------------------------------
+# 7a. Client-feed publisher unit template (rendered, never enabled)
+# ---------------------------------------------------------------------------
+info "Installing the client-feed publisher unit template"
+
+# One instance per client project is enabled by hand: OPERATIONS.md §"Client feed".
+_cf_render_script="$REPO_ROOT/scripts/render_systemd_unit.py"
+if python3 "$_cf_render_script" \
+     --unit      client-feed \
+     --template  "$REPO_ROOT/scripts/client-feed.service.template" \
+     --repo-root "$REPO_ROOT" \
+     --uv-path   "$UV_PATH" \
+     --output    "$UNIT_DIR/client-feed@.service"; then
+  systemctl --user daemon-reload
+  ok "client-feed@.service installed; no instance enabled (one per client project, by hand: OPERATIONS.md §\"Client feed\")"
+else
+  fail "client-feed@.service render FAILED — see the [client_feed_unit_render] report above."
+  fail "  Any installed $UNIT_DIR/client-feed@.service was left untouched."
 fi
 
 # ---------------------------------------------------------------------------

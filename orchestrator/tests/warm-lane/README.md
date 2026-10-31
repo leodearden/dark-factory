@@ -52,10 +52,8 @@ the ported block diverges.
 **Task 6053** ported reify `a90327f927` (2026-09-25), reify's deflake that adds
 `dd conv=fsync` to `_seed_divergent_lane`, and that commit is the only change to
 the file since the `62c0f188c5` port anchor. The copy therefore differs from
-reify@`a90327f927` only by the port's existing edits: Delta 1, plus the two
-header comments the port rewrote (the file's own path, and a
-`Driven by … (PORTED_TESTS)` line in place of reify's `run_all.sh` one). No new
-delta is introduced.
+reify@`a90327f927` only by Deltas 1 and 8, the edits every port carries; the
+re-sync introduced no delta of its own.
 
 `test_warm_lane_gc.sh` has since grown DARK-FACTORY-NATIVE coverage that has no
 reify counterpart, added by **task 3075** (PRD leaf γ) — the line count and SHA
@@ -280,6 +278,40 @@ things about it are not, and both are prose:
    and the measured corpus had 81 of them against zero contrived K6-shaped
    flips. K6 pins the direction of the cost as a KNOWN CONSEQUENCE, not a
    goal.
+
+### Delta 8 — header comments: own path, subject script, driver line (all eight)
+
+Three header comment lines are re-pointed at their dark-factory homes. No
+executable line changes.
+
+| reify | here | files |
+|---|---|---|
+| `# tests/infra/<name>` | `# orchestrator/tests/warm-lane/<name>` | all eight |
+| `# Hermetic tests for scripts/<x>.sh` | `# Hermetic tests for orchestrator/scripts/warm-lane/<x>.sh` | seven |
+| `# Auto-discovered by tests/infra/run_all.sh via the test_*.sh glob.` | `# Driven by orchestrator/tests/test_warm_lane_bash_suite.py (PORTED_TESTS).` | all eight |
+
+Any task or PRD reference trailing the subject line is verbatim.
+`test_warm_lane_sizing_lifecycle.sh` has no subject line: its header opens
+`END-TO-END INTEGRATION GATE`. `test_helpers.sh` carries none of the three; its
+header rewrite is Delta 2.
+
+The port left every other reify path in a comment or in output **verbatim**:
+the `# shellcheck source=tests/infra/test_helpers.sh` directive in all eight,
+the seven `=== scripts/<x>.sh hermetic tests (task N) ===` banners, the
+`scripts/warm-lane-*.sh` names in `test_warm_lane_sizing_lifecycle.sh`'s
+capture-variable list, and the `tests/infra/…` and `scripts/…`
+cross-references in headers and bodies. They are not drift. Re-pointing them
+on a re-sync would only grow every file's diff against reify. A later
+dark-factory-native edit may still reword such a comment for its own reasons,
+and that hunk belongs to the edit, not to the port: commit `56a78879c7`
+rewrote `test_warm_lane_gc_sweep.sh`'s G6 comment, dropping its
+`scripts/warm-lane-gc-sweep.sh:` reference.
+
+The remaining header-block differences belong to other entries. The
+`# shellcheck source=…/lib_warm_lane_paths.sh` directive rides with Delta 1's
+`source` line, the excised block-list entries are Deltas 3, 5 and 6, and the
+K1–K6 index line is Delta 7. Header entries that describe dark-factory-native
+additions travel with those additions.
 
 ### Not a delta — α's provision Deltas 1–2 needed no test-side change
 

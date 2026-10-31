@@ -14,6 +14,7 @@ from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claima
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.memory_metadata import normalize_supersedes
+from fused_memory.middleware.metadata_dict import raw_metadata_dict
 from fused_memory.middleware.task_interceptor import (
     _extract_metadata_files,
     _missing_files,
@@ -2618,18 +2619,12 @@ def _unblock_veto_reason(dependent: dict) -> str | None:
     BEFORE the escalation-store I/O, exactly as that sibling sweep orders
     them: a park that can be recognized for free must never cost a scan.
 
-    Reads metadata defensively: a JSON-string metadata value (as stored by
-    some callers) is tolerated the same way the rest of this module treats
-    task metadata, and anything else unparseable is treated as empty.
+    Reads metadata through
+    :func:`fused_memory.middleware.metadata_dict.raw_metadata_dict`: a
+    JSON-string value (as stored by some callers) is read like a dict, and
+    unreadable metadata is logged and read as empty, so it raises no veto.
     """
-    metadata = dependent.get('metadata')
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (TypeError, ValueError):
-            metadata = {}
-    if not isinstance(metadata, dict):
-        metadata = {}
+    metadata = raw_metadata_dict(dependent.get('metadata'), source='targeted._unblock_veto_reason')
 
     if metadata.get('parent_cancelled') or metadata.get('needs_recheck_against_main'):
         return 'parent_cancelled'

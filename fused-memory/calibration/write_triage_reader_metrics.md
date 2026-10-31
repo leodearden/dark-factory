@@ -3,7 +3,8 @@
 This document defines the metrics that judge write triage by what a later
 reader of the corpus meets, and the procedure that measures them for task
 3131's release. Raters answer the questions in
-`write_triage_rater_brief_v2.md` (rater brief v2.1). `fused-memory/scripts/write_triage_reader_rubric.py`
+`write_triage_rater_brief_v2.md` (rater brief v2.2 since task 7160; v2.1 is commit
+`c7b682bcb9`). `fused-memory/scripts/write_triage_reader_rubric.py`
 turns their answers into cells, and `fused-memory/scripts/score_write_triage_reader.py`
 turns cells into the figures below. The scorer reports and never gates: every
 gate on this page is applied by a person reading its report.
@@ -93,7 +94,8 @@ left out.
   A rater whose line breaks the contract, or whose quote or span is not found,
   is asked the item again (the `reask` subcommand of
   `fused-memory/scripts/build_write_triage_v2_soak_baseline.py`, via
-  `::rating_problems`), and the later round's line supersedes the earlier one.
+  `fused-memory/scripts/write_triage_rating_rounds.py::rating_problems`), and
+  the later round's line supersedes the earlier one.
   `third` and `assemble` refuse while any such line is left.
 - Agreement is Cohen's kappa per binary between the primary and the second
   rater, over consumed answers only. An answer is consumed when both raters
@@ -132,6 +134,15 @@ left out.
   its `unreached_follow_ups`). A follow-up the raters' own answers leave open
   is not UNCLEAR: it goes to a third round. An item whose deciding binary is
   UNCLEAR is left out of every rate and counted.
+- The brief is v2.2 from task 7160 (task 7703, commit `169dcb2ef0`). Only the
+  LOSS question and anchors 5 to 8 changed from v2.1, whose text is commit
+  `c7b682bcb9`. When a brief revision changes a question, every pair whose
+  derivation reads that question is re-rated by fresh primary and second
+  raters, and earlier third votes on those pairs are retired
+  (`fused-memory/scripts/write_triage_rating_rounds.py::rerate_round`).
+  `write_triage_eval_set_v2.md` §6 records why v2.2 was written and what it
+  moved. Verdict rows do not record the brief, so the scorer takes the label
+  from its caller (`score_write_triage_reader.py --rubric`).
 
 ## 5. Reconstructing write-time state
 
@@ -209,13 +220,13 @@ record marked). The window opens when the last of them is live, runs at least
    their nearest earlier records for M3; and the M6 census of children whose
    parent was edited after attach. Record each stratum's population in a
    strata file.
-3. Build shards as `fused-memory/scripts/build_write_triage_v2_soak_baseline.py`
-   does: the brief verbatim, texts capped at 4,000 characters, no digest,
+3. Build shards with `fused-memory/scripts/write_triage_rating_rounds.py`, as
+   the soak builder does: the brief verbatim, texts capped at 4,000 characters, no digest,
    opaque item ids, a separate key, and a record of the texts each rater saw.
 4. Rate per §4: two blind Opus raters on every item. Validate every line, and
    re-ask each rater whose line breaks the row contract or whose evidence is
    not found until none is left. Then check kappa over consumed answers.
-5. Score with `score_write_triage_reader.py --strata`. For the gaps a refusal
+5. Score with `score_write_triage_reader.py --strata --rubric <brief label>`. For the gaps a refusal
    names, run a third round with a new rater, and repeat until the scorer
    accepts the corpus.
 6. Read the release condition off the report and the window's logs.
@@ -233,8 +244,19 @@ record marked). The window opens when the last of them is live, runs at least
 **Report-only:** M2 per outcome, M4 against 0.20, M5, M6, and harm per write
 under the provisional weights.
 
+**Which brief: v2.2 (Leo, 2026-10-30).** The post-fix measurement rates under
+rater brief v2.2, the file's default, and is scored with `--rubric v2.2`. This
+release condition was first ratified under v2.1: M1 <= 0.15, and M3 population
+<= 0.35 (esc-7301-1, recorded on task 3131), were set against the v2.1 soak
+baseline (§8). v2.2 narrows LOSS, which can only lower the figures that rest on
+it (§8). So before the release condition is read, task 7812 re-rates the soak's
+LOSS-consuming pairs under v2.2 and Leo re-confirms the bounds in gate 7813, on
+which task 3131 depends. Those bounds stand until that gate rules. The v2.2
+soak figures before that gate are §8, "Under brief v2.2 (task 7812)".
+
 **After the embedder cutover (6807)** re-run the whole measurement: the band
 edges and every cosine-derived threshold move with the embedder.
+The labelled pair set for it is `write_triage_eval_set_v2.md`.
 
 ## 8. Soak baseline
 
@@ -250,6 +272,14 @@ otherwise. Rates and kappas are quoted to four places as the JSON gives them.
 Every floor binary meets the kappa floor, and no v1 row that failed the
 derivation check fixes an answer (both below), so this baseline meets §4's
 conditions for scoring.
+
+These figures are rated under brief v2.1 (commit `c7b682bcb9`), not the v2.2
+the brief file now holds. M1 hidden, M1 as amended, M2 restated, and the
+hidden_detail and duplicate_clutter harm all rest partly on LOSS. v2.2
+narrowed LOSS to needed detail (`write_triage_eval_set_v2.md` §6), so these
+figures do not compare with a v2.2-rated measurement until the soak's
+LOSS-consuming pairs are re-rated under v2.2. Task 7812 re-rated them, and the
+v2.2 figures are in "Under brief v2.2 (task 7812)" below.
 
 ### Provenance
 
@@ -416,6 +446,111 @@ if its judge contests at least 22 of the 24 band CONFLICT writes. A digest or
 render change for the detail hits alone cannot clear it: with every CONFLICT
 write still hidden, M1 would be 24 / 91 = 0.2637. These are sample counts; the
 population rate is not split here.
+
+### Under brief v2.2 (task 7812)
+
+The same soak, with every pair whose derivation reads LOSS re-rated under brief
+v2.2, the committed `write_triage_rater_brief_v2.md`. The report is
+`write_triage_v2_soak_baseline_v2_2.json` (rendered as
+`write_triage_v2_soak_baseline_v2_2.md`), the scorer's output with
+`--rubric v2.2` over `write_triage_v2_soak_{items.jsonl,strata.json}` and
+`write_triage_v2_soak_verdicts_v2_2.jsonl`. The derivation is
+`write_triage_v2_soak_derivation_v2_2.json`. The v2.1 files above are
+unchanged. Figures are quoted from the two v2.2 JSON files unless marked
+otherwise, and `fused-memory/tests/test_write_triage_v2_soak_v2_2_committed.py`
+pins that the report re-scores from git alone.
+
+**Provenance.**
+
+- **The rounds**: the v2.1 scratch above, copied verbatim into
+  `fused-memory/calibration/write_triage_v2_soak_rounds/`, where its key and
+  every ratings file are committed. Each of its 39 shards was backfilled with
+  `brief_sha256` = `write_triage_rating_rounds.py::BRIEF_V2_1_SHA256` (brief
+  v2.1). Re-assembling the copy reproduced the v2.1 corpus byte for byte (not
+  in the JSON).
+- **The re-rate** (`rerates`): version v2.2, round 1, 85 pairs, brief sha256
+  `7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1`. The pairs
+  are `write_triage_rating_rounds.py::pairs_reading_loss` over the v2.1
+  corpus's current derivations. They sit in `rerate_01_primary_00` to `_02`
+  and `rerate_01_second_00` to `_02` (29, 28 and 28 items each), each read by
+  a fresh blind Opus agent.
+- **Retired third raters** (the key's `retires_third_raters`, not in the
+  JSON): `opus-third-00`, `-01` and `-02`, on those 85 pairs only.
+- **Re-asks and third rounds**: `reasked` is 0. One new third round,
+  `third_03` (`opus-third-03`, 6 pairs, under v2.2); the next `third` sharded
+  nothing.
+
+**Rater agreement.** Every floor binary still meets the floor, so no
+escalation was filed.
+
+| Binary | n consumed | Kappa v2.1 | Kappa v2.2 | Floor met under v2.2 |
+|---|---|---|---|---|
+| home | 223 | 0.9462 | 0.9371 | yes |
+| conflict | 423 | 0.8267 | 0.8372 | yes |
+| loss | 81 | 0.9212 | 0.8652 | yes |
+
+**Side by side.** Sample rate with its Wilson 95% interval, then population
+rate with its stratified bootstrap 95% interval.
+
+| Figure | v2.1 sample | v2.1 population | v2.2 sample | v2.2 population |
+|---|---|---|---|---|
+| M1 hidden in band | 34 / 91 = 0.3736 [0.2812, 0.4762] | 0.3744 [0.2766, 0.4752] | 28 / 91 = 0.3077 [0.2223, 0.4087] | 0.3084 [0.2149, 0.4054] |
+| M1 as amended | 35 / 91 = 0.3846 [0.2913, 0.4873] | 0.3833 [0.2857, 0.4835] | 29 / 91 = 0.3187 [0.232, 0.4201] | 0.3172 [0.2225, 0.4157] |
+| M2 restated correct | 23 / 99 = 0.2323 [0.1601, 0.3246] | 0.2323 [0.1515, 0.3163] | 29 / 99 = 0.2929 [0.2124, 0.389] | 0.2929 [0.202, 0.3878] |
+| M3 hidden corrections | 39 / 371 = 0.1051 [0.0779, 0.1405] | 0.379 [0.2686, 0.4673] | 39 / 371 = 0.1051 [0.0779, 0.1405] | 0.379 [0.2686, 0.4673] |
+| Harm per write, triage / status quo | 0.9553 / 0.8525 | 0.9511 / 0.4662 | 0.9478 / 0.8674 | 0.9476 / 0.5061 |
+| Harm delta per write | +0.1028 [−0.0268, 0.2377] | +0.4849 [0.396, 0.5742] | +0.0805 [−0.0507, 0.2146] | +0.4415 [0.3421, 0.5397] |
+
+| Cell (provisional weight) | v2.1 count | v2.1 weighted | v2.2 count | v2.2 weighted |
+|---|---|---|---|---|
+| hidden_detail, triage (1) | 13 | 13 | 7 | 7 |
+| duplicate_clutter, status quo (0.5) | 31 | 15.5 | 51 | 25.5 |
+
+The re-rate moved LOSS only downward. On the 85 pairs, LOSS resolves YES
+under v2.1 and NO under v2.2 on 20, YES under both on 31, NO under both on
+31, and UNCLEAR under both on 2. On the last pair HOME no longer resolves as
+it did, so LOSS is not asked. Besides hidden_detail, the only triage cell that
+moves is wrong_home, from 233 to 234 (these transitions are counted from the
+two committed verdict files, not in the JSON).
+
+**M3 did not move**: sample, population and every ending are the same. No
+re-rated pair's CONFLICT resolves differently under v2.2 (counted from the
+committed verdicts, not in the JSON).
+
+**The counterfactual under v2.2**, recomputed as above with the scorer's own
+derivation over the v2.2 corpus (not in the JSON). Let n be M1's n (91), and
+g = floor(0.15 · n) = 13, the most hidden writes the gate allows. Let C be the
+band CONFLICT hits in M1 as amended, and D the HOME-and-LOSS hits whose DIGEST
+is NO. Under v2.2, C = 24, as under v2.1, including the already-contested
+`998b9d5d-a30a-4832-99de-6978736dfcf8`. D = 5, down from 11, and every one of
+the 5 has DIGEST NO. F3′ alone must contest x of the C writes:
+
+- without task 7518's render, x >= C + D − g = 24 + 5 − 13 = 16 of 24 (v2.1:
+  22);
+- with 7518's render, which makes the detail hits visible to a reader of the
+  record, x >= C − g = 11 of 24 (v2.1: 11, since C did not move).
+
+A render change alone still cannot clear the gate. With every CONFLICT write
+hidden, M1 would be 24 / 91 = 0.2637.
+
+**Caveats.**
+
+- The held v1 rows are decided on the round-0 brief's lines
+  (`check.brief_sha256` is the v2.1 sha), so `held_rows` and the derived rows
+  are the v2.1 baseline's. The report-only `effective_lines_check`, over the
+  mixed v2.1 and v2.2 lines, would also hold no_new_detail_loss_no: 26 / 28
+  = 0.929, against 25 / 28 = 0.893 on the v2.1 lines. Held, that row would fix
+  LOSS NO on its items wherever HOME is YES and CONFLICT is NO, in place of
+  the raters' answers.
+- Only current-basis pairs were re-rated, and attach-time pairs stay rated
+  under v2.1. 4 of the 85 re-rated pairs have an attach-time pair, and 2 of
+  those read LOSS at attach time (counted from the committed verdicts, not in
+  the JSON). There M6 would compare a v2.2 current answer with a v2.1
+  attach-time answer, so M6 is not compared between the briefs (11 of 20
+  drift in both reports).
+- HOME and CONFLICT were asked again, fresh, on the re-rated pairs, since a
+  rater answers the whole item. Their v2.2 answers replace v2.1's there:
+  CONFLICT resolves as before on all 85, and HOME on 84.
 
 ### Caveats
 

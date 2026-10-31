@@ -24,15 +24,20 @@ Before starting, verify these are in place. If anything is missing, ask the user
 
 Terminal discovery for spawned `/unblock` sessions is handled lazily by the `/spawn` skill — no setup is required here.
 
-## Launching this watcher (default lane: tmux)
+## Launching this watcher
 
-This is a long-running loop session (PRD `plans/fleet-cockpit-prd.md` §3 fork 1) — launch it in
-the crash-survivable, reattachable **tmux lane** by default: spawn with `CLAUDE_SPAWN_BACKEND=tmux`
-(see `skills/spawn/spawn-claude.sh`'s header) so the session gets a `display.kind=tmux`
-session-registry record and a `tmux attach`-reattachable window whose record persists across a
-crash. Interactive one-off skills this watcher spawns (e.g. `/unblock` sessions) stay as ordinary
-WM terminal windows, unchanged. tmux stays the default; running in the foreground instead is a
-self-operation, decided without asking (see "Self-operations need no permission").
+This is a long-running loop session (PRD `plans/fleet-cockpit-prd.md` §3 fork 1). The operator runs
+it as a **T3 Code thread** — a hosted session, so no `CLAUDE_SPAWN_BACKEND` is needed. Launched from
+a plain terminal instead, use the crash-survivable, reattachable **tmux lane**: spawn with
+`CLAUDE_SPAWN_BACKEND=tmux` (see `skills/spawn/spawn-claude.sh`'s header) so the session gets a
+`display.kind=tmux` session-registry record and a `tmux attach`-reattachable window whose record
+persists across a crash. Interactive one-off skills this watcher spawns (e.g. `/unblock` sessions)
+follow the spawner's lane under `CLAUDE_SPAWN_BACKEND=auto`: from a T3-hosted watcher they appear as
+T3 threads in the project's sidebar, from a terminal-launched one as ordinary WM terminal windows.
+Joining a spawn is the same on either lane — read its `result.md` (see "Joining a completed
+spawn: read `result.md`, don't explore"); on the t3 lane the spawn script's background task ends on
+the result file or an archived thread, never on a process exit. Running in the foreground instead
+is a self-operation, decided without asking (see "Self-operations need no permission").
 
 ## Claiming the Watcher Lease (single-owner-per-role)
 
@@ -81,12 +86,6 @@ the slug as `<--name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID`; without a usable
 stand-down, and once its heartbeat is past the TTL the reaper reclaims it. The per-cycle
 `lease-heartbeat` is the **only** liveness signal a hosted holder has
 (`orchestrator/src/orchestrator/session_registry.py::resolve_session_identity`).
-
-**One-time rollout note (task 6916).** A lease a hosted session claimed *before* this change carries
-the bare `<--name>-$CLAUDE_PID` slug, so that session's re-derived heartbeat and release get
-`result=refused` (naming the holder's pid `alive`) — nothing is damaged. The lease becomes
-reclaimable once its heartbeat is past the 2h TTL; to skip the wait, release it with its original
-`--slug` (`lease-show` prints it as `holder_slug`) and claim again.
 
 If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** with a
 message naming both, rather than silently drifting to a slug your own later heartbeat would fail to
@@ -147,10 +146,7 @@ Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-reada
   Do **not** force-release it on this evidence alone — `holder_liveness` is a single-signal
   diagnostic, and a dead-*looking* holder that is merely quiet is the duplicate-spawn incident. A
   `holder_record=exited` or `absent` beside it is corroboration, not a licence: **never
-  auto-steal**. (Task 3994 withdrew an earlier record cross-check because a lease slug is a
-  claimant-chosen ownership token, not a record key; `holder_record=` instead reads the separate
-  `record_slug` the lease body now carries.) Reclaiming is the human's call, or the reaper's once
-  the TTL expires.
+  auto-steal**. Reclaiming is the human's call, or the reaper's once the TTL expires.
 
 **Reading the contention message.** It reports two INDEPENDENT axes — whether the holder's *pid* is
 running, and how fresh its *heartbeat* is — and then states the decision they imply:
@@ -231,9 +227,10 @@ The handover lives at `<project_root>/data/escalations/l2-handover.md`, one per 
 beside the queue it describes. It is runtime state like that queue: never committed (dark-factory
 gitignores `/data/`), and overwritten by each stop. The watcher reacts only to `esc-*.json`, so
 writing it never fires a wake. `scripts/sitting/ownership.py::HANDOVER_CANDIDATES` holds the path
-and its fallback. The sitting preparer reads only dark-factory's own handover, as ownership
-`mentions` evidence (`scripts/sitting/prepare_sitting.py::handover_file`). Another project's
-handover reaches the next watcher of that project, never the cross-project sitting.
+and its fallback. The sitting preparer reads each item's own project's handover, resolved under
+that project's root, as ownership `mentions` evidence (`scripts/sitting/prepare_sitting.py::read_sources`).
+A project with no handover reads as `unavailable`, never as another project's.
+`--handover PROJECT=PATH` substitutes one project's file.
 
 **As of writing.** A handover is written from session knowledge, without re-probing. Every figure
 in it is as of the time it was written and must be re-verified before anyone acts on it.
@@ -337,8 +334,8 @@ of the self-execute tier, so report them the way that tier says.
   timeout contract in "Starting the watcher".
 - Releasing the lease on an announced reboot, which is a stop (see "Stopping").
 - Writing and reading handovers.
-- Running in the tmux lane or in the foreground of the terminal you were started in (see
-  "Launching this watcher (default lane: tmux)").
+- Running as a T3 thread, in the tmux lane, or in the foreground of the terminal you were started in
+  (see "Launching this watcher").
 
 Still forbidden, and not a self-operation: forcing a lease takeover on a pid probe, whether by
 `--force` or by treating `holder_liveness=orphaned` as yours. "Claiming the Watcher Lease
@@ -387,7 +384,7 @@ drops the heavy free-text/cluster fields (`detail`, `options`, `train_state`, �
 docstring carries the authoritative list — read it there rather than trusting a copy in this
 file, which is how this paragraph went stale before.
 
-**`root_cause` and `member_ids` ARE returned** (task 3997) — they were dropped until then.
+**`root_cause` and `member_ids` ARE returned.**
 Operationally that is what makes a drain self-sufficient: you can rebuild the already-promoted
 set as {`root_cause` of the pending L2s} ∪ {their `member_ids`} from the drain ALONE, so a
 rotation that inherits no session memory does not re-promote a cluster its predecessor already
@@ -490,12 +487,8 @@ substring rather than anchoring at the start of the line.
 **Bash-tool timeout contract:** the wrapper blocks for up to `--timeout` seconds per slice before
 returning, and **every** call — background *and* foreground — must carry an explicit Bash-tool
 `timeout` parameter sized to at least `(--timeout + 60s) × 1000` ms — e.g. `timeout: 3660000` for
-`--timeout 3600`. `run_in_background: true` does **not** exempt a call from the harness timeout:
-measured 2026-08-10, background arms launched with no `timeout` parameter were killed after ~116s
-(≈ the 120000ms Bash default) against a configured `--timeout 540` slice, so the slice length was
-never the constraint; re-arming the identical command with `timeout: 3660000` survived 6m32s and
-exited cleanly with `WATCHER_REARM_OUTCOME: FIRED exit=0`. With that parameter passed, use the long
-canonical slice: `--timeout 3600` yields at most one heartbeat wake per hour (`CEILING`) while a
+`--timeout 3600`. `run_in_background: true` does **not** exempt a call from the harness timeout.
+With that parameter passed, use the long canonical slice: `--timeout 3600` yields at most one heartbeat wake per hour (`CEILING`) while a
 real L2 escalation still fires instantly via inotify. A short slice buys no protection — the old
 `--timeout 540` merely forced a wake-notify-rearm turn every 9 minutes. A slice that long requires
 `BASH_MAX_TIMEOUT_MS` ≥ that value in the settings env (dark-factory onboarding provisions it —
@@ -585,11 +578,9 @@ Every decision must respect this order:
 - If the MCP is down, ask the human for help. MCP task mutations trigger reconciliation that maintains memory quality; bypassing it silently degrades the system.
 
 **tasks.db corruption detection:**
-Task state lives in fused-memory's SQLite at `<project_root>/.taskmaster/tasks/tasks.db` (the older on-disk
-`tasks.json` was superseded by SQLite and later deleted, so a doc naming it is stale). **Do not use the
-file's size as the signal** — it was a usable proxy for the JSON and is not one for SQLite: the file does
-not shrink when rows are deleted (freed pages go on the freelist), so mass task loss can show *no* size
-change at all, while a routine `VACUUM` or WAL checkpoint changes the size with nothing wrong. Use these
+Task state lives in fused-memory's SQLite at `<project_root>/.taskmaster/tasks/tasks.db`. **Do not use
+the file's size as the signal** — the file does not shrink when rows are deleted (freed pages go on the
+freelist), so mass task loss can show *no* size change at all, while a routine `VACUUM` or WAL checkpoint changes the size with nothing wrong. Use these
 two instead:
 
 - **Task count, cycle over cycle.** `mcp__fused-memory__get_statuses(project_root=<project_root>, page_size=1)`
@@ -600,8 +591,7 @@ two instead:
   contend with the live orchestrator, per the hard constraint above:
   `sqlite3.connect('file:<project_root>/.taskmaster/tasks/tasks.db?mode=ro', uri=True)`. Anything other
   than a single `ok` row is corruption. `SELECT COUNT(*) FROM tasks` on that same connection is the
-  fallback count when the MCP is down — measured 2026-08-30 against the live df store, it agrees exactly
-  with `pagination['total']` (both 4907), and the whole check runs in ~0.2s.
+  fallback count when the MCP is down.
 
 If the count drops with no cause you can name (a `remove_task` you ran, an operator prune), if
 `integrity_check` returns anything but `ok`, or if task IDs are mismatched/duplicated or tasks have
@@ -700,6 +690,41 @@ carries the brief. Check "Always ask — keyed on record content" below first: i
     names has been recovered from `data/escalations/archive/<date>/` and routed: appended to a
     `pending` owner task (line 5), or filed to the owner task of its class. The resolution names
     where each note went (Leo, 2026-10-22, on scoping_intake's esc-__stale_l0_strand_sweep__-6).
+11. Cancelling a task auto-filed by the completion-claim gate (`spawned_from: unverified-claim-<n>`)
+    whose flagged claim is TRUE, with `resolve_issue(action='abandon')` on its L2. Verify yourself
+    against the authority in the project the claim names: the cited task's status and
+    `done_provenance`, and `git merge-base --is-ancestor <commit> main` in that project's repo. The
+    task must have no dependents, no branch commits (`git rev-list --count main..task/<id>` is 0)
+    and no pin. A FALSE claim needs corpus repair, so it still goes to Leo (Leo, 2026-10-29,
+    solar_challenge_platform esc-1558-2; precedent esc-1185-2).
+12. Marking a task done `found_on_main` when another task's commit already delivered its whole
+    outcome, then `close_only` on its L2. Verify yourself: the delivering commit is an ancestor of
+    main, and every item of the task's ask is present on main (read the file, and grep for the text
+    it says to remove). Pass `done_provenance` naming the delivering task and commit. The task must
+    have no branch commits and no pin. Any item not on main sends it to Leo (Leo, 2026-10-29,
+    solar_challenge_platform esc-1556-2; precedents 1470, 1058, 683).
+13. Repairing a stale delivered check behind a `dependency_capability` record, then `resume` on
+    every record waiting on it. This is case 1 of that category's handler: the capability is on
+    main, and the check fails only because later landed work reshaped the code it greps (a moved
+    file, a renamed idiom, a refactor). Edit only the owner's sites: its `delivered_checks`, re-sent
+    whole, and its sidecar on main when `on_main` is `declares` (plus the `.md` twin if that quotes
+    the old form), as a docs-only commit. Verify yourself before the resume: the new check passes at
+    `main`, the owner's other checks still pass, and the new form still states what the check meant.
+    A capability missing from main is case 2 and still goes to Leo (Leo, 2026-10-30,
+    solar_challenge esc-224-3 and its six twins: "Always fix this sort of check breakage").
+14. Curating a memory-only follow-up yourself when it was routed to the TDD pipeline (its architect
+    reports it unactionable for want of `update_memory` or `consolidate_memories`), then marking it
+    done `found_on_main` at main's tip, with a note naming the run and the memory ids. Verify
+    yourself first: the trigger the task waits on is on main, and every fact the new text states
+    holds there (read the code it cites, at the lines it cites). Amend in place, or mark records
+    `x_superseded_by` a canonical, and read each one back. Use a `curator-` agent id and a named
+    run id. Never delete a memory: deletion stays on the always-ask list below. A trigger not yet
+    on main means the task is a gate: add the dependency on the code task and `resume`, so it fires
+    again later (Leo, 2026-10-31, solar_challenge_platform esc-1538-2; precedents 1490, 1503, 1498,
+    1545 and 1567).
+
+Lines 11, 12 and 14 are exceptions to the scope-change class below. Cancelling a task WITH dependents
+still goes to Leo.
 
 #### Always ask — keyed on record content
 
@@ -728,7 +753,32 @@ it, and the gate slug where one corresponds:
 - A record whose `pin_declared_by` field is set, that is under a Leo HOLD, or that names Leo's
   other session or his personal backlog.
 - Priority, pin-queue placement, cross-cluster dependency sequencing.
-- Scope changes: acceptance criteria, cancel-and-refile or re-scope.
+- Scope changes: acceptance criteria, cancel-and-refile or re-scope. **Except** cancelling a task
+  that a PRD decision Leo ruled has superseded (Leo, 2026-10-22; ratified 2026-10-26), which is
+  allowed and reported under **Done**. All four must hold, each checked by you, never taken from
+  the record:
+  1. **The PRD decision is one Leo ruled.** The PRD says so, the program doc records it
+     `ruled_by: human`, or a task's `x_ruling` carries it. A lead ruling, an architect's reading
+     or a `triage_note` does not qualify.
+  2. **The superseding task exists**, in any status except `cancelled`.
+  3. **The superseded task's full scope is covered.** Each of its items is done on main, rendered
+     moot by the decision, or included in the superseding task's description or plan. One
+     uncovered item fails this check: that item goes to Leo, or into the superseding task's
+     `details` while that task is `pending` (self-execute item 5).
+  4. **The superseded task's branch has no commits**: `git rev-list --count main..task/<id>` is 0.
+
+  Then, in order:
+  1. Repoint every task that depends on the superseded task onto the superseding task
+     (`remove_dependency`, then `add_dependency`), and confirm no dependents remain, so the cancel
+     never trips the irreversible-deletion class above.
+  2. Stamp `x_superseded_by: [<id>]` and an `x_ruling` naming the decision with its file:line,
+     using `metadata_mode='merge'`.
+  3. Cancel the task. When an L2 holds it, cancel it with `resolve_issue(action='abandon')`.
+  4. Close its streak alarm.
+
+  Exemplars: 603 (S7 decision 4), 856 (lane-harness decision 9) and 858 (D-S20-8), each ruled
+  cancel by Leo, 2026-10-20..22. A deliverable that landed under another task's commit is not this
+  case: it is marked done `found_on_main` with `delivered_checks` (683, 1058).
 
 Choosing Fable for an H3 investigation seat is your call. The "fable run" key matches a record that
 asks to launch one.
@@ -782,7 +832,7 @@ ready to discuss.
   conversation un-interleaved and out of this session's context, which is reserved for system
   supervision. The category handlers' interactive `/unblock` spawns below are this case.
 - If it ends in a single report and a single ruling, use a sub-agent (the `Agent` tool) and deliver
-  its result into this session. That means fewer terminals; Leo has run more than 15 at once.
+  its result into this session. That means fewer interactive sessions; Leo has run more than 15 at once.
 
 Join a completed spawn per "Joining a completed spawn: read `result.md`, don't explore".
 
@@ -799,8 +849,8 @@ human — Priority 3b, an AFK-mode deferral, a B3 gate abort/drift-pending outco
 ADDITION to** (not instead of) the in-session note and the `afk-digest.md` line. The registry is
 what makes the cockpit decision queue (C5b) a return-triage surface, and the 05:30 return brief,
 `data/return-brief.md`, reads it too: that brief is the primary pull-on-return surface and
-supersedes `afk-digest.md`. The digest is **retained** (demoted to a generated history view, not
-removed in this batch), so nothing that already reads it breaks.
+supersedes `afk-digest.md`. The digest is **retained** (demoted to a generated history view),
+so nothing that already reads it breaks.
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
@@ -912,7 +962,11 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   its lease-token shape is not a session-registry key. The cockpit's Enter-to-focus follows
   `record_slug`, your session record's key, which `write-decision` stamps itself from `$CLAUDE_PID`;
   there is no shell token to add. If it cannot be resolved the decision is still filed, just
-  unlinked.
+  unlinked, and the verb says so with a line on stderr that starts `write-decision --id <your id>`,
+  names `$CLAUDE_PID` and says `BLANK record_slug` (it carries no `WARNING` prefix). That line alone
+  is not a failed filing: an id on stdout still means the filing landed, and the row is only
+  unfocusable in the cockpit. Re-filing from the same session resolves the same way, so it does not
+  repair the link and is not called for.
 - **`--severity`**: pass through the parked escalation's own severity (`esc.severity` —
   `info`/`blocking`/`critical`/`urgent`). This now weights the cockpit decision-queue rank, so a
   freshly-filed `critical`/`urgent` park surfaces at the top of the queue instead of being buried
@@ -1077,8 +1131,7 @@ Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
    The six worker-internal outcomes (`wip_halted`, `done_wip_recovery`,
    `wip_recovery_no_advance`, `unmerged_state`, `stash_failed`, `error`) are rare;
    `merge_status` collapses all of them except `done_wip_recovery` to `blocked` when
-   observed by polling — handle them as `blocked`. (`failed`, which this list named
-   until task 4829, is not a value the server ever returns; the real one is `error`.)
+   observed by polling — handle them as `blocked`.
    <!-- merge-state-vocab:begin partition=SUBMIT_NON_TERMINAL
         Mirrors shared/src/shared/merge_state.py::SUBMIT_NON_TERMINAL. Pinned by
         scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
@@ -1103,8 +1156,8 @@ Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
         and this list goes red until it matches. -->
    `done | conflict | blocked | abandoned | superseded`.
    <!-- merge-state-vocab:end -->
-   (`already_merged`, which this list named until task 4829, is a *submit* status the
-   server collapses to `done` when observed by polling — see step 1 and
+   (`already_merged` is a *submit* status the server collapses to `done` when observed by
+   polling — see step 1 and
    `escalation/src/escalation/server.py::_map_terminal_state`.)
    After an orchestrator restart,
    `{state: 'unknown', hint: 'check git log main'}` → fall back to `git log main` (PRD I3).
@@ -1160,8 +1213,8 @@ switches on and off. Three behavioural shifts:
    half-merged or destructive state. The Priority Hierarchy bar still holds: better to defer than to
    bake in a bad decision — when in real doubt, fall back to "leave pending + digest."
 
-2. **Don't spawn unattended terminals.** The interactive `/spawn` → `/unblock` path needs a human at
-   a terminal; while AFK those sit idle and the task stays blocked anyway. So in AFK mode:
+2. **Don't spawn unattended interactive sessions.** The interactive `/spawn` → `/unblock` path needs a human
+   in the session; while AFK those sit idle and the task stays blocked anyway. So in AFK mode:
    - **`task_failure` / `review_issues`:** run the **low-risk auto-unblock gate** first (see the
      [Low-risk auto-unblock gate (B3)](#low-risk-auto-unblock-gate-b3) subsection for the full
      gate procedure and applicability rule). If the gate does not launch (abort / over-cap /
@@ -1169,7 +1222,7 @@ switches on and off. Three behavioural shifts:
      it to the digest — do NOT spawn an interactive `/unblock`.
    - **`wip_conflict` / `unmerged_state` / `stash_failed` / `dependency_discovered`-with-no-task / `design_concern` /
      `risk_identified` / `infra_issue` / `recon_*`:** leave pending + digest. These need a human;
-     a terminal nobody attends just clutters. Append `<esc-id>` to the wrapper-owned exclude-file
+     a session nobody attends just clutters. Append `<esc-id>` to the wrapper-owned exclude-file
      (see "Starting the watcher" above) for each item left pending so the initial scan does not
      busy-loop on it.
    - Either way, also **file a DecisionRecord via `write-decision`** (see "Filing Parked Decisions
@@ -1199,10 +1252,10 @@ wake, compare against that file, not against a time you remember: a compaction c
 context. A quiet queue still wakes you once per slice (the Bash-tool timeout contract in "Starting
 the watcher"), so the switch lags the 4-hour mark by at most one slice.
 
-**What changes.** The three shifts above: defer, don't wedge; no unattended interactive terminals;
+**What changes.** The three shifts above: defer, don't wedge; no unattended interactive sessions;
 a DecisionRecord and the brief instead of per-item pings. The 3b reminder cadence also stops.
 
-**What keeps running.** Pre-investigation sub-agents are not terminals. Keep launching the
+**What keeps running.** Pre-investigation sub-agents are not interactive sessions. Keep launching the
 ownership and in-flight checks of "Investigate before you `record`" and the H1–H3 and H6 seats of
 "Disposition before briefing (H1–H6)", so items are ready to brief on return. A `/spawn` for a
 multi-turn conversation with Leo (see "Sub-agent or `/spawn`") waits for his return; meanwhile a
@@ -1392,10 +1445,8 @@ config `UnblockAutoConfig.attended_b3_enabled` (`<project_root>/dark-factory-orc
 session via a session override. A session override wins in either direction — a human may turn it on
 even if config is false, or off even if config is true.
 
-**Digest line format** (written into `<project_root>/data/escalations/afk-digest.md` — the single
-shared B3 outcome ledger for both AFK and attended modes; the "afk" prefix reflects the file's
-original AFK-only scope, but it is now the unified record for all B3 outcomes regardless of session
-mode; AFK shift 3 manages it):
+**Digest line format** (written into `<project_root>/data/escalations/afk-digest.md`, the one B3
+outcome ledger for AFK and attended modes alike; AFK shift 3 manages it):
 - **Merged**: `B3 <task_id> — merged: <one-line summary> (sha: <merge_sha>)`
 - **Aborted**: `B3 <task_id> — aborted: <reason>`
 - **Drift-reinvestigated, second drift**: `B3 <task_id> — drift re-investigated; re-gate: drift-again → pending`
@@ -1403,13 +1454,10 @@ mode; AFK shift 3 manages it):
 - **Handed off**: `B3 <task_id> — handed off: <request_id> still <state> at the polling ceiling → resume launched`
 - **Resume backstop**: `B3 <task_id> — resume backstop: <request_id> still <state> → pending (not cancelled)`
 
-`afk-digest.md` is **retained** (Fleet Cockpit C8) — it is not removed in this batch, but it is
-demoted to a generated history view: `data/return-brief.md`, the 05:30 return brief, is the
-primary pull-on-return surface that supersedes it, and it reads the cockpit decision queue (C5b),
-fed by `write-decision` (see "Filing Parked Decisions to the Cockpit Registry" above), for any of
-the above that left a decision open (i.e. every outcome except "Merged", a first "Handed off",
-whose resume is still running, and a resume-mode "Aborted" on an escalation someone else already
-took).
+Every outcome above that left a decision open reaches the return brief through its DecisionRecord
+— that is every outcome except "Merged", a first "Handed off" (its resume is still running) and a
+resume-mode "Aborted" on an escalation someone else already took; why the digest is kept beside the
+return brief is stated in "Filing Parked Decisions to the Cockpit Registry (C8)" above.
 
 **When a line is derived from a triage ack.** If a digest line above, or a `write-decision --text`
 registry entry (see "Filing Parked Decisions to the Cockpit Registry" above), draws on an existing
@@ -1569,8 +1617,7 @@ normative statement of the rule:
 A pending L2 is a **cluster**, and `escalation-watcher-auto` re-promotes the same cluster every
 time it finds more L1s matching that root cause. Each of those folds carries its own
 `root_cause`/`evidence`/`options`/`summary` — the promoting rotation's current read of the problem,
-which is often sharper than the first one. Until task 3997 all of it was discarded on the floor
-(measured: 336,875 characters). It is now kept.
+which is often sharper than the first one.
 
 **When you pull the full record with `get_escalation(id)`, read `amendments` alongside the record's
 own framing.** The two are different things and the distinction is the whole point:
@@ -1792,6 +1839,25 @@ of `scripts/sitting/preparation.py::to_json_payload`, where `item` is the `key` 
 - Put every escalation and task id you mention in `cites`, so the brief glosses it.
 - The item's briefing disposition decides whether it is recorded now, after investigation, or as a
   direct ask (see "Disposition before briefing (H1–H6)").
+- A `dependency_capability` record (`DEP_CAPABILITY_NOT_DELIVERED`) is about a check the blocked
+  task does NOT own. Read the owner from the record JSON in the item's own queue: the `brief --json`
+  row's `queue_dir` and `escalation_id` name `<queue_dir>/<escalation_id>.json`, else
+  `<queue_dir>/archive/*/<escalation_id>.json`. `mcp__escalation__get_escalation` reaches only
+  dark-factory's own queue, and without `project_root` it answers a foreign id from a same-numbered
+  local record; use it only for a dark-factory item, and pass `project_root` so a foreign id is
+  refused. The record's `delivered_check_owner`
+  (shape: `escalation/src/escalation/models.py::DeliveredCheckOwner`) has a `task_id`, which is the
+  dependency whose `metadata.delivered_checks` entry `check_name` failed, and a `sidecar`, which is
+  that dependency's capability manifest, with `on_main` saying whether the file declares the check on
+  `main`. An option that repaths, re-patterns or drops the check edits the owner's sites only:
+  `update_task` on the owner, re-sending its full `delivered_checks` list, plus the sidecar when
+  `on_main` is `declares` (and its `.capability-manifest.md` twin if that names the old path). Settle
+  `unverified` with `git show main:<path>` before writing the option. The record's own task appears
+  in an option only as the task to re-pend; never propose editing its `delivered_checks` or its
+  sidecar. A record without the field (filed before task 7514, or rewritten by an older process)
+  states the same owner in prose: the dependency in the summary's `dep <id>` and the detail's
+  `Dependency: task <id>`. `get_task` it and derive its sidecar from its
+  `metadata.prd_path` with `shared/src/shared/capability_manifest.py::sidecar_path`.
 
 #### Gate facts are yours to supply
 
@@ -1905,7 +1971,7 @@ If the low-risk auto-unblock gate applies — see [Low-risk auto-unblock gate (B
 
 ### `wip_conflict` / `unmerged_state` / `stash_failed` (blocking, halt-owner)
 
-These escalations mean the **merge queue is globally halted** — no other task can merge until exactly one of them (the "halt owner") is resolved. The orchestrator records which escalation owns the halt on the merge worker (`_halt_owner_esc_id`); resolving that specific escalation via MCP un-halts the queue. Resolving any other escalation — even another `wip_conflict` — will NOT release the halt (fixed 2026-04-19; prior code relied on a category heuristic that caused phantom-L1 bugs like esc-1888-57).
+These escalations mean the **merge queue is globally halted** — no other task can merge until exactly one of them (the "halt owner") is resolved. The orchestrator records which escalation owns the halt on the merge worker (`_halt_owner_esc_id`); resolving that specific escalation via MCP un-halts the queue. Resolving any other escalation — even another `wip_conflict` — will NOT release the halt.
 
 Three flavours:
 - **`wip_conflict`** — the merge queue tripped on uncommitted work in `project_root`. Three sub-variants distinguishable from the `detail`:
@@ -1929,7 +1995,7 @@ resolution, and is never a flake.
 
 **Spawn an interactive `/unblock` session** via `/spawn` (`prompt="/unblock <task_id> (esc <escalation_id>, <wip_conflict|unmerged_state|stash_failed>, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` — e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention — `cwd=<project_root>`, `skip_permissions=true`) so the human can see the recovery branch, inspect `project_root`, and resolve the escalation when finished. The trailing `(esc ...)` context is additive only (see the additive-context convention note above).
 
-**Phantom-halt check:** if the orchestrator log shows "Merge queue un-halted: halt owner &lt;esc.id&gt; resolved" but the escalation file still has `status: pending`, that is a bug — report to the human; do **not** silently dismiss. (Historical context: pre-fix, this was a common symptom of the category-match un-halt bug.)
+**Phantom-halt check:** if the orchestrator log shows "Merge queue un-halted: halt owner &lt;esc.id&gt; resolved" but the escalation file still has `status: pending`, that is a bug — report to the human; do **not** silently dismiss.
 
 ### `scope_violation` (info or blocking)
 
@@ -1946,12 +2012,7 @@ mcp__escalation__resolve_issue(
 )
 ```
 
-**`granted_files` is now delivered on the re-pend path, not just to a live workflow.** It is persisted durably on the escalation record either way, and there are two consumers:
-
-- **Live workflow (per-task steward's path).** `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._collect_granted_files` → `_set_task_scope`, from a single call site in `workflow.py::TaskWorkflow._drive`, reached only after `_wait_for_resolution()` returns for a still-alive workflow process. That is why the same wording is correct in `orchestrator/src/orchestrator/agents/roles.py::STEWARD`.
-- **No live workflow (this queue's normal case).** The `scope_violation` items reaching an L2 queue are usually on a `blocked` — or stranded `in-progress` — task whose workflow slot is gone. Resolution takes the orphan/cascade branch (`orchestrator/src/orchestrator/harness.py::Harness._on_escalation_resolved`) into `harness.py::Harness._cascade_unblock_member`, which since **task 3540** calls `harness.py::Harness._fold_granted_files_on_repend` between the re-block guard and the status write. That helper unions `granted_files` across **every resolved** escalation for the task (the whole history, order-preserving — the same union `_collect_granted_files` computes) and writes it to **both** `plan.json`'s `files` and `metadata.files`, before the row goes re-pendable.
-
-So `resume` + `granted_files` on a blocked or stranded task with no live claimant now widens the scope the redispatched agent actually works to. `plans/task-escalation-state-graph-prd.md` **D8** and `docs/task-escalation-state-spec.md` **E9** list this as semantics to be built; 3540 built it.
+**`granted_files` is delivered on the re-pend path, not just to a live workflow.** It is persisted durably on the escalation record either way. On a `blocked` — or stranded `in-progress` — task with no live workflow, which is this queue's normal case, the resolve folds the union of every resolved escalation's `granted_files` into both `plan.json`'s `files` and `metadata.files` before the re-pend (`orchestrator/src/orchestrator/harness.py::Harness._fold_granted_files_on_repend`). A live workflow takes `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._collect_granted_files` instead.
 
 **Three caveats that survive, so state them accurately rather than promising more than the fold delivers:**
 
@@ -1959,9 +2020,9 @@ So `resume` + `granted_files` on a blocked or stranded task with no live claiman
 - **No plan, no widen.** A task that never reached the architect (no `plan.json` in either `.task-meta/<worktree>/` or the legacy `<worktree>/.task/`) has no scope to widen; the fold logs a DEBUG and skips, and the re-pend still happens.
 - **The re-block guard outranks the grant.** If the guard withholds the flip, nothing is re-pended, so nothing is widened.
 
-Module **locks** are a separate question from working scope, and the fold does not touch them directly: `orchestrator/src/orchestrator/scheduler.py::Scheduler._get_modules` is cache-first (its own docstring: "deterministic short-circuit > in-memory cache > metadata.files > fallback"), and the narrow `_module_cache` entry from the task's prior dispatch survives an escalation — `blocked` is in `orchestrator/src/orchestrator/task_status.py::ACTIVE_TASK_STATUSES`, so `scheduler.py::Scheduler._phase_stale_sweep` does not evict it. Lock widening is re-established branch-side instead, by `workflow.py::TaskWorkflow._reconcile_scope_locks` — the choke point every path that (re)establishes `plan.files` runs through (`_plan()`, `_apply_revalidation_skip()`, `_run_simple_task()`, `_set_task_scope()`). That is also why writing **`plan.json`** is the load-bearing half of the fold: `_reconcile_scope_locks` persists `metadata.files = plan_files` on every successful refinement, so a metadata-only widen would be narrowed straight back down on the next dispatch, while a plan-level widen propagates the other way.
+Module **locks** follow `plan.files`, but the fold does not touch them directly: `orchestrator/src/orchestrator/scheduler.py::Scheduler._get_modules` is cache-first, and the task's narrow `_module_cache` entry from its prior dispatch outlives the escalation, so the old lock can stand until the next plan boundary. There `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._reconcile_scope_locks` re-derives the locks and persists `metadata.files = plan_files`.
 
-Do **not** hand-write `metadata.files` yourself to simulate the fold. Beyond being redundant now, a metadata-only write is self-reverting for exactly that reason, and it is not consulted for lock derivation while the module cache is warm.
+Do **not** hand-write `metadata.files` yourself to simulate the fold. Beyond being redundant now, a metadata-only write is self-reverting for exactly that reason, and it is not consulted for lock derivation while that `_module_cache` entry stands.
 
 Do **not** try to widen scope by writing `modules` into task metadata. Lock derivation (`Scheduler._get_modules`) reads `metadata.files` and has never read that key, so such a write is a silent no-op that reports success. A lock conflict on the grant is handled orchestrator-side — the task requeues rather than resuming under another task's lock.
 
@@ -1981,6 +2042,25 @@ Agent found it depends on work that isn't done yet.
    )
    ```
 3. **If no matching task exists**: spawn an interactive `/unblock` session via `/spawn` (`prompt="/unblock <task_id> (esc <escalation_id>, dependency_discovered, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` — e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention — `cwd=<project_root>`, `skip_permissions=true`). The trailing `(esc ...)` context is additive only (see the additive-context convention note above).
+
+### `dependency_capability` (critical, born at L2)
+
+Filed by the scheduler (`agent_role='orchestrator-scheduler'`) when a dependency's
+`metadata.delivered_checks` entry has failed on `main` for `delivered_checks.grace_cycles` ticks.
+The record's task is the blocked DEPENDENT; the check belongs to the dependency named in
+`delivered_check_owner.task_id`. Read it from the record JSON in the item's own queue; the prose
+fallback, the field meanings and why not `get_escalation` are in the "Investigate before you
+`record`" bullet above. Two cases, with opposite responses (`docs/task-authoring.md` §3.3):
+
+1. **The capability is on main and the check is stale or mis-authored.** An `AUTHORING DIAGNOSIS`
+   block, or your own `git grep` at `main` finding the capability elsewhere, shows this. Fix the
+   check at the owner's sites yourself and report it under **Done** (self-execute item 13).
+2. **The capability is missing from main.** The gap is the owner's work. Put it to Leo with the
+   owner named; do not touch any descriptor.
+
+Once the check passes on main, resolve with `action='resume'` to re-pend the dependent. Other
+dependents of the same owner may hold their own records for the same check: one fix on the owner
+serves them all, so close each against the ruling.
 
 ### `design_concern` (info or blocking)
 
@@ -2175,20 +2255,10 @@ DecisionRecord. The stamp changes nothing about what you do.
 
 ### Never stamp a record you are going to rule yourself
 
-This rule comes before the mechanics because skimming past it is how the measurement goes bad.
-
 A `design_concern` you close under "Standing rule: accept verified info-level design deviations
 (Leo, 2026-09-17)" above gets **no shadow stamp**. You are the adjudicator there, so there is no
-independent decision to compare your proposal against.
-
-The reason, in one line you can check: the weekly count reads `resolved_by` back through
-`escalation/src/escalation/classify.py::classify_resolver_tier`, where `escalation-watcher`
-classifies as `human` — exactly like a Leo ruling. A stamp plus a self-close is therefore the
-session agreeing with itself, and it would push a class toward its own adoption threshold on the
-strength of your own actions.
-
-The count does catch it: such a record is bucketed `self_resolved` and dropped from every rate. So a
-violation costs the sample, not the truth — but it still costs the sample.
+independent decision to compare your proposal against. Why, and how the weekly count buckets a
+violation as `self_resolved`, is in `docs/escalation-standing-policy.md` §"The integrity rule".
 
 ### Stamping
 
@@ -2241,12 +2311,10 @@ x_shadow_ruling: {"class": "risk_identified_branch_behind_main", "proposed_actio
 
 ### Never stamp a human-forever gate
 
-`docs/escalation-standing-policy.md` lists all seven. Two are detectable from the record itself and
-`escalation/src/escalation/shadow_ruling.py::mechanically_gated` finds them: a `milestone_gate`
-category and the `orchestrator-deterministic` role. The other five — model admission, physical
-operator actions, irreversible deletions, spend or eval launches, and a post-breaker
-`resume_scheduler` — have no signal on the record, so they are your judgement. A stamp on any of
-them is reported as `gated_stamps` and excluded from every rate.
+`docs/escalation-standing-policy.md` §"Human-forever gates" lists all seven and says which two
+`escalation/src/escalation/shadow_ruling.py::mechanically_gated` detects from the record; the other
+five are your judgement. A stamp on any of them is reported as `gated_stamps` and excluded from
+every rate.
 
 ### Two facts about attribution and timing
 
@@ -2265,21 +2333,9 @@ uv run --directory escalation python -m escalation.shadow_ruling \
     --queue-dir <project_root>/data/escalations
 ```
 
-Read it as: `agreed` / `diverged` over the **comparable** denominator printed beside the rate;
-`not_comparable` for proposals whose action is task-side and leaves no `resolution_action` to check
-against; `non_human_resolver` for a record no human resolved at all — a cascade, a sweep, the
-steward — counted per class, because the aggregate `resolver_tiers` line says only which tier took
-the sample; `gated_stamps`, `self_resolved` and `rejected_stamps` for stamps excluded from every rate
-— those three are counted over the same window as the rate. A class whose records are mostly
-`self_resolved` is not a class with a small sample — it is not measurable yet, and a non-zero
-`rejected_stamps` means the count could not read that many markers at all.
-
-`unresolved_lifetime` is the exception and says so in its name: a pending record has no
-`resolved_at` to window on, so that number is the standing backlog at sweep time, not a count from
-the window in the header.
-
-A class adopts only when task 3346 has landed **and** it has met the threshold in
-`docs/escalation-standing-policy.md`. Until both hold, keep stamping and keep escalating.
+How to read each bucket it prints is in `docs/escalation-standing-policy.md` §"How the shadow
+measurement is read". When a class may adopt is in §"Adoption preconditions"; until a class adopts,
+keep stamping and keep escalating.
 
 ## Context Conservation
 
@@ -2466,77 +2522,21 @@ be possible under the enforced guard, and is the actual anomaly worth reporting 
 (possible guard regression, bypassed connection headers, or a stale pre-guard orchestrator/server
 pair that hasn't been restarted onto the fix yet).
 
-**Capped identity leaking into an interactive session (task 2796):** the supervised auto rotation
-now attaches its capped `escalation` connection with `--strict-mcp-config`, scoping the rotation to
-only its own MCP config and no longer merging the ambient project `.mcp.json`. Because the capped
-block shares the identical server name (`escalation`) and URL (port `8102`) as an interactive
-session's header-less block, that non-strict ambient merge was the path by which a capped
-`X-Escalation-Identity: orchestrator-escalation-watcher-auto` / `X-Escalation-Levels: 0,1` identity
-could bleed into a concurrent header-less **interactive** watcher session — making that session's own
-L2 `resolve_issue`/`park` fail `level_forbidden` as if it were the capped auto-watcher. With the
-strict isolation now in place, a capped identity should no longer leak into an interactive session.
-**If it recurs anyway**, the supervised rotation is no longer the likely culprit — suspect a
+**Capped identity leaking into an interactive session:** if this session's own L2
+`resolve_issue`/`park` fails `level_forbidden`, the capped identity
+(`X-Escalation-Identity: orchestrator-escalation-watcher-auto`, `X-Escalation-Levels: 0,1`) has
+reached its connection. The supervised rotation attaches under `--strict-mcp-config`, so suspect a
 hand-injected `--mcp-config` (e.g. a `CLAUDE_SPAWN_CLAUDE_ARGS` passthrough) or a config generator
-writing capped headers directly into `.mcp.json`.
+writing capped headers into `.mcp.json`.
 
 **If MCP is unreachable:** ask the human for help. Don't try to resolve escalations by writing directly to the queue files — this bypasses callbacks and can leave the orchestrator in an inconsistent state.
 
 ## Red-on-main recovery (enforce-safe, break-glass)
 
-When a bad merge has turned `main` RED and the ref must be moved to a known-good SHA, use the `recover_main` CLI for a **single atomic move**. This avoids the rewind-then-readvance back-and-forth that produces a net no-op (the jun9 fumble: f4101683→4001d48d→f4101683).
-
-**This move is BACKWARD (non-fast-forward):** `<current-main>` is not an ancestor of `<good-sha>`, so it rewrites history. A project whose main-gate hook has an **always-on non-fast-forward guard** (reify) REJECTS a backward ref move *unconditionally* — before the sanction/sentinel check is even reached — so `git.main_gate_mark_command` (the forward-move sanction that `advance_main` uses) is **not** sufficient on its own for recovery. For those projects the CLI instead engages a **durable break-glass bypass** of the non-ff guard for exactly the CAS window (see the prerequisite check). Projects with only a sanction gate (no non-ff guard) still get the mark and land the move as `SANCTIONED`.
-
-### Prerequisite check
-
-- The watched project's `project_root` working tree must be **clean** (no uncommitted WIP). The CLI does not stash/pop — that is out of scope for a break-glass operation.
-- **If the watched project has an always-on non-ff main-gate guard (reify):** confirm its `orchestrator.yaml` `git:` block sets **BOTH** `git.main_gate_bypass_command` (engages the durable bypass) **AND** `git.main_gate_bypass_clear_command` (clears it). When both are set, `recover_main` **AUTO-engages** the durable bypass immediately before its CAS `update-ref` and **AUTO-clears** it immediately after on every path (success, CAS failure, exception), so the recovery move is allowed through without leaking the bypass into later ref moves. These are generic per-project shell commands (run via `sh -c` in `project_root`); they should drive the same gate-side knob the project's hook reads — see the fallback subsection below for the knob forms. When the bypass command is set it **supersedes** `git.main_gate_mark_command`: the CLI skips the mark entirely (running both would leave the one-shot sanction sentinel unconsumed and falsely sanction the next ref move).
-- **If the watched project has only a sanction gate (no non-ff guard):** confirm `git.main_gate_mark_command` is set. Leave the bypass commands unset. If the mark is also unset, the move is still atomic but will not be sanctioned by the reference-transaction hook (use the manual fallback below).
-
-### Step 1 — Identify the bad merge and good target
-
-```bash
-# In the WATCHED project's repo:
-git log --oneline -10 main
-# Find the last known-good SHA (pre-bad-merge) and the current bad SHA.
-```
-
-- `<good-sha>` = the commit you want to restore `main` to (pre-bad-merge)
-- `<current-main>` = current value of `refs/heads/main` (the bad merge; CAS old-value)
-
-### Step 2 — Perform the single atomic recovery move
-
-Run from `$DARK_FACTORY_ROOT`:
-
-```bash
-.venv/bin/python -m orchestrator.recover_main \
-  --project-root <watched-project-root> \
-  --config <watched-project-root>/dark-factory-orchestrator.yaml \
-  --target-sha <good-sha> \
-  --expected-main <current-main>
-```
-
-Parse JSON output: `{"result": "rewound"|"cas_failed"|"error", "target_sha": "..."}` (on an unexpected exception the object also carries a `"detail"` key).
-
-- `rewound` (exit 0): `main` is now at `<good-sha>`; the durable bypass (if configured) has already been cleared. Proceed to step 3.
-- `cas_failed` (exit 1): another writer moved the ref first. Re-read current `main` and retry — or escalate to the human if the situation is unclear.
-- `error` (exit 1): a SHA failed pre-validation (typo, or not a commit in the watched repo). Fix the SHA and retry — do **not** treat this as a CAS race.
-
-### Step 3 — Re-advance the fix through the normal merge queue
-
-Once `main` is at the good SHA, the fix commit must land through the normal merge queue (already sanctioned by `advance_main`). Do **not** repeat a raw `git update-ref` — use the queue.
-
-### Break-glass bypass fallback (bypass commands NOT configured)
-
-Prefer the automatic path above: set `git.main_gate_bypass_command` / `git.main_gate_bypass_clear_command` in the watched project's `orchestrator.yaml` so `recover_main` engages and clears the bypass for exactly the CAS window. Use this **manual** fallback only when a non-ff-guarded project has **not** yet configured those two commands and you cannot add them right now.
-
-The gate itself honors a project-specific break-glass bypass; the two config commands above are just generic `sh -c` wrappers that toggle one of these gate-side knobs. Check the watched project's config for the knob it reads:
-
-- **Environment variable**: `<PROJ>_MAIN_GATE_BYPASS=1` (e.g. `REIFY_MAIN_GATE_BYPASS=1`)
-- **Git config key**: `git config <proj>.mainGate.bypass true` in the watched repo
-- **Flag file**: a sentinel file under the repo's git common-dir (path from the watched project's gate config)
-
-These are gate-side controls read by the watched project's reference-transaction hook — they are not dark-factory settings. Consult the watched project's gate documentation for the exact knob. To recover manually: **(1)** engage the bypass (set the knob), **(2)** run a raw CAS `git update-ref refs/heads/main <good-sha> <current-main>` in the watched repo (which the guard now allows through), **(3)** **clear the bypass immediately after** — on both success and failure, since the bypass is durable and would otherwise leak into every later ref move. Once the bypass commands are configured, `recover_main` does steps 1–3 for you; wire them up so the next recovery is one command.
+When a bad merge has turned `main` RED and the ref must move back to a known-good SHA (typically
+the `bad-merge-to-main:*` `infra_issue` L2 the auto-watcher promotes with option A), follow
+`$DARK_FACTORY_ROOT/skills/escalation-watcher/references/red-on-main-recovery.md`: one atomic
+`recover_main` move, then the fix re-lands through the merge queue.
 
 ## Failure Modes
 

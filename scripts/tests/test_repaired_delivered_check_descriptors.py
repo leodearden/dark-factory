@@ -2,7 +2,7 @@
 
 Three populations are pinned. Task 6036 re-anchored descriptors on BOTH sides: the
 producer task's ``metadata.delivered_checks`` entry in tasks.db AND the sidecar
-the stamper copies it from. Task 5256 resynced sidecars, sidecar-only, to task
+the stamper copies it from. Tasks 5256 and 6209 resynced sidecars, sidecar-only, to task
 records that had already been repaired. CI can never see the tasks.db half, so
 either way these pins guard the SIDECAR half: a stale sidecar would be
 re-stamped over the repaired record by the next re-decompose. Every resynced
@@ -62,7 +62,7 @@ _REANCHORED = [
     ),
 ]
 
-# Task 5256: sidecar resynced to the already-repaired task record.
+# Tasks 5256 and 6209: sidecar resynced to the already-repaired task record.
 _RESYNCED_TO_TASK_RECORD = [
     (
         "plans/flake-ledger-prd.capability-manifest.yaml",
@@ -100,6 +100,12 @@ _RESYNCED_TO_TASK_RECORD = [
         {"kind": "grep", "pattern": "_received_at", "expect": "present",
          "paths": ["dashboard/src/dashboard/static/redux/data.js",
                    "dashboard/src/dashboard/static/redux/datum.js"]},
+    ),
+    (
+        "plans/uuid-prefix-resolution-prd.capability-manifest.yaml",
+        5323, "β", "resolver-unavailable-raises",
+        {"kind": "grep", "pattern": r"raise ResolverUnavailable\(", "expect": "present",
+         "paths": ["fused-memory/src/fused_memory/services/id_resolver.py"]},
     ),
 ]
 

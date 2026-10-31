@@ -6,6 +6,12 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from reconciliation.harness_fixtures import (
+    make_harness,
+    make_harness_config,
+    open_event_buffer,
+    open_journal,
+)
 from test_backlog_policy import _seed_buffered, _StubQueue
 
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
@@ -334,37 +340,20 @@ class TestUnhaltReconciliationClosesEscalation:
     async def test_unhalt_resolves_pending_halt_escalation(self, tmp_path):
         from escalation.queue import EscalationQueue
 
-        from fused_memory.config.schema import (
-            FusedMemoryConfig,
-            ReconciliationConfig,
-        )
-        from fused_memory.reconciliation.harness import ReconciliationHarness
-        from fused_memory.reconciliation.journal import ReconciliationJournal
-
         project_root = tmp_path / 'proj_root'
         project_root.mkdir()
 
-        buf = EventBuffer(db_path=tmp_path / 'eb.db', buffer_size_threshold=100)
-        await buf.initialize()
-        journal = ReconciliationJournal(tmp_path / 'journal')
-        await journal.initialize()
-        try:
+        async with (
+            open_event_buffer(tmp_path / 'eb.db', buffer_size_threshold=100) as buf,
+            open_journal(tmp_path / 'journal') as journal,
+        ):
             policy = BacklogPolicy(buf, _StubQueue(), lambda _: True)
-            config = FusedMemoryConfig(
-                reconciliation=ReconciliationConfig(
-                    enabled=True,
-                    judge_enabled=True,
-                    explore_codebase_root='/tmp/test',
-                    agent_llm_provider='anthropic',
-                    agent_llm_model='claude-sonnet-4-20250514',
-                )
-            )
-            harness = ReconciliationHarness(
-                memory_service=AsyncMock(),
-                taskmaster=AsyncMock(),
+            harness = make_harness(
                 journal=journal,
                 event_buffer=buf,
-                config=config,
+                memory_service=AsyncMock(),
+                taskmaster=AsyncMock(),
+                config=make_harness_config(judge_enabled=True),
                 backlog_policy=policy,
                 known_projects={'proj': str(project_root)},
             )
@@ -407,9 +396,6 @@ class TestUnhaltReconciliationClosesEscalation:
             assert again['status'] == 'already_running'
             assert again['escalations_resolved'] == []
             assert esc_id not in again['message']
-        finally:
-            await journal.close()
-            await buf.close()
 
     @pytest.mark.asyncio
     async def test_not_halted_discards_rather_than_reports_a_stale_stash(
@@ -424,33 +410,16 @@ class TestUnhaltReconciliationClosesEscalation:
         minutes or hours ago. The stash is still TAKEN, so the stale entry is
         cleared rather than left to mislead the next caller too.
         """
-        from fused_memory.config.schema import (
-            FusedMemoryConfig,
-            ReconciliationConfig,
-        )
-        from fused_memory.reconciliation.harness import ReconciliationHarness
-        from fused_memory.reconciliation.journal import ReconciliationJournal
-
-        buf = EventBuffer(db_path=tmp_path / 'eb.db', buffer_size_threshold=100)
-        await buf.initialize()
-        journal = ReconciliationJournal(tmp_path / 'journal')
-        await journal.initialize()
-        try:
-            config = FusedMemoryConfig(
-                reconciliation=ReconciliationConfig(
-                    enabled=True,
-                    judge_enabled=True,
-                    explore_codebase_root='/tmp/test',
-                    agent_llm_provider='anthropic',
-                    agent_llm_model='claude-sonnet-4-20250514',
-                )
-            )
-            harness = ReconciliationHarness(
-                memory_service=AsyncMock(),
-                taskmaster=AsyncMock(),
+        async with (
+            open_event_buffer(tmp_path / 'eb.db', buffer_size_threshold=100) as buf,
+            open_journal(tmp_path / 'journal') as journal,
+        ):
+            harness = make_harness(
                 journal=journal,
                 event_buffer=buf,
-                config=config,
+                memory_service=AsyncMock(),
+                taskmaster=AsyncMock(),
+                config=make_harness_config(judge_enabled=True),
             )
             assert harness.judge is not None
             assert not harness.judge.is_halted('proj')
@@ -468,6 +437,3 @@ class TestUnhaltReconciliationClosesEscalation:
             assert 'esc-reconciliation-halt-OLD' not in result['message']
             # Taken, not merely hidden — the stale entry is gone.
             assert harness.take_resolved_halt_escalations('proj') == []
-        finally:
-            await journal.close()
-            await buf.close()

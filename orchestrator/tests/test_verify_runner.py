@@ -2201,7 +2201,8 @@ class TestBuildMergeVerifySpec:
         )
         assert spec_from_json(spec_to_json(spec)) == spec
 
-    def test_effective_verify_env_propagated_to_spec(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_effective_verify_env_propagated_to_spec(self):
         """spec.verify_env carries the merged sccache backend from effective_verify_env.
 
         Uses a real OrchestratorConfig (not MagicMock) so that effective_verify_env
@@ -2210,9 +2211,6 @@ class TestBuildMergeVerifySpec:
         """
         from orchestrator.config import OrchestratorConfig, SccacheConfig
         from orchestrator.verify_runner import build_merge_verify_spec
-
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
 
         config = OrchestratorConfig(
             verify_env={'RUSTC_WRAPPER': 'sccache'},
@@ -8835,7 +8833,7 @@ class TestRemoteRunnerPassSummaryArchival:
 # deadline and lets the CHILD return the verdict.
 #
 # The bound needs a basis, because the flake class it must avoid is measured:
-# test_laptop_warm_verify_boundary.py's HeartbeatWriter comment records an
+# the ROW_WATCHDOG banner of _verify_boundary_ceilings.py records an
 # Event.wait-driven writer showing inter-write gaps of p999 0.386s / MAX 0.845s
 # at loadavg 113-178, with the overshoot largely ADDITIVE scheduling delay
 # rather than multiplicative.  Five beats at 0.05s is 0.25s nominal; even a
@@ -8876,7 +8874,7 @@ HEARTBEAT_STOP_JOIN_CEILING_SECS = HEARTBEAT_STOP_JOIN_SECS
 #: — so any positive floor detects it and a low one cannot be flaky.  Two, in a
 #: window of HEARTBEAT_STOP_JOIN_SECS: even if every tick cost the ~0.85s worst
 #: single-gap scheduling delay measured at loadavg 113-178
-#: (test_laptop_warm_verify_boundary.py's HeartbeatWriter comment) rather than
+#: (the ROW_WATCHDOG banner of _verify_boundary_ceilings.py) rather than
 #: this cadence, that window still fits five.
 LOOP_TICK_SECS = 0.05
 LOOP_TICKS_REQUIRED_DURING_TEARDOWN = 2

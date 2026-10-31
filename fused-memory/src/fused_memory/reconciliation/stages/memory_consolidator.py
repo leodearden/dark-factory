@@ -32,6 +32,10 @@ from fused_memory.reconciliation.degenerate_task_node_sweep import (
     extract_terminal_task_ids,
     sweep_degenerate_task_nodes,
 )
+from fused_memory.reconciliation.episode_window import (
+    UNFINISHED_WRITE_START_STAT,
+    unfinished_write_start_stat,
+)
 from fused_memory.reconciliation.flag_dedup import (
     EntityStandingSuppressionResult,
     acknowledge_resolved_flags,
@@ -110,6 +114,11 @@ from fused_memory.reconciliation.task_filter import (
     format_filtered_task_tree,
     strip_snapshot_lines,
 )
+from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
+from fused_memory.reconciliation.unlanded_path_check import (
+    UnlandedPathCheckResult,
+    check_unlanded_path_claims,
+)
 from fused_memory.server.grouped_read import PARENT_ID_KEY, _parent_id_in_meta
 from fused_memory.utils.clip_disclosure import clip_note, elide_text, fetch_cap_note
 
@@ -127,7 +136,7 @@ logger = logging.getLogger(__name__)
 # enforce_summary_pool_cap call trims the pool to at most this many members by
 # deleting the OLDEST entries — deterministically via Qdrant scroll, NOT semantic search.
 STAGE1_CYCLE_SUMMARY_POOL_CAP: int = 2
-_RECORD_BODY_CHARS = 500
+_RECORD_BODY_CHARS = 2_000  # basis: plans/recon-evidence-caps-measurement-2026-10.md
 _STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
 
 
@@ -223,6 +232,8 @@ class MemoryConsolidator(BaseStage):
 
     # Active task tree — set by harness before run() (task 455)
     filtered_task_tree: FilteredTaskTree | None = None
+    # Set with filtered_task_tree: the instant that tree, and every heartbeat_at in it, was read.
+    filtered_task_tree_fetched_at: datetime | None = None
 
     # Authoritative task-count cross-verification record — set by harness (task 1785).
     # None when the status map was unavailable (e.g. taskmaster down) or in remediation passes.
@@ -263,6 +274,9 @@ class MemoryConsolidator(BaseStage):
     # design invariant INV-2 structured-facts-at-failure.
     _undatable_freshness_records: int
 
+    # Sampled just before the episode fetch; see reconciliation/episode_window.py.
+    _unfinished_graphiti_write_start: datetime | None
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Per-instance initialisation: avoids shared-mutable-default hazard.
@@ -271,6 +285,7 @@ class MemoryConsolidator(BaseStage):
         # state across all instances (and across reused-instance runs).
         self._fetch_degraded_sources: list = []
         self._undatable_freshness_records: int = 0
+        self._unfinished_graphiti_write_start: datetime | None = None
         self._live_workflow_snapshot: LiveWorkflowSnapshot | None = None
 
     async def run(
@@ -306,12 +321,18 @@ class MemoryConsolidator(BaseStage):
             self._entity_summary_snapshot_lines_stripped
         )
         report.stats['stage1_fetch_degraded'] = self._fetch_degraded_sources or []
+        report.stats['stage1_assembled_budget'] = (
+            self.assembled_payload.budget_report() if self.assembled_payload is not None else None
+        )
 
         # Always present (task 4574, mirrors stage1_fetch_degraded above): set BEFORE
         # the remediation early-return so the key is unconditionally present, including
         # on remediation passes (which never call assemble_payload's freshness filters
         # and so leave the per-instance counter at its __init__/reset value of 0).
         report.stats['stage1_undatable_freshness_records'] = self._undatable_freshness_records
+        report.stats[UNFINISHED_WRITE_START_STAT] = unfinished_write_start_stat(
+            self._unfinished_graphiti_write_start
+        )
 
         # Always present (task-2312): set BEFORE the remediation early-return below
         # so downstream consumers see this key on every run, including remediation
@@ -380,6 +401,8 @@ class MemoryConsolidator(BaseStage):
         report.stats['orphaned_recon_escalations_unresolvable'] = 0
         report.stats['orphaned_recon_escalations_errors'] = 0
         report.stats['orphaned_recon_escalations_flags_emitted'] = 0
+        # Same always-present contract for the unlanded-path check (task 5626).
+        report.stats.update(UnlandedPathCheckResult.empty().stats())
 
         # Always present (task 2896 γ): count of recon flags suppressed this cycle
         # by an ACTIVE entity_standing_decision (Hook A).  Overwritten below to the
@@ -712,6 +735,12 @@ class MemoryConsolidator(BaseStage):
                 report.stats['orphaned_recon_escalations_flags_emitted'] = len(
                     orphan_sweep['flags'],
                 )
+
+        # Done-task memories naming paths the branch added then removed before merge (task 5626);
+        # emits flags, so it sits above dedup_flags — see reconciliation/unlanded_path_check.py.
+        unlanded = await check_unlanded_path_claims(self.memory, self.project_id, self.project_root, events)
+        report.items_flagged = (report.items_flagged or []) + list(unlanded.flags)
+        report.stats.update(unlanded.stats())
 
         # Always present (task-2029 amendment): downstream consumers that read this
         # stat symmetrically with stats['stage2_flag_markers_acknowledged'] (which is
@@ -1575,11 +1604,15 @@ class MemoryConsolidator(BaseStage):
         # leak hazard as _fetch_degraded_sources above, so it gets the identical
         # precede-every-early-return placement.
         self._undatable_freshness_records = 0
+        self._unfinished_graphiti_write_start = None
 
         # Remediation mode: return focused payload with findings only
         if self.remediation_findings is not None:
             return await self._assemble_remediation_payload()
 
+        self._unfinished_graphiti_write_start = (
+            self.memory.earliest_unfinished_graphiti_write_start(self.project_id)
+        )
         # 1. Episodes since last reconciliation
         try:
             episodes = await self.memory.get_episodes(
@@ -1764,6 +1797,7 @@ Review the above data and perform memory consolidation:
         # value from a prior time-windowed assemble_payload call (task 4574, same
         # leak hazard as _fetch_degraded_sources above).
         self._undatable_freshness_records = 0
+        self._unfinished_graphiti_write_start = None
 
         event_summary = _format_events(ap.events)
         deferred_events_note = clip_note(
@@ -1905,13 +1939,21 @@ Review the above data and perform memory consolidation:
         snapshot is retained for :meth:`run`'s citation guard.  A tree with no
         active task yields a real, empty snapshot, because an absent section
         tells this stage that no task is live; only an unset tree leaves it
-        None, and the guard inert.
+        None, and the guard inert.  Claimant heartbeats are aged at
+        ``filtered_task_tree_fetched_at``, the instant the tree was read, not
+        at render time (task 6027).
         """
         if self.filtered_task_tree is None:
             return ''
+        claims_read_at = resolve_tree_read_instant(
+            self.filtered_task_tree_fetched_at,
+            event='reconciliation.stage1_task_tree_read_instant_missing',
+            extra={'project_id': self.project_id},
+        )
         self._live_workflow_snapshot = await build_live_workflow_snapshot(
             self.filtered_task_tree.active_tasks,
             self.scope.project_root,
+            claims_read_at=claims_read_at,
         )
         section = self._live_workflow_snapshot.render()
         return '\n' + section if section else ''

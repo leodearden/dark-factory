@@ -22,12 +22,12 @@ from _role_splice_contract import (
     bash_capable_unpinned_contract,
 )
 
-from orchestrator.agents.path_not_found_guidance import PATH_NOT_FOUND_GUIDANCE
-from orchestrator.agents.roles import (
+from orchestrator.agents.harness_guidance import (
     GREP_LOOKAROUND_GUIDANCE,
     GREP_LOOKAROUND_GUIDANCE_READ_ONLY,
-    ROLES,
 )
+from orchestrator.agents.path_not_found_guidance import PATH_NOT_FOUND_GUIDANCE
+from orchestrator.agents.roles import ROLES
 
 #: Every role with a literal system_prompt, derived from ROLES.
 _UNPINNED_ROLES = frozenset(name for name, role in ROLES.items() if role.prompt_spec is None)
@@ -110,7 +110,7 @@ def test_every_unpinned_role_carries_guidance():
     _CONTRACT.assert_every_role_carries(
         remedy=(
             'For a role holding unqualified `Bash`, append PATH_NOT_FOUND_GUIDANCE '
-            'to the tail of roles.py::_BASH_CAPABLE_ROLE_PREAMBLE. For any other '
+            'to the tail of harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE. For any other '
             "literal-prompt role, splice it into that role's own chain, as "
             'roles.py::JUDGE does after GREP_LOOKAROUND_GUIDANCE_READ_ONLY.'
         ),
@@ -148,7 +148,7 @@ def test_guidance_lands_after_the_grep_block_in_bash_roles():
 
     Order, not adjacency: sibling census blocks append to the same tail in any
     merge order. The APPEND-ONLY comment above
-    `orchestrator/src/orchestrator/agents/roles.py::_BASH_CAPABLE_ROLE_PREAMBLE`
+    `orchestrator/src/orchestrator/agents/harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE`
     holds that rationale.
     """
     bash_capable_unpinned_contract(
@@ -157,7 +157,7 @@ def test_guidance_lands_after_the_grep_block_in_bash_roles():
         follows=GREP_LOOKAROUND_GUIDANCE,
         follows_name='GREP_LOOKAROUND_GUIDANCE',
         remedy=(
-            'Re-append it at the END of roles.py::_BASH_CAPABLE_ROLE_PREAMBLE; '
+            'Re-append it at the END of harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE; '
             'moving it earlier breaks the adjacency pins of the blocks ahead of '
             'it.'
         ),

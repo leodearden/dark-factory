@@ -1,9 +1,8 @@
 """Role-prompt guidance: a pipeline's exit status is not its first command's, with `pipefail` off or on.
 
-`orchestrator/src/orchestrator/agents/roles.py::_BASH_CAPABLE_ROLE_PREAMBLE`
+`orchestrator/src/orchestrator/agents/harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE`
 splices `PIPELINE_EXIT_STATUS_GUIDANCE` into every role holding unqualified
-`Bash`. It is a leaf module, imported downward by roles.py, only so that
-already oversized file does not grow further.
+`Bash`. It is a leaf module, imported downward by harness_guidance.py.
 
 The block is one section built from two named halves.
 `PIPELINE_LAST_STAGE_STATUS` covers `pipefail` off, where `$?` after

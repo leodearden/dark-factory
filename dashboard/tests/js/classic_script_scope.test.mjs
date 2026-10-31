@@ -74,12 +74,14 @@ const EXPECTED_WINDOW_GLOBALS = {
   'performance_cards.js': 'DF_PERFORMANCE_CARDS',
   'escalation_views.js': 'DF_ESCALATION_VIEWS',
   'escalation_focus.js': 'DF_ESCALATION_FOCUS',
+  'escalation_check_owner.js': 'DF_ESCALATION_CHECK_OWNER',
   'memory_readings.js': 'DF_MEMORY_READINGS',
   'system_health.js': 'DF_SYSTEM_HEALTH',
   'spend_readings.js': 'DF_SPEND_READINGS',
   'persisted_state.js': 'DF_PERSISTED_STATE',
   'invariant_chip.js': 'DF_INVARIANT_CHIP',
   'deferral_cell.js': 'DF_DEFERRAL_CELL',
+  'render_failure.js': 'DF_RENDER_FAILURE',
 };
 
 // NOTE — no `document` shim, and that omission is load-bearing rather than an

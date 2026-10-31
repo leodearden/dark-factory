@@ -390,6 +390,15 @@ another project's files. A submission from an **unregistered** filer, or one
 that **mixes** local and foreign files, is **not** tagged and stays a hard
 path-scope reject (the task-2206 anti-bypass guard is preserved).
 
+Ownership of a **relative** `metadata.files` entry is resolved against the
+filing project's own root first: an entry whose leading directory exists in
+the filing project is that project's, even when another registered project
+has a same-named top-level directory (a stream_touch `sessions/…` entry is
+never credited to mission_control). Only an entry whose leading directory
+exists solely in another project makes the task cross-repo; generic names
+such as `docs/` or `src/` count for neither side. The rule has one home:
+`fused-memory/src/fused_memory/middleware/project_prefix_registry.py::ProjectPrefixRegistry.attributed_owner`.
+
 When the marker is present, the orchestrator pre-merge narrowing gate treats
 the task as a cross-repo deliverable: instead of flagging "files not
 touched" and forcing a dishonest plan-narrowing pass, it routes the merge
@@ -694,7 +703,15 @@ they never affect the exit code and no gating test sweeps them.
 mis-authored now carries an `AUTHORING DIAGNOSIS` block in its `detail`,
 naming the code and a remedy. Without it a malformed check and a genuinely
 undelivered capability produce identical records, and they need opposite
-responses.
+responses. Every such escalation also names the check's OWNER, which is the
+dependency whose `metadata.delivered_checks` declares it, never the blocked
+dependent. It says where the check is declared both as data in
+`delivered_check_owner` (`escalation/src/escalation/models.py::DeliveredCheckOwner`:
+the owner task, the check name, and the owner's sidecar with whether it declares
+the check on `main`) and as the `Check owner:` / `Declared in:` / `Sidecar:`
+lines of `detail`, which are rendered from that same value. A stale or
+mis-authored check is corrected at the owner's sites (see "Stale scope paths");
+the blocked dependent is only re-pended.
 
 **Dispatch-time policy**
 
@@ -702,7 +719,7 @@ responses.
 |---|---|
 | All checks DELIVERED on `main@SHA` | Satisfied — dep counts toward dispatch |
 | ≥1 check FAILED, consecutive-fail streak `< grace_cycles` | Withheld; `delivered_check_gate_held` event emitted each held tick (hold-visibility only) |
-| ≥1 check FAILED, streak reaches `grace_cycles` | Born-at-L2 `dependency_capability` escalation naming the failed check/pattern-or-script/dep id/`main` SHA; dependent → `blocked`; streak cleared (re-fires on a later re-crossing) |
+| ≥1 check FAILED, streak reaches `grace_cycles` | Born-at-L2 `dependency_capability` escalation naming the failed check/pattern-or-script/dep id/`main` SHA and the check's owner and declaration sites (`delivered_check_owner`); dependent → `blocked`; streak cleared (re-fires on a later re-crossing) |
 | A check ERRORS (git/script failure) or exceeds `check_timeout_secs` | Fail-safe wait — dep left uncached, **no** streak bump on either counter, retried next tick |
 | `delivered_checks.enabled = false` | Gate entirely inert — no sweep, no cache, no streaks, no escalation; the dep gate takes its legacy arm-off path as if the metadata didn't exist |
 
@@ -970,7 +987,13 @@ satisfied:
 
 A path whose extension is not on the lock-charter allowlist (for example
 `tasks.db`) is refused earlier, as a "directory declaration" with
-`LockCharterViolation`, so this lint never sees it.
+`LockCharterViolation`, so this lint never sees it. That rejection lists
+such paths under `unrecognised_extension_paths`, and its hint gives the same
+`task_kind='deterministic'` routing as this lint. An upper-case spelling of a
+listed extension, such as `README.MD`, is not listed there: it gets only the
+advice to lowercase the extension. Leave a gitignored path out
+of `metadata.files` whatever the `task_kind`: the lock-charter check runs
+first and classifies it as a directory either way.
 
 **Posture.** By default the lint only warns. When the submission succeeds,
 it merges a `gitignored_deliverable_warning` key into the result and logs a

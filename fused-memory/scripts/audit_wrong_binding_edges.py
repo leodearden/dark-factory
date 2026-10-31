@@ -60,11 +60,11 @@ names ``reassign_edge`` and ``merge_entities``: they are the lossless
 remediation primitives a later editor would reach for on THIS defect class,
 and remediation stays human-gated and out of scope here.
 
-The graph is read exclusively over ``GRAPH.RO_QUERY``, where read-only is
-SERVER-enforced rather than client-promised — never through ``MemoryService``
-or ``GraphitiBackend``, whose handles can write, and never through
-``graphiti_core.driver.falkordb_driver.FalkorDriver``, whose ``__init__``
-fire-and-forgets ``build_indices_and_constraints()``.
+The graph is read exclusively through
+``fused_memory/backends/falkor_read_only.py::ReadOnlyGraphReader``: over
+``GRAPH.RO_QUERY``, where read-only is SERVER-enforced rather than
+client-promised, and never through graphiti's ``FalkorDriver``. That module
+says why both matter.
 
 Usage
 -----
@@ -98,12 +98,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fused_memory.backends.graphiti_client import (
-    _DEFAULT_READ_PAGE_SIZE,
-    _RESULTSET_SIZE,
-    PagedRead,
-    _paged_ro_query,
-)
+from fused_memory.backends.falkor_read_only import PagedQuery, ReadOnlyGraphReader
+from fused_memory.backends.graphiti_client import PagedRead
 from fused_memory.utils.canonical_labels import (
     Referent,
     parse_node_name,
@@ -702,155 +698,54 @@ def correct_node_present(nearest_id: str, task_node_ids: Collection[str]) -> boo
 DEFAULT_GRAPH = 'dark_factory'
 """The graph swept when --graph is not given."""
 
-RO_COMMAND = 'GRAPH.RO_QUERY'
-"""The only FalkorDB command this script is permitted to issue.
-
-Read-only here is SERVER-enforced, not client-promised: a ``CREATE`` issued
-through this command path is refused by a live FalkorDB and materializes
-nothing. For a sweep whose entire premise is "do not reassign an edge on a
-regex verdict", that is the difference between a promise and a guarantee.
-
-Which is why this reads over Cypher rather than through ``MemoryService`` /
-``GraphitiBackend`` (both reach the store through a handle that CAN write) and
-never constructs ``graphiti_core.driver.falkordb_driver.FalkorDriver``, whose
-``__init__`` fire-and-forgets ``build_indices_and_constraints()`` — a WRITE,
-issued before a read-only sweep had read anything.
-"""
-
-_EDGE_MATCH = (
-    'MATCH (a)-[r:RELATES_TO]->(b) '
-    'WHERE r.invalid_at IS NULL AND r.expired_at IS NULL '
+EDGE_READ = PagedQuery(
+    match='MATCH (a)-[r:RELATES_TO]->(b) WHERE r.invalid_at IS NULL AND r.expired_at IS NULL',
+    row='r',
+    returns=('a.name', 'b.name', 'r.uuid', 'r.fact', 'r.episodes'),
 )
-
-EDGE_PAGE_CYPHER = (
-    _EDGE_MATCH
-    + 'RETURN a.name, b.name, r.uuid, r.fact, r.episodes '
-    'ORDER BY r.uuid SKIP {skip} LIMIT {limit}'
-)
-"""One page of LIVE ``RELATES_TO`` edges.
+"""The LIVE ``RELATES_TO`` edges.
 
 ``r.fact_embedding`` is deliberately NOT projected: ~1500 floats per edge over
 15256 edges, for a text detector that never looks at them.
-
-``ORDER BY r.uuid`` is a TOTAL order over the matched population, and is
-load-bearing rather than cosmetic — see ``_paged_ro_query``'s docstring: each
-page is a separate query, so without a total order SKIP n on page 2 can skip
-rows page 1 never returned, silently and permanently.
 """
 
-EDGE_CENSUS_CYPHER = _EDGE_MATCH + 'RETURN count(*)'
-"""The identical MATCH/WHERE as a single-row count, so the two numbers
-describe the same population. A single-row aggregate can never be truncated by
-the row cap it is being used to detect."""
-
-_NODE_MATCH = 'MATCH (n:Entity) '
-
-NODE_PAGE_CYPHER = (
-    _NODE_MATCH + 'RETURN n.uuid, n.name ORDER BY n.uuid SKIP {skip} LIMIT {limit}'
-)
-"""One page of Entity names, filtered to task labels in Python.
+NODE_READ = PagedQuery(match='MATCH (n:Entity)', row='n', returns=('n.uuid', 'n.name'))
+"""Entity names, filtered to task labels in Python.
 
 The filter cannot run in Cypher: "is this name a task label" is the imported
 anchored parser's question, and re-expressing it as a Cypher predicate would
 be exactly the second vocabulary INV-5 forbids.
 
-``ORDER BY n.uuid`` — not ``n.name``, which this template used to page on.
-``n.name`` is NOT a total order and paging on it violates the documented
-precondition of ``_paged_ro_query``. Duplicate names are not hypothetical:
-measured 2026-08-27, dark_factory holds 17260 Entity nodes against 17210
-distinct names (50 duplicate-name groups) and reify 24344 against 24193 (151
-excess rows). At the default page_size of 5000 that is 3 page boundaries in
-dark_factory and 4 in reify, and a tie straddling one drops a row while
-duplicating another — leaving ``rows_seen`` unchanged, so guard 4
-(``rows_seen < expected_rows``) never fires and the loss is invisible in
-``truncated_by``.
+Paged on ``n.uuid``, not on ``n.name``, which this read used to page on.
+``n.name`` is not a total order, and
+``fused_memory/backends/falkor_read_only.py::PagedQuery`` says why paging
+needs one. Duplicate names are not hypothetical: measured 2026-08-27,
+dark_factory holds 17260 Entity nodes against 17210 distinct names (50
+duplicate-name groups) and reify 24344 against 24193 (151 excess rows). At
+the default page_size of 5000 that is 3 page boundaries in dark_factory and 4
+in reify, and a tie straddling one drops a row while duplicating another —
+leaving ``rows_seen`` unchanged, so guard 4 (``rows_seen < expected_rows``)
+never fires and the loss is invisible in ``truncated_by``.
 
-This was a MISSED REUSE, not a novel design question. The in-tree precedent
-``graphiti_client.py::_ENTITY_NODES_PAGE_TEMPLATE`` solves the identical
-problem identically — ``RETURN n.uuid, n.name, n.summary ORDER BY n.uuid``,
-carrying the comment "Here ``n.uuid`` alone IS a total order — one row per
-node, and node uuids are unique". The two templates now agree by
-construction rather than by coincidence.
-
-The sort key is PROJECTED rather than ordered on as a bare non-returned
-property, again mirroring the precedent: a driver may refuse to order on
-what it does not return, and an identifying column that never reaches the
-result set cannot be audited by a reader or a test double.
-
-No dedup pass is layered on top, unlike the precedent's ``n.uuid`` dedup.
-The difference is the consumer, not the hazard: this reader accumulates into
-a ``set`` of ids, so a re-returned row is harmless. What the non-total order
-actually cost was measured (see the RED commit and
-``test_a_tie_straddling_a_page_boundary_drops_a_node``): the DROPPED row was
-always a name-tie of a row that WAS returned, so it carried the same task id
-and ``correct_node_present`` was never corrupted by it. The read was lossy;
-this particular consumer happened to be immune. Ordering on a unique key
-removes the loss rather than continuing to rely on that immunity.
+No dedup pass is layered on top. This reader accumulates into a ``set`` of
+ids, so a re-returned row is harmless. What the non-total order actually cost
+was measured (see ``test_a_tie_straddling_a_page_boundary_drops_a_node``):
+the DROPPED row was always a name-tie of a row that WAS returned, so it
+carried the same task id and ``correct_node_present`` was never corrupted by
+it. The read was lossy; this particular consumer happened to be immune.
+Ordering on a unique key removes the loss rather than continuing to rely on
+that immunity.
 """
-
-NODE_CENSUS_CYPHER = _NODE_MATCH + 'RETURN count(*)'
-
-COMMAND_BY_PRIMITIVE: dict[str, str] = {
-    'ro_query': 'GRAPH.RO_QUERY',
-    'query': 'GRAPH.QUERY',
-}
-"""Which FalkorDB command each graph-handle method issues.
-
-The whole point of naming both: it is what lets
-:meth:`EdgeReader.assert_read_only_command` be asked a question whose answer
-is not already fixed. A guard that can only ever be handed
-:data:`RO_COMMAND` proves nothing.
-"""
-
-
-class _ReadOnlyGraphProxy:
-    """The graph handle as :func:`_paged_ro_query` sees it, guarded.
-
-    WHY THIS EXISTS. ``EdgeReader._read`` used to call
-    ``assert_read_only_command(RO_COMMAND)`` — a module constant compared
-    against itself, so the branch was unreachable by construction and the
-    guard could never fire on a real run. It read as a safety net in the file
-    whose central claim is that reads are read-only by construction, and it
-    was not one: the actual guarantee came entirely from ``_paged_ro_query``
-    choosing ``ro_query``, with nothing checking that choice.
-
-    This proxy makes the same guard load-bearing by moving it to the seam
-    where the choice is OBSERVABLE. ``_paged_ro_query`` reaches the store
-    through exactly one attribute of the handle it is given, so every
-    primitive it resolves passes through :meth:`__getattr__` here; a
-    primitive that maps to a write command raises a typed error naming it
-    BEFORE any bytes reach the store. If a future edit to the shared
-    primitive — or a caller passing the wrong page template — reached for
-    ``query``, this fires. The behavioural double in the tests raises too;
-    the two are independent, and this one is the layer that names the
-    COMMAND rather than the method.
-
-    Attributes the map does not name are forwarded untouched: a handle
-    legitimately carries a name, a connection and other bookkeeping, and
-    guarding those would only make the proxy brittle without making it safer.
-    """
-
-    __slots__ = ('_graph', '_assert_command')
-
-    def __init__(self, graph: Any, assert_command: Any) -> None:
-        self._graph = graph
-        self._assert_command = assert_command
-
-    def __getattr__(self, name: str) -> Any:
-        command = COMMAND_BY_PRIMITIVE.get(name)
-        if command is not None:
-            self._assert_command(command)
-        return getattr(self._graph, name)
 
 
 class EdgeReader:
     """Reads one graph's live ``RELATES_TO`` edges and task-node ids.
 
     Constructed either with an explicit *graph* handle (the tests pass a
-    double) or with a uri + graph name, in which case a ``falkordb.asyncio``
-    client is opened lazily on first use. ``falkordb.FalkorDB`` — the DB
-    client — is categorically distinct from graphiti's ``FalkorDriver``; see
-    :data:`RO_COMMAND` for why the latter must never be constructed here.
+    double) or with a uri + graph name. Every read goes through
+    ``fused_memory/backends/falkor_read_only.py::ReadOnlyGraphReader``, which
+    opens the client lazily, issues only ``GRAPH.RO_QUERY`` and never
+    constructs graphiti's ``FalkorDriver``.
 
     BOTH READS ARE PAGED, and that is a DELIBERATE DIVERGENCE from
     ``audit_unverified_completion_claims.py``, which issues one unpaginated
@@ -864,9 +759,8 @@ class EdgeReader:
     complete=True``.
 
     *page_size* and *resultset_size* are injectable so a test can exercise the
-    paging behaviour against a small cap; the defaults are the module-level
-    constants ``_paged_ro_query`` itself uses, so production runs cannot drift
-    from the shared primitive's tuning.
+    paging behaviour against a small cap; None means the shared primitive's
+    own defaults, so production runs cannot drift from its tuning.
     """
 
     def __init__(
@@ -875,61 +769,16 @@ class EdgeReader:
         graph: Any | None = None,
         graph_name: str = DEFAULT_GRAPH,
         uri: str | None = None,
-        page_size: int = _DEFAULT_READ_PAGE_SIZE,
-        resultset_size: int = _RESULTSET_SIZE,
+        page_size: int | None = None,
+        resultset_size: int | None = None,
     ) -> None:
-        self._graph = graph
         self.graph_name = graph_name
-        self.uri = uri
-        self.page_size = page_size
-        self.resultset_size = resultset_size
-
-    @staticmethod
-    def assert_read_only_command(command: str) -> None:
-        """Raise unless *command* is :data:`RO_COMMAND`.
-
-        A client-side guard layered on the server-side one, so a violation is
-        a typed error at the seam that owns the guarantee rather than a redis
-        error surfacing three layers down.
-
-        It is reached from :class:`_ReadOnlyGraphProxy`, with the command
-        looked up from the primitive the reader is ACTUALLY about to call —
-        never with :data:`RO_COMMAND` handed back to itself. See that class
-        for why the difference is the whole guard.
-        """
-        if command != RO_COMMAND:
-            raise RuntimeError(
-                f'this sweep may only issue {RO_COMMAND}, refused {command!r} '
-                f'— it is strictly read-only'
-            )
-
-    def _resolve_graph(self) -> Any:
-        """Return the graph handle, opening a client on first use.
-
-        The import is local so that merely importing this module — which the
-        tests do, with a double in hand — never requires falkordb to be
-        installed or a store to be running.
-        """
-        if self._graph is None:
-            from falkordb.asyncio import FalkorDB  # noqa: PLC0415
-
-            client = FalkorDB.from_url(self.uri) if self.uri else FalkorDB()
-            self._graph = client.select_graph(self.graph_name)
-        return self._graph
-
-    async def _read(self, page: str, census: str) -> PagedRead:
-        """One paged read, with the handle wrapped so the guard can fire.
-
-        The proxy — not a constant compared against itself — is what makes
-        ``assert_read_only_command`` load-bearing: the command asserted on is
-        resolved from whichever primitive ``_paged_ro_query`` reaches for.
-        """
-        return await _paged_ro_query(
-            _ReadOnlyGraphProxy(self._resolve_graph(), self.assert_read_only_command),
-            page,
-            census,
-            page_size=self.page_size,
-            resultset_size=self.resultset_size,
+        self._reader = ReadOnlyGraphReader(
+            graph_name=graph_name,
+            graph=graph,
+            uri=uri,
+            page_size=page_size,
+            resultset_size=resultset_size,
         )
 
     async def fetch_edges(self) -> tuple[list[list], PagedRead]:
@@ -941,7 +790,7 @@ class EdgeReader:
         not an exception — a census disagreeing by a handful of rows is the
         expected signature of a live graph being written to mid-read.
         """
-        read = await self._read(EDGE_PAGE_CYPHER, EDGE_CENSUS_CYPHER)
+        read = await self._reader.read_paged(EDGE_READ)
         return list(read.rows), read
 
     async def read_task_node_ids(self) -> tuple[set[str], PagedRead]:
@@ -959,11 +808,11 @@ class EdgeReader:
         for every node past the cut — manufacturing exactly the "the correct
         node was missing" conclusion it exists to test.
         """
-        read = await self._read(NODE_PAGE_CYPHER, NODE_CENSUS_CYPHER)
+        read = await self._reader.read_paged(NODE_READ)
         ids: set[str] = set()
         for row in read.rows:
-            # row is (n.uuid, n.name) — see NODE_PAGE_CYPHER for why the uuid
-            # is projected even though only the name is read here.
+            # row is (n.uuid, n.name) — see NODE_READ for why the uuid is
+            # projected even though only the name is read here.
             referent = endpoint_referent(row[1] if len(row) > 1 else None)
             if referent is not None and not referent.project_id:
                 ids.add(referent.number)

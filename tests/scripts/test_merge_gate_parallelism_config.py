@@ -840,11 +840,12 @@ PYRIGHT_PROBE_GROUP = 'pyright_threads_probe'
 # so a wedged pyright surfaces as a TimeoutExpired carrying its captured output
 # rather than as pytest's axe carrying nothing.
 #
-# Those markers are 120s, which TIGHTENS rather than raises: the scripts verify
-# leg passes --timeout=300 on the command line, and a probe that checks ONE
-# trivially clean file has no business taking two minutes even behind a uv
-# resolve and a node startup on a loaded 32-core host. Failing at 2 minutes with
-# pyright's own captured output beats consuming the full 300s to say nothing.
+# This bound, not the marker, is what fails a wedged pyright fast: a probe that
+# checks ONE trivially clean file has no business taking 100s even behind a uv
+# resolve and a node startup on a loaded host. The markers sit at verify's own
+# --timeout=300, because a marker between 60 and that budget would clamp the
+# merge-gating leg rather than loosen it; why is in
+# shared/src/shared/testing_timeout_markers.py.
 PROBE_SUBPROCESS_TIMEOUT_SECS = 100
 
 _PROBE_SRC = 'def f(x: int) -> int:\n    return x + 1\n'
@@ -945,7 +946,7 @@ def test_pyright_long_pole_modules_pass_threads_eight(
 
 
 @pytest.mark.xdist_group(PYRIGHT_PROBE_GROUP)
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(300)
 def test_the_configured_pyright_actually_accepts_threads_eight(
     tmp_path: pathlib.Path,
     discover_module_configs: Callable[[], dict[str, ModuleConfig]],
@@ -983,7 +984,7 @@ def test_the_configured_pyright_actually_accepts_threads_eight(
 
 
 @pytest.mark.xdist_group(PYRIGHT_PROBE_GROUP)
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(300)
 def test_pyright_refuses_threads_together_with_stats(
     tmp_path: pathlib.Path,
     discover_module_configs: Callable[[], dict[str, ModuleConfig]],

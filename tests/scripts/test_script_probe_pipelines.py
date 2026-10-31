@@ -23,7 +23,7 @@ happens, both covered below per site:
 
 EVERY ONE OF THESE SITES SITS INSIDE AN `if`, so the failure mode is a WRONG
 ANSWER, not an abort: export-data.sh decides a running FalkorDB is not running
-and skips the BGSAVE, import-data.sh decides live containers need no stopping
+and skips the AOF flush, import-data.sh decides live containers need no stopping
 and then reports a healthy FalkorDB as not responding, verify-migration.sh
 fails a good migration on a FalkorDB that answered PONG. Nothing crashes and
 nothing is logged as a failure — the scripts just quietly do the wrong thing,
@@ -38,6 +38,7 @@ the unfixed text and the fixed text.
 
 from __future__ import annotations
 
+import os
 import pathlib
 
 from shell_sections import (
@@ -144,7 +145,7 @@ _LISTING_WITHOUT_FALKORDB = "qdrant"
 _REPLY_WITHOUT_PONG = "ERR unknown command"
 
 
-# --- export-data.sh section 3: the FalkorDB BGSAVE flush --------------------
+# --- export-data.sh section 3: the FalkorDB AOF export ---------------------
 # Both anchors are CODE (not comment prose), are unique in the file, and
 # survive the fix.
 #
@@ -157,49 +158,52 @@ _REPLY_WITHOUT_PONG = "ERR unknown command"
 # below plus `slice_section`'s self-naming AssertionError already carry the
 # claim that matters: the slice covers the site under test, or the test dies
 # loudly.
-_EXPORT_BGSAVE_START = 'info "Flushing FalkorDB to disk"'
-_EXPORT_BGSAVE_END = "\nfi\n"
+_EXPORT_FALKORDB_START = 'info "Exporting FalkorDB"'
+_EXPORT_FALKORDB_END = "\nfi\n"
+_EXPORT_COPY_MARKER = "EXPORT-COPY"
+_NOT_RUNNING = "WARN FalkorDB container not running"
 
 
-def _lastsave_counter(tmp_path):
-    """A `redis-cli LASTSAVE` branch returning a CHANGING value on every call.
+def _fake_export_copy(tmp_path, rc):
+    """Install a stand-in for scripts/falkordb_export_copy.py under the slice's $REPO_ROOT.
 
-    The section reads LASTSAVE once as $BEFORE, fires BGSAVE, then polls
-    LASTSAVE until it differs. A stub answering a constant would poll thirty
-    times and warn — so the success path would never reach
-    `ok "FalkorDB BGSAVE completed"` and test 1 below would assert on an
-    absence rather than on a positive message.
-
-    Exits 0: the LASTSAVE call is NOT the producer under test here (the
-    `ps --status running` branch is), and its own `|| echo "0"` guard already
-    covers a failing one.
+    It parses bash's arguments with the REAL helper's `parse_args`, so an
+    argument renamed on one side and not the other fails here, then prints
+    `_EXPORT_COPY_MARKER` with the parsed compose file and dest and exits *rc*.
+    The real scripts dir goes in at sys.path[0] because a script's own
+    directory, which holds this stand-in under the same name, is searched first
+    otherwise. On success it creates the dest, as the real helper does.
     """
-    counter = tmp_path / "lastsave-counter"
-    return (
-        f'    _n="$(cat {counter} 2>/dev/null || echo 0)"\n'
-        f"    _n=$((_n + 1))\n"
-        f'    printf \'%s\\n\' "$_n" > {counter}\n'
-        f'    printf \'%s\\n\' "$_n"\n'
-        f"    exit 0\n"
+    scripts = tmp_path / "scripts"
+    scripts.mkdir(exist_ok=True)
+    (scripts / "falkordb_export_copy.py").write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {str(REPO_ROOT / 'scripts')!r})\n"
+        "import falkordb_export_copy\n"
+        "args = falkordb_export_copy.parse_args(sys.argv[1:])\n"
+        f"if {rc} == 0:\n"
+        "    args.dest.mkdir(parents=True, exist_ok=True)\n"
+        f"print(f'{_EXPORT_COPY_MARKER} compose={{args.compose_file}} dest={{args.dest}}')\n"
+        f"sys.exit({rc})\n",
+        encoding="utf-8",
     )
 
 
-def _run_export_bgsave(tmp_path, ps_body):
+def _run_export_falkordb(tmp_path, ps_body, *, helper_rc=0):
     """Slice export-data.sh's section-3 block and run it against a scripted docker.
 
-    The `ps --status running` branch carries the scenario; the `exec` branch
-    answers LASTSAVE. Order matters only in that neither glob matches the
-    other's argv — `"$*"` for the listing contains `" ps "` and never `" exec "`.
+    The `ps --status running` branch carries the scenario; the copy itself is
+    the stand-in helper. $EXPORT_DIR is bound ahead of the slice because the
+    section reads it under `set -u`.
     """
+    _fake_export_copy(tmp_path, helper_rc)
+    section = f'EXPORT_DIR="{tmp_path / "export"}"\n' + slice_section(
+        EXPORT_DATA_PATH, _EXPORT_FALKORDB_START, _EXPORT_FALKORDB_END
+    )
     return _run_probe(
         tmp_path,
-        slice_section(EXPORT_DATA_PATH, _EXPORT_BGSAVE_START, _EXPORT_BGSAVE_END),
-        docker_body=dispatch_stub_body(
-            (
-                ('*" ps "*', ps_body),
-                ('*" exec "*', _lastsave_counter(tmp_path)),
-            )
-        ),
+        section,
+        docker_body=dispatch_stub_body((('*" ps "*', ps_body),)),
     )
 
 
@@ -208,14 +212,15 @@ def test_export_flushes_falkordb_when_the_listing_exits_nonzero(tmp_path):
 
     `docker compose ps` reports on the whole compose invocation; the container
     appearing in the listing is a fact about the OUTPUT. Conflating the two
-    skips the BGSAVE on a live database and exports a stale dump.rdb — silent
-    data loss, logged as a routine warning.
+    skips the AOF flush on a live database and copies its data dir as it is —
+    a manifest older than dump.rdb, which import-data.sh refuses, and a copy
+    racing the live server's writes.
     """
-    result = _run_export_bgsave(tmp_path, match_then_nonzero("falkordb"))
+    result = _run_export_falkordb(tmp_path, match_then_nonzero("falkordb"))
 
     combined = result.stdout + result.stderr
-    assert "OK FalkorDB BGSAVE completed" in combined, combined
-    assert "WARN FalkorDB container not running" not in combined, combined
+    assert _EXPORT_COPY_MARKER in combined, combined
+    assert _NOT_RUNNING not in combined, combined
 
 
 def test_export_flushes_falkordb_when_the_listing_is_sigpiped(tmp_path):
@@ -225,11 +230,11 @@ def test_export_flushes_falkordb_when_the_listing_is_sigpiped(tmp_path):
     signal 13, `pipefail` turns that into 141, and the `if` reads "not running"
     off a listing that began with the container's own name.
     """
-    result = _run_export_bgsave(tmp_path, match_then_bulk("falkordb"))
+    result = _run_export_falkordb(tmp_path, match_then_bulk("falkordb"))
 
     combined = result.stdout + result.stderr
-    assert "OK FalkorDB BGSAVE completed" in combined, combined
-    assert "WARN FalkorDB container not running" not in combined, combined
+    assert _EXPORT_COPY_MARKER in combined, combined
+    assert _NOT_RUNNING not in combined, combined
 
 
 def test_export_skips_the_flush_when_the_listing_says_nothing(tmp_path):
@@ -241,12 +246,12 @@ def test_export_skips_the_flush_when_the_listing_says_nothing(tmp_path):
     else branch. `returncode == 0` is the only assertion in this file that
     distinguishes the correct fix from that plausible-looking regression.
     """
-    result = _run_export_bgsave(tmp_path, SILENT_FAILURE)
+    result = _run_export_falkordb(tmp_path, SILENT_FAILURE)
 
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
-    assert "WARN FalkorDB container not running" in combined, combined
-    assert "OK FalkorDB BGSAVE completed" not in combined, combined
+    assert _NOT_RUNNING in combined, combined
+    assert _EXPORT_COPY_MARKER not in combined, combined
 
 
 def test_export_skips_the_flush_when_the_listing_omits_falkordb(tmp_path):
@@ -258,23 +263,66 @@ def test_export_skips_the_flush_when_the_listing_omits_falkordb(tmp_path):
     the silent-producer guard makes, on the path where `|| true` is NOT what
     supplies the empty capture.
     """
-    result = _run_export_bgsave(
+    result = _run_export_falkordb(
         tmp_path, _nonmatching_output(_LISTING_WITHOUT_FALKORDB)
     )
 
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
-    assert "WARN FalkorDB container not running" in combined, combined
-    assert "OK FalkorDB BGSAVE completed" not in combined, combined
+    assert _NOT_RUNNING in combined, combined
+    assert _EXPORT_COPY_MARKER not in combined, combined
 
 
 def test_export_flushes_falkordb_on_a_clean_listing(tmp_path):
     """Characterization: the ordinary path lists falkordb and exits 0."""
-    result = _run_export_bgsave(tmp_path, clean_match("falkordb"))
+    result = _run_export_falkordb(tmp_path, clean_match("falkordb"))
 
     combined = result.stdout + result.stderr
-    assert "OK FalkorDB BGSAVE completed" in combined, combined
-    assert "WARN FalkorDB container not running" not in combined, combined
+    assert _EXPORT_COPY_MARKER in combined, combined
+    assert _NOT_RUNNING not in combined, combined
+
+
+def test_export_hands_a_running_falkordb_to_the_copy_helper(tmp_path):
+    result = _run_export_falkordb(tmp_path, clean_match("falkordb"))
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    dest = tmp_path / "export" / "fused-memory-data" / "falkordb"
+    assert (
+        f"{_EXPORT_COPY_MARKER} compose={tmp_path / 'docker-compose.yml'} dest={dest}"
+        in combined
+    ), combined
+    assert "OK FalkorDB" in combined, combined
+
+
+def test_export_fails_when_the_copy_helper_fails(tmp_path):
+    """An export import-data.sh would refuse is not a migration artifact, so it stops here."""
+    result = _run_export_falkordb(tmp_path, clean_match("falkordb"), helper_rc=1)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1, combined
+    fail_lines = [line for line in combined.splitlines() if line.startswith("FAIL")]
+    assert fail_lines and "systemctl --user start fused-memory" in fail_lines[0], combined
+    assert "OK FalkorDB" not in combined, combined
+
+
+def test_export_copies_a_stopped_falkordb_data_dir_as_it_is(tmp_path):
+    """At rest nothing races the copy, so the whole data dir goes, mtimes kept for import's rule."""
+    source = tmp_path / "fused-memory" / "data" / "falkordb"
+    _falkordb_files(source, dump_mtime=_NEW, manifest_mtime=_OLD)
+
+    result = _run_export_falkordb(
+        tmp_path, _nonmatching_output(_LISTING_WITHOUT_FALKORDB)
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _NOT_RUNNING in combined, combined
+    assert _EXPORT_COPY_MARKER not in combined, combined
+    dest = tmp_path / "export" / "fused-memory-data" / "falkordb"
+    for name in ("dump.rdb", "appendonlydir/appendonly.aof.manifest"):
+        assert (dest / name).read_text() == (source / name).read_text(), name
+        assert (dest / name).stat().st_mtime == (source / name).stat().st_mtime, name
 
 
 # --- import-data.sh section 1: stopping the backing stores ------------------
@@ -743,3 +791,81 @@ def test_verify_sees_the_container_on_a_clean_listing(tmp_path):
     combined = result.stdout + result.stderr
     assert _CONTAINER_RUNNING in combined, combined
     assert _CONTAINER_NOT_FOUND not in combined, combined
+
+
+# --- import-data.sh section 3: no import of a dump.rdb newer than its AOF (task 6330) ---
+# A new falkordb container boots with appendonly yes and loads ONLY the AOF, so
+# an exported dump.rdb with no AOF manifest, or one older than it, would come
+# up stale or empty. The rule is judged on the EXPORT, before the overlay copy:
+# judged on the destination, the destination's own newer manifest survives
+# `cp -a` and accepts an RDB-only export whose graph is then silently ignored.
+_IMPORT_RESTORE_START = 'FALKOR_EXPORT="$EXPORT_DIR/fused-memory-data/falkordb"'
+_IMPORT_RESTORE_END_AFTER = 'warn "No FalkorDB data in export"'
+_IMPORT_RESTORE_END = "\nfi\n"
+_DECIDE_NEWEST = "Deciding which FalkorDB copy is newest"
+_OLD, _NEW = 2_000_000_000, 2_000_000_100
+
+
+def _falkordb_files(root, *, dump_mtime=None, manifest_mtime=None):
+    (root / "appendonlydir").mkdir(parents=True)
+    for name, mtime in (("dump.rdb", dump_mtime), ("appendonlydir/appendonly.aof.manifest", manifest_mtime)):
+        if mtime is not None:
+            (root / name).write_text(f"{name}@{mtime}")
+            os.utime(root / name, (mtime, mtime))
+
+
+def _run_import_restore(tmp_path, *, export=None, dest=None):
+    export_dir = tmp_path / "export"
+    falkor_export = export_dir / "fused-memory-data" / "falkordb"
+    falkor_dest = tmp_path / "fused-memory" / "data" / "falkordb"
+    _falkordb_files(falkor_export, **(export or {}))
+    if dest is not None:
+        _falkordb_files(falkor_dest, **dest)
+    section = (
+        f'EXPORT_DIR="{export_dir}"\n'
+        + slice_section(
+            IMPORT_DATA_PATH, _IMPORT_RESTORE_START, _IMPORT_RESTORE_END,
+            end_after=_IMPORT_RESTORE_END_AFTER,
+        )
+        + 'echo "IMPORTED"\n'
+    )
+    return _run_probe(tmp_path, section, docker_body=dispatch_stub_body(())), falkor_dest
+
+
+def test_import_refuses_an_exported_dump_rdb_with_no_aof_manifest(tmp_path):
+    result, dest = _run_import_restore(tmp_path, export={"dump_mtime": _OLD})
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1, combined
+    assert "FAIL" in combined and _DECIDE_NEWEST in combined
+    assert "IMPORTED" not in combined and not (dest / "dump.rdb").exists()
+
+
+def test_import_refuses_an_exported_dump_rdb_newer_than_its_aof_manifest(tmp_path):
+    result, _ = _run_import_restore(tmp_path, export={"dump_mtime": _NEW, "manifest_mtime": _OLD})
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert _DECIDE_NEWEST in result.stdout + result.stderr
+
+
+def test_import_judges_the_export_not_a_destination_with_its_own_newer_manifest(tmp_path):
+    result, dest = _run_import_restore(
+        tmp_path, export={"dump_mtime": _OLD}, dest={"dump_mtime": _OLD + 50, "manifest_mtime": _NEW},
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert (dest / "dump.rdb").read_text() == f"dump.rdb@{_OLD + 50}"
+    assert "IMPORTED" not in result.stdout
+
+
+def test_import_copies_an_export_whose_aof_manifest_is_as_new_as_dump_rdb(tmp_path):
+    result, dest = _run_import_restore(tmp_path, export={"dump_mtime": _OLD, "manifest_mtime": _OLD})
+
+    assert result.returncode == 0 and "IMPORTED" in result.stdout, result.stdout + result.stderr
+    assert (dest / "dump.rdb").exists() and (dest / "appendonlydir" / "appendonly.aof.manifest").exists()
+
+
+def test_import_copies_an_export_with_no_dump_rdb(tmp_path):
+    result, _ = _run_import_restore(tmp_path, export={"manifest_mtime": _OLD})
+
+    assert result.returncode == 0 and "IMPORTED" in result.stdout, result.stdout + result.stderr

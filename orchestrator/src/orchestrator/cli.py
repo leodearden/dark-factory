@@ -18,11 +18,12 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import click
 from dotenv import load_dotenv
-from shared.project_layout import tasks_db
+from shared.project_layout import runs_db, tasks_db
 
 from orchestrator.config import ConfigRequiredError, OrchestratorConfig, load_config
 from orchestrator.config_census_ignore import audit_census_ignore_entries
 from orchestrator.main_checkout_defaults import cli_default
+from orchestrator.shadow_types import ShadowShape
 from orchestrator.verify_cancel import (
     WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
     WATCHDOG_KILL_GRACE_SECS,
@@ -1567,7 +1568,7 @@ def _run_single_eval(
 ):
     """Run eval for a single task with one or all configs.
 
-    A candidate whose ``role == 'architect'`` (eval-revival θ) is dispatched to
+    A candidate whose role is ARCHITECT (eval-revival θ) is dispatched to
     ``run_architect_eval`` — the plan-only architect eval that scores the
     produced plan against the real landed diff and FREEZES every downstream
     role — and its per-fixture ``plan_quality`` score is surfaced (plus a
@@ -1576,6 +1577,7 @@ def _run_single_eval(
     """
     from orchestrator.evals.configs import EVAL_CONFIGS, get_config_by_name
     from orchestrator.evals.eval_gate import campaign_usage_gate
+    from orchestrator.evals.metrics import RoleUnderTest
     from orchestrator.evals.report import (
         build_plan_quality_report,
         format_invocation_errors,
@@ -1605,7 +1607,7 @@ def _run_single_eval(
         async with campaign_usage_gate(base_config) as gate:
             architect_results = []
             for cfg in configs:
-                if cfg.role == 'architect':
+                if cfg.role is RoleUnderTest.ARCHITECT:
                     # θ: plan-only architect eval — downstream roles frozen.
                     # run_architect_eval manages its own eval worktree at the
                     # fixture's pre_task_commit, so it takes no worktree_path.
@@ -1753,6 +1755,7 @@ def _emit_composite_report(results, price_table) -> None:
     architect rows emits the composite table alone, so the existing
     ``eval-matrix`` / ``eval-confirm`` end-to-end surfaces are unchanged.
     """
+    from orchestrator.evals.metrics import RoleUnderTest
     from orchestrator.evals.report import (
         build_composite_report,
         build_plan_quality_report,
@@ -1763,7 +1766,7 @@ def _emit_composite_report(results, price_table) -> None:
     report = build_composite_report(results, price_table=price_table)
     click.echo(format_composite_table(report))
 
-    if any(r.metrics.get('role_under_test') == 'architect' for r in results):
+    if any(r.metrics.get('role_under_test') == RoleUnderTest.ARCHITECT for r in results):
         click.echo('')
         click.echo(format_plan_quality_table(build_plan_quality_report(results)))
 
@@ -1801,14 +1804,15 @@ def _run_matrix_driver(
     (INCLUDING same-family diagonals) via ``configs.matrix_pairs``.
     """
     from orchestrator.evals.configs import matrix_pairs, ofat_candidates
+    from orchestrator.evals.metrics import RoleUnderTest
     from orchestrator.evals.report import build_pairwise_price_table
     from orchestrator.evals.runner import run_matrix_stage
 
     task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
     candidates = ofat_candidates()
     _require_zai_coding_plan(candidates)
-    arch_cfgs = [c for c in candidates if c.role == 'architect']
-    impl_cfgs = [c for c in candidates if c.role == 'implementer']
+    arch_cfgs = [c for c in candidates if c.role is RoleUnderTest.ARCHITECT]
+    impl_cfgs = [c for c in candidates if c.role is RoleUnderTest.IMPLEMENTER]
     results = asyncio.run(run_matrix_stage(
         task_paths, arch_cfgs, impl_cfgs, base_config,
         max_parallel=max_parallel, trials=trials, timeout_override=timeout,
@@ -1829,6 +1833,7 @@ def _run_confirm_driver(
 ) -> None:
     """Confirmation batch: the single winning ``(arch, impl)`` combo → composite (μ)."""
     from orchestrator.evals.configs import get_config_by_name
+    from orchestrator.evals.metrics import RoleUnderTest
     from orchestrator.evals.report import build_pairwise_price_table
     from orchestrator.evals.runner import run_confirm_stage
 
@@ -1842,13 +1847,13 @@ def _run_confirm_driver(
     # an IMPLEMENTER one. Swapping the flags otherwise resolves fine and silently
     # builds a nonsensical both-live combo (implementer pinned as the architect
     # and vice-versa) — reject the mismatch NAMING the offending flag + role.
-    if arch_cfg.role != 'architect':
+    if arch_cfg.role is not RoleUnderTest.ARCHITECT:
         click.echo(
             f'--arch: {arch!r} is a {arch_cfg.role} config, expected an architect',
             err=True,
         )
         sys.exit(1)
-    if impl_cfg.role != 'implementer':
+    if impl_cfg.role is not RoleUnderTest.IMPLEMENTER:
         click.echo(
             f'--impl: {impl!r} is a {impl_cfg.role} config, expected an implementer',
             err=True,
@@ -1966,6 +1971,60 @@ def eval_confirm_cmd(config_path, arch, impl, tasks_dir, trials, max_parallel, t
         base_config, arch=arch, impl=impl, tasks_dir=tasks_dir,
         max_parallel=max_parallel, trials=trials, timeout=timeout,
     )
+
+
+@main.group('eval-shadow')
+def eval_shadow():
+    """Live paired shadow evaluation (plans/live-shadow-eval-prd.md)."""
+
+
+@eval_shadow.command('report')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to orchestrator config YAML (REQUIRED unless '
+                   'ORCH_CONFIG_PATH is set).')
+@click.option('--shape', type=click.Choice([s.value for s in ShadowShape]),
+              default=ShadowShape.IMPLEMENTER.value, show_default=True,
+              help='Cell shape to report.')
+@click.option('--candidate', default=None, help='Report only this candidate.')
+@click.option('--json', 'as_json', is_flag=True, help='Emit the report as JSON.')
+def eval_shadow_report_cmd(config_path, shape, candidate, as_json):
+    """C5 report of one project's shadow cells: one paired line per candidate.
+
+    Exits 1 when a settled cell's result is missing, in either form, so a
+    short table never reads as a complete measurement.
+    """
+    try:
+        config = load_config(config_path)
+    except ConfigRequiredError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+    from orchestrator.evals.shadow_report import (
+        RunsDbMissingError,
+        UnsupportedShapeError,
+        read_shadow_report,
+        render_text,
+    )
+    try:
+        report = asyncio.run(read_shadow_report(
+            runs_db(config.project_root),
+            project_id=config.fused_memory.project_id,
+            shape=ShadowShape(shape),
+            candidate=candidate,
+            n_min=config.shadow_eval.n_min,
+        ))
+    except RunsDbMissingError as e:
+        click.echo(f'Error: {e}. Does --config name the intended project?', err=True)
+        sys.exit(1)
+    except UnsupportedShapeError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+    if as_json:
+        click.echo(json.dumps(report.to_dict(), indent=2))
+    else:
+        click.echo(render_text(report), nl=False)
+    if not report.complete:
+        sys.exit(1)
 
 
 def _run_judge_cmd(max_rounds: int = 50, reset: bool = False):

@@ -52,7 +52,11 @@ is one the CLI rejected.  Four ad-hoc re-runs of the same captured shape
 named them: native ``Grep`` calls ("No such tool available: Grep") in 2 of
 the 4, searching for names the synthetic run's journal reasoning cites.
 Each run still delivered its verdict.  The synthetic reasoning cites file
-names, so it may invite more such calls than production runs do.
+names, so it may invite more such calls than production runs do.  This
+baseline predates task 5890: the synthetic writes then reached the prompt as
+Journal Entries whose reasoning cited those file names.  Since task 5890 they
+reach it as MCP Actions carrying only operation and target, so re-run
+``--shape judge`` before relying on these numbers.
 
 Permission facts
 ----------------
@@ -261,7 +265,6 @@ from shared.cli_invoke import (  # noqa: E402
 
 from fused_memory.config.schema import ReconciliationConfig  # noqa: E402
 from fused_memory.models.reconciliation import (  # noqa: E402
-    JournalEntry,
     ReconciliationRun,
     RunStatus,
     RunType,
@@ -501,24 +504,21 @@ def _capture_failure_message(returned: Any, codebase_root: Path) -> str:
 class _OneRunJournal:
     """The reads ``Judge.review_run`` makes, answered from one synthetic run."""
 
-    def __init__(self, run: ReconciliationRun, entries: list[JournalEntry]):
+    def __init__(self, run: ReconciliationRun, actions: list[dict]):
         self._run = run
-        self._entries = entries
+        self._actions = actions
 
     async def get_run(self, run_id: str) -> ReconciliationRun | None:
         return self._run if run_id == self._run.id else None
 
-    async def get_entries(self, run_id: str) -> list[JournalEntry]:
-        return self._entries
-
     async def get_run_actions_combined(self, run_id: str) -> list[dict]:
-        return []
+        return self._actions
 
     async def get_recent_verdicts(self, project_id: str, limit: int = 10, since: Any = None) -> list:
         return []
 
 
-def _synthetic_judge_run() -> tuple[ReconciliationRun, list[JournalEntry]]:
+def _synthetic_judge_run() -> tuple[ReconciliationRun, list[dict]]:
     """A small completed targeted run: three memory writes and one task closed."""
     now = datetime.now(UTC)
     run = ReconciliationRun(
@@ -533,19 +533,16 @@ def _synthetic_judge_run() -> tuple[ReconciliationRun, list[JournalEntry]]:
         },
     )
     writes = [
-        ('add_memory', 'mem0', 'agent_loop.py passes setting_sources=[] (agent_loop.py).'),
-        ('add_memory', 'mem0', 'verify.py hands Read/Grep/Glob to the CLI (verify.py).'),
-        ('add_memory', 'graphiti', 'cli_invoke.py emits --setting-sources (cli_invoke.py).'),
-        ('set_task_status', 'taskmaster', 'Task 4344 merged; its commits touch agent_loop.py.'),
+        ('add_memory', 'probe-mem-1', 'write_journal'),
+        ('add_memory', 'probe-mem-2', 'write_journal'),
+        ('add_memory', 'probe-mem-3', 'write_journal'),
+        ('set_task_status', '4344', 'run_actions'),
     ]
-    entries = [
-        JournalEntry(
-            id=f'probe-entry-{i}', run_id=run.id, timestamp=now, operation=operation,
-            target_system=target, after_state={'ok': True}, reasoning=reasoning,
-        )
-        for i, (operation, target, reasoning) in enumerate(writes)
+    actions = [
+        {'operation': operation, 'target': target, 'source': source, 'created_at': now.isoformat()}
+        for operation, target, source in writes
     ]
-    return run, entries
+    return run, actions
 
 
 def _capture_judge_shape(config: ReconciliationConfig) -> Shape:
@@ -556,10 +553,10 @@ def _capture_judge_shape(config: ReconciliationConfig) -> Shape:
     """
     from fused_memory.reconciliation import judge
 
-    run, entries = _synthetic_judge_run()
+    run, actions = _synthetic_judge_run()
     reviewer = judge.Judge(
         config.model_copy(update={'judge_llm_provider': 'claude_cli'}),
-        cast('ReconciliationJournal', _OneRunJournal(run, entries)),
+        cast('ReconciliationJournal', _OneRunJournal(run, actions)),
     )
     captured, _returned = _capture_invocation(judge, lambda: reviewer.review_run(run.id))
     if not captured:

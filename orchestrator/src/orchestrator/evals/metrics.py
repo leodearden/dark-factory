@@ -1,13 +1,11 @@
-"""Metric collection and composite scoring for eval runs."""
+"""Eval-cell metric vocabularies, the EvalMetrics record and its pure scoring."""
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import UTC, datetime
-from pathlib import Path
+from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
@@ -19,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 # cycle back to evals (it reaches only config/fm_retry/shared.*), so a
 # module-level import is safe.
 from orchestrator.agents.invoke import _FALLBACK_PRICE, _rate
+from orchestrator.shadow_types import ReferenceKind
 
 from .measurement import UnmeasuredRecord
 from .plan_predicates import is_scorable_plan
@@ -31,7 +30,6 @@ if TYPE_CHECKING:
     # the readers by getattr, so it needs the NAME for the signature and
     # nothing at import time.
     from orchestrator.artifacts import TaskArtifacts
-    from orchestrator.workflow import TaskWorkflow
 
 logger = logging.getLogger(__name__)
 
@@ -68,13 +66,28 @@ DECLINE_KINDS: tuple[str, ...] = tuple(DECLINE_READERS)
 TERMINAL_KINDS: tuple[str, ...] = ('planned', *DECLINE_KINDS, 'none')
 
 
+class RoleUnderTest(StrEnum):
+    """Which role an eval cell put under test."""
+
+    IMPLEMENTER = 'implementer'
+    ARCHITECT = 'architect'
+    JUDGE = 'judge'
+    END_TO_END = 'end_to_end'
+
+
+# The roles an OFAT candidate can vary; END_TO_END is a methodology stage.
+CANDIDATE_ROLES: frozenset[RoleUnderTest] = frozenset({
+    RoleUnderTest.IMPLEMENTER, RoleUnderTest.ARCHITECT, RoleUnderTest.JUDGE,
+})
+
+
 @dataclass
 class EvalMetrics:
     """Metrics collected from a single eval run."""
 
     # Correctness (pass/fail gate). ``None`` means "unknown / suspicious" —
     # see the false-green and null-work guards at the bottom of
-    # ``collect_metrics``.
+    # ``runner.collect_metrics``.
     tests_pass: bool | None = False
     lint_clean: bool | None = False
     typecheck_clean: bool | None = False
@@ -98,7 +111,7 @@ class EvalMetrics:
     iterations: int = 0          # implementer re-invocations
     debug_cycles: int = 0        # debugger invocations
 
-    # Judge spend, populated by TWO producers: ``collect_metrics`` copies it
+    # Judge spend, populated by TWO producers: ``runner.collect_metrics`` copies it
     # from ``workflow.metrics`` on the implementer path (the completion judge,
     # ζ), and ``run_architect_eval`` sets it from the plan judge's verdict on
     # the architect path (θ, eval-revival υ). judge_cost_usd is a SUBSET of
@@ -146,7 +159,7 @@ class EvalMetrics:
 
     # Whether this run scored an ADVERSARIAL fixture (eval-revival η), threaded
     # explicitly from the task record. Kept distinct from ``recovery_score`` so
-    # that a recovery-scoring FAILURE (which the ``collect_metrics`` guard
+    # that a recovery-scoring FAILURE (which the ``runner.collect_metrics`` guard
     # degrades to ``recovery_score=None``) stays distinguishable from a
     # genuinely non-adversarial run: the report keys its ``adversarial`` column
     # on THIS flag, not on ``recovery_score is not None``. Otherwise an
@@ -157,7 +170,7 @@ class EvalMetrics:
     # Plan-quality rubric (eval-revival θ) — the architect-eval analogues of
     # recovery_score/adversarial above. ``plan_quality`` is a rubric DISTINCT
     # from the base composite, populated ONLY for architect runs
-    # (role_under_test=='architect'); ``None`` is the C4 ``plan_quality | null``
+    # (role_under_test ARCHITECT); ``None`` is the C4 ``plan_quality | null``
     # sentinel for non-architect (implementer) runs, kept distinct from a
     # genuinely scored ``0.0``. Unlike recovery scoring (which degrades to None
     # on failure), an architect run that was actually ASKED always emits a
@@ -165,7 +178,7 @@ class EvalMetrics:
     # ``score_plan_structure`` floor if the LLM plan judge fails.
     #
     # ``None`` therefore has exactly TWO causes, disambiguated by the markers
-    # below: (1) not an architect run at all (``role_under_test != 'architect'``,
+    # below: (1) not an architect run at all (role_under_test not ARCHITECT,
     # ``cap_tainted`` False), or (2) an architect run we could NOT measure
     # because the invocation was refused at the transport layer — a 429 cap hit
     # or auth failure — which carries ``cap_tainted=True`` and an architect
@@ -173,12 +186,9 @@ class EvalMetrics:
     # it degrades to the structural floor, not to None.
     plan_quality: float | None = None
 
-    # Which role this run put UNDER TEST (eval-revival θ / C4 role_under_test),
-    # threaded from the candidate's ``EvalConfig.role``. ``None`` for legacy
-    # runs; ``'architect'`` for an architect-eval run, ``'implementer'`` for the
-    # ordinary path. The plan-quality report keys its column on this being
-    # ``'architect'``.
-    role_under_test: str | None = None
+    # END_TO_END marks a both-live methodology cell. None only for cells persisted
+    # before task 6738, which results.normalize_legacy_metrics maps to IMPLEMENTER.
+    role_under_test: RoleUnderTest | None = None
 
     # Infra-failure markers (tasks 3118, 6734). ``invocation_errors`` holds one
     # typed record per stage that produced no measurement; ``None`` means none was
@@ -280,8 +290,24 @@ class EvalMetrics:
     # The key is written unconditionally; see docs/eval-replay-frame.md.
     replay_frame: str | None = None
 
+    # Live shadow eval (plans/live-shadow-eval-prd.md C1/C4): the shadow_cells row
+    # is the record's home and this is its pointer. None on every non-shadow cell
+    # and on every result persisted before these fields existed.
+    shadow_cell_id: str | None = None
+    reference_kind: ReferenceKind | None = None
+
+    def __post_init__(self) -> None:
+        if self.reference_kind is not None:
+            self.reference_kind = ReferenceKind(self.reference_kind)
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> EvalMetrics:
+        """A persisted metrics dict read back; a key this dataclass does not declare is ignored."""
+        declared = {field.name for field in fields(cls)}
+        return cls(**{key: value for key, value in data.items() if key in declared})
 
 
 def terminal_kind_of(metrics: dict[str, Any]) -> str | None:
@@ -467,7 +493,7 @@ def read_decline_artifacts(
     return out
 
 
-def _is_false_green(m: EvalMetrics, max_iterations: int) -> bool:
+def is_false_green(m: EvalMetrics, max_iterations: int) -> bool:
     """The 404-bug signature: iteration cap hit with zero work but T/T/T.
 
     When every agent subprocess errors at the network layer (e.g. the vLLM
@@ -486,14 +512,14 @@ def _is_false_green(m: EvalMetrics, max_iterations: int) -> bool:
     )
 
 
-def _is_null_work(m: EvalMetrics) -> bool:
+def is_null_work(m: EvalMetrics) -> bool:
     """The NULL-byte implementer signature: real inference but zero code changes.
 
     When a vLLM model emits pad tokens (\\u0000) instead of tool calls — e.g.
     the reap-139b minimax_m2 parser bug (2026-04-08) — the Claude CLI reports
     "success" on each turn but no tool calls are executed, so the worktree is
     unchanged.  Cost is non-zero because inference actually ran, distinguishing
-    this from the 404-bug (``_is_false_green``).  Verify gates then pass
+    this from the 404-bug (``is_false_green``).  Verify gates then pass
     against the unchanged baseline → false T/T/T.
     """
     return (
@@ -626,7 +652,7 @@ def is_proxied_endpoint(env_overrides: dict[str, str] | None) -> bool:
     apart from a native-cloud one, and THREE sites key on it: ``runner
     .build_eval_orch_config`` (which seeds :func:`claude_endpoint_price_table`
     into ``config.prices`` for a proxied candidate, task 2820),
-    :func:`collect_metrics` and ``architect_eval.invoke_architect`` (both of
+    ``runner.collect_metrics`` and ``architect_eval.invoke_architect`` (both of
     which pass it to :func:`resolve_cost_usd` as the do-not-trust-the-CLI-cost
     flag).
     Those three MUST agree — a seeded price table beside a "native, trust the
@@ -757,188 +783,3 @@ def compose_cost_source(primary: str, *, secondary_cost_usd: float) -> str:
     if secondary_cost_usd <= 0.0:
         return primary
     return primary if primary == 'cli' else 'mixed'
-
-
-async def collect_metrics(
-    workflow: TaskWorkflow,
-    worktree: Path,
-    task: dict,
-) -> EvalMetrics:
-    """Collect metrics from a completed workflow run."""
-    wf_metrics = workflow.metrics
-
-    # Plan completion
-    plan = workflow.artifacts.read_plan() if workflow.artifacts else {}
-    steps = plan.get('steps', [])
-    done_count = sum(1 for s in steps if isinstance(s, dict) and s.get('status') == 'done')
-    total_steps = len(steps) if steps else 1
-    plan_completion = done_count / total_steps
-
-    # Verification results (re-read from last run)
-    from orchestrator.verify import run_verification
-    verify = await run_verification(worktree, workflow.config)
-
-    # Review stats from artifacts
-    reviews = workflow.artifacts.aggregate_reviews() if workflow.artifacts else None
-    blocking_issues = len(reviews.blocking_issues) if reviews else 0
-    suggestions = len(reviews.suggestions) if reviews else 0
-
-    # Git stats (diff against pre-task commit to capture all workflow changes)
-    lines_changed, files_changed = await _git_diff_stats(
-        worktree, task['pre_task_commit'],
-    )
-
-    # Inference speed metrics
-    duration_secs = wf_metrics.total_duration_ms / 1000 if wf_metrics.total_duration_ms else 0.0
-    tps = wf_metrics.total_output_tokens / duration_secs if duration_secs > 0 else 0.0
-    # Via the shared predicate, NOT an inline env read: the same signal decides
-    # whether build_eval_orch_config seeds the proxied price table, so the two
-    # must not be able to drift apart (see is_proxied_endpoint).
-    is_local = is_proxied_endpoint(workflow.config.env_overrides)
-
-    # Cost provenance (Invariant P5): the CLI's own cost figure is wrong for a
-    # proxied endpoint, so resolve cost from the config price table by the run's
-    # model, tracking which source was used. collect_metrics is the IMPLEMENTER
-    # path (run_eval), so the model under test is config.models.implementer.
-    # ``run_architect_eval`` resolves through this SAME seam (task 3656) — with
-    # ``model=EvalConfig.model`` and ``prices`` from its own eval orch config,
-    # the leaves that actually produced its tokens — and then composes its
-    # two-component (architect + plan-judge) label via ``compose_cost_source``.
-    # So both eval paths share ONE cost-provenance seam rather than one
-    # resolving and one copying the raw CLI number.
-    run_model = workflow.config.models.implementer
-    resolved_cost, cost_source = resolve_cost_usd(
-        wf_metrics.total_input_tokens,
-        wf_metrics.total_output_tokens,
-        model=run_model,
-        prices=workflow.config.prices,
-        cli_cost_usd=wf_metrics.total_cost_usd,
-        is_local_model=is_local,
-    )
-
-    m = EvalMetrics(
-        tests_pass=verify.passed if verify else False,
-        lint_clean=(not verify.lint_output) if verify else False,
-        typecheck_clean=(not verify.type_output) if verify else False,
-        plan_completion_pct=plan_completion,
-        plan_steps=total_steps,
-        cost_usd=resolved_cost,
-        cost_source=cost_source,
-        workflow_duration_ms=wf_metrics.total_duration_ms,
-        turns_used=wf_metrics.total_turns,
-        iterations=wf_metrics.execute_iterations,
-        debug_cycles=wf_metrics.verify_attempts,
-        judge_invocations=wf_metrics.judge_invocations,
-        judge_cost_usd=wf_metrics.judge_cost_usd,
-        judge_early_exits=wf_metrics.judge_early_exits,
-        input_tokens=wf_metrics.total_input_tokens,
-        output_tokens=wf_metrics.total_output_tokens,
-        cache_read_tokens=wf_metrics.total_cache_read_tokens,
-        cache_create_tokens=wf_metrics.total_cache_create_tokens,
-        review_blocking_issues=blocking_issues,
-        review_suggestions=suggestions,
-        lines_changed=lines_changed,
-        files_changed=files_changed,
-        tokens_per_second=round(tps, 2),
-        is_local_model=is_local,
-    )
-    # False-green guard — catches the 404-bug signature so the same class of
-    # silent failure doesn't need manual quarantine in future runs.
-    if _is_false_green(m, workflow.config.max_execute_iterations):
-        logger.warning(
-            'False-green signature for task %s: %d iters @ cap, '
-            '$0 cost, 0 lines / 0 files changed, T/T/T — '
-            'nulling gate fields so score is 0',
-            task.get('id', '?'), m.iterations,
-        )
-        m.tests_pass = None
-        m.lint_clean = None
-        m.typecheck_clean = None
-    # Null-work guard — catches the NULL-byte implementer signature where
-    # real inference ran (cost > 0) but the model emitted pad tokens instead
-    # of tool calls, producing zero code changes.
-    elif _is_null_work(m):
-        logger.warning(
-            'Null-work signature for task %s: %d iters, '
-            '$%.4f cost, 0 lines / 0 files changed — '
-            'nulling gate fields so score is 0',
-            task.get('id', '?'), m.iterations, m.cost_usd,
-        )
-        m.tests_pass = None
-        m.lint_clean = None
-        m.typecheck_clean = None
-
-    m.composite_score = compute_composite(m)
-
-    # Stamp the adversarial flag from the task record BEFORE recovery scoring
-    # runs, so it is set regardless of whether recovery scoring succeeds, is
-    # None, or raises below. The report keys its ``adversarial`` column on this
-    # flag (not on ``recovery_score is not None``), so a recovery-scoring
-    # FAILURE on an adversarial fixture renders as ``adversarial: true`` with a
-    # null score — visibly distinct from a genuinely non-adversarial run.
-    m.adversarial = bool(task.get('adversarial'))
-
-    # Recovery-behavior scoring (eval-revival η) — a rubric DISTINCT from the
-    # base composite, scored only for adversarial fixtures (returns None
-    # otherwise). The local import breaks the metrics<->scoring cycle (scoring
-    # imports EvalMetrics/compute_composite from this module), mirroring the
-    # run_verification local import above. Guarded: a recovery-scoring bug
-    # degrades to a named WARNING + null column and never nukes the run's
-    # composite/cost/gate metrics.
-    try:
-        from orchestrator.evals.scoring import recovery_score_for_run
-        m.recovery_score = await recovery_score_for_run(
-            task, workflow.artifacts, worktree, task['pre_task_commit'],
-        )
-    except Exception:
-        logger.warning(
-            'recovery scoring failed for %s', task.get('id', '?'),
-            exc_info=True,
-        )
-
-    return m
-
-
-async def _git_diff_stats(worktree: Path, base_commit: str) -> tuple[int, int]:
-    """Get lines changed and files changed vs the pre-task baseline commit.
-
-    Returns (-1, -1) on git failure or subprocess error so callers can
-    distinguish a genuine zero-change diff from a failed measurement.
-    """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            'git', 'diff', '--stat', f'{base_commit}..HEAD',
-            cwd=str(worktree),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            logger.warning(
-                '_git_diff_stats: git diff --stat failed (rc=%s) base=%s: %s',
-                proc.returncode, base_commit,
-                stderr.decode(errors='replace')[:200],
-            )
-            return -1, -1
-        output = stdout.decode().strip()
-        if not output:
-            return 0, 0
-
-        # Last line: " X files changed, Y insertions(+), Z deletions(-)"
-        summary = output.split('\n')[-1]
-        files_changed = 0
-        lines_changed = 0
-
-        m = re.search(r'(\d+) files? changed', summary)
-        if m:
-            files_changed = int(m.group(1))
-        for m in re.finditer(r'(\d+) (?:insertions?|deletions?)', summary):
-            lines_changed += int(m.group(1))
-
-        return lines_changed, files_changed
-    except Exception:
-        logger.warning(
-            '_git_diff_stats: git diff raised for base=%s',
-            base_commit, exc_info=True,
-        )
-        return -1, -1

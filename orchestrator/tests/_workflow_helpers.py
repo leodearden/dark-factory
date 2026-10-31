@@ -711,7 +711,13 @@ def _make(
     get_main_sha = AsyncMock(return_value=main_sha)
     git_ops = MagicMock()
     git_ops.is_ancestor = is_ancestor
+
+    async def _is_ancestor_checked(ancestor: str, descendant: str) -> bool:
+        return await git_ops.is_ancestor(ancestor, descendant)
+    git_ops.is_ancestor_checked = _is_ancestor_checked
     git_ops.get_main_sha = get_main_sha
+    git_ops.resolve_branch_sha = AsyncMock(return_value=None)
+    git_ops.has_uncommitted_work = AsyncMock(return_value=False)
     git_ops.find_task_citation_commit = AsyncMock(return_value=landing_citation)
     git_ops.commit_effect_present_in_main = AsyncMock(
         return_value=landing_effect_present,
@@ -828,7 +834,7 @@ def _build_harness(config: OrchestratorConfig) -> Harness:
 GIT_REPO_SEED = RepoSeed(files=(('README.md', '# Test\n'),), message='init')
 
 
-async def _init_git_repo(repo: Path) -> None:
+def _init_git_repo(repo: Path) -> None:
     seed_repo(repo, GIT_REPO_SEED)
 
 
@@ -888,7 +894,7 @@ E2E_REPO_SEED = RepoSeed(
 )
 
 
-async def _init_repo(repo: Path) -> None:
+def _init_repo(repo: Path) -> None:
     seed_repo(repo, E2E_REPO_SEED)
 
 
@@ -1377,7 +1383,7 @@ TRANSCRIPT_REPO_SEED = RepoSeed(
 )
 
 
-async def _init_transcript_repo(repo: Path) -> None:
+def _init_transcript_repo(repo: Path) -> None:
     """Seed a real, committed git repo for the transcript-archival suites.
 
     A THIRD seeder beside the two already in this module, deliberately not a

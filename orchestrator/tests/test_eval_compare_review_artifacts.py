@@ -10,6 +10,7 @@ verdict envelope and fall back to legacy reviews/ for pre-migration runs.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ from orchestrator.evals.compare import (
     _read_review_artifacts,
     _read_reviewer_verdict_envelopes,
 )
+from orchestrator.review_payload import normalize_review
 
 
 @pytest.fixture
@@ -72,7 +74,7 @@ class TestReadReviewerVerdictEnvelopes:
 
         result = _read_reviewer_verdict_envelopes(artifacts)
 
-        assert result == {'reviewer_comprehensive': payload}
+        assert result == {'reviewer_comprehensive': normalize_review(payload)}
 
     def test_excludes_non_reviewer_envelopes(self, artifacts: TaskArtifacts):
         payload = {
@@ -120,7 +122,37 @@ class TestReadReviewerVerdictEnvelopes:
 
         result = _read_reviewer_verdict_envelopes(artifacts)
 
-        assert result == {'reviewer_comprehensive': good_payload}
+        assert result == {'reviewer_comprehensive': normalize_review(good_payload)}
+
+    def test_skips_an_off_contract_envelope_with_a_warning(
+        self, artifacts: TaskArtifacts, caplog: pytest.LogCaptureFixture,
+    ):
+        good_payload = {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 'ENV',
+        }
+        artifacts.write_verdict(
+            'reviewer_comprehensive', _envelope('reviewer_comprehensive', good_payload),
+        )
+        flat = _envelope('reviewer_flat', {})
+        flat['verdict'] = 'PASS'
+        artifacts.write_verdict('reviewer_flat', flat)
+        artifacts.write_verdict('reviewer_offcontract', _envelope('reviewer_offcontract', {
+            'reviewer': 'reviewer_offcontract',
+            'verdict': 'NEEDS_CHANGES',
+            'issues': [],
+            'summary': 'off contract',
+        }))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.compare'):
+            result = _read_reviewer_verdict_envelopes(artifacts)
+
+        assert result == {'reviewer_comprehensive': normalize_review(good_payload)}
+        warned = '\n'.join(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+        assert 'reviewer_flat.json' in warned
+        assert 'reviewer_offcontract.json' in warned
 
     def test_empty_when_verdicts_dir_has_no_reviewer_files(self, artifacts: TaskArtifacts):
         artifacts.write_verdict('judge', _envelope('judge', {'complete': True}))
@@ -154,7 +186,7 @@ class TestReadLegacyReviews:
 
         result = _read_legacy_reviews(artifacts)
 
-        assert result == {'reviewer_comprehensive': legacy}
+        assert result == {'reviewer_comprehensive': normalize_review(legacy)}
 
     def test_skips_corrupt_file_keeps_good_ones(self, artifacts: TaskArtifacts):
         good = {
@@ -168,7 +200,26 @@ class TestReadLegacyReviews:
 
         result = _read_legacy_reviews(artifacts)
 
-        assert result == {'reviewer_comprehensive': good}
+        assert result == {'reviewer_comprehensive': normalize_review(good)}
+
+    def test_skips_an_off_contract_file_keeps_good_ones(self, artifacts: TaskArtifacts):
+        good = {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 'LEGACY-GOOD',
+        }
+        artifacts.write_review('reviewer_comprehensive', good)
+        artifacts.write_review('reviewer_bad', {
+            'reviewer': 'reviewer_bad',
+            'verdict': 'NEEDS_CHANGES',
+            'issues': [],
+            'summary': 'off contract',
+        })
+
+        result = _read_legacy_reviews(artifacts)
+
+        assert result == {'reviewer_comprehensive': normalize_review(good)}
 
     def test_empty_when_reviews_dir_absent(self, worktree: Path):
         # No init() call — .task/reviews/ never created.
@@ -197,7 +248,7 @@ class TestReadReviewArtifacts:
 
         result = _read_review_artifacts(str(worktree))
 
-        assert result == {'reviewer_comprehensive': payload}
+        assert result == {'reviewer_comprehensive': normalize_review(payload)}
         formatted = _format_review_artifacts(result)
         assert 'ENV' in formatted
         assert '(no review data available)' not in formatted
@@ -215,7 +266,7 @@ class TestReadReviewArtifacts:
 
         result = _read_review_artifacts(str(worktree))
 
-        assert result == {'reviewer_comprehensive': legacy}
+        assert result == {'reviewer_comprehensive': normalize_review(legacy)}
         formatted = _format_review_artifacts(result)
         assert 'LEGACY' in formatted
         assert '(no review data available)' not in formatted
@@ -237,7 +288,7 @@ class TestReadReviewArtifacts:
 
         result = _read_review_artifacts(str(worktree))
 
-        assert result == {'reviewer_comprehensive': good}
+        assert result == {'reviewer_comprehensive': normalize_review(good)}
         formatted = _format_review_artifacts(result)
         assert 'LEGACY-GOOD' in formatted
 
@@ -261,7 +312,7 @@ class TestReadReviewArtifacts:
 
         result = _read_review_artifacts(str(worktree))
 
-        assert result == {'reviewer_comprehensive': env_payload}
+        assert result == {'reviewer_comprehensive': normalize_review(env_payload)}
 
     def test_neither_present_returns_empty(self, worktree: Path):
         # worktree exists but .task/ was never initialized.

@@ -76,6 +76,7 @@ from df_pytest_isolation import (  # noqa: E402
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
     _df_no_synthetic_heartbeats_in_live_fleet,  # noqa: F401  — the binding IS the wiring
+    arm_leaked_drain_process_guard,
     reject_unsafe_basetemp,
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
@@ -330,8 +331,10 @@ def _isolate_orch_config(monkeypatch, tmp_path):
 
     Precedence keeps this safe: explicit kwargs still win over the env, which overrides
     only ``project_root`` and the host-reaching knobs: laptop runner, ``prefer_remote``
-    (task 5053) and ``verify_use_cgroup_scope`` (task 5206), so a bare config never
-    ssh's the laptop or spawns a real systemd scope; all else loads from yaml/defaults.
+    (task 5053), ``verify_use_cgroup_scope`` (task 5206) and
+    ``verify_cold_preprovision_command`` (task 6917), so a bare config never ssh's the
+    laptop, spawns a real systemd scope or runs a real ``uv sync``; all else loads from
+    yaml/defaults.
     Config-loading tests already use ``tmp_path`` as their project_root, so the
     env value agrees with the YAML they write.  The opt-in
     ``code_default_config`` fixture runs after this autouse fixture and still
@@ -343,6 +346,7 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     monkeypatch.setenv("ORCH_VERIFY_RUNNERS", "[]")
     monkeypatch.setenv("ORCH_VERIFY_HOST_POLICY", "prefer_local")
     monkeypatch.setenv("ORCH_VERIFY_USE_CGROUP_SCOPE", "false")
+    monkeypatch.setenv("ORCH_VERIFY_COLD_PREPROVISION_COMMAND", "")
 
 
 @pytest.fixture
@@ -381,6 +385,7 @@ def code_default_config(monkeypatch, tmp_path):
     monkeypatch.delenv("ORCH_VERIFY_RUNNERS", raising=False)
     monkeypatch.delenv("ORCH_VERIFY_HOST_POLICY", raising=False)
     monkeypatch.delenv("ORCH_VERIFY_USE_CGROUP_SCOPE", raising=False)
+    monkeypatch.delenv("ORCH_VERIFY_COLD_PREPROVISION_COMMAND", raising=False)
 
 
 #: Guaranteed-absent path for the autouse warm-lane script-dir pin below.
@@ -548,7 +553,7 @@ def df_warm_lane_script_dir(monkeypatch, tmp_path: Path):
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Refuse an unsafe ``--basetemp``, then register ``real_psi_reader`` (task 2418).
+    """Refuse an unsafe ``--basetemp``, arm the drain-leak guard, register ``real_psi_reader``.
 
     The ``reject_unsafe_basetemp`` call comes FIRST and is unrelated to the
     marker below: it aborts collection when ``--basetemp`` points inside a live
@@ -566,6 +571,7 @@ def pytest_configure(config: pytest.Config) -> None:
     load-bearing yet.
     """
     reject_unsafe_basetemp(config)
+    arm_leaked_drain_process_guard(config)
     config.addinivalue_line(
         'markers',
         'real_psi_reader: opt a test OUT of the autouse `_hermetic_psi_reader` '
@@ -1154,6 +1160,7 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
       - ``escalation`` = pre-created sub-section mock (no default value)
       - ``overrides_db_path`` = ``tmp_path / 'overrides.db'``
       - ``park_eviction_requests_db_path`` = ``tmp_path / 'park_eviction_requests.db'``
+      - ``eligibility_clock_db_path`` = ``tmp_path / 'scheduler_eligibility.db'``
 
     The top-level mock and each sub-section (usage_cap, review, sandbox,
     fused_memory, escalation) are spec_set'd against their pydantic model's
@@ -1262,6 +1269,9 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # Same failure mode as overrides_db_path above (tasks 1313/1339); this
     # instance of it is task 2045.
     config.park_eviction_requests_db_path = tmp_path / 'park_eviction_requests.db'
+    # Real Path for EligibilityClockStore.from_config(config), which Harness
+    # wires at construction (task 3821); same stray-file failure mode as above.
+    config.eligibility_clock_db_path = tmp_path / 'scheduler_eligibility.db'
     # Production default (task 4757). Unassigned, TaskWorkflow._invoke would
     # read a truthy Mock and run every mock-config workflow test strictly scoped.
     config.strict_mcp_config = False

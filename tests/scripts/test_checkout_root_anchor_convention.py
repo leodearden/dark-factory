@@ -13,6 +13,7 @@ import subprocess
 
 import pytest
 import verify_command_invariants as vci
+from git_listing import git
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -178,28 +179,14 @@ def _describe(completed):
     )
 
 
-def _git(root, *args):
-    completed = subprocess.run(
-        ["git", "-C", str(root), *args],
-        capture_output=True,
-        text=True,
-        timeout=_RUN_TIMEOUT_SECS,
-        check=False,
-    )
-    assert completed.returncode == 0, (
-        f"fixture setup: git -C {root} {' '.join(args)}: {_describe(completed)}"
-    )
-    return completed
-
-
 def _seeded_checkout(parent, name="checkout"):
     """A checkout at *parent*/*name* holding one commit, and its ``pkg/tests`` subdir."""
     root = parent / name
     (root / "pkg" / "tests").mkdir(parents=True)
-    _git(root.parent, "init", "-q", "-b", "main", str(root))
+    git(root.parent, "init", "-q", "-b", "main", str(root))
     (root / "seed.txt").write_text("seed\n", encoding="utf-8")
-    _git(root, "add", "seed.txt")
-    _git(root, *_GIT_IDENTITY, "commit", "-q", "-m", "seed")
+    git(root, "add", "seed.txt")
+    git(root, *_GIT_IDENTITY, "commit", "-q", "-m", "seed")
     return root, root / "pkg" / "tests"
 
 
@@ -225,7 +212,7 @@ def test_documented_anchor_answers_with_the_linked_worktrees_own_root(tmp_path):
     argv = _live_anchor_argv()
     main_root, _ = _seeded_checkout(tmp_path, name="main")
     worktree_root = tmp_path / "wt"
-    _git(main_root, "worktree", "add", "-q", "-b", "task-5690", str(worktree_root), "main")
+    git(main_root, "worktree", "add", "-q", "-b", "task-5690", str(worktree_root), "main")
     nested = worktree_root / "pkg" / "tests"
     nested.mkdir(parents=True)
 

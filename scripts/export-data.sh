@@ -46,19 +46,28 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. FalkorDB BGSAVE
+# 3. FalkorDB: rewrite the AOF and copy its restore set
 # ---------------------------------------------------------------------------
-info "Flushing FalkorDB to disk"
+info "Exporting FalkorDB"
 
+# A restored server boots with appendonly yes and loads ONLY the AOF under
+# appendonlydir/, ignoring dump.rdb (task 6330). A running server's AOF is
+# exported through scripts/falkordb_export_copy.py, whose docstring carries
+# the why: it saves, rewrites the AOF so its manifest is newer than dump.rdb,
+# and copies only the restore set. A stopped server's files are at rest, so
+# its data dir is copied whole.
+#
 # Read the verdict from the captured LISTING, never from the pipeline's status.
 # `producer | grep -q falkordb` reports the PRODUCER's status under `pipefail`,
 # so the `if` took the else branch on a listing that plainly named the
-# container — skipping the BGSAVE on a LIVE database and exporting a stale
-# dump.rdb. Two ways it happened: `docker compose ps` exiting non-zero for its
-# own reasons after printing the listing, and SIGPIPE, because `grep -q` closes
-# the read end on its first match and a producer still writing dies of signal
-# 13 (pipeline status 141). Size is not a defence — a sub-buffer reply is a
-# low-rate flake, not a safe site.
+# container — skipping the flush on a LIVE database and copying its data dir
+# as it is: a manifest older than dump.rdb, which import-data.sh refuses,
+# copied from an AOF the server was still writing. Two ways it happened:
+# `docker compose ps` exiting non-zero for its own reasons after printing the
+# listing, and SIGPIPE, because `grep -q` closes the read end on its first
+# match and a producer still writing dies of signal 13 (pipeline status 141).
+# Size is not a defence — a sub-buffer reply is a low-rate flake, not a safe
+# site.
 #
 # Each rejected alternative was MEASURED, not merely disliked:
 #   - `|| true` is load-bearing. Without it the assignment is a SIMPLE COMMAND,
@@ -77,21 +86,19 @@ info "Flushing FalkorDB to disk"
 #
 # The four sibling sites in scripts/import-data.sh back-reference this block.
 _running="$(docker compose -f "$COMPOSE_FILE" ps --status running 2>/dev/null)" || true
+FALKOR_SRC="$REPO_ROOT/fused-memory/data/falkordb"
+FALKOR_EXPORT="$EXPORT_DIR/fused-memory-data/falkordb"
 if [[ "$_running" == *falkordb* ]]; then
-  BEFORE=$(docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli LASTSAVE 2>/dev/null || echo "0")
-  docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli BGSAVE &>/dev/null
-
-  for i in $(seq 1 30); do
-    AFTER=$(docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli LASTSAVE 2>/dev/null || echo "0")
-    if [ "$AFTER" != "$BEFORE" ]; then
-      ok "FalkorDB BGSAVE completed"
-      break
-    fi
-    [ "$i" -eq 30 ] && warn "FalkorDB BGSAVE did not complete in 30s (using existing dump.rdb)"
-    sleep 1
-  done
+  python3 "$REPO_ROOT/scripts/falkordb_export_copy.py" --compose-file "$COMPOSE_FILE" --dest "$FALKOR_EXPORT" \
+    || fail "FalkorDB export failed (cause logged above) and fused-memory was left stopped: run 'systemctl --user start fused-memory', then re-run the export once that cause is fixed"
+  ok "FalkorDB: $(du -sh "$FALKOR_EXPORT" | cut -f1)"
+elif [ -d "$FALKOR_SRC" ]; then
+  warn "FalkorDB container not running — copying its data dir as it is; import-data.sh refuses it if its AOF manifest is older than dump.rdb"
+  mkdir -p "$FALKOR_EXPORT"
+  cp -a "$FALKOR_SRC/." "$FALKOR_EXPORT/"
+  ok "FalkorDB: $(du -sh "$FALKOR_EXPORT" | cut -f1)"
 else
-  warn "FalkorDB container not running — using existing dump.rdb"
+  warn "FalkorDB container not running and no data dir at $FALKOR_SRC — no FalkorDB data exported"
 fi
 
 # ---------------------------------------------------------------------------
@@ -100,14 +107,6 @@ fi
 info "Exporting data to $EXPORT_DIR"
 
 mkdir -p "$EXPORT_DIR"
-
-# FalkorDB
-FALKOR_SRC="$REPO_ROOT/fused-memory/data/falkordb"
-if [ -d "$FALKOR_SRC" ]; then
-  mkdir -p "$EXPORT_DIR/fused-memory-data/falkordb"
-  cp -a "$FALKOR_SRC/." "$EXPORT_DIR/fused-memory-data/falkordb/"
-  ok "FalkorDB: $(du -sh "$FALKOR_SRC" | cut -f1)"
-fi
 
 # Qdrant
 QDRANT_SRC="$REPO_ROOT/fused-memory/data/qdrant"

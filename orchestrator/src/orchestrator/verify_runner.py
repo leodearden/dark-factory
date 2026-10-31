@@ -93,6 +93,7 @@ from orchestrator.verify_cancel import (
     start_stdin_heartbeat,
 )
 from orchestrator.verify_categories import FailureCategory, _assert_sentinels_disjoint
+from orchestrator.verify_evidence import verify_event_fields
 from orchestrator.verify_spec_shared import (
     VerifyCommand,
     apply_spec_to_host_config,
@@ -664,7 +665,9 @@ class RunnerUnavailable(Exception):
     (stdout is not JSON), ``wire_shape`` (a gate identity or a verdict of the
     wrong shape — a contract skew between the two hosts), or ``no_verdict`` —
     the ONE parseable outcome that raises: a result whose summary records no
-    verdict (``verify.is_no_verdict_summary``).  Every other parseable
+    verdict (``verify.is_no_verdict_summary``), whose output (stderr, streams,
+    summary and a no-verdict record) is archived before the raise when the
+    caller gave an archive root.  Every other parseable
     VerifyResult is returned — even passed=False or timed_out=True (PRD §A
     Invariant 5).
 
@@ -896,6 +899,9 @@ class LocalRunner:
                 # likely to occur under load — and would REGRESS an emission that
                 # happened inline before the recorder was split out.
                 flake_suppression=getattr(scoped, 'flake_suppression', None),
+                # The scoped plan did run; the unscoped gate is not one of its units.
+                plan=scoped.plan,
+                units=scoped.units,
             )
 
         return scoped
@@ -1085,9 +1091,9 @@ async def env_probe_local_run(
 #: writer's only blocking operation is a ``threading.Event.wait`` that ``stop()``
 #: ends within one GIL switch, and its write end is non-blocking so ``os.write``
 #: can never park on a full pipe — so 5.0s is ~6x the ~0.85s worst single-gap
-#: additive scheduling delay measured at loadavg 113-178 (recorded in
-#: ``test_laptop_warm_verify_boundary.py``'s ``HeartbeatWriter`` comment) and is
-#: never reached in practice.
+#: additive scheduling delay measured at loadavg 113-178 (recorded in the
+#: ROW_WATCHDOG banner of ``orchestrator/tests/_verify_boundary_ceilings.py``)
+#: and is never reached in practice.
 #:
 #: WHO PAYS THE WAIT: not the event loop.  ``Thread.join`` is synchronous, and
 #: the coroutine that tears the writer down runs on the orchestrator's single
@@ -1243,6 +1249,45 @@ class _DispatchOutcome:
     result: VerifyResult
     ssh_stderr: str
     duration_ms: int
+
+
+@dataclass(frozen=True)
+class _RemoteArchiveTarget:
+    """Where one remote verify's artefacts go: ``<root>/<task_id>/attempt-<attempt_id>.remote-<name>...``."""
+
+    root: Path
+    task_id: str
+    attempt_id: int
+    role: Literal['merge', 'task']
+
+
+def _no_verdict_record_payload(
+    runner_name: str,
+    ssh_host: str,
+    sha: str,
+    archive: _RemoteArchiveTarget,
+    outcome: _DispatchOutcome,
+) -> dict[str, Any]:
+    """A remote NO-VERDICT's audit record: the host, the verified sha and what the wire said.
+
+    It carries no ``passed`` key, so it cannot be read as a red.
+    """
+    result = outcome.result
+    return {
+        'sha': sha,
+        'runner': runner_name,
+        'ssh_host': ssh_host,
+        'task_id': archive.task_id,
+        'attempt_id': archive.attempt_id,
+        'role': archive.role,
+        'summary': result.summary,
+        'category': result.category,
+        'cause_hint': result.cause_hint,
+        'timed_out': result.timed_out,
+        'duration_ms': outcome.duration_ms,
+        'failing_test_ids': result.failing_test_ids,
+        'skipped_test_ids': result.skipped_test_ids,
+    }
 
 
 def _merge_pass_summary_payload(
@@ -1608,26 +1653,31 @@ class RemoteRunner:
         (task 2822 fix c) so a remote GREEN is auditable.  Any archival error is
         swallowed so the VerifyResult is always returned unchanged (PRD §A Invariant 5).
 
-        Raises RunnerUnavailable when the host produced no usable verdict.
+        Raises RunnerUnavailable when the host produced no usable verdict.  A
+        ``no_verdict`` first archives, given both *task_id* and *archive_root*,
+        its stderr, streams and summary exactly as a red does, plus an
+        ``attempt-1.remote-<name>.no-verdict-<utc_ts>.json`` record.
         Returns any other VerifyResult unchanged — even passed=False or
         timed_out=True (PRD §A Invariant 5).
         """
         request_id = self._id_factory()
+        archive = (
+            _RemoteArchiveTarget(archive_root, task_id, _MERGE_ARCHIVE_ATTEMPT_ID, 'merge')
+            if archive_root is not None and task_id is not None else None
+        )
         await self._push_main_mirror(task_id=task_id, event_store=event_store)
         outcome = await self._dispatch(
             merge_sha, 'verify-merge', spec_to_json(spec), request_id=request_id,
-            event_store=event_store, task_id=task_id,
+            archive=archive, event_store=event_store, task_id=task_id,
         )
         result = outcome.result
-        if archive_root is not None and task_id is not None:
+        if archive is not None:
             if not result.passed:
-                self._archive_remote_red(
-                    archive_root, task_id, _MERGE_ARCHIVE_ATTEMPT_ID, outcome, role='merge',
-                )
+                self._archive_remote_output(archive, outcome)
             else:
                 # task-2822 fix (c): a remote GREEN is auditable beside the red archives.
-                self._archive_pass_summary(
-                    archive_root, task_id, _MERGE_ARCHIVE_ATTEMPT_ID,
+                self._archive_record(
+                    archive, 'pass-summary',
                     _merge_pass_summary_payload(
                         self.name, spec, result, merge_sha, outcome.duration_ms,
                     ),
@@ -1651,25 +1701,32 @@ class RemoteRunner:
         one ``.pass-summary-<stamp>.json``.  The result's archive_log_paths name
         exactly those workstation files and worktree_log_paths is emptied, since
         laptop paths mean nothing here.  *task_id* must equal ``spec.task_id``.
+
+        Raises RunnerUnavailable when the host produced no usable verdict.  A
+        ``no_verdict`` first archives, with *archive_root*, what a red would
+        plus a ``.no-verdict-<stamp>.json`` record.
         """
         if task_id != spec.task_id:
             raise ValueError(
                 f'run_task_verify task_id {task_id!r} disagrees with spec.task_id '
                 f'{spec.task_id!r}'
             )
+        archive = (
+            _RemoteArchiveTarget(archive_root, task_id, spec.attempt_id, 'task')
+            if archive_root is not None else None
+        )
         outcome = await self._dispatch(
             spec.tip_sha, 'verify-task', task_spec_to_json(spec),
-            request_id=self._id_factory(), event_store=event_store, task_id=task_id,
+            request_id=self._id_factory(), archive=archive,
+            event_store=event_store, task_id=task_id,
         )
         archived: list[Path] = []
-        if archive_root is not None:
+        if archive is not None:
             if not outcome.result.passed:
-                archived = self._archive_remote_red(
-                    archive_root, task_id, spec.attempt_id, outcome, role='task',
-                )
+                archived = self._archive_remote_output(archive, outcome)
             else:
-                pass_summary = self._archive_pass_summary(
-                    archive_root, task_id, spec.attempt_id,
+                pass_summary = self._archive_record(
+                    archive, 'pass-summary',
                     _task_pass_summary_payload(
                         self.name, spec, outcome.result, outcome.duration_ms,
                     ),
@@ -1773,6 +1830,7 @@ class RemoteRunner:
         spec_json: str,
         *,
         request_id: str,
+        archive: _RemoteArchiveTarget | None,
         event_store: Any = None,
         task_id: str | None = None,
     ) -> _DispatchOutcome:
@@ -1789,7 +1847,8 @@ class RemoteRunner:
         ('transport') instead of starting the verify.
 
         Raises RunnerUnavailable, whose ``kind`` says why, whenever the host
-        produced no usable verdict — a parseable no-verdict result included.
+        produced no usable verdict — a parseable no-verdict result included,
+        whose output is first archived best-effort to *archive* (when given).
         """
         if self._inflight_request_id is not None:
             raise ConcurrentDispatchError(
@@ -1802,7 +1861,10 @@ class RemoteRunner:
             await self.ensure_gate(event_store=event_store, task_id=task_id)
             await self._push(self._git_remote, f'{sha}:{ref}', cwd=self._cwd)
             try:
-                return await self._run_gate_verify(sha, subcommand, spec_json, request_id)
+                outcome = await self._run_gate_verify(sha, subcommand, spec_json, request_id)
+                if verify.is_no_verdict_summary(outcome.result.summary):
+                    raise self._no_verdict_unavailable(outcome, sha, archive)
+                return outcome
             finally:
                 # Best-effort ref cleanup — never alters returned result nor masks exceptions
                 with contextlib.suppress(Exception):
@@ -1842,7 +1904,7 @@ class RemoteRunner:
         if ssh_rc != 0:
             raise self._verify_exit_unavailable(ssh_rc, ssh_stderr, request_id)
         return _DispatchOutcome(
-            result=self._parse_verdict(ssh_stdout),
+            result=self._parse_wire_result(ssh_stdout),
             ssh_stderr=ssh_stderr,
             duration_ms=duration_ms,
         )
@@ -1868,7 +1930,7 @@ class RemoteRunner:
             f'ssh {self._ssh_host} exited {rc}: {stderr}', kind=classify_remote_exit(rc),
         )
 
-    def _parse_verdict(self, stdout: str) -> VerifyResult:
+    def _parse_wire_result(self, stdout: str) -> VerifyResult:
         try:
             result = result_from_json(stdout)
         except ValueError as exc:  # json.JSONDecodeError included
@@ -1887,113 +1949,109 @@ class RemoteRunner:
                 f'summary {result.summary!r} is not a string',
                 kind='wire_shape',
             )
-        if verify.is_no_verdict_summary(result.summary):
-            raise RunnerUnavailable(
-                f'{self.name!r} returned no verdict: {result.summary}',
-                kind='no_verdict',
-            )
         return result
 
-    def _archive_remote_red(
-        self,
-        archive_root: Path,
-        task_id: str,
-        attempt_id: int,
-        outcome: _DispatchOutcome,
-        *,
-        role: Literal['merge', 'task'],
+    def _no_verdict_unavailable(
+        self, outcome: _DispatchOutcome, sha: str, archive: _RemoteArchiveTarget | None,
+    ) -> RunnerUnavailable:
+        """The RunnerUnavailable('no_verdict') for *outcome*, archived to *archive* first.
+
+        Its one-line message names every archived path: it becomes the bench
+        entry's reason, so the hosts block, the verify_host_skew event and the
+        L1 all lead to the output.
+        """
+        archived = self._archive_no_verdict(archive, outcome, sha) if archive is not None else []
+        message = f'{self.name!r} returned no verdict: {outcome.result.summary}'
+        if archived:
+            message += '; output archived at ' + ', '.join(str(path) for path in archived)
+        return RunnerUnavailable(message, kind='no_verdict')
+
+    def _archive_no_verdict(
+        self, archive: _RemoteArchiveTarget, outcome: _DispatchOutcome, sha: str,
     ) -> list[Path]:
-        """Archive a remote red: its ssh stderr (task 1920), then its captured streams (task 1921)."""
+        """Archive a remote no-verdict: its no-verdict record, then what a red would archive."""
+        record = self._archive_record(
+            archive, 'no-verdict',
+            _no_verdict_record_payload(self.name, self._ssh_host, sha, archive, outcome),
+        )
+        archived = [record] if record is not None else []
+        return archived + self._archive_remote_output(archive, outcome)
+
+    def _archive_remote_output(
+        self, archive: _RemoteArchiveTarget, outcome: _DispatchOutcome,
+    ) -> list[Path]:
+        """Archive a remote run's output: its ssh stderr (task 1920), then its captured streams (task 1921)."""
         archived: list[Path] = []
         if outcome.ssh_stderr.strip():
-            stderr_path = self._archive_failure_stderr(
-                archive_root, task_id, attempt_id, outcome.ssh_stderr,
-            )
+            stderr_path = self._archive_failure_stderr(archive, outcome.ssh_stderr)
             if stderr_path is not None:
                 archived.append(stderr_path)
-        archived += self._archive_failure_streams(
-            archive_root, task_id, attempt_id, outcome.result, role=role,
-        )
+        archived += self._archive_failure_streams(archive, outcome.result)
         return archived
 
-    def _archive_failure_stderr(
+    def _archive_file(
         self,
-        archive_root: Path,
-        task_id: str,
-        attempt_id: int,
-        stderr_text: str,
+        archive: _RemoteArchiveTarget,
+        what: str,
+        name_tail: Callable[[str], str],
+        render: Callable[[], str],
     ) -> Path | None:
-        """Write *stderr_text* to a timestamped .stderr.log file under archive_root/task_id/.
+        """Write ``render()`` to ``<root>/<task_id>/attempt-<attempt_id>.remote-<safe_name><name_tail(stamp)>``.
 
-        Filename: ``attempt-<attempt_id>.remote-<safe_name>-<utc_ts>.stderr.log``
+        The one home of the remote archive file naming that this runner owns:
+        the directory, the ``attempt-<attempt_id>.remote-<safe_name>`` stem
+        (_sanitize_runner_name) and the microsecond UTC stamp
+        (_STDERR_ARCHIVE_TS_FMT), co-located with local verify archives for
+        side-by-side triage.  The I/O is synchronous, matching the local-archive
+        convention; payloads are bounded by the ssh output buffer.
 
-        Co-located with local verify archives for side-by-side operator triage (task 1920,
-        sibling of 1768).  Timestamp format and name sanitization mirror _archive_merge_verify_logs
-        via _STDERR_ARCHIVE_TS_FMT and _sanitize_runner_name.
-
-        Filesystem I/O is synchronous (mkdir + write_text), matching the local-archive convention.
-        Remote stderr payloads are bounded by the ssh process output buffer; the event-loop
-        blocking window is negligible at current sizes.
-
-        Best-effort: any exception is swallowed with a WARNING (returning None) so the
-        caller's VerifyResult is always returned unchanged (PRD §A Invariant 5).
+        Best-effort: any exception, *render*'s included, is swallowed with a
+        WARNING naming *what*, returning None, so the caller's VerifyResult or
+        raise is unchanged (PRD §A Invariant 5).
         """
-        import logging as _logging
         try:
-            target_dir = Path(archive_root) / task_id
+            target_dir = archive.root / archive.task_id
             target_dir.mkdir(parents=True, exist_ok=True)
-            utc_ts = datetime.now(UTC).strftime(_STDERR_ARCHIVE_TS_FMT)
-            safe = _sanitize_runner_name(self.name)
-            path = target_dir / f'attempt-{attempt_id}.remote-{safe}-{utc_ts}.stderr.log'
-            path.write_text(stderr_text, encoding='utf-8')
+            stamp = datetime.now(UTC).strftime(_STDERR_ARCHIVE_TS_FMT)
+            stem = f'attempt-{archive.attempt_id}.remote-{_sanitize_runner_name(self.name)}'
+            path = target_dir / f'{stem}{name_tail(stamp)}'
+            path.write_text(render(), encoding='utf-8')
             return path
         except Exception as exc:
-            _logging.getLogger(__name__).warning(
-                'RemoteRunner %r: best-effort stderr archival failed: %s', self.name, exc,
+            logger.warning(
+                'RemoteRunner %r: best-effort %s archival failed: %s', self.name, what, exc,
             )
             return None
 
-    def _archive_pass_summary(
+    def _archive_failure_stderr(
+        self, archive: _RemoteArchiveTarget, stderr_text: str,
+    ) -> Path | None:
+        """Archive the remote ssh stderr as ``attempt-<attempt_id>.remote-<safe_name>-<stamp>.stderr.log`` (task 1920)."""
+        return self._archive_file(
+            archive, 'stderr', lambda stamp: f'-{stamp}.stderr.log', lambda: stderr_text,
+        )
+
+    def _archive_record(
         self,
-        archive_root: Path,
-        task_id: str,
-        attempt_id: int,
+        archive: _RemoteArchiveTarget,
+        label: Literal['pass-summary', 'no-verdict'],
         payload: dict[str, Any],
     ) -> Path | None:
-        """Archive a PASSING remote verify's *payload* as a best-effort JSON pass-summary.
+        """Archive *payload* as ``attempt-<attempt_id>.remote-<safe_name>.<label>-<stamp>.json``.
 
-        Filename: ``attempt-<attempt_id>.remote-<safe_name>.pass-summary-<utc_ts>.json``
-
-        Mirrors _archive_failure_stderr's best-effort shape (mkdir(parents,exist_ok),
-        microsecond-UTC timestamp via _STDERR_ARCHIVE_TS_FMT, _sanitize_runner_name,
-        swallow-with-WARNING returning None) so a remote GREEN is auditable
-        side-by-side with the failure archives (task 2822 fix c).
+        'pass-summary' makes a remote GREEN auditable side-by-side with the
+        failure archives (task 2822 fix c); 'no-verdict' records which host and
+        sha a no-verdict ran on.
         """
-        import logging as _logging
-        try:
-            target_dir = Path(archive_root) / task_id
-            target_dir.mkdir(parents=True, exist_ok=True)
-            utc_ts = datetime.now(UTC).strftime(_STDERR_ARCHIVE_TS_FMT)
-            safe = _sanitize_runner_name(self.name)
-            path = target_dir / f'attempt-{attempt_id}.remote-{safe}.pass-summary-{utc_ts}.json'
-            path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding='utf-8')
-            return path
-        except Exception as exc:
-            _logging.getLogger(__name__).warning(
-                'RemoteRunner %r: best-effort pass-summary archival failed: %s', self.name, exc,
-            )
-            return None
+        return self._archive_file(
+            archive, label, lambda stamp: f'.{label}-{stamp}.json',
+            lambda: json.dumps(payload, indent=2, sort_keys=True),
+        )
 
     def _archive_failure_streams(
-        self,
-        archive_root: Path,
-        task_id: str,
-        attempt_id: int,
-        result: VerifyResult,
-        *,
-        role: Literal['merge', 'task'],
+        self, archive: _RemoteArchiveTarget, result: VerifyResult,
     ) -> list[Path]:
-        """Archive captured test/lint/type output streams to archive_root/task_id/ on failure.
+        """Archive *result*'s captured test/lint/type output streams under *archive*.
 
         Mirrors verify._archive_merge_verify_logs by projecting the three VerifyResult
         output fields into synthetic per-stream run dicts, one per NON-EMPTY stream.
@@ -2022,7 +2080,6 @@ class RemoteRunner:
         _archive_merge_verify_logs already swallows OSError internally; this outer
         guard additionally swallows non-OSError failures as a backstop (task 1921 step-4).
         """
-        import logging as _logging
         try:
             runs = [
                 {
@@ -2051,16 +2108,16 @@ class RemoteRunner:
             # this method threads the fields through verbatim but cannot enforce them.
             return _archive_merge_verify_logs(
                 runs,
-                Path(archive_root),
-                task_id,
-                attempt_id,
+                archive.root,
+                archive.task_id,
+                archive.attempt_id,
                 result.category,
                 result.cause_hint,
                 module_prefix=f'remote-{self.name}',
-                role=role,
+                role=archive.role,
             )
         except Exception as exc:
-            _logging.getLogger(__name__).warning(
+            logger.warning(
                 'RemoteRunner %r: best-effort stream archival failed: %s', self.name, exc,
             )
             return []
@@ -2609,6 +2666,7 @@ class VerifyRunnerPool:
                     # spec.verify_env, so a narrowed retry is never miscounted as
                     # a full green gate.
                     **retry_scope_event_fields(spec.verify_env),
+                    **verify_event_fields(result),
                 },
             )
 

@@ -98,7 +98,9 @@ class RequeueCooldown(BaseModel):
 class SchedulerStateSnapshot(BaseModel):
     """``parks`` maps each owner to the modules it tops; ``park_stacks`` maps each
     module to its whole stack, bottom to top, as open entry records; ``lock_depth``
-    is the depth the producer normalises lock keys to.
+    is the depth the producer normalises lock keys to. ``pause_class`` is the wire
+    value of ``orchestrator/src/orchestrator/pause_policy.py::PauseClass`` (shared
+    cannot import orchestrator), ``None`` when not paused.
 
     Frozen means no field can be reassigned. The mappings are plain dicts that
     validation copies from its input, so a snapshot never aliases its producer's
@@ -118,6 +120,7 @@ class SchedulerStateSnapshot(BaseModel):
     lock_depth: StrictInt | None = None
     is_paused: bool = False
     pause_reason: str | None = None
+    pause_class: str | None = None
     requeue_cooldowns: Mapping[str, RequeueCooldown] = Field(default_factory=dict)
     snapshot_at: AwareDatetime | None = None
 

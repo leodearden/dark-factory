@@ -227,7 +227,11 @@ next to the per-phase `detect.log`, `confirm.log` and `*.junit.xml`.
 `confirm` run blocks (`null` for a phase that did not run), the `outcome`,
 and `effect`: `tests_counted`, `episodes_started`,
 `episodes_extended`, `episodes_ended`, `threshold_reached`, `stale_heads`,
-`no_decision`, `tasks_filed` and `escalations_raised`. `effect` is `null` while
+`no_decision`, `tasks_filed`, `escalations_raised`, `debts_offered` (the tests
+this pass put on the flake ledger's due list, each with its trigger, `cleared`
+or `recovered`, and the head of its evidence) and `debts_undecided` (the cleared
+tests it did not offer because their covering fix task's status could not be
+read; the orchestrator log names each at ERROR). `effect` is `null` while
 a pass is still running, and stays `null` if the pass was cut short (it is
 written after the engine observes).
 
@@ -275,7 +279,7 @@ after 14 days without a write.
 
 **Outages.** A command may declare `outage_probe`; dark-factory's `qdrant-integration` runs `python scripts/lane_dependency_probe.py` in `fused-memory/`. After a red detection run the lane runs the probe once, at normal priority, bounded by `outage_probe_timeout_secs` (180). If it exits 0 the red goes on to the confirm as usual. If it exits 75 with a first stdout line `<dependency>: <reason>`, the pass is an outage: no confirm, no fix task and no ledger row, and each held episode gets `had_outage_pass: true`. The lane then opens one `infra_issue` level-1 escalation on the command's sentinel, naming the dependency and the pass directory, and amends it only when the probe's answer changes. While the command's `last_probe_result` reads `outage`, the lane re-runs the probe alone every `recheck_secs` on its idle poll, and held reds are not rechecked. When the probe exits 0, the lane resolves its own record and any level-2 whose only member it is (a level-2 with other members is amended instead), then runs the command again. The lane also closes the outage record when the probe turns broken, or when the probe or the command is removed or disabled. You do not need to close it. If you resolve it while the dependency is still down, the lane opens nothing until the next red pass whose probe fails. Any other probe result is a broken probe: another exit code, 75 with no line, a crash, or the timeout. The red is then handled as if no probe were declared, and a second `infra_issue` record says the probe is broken until a probe next exits 0, or 75 with a name. To run the probe by hand: `cd fused-memory && python scripts/lane_dependency_probe.py; echo $?`. Name dependencies (`qdrant falkordb embedder chat-model`) to check only those. Exit 75 means "this dependency is not usable", and the printed line names it. Any other non-zero exit is a defect in the probe. The command's record in `offline_lane_episodes.json` carries `last_probe_result` (the probe object), `last_probe_at`, `outage_escalation_id` and `probe_broken_escalation_id`.
 
-Appended by later leaves of plans/offline-lane-red-path-prd.md.
+**The flake ledger.** The lane's rows are read by call site with `orchestrator flake-ledger` (see *Reading the flake ledger*), listed under `offline_lane`, apart from the merge gate's; the de-flake task a lane debt opened is found by its metadata (`flake_debt_call_site: offline_lane`, `flake_debt_trigger: cleared` or `recovered`, `flake_debt_command: <command>`), for example with `find_tasks_by_metadata`. Every non-outage red pass writes one row per test it examined, at the pass's head and start. A cleared test, or a held red that failed and passed at one head with no fix task filed, owes flake debt, and the ledger's drain files its de-flake task; a cleared test that an open or deferred fix task covers owes none. When a fix task is filed for a test that owes debt, its details name the live de-flake owner under `Live de-flake owners:`.
 
 ### Reading the verify artefact archive (`data/verify-logs/<task_id>/`)
 
@@ -602,6 +606,123 @@ CLI. Every invocation needs an explicit `--config <path>` or an
 your shell profile — it will silently redirect an unrelated invocation at
 the wrong project. Prefer a per-project `.envrc` (direnv) instead, and note
 that direnv isn't installed by default on a fresh host.
+
+### Client feed
+
+#### What the publisher is
+
+One long-running `client-feed publish --config <policy>` per client project,
+run as `client-feed@<name>.service`. Every pass writes that project's
+client-safe evidence to its `out/` (`feed.jsonl`, `state.json`,
+`cursor.json`) and reads its `in/` (`inbox.jsonl`, `engagement.json`), which
+the client portal writes. `scripts/setup-host.sh` renders the unit from
+`scripts/client-feed.service.template` and never enables it. The design is
+`plans/client-feed-prd.md`; what the publisher may open and write is its
+isolation invariant, §8.
+
+#### The policy file
+
+Each instance reads `~/.config/client-feed/<name>.yaml` (PRD §7.6). The schema
+and every default live in `client-feed/src/client_feed/policy.py::Policy`. The
+worked example for this repository is `client-feed/examples/dark-factory.yaml`.
+From the checkout root:
+
+```bash
+install -D -m 0600 client-feed/examples/dark-factory.yaml ~/.config/client-feed/dark-factory.yaml
+```
+
+For a client project, install it under the project's name, then edit
+`project_id`, `project_root`, `out_dir`, `in_dir` and `visible_globs`. The
+publisher refuses to start on a file it cannot read, parse or validate, on a
+`project_root` that is not the top of a git work tree, and on an `out_dir` that
+is missing, a symlink, or not the running user's
+(`client-feed/src/client_feed/policy.py::PolicyProblem`).
+
+#### The two directories
+
+| Directory | Owner:group | Mode | Written by |
+|---|---|---|---|
+| `<root>/<name>/out` | `leo:scoping-intake` | 2750, setgid | the publisher; its files are 0640 (`client-feed/src/client_feed/feed_io.py::FILE_MODE`) |
+| `<root>/<name>/in` | `scoping-intake:scoping-intake` | 2750, setgid | the portal; Leo reads it through the group |
+
+`<root>` is `/var/lib/scoping-intake-feeds` unless moved, and `scoping-intake`
+is the portal account's group. The portal repository creates both directories
+(`sudo ~leo/src/scoping-intake/deploy/install.sh feed <name>`), and the portal
+PRD owns them. The authoritative layout is that repository's
+`deploy/README.md` §"Feeds". If the root moves, point the policy's `out_dir`
+and `in_dir` at the new paths and restart the instance.
+
+`install.sh` adds Leo to the group (`usermod -aG scoping-intake leo`). The
+publisher's user units see the new membership only once Leo's user manager
+restarts. A reboot restarts it; with linger on, logging out does not.
+`sudo systemctl restart user@$(id -u).service` also restarts it, but that
+stops every user unit, the orchestrators and fused-memory included, so treat
+it as a fleet restart and drain first (§8). To check, and to keep the units
+running without a login:
+
+```bash
+systemd-run --user --pipe --wait id -nG   # must list scoping-intake
+loginctl enable-linger leo
+```
+
+#### Enabling an instance
+
+From the checkout root:
+
+```bash
+bash scripts/setup-host.sh       # renders client-feed@.service; enables nothing
+# install the policy (above), then publish one pass; a refusal prints on stderr and exits 1:
+uv run --no-sync --project client-feed client-feed snapshot --config ~/.config/client-feed/<name>.yaml
+systemctl --user enable --now client-feed@<name>.service
+systemctl --user cat client-feed@<name>.service                # the template, repo root and uv path substituted
+systemctl --user show -p ExecStart client-feed@<name>.service  # --config resolved to ~/.config/client-feed/<name>.yaml
+journalctl --user -u client-feed@<name>.service
+```
+
+The unit runs `uv run --no-sync`, so the shared `.venv` must already hold
+`client-feed`. setup-host's sync installs it, and so does
+`scripts/sync-orchestrator-env.sh`. After a template change, re-run setup-host
+and restart the instance. A clean stop exits 0. A refusal exits 1, and systemd
+retries it with a 5s→60s backoff until the cause is fixed.
+
+#### Reading the heartbeat's degraded list
+
+```bash
+uv run --no-sync --project client-feed client-feed dump-state --out-dir <out>
+```
+
+prints the fold of the feed. Its `degraded` is the last heartbeat's list of
+`{source, reason}`, and its `as_of` is that heartbeat's time. An empty list is
+healthy; an `as_of` older than a few intervals means the publisher is not
+running. The sources are `client-feed/src/client_feed/contract.py::Source`.
+What a degraded source holds back is stated in `plans/client-feed-prd.md`
+§12:
+
+- `engagement`: reveals are disabled for the pass (δ entry (d)).
+- `inbox`: the inbox offset is held (δ entry (e)).
+- `git`: a merge commit git cannot read holds the landing batch (γ entry (f)).
+  Unparseable git output and a timed-out `git cat-file --batch` read degrade
+  `git` too (task 7484 entry (c)).
+- `archive`: only that run's archived details are lost (γ entry (f)).
+- `tasks`, `events`: rows that cannot be projected are counted as
+  `skipped N rows: …` (γ entry (f)).
+
+The same failures are WARNING lines in the unit's journal.
+
+#### The isolation check
+
+The isolation gate is ζ's `client-feed/tests/test_isolation.py` (task 6973;
+PRD §10 row ζ, B1, B2, B15 and B22). The deployment canary is the portal
+repository's `deploy/README.md` §"Check": step 4 (the portal account cannot
+list `/home/leo`) and step 7 (the canary feed).
+
+#### What evidence exists
+
+- Test and criteria evidence exists for pytest projects only: junit
+  injection is pytest-only (PRD §2).
+- Per-test results for merge runs exist only when the client project's
+  `dark-factory-orchestrator.yaml` sets `merge_verify_breadth: full`.
+  Otherwise only task legs carry `test_results`.
 
 ---
 
@@ -2198,6 +2319,145 @@ writing streak state: `is_unit_enabled` (operator intent) and the 120s
 `STARTUP_GRACE_SECS` window after the unit starts (a not-yet-bound port is
 neither failure evidence nor recovery).
 
+### FalkorDB settings and the recreate gate
+
+FalkorDB's durable settings live in `fused-memory/docker/docker-compose.yml`
+and nowhere else: `REDIS_ARGS` turns the AOF on (`appendonly yes`,
+`appendfsync everysec`), `FALKORDB_ARGS` sets the query `TIMEOUT 30000`, and
+the image is pinned by digest (FalkorDB 4.18.0; `:latest` is now the 6.0
+engine). The image runs `redis-server` with no config file, so a runtime
+`CONFIG SET` or `GRAPH.CONFIG SET` lasts only until the next container
+restart, and a crash restart drops it silently (task 6330, 6848; the 10-26
+segfault reset both). Use `CONFIG SET` only as a stop-gap, never as the fix.
+
+fused-memory checks both at startup and logs a WARNING naming the shortfall
+when `TIMEOUT` is below `graphiti.falkordb.expected_graph_timeout_ms` or
+`appendonly` is not `yes`. `get_status` reports the live values on every call
+under `graphiti.server_settings` (`ok`, `shortfalls`, `read_errors`). It never
+sets them.
+
+The unit's `ExecStartPre` (and `scripts/setup-host.sh`) runs
+`scripts/falkordb_aof_gate.py` instead of a bare compose-up, and the
+fused-memory parity checker reports a unit that does not as drift. A recreate
+starts the new server with `appendonly yes`, which loads only the AOF and
+ignores `dump.rdb`, so a stale AOF would drop every write made since it went
+stale. The gate therefore decides as follows:
+
+| falkordb container | Gate action |
+|---|---|
+| any, but the compose file binds a different host data dir than the container mounts | not touched, qdrant comes up, ERROR |
+| running, AOF current | `compose up -d falkordb qdrant` (a recreate goes ahead) |
+| running, AOF not current or unreadable | left running, qdrant comes up, ERROR with each problem's remedy |
+| created / exited, its `REDIS_ARGS` enable `--appendonly yes` | `docker start` it unchanged and bring qdrant up; any pending recreate waits for the next restart |
+| created / exited, AOF not enabled at boot | not started (it would load a stale `dump.rdb`), qdrant comes up, ERROR; fused-memory then fails at its port wait |
+| restarting / paused / dead / removing | left alone, qdrant comes up, ERROR |
+| absent, data dir empty | `compose up -d falkordb qdrant` (fresh install) |
+| absent, `dump.rdb` or `appendonlydir` present | not created, qdrant comes up, ERROR; fused-memory then fails at its port wait |
+
+"AOF current" means the live server reports `appendonly yes`, `aof_enabled:1`,
+`loading:0`, `aof_last_write_status:ok` and `aof_rewrite_in_progress:0`. It
+also means the base and incr files in the host-side manifest total exactly
+the server's `aof_current_size`, bracketed by two `INFO` reads. Size is used
+rather than mtime because an idle server's incr file mtime does not move.
+
+**When it refuses**, the journal line names each problem and its remedy:
+
+| Problem | Remedy |
+|---|---|
+| `appendonly` no, `aof_enabled:0`, no manifest on the host | `docker exec docker-falkordb-1 redis-cli CONFIG SET appendonly yes`, wait for `aof_rewrite_in_progress:0`, restart fused-memory |
+| `loading:1` or `aof_rewrite_in_progress:1` | wait until both read 0, then restart fused-memory |
+| `aof_last_write_status:err` | the AOF write failed: check free space and IO errors on the disk holding `fused-memory/data/falkordb`, then restart |
+| compose file and container disagree on the data dir | run the gate with the main checkout's compose file, never a worktree's (a worktree's binds an empty data dir) |
+| container restarting / paused / dead | wait for it to settle (`docker ps -a`), then restart fused-memory |
+| stopped without AOF at boot, absent over data, or an `import-data.sh` refusal | "Deciding which FalkorDB copy is newest" below, BEFORE removing any container |
+| host AOF size disagrees with the server, or state unreadable | inspect by hand before restarting anything |
+
+To check the verdict without acting, run the gate with the main checkout's
+paths (exit 0 means a recreate is allowed):
+
+```bash
+python3 /home/leo/src/dark-factory/scripts/falkordb_aof_gate.py \
+  --compose-file /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml --check-only
+```
+
+#### Deciding which FalkorDB copy is newest
+
+A data dir can hold two copies of the graph: the AOF (`appendonlydir/`, base
+plus incr) and `dump.rdb`. A server started with `appendonly yes` loads only
+the AOF, and one started without it loads only `dump.rdb`. Whichever copy is
+older loses every write made after it. Do not assume `dump.rdb` is newer.
+Take a container whose runtime AOF was on and stop it: the AOF is fsynced
+first, and the final RDB save is SIGKILLed at compose's 10 s grace, so the AOF
+holds writes that `dump.rdb` lacks. Decide before any `docker rm`, because a
+stopped container's log is the best evidence. Everything below uses the main
+checkout.
+
+1. **Set aside a copy first**, so that a wrong choice can be undone. The files
+   are root-owned, so copy them inside a container. This needs free space
+   equal to their size.
+
+   ```bash
+   D=/home/leo/src/dark-factory/fused-memory/data/falkordb
+   IMG=falkordb/falkordb@sha256:58a95a33d591b25648bbb13268a23329aa39e70b4cbeff0752c65f8b4beba6db
+   docker run --rm --entrypoint sh -v "$D":/d "$IMG" -c \
+     'cp -a /d/appendonlydir /d/appendonlydir.pre-bootstrap; cp -a /d/dump.rdb /d/dump.rdb.pre-bootstrap'
+   ```
+
+2. **Read the stopped container's log**, if a container exists:
+   `docker logs --tail 50 docker-falkordb-1`. If "Saving the final RDB
+   snapshot" is followed by "DB saved on disk", the final save finished and
+   `dump.rdb` is current.
+3. **Otherwise, compare mtimes**: `stat -c '%y %n' "$D"/dump.rdb
+   "$D"/appendonlydir/*.incr.aof`. After an `import-data.sh` refusal, run this
+   on the export's files.
+4. **If the AOF is newer**, start onto it. No bootstrap is needed:
+
+   ```bash
+   docker rm docker-falkordb-1      # the stopped container, if one exists
+   docker compose -f /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml up -d falkordb
+   ```
+
+   Then record the graph counts below and check them against what you expect.
+5. **Only if `dump.rdb` is newer**, follow the bootstrap below.
+
+**Graph counts.** Record these from the first server that loads the data, and
+compare them after each later step:
+
+```bash
+C=docker-falkordb-1   # or falkordb-bootstrap during the bootstrap
+for g in $(docker exec $C redis-cli GRAPH.LIST); do
+  printf '%s %s\n' "$g" "$(docker exec $C redis-cli GRAPH.RO_QUERY "$g" 'MATCH (n) RETURN count(n)' | sed -n 2p)"
+done > /tmp/falkordb-graph-counts-$(date +%s).txt
+```
+
+#### Bootstrapping FalkorDB's AOF from dump.rdb
+
+Use this only when the decision above found `dump.rdb` to be the newest copy,
+for example an RDB-only export. It loads `dump.rdb` into one container that has
+no `REDIS_ARGS` (so the AOF is off and `dump.rdb` is what loads), then turns
+the AOF on, so that Redis rewrites the AOF from the loaded data. That rewrite
+replaces the old AOF; the set-aside copy from step 1 is the way back.
+
+```bash
+systemctl --user stop fused-memory
+docker rm docker-falkordb-1            # only if it exists and is stopped; never a running one
+docker run -d --name falkordb-bootstrap -p 6379:6379 -v "$D":/var/lib/falkordb/data \
+  -e FALKORDB_ARGS="MAX_QUEUED_QUERIES 25 TIMEOUT 30000 RESULTSET_SIZE 10000" "$IMG"
+docker exec falkordb-bootstrap redis-cli INFO persistence   # repeat until loading:0
+# record the graph counts (C=falkordb-bootstrap)
+docker exec falkordb-bootstrap redis-cli CONFIG SET appendonly yes
+docker exec falkordb-bootstrap redis-cli INFO persistence   # repeat until aof_rewrite_in_progress:0, aof_last_write_status:ok
+docker stop falkordb-bootstrap && docker rm falkordb-bootstrap
+docker compose -f /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml up -d falkordb
+# record the graph counts again (C=docker-falkordb-1): every graph's count must match
+systemctl --user start fused-memory
+```
+
+The compose-up by hand is deliberate: with no container and data on disk, the
+gate refuses to create one. Here the AOF was written moments ago from the
+loaded data, so it is current. Delete the `.pre-bootstrap` copies once the
+counts match.
+
 ### Dashboard unit-parity check
 
 Each orchestrator-watchdog tick also runs
@@ -2500,7 +2760,7 @@ critical path — so a cold cache degrades to the previous behaviour exactly.
 | Escalation MCP calls (`get_pending_escalations`, `resolve_issue`, `merge_request`) time out for minutes while the orchestrator process is alive, and the journal shows starlette `ClientDisconnect` tracebacks | The orchestrator's single event loop is blocked by synchronous work, and the in-process escalation server shares that loop | `journalctl --user -u orchestrator-<name>.service \| grep loop_stall:` — the `blocked for Ns so far` WARNING from `shared/src/shared/loop_stall.py::LoopStallMonitor` carries the loop thread's stack, which names the blocking call. File it as an INV-8 defect with that stack (recursive deletes already run off-loop through `orchestrator/src/orchestrator/tree_removal.py::remove_tree`). A call that failed during a stall may still have applied, so re-read state before retrying a `resolve_issue` |
 | Reconciliation escalation queue looks permanently poisoned for a project | The project's `project_id` was never registered on fused-memory's `DASHBOARD_KNOWN_PROJECT_ROOTS` before its first task was queued | This must be prevented, not fixed after the fact — always complete project registration (factory-init Stage 6) before queuing any task. If it's already happened, this needs an operator-level fused-memory intervention, not a task-level fix |
 | A task blocks at VERIFY with failures unrelated to its own changes | Verification currently runs test/lint/typecheck **repo-wide** by default, not scoped to the task's own modules | Check whether the failures are pre-existing on main outside the task's scope; if so, fix main's cleanliness first (module-scoped verification is planned but not yet implemented) |
-| An agent reports `AttributeError` / assertion mismatches **in its own shell** for code it just wrote in a worktree | An agent subprocess inherits the orchestrator's environment verbatim (`orchestrator/src/orchestrator/agents/invoke.py` passes a copy of `os.environ`), so its shell carries the MAIN checkout's `VIRTUAL_ENV` and a first-party `import` resolves main's editable source rather than the worktree's edits — and a worktree gets its own `.venv` only once it has been cold-verified (`verify_cold_preprovision_command`, `uv sync --all-packages && npm ci …`, runs inside it). **Verify itself is insulated and this cannot cause a VERIFY-stage failure**: every verify command is spawned through `orchestrator/src/orchestrator/verify.py::_target_subprocess_env`, which strips `VIRTUAL_ENV` and drops the venv's `bin` from `PATH` so the target resolves its OWN `.venv` (the 2026-05-29 ghost-venv fix) | Trust verify's result over a hand-run import — verify is the one reading the worktree. Use the one-line provenance check in `### Locating installed code` in `CLAUDE.md` to see which tree a shell import actually came from. A genuine verify-stage interpreter fault looks nothing like this (hundreds of `could not be resolved` imports, `pytest` among them); it is detected by `orchestrator/src/orchestrator/verify_classify.py::is_interpreter_missing_workspace_packages` and held as an infra issue rather than blamed on the branch |
+| An agent reports `AttributeError` / assertion mismatches **in its own shell** for code it just wrote in a worktree | An interactive session inherits its launching shell's environment, often the MAIN checkout's `VIRTUAL_ENV`, so a first-party `import` resolves main's editable source rather than the worktree's edits. Dispatched agents are scrubbed of Python-env selection (`shared/src/shared/python_env.py::without_python_env_selection`, which Claude spawns reach via `shared/src/shared/secret_env.py::agent_subprocess_env`; task 7399), so they hit this only by naming main's `.venv/bin/python` in a worktree without its own `.venv`; a bare `python` there is the system interpreter, which fails the import instead. A worktree gets its own `.venv` only once it has been cold-verified (`verify_cold_preprovision_command`, `uv sync --all-packages && npm ci …`, runs inside it). **Verify itself is insulated and this cannot cause a VERIFY-stage failure**: every verify command is spawned through `orchestrator/src/orchestrator/verify.py::_target_subprocess_env`, which strips `VIRTUAL_ENV` and drops the venv's `bin` from `PATH` so the target resolves its OWN `.venv` (the 2026-05-29 ghost-venv fix) | Trust verify's result over a hand-run import — verify is the one reading the worktree. In a dispatched agent, name the worktree's own `.venv/bin/python`. Use the one-line provenance check in `### Locating installed code` in `CLAUDE.md` to see which tree a shell import actually came from. A genuine verify-stage interpreter fault looks nothing like this (hundreds of `could not be resolved` imports, `pytest` among them); it is detected by `orchestrator/src/orchestrator/verify_classify.py::is_interpreter_missing_workspace_packages` and held as an infra issue rather than blamed on the branch |
 | All work across the fleet stalls; every account shows capped | The multi-account usage gate is **all-or-nothing per scope**: capacity in a scope only frees up once at least one account is uncapped for it | Check account-level cap/reset times; this self-heals once any single account resets — it is not a per-request failure to retry individually |
 | A burst of zero-output invocations across many tasks at once | Usually a transient upstream 529 (overloaded), not a real failure | Check host health via PSI (`full` pressure), not load average; these typically clear on their own — avoid treating them as a code regression |
 | Every open Claude session's fused-memory MCP calls fail at once, each within a second, with the harness's `Unable to connect. Is the computer able to access the url?`; on Claude Code ≥2.1.280 the server's tools can then be withdrawn from the session until a manual `/mcp` | Port 8002 is **closed**: the request never reaches the server, so no backing store is involved, and nothing is worktree-specific (8002 is host-global). Under socket activation a `restart`, a watchdog revive (`scripts/orchestrator-watchdog.py::restart_unit`) or a crash keeps 8002 bound, and a client waits rather than being refused. The port closes only on a deliberate `systemctl --user stop`/`disable` of `fused-memory.service` (its `ExecStopPost` stops the socket), on the port-change stop-then-start, or on a host where `fused-memory.socket` is not installed — see [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts) and [§8 fused-memory liveness revive](#fused-memory-liveness-revive). Before 2026-09-29 every restart closed it for the whole restart; the 2026-09-19 sighting (codebook `entry-cand-20260919-3`) was two calls refused during a watchdog revive's 40s start | Check that `systemctl --user show fused-memory.service -p TriggeredBy` prints `TriggeredBy=fused-memory.socket`; if it does not, install the socket per [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts). Prefer `restart` over `stop` then `start`. Run `/mcp` in any session whose fused-memory tools were withdrawn, then retry the failed call: its payload never left the client. A **manual** stop or restart of fused-memory still needs explicit operator sign-off, because it is one shared process and affects the whole fleet, not one project |
@@ -2626,6 +2886,7 @@ missing `LoadState` detector).
 
 | Slot | Job | Units |
 |---|---|---|
+| 02:30 | Transcript secret sweep | `transcript-secret-sweep.timer` |
 | 03:00 | Legibility trickle coder | `legibility-trickle@.timer` |
 | 03:30 | fused-memory flag-marker drain | `fused-memory-flag-marker-sweep.timer` |
 | 04:00 | Orphaned-worktree reclaim | `reclaim-orphaned-worktrees.timer` |
@@ -2639,7 +2900,7 @@ caught up on next boot/login rather than silently skipped) and
 `RandomizedDelaySec=300`.
 
 Per-job docs: [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
-for the 03:30 job; the sections below for the 03:00, 04:00 and 05:00 ones, and
+for the 03:30 job; the sections below for the 02:30, 03:00, 04:00 and 05:00 ones, and
 [Cross-project return brief (05:30)](#cross-project-return-brief-0530) for the 05:30 one.
 
 **04:30 was freed by task 5247 and is taken as of task 4514** by the legibility
@@ -2662,6 +2923,45 @@ harness deterministic-recon sweep, and fused-memory's Stage 2 task-knowledge
 reconciliation. Those residual units do **not** collide with the new 04:30 job:
 they carry a different unit name, and a re-armed sweep would merely fail
 `203/EXEC` alongside it rather than contend for anything.
+
+### Transcript secret sweep (02:30)
+
+Agent subprocesses inherit no secret-bearing variable except their own
+`CLAUDE_CODE_OAUTH_TOKEN` (`shared/src/shared/secret_env.py`), and transcripts
+are redacted as they are archived (task 6820). This sweep is the backstop for
+everything already on disk.
+
+- **What it scans.** Every regular `*.jsonl` file under each orchestrator
+  unit's `data/orchestrator/agent-transcripts` (the roots
+  `scripts/orchestrator_projects.py` reads from
+  `~/.config/systemd/user/orchestrator-*.service`) and under
+  `~/.claude/projects`, subagent transcripts included. It also scans the
+  `*.jsonl.archive-tmp` staging copies a hard kill can strand mid-archive,
+  which are redacted only after they are staged.
+- **What it matches.** Only the live values the sweep's own environment holds.
+  The wrapper sources the repo `.env` for them. It never matches a token-shaped
+  pattern. Each hit is replaced in place, by the 2026-10-11 method: a
+  `<redacted:VAR>` placeholder padded with `x` to the same length, mode and
+  mtime kept, no backup. A rewrite that would break a JSON line is refused
+  for that line only: the line keeps its value, the rest of the file is still
+  redacted, and the escalation names the path, the line and the variable.
+- **What it cannot see.** A secret defined only in another factory project's
+  own `.env` (simple-algo's `KRAKEN_API_KEY`, say). The wrapper sources
+  dark-factory's `.env` alone, so such a value is never matched. Task 6820
+  filed this gap as a follow-up.
+- **What it files.** One `risk_identified` info escalation per sweep that
+  redacted or refused anything, naming each path with its per-variable counts.
+  It prints one JSON record line to the journal, and never prints a value.
+- **What it skips.** Files modified in the last 15 minutes, which a live
+  session may still be appending to. The next night picks them up.
+
+Installing it is a post-merge deterministic deploy
+(`scripts/install-transcript-secret-sweep-timer.sh`, which kicks no immediate
+run). For a run now: `systemctl --user start transcript-secret-sweep.service`.
+At archive time a refused redaction is counted like any other archival
+failure (`transcript_archive: failed to redact` WARNING), and the transcript is
+held rather than archived with its value. At teardown, its other lines are
+still redacted in place.
 
 ### Legibility trickle accounts (03:00)
 

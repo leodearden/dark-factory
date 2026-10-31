@@ -19,6 +19,7 @@ from shared.plan_deviation import DeviationRecord
 
 from orchestrator import file_mutex
 from orchestrator.config import TASK_META_DIRNAME
+from orchestrator.review_payload import Verdict, normalize_review
 
 logger = logging.getLogger(__name__)
 
@@ -1101,26 +1102,22 @@ class TaskArtifacts:
         return reviews
 
     def aggregate_reviews(self) -> ReviewAggregation:
-        """Parse all reviews, separate blocking from suggestions.
-
-        Reviews with verdict ``ERROR`` are filtered into a separate list
-        so the workflow can detect incomplete reviewer coverage.
-        """
+        """Aggregate every review as ``orchestrator/review_payload.py::normalize_review`` reads it."""
         reviews = self.read_reviews()
         blocking = []
         suggestions = []
         errors = []
 
         for reviewer_name, review in reviews.items():
-            if review.get('verdict') == 'ERROR':
+            payload = normalize_review(review)
+            if payload.verdict is Verdict.ERROR:
                 errors.append(reviewer_name)
-                continue
-            for issue in review.get('issues', []):
-                enriched = {**issue, 'reviewer': reviewer_name}
-                if issue.get('severity') == 'blocking':
-                    blocking.append(enriched)
-                else:
-                    suggestions.append(enriched)
+            blocking.extend(
+                {**issue, 'reviewer': reviewer_name} for issue in payload.blocking_issues
+            )
+            suggestions.extend(
+                {**issue, 'reviewer': reviewer_name} for issue in payload.suggestions
+            )
 
         clean = {k: v for k, v in reviews.items() if k not in errors}
         return ReviewAggregation(
@@ -1265,10 +1262,10 @@ class TaskArtifacts:
             return False
 
     def set_plan_files(self, files: list[str], session_id: str) -> None:
-        """Widen plan.json's ``files`` list in place — the orchestrator-side
-        mechanical union used by the resume-path scope-grant consumer
-        (``TaskWorkflow._set_task_scope``) instead of re-invoking the
-        architect for a known file-set append.
+        """Replace plan.json's ``files`` list in place — the orchestrator-side
+        mechanical write used by ``TaskWorkflow._set_task_scope`` (the
+        resume-path scope grant and the merge-gate narrowing pass) instead of
+        re-invoking the architect for a known file set.
 
         Preserves every other plan field (steps, analysis, design_decisions,
         provenance) untouched — only ``files`` is replaced.
@@ -1371,6 +1368,9 @@ class TaskArtifacts:
     # files at most genuinely-new pairs.
     # ──────────────────────────────────────────────────────────────────
 
+    _RECONCILE_STATE_NAME = 'reconcile_state.json'
+    _EMITTED_STEP_ESCALATIONS_KEY = 'emitted_done_step_escalations'
+
     def read_emitted_step_escalations(self) -> set[tuple[str, str]]:
         """Return the set of ``(step_id, stale_commit)`` orphaned-done-step
         escalation keys already filed for this task, persisted across restarts.
@@ -1378,26 +1378,39 @@ class TaskArtifacts:
         Stored at ``self.root/reconcile_state.json`` (beside plan.json in the
         meta-root).  JSON has no set/tuple types, so the on-disk shape is
         ``{"emitted_done_step_escalations": [[step_id, commit], ...]}``; each
-        2-element list is re-tupled here and malformed entries are skipped.
+        2-element list of strings is re-tupled here; any other entry is
+        skipped, with one warning counting the skipped entries.
 
-        Fail-safe: a missing file, corrupt/unreadable or non-UTF-8 JSON, or a
-        non-object payload all return an empty ``set``, so a corrupt sidecar
-        re-files rather than silently suppressing.
+        Fail-safe: a missing file, corrupt/unreadable or non-UTF-8 JSON, a
+        non-object payload, or a non-list ``emitted_done_step_escalations``
+        field all return an empty ``set``, so a corrupt sidecar re-files
+        rather than silently suppressing.
         """
-        data = self._read_json_object('reconcile_state.json')
+        name = self._RECONCILE_STATE_NAME
+        key = self._EMITTED_STEP_ESCALATIONS_KEY
+        data = self._read_json_object(name)
         if data is None:
             return set()
-        result: set[tuple[str, str]] = set()
-        for entry in data.get('emitted_done_step_escalations', []):
-            # Each entry must be a 2-element [step_id, commit] list of strings;
-            # skip anything malformed rather than raising (fail-safe read).
-            if (
-                isinstance(entry, list)
-                and len(entry) == 2
-                and all(isinstance(x, str) for x in entry)
-            ):
-                result.add((entry[0], entry[1]))
-        return result
+        entries = data.get(key, [])
+        if not isinstance(entries, list):
+            logger.warning(
+                'Malformed %s at %s: %s is not a list',
+                name, self._read_path(name), key,
+            )
+            return set()
+        pairs = [
+            (entry[0], entry[1])
+            for entry in entries
+            if isinstance(entry, list)
+            and len(entry) == 2
+            and all(isinstance(x, str) for x in entry)
+        ]
+        if len(pairs) < len(entries):
+            logger.warning(
+                'Malformed %s at %s: skipped %d malformed %s entries',
+                name, self._read_path(name), len(entries) - len(pairs), key,
+            )
+        return set(pairs)
 
     def append_emitted_step_escalation(
         self, step_id: str, stale_commit: str
@@ -1423,9 +1436,9 @@ class TaskArtifacts:
             return
         keys.add((step_id, stale_commit))
         self._write_json(
-            self.root / 'reconcile_state.json',
+            self.root / self._RECONCILE_STATE_NAME,
             {
-                'emitted_done_step_escalations': sorted(
+                self._EMITTED_STEP_ESCALATIONS_KEY: sorted(
                     [k[0], k[1]] for k in keys
                 )
             },

@@ -111,6 +111,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
         'create_subprocess_exec is faked; the git argv is a recorded-call literal'
     ),
     'orchestrator/tests/test_train_moved_main.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_verify_events_units.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_verify_phase_rebase.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_warm_lane_abort_teardown.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_warm_lane_integration_gate.py': _SEEDS_ITS_OWN_REPO,

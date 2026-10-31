@@ -1473,8 +1473,12 @@ def derive_verify_plan(
 
 def executed_module_prefixes(plan: VerifyPlan) -> frozenset[str]:
     """The module prefixes *plan* executes: none for a TRIVIAL plan, and never a
-    module whose only run is the cmd-None 'no files under prefix' SKIPPED (the rule
-    ``verify.py::_executed_module_configs_from_plan`` applies)."""
+    module whose only run is the cmd-None 'no files under prefix' SKIPPED.
+
+    This is the which-modules-execute rule: ``run_scoped_verification``'s executor
+    (``verify.py::_executed_module_configs_from_plan``) and the task-verify
+    dispatcher's eligibility both call it.
+    """
     if len(plan.runs) == 1 and plan.runs[0].scope_kind is ScopeKind.TRIVIAL:
         return frozenset()
     runs_by_prefix: dict[str, list[PlannedRun]] = {}

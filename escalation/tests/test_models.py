@@ -14,10 +14,13 @@ from escalation.models import (
     RESOLUTION_CLASSES,
     SEVERITY_RANK,
     Amendment,
+    DeliveredCheckOwner,
     Escalation,
     EvidenceEntry,
+    EwaRateTripFacts,
     IndexHealthState,
     LateResolution,
+    ParkStopTripFacts,
     TrainState,
     max_severity,
     normalised_severity,
@@ -483,6 +486,143 @@ class TestEscalationIndexHealthField:
         assert restored.index_health is None, (
             f'Expected index_health=None for legacy JSON, got {restored.index_health!r}'
         )
+
+
+class TestEscalationDeliveredCheckOwnerField:
+    """Escalation carries the failing delivered check's owner as data (task 7514).
+
+    A `dependency_capability` record's task is the blocked DEPENDENT; the
+    check belongs to the dependency named here. Same additive zero-migration
+    contract as `index_health`.
+    """
+
+    _OWNER: DeliveredCheckOwner = {
+        'task_id': '5405',
+        'check_name': 'pattern-module-substrate',
+        'sidecar': {
+            'path': 'docs/prds/v0_6/eradicate-silent-undef.capability-manifest.yaml',
+            'on_main': 'declares',
+        },
+    }
+    _OWNER_WITHOUT_SIDECAR: DeliveredCheckOwner = {
+        'task_id': '6371',
+        'check_name': 'x-cap',
+        'sidecar': None,
+    }
+
+    def _make_base_esc(self, **kwargs) -> Escalation:
+        base: dict[str, Any] = {
+            'id': 'esc-5542-0001',
+            'task_id': '5542',
+            'agent_role': 'orchestrator-scheduler',
+            'severity': 'critical',
+            'category': 'dependency_capability',
+            'summary': 'DEP_CAPABILITY_NOT_DELIVERED: task 5542 - dep 5405 done',
+        }
+        base.update(kwargs)
+        return Escalation(**base)
+
+    def test_default_is_none_and_surfaces_in_to_dict(self):
+        esc = self._make_base_esc()
+        assert esc.delivered_check_owner is None
+        assert esc.to_dict()['delivered_check_owner'] is None
+
+    @pytest.mark.parametrize('owner', [_OWNER, _OWNER_WITHOUT_SIDECAR])
+    def test_round_trip_via_to_dict_from_dict(self, owner):
+        esc = self._make_base_esc(delivered_check_owner=owner)
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.delivered_check_owner == owner
+
+    @pytest.mark.parametrize('owner', [_OWNER, _OWNER_WITHOUT_SIDECAR])
+    def test_round_trip_via_to_json_from_json(self, owner):
+        esc = self._make_base_esc(delivered_check_owner=owner)
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.delivered_check_owner == owner
+        assert restored.to_json() == esc.to_json()
+
+    def test_legacy_json_without_the_key_deserialises_to_none(self):
+        payload = self._make_base_esc().to_dict()
+        del payload['delivered_check_owner']
+        restored = Escalation.from_json(json.dumps(payload))
+        assert restored.delivered_check_owner is None
+
+
+_EWA_RATE_TRIP: EwaRateTripFacts = {
+    'ewa': 73.59,
+    'threshold': 24.6,
+    'ratio': 82.0,
+    'window_secs': 3600.0,
+    'dones_in_window': 1,
+    'submissions_in_step': 82,
+}
+
+_PARK_STOP_TRIP: ParkStopTripFacts = {
+    'blocked_in_window': 15,
+    'window_secs': 3600.0,
+    'threshold': 15,
+}
+
+
+class TestEscalationTripFactsFields:
+    """A non-halting pause detector's escalation carries its trip facts as fields.
+
+    PRD scheduler-pause-halt-retirement §6 invariant 5 (INV-2): no consumer
+    scrapes prose for a number the detector held in a variable.
+    """
+
+    def _make_base_esc(self, **kwargs) -> Escalation:
+        base: dict[str, Any] = {
+            'id': 'esc-orchestrator-0001',
+            'task_id': 'orchestrator',
+            'agent_role': 'orchestrator',
+            'severity': 'blocking',
+            'category': 'task_failure',
+            'summary': 'pause detector tripped',
+        }
+        base.update(kwargs)
+        return Escalation(**base)
+
+    def test_both_default_to_none_and_serialise_as_none(self):
+        esc = self._make_base_esc()
+
+        assert esc.ewa_rate_trip is None
+        assert esc.park_stop_trip is None
+        d = esc.to_dict()
+        assert d['ewa_rate_trip'] is None
+        assert d['park_stop_trip'] is None
+
+    def test_ewa_rate_trip_round_trips_with_numeric_types(self):
+        esc = self._make_base_esc(ewa_rate_trip=_EWA_RATE_TRIP)
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.ewa_rate_trip == _EWA_RATE_TRIP
+        assert restored.ewa_rate_trip is not None
+        assert type(restored.ewa_rate_trip['dones_in_window']) is int
+        assert type(restored.ewa_rate_trip['submissions_in_step']) is int
+        assert type(restored.ewa_rate_trip['window_secs']) is float
+        assert type(restored.ewa_rate_trip['ewa']) is float
+
+    def test_park_stop_trip_round_trips_with_numeric_types(self):
+        esc = self._make_base_esc(park_stop_trip=_PARK_STOP_TRIP)
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.park_stop_trip == _PARK_STOP_TRIP
+        assert restored.park_stop_trip is not None
+        assert type(restored.park_stop_trip['blocked_in_window']) is int
+        assert type(restored.park_stop_trip['threshold']) is int
+        assert type(restored.park_stop_trip['window_secs']) is float
+
+    def test_legacy_json_without_either_key_reads_none(self):
+        legacy = self._make_base_esc().to_dict()
+        del legacy['ewa_rate_trip']
+        del legacy['park_stop_trip']
+
+        restored = Escalation.from_json(json.dumps(legacy))
+
+        assert restored.ewa_rate_trip is None
+        assert restored.park_stop_trip is None
 
 
 class TestEscalationResolutionAction:

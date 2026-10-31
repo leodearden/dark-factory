@@ -15,6 +15,7 @@ from _qdrant_responses import missing_collection_404
 from qdrant_client.http.exceptions import UnexpectedResponse
 from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, escalation_queue_dir
 
+from fused_memory.backends.falkor_server_settings import FalkorServerSettings
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware import mem0_update_storm_escalator as storm_mod
 from fused_memory.models.enums import MemoryCategory, SourceStore
@@ -51,6 +52,11 @@ DEFAULT_POINT_PAYLOAD = {
 }
 
 
+_MATCHING_SERVER_SETTINGS = FalkorServerSettings(
+    expected_graph_timeout_ms=30000, graph_timeout_ms=30000, appendonly='yes',
+)
+
+
 @pytest.fixture
 def service(mock_config):
     """MemoryService with mocked backends (no real DB needed)."""
@@ -82,6 +88,7 @@ def _mocked_service(config) -> MemoryService:
     svc.graphiti._require_client = MagicMock()
     svc.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
     svc.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+    svc.graphiti.read_server_settings = AsyncMock(return_value=_MATCHING_SERVER_SETTINGS)
     install_identity_mocks(svc.graphiti)
 
     svc.mem0 = MagicMock()
@@ -8173,6 +8180,33 @@ class TestGetStatusScoping:
         )
 
 
+class TestGetStatusSurfacesFalkorServerSettings:
+    """`get_status()['graphiti']['server_settings']` carries the live FalkorDB settings (task 6848)."""
+
+    @pytest.mark.asyncio
+    async def test_a_reset_timeout_is_visible_in_get_status(self, service):
+        service.graphiti.list_graphs = AsyncMock(return_value=[])
+        service.mem0.list_projects = AsyncMock(return_value=[])
+        reset = FalkorServerSettings(
+            expected_graph_timeout_ms=30000, graph_timeout_ms=1000, appendonly='no',
+        )
+        service.graphiti.read_server_settings = AsyncMock(return_value=reset)
+
+        result = await service.get_status()
+
+        assert result['graphiti']['server_settings'] == reset.to_status()
+        assert result['graphiti']['server_settings']['ok'] is False
+
+    @pytest.mark.asyncio
+    async def test_server_settings_are_reported_even_when_graph_listing_fails(self, service):
+        service.graphiti.list_graphs = AsyncMock(side_effect=ConnectionError('down'))
+        service.mem0.list_projects = AsyncMock(return_value=[])
+
+        result = await service.get_status()
+
+        assert result['graphiti']['connected'] is False
+        assert result['graphiti']['server_settings'] == _MATCHING_SERVER_SETTINGS.to_status()
+
 class TestGetStatusSurfacesDeadByOperation:
     """`get_status()['queue']` must carry the per-operation dead breakdown.
 
@@ -13851,6 +13885,34 @@ class TestCanonicalClaimChangeOnTheUpdatePath:
         call = service.mem0.count_by_metadata.await_args
         filters = call.kwargs.get('filters', call.args[1] if len(call.args) > 1 else None)
         assert filters == {'topic': 'other-topic', 'canonical': True}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('held', [1, 1.0, 'true'])
+    async def test_a_non_bool_canonical_pre_image_is_not_a_held_claim(
+        self, service, held
+    ):
+        """A pre-image whose canonical is not the bool True does not hold the
+        claim under the strict meaning, so patching it to True ACQUIRES the
+        claim and must be probed.
+
+        Guard 3's tuple equality `(1, t) == (True, t)` let int and float
+        pre-images skip the probe; 'true' is the companion row.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        self._stage(service, {'topic': self._TOPIC, 'canonical': held})
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation) as excinfo:
+            await service.update_memory(
+                memory_id=self._POINT, project_id='dark_factory',
+                metadata_patch={'canonical': True},
+            )
+
+        assert excinfo.value.incumbent_id == self._INCUMBENT
+        service.mem0.count_by_metadata.assert_awaited_once()
+        service.mem0.set_payload.assert_not_called()
 
 
 class TestParentIdLivenessAtSeam:

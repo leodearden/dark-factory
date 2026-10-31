@@ -21,7 +21,7 @@ import logging
 import os
 import signal
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
 
-from shared.cli_invoke import BUDGET_EXHAUSTED_SUBTYPE, AgentResult
+from shared.cli_invoke import BUDGET_EXHAUSTED_SUBTYPE, AgentResult, parse_claude_cli_output
 from shared.config_dir import (
     CONFIG_DIR_PREFIX,
     TaskConfigDir,
@@ -56,6 +56,7 @@ from shared.invocation_outcome import (
 # guard that keeps a fabricating fork from being re-introduced here.
 from shared.invocation_outcome import _parse_resets_at as _parse_resets_at_strict
 from shared.proc_group import terminate_process_group
+from shared.secret_env import agent_subprocess_env
 
 if TYPE_CHECKING:
     from collections.abc import Collection
@@ -182,52 +183,54 @@ def _sweep_stale_probe_dirs_once() -> int:
     )
 
 
-def _load_probe_result(stdout_bytes: bytes) -> dict[str, object] | None:
-    """Return the probe's CLI JSON result object, or None when stdout is
-    empty, not JSON, or not a JSON object."""
-    if not stdout_bytes:
-        return None
-    try:
-        obj = json.loads(stdout_bytes.decode(errors='replace'))
-    except ValueError:
-        return None
-    return obj if isinstance(obj, dict) else None
+def _classify_probe_result(result: AgentResult) -> InvocationOutcome:
+    """Classify the probe's parsed CLI result under the DD-2 probe regime.
+
+    ``success`` is withheld so ``classify_invocation``'s OK short-circuit
+    cannot skip the cap tier: the probe runs only while an account is already
+    blocked, and any cap prefix in its output means the account is still
+    capped, even beside a served result. ``strict_confirm=False`` for the same
+    reason: a bare prefix with no confirm keyword still counts, deliberately
+    asymmetric with ``detect_cap_hit``. Served-ness is decided afterwards by
+    ``_probe_hit_local_budget_cap`` and ``_probe_succeeded``. Pinned by
+    ``shared/tests/test_probe_loop.py::TestRunProbe::test_probe_prefix_only_without_confirm_keyword_still_returns_false``.
+    """
+    return classify_invocation(replace(result, success=False), strict_confirm=False, backend='claude')
 
 
-def _probe_hit_local_budget_cap(result: dict[str, object] | None) -> bool:
-    """Return True iff the probe's CLI JSON result reports that the local
-    ``--max-budget-usd`` cap was hit.
+def _probe_hit_local_budget_cap(result: AgentResult) -> bool:
+    """Return True iff the probe's CLI result reports that the local
+    ``--max-budget-usd`` cap was hit, with no API error status.
 
     This indicates the Anthropic API accepted the request and consumed real
     tokens — the account is NOT capped. Distinct from account-level cap hits
     (which surface as text prefixes in stderr, not JSON subtypes).
     """
-    return result is not None and result.get('subtype') == BUDGET_EXHAUSTED_SUBTYPE
+    return result.subtype == BUDGET_EXHAUSTED_SUBTYPE and result.api_error_status is None
 
 
-def _probe_succeeded(returncode: int | None, result: dict[str, object] | None) -> bool:
+def _probe_succeeded(returncode: int, result: AgentResult) -> bool:
     """Return True iff the probe's CLI result is POSITIVE evidence that the
     API served the request: exit 0, subtype ``success``, no ``is_error`` and
     no ``api_error_status``.
 
-    The absence of recognised failure text is never enough — an org-disabled
-    account answers with a ``success``-subtype result carrying ``is_error``
-    and a 403 (task 5944).
+    Under subtype ``success``, ``success and not schema_salvaged`` is exactly
+    ``not is_error``. The absence of recognised failure text is never enough —
+    an org-disabled account answers with a ``success``-subtype result carrying
+    ``is_error`` and a 403 (task 5944).
     """
     return (
-        result is not None
-        and returncode == 0
-        and result.get('subtype') == 'success'
-        and not result.get('is_error', False)
-        and result.get('api_error_status') is None
+        returncode == 0
+        and result.subtype == 'success'
+        and result.success
+        and not result.schema_salvaged
+        and result.api_error_status is None
     )
 
 
-def _probe_result_snippet(result: dict[str, object] | None) -> str:
-    """One line of the probe's ``result`` text, cut to 120 characters."""
-    if result is None:
-        return '<no JSON result>'
-    return ' '.join(str(result.get('result', '')).split())[:120]
+def _probe_result_snippet(result: AgentResult) -> str:
+    """One line of the probe's result text, cut to 120 characters."""
+    return ' '.join(result.output.split())[:120]
 
 
 class AccountPhase(StrEnum):
@@ -2669,8 +2672,10 @@ class UsageGate:
 
         Returns ``True`` only when the CLI result proves the API served the
         request — a success result, or the local budget cap after real spend —
-        and ``False`` otherwise.  Uses haiku to minimise cost (~$0.001 per
-        probe).
+        and ``False`` otherwise.  The result is parsed once, by
+        ``shared.cli_invoke.parse_claude_cli_output``, and that one parse feeds
+        both the cap classification and the served check in
+        ``_probe_verdict``.  Uses haiku to minimise cost (~$0.001 per probe).
 
         Raises:
             ProbeSpawnError: The probe could not be SPAWNED (task 4512) — the
@@ -2707,7 +2712,7 @@ class UsageGate:
             'Say ok',
         ]
 
-        env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+        env = agent_subprocess_env(os.environ)
         if acct.token is not None:
             env['CLAUDE_CODE_OAUTH_TOKEN'] = acct.token
         env['CLAUDE_CONFIG_DIR'] = str(config_dir.path)
@@ -2784,19 +2789,20 @@ class UsageGate:
 
         stdout_text = stdout_bytes.decode(errors='replace') if stdout_bytes else ''
         stderr_text = stderr_bytes.decode(errors='replace') if stderr_bytes else ''
+        returncode = proc.returncode if proc.returncode is not None else 1
+        result = parse_claude_cli_output(
+            stdout=stdout_text, stderr=stderr_text, returncode=returncode,
+        )
+        return self._probe_verdict(acct, returncode, result)
 
-        # NOTE — intentional asymmetry with detect_cap_hit: strict_confirm=False
-        # skips the CAP_CONFIRM_KEYWORDS guard applied by detect_cap_hit's
-        # strict_confirm=True regime (see DD-2 on classify_invocation).  The
-        # probe runs only while an account is already blocked (capped or
-        # auth_failed); any whiff of a cap prefix in the probe output means the
-        # account is still capped and we must NOT unpause it.  Being
-        # conservative here avoids the far worse outcome of unpausing a capped
-        # account and burning quota on a still-limited account.  Do not 'fix'
-        # this asymmetry without understanding the safety-margin implications
-        # — see test_probe_prefix_only_without_confirm_keyword_still_returns_false.
-        result = AgentResult(success=False, output=stdout_text, stderr=stderr_text)
-        outcome = classify_invocation(result, strict_confirm=False, backend='claude')
+    def _probe_verdict(self, acct: AccountState, returncode: int, result: AgentResult) -> bool:
+        """Judge one finished probe of *acct* from its parsed CLI *result*.
+
+        A cap message keeps the account blocked (demoting AUTH_FAILED to
+        CAPPED); otherwise only positive evidence the API served the call
+        returns True.
+        """
+        outcome = _classify_probe_result(result)
         if isinstance(outcome, (CapHit, NearCap)):
             logger.info(
                 f'Account {acct.name}: probe got cap message: {outcome.reason}',
@@ -2842,28 +2848,24 @@ class UsageGate:
         # request and consumed real tokens — the account has capacity. Cache
         # creation on a fresh session easily pushes total_cost past $0.01, so
         # this is a routine outcome, not a cap hit.
-        probe_result = _load_probe_result(stdout_bytes)
-        result_fields = probe_result or {}
-        if (
-            _probe_hit_local_budget_cap(probe_result)
-            and result_fields.get('api_error_status') is None
-        ):
+        if _probe_hit_local_budget_cap(result):
             logger.info(
                 f'Account {acct.name}: probe hit local $0.01 budget '
                 f'cap (API accepted request) — treating as success',
             )
             return True
-        if _probe_succeeded(proc.returncode, probe_result):
+        if _probe_succeeded(returncode, result):
             logger.info(f'Account {acct.name}: probe succeeded')
             return True
         logger.warning(
             'Account %s: probe did not succeed — exit %s, subtype=%r, '
-            'api_error_status=%s: %s — account stays blocked',
+            'api_error_status=%s, outcome=%s: %s — account stays blocked',
             acct.name,
-            proc.returncode,
-            result_fields.get('subtype'),
-            result_fields.get('api_error_status'),
-            _probe_result_snippet(probe_result),
+            returncode,
+            result.subtype,
+            result.api_error_status,
+            type(outcome).__name__,
+            _probe_result_snippet(result),
         )
         return False
 

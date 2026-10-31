@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import contextlib
 import errno
@@ -12,7 +11,6 @@ import itertools
 import json
 import logging
 import os
-import re
 import time
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -23,6 +21,8 @@ from typing import IO, TYPE_CHECKING, Any, ClassVar, cast
 
 from escalation.categories import EscalationCategory
 from escalation.classify import is_done_step_commit_orphan
+from escalation.disposition import ExitKind
+from escalation.models import DeliveredCheckOwner, Escalation
 from escalation.pins import classify_pins
 from shared import delivered_check_polarity
 from shared.asyncio_tasks import abandon_task
@@ -33,6 +33,7 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
+from shared.elision import elide_at_word
 from shared.eval_lane import eval_lane_provenance
 from shared.loop_stall import LoopStallMonitor
 from shared.mcp_envelope import resolver_failed
@@ -57,8 +58,8 @@ from shared.transcript_archive import (
     set_archival_failure_hook,
 )
 
+from orchestrator import delivered_check_owner, recovery_pins, recut_ruling
 from orchestrator import digest as digest_mod
-from orchestrator import recovery_pins, recut_ruling
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
@@ -95,6 +96,8 @@ from orchestrator.deterministic_runner import (
     DeterministicRunner,
     build_milestone_gate_escalation_fields,
 )
+from orchestrator.eligibility_clock import EligibilityClockStore
+from orchestrator.escalation_router import InfoL0Sweep, RouterPorts, read_hold, router_owns
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.flake_debt_drain import DRAIN_INTERVAL_SECS, run_drain_pass
 from orchestrator.flake_ledger import ledger_db_path
@@ -132,6 +135,12 @@ from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.offline_lane_pass import lane_pass_outcome_hooks
 from orchestrator.overrides import OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+from orchestrator.pause_policy import (
+    STORED_EWA_PREDICATE_CLASSES,
+    HaltNotPermittedError,
+    PauseClass,
+    policy_for,
+)
 from orchestrator.proc_supervision import EscalationSpec
 from orchestrator.provenance_conflict import ProvenanceConflictSink
 from orchestrator.recovery_emission import (
@@ -162,7 +171,6 @@ from orchestrator.scheduler import (
     SchedulerCallbacks,
     SetTaskStatusRejected,
     StaleEvidenceRejection,
-    TerminalExitRejection,
 )
 from orchestrator.service_restart import (
     FLEET_DEPLOY_CLOCK_RELPATH,
@@ -177,6 +185,7 @@ from orchestrator.slot_lease import (
     suspended_slot_tasks,
     wedged_slot_escalation,
 )
+from orchestrator.starvation_watchdog import STARVATION_WATCHDOG_ROLE
 from orchestrator.strand_conversion import record_strand_conversion
 from orchestrator.stranded_verified_green import (
     DURABLE_MERGE_FAILURE_STATUSES,
@@ -228,8 +237,6 @@ from orchestrator.zero_progress_requeue import (
 )
 
 if TYPE_CHECKING:
-    from escalation.models import Escalation
-
     from orchestrator.merge_lane.worker import (
         BreakerTrip,
         SpeculativeMergeWorker,
@@ -416,6 +423,8 @@ _AUTO_EVAL_EXCLUDED_BLOCK_CATEGORIES: frozenset[str] = frozenset(
     {'wip_conflict', 'infra_issue', 'branch_reset'},
 )
 
+_REDO_TITLE_MAX = 200
+
 # Grace period added to the watcher rotation timeout on top of
 # watcher_rotation_hours*3600.  Gives the agent time to emit its digest and
 # exit cleanly before the supervisor kills it with a SIGTERM timeout.
@@ -521,7 +530,8 @@ _IDLE_POLL_LOG_SECS: float = 180.0
 # Allowed and disallowed tools for the escalation-watcher-auto rotation.
 # Scoped to what escalation triage actually needs: file reads, foreground
 # escalation.watcher subprocess, safe git reads, and the MCP tools for
-# autonomous dispatch (update_task, add_dependency, resolve_issue).
+# autonomous dispatch (update_task, add_dependency, resolve_issue), plus the
+# submit_task/resolve_ticket filing pair.
 # Defence-in-depth mirrors the unblock-auto precedent (dry_run_unblock.py).
 #
 # NOTE — this allowlist is ADVISORY, not the durable enforcement boundary.
@@ -569,12 +579,16 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     # pending L1/L2 it assessed (task 2555) so future rotations can skip
     # re-deriving the same disposition every rotation.
     'mcp__escalation__stamp_triage',
-    # Fused-memory MCP: read + autonomous dispatch (scope_violation/dependency/cleanup)
+    # Fused-memory MCP: read + autonomous dispatch (scope_violation/dependency/cleanup) + filing
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
     'mcp__fused-memory__search',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__add_dependency',
+    # Convert-to-tracked-work filing (task 3726): submit_task files the
+    # candidate; resolve_ticket waits for the task id the resolution cites.
+    'mcp__fused-memory__submit_task',
+    'mcp__fused-memory__resolve_ticket',
 ]
 # Connection-capability headers for the escalation-watcher-auto rotation's
 # escalation MCP connection (plans/escalation-connection-capability-guard-prd.md
@@ -1680,7 +1694,7 @@ def _already_landed_gate_shape(*, has_open_escalation: bool | None) -> str:
 
 
 def _ewa_trip_reason(ewa: float, storm: digest_mod.CategoryShare | None) -> str:
-    """The EWA pause reason: the ``ewa_trip_`` prefix every reader keys on, then the storm share."""
+    """The human-readable EWA pause reason: the tripping EWA, then the storm share."""
     if storm is None:
         return f'ewa_trip_{ewa:.4f}'
     return f'ewa_trip_{ewa:.4f} · storm: {storm}'
@@ -1781,6 +1795,7 @@ class Harness:
             ),
             override_store=OverrideStore.from_config(config),
             park_eviction_store=ParkEvictionRequestStore.from_config(config),
+            eligibility_clock_store=EligibilityClockStore.from_config(config),
         )
         # --- Action-teardown suppression (task 1620, β Pair F / C3.2) ---
         # Counter of task_ids currently undergoing action-teardown (park/restart/abandon).
@@ -2952,8 +2967,17 @@ class Harness:
             # skip branches (identity-guard defer, no-plan/corrupt-plan
             # release) — runs while no task is yet dispatched, so it only
             # repairs what _recover_crashed_tasks skipped and never races a
-            # live dispatch.
-            await self._reconcile_lane_checkouts()
+            # live dispatch.  Own try/except (non-fatal): a startup repair
+            # sweep must never prevent startup.  A conflicted lane is already
+            # handled per lane inside
+            # git_ops.py::GitOps::detach_lane_checkout; this backstops the rest.
+            try:
+                await self._reconcile_lane_checkouts()
+            except Exception as e:
+                logger.warning(
+                    'Failed to reconcile lane checkouts (non-fatal, startup '
+                    'continues): %s', e, exc_info=True,
+                )
 
             # 2d. Reconcile stranded in-progress tasks (live-claimant-aware)
             await self._reconcile_stranded_in_progress()
@@ -4256,6 +4280,7 @@ class Harness:
         top_pool = self.git_ops.warm_lane_pool
         if top_pool is not None:
             top_pool.set_lane_lifecycle(self.git_ops._lane_lifecycle)
+        self.git_ops.warn_on_warm_lane_pool_shrink()
 
         for entry in worktree_base.iterdir():
             if not entry.is_dir():
@@ -4289,7 +4314,10 @@ class Harness:
             # `_merge-*` disposition; every other infra band is left to its
             # owner.  This subsumes the former dedicated `.lane-state`/
             # `.task-meta` (LANE_STATE_DIRNAME/TASK_META_DIRNAME) skip —
-            # both are `.`-prefixed => classified 'infra'.
+            # both are `.`-prefixed => classified 'infra'.  Over-cap lanes a
+            # pool shrink left behind are lanes too (see
+            # orchestrator/src/orchestrator/warm_lane_pool.py::WarmLanePool.canonical_lane),
+            # so they reach the lane branch below, not the C2 'infra' skip.
             if not is_lane:
                 worktree_class = classify_worktree_entry(entry.name)
                 if worktree_class == 'merge':
@@ -5759,19 +5787,16 @@ class Harness:
                     tid, status, mid_run=mid_run, tally=tally,
                 )
             except SetTaskStatusRejected as exc:
-                # Persistence layer refused our write — escalate directly
-                # (task 2243, W10-θ2 step-14: the per-tid strike counter and
-                # its MAX_RECONCILE_FAILURES threshold gate are retired; a
-                # persistent rejection is now surfaced loudly on the sweep
-                # it occurs, not tallied toward a threshold first).  Honest
-                # log so future operators can see *why* the task is still
-                # stranded instead of the old "marked done" misnomer.
-                # Other (unexpected) exception types intentionally propagate
-                # so bugs in the sweep surface rather than being silently
-                # skipped.
+                # Persistence layer refused a recovery write (mark-done or the
+                # pending revert) — escalate directly (task 2243, W10-θ2
+                # step-14: the per-tid strike counter is retired).  The log
+                # names the transition the refused write attempted.  Other
+                # (unexpected) exception types intentionally propagate so bugs
+                # in the sweep surface rather than being silently skipped.
                 logger.error(
-                    '%s: failed to mark task %s done — %s: %s',
-                    log_prefix, tid, exc.error_code, exc.raw,
+                    '%s: reconcile write refused for task %s (%s) — %s: %s',
+                    log_prefix, tid, exc.attempted_transition,
+                    exc.error_code, exc.raw,
                 )
                 if self._escalation_queue:
                     self._escalate_reconcile_failure(tid, exc)
@@ -7085,10 +7110,9 @@ class Harness:
         """Revert a stranded in-progress task to pending (REVERT_TO_PENDING applier).
 
         Returns ``'reverted'`` (status flipped to pending) or ``None`` (left
-        intact — the sole remaining early-return is the infra-held
-        non-degenerate branch guard below; task 2763 removed the
-        unreadable-lock fail-closed early-return along with the worktree
-        plan.lock read that produced it).
+        intact: the infra-held non-degenerate branch guard below, or the row
+        was already terminal at the live status re-read just before the write,
+        or by the time the write reached the server).
 
         Callers only reach this on the REVERT_TO_PENDING action:
         ``TaskGroundTruth.recovery_for``'s ``live_claimant`` resolution has
@@ -7244,7 +7268,25 @@ class Harness:
         # exist; the suppress + missing_ok keep it a harmless no-op then.
         with contextlib.suppress(OSError):
             lock_path.unlink(missing_ok=True)
-        await self.scheduler.clear_claim_then_set_status(tid, 'pending')
+        live_status = await self.scheduler.get_status(tid)
+        if live_status in TERMINAL_STATUSES:
+            logger.info(
+                'Reconcile: task %s is already %s — skipping the stale pending '
+                'revert (status snapshot predates it)',
+                tid, live_status,
+            )
+            return None
+        try:
+            await self.scheduler.clear_claim_then_set_status(tid, 'pending')
+        except SetTaskStatusRejected as exc:
+            if not exc.row_already_terminal:
+                raise
+            logger.info(
+                'Reconcile: task %s went terminal between the live re-read and '
+                'the write — pending revert refused (%s); nothing to recover',
+                tid, exc.attempted_transition,
+            )
+            return None
         logger.info(
             'Reconcile: reverted task %s to pending', tid
         )
@@ -7407,12 +7449,13 @@ class Harness:
     ) -> None:
         """Submit an L1 escalation for a persistent reconcile failure.
 
-        Fired directly on every ``mark_done`` rejection the reconcile sweep
-        observes for *tid* (task 2243, W10-θ2 step-14 — the per-tid strike
-        counter and its ``MAX_RECONCILE_FAILURES`` threshold gate are
-        retired): the persistence layer contradicts a branch-on-main
-        observation, which is L1-worthy on its own without waiting for a
-        run of consecutive sweeps to confirm it.
+        Fired directly on every recovery-write rejection the reconcile sweep
+        observes for *tid* — a mark-done on landing evidence or the pending
+        revert of a stranded task (task 2243, W10-θ2 step-14 — the per-tid
+        strike counter and its ``MAX_RECONCILE_FAILURES`` threshold gate are
+        retired): the persistence layer refusing the sweep's recovery is
+        L1-worthy on its own without waiting for a run of consecutive sweeps
+        to confirm it.
         """
         if not self._escalation_queue:
             return
@@ -7424,17 +7467,20 @@ class Harness:
             agent_role='harness-reconcile',
             severity='blocking',
             category='reconcile_persistent_rejection',
-            summary=f'Reconcile sweep failed to mark task {tid} done'[:200],
+            summary=(
+                f'Reconcile sweep write refused for task {tid}: '
+                f'{exc.attempted_transition}'
+            )[:200],
             detail=(
-                f'set_task_status(done) rejected by fused-memory for task '
-                f'{tid}.\n\n'
+                f'Reconcile sweep write for task {tid} was refused by '
+                f'fused-memory.\n\n'
+                f'attempted transition: {exc.attempted_transition}\n'
                 f'error_code: {exc.error_code}\n'
                 f'raw: {exc.raw}\n\n'
-                f'The branch was observed on main (or a merge marker was '
-                f'found) but the persistence layer refuses the transition. '
-                f'Manual investigation required — the row may carry stale '
-                f'metadata.files or the done_provenance ancestor check may '
-                f'be failing.'
+                f"The sweep's recovery write (mark-done on landing evidence, "
+                f'or revert-to-pending of a stranded task) was refused by the '
+                f'persistence layer; the error_code and raw rejection above '
+                f'name the gate that refused it. Manual investigation required.'
             ),
             suggested_action='investigate_persistence_layer_rejection',
             filing_claimant_run_id=self._filing_claimant_run_id,
@@ -7468,8 +7514,8 @@ class Harness:
         NON-transient rejections, so an exception reaching this caller is by
         construction post-retry and a caller-level re-retry would be dead code.
 
-        Carve-out: a :class:`TerminalExitRejection` whose ``old_status`` is
-        terminal is a legitimately-finished row, not a hold.  Nothing is stuck
+        Carve-out: a rejection whose ``row_already_terminal`` holds is a
+        legitimately-finished row, not a hold.  Nothing is stuck
         and nobody needs to investigate, so it is logged at INFO and NOT filed —
         filing there would be pure noise on a common, benign race.
 
@@ -7487,7 +7533,7 @@ class Harness:
         fire-and-forget, so an exception escaping here would surface only as an
         unretrieved-task-exception at GC time — i.e. be lost.
         """
-        if isinstance(exc, TerminalExitRejection) and exc.old_status in TERMINAL_STATUSES:
+        if isinstance(exc, SetTaskStatusRejected) and exc.row_already_terminal:
             logger.info(
                 'cascade-unblock: resume of task %s to %r refused because the row '
                 'is already %s — legitimately finished out of band, not a hold; '
@@ -8405,58 +8451,8 @@ class Harness:
 
     # ── task 3500: authoring-defect diagnosis for a failed delivered check ──
 
-    #: Recovers the failed check's descriptor from the detail
-    #: ``scheduler._build_delivered_check_escalation`` renders. Parsing a
-    #: rendered string is not the shape anyone would choose — the descriptor
-    #: exists as a dict three frames up — but the ``on_delivered_check_block``
-    #: callback's signature is ``(task_id, *, summary, detail, category)`` and
-    #: widening it means editing ``scheduler.py``, which is outside task 3500's
-    #: lock scope. The coupling is filed as a follow-up; until then this is
-    #: deliberately total-or-nothing (any shape it does not recognise yields
-    #: None -> no diagnosis), and its only consumer is best-effort, so a format
-    #: drift costs the enhancement and never the escalation.
-    _DELIVERED_CHECK_DETAIL_RE = re.compile(
-        r"^Delivered check '(?P<name>[^']*)' \(kind=(?P<kind>[^)]*)\)", re.MULTILINE
-    )
-    _DELIVERED_CHECK_FIELD_RE = re.compile(
-        r'^(?P<key>pattern|paths|expect): (?P<value>.*)$', re.MULTILINE
-    )
-
-    @classmethod
-    def _parse_delivered_check_detail(cls, detail: str) -> dict | None:
-        """Recover ``{name, kind, pattern, expect, paths}`` from *detail*.
-
-        Returns None for anything it does not fully recognise — a grep check
-        without a pattern cannot be linted, and guessing at a half-parsed
-        descriptor would produce a diagnosis about a check nobody authored.
-        """
-        head = cls._DELIVERED_CHECK_DETAIL_RE.search(detail or '')
-        if head is None:
-            return None
-        fields = {
-            m.group('key'): m.group('value')
-            for m in cls._DELIVERED_CHECK_FIELD_RE.finditer(detail)
-        }
-        pattern = fields.get('pattern')
-        if not pattern or pattern == 'None':
-            return None
-        try:
-            # `paths` is rendered as a Python list repr by the escalation
-            # builder; literal_eval, never eval — this string reaches us from
-            # task metadata an agent authored.
-            paths = ast.literal_eval(fields.get('paths') or '[]')
-        except (ValueError, SyntaxError):
-            paths = []
-        return {
-            'name': head.group('name'),
-            'kind': head.group('kind'),
-            'pattern': pattern,
-            'expect': fields.get('expect'),
-            'paths': list(paths) if isinstance(paths, list) else [],
-        }
-
-    def _diagnose_delivered_check_authoring(self, detail: str) -> str | None:
-        """An ``AUTHORING DIAGNOSIS`` block for *detail*, or None if clean.
+    def _diagnose_delivered_check_authoring(self, check: dict[str, Any]) -> str | None:
+        """An ``AUTHORING DIAGNOSIS`` block for the failed *check*, or None if clean.
 
         THE POINT OF TASK 3500. ``DEP_CAPABILITY_NOT_DELIVERED`` reads
         identically whether the check is mis-authored or the capability
@@ -8466,7 +8462,8 @@ class Harness:
         actually reads the record.
 
         ONLY ``severity='reject'`` findings are surfaced, which in practice
-        means ``filename_shaped``. The exclusions are deliberate:
+        means ``filename_shaped``, ``removed_path`` and
+        ``shim_path``. The exclusions are deliberate:
 
         * The ``vacuous_*`` codes are unreachable on this path by
           construction — they fire on a check that PASSES, and we are here
@@ -8478,13 +8475,10 @@ class Harness:
           confident-sounding diagnosis built on data we do not have is worse
           than none, because the reader cannot tell it is unfounded.
         """
-        parsed = self._parse_delivered_check_detail(detail)
-        if parsed is None:
-            return None
         findings = [
             f
             for f in delivered_check_polarity.lint_delivered_checks(
-                [parsed],
+                [check],
                 files=None,
                 repo_root=self.config.project_root,
                 # The same tree the gate itself evaluated against, so the
@@ -8511,6 +8505,8 @@ class Harness:
         summary: str,
         detail: str,
         category: str,
+        check: dict[str, Any] | None = None,
+        owner: DeliveredCheckOwner | None = None,
     ) -> None:
         """Block a task and file a BORN-AT-L2 escalation for a delivered
         check that has FAILED for ``delivered_checks.grace_cycles``
@@ -8590,22 +8586,46 @@ class Harness:
         # nothing else. Runs AFTER the dedupe read so it can neither trigger a
         # second file nor change what the existing one matches on, and in a
         # worker thread because the lint shells out to git.
-        try:
-            diagnosis = await asyncio.to_thread(
-                self._diagnose_delivered_check_authoring, detail
-            )
-        except Exception:
-            logger.warning(
-                'Delivered-check block for task %s — authoring diagnosis '
-                'failed; filing the escalation undiagnosed',
-                task_id,
-                exc_info=True,
-            )
-            diagnosis = None
-        if diagnosis:
-            detail = f'{detail}\n{diagnosis}'
+        diagnosis = None
+        if check is not None:
+            try:
+                diagnosis = await asyncio.to_thread(
+                    self._diagnose_delivered_check_authoring, check
+                )
+            except Exception:
+                logger.warning(
+                    'Delivered-check block for task %s — authoring diagnosis '
+                    'failed; filing the escalation undiagnosed',
+                    task_id,
+                    exc_info=True,
+                )
 
-        from escalation.models import Escalation
+        # Task 7514: resolve whether the owner's sidecar declares the check on
+        # main. Best-effort in the same way, and keeping the derived owner on
+        # failure so `task_id` is always present.
+        if owner is not None:
+            try:
+                owner = await asyncio.to_thread(
+                    delivered_check_owner.verify_check_owner,
+                    owner,
+                    project_root=self.config.project_root,
+                )
+            except Exception:
+                logger.warning(
+                    'Delivered-check block for task %s — owner sidecar '
+                    'verification failed; filing with the derived owner',
+                    task_id,
+                    exc_info=True,
+                )
+        detail = '\n'.join(
+            part
+            for part in (
+                detail,
+                diagnosis,
+                delivered_check_owner.render_check_owner(owner, dependent_id=task_id),
+            )
+            if part
+        )
 
         esc = Escalation(
             id=self._escalation_queue.make_id(task_id),
@@ -8615,12 +8635,13 @@ class Harness:
             category=category,
             # `summary` is deliberately UNTOUCHED: it is truncated to 200
             # chars and existing e2e tests assert its contents, so the
-            # diagnosis is additive to `detail` alone.
+            # diagnosis and the owner block are additive to `detail` alone.
             summary=summary[:200],
             detail=detail,
             suggested_action='manual_intervention',
             level=2,
             filing_claimant_run_id=self._filing_claimant_run_id,
+            delivered_check_owner=owner,
         )
         self._escalation_queue.submit(esc)
         logger.warning(
@@ -8635,6 +8656,7 @@ class Harness:
         *,
         summary: str,
         detail: str,
+        level: int = 0,
     ) -> None:
         """File a non-blocking INFO escalation for a scheduler-starved task.
 
@@ -8647,15 +8669,15 @@ class Harness:
         deduped while a pending watchdog escalation already exists.  No-ops
         gracefully when no escalation queue is attached.
 
-        **Routing note:** filed at ``severity='info', level=0``.  Level-0 INFO
-        escalations are surfaced via the steward's pending-escalation view and
-        any external monitors polling the escalation queue (e.g. dashboards,
-        alerting webhooks).  They do NOT auto-promote to L1/L2 and do NOT
-        block or interrupt the scheduler — they are a passive signal intended
-        for an operator reviewing the queue at their next opportunity.  If
-        immediate paging is required for a specific deployment, configure an
-        external monitor to watch for ``agent_role='orchestrator-starvation-watchdog'``
-        pending entries and promote or alert as appropriate.
+        **Routing note:** filed at ``severity='info'`` and the scheduler's
+        *level*.  Level 0 is the info trail of a pinning gate (``dual``,
+        ``lock_refused``): the info-L0 router (task 5223) closes it as
+        status-info, keyed by ``STARVATION_WATCHDOG_ROLE``, which
+        ``escalation.classify.INFO_L0_MECHANICAL_ROLES`` must list.  Level 1
+        is a ``park_blocked`` firing: an auto-pin cannot help a task parked
+        behind a live holder, so a human sees it.  Neither feeds the EWA
+        breaker's numerator (``digest.counts_toward_ewa_numerator``): the
+        watchdog's alarms are observations, not faults.
         """
         if not self._escalation_queue:
             return
@@ -8663,7 +8685,7 @@ class Harness:
         existing = [
             e
             for e in self._escalation_queue.get_by_task(task_id, status='pending')
-            if e.agent_role == 'orchestrator-starvation-watchdog'
+            if e.agent_role == STARVATION_WATCHDOG_ROLE
         ]
         if existing:
             logger.debug(
@@ -8678,13 +8700,13 @@ class Harness:
         esc = Escalation(
             id=self._escalation_queue.make_id(task_id),
             task_id=task_id,
-            agent_role='orchestrator-starvation-watchdog',
+            agent_role=STARVATION_WATCHDOG_ROLE,
             severity='info',
             category='risk_identified',
             summary=summary[:200],
             detail=detail,
             suggested_action='manual_investigation',
-            level=0,
+            level=level,
             filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
@@ -8695,11 +8717,12 @@ class Harness:
         )
 
     async def _resolve_starvation_info(self, task_id: str) -> None:
-        """Resolve an open starvation-watchdog INFO escalation for a task.
+        """Resolve every open starvation-watchdog escalation (L0 or L1) for a task.
 
         Wired as ``on_starvation_resolve`` in the ``SchedulerCallbacks`` bundle.
         Called at both dispatch sites and from the GC backstop when the task
-        is terminal.
+        leaves ``pending``, so an open watchdog L1 cannot outlive the wait it
+        reports.
 
         Uses ``EscalationQueue.resolve`` which is idempotent (no-op if already
         resolved), so double-resolve from the dispatch site and the GC backstop
@@ -8711,13 +8734,13 @@ class Harness:
         pending = [
             e
             for e in self._escalation_queue.get_by_task(task_id, status='pending')
-            if e.agent_role == 'orchestrator-starvation-watchdog'
+            if e.agent_role == STARVATION_WATCHDOG_ROLE
         ]
         for esc in pending:
             self._escalation_queue.resolve(
                 esc.id,
                 'auto-resolved: task dispatched (starvation watchdog)',
-                resolved_by='orchestrator-starvation-watchdog',
+                resolved_by=STARVATION_WATCHDOG_ROLE,
             )
             logger.info(
                 'Starvation watchdog: auto-resolved INFO escalation %s for task %s',
@@ -9012,8 +9035,8 @@ class Harness:
         free-bytes from ``git_ops.worktree_base`` (fail-open on OSError), feeds
         the breaker, and reacts to any ``BreakerTrip`` decision:
 
-        * ``action='halt'``:  ``force_halt_scheduler(reason)`` +
-          ``_file_no_landings_info_escalation(trip)``
+        * ``action='halt'``:  ``force_halt_scheduler(reason,
+          PauseClass.NO_LANDINGS)`` + ``_file_no_landings_info_escalation(trip)``
         * ``action='resume'``: ``force_resume_scheduler(reason)`` +
           ``_resolve_no_landings_info_escalation(trip)``
 
@@ -9128,7 +9151,9 @@ class Harness:
             return
 
         if trip.action == 'halt':
-            await self.force_halt_scheduler(reason=trip.reason)
+            await self.force_halt_scheduler(
+                reason=trip.reason, pause_class=PauseClass.NO_LANDINGS,
+            )
             self._file_no_landings_info_escalation(trip)
         elif trip.action == 'resume':
             await self.force_resume_scheduler(reason=trip.reason)
@@ -11249,14 +11274,14 @@ class Harness:
             'files': sanitize_files_for_persist(task_metadata.get('files') or []),
         }
 
-        title = (
-            f'[auto-eval redo] {assignment.task.get("title", "")}'
-        )[:200]
+        original_title = str(assignment.task.get('title') or '')
+        title = elide_at_word(f'[auto-eval redo] {original_title}', _REDO_TITLE_MAX)
         description = (
             f'Automated full-architect redo of task {original_id} '
             f'(blocked at phase={report.block_phase} via optimistic path '
             f'{optimistic_path!r}). Original branch+worktree are renamed to '
             f'{new_branch} for forensic comparison once this redo is released.'
+            f'\n\nOriginal title: {original_title}'
         )
 
         outcome = await self.scheduler.submit_task({
@@ -11400,46 +11425,6 @@ class Harness:
             len(cancellable_redo_ids), cancellable_redo_ids,
         )
 
-    async def _trailing_24h_fetch_one(
-        self,
-        sql: str,
-        leading_params: tuple = (),
-        *,
-        label: str,
-    ) -> tuple | None:
-        """Execute an arbitrary trailing-24h aggregate query and return the first row.
-
-        ``sql`` must be a full SELECT ending with ``... completed_at >= ?`` (the
-        cutoff is appended internally as the LAST parameter).  ``leading_params``
-        are passed in front of the cutoff in the same order.
-
-        Fail-open: returns None when ``cost_store is None`` or when any
-        exception is raised by ``_require_conn()`` / cursor execute / fetchone.
-        Callers MUST treat None as "skip / assume zero" — dispatch must
-        never be blocked by a transient cost-DB error.  The ``label`` is used
-        only in the warning log.
-        """
-        if not sql.rstrip().endswith('completed_at >= ?'):
-            raise ValueError(
-                '_trailing_24h_fetch_one: sql must end with "completed_at >= ?" '
-                f'(got {sql[:80]!r})'
-            )
-        if self.cost_store is None:
-            return None
-        cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
-        try:
-            conn = self.cost_store._require_conn()  # type: ignore[attr-defined]
-            cur = await conn.execute(sql, (*leading_params, cutoff))
-            row = await cur.fetchone()
-            await cur.close()
-            return tuple(row) if row is not None else None
-        except Exception as exc:  # noqa: BLE001 — never block dispatch on this
-            logger.warning(
-                '%s: trailing-24h cost query failed (%s) — fail-open',
-                label, exc,
-            )
-            return None
-
     async def _auto_eval_budget_used_24h(self) -> float:
         """Sum cost_usd from invocations table for known auto-eval redo
         task_ids in the trailing 24h.
@@ -11448,16 +11433,21 @@ class Harness:
         because auto-eval is rollout instrumentation that will be sunset
         once metrics stabilise.
         """
-        if not self._auto_eval_redo_task_ids:
+        if not self._auto_eval_redo_task_ids or self.cost_store is None:
             return 0.0
-        placeholders = ','.join('?' for _ in self._auto_eval_redo_task_ids)
-        row = await self._trailing_24h_fetch_one(
-            f'SELECT COALESCE(SUM(cost_usd), 0.0) FROM invocations '
-            f'WHERE task_id IN ({placeholders}) AND completed_at >= ?',
-            tuple(self._auto_eval_redo_task_ids),
-            label='auto_eval_budget_used_24h',
-        )
-        return float(row[0]) if row and row[0] is not None else 0.0
+        since = datetime.now(UTC) - timedelta(hours=24)
+        try:
+            return await self.cost_store.tasks_invocation_cost(
+                self.config.fused_memory.project_id,
+                frozenset(self._auto_eval_redo_task_ids),
+                since=since,
+            )
+        except Exception as exc:  # noqa: BLE001 — never block dispatch on this
+            logger.warning(
+                '_auto_eval_budget_used_24h: trailing-24h cost query failed (%s) — fail-open',
+                exc,
+            )
+            return 0.0
 
     async def _enforce_cost_ceilings(self) -> None:
         """Check daily cost ceilings and pause the scheduler on breach.
@@ -11506,7 +11496,9 @@ class Harness:
                 '— pausing scheduler',
                 watcher, self.config.watcher_daily_cost_ceiling_usd,
             )
-            await self.pause_scheduler('cost_ceiling_watcher_exceeded')
+            await self.pause_scheduler(
+                'cost_ceiling_watcher_exceeded', PauseClass.COST_CEILING,
+            )
             # File an L2 outage escalation so the operator learns via their L2
             # stream that the watcher has been paused (dedup-safe: no-op if one
             # is already open).  Intentionally NOT done for the orch-wide ceiling
@@ -11521,7 +11513,9 @@ class Harness:
                 '— pausing scheduler',
                 total, self.config.orch_daily_cost_ceiling_usd,
             )
-            await self.pause_scheduler('cost_ceiling_orch_exceeded')
+            await self.pause_scheduler(
+                'cost_ceiling_orch_exceeded', PauseClass.COST_CEILING,
+            )
 
     async def _apply_retry_cap(
         self, task_id: str, report: TaskReport, requeued: bool,
@@ -13169,9 +13163,16 @@ class Harness:
         L0 with a parked workflow can never age out there.  The origin strand
         esc-5189-7 sat pending 20h58m for exactly that reason — a workflow WAS
         attending it — and then this sweep closed it as ordinary restart noise.
+
+        Info notes the info-L0 router owns are routed first, never dismissed
+        unread (plans/info-l0-disposition-router-prd.md boundary #16): a held
+        or still-unrouted one survives the sweep for the orphan reaper, and
+        none is counted as a strand.
         """
         if self._escalation_queue is None:
             return
+
+        await self._route_info_l0s_across_restart(self._escalation_queue)
 
         threshold = self.config.orphan_l0_timeout_secs
         strands = self._snapshot_stale_l0_strands(threshold)
@@ -13180,7 +13181,7 @@ class Harness:
             'Auto-dismissed: orchestrator restarted — stale from prior run'
         )
         count = self._escalation_queue.dismiss_all_pending(
-            resolution, strand_age_secs=threshold
+            resolution, strand_age_secs=threshold, keep=self._router_owns,
         )
         if count:
             logger.info(
@@ -13194,6 +13195,34 @@ class Harness:
             self._report_stale_l0_strands(strands)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning(f'Failed to report stale L0 strand telemetry: {e}')
+
+    async def _route_info_l0s_across_restart(self, queue: EscalationQueue) -> None:
+        """One startup-amnesty router pass: finish held notes, route the rest.
+
+        A router failure never aborts startup; the notes it left pending are
+        kept by the sweep for the orphan reaper.
+        """
+        try:
+            sweep = InfoL0Sweep(
+                self._router_ports(queue), by='startup-amnesty',
+                max_conversions=self.config.info_l0_router_max_conversions_per_sweep,
+            )
+            now = datetime.now(UTC)
+            for esc in queue.get_pending():
+                if not self._router_owns(esc):
+                    continue
+                hold = read_hold(esc)
+                if hold is None:
+                    await sweep.route(esc, exit_kind=ExitKind.RESTART)
+                else:
+                    await sweep.finish_hold(
+                        esc, hold, now=now,
+                        timeout_secs=self.config.info_l0_router_ticket_timeout_secs,
+                        exit_kind=ExitKind.RESTART,
+                    )
+            sweep.close()
+        except Exception:
+            logger.exception('info-l0-router: the startup amnesty pass failed')
 
     def _snapshot_stale_l0_strands(self, threshold_secs: float) -> list[dict[str, Any]]:
         """Per-record detail for the L0s about to be swept as strands.
@@ -13220,7 +13249,7 @@ class Harness:
         try:
             now = datetime.now(UTC)
             for esc in self._escalation_queue.get_pending():
-                if esc.level != 0:
+                if esc.level != 0 or self._router_owns(esc):
                     continue
                 # fallback=datetime.max — same sentinel direction as the queue
                 # side, so an unparseable timestamp is never mistaken for a
@@ -13276,12 +13305,55 @@ class Harness:
 
         self._file_stale_l0_strand_escalation(strands)
 
-    # Strand-sweep aggregate escalation (task 3172).  Constant (not per-task)
-    # dedup key — one open record at a time however many strands a restart
-    # sweeps — mirroring _LANE_RECORD_DRIFT_ROOT_CAUSE's bare-literal style.
+    # Strand-sweep aggregate escalation (task 3172).  One record per sweep that
+    # strands anything, however many strands it sweeps.  The rate is bounded by
+    # the strand threshold, not by a guard: each sweep dismisses every pending
+    # L0, so a strand at the next sweep was filed after this one and has aged
+    # past orphan_l0_timeout_secs since (task 4988).
     _STALE_L0_STRAND_SENTINEL: str = '__stale_l0_strand_sweep__'
     _STALE_L0_STRAND_ROOT_CAUSE: str = 'stale_l0_strand_sweep'
     _STALE_L0_STRAND_ROLE: str = 'harness-stale-l0-strand-sweep'
+
+    @staticmethod
+    def _open_stale_l0_strand_records(
+        pending: list[Escalation],
+    ) -> list[tuple[str, str | None]]:
+        """Earlier strand L1s still pending, each paired with the pending L2 clustering it.
+
+        Sorted by id because ``EscalationQueue.get_pending`` reads in glob order.
+        """
+        clustered_by = {
+            member_id: l2.id
+            for l2 in pending if l2.level == 2
+            for member_id in l2.members
+        }
+        return sorted(
+            (
+                (e.id, clustered_by.get(e.id))
+                for e in pending
+                if e.level == 1 and e.root_cause == Harness._STALE_L0_STRAND_ROOT_CAUSE
+            ),
+            key=lambda record: record[0],
+        )
+
+    @staticmethod
+    def _cite_open_stale_l0_strand_records(
+        open_records: list[tuple[str, str | None]],
+    ) -> str:
+        """The detail paragraph citing earlier open strand records; empty when there are none."""
+        if not open_records:
+            return ''
+        cited = '\n'.join(
+            f'  - {l1_id}' if l2_id is None
+            else f'  - {l1_id} (clustered under pending L2 {l2_id})'
+            for l1_id, l2_id in open_records
+        )
+        return (
+            f'Earlier stale-L0 strand records are still open:\n{cited}\n'
+            f'Triage this sweep\'s strands alongside them (fold this record into '
+            f'the same L2) rather than closing it as a duplicate: it names only '
+            f'the strands this sweep dismissed, which no earlier record lists.\n\n'
+        )
 
     def _file_stale_l0_strand_escalation(self, strands: list[dict[str, Any]]) -> None:
         """File ONE level-1 escalation for the strands this restart destroyed.
@@ -13296,19 +13368,17 @@ class Harness:
         sweep, and eleven separate escalations would be its own noise failure.
         Per-strand granularity is not lost — it lives in the
         ``stale_l0_strand_dismissed`` events and in this record's detail.
+
+        An earlier strand record that is still open never suppresses this one
+        (task 4988).  The new record names only this sweep's strands and cites
+        the open records, plus any pending L2 clustering them, so triage folds
+        it into the same decision instead of closing it as a duplicate.
         """
         queue = getattr(self, '_escalation_queue', None)
         if not queue or not strands:
             return
         try:
-            # find_pending_l2_by_root_cause is level-2 only by construction, so
-            # the L1 aggregate needs the level-appropriate equivalent of the
-            # same O(N) root_cause scan.
-            for existing in queue.get_pending():
-                if existing.level == 1 and existing.root_cause == self._STALE_L0_STRAND_ROOT_CAUSE:
-                    return  # dedup: one open strand record at a time
-
-            from escalation.models import Escalation
+            open_records = self._open_stale_l0_strand_records(queue.get_pending())
 
             max_age = max(s['pending_secs'] for s in strands)
             blocked = sum(1 for s in strands if s['workflow_blocked'])
@@ -13323,6 +13393,7 @@ class Harness:
                 f'agent_role={s["agent_role"]}'
                 for s in strands
             )
+            earlier = self._cite_open_stale_l0_strand_records(open_records)
             detail = (
                 f'The startup L0 sweep dismissed {len(strands)} escalation(s) that had '
                 f'already been pending longer than the '
@@ -13330,13 +13401,23 @@ class Harness:
                 f'NOT ordinary restart artifacts: each one had been waiting, unanswered, '
                 f'while the previous orchestrator run was alive.\n\n'
                 f'{lines}\n\n'
-                f'A strand with workflow_blocked=True means a workflow slot was parked on '
-                f'that escalation (derived from severity != "info") and was killed by the '
-                f'restart without ever getting an answer.  The orphan-L0 reaper cannot see '
-                f'this class: it skips any L0 whose task has a live workflow attending it, '
-                f'which is precisely the condition these records were in.\n\n'
-                f'Investigate why the escalation(s) went unanswered for that long — an '
-                f'unattended steward, a wedged watcher, or a long AFK period.'
+                f'{earlier}'
+                'Nothing routes a level-0 record to the L1 watcher or to a human.  The '
+                'orphan-L0 reaper promotes an aged L0 to L1 only once no live workflow '
+                'holds its task or its filing incarnation is provably gone, and none of '
+                'these had been promoted.  Who should have answered each strand depends '
+                'on workflow_blocked (derived from severity != "info"):\n'
+                '  - workflow_blocked=True: a workflow slot was parked on the record and '
+                'the restart killed it unanswered.  Its consumer was the steward that '
+                'workflow started on entering _wait_for_resolution.  Ask why no steward '
+                'pass resolved it before the restart.\n'
+                '  - workflow_blocked=False: an info note parks no slot, so nothing '
+                'consumed it while its task stayed held, and a hold that outlasted the '
+                'run brought it here unread.  Ask which hold outlasted the run, and '
+                'whether the note still matters to work in flight.\n\n'
+                'Each dismissed strand stays readable by id: get_escalation '
+                '(EscalationQueue.get) falls back to the escalation archive.  Read the '
+                'listed ids before closing this record.'
             )
             esc = Escalation(
                 id=queue.make_id(self._STALE_L0_STRAND_SENTINEL),
@@ -14162,6 +14243,20 @@ class Harness:
             self._escalation_task = None
             logger.info('Escalation server stopped')
 
+    def _router_ports(self, queue: EscalationQueue) -> RouterPorts:
+        """The I/O the info-L0 router may touch from the harness."""
+        return RouterPorts(
+            queue=queue,
+            event_store=self.event_store,
+            dispatch_tool=self.scheduler.dispatch_tool,
+            project_root=str(self.config.project_root),
+            filing_claimant_run_id=self._filing_claimant_run_id,
+        )
+
+    def _router_owns(self, esc: Escalation) -> bool:
+        """True when the info-L0 router is *esc*'s consumer under the live config."""
+        return router_owns(esc, enabled=self.config.info_l0_router_enabled)
+
     #: "not read yet", distinguishable from a genuine ``get_task`` -> ``None``
     #: (no such row).  Scoped to :meth:`_reap_orphan_l0_escalations`'s per-record
     #: memo, whose whole point is that ONE record costs at most ONE task read.
@@ -14196,6 +14291,10 @@ class Harness:
         timeout = self.config.orphan_l0_timeout_secs
         now = datetime.now(UTC)
         promoted = 0
+        router = InfoL0Sweep(
+            self._router_ports(self._escalation_queue), by='orphan-reaper',
+            max_conversions=self.config.info_l0_router_max_conversions_per_sweep,
+        )
 
         for esc in self._escalation_queue.get_pending():
             if esc.level != 0:
@@ -14222,6 +14321,18 @@ class Harness:
                 logger.info(
                     'Orphan L0 reaper: dismissed eval-lane orphan for task_id=%s (%s)',
                     esc.task_id, eval_lane_reason,
+                )
+                continue
+
+            # A router hold (PRD D9) is owned by this reaper alone, so it is
+            # finished ahead of the liveness arm: a live newer incarnation
+            # never consumes it.
+            routed_here = self._router_owns(esc)
+            hold = read_hold(esc) if routed_here else None
+            if hold is not None:
+                await router.finish_hold(
+                    esc, hold, now=now,
+                    timeout_secs=self.config.info_l0_router_ticket_timeout_secs,
                 )
                 continue
 
@@ -14293,23 +14404,22 @@ class Harness:
                     f'current claimant is {live_run_id}'
                 )
 
+            if routed_here:
+                row = await _task_row()
+                await router.route(
+                    esc, exit_kind=ExitKind.ORPHAN, task_status=(row or {}).get('status'),
+                )
+                continue
+
             # Defense-in-depth: never double-escalate a task a human is
             # already looking at.  B1 (commit 1a1eca9a67) stopped the main
             # orphan source by skipping L0 creation on escalate_to_human
             # paths, but other L0 sources remain (agent escalate_info,
             # deep-reviewer L0s, steward-chained L0s) and an /unblock can be
-            # in flight.  If an L1 is already open for this task, dismiss the
-            # orphan L0 rather than promoting it to a duplicate "echo" L1.
-            if self._escalation_queue.has_open_l1(esc.task_id):
-                self._escalation_queue.resolve(
-                    esc.id,
-                    (
-                        'Dismissed by orphan reaper — open L1 already covers '
-                        f'this task (task_id={esc.task_id})'
-                    ),
-                    dismiss=True,
-                    resolved_by='harness-orphan-reaper',
-                )
+            # in flight.  If an L1 about the same category is already open for
+            # this task, dismiss the orphan L0 rather than promoting it to a
+            # duplicate "echo" L1.
+            if self._escalation_queue.dismiss_if_covered(esc, resolver='harness-orphan-reaper'):
                 continue
 
             # Live lock-free-stage race (task 2931): defer — don't promote —
@@ -14449,6 +14559,7 @@ class Harness:
             )
             promoted += 1
 
+        router.close()
         if promoted:
             logger.warning(
                 'Orphan L0 reaper: promoted %d escalation(s) to L1', promoted,
@@ -15280,7 +15391,7 @@ class Harness:
             window_secs,
         )
         try:
-            await self.pause_scheduler(reason)
+            await self.pause_scheduler(reason, PauseClass.WATCHER_GUARD)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -16340,8 +16451,10 @@ class Harness:
         # May drift by a small constant under concurrency; not a correctness gate.
         self._escalation_event_count += 1  # task 1327 AFK hardening
         # A submission advances the EWA numerator as well as the gate; a
-        # resolution (below) advances the gate ONLY.  Task 4559.
-        self._escalation_submit_count += 1  # task 4559 — EWA numerator
+        # resolution (below) advances the gate ONLY.  Task 4559.  A
+        # starvation-watchdog alarm advances the gate only (task 3821).
+        if digest_mod.counts_toward_ewa_numerator(escalation):
+            self._escalation_submit_count += 1  # task 4559 — EWA numerator
         event = self._escalation_events.get(escalation.task_id)
         if event:
             event.set()
@@ -18115,19 +18228,25 @@ class Harness:
         """
         was_paused = self.scheduler.is_paused
         prior_reason = self.scheduler.pause_reason
+        prior_class = self.scheduler.pause_class
+        prior_pause_class = prior_class.value if prior_class else None
         await self.resume_scheduler()
         logger.warning(
-            'force_resume_scheduler: was_paused=%s prior_reason=%r by_reason=%r',
-            was_paused, prior_reason, reason,
+            'force_resume_scheduler: was_paused=%s prior_reason=%r '
+            'prior_pause_class=%s by_reason=%r',
+            was_paused, prior_reason, prior_pause_class, reason,
         )
         return {
             'resumed': was_paused,
             'was_paused': was_paused,
             'prior_reason': prior_reason,
+            'prior_pause_class': prior_pause_class,
             'reason': reason,
         }
 
-    async def force_halt_scheduler(self, reason: str) -> dict[str, Any]:
+    async def force_halt_scheduler(
+        self, reason: str, pause_class: PauseClass = PauseClass.OPERATOR,
+    ) -> dict[str, Any]:
         """Operator-initiated scheduler halt (backs the halt_scheduler tool).
 
         Pauses the scheduler so ``acquire_next()`` stops dispatching new tasks,
@@ -18138,21 +18257,32 @@ class Harness:
         that L1 would silently undo the halt.  Reversed by
         ``force_resume_scheduler`` / ``resume_scheduler``.
 
+        ``pause_class`` defaults to the operator MCP tool's class; automatic
+        breakers pass their own (PRD decision 5).
+
         ``reason`` is required for audit.  Returns
-        ``{halted, was_paused, prior_reason, reason}``.
+        ``{halted, was_paused, prior_reason, prior_pause_class, reason,
+        requested_pause_class}``.  The in-memory pause is first-wins, so when
+        ``was_paused`` the scheduler stays held under the prior class, not the
+        requested one.
         """
         was_paused = self.scheduler.is_paused
         prior_reason = self.scheduler.pause_reason
-        await self.pause_scheduler(reason, file_escalation=False)
+        prior_class = self.scheduler.pause_class
+        prior_pause_class = prior_class.value if prior_class else None
+        await self.pause_scheduler(reason, pause_class, file_escalation=False)
         logger.warning(
-            'force_halt_scheduler: was_paused=%s prior_reason=%r by_reason=%r',
-            was_paused, prior_reason, reason,
+            'force_halt_scheduler: was_paused=%s prior_reason=%r '
+            'prior_pause_class=%s by_reason=%r requested_pause_class=%s',
+            was_paused, prior_reason, prior_pause_class, reason, pause_class,
         )
         return {
             'halted': True,
             'was_paused': was_paused,
             'prior_reason': prior_reason,
+            'prior_pause_class': prior_pause_class,
             'reason': reason,
+            'requested_pause_class': pause_class.value,
         }
 
     # ------------------------------------------------------------------ #
@@ -18258,29 +18388,24 @@ class Harness:
     # Scheduler park-and-stop pause (task 1322)                           #
     # ------------------------------------------------------------------ #
 
-    async def pause_scheduler(self, reason: str, *, file_escalation: bool = True) -> None:
+    async def pause_scheduler(
+        self, reason: str, pause_class: PauseClass, *, file_escalation: bool = True,
+    ) -> None:
         """Pause the scheduler so acquire_next() returns None until resumed.
 
-        1. Delegates to ``scheduler.pause(reason)`` (idempotent in-memory state).
-        2. Persists via ``RunStore.save_scheduler_pause`` (best-effort),
-           including the live ``_ewa_value`` (task 4559).  The value is
-           recorded for EVERY pause class, not just ``ewa_trip_*``: it is
-           operator EVIDENCE and forensic record, never a trip flag — the
-           pause class is carried by *reason*, which is also the only thing
-           the restore-time predicate keys on.  Seven ``scheduler_pause_restored``
-           events across four pause classes showed a restart re-asserted the
-           halt while losing the number behind it, so the evidence-vs-halt
-           asymmetry is structural to ``pause_scheduler`` rather than
-           EWA-specific, and is fixed here for all classes at once.
-           This write is the trip-TIME snapshot.  While an ``ewa_trip_`` halt
-           is subsequently HELD, ``_maybe_write_digest`` step (13b) refreshes
-           the same column on every digest step, so the stored scalar tracks
-           the decaying statistic rather than freezing at the tripping value —
-           without which the restart-time predicate re-check below could never
-           observe recovery.  That refresh is scoped to ``ewa_trip_`` rows;
-           for every other class the trip-time snapshot written here is the
-           forensic record and is never overwritten.
-        3. Emits ``EventType.scheduler_paused`` (best-effort).
+        1. Delegates to ``scheduler.pause(reason, pause_class)`` (idempotent
+           in-memory state; refuses a class whose policy forbids halting).
+        2. If the class's policy persists, saves the hold via
+           ``RunStore.save_scheduler_pause`` (best-effort) with its class and
+           the live ``_ewa_value`` (task 4559).  The value is recorded for
+           EVERY class as operator evidence, never as a trip flag.  This write
+           is the trip-TIME snapshot; while an ewa_rate hold is HELD,
+           ``_maybe_write_digest`` step (13b) refreshes the same column so the
+           stored scalar tracks the decaying statistic.  For every other class
+           the snapshot written here is the forensic record and is never
+           overwritten.
+        3. Emits ``EventType.scheduler_paused`` with the reason and class
+           (best-effort).
         4. Logs a WARNING so the operator sees it.
         5. Files an auto-resumable scheduler-pause L1 — unless ``file_escalation``
            is False.
@@ -18306,10 +18431,11 @@ class Harness:
         and disk for the in-flight pause is accepted as the cost of keeping
         the trip's status write off the synchronous critical path.
         """
-        self.scheduler.pause(reason)
-        logger.warning('Scheduler paused: %s', reason)
+        policy = policy_for(pause_class)
+        self.scheduler.pause(reason, pause_class)
+        logger.warning('Scheduler paused (%s): %s', pause_class, reason)
 
-        if self._run_store and self._run_id:
+        if policy.persisted and self._run_store and self._run_id:
             try:
                 self._run_store.save_scheduler_pause(
                     project_id=self.config.fused_memory.project_id,
@@ -18317,6 +18443,7 @@ class Harness:
                     pause_at_iso=datetime.now(UTC).isoformat(),
                     set_by_run_id=self._run_id,
                     ewa_value=self._ewa_value,  # task 4559 — evidence, every class
+                    pause_class=pause_class,
                 )
             except Exception:
                 logger.warning('pause_scheduler: failed to persist pause state', exc_info=True)
@@ -18324,7 +18451,7 @@ class Harness:
         if self.event_store:
             self.event_store.emit(
                 EventType.scheduler_paused,
-                data={'reason': reason},
+                data={'reason': reason, 'pause_class': pause_class.value},
             )
 
         # File an L1 so an AFK operator is actually notified (a WARNING log +
@@ -18344,21 +18471,23 @@ class Harness:
         1. Delegates to ``scheduler.resume()`` (idempotent).
         2. Clears persistence via ``RunStore.clear_scheduler_pause`` (best-effort).
         3. Emits ``EventType.scheduler_resumed`` (best-effort).
-        4. If the pause was caused by an EWA trip (reason starts with 'ewa_trip_'),
-           resets ``_ewa_value`` to 0.0 so the next digest step does not immediately
+        4. If the cleared hold's stored EWA was its predicate
+           (``STORED_EWA_PREDICATE_CLASSES``), resets
+           ``_ewa_value`` to 0.0 so the next digest step does not immediately
            re-trigger a pause.  EWA decays naturally with alpha=0.3 (~N digests of
            low ratio to fall back below threshold), but an operator-driven resume
            signals that the situation is under control — a clean reset is less
            surprising than watching the EWA trip instantly again.
         5. Logs INFO.
         """
-        # Snapshot pause reason BEFORE resume() clears it.
-        prior_reason = self.scheduler.pause_reason or ''
+        # Snapshot the class BEFORE resume() clears it.
+        prior_class = self.scheduler.pause_class
         self.scheduler.resume()
-        if prior_reason.startswith('ewa_trip_'):
+        if prior_class in STORED_EWA_PREDICATE_CLASSES:
             self._ewa_value = 0.0
             logger.info(
-                'resume_scheduler: EWA value reset to 0.0 (prior pause was ewa_trip).'
+                'resume_scheduler: EWA value reset to 0.0 (prior pause class %s).',
+                prior_class,
             )
         logger.info('Scheduler resumed.')
 
@@ -18371,7 +18500,10 @@ class Harness:
                 logger.warning('resume_scheduler: failed to clear persisted pause', exc_info=True)
 
         if self.event_store:
-            self.event_store.emit(EventType.scheduler_resumed)
+            self.event_store.emit(
+                EventType.scheduler_resumed,
+                data={'pause_class': prior_class.value if prior_class else None},
+            )
 
     async def _load_persisted_scheduler_pause(self) -> None:
         """Restore scheduler pause state from runs.db on restart.
@@ -18386,38 +18518,17 @@ class Harness:
         is alerted on startup.  Any failure is caught and logged but never
         blocks startup.
 
-        Task 4559 — restart-time predicate re-check.  SCOPE, stated precisely,
-        because it sits next to something deliberately excluded: this is NOT an
-        auto-resume of a live pause.  Nothing new reads ``_ewa_value`` to
-        unpause a running scheduler.  What this declines to do is RE-ASSERT,
-        across a process boundary, a halt whose stored predicate no longer
-        holds.  It is scoped strictly to ``ewa_trip_*`` — the one pause class
-        whose predicate is a stored scalar and can therefore be re-evaluated.
-        Park-stop, cost-ceiling and operator halts are restored blind exactly
-        as before (task 3328: 'Non-5xx park-stop pauses NEVER auto-resume'), as
-        is an ``ewa_trip_*`` row with a NULL value — a row predating the
-        migration — which fails safe toward KEEPING the halt when the predicate
-        is unknowable, never toward releasing it.
-
-        What makes that re-check reachable at all is ``_maybe_write_digest``
-        step (13b): while an ``ewa_trip_`` halt is held it refreshes the stored
-        ``ewa_value`` on every digest step, so the number read here is the EWA
-        as of the last digest before shutdown, not the trip-time snapshot.
-        Without that refresh the stored value would be >= the threshold by
-        construction and this branch could only ever fire because an operator
-        RAISED ``digest_ewa_threshold`` — never because the backlog drained.
-
-        The stored value is written back to LIVE state (``self._ewa_value``)
-        only for an ``ewa_trip_*`` row — the same predicate that governs the
-        halt decision, and the one class whose stored scalar IS the live
-        statistic.  For every other pause class it is forensic evidence about
-        a value that never tripped anything: seeding it would leave a latent
-        EWA trip input that ``resume_scheduler`` never clears (it resets only
-        on ``ewa_trip_`` reasons), turning a park-stop restart into a head
-        start toward the threshold.  The evidence is not lost by that
-        narrowing — every pause class still carries ``ewa_value`` on the
-        ``scheduler_pause_restored`` event and in the startup WARNING, which is
-        where an operator reads it.
+        Restart-time predicate re-check (task 4559): the row's class policy
+        decides.  A class whose stored EWA is its predicate
+        (``PausePolicy.stored_ewa_is_predicate``) declines to RE-ASSERT a halt
+        whose stored EWA is below the current threshold (never an auto-resume
+        of a live pause), and only that class seeds its stored value into live
+        ``_ewa_value``; for every other class the value is forensic evidence,
+        reported on the event and WARNING but never seeded.  Every other class
+        re-asserts blind, as does a NULL stored value.  A NULL or unrecognised
+        stored class reads as operator and re-asserts (PRD open question 3).
+        A row whose class may no longer halt is declined the same way: the
+        scheduler refuses it, the row is cleared and the event says why.
         """
         if not self._run_store:
             return
@@ -18429,56 +18540,51 @@ class Harness:
                 reason = record.get('reason', '<unknown reason>')
                 pause_at = record.get('pause_at', '<unknown time>')
                 restored_from_run_id = record.get('set_by_run_id', '<unknown>')
+                pause_class = record['pause_class']
+                policy = policy_for(pause_class)
                 logger.warning(
                     'Scheduler pause persisted from prior run — restoring. '
-                    'reason=%r  pause_at=%r  set_by_run_id=%r  '
+                    'reason=%r  pause_class=%s  pause_at=%r  set_by_run_id=%r  '
                     '(call Harness.resume_scheduler() to clear)',
                     reason,
+                    pause_class,
                     pause_at,
                     restored_from_run_id,
                 )
                 ewa_value = record.get('ewa_value')
                 threshold = self.config.digest_ewa_threshold
-                # One class test, two decisions — hoisted to a single local so
+                # One policy test, two decisions — hoisted to a single local so
                 # the live-state restore and the halt re-assertion below can
                 # never drift apart (task 4559).
-                is_ewa_trip = reason.startswith('ewa_trip_')
+                retests_stored_ewa = policy.stored_ewa_is_predicate
 
-                # Restore the value into LIVE state only for an ewa_trip_ row,
-                # the one class whose stored scalar IS the live statistic.  For
-                # any other class it is forensic evidence about a value that
-                # never tripped anything; seeding it would leave a head start
-                # toward the threshold that resume_scheduler never clears.
-                if is_ewa_trip and ewa_value is not None:
+                if retests_stored_ewa and ewa_value is not None:
                     self._ewa_value = ewa_value
 
-                # Re-assert unless this is an ewa_trip_ pause whose stored
-                # predicate demonstrably no longer holds.  A missing value is
-                # an unknowable predicate, so it re-asserts.
-                reassert = not (
-                    is_ewa_trip
-                    and ewa_value is not None
-                    and ewa_value < threshold
-                )
-
-                if reassert:
-                    self.scheduler.pause(reason)
-                    # Stash the reason so run() can file the L1 escalation once
-                    # the escalation queue exists (this runs at line ~492, before
-                    # _start_escalation_server creates _escalation_queue).  See
-                    # _file_restored_pause_escalation.
-                    self._restored_pause_reason = reason
-                    disposition = 'predicate still holds or is not re-checkable'
-                else:
-                    # Do NOT pause, and do NOT set _restored_pause_reason — no
-                    # L1 may be filed for a halt that is not being re-asserted.
+                # A missing value is an unknowable predicate, so it re-asserts.
+                if retests_stored_ewa and ewa_value is not None and ewa_value < threshold:
                     logger.warning(
                         'Scheduler pause NOT re-asserted: persisted EWA %.4f is '
                         'below the current threshold %.4f, so the stored trip '
                         'predicate no longer holds. reason=%r  (task 4559)',
                         ewa_value, threshold, reason,
                     )
+                    reassert = False
                     disposition = 'ewa below threshold — halt not re-asserted'
+                else:
+                    reassert, disposition = self._reassert_restored_pause(
+                        reason, pause_class,
+                    )
+
+                if reassert:
+                    # Stash the reason so run() can file the L1 escalation once
+                    # the escalation queue exists (this runs at line ~492, before
+                    # _start_escalation_server creates _escalation_queue).  See
+                    # _file_restored_pause_escalation.
+                    self._restored_pause_reason = reason
+                else:
+                    # Do NOT set _restored_pause_reason — no L1 may be filed for
+                    # a halt that is not being re-asserted.
                     try:
                         self._run_store.clear_scheduler_pause(
                             self.config.fused_memory.project_id,
@@ -18500,6 +18606,7 @@ class Harness:
                         EventType.scheduler_pause_restored,
                         data={
                             'reason': reason,
+                            'pause_class': pause_class.value,
                             'pause_at': pause_at,
                             'restored_from_run_id': restored_from_run_id,
                             'reasserted': reassert,
@@ -18513,6 +18620,26 @@ class Harness:
                 '_load_persisted_scheduler_pause: failed to read pause state',
                 exc_info=True,
             )
+
+    def _reassert_restored_pause(
+        self, reason: str, pause_class: PauseClass,
+    ) -> tuple[bool, str]:
+        """Re-assert a persisted hold, declining one whose class may no longer halt.
+
+        Returns ``(reasserted, disposition)``.  The refusal is
+        ``Scheduler.pause``'s (PRD §6 invariant 1), so a row written before its
+        class stopped halting is retired instead of failing the whole restore.
+        """
+        try:
+            self.scheduler.pause(reason, pause_class)
+        except HaltNotPermittedError:
+            logger.warning(
+                'Scheduler pause NOT re-asserted: pause class %s may not halt '
+                '(PRD §6 invariant 1). reason=%r',
+                pause_class, reason,
+            )
+            return False, 'class may not halt — halt not re-asserted'
+        return True, 'predicate still holds or is not re-checkable'
 
     # ------------------------------------------------------------------ #
     # Digest + EWA trip (task 1327)                                       #
@@ -18547,7 +18674,7 @@ class Harness:
         13. Advance counters/state using the snapshot from step 2 (not the
             live counter), so that concurrent callbacks firing inside this
             function do not silently skip counted events.
-        13b. If an ``ewa_trip_`` halt is currently HELD, refresh the persisted
+        13b. If an ewa_rate hold is currently HELD, refresh the persisted
             ``scheduler_state.ewa_value`` so the stored scalar tracks the
             decaying live statistic instead of freezing at the trip-time
             snapshot (fail-open; see the inline note).
@@ -18734,46 +18861,19 @@ class Harness:
             self._last_digest_submit_count = submit_count_snapshot
             self._last_digest_window_end_iso = window_end
 
-            # (13b) While an ewa_trip_ halt is HELD, keep the persisted scalar
-            # tracking the live statistic (task 4559 amendment).
+            # (13b) While a hold whose stored EWA is its predicate is HELD
+            # (STORED_EWA_PREDICATE_CLASSES), keep the persisted scalar
+            # tracking the live statistic (task 4559 amendment), so the
+            # restart-time re-test in _load_persisted_scheduler_pause can
+            # observe the decay instead of the frozen trip-time value.
             #
-            # pause_scheduler is otherwise the only writer, and step (14) below
-            # only fires `if tripped and not is_paused` — so once the halt is
-            # asserted the row would freeze at the trip-time value forever,
-            # even as this method decays _ewa_value on every drain window.  Two
-            # things broke as a result: the restart-time predicate re-check in
-            # _load_persisted_scheduler_pause could essentially never observe
-            # recovery (a stored value is by construction >= the threshold at
-            # write time, so `ewa_value < threshold` was only reachable if an
-            # operator RAISED digest_ewa_threshold), and a restart re-seeded
-            # _ewa_value with the stale high number, discarding the decay the
-            # drain had achieved — on the 8h fleet-redeploy cadence, on every
-            # restart.  Refreshing here is what makes "draining heals the
-            # breaker" survive a process boundary rather than being reset by it.
-            #
-            # Scoped to ewa_trip_ pauses for the same reason the restore is
-            # (see _load_persisted_scheduler_pause): that is the one class whose
-            # stored scalar IS the live statistic.  For every other class the
-            # value is trip-time forensic evidence about the pause, and
-            # overwriting it with an unrelated later number would destroy it.
-            #
-            # The check below is a cheap PRE-FILTER, not the enforcement point:
-            # it reads the IN-MEMORY reason, which can disagree with the row's
-            # stored reason (Scheduler.pause is first-wins in memory;
-            # save_scheduler_pause is INSERT OR REPLACE, last-wins on disk — so
-            # a park-stop trip during a held ewa_trip_ halt is an in-memory
-            # no-op that still rewrites the row).  refresh_scheduler_pause_ewa
-            # re-tests the prefix against the ROW's own pause_reason in its
-            # WHERE clause; that is what actually protects a non-EWA row's
-            # forensic value.  Do not drop it in favour of this check.
-            #
-            # Best-effort with its own guard: a persistence hiccup must never
-            # break the digest, and this is observability plus a restart hint,
-            # never a correctness gate.
+            # The class check below is only a PRE-FILTER: memory is first-wins
+            # while the row is last-wins, so they can disagree.  The enforcement
+            # point is refresh_scheduler_pause_ewa's WHERE pause_class clause.
+            # Best-effort: a persistence hiccup must never break the digest.
             if (
                 self._run_store
-                and self.scheduler.is_paused
-                and (self.scheduler.pause_reason or '').startswith('ewa_trip_')
+                and self.scheduler.pause_class in STORED_EWA_PREDICATE_CLASSES
             ):
                 try:
                     self._run_store.refresh_scheduler_pause_ewa(
@@ -18806,7 +18906,8 @@ class Harness:
             # auto-resume here without engaging those three first.
             if tripped and not self.scheduler.is_paused:
                 await self.pause_scheduler(
-                    _ewa_trip_reason(new_ewa, escalation_stats.dominant_category())
+                    _ewa_trip_reason(new_ewa, escalation_stats.dominant_category()),
+                    PauseClass.EWA_RATE,
                 )
 
         except asyncio.CancelledError:

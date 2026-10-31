@@ -355,7 +355,11 @@ def applier_harness(tmp_path, mock_orch_config):
     import shutil
     from unittest.mock import AsyncMock, MagicMock, patch
 
-    from _orch_helpers import wire_clear_claim_then_set_status, wire_scheduler_liveness_mock
+    from _orch_helpers import (
+        wire_clear_claim_then_set_status,
+        wire_live_status_from_get_task,
+        wire_scheduler_liveness_mock,
+    )
     from escalation.queue import EscalationQueue
 
     from orchestrator.config import RecoveryEmissionConfig
@@ -370,6 +374,7 @@ def applier_harness(tmp_path, mock_orch_config):
     h.scheduler = MagicMock()
     wire_scheduler_liveness_mock(h.scheduler)
     wire_clear_claim_then_set_status(h.scheduler)
+    wire_live_status_from_get_task(h.scheduler)
     h.scheduler.get_tasks = AsyncMock(return_value=[])
     h.scheduler.get_statuses = AsyncMock(
         return_value=({_TID: str(TaskStatus.IN_PROGRESS)}, None),
@@ -1726,6 +1731,63 @@ class TestResolveAlreadyLandedBranch:
             'the merge is still an ancestor and still names the declared '
             'file, but its effect is gone from main — signal 4 must decline'
         )
+
+    async def test_a_heavy_rewrite_is_logged_as_a_survival_reject_not_a_revert(
+        self, git_repo: Path, git_ops: GitOps,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A rewrite still fails signal 4, but must not be logged as a revert.
+
+        Signal 4 is a line-SURVIVAL threshold test, so rewriting every added
+        line on main rejects the landing exactly as a revert would, while
+        the deliverable is still on main.  The decision stays fail-closed;
+        the WARNING must report what the check measured, not claim a cause.
+        """
+        plan_files = ['src/pkg/rewritten.py']
+        merge_sha = await _land_via_merge(
+            git_repo, 'task/925',
+            {plan_files[0]: ''.join(f'value_{i} = {i}\n' for i in range(30))},
+        )
+        (git_repo / plan_files[0]).write_text(
+            ''.join(f'renamed_{i} = {i}\n' for i in range(30)),
+        )
+        rc, _, err = await _run(
+            ['git', 'commit', '-am', 'impl(925): rewrite every line'],
+            cwd=git_repo,
+        )
+        assert rc == 0, err
+        parked = await _head_of(git_repo)
+        await _reseed(git_repo, 'task/925', parked)
+
+        # Guard the guard: the deliverable is still on main (a rewrite, not a
+        # revert) and attribution still resolves to the MERGE commit.
+        assert (git_repo / plan_files[0]).exists()
+        assert await git_ops.find_merge_marker(
+            'task/925', gate_on_existing_ref=False,
+        ) == merge_sha
+
+        with caplog.at_level('WARNING', logger='orchestrator.merge_lane'):
+            result = await _resolve(
+                plan_files, parked, parked, git_ops,
+                task_id='925', branch='task/925',
+            )
+
+        assert result is None
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.levelname == 'WARNING'
+            and 'already-landed:' in r.getMessage()
+            and merge_sha in r.getMessage()
+        ]
+        assert len(messages) == 1, messages
+        msg = messages[0]
+        assert 'post-hoc revert' not in msg
+        assert 'failure=effect_not_survived' in msg
+        assert 'added_lines_total=30' in msg
+        assert 'aggregate_survival=0.0 ' in msg
+        assert 'worst_guarded_path=src/pkg/rewritten.py' in msg
+        assert 'worst_guarded_survival=0.0 ' in msg
+        assert not any(r.exc_info for r in caplog.records)
 
     # --- (9) SIGNAL 2 PRECISION — a mention is not a delivery ---------------
     #

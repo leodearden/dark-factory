@@ -19,6 +19,7 @@ from typing import Any, TypedDict, TypeVar, cast
 from urllib.parse import urlparse
 
 from graphiti_core import Graphiti
+from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.falkordb_driver import FalkorDriver
@@ -33,8 +34,10 @@ from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
+from fused_memory.backends.exact_episode_window import ExactEpisodeWindowGraphiti
 from fused_memory.backends.falkor_edge_search import FalkorEdgeSearch
 from fused_memory.backends.falkor_fulltext import build_query
+from fused_memory.backends.falkor_graph_operations import FalkorGraphOperations
 from fused_memory.backends.falkor_indices import (
     IndexCatalogUnsettledError,
     IndexHeaderShapeError,
@@ -49,6 +52,12 @@ from fused_memory.backends.falkor_indices import (
     vector_drop_statement,
     vector_index_properties,
 )
+from fused_memory.backends.falkor_server_settings import (
+    FalkorServerSettings,
+    read_falkor_server_settings,
+    warn_on_shortfalls,
+)
+from fused_memory.backends.falkor_string_bounds import exact_string_upper_bound
 from fused_memory.backends.llm_clients import (
     ForceJsonObjectOpenAIGenericClient,
     TokenRecordingOpenAIGenericClient,
@@ -58,6 +67,7 @@ from fused_memory.backends.llm_token_usage import (
     TokenMeasurement,
     measure_llm_tokens,
 )
+from fused_memory.backends.recent_episodes import read_recent_group_episodes
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.backends.timeout_budget import await_within
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
@@ -566,9 +576,10 @@ _RESULTSET_SIZE = 10000
 """FalkorDB's server-wide result-set ceiling: every query returns at most this
 many rows, silently truncated — no error, no marker.
 
-This is an ASSUMPTION about server configuration, not a fact this repo
-controls: nothing here sets ``RESULTSET_SIZE``, and a grep finds no override
-anywhere.  Measured 2026-08-17 against localhost:6379::
+This is an ASSUMPTION about server configuration, not a fact this module
+controls: fused-memory/docker/docker-compose.yml pins ``RESULTSET_SIZE`` in
+FALKORDB_ARGS (task 6848), but a server started any other way may differ.
+Measured 2026-08-17 against localhost:6379::
 
     GRAPH.CONFIG GET RESULTSET_SIZE  ->  10000
 
@@ -732,10 +743,14 @@ _EMBEDDED_EDGES_CENSUS = _EMBEDDED_EDGES_MATCH + 'RETURN count(*)'
 
 # Edges whose valid_at falls in a window (task 4869). `e.uuid` is total for the
 # directed-pattern reason given at _EMBEDDED_EDGES_MATCH. No vector here, so the
-# plain RETURN-then-ORDER shape suffices.
+# plain RETURN-then-ORDER shape suffices. The upper bound goes through
+# exact_string_upper_bound because FalkorDB's RANGE index over-returns on a
+# string `<=` (task 7543).
 _EDGES_IN_VALID_AT_WINDOW_MATCH = (
     'MATCH ()-[e:RELATES_TO]->() '
-    'WHERE e.valid_at >= $start AND e.valid_at <= $end '
+    'WHERE e.valid_at >= $start AND '
+    + exact_string_upper_bound('e.valid_at', 'end', inclusive=True)
+    + ' '
 )
 _EDGES_IN_VALID_AT_WINDOW_PAGE_TEMPLATE = (
     _EDGES_IN_VALID_AT_WINDOW_MATCH
@@ -747,10 +762,12 @@ _EDGES_IN_VALID_AT_WINDOW_CENSUS = _EDGES_IN_VALID_AT_WINDOW_MATCH + 'RETURN cou
 
 # Ids starting with a uuid prefix, for services/id_resolver.py (task 5323).
 # `$prefix`/`$upper` are bound, never interpolated. The half-open range
-# [$prefix, $upper) lets FalkorDB use the uuid RANGE index; STARTS WITH stays
-# as the exact predicate. No invalid_at filter: a superseded edge's uuid is
-# still an id a prefix can cite. The edge pattern is DIRECTED for the
-# one-row-per-edge reason given at _EMBEDDED_EDGES_MATCH.
+# [$prefix, $upper) lets FalkorDB use the uuid RANGE index; STARTS WITH is
+# load-bearing, because that index can over-return on a string `<` (see
+# plans/falkordb-resultset-cap-audit.md, section 'String < / <= on
+# RANGE-indexed properties (task 7543)'). No invalid_at filter: a superseded
+# edge's uuid is still an id a prefix can cite. The edge pattern is DIRECTED
+# for the one-row-per-edge reason given at _EMBEDDED_EDGES_MATCH.
 _ENTITY_UUID_PREFIX_MATCH = (
     'MATCH (n:Entity) '
     'WHERE n.uuid >= $prefix AND n.uuid < $upper AND n.uuid STARTS WITH $prefix '
@@ -1109,46 +1126,6 @@ async def _paged_ro_query(
     )
 
 
-async def _read_all_group_episodes(
-    driver: GraphDriver,
-    group_ids: list[str],
-    *,
-    page_size: int = _DEFAULT_READ_PAGE_SIZE,
-    max_pages: int = _MAX_READ_PAGES,
-) -> list[EpisodicNode]:
-    """Read every episode in ``group_ids``, past the server's row cap.
-
-    A different mechanism from ``_paged_ro_query`` because this read goes
-    through graphiti-core, not ``ro_query``.  ``EpisodicNode.get_by_group_ids``'
-    own ``uuid_cursor`` is KEYSET paging (``uuid < cursor ORDER BY uuid DESC``),
-    and keyset pages never shift under concurrent insert.  Only an EMPTY page
-    ends the read, never a short one, so a server cap below ``page_size``
-    cannot truncate it — which is why neither ``_paged_ro_query``'s refusal
-    guard nor a census is needed.  See plans/falkordb-resultset-cap-audit.md.
-
-    Raises:
-        IncompleteEnumerationError: ``max_pages`` ran out on a non-empty page.
-    """
-    episodes: list[EpisodicNode] = []
-    cursor: str | None = None
-    for _ in range(max_pages):
-        page = await EpisodicNode.get_by_group_ids(
-            driver, group_ids, limit=page_size, uuid_cursor=cursor
-        )
-        if not page:
-            return episodes
-        episodes.extend(page)
-        cursor = min(ep.uuid for ep in page)
-    raise IncompleteEnumerationError(
-        f'_read_all_group_episodes(group_ids={group_ids!r}): the enumeration '
-        f'was structurally incomplete (incomplete_kind={INCOMPLETE_PAGE_CAP!r}): '
-        f'max_pages={max_pages} exhausted at page_size={page_size} with '
-        f'episodes_seen={len(episodes)} and the last page non-empty, so the '
-        f'episodes read are a uuid-ordered prefix and sorting them by '
-        f'created_at would select the wrong most-recent episodes'
-    )
-
-
 def apply_incompleteness_policy(
     paged: PagedRead,
     *,
@@ -1328,15 +1305,12 @@ def _embedding_dim(raw) -> int:
     return len(str(raw).strip('<>').split(', '))
 
 
-def _as_sortable_utc(created_at: datetime | None) -> datetime:
+def _as_sortable_utc(created_at: datetime) -> datetime:
     """Coerce an episode's created_at to a tz-aware UTC datetime for sorting.
 
     Naive (tzinfo-less) datetimes are assumed to already be UTC rather than
-    raising on naive-vs-aware comparison; None sorts as the minimum possible
-    value (oldest/unknown), landing last in a descending sort.
+    raising on naive-vs-aware comparison.
     """
-    if created_at is None:
-        return datetime.min.replace(tzinfo=UTC)
     if created_at.tzinfo is None:
         return created_at.replace(tzinfo=UTC)
     return created_at.astimezone(UTC)
@@ -1383,9 +1357,15 @@ class _MultiTenantFalkorDriver(FalkorDriver):
     Cypher FalkorDB can plan over the provisioned indices; see
     :mod:`fused_memory.backends.falkor_edge_search`.  It is a class attribute, so
     every ``clone()`` carries it on both the read and the write path.
+
+    ``graph_operations_interface`` is set (task 7714) so graphiti's edge
+    get-by-uuid(s) runs Cypher FalkorDB can plan; see
+    :mod:`fused_memory.backends.falkor_graph_operations`.  It is a class
+    attribute, so every ``clone()`` carries it.
     """
 
     search_interface = FalkorEdgeSearch()
+    graph_operations_interface = FalkorGraphOperations()
 
     async def build_indices_and_constraints(self, delete_existing=False):
         pass
@@ -1625,6 +1605,43 @@ class GraphitiBackend:
         self._cross_encoder = None
         self._group_clients: dict[str, Graphiti] = {}
 
+    @classmethod
+    def with_driver(
+        cls,
+        config: FusedMemoryConfig,
+        driver: FalkorDriver,
+        *,
+        registered_graph_ids: Iterable[str],
+        llm_client: LLMClient | None = None,
+        embedder: EmbedderClient | None = None,
+        cross_encoder: CrossEncoderClient | None = None,
+    ) -> 'GraphitiBackend':
+        """A backend over *driver* and the given sub-clients, wired without ``initialize()``.
+
+        No provisioning sweep, identity scan or server-settings read runs, and no
+        base ``client`` is built: methods that need one raise until it is assigned.
+        The registry is required because the derived one names real project graphs.
+        The backend takes ownership: ``close()`` releases the driver and sub-clients.
+        """
+        backend = cls(config, registered_graph_ids=registered_graph_ids)
+        backend._attach(
+            driver, llm_client=llm_client, embedder=embedder, cross_encoder=cross_encoder,
+        )
+        return backend
+
+    def _attach(
+        self,
+        driver: FalkorDriver,
+        *,
+        llm_client: LLMClient | None,
+        embedder: EmbedderClient | None,
+        cross_encoder: CrossEncoderClient | None,
+    ) -> None:
+        self._driver = driver
+        self._llm_client = llm_client
+        self._embedder = embedder
+        self._cross_encoder = cross_encoder
+
     @property
     def registered_graph_ids(self) -> frozenset[str]:
         """The graphs this backend provisions — PRD D5, docs/prds/falkordb-index-provisioning.md."""
@@ -1676,9 +1693,9 @@ class GraphitiBackend:
         graphiti.py:889-890) — since that condition is never true for a
         per-group client, the shared-driver mutation race that misroutes
         concurrent cross-group writes is structurally unreachable here.
-        The llm_client/embedder/cross_encoder sub-clients are shared (hoisted
-        in ``initialize()``) across every per-group client and the base
-        ``self.client``.
+        The llm_client/embedder/cross_encoder sub-clients are shared (attached
+        by ``initialize()`` or ``with_driver()``) across every per-group client
+        and the base ``self.client``.
 
         ``_group_clients`` is unbounded and never evicted, mirroring
         ``_cloned_drivers``/``_identity_locks`` above — safe because
@@ -1705,11 +1722,14 @@ class GraphitiBackend:
         ``graphiti_max_coroutines`` (each call's own internal fan-out) — by
         default 3 × 5 = 15 concurrent OpenAI calls at most, unchanged by
         this per-group cache.
+
+        Per-group clients are ``ExactEpisodeWindowGraphiti`` so add_episode's
+        previous-episode read is exact (task 7543).
         """
         cached = self._group_clients.get(group_id)
         if cached is not None:
             return cached
-        client = Graphiti(
+        client = ExactEpisodeWindowGraphiti(
             graph_driver=self._driver_for(group_id),
             llm_client=self._llm_client,
             embedder=self._embedder,
@@ -1773,6 +1793,14 @@ class GraphitiBackend:
         """Return the FalkorDB client from the underlying driver."""
         driver = self._require_driver()
         return cast(Any, driver).client
+
+    async def read_server_settings(self) -> FalkorServerSettings:
+        """Read the live TIMEOUT and appendonly settings; read-only, and a failed read is reported, not raised."""
+        client = getattr(self._driver, 'client', None)
+        return await read_falkor_server_settings(
+            client,
+            expected_graph_timeout_ms=self.config.graphiti.falkordb.expected_graph_timeout_ms,
+        )
 
     async def _ensure_indices(self, group_id: str) -> None:
         """Provision *group_id*'s indices if it is registered and not yet cached.
@@ -1892,14 +1920,11 @@ class GraphitiBackend:
         host = parsed.hostname or 'localhost'
         port = parsed.port or 6379
 
-        self._driver = _MultiTenantFalkorDriver(
+        driver = _MultiTenantFalkorDriver(
             host=host,
             port=port,
             password=falkor_cfg.password,
         )
-
-        self._llm_client = llm_client
-        self._embedder = embedder_client
 
         # --- Cross-encoder (reranker) ---
         # Shared across the base client and every per-group client (see
@@ -1926,15 +1951,20 @@ class GraphitiBackend:
                 api_key=reranker_provider.api_key,
                 base_url=reranker_provider.api_url,
             )
-        self._cross_encoder = OpenAIRerankerClient(config=reranker_config)
+        cross_encoder = OpenAIRerankerClient(config=reranker_config)
 
+        self._attach(
+            driver, llm_client=llm_client, embedder=embedder_client, cross_encoder=cross_encoder,
+        )
         self.client = Graphiti(
-            graph_driver=self._driver,
-            llm_client=self._llm_client,
-            embedder=self._embedder,
-            cross_encoder=self._cross_encoder,
+            graph_driver=driver,
+            llm_client=llm_client,
+            embedder=embedder_client,
+            cross_encoder=cross_encoder,
             max_coroutines=cfg.queue.graphiti_max_coroutines,
         )
+
+        warn_on_shortfalls(await self.read_server_settings())
 
         # Provision the registered project graphs that already exist (PRD D6).
         if not skip_maintenance:
@@ -2102,44 +2132,34 @@ class GraphitiBackend:
         last_n: int = 10,
         reference_time: datetime | None = None,
     ) -> list[Any]:
-        """Retrieve recent episodes by group, ordered by created_at (most recent first) and truncated to last_n.
-
-        EpisodicNode.get_by_group_ids truncates via ``ORDER BY uuid DESC LIMIT``,
-        which is unrelated to recency, so we read the group's full episode set
-        in keyset pages (``_read_all_group_episodes``, task 4869) and
-        sort/truncate by created_at ourselves.
+        """Return the group's last_n most recent episodes, newest created_at first, ties by uuid descending.
 
         Raises:
-            IncompleteEnumerationError: The keyset read ran out of page budget.
+            ValueError: last_n is outside 1 <= last_n < ``_RESULTSET_SIZE``.
             TimeoutError: The read overran its budget (class TIMEOUT POSTURE).
                 MemoryConsolidator then marks 'episodes' a degraded fetch
                 source, and get_episodes answers an error, not an empty list.
+
+        Why the read is neither keyset-paged nor a full scan:
+        plans/falkordb-resultset-cap-audit.md, the ``retrieve_episodes`` entry.
         """
-        driver = self._driver_for(group_ids[0]) if group_ids else self._require_driver()
-        # The full set is still read, now in keyset pages, because the
-        # created_at sort must see every episode: a cap-truncated set would
-        # silently select the wrong episodes, not merely fewer of them. The
-        # cheaper bounded read (ORDER BY created_at ... LIMIT last_n) was
-        # declined; its cost and reasons are in
-        # plans/falkordb-resultset-cap-audit.md.
+        if not 1 <= last_n < _RESULTSET_SIZE:
+            raise ValueError(
+                f'retrieve_episodes: last_n={last_n} must satisfy 1 <= last_n < '
+                f'{_RESULTSET_SIZE} (the assumed FalkorDB RESULTSET_SIZE); at or '
+                f'above it the server truncates this unpaged read silently'
+            )
+        if not group_ids:
+            return []
         episodes = await self._timed_read(
-            _read_all_group_episodes(driver, group_ids), 'retrieve_episodes',
+            read_recent_group_episodes(self._graph_for(group_ids[0]), group_ids, last_n),
+            'retrieve_episodes',
         )
-        episodes = sorted(
-            episodes or [],
-            # Secondary key (uuid) makes this a total order: get_by_group_ids
-            # truncates via ORDER BY uuid DESC, so without a tie-breaker,
-            # episodes sharing created_at (batch/rapid co-ingestion, or
-            # reduced-precision storage) fall back to that upstream order,
-            # which is not guaranteed reproducible across executions and can
-            # read as non-monotonic to a strict-descending observer.
-            key=lambda ep: (
-                _as_sortable_utc(getattr(ep, 'created_at', None)),
-                getattr(ep, 'uuid', None) or '',
-            ),
+        return sorted(
+            episodes,
+            key=lambda ep: (_as_sortable_utc(ep.created_at), ep.uuid),
             reverse=True,
         )
-        return episodes[:last_n]
 
     @_canonicalize_group_args
     async def get_episode_by_uuid(self, episode_uuid: str, *, group_id: str) -> EpisodicNode | None:

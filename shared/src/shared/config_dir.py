@@ -83,6 +83,7 @@ def sweep_stale_pid_dirs(
     base_dir: Path | None = None,
     min_age_secs: float = 300.0,
     deadline_secs: float = 5.0,
+    reclaim: Callable[[Path], object] | None = None,
 ) -> int:
     """Remove ``{prefix}*`` directories whose embedded trailing PID is dead.
 
@@ -132,6 +133,14 @@ def sweep_stale_pid_dirs(
     ``claude-config-`` stem and must not be swept. Symlinks and plain files
     matching the prefix are skipped.
 
+    *reclaim* replaces the delete for each selected dir (``None`` means
+    ``shutil.rmtree``, looked up at call time so a patched ``rmtree`` still
+    intercepts), e.g. to archive a dir's transcripts before removing it. It
+    must honour ``shutil.rmtree``'s contract: return once the dir is gone,
+    raise ``FileNotFoundError`` when it had already vanished, and raise
+    another ``OSError`` when it could not be removed. The selection guards and
+    the deadline are unaffected.
+
     ASSUMPTION — a **shared PID namespace**. ``os.kill(pid, 0)`` is only
     meaningful if the sweeper and the dir's owner see the same PID space.
     That holds today: the sandbox backend is ``landlock`` (a filesystem LSM,
@@ -172,7 +181,7 @@ def sweep_stale_pid_dirs(
                 # ignored, `removed` would count a removal that never happened
                 # and the operator-visible "reclaimed N" INFO would report a
                 # drain that did not occur.
-                shutil.rmtree(path)
+                (shutil.rmtree if reclaim is None else reclaim)(path)
             except FileNotFoundError:
                 # Raced by a concurrent sweeper — the fleet restarts its units
                 # together, so several gates can sweep at once — or by the OS

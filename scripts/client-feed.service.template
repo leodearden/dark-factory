@@ -1,0 +1,19 @@
+# Rendered by scripts/setup-host.sh into client-feed@.service and never enabled
+# there: one instance per client project is enabled by hand, OPERATIONS.md §"Client feed".
+[Unit]
+Description=Client feed publisher %i
+Documentation=file://__REPO_ROOT__/OPERATIONS.md file://__REPO_ROOT__/plans/client-feed-prd.md
+
+[Service]
+Type=exec
+WorkingDirectory=__REPO_ROOT__
+ExecStart=__UV_PATH__ run --no-sync --project client-feed client-feed publish --config %h/.config/client-feed/%i.yaml
+Restart=on-failure
+RestartSec=5
+RestartSteps=4
+RestartMaxDelaySec=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

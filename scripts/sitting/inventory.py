@@ -186,6 +186,15 @@ def queue_project(queue_dir: str) -> str:
     return fold_project_token(root.name) if root is not None else ''
 
 
+def queue_project_roots(queue_dirs: Iterable[str]) -> Mapping[str, Path]:
+    """Each queue's canonical project and the root holding it; a queue of no known shape names none."""
+    return MappingProxyType({
+        queue_project(q): root
+        for q in queue_dirs
+        if (root := queue_project_root(q)) is not None
+    })
+
+
 def escalation_queue_dirs(
     project_roots: Sequence[str] | None,
     decisions: Iterable[DecisionRecord],
@@ -304,7 +313,7 @@ def gloss(
         escalations[queue_dir] = MappingProxyType(summaries)
         shortfalls += queue_shortfalls
 
-    roots = {queue_project(q): root for q in escalation_index if (root := queue_project_root(q)) is not None}
+    roots = queue_project_roots(escalation_index)
     tasks: dict[str, Mapping[str, str]] = {}
     for project, task_ids in task_scoped.items():
         if not task_ids:

@@ -20,6 +20,7 @@ from shared.project_layout import (
     ESCALATION_QUEUE_RELPATH,
     KNOWN_PROJECT_ROOTS_ENV,
     CheckoutRootError,
+    agent_transcripts_dir,
     default_project_root,
     escalation_queue_dir,
     known_project_roots,
@@ -27,6 +28,7 @@ from shared.project_layout import (
     orchestrator_data_dir,
     park_eviction_requests_db,
     runs_db,
+    scheduler_eligibility_db,
     scheduler_overrides_db,
     scheduler_state_json,
     tasks_db,
@@ -37,6 +39,7 @@ _ORCHESTRATOR_STORES = (
     (scheduler_state_json, 'scheduler_state.json'),
     (scheduler_overrides_db, 'scheduler_overrides.db'),
     (park_eviction_requests_db, 'park_eviction_requests.db'),
+    (scheduler_eligibility_db, 'scheduler_eligibility.db'),
 )
 
 
@@ -55,9 +58,15 @@ class TestStoreLocators:
     def test_orchestrator_data_dir(self, root: str | Path) -> None:
         assert orchestrator_data_dir(root) == Path(root) / 'data' / 'orchestrator'
 
+    def test_agent_transcripts_dir(self, root: str | Path) -> None:
+        assert agent_transcripts_dir(root) == Path(root) / 'data' / 'orchestrator' / 'agent-transcripts'
+
     @pytest.mark.parametrize(('locator', 'name'), _ORCHESTRATOR_STORES)
     def test_orchestrator_store(self, root: str | Path, locator, name: str) -> None:
         assert locator(root) == Path(root) / 'data' / 'orchestrator' / name
+
+    def test_scheduler_eligibility_db_is_exported(self) -> None:
+        assert 'scheduler_eligibility_db' in shared.project_layout.__all__
 
     def test_tasks_db_is_the_real_store_not_the_decoy(self, root: str | Path) -> None:
         assert tasks_db(root) == Path(root) / '.taskmaster' / 'tasks' / 'tasks.db'

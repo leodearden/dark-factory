@@ -9,7 +9,8 @@ At task-creation time, the curator decides whether a candidate task should:
 - **create** — genuinely new work; proceed with task creation.
 
 The decision is made by an LLM against a layered corpus of existing tasks (review-chain
-anchor + module-lock pool + embedding neighbors + dependency neighbors). See
+anchor + the parent's other follow-ups for an agent-followup candidate + module-lock
+pool + embedding neighbors + dependency neighbors). See
 docs/reify-task-fragmentation-report-2026-04-11.txt for the motivating analysis.
 
 When the curator cannot judge a candidate it returns ``action="defer"``
@@ -33,7 +34,7 @@ Batch API (task 924)
 :meth:`TaskCurator.curate_batch` is the preferred entry point for the ticket worker:
 one ``invoke_with_cap_retry`` round-trip for up to ``CuratorConfig.batch_max`` candidates.
 Identical candidates in the same batch are short-circuited via pre-batch payload-hash
-dedup; each unique candidate gets its own four-stream pool.  See plan.json for task 924
+dedup; each unique candidate gets its own pool.  See plan.json for task 924
 for the full design rationale (batch prompt, schema, topo-sort dispatch, fallback).
 """
 
@@ -48,6 +49,7 @@ import uuid as uuid_mod
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
 
@@ -70,9 +72,13 @@ from shared.config_dir import (
 from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_artifacts_root
+from shared.streak import KeyedStreaks
+from shared.task_statuses import ACTIVE, TaskStatus
+from shared.transcript_archive import ArchiveBeforeDelete, archive_before_delete
 
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
+from fused_memory.backends.task_backend_types import MetadataLookupRow
 from fused_memory.mcp_tools.scheduler_state import effective_lock_depth
 from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
 from fused_memory.middleware.cancelled_premise_blocklist import (
@@ -116,6 +122,8 @@ from fused_memory.middleware.recon_code_fix_premise_guard import (
 from fused_memory.middleware.recon_code_fix_premise_guard import (
     match_candidate as match_refuted_premise,
 )
+from fused_memory.middleware.zero_output_breaker import ZeroOutputBreaker
+from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
 from fused_memory.reconciliation.context_assembler import estimate_tokens
 from fused_memory.utils.task_dependency_ids import task_dependency_ids as _task_dependencies
 
@@ -154,8 +162,48 @@ _CURATOR_CAP_WAIT_SANITY_SECS = 120.0
 _CONFIG_DIR_TASK_PREFIX = 'fm-curator-'
 
 
-def _sweep_stale_curator_config_dirs_once(base_dir: Path | None) -> None:
-    """Reclaim curator config dirs whose owning process is dead. Never raises."""
+def _archive_curator_config_dir(config_dir: Path, archive_root: Path) -> ArchiveBeforeDelete:
+    """Archive a curator config dir's transcripts, then remove the dir. Never raises.
+
+    The archive key is the dir's TaskConfigDir task_id, ``fm-curator-<pid>``.
+    """
+    outcome = archive_before_delete(
+        config_dir, config_dir.name.removeprefix(CONFIG_DIR_PREFIX), archive_root=archive_root,
+    )
+    if outcome.archived or outcome.held:
+        logger.info(
+            'TaskCurator config dir %s archival: archived=%d already_current=%d held=%d '
+            'removed=%s archive_root=%s',
+            config_dir.name,
+            outcome.archived,
+            outcome.already_current,
+            len(outcome.held),
+            outcome.config_dir_removed,
+            archive_root,
+        )
+    return outcome
+
+
+def _reclaim_by_archiving(path: Path, *, archive_root: Path) -> None:
+    """The dead-PID sweep's reclaim step, honouring ``shutil.rmtree``'s contract.
+
+    A dir left holding unarchivable transcripts keeps its dead-PID name, so the
+    next process's sweep retries it.
+    """
+    outcome = _archive_curator_config_dir(path, archive_root)
+    if outcome.config_dir_removed:
+        return
+    if not path.exists():
+        raise FileNotFoundError(path)
+    if outcome.held:
+        raise OSError(f'{len(outcome.held)} transcript(s) held, not archivable, in {path}')
+    raise OSError(f'transcripts archived, but the dir could not be removed: {path}')
+
+
+def _sweep_stale_curator_config_dirs_once(
+    base_dir: Path | None, archive_root: Path | None,
+) -> None:
+    """Archive, then reclaim, curator config dirs whose owning process is dead. Never raises."""
     prefix = CONFIG_DIR_PREFIX + _CONFIG_DIR_TASK_PREFIX
     sweep_stale_pid_dirs_once(
         prefix,
@@ -169,6 +217,9 @@ def _sweep_stale_curator_config_dirs_once(base_dir: Path | None) -> None:
             prefix, exc_info=True,
         ),
         base_dir=base_dir,
+        reclaim=None if archive_root is None else partial(
+            _reclaim_by_archiving, archive_root=archive_root,
+        ),
     )
 
 
@@ -702,19 +753,6 @@ def _render_batch_prompt(
     return '\n'.join([*sections, instruction])
 
 
-@dataclass
-class _DegradedStreak:
-    """One project's run of consecutive degraded curations.
-
-    ``alarm_fired`` latches so a streak escalates once, not once per curation
-    past the threshold; the whole record is discarded on that project's next
-    usable decision.
-    """
-
-    count: int = 0
-    alarm_fired: bool = False
-
-
 class _LazyRegistry:
     """One-shot, off-loop lazy load of a YAML registry file.
 
@@ -884,53 +922,21 @@ class TaskCurator:
         self._operational_registry = _LazyRegistry(
             config_key='operational_ask_registry_path', label='operational-ask',
         )
-        # Consecutive-ZOT circuit breaker (task 1743).
-        # Counts zero-output/full-timeout curator LLM failures since the
-        # last real LLM success; a non-ZOT failure neither increments nor
-        # resets it.
-        self._consecutive_zero_output_timeouts: int = 0
-        # monotonic() time until which the breaker is open (None = closed).
-        self._zero_output_breaker_open_until: float | None = None
+        # Consecutive-ZOT circuit breaker (task 1743): counts only ZOTs; a
+        # non-ZOT failure neither increments nor resets it.
+        self._zero_output_breaker = ZeroOutputBreaker(
+            threshold=config.curator.zero_output_breaker_threshold,
+            cooldown_seconds=config.curator.zero_output_breaker_cooldown_seconds,
+        )
         # Degraded-curation streaks by project_id (task 4448). Distinct from
-        # the ZOT counter above: that one counts hung calls in order to stop
+        # the ZOT breaker above: that one counts hung calls in order to stop
         # paying for them; these count degraded decisions of every cause, in
         # order to make a sustained outage visible. Keyed by project because
         # one curator serves every project, so a shared count would let one
         # project's healthy curations mask another's outage.
-        self._degraded_streaks: dict[str, _DegradedStreak] = {}
-
-    # ------------------------------------------------------------------
-    # Zero-output-timeout circuit breaker (task 1743)
-    # ------------------------------------------------------------------
-
-    def _zero_output_breaker_open(self, now: float) -> bool:
-        """Return True while the breaker is tripped and the cooldown has not elapsed."""
-        return (
-            self._zero_output_breaker_open_until is not None
-            and now < self._zero_output_breaker_open_until
+        self._degraded_streaks: KeyedStreaks[str] = KeyedStreaks(
+            threshold=config.curator.degraded_streak_threshold,
         )
-
-    def _record_zero_output_timeout(self, now: float) -> None:
-        """Increment the consecutive-ZOT counter; open the breaker when threshold is reached."""
-        self._consecutive_zero_output_timeouts += 1
-        if (
-            self._consecutive_zero_output_timeouts
-            >= self._config.curator.zero_output_breaker_threshold
-        ):
-            self._zero_output_breaker_open_until = (
-                now + self._config.curator.zero_output_breaker_cooldown_seconds
-            )
-            logger.warning(
-                'task_curator: zero-output-breaker OPEN after %d consecutive ZOTs; '
-                'short-circuiting curator LLM calls for %.0fs',
-                self._consecutive_zero_output_timeouts,
-                self._config.curator.zero_output_breaker_cooldown_seconds,
-            )
-
-    def _reset_zero_output_breaker(self) -> None:
-        """Reset the breaker on any real LLM success."""
-        self._consecutive_zero_output_timeouts = 0
-        self._zero_output_breaker_open_until = None
 
     # ------------------------------------------------------------------
     # Lazy init (mirrors task_dedup.py pattern)
@@ -1571,10 +1577,6 @@ class TaskCurator:
     # Class-agnostic degraded-streak alarm (task 4448)
     # ------------------------------------------------------------------
 
-    def _reset_degraded_streak(self, project_id: str) -> None:
-        """Clear *project_id*'s streak and re-arm its alarm, on a usable decision."""
-        self._degraded_streaks.pop(project_id, None)
-
     async def _degraded_create(
         self,
         *,
@@ -1628,24 +1630,22 @@ class TaskCurator:
         nonetheless failed to decide).  The alarm is class-agnostic by construction: it
         takes only the fact that a curation degraded, never the reason.
         """
-        streak = self._degraded_streaks.setdefault(project_id, _DegradedStreak())
-        streak.count += 1
-        threshold = self._config.curator.degraded_streak_threshold
-        if streak.count < threshold or streak.alarm_fired:
+        step = self._degraded_streaks.failure(project_id)
+        if not step.fired:
             return
 
-        streak.alarm_fired = True
+        threshold = self._config.curator.degraded_streak_threshold
         logger.error(
             'task_curator: %d consecutive degraded curations for project %s '
             '(threshold %d) — every candidate in that run was filed without '
             'dedupe. Last: %s',
-            streak.count, project_id, threshold, justification,
+            step.count, project_id, threshold, justification,
         )
         if self._escalator is not None:
             await self._escalator.report_consecutive_degraded(
                 project_root=project_root,
                 project_id=project_id,
-                streak=streak.count,
+                streak=step.count,
                 threshold=threshold,
                 last_justification=justification,
                 candidate_title=candidate_title,
@@ -1741,12 +1741,12 @@ class TaskCurator:
         # Only the 180s LLM call (and the corpus build that precedes it) is the
         # cost the breaker exists to avoid; cheap cache checks above run always.
         now = time.monotonic()
-        if self._zero_output_breaker_open(now):
+        if self._zero_output_breaker.is_open(now):
             logger.warning(
                 'task_curator: zero-output-breaker open — deferring curation '
                 'for candidate %r (consecutive ZOTs=%d)',
                 candidate.title,
-                self._consecutive_zero_output_timeouts,
+                self._zero_output_breaker.consecutive_timeouts,
             )
             return CuratorDecision.deferred(
                 DeferReason.ZERO_OUTPUT_BREAKER_OPEN,
@@ -1782,9 +1782,9 @@ class TaskCurator:
                 agent_result, pool_sizes=pool_sizes,
                 latency_ms=int((time.monotonic() - start) * 1000), pool=pool,
             )
-            # Success: reset the consecutive-ZOT counter so a single hung call
-            # that was followed by a healthy one doesn't accumulate toward open.
-            self._reset_zero_output_breaker()
+            # Success: close the ZOT breaker so a single hung call that was
+            # followed by a healthy one doesn't accumulate toward open.
+            self._zero_output_breaker.close()
             # A completed call can still carry no usable decision (the parser
             # fails open without raising), so the streak keys on the decision.
             if decision.degraded:
@@ -1795,7 +1795,7 @@ class TaskCurator:
                     candidate_title=candidate.title,
                 )
             else:
-                self._reset_degraded_streak(project_id)
+                self._degraded_streaks.success(project_id)
         except POOL_UNAVAILABLE_ERRORS as exc:
             decision = CuratorDecision.deferred(
                 pool_defer_reason(exc),
@@ -1833,7 +1833,13 @@ class TaskCurator:
                 # Capture a fresh timestamp so the cooldown window is measured
                 # from when the failure was observed, not from before the
                 # (potentially 180s) hung LLM call started.
-                self._record_zero_output_timeout(time.monotonic())
+                if self._zero_output_breaker.record_timeout(time.monotonic()):
+                    logger.warning(
+                        'task_curator: zero-output-breaker OPEN after %d consecutive ZOTs; '
+                        'short-circuiting curator LLM calls for %.0fs',
+                        self._zero_output_breaker.consecutive_timeouts,
+                        self._zero_output_breaker.cooldown_seconds,
+                    )
                 decision = await self._degraded_create(
                     justification='llm-error-escalated',
                     pool_sizes=pool_sizes,
@@ -2181,22 +2187,22 @@ class TaskCurator:
         # Batch ZOT counting: each size-1 curate() that bisects out of a batch
         # ZOT records the failure independently via its own except block.
         # A single batch outage of M LLM-bound candidates may therefore
-        # increment _consecutive_zero_output_timeouts up to M times, opening
+        # count up to M consecutive ZOTs on the breaker, opening
         # the breaker faster than a single count per event would.  That is
         # intentional — opening sooner is harmless and simpler than trying to
         # normalise concurrent increments.  curate_batch_prepared need not
         # record separately; it relies on the per-size-1 accumulation.
-        # Conversely, a successful batch call resets the counter itself
+        # Conversely, a successful batch call closes the breaker itself
         # (see _decisions_from_batch_result, task 4143), so
         # "consecutive" is measured across every real LLM success — batch
         # and size-1 alike — not just the size-1 successes handled by
         # curate().
-        if llm_k_list and self._zero_output_breaker_open(time.monotonic()):
+        if llm_k_list and self._zero_output_breaker.is_open(time.monotonic()):
             logger.warning(
                 'curate_batch: zero-output-breaker open — deferring curation of %d '
                 'LLM-bound candidate(s) (consecutive ZOTs=%d)',
                 len(llm_k_list),
-                self._consecutive_zero_output_timeouts,
+                self._zero_output_breaker.consecutive_timeouts,
             )
             for _k in llm_k_list:
                 decided_without_llm[_k] = CuratorDecision.deferred(
@@ -2643,6 +2649,25 @@ class TaskCurator:
             return PruneResult(skipped=True, reason='error', live=len(live))
 
     async def close(self) -> None:
+        """Archive and remove this process's config dir, then release the clients.
+
+        Archival goes first, so a hanging client close cannot starve it. The
+        thread hop holds the delete as well as the archival, so a cancelled
+        await cannot skip one and keep the other, which is the hazard
+        ``archive_before_delete``'s no-``to_thread`` note guards against. A
+        cancellation landing on that await still releases the clients.
+        """
+        config_dir, self._config_dir = self._config_dir, None
+        archive_root = self._transcript_archive_root()
+        try:
+            if config_dir is not None and archive_root is not None:
+                await asyncio.to_thread(
+                    _archive_curator_config_dir, config_dir.path, archive_root,
+                )
+        finally:
+            await self._close_clients()
+
+    async def _close_clients(self) -> None:
         if self._qdrant_client is not None:
             import contextlib as _ctx
 
@@ -2689,7 +2714,7 @@ class TaskCurator:
         project_id: str,
         project_root: str,
     ) -> tuple[list[PoolEntry], dict[str, int], PoolWithheld]:
-        """Assemble the four-stream pool for the LLM prompt.
+        """Assemble the candidate's pool for the LLM prompt, one stream per ``POOL_SOURCES`` entry.
 
         Returns ``(pool, pool_sizes, withheld)``. ``withheld`` is the
         :class:`PoolWithheld` census of everything the caps kept out, counted
@@ -2737,7 +2762,18 @@ class TaskCurator:
             except Exception as exc:
                 logger.debug('task_curator: anchor fetch failed: %s', exc)
 
-        # Stream 2: module-lock pool
+        # Stream 2: the parent's other follow-ups, for an agent-followup candidate
+        sibling_overflow_ids: list[str] = []
+        parent_id = _followup_parent_id(candidate)
+        if parent_id is not None:
+            sibling_entries, sibling_overflow_ids = await self._sibling_stream(
+                parent_id, project_root, lock_depth=lock_depth, exclude=seen_ids,
+            )
+            for entry in sibling_entries:
+                pool.append(entry)
+                seen_ids.add(entry.task_id)
+
+        # Stream 3: module-lock pool
         candidate_modules = set(
             files_to_modules(candidate.files_to_modify, depth=lock_depth),
         )
@@ -2772,14 +2808,14 @@ class TaskCurator:
         # The sort key is status+priority, NOT relevance, so the entries this
         # cap discards are not the least-similar ones — a genuinely
         # overlapping task can sit just past it. Which of them the POOL
-        # actually loses is not known yet: streams 3 and 4 can still admit
+        # actually loses is not known yet: streams 4 and 5 can still admit
         # one. Hold the ids and count the absent ones once, below.
         module_overflow_ids = [e.task_id for e in module_matches[module_cap:]]
         for entry in module_matches[:module_cap]:
             pool.append(entry)
             seen_ids.add(entry.task_id)
 
-        # Stream 3: embedding neighbors
+        # Stream 4: embedding neighbors
         embedding_matches: list[PoolEntry] = []
         embedding_unvisited_ids: list[str] = []
         embedding_window_full = False
@@ -2791,7 +2827,7 @@ class TaskCurator:
             )
             embedding = await embedder.create(text)
             client = await self._get_qdrant()
-            # Over-fetch so filtering out stream 1/2 overlaps still leaves K.
+            # Over-fetch so filtering out stream 1-3 overlaps still leaves K.
             overfetch = self._config.curator.pool_embedding_cap + 20
             results = await client.query_points(
                 collection_name=collection,
@@ -2843,7 +2879,7 @@ class TaskCurator:
             pool.append(entry)
             seen_ids.add(entry.task_id)
 
-        # Stream 4: dependency neighbors of the anchor
+        # Stream 5: dependency neighbors of the anchor
         dep_matches: list[PoolEntry] = []
         if anchor_entry is not None and all_tasks_flat:
             anchor_deps = _task_dependencies(
@@ -2879,11 +2915,12 @@ class TaskCurator:
         # keeps the stream counts and total_cap DISJOINT by construction: a
         # stream can only count ids that were never admitted, the trim only
         # ids that were, so `total` stays a count of distinct absent entries.
+        sibling_withheld = _count_absent(sibling_overflow_ids, seen_ids)
         module_withheld = _count_absent(module_overflow_ids, seen_ids)
         embedding_withheld = _count_absent(embedding_unvisited_ids, seen_ids)
         dependency_withheld = _count_absent(dep_overflow_ids, seen_ids)
 
-        # Final cap — trim weakest entries first (embedding, then module, then dep).
+        # Final cap — trim weakest entries first (POOL_SOURCES reversed).
         pool, total_cap_dropped = _trim_pool(
             pool, self._config.curator.pool_total_cap,
         )
@@ -2893,12 +2930,14 @@ class TaskCurator:
         }
         withheld = PoolWithheld(
             by_source={
+                'sibling': sibling_withheld,
                 'module': module_withheld,
                 'embedding': embedding_withheld,
                 'dependency': dependency_withheld,
                 'total_cap': total_cap_dropped,
             },
             caps={
+                'sibling': self._config.curator.pool_sibling_cap,
                 'module': module_cap,
                 'embedding': self._config.curator.pool_embedding_cap,
                 'dependency': dependency_cap,
@@ -2907,6 +2946,71 @@ class TaskCurator:
             lower_bounds=('embedding',) if embedding_window_full else (),
         )
         return pool, pool_sizes, withheld
+
+    async def _sibling_stream(
+        self,
+        parent_id: str,
+        project_root: str,
+        *,
+        lock_depth: int,
+        exclude: set[str],
+    ) -> tuple[list[PoolEntry], list[str]]:
+        """The non-cancelled tasks sharing *parent_id* as ``spawned_from``, ranked and capped.
+
+        It runs ahead of the module, embedding and dependency streams, so a
+        sibling is never left to rank in by its files or its embedding.
+        Returns ``(entries, overflow_ids)``: the admitted entries, and the
+        ranked ids that ``pool_sibling_cap`` kept out.
+        """
+        taskmaster = self._taskmaster
+        cap = self._config.curator.pool_sibling_cap
+        if taskmaster is None or cap < 1:
+            return [], []
+        rows = await self._sibling_lookup_rows(taskmaster, parent_id, project_root)
+        ranked = sorted(
+            (row for row in rows if str(row['task_id']) not in exclude),
+            key=_sibling_rank,
+        )
+        entries: list[PoolEntry] = []
+        overflow_ids: list[str] = []
+        for row in ranked:
+            tid = str(row['task_id'])
+            if len(entries) >= cap:
+                overflow_ids.append(tid)
+                continue
+            entry = await self._fetch_entry_for_neighbor(
+                tid, dict(row), source='sibling',
+                lock_depth=lock_depth, project_root=project_root,
+            )
+            if entry is not None:
+                entries.append(entry)
+        return entries, overflow_ids
+
+    @staticmethod
+    async def _sibling_lookup_rows(
+        taskmaster: TaskBackendProtocol, parent_id: str, project_root: str,
+    ) -> list[MetadataLookupRow]:
+        """The tasks naming *parent_id* in any stored form; a form whose lookup fails is skipped.
+
+        Each form is looked up on its own, so one failure keeps the rows the
+        other forms returned. A decimal id past SQLite's INTEGER range is one
+        such failure: its int form is refused before the store is read.
+        """
+        rows: dict[int, MetadataLookupRow] = {}
+        for value in _sibling_lookup_values(parent_id):
+            try:
+                page = await taskmaster.find_tasks_by_metadata(
+                    project_root, 'spawned_from', value,
+                    statuses=list(_SIBLING_LOOKUP_STATUSES), limit=_SIBLING_LOOKUP_PAGE,
+                )
+            except Exception as exc:
+                logger.warning(
+                    'task_curator: sibling lookup failed for parent %s as %r: %s',
+                    parent_id, value, exc,
+                )
+                continue
+            rows.update((row['task_id'], row) for row in page['results'])
+        return list(rows.values())
 
     async def _fetch_entry_for_neighbor(
         self,
@@ -2917,7 +3021,7 @@ class TaskCurator:
         lock_depth: int,
         project_root: str,
     ) -> PoolEntry | None:
-        """Fetch a full task for an embedding neighbor, fall back to payload.
+        """Fetch a full task for an embedding neighbour or a sibling, falling back to *payload*.
 
         ``get_task`` is called without a ``tag`` — it resolves to
         ``DEFAULT_TAG``. That does NOT match the Qdrant corpus's own scope:
@@ -2958,7 +3062,7 @@ class TaskCurator:
                 # to the cheap failure and keep the conservative thin entry
                 # built below, rather than risk dropping a live candidate.
                 pass
-        # Fallback: build a thin entry from the qdrant payload
+        # Fallback: build a thin entry from the qdrant payload or lookup row
         return PoolEntry(
             task_id=tid,
             title=str(payload.get('title', '')),
@@ -2990,18 +3094,26 @@ class TaskCurator:
         The dead-PID sweep runs on a worker thread and is not awaited: it
         reclaims other processes' leftovers, so no call depends on it, and a
         readdir of a large system tempdir must stall neither the server's event
-        loop nor this call (task 7335).
+        loop nor this call (task 7335). It archives each dead dir's transcripts
+        before removing the dir.
         """
         if self._usage_gate is None:
             return None
         if self._config_dir is None:
             asyncio.get_running_loop().run_in_executor(
-                None, _sweep_stale_curator_config_dirs_once, self._config_dir_base,
+                None,
+                _sweep_stale_curator_config_dirs_once,
+                self._config_dir_base,
+                self._transcript_archive_root(),
             )
             self._config_dir = TaskConfigDir(
                 f'{_CONFIG_DIR_TASK_PREFIX}{os.getpid()}', base_dir=self._config_dir_base,
             )
         return self._config_dir
+
+    def _transcript_archive_root(self) -> Path | None:
+        """Where curator transcripts are archived: recon's root, under recon's kill switch."""
+        return recon_archive_root(self._config.reconciliation)
 
     def _ledger_kwargs(self, role: str) -> dict[str, Any]:
         """The ``invoke_with_cap_retry`` kwargs that land a call in the invocations ledger.
@@ -3140,9 +3252,9 @@ class TaskCurator:
         project_root: str,
     ) -> list[CuratorDecision]:
         """Parse a successful batch call into one decision per candidate, and account for it."""
-        # A real LLM round-trip completed, so the service is not wedged — reset
-        # the consecutive-ZOT counter exactly as TaskCurator.curate does for a
-        # single call. Without this, size-1 bisect ZOTs accumulate across
+        # A real LLM round-trip completed, so the service is not wedged — close
+        # the ZOT breaker exactly as TaskCurator.curate does for a single call.
+        # Without this, size-1 bisect ZOTs accumulate across
         # arbitrarily many healthy BATCH calls in a batch-dominant deployment
         # until threshold (default 2) trips the breaker and disables dedupe for
         # the cooldown (default 600s) on a healthy service (task 4143).
@@ -3157,7 +3269,7 @@ class TaskCurator:
         # flight. Closing that cooldown early is deliberate (task 4143's plan
         # design decision 3; pinned by
         # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker).
-        self._reset_zero_output_breaker()
+        self._zero_output_breaker.close()
 
         decisions = _parse_batch_decisions(
             agent_result,
@@ -3171,7 +3283,7 @@ class TaskCurator:
         # action='create' without raising. One usable decision suffices — the
         # other items' degradation is then the designed per-item fail-open.
         if any(not d.degraded for d in decisions):
-            self._reset_degraded_streak(project_id)
+            self._degraded_streaks.success(project_id)
         else:
             for candidate, decision in zip(candidates, decisions, strict=True):
                 await self._count_degraded(
@@ -3318,13 +3430,48 @@ def _task_files(task: dict) -> list[str]:
     return [str(f) for f in files if f]
 
 
-def _task_metadata_spawned_from(task: dict) -> str | None:
-    meta = task.get('metadata') or {}
-    if isinstance(meta, dict):
-        v = meta.get('spawned_from')
-        if isinstance(v, str) and v:
-            return v
+_SIBLING_STREAM_SPAWN_CONTEXT = 'agent_followup'
+_SIBLING_LOOKUP_STATUSES: tuple[str, ...] = tuple(
+    sorted(status.value for status in TaskStatus if status is not TaskStatus.CANCELLED),
+)
+# One lookup page, far above the measured maximum of 11 siblings per parent;
+# rows past it are neither ranked nor counted.
+_SIBLING_LOOKUP_PAGE = 100
+
+
+def _spawned_from_id(value: object) -> str | None:
+    """The parent id a ``spawned_from`` value names, or ``None`` when it names none.
+
+    The live store holds str, int and dict values; only the first two name a task.
+    """
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
     return None
+
+
+def _followup_parent_id(candidate: CandidateTask) -> str | None:
+    """The parent whose follow-ups form *candidate*'s sibling stream, if it has one."""
+    if candidate.spawn_context != _SIBLING_STREAM_SPAWN_CONTEXT:
+        return None
+    return _spawned_from_id(candidate.spawned_from)
+
+
+def _sibling_lookup_values(parent_id: str) -> tuple[str | int, ...]:
+    """Every stored form of *parent_id*: the metadata lookup is type-strict."""
+    if parent_id.isdecimal():
+        return (parent_id, int(parent_id))
+    return (parent_id,)
+
+
+def _sibling_rank(row: MetadataLookupRow) -> tuple[bool, int, int]:
+    """Active before done, then by priority, then newest first."""
+    return (
+        row['status'] not in ACTIVE,
+        _PRIORITY_RANK.get(row['priority'], 99),
+        -row['task_id'],
+    )
 
 
 def _to_pool_entry(
@@ -3378,7 +3525,7 @@ def _trim_pool(
 ) -> tuple[list[PoolEntry], int]:
     """Trim a pool that exceeds the total cap, dropping the weakest first.
 
-    Weak = dependency > embedding > module > anchor, preserving anchor always.
+    Weak = the reverse of ``POOL_SOURCES``, preserving anchor always.
 
     Returns ``(kept, dropped_n)``. ``dropped_n`` is how many entries the cap
     removed, and it feeds the :class:`PoolWithheld` census so the prompt can
@@ -3389,7 +3536,7 @@ def _trim_pool(
     """
     if len(pool) <= total_cap:
         return pool, 0
-    weakest_order = ['dependency', 'embedding', 'module', 'anchor']
+    weakest_order = list(reversed(POOL_SOURCES))
     result = list(pool)
     for source in weakest_order:
         if len(result) <= total_cap:

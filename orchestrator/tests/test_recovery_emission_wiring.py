@@ -26,7 +26,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import wire_clear_claim_then_set_status, wire_scheduler_liveness_mock
+from _orch_helpers import (
+    wire_clear_claim_then_set_status,
+    wire_live_status_from_get_task,
+    wire_scheduler_liveness_mock,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.deploy_state import DeployPhase
@@ -78,6 +82,7 @@ def _ref(
     severity: str = 'blocking',
     category: str = 'needs_human',
     age_secs: float = 300.0,
+    members: tuple[str, ...] = (),
 ) -> EscalationRef:
     """A pinning record, by default one the auto-watcher has NOT yet promoted.
 
@@ -92,6 +97,7 @@ def _ref(
         category=category,
         severity=severity,
         created_at=_iso(secs_ago=age_secs),
+        members=members,
     )
 
 
@@ -240,6 +246,7 @@ def harness(tmp_path: Path, mock_orch_config):
     h.scheduler = MagicMock()
     wire_scheduler_liveness_mock(h.scheduler)
     wire_clear_claim_then_set_status(h.scheduler)
+    wire_live_status_from_get_task(h.scheduler)
     h.scheduler.get_tasks = AsyncMock(return_value=[])
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
     h.scheduler.set_task_status = AsyncMock()
@@ -1050,6 +1057,29 @@ class TestHumanParkedHoldsDoNotAlarm:
         _bind_reports(harness, {
             'T1': _pinned_hold(escalations=[_ref('a', level=2), _ref('b', level=1)]),
         })
+
+        await _sweeps(harness, clock, 3)
+
+        assert len(_alarms(harness)) == 1
+
+    async def test_a_hold_pinned_by_an_l2_and_its_member_l1_files_no_alarm(self, clocked):
+        """Task 7709: the promoted hold — the L1 stays open beside the L2 that
+        names it in members until the L2's cascade closes it."""
+        harness, clock = clocked
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[
+            _ref('esc-1', level=1), _ref('esc-2', level=2, members=('esc-1',)),
+        ])})
+
+        await _sweeps(harness, clock, 8)
+
+        assert _alarms(harness) == []
+
+    async def test_an_l1_beside_an_l2_that_does_not_hold_it_still_alarms(self, clocked):
+        """COUNTER-SIGNAL: an L2 holding some other id leaves the L1 unpromoted."""
+        harness, clock = clocked
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[
+            _ref('esc-1', level=1), _ref('esc-2', level=2, members=('esc-other',)),
+        ])})
 
         await _sweeps(harness, clock, 3)
 

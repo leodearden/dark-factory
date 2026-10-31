@@ -22,20 +22,20 @@ not-yet-wired attribute/key never breaks collection during the RED steps.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 from _merge_lane_fakes import FakeVerifier, lane_scene_config, main_health_probe_spawned
-from _orch_helpers import MERGE_RESULT_TIMEOUT
+from _orch_helpers import MERGE_GATE_BARRIER_TIMEOUT, wait_responsive
+from _verify_result_doubles import fake_verify_result
 from test_merge_queue_concurrent_verify import (
-    _fake_verify_result,
     _gated_runner,
     _inject_two_host_allocator,
     _make_branch_with_file,
     _make_request,
+    _stop_worker,
 )
 
 from orchestrator.config import GitConfig
@@ -296,7 +296,7 @@ class TestPrefetchLookaheadAndAttachConservation:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-            return _fake_verify_result(passed=True)
+            return fake_verify_result(passed=True)
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -323,34 +323,45 @@ class TestPrefetchLookaheadAndAttachConservation:
         req_b = _make_request('pc-attach-b', 'task/pc-attach-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
+        try:
+            await queue.put(req_a)
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='pc-attach-a: local verify entered',
+            )
 
-        await queue.put(req_a)
-        await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            # (1) prefetch look-ahead: A merged, look-ahead peeked (found
+            # nothing), permit RETAINED for a possible late arrival.
+            _assert_conservation(worker, where='after look-ahead retain (A in-flight)')
 
-        # (1) prefetch look-ahead: A merged, look-ahead peeked (found
-        # nothing), permit RETAINED for a possible late arrival.
-        _assert_conservation(worker, where='after look-ahead retain (A in-flight)')
+            # (2) late-arrival ATTACH: B attaches to A's retained spec_base.
+            await queue.put(req_b)
+            await wait_responsive(
+                gate_b_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='pc-attach-b: remote verify entered',
+            )
 
-        # (2) late-arrival ATTACH: B attaches to A's retained spec_base.
-        await queue.put(req_b)
-        await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+            _assert_conservation(worker, where='after ATTACH transfer (B in-flight)')
 
-        _assert_conservation(worker, where='after ATTACH transfer (B in-flight)')
+            gate_a_release.set()
+            gate_b_release.set()
 
-        gate_a_release.set()
-        gate_b_release.set()
+            outcome_a = await wait_responsive(
+                req_a.result,
+                label='pc-attach-a: MergeOutcome (lands)',
+            )
+            outcome_b = await wait_responsive(
+                req_b.result,
+                label='pc-attach-b: MergeOutcome (lands on the attached spec_base)',
+            )
+            assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
+            assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
 
-        outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
-        outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
-        assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
-        assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
-
-        _assert_conservation(worker, where='post-landing quiescence')
-
-        await worker.stop()
-
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            _assert_conservation(worker, where='post-landing quiescence')
+        finally:
+            await _stop_worker(worker, worker_task)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
 
@@ -371,7 +382,7 @@ class TestFallbackConservation:
         K = 2
 
         async def _passing_local(*args: Any, **kwargs: Any) -> MagicMock:
-            return _fake_verify_result(passed=True)
+            return fake_verify_result(passed=True)
 
         gate_b_prerelease = asyncio.Event()
         gate_b_prerelease.set()
@@ -396,25 +407,28 @@ class TestFallbackConservation:
         req_b = _make_request('pc-fallback-b', 'task/pc-fallback-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
+        try:
+            await queue.put(req_a)
+            outcome_a = await wait_responsive(
+                req_a.result,
+                label='pc-fallback-a: MergeOutcome (lands)',
+            )
+            assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
 
-        await queue.put(req_a)
-        outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
-        assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
+            # A is fully done before B is even enqueued — the ATTACH
+            # condition (predecessor not yet done) fails, so B FALLBACKs.
+            _assert_conservation(worker, where='after A lands, before B enqueued')
 
-        # A is fully done before B is even enqueued — the ATTACH
-        # condition (predecessor not yet done) fails, so B FALLBACKs.
-        _assert_conservation(worker, where='after A lands, before B enqueued')
+            await queue.put(req_b)
+            outcome_b = await wait_responsive(
+                req_b.result,
+                label='pc-fallback-b: MergeOutcome (lands after FALLBACK)',
+            )
+            assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
 
-        await queue.put(req_b)
-        outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
-        assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
-
-        _assert_conservation(worker, where='after FALLBACK, B lands')
-
-        await worker.stop()
-
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            _assert_conservation(worker, where='after FALLBACK, B lands')
+        finally:
+            await _stop_worker(worker, worker_task)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
 
@@ -446,11 +460,11 @@ class TestCascadeRemergeConservation:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return _fake_verify_result(
+                return fake_verify_result(
                     passed=False, summary='tests failed', test_output='FAIL', category='',
                 )
             # B's re-verify after the cascade remerges it: passes.
-            return _fake_verify_result(passed=True)
+            return fake_verify_result(passed=True)
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -477,41 +491,52 @@ class TestCascadeRemergeConservation:
         req_b = _make_request('pc-cascade-b', 'task/pc-cascade-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
+        try:
+            await queue.put(req_a)
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='pc-cascade-a: local verify entered',
+            )
 
-        await queue.put(req_a)
-        await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            _assert_conservation(
+                worker, where='after look-ahead retain (A in-flight, failing)',
+            )
 
-        _assert_conservation(
-            worker, where='after look-ahead retain (A in-flight, failing)',
-        )
+            await queue.put(req_b)
+            await wait_responsive(
+                gate_b_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='pc-cascade-b: remote verify entered',
+            )
 
-        await queue.put(req_b)
-        await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+            _assert_conservation(
+                worker, where='after ATTACH transfer (B in-flight, pre-cascade)',
+            )
 
-        _assert_conservation(
-            worker, where='after ATTACH transfer (B in-flight, pre-cascade)',
-        )
+            # Release A's gate with passed=False -> A fails; the head-failure
+            # cascade cancels B's remote verify, re-merges B against actual
+            # main, and re-dispatches it (local re-verify, passes).
+            gate_a_release.set()
 
-        # Release A's gate with passed=False -> A fails; the head-failure
-        # cascade cancels B's remote verify, re-merges B against actual
-        # main, and re-dispatches it (local re-verify, passes).
-        gate_a_release.set()
+            outcome_b = await wait_responsive(
+                req_b.result,
+                label='pc-cascade-b: MergeOutcome after cascade + remerge + re-verify',
+            )
+            outcome_a = await wait_responsive(
+                req_a.result,
+                label='pc-cascade-a: MergeOutcome (head verify failed)',
+            )
 
-        outcome_b = await asyncio.wait_for(req_b.result, timeout=25.0)
-        outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
+            assert outcome_a.status != 'done', f'A must NOT land; got {outcome_a!r}'
+            assert not main_health_probe_spawned(outcome_a), outcome_a.reason
+            assert outcome_b.status == 'done', (
+                f'B must land after cascade + remerge + re-verify; got {outcome_b!r}'
+            )
 
-        assert outcome_a.status != 'done', f'A must NOT land; got {outcome_a!r}'
-        assert not main_health_probe_spawned(outcome_a), outcome_a.reason
-        assert outcome_b.status == 'done', (
-            f'B must land after cascade + remerge + re-verify; got {outcome_b!r}'
-        )
-
-        _assert_conservation(worker, where='after cascade + remerge + B lands')
-
-        await worker.stop()
-
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            _assert_conservation(worker, where='after cascade + remerge + B lands')
+        finally:
+            await _stop_worker(worker, worker_task)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
 
@@ -543,7 +568,7 @@ class TestShutdownRetainedPermitConservation:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-            return _fake_verify_result(passed=True)
+            return fake_verify_result(passed=True)
 
         gate_b_prerelease = asyncio.Event()
         gate_b_prerelease.set()
@@ -564,21 +589,22 @@ class TestShutdownRetainedPermitConservation:
         req_a = _make_request('pc-shutdown-a', 'task/pc-shutdown-a', wt_a, config)
 
         worker_task = asyncio.create_task(worker.run())
+        try:
+            await queue.put(req_a)
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='pc-shutdown-a: local verify entered',
+            )
 
-        await queue.put(req_a)
-        await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            # Retain state: one permit held; no B ever arrives.
+            _assert_conservation(worker, where='retain state, no late arrival')
 
-        # Retain state: one permit held; no B ever arrives.
-        _assert_conservation(worker, where='retain state, no late arrival')
-
-        gate_a_release.set()
-
-        # Shut down while the merger is blocked in _acquire_next_request()
-        # (queue empty) — possibly still holding the retained permit.
-        await worker.stop()
-
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=10.0)
+            gate_a_release.set()
+        finally:
+            # Shut down while the merger is blocked in _acquire_next_request()
+            # (queue empty) — possibly still holding the retained permit.
+            await _stop_worker(worker, worker_task, join_timeout=10.0)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
 
@@ -622,7 +648,7 @@ class TestLedgerLiveEmptiesAfterTransferRelease:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-            return _fake_verify_result(passed=True)
+            return fake_verify_result(passed=True)
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -649,47 +675,58 @@ class TestLedgerLiveEmptiesAfterTransferRelease:
         req_b = _make_request('pc-live-b', 'task/pc-live-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
+        try:
+            await queue.put(req_a)
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='pc-live-a: local verify entered',
+            )
 
-        await queue.put(req_a)
-        await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            # (1) prefetch look-ahead: A merged, look-ahead peeked (found
+            # nothing), permit RETAINED for a possible late arrival.
+            await queue.put(req_b)
+            await wait_responsive(
+                gate_b_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='pc-live-b: remote verify entered',
+            )
 
-        # (1) prefetch look-ahead: A merged, look-ahead peeked (found
-        # nothing), permit RETAINED for a possible late arrival.
-        await queue.put(req_b)
-        await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+            # (2) B is now dispatched (in-flight, verifying) — its
+            # InflightEntry must carry the SAME token still registered in
+            # ledger.live, proving the merger stamped item.permit at
+            # transfer time (step 4a) and _dispatch_item copied it onto the
+            # InflightEntry (step 4b).
+            # Read as the derived count rather than off the entry:
+            # inflight_speculative IS
+            # `len(speculation_ledger.live) - held_by_merger`
+            # (_inflight_speculative_count, task 2160 eta), so exactly one
+            # verifier-owned permit proves the merger stamped item.permit at
+            # transfer time and _dispatch_item copied it onto the
+            # InflightEntry. A transfer that dropped the token leaves this 0.
+            assert req_b.task_id in {
+                e['task_id'] for e in worker.snapshot()['entries']
+            }, worker.snapshot()['entries']
+            assert _speculation_snapshot(worker)['inflight_speculative'] == 1, (
+                "B's transferred permit must be verifier-owned and still live "
+                f'in the ledger; got {_speculation_snapshot(worker)!r}'
+            )
 
-        # (2) B is now dispatched (in-flight, verifying) — its
-        # InflightEntry must carry the SAME token still registered in
-        # ledger.live, proving the merger stamped item.permit at
-        # transfer time (step 4a) and _dispatch_item copied it onto the
-        # InflightEntry (step 4b).
-        # Read as the derived count rather than off the entry:
-        # inflight_speculative IS
-        # `len(speculation_ledger.live) - held_by_merger`
-        # (_inflight_speculative_count, task 2160 eta), so exactly one
-        # verifier-owned permit proves the merger stamped item.permit at
-        # transfer time and _dispatch_item copied it onto the
-        # InflightEntry. A transfer that dropped the token leaves this 0.
-        assert req_b.task_id in {
-            e['task_id'] for e in worker.snapshot()['entries']
-        }, worker.snapshot()['entries']
-        assert _speculation_snapshot(worker)['inflight_speculative'] == 1, (
-            "B's transferred permit must be verifier-owned and still live "
-            f'in the ledger; got {_speculation_snapshot(worker)!r}'
-        )
+            gate_a_release.set()
+            gate_b_release.set()
 
-        gate_a_release.set()
-        gate_b_release.set()
-
-        outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
-        outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
-        assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
-        assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
-
-        await worker.stop()
-
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            outcome_a = await wait_responsive(
+                req_a.result,
+                label='pc-live-a: MergeOutcome (lands)',
+            )
+            outcome_b = await wait_responsive(
+                req_b.result,
+                label='pc-live-b: MergeOutcome (lands with the transferred permit)',
+            )
+            assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
+            assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
+        finally:
+            await _stop_worker(worker, worker_task)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
 
@@ -750,7 +787,7 @@ class TestEarlyContinueTerminalTransferClearsSpecBase:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-            return _fake_verify_result(passed=True)
+            return fake_verify_result(passed=True)
 
         config = lane_scene_config(git_ops.project_root, git_config)
         wt_a = await _make_branch_with_file(
@@ -770,65 +807,72 @@ class TestEarlyContinueTerminalTransferClearsSpecBase:
         req_b = _make_request('pc-term-b', 'task/pc-term-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
-
-        await queue.put(req_a)
-        await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-
-        # A in-flight, permit RETAINED (pending) for a possible late
-        # arrival — genuinely not idle yet.
-        assert _merger_is_idle(worker) is False
-
-        # Drop the loop-breaker threshold to 0 so B's dequeue hits the Step-0
-        # early-continue site (abandoned) instead of a real merge. The gate is
-        # `prior_timeouts >= MAX_POST_MERGE_VERIFY_TIMEOUTS` and B's count
-        # defaults to 0, so 0 >= 0 fires. Done HERE, after A is already past
-        # its own dequeue, so only B is abandoned —
-        # MAX_POST_MERGE_VERIFY_TIMEOUTS is the lane's own public threshold.
-        worker.MAX_POST_MERGE_VERIFY_TIMEOUTS = 0
-
-        await queue.put(req_b)
-
-        # B's terminal (early-continue) transfer happens entirely on the
-        # MERGER side (on_dequeue's ATTACH + the Step-0 loop-breaker +
-        # on_transfer_terminal()) and does NOT require the verifier to
-        # drain B — A still holds the only local host slot until
-        # gate_a_release is set, so the verifier cannot reach B's item
-        # yet. Poll for the merger-side idle transition rather than
-        # awaiting req_b.result (see class docstring).
-        for _ in range(500):
-            if _merger_is_idle(worker):
-                break
-            await asyncio.sleep(0.01)
-        else:
-            pytest.fail(
-                'merger never returned to idle after B was abandoned '
-                '(is_idle() stayed False — see is_idle()/spec_base below)'
-                f': {_speculation_snapshot(worker)!r}'
+        try:
+            await queue.put(req_a)
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='pc-term-a: local verify entered',
             )
 
-        # Core amendment assertion: a terminal (early-continue) transfer
-        # must fully clear spec_base, not just held_by_merger — so the
-        # controller reads genuinely idle immediately, not just
-        # permit-conserved.
-        spec = _speculation_snapshot(worker)
-        assert spec['spec_base'] is None, (
-            f"spec_base must be None after B's terminal transfer; got "
-            f'{spec["spec_base"]!r} (stale from on_transfer() not '
-            f'clearing it — see SpeculationController.on_transfer_terminal())'
-        )
-        _assert_conservation(worker, where='after early-continue terminal transfer')
+            # A in-flight, permit RETAINED (pending) for a possible late
+            # arrival — genuinely not idle yet.
+            assert _merger_is_idle(worker) is False
 
-        gate_a_release.set()
-        outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
-        outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
-        assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
-        assert outcome_b.status == 'blocked', f'B must be abandoned; got {outcome_b!r}'
+            # Drop the loop-breaker threshold to 0 so B's dequeue hits the Step-0
+            # early-continue site (abandoned) instead of a real merge. The gate is
+            # `prior_timeouts >= MAX_POST_MERGE_VERIFY_TIMEOUTS` and B's count
+            # defaults to 0, so 0 >= 0 fires. Done HERE, after A is already past
+            # its own dequeue, so only B is abandoned —
+            # MAX_POST_MERGE_VERIFY_TIMEOUTS is the lane's own public threshold.
+            worker.MAX_POST_MERGE_VERIFY_TIMEOUTS = 0
 
-        _assert_conservation(worker, where='post-landing quiescence')
+            await queue.put(req_b)
 
-        await worker.stop()
+            # B's terminal (early-continue) transfer happens entirely on the
+            # MERGER side (on_dequeue's ATTACH + the Step-0 loop-breaker +
+            # on_transfer_terminal()) and does NOT require the verifier to
+            # drain B — A still holds the only local host slot until
+            # gate_a_release is set, so the verifier cannot reach B's item
+            # yet. Poll for the merger-side idle transition rather than
+            # awaiting req_b.result (see class docstring).
+            for _ in range(500):
+                if _merger_is_idle(worker):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail(
+                    'merger never returned to idle after B was abandoned '
+                    '(is_idle() stayed False — see is_idle()/spec_base below)'
+                    f': {_speculation_snapshot(worker)!r}'
+                )
 
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            # Core amendment assertion: a terminal (early-continue) transfer
+            # must fully clear spec_base, not just held_by_merger — so the
+            # controller reads genuinely idle immediately, not just
+            # permit-conserved.
+            spec = _speculation_snapshot(worker)
+            assert spec['spec_base'] is None, (
+                f"spec_base must be None after B's terminal transfer; got "
+                f'{spec["spec_base"]!r} (stale from on_transfer() not '
+                f'clearing it — see SpeculationController.on_transfer_terminal())'
+            )
+            _assert_conservation(worker, where='after early-continue terminal transfer')
+
+            gate_a_release.set()
+            outcome_a = await wait_responsive(
+                req_a.result,
+                label='pc-term-a: MergeOutcome (lands)',
+            )
+            outcome_b = await wait_responsive(
+                req_b.result,
+                label='pc-term-b: MergeOutcome (abandoned by the loop-breaker)',
+            )
+            assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
+            assert outcome_b.status == 'blocked', f'B must be abandoned; got {outcome_b!r}'
+
+            _assert_conservation(worker, where='post-landing quiescence')
+        finally:
+            await _stop_worker(worker, worker_task)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)

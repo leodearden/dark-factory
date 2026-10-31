@@ -235,12 +235,15 @@ def _follow_events(
     return [*ended, *moved]
 
 
-def _answer(request: RevealRequested, at_head: _Head, revealed: set[str]) -> Answer:
+def _answer(request: RevealRequested, at_head: _Head, revealed: set[str]) -> Answer | None:
+    """The request judged at head; None when it is granted for a path already revealed, since _follow_events put head's blob in the feed."""
     verdict = at_head.judge(request.path, revealed)
-    if isinstance(verdict, Granted):
-        revealed.add(request.path)
-        return _revealed(request.path, at_head.commit, verdict, renamed_from=None)
-    return RefusalAnswer(path=request.path, reason=verdict)
+    if not isinstance(verdict, Granted):
+        return RefusalAnswer(path=request.path, reason=verdict)
+    if request.path in revealed:
+        return None
+    revealed.add(request.path)
+    return _revealed(request.path, at_head.commit, verdict, renamed_from=None)
 
 
 def _counted(
@@ -292,8 +295,9 @@ def reveal_events(
 ) -> RevealOutput:
     """Every revealed file followed from `since` to head, then each request answered in inbox order; the budget is what is spent after them.
 
-    An answer already in `answered`, the uncommitted tail, is consumed there instead of emitted again. A blob
-    pair `added_line_counts` already counted is not diffed again.
+    A request for a path already revealed appends nothing, because _follow_events has already put head's blob in the
+    feed for every revealed path. An answer already in `answered`, the uncommitted tail, is consumed there instead of
+    emitted again. A blob pair `added_line_counts` already counted is not diffed again.
     """
     counted, counts = _counted(
         root, policy, files, engagement, head=head, cached=added_line_counts
@@ -309,7 +313,10 @@ def reveal_events(
             read=read,
         )
         decided = _follow_events(tracks, at_head, revealed)
-        decided += [_answer(request, at_head, revealed) for request in requests]
+        for request in requests:
+            answer = _answer(request, at_head, revealed)
+            if answer is not None:
+                decided.append(answer)
     return RevealOutput(
         events=_unanswered(decided, answered, stamp=stamp, now=now),
         budget=counted.budget(revealed),

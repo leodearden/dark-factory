@@ -74,6 +74,7 @@ def _make(
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
     config.project_root = MOCK_WORKFLOW_PROJECT_ROOT
+    config.git.branch_prefix = 'task/'  # a real str for QueuedBranch.parse
 
     if update_task_raises:
         update_task = AsyncMock(side_effect=RuntimeError('mcp down'))
@@ -93,6 +94,12 @@ def _make(
 
     git_ops = MagicMock()
     git_ops.get_main_sha = AsyncMock(return_value=main_sha)
+    # The merge phase's _settle_unmergeable_branch reads: no ref, a clean tree
+    # and a HEAD beyond main, so every merge-phase test here reads MERGEABLE.
+    git_ops.resolve_branch_sha = AsyncMock(return_value=None)
+    git_ops.has_uncommitted_work = AsyncMock(return_value=False)
+    git_ops.is_ancestor = AsyncMock(return_value=False)
+    git_ops.is_ancestor_checked = AsyncMock(return_value=False)
 
     queue = MagicMock()
     queue.get_by_task = MagicMock(return_value=[])
@@ -687,9 +694,9 @@ class TestRetryLoopReStamp:
         wf._check_merge_outcome_thrash = AsyncMock(return_value=None)  # type: ignore[method-assign]
         wf.git_ops.get_main_sha = AsyncMock(return_value='main_sha')
         wf.git_ops.rebase_onto_main = AsyncMock(return_value=True)
-        # False → the "branch landed on main after steward resolution" break
-        # does not fire, so the loop actually reaches attempt 2.
-        wf.git_ops.is_ancestor = AsyncMock(return_value=False)
+        # False → the post-steward _settle_unmergeable_branch read finds the
+        # branch beyond main, so the loop actually reaches attempt 2.
+        wf.git_ops.is_ancestor_checked = AsyncMock(return_value=False)
 
         # The REAL stamp/clear helpers run; the stamp is only wrapped so calls
         # are counted. get_task mirrors the in-memory blob so the

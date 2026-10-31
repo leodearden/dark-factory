@@ -83,12 +83,14 @@ PIN-CLASS AWARENESS
 The alarm's trigger was itself "a human-facing escalation is still open", so
 on a queue where L2s legitimately stay parked for days it re-fired forever,
 and an operator closing it only restarted the cycle.  So an
-``escalation_pinned`` hold whose every pin is already an L2 (the predicate is
-``escalation.pins.pinned_only_by_human_parked``) files no alarm; any other
-reason, and any hold with an unpromoted pin, still does.  Only the queue WRITE
-is suppressed — the streak still counts and the events and sweep summary still
-flow — and ``recovery_emission.streak_escalation_suppress_human_parked`` turns
-it off live.  Retuning ``veto_streak_threshold`` / ``veto_streak_min_span_secs``
+``escalation_pinned`` hold whose every pin is an L2, or an L1 that one of those
+L2s holds as a member, files no alarm (the canonical statement is
+``escalation.pins.pinned_only_by_human_parked``); any other reason, and any
+hold with an L1 that no L2 in the task's read holds, still does.  Only the
+queue WRITE is suppressed — the streak still counts and the events and sweep
+summary still flow — and
+``recovery_emission.streak_escalation_suppress_human_parked`` turns it off
+live.  Retuning ``veto_streak_threshold`` / ``veto_streak_min_span_secs``
 or ``streak_escalation_enabled`` instead was rejected: each also silences
 genuinely stuck tasks.  An alarm filed BEFORE its pin was promoted stays open
 until the release edge stands it down; no earlier stand-down is attempted,
@@ -103,7 +105,8 @@ REAL id (esc-5469-11), which ``escalation/src/escalation/server.py::promote_to_l
 now refuses for a cluster of alarms alone.  A misfiled L1 ECHO of the alarm can
 likewise sit on the real id.  The resolve half discharges all of these by
 MEMBERSHIP rather than by task id, which is what keeps the class
-self-discharging end to end — see :func:`resolve_recovery_veto_streak_escalation`.
+self-discharging end to end — see :func:`resolve_recovery_veto_streak_escalation`
+for the echoes and ``sentinel_alarm_wrappers.py`` for the wrapper rule.
 
 SHAPE
 -----
@@ -126,6 +129,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+
+from orchestrator.sentinel_alarm_wrappers import discharge_sentinel_wrappers
 
 logger = logging.getLogger(__name__)
 
@@ -820,8 +825,8 @@ _STREAK_CATEGORY = 'risk_identified'
 #: orchestrator.  ``escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES``
 #: duplicates it (lockstep-tested in ``escalation/tests/test_authority.py``)
 #: so ``promote_to_l2`` can refuse to mint a wrapper of these alarms under the
-#: real task id, and :func:`resolve_recovery_veto_streak_escalation` reads it
-#: to recognise a wrapper's members.  Rename both sides together.
+#: real task id, and ``sentinel_alarm_wrappers.discharge_sentinel_wrappers``
+#: reads it to recognise a wrapper's members.  Rename both sides together.
 RECOVERY_VETO_STREAK_ROLE = 'orchestrator-recovery-veto-streak'
 
 
@@ -959,7 +964,7 @@ def emit_recovery_veto_streak_escalation(
         if streak == threshold:
             logger.info(
                 'Recovery veto streak for task %s at %s not escalated: every '
-                'pin is already an L2 in front of a human (%s)',
+                'pin is already in front of a human (%s)',
                 task_id, site, ','.join(_flatten_ids(escalation_ids)) or '(none)',
             )
         return False
@@ -1097,20 +1102,12 @@ def resolve_recovery_veto_streak_escalation(
     1. this task's L1 alarms, filed under its sentinel;
     2. L1 ECHOES of them on the REAL id, filed under
        :data:`RECOVERY_VETO_STREAK_ROLE`;
-    3. then L2 WRAPPERS, under ANY task id, judged by MEMBERSHIP: every member
-       resolves to a streak alarm, none is still pending, at least one is
-       THIS task's, and no blocking declared pin rides on the cluster.
-       Neither the wrapper's category nor its task_id is consulted — an LLM
-       chose both.
+    3. then L2 WRAPPERS, under ANY task id, judged by MEMBERSHIP alone; the
+       full rule is ``sentinel_alarm_wrappers.py``'s module docstring.
 
     Own alarms go first so they keep this detector's ``resolved_by`` rather
     than ``l2-cascade:<id>``, and so "none still pending" already holds for
-    this task's members when a wrapper is judged.  Every uncertainty — an
-    unreadable member, an ordinary one, another task's still-live alarm —
-    leaves the wrapper pending: a stale wrapper is visible and hand-closable,
-    while closing a cluster that still holds another task's live alarm would
-    resolve that alarm silently through the cascade.  The LAST recovering
-    member-task therefore closes a shared wrapper.
+    this task's members when a wrapper is judged.
 
     Returns ``True`` when at least one record was resolved.
     """
@@ -1155,8 +1152,9 @@ def resolve_recovery_veto_streak_escalation(
         )
         return False
 
-    wrappers = _discharge_streak_wrappers(
-        escalation_queue, pending, sentinel, resolution,
+    wrappers = discharge_sentinel_wrappers(
+        escalation_queue, pending, alarm_role=RECOVERY_VETO_STREAK_ROLE,
+        sentinel=sentinel, resolution=resolution,
     )
     if not (alarms or wrappers):
         return False
@@ -1176,56 +1174,6 @@ def _is_own_streak_alarm(esc: Any, *, task_id: str, sentinel: str) -> bool:
     if esc.task_id == sentinel:
         return True
     return esc.task_id == task_id and esc.agent_role == RECOVERY_VETO_STREAK_ROLE
-
-
-def _settled_streak_alarms(escalation_queue: Any, member_ids: list[str]) -> list[Any] | None:
-    """Read *member_ids*; ``None`` at the first that is unreadable, not an alarm, or still pending."""
-    members = []
-    for member_id in dict.fromkeys(member_ids):
-        member = escalation_queue.get(member_id)
-        if (
-            member is None
-            or member.agent_role != RECOVERY_VETO_STREAK_ROLE
-            or member.status == 'pending'
-        ):
-            return None
-        members.append(member)
-    return members
-
-
-def _discharge_streak_wrappers(
-    escalation_queue: Any, pending: list[Any], sentinel: str, resolution: str,
-) -> int:
-    """Resolve every pending L2 in *pending* that only wraps settled streak alarms, one of them *sentinel*'s.
-
-    See :func:`resolve_recovery_veto_streak_escalation` for the membership rule.
-    """
-    discharged = 0
-    # Its own guard: the caller's returns False, which would report a pass-1
-    # resolve that already happened on disk as "nothing cleared".
-    try:
-        from escalation.declared_pins import (  # noqa: PLC0415 — optional dep
-            blocking_pin_declarations,
-        )
-
-        for wrapper in pending:
-            if wrapper.level < 2 or not wrapper.members:
-                continue
-            members = _settled_streak_alarms(escalation_queue, wrapper.members)
-            if not members or not any(m.task_id == sentinel for m in members):
-                continue
-            if blocking_pin_declarations([wrapper, *members]):
-                continue
-            escalation_queue.resolve(
-                wrapper.id, resolution, resolved_by=RECOVERY_VETO_STREAK_ROLE,
-            )
-            discharged += 1
-    except Exception as exc:  # noqa: BLE001 — fail-open backstop
-        logger.warning(
-            'recovery veto streak wrappers for %s could not be discharged '
-            '(non-fatal): %s', sentinel, exc,
-        )
-    return discharged
 
 
 #: How many pinning escalation ids the sweep summary NAMES before it renders

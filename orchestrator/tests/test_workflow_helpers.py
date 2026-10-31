@@ -160,12 +160,11 @@ def test_warmlane_workflow_factory_smoke(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_init_git_repo_factory_smoke(tmp_path) -> None:
+def test_init_git_repo_factory_smoke(tmp_path) -> None:
     """_init_git_repo seeds a real git repo with an initial README commit."""
     from _workflow_helpers import _init_git_repo  # noqa: PLC0415
 
-    await _init_git_repo(tmp_path)
+    _init_git_repo(tmp_path)
     assert (tmp_path / '.git').is_dir()
     assert (tmp_path / 'README.md').exists()
 
@@ -175,8 +174,7 @@ async def test_init_git_repo_factory_smoke(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_e2e_factories_smoke(tmp_path) -> None:
+def test_e2e_factories_smoke(tmp_path) -> None:
     """Behavioral smoke: PLAN/_make_review/AgentStub/_init_repo real invocation checks."""
     from _workflow_helpers import PLAN, AgentStub, _init_repo, _make_review  # noqa: PLC0415
 
@@ -189,7 +187,7 @@ async def test_e2e_factories_smoke(tmp_path) -> None:
     assert AgentStub()._detect_role('You are a TDD architect') == 'architect'
     assert AgentStub()._detect_role('You are the completion judge') == 'judge'
 
-    await _init_repo(tmp_path)
+    _init_repo(tmp_path)
     assert (tmp_path / 'lib.py').exists()
     assert (tmp_path / '.git').is_dir()
 
@@ -284,7 +282,7 @@ async def test_init_transcript_repo_smoke(tmp_path) -> None:
 
     from orchestrator.git_ops import _run  # noqa: PLC0415
 
-    await _init_transcript_repo(tmp_path)
+    _init_transcript_repo(tmp_path)
 
     assert (tmp_path / '.git').is_dir()
     assert (tmp_path / 'lib.py').exists()

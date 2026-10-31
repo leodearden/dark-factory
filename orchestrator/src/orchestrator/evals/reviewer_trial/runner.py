@@ -49,6 +49,7 @@ from orchestrator.evals.reviewer_trial.variants import (
 )
 from orchestrator.mcp_lifecycle import verdict_tools_mcp_server
 from orchestrator.review_inputs import gather_review_subject
+from orchestrator.review_payload import ReviewPayload, ReviewPayloadError, Verdict, normalize_review
 from orchestrator.tree_removal import remove_tree
 
 logger = logging.getLogger(__name__)
@@ -187,7 +188,7 @@ async def _run_single_reviewer(
     *,
     max_retries: int = 2,
     meta_root: Path | None = None,
-) -> tuple[str, dict | None, float]:
+) -> tuple[str, ReviewPayload | None, float]:
     """Review *diff* in place at its own cwd, briefed by the production diff-only builder.
 
     For a caller whose cwd already holds the reviewed tree
@@ -202,6 +203,17 @@ async def _run_single_reviewer(
     )
 
 
+def _submitted_review(envelope: dict | None) -> ReviewPayload | None:
+    if envelope is None:
+        return None
+    try:
+        review = normalize_review(envelope)
+    except ReviewPayloadError as exc:
+        logger.warning('Reviewer verdict envelope is off-contract: %s', exc)
+        return None
+    return None if review.verdict is Verdict.ERROR else review
+
+
 async def _review(
     spec: ReviewerSpec,
     role: AgentRole,
@@ -213,7 +225,7 @@ async def _review(
     prices: dict | None = None,
     meta_root: Path | None = None,
     usage_gate: UsageGate | None = None,
-) -> tuple[str, dict | None, float]:
+) -> tuple[str, ReviewPayload | None, float]:
     """Run one reviewer at *cwd* on *prompt* via the live verdict-tools transport.
 
     Mirrors workflow.TaskWorkflow._run_reviewer's read+fail-safe contract
@@ -234,7 +246,7 @@ async def _review(
     a ``finally`` block; an injected *meta_root* is left untouched for the
     caller to inspect.
 
-    Returns (reviewer_name, review_dict_or_None, cost_usd), where cost_usd is
+    Returns (reviewer_name, ReviewPayload_or_None, cost_usd), where cost_usd is
     the summed spend across every invocation attempt (not just the last):
     a verdict-less attempt that triggers a retry still costs money, so
     run_panel's total_cost_usd rollup would under-report multi-attempt trial
@@ -325,17 +337,12 @@ async def _review(
 
             total_cost += result.cost_usd
 
-            # Read the reviewer's structured verdict instead of the
-            # structured_output/json.loads cascade (task 2493, mirrors task
-            # 2484's production change). A dict envelope with a dict 'verdict'
-            # payload carrying verdict∈{PASS,ISSUES_FOUND} is trusted only when
-            # the invocation itself also reported success — an invocation
-            # failure is untrusted even if it happened to write a verdict
-            # before failing.
-            envelope = artifacts.read_verdict(role.name)
-            payload = envelope.get('verdict') if isinstance(envelope, dict) else None
-            if result.success and isinstance(payload, dict) and payload.get('verdict') in {'PASS', 'ISSUES_FOUND'}:
-                return spec.name, payload, total_cost
+            # A submitted verdict is trusted only when the invocation itself
+            # also reported success — an invocation failure is untrusted even
+            # if it happened to write a verdict before failing.
+            review = _submitted_review(artifacts.read_verdict(role.name))
+            if result.success and review is not None:
+                return spec.name, review, total_cost
 
             if attempt < max_retries:
                 logger.warning(
@@ -347,15 +354,15 @@ async def _review(
                 'Reviewer %s: no/invalid verdict after %d attempts (result.success=%s)',
                 spec.name, max_retries, result.success,
             )
-            return spec.name, {
-                'reviewer': role.name,
-                'verdict': 'ERROR',
-                'issues': [],
-                'summary': (
+            return spec.name, ReviewPayload(
+                verdict=Verdict.ERROR,
+                issues=(),
+                reviewer=role.name,
+                summary=(
                     f'Reviewer emitted no/invalid verdict after {max_retries} '
                     f'attempt(s) (result.success={result.success}).'
                 ),
-            }, total_cost
+            ), total_cost
 
         # Unreachable, but satisfy type checker
         return spec.name, None, total_cost
@@ -413,7 +420,7 @@ async def run_panel(
         name, review, cost = r
         total_cost += cost
         if review is not None:
-            reviews[name] = review
+            reviews[name] = review.to_record()
         else:
             errors.append(f'{name}: no result')
 

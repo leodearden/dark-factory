@@ -263,9 +263,8 @@ def test_converged_resume_over_the_real_stateful_transport(tmp_path):
     a 400 before any tool runs -- so exiting 0 here cannot be luck.
 
     The sequence is asserted as "some tools/call AFTER the initialize", not
-    as a fixed list: `post_mcp_envelope` is deliberately ADAPTIVE, sending
-    the envelope session-less first and handshaking only on the 400, so the
-    real wire also carries a rejected tools/call ahead of the handshake.
+    as a fixed list: what this script depends on is a handshake before the
+    tool, not the client's full message sequence.
 
     The session it opened is asserted CLOSED for the same reason it is
     asserted opened: both are wire facts this script depends on and cannot
@@ -658,10 +657,9 @@ def test_a_git_failure_at_the_landing_still_ends_in_a_verdict(tmp_path, scratch)
 # ---------------------------------------------------------------------------
 # Which interpreter runs the script's python steps
 #
-# The transport is not stdlib: it needs httpx, plus pydantic via
-# census_trigger's module-level `legibility.config` import. Measured here on
-# 2026-09-12: the system interpreter (/usr/bin/python3, 3.12.3) has neither
-# (it does have yaml), while every venv in this tree has all three. So a
+# The transport is not stdlib: shared.mcp_session needs httpx. Measured here
+# on 2026-09-12: the system interpreter (/usr/bin/python3, 3.12.3) lacks it
+# (it does have yaml), while every venv in this tree has both. So a
 # reload step that inherits whatever `python3` the caller's shell offers is a
 # deploy gate an operator cannot reach from a login shell -- the same
 # unreachable-gate outcome as the transport defect above, with a different

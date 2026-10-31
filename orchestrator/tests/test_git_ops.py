@@ -48,6 +48,7 @@ from orchestrator.git_ops import (
     _merge_subject,
     _run,
 )
+from orchestrator.lane_branch_holder import BranchCheckedOutElsewhere, BranchHolderAction
 
 
 @pytest.fixture
@@ -314,16 +315,6 @@ async def _build_cold_orphan_branch(
 
 @pytest.mark.asyncio
 class TestWorktreeLifecycle:
-    async def test_worktree_info_stale_commits_field(self, git_ops: GitOps):
-        """WorktreeInfo.stale_commits defaults to None and can be set explicitly."""
-        info_default = WorktreeInfo(path=git_ops.project_root, base_commit='a' * 40)
-        assert info_default.stale_commits is None
-
-        info_explicit = WorktreeInfo(
-            path=git_ops.project_root, base_commit='a' * 40, stale_commits=5,
-        )
-        assert info_explicit.stale_commits == 5
-
     async def test_worktree_info_reify_debug_port_field(self, git_ops: GitOps):
         """WorktreeInfo.reify_debug_port defaults to None and can be set explicitly."""
         info_default = WorktreeInfo(path=git_ops.project_root, base_commit='a' * 40)
@@ -1410,34 +1401,31 @@ class TestWorktreeLifecycle:
 @pytest.mark.asyncio
 class TestFreshenMain:
     async def test_freshen_main_no_remote(self, git_ops: GitOps):
-        """Without a remote, _freshen_main returns (main_branch, None)."""
-        ref, stale = await git_ops._freshen_main()
+        """Without a remote, _freshen_main returns main_branch."""
+        ref = await git_ops._freshen_main()
         assert ref == git_ops.config.main_branch
-        assert stale is None
 
     async def test_freshen_main_remote_ahead(
         self, git_ops_with_remote: tuple[GitOps, Path],
     ):
-        """When origin/main is 3 commits ahead, returns ('origin/main', 3)."""
+        """When origin/main is 3 commits ahead, returns 'origin/main'."""
         git_ops, origin = git_ops_with_remote
         await _push_n_commits_to_origin(origin, 3)
-        ref, stale = await git_ops._freshen_main()
+        ref = await git_ops._freshen_main()
         assert ref == f'{git_ops.config.remote}/{git_ops.config.main_branch}'
-        assert stale == 3
 
     async def test_freshen_main_already_current(
         self, git_ops_with_remote: tuple[GitOps, Path],
     ):
-        """When local main == origin/main (no new commits), returns (main_branch, 0)."""
+        """When local main == origin/main (no new commits), returns main_branch."""
         git_ops, _origin = git_ops_with_remote
-        ref, stale = await git_ops._freshen_main()
+        ref = await git_ops._freshen_main()
         assert ref == git_ops.config.main_branch
-        assert stale == 0
 
     async def test_freshen_main_diverged(
-        self, git_ops_with_remote: tuple[GitOps, Path],
+        self, git_ops_with_remote: tuple[GitOps, Path], caplog,
     ):
-        """When local and remote have diverged, returns (main_branch, N) with N behind count."""
+        """When local and remote have diverged, returns main_branch and logs a divergence warning."""
         git_ops, origin = git_ops_with_remote
         local = git_ops.project_root
         # Add a local-only commit (not pushed to origin)
@@ -1446,15 +1434,21 @@ class TestFreshenMain:
         await _run(['git', 'commit', '-m', 'Local only commit'], cwd=local)
         # Add a different commit to origin (creates divergence)
         await _push_n_commits_to_origin(origin, 1, prefix='remote_div')
-        ref, stale = await git_ops._freshen_main()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            ref = await git_ops._freshen_main()
         # Diverged: use local ref to avoid losing advance_main commits
         assert ref == git_ops.config.main_branch
-        assert stale == 1
+        assert any(
+            r.levelno == logging.WARNING
+            and r.name == 'orchestrator.git_ops'
+            and 'diverged' in r.getMessage()
+            for r in caplog.records
+        )
 
     async def test_freshen_main_behind_rev_list_fails(
         self, git_ops_with_remote: tuple[GitOps, Path],
     ):
-        """When behind rev-list exits non-zero, _freshen_main returns (main_branch, None)."""
+        """When behind rev-list exits non-zero, _freshen_main returns main_branch."""
         git_ops, _origin = git_ops_with_remote
 
         async def fake_run(cmd, cwd=None):
@@ -1463,15 +1457,14 @@ class TestFreshenMain:
             return (128, '', 'fatal: bad revision')   # rev-list fails
 
         with patch('orchestrator.git_ops._run', side_effect=fake_run):
-            ref, stale = await git_ops._freshen_main()
+            ref = await git_ops._freshen_main()
 
         assert ref == git_ops.config.main_branch
-        assert stale is None
 
     async def test_freshen_main_behind_count_value_error(
         self, git_ops_with_remote: tuple[GitOps, Path],
     ):
-        """When behind rev-list returns non-numeric stdout, _freshen_main returns (main_branch, None)."""
+        """When behind rev-list returns non-numeric stdout, _freshen_main returns main_branch."""
         git_ops, _origin = git_ops_with_remote
 
         async def fake_run(cmd, cwd=None):
@@ -1480,15 +1473,14 @@ class TestFreshenMain:
             return (0, 'not-a-number', '')   # rev-list returns garbage
 
         with patch('orchestrator.git_ops._run', side_effect=fake_run):
-            ref, stale = await git_ops._freshen_main()
+            ref = await git_ops._freshen_main()
 
         assert ref == git_ops.config.main_branch
-        assert stale is None
 
     async def test_freshen_main_ahead_count_value_error(
         self, git_ops_with_remote: tuple[GitOps, Path],
     ):
-        """When ahead rev-list returns non-numeric stdout, falls back to (main_branch, behind)."""
+        """When ahead rev-list returns non-numeric stdout, falls back to main_branch."""
         git_ops, _origin = git_ops_with_remote
 
         remote_ref = f'{git_ops.config.remote}/'
@@ -1507,16 +1499,15 @@ class TestFreshenMain:
             return (0, '', '')
 
         with patch('orchestrator.git_ops._run', side_effect=fake_run):
-            ref, stale = await git_ops._freshen_main()
+            ref = await git_ops._freshen_main()
 
-        # Falls back to local main; reports behind count as-is
+        # Falls back to local main
         assert ref == git_ops.config.main_branch
-        assert stale == 3
 
     async def test_freshen_main_ahead_rev_list_fails(
         self, git_ops_with_remote: tuple[GitOps, Path], caplog,
     ):
-        """When ahead rev-list exits non-zero, _freshen_main returns (main_branch, behind) and logs a warning."""
+        """When ahead rev-list exits non-zero, _freshen_main returns main_branch and logs a warning."""
         git_ops, _origin = git_ops_with_remote
 
         call_count = 0
@@ -1532,10 +1523,9 @@ class TestFreshenMain:
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
              patch('orchestrator.git_ops._run', side_effect=fake_run):
-            ref, stale = await git_ops._freshen_main()
+            ref = await git_ops._freshen_main()
 
         assert ref == git_ops.config.main_branch
-        assert stale == 3
         assert any('rev-list (ahead) failed' in r.message for r in caplog.records)
 
 
@@ -1549,30 +1539,12 @@ class TestCreateWorktreeFreshening:
         await _push_n_commits_to_origin(origin, 1, prefix='fresh')
         worktree_info = await git_ops.create_worktree('freshen-test')
         assert (worktree_info.path / 'fresh_0.txt').exists()
-        # Exactly 1 commit was pushed, so stale_commits must reflect that.
-        assert worktree_info.stale_commits == 1
         # base_commit must match origin/main SHA captured after create_worktree
         # (which internally fetched, so origin/main is now up-to-date in the local repo).
         _, expected_sha, _ = await _run(
             ['git', 'rev-parse', 'origin/main'], cwd=git_ops.project_root,
         )
         assert worktree_info.base_commit == expected_sha
-
-    async def test_create_worktree_stale_commits_populated(
-        self, git_ops_with_remote: tuple[GitOps, Path],
-    ):
-        """stale_commits == 2 when origin is 2 commits ahead at create_worktree time."""
-        git_ops, origin = git_ops_with_remote
-        await _push_n_commits_to_origin(origin, 2)
-        worktree_info = await git_ops.create_worktree('stale-commits-test')
-        assert worktree_info.stale_commits == 2
-
-    async def test_create_worktree_stale_commits_none_without_remote(
-        self, git_ops: GitOps,
-    ):
-        """stale_commits is None when no remote is configured (graceful degradation)."""
-        worktree_info = await git_ops.create_worktree('no-remote-test')
-        assert worktree_info.stale_commits is None
 
     async def test_create_worktree_revparse_fallback(self, git_ops: GitOps):
         """When rev-parse of start_ref fails, create_worktree falls back to local main.
@@ -1589,14 +1561,13 @@ class TestCreateWorktreeFreshening:
         local_main_sha = local_main_sha.strip()
 
         with patch.object(
-            git_ops, '_freshen_main', return_value=('origin/nonexistent-ref', 3),
+            git_ops, '_freshen_main', return_value='origin/nonexistent-ref',
         ):
             worktree_info = await git_ops.create_worktree('revparse-fallback-test')
 
         assert (worktree_info.path / 'README.md').exists()
         assert len(worktree_info.base_commit) == 40
         assert worktree_info.base_commit == local_main_sha
-        assert worktree_info.stale_commits == 3  # persists through fallback
 
 
 @pytest.mark.asyncio
@@ -7557,7 +7528,6 @@ class TestCreateWorktreeTrain:
         info = await git_ops.create_worktree('feature-notrain', train=None)
 
         assert info.base_commit == main_sha
-        assert info.stale_commits is None  # no remote in git_repo fixture
 
     async def test_train_order_zero_degenerate(self, git_ops: GitOps):
         """order=0 is degenerate — must branch from main, same as train=None."""
@@ -7596,17 +7566,14 @@ class TestCreateWorktreeTrain:
         # (1) WorktreeInfo.base_commit == α's branch tip SHA
         assert beta_info.base_commit == alpha_tip
 
-        # (2) stale_commits is None for train-based worktrees
-        assert beta_info.stale_commits is None
-
-        # (3) git merge-base task/beta task/alpha == α's tip (β forks from α)
+        # (2) git merge-base task/beta task/alpha == α's tip (β forks from α)
         _, mb, _ = await _run(
             ['git', 'merge-base', 'task/beta', 'task/alpha'],
             cwd=git_ops.project_root,
         )
         assert mb.strip() == alpha_tip
 
-        # (4) git log task/beta..task/alpha is empty (β already has all of α's commits)
+        # (3) git log task/beta..task/alpha is empty (β already has all of α's commits)
         _, log_out, _ = await _run(
             ['git', 'log', 'task/beta..task/alpha', '--oneline'],
             cwd=git_ops.project_root,
@@ -10992,6 +10959,44 @@ class TestGetFilesTouchedInBranchWarning:
         ), f'Expected WARNING to mention get_files_touched_in_branch; got: {warning_texts}'
 
 
+@pytest.mark.asyncio
+class TestGetChangedFilesWarning:
+    """Task 3493: get_changed_files keeps its fail-open ``[]`` on a git diff
+    error but no longer swallows the failure silently: it WARNs.
+    """
+
+    async def test_nonexistent_sha_returns_empty_and_warns(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        unresolvable = 'deadbeef' * 5
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops.get_changed_files(unresolvable, 'HEAD')
+
+        assert result == [], f'Expected [] on git error; got {result!r}'
+        warning_texts = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any('get_changed_files' in t for t in warning_texts), (
+            f'Expected a WARNING naming get_changed_files; got: {warning_texts}'
+        )
+
+    async def test_success_lists_changed_files_without_warning(
+        self, git_ops: GitOps, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        (git_repo / 'base.py').write_text('# base\n')
+        base_sha = await _commit_all(git_repo, 'base')
+        (git_repo / 'alpha.py').write_text('# alpha\n')
+        (git_repo / 'beta.py').write_text('# beta\n')
+        head_sha = await _commit_all(git_repo, 'add alpha and beta')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            files = await git_ops.get_changed_files(base_sha, head_sha)
+
+        assert sorted(files) == ['alpha.py', 'beta.py']
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
 # ---------------------------------------------------------------------------
 # TestMergeTreeConflicts — tests for merge_tree_conflicts() (PRD §5.2, task β)
 # ---------------------------------------------------------------------------
@@ -11465,6 +11470,19 @@ class TestCleanupWorktreeColdBranchRetention:
         )
 
 
+def _worktree_listing_unreadable(git_ops: GitOps):
+    """Patch context forcing ``GitOps._settle_branch_checkout``'s fail-open read.
+
+    An unreadable ``git worktree list`` leaves the settle with no holder, so
+    the acquire enters its route as it did before task 5565 and the route's
+    own reattach rc guard is what must hold.
+    """
+    async def _no_holder(full_branch: str) -> None:
+        return None
+
+    return patch.object(git_ops, '_worktree_holding_branch', side_effect=_no_holder)
+
+
 # ===========================================================================
 # Task-1914 step-5: RED — create-once leftover protective guard + fail-safe
 # ===========================================================================
@@ -11473,10 +11491,12 @@ class TestCleanupWorktreeColdBranchRetention:
 @pytest.mark.asyncio
 class TestAcquireWarmLaneCreateOnceLeftoverGuard:
     """create-once site NEVER destroys a leftover task/<id> branch that carries
-    commits beyond main.  If the leftover cannot be re-attached (e.g. already
-    checked out in another worktree), acquire returns WarmLaneUnavailable.FAULT
-    while leaving the branch intact.  Fail-safe: _branch_has_commits_beyond_main
-    True (including on git error) → reattach/retain direction taken on both paths."""
+    commits beyond main.  A leftover checked out in a worktree outside the pool
+    is refused before the route (BranchCheckedOutElsewhere, task 5565); when
+    that pre-route read fails open and re-attach is refused by git, acquire
+    returns WarmLaneUnavailable.FAULT while leaving the branch intact.
+    Fail-safe: _branch_has_commits_beyond_main True (including on git error)
+    → reattach/retain direction taken on both paths."""
 
     @pytest.fixture(autouse=True)
     def _warm_base(self, git_repo: Path) -> None:
@@ -11499,14 +11519,13 @@ class TestAcquireWarmLaneCreateOnceLeftoverGuard:
         be re-attached (already checked out in another worktree).
 
         Setup: create task/A with commits via a temp worktree and LEAVE the
-        worktree in place (not removed).  When acquire_warm_lane tries
-        `git worktree add <lane> task/A`, git refuses with 'branch already
-        checked out' — and the branch must NOT be deleted as a fallback.
+        worktree in place (not removed).
 
-        After step-4: the reattach guard fires and `git worktree add` (no -b)
-        fails → FAULT returned; task/A is never touched → both assertions PASS.
-        After step-6: same external result; the raise-not-destroy contract is
-        the same observable effect.
+        With the worktree listing readable, the pre-route settle refuses with
+        BranchCheckedOutElsewhere(REFUSE_FOREIGN_WORKTREE) and no lane is
+        created.  With it unreadable (fail-open), acquire enters the
+        create-once route, `git worktree add <lane> task/A` is refused by git
+        → FAULT, and the branch must NOT be deleted as a fallback.
         """
         from orchestrator.git_ops import WarmLaneUnavailable
 
@@ -11535,12 +11554,24 @@ class TestAcquireWarmLaneCreateOnceLeftoverGuard:
 
         # FRESH pool — _lane-0 never acquired
         git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        (lane_path,) = pool.lane_paths()
 
-        result = await git_ops.acquire_warm_lane('A', start_ref)
+        with pytest.raises(BranchCheckedOutElsewhere) as refused:
+            await git_ops.acquire_warm_lane('A', start_ref)
+        assert refused.value.action is BranchHolderAction.REFUSE_FOREIGN_WORKTREE
+        assert refused.value.holder.resolve() == tmp_wt_a.resolve()
+        assert pool.assignment_for('A') is None
+        assert not pool.is_assigned(lane_path)
+        assert not lane_path.exists(), 'the refusal must come before any lane is created'
 
-        # Must return WarmLaneUnavailable (FAULT), NOT WorktreeInfo
-        assert isinstance(result, WarmLaneUnavailable), (
-            f'Expected WarmLaneUnavailable for unattachable orphan, got {result!r}'
+        with _worktree_listing_unreadable(git_ops):
+            result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        # Must return WarmLaneUnavailable.FAULT, NOT WorktreeInfo
+        assert result is WarmLaneUnavailable.FAULT, (
+            f'Expected WarmLaneUnavailable.FAULT for unattachable orphan, got {result!r}'
         )
 
         # task/A branch must be RETAINED — never destroyed regardless of failure
@@ -11763,16 +11794,14 @@ class TestAcquireWarmLaneResetInPlaceCheckoutGuard:
         (a) Create task/A with 2 commits via tmp_wt_a; LEAVE it checked out.
         (b) Register+free _lane-0 as 'seed' so the lane is on task/seed and
             the next acquire for 'A' hits the registered (else) path.
-        (c) Acquire for 'A' — reattach guard fires (task/A exists + commits)
-            but git checkout -f task/A inside the lane FAILS because task/A
-            is already checked out in tmp_wt_a.
-
-        RED today: rc of checkout is discarded and _reuse_warm_lane(lane,
-        task/A) runs against the lane still on task/seed, returning WorktreeInfo
-        instead of WarmLaneUnavailable.
-
-        GREEN after step-8: rc is captured; non-zero → RuntimeError →
-        top-level except → WarmLaneUnavailable.FAULT, task/A intact.
+        (c) Acquire for 'A' with the worktree listing readable: the pre-route
+            settle refuses with BranchCheckedOutElsewhere(REFUSE_FOREIGN_WORKTREE)
+            and the lane stays FREE on task/seed.
+        (d) Acquire for 'A' with the listing unreadable (fail-open): the
+            reattach guard fires (task/A exists + commits) but git checkout -f
+            task/A inside the lane FAILS because task/A is already checked out
+            in tmp_wt_a.  The rc is captured; non-zero → RuntimeError →
+            top-level except → WarmLaneUnavailable.FAULT, task/A intact.
         """
         from orchestrator.git_ops import WarmLaneUnavailable
 
@@ -11817,13 +11846,27 @@ class TestAcquireWarmLaneResetInPlaceCheckoutGuard:
             f'Lane should be on task/seed before reattach attempt, got {seed_head_raw.strip()!r}'
         )
 
-        # (d) Acquire for 'A' — hits reset-in-place site → reattach guard fires
-        #     → git checkout -f task/A FAILS (task/A checked out in tmp_wt_a)
-        result = await git_ops.acquire_warm_lane('A', start_ref)
+        # (c) Listing readable — refused before the route touches the lane.
+        with pytest.raises(BranchCheckedOutElsewhere) as refused:
+            await git_ops.acquire_warm_lane('A', start_ref)
+        assert refused.value.action is BranchHolderAction.REFUSE_FOREIGN_WORKTREE
+        assert refused.value.holder.resolve() == tmp_wt_a.resolve()
+        assert git_ops.warm_lane_pool.assignment_for('A') is None
+        assert not git_ops.warm_lane_pool.is_assigned(lane_path)
+        _, refused_head_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane_path,
+        )
+        assert refused_head_raw.strip() == 'task/seed', (
+            f'The refusal must leave the lane on task/seed, got {refused_head_raw.strip()!r}'
+        )
 
-        # PRIMARY discriminator (RED today → GREEN after step-8):
-        # must return WarmLaneUnavailable.FAULT, NOT WorktreeInfo
-        assert isinstance(result, WarmLaneUnavailable), (
+        # (d) Listing unreadable — hits reset-in-place site → reattach guard
+        #     fires → git checkout -f task/A FAILS (task/A checked out in tmp_wt_a)
+        with _worktree_listing_unreadable(git_ops):
+            result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        # PRIMARY discriminator: must return WarmLaneUnavailable.FAULT, NOT WorktreeInfo
+        assert result is WarmLaneUnavailable.FAULT, (
             f'Expected WarmLaneUnavailable.FAULT when checkout -f task/A fails '
             f'(branch already checked out in another worktree), got {result!r}. '
             f'The reset-in-place site must capture the checkout rc and raise, '

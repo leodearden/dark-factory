@@ -1,6 +1,6 @@
 /* Main app — routes tabs, manages filter state, hosts tweaks */
 const { useState: uS, useEffect: uE } = React;
-const { Rail, StatStrip, Toolbar, DatumReading } = window.DF_SHELL;
+const { Rail, StatStrip, Toolbar, DatumReading, RenderFailureBoundary } = window.DF_SHELL;
 const { OverviewTab } = window.DF_OVERVIEW;
 const { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab, EscalationsTab, EscalationAnalyticsTab } = window.DF_TABS;
 const { TasksTab } = window.DF_TASKS;
@@ -14,6 +14,7 @@ const { inQueueOver } = window.DF_MERGE_QUEUE;
 const { writeQueue } = window.DF_MEMORY_READINGS;
 const { todaySpend, spendText } = window.DF_SPEND_READINGS;
 const { DEFAULT_WINDOW: CHIP_DEFAULT_WINDOW, TAB_WINDOWS: CHIP_TAB_WINDOWS, windowForTab, windowEcho, highlightedWindow, pendingWindow } = window.DF_WINDOW_CHIP;
+const { tabRenderFailureNotice, chromeRenderFailureNotice, pageRenderFailureNotice } = window.DF_RENDER_FAILURE;
 const DD = window.DF_DATA;
 
 // Tweaks helpers are attached directly to window
@@ -60,6 +61,19 @@ function noticeBannerStyle(edgeColor) {
     fontFamily: 'var(--mono)',
     fontSize: 11,
   };
+}
+
+// Each chrome region fails alone, so a broken topbar reading cannot take the
+// navigation down with it.
+function ChromeBoundary({ region, testId, className, children }) {
+  return (
+    <RenderFailureBoundary describe={thrown => chromeRenderFailureNotice(region, thrown)}
+                           testId={testId}
+                           className={className}
+                           style={noticeBannerStyle('var(--bad)')}>
+      {children}
+    </RenderFailureBoundary>
+  );
 }
 
 function App() {
@@ -232,46 +246,53 @@ function App() {
 
   return (
     <div className="app" data-density={tw.density}>
-      <Rail active={tab} onSelect={setTab} counts={railCounts} />
+      <ChromeBoundary region="navigation rail" testId="rail-render-failure-banner" className="rail">
+        <Rail active={tab} onSelect={setTab} counts={railCounts} />
+      </ChromeBoundary>
       <div className="topbar">
         <div className="crumbs">
           <span style={{ color: 'var(--fg-3)' }}>dark-factory</span>
           <span style={{ color: 'var(--fg-3)' }}>/</span>
           <span className="here">{tabLabel}</span>
         </div>
-        <StatStrip live={!tw.pauseLive} lastUpdate={<LiveClock live={!tw.pauseLive} />} summary={summary} />
+        <ChromeBoundary region="status strip" testId="status-strip-render-failure-banner">
+          <StatStrip live={!tw.pauseLive} lastUpdate={<LiveClock live={!tw.pauseLive} />} summary={summary} />
+        </ChromeBoundary>
       </div>
       <div className="main">
-        <Toolbar
-          showWindow={!!chip}
-          windows={chip?.windows}
-          window={chip ? highlightedWindow(chipEcho, chip.windows) : null}
-          onWindow={setWin}
-          showProjects={toolbarConfig.showProjects !== false}
-          projects={projects} onProjects={setProjects}
-          agents={agents} onAgents={setAgents}
-          showAgents={toolbarConfig.showAgents}
-          search={toolbarConfig.search ? search : undefined}
-          onSearch={toolbarConfig.search ? setSearch : undefined}
-          searchPlaceholder={toolbarConfig.searchPlaceholder}
-          extra={
-            <>
-              {pending && (
-                <span title="chosen, not yet served" style={{ color: 'var(--fg-3)', fontSize: 11 }}>
-                  {pending} pending
-                </span>
-              )}
-              <button onClick={() => setTw('pauseLive', !tw.pauseLive)}
-                className="multi" style={{ cursor: 'pointer' }}>
-                {tw.pauseLive ? '▶ resume' : '❚❚ pause live'}
-              </button>
-            </>
-          }
-        />
+        <ChromeBoundary region="toolbar" testId="toolbar-render-failure-banner">
+          <Toolbar
+            showWindow={!!chip}
+            windows={chip?.windows}
+            window={chip ? highlightedWindow(chipEcho, chip.windows) : null}
+            onWindow={setWin}
+            showProjects={toolbarConfig.showProjects !== false}
+            projects={projects} onProjects={setProjects}
+            agents={agents} onAgents={setAgents}
+            showAgents={toolbarConfig.showAgents}
+            search={toolbarConfig.search ? search : undefined}
+            onSearch={toolbarConfig.search ? setSearch : undefined}
+            searchPlaceholder={toolbarConfig.searchPlaceholder}
+            extra={
+              <>
+                {pending && (
+                  <span title="chosen, not yet served" style={{ color: 'var(--fg-3)', fontSize: 11 }}>
+                    {pending} pending
+                  </span>
+                )}
+                <button onClick={() => setTw('pauseLive', !tw.pauseLive)}
+                  className="multi" style={{ cursor: 'pointer' }}>
+                  {tw.pauseLive ? '▶ resume' : '❚❚ pause live'}
+                </button>
+              </>
+            }
+          />
+        </ChromeBoundary>
         <div className="body" key={tab}>
           {/* ADDITIVE, never a replacement: renderTab() below stays
               unconditional so the last-good payload refreshOne deliberately
-              preserved stays on screen — marked as old, not blanked. */}
+              preserved stays on screen — marked as old, not blanked. Only the
+              boundary replaces it, when the tab's own render throws. */}
           {staleNotices.map(notice => (
             <div key={notice.path} className="col-span-12"
                  data-testid="endpoint-stale-banner"
@@ -286,7 +307,11 @@ function App() {
               {loadingNotice.text}
             </div>
           )}
-          {renderTab()}
+          {/* The keyed .body remounts this boundary per tab, so switching tabs retries. */}
+          <RenderFailureBoundary describe={thrown => tabRenderFailureNotice(tabLabel, thrown)}
+                                 testId="tab-render-failure-banner"
+                                 className="col-span-12"
+                                 style={noticeBannerStyle('var(--bad)')}>{renderTab()}</RenderFailureBoundary>
         </div>
       </div>
 
@@ -323,4 +348,12 @@ function App() {
 // Apply density / tweak side-effects via class
 const obs = new MutationObserver(() => {});
 const root = document.getElementById('root');
-ReactDOM.createRoot(root).render(<App />);
+// The last resort: App's own body (the summary and rail-count derivations) runs
+// above every region boundary, so the operator reads its error, not an empty #root.
+ReactDOM.createRoot(root).render(
+  <RenderFailureBoundary describe={pageRenderFailureNotice}
+                         testId="page-render-failure-banner"
+                         style={{ ...noticeBannerStyle('var(--bad)'), margin: 24 }}>
+    <App />
+  </RenderFailureBoundary>
+);
