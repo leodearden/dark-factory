@@ -1,4 +1,5 @@
-"""With the shared httpx pool saturated, fused-memory failures name PoolTimeout.
+"""With the shared httpx pool saturated, dashboard MCP failures (fused-memory
+fan-outs and the escalation-URL probes) name PoolTimeout.
 
 The user-observable signal: a dashboard failure log for a saturated pool names
 ``PoolTimeout`` — never a content-free line, never a generic timeout that reads
@@ -23,12 +24,14 @@ import pytest
 
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
+from dashboard.data import task_runtime
 from dashboard.data.metrics import METRICS_SCHEMA, collect_metrics_snapshot
 
 _SATURATED_URL = 'http://saturated-pool.test'
 _FANOUT_LOGGER = 'dashboard.data.mcp_fanout'
 _GATHER_LOGGER = 'dashboard.data.utils'
 _METRICS_LOGGER = 'dashboard.data.metrics'
+_TASK_RUNTIME_LOGGER = 'dashboard.data.task_runtime'
 _CURATOR_BUDGET = 'dashboard.app._CURATOR_ENDPOINT_TIMEOUT_SECONDS'
 _MEMORY_BUDGET = 'dashboard.api.memory._MEMORY_ENDPOINT_TIMEOUT_SECONDS'
 _SAMPLER_BUDGET = 'dashboard.data.metrics._HTTP_SAMPLER_TIMEOUT_SECONDS'
@@ -157,4 +160,30 @@ async def test_metrics_memory_and_queue_samplers_name_pool_timeout(
     assert not sampler_failures, (
         f'a sampler hit its outer deadline instead of degrading through the '
         f"fan-out's own offline sentinel; got {sampler_failures}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_runtime_probe_names_pool_timeout_in_the_dashboard_fault_domain(caplog):
+    memory_data.reset_sessions()
+    task_runtime.reset_probe_log_state()
+    try:
+        async with httpx.AsyncClient(transport=_SaturatedPoolTransport()) as client:
+            with caplog.at_level(logging.WARNING):
+                result = await task_runtime.fetch_task_runtime(
+                    client,
+                    {'saturated': f'{_SATURATED_URL}/mcp'},
+                    per_call_timeout=_FAST_BUDGET_SECONDS,
+                )
+    finally:
+        memory_data.reset_sessions()
+        task_runtime.reset_probe_log_state()
+
+    assert result['saturated'].offline_reason == 'deadline_exceeded', (
+        "a saturated local pool is the DASHBOARD's fault domain (task 3517), "
+        f"never the orchestrator's; got {result['saturated'].offline_reason!r}"
+    )
+    probe = _warnings(caplog, _TASK_RUNTIME_LOGGER)
+    assert any('deadline_exceeded' in m and 'PoolTimeout' in m for m in probe), (
+        f'no task_runtime WARNING named PoolTimeout; got {probe}'
     )
