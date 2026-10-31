@@ -203,7 +203,7 @@ class TestEvalMetricsInvocationErrorField:
         ``scripts/run_fable_trial_v2_campaign.py`` decides per-cell reference
         validity by KEY PRESENCE — its ``MARKER_KEY not in metrics`` means "not
         known-good", never False, and the count it consumes from
-        ``report._judged_blind_count`` is None for any config with even one
+        ``cell_admission.judged_blind_count`` is None for any config with even one
         keyless cell. If this key
         were emitted only when True (a conditional dict update, or filtering
         falsy fields out of the persisted dict), every HEALTHY cell would be
@@ -768,7 +768,7 @@ class TestJudgePlanQuality:
     # clamp_unit_score's docstring in judge.py for the mechanics). A bare
     # clamp DOES keep +/-Infinity in [0, 1] — but only by fabricating the
     # best/worst possible score (1.0/0.0) on a surface
-    # report._mean_plan_quality -> select_survivors actually ranks on. Both
+    # cell_admission.mean_plan_quality -> select_survivors actually ranks on. Both
     # are equally NOT a judgement, so both are Unmeasured(judge, unparseable).
     # Both are reachable through the SAME schema-bypassing
     # json.loads(result.output) fallback — CPython's json.loads accepts the
@@ -998,8 +998,8 @@ class TestPlanJudgeOutcomeCarriesItsSpend:
 # judge, which scored an empty artifact because it had no scorability guard of
 # its own — its coherence rested ENTIRELY on its one caller remembering to gate.
 #
-# Task 3302 closed the two OUTER halves: the CALL SITE (run_architect_eval
-# gates on is_scorable_plan) and the READER (report._plan_quality_score floors
+# Task 3302 closed the two OUTER halves: the CALL SITE (run_architect_eval gates
+# on is_scorable_plan) and the READER (cell_admission.plan_quality_score floors
 # an on-disk no-plan cell). This class pins the INSTRUMENT itself, so a second
 # caller — a backfill/re-scoring script, a new eval path, prompt_opt, a resume
 # wave — cannot silently re-open the same defect.
@@ -3240,7 +3240,7 @@ class TestPlanQualityReport:
         many of its scores were judged blind — it can only report that it does
         not know. Reporting the measured ones' count (here 1) would understate
         the bound while wearing the appearance of a complete answer. This is
-        ``report._judged_blind_count``'s rule, which task 3632's campaign
+        ``cell_admission.judged_blind_count``'s rule, which task 3632's campaign
         script consumes rather than re-deriving, so the two surfaces of one
         field answer the same question identically.
         """

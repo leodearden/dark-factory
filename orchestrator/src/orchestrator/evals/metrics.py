@@ -591,16 +591,17 @@ def blend_composite(
       failing workflow trial does.
 
     The bound *no_plan* closes: flooring such a cell's *quality* axis to ``0.0``
-    (the report layer's :func:`_plan_quality_score`) bounds only the 0.6 quality
-    weight. The remaining 0.2 cost + 0.2 latency is still collected, so an
-    ungated no-plan cell caps at ``0.40`` — and a cell that is the sole member of
-    its ``(fixture, 'plan_only')`` group takes the report layer's all-trials
-    fallback baseline, earning ratios of ``1.0`` on both axes and banking the
-    full ``0.40`` for having FAILED. Measured (task 3302 review): a no-plan cell
-    at ``0.40`` outranked a config that produced a real 6-step plan at ``0.26``
-    and survived ``select_survivors(top_k=2)``, while the plan-producing one was
-    cut. Barring the cell from SEEDING its group's floor closes only the
-    intra-group route; this gate closes the cross-group one.
+    (the report layer's :func:`cell_admission.plan_quality_score`) bounds only
+    the 0.6 quality weight. The remaining 0.2 cost + 0.2 latency is still
+    collected, so an ungated no-plan cell caps at ``0.40`` — and a cell that is
+    the sole member of its ``(fixture, 'plan_only')`` group takes the report
+    layer's all-trials fallback baseline, earning ratios of ``1.0`` on both axes
+    and banking the full ``0.40`` for having FAILED. Measured (task 3302
+    review): a no-plan cell at ``0.40`` outranked a config that produced a real
+    6-step plan at ``0.26`` and survived ``select_survivors(top_k=2)``, while
+    the plan-producing one was cut. Barring the cell from SEEDING its group's
+    floor closes only the intra-group route; this gate closes the cross-group
+    one.
 
     The gate is UNCONDITIONAL rather than scoped to *plan_only*, so a caller
     cannot silently bypass it by forgetting the flag. The report layer computes

@@ -107,8 +107,9 @@ def build_composite_report(
     """Build the C4 per-config composite report over the UNION of configs.
 
     This retires the April all-tasks-INTERSECTION collapse (see
-    :func:`elo_report.compute_aggregate_ratings`): a config that ran in *any* fixture gets a
-    row, so a config present in only one fixture is no longer silently dropped.
+    :func:`elo_report.compute_aggregate_ratings`): a config that ran in *any*
+    fixture gets a row, so a config present in only one fixture is no longer
+    silently dropped.
 
     Aggregation (Open-Q3 / decision 10) is per-fixture NORMALIZED composite →
     mean with a small-sample CI:

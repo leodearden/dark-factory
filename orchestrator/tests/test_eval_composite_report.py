@@ -1,9 +1,9 @@
 """Tests for evals/report.py — the C4 composite report surface (task 2477 λ).
 
-Covers the statistics substrate (mean_ci95, _ratio_score), the per-config
-price table, the composite report over the UNION of configs (retiring the
-all-tasks-intersection collapse), its deterministic renderer, and the
-union-aggregation of Elo ratings.
+Covers _ratio_score, the composite report over the UNION of configs (retiring
+the all-tasks-intersection collapse) and its deterministic renderer. The leaves
+report.py builds on are tested beside them: test_eval_stats, test_eval_prices,
+test_eval_table_render, test_eval_cell_admission and test_eval_elo_report.
 """
 
 from __future__ import annotations
@@ -410,8 +410,8 @@ class TestBuildCompositeReport:
         The composite row is the surface ``select_survivors`` ranks on, so a
         fabricated 0 here reads as "this candidate's plan_quality was fully
         validity-bounded" for a corpus in which nothing bounded it — the same
-        inversion ``report._judged_blind_count`` refuses per config, and which
-        task 3632's campaign script inherits by consuming that count rather
+        inversion ``cell_admission.judged_blind_count`` refuses per config, and
+        which task 3632's campaign script inherits by consuming that count rather
         than deriving its own (reviewer: architecture-coherence).
         """
         from orchestrator.evals.report import build_composite_report
@@ -1478,7 +1478,8 @@ class TestPlanRateIsTheReliabilityColumn:
         A fabricated ``0.0`` would slander a config that never ran an architect
         cell ("it never planned"); a fabricated ``1.0`` would flatter it ("it
         always planned"). Only ``None`` says the true thing: we measured
-        nothing (``_mean_plan_quality`` / ``_optional_float_cell`` precedent).
+        nothing (``cell_admission.mean_plan_quality`` /
+        ``table_render.optional_float_cell`` precedent).
         """
         from orchestrator.evals.report import build_composite_report
 
@@ -1501,8 +1502,8 @@ class TestBothSurfacesReportTheSamePlanRate:
     hold (``n`` / ``no_plan``). Deriving it twice would leave two tables free to
     answer the reliability question differently — the "two exclusion surfaces
     that disagree are worse than one" hazard this module repeatedly closes, most
-    recently by :func:`_mean_plan_quality` (task 3099) and
-    :func:`_plan_quality_score` (task 3302).
+    recently by :func:`cell_admission.mean_plan_quality` (task 3099) and
+    :func:`cell_admission.plan_quality_score` (task 3302).
     """
 
     def test_the_theta_aggregate_carries_the_same_hand_computed_rate(self):
@@ -1631,9 +1632,10 @@ class TestCostPerUsablePlan:
         """One admission decision sources both numerator and denominator.
 
         A refused cell's recorded $0.00 is the price of a run that never
-        happened, not a measurement — the same reason ``_is_unmeasurable`` keeps
-        it out of the ``cost`` pool. Letting it into the numerator would DILUTE
-        $/plan with a free run, reporting the cap window as a discount.
+        happened, not a measurement — the same reason
+        ``cell_admission.is_unmeasurable`` keeps it out of the ``cost`` pool.
+        Letting it into the numerator would DILUTE $/plan with a free run,
+        reporting the cap window as a discount.
         """
         from orchestrator.evals.report import build_composite_report
 
@@ -1813,11 +1815,12 @@ class TestTheReliabilityColumnsAreRendered:
 class TestTheDiscardedJudgeScoreIsLoggedNotSwallowed:
     """The floor DISCARDS a persisted LLM-judge score — loudly, or not at all.
 
-    `_plan_quality_score`'s warning is the ONLY runtime signal that a number
-    written to disk was overridden at read time, and the two-scorer disagreement
-    it reports (Graphiti e2066ec6) is exactly what an operator needs to see. An
-    untested log line is a log line a refactor deletes (reviewer: test-coverage);
-    these also exercise the `where=` plumbing that exists solely to serve it.
+    `cell_admission.plan_quality_score`'s warning is the ONLY runtime signal
+    that a number written to disk was overridden at read time, and the
+    two-scorer disagreement it reports (Graphiti e2066ec6) is exactly what an
+    operator needs to see. An untested log line is a log line a refactor deletes
+    (reviewer: test-coverage); these also exercise the `where=` plumbing that
+    exists solely to serve it.
     """
 
     _LOGGER = 'orchestrator.evals.cell_admission'
@@ -1889,8 +1892,8 @@ class TestTheDiscardedJudgeScoreIsLoggedNotSwallowed:
         """Each surface reports the floor decisions IT made: the accessor is
         pure, so the warning belongs to the build that read the cell. The CLI
         builds both, so a floored cell warns once per surface — documented on
-        :func:`_plan_quality_score`, and pinned here so the count is a decision
-        rather than an accident.
+        :func:`cell_admission.plan_quality_score`, and pinned here so the count
+        is a decision rather than an accident.
         """
         from orchestrator.evals.report import build_plan_quality_report
 
