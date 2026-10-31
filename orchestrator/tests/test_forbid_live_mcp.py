@@ -4,7 +4,11 @@ fused-memory MCP round-trip fails the test at once, even through a retrying call
 from __future__ import annotations
 
 import asyncio
+import json
+import subprocess
+import sys
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 import pytest
 from shared.mcp_session import McpSession
@@ -14,6 +18,7 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.scheduler import Scheduler
 
 _PROMPT_SECS = 5
+_WORKSPACE_PACKAGES = ('shared', 'orchestrator')
 _REAL_INITIALIZE = McpSession.initialize
 _REAL_CALL = McpSession.call
 
@@ -76,3 +81,24 @@ def test_every_test_is_guarded_without_requesting_the_fixture() -> None:
 def test_real_mcp_session_marker_leaves_mcp_session_unpatched() -> None:
     assert McpSession.initialize is _REAL_INITIALIZE
     assert McpSession.call is _REAL_CALL
+
+
+def test_importing_the_guard_loads_no_workspace_package() -> None:
+    probe = (
+        'import json, sys, _live_mcp_guard; '
+        f'print(json.dumps(sorted(set({_WORKSPACE_PACKAGES!r}) & set(sys.modules))))'
+    )
+    child = subprocess.run(
+        [sys.executable, '-c', probe],
+        cwd=Path(__file__).parent,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert child.returncode == 0, child.stderr
+
+    leaked = json.loads(child.stdout)
+    assert leaked == [], (
+        f'importing _live_mcp_guard loaded {leaked}; conftest.py imports it '
+        'before putting this worktree\'s src dirs on sys.path'
+    )
