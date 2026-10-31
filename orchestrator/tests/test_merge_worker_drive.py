@@ -116,6 +116,9 @@ class TestScannersRecogniseTheTeardownHelper:
     """Both wait scanners match the teardown helper by name, so each source
     here spells it through ``stop_merge_worker.__name__``: renaming the helper
     reddens this class instead of silently disabling the two guards.
+
+    Only recognition is pinned here. The billing and finally-guard rules are
+    pinned in test_wait_budget_audit.py and test_wait_hygiene_scan.py.
     """
 
     def test_wait_budget_audit_bills_the_default_join(self) -> None:
@@ -128,16 +131,6 @@ class TestDefaultJoin:
 
         assert budgets == {'TestDefaultJoin::test_it': STOP_WORKER_JOIN_TIMEOUT}
 
-    def test_wait_budget_audit_bills_an_explicit_join_timeout(self) -> None:
-        source = f'''
-class TestExplicitJoin:
-    async def test_it(self):
-        await {stop_merge_worker.__name__}(worker, worker_task, join_timeout=20.0)
-'''
-        budgets = item_wait_budgets(source)
-
-        assert budgets == {'TestExplicitJoin::test_it': 20.0}
-
     def test_teardown_scan_reports_a_straight_line_call(self) -> None:
         source = f'''
 class TestUnguarded:
@@ -148,19 +141,6 @@ class TestUnguarded:
         offenders = unguarded_worker_teardown_items(source)
 
         assert offenders == ['TestUnguarded::test_it']
-
-    def test_teardown_scan_accepts_a_call_in_finally(self) -> None:
-        source = f'''
-class TestGuarded:
-    async def test_it(self):
-        try:
-            await wait_responsive(fut, timeout=5.0, label='x')
-        finally:
-            await {stop_merge_worker.__name__}(worker, worker_task)
-'''
-        offenders = unguarded_worker_teardown_items(source)
-
-        assert offenders == []
 
 
 class TestHeavyBarrierTimeoutConstant:
