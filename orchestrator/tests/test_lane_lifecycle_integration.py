@@ -597,7 +597,7 @@ class TestB7ReuseDispatchRefreshesRecordAge:
         ta.init('42', 'B7 task', 'd')
         ta.write_plan(_make_plan(1, 3, '42'))
 
-        lifecycle = harness.git_ops._lane_lifecycle
+        lifecycle = LaneLifecycle(harness.git_ops.worktree_base)
         old = _backdate_record(lifecycle, lane, days=30)
 
         old_pool = harness.git_ops.warm_lane_pool

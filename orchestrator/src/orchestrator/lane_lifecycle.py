@@ -21,7 +21,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeGuard
 
 from shared import safe_io
 
@@ -223,7 +223,7 @@ def _now_stamp() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _held_by(record: LaneRecord | None, task_id: str) -> bool:
+def _held_by(record: LaneRecord | None, task_id: str) -> TypeGuard[LaneRecord]:
     """True iff *record* is ``ASSIGNED``/``IN_USE`` for *task_id*."""
     return (
         record is not None
@@ -583,7 +583,7 @@ class LaneLifecycle:
         rec = self.read(lane)
         state = rec.state if rec is not None else None
 
-        if rec is not None and _held_by(rec, task_id):
+        if _held_by(rec, task_id):
             return rec  # idempotent no-op; no I/O
 
         registered_fields = {'branch': branch} if branch is not None else {}
@@ -634,14 +634,10 @@ class LaneLifecycle:
         """
         task_id = str(task_id)
         rec = self.read(lane)
-        if rec is None or not _held_by(rec, task_id):
-            found = (
-                'no readable record' if rec is None
-                else f'state={rec.state.value} task_id={rec.task_id!r}'
-            )
+        if not _held_by(rec, task_id):
             raise IllegalLaneTransition(
                 f'refusing updated_at refresh for lane {Path(lane).name!r}: '
-                f'task_id={task_id!r} does not hold it ({found})'
+                f'task_id={task_id!r} does not hold it (record={rec!r})'
             )
         refreshed = replace(rec, updated_at=_now_stamp())
         self._write(lane, refreshed)
