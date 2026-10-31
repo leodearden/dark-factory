@@ -147,7 +147,12 @@ from orchestrator.merge_lane.landing_evidence import (
 )
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
-from orchestrator.plan_descope import DoneStepIntegrityVerdict, check_done_step_integrity
+from orchestrator.plan_descope import (
+    DoneStepIntegrityVerdict,
+    check_done_step_integrity,
+    done_step_items,
+    done_step_records,
+)
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.recut_ruling import ruling_to_enforce
 from orchestrator.review_inputs import gather_review_subject, review_fork_point
@@ -5682,18 +5687,29 @@ class TaskWorkflow:
         changed_files: list[str], text_drift: TaskTextDrift | None,
     ) -> WorkflowOutcome | None:
         """Until β and the prerequisite check pass, every exit puts *before* back, so the next dispatch revalidates under β instead of taking the completion pass or fresh-plan branch."""
-        accepted = False
         try:
             outcome = (
                 await self._run_architect_for_plan(build_prompt)
                 or await self._enforce_done_step_integrity(before, changed_files, text_drift)
                 or await self._validate_prerequisites_or_block('initial plan')
             )
-            accepted = outcome is None
-            return outcome
-        finally:
-            if not accepted:
-                self._restore_plan(before)
+        except BaseException:
+            self._restore_plan_under_exception(before)
+            raise
+        if outcome is not None:
+            self._restore_plan(before)
+        return outcome
+
+    def _restore_plan_under_exception(self, before: dict) -> None:
+        """Restore *before* while another exception propagates, logging a restore failure instead of raising it over that exception."""
+        try:
+            self._restore_plan(before)
+        except Exception:
+            logger.exception(
+                'Task %s: could not restore the pre-revalidation plan; the revised '
+                'plan stays on disk, done steps to put back by hand: %s',
+                self.task_id, list(done_step_records(before)),
+            )
 
     async def _enforce_done_step_integrity(
         self, before: dict, changed_files: list[str], text_drift: TaskTextDrift | None,
@@ -9858,7 +9874,7 @@ class TaskWorkflow:
         ``base..HEAD`` patch-id map from scratch (~4 subprocesses, one of them
         a full-range ``git log -p``). With N orphans that is N such rebuilds.
         The bill is bounded and only ever charged on the already-degraded
-        orphaned-step path — a clean pass has no ``done_items`` failing the
+        orphaned-step path — a clean pass has no ``done_step_items`` failing the
         ``is_ancestor`` check at all and calls it zero times — and the WIP
         run's own filename union is now materialised lazily so tier 1 hits stop
         paying for it. n is the number of ORPHANED done steps in one pass,
@@ -9983,13 +9999,7 @@ class TaskWorkflow:
                     wip_files = collected
                 return wip_files
 
-            done_items = [
-                item
-                for col in ('prerequisites', 'steps')
-                for item in self.plan.get(col, [])
-                if isinstance(item, dict) and item.get('status') == 'done' and item.get('commit')
-            ]
-            for item in done_items:
+            for item in done_step_items(self.plan):
                 commit = item['commit']
                 if await self.git_ops.is_ancestor(commit, head):
                     continue  # still reachable — nothing to reconcile

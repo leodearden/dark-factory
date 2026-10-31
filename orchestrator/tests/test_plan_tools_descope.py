@@ -26,6 +26,7 @@ from orchestrator.plan_descope import (
     DESCOPED_STEPS_KEY,
     RESCOPED_AT_KEY,
     RESCOPED_BY_KEY,
+    RESCOPED_BY_UNKNOWN,
     RESCOPED_NOTE_KEY,
 )
 
@@ -102,6 +103,21 @@ class TestRecordDescopedStep:
         _record(artifacts)
 
         assert artifacts.read_plan()[RESCOPED_BY_KEY] == 'orch-sess-1'
+
+    def test_rescoped_by_is_a_str_marker_with_no_session_in_hand(self, artifacts):
+        _seed_plan(artifacts)
+        assert '_session_id' not in artifacts.read_plan()
+        assert artifacts.read_agent_session() is None
+
+        _record(artifacts)
+
+        assert artifacts.read_plan()[RESCOPED_BY_KEY] == RESCOPED_BY_UNKNOWN
+
+    def test_a_prefix_of_a_recorded_commit_upserts_the_same_entry(self, artifacts):
+        _seed_plan(artifacts)
+        _record(artifacts, commit='309c22ab6f' + '0' * 30)
+
+        assert _record(artifacts, commit='309c22ab6f')['descoped_steps'] == 1
 
     def test_out_of_vocabulary_disposition_is_refused_without_a_write(self, artifacts):
         _seed_plan(artifacts)

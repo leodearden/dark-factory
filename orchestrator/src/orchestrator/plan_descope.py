@@ -10,6 +10,7 @@ __all__ = [
     'DESCOPE_PLAN_KEYS',
     'RESCOPED_AT_KEY',
     'RESCOPED_BY_KEY',
+    'RESCOPED_BY_UNKNOWN',
     'RESCOPED_NOTE_KEY',
     'DescopedStep',
     'DoneRecord',
@@ -19,7 +20,9 @@ __all__ = [
     'check_done_step_integrity',
     'commits_match',
     'descope_record_of',
+    'done_step_items',
     'done_step_records',
+    'same_done_record',
 ]
 
 RESCOPED_AT_KEY = '_rescoped_at'
@@ -32,6 +35,7 @@ DESCOPE_PLAN_KEYS: tuple[str, ...] = (
     RESCOPED_NOTE_KEY,
     DESCOPED_STEPS_KEY,
 )
+RESCOPED_BY_UNKNOWN = 'unknown'
 
 DESCOPE_DISPOSITIONS: frozenset[str] = frozenset({'orphan', 'revert', 'ride-along'})
 
@@ -84,6 +88,10 @@ class DescopedStep:
             note=_non_blank_str('note', obj.get('note')),
         )
 
+    @property
+    def done_record(self) -> DoneRecord:
+        return (self.step_id, self.commit)
+
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
 
@@ -126,14 +134,19 @@ class DoneStepIntegrityVerdict:
         )
 
 
-def done_step_records(plan: Mapping) -> tuple[DoneRecord, ...]:
-    """``(id, commit)`` of every done prerequisite/step that records a commit."""
-    return tuple(
-        (str(item.get('id')), str(item['commit']))
+def done_step_items(plan: Mapping) -> list[dict]:
+    """Every done prerequisite/step that records a commit, as the plan's own dicts."""
+    return [
+        item
         for column in ('prerequisites', 'steps')
         for item in plan.get(column) or []
         if isinstance(item, dict) and item.get('status') == 'done' and item.get('commit')
-    )
+    ]
+
+
+def done_step_records(plan: Mapping) -> tuple[DoneRecord, ...]:
+    """``(id, commit)`` of every :func:`done_step_items` entry."""
+    return tuple((str(item.get('id')), str(item['commit'])) for item in done_step_items(plan))
 
 
 def commits_match(a: str, b: str) -> bool:
@@ -162,16 +175,19 @@ def check_done_step_integrity(before: Mapping, after: Mapping) -> DoneStepIntegr
     )
 
 
+def same_done_record(a: DoneRecord, b: DoneRecord) -> bool:
+    """The same step id, and commits that :func:`commits_match`."""
+    a_id, a_commit = a
+    b_id, b_commit = b
+    return a_id == b_id and commits_match(a_commit, b_commit)
+
+
 def _has_match(record: DoneRecord, candidates: Iterable[DoneRecord]) -> bool:
-    step_id, commit = record
-    return any(
-        other_id == step_id and commits_match(other_commit, commit)
-        for other_id, other_commit in candidates
-    )
+    return any(same_done_record(record, other) for other in candidates)
 
 
 def _is_disposed(record: DoneRecord, descoped: Iterable[DescopedStep]) -> bool:
-    return _has_match(record, ((entry.step_id, entry.commit) for entry in descoped))
+    return _has_match(record, (entry.done_record for entry in descoped))
 
 
 def _parse_descoped_steps(plan: Mapping) -> tuple[tuple[DescopedStep, ...], tuple[str, ...]]:

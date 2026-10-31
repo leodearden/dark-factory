@@ -1274,6 +1274,41 @@ async def test_revalidation_cancelled_mid_revision_restores_the_done_steps(
     _assert_restored(f, before)
 
 
+def _break_plan_writes(monkeypatch: pytest.MonkeyPatch) -> ArchitectAction:
+    def act(a: TaskArtifacts) -> None:
+        def refuse(*_args, **_kwargs) -> None:
+            raise OSError('plan.json: no space left on device')
+        monkeypatch.setattr(a, 'write_plan', refuse)
+    return act
+
+
+@pytest.mark.parametrize('crash', [
+    pytest.param(asyncio.CancelledError(), id='cancelled'),
+    pytest.param(RuntimeError('architect boom'), id='architect_error'),
+])
+@pytest.mark.asyncio
+async def test_a_failed_restore_is_logged_and_does_not_replace_the_propagating_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    crash: BaseException,
+):
+    f = _beta_fixture(tmp_path, _STEP_1_DONE_STEP_2_PENDING)
+    _scripted_architect(f, monkeypatch, [
+        [_wipe_to('step-1', 'step-2'), _break_plan_writes(monkeypatch), _crash(crash)],
+    ])
+
+    with (
+        caplog.at_level('ERROR', logger='orchestrator.workflow'),
+        pytest.raises(type(crash)) as excinfo,
+    ):
+        await f.wf._plan()
+
+    assert excinfo.value is crash
+    [record] = [r for r in caplog.records if 'restore' in r.getMessage()]
+    assert record.levelname == 'ERROR'
+    assert 'step-1' in record.getMessage()
+    assert _A in record.getMessage()
+
+
 @pytest.mark.parametrize('remedy_passes', [
     pytest.param(
         [[_wipe_to('step-9'), _record_drop('step-1', _A, 'esc-4032-1')]],

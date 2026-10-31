@@ -1511,13 +1511,15 @@ def _descope_refusal(exc: plan_descope.InvalidDescopeRecord) -> dict[str, Any]:
 
 
 def _upsert_descoped_step(entries: object, entry: plan_descope.DescopedStep) -> list:
-    """*entries* without any record of the same ``(step_id, commit)``, then *entry*."""
+    """*entries* without any record of *entry*'s ``plan_descope.same_done_record``, then *entry*."""
     def same_pair(old: object) -> bool:
+        if not isinstance(old, dict):
+            return False
+        old_id, old_commit = old.get('step_id'), old.get('commit')
         return (
-            isinstance(old, dict)
-            and old.get('step_id') == entry.step_id
-            and isinstance(old.get('commit'), str)
-            and plan_descope.commits_match(old['commit'], entry.commit)
+            isinstance(old_id, str)
+            and isinstance(old_commit, str)
+            and plan_descope.same_done_record((old_id, old_commit), entry.done_record)
         )
 
     kept = [old for old in entries if not same_pair(old)] if isinstance(entries, list) else []
@@ -1551,7 +1553,9 @@ def _record_descoped_step(
     entries = _upsert_descoped_step(plan.get(plan_descope.DESCOPED_STEPS_KEY), entry)
     plan[plan_descope.DESCOPED_STEPS_KEY] = entries
     plan[plan_descope.RESCOPED_AT_KEY] = datetime.now(UTC).isoformat()
-    plan[plan_descope.RESCOPED_BY_KEY] = _session_identity_in_hand(artifacts, plan)
+    plan[plan_descope.RESCOPED_BY_KEY] = (
+        _session_identity_in_hand(artifacts, plan) or plan_descope.RESCOPED_BY_UNKNOWN
+    )
     plan[plan_descope.RESCOPED_NOTE_KEY] = note
     artifacts.write_plan(plan, mutex_held=True)
     return _with_markup_repairs(

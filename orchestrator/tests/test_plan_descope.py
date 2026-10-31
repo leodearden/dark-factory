@@ -21,7 +21,9 @@ from orchestrator.plan_descope import (
     check_done_step_integrity,
     commits_match,
     descope_record_of,
+    done_step_items,
     done_step_records,
+    same_done_record,
 )
 
 
@@ -160,6 +162,12 @@ def test_four_char_prefix_does_not_keep_the_step():
     assert verdict.undisposed_drops == (('step-1', 'abcd'),)
 
 
+def test_same_done_record_needs_the_step_id_and_a_commit_match():
+    assert same_done_record(('step-1', _SHORT), ('step-1', _FULL))
+    assert not same_done_record(('step-1', _SHORT), ('step-2', _FULL))
+    assert not same_done_record(('step-1', 'abcd'), ('step-1', _FULL))
+
+
 # --- (f) duplicates ---------------------------------------------------------
 
 def test_introduced_duplicate_commit_is_refused_naming_both_steps():
@@ -192,6 +200,21 @@ def test_prerequisites_and_steps_are_both_done_records():
         prerequisites=[_step('pre-1', 'done', 'aaaaaaa111')],
     )
     assert set(done_step_records(plan)) == {('pre-1', 'aaaaaaa111'), ('step-1', 'bbbbbbb222')}
+
+
+def test_done_step_items_are_the_plans_own_dicts():
+    plan = _plan(
+        [_step('step-1', 'done', 'bbbbbbb222'), _step('step-2', 'done')],
+        prerequisites=[_step('pre-1', 'done', 'aaaaaaa111')],
+    )
+    items = done_step_items(plan)
+    assert [item['id'] for item in items] == ['pre-1', 'step-1']
+    assert items[0] is plan['prerequisites'][0]
+    assert items[1] is plan['steps'][0]
+
+
+def test_done_step_items_tolerate_a_null_column():
+    assert done_step_items({'steps': None, 'prerequisites': None}) == []
 
 
 def test_dropped_prerequisite_is_undisposed():
@@ -251,6 +274,16 @@ def test_from_mapping_round_trips_and_refuses_a_non_mapping():
     assert DescopedStep.from_mapping(entry).to_dict() == entry
     with pytest.raises(InvalidDescopeRecord):
         DescopedStep.from_mapping('step-1')
+
+
+@pytest.mark.parametrize('field', ['step_id', 'commit', 'disposition', 'authority', 'note'])
+def test_from_mapping_names_a_missing_field(field):
+    entry = _descope('step-1', '309c22ab6f')
+    del entry[field]
+    with pytest.raises(InvalidDescopeRecord) as excinfo:
+        DescopedStep.from_mapping(entry)
+    assert excinfo.value.field == field
+    assert excinfo.value.value is None
 
 
 def test_dispositions_are_the_closed_vocabulary():
