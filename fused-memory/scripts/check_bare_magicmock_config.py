@@ -195,7 +195,7 @@ Scoping the rule to orchestrator/tests instead would reintroduce exactly the
 a-list-decides-coverage failure mode the paragraph above rejects.
 
 What is deliberately NOT load-bearing: a wait on a bare ``ast.Name`` target, i.e. the
-``asyncio.wait_for(worker_task, ...)`` teardown join in ``_stop_worker``.  It sits
+``asyncio.wait_for(worker_task, ...)`` teardown join in ``stop_merge_worker``.  It sits
 inside ``contextlib.suppress(Exception)``, asserts nothing and swallows its own
 TimeoutError, so it cannot manufacture the flake this rule exists to prevent.  That
 exclusion is STRUCTURAL — the Name-vs-Attribute/Call distinction — precisely so it is
@@ -771,7 +771,7 @@ def _load_bearing_wait_target(node: ast.expr) -> str | None:
 
     Deliberately NOT load-bearing, and therefore excluded: the
     ``await asyncio.wait_for(worker_task, timeout=join_timeout)`` join in
-    ``_stop_worker``.  It targets a bare ``Name`` (the worker Task), sits inside
+    ``stop_merge_worker``.  It targets a bare ``Name`` (the worker Task), sits inside
     ``contextlib.suppress(Exception)``, asserts nothing, and swallows its own
     TimeoutError — so it cannot manufacture the flake task 3980 fixed, and
     stretching it would only slow teardown down.  The Name-vs-Attribute/Call

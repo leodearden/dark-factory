@@ -865,7 +865,7 @@ RESPONSIVE_WAIT_WALL_CAP = int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT)  
 # progress observable to the accounting, not to grow this number.  Never-narrow.
 MERGE_GATE_BARRIER_TIMEOUT = MERGE_RESULT_TIMEOUT // 3  # 15s
 
-# Default worker-task join of test_merge_queue_concurrent_verify.py::_stop_worker,
+# Default worker-task join of _merge_worker_drive.py::stop_merge_worker,
 # which `_wait_budget_audit.py::_call_wait_budget` bills for a bare call.
 STOP_WORKER_JOIN_TIMEOUT = 5.0
 

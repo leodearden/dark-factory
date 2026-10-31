@@ -1448,7 +1448,7 @@ class TestWallClockLoadBearingTarget:
     ``asyncio.wait(aws)`` and ``threading.Event.wait(timeout)`` out.
 
     The Name negative is the load-bearing one: it is what keeps the
-    ``_stop_worker`` teardown join — ``asyncio.wait_for(worker_task, ...)``,
+    ``stop_merge_worker`` teardown join — ``asyncio.wait_for(worker_task, ...)``,
     inside ``contextlib.suppress``, asserting nothing — exempt STRUCTURALLY by
     its Name-vs-Attribute/Call shape rather than by a hand-maintained name list.
     """
@@ -1483,7 +1483,7 @@ class TestWallClockLoadBearingTarget:
     def test_bare_name_target_is_not_load_bearing(self):
         """``worker_task`` → None.
 
-        THE load-bearing negative. ``_stop_worker``'s teardown join targets a
+        THE load-bearing negative. ``stop_merge_worker``'s teardown join targets a
         bare Name; that shape — not a name list — is what exempts it, which is
         what lets the rule scan every scope in every scanned file.
         """
@@ -1590,7 +1590,7 @@ class TestWallClockDeadlineDetection:
         assert all(v.lineno == 3 for v in violations), violations
 
     def test_a_name_targeted_teardown_join_is_clean(self):
-        """``_stop_worker``'s join stays exempt by its Name target, not by a list.
+        """``stop_merge_worker``'s join stays exempt by its Name target, not by a list.
 
         The rule scans every scope in every scanned file, so a module-level
         teardown helper is squarely in range.  It must stay silent anyway.
