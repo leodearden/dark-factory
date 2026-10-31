@@ -133,8 +133,10 @@ def test_the_merge_request_names_a_deploy_branch_the_worker_can_read(repo, scrat
     assert not os.path.exists(arguments["worktree"]), "the deploy worktree outlived its landing"
 
 
-def test_a_submit_that_is_already_done_lands_without_polling(repo, scratch):
-    queue = FakeMergeQueue(repo, submit="done")
+@pytest.mark.parametrize("status", ["done", "already_merged", "done_wip_recovery"])
+def test_a_submit_that_settled_as_landed_lands_without_polling(repo, scratch, status):
+    """done_wip_recovery landed too: only the WIP stash-pop after it conflicted."""
+    queue = FakeMergeQueue(repo, submit=status)
 
     landing, calls = _land(repo, queue)
 
@@ -142,6 +144,30 @@ def test_a_submit_that_is_already_done_lands_without_polling(repo, scratch):
     assert landing.landed_as == queue.merge_sha == _main(repo)
     assert (repo / CONFIG).read_bytes() == EDITED
     _assert_left_nothing_behind(repo, scratch)
+
+
+def test_a_submit_settlement_is_judged_by_git_not_by_its_status(repo, scratch):
+    """A submit status that claims no landing, while main carries the deploy
+    commit, is a landing."""
+    queue = FakeMergeQueue(repo, submit="blocked", lands_on={"blocked"})
+
+    landing, _ = _land(repo, queue)
+
+    assert landing.landed_as == _main(repo)
+    assert (repo / CONFIG).read_bytes() == EDITED
+    _assert_left_nothing_behind(repo, scratch)
+
+
+def test_a_wip_recovery_that_left_the_checkout_unsynced_is_refused(repo, scratch):
+    """The merge landed but the checkout's file is not main's: a reload
+    would re-read the old file, and the refusal says so rather than that
+    nothing landed."""
+    queue = FakeMergeQueue(repo, submit="done_wip_recovery", landing="ref_only")
+
+    refusal = _refused_by(repo, queue)
+
+    assert refusal.failure is LandingFailure.CHECKOUT_NOT_SYNCED
+    assert "nothing landed" not in refusal.detail, refusal.detail
 
 
 def test_a_rebased_landing_is_confirmed_by_patch_identity(repo, scratch):
@@ -301,6 +327,43 @@ def test_a_done_that_git_cannot_find_on_main_is_refused(repo, scratch):
     _assert_untouched(repo, before, scratch)
 
 
+def test_a_git_step_that_fails_while_creating_the_branch_is_git_failed(repo, scratch):
+    """No worktree can be added; the branch made for it is removed again."""
+    before = _main(repo)
+    blocker = repo / ".git" / "worktrees"
+    blocker.write_text("not a directory\n")
+    queue = FakeMergeQueue(repo)
+
+    refusal = _refused_by(repo, queue)
+    blocker.unlink()
+
+    assert refusal.failure is LandingFailure.GIT_FAILED
+    assert "worktree add" in refusal.detail, refusal.detail
+    assert queue.calls == []
+    _assert_untouched(repo, before, scratch)
+
+
+def test_a_git_failure_while_polling_cancels_the_request(repo, scratch):
+    """git cannot say whether a journaled request landed: the request is
+    cancelled rather than left live without its worktree."""
+    before = _main(repo)
+    queue = FakeMergeQueue(repo, states=["verifying", "journaled"])
+    handlers = queue.handlers()
+    handlers["merge_status"] = _acting_after(
+        handlers["merge_status"], lambda: git(repo, "update-ref", "-d", "refs/heads/main"),
+        when=lambda reply: reply["state"] == "journaled",
+    )
+
+    with FakeEscalationMcp(tool_handlers=handlers) as server:
+        refusal = _refusal(repo, server.port, timeout_secs=20)
+    git(repo, "update-ref", "refs/heads/main", before)
+
+    assert refusal.failure is LandingFailure.GIT_FAILED, refusal.detail
+    assert "journaled" in refusal.detail, refusal.detail
+    assert queue.calls_to("merge_cancel") == [{"request_id": queue.request_id}]
+    _assert_untouched(repo, before, scratch)
+
+
 def test_a_landing_the_checkout_never_synced_is_refused(repo, scratch):
     """main moved but the checkout's file did not: a reload would re-read
     the old file. The fake leaves the checkout dirty itself, so no clean
@@ -422,6 +485,37 @@ def test_journaled_and_unknown_keep_polling_to_done(repo, scratch):
     assert landing.landed_as == _main(repo)
 
 
+@pytest.mark.parametrize("state", ["no_record", "stale_record"])
+def test_an_unattributable_answer_with_the_commit_on_main_is_a_landing(repo, scratch, state):
+    queue = FakeMergeQueue(
+        repo, states=["verifying", {"state": state, "reason": "landing_unattributable"}],
+        lands_on={state},
+    )
+
+    landing, _ = _land(repo, queue)
+
+    assert landing.landed_as == _main(repo)
+    assert (repo / CONFIG).read_bytes() == EDITED
+    _assert_left_nothing_behind(repo, scratch)
+
+
+def test_an_attached_submit_naming_no_handle_polls_the_deploy_branch(repo, scratch):
+    """The server's attach can name neither an in-flight request nor a task;
+    the deploy branch is unique, so it names this deploy's request."""
+    queue = FakeMergeQueue(
+        repo,
+        submit={"status": "attached", "inflight_request_id": None, "inflight_task_id": None,
+                "poll_by": "branch", "pollable": False},
+        states=["verifying", "done"],
+    )
+
+    landing, _ = _land(repo, queue)
+
+    (submitted,) = queue.calls_to("merge_request")
+    assert queue.calls_to("merge_status") == [{"branch": submitted["branch"]}] * 2
+    assert landing.landed_as == _main(repo)
+
+
 def test_no_record_with_nothing_on_main_is_not_landed(repo, scratch):
     before = _main(repo)
     queue = FakeMergeQueue(repo, states=["queued", {"state": "no_record", "reason": "never_submitted"}])
@@ -444,9 +538,83 @@ def test_a_poll_the_transport_drops_is_retried(repo, scratch, capsys):
     _assert_left_nothing_behind(repo, scratch)
 
 
-class _SigtermStandIn:
-    """SIGTERM's disposition for a test: records each delivery rather than
-    ending the test run, so a SIGTERM land_file failed to take over, or
+def test_a_submit_whose_reply_was_lost_is_followed_by_its_branch(repo, scratch, capsys):
+    """The target restarted mid-submit: the queue may hold the request, so it
+    is asked about the deploy branch and the request it names is landed."""
+    queue = FakeMergeQueue(repo, lose_submit_reply=True, states=["verifying", "done"])
+
+    landing, _ = _land(repo, queue)
+
+    (submitted,) = queue.calls_to("merge_request")
+    assert queue.calls_to("merge_status") == [{"branch": submitted["branch"]}] * 2
+    assert landing.request_id == queue.request_id
+    assert landing.landed_as == _main(repo) == queue.merge_sha
+    assert "merge_request" in capsys.readouterr().err
+    _assert_left_nothing_behind(repo, scratch)
+
+
+def test_a_lost_submit_the_queue_never_recorded_is_torn_down(repo, scratch):
+    before = _main(repo)
+    queue = FakeMergeQueue(
+        repo, lose_submit_reply=True, states=[{"state": "no_record", "reason": "never_submitted"}],
+    )
+
+    refusal = _refused_by(repo, queue)
+
+    assert refusal.failure is LandingFailure.NOT_LANDED
+    assert "no_record" in refusal.detail, refusal.detail
+    _assert_untouched(repo, before, scratch)
+
+
+def test_a_lost_submit_the_queue_never_answers_for_keeps_the_deploy_branch(repo, scratch):
+    """Nothing rules out that the queue holds the request, so the worktree it
+    would land from is kept."""
+    queue = FakeMergeQueue(repo, lose_submit_reply=True, states=[TRANSPORT_FAULT])
+
+    refusal = _refused_by(repo, queue, timeout_secs=1)
+
+    assert refusal.failure is LandingFailure.TIMED_OUT
+    assert refusal.state == "unknown"
+    assert queue.calls_to("merge_cancel") == []
+    (submitted,) = queue.calls_to("merge_request")
+    worktree, branch = submitted["worktree"], f"task/{submitted['branch']}"
+    assert os.path.isdir(worktree), "a request that may be live lost its worktree"
+    for named in (worktree, branch):
+        assert named in refusal.detail, (named, refusal.detail)
+
+
+def test_teardown_tolerates_a_lane_that_already_removed_the_deploy_branch(repo, scratch):
+    def lane_cleans_up(repo, branch, worktree):
+        git(repo, "worktree", "remove", "--force", worktree)
+        git(repo, "branch", "-D", branch)
+
+    queue = FakeMergeQueue(repo, after_landing=lane_cleans_up)
+
+    landing, _ = _land(repo, queue)
+
+    assert landing.landed_as == _main(repo)
+    _assert_left_nothing_behind(repo, scratch)
+
+
+def test_a_teardown_git_refuses_keeps_the_landing(repo, scratch, capsys):
+    """The knob is on main: a deploy branch git will not remove is reported,
+    not raised over the landing."""
+    def lane_locks_the_worktree(repo, branch, worktree):
+        git(repo, "worktree", "lock", worktree)
+
+    queue = FakeMergeQueue(repo, after_landing=lane_locks_the_worktree)
+
+    landing, _ = _land(repo, queue)
+
+    assert landing.landed_as == _main(repo)
+    assert (repo / CONFIG).read_bytes() == EDITED
+    err = capsys.readouterr().err
+    assert landing.branch in err and "locked" in err, err
+
+
+class _SignalStandIn:
+    """A stop signal's disposition for a test: records each delivery rather
+    than ending the test run, so a signal land_file failed to take over, or
     re-delivered, is observable."""
 
     def __init__(self):
@@ -457,47 +625,57 @@ class _SigtermStandIn:
 
 
 @contextlib.contextmanager
-def _sigterm_stand_in():
-    stand_in = _SigtermStandIn()
-    previous = signal.signal(signal.SIGTERM, stand_in)
+def _stand_in_for(received):
+    stand_in = _SignalStandIn()
+    previous = signal.signal(received, stand_in)
     try:
         yield stand_in
     finally:
-        signal.signal(signal.SIGTERM, previous)
+        signal.signal(received, previous)
+
+
+def _acting_after(handler, action, *, when=lambda reply: True):
+    """*handler*, running *action* once it has a reply *when* accepts and
+    before that reply goes out."""
+    def act_mid_call(arguments):
+        reply = handler(arguments)
+        if when(reply):
+            action()
+        return reply
+    return act_mid_call
 
 
 def _terminating_after(handler, *, when=lambda reply: True):
     """*handler*, sending this process SIGTERM once it has a reply *when*
     accepts and holding that reply back a moment, so the signal reaches the
     main thread while it is still waiting on the call."""
-    def terminate_mid_call(arguments):
-        reply = handler(arguments)
-        if when(reply):
-            os.kill(os.getpid(), signal.SIGTERM)
-            time.sleep(0.2)
-        return reply
-    return terminate_mid_call
+    def terminate():
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(0.2)
+    return _acting_after(handler, terminate, when=when)
 
 
-def test_sigterm_while_polling_cancels_and_tears_down(repo, scratch):
-    """The deterministic runner stops a deploy with killpg: SIGTERM must
-    cancel the request rather than kill the process with it still live."""
+@pytest.mark.parametrize("received", [signal.SIGTERM, signal.SIGINT], ids=lambda sig: sig.name)
+def test_a_stop_signal_while_polling_cancels_and_tears_down(repo, scratch, received):
+    """The deterministic runner stops a deploy with killpg, an operator with
+    ^C: either must cancel the request rather than kill the process with it
+    still live."""
     before = _main(repo)
     queue = FakeMergeQueue(repo, states=["verifying"])
 
-    def terminate_once_polled():
+    def stop_once_polled():
         deadline = time.monotonic() + 10
         while not queue.calls_to("merge_status") and time.monotonic() < deadline:
             time.sleep(0.01)
-        os.kill(os.getpid(), signal.SIGTERM)
+        os.kill(os.getpid(), received)
 
-    with _sigterm_stand_in() as stand_in:
-        threading.Thread(target=terminate_once_polled, daemon=True).start()
+    with _stand_in_for(received) as stand_in:
+        threading.Thread(target=stop_once_polled, daemon=True).start()
         refusal = _refused_by(repo, queue, timeout_secs=20)
-        restored = signal.getsignal(signal.SIGTERM)
+        restored = signal.getsignal(received)
 
-    assert stand_in.caught == [], "land_file let SIGTERM through to the previous handler"
-    assert restored is stand_in, "land_file did not restore the previous SIGTERM handler"
+    assert stand_in.caught == [], f"land_file let {received.name} through to the previous handler"
+    assert restored is stand_in, f"land_file did not restore the previous {received.name} handler"
     assert refusal.failure is LandingFailure.INTERRUPTED
     assert queue.calls_to("merge_cancel") == [{"request_id": queue.request_id}]
     _assert_untouched(repo, before, scratch)
@@ -511,7 +689,8 @@ def test_sigterm_during_the_submit_is_held_until_the_request_can_be_cancelled(re
     handlers = queue.handlers()
     handlers["merge_request"] = _terminating_after(handlers["merge_request"])
 
-    with _sigterm_stand_in() as stand_in, FakeEscalationMcp(tool_handlers=handlers) as server:
+    with _stand_in_for(signal.SIGTERM) as stand_in, \
+            FakeEscalationMcp(tool_handlers=handlers) as server:
         refusal = _refusal(repo, server.port, timeout_secs=20)
 
     assert stand_in.caught == [], "land_file let SIGTERM through to the previous handler"
@@ -530,7 +709,8 @@ def test_sigterm_held_while_the_request_lands_is_redelivered(repo, scratch):
         handlers["merge_status"], when=lambda reply: reply["state"] == "done",
     )
 
-    with _sigterm_stand_in() as stand_in, FakeEscalationMcp(tool_handlers=handlers) as server:
+    with _stand_in_for(signal.SIGTERM) as stand_in, \
+            FakeEscalationMcp(tool_handlers=handlers) as server:
         landing = land_file(
             str(repo), CONFIG, _main(repo), EDITED,
             port=str(server.port), label=LABEL, message=MESSAGE, timeout_secs=20,
@@ -555,4 +735,5 @@ def test_failure_tags_are_the_wire_vocabulary():
         "queue_done_not_on_main",
         "checkout_not_synced",
         "invalid_change",
+        "git_failed",
     }

@@ -632,6 +632,29 @@ def test_a_dead_socket_fails_a_flip_at_the_landing(tmp_path, scratch):
     _assert_left_nothing_behind(repo, scratch)
 
 
+def test_a_git_failure_at_the_landing_still_ends_in_a_verdict(tmp_path, scratch):
+    """No deploy worktree can be added: the run fails with the landing's own
+    tag in its JSON verdict, for the predicate note, not with a traceback."""
+    config = _make_repo(tmp_path, "16")
+    repo = config.parent
+    before = head(repo)
+    blocker = repo / ".git" / "worktrees"
+    blocker.write_text("not a directory\n")
+    queue = FakeMergeQueue(repo)
+
+    with _target(queue, reload_report(config_path=str(config), applied=FLIP_TO_8)) as server:
+        proc = _run(server, config, "8")
+        tools = _tool_names(server)
+    blocker.unlink()
+
+    assert _failure(proc) == "git_failed"
+    assert _verdict(proc)["commit"] is None
+    assert "Traceback" not in proc.stderr, proc.stderr
+    assert tools == [], tools
+    assert head(repo) == before
+    _assert_left_nothing_behind(repo, scratch)
+
+
 # ---------------------------------------------------------------------------
 # Which interpreter runs the script's python steps
 #

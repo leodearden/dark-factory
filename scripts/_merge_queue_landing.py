@@ -17,7 +17,10 @@ exiting through `_config_reload_gate.die`.
 The deploy branch is torn down once its request can no longer land. A request
 still in flight when the deadline passes, or when SIGTERM/SIGINT arrives, is
 cancelled first; if the queue refuses that cancel, the branch and its worktree
-are kept, because the merge worker reads the request's source from them.
+are kept, because the merge worker reads the request's source from them. A
+submit whose reply the transport lost may still have been accepted, so the
+queue is then asked about the deploy branch by its unique name, and the
+request it names is waited for like any other.
 
 The calling heredoc's side of the contract (argv-only inputs, the script's
 directory on sys.path, the checkout venv's interpreter) is
@@ -37,13 +40,12 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from _config_reload_gate import die, load_transport, transport_not_importable_remedy
 
 try:
     from shared.merge_state import (
-        EPISTEMIC_STATES,
         LIVE_STATES,
         SUBMIT_NON_TERMINAL,
         SUBMIT_TERMINAL,
@@ -81,6 +83,7 @@ class LandingFailure(enum.StrEnum):
     QUEUE_DONE_NOT_ON_MAIN = "queue_done_not_on_main"
     CHECKOUT_NOT_SYNCED = "checkout_not_synced"
     INVALID_CHANGE = "invalid_change"
+    GIT_FAILED = "git_failed"
 
 
 class LandingNotConfirmed(Exception):
@@ -94,12 +97,28 @@ class LandingNotConfirmed(Exception):
         self.state = state
 
 
+class _GitFailed(LandingNotConfirmed):
+    """A git step of the landing failed; no merge state follows from it."""
+
+    def __init__(self, detail: str):
+        super().__init__(LandingFailure.GIT_FAILED, detail)
+
+
+class _ReplyLost(LandingNotConfirmed):
+    """A queue call whose reply the transport lost after the request may have
+    reached the tool: whether it ran is unknown, and so is the merge state."""
+
+    def __init__(self, detail: str):
+        super().__init__(LandingFailure.TRANSPORT_FAILED, detail, MergeState.unknown)
+
+
 @dataclass(frozen=True)
 class Landing:
-    """A confirmed landing: the request that carried it, the deploy branch
-    and commit, and the commit the queue reports it landed as."""
+    """A confirmed landing: the request that carried it (None when the queue's
+    answer named none), the deploy branch and commit, and the commit the queue
+    reports it landed as."""
 
-    request_id: str
+    request_id: str | None
     branch: str
     tip_sha: str
     landed_as: str
@@ -114,9 +133,14 @@ def land_file(
     *main_branch*, branching from *base_sha*, through the merge queue of the
     orchestrator whose escalation MCP listens on 127.0.0.1:*port*.
 
-    *timeout_secs* bounds the whole landing, defaulting to
+    *timeout_secs* bounds the wait for the queue, defaulting to
     DEFAULT_LANDING_TIMEOUT_SECS. A string is read as a number, so a caller
-    can pass an environment variable through unparsed.
+    can pass an environment variable through unparsed. The deadline is checked
+    between polls: a queue call in flight when it passes runs to its own reply
+    timeout (SUBMIT_REPLY_TIMEOUT_SECS for the submit, POLL_REPLY_TIMEOUT_SECS
+    for a poll), and a request still unsettled is then cancelled
+    (POLL_REPLY_TIMEOUT_SECS more), so land_file can return up to about 190 s,
+    plus its git teardown, after the deadline.
     """
     queue = _MergeQueue.connect(port)
     target = _Target(Path(repo), path, main_branch)
@@ -141,12 +165,18 @@ def land_or_exit(repo: str, path: str, base_sha: str, content: bytes, *, prog: s
 def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: float,
           stop: _StopSignals, *, description: str) -> Landing:
     stop.check()
-    submitted = queue.submit(deploy, description=description)
-    settled = (
-        _poll_until_landed(queue, target, deploy, submitted, deadline, stop)
-        if _submit_pending(submitted) else submitted
-    )
-    return _confirmed(target, deploy, settled)
+    try:
+        submitted = queue.submit(deploy, description=description)
+    except _ReplyLost as lost:
+        print(f"{_LOG_PREFIX} {lost.detail}; asking the queue about {deploy.branch} instead",
+              file=sys.stderr)
+        pending = _Pending.after_lost_submit(deploy)
+    else:
+        if not _submit_pending(submitted, target, deploy):
+            return _confirmed(target, deploy, submitted)
+        pending = _Pending.submitted(submitted, deploy)
+    return _confirmed(target, deploy,
+                      _poll_until_landed(queue, target, deploy, pending, deadline, stop))
 
 
 # ---------------------------------------------------------------------------
@@ -156,10 +186,14 @@ def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: 
 class _CeilingReached(Exception):
     """The landing's deadline passed with its request still unsettled."""
 
+    failure = LandingFailure.TIMED_OUT
+
 
 class _Interrupted(BaseException):
     """SIGTERM or SIGINT arrived. A BaseException, so that no transport-fault
     handler can swallow it."""
+
+    failure = LandingFailure.INTERRUPTED
 
     def __init__(self, received: signal.Signals):
         super().__init__(f"interrupted by {received.name}")
@@ -239,10 +273,11 @@ def _run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
 
 
 def _git(cwd: Path, *args: str) -> str:
-    """git's stdout, stripped; raising with git's own stderr on failure."""
+    """git's stdout, stripped; raising _GitFailed with git's own stderr on
+    failure."""
     proc = _run_git(cwd, *args)
     if proc.returncode != 0:
-        raise RuntimeError(
+        raise _GitFailed(
             f"git -C {cwd} {' '.join(args)} failed (rc={proc.returncode}): "
             f"{proc.stderr.decode(errors='replace').strip()}"
         )
@@ -315,7 +350,15 @@ class _DeployBranch:
         branch = f"task/deploy-{label}-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
         worktree = _worktree_in(scratch)
         try:
-            _git(target.repo, "worktree", "add", "-q", "-b", branch, str(worktree), base_sha)
+            # Its own step, not `worktree add -b`: that leaves the branch it
+            # made when the worktree fails, and fails the same way when a
+            # branch of that name already exists, which is not ours to delete.
+            _git(target.repo, "branch", "--no-track", branch, base_sha)
+        except BaseException:
+            shutil.rmtree(scratch, ignore_errors=True)
+            raise
+        try:
+            _git(target.repo, "worktree", "add", "-q", str(worktree), branch)
             (worktree / target.path).write_bytes(content)
             _git(worktree, "commit", "-q", "--no-verify", "-m", message, "--", target.path)
             tip = _git(worktree, "rev-parse", "HEAD")
@@ -332,6 +375,12 @@ class _DeployBranch:
     def bare_id(self) -> str:
         """The branch without its `task/` prefix: the id the queue knows it by."""
         return self.branch.removeprefix("task/")
+
+    @property
+    def status_handle(self) -> dict[str, str]:
+        """The merge_status arguments naming this branch's most recent
+        request: the branch is unique, so that request is this deploy's."""
+        return {"branch": self.bare_id}
 
     def tear_down(self) -> None:
         _tear_down(self.repo, self.scratch, self.branch)
@@ -372,13 +421,21 @@ def _worktree_in(scratch: Path) -> Path:
 
 def _tear_down(repo: Path, scratch: Path, branch: str) -> None:
     """Remove the deploy worktree, its branch and the scratch directory,
-    whichever of them still exist."""
+    whichever of them still exist. A step git refuses is reported on stderr,
+    never raised: tidying up must not replace the landing's own outcome."""
     worktree = _worktree_in(scratch)
-    if worktree.exists():
-        _git(repo, "worktree", "remove", "--force", str(worktree))
-    _git(repo, "worktree", "prune")
+    removals: list[tuple[str, ...]] = (
+        [("worktree", "remove", "--force", str(worktree))] if worktree.exists() else []
+    )
+    removals.append(("worktree", "prune"))
     if _run_git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0:
-        _git(repo, "branch", "-D", branch)
+        removals.append(("branch", "-D", branch))
+    for args in removals:
+        proc = _run_git(repo, *args)
+        if proc.returncode != 0:
+            print(f"{_LOG_PREFIX} could not tear down {branch} in {repo}: git {' '.join(args)} "
+                  f"failed (rc={proc.returncode}): {proc.stderr.decode(errors='replace').strip()}",
+                  file=sys.stderr)
     shutil.rmtree(scratch, ignore_errors=True)
 
 
@@ -386,29 +443,41 @@ def _tear_down(repo: Path, scratch: Path, branch: str) -> None:
 # The merge queue
 # ---------------------------------------------------------------------------
 
+class _ToolCall(Protocol):
+    """`legibility.census_trigger.post_mcp_tool_call`'s signature."""
+
+    def __call__(self, url: str, tool_name: str, arguments: dict, *,
+                 timeout: float = ...) -> dict: ...
+
+
 @dataclass(frozen=True)
 class _MergeQueue:
     """The target's merge queue, reached through its escalation MCP.
 
     The MCP is STATEFUL, so every call goes through the shared transport
     (`legibility.census_trigger.post_mcp_tool_call`), as reload_config's does.
+    *reply_lost* are the transport faults after which the request may have
+    reached the tool.
     """
 
     url: str
-    post: Any
+    post: _ToolCall
+    reply_lost: tuple[type[Exception], ...]
 
     @classmethod
     def connect(cls, port: str) -> _MergeQueue:
-        missing = _MERGE_STATE_UNAVAILABLE
         try:
-            census_trigger, _ = load_transport()
+            census_trigger, httpx = load_transport()
         except ImportError as exc:
-            missing = exc
-        if missing is not None:
-            raise LandingNotConfirmed(
-                LandingFailure.TRANSPORT_NOT_IMPORTABLE, transport_not_importable_remedy(missing),
-            ) from missing
-        return cls(f"http://127.0.0.1:{port}/mcp", census_trigger.post_mcp_tool_call)
+            raise _not_importable(exc) from exc
+        if _MERGE_STATE_UNAVAILABLE is not None:
+            raise _not_importable(_MERGE_STATE_UNAVAILABLE) from _MERGE_STATE_UNAVAILABLE
+        # A read that timed out or broke, or a server that hung up without
+        # answering, can follow a request the server received in full. A
+        # fault in the handshake reads the same, so it is treated the same:
+        # asking the queue afterwards costs one poll.
+        reply_lost = (httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError)
+        return cls(f"http://127.0.0.1:{port}/mcp", census_trigger.post_mcp_tool_call, reply_lost)
 
     def submit(self, deploy: _DeployBranch, *, description: str) -> dict:
         return self._call("merge_request", {
@@ -438,6 +507,11 @@ class _MergeQueue:
     def _call(self, tool: str, arguments: dict, *, timeout: float) -> dict:
         try:
             return self.post(self.url, tool, arguments, timeout=timeout)
+        except self.reply_lost as exc:
+            raise _ReplyLost(
+                f"{tool} sent to {self.url} got no reply, so it may have run: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
         except Exception as exc:
             # Broad on purpose, as in _config_reload_gate: every transport
             # fault leaves the queue's answer unknown.
@@ -447,9 +521,17 @@ class _MergeQueue:
             ) from exc
 
 
-def _submit_pending(submitted: dict) -> bool:
-    """Whether the submitted request must now be polled; False when the
-    submit itself settled it as landed. Raises for any other settlement."""
+def _not_importable(missing: ImportError) -> LandingNotConfirmed:
+    return LandingNotConfirmed(
+        LandingFailure.TRANSPORT_NOT_IMPORTABLE, transport_not_importable_remedy(missing),
+    )
+
+
+def _submit_pending(submitted: dict, target: _Target, deploy: _DeployBranch) -> bool:
+    """Whether the submitted request must now be polled. False when the submit
+    settled it and git finds the deploy commit on main, or the queue says it
+    landed (which _confirmed then holds to git). Raises for any other
+    settlement."""
     status = submitted.get("status")
     if "error" in submitted or (status not in SUBMIT_NON_TERMINAL and status not in SUBMIT_TERMINAL):
         code = f" (code {submitted['code']})" if submitted.get("code") else ""
@@ -459,56 +541,92 @@ def _submit_pending(submitted: dict) -> bool:
         )
     if status in SUBMIT_NON_TERMINAL:
         return True
-    if status in (MergeSubmitStatus.done, MergeSubmitStatus.already_merged):
+    if _submit_says_landed(status) or target.carries(deploy.tip):
         return False
     raise _not_landed(submitted, state=status)
 
 
+def _submit_says_landed(status: str | None) -> bool:
+    """Whether a settled submit *status* reports the merge landed: the ones
+    merge_status_answer.py::map_terminal_state serves as done."""
+    return status in (MergeSubmitStatus.done, MergeSubmitStatus.already_merged,
+                      MergeSubmitStatus.done_wip_recovery)
+
+
+@dataclass(frozen=True)
+class _Pending:
+    """A request still to be polled: the merge_status handle naming it, the
+    state it was last seen in, the queue's estimate of the wait (None when it
+    gave none), and the wait before the first poll (None: that estimate, else
+    the backoff)."""
+
+    handle: dict[str, str]
+    state: str
+    eta: float | None
+    first_wait: float | None
+
+    @classmethod
+    def submitted(cls, reply: dict, deploy: _DeployBranch) -> _Pending:
+        eta = _eta(reply)
+        return cls(_poll_handle(reply, deploy), reply["status"], eta, eta)
+
+    @classmethod
+    def after_lost_submit(cls, deploy: _DeployBranch) -> _Pending:
+        """A submit whose reply was lost: asked at once, by the deploy
+        branch, what the queue made of it."""
+        return cls(deploy.status_handle, MergeState.unknown, None, 0.0)
+
+
 def _poll_until_landed(queue: _MergeQueue, target: _Target, deploy: _DeployBranch,
-                       submitted: dict, deadline: float, stop: _StopSignals) -> dict:
-    """The merge_status reply that shows the submitted request landed,
-    cancelling the request if the deadline or a stop signal comes first."""
-    handle = _poll_handle(submitted)
-    state = submitted["status"]
-    eta = _eta(submitted)
-    backoff = _backoff()
+                       pending: _Pending, deadline: float, stop: _StopSignals) -> dict:
+    """The merge_status reply that shows the *pending* request landed,
+    cancelling the request if the deadline, a stop signal or a git failure
+    comes first."""
+    handle, state, eta = pending.handle, pending.state, pending.eta
+    request_id = handle.get("request_id")
+    wait, backoff = pending.first_wait, _backoff()
     try:
         while True:
-            _sleep_before_poll(eta if eta is not None else next(backoff), deadline, stop)
+            _sleep_before_poll(wait if wait is not None else next(backoff), deadline, stop)
             reply = queue.poll(handle)
-            if reply is None:
-                continue
-            state, eta = reply.get("state"), _eta(reply)
-            next_handle = _next_handle(reply, handle, target, deploy)
-            if next_handle is None:
-                return reply
-            handle = next_handle
-    except (_CeilingReached, _Interrupted) as stopped_by:
-        raise _stopped(queue, handle, state, stopped_by) from None
+            if reply is not None:
+                state, eta = reply.get("state"), _eta(reply)
+                request_id = handle.get("request_id") or reply.get("request_id") or request_id
+                next_handle = _next_handle(reply, handle, target, deploy)
+                if next_handle is None:
+                    return reply
+                handle = next_handle
+            wait = eta
+    except (_CeilingReached, _Interrupted, _GitFailed) as stopped_by:
+        raise _stopped(queue, request_id, handle, state, stopped_by) from None
 
 
-def _poll_handle(submitted: dict) -> dict[str, str]:
-    """The merge_status arguments naming the submitted request: an attached
-    submit names its own handle in `poll_by`."""
+def _poll_handle(submitted: dict, deploy: _DeployBranch) -> dict[str, str]:
+    """The merge_status arguments naming the submitted request, by the handle
+    an attached submit names in `poll_by`; one that names neither a request
+    nor a task is polled by the deploy branch."""
     poll_by = submitted.get("poll_by", "request_id")
     if poll_by == "task_id":
         return {"task_id": submitted["inflight_task_id"]}
     if poll_by == "branch":
-        return {"branch": submitted["branch"]}
+        return deploy.status_handle
     return {"request_id": submitted["request_id"]}
 
 
 def _next_handle(reply: dict, handle: dict[str, str], target: _Target,
                  deploy: _DeployBranch) -> dict[str, str] | None:
     """The handle to poll next, or None once *reply* shows the request
-    landed. Raises when it settled any other way."""
+    landed: the queue answers done, or, in any state but a live one, git finds
+    the deploy commit on main. Raises when it settled any other way."""
     state = reply.get("state")
     if state == MergeState.done:
         return None
+    if state in LIVE_STATES:
+        return handle
+    if target.carries(deploy.tip):
+        return None
     if state == MergeState.superseded:
         return _successor(reply)
-    if state in EPISTEMIC_STATES and target.carries(deploy.tip):
-        return None
     if _may_still_land(state):
         return handle
     raise _not_landed(reply, state=state)
@@ -535,32 +653,34 @@ def _may_still_land(state: str | None) -> bool:
 
 def _not_landed(reply: dict, *, state: str | None) -> LandingNotConfirmed:
     request_id = reply.get("request_id")
+    subject = f"merge request {request_id}" if request_id else "the deploy's merge request"
     reason = f" ({reply['reason']})" if reply.get("reason") else ""
     successor = f" superseded_by={reply['superseded_by']}" if reply.get("superseded_by") else ""
     return LandingNotConfirmed(
         LandingFailure.NOT_LANDED,
-        f"merge request {request_id} settled {state}{reason}{successor}: nothing landed",
+        f"{subject} settled {state}{reason}{successor}: nothing landed",
         state,
     )
 
 
-def _stopped(queue: _MergeQueue, handle: dict[str, str], state: str | None,
-             stopped_by: BaseException) -> LandingNotConfirmed:
-    """The refusal for a poll *stopped_by* the deadline or a stop signal with
-    the request still *state*, after asking the queue to cancel it."""
-    failure = (LandingFailure.TIMED_OUT if isinstance(stopped_by, _CeilingReached)
-               else LandingFailure.INTERRUPTED)
-    request_id = handle.get("request_id")
+def _stopped(queue: _MergeQueue, request_id: str | None, handle: dict[str, str],
+             state: str | None,
+             stopped_by: _CeilingReached | _Interrupted | _GitFailed) -> LandingNotConfirmed:
+    """The refusal for a poll *stopped_by* the deadline, a stop signal or a
+    git failure with the request still *state*, after asking the queue to
+    cancel it."""
     stopped = f"{stopped_by} with merge request {request_id or handle} still {state}"
     if request_id is None:
-        return LandingNotConfirmed(failure, f"{stopped}; it has no request id to cancel", state)
+        return LandingNotConfirmed(
+            stopped_by.failure, f"{stopped}; it has no request id to cancel", state,
+        )
     try:
         reply = queue.cancel(request_id)
     except LandingNotConfirmed as fault:
-        return LandingNotConfirmed(failure, f"{stopped}; {fault.detail}", state)
+        return LandingNotConfirmed(stopped_by.failure, f"{stopped}; {fault.detail}", state)
     code = f" code={reply['code']}" if reply.get("code") else ""
     return LandingNotConfirmed(
-        failure,
+        stopped_by.failure,
         f"{stopped}; merge_cancel answered cancelled={reply.get('cancelled')} "
         f"state={reply.get('state')}{code}",
         reply.get("state") or state,
@@ -588,13 +708,15 @@ def _backoff() -> Iterator[float]:
 # ---------------------------------------------------------------------------
 
 def _confirmed(target: _Target, deploy: _DeployBranch, reply: dict) -> Landing:
-    """The Landing the queue's done *reply* claims, once git agrees."""
+    """The Landing *reply* settled, once git agrees: the deploy commit is on
+    main, and the checkout's file is main's."""
     request_id = reply.get("request_id")
     if not target.carries(deploy.tip):
+        reported = reply.get("state") or reply.get("status")
         raise LandingNotConfirmed(
             LandingFailure.QUEUE_DONE_NOT_ON_MAIN,
-            f"the queue reported request {request_id} done, but {target.main_branch} carries "
-            f"{deploy.tip} neither as an ancestor nor as an equal patch",
+            f"the queue reported request {request_id} {reported}, but {target.main_branch} "
+            f"carries {deploy.tip} neither as an ancestor nor as an equal patch",
             MergeState.done,
         )
     if not target.checkout_synced():
@@ -605,7 +727,7 @@ def _confirmed(target: _Target, deploy: _DeployBranch, reply: dict) -> Landing:
             MergeState.done,
         )
     return Landing(
-        request_id=str(request_id),
+        request_id=request_id,
         branch=deploy.branch,
         tip_sha=deploy.tip,
         landed_as=_reported_sha(reply) or target.main_tip(),

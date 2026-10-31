@@ -33,6 +33,11 @@ def sse_frame(payload):
 # The stateful escalation MCP, for real, on an ephemeral port
 # ---------------------------------------------------------------------------
 
+# A tool handler's answer for a call the server never answers: it hangs up
+# with no response at all, as a server that restarts mid-call does, after the
+# tool has run.
+DROP_REPLY = object()
+
 class FakeEscalationMcp:
     """A real HTTP server speaking the STATEFUL streamable-HTTP protocol the
     escalation MCP really speaks, answering `reload_config` with *report*.
@@ -65,8 +70,8 @@ class FakeEscalationMcp:
     read timeout.
 
     `tool_handlers` maps a tool name to a function of its arguments whose
-    return value is that tool's structuredContent. A tool without a handler
-    answers *report*, as reload_config does.
+    return value is that tool's structuredContent, or DROP_REPLY. A tool
+    without a handler answers *report*, as reload_config does.
     """
 
     SESSION_ID = "sess-5379-fake"
@@ -105,7 +110,11 @@ class FakeEscalationMcp:
                 except json.JSONDecodeError:
                     payload = {"_raw": raw.decode()}
                 outer.received.append((self.command, dict(self.headers), payload))
-                self._reply(*outer._respond(self.headers, payload))
+                response = outer._respond(self.headers, payload)
+                if response is None:
+                    self.close_connection = True
+                    return
+                self._reply(*response)
 
             def do_DELETE(self):
                 outer.received.append((self.command, dict(self.headers), {}))
@@ -128,7 +137,7 @@ class FakeEscalationMcp:
         self.port = self._httpd.server_port
 
     def _respond(self, headers, payload):
-        """(status, headers, body) for one request."""
+        """(status, headers, body) for one request, or None for no reply."""
         method = payload.get("method")
         if method != "initialize" and not headers.get("mcp-session-id"):
             return self.MISSING_SESSION_REPLY
@@ -147,7 +156,8 @@ class FakeEscalationMcp:
         self._dispatched.append((params.get("name"), params.get("arguments") or {}))
         handler = self.tool_handlers.get(params.get("name"))
         if handler is not None:
-            return self._structured(payload, handler(params.get("arguments") or {}))
+            content = handler(params.get("arguments") or {})
+            return None if content is DROP_REPLY else self._structured(payload, content)
         if self.tool_call_delay > 0:
             self._release.wait(self.tool_call_delay)
         return (armed and self.tool_call_reply) or self._structured(payload, self.report)

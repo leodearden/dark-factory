@@ -14,43 +14,60 @@ from __future__ import annotations
 
 import os
 import subprocess
+from collections.abc import Collection
 
-from config_reload_script_fakes import git
+from config_reload_script_fakes import DROP_REPLY, git
 
 DEPLOY_BRANCH_PREFIX = "refs/heads/task/deploy-"
 
-# A merge_status step that answers no tool result at all: the transport
-# refuses the envelope, as it would a reply cut off by a server restart.
+# A merge_status step whose reply carries no tool result: the transport
+# refuses the envelope.
 TRANSPORT_FAULT = object()
+
+# The answers that report a landing: merge_request's done and the two submit
+# statuses merge_status serves as done, and merge_status's own done.
+LANDING_ANSWERS = frozenset({"done", "already_merged", "done_wip_recovery"})
 
 
 class FakeMergeQueue:
     """One deploy request's scripted journey through a target's merge queue.
 
     *submit* is merge_request's status, or a dict of reply fields (an
-    `{error: ...}` reply among them). A submit of 'done' lands at once and
-    carries `commit`, as a wait_secs merge that finished inside the wait does.
+    `{error: ...}` reply among them). A settled submit in *lands_on* lands at
+    once and carries `commit`, as a wait_secs merge that finished inside the
+    wait does. *lose_submit_reply* accepts the submission as scripted, then
+    hangs up without replying.
 
     *states* is the merge_status sequence for this request's own id, one entry
     per poll with the last repeating; or a dict mapping each pollable handle to
-    its own sequence. An entry is a state, a dict of reply fields carrying
-    `state`, or TRANSPORT_FAULT. A handle the script does not know answers
-    *foreign_state*, as the queue's other requests would, and never lands
-    anything.
+    its own sequence. The deploy branch the request was submitted on, bare or
+    prefixed, names the request's own id. An entry is a state, a dict of reply
+    fields carrying `state`, or TRANSPORT_FAULT. A handle the script does not
+    know answers *foreign_state*, as the queue's other requests would, and
+    never lands anything.
 
-    *landing* is what reaching 'done' does to the repo: 'merge' (a `--no-ff`
-    merge in the main checkout, which syncs the working tree), 'cherry_pick'
-    (the rebased landing: patch-equal, tip not an ancestor), 'ref_only' (main
-    moves, the working tree does not) or 'none' (a phantom done).
+    *lands_on* is the submit statuses and poll states whose answer performs
+    the landing, LANDING_ANSWERS by default; a state outside it models a queue
+    that landed the request but answers otherwise. *landing* is what that does
+    to the repo: 'merge' (a `--no-ff` merge in the main checkout, which syncs
+    the working tree), 'cherry_pick' (the rebased landing: patch-equal, tip not
+    an ancestor), 'ref_only' (main moves, the working tree does not) or 'none'
+    (a phantom done). *after_landing*, if given, is then called with the repo,
+    the deploy branch and its worktree, as the lane's own clean-up would run.
     """
 
     REQUEST_ID = "mr-deploy0001"
 
     def __init__(self, repo, *, submit: str | dict = "queued", states=("done",), landing="merge",
                  eta_seconds=0.01, cancel_reply=None, foreign_state="done",
-                 request_id=REQUEST_ID):
+                 request_id=REQUEST_ID, lands_on: Collection[str] = LANDING_ANSWERS,
+                 lose_submit_reply=False,
+                 after_landing=None):
         self.repo = repo
         self.submit = submit if isinstance(submit, dict) else {"status": submit}
+        self.lands_on = frozenset(lands_on)
+        self.lose_submit_reply = lose_submit_reply
+        self.after_landing = after_landing
         self.sequences = {
             handle: list(steps)
             for handle, steps in (
@@ -64,6 +81,7 @@ class FakeMergeQueue:
         self.request_id = request_id
         self.calls = []
         self.branch = None
+        self.worktree = None
         self.merge_sha = None
         self._landed = False
         self._polls = {}
@@ -90,13 +108,18 @@ class FakeMergeQueue:
 
     def _merge_request(self, arguments):
         self.branch = f"task/{arguments.get('branch')}"
+        self.worktree = arguments.get("worktree")
         self._record("merge_request", arguments, self._observe_submission(arguments))
+        reply = self._submit_reply()
+        return DROP_REPLY if self.lose_submit_reply else reply
+
+    def _submit_reply(self):
         if "error" in self.submit:
             return dict(self.submit)
         status = self.submit["status"]
         if status in ("queued", "attached"):
             return {**self._queued_reply(status), **self.submit}
-        if status == "done":
+        if status in self.lands_on:
             self._land()
         return {
             "status": status,
@@ -104,13 +127,13 @@ class FakeMergeQueue:
             "reason": "",
             "conflict_details": "",
             "push_status": None,
-            "commit": self.merge_sha if status == "done" else None,
+            "commit": self.merge_sha if status in self.lands_on else None,
             **self.submit,
         }
 
     def _merge_status(self, arguments):
         self._record("merge_status", arguments, {})
-        handle = arguments.get("request_id") or arguments.get("task_id") or arguments.get("branch")
+        handle = self._sequence_key(arguments)
         steps = self.sequences.get(handle)
         if steps is None:
             return self._status_reply(handle, {"state": self.foreign_state})
@@ -120,9 +143,16 @@ class FakeMergeQueue:
         if step is TRANSPORT_FAULT:
             return None
         fields = step if isinstance(step, dict) else {"state": step}
-        if fields["state"] == "done":
+        if fields["state"] in self.lands_on:
             self._land()
         return self._status_reply(handle, fields)
+
+    def _sequence_key(self, arguments):
+        """The script entry a merge_status handle names."""
+        branch = arguments.get("branch")
+        if self.branch is not None and branch in (self.branch, self.branch.removeprefix("task/")):
+            return self.request_id
+        return arguments.get("request_id") or arguments.get("task_id") or branch
 
     def _merge_cancel(self, arguments):
         self._record("merge_cancel", arguments, {})
@@ -210,6 +240,8 @@ class FakeMergeQueue:
             raise ValueError(f"unknown landing {self.landing!r}")
         if self.landing != "none":
             self.merge_sha = git(self.repo, "rev-parse", "main").strip()
+        if self.after_landing is not None:
+            self.after_landing(self.repo, self.branch, self.worktree)
 
 
 def _rev_parse(repo, rev):
