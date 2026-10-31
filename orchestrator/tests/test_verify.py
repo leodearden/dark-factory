@@ -10899,6 +10899,9 @@ class TestRunVerificationGovernRouting:
 
         from orchestrator.config import ModuleConfig
         config, exec_file = self._make_govern_config(tmp_path)
+        # Under 'full', role='merge' injects --junitxml into the test leg,
+        # which would change the exact inner command this test pins.
+        config.merge_verify_breadth = 'scoped'
         module_config = ModuleConfig(
             prefix='pkg',
             test_command='pytest tests/x.py -v',
