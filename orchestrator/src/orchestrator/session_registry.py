@@ -393,8 +393,11 @@ class SessionRecord:
         ``session_hooks._env_slug_is_owned``. A non-int, bool, or
         non-positive value in a record body reads back as None instead of
         surviving unchanged (see ``_coerce_owner_pid``).
-    self_exit: true when the spawn was launched with CLAUDE_SPAWN_SELF_EXIT=1;
-        stamped at ``launching`` and preserved by every later
+    self_exit: true when the spawn launched with self-exit on: the default on
+        the tmux and terminal-emulator lanes (off with CLAUDE_SPAWN_SELF_EXIT=0),
+        opt-in on the T3 lane (CLAUDE_SPAWN_SELF_EXIT=1). spawn-claude.sh
+        resolves that and hands the registry 1 or empty; stamped at
+        ``launching`` and preserved by every later
         read-modify-write. Anything but a JSON true reads back as False.
     exit_request: the Stop hook's last self-exit evaluation, or None; written
         only when the ``exit-requested`` marker is present on a proven-owner

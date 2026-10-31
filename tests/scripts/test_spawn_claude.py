@@ -2641,11 +2641,12 @@ def test_trailer_asks_for_a_checkpoint_outcome_and_reflect(tmp_path: pathlib.Pat
     assert "/reflect" in after_exit_clause
 
 
+@pytest.mark.parametrize("lane", ["xterm", "tmux"])
 @pytest.mark.parametrize(("self_exit", "expected"), [
-    ("1", True), ("0", False), ("true", False), ("", False), (None, False),
+    (None, True), ("", True), ("true", True), ("1", True), ("0", False),
 ])
 def test_self_exit_input_stamps_the_record_and_gates_the_marker_instruction(
-    tmp_path: pathlib.Path, self_exit: str | None, expected: bool,
+    tmp_path: pathlib.Path, lane: str, self_exit: str | None, expected: bool,
 ) -> None:
     bin_dir = _make_bin_dir(tmp_path)
     prompt_file = tmp_path / "captured_prompt.txt"
@@ -2653,6 +2654,12 @@ def test_self_exit_input_stamps_the_record_and_gates_the_marker_instruction(
     _write_fake_claude_obeying_exit_marker(bin_dir, prompt_file, env_file)
     _write_foreground_terminal(bin_dir, "xterm")
     env = _base_env(bin_dir, "xterm")
+    if lane == "tmux":
+        _write_fake_tmux(bin_dir, tmp_path / "tmux_used")
+        env["CLAUDE_SPAWN_BACKEND"] = "tmux"
+        env["CLAUDE_SPAWN_PROJECT"] = "proj"
+    else:
+        env["CLAUDE_SPAWN_BACKEND"] = "wm"
     if self_exit is not None:
         env["CLAUDE_SPAWN_SELF_EXIT"] = self_exit
 
@@ -5255,3 +5262,16 @@ def test_t3_lane_self_exit_asks_the_thread_to_archive_itself(tmp_path: pathlib.P
     prompt = start.stdin
     assert "t3_thread_organize" in prompt and '"archive"' in prompt
     assert "exit-requested" not in prompt
+
+
+def test_t3_lane_leaves_self_exit_off_when_the_input_is_unset(tmp_path: pathlib.Path) -> None:
+    lane = _T3Lane(tmp_path)
+    lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
+    lane.env.pop("CLAUDE_SPAWN_SELF_EXIT", None)
+
+    result = lane.run()
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    (start,) = lane.started_threads()
+    assert "t3_thread_organize" not in start.stdin and "exit-requested" not in start.stdin
+    assert lane.record().self_exit is False

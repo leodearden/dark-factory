@@ -1,5 +1,7 @@
-"""The Stop hook's opt-in self-exit: decide from the record dir, then SIGINT the owning ``claude``.
+"""The Stop hook's self-exit: decide from the record dir, then SIGINT the owning ``claude``.
 
+On by default for tmux and terminal-emulator spawns (``CLAUDE_SPAWN_SELF_EXIT=0``
+opts out) and opt-in for T3 spawns; ``record.self_exit`` carries the outcome.
 A spawned session that has finished touches ``exit-requested`` in its record
 dir. On a proven-owner Stop, ``SelfExit.evaluate`` checks every precondition
 and returns the ``ExitRequest`` the hook stamps in its one write;
