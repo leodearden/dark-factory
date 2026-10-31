@@ -185,7 +185,7 @@ tasks:
       reason: release discipline is asserted by executed boundary rows 13, 14 and
         21
 - label: γ2
-  task_id: null
+  task_id: 7977
   title: Re-offer the laptop to a refused verify while it queues locally
   note: Amendment of 2026-10-31 (PRD decision 14). The config key is δ2's.
   capabilities:
