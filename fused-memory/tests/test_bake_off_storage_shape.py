@@ -29,10 +29,12 @@ tests assert exact values with no tolerances.
 """
 from __future__ import annotations
 
+import dataclasses
 import functools
 import re
 import subprocess
 import types
+import uuid
 from collections.abc import Container
 from pathlib import Path
 
@@ -3288,7 +3290,6 @@ class TestAuditRecallOverTheCommittedFixture:
 
 
 import copy  # noqa: E402
-import uuid  # noqa: E402
 
 
 def _count_detector_calls(monkeypatch, mod) -> list:
@@ -4255,7 +4256,6 @@ class TestTheTwoArtifactsAreWrittenAsAPair:
         )
 
 
-import dataclasses  # noqa: E402
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4270,8 +4270,8 @@ class _GitShim:
 
     @classmethod
     def install(cls, tmp_path: Path, monkeypatch) -> _GitShim:
-        import os  # noqa: PLC0415
-        import shutil  # noqa: PLC0415
+        import os
+        import shutil
 
         real = shutil.which('git')
         if real is None:
