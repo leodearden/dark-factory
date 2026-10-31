@@ -492,7 +492,7 @@ def _granted_files_blocker(harness: Any | None, task_id: str) -> GrantDelivery |
         return None
     try:
         blocker = probe(task_id)
-    except Exception:  # noqa: BLE001 — best-effort diagnostic
+    except Exception:
         logger.warning(
             'granted_files delivery probe failed for task %s (non-fatal)',
             task_id, exc_info=True,
