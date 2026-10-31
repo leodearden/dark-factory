@@ -21,9 +21,11 @@ Covers:
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -55,8 +57,13 @@ def test_extraction_module_imports_nothing_from_the_sweep():
     Probed in a FRESH interpreter: this test process has already imported the
     sweep, so an in-process ``sys.modules`` check would pass vacuously. The
     extraction round-trip at the end keeps the probe itself from silently
-    no-opping if the import ever stops resolving.
+    no-opping if the import ever stops resolving. Prepending this tree's
+    ``src`` to PYTHONPATH pins the probe to it, since PYTHONPATH outranks
+    whichever checkout the interpreter's editable install points at; the
+    env construction follows
+    ``shared/tests/test_pure_stdlib_leaves.py::run_python_child``.
     """
+    tree_under_test_src = Path(__file__).resolve().parents[2] / 'src'
     probe = (
         'import sys; '
         'import fused_memory.reconciliation.status_snapshot_extraction as x; '
@@ -65,7 +72,15 @@ def test_extraction_module_imports_nothing_from_the_sweep():
         "assert x.extract_snapshot_edge_task_ids('Task 5 is pending') == {5}"
     )
     result = subprocess.run(
-        [sys.executable, '-c', probe], capture_output=True, text=True, timeout=120
+        [sys.executable, '-c', probe],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={
+            **os.environ,
+            'PYTHONPATH': f'{tree_under_test_src}{os.pathsep}'
+            + os.environ.get('PYTHONPATH', ''),
+        },
     )
     assert result.returncode == 0, result.stderr
 
@@ -1229,12 +1244,13 @@ class TestExtractSnapshotEdgeTaskIds:
 
         The slash form was admitted to TASK_REF_RE so 'task/94' — the
         orchestrator's own branch-name convention — stops being invisible.
-        The cost is that the SAME spelling occurs inside paths, and this
-        module's path ends in memory_service.update_edge(invalid_at=...): the
-        first case below makes an edge asserting something about a WORKTREE
-        retirable as soon as task 94 goes terminal. That is over-selection,
-        the direction this module's docstring forbids, and it is newly
-        reachable — MEASURED set() before the widening.
+        The cost is that the SAME spelling occurs inside paths, and the
+        sweep's path (stale_status_snapshot_edge_sweep.py) ends in
+        memory_service.update_edge(invalid_at=...): the first case below makes
+        an edge asserting something about a WORKTREE retirable as soon as task
+        94 goes terminal. That is over-selection, the direction
+        status_snapshot_extraction.py's docstring calls unrecoverable, and it
+        is newly reachable — MEASURED set() before the widening.
 
         It is accepted rather than fixed. Excluding it would mean refusing a
         reference preceded by a path character, which would also refuse the
@@ -1534,8 +1550,9 @@ class TestExtractBlockedAssertionTaskIds:
         on an id it never put into its get_statuses census — i.e.
         cross-reference an assertion against a status it never looked up —
         and then permanently retire that edge. Over-selection is the
-        direction this module's docstring calls unrecoverable, so this
-        property is the one that must hold for inputs nobody enumerated.
+        direction status_snapshot_extraction.py's docstring calls
+        unrecoverable, so this property is the one that must hold for inputs
+        nobody enumerated.
 
         Driven from _SUBSET_PROPERTY_CORPUS rather than
         _BLOCKED_EXTRACTION_CASES on purpose (amendment,

@@ -10,13 +10,21 @@ invalidate any edge whose asserted non-terminal (active/pending/blocked/
 in-progress) status now contradicts a terminal task.
 
 Covers:
+- build_supersede_fact: the resulting-state-only fact written after a stale
+  blocked edge is retired, worded so the sweep's own extractor never selects
+  it again.
 - flatten_dedup_edges: flattens get_all_valid_edges' dict[entity_uuid,
   list[EdgeDict]] shape and dedups by edge uuid (handles the backend's
   double-attribution of each directed edge under both endpoint entities).
 - select_stale_status_snapshot_edges: pure decision core — selects edges
-  whose asserted status contradicts a positively-terminal current status.
+  whose asserted status contradicts a positively-terminal current status,
+  and, through is_blocked_assertion_contradicted, blocked assertions whose
+  task is positively known to be no longer blocked.
 - sweep_stale_status_snapshot_edges: async orchestrator — enumerates,
   cross-references, and invalidates, best-effort throughout.
+- sweep_stale_status_snapshot_edges_for_task: the same rules over a read
+  narrowed to one task's edges, and overlapping sweeps of one project
+  writing each superseding fact once.
 """
 
 from __future__ import annotations
