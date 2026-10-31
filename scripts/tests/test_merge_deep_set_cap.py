@@ -29,6 +29,7 @@ from config_reload_script_fakes import (
     ClosedPort,
     FakeEscalationMcp,
     commit_config,
+    failure_tag,
     git,
     head,
     init_repo,
@@ -256,8 +257,7 @@ def test_rerunning_at_the_cap_main_carries_dies_before_any_request(tmp_path, dep
         proc = _run(server, config, "6", env=deploy_env)
         received = list(server.received)
 
-    assert proc.returncode != 0, f"stdout={proc.stdout}"
-    assert f"nothing to land: main already carries {KNOB}=6" in proc.stderr, proc.stderr
+    assert failure_tag(proc) == "nothing_to_land"
     assert received == [], f"a no-op deploy reached the server: {received}"
     assert head(repo) == before
     _assert_left_nothing_behind(repo, deploy_env)
@@ -279,11 +279,54 @@ def test_a_cap_with_a_leading_zero_is_refused_before_anything_lands(tmp_path, de
         proc = _run(server, config, cap, env=deploy_env)
         received = list(server.received)
 
-    assert proc.returncode != 0, f"stdout={proc.stdout}"
-    assert "leading zero" in proc.stderr, f"stderr={proc.stderr}"
+    assert failure_tag(proc) == "invalid_cap"
     assert head(repo) == before
     assert config.read_text() == SEEDS["block_present"]
     assert received == [], f"a refused cap reached the server: {received}"
+    _assert_left_nothing_behind(repo, deploy_env)
+
+
+def test_a_config_main_does_not_track_is_refused_before_anything_lands(tmp_path, deploy_env):
+    """A config file main does not carry has no committed copy to edit, so
+    the run is refused with scripts/lib/deploy_main_copy.sh's own tag before
+    the server sees anything. The untracked file leaves the checkout dirty by
+    design, so only the scratch space is checked."""
+    config = _seeded(tmp_path)
+    repo = config.parent
+    before = head(repo)
+    untracked = repo / "untracked.yaml"
+    untracked.write_text(SEEDS["block_present"])
+    queue = FakeMergeQueue(repo)
+
+    with _target(queue, reload_report(config_path=str(untracked))) as server:
+        proc = _run(server, untracked, "6", env=deploy_env)
+        received = list(server.received)
+
+    assert failure_tag(proc) == "config_not_on_main"
+    assert head(repo) == before
+    assert received == [], f"an untracked config reached the server: {received}"
+    assert os.listdir(deploy_env["TMPDIR"]) == [], os.listdir(deploy_env["TMPDIR"])
+
+
+def test_a_config_step_1_cannot_edit_ends_in_a_verdict(tmp_path, deploy_env):
+    """main's copy is not UTF-8, so step 1's editor cannot read it: the run
+    ends in a tagged verdict rather than a bare traceback, before anything
+    lands."""
+    repo = init_repo(tmp_path)
+    config = repo / CONFIG
+    config.write_bytes(b"project_root: /nowhere\nmerge_deep:\n  chain_cap: 0\n# \xff\n")
+    git(repo, "add", CONFIG)
+    git(repo, "commit", "-q", "-m", "seed")
+    before = head(repo)
+    queue = FakeMergeQueue(repo)
+
+    with _target(queue, reload_report(config_path=str(config))) as server:
+        proc = _run(server, config, "6", env=deploy_env)
+        received = list(server.received)
+
+    assert failure_tag(proc) == "config_edit_failed"
+    assert head(repo) == before
+    assert received == [], f"an unedited config reached the server: {received}"
     _assert_left_nothing_behind(repo, deploy_env)
 
 
