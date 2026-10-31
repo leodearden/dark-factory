@@ -339,7 +339,8 @@ def positional_targets(
       * ``test_hook_ruff_targets_drift.py::_gate_ruff_targets`` — none; the
         list EQUALS the hook's ``RUFF_TARGETS``.
       * ``test_hook_magicmock_test_dirs_drift.py::_gate_magicmock_test_dirs``
-        — none; the list EQUALS the hook's ``MAGICMOCK_TEST_DIRS``.
+        — none, which is that checker's exact set; the list EQUALS the hook's
+        ``MAGICMOCK_TEST_DIRS``.
       * ``test_scripts_module_config.py::_targets`` — none for the ruff and
         pyright legs, which check MEMBERSHIP; its own ``_PYTEST_VALUE_FLAGS``
         for the pytest leg via ``_pytest_targets``, which checks MEMBERSHIP
@@ -365,18 +366,21 @@ def positional_targets(
     ``test_fallback_verify_config.py`` passes one at
     ``_fleet_pytest_suite_names``, which asserts no existence, and none at
     ``_lint_leg_targets``, which does. The remaining exposure is therefore
-    every set-less EXISTS or EQUALS row. The two set-less EXISTS rows each
+    every set-less EXISTS or EQUALS row whose checker takes a value flag at
+    all. The two set-less EXISTS rows and the hook's ruff EQUALS row each
     record it on their own extractor rather than papering over it here; the
-    two hook-drift EQUALS rows carry no such record yet.
+    hook's magicmock EQUALS row records on its extractor why that checker has
+    none.
 
     Discarding unrecognised tokens instead is not an option: that would silently
     shrink the target list and re-open the false-pass hazard the parsing exists
     to close. Widening the set is the caller's call, not this module's.
 
-    *path_anchor* is passed straight through to :func:`anchor_split`, for the
-    fifth caller ``test_fallback_verify_config.py::_lint_leg_targets`` (task
-    3883), whose ``check_bare_magicmock_config.py`` leg names the checker by
-    PATH. It is ORTHOGONAL to *value_flags*, and reading it as another policy
+    *path_anchor* is passed straight through to :func:`anchor_split`, for
+    callers reading the ``check_bare_magicmock_config.py`` leg, which names its
+    checker by PATH (first needed by
+    ``test_fallback_verify_config.py::_lint_leg_targets``, task 3883). It is
+    ORTHOGONAL to *value_flags*, and reading it as another policy
     knob would be a category error: *value_flags* is per-checker POLICY (which
     flags eat the following token — a fact about the checker's CLI), while
     *path_anchor* is a fact about how the checker was SPELLED on this particular
