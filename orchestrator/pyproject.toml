@@ -173,10 +173,10 @@ filterwarnings = [
 # Default per-test timeout — see shared/pyproject.toml for the full rationale
 # (UsageGate mock hang, make_gate_mock, asyncio-sleep footguns, and why this
 # is large rather than the original 60: the cap is WALL-CLOCK, so a healthy test
-# starved of CPU on a loaded 32-core host trips it and — under thread mode
-# plus --max-worker-restart=0 — reds a SHIFTING VICTIM rather than itself).
-# 420 is DERIVED FROM MEASUREMENT — worst unmarked per-test wall clock under
-# real fleet load x the 8x headroom factor — and no longer judgement-picked;
+# starved of CPU on a loaded 32-core host trips it; under signal it reds
+# itself, where thread mode plus --max-worker-restart=0 used to red a SHIFTING
+# VICTIM). 420 is DERIVED FROM MEASUREMENT — worst unmarked per-test wall clock
+# under real fleet load x the 8x headroom factor — and no longer judgement-picked;
 # the measurement and the value's history are in
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 # Slow tests opt out with @pytest.mark.timeout(N) — but N is NOT free, and
@@ -194,35 +194,31 @@ filterwarnings = [
 # The SINGLE home of this rationale, including why the marker beats this
 # setting, is shared/src/shared/testing_timeout_markers.py. Enforced by
 # tests/test_timeout_marker_inversion_guard.py.
-# timeout_method: thread is RETAINED. Its original premise, that xdist worker
-# subprocesses run pytest in a thread so signal cannot reach the test, is
-# falsified by tests/scripts/test_timeout_method_policy.py, where the
-# signal-vs-thread trade lives.
+# timeout_method: signal, decided on measurement by task 6354. The trade and
+# its measurement live in tests/scripts/test_timeout_method_policy.py.
 # UNCHANGED by every change of the value, deliberately: a raise attacks the
 # trigger, not the two safety mechanisms.
 # MIRRORED by tests/_orch_helpers.py::PYPROJECT_DEFAULT_TIMEOUT, which
 # test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants asserts against
 # this value with tomllib at runtime — edit the two together.
 timeout = 420
-timeout_method = "thread"
+timeout_method = "signal"
 # A test still running after this many seconds dumps every thread's stack to
-# the worker's stderr, which the verify log carries, so a hang whose kill comes
-# LATER than this is legible before the os._exit() below erases the worker.
-# Kept under verify's CLI --timeout=300 so an unmarked test dumps before it is
-# killed. Why stderr, and why not pytest-timeout's own banner:
+# the worker's stderr, which the verify log carries. Kept under verify's CLI
+# --timeout=300 so the dump lands before the cap fails an unmarked test. It is
+# the ONLY witness for a main thread stuck in a C call, which signal cannot
+# interrupt. Why stderr:
 # test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants, which pins it.
 faulthandler_timeout = 240
 # Parallelise the 2183-test orchestrator suite. ``-n auto`` picks worker
 # count from CPUs; ``--dist loadgroup`` keeps tests tagged with the same
 # xdist_group on a single worker (see test_cargo_scope.py /
 # test_stale_escalation_cleanup.py for the unsafe-to-share fixtures).
-# ``--max-worker-restart=0`` is the resilience net (task 1907): if any test
-# ever exceeds the timeout above, pytest-timeout's thread method
-# os._exit()s the xdist worker. With restarts allowed, xdist spawns a
-# replacement node that
-# re-collects the full suite and re-dies → restart/re-collect/re-die loop that
-# hangs the whole suite at ~98%. Disabling restarts degrades a worker death to
-# a single clean per-test failure instead of a suite-wide hang.
+# ``--max-worker-restart=0`` (task 1907) is kept under signal for the worker
+# deaths a timeout no longer causes (segfault, OOM kill, os._exit in code under
+# test): with restarts allowed, each replacement re-collects the full suite,
+# and two concurrent replacements can abort the session unattributed. The
+# reason, and the pin: tests/scripts/test_xdist_worker_restart_policy.py.
 # ``-m 'not warm_lane_bash'`` deselects the ported warm-lane bash bucket from
 # the default suite — PRD §11 q4 RE-DECIDED (task 3349, 2026-08-01): the
 # documented escape is taken and the bucket now runs post-merge on
@@ -285,15 +281,14 @@ dev = [
     # one every committed baseline number was measured with.
     #
     # The CEILING (<7) is not hygiene — it is what keeps the instrument from
-    # becoming a suite-truncating landmine. 7.0.1's cost grows roughly cubically
+    # becoming a timeout landmine. 7.0.1's cost grows roughly cubically
     # in file size (2,800 lines = 0.31s; 21,550 lines = 247s), so the whole
     # 22-path cluster costs ~330s+ at 7.0.1 against 9.52s at 6.2.0. The ratchet
     # carries @pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT) = 300s and this
-    # file's own `timeout = 300`-equivalent budget; exceeding it does not merely
-    # fail the test — pytest-timeout's thread method os._exit()s the xdist
-    # worker and `--max-worker-restart=0` then truncates the ENTIRE orchestrator
-    # suite, reporting against an innocent test (the esc-3980-1 / esc-3787-1
-    # mode documented at tests/_orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT).
+    # file's own `timeout = 300`-equivalent budget; exceeding it fails the
+    # ratchet test, and only once complexipy's Rust call returns, because signal
+    # cannot interrupt it sooner (see
+    # tests/_orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT).
     # Do not relax to >=6 or drop the <7 ceiling without re-measuring.
     "complexipy>=6.2,<7",
     # mutmut — the mutation-score baseline of task 5035 ([tool.mutmut] below).
