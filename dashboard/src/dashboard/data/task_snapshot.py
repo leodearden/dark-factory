@@ -167,8 +167,7 @@ _RETENTION_BOUND_SECONDS = 24 * 60 * 60
 
 ROW_READ_STATUSES: frozenset[TaskStatus] = ACTIVE
 """The statuses the unit's rows half asks for, applied server-side as
-``WHERE status IN (...)``. Public because ``app.py::_fanout_probe_completion``
-asks the same question, for one row."""
+``WHERE status IN (...)``."""
 
 
 class SnapshotFailure(enum.StrEnum):

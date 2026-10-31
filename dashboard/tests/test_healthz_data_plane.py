@@ -218,13 +218,8 @@ async def test_the_probe_asks_the_unit_row_question_for_one_row(
 ):
     """The probe crosses the request path's own row query, and ships ONE row of it.
 
-    The verdict keys on completion alone, so the bulk of a whole-tree answer
-    was never consulted. Two ``get_tasks`` arguments narrow two different
-    costs: ``statuses`` becomes ``WHERE status IN (...)`` in SQL and so cuts
-    the SERVER READ, while ``page_size`` is an in-memory slice after that read
-    and so cuts only the TRANSFER. Either alone leaves half the cost. Taking
-    the statuses from the snapshot unit's own row read, rather than from some
-    cheaper set, keeps the probe on the very query the request path issues.
+    Rationale: ``plans/dashboard-one-datum-one-path-prd.md``, the note "The
+    ``/healthz`` probe reads one row of the unit's row query (task 6321)".
     """
     canned = CannedMCP(
         rows=[_raw_row(1, 'pending'), _raw_row(2, 'in-progress'), _raw_row(3, 'done')],
@@ -252,19 +247,12 @@ async def test_the_probe_asks_the_unit_row_question_for_one_row(
         'ONE raw read per launch'
     )
     probe_args = probe_reads[0]['args']
-    assert probe_args.get('statuses') == unit_args['statuses'], (
-        f'the probe sent statuses={probe_args.get("statuses")!r}. The SERVER '
-        'READ is narrowed only by statuses, and only the unit row read\'s own '
-        'set keeps the probe on the SQL the request path runs'
-    )
-    assert (probe_args.get('page_size'), probe_args.get('offset')) == (1, 0), (
-        f'the probe sent {probe_args!r}. The TRANSFER is narrowed only by a '
-        'window, and the verdict needs a completed traversal, not its rows'
-    )
     assert probe_args == {**unit_args, 'page_size': 1, 'offset': 0}, (
         f'the probe sent {probe_args!r} against the unit row read '
-        f'{unit_args!r}: apart from the one-row window it must be the SAME '
-        'query, or it watches a neighbour of the request path, not the path'
+        f'{unit_args!r}. It must be the SAME query apart from a one-row window: '
+        'only the unit\'s own statuses narrow the SERVER READ onto the SQL the '
+        'request path runs, and only page_size=1, offset=0 narrows the '
+        'TRANSFER, since the verdict needs a completed traversal, not its rows'
     )
     assert body['checks']['mcp_fanout'] == 'ok', body
 
