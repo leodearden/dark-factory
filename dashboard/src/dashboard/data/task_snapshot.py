@@ -801,6 +801,8 @@ async def acquire_terminal_window(
     Benign race: *terminal_total* was measured by a different read, so a task
     completing between the two shifts the window by a row.
     """
+    if window < 1:
+        raise ValueError(f'window must be at least 1, got {window!r}')
     if terminal_total is None:
         return unknown_datum(
             'the terminal window cannot be positioned without a measured '

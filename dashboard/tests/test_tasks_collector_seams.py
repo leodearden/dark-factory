@@ -33,6 +33,29 @@ def test_tasks_budget_refuses_a_bound_that_cannot_serve_a_root(field, bad):
     )
 
 
+@pytest.mark.parametrize('bad', [0, -3])
+async def test_a_terminal_window_that_reads_no_row_is_refused_before_any_read(
+    bad, dummy_client, dashboard_config, monkeypatch,
+):
+    from dashboard.data.task_snapshot import acquire_terminal_window
+
+    canned = CannedMCP()
+    monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', canned)
+
+    with pytest.raises(ValueError, match='window') as refused:
+        await acquire_terminal_window(
+            dummy_client, dashboard_config, dashboard_config.project_root,
+            now=NOW, terminal_total=10, window=bad,
+        )
+
+    assert str(bad) in str(refused.value), (
+        f'the refusal must name the offending value {bad!r}, got {refused.value}'
+    )
+    assert canned.calls == [], (
+        f'a window that cannot hold a row must not reach the substrate: {canned.calls}'
+    )
+
+
 async def test_reset_forgets_every_unit_the_last_good_and_the_rotation(
     tmp_path, dummy_client, monkeypatch,
 ):
