@@ -10,9 +10,9 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 # Cost primitives (the USD/1M fallback rate + the PriceEntry-or-dict accessor)
-# have a SINGLE home in agents.invoke (task 2459); this module re-exports them
-# rather than re-declaring so the three-way copy can never drift (reviewer:
-# code-reuse). resolve_cost_usd below mirrors invoke's Invariant-P5 policy.
+# have a SINGLE home in agents.invoke (task 2459); this module imports them from
+# agents.invoke rather than re-declaring them, so the three-way copy can never
+# drift (reviewer: code-reuse). resolve_cost_usd below mirrors invoke's Invariant-P5 policy.
 # agents.invoke has no import cycle back to evals (it reaches only
 # config/fm_retry/shared.*), so a module-level import is safe.
 from orchestrator.agents.invoke import _FALLBACK_PRICE, _rate

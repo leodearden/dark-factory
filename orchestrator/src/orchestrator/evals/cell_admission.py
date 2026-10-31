@@ -23,8 +23,8 @@ def is_plan_only(metrics: dict[str, Any]) -> bool:
     carries its quality in ``plan_quality`` rather than ``composite_score``.
 
     Keyed on the EXISTING ``role_under_test`` stamp rather than a new persisted
-    ``plan_only`` field for two reasons: ``build_composite_report`` already keys
-    ``plan_quality_cap_excluded`` on exactly this test (a second field could
+    ``plan_only`` field for two reasons: the composite report builder already
+    keys ``plan_quality_cap_excluded`` on exactly this test (a second field could
     drift from the first), and a new field would read back as its default on
     every result JSON written before this task — silently mis-classifying the
     whole existing corpus, including the campaign this fix exists to make
@@ -37,15 +37,14 @@ def has_plan_quality_score(metrics: dict[str, Any]) -> bool:
     """THE plan-quality admission cascade: architect / not tainted / scored.
 
     One function, so every surface that admits or refuses a plan-only cell asks
-    the SAME question (task 3099, reviewer amendment).
-    :func:`report.build_plan_quality_report` and
-    :func:`report.build_composite_report` both call it, and the two clauses used
-    to coincide only by COUPLING —
+    the SAME question (task 3099, reviewer amendment). Both the plan-quality and
+    the composite report builders call it, and the two clauses used to coincide
+    only by COUPLING —
     ``run_architect_eval`` happens to taint exactly when it has no score, so a
     ``cap_tainted``-only test and a ``plan_quality is None``-only test agreed by
     accident. A hand-edited result, a legacy JSON, or a future taint cause that
     preserves the structural floor would break that coincidence and feed a score
-    the θ pool REFUSES into the composite pool ``select_survivors`` ranks on.
+    the θ pool REFUSES into the composite pool that survivor selection ranks on.
     """
     return (
         is_plan_only(metrics)
@@ -59,9 +58,8 @@ def plan_quality_score(
 ) -> float | None:
     """THE θ score of one plan-only cell — ``None`` when it must be EXCLUDED.
 
-    ONE accessor, called by both :func:`report.build_composite_report` and
-    :func:`report.build_plan_quality_report`, so ``mean_plan_quality`` and the
-    composite row's ``plan_quality`` cannot drift (task 3302, extending the
+    ONE accessor, shared by the composite and plan-quality report builders, so
+    ``mean_plan_quality`` and the composite row's ``plan_quality`` cannot drift (task 3302, extending the
     :func:`mean_plan_quality` discipline from the reduction to the value being
     reduced). It COMPOSES with :func:`has_plan_quality_score` rather than
     re-deriving its cascade.
@@ -158,8 +156,8 @@ def judged_without_reference(metrics: dict[str, Any]) -> bool | None:
     * ``True`` / ``False`` — the instrument measured this cell's validity.
     * ``None`` — the metrics dict predates σ, so the cell's validity was NEVER
       measured. Reading that back as ``False`` would let a rebuild over the
-      2026-07-27 / 07-29 corpus — which this doc's own provenance section says
-      was judged blind on half the hard subset — render ``0`` on every surface
+      2026-07-27 / 07-29 corpus — which the provenance note in
+      ``docs/plan-scoring-and-judge.md`` says was judged blind on half the hard subset — render ``0`` on every surface
       and suppress the trailer entirely, byte-identically to a campaign whose
       every score was graded against a real landed diff. That is precisely the
       silent degradation σ exists to remove, re-introduced at the reader.
@@ -198,13 +196,12 @@ def judged_blind_count(counted: int, unmeasured: int) -> int | None:
 def mean_plan_quality(scores: list[float]) -> float | None:
     """Reduce a pool of θ-rubric plan-quality scores to its mean (4 dp).
 
-    THE ONE reduction, called by BOTH :func:`report.build_composite_report`'s
-    row and :func:`report.build_plan_quality_report`'s per-config aggregate
-    (task 3099). The
+    THE ONE reduction, shared by BOTH the composite report's row and the
+    plan-quality report's per-config aggregate (task 3099). The
     composite row's ``plan_quality`` used to be a first-untainted-TRIAL
     passthrough — a harmless diagnostic echo until this task promoted the field
-    to a DECISION surface (:func:`report.select_survivors` ranks on it and
-    :func:`report.format_composite_table` renders it beside the composite). A
+    to a DECISION surface (survivor selection ranks on it and the composite
+    table renders it beside the composite). A
     trial-1 score sitting next to a mean would let the two tables the CLI now prints
     ADJACENTLY — and the ``quality`` / ``plan_quality`` cells of one row — give
     contradictory answers about the same quantity, reintroducing the "two
@@ -224,8 +221,8 @@ def mean_plan_quality(scores: list[float]) -> float | None:
 def plan_rate(n_admitted: int, no_plan: int) -> float | None:
     """The fraction of ADMITTED plan-only cells that emitted a plan at all (4 dp).
 
-    THE ONE reduction, called by BOTH :func:`report.build_composite_report`'s
-    row and :func:`report.build_plan_quality_report`'s per-config aggregate — the
+    THE ONE reduction, shared by BOTH the composite report's row and the
+    plan-quality report's per-config aggregate — the
     :func:`mean_plan_quality` precedent, and for the same reason: the CLI
     prints those two tables ADJACENTLY, so a reliability figure derived twice
     from separately-maintained arithmetic is a pair of surfaces free to give
@@ -241,8 +238,8 @@ def plan_rate(n_admitted: int, no_plan: int) -> float | None:
     ``trials`` instead would report a candidate as LESS RELIABLE for a question
     it never got to answer, purely because it happened to be scheduled inside a
     session-cap window — the schedule-attributable penalty tasks 3118 and 3099
-    spent two rounds removing, reintroduced on the surface
-    :func:`report.select_survivors` ranks on. It also matches the campaign this
+    spent two rounds removing, reintroduced on the surface survivor selection
+    ranks on. It also matches the campaign this
     automates: ``plans/eval-architect-effort-verdict-2026-07-27.md`` computes
     its own planRate over 19 fixtures, dropping the 3 cap-contaminated ones from
     the denominator, not over all 22.

@@ -1480,6 +1480,8 @@ _COMPOSITE_COLUMNS = (
     'pq_no_plan', 'pq_no_ref', 'plan_rate', 'cost_usd', 'cost_per_plan',
     'cost_source', 'latency_secs', 'ci95_composite', 'trials', 'fixtures',
 )
+
+
 def format_composite_table(report: dict[str, Any]) -> str:
     """Render :func:`build_composite_report` output as a deterministic table.
 
