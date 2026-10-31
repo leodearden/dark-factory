@@ -1349,19 +1349,76 @@ def test_registry_keys_are_all_declared_in_the_committed_units():
             )
 
 
+def _committed_service(spec) -> dict[str, list[str]]:
+    """The parsed [Service] section of *spec*'s committed repo unit."""
+    return systemd_unit_parity.parse_unit_directives(
+        (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
+    ).get("Service", {})
+
+
+def _flags_reading_an_option(mod: types.ModuleType, spec, service) -> list[str]:
+    """Registered flags of *spec* whose argument, read from *service*, is itself an option.
+
+    A switch mis-registered on exec_start_flags reads the NEXT option as its
+    value: `--no-sync --project dashboard` hands no-sync the argument
+    `--project`, so the comparison would track the wrong token entirely.
+    Shared by the guard and its proof, as _unregistered_directives is.
+    """
+    return [
+        flag
+        for flag in spec.exec_start_flags
+        if (mod._exec_start_flag(service, flag) or "").startswith("-")
+    ]
+
+
 def test_registry_exec_start_flags_are_really_on_the_committed_command():
-    """STALENESS GUARD, flag edition: each registered flag is on the real command."""
+    """STALENESS GUARD, flag edition: each registered flag is on the real command.
+
+    And each one reads a real ARGUMENT, not the next option — the shape a
+    switch registered on the wrong field takes.
+    """
     mod = _load_checker()
 
     for name, spec in mod.UNITS.items():
         if not spec.exec_start_flags:
             continue
-        parsed = systemd_unit_parity.parse_unit_directives(
-            (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
-        )
+        service = _committed_service(spec)
         for flag in spec.exec_start_flags:
-            assert mod._exec_start_flag(parsed.get("Service", {}), flag) is not None, (
+            assert mod._exec_start_flag(service, flag) is not None, (
                 f"{name}: registry compares --{flag}, but it is absent from the "
+                f"committed ExecStart in {spec.repo_relpath} — the entry checks nothing."
+            )
+        misread = _flags_reading_an_option(mod, spec, service)
+        assert misread == [], (
+            f"{name}: exec_start_flags registers {misread}, but on the committed "
+            f"ExecStart in {spec.repo_relpath} each is followed by another option, "
+            "so its 'argument' is that option. An argument-less option belongs on "
+            "exec_start_switches."
+        )
+
+
+def test_flag_guard_fires_on_a_switch_registered_as_a_flag():
+    """The extended flag guard's own proof, over the real committed command."""
+    mod = _load_checker()
+    registered = mod.UNITS[_DASHBOARD_SERVICE]
+    misregistered = dataclasses.replace(
+        registered, exec_start_flags=("no-sync",), exec_start_switches=()
+    )
+    service = _committed_service(registered)
+
+    assert _flags_reading_an_option(mod, misregistered, service) == ["no-sync"]
+    assert _flags_reading_an_option(mod, registered, service) == []
+
+
+def test_registry_exec_start_switches_are_really_on_the_committed_command():
+    """STALENESS GUARD, switch edition: each registered switch is on the real command."""
+    mod = _load_checker()
+
+    for name, spec in mod.UNITS.items():
+        service = _committed_service(spec)
+        for switch in spec.exec_start_switches:
+            assert mod._exec_start_switch(service, switch) is not None, (
+                f"{name}: registry compares --{switch}, but it is absent from the "
                 f"committed ExecStart in {spec.repo_relpath} — the entry checks nothing."
             )
 
@@ -1785,6 +1842,64 @@ def test_installed_copy_missing_success_exit_status_is_drift():
     assert drift.key == "SuccessExitStatus"
     assert drift.repo_value == "143"
     assert "absent from the installed copy" in drift.reason, drift.reason
+
+
+def test_dashboard_service_spec_compares_the_no_sync_switch():
+    """`uv run --no-sync` and its `--project` are compared on the dashboard service.
+
+    Task 5553 put --no-sync on every committed uv-run unit: without it a
+    process start re-syncs the shared root .venv. On 2026-10-05 the installed
+    copy lacked it while this gate reported parity, because nothing compared
+    it.
+    """
+    mod = _load_checker()
+    spec = mod.UNITS[_DASHBOARD_SERVICE]
+
+    assert "no-sync" in spec.exec_start_switches, spec.exec_start_switches
+    assert "project" in spec.exec_start_flags, spec.exec_start_flags
+
+
+def _committed_with(spec, old: str, new: str) -> tuple[str, str]:
+    """*spec*'s real committed unit, and a copy with *old* replaced once by *new*."""
+    text = (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
+    assert text.count(old) == 1, f"fixture edit target {old!r} must occur exactly once"
+    return text, text.replace(old, new)
+
+
+def test_installed_copy_missing_no_sync_is_drift():
+    """The registered spec reports the measured host shape: `uv run` without --no-sync."""
+    mod = _load_checker()
+    spec = mod.UNITS[_DASHBOARD_SERVICE]
+    repo_text, installed_text = _committed_with(spec, "run --no-sync --project", "run --project")
+
+    drifts = mod.compare_unit(spec, repo_text, installed_text)
+
+    assert len(drifts) == 1, drifts
+    (drift,) = drifts
+    assert drift.key == "ExecStart --no-sync"
+    assert drift.repo_value == "--no-sync"
+    assert drift.installed_value == systemd_unit_parity.ABSENT
+
+
+def test_installed_copy_with_a_different_project_is_drift():
+    """`--project` is value-compared: a different project on the command is drift.
+
+    The edit targets the command's spelling; the committed unit's comment
+    prose also quotes `--project dashboard`, and comments are not the command.
+    """
+    mod = _load_checker()
+    spec = mod.UNITS[_DASHBOARD_SERVICE]
+    repo_text, installed_text = _committed_with(
+        spec, "run --no-sync --project dashboard", "run --no-sync --project elsewhere"
+    )
+
+    drifts = mod.compare_unit(spec, repo_text, installed_text)
+
+    assert len(drifts) == 1, drifts
+    (drift,) = drifts
+    assert drift.key == "ExecStart --project"
+    assert drift.repo_value == "dashboard"
+    assert drift.installed_value == "elsewhere"
 
 
 def test_dashboard_service_spec_pins_the_project_root_env_contract():
@@ -2376,6 +2491,29 @@ def test_main_reports_the_watchdog_pre_incident_drift(tmp_path: pathlib.Path, ca
         f"3308's whole-tick bound is missing from the installed copy: {out}"
     )
     assert _WATCHDOG_SERVICE in out
+
+
+def test_main_reports_the_installed_unit_missing_no_sync(tmp_path: pathlib.Path, capsys):
+    """End to end, the 2026-10-05 measurement: an installed `uv run` without --no-sync.
+
+    That host's checker run printed parity and exited 0 against exactly this
+    shape.
+    """
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = _installed_from(
+        tmp_path,
+        mod,
+        repo,
+        edits={_DASHBOARD_SERVICE: ("run --no-sync --project", "run --project")},
+    )
+
+    rc = mod.main(["--repo-root", str(repo), "--installed-dir", str(installed)])
+    out = capsys.readouterr().out
+
+    assert rc == 1, out
+    assert "ExecStart --no-sync" in out, out
+    assert str(installed / _DASHBOARD_SERVICE) in out, out
 
 
 # ---------------------------------------------------------------------------
