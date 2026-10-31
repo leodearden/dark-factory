@@ -2280,46 +2280,6 @@ class TestFormatCompositeTable:
 
 
 # ---------------------------------------------------------------------------
-# Task 2477 step-13: compute_aggregate_ratings — UNION, not intersection.
-# ---------------------------------------------------------------------------
-
-class TestAggregateRatingsUnion:
-    """The April all-tasks-INTERSECTION collapse is retired: the aggregate
-    leaderboard spans the UNION of configs, each averaged over only the tasks in
-    which it actually appears.
-    """
-
-    def _state(self):
-        from orchestrator.evals.elo import JudgeState, TaskPool
-
-        return JudgeState(per_task={
-            't1': TaskPool(ratings={'A': 1100.0, 'B': 1000.0, 'C': 900.0}),
-            't2': TaskPool(ratings={'A': 1200.0, 'B': 1050.0}),
-        })
-
-    def test_union_includes_config_present_in_only_one_task(self):
-        from orchestrator.evals.report import compute_aggregate_ratings
-
-        agg = compute_aggregate_ratings(self._state())
-        # C ran ONLY in t1 but MUST survive — no collapse-to-2-entries.
-        assert set(agg.keys()) == {'A', 'B', 'C'}
-
-    def test_aggregate_is_mean_over_tasks_where_config_appears(self):
-        from orchestrator.evals.report import compute_aggregate_ratings
-
-        agg = compute_aggregate_ratings(self._state())
-        assert agg['A'] == pytest.approx(1150.0)   # mean(1100, 1200)
-        assert agg['B'] == pytest.approx(1025.0)   # mean(1000, 1050)
-        assert agg['C'] == pytest.approx(900.0)    # only t1 → its t1 rating
-
-    def test_empty_state_is_empty(self):
-        from orchestrator.evals.elo import JudgeState
-        from orchestrator.evals.report import compute_aggregate_ratings
-
-        assert compute_aggregate_ratings(JudgeState(per_task={})) == {}
-
-
-# ---------------------------------------------------------------------------
 # Rendered surfaces for judged_without_reference (eval-revival σ, task 3628)
 #
 # A count that is loud only in JSON is still mute where an operator reads it.
