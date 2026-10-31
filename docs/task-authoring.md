@@ -2151,6 +2151,35 @@ a dead holder's row and a lapsed `expires_at` stay `deferred` until someone
 releases them. A session that ends without landing its hold releases it
 first.
 
+### Amending a planned task's text
+
+When a task is planned, the orchestrator stamps a fingerprint of its
+description and details into `metadata.plan_text_fp`, with the plan's time
+in `metadata.plan_authored_at`. An `update_task` that supplies `title`,
+`description`, `details` or `prompt` is compared against that stamp. If the
+fingerprint of the post-write description and details no longer matches, the
+result carries `amendment_advisory`:
+
+| Field | Meaning |
+|---|---|
+| `task_id` | the amended task |
+| `plan_authored_at` | when the current plan was written |
+| `fields_changed` | the text fields this write supplied |
+| `will_replan` | False for a `done` or `cancelled` task, whose amendment reaches no work |
+| `plan_text_fp_before` | the stamped plan fingerprint |
+| `task_text_fp_after` | the fingerprint of the text now stored |
+
+A task with no stamp, a metadata-only write, and a whitespace-only reflow
+get no advisory. The running agent of an `in-progress` task does not see
+the amendment. Its next dispatch takes the revalidation path (task 4031)
+and re-plans against the new text.
+
+Every such amendment also journals a `task_text_amended` reconciliation
+event carrying the advisory plus `writer_source` (`update_task` or
+`curator_combine`) and `agent_id`. That includes a curator combine
+rewriting a planned task's text, which no caller is told about. Contract:
+`plans/task-amendment-delivery-prd.md` §9 C7.
+
 ## 10. Rotating a long-running audit-trail task
 
 A task that stays open across many reconciliation cycles accretes. Each
