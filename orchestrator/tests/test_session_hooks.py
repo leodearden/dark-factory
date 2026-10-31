@@ -1,8 +1,11 @@
 """Tests for orchestrator.session_hooks module (Attention Rail T6).
 
 Covers: identity/slug resolution for hook events (env > default, keyed on
-session_id); pure OSC-retitle + display-title helpers; the SessionStart /
-Notification / Stop handlers against a tmp session-registry root; and the
+session_id), including CLAUDE_SPAWN_SESSION_ID convergence and
+sessions-by-claude-id pointer keying (task 7489); the pure OSC-retitle and
+display-title helpers; the SessionStart / Notification / Stop handlers
+against a tmp session-registry root, including parent_session_id stamping,
+question capture and the Stop-only self-exit decision (task 7193); and the
 fail-soft main() CLI dispatch.
 """
 
@@ -19,11 +22,7 @@ from pathlib import Path
 
 import pytest
 from _process_tree_fakes import claude_process_tree
-from _session_hook_fixtures import (
-    isolate_hook_env,
-    owner_ppid_env,
-    stdin_json,
-)
+from _session_hook_fixtures import isolate_hook_env, owner_ppid_env, stdin_json
 
 from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
