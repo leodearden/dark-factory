@@ -204,7 +204,7 @@ class TestIntegrationFlow:
         svc.graphiti.add_episode.assert_called_once()
         assert stats['counts'].get('completed', 0) == 2
         svc.mem0.add.assert_awaited_once()
-        assert fact in str(svc.mem0.add.await_args)
+        assert svc.mem0.add.await_args.kwargs['content'] == fact
 
     @pytest.mark.asyncio
     async def test_dual_write_both_paths(self, integrated_service):
@@ -380,7 +380,6 @@ class TestFailureRecovery:
         """Enqueue item, close before processing, new service recovers and processes it."""
         # Service 1: enqueue but close quickly
         svc1 = _mock_backends(MemoryService(mock_config))
-        svc1.mem0.add = AsyncMock(return_value={'results': []})
 
         await svc1.initialize()
 
@@ -396,7 +395,6 @@ class TestFailureRecovery:
         # Service 2: same data_dir -> should recover the item
         svc2 = _mock_backends(MemoryService(mock_config))
         svc2.graphiti.add_episode = AsyncMock(return_value={'ok': True})
-        svc2.mem0.add = AsyncMock(return_value={'results': []})
 
         await svc2.initialize()
         assert svc2.durable_queue is not None
