@@ -12108,16 +12108,17 @@ class GitOps:
         paths. An EMPTY *paths* means no tier-1 candidates, never an
         unrestricted scan. Tier 2 always scans the whole range.
 
-        No exception handling: each caller owns its fail-safe posture.
+        Raises GitQueryFailed when a git query fails; each caller owns its
+        fail-safe posture.
         """
         # Tier 1: patch-id equivalence. Compute the target's patch-id from its
         # own diff.
-        rc, target_diff, _ = await _run(
+        target_diff = await _git_query(
             ['git', 'log', '-p', '-1', '--no-color', target_sha], cwd=cwd,
         )
-        if rc != 0 or not target_diff.strip():
+        if not target_diff.strip():
             return None
-        _, target_pid_out, _ = await _run(
+        target_pid_out = await _git_query(
             ['git', 'patch-id', '--stable'], cwd=cwd, input_text=target_diff,
         )
         target_pid = target_pid_out.split()[0] if target_pid_out.strip() else None
@@ -12131,15 +12132,15 @@ class GitOps:
         # in rev_range shares the target's subject, so we never mis-point at a
         # commit whose subject two replayed commits happen to share (e.g. a
         # generic "feat: GREEN — implementation").
-        rc, target_subject, _ = await _run(
+        target_subject = await _git_query(
             ['git', 'log', '-1', '--format=%s', target_sha], cwd=cwd,
         )
-        if rc != 0 or not target_subject.strip():
+        if not target_subject.strip():
             return None
-        rc, subj_out, _ = await _run(
+        subj_out = await _git_query(
             ['git', 'log', '--format=%H\x1f%s', rev_range], cwd=cwd,
         )
-        if rc != 0 or not subj_out.strip():
+        if not subj_out.strip():
             return None
         subject_matches: list[str] = []
         for line in subj_out.splitlines():
@@ -12166,10 +12167,10 @@ class GitOps:
             ]
         else:
             return {}
-        rc, range_diff, _ = await _run(range_log, cwd=cwd)
-        if rc != 0 or not range_diff.strip():
+        range_diff = await _git_query(range_log, cwd=cwd)
+        if not range_diff.strip():
             return {}
-        _, range_pid_out, _ = await _run(
+        range_pid_out = await _git_query(
             ['git', 'patch-id', '--stable'], cwd=cwd, input_text=range_diff,
         )
         pid_to_sha: dict[str, str] = {}
@@ -12232,43 +12233,34 @@ class GitOps:
         could pair it with a LATER same-subject commit), or has no twin.
 
         Read-only: runs git queries at ``project_root`` and never rewrites a
-        ref, a record or anything else. Fail-safe like
-        :meth:`find_equivalent_commit`: any error is logged at WARNING and
-        yields None.
+        ref, a record or anything else. None means only one of the three
+        facts above: when git could not answer, this raises GitQueryFailed
+        (or WorktreeMissing for a vanished root), so a fault is never
+        reported as one of those facts.
         """
         main = self.config.main_branch
-        try:
-            rc, out, _ = await _run(
-                ['git', 'rev-parse', '--verify', '--quiet', f'{sha}^{{commit}}'],
-                cwd=self.project_root,
-            )
-            cited = out.strip()
-            if rc != 0 or not cited:
-                return None
-            if await self.is_ancestor_checked(cited, main) is not False:
-                return None
-            base = await self.merge_base_with_main(cited)
-            if base is None:
-                return None
-            paths = await self.get_commit_changed_files(cited)
-            match = await self._find_replay(
-                self.project_root, cited, f'{base}..{main}', paths=paths,
-            )
-            if match is None:
-                return None
-            landed, method = match
-            rc, subject, _ = await _run(
-                ['git', 'log', '-1', '--format=%s', landed], cwd=self.project_root,
-            )
-            if rc != 0:
-                return None
-            return RebasedCitation(landed=landed, subject=subject.strip(), method=method)
-        except Exception:
-            logger.warning(
-                'resolve_rebased_citation failed for sha=%s; returning None',
-                sha, exc_info=True,
-            )
+        cited = (await self.commits_named([sha])).get(sha)
+        if cited is None:
             return None
+        on_main = await self.is_ancestor_checked(cited, main)
+        if on_main is None:
+            raise GitQueryFailed(f'git could not tell whether {cited} is an ancestor of {main}')
+        if on_main:
+            return None
+        base = await self.merge_base_with_main(cited)
+        if base is None:
+            raise GitQueryFailed(f'git found no fork point of {cited} from {main}')
+        paths = await self._commit_paths(cited)
+        match = await self._find_replay(
+            self.project_root, cited, f'{base}..{main}', paths=paths,
+        )
+        if match is None:
+            return None
+        landed, method = match
+        subject = await _git_query(
+            ['git', 'log', '-1', '--format=%s', landed], cwd=self.project_root,
+        )
+        return RebasedCitation(landed=landed, subject=subject.strip(), method=method)
 
     async def get_changed_files(self, from_sha: str, to_sha: str) -> list[str]:
         """Return list of files changed between two commits.
@@ -12309,12 +12301,17 @@ class GitOps:
         done-step commit against the tip WIP safety-commit run's
         changed-file set.
         """
-        rc, output, _ = await _run(
+        try:
+            return await self._commit_paths(sha)
+        except GitQueryFailed:
+            return []
+
+    async def _commit_paths(self, sha: str) -> list[str]:
+        """The files *sha* itself changed; raises GitQueryFailed on a git error."""
+        output = await _git_query(
             ['git', 'diff-tree', '--no-commit-id', '--name-only', '-r', '--root', sha],
             cwd=self.project_root,
         )
-        if rc != 0:
-            return []
         return [f for f in output.strip().splitlines() if f.strip()]
 
     async def get_rebase_distance(self, old_base: str, new_base: str) -> int:
