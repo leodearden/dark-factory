@@ -2030,8 +2030,8 @@ def eval_shadow_report_cmd(config_path, shape, candidate, as_json):
 def _run_judge_cmd(max_rounds: int = 50, reset: bool = False):
     """Run Elo-based judge on existing results."""
     from orchestrator.evals.elo import JudgeState, TaskPool, load_state, save_state
+    from orchestrator.evals.elo_report import build_report, format_markdown, save_report
     from orchestrator.evals.judge import run_elo_tournament
-    from orchestrator.evals.report import build_report, format_markdown, save_report
     from orchestrator.evals.results import ResultStore
     from orchestrator.evals.runner import load_task
     from orchestrator.evals.snapshots import get_diff_between_commits
@@ -2132,7 +2132,7 @@ def _run_judge_cmd(max_rounds: int = 50, reset: bool = False):
 def _run_report_cmd():
     """Generate report from existing judge state (no new judge calls)."""
     from orchestrator.evals.elo import load_state
-    from orchestrator.evals.report import build_report, format_markdown, save_report
+    from orchestrator.evals.elo_report import build_report, format_markdown, save_report
 
     state = load_state()
     if not state.per_task:
