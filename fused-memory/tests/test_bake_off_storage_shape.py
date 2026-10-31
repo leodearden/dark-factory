@@ -4293,6 +4293,43 @@ class TestFixtureProvenance:
 
         assert provenance[0]['blob'] is None
 
+    def test_a_second_stamp_of_the_same_paths_does_not_walk_history_again(
+        self, tmp_path, monkeypatch,
+    ):
+        """Observed through a real git shim on PATH.  At most one walk per
+        path, because an earlier test on this worker may already have
+        stamped these paths."""
+        import os  # noqa: PLC0415
+        import shutil  # noqa: PLC0415
+
+        real = shutil.which('git')
+        if real is None:
+            pytest.skip('no git on PATH')
+        log = tmp_path / 'git.log'
+        shim = tmp_path / 'bin' / 'git'
+        shim.parent.mkdir()
+        shim.write_text(
+            '#!/bin/sh\n'
+            f'printf \'%s\\n\' "$*" >> "{log}"\n'
+            f'exec "{real}" "$@"\n'
+        )
+        shim.chmod(0o755)
+        monkeypatch.setenv(
+            'PATH', f'{shim.parent}{os.pathsep}{os.environ["PATH"]}',
+        )
+        paths = [ARM_CLAIMS_PATH, QUERY_SET_PATH]
+
+        first = _mod().fixture_provenance(paths)
+        second = _mod().fixture_provenance(paths)
+
+        assert first == second
+        assert all(len(entry['commit']) == 40 for entry in second)
+        walks = [
+            line for line in log.read_text().splitlines()
+            if line.startswith('log ')
+        ]
+        assert len(walks) <= 2, walks
+
 
 # ===========================================================================
 # step-19 — the live driver's wiring, exercised WITHOUT a network
