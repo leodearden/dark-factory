@@ -380,7 +380,7 @@ class TestCommittedRegistryFixture:
         topics = [e.topic for e in registry.entries]
         assert len(topics) == len(set(topics))
         for topic in topics:
-            assert topic_registry.TOPIC_SLUG_RE.match(topic), f'{topic!r} is not slug-shaped'
+            assert topic_registry.REGISTRY_SLUG_RE.match(topic), f'{topic!r} is not slug-shaped'
 
     def test_breadth_floor(self, registry):
         assert len(registry.entries) >= MIN_TOPICS

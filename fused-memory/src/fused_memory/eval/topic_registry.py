@@ -53,20 +53,22 @@ hand-authoring — the ``derived_from`` half of the additive-tolerant decision.
 
 REGISTRY_SCHEMA_VERSION = 1
 
-TOPIC_SLUG_RE = re.compile(r'^[a-z0-9]+(?:[-_][a-z0-9]+)*$')
+REGISTRY_SLUG_RE = re.compile(r'^[a-z0-9]+(?:[-_][a-z0-9]+)*$')
 """Registry topic slugs: lowercase alphanumerics separated by ``-`` or ``_``.
 
 ``_`` is accepted because live ``metadata.topic`` values use both spellings
 (the census reports ``architect_report_task_already_done_main_reachability``
 against the guard cluster's ``architect-report-task-already-done-main-reachability``).
-Comparison normalises the two; the slug syntax merely has to admit both.
+Comparison normalises the two; the slug syntax merely has to admit both. So
+this is deliberately wider than ``fused_memory/topic_slug.py::TOPIC_SLUG_RE``,
+which rejects ``_``.
 """
 
 
 def normalize_topic(topic: str) -> str:
     """Fold a topic slug for comparison: lowercased, ``_`` unified to ``-``.
 
-    The live corpus spells the same topic both ways (see :data:`TOPIC_SLUG_RE`), so
+    The live corpus spells the same topic both ways (see :data:`REGISTRY_SLUG_RE`), so
     an exact string comparison would silently fail to match the very entries
     the registry was built from.
     """
@@ -439,7 +441,7 @@ def _parse_entry(raw: Any, index: int) -> RegistryEntry:
             'The slug is the tripwire item key, so an entry without one cannot be '
             'reported against.'
         )
-    if not TOPIC_SLUG_RE.match(topic):
+    if not REGISTRY_SLUG_RE.match(topic):
         raise _fail(
             topic,
             'topic is not slug-shaped (lowercase alphanumerics separated by - or _).',
