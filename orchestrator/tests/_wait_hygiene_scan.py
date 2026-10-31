@@ -106,7 +106,7 @@ def suppressed_result_wait_items(source: str) -> list[str]:
     is the safe direction here.
 
     Not reported: ``suppress(Exception)`` (the blessed best-effort
-    teardown-join shape in test_merge_queue_concurrent_verify.py::_stop_worker),
+    teardown-join shape in _merge_worker_drive.py::stop_merge_worker),
     a ``suppress(TimeoutError)`` or ``try`` enclosing no ``asyncio.wait_for``,
     and a handler that does not catch ``TimeoutError``.
     """
@@ -132,7 +132,7 @@ def _is_worker_stop_call(node: ast.AST) -> bool:
         return False
     func = node.func
     if isinstance(func, ast.Name):
-        return func.id == '_stop_worker'
+        return func.id == 'stop_merge_worker'
     return (
         isinstance(func, ast.Attribute)
         and func.attr == 'stop'
@@ -166,7 +166,7 @@ def _has_unguarded_worker_stop(function: ast.AST) -> bool:
 
 def unguarded_worker_teardown_items(source: str) -> list[str]:
     """Every pytest item of *source* that breaks the esc-3980-4 leak
-    invariant recorded in test_merge_queue_concurrent_verify.py::_stop_worker's
+    invariant recorded in _merge_worker_drive.py::stop_merge_worker's
     docstring, as sorted item ids.
 
     ``wait_responsive`` gives up by raising ``_pytest.outcomes.Failed`` (a
@@ -177,12 +177,12 @@ def unguarded_worker_teardown_items(source: str) -> list[str]:
     (task 4219).
 
     An item is reported when it calls ``wait_responsive(...)`` and calls a
-    worker stop -- ``worker.stop()`` or the shared ``_stop_worker(...)``
+    worker stop -- ``worker.stop()`` or the shared ``stop_merge_worker(...)``
     helper -- anywhere other than inside a ``finally:`` whose ``try:`` body
     encloses EVERY ``wait_responsive`` call in the item. Crediting any
     finally at all would miss a wait that sits before the ``try:``, whose
     give-up skips that finally too (task 4219 amendment). Recognising
-    ``_stop_worker`` keeps the scan from going vacuous for an item that
+    ``stop_merge_worker`` keeps the scan from going vacuous for an item that
     adopts the other blessed teardown shape.
 
     Deliberately scoped to items that call ``wait_responsive``: unmigrated
