@@ -2,10 +2,9 @@
 
 ``docs/prds/memory-eval-program.md`` §5 leaf β. Every function here takes an
 already-fetched result list, or the observations built from such lists, and
-returns a record; nothing touches a store. That is what lets the merge lane
-test the whole metric family with no Qdrant, no embedder and no
-OPENAI_API_KEY. The search itself, the report and the CLI runner live in
-``scripts/memory_eval_retrieval_probe.py``; what a probed topic is lives in
+returns a record; callers fetch the results and this module never touches a
+store. That is what lets the merge lane test the whole metric family with no
+Qdrant, no embedder and no OPENAI_API_KEY. What a probed topic is lives in
 :mod:`fused_memory.eval.topic_registry`.
 
 **What it measures** (seven metrics, all owned by leaf β):
@@ -1080,8 +1079,8 @@ def normalise_ks(ks: tuple[int, ...]) -> tuple[int, ...]:
     added depth is disclosed in the report; it is not left to be inferred
     from the metric list.
 
-    Deliberately the idiom ``scripts/memory_eval_retrieval_probe.py::run_probe``
-    uses to dedup ``project_ids``.
+    The dedup is order-preserving: a repeated ``k`` keeps its first position,
+    and :data:`TRIPWIRE_K` is appended only when the caller did not ask for it.
     """
     return tuple(dict.fromkeys((*ks, TRIPWIRE_K)))
 

@@ -102,7 +102,7 @@ from fused_memory.backends.mem0_client import (
     DEFAULT_SCROLL_MAX_PAGES,
     ScrollPageBudgetExhausted,
 )
-from fused_memory.eval.topic_registry import load_topic_registry
+from fused_memory.eval.topic_registry import TopicRegistry, load_topic_registry
 from fused_memory.models.enums import GRAPHITI_PRIMARY, MEM0_PRIMARY, MemoryCategory
 
 # THE shared slug predicate and fold, imported and called -- never
@@ -712,7 +712,7 @@ DEFAULT_REGISTRY_PATH = str(
 )
 
 
-def load_registry_or_error(path: str) -> tuple[Any | None, str | None]:
+def load_registry_or_error(path: str) -> tuple[TopicRegistry | None, str | None]:
     """Load the topic registry, returning ``(registry, error)``.
 
     Exactly one of the pair is ever non-``None``. Degrades LOUDLY: the caller
