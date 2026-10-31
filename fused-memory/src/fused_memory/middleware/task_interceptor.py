@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, get_args
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, get_args
 
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
 from pydantic import ValidationError
@@ -199,6 +199,12 @@ _GATE_MARKER_KEYS = ('execution_class', 'operational_mode', 'task_kind', 'always
 # The retired ``metadata.modules`` is deliberately absent
 # (plans/metadata-modules-retirement-prd.md decision 6).
 _DELIVERABLE_SIGNAL_KEYS = ('files', 'files_to_modify')
+
+
+class _CombineRewrite(TypedDict):
+    title: str
+    description: str
+    details: str
 
 
 def _parse_metadata_value(metadata: Any) -> tuple[dict | None, list[SchemaWarning]]:
@@ -3652,8 +3658,11 @@ class TaskInterceptor:
             justification=decision.justification,
         )
 
+        rewrite = _CombineRewrite(
+            title=rt.title, description=rt.description, details=details_with_files,
+        )
         try:
-            return dict(
+            combined = dict(
                 await tm.update_task(
                     task_id=decision.target_id,
                     project_root=project_root,
@@ -3684,10 +3693,8 @@ class TaskInterceptor:
                     # rejection in _resolve_metadata_mode is still satisfied and
                     # the details path is unaffected (append falsy → replace).
                     metadata_mode='merge',
-                    title=rt.title,
-                    description=rt.description,
-                    details=details_with_files,
                     priority=rt.priority,
+                    **rewrite,
                 )
             )
         except LeakedEnvelopeMarkupError as exc:
@@ -3710,6 +3717,15 @@ class TaskInterceptor:
                 exc,
             )
             return None
+        await self._advise_text_amendment(
+            decision.target_id,
+            project_root,
+            combined,
+            text_fields_written(rewrite),
+            writer_source=AmendmentWriter.CURATOR_COMBINE,
+            agent_id=None,
+        )
+        return combined
 
     # ── Write pass-throughs (emit event, no targeted reconciliation) ───
 
