@@ -446,7 +446,7 @@ class QueueConfig(BaseModel):
 # --- Write journal ---
 
 class WriteJournalConfig(BaseModel):
-    """Retention horizons and prune budgets for the ``write_ops`` journal.
+    """Retention horizons and prune budgets for the write journal's tables.
 
     RESTART-ONLY BY CONSTRUCTION. The prune runs at startup and every
     ``prune_interval_seconds`` (``services/write_ops_retention.py``), and both
@@ -490,6 +490,10 @@ class WriteJournalConfig(BaseModel):
     #: ``prune_max_seconds`` / ``prune_max_rows_per_run``. The sizing basis is
     #: in the ``write_journal`` block of ``fused-memory/config/config.yaml``.
     prune_interval_seconds: float = Field(default=1800.0, gt=0)
+    #: ``referent_findings``, a diagnosis log whose reader (the phase-5 replay
+    #: pass) re-verifies every row against the live graph, so a long horizon
+    #: loses nothing.
+    referent_findings_retention_days: float = Field(default=365.0, gt=0)
 
     @model_validator(mode='after')
     def _validate_search_outlives_reads(self) -> 'WriteJournalConfig':

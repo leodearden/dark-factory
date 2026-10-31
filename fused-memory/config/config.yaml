@@ -177,8 +177,8 @@ taskmaster:
 #
 # These are the DEPLOYED values, and they are meant to be edited. The fallback
 # for an omitted leaf is config/schema.py::WriteJournalConfig, which is the one
-# place the numbers are defined — prune_write_ops itself takes all six as
-# required arguments precisely so there is no third copy to drift.
+# place the numbers are defined — the prune methods these leaves feed take them
+# as required arguments precisely so there is no third copy to drift.
 #
 # MEASURED STARTING STATE (2026-09-11, before this section existed): write_ops
 # held 35,428,715 rows / 16 GB spanning 157 days, never pruned. The mix is
@@ -257,6 +257,10 @@ taskmaster:
 #   the batch in flight and the serving-cost basis above stands.
 # - prune_interval_seconds: a pass with nothing expired seeks each horizon from
 #   its resume point, milliseconds, so frequent passes cost nothing once drained.
+#
+# referent_findings_retention_days (task 5551) ages out the referent diagnosis
+# log at startup. Measured 2026-10-31: 416 rows from 2026-09-17 to 2026-10-31,
+# ~12.6/day, so the 365-day horizon keeps ~4.6k rows.
 # ─────────────────────────────────────────────────────────────────────────────
 write_journal:
   read_retention_days: ${WRITE_JOURNAL_READ_RETENTION_DAYS:30}
@@ -266,6 +270,7 @@ write_journal:
   prune_max_rows_per_run: ${WRITE_JOURNAL_PRUNE_MAX_ROWS:500000}
   prune_max_seconds: ${WRITE_JOURNAL_PRUNE_MAX_SECONDS:30}
   prune_interval_seconds: ${WRITE_JOURNAL_PRUNE_INTERVAL_SECONDS:1800}
+  referent_findings_retention_days: ${WRITE_JOURNAL_REFERENT_FINDINGS_RETENTION_DAYS:365}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # write_journal_growth_alarm — RED-TIER / restart-only (task 3311). Every

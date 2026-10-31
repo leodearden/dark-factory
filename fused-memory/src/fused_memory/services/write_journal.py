@@ -278,10 +278,8 @@ CREATE TABLE IF NOT EXISTS idempotent_ops (
 -- returns the OLDEST page and takes an `after_seq` cursor over the sqlite rowid,
 -- which is the only total insertion order here — one episode's findings are
 -- written in ONE batched commit and deliberately share a single `created_at`.
--- RETENTION is NOT yet wired: the startup sweep that runs prune_mem0_intents /
--- prune_idempotent_ops / prune_write_ops lives in server/main.py, outside task
--- 4984's locks, so growth is watched rather than bounded for now (the write path
--- is the ~0.2%-of-edges finding path, so the rate is low, not zero).
+-- RETENTION: rows are aged out by WriteJournal.prune_referent_findings at
+-- WriteJournalConfig.referent_findings_retention_days.
 --
 -- No ALTER migration: initialize() runs executescript(SCHEMA_SQL) unconditionally
 -- and this DDL is IF NOT EXISTS, so a fresh AND an existing database both pick
@@ -771,8 +769,8 @@ class WriteJournal:
         """The OLDEST *limit* findings, in insertion order, ``payload`` decoded.
 
         OLDEST-FIRST AND TRUNCATED AT *limit* — say it plainly, because the
-        table has no prune path and no status column to mark a row handled (it
-        is a diagnosis log, not a work queue). A consumer of a table longer
+        table has no status column to mark a row handled (it is a diagnosis
+        log, not a work queue). A consumer of a table longer
         than one page that does not carry *after_seq* forward therefore re-reads
         the same oldest page forever and never reaches a newer diagnosis. Pass
         the ``seq`` of the last row handled to get the next page.
@@ -780,9 +778,9 @@ class WriteJournal:
         ``seq`` is the row's sqlite ``rowid``: assigned at INSERT, so it is the
         ONE key that totally orders these rows the way they were written —
         including inside a batched commit, where every row deliberately shares
-        one ``created_at``. It is also gap-tolerant as a cursor: a future
-        retention sweep deleting the oldest rows cannot renumber the newer ones
-        under a reader mid-page.
+        one ``created_at``. It is also gap-tolerant as a cursor, which matters
+        because the oldest rows ARE aged out (:meth:`prune_referent_findings`):
+        deleting them cannot renumber the newer ones under a reader mid-page.
 
         Unlike :meth:`log_referent_findings` this one MAY raise: it is an
         operator/replay read, not a hot write path, and an unreadable journal is
@@ -804,6 +802,32 @@ class WriteJournal:
             params,
         )
         return [{**dict(row), 'payload': json.loads(row['payload'])} for row in rows]
+
+    async def prune_referent_findings(self, *, older_than_days: float) -> int:
+        """Age out ``referent_findings`` rows older than ``older_than_days``.
+
+        Same fire-and-forget contract as :meth:`prune_idempotent_ops`. One
+        unbounded DELETE is safe because the table is tiny. The predicate scans,
+        since ``idx_rf_group_time`` leads with ``group_id``; an index is
+        deliberately not added, per the index note beside it in ``SCHEMA_SQL``.
+        """
+        try:
+            cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+            async with self._require_access().write() as db:
+                cursor = await db.execute(
+                    'DELETE FROM referent_findings WHERE created_at < ?', (cutoff,),
+                )
+                deleted = max(cursor.rowcount, 0)
+            if deleted:
+                logger.info(
+                    'Pruned %d referent_findings rows older than %s days',
+                    deleted,
+                    older_than_days,
+                )
+            return deleted
+        except Exception as e:
+            logger.error(f'Failed to prune referent_findings: {e}')
+            return 0
 
     def journal_drop_stats(self) -> dict:
         """Return ``{'dropped_total': int, 'by_operation': dict}`` — rows LOST.
