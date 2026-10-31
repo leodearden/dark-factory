@@ -39,9 +39,15 @@
 # Exit 0 = knob landed on the target's main, reloaded, and observed in
 # `applied`.  Non-zero = a failure the caller (a deterministic deploy task)
 # escalates born-at-L2; one that did not land names the request's last merge
-# state.  Every designed exit before the landing ends its stdout with the
-# JSON verdict `{"failure": <tag>}`, its prose on stderr just before it; the
-# tags come from die() below and scripts/lib/deploy_main_copy.sh.
+# state.  The last stdout line of every designed exit is a JSON verdict, for a
+# kind='predicate' before_done note, in merge-pytest-n-ab-switch.sh's shape:
+# {chain_cap, commit, outcome: "applied"} on exit 0, or one carrying
+# `failure: <tag>` on a failure, its prose on stderr just before it.  `commit` is
+# the sha the queue landed the cap as, or null when nothing landed; a refusal
+# before the landing prints only {"failure": <tag>}.  The tags come from die()
+# below, scripts/lib/deploy_main_copy.sh, step 3's fail(),
+# scripts/_merge_queue_landing.py::LandingFailure and
+# scripts/_config_reload_gate.py::ReloadFailure.
 set -euo pipefail
 
 KNOB_KEY="merge_deep.chain_cap"
@@ -117,38 +123,64 @@ fi
 
 # 3. Land the edit through the target's merge queue, then hot-reload the running
 #    orchestrator and assert the knob is live.  The landing is
-#    scripts/_merge_queue_landing.py's; the transport, its failure diagnostics
-#    and the argv-only heredoc contract are scripts/_config_reload_gate.py's.
-#    This checks only the knob's disposition.
-"$PY" - "$SCRIPT_DIR" "$KNOB_KEY" "$CAP" "$PORT" "$REPO" "$REL" "$BASE" "$EDITED" <<'LAND_PY'
+#    scripts/_merge_queue_landing.py's; the transport, its failure diagnostics,
+#    the argv-only heredoc contract and the check that the reload committed a
+#    re-read of THIS file are scripts/_config_reload_gate.py's: this config path
+#    is passed to it, so a reload of another orchestrator (a wrong port) or a
+#    rolled-back reload is refused before the knob's disposition is read.
+#    This checks only that disposition.
+"$PY" - "$SCRIPT_DIR" "$KNOB_KEY" "$CAP" "$CONFIG" "$PORT" "$REPO" "$REL" "$BASE" "$EDITED" <<'LAND_PY'
+import json
 import os
 import sys
-script_dir, knob, cap, port, repo, rel, base, edited = sys.argv[1:9]
+script_dir, knob, cap, config_path, port, repo, rel, base, edited = sys.argv[1:10]
 sys.path.insert(0, script_dir)
-from _config_reload_gate import die, reload_or_exit
-from _merge_queue_landing import land_or_exit
+from _config_reload_gate import ReloadNotConfirmed, fetch_reload_report
+from _merge_queue_landing import LandingNotConfirmed, land_file
 
-PROG = "merge-deep-set-cap"
+
+def verdict(commit, **result):
+    print(json.dumps({"chain_cap": int(cap), "commit": commit, **result}))
+
+
+def fail(failure, message, *, commit):
+    print(f"merge-deep-set-cap: {message}", file=sys.stderr, flush=True)
+    verdict(commit, failure=failure)
+    sys.exit(1)
+
+
 with open(edited, "rb") as edit:
     content = edit.read()
-landing = land_or_exit(
-    repo, rel, base, content, prog=PROG, port=port,
-    label=f"merge-deep-chain-cap-{cap}",
-    message=f"chore(merge-deep): set {knob}={cap} (deep merge-ahead canary)",
-    timeout_secs=os.environ.get("MERGE_QUEUE_LANDING_TIMEOUT_SECS") or None,
-)
-print(f"{PROG}: landed {landing.branch} request_id={landing.request_id} as {landing.landed_as}",
-      flush=True)
+try:
+    landing = land_file(
+        repo, rel, base, content, port=port,
+        label=f"merge-deep-chain-cap-{cap}",
+        message=f"chore(merge-deep): set {knob}={cap} (deep merge-ahead canary)",
+        timeout_secs=os.environ.get("MERGE_QUEUE_LANDING_TIMEOUT_SECS") or None,
+    )
+except LandingNotConfirmed as exc:
+    fail(exc.failure.value, exc.detail, commit=None)
+sha = landing.landed_as
+print(f"merge-deep-set-cap: landed {landing.branch} request_id={landing.request_id} as {sha}",
+      file=sys.stderr, flush=True)
 
-report = reload_or_exit(port, prog=PROG, committed_as=landing.landed_as)
+try:
+    report = fetch_reload_report(port, committed_as=sha, config_path=config_path)
+except ReloadNotConfirmed as exc:
+    fail(exc.failure.value, exc.detail, commit=sha)
 applied = report.get("applied") or {}
+restart_required = report.get("restart_required") or {}
 entry = applied.get(knob)
 if not isinstance(entry, dict):
-    die(PROG, f"applied disposition missing {knob}: applied_keys={sorted(applied)} "
-              f"restart_required_keys={sorted(report.get('restart_required') or {})}")
+    if knob in restart_required:
+        fail("restart_required", f"{knob} changed but is restart-required, not hot-applied: "
+                                 f"restart_required_keys={sorted(restart_required)} "
+                                 f"(committed as {sha}; the value lands at the next restart)", commit=sha)
+    fail("not_applied", f"applied disposition missing {knob}: applied_keys={sorted(applied)} "
+                        f"restart_required_keys={sorted(restart_required)}", commit=sha)
 if str(entry.get("new")) != cap:
-    die(PROG, f"applied {knob} does not carry {cap}: entry={entry}")
-print(f"{PROG}: {knob} applied old={entry.get('old')} new={entry.get('new')}")
+    fail("value_mismatch", f"applied {knob} does not carry {cap}: entry={entry}", commit=sha)
+print(f"merge-deep-set-cap: {knob} applied old={entry.get('old')} new={entry.get('new')}",
+      file=sys.stderr, flush=True)
+verdict(sha, outcome="applied")
 LAND_PY
-
-echo "merge-deep-set-cap: done cap=${CAP} config=${CONFIG} port=${PORT}"
