@@ -6,7 +6,10 @@ Task 5462.  These tests assert values only: nothing is created under
 
 from pathlib import Path
 
+import pytest
+
 import fused_memory
+from fused_memory.config import checkout_anchor
 from fused_memory.config.checkout_anchor import CHECKOUT_ROOT, anchor_at_checkout
 
 
@@ -35,3 +38,27 @@ def test_an_absolute_path_is_returned_byte_identical(tmp_path):
 
     assert anchor_at_checkout(absolute) == absolute
     assert anchor_at_checkout(non_normalised) == non_normalised
+
+
+def test_a_relative_path_is_refused_when_the_anchor_holds_no_checkout(monkeypatch, tmp_path):
+    """A non-editable install puts the anchor inside site-packages' parents.
+
+    Joining onto it would fork an empty ledger there, so the refusal names the
+    anchor, the offending path and the remedy instead.
+    """
+    monkeypatch.setattr(checkout_anchor, 'CHECKOUT_ROOT', tmp_path)
+
+    with pytest.raises(RuntimeError) as refusal:
+        anchor_at_checkout('./data/reconciliation')
+
+    message = str(refusal.value)
+    assert str(tmp_path) in message
+    assert './data/reconciliation' in message
+    assert 'absolute' in message
+
+
+def test_an_absolute_path_needs_no_checkout(monkeypatch, tmp_path):
+    monkeypatch.setattr(checkout_anchor, 'CHECKOUT_ROOT', tmp_path)
+    absolute = str(tmp_path / 'abs')
+
+    assert anchor_at_checkout(absolute) == absolute
