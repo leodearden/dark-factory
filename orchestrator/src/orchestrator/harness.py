@@ -22,6 +22,7 @@ from typing import IO, TYPE_CHECKING, Any, ClassVar, cast
 from escalation.categories import EscalationCategory
 from escalation.classify import is_done_step_commit_orphan
 from escalation.disposition import ExitKind
+from escalation.grant_delivery import GrantDelivery
 from escalation.models import DeliveredCheckOwner, Escalation
 from escalation.pins import classify_pins
 from shared import delivered_check_polarity
@@ -17537,6 +17538,35 @@ class Harness:
             timedelta(seconds=self.config.claimant_liveness_ttl_secs),
         )
 
+    def _locate_plan_artifacts(self, task_id: str) -> TaskArtifacts | None:
+        """Return *task_id*'s plan artifacts resolved new-then-old, or None.
+
+        The W11 ``.task-meta`` SIBLING first, the legacy ``<worktree>/.task``
+        second. Without the fallback arm every pre-relocation task would take
+        the "no plan" exit of :meth:`_fold_granted_files_on_repend`.
+        :meth:`_resolve_recovery_artifact` is the read-only sibling of the same
+        contract, for single artifact paths.
+        """
+        wt = self._resolve_task_worktree(task_id)
+        new_root = TaskArtifacts.meta_root_for(self.git_ops.worktree_base, wt.name)
+        if (new_root / 'plan.json').exists():
+            return TaskArtifacts(wt, meta_root=new_root)
+        if (wt / '.task' / 'plan.json').exists():
+            return TaskArtifacts(wt)
+        return None
+
+    def granted_files_delivery_blocker(self, task_id: str) -> GrantDelivery | None:
+        """Why a scope grant for *task_id* could not land, or None if it could.
+
+        Called from ``escalation/server.py::resolve_issue`` on a FastMCP worker
+        thread, so it stays SYNC and side-effect-free: a worktree dict lookup
+        and two ``Path.exists()`` calls. The asynchronous delivery itself can
+        still fall short later; see :meth:`_fold_granted_files_on_repend`.
+        """
+        if self._locate_plan_artifacts(task_id) is None:
+            return GrantDelivery.NO_PLAN_TO_WIDEN
+        return None
+
     async def _fold_granted_files_on_repend(self, task_id: str, escalation) -> None:
         """Deliver the steward's ``granted_files`` scope grant before a re-pend.
 
@@ -17659,25 +17689,19 @@ class Harness:
             if not granted:
                 return
 
-            # Resolve the plan artifacts new-then-old, mirroring
-            # _resolve_recovery_artifact: the W11 `.task-meta` SIBLING first,
-            # the legacy `<worktree>/.task` second. Without the fallback arm
-            # every pre-relocation task would take the "no plan" exit below.
-            wt = self._resolve_task_worktree(task_id)
-            new_root = TaskArtifacts.meta_root_for(self.git_ops.worktree_base, wt.name)
-            if (new_root / 'plan.json').exists():
-                arts = TaskArtifacts(wt, meta_root=new_root)
-            elif (wt / '.task' / 'plan.json').exists():
-                arts = TaskArtifacts(wt)
-            else:
+            arts = self._locate_plan_artifacts(task_id)
+            if arts is None:
                 # A task can legitimately have no plan (never reached the
                 # architect, or its worktree was reclaimed). There is no scope
                 # to widen and the re-pend is still correct — the grant is not
                 # a precondition of the resume.
+                wt = self._resolve_task_worktree(task_id)
                 logger.debug(
                     'granted-files fold: task %s has no plan.json at %s or %s '
                     '— nothing to widen (grant %s)',
-                    task_id, new_root, wt / '.task', granted,
+                    task_id,
+                    TaskArtifacts.meta_root_for(self.git_ops.worktree_base, wt.name),
+                    wt / '.task', granted,
                 )
                 return
 
