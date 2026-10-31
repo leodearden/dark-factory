@@ -395,8 +395,11 @@ async def _read_grouped_document(
 def child_parent_id(meta: Mapping[str, Any] | None) -> str | None:
     """The parent id *meta* points at, or ``None`` when it is not a child's.
 
-    THE single definition of child-ness: every module that asks "is this Mem0
-    record a child, and of what?" calls this rather than restating the rule.
+    Modules that ask "is this Mem0 record a child, and of what?" call this
+    rather than restating the rule. One restatement remains:
+    ``services/topic_anchor.py::_is_child_shaped``, kept because importing this
+    module from ``services`` would close an import cycle. Task 6720 moves this
+    function into ``memory_metadata.py`` and removes that copy.
 
     A child is identified STRICTLY by ``metadata.parent_id`` plus a child
     ``kind`` (D5): a shared ``topic`` is not a grouping key, and two entries

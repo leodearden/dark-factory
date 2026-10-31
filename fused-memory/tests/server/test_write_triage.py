@@ -631,6 +631,7 @@ class TestDecideBand:
         ('label', 'extra'),
         [
             ('no kind at all', None),
+            ('parent_id without kind', {PARENT_ID_KEY: 'm1'}),
             ('kind outside CHILD_KINDS', {'kind': 'note', PARENT_ID_KEY: 'm1'}),
             ('kind is None', {'kind': None, PARENT_ID_KEY: 'm1'}),
         ],
