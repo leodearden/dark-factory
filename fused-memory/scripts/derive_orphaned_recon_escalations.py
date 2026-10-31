@@ -157,7 +157,7 @@ DEFAULT_QUEUE_DIR: str = './data/reconciliation/escalations'
 # (--project-root).  2 is skipped: argparse exits with it on a usage error, so
 # reusing it would make a bad flag indistinguishable from a degraded scan.
 EXIT_OK: int = 0
-EXIT_QUEUE_DIR_MISSING: int = 1
+EXIT_QUEUE_DIR_UNPOPULATED: int = 1
 EXIT_CENSUS_ERRORS: int = 3
 EXIT_UNRESOLVABLE: int = 4
 
@@ -340,7 +340,7 @@ def main() -> int:
         # one line on stderr says more than a traceback, and the exit code is
         # what a caller actually branches on.
         print(f'error: {exc}', file=sys.stderr)
-        return EXIT_QUEUE_DIR_MISSING
+        return EXIT_QUEUE_DIR_UNPOPULATED
 
     print(json.dumps(report, indent=2, default=str))
     # The report is printed either way — a degraded run is still the operator's
