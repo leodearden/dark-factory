@@ -3296,7 +3296,8 @@ def _count_detector_calls(monkeypatch, mod) -> list:
 
     ``functools.wraps`` is load-bearing: ``resolve_audit_threshold`` reads the
     detector's default through ``inspect.signature``, which follows
-    ``__wrapped__``.
+    ``__wrapped__``.  The counter is a new detector, so ``memoized_audit_recall``
+    holds nothing for it yet and its first audit always reaches it.
     """
     audit = mod.load_audit_script()
     detector = audit.find_near_duplicate_memory_groups
@@ -3366,6 +3367,25 @@ class TestAuditRecallIsComputedOncePerContent:
         first['true_dup']['pairs'] = -1
 
         assert mod.memoized_audit_recall(records, 0.85) == pristine
+
+    def test_a_swapped_detector_neither_reads_nor_leaves_a_remembered_result(
+        self, monkeypatch,
+    ):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        audit = mod.load_audit_script()
+        real = mod.memoized_audit_recall(records, 0.85)
+
+        with monkeypatch.context() as swapped:
+            swapped.setattr(
+                audit, 'find_near_duplicate_memory_groups',
+                lambda memories, threshold: [],
+            )
+            stubbed = mod.memoized_audit_recall(records, 0.85)
+
+        assert real['groups_found'] == 1
+        assert stubbed['groups_found'] == 0
+        assert mod.memoized_audit_recall(records, 0.85) == real
 
 
 # ===========================================================================
@@ -4235,6 +4255,50 @@ class TestTheTwoArtifactsAreWrittenAsAPair:
         )
 
 
+import dataclasses  # noqa: E402
+
+
+@dataclasses.dataclass(frozen=True)
+class _GitShim:
+    """A real ``git`` first on PATH that logs every argv before running it.
+
+    While ``failing_walks`` exists, every ``git log`` exits 1 instead.
+    """
+
+    log: Path
+    failing_walks: Path
+
+    @classmethod
+    def install(cls, tmp_path: Path, monkeypatch) -> _GitShim:
+        import os  # noqa: PLC0415
+        import shutil  # noqa: PLC0415
+
+        real = shutil.which('git')
+        if real is None:
+            pytest.skip('no git on PATH')
+        shim = cls(log=tmp_path / 'git.log', failing_walks=tmp_path / 'fail-walks')
+        executable = tmp_path / 'bin' / 'git'
+        executable.parent.mkdir()
+        executable.write_text(
+            '#!/bin/sh\n'
+            f'printf \'%s\\n\' "$*" >> "{shim.log}"\n'
+            f'if [ "$1" = log ] && [ -e "{shim.failing_walks}" ]; then exit 1; fi\n'
+            f'exec "{real}" "$@"\n'
+        )
+        executable.chmod(0o755)
+        monkeypatch.setenv(
+            'PATH', f'{executable.parent}{os.pathsep}{os.environ["PATH"]}',
+        )
+        return shim
+
+    def calls(self, subcommand: str) -> list[str]:
+        logged = self.log.read_text() if self.log.exists() else ''
+        return [
+            line for line in logged.splitlines()
+            if line.startswith(f'{subcommand} ')
+        ]
+
+
 class TestFixtureProvenance:
     """The blind-authoring audit trail is git history; the report cites it."""
 
@@ -4299,24 +4363,7 @@ class TestFixtureProvenance:
         """Observed through a real git shim on PATH.  At most one walk per
         path, because an earlier test on this worker may already have
         stamped these paths."""
-        import os  # noqa: PLC0415
-        import shutil  # noqa: PLC0415
-
-        real = shutil.which('git')
-        if real is None:
-            pytest.skip('no git on PATH')
-        log = tmp_path / 'git.log'
-        shim = tmp_path / 'bin' / 'git'
-        shim.parent.mkdir()
-        shim.write_text(
-            '#!/bin/sh\n'
-            f'printf \'%s\\n\' "$*" >> "{log}"\n'
-            f'exec "{real}" "$@"\n'
-        )
-        shim.chmod(0o755)
-        monkeypatch.setenv(
-            'PATH', f'{shim.parent}{os.pathsep}{os.environ["PATH"]}',
-        )
+        shim = _GitShim.install(tmp_path, monkeypatch)
         paths = [ARM_CLAIMS_PATH, QUERY_SET_PATH]
 
         first = _mod().fixture_provenance(paths)
@@ -4324,11 +4371,28 @@ class TestFixtureProvenance:
 
         assert first == second
         assert all(len(entry['commit']) == 40 for entry in second)
-        walks = [
-            line for line in log.read_text().splitlines()
-            if line.startswith('log ')
-        ]
-        assert len(walks) <= 2, walks
+        # Every stamp hashes every path, so the shim saw all four blobs.
+        assert len(shim.calls('hash-object')) == 4
+        assert len(shim.calls('log')) <= 2, shim.calls('log')
+
+    def test_a_walk_that_failed_is_asked_again_rather_than_remembered(
+        self, tmp_path, monkeypatch,
+    ):
+        """A walk can fail transiently, e.g. the 30s timeout under load.  Its
+        None must not stand in for the commit for the rest of the process.
+        Stamps this test module, which no other test stamps, so no earlier
+        test can have filled the memo for it."""
+        shim = _GitShim.install(tmp_path, monkeypatch)
+        this_module = Path(__file__)
+
+        shim.failing_walks.touch()
+        failed = _mod().fixture_provenance([this_module])
+        shim.failing_walks.unlink()
+        answered = _mod().fixture_provenance([this_module])
+
+        assert failed[0]['commit'] is None
+        assert len(answered[0]['commit']) == 40
+        assert len(shim.calls('log')) == 2, shim.calls('log')
 
 
 # ===========================================================================
@@ -5253,9 +5317,7 @@ class TestRunBakeOffWiring:
         self, monkeypatch,
     ):
         """cluster_limit does not shrink the audit: it sweeps the whole alpha
-        fixture, so every run of the same fixture would otherwise repay it.
-        At most one call, because an earlier test on this worker may already
-        have audited it."""
+        fixture, so every run of the same fixture would otherwise repay it."""
         mod = _mod()
         _install_driver_doubles(monkeypatch)
         calls = _count_detector_calls(monkeypatch, mod)
@@ -5263,7 +5325,7 @@ class TestRunBakeOffWiring:
         first = await mod.run_bake_off(**_SIX_ARM_RUN)
         second = await mod.run_bake_off(**_SIX_ARM_RUN)
 
-        assert len(calls) <= 1
+        assert len(calls) == 1
         assert first['audit_recall'] == second['audit_recall']
 
 
