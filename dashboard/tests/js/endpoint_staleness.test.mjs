@@ -41,27 +41,29 @@ const {
   staleNoticesForTab,
   loadingNoticeForTab,
 } = staleness;
+const { TAB_ENDPOINTS } = pollScope;
 
 const REDUX_DIR = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   '../../src/dashboard/static/redux',
 );
 
-// A representative endpoint that only ONE tab consumes, so a notice for it
-// can never be confused with a different tab's fan-in.
 const DASH = '/api/v2/dashboard';
-const MERGE_PATH = '/api/v2/dashboard/merge-queue';
-const TASKS_PATH = '/api/v2/dashboard/tasks';
-const ESC_PATH = '/api/v2/dashboard/escalations';
+
+// Fixture endpoints: real dashboard paths, handed to the notice functions
+// directly, so each decision test names exactly the paths it decides over.
+const MERGE_PATH = `${DASH}/merge-queue`;
+const TASKS_PATH = `${DASH}/tasks`;
+const ESC_PATH = `${DASH}/escalations`;
 
 // A multi-endpoint path list, spelled out here rather than read off a surface
 // map: the notice functions decide over whatever paths they are handed, so
 // their decision tests do not depend on which tab polls what.
 const TASKS_TAB_PATHS = Object.freeze([
   TASKS_PATH,
-  '/api/v2/dashboard/orchestrators',
-  '/api/v2/dashboard/scheduler',
-  '/api/v2/dashboard/invariants',
+  `${DASH}/orchestrators`,
+  `${DASH}/scheduler`,
+  `${DASH}/invariants`,
 ]);
 
 const NOW = 1_700_000_000_000;
@@ -420,8 +422,6 @@ test('loadingNoticeForTab tolerates every missing input', () => {
 // ── loadingNoticeForTab over the real data.js ──────────────────────────────
 //
 // These hand each tab the paths app.jsx would: its poll_scope.js entry.
-
-const { TAB_ENDPOINTS } = pollScope;
 
 function liveLoadingNotices(win) {
   return Object.fromEntries(Object.keys(TAB_ENDPOINTS).map(tab => [

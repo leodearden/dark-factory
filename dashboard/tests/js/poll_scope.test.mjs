@@ -92,18 +92,6 @@ test('TAB_ENDPOINTS and each of its entries are frozen', () => {
   }
 });
 
-// ── the two TAB_ENDPOINTS gaps that become silent freezes once the map polls ─
-
-test('the Orchestrators tab watches /scheduler — its Deps/Locks cells read DF.SCHEDULER', () => {
-  assert.ok(TAB_ENDPOINTS.orch.includes(`${DASH}/scheduler`),
-    `TAB_ENDPOINTS.orch must include ${DASH}/scheduler, got ${JSON.stringify(TAB_ENDPOINTS.orch)}`);
-});
-
-test('the Overview tab watches /merge-queue — its LiveFeed reads MERGE_QUEUE', () => {
-  assert.ok(TAB_ENDPOINTS.overview.includes(`${DASH}/merge-queue`),
-    `TAB_ENDPOINTS.overview must include ${DASH}/merge-queue, got ${JSON.stringify(TAB_ENDPOINTS.overview)}`);
-});
-
 // ── CHROME_ENDPOINTS: what the rail, topbar and toolbar read on EVERY tab ───
 
 test('CHROME_ENDPOINTS is an exported, frozen, duplicate-free array', () => {

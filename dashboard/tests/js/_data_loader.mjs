@@ -17,6 +17,7 @@ import { createRequire } from 'node:module';
 
 // The object datum.js reads at load; see loadDataJs's comment.
 import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
+// The maps data.js destructures at load for pollSetFor.
 import pollScope from '../../src/dashboard/static/redux/poll_scope.js';
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/data.js';
