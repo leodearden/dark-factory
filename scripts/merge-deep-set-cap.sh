@@ -68,10 +68,12 @@ CAP="$1"; CONFIG="$2"; PORT="$3"
 [[ "$PORT" =~ ^[0-9]+$ ]] || die invalid_port "port must be an integer, got: $PORT"
 [ -f "$CONFIG" ]          || die config_not_found "config not found: $CONFIG"
 
-# Step 3's landing and reload run under the SCRIPT's checkout venv and import
-# from the SCRIPT's checkout -- never from $REPO, the config's checkout (the
-# contract is scripts/_config_reload_gate.py's).  Step 1 is stdlib-only plain
-# python3.
+# One interpreter, resolved once, runs both python steps.  Step 3's landing and
+# reload import a non-stdlib transport from the SCRIPT's checkout, never from
+# $REPO, the config's checkout, so they need that checkout's venv (the contract
+# is scripts/_config_reload_gate.py's module docstring).  Step 1's editor is
+# stdlib-only but shares the interpreter, so the script has one resolution
+# mechanism rather than two.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="$SCRIPT_DIR/../.venv/bin/python3"
 [ -x "$PY" ] || PY=python3
@@ -82,9 +84,9 @@ PY="$SCRIPT_DIR/../.venv/bin/python3"
 source "$SCRIPT_DIR/lib/deploy_main_copy.sh"
 deploy_main_copy "$CONFIG" die
 
-# 1. Upsert `merge_deep:\n  chain_cap: <cap>` (stdlib python3; line-oriented so
+# 1. Upsert `merge_deep:\n  chain_cap: <cap>` (stdlib only; line-oriented so
 #    the raw-shell deploy layer needs no yaml library).
-python3 - "$EDITED" "$CAP" <<'PY' || die config_edit_failed "step 1 could not edit main's ${REL} (reason above)"
+"$PY" - "$EDITED" "$CAP" <<'PY' || die config_edit_failed "step 1 could not edit main's ${REL} (reason above)"
 import re, sys
 path, cap = sys.argv[1], sys.argv[2]
 lines = open(path, encoding="utf-8").read().splitlines()
