@@ -124,6 +124,41 @@ async def test_write_ops_and_backend_ops_share_one_row_budget(journal):
     assert _row_count(journal, 'write_ops') + _row_count(journal, 'backend_ops') == 2
 
 
+class _TickingClock:
+    """Each reading is one second after the last, so every deadline check costs a second."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        self.now += 1.0
+        return self.now
+
+
+@pytest.mark.asyncio
+async def test_write_ops_and_backend_ops_share_one_deadline(journal, monkeypatch):
+    from fused_memory.services import write_journal as wj
+
+    aged = (datetime.now(UTC) - timedelta(days=800)).isoformat()
+    for _ in range(3):
+        write_op_id = str(uuid.uuid4())
+        await journal.log_write_op(write_op_id=write_op_id, operation='add_memory', kind='write')
+        _backdate(journal, 'write_ops', 'id', write_op_id, to=aged)
+        await journal.log_backend_op(write_op_id=write_op_id, backend='mem0', operation='add')
+        _backdate(journal, 'backend_ops', 'write_op_id', write_op_id, to=aged)
+    monkeypatch.setattr(wj, '_monotonic', _TickingClock())
+
+    result = await prune_every_table_at_startup(
+        journal, WriteJournalConfig(prune_batch_size=1, prune_max_seconds=2.0),
+    )
+
+    assert result['backend_ops'] == 1, (
+        f'write_ops spent the shared deadline, so backend_ops gets only the one batch '
+        f'a between-batches deadline check allows: {result}'
+    )
+    assert _row_count(journal, 'backend_ops') == 2
+
+
 @pytest.mark.asyncio
 async def test_the_sweep_never_raises(journal):
     await journal.close()

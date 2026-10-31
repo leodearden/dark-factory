@@ -51,6 +51,11 @@ logger = logging.getLogger(__name__)
 #: turn a 30 s budget into an unbounded one.
 _monotonic = time.monotonic
 
+
+def prune_deadline(max_seconds: float) -> float:
+    """The instant *max_seconds* from now on the clock every batched prune checks its deadline against."""
+    return _monotonic() + max_seconds
+
 SCHEMA_SQL = """
 -- The read rollup table read_op_counts (task 5405) is created beside these; its DDL lives in services/read_rollup.py.
 CREATE TABLE IF NOT EXISTS write_ops (
@@ -337,7 +342,7 @@ BACKEND_OPS_PRUNE_BATCH_SQL = (
 
 
 class _PruneStop(StrEnum):
-    """Why a batched prune stopped with rows still expired; the value is the log wording."""
+    """Why a batched prune stopped before showing its horizon drained; the value is the log wording."""
 
     ROW_BUDGET = 'row budget'
     DEADLINE = 'deadline'
@@ -1430,7 +1435,7 @@ class WriteJournal:
             'write': write_older_than_days,
         }
         try:
-            deadline = _monotonic() + max_seconds
+            deadline = prune_deadline(max_seconds)
             total = 0
             by_horizon: dict[str, int] = {}
             halted: _PruneStop | None = None
@@ -1485,7 +1490,7 @@ class WriteJournal:
         older_than_days: float,
         batch_size: int,
         max_rows: int,
-        max_seconds: float,
+        deadline: float,
     ) -> int:
         """Age out ``backend_ops`` rows older than ``older_than_days``.
 
@@ -1496,15 +1501,25 @@ class WriteJournal:
 
         Batched and bounded through the same drain as :meth:`prune_write_ops`,
         whose docstring measures why, with the same fire-and-forget contract.
-        Its resume cursor is correct because :meth:`log_backend_op`, the only
-        INSERT, stamps ``created_at`` with the current time.
+        *deadline* is an instant from :func:`prune_deadline`, so a caller can
+        share one deadline across prunes. Its resume cursor is correct because
+        :meth:`log_backend_op`, the only INSERT, stamps ``created_at`` with the
+        current time.
         """
         try:
+            if max_rows <= 0:
+                logger.warning(
+                    'backend_ops prune not attempted: its row budget was already spent '
+                    '(max_rows=%d), so rows past the %s-day horizon, if any, wait for '
+                    'a later startup.',
+                    max_rows, older_than_days,
+                )
+                return 0
             started = _monotonic()
             cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
             removed, stop = await self._drain_horizon(
                 'backend_ops', BACKEND_OPS_PRUNE_BATCH_SQL, cutoff,
-                batch_size=batch_size, max_rows=max_rows, deadline=started + max_seconds,
+                batch_size=batch_size, max_rows=max_rows, deadline=deadline,
             )
             if removed:
                 logger.info(
@@ -1515,7 +1530,7 @@ class WriteJournal:
             if stop is not None:
                 logger.warning(
                     'backend_ops prune stopped early on the %s after %d rows in %.1fs '
-                    '(horizon %s days); the remainder drains on later startups.',
+                    '(horizon %s days); any remainder drains on later startups.',
                     stop, removed, _monotonic() - started, older_than_days,
                 )
             return removed

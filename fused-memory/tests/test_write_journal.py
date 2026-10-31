@@ -1854,12 +1854,14 @@ def test_prune_write_ops_takes_every_bound_from_its_caller():
 
 async def _prune_backend(journal, **overrides):
     """Run the backend_ops prune at the SHIPPED bounds, overriding only what a test is about."""
+    from fused_memory.services.write_journal import prune_deadline
+
     config = WriteJournalConfig()
     bounds = {
         'older_than_days': config.write_retention_days,
         'batch_size': config.prune_batch_size,
         'max_rows': config.prune_max_rows_per_run,
-        'max_seconds': config.prune_max_seconds,
+        'deadline': prune_deadline(config.prune_max_seconds),
     }
     return await journal.prune_backend_ops(**{**bounds, **overrides})
 
@@ -1934,6 +1936,24 @@ async def test_prune_backend_ops_row_budget_bounds_a_single_run(journal, caplog)
 
 
 @pytest.mark.asyncio
+async def test_a_spent_row_budget_is_reported_as_not_attempted(journal, caplog):
+    """A row budget spent before the prune starts shows nothing about the horizon,
+    so the WARNING must not claim a backlog."""
+    from fused_memory.services import write_journal as wj
+
+    await _aged_backend_op(journal, age_days=800)
+
+    with caplog.at_level(logging.WARNING, logger=wj.logger.name):
+        deleted = await _prune_backend(journal, max_rows=0)
+
+    assert deleted == 0
+    assert len(_surviving_backend_write_op_ids(journal)) == 1
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any('not attempted' in message for message in warnings), warnings
+    assert not any('stopped' in message for message in warnings), warnings
+
+
+@pytest.mark.asyncio
 async def test_the_next_backend_ops_prune_drains_what_the_row_budget_left(journal):
     for _ in range(4):
         await _aged_backend_op(journal, age_days=800)
@@ -1956,7 +1976,7 @@ async def test_prune_backend_ops_deadline_bounds_a_single_run(journal, caplog):
 
     with caplog.at_level(logging.WARNING, logger=wj.logger.name):
         deleted = await _prune_backend(
-            journal, batch_size=1, max_rows=1_000_000, max_seconds=0,
+            journal, batch_size=1, max_rows=1_000_000, deadline=wj.prune_deadline(0),
         )
 
     assert deleted == 1
