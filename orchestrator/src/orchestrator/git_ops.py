@@ -7824,6 +7824,8 @@ class GitOps:
                     # .task/plan.json is preserved; WIP is committed + rebased.
                     if route is None:
                         route = AcquireRoute.REUSE
+                    # Dispatch-activity stamp for the GC record gate; see WarmLanePool.refresh_assignment.
+                    self.warm_lane_pool.refresh_assignment(branch_name, lane)
                     info = await self._reuse_warm_lane(lane, full_branch)
                     self._note_assigned_via_route(
                         info.path, route, branch_name, expected_title, full_branch,
