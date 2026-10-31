@@ -154,6 +154,14 @@ def test_handles_envelope_markup_selects_markup_handling_sources(source: str) ->
             'XML = "' + _LT + 'description>d' + _LT + '/description>"\n',
             id='xml-description-closer',
         ),
+        pytest.param(
+            'POM = "' + _LT + 'parameters>p' + _LT + '/parameters>"\n',
+            id='xml-parameters-tag',
+        ),
+        pytest.param(
+            'WSDL = "' + _LT + 'parameterList>p' + _LT + '/parameterList>"\n',
+            id='xml-parameterlist-tag',
+        ),
     ],
 )
 def test_handles_envelope_markup_rejects_other_sources(source: str) -> None:

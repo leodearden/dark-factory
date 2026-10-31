@@ -7,11 +7,13 @@ raw opening bracket. That module's 'Sentinel-literal hazard' section says why.
 POPULATION. Every ``.py`` file git knows about (tracked, or untracked and not
 ignored) whose source either (i) handles envelope markup the sanctioned way:
 it spells the bracket as the text ``chr(60)`` or the ``\\x3c`` escape, or it
-imports ``shared.toolcall_markup``; or (ii) spells a raw prefix of one of the
-envelope grammar's own tags, ``ENVELOPE_ONLY_RAW_PREFIXES``: the parameter
-opener, the parameter closer or the invoke closer (escaped, ``\\x3cparameter``,
-``\\x3c/parameter`` and ``\\x3c/invoke``). Files are found by path scan, read
-once and never imported. Signal (i) stops a markup-handling file from
+imports ``shared.toolcall_markup``; or (ii) spells raw one of the envelope
+grammar's own tags, ``ENVELOPE_ONLY_RAW_PREFIXES``: the parameter opener
+followed by a space, the whole parameter closer or the whole invoke closer
+(escaped, ``\\x3cparameter`` plus a space, ``\\x3c/parameter>`` and
+``\\x3c/invoke>``). Each ends at a tag boundary, so a longer XML tag name that
+shares the prefix, such as ``parameters`` or ``parameterList``, admits nothing.
+Files are found by path scan, read once and never imported. Signal (i) stops a markup-handling file from
 regressing to a raw literal; signal (ii) reaches a file that spells envelope
 literals ONLY raw. The echoed parameter-name closers (description, details,
 content) are not signals, because HTML and XML use those words as tag names
@@ -50,7 +52,7 @@ _LT = chr(60)
 ESCAPED_BRACKET = '\\x3c'
 _PARAMETER_OPENER = _LT + 'parameter'
 RAW_PREFIXES: tuple[str, ...] = (_LT + '/', _PARAMETER_OPENER)
-ENVELOPE_ONLY_RAW_PREFIXES: tuple[str, ...] = (_PARAMETER_OPENER, _LT + '/parameter', _LT + '/invoke')
+ENVELOPE_ONLY_RAW_PREFIXES: tuple[str, ...] = (_PARAMETER_OPENER + ' ', _LT + '/parameter>', _LT + '/invoke>')
 SANCTIONED_BRACKET_SPELLINGS: tuple[str, ...] = ('chr(60)', ESCAPED_BRACKET)
 LITERAL_OWNER = 'shared.toolcall_markup'
 _OWNER_PACKAGE, _, _OWNER_MODULE = LITERAL_OWNER.rpartition('.')
