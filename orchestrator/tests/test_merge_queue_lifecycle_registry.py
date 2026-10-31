@@ -3052,7 +3052,6 @@ class TestMultiItemPipelineToQuiescenceNoLeaks:
 # ---------------------------------------------------------------------------
 
 _VACATE_TRIGGERS = ('operator_halt', 'no_progress', 'lane_contended', 'abandon')
-_REQUEUE_TRIGGERS = ('operator_halt', 'no_progress', 'lane_contended')
 
 
 @dataclasses.dataclass
@@ -3367,81 +3366,8 @@ def _rendered_ids(snap: dict) -> list[str]:
     return [e['request_id'] for e in snap['entries']]
 
 
-@pytest.mark.asyncio
-class TestVacatedInflightEntryRendersAtMostOnce:
-    """A vacated entry is invisible to every in-flight reader: the requeued
-    request renders exactly once, as queued, and never sits in the frozen
-    prefix and the unfrozen suffix at once (task 4582 step-3 RED / step-4
-    GREEN). Read through the public seams only: ``snapshot()``,
-    ``frozen_prefix()``, ``unfrozen_suffix()``, ``check_frozen_prefix_invariant()``.
-    """
-
-    @pytest.mark.parametrize('trigger', _REQUEUE_TRIGGERS)
-    async def test_requeued_request_renders_once_before_and_after_the_drain(
-        self, git_ops: GitOps, config: OrchestratorConfig, trigger: str,
-    ) -> None:
-        async with _verify_exit_scene(git_ops, config, trigger) as scene:
-            worker = scene.worker
-            rid = scene.req.request_id
-            head_rid = scene.head_req.request_id
-            head_tid = scene.head_req.task_id
-
-            for where in ('on the input queue', 'in a lane buffer'):
-                if where == 'in a lane buffer':
-                    worker._drain_queue_into_lanes()
-                    assert rid in worker.unfrozen_suffix(), (
-                        f'the drain must have buffered the requeued request: '
-                        f'{worker.unfrozen_suffix()!r}'
-                    )
-                snap = worker.snapshot()
-                rendered = _rendered_ids(snap)
-                assert rendered.count(rid) == 1, (
-                    f'{where}: the requeued request must render exactly once, '
-                    f'not also as its vacated InflightEntry: {snap["entries"]!r}'
-                )
-                assert next(
-                    e['state'] for e in snap['entries'] if e['request_id'] == rid
-                ) == 'queued', f'{where}: {snap["entries"]!r}'
-                assert rid not in worker.frozen_prefix(), (
-                    f'{where}: a vacated entry is not frozen: {worker.frozen_prefix()!r}'
-                )
-                assert worker.check_frozen_prefix_invariant(scene.head_item.base_sha) == [], (
-                    f'{where}: {worker.check_frozen_prefix_invariant(scene.head_item.base_sha)!r}'
-                )
-                assert snap['depth'] == 2 == len(set(rendered)), (
-                    f'{where}: depth must count the two live requests: '
-                    f'depth={snap["depth"]} entries={snap["entries"]!r}'
-                )
-                assert snap['occupancy']['inflight_by_host'] == {'head-host': [head_tid]}, (
-                    f'{where}: {snap["occupancy"]!r}'
-                )
-                assert snap['occupancy']['inflight_total'] == 1, f'{where}: {snap["occupancy"]!r}'
-                assert snap['verify_in_progress'] is not None
-                assert snap['verify_in_progress']['task_id'] == head_tid, (
-                    f'{where}: {snap["verify_in_progress"]!r}'
-                )
-                assert snap['frozen_prefix']['request_ids'] == [head_rid], (
-                    f'{where}: {snap["frozen_prefix"]!r}'
-                )
-
-    async def test_dropped_request_does_not_render(
-        self, git_ops: GitOps, config: OrchestratorConfig,
-    ) -> None:
-        async with _verify_exit_scene(git_ops, config, 'abandon') as scene:
-            worker = scene.worker
-            rid = scene.req.request_id
-
-            snap = worker.snapshot()
-
-            assert _rendered_ids(snap).count(rid) == 0, (
-                f'a dropped request must not render as its vacated entry: '
-                f'{snap["entries"]!r}'
-            )
-            assert rid not in worker.frozen_prefix(), f'{worker.frozen_prefix()!r}'
-            assert snap['depth'] == 1, f'{snap["entries"]!r}'
-            assert worker.check_frozen_prefix_invariant(scene.head_item.base_sha) == [], (
-                f'{worker.check_frozen_prefix_invariant(scene.head_item.base_sha)!r}'
-            )
+# The render-once property is pinned through public submission in
+# test_merge_lane_vacated_entry_census.py::TestVacatedInflightEntryRendersAtMostOnce.
 
 
 @pytest.mark.asyncio
@@ -3452,6 +3378,11 @@ class TestVacatedCorpseFinalizeLeavesReincarnationAlone:
 
     This is the reify mr-945466ca shape — a corpse still in ``_inflight`` while
     the same request_id verifies again behind it.
+
+    It stays hand-built because in a running lane the corpse's head-of-line
+    finalize is followed, in the same verifier pass, by the head-failure
+    cascade over the re-dispatched entry, so the registry between the two is
+    not observable through public seams (task 6342).
     """
 
     async def test_corpse_finalize_leaves_the_redispatched_verify_verifying(
