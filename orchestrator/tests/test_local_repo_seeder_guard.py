@@ -93,7 +93,7 @@ _NOT_YET_MIGRATED = frozenset({
     'test_rebase_verify_cost.py',
     'test_reconcile_done_step_commits.py',
     'test_remove_merge_worktree_guarded.py',
-    'test_session_hooks.py',
+    'test_session_hooks_install.py',
     'test_session_resume_integration_gate.py',
     'test_substrate_gate.py',
     'test_suffix_conflict_tracker.py',
