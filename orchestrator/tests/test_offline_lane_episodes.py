@@ -36,9 +36,10 @@ from escalation.queue import EscalationQueue
 from shared.task_submit import SubmitFailed, SubmittedTask, SubmittedTicket
 
 from orchestrator.offline_lane_episode_state import EpisodeStore, unconfirmable_node
-from orchestrator.offline_lane_episodes import TickResult
+from orchestrator.offline_lane_episodes import TICK_FAILURES_BEFORE_ESCALATION, TickResult
 from orchestrator.offline_lane_escalations import (
     STUCK_FILING_CATEGORY,
+    TICK_FAILURE_CATEGORY,
     UNLANDED_RED_CATEGORY,
     escalation_state,
 )
@@ -1141,3 +1142,44 @@ async def test_one_command_whose_record_makes_its_tick_raise_leaves_the_other_co
         for r in caplog.records
     )
     assert lane.stored(BROKEN).episodes[A].filing_due is True
+
+
+@pytest.mark.asyncio
+async def test_a_command_failing_every_tick_keeps_one_level_one_record_resolved_at_its_first_clean_tick(tmp_path):
+    lane = Lane(tmp_path)
+    assert lane.queue is not None
+    _plant_broken(lane)
+    for _ in range(TICK_FAILURES_BEFORE_ESCALATION - 1):
+        await lane.tick()
+    assert lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN) == []
+
+    await lane.tick()
+    (record,) = lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN)
+    assert record.level == 1
+    assert BROKEN in record.summary and 'ValueError' in record.summary
+    assert 'a lane fix task needs at least one test, each with a counted pass' in record.detail
+
+    await lane.tick()
+    assert [e.id for e in lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN)] == [record.id]
+
+    lane.client.set_status('850', 'pending', **_engine_filed(command=BROKEN))
+    await lane.tick()
+
+    assert escalation_state(lane.queue, record.id) == 'resolved'
+    assert lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN) == []
+    assert lane.stored(BROKEN).episodes[A].covering_task_id == '850'
+
+
+@pytest.mark.asyncio
+async def test_with_no_escalation_queue_a_failing_command_is_only_logged(tmp_path, caplog):
+    lane = Lane(tmp_path, queue=None)
+    _plant_broken(lane)
+
+    for in_a_row in range(1, TICK_FAILURES_BEFORE_ESCALATION + 2):
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger='orchestrator.offline_lane_episodes'):
+            await lane.tick()
+        assert any(
+            r.levelno == logging.ERROR and f'{BROKEN}: tick failed ({in_a_row} in a row)' in r.getMessage()
+            for r in caplog.records
+        )
