@@ -17,8 +17,8 @@ inside ``_HEALTHZ_TOTAL_BUDGET``. Only "could a caller get THROUGH to the
 substrate, inside a bound" separates the two, and that is the property the
 incident actually violated.
 
-So the probe keys on TRAVERSAL, through the raw uncached read (PRD decision
-17). A completed fan-out is ``'ok'`` whatever it returned, the offline marker
+So the probe keys on TRAVERSAL, through a raw uncached read of one row of the
+snapshot unit's row query (PRD decision 17, task 6321). A completed fan-out is ``'ok'`` whatever it returned, the offline marker
 included.
 
 Every test calls ``dashboard.app.healthz(request)`` directly through
