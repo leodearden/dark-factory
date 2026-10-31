@@ -16,8 +16,10 @@ import pytest
 import verify_admission_cancel_on_red_census as mod
 
 
-def _leg(module, granted_at, held_secs, *, red=False, arrived_at=0.0):
-    return mod.Leg(module=module, arrived_at=arrived_at, granted_at=granted_at, held_secs=held_secs, red=red)
+def _leg(module, granted_at, held_secs, *, rc=0, timed_out=False, arrived_at=0.0):
+    return mod.Leg(
+        module=module, arrived_at=arrived_at, granted_at=granted_at, held_secs=held_secs, rc=rc, timed_out=timed_out,
+    )
 
 
 def _plan(*legs, role='task', plan_id='p1'):
@@ -25,28 +27,35 @@ def _plan(*legs, role='task', plan_id='p1'):
 
 
 def test_leg_granted_after_a_red_sibling_ends_is_avoidable():
-    a = _leg('a', 0.0, 40.0, red=True)
+    a = _leg('a', 0.0, 40.0, rc=1)
     b = _leg('b', 41.0, 10.0)
 
     assert mod.avoidable_legs(_plan(a, b)) == (mod.AvoidableLeg(leg=b, cutoff=40.0),)
 
 
+def test_leg_granted_exactly_as_the_red_sibling_ends_is_not_avoidable():
+    a = _leg('a', 0.0, 40.0, rc=1)
+    b = _leg('b', 40.0, 10.0)
+
+    assert mod.avoidable_legs(_plan(a, b)) == ()
+
+
 def test_leg_already_running_when_the_sibling_goes_red_is_not_avoidable():
-    a = _leg('a', 0.0, 40.0, red=True)
+    a = _leg('a', 0.0, 40.0, rc=1)
     b = _leg('b', 20.0, 10.0)
 
     assert mod.avoidable_legs(_plan(a, b)) == ()
 
 
-def test_red_flag_alone_decides_redness_so_a_timeout_counts():
-    timed_out_with_rc_zero = _leg('a', 0.0, 1200.0, red=True)
+def test_a_timed_out_leg_is_red_even_with_rc_zero():
+    timed_out_with_rc_zero = _leg('a', 0.0, 1200.0, timed_out=True)
     b = _leg('b', 1201.0, 10.0)
 
     assert mod.avoidable_legs(_plan(timed_out_with_rc_zero, b)) == (mod.AvoidableLeg(leg=b, cutoff=1200.0),)
 
 
 def test_a_module_whose_retry_passed_is_green_and_not_its_own_sibling():
-    a_timeout = _leg('a', 0.0, 1200.0, red=True)
+    a_timeout = _leg('a', 0.0, 1200.0, timed_out=True)
     a_retry_green = _leg('a', 1201.0, 1199.0)
     b = _leg('b', 2401.0, 10.0)
 
@@ -54,15 +63,15 @@ def test_a_module_whose_retry_passed_is_green_and_not_its_own_sibling():
 
 
 def test_a_module_red_on_every_attempt_cuts_off_at_its_final_attempts_end():
-    a_timeout = _leg('a', 0.0, 1200.0, red=True)
-    a_retry_red = _leg('a', 1201.0, 1199.0, red=True)
+    a_timeout = _leg('a', 0.0, 1200.0, timed_out=True)
+    a_retry_red = _leg('a', 1201.0, 1199.0, rc=1)
     b = _leg('b', 2401.0, 10.0)
 
     assert mod.avoidable_legs(_plan(a_timeout, a_retry_red, b)) == (mod.AvoidableLeg(leg=b, cutoff=2400.0),)
 
 
 def test_queued_at_red_tells_a_leg_already_waiting_from_one_that_arrived_later():
-    a = _leg('a', 0.0, 40.0, red=True)
+    a = _leg('a', 0.0, 40.0, rc=1)
     arrived_after_red = _leg('b', 200.0, 10.0, arrived_at=100.0)
     queued_before_red = _leg('c', 300.0, 10.0, arrived_at=30.0)
 
@@ -75,8 +84,8 @@ def test_queued_at_red_tells_a_leg_already_waiting_from_one_that_arrived_later()
 
 
 def test_every_later_leg_is_measured_against_the_earliest_red_sibling():
-    a = _leg('a', 0.0, 40.0, red=True)
-    b = _leg('b', 41.0, 59.0, red=True)
+    a = _leg('a', 0.0, 40.0, rc=1)
+    b = _leg('b', 41.0, 59.0, rc=1)
     c = _leg('c', 101.0, 10.0)
 
     assert mod.avoidable_legs(_plan(a, b, c)) == (
@@ -86,7 +95,7 @@ def test_every_later_leg_is_measured_against_the_earliest_red_sibling():
 
 
 def test_a_single_module_red_plan_has_nothing_to_avoid():
-    assert mod.avoidable_legs(_plan(_leg('a', 0.0, 40.0, red=True))) == ()
+    assert mod.avoidable_legs(_plan(_leg('a', 0.0, 40.0, rc=1))) == ()
 
 
 def test_an_all_green_multi_module_plan_has_nothing_to_avoid():
@@ -94,7 +103,7 @@ def test_an_all_green_multi_module_plan_has_nothing_to_avoid():
 
 
 def test_by_leg_is_the_literal_reading_that_counts_a_passing_retry():
-    a_timeout = _leg('a', 0.0, 1200.0, red=True)
+    a_timeout = _leg('a', 0.0, 1200.0, timed_out=True)
     a_retry_green = _leg('a', 1201.0, 1199.0)
     b = _leg('b', 2401.0, 10.0)
 
@@ -105,14 +114,14 @@ def test_by_leg_is_the_literal_reading_that_counts_a_passing_retry():
 
 
 def test_a_none_module_is_one_module_so_its_legs_are_attempts_of_one_unit():
-    whole_project_timeout = _leg(None, 0.0, 1200.0, red=True)
+    whole_project_timeout = _leg(None, 0.0, 1200.0, timed_out=True)
     whole_project_retry_green = _leg(None, 1201.0, 1199.0)
 
     assert mod.avoidable_legs(_plan(whole_project_timeout, whole_project_retry_green)) == ()
 
 
 def test_a_none_module_is_a_sibling_of_a_named_module():
-    whole_project = _leg(None, 0.0, 40.0, red=True)
+    whole_project = _leg(None, 0.0, 40.0, rc=1)
     named = _leg('a', 41.0, 10.0)
 
     assert mod.avoidable_legs(_plan(whole_project, named)) == (mod.AvoidableLeg(leg=named, cutoff=40.0),)
@@ -170,18 +179,21 @@ def test_loader_keeps_only_returned_arrival_plans_in_row_order(mixed_runs_db):
     assert [(plan.plan_id, plan.role) for plan in sample.plans] == [('first', 'task'), ('second', 'background')]
 
 
-def test_loader_parses_legs_to_epoch_floats_and_a_red_flag(mixed_runs_db):
+def test_loader_parses_legs_to_epoch_floats_keeping_rc_and_timed_out_apart(mixed_runs_db):
     first = mod.load_arrival_plans(mixed_runs_db).plans[0]
 
     assert first.legs == (
-        mod.Leg(module='a', arrived_at=_epoch(ARRIVED), granted_at=_epoch(GRANTED), held_secs=30.5, red=True),
+        mod.Leg(
+            module='a', arrived_at=_epoch(ARRIVED), granted_at=_epoch(GRANTED),
+            held_secs=30.5, rc=1, timed_out=False,
+        ),
         mod.Leg(
             module='b', arrived_at=_epoch(ARRIVED), granted_at=_epoch('2026-10-17T06:00:41+00:00'),
-            held_secs=1200.0, red=True,
+            held_secs=1200.0, rc=0, timed_out=True,
         ),
         mod.Leg(
             module='c', arrived_at=_epoch(ARRIVED), granted_at=_epoch('2026-10-17T06:20:41+00:00'),
-            held_secs=7.0, red=False,
+            held_secs=7.0, rc=0, timed_out=False,
         ),
     )
 
@@ -202,6 +214,24 @@ def test_loader_opens_read_only_so_a_missing_db_is_an_error_not_a_new_file(tmp_p
     assert not missing.exists()
 
 
+def test_loader_never_creates_a_file_when_the_path_holds_a_uri_fragment_mark(tmp_path):
+    missing = tmp_path / 'runs#1.db'
+
+    with pytest.raises(sqlite3.OperationalError):
+        mod.load_arrival_plans(missing)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_loader_reads_a_db_whose_path_holds_uri_metacharacters(make_runs_db, tmp_path):
+    odd = tmp_path / 'odd?mode=rwc#dir%20'
+    odd.mkdir()
+    db = make_runs_db([
+        _plan_event('2026-10-17T06:07:41+00:00', 'only', [_leg_payload('only', 'a', ARRIVED, GRANTED, 5.0)]),
+    ], directory=odd)
+
+    assert [plan.plan_id for plan in mod.load_arrival_plans(db).plans] == ['only']
+
+
 def test_loader_on_a_store_without_arrival_rows_returns_an_empty_window(make_runs_db):
     db = make_runs_db([
         _plan_event('2026-10-16T20:00:00+00:00', 'old', [
@@ -218,26 +248,27 @@ def test_loader_on_a_store_without_arrival_rows_returns_an_empty_window(make_run
 # measure() fixture. Busy = 150 + 1550 + 180 + 10 + 50 = 1940 s over 2 days.
 #   red:        task  a red 0-40; b 50-150 (queued at red); d red 160-170 (arrived 100) -> b, d avoidable = 110 s
 #   retry:      task  fm timed out 1000-2200, fm retry green 2201-2501, c 2600-2650 -> BY_LEG only: 300 + 50
-#   sweep:      background x red 3000-3020; y 3030-3100; r red twice 3100-3150, 3151-3191 -> 160 s, out of headline
+#   sweep:      background x red 3000-3020; y 3030-3100; r red twice (rc, not a timeout) 3100-3150, 3151-3191
+#               -> 160 s, out of headline
 #   single:     task  one green leg 4000-4010
 #   waiter:     task  w waits 80-120, w2 waits 100-150: their union covers 70 s of b's 50-150 hold
 RED = _plan(
-    _leg('a', 0.0, 40.0, red=True),
+    _leg('a', 0.0, 40.0, rc=1),
     _leg('b', 50.0, 100.0),
-    _leg('d', 160.0, 10.0, red=True, arrived_at=100.0),
+    _leg('d', 160.0, 10.0, rc=1, arrived_at=100.0),
     plan_id='red',
 )
 RETRY = _plan(
-    _leg('fm', 1000.0, 1200.0, red=True, arrived_at=1000.0),
+    _leg('fm', 1000.0, 1200.0, timed_out=True, arrived_at=1000.0),
     _leg('fm', 2201.0, 300.0, arrived_at=1000.0),
     _leg('c', 2600.0, 50.0, arrived_at=1000.0),
     plan_id='retry',
 )
 SWEEP = _plan(
-    _leg('x', 3000.0, 20.0, red=True, arrived_at=3000.0),
+    _leg('x', 3000.0, 20.0, rc=1, arrived_at=3000.0),
     _leg('y', 3030.0, 70.0, arrived_at=3000.0),
-    _leg('r', 3100.0, 50.0, red=True, arrived_at=3000.0),
-    _leg('r', 3151.0, 40.0, red=True, arrived_at=3000.0),
+    _leg('r', 3100.0, 50.0, rc=1, arrived_at=3000.0),
+    _leg('r', 3151.0, 40.0, rc=1, arrived_at=3000.0),
     role='background',
     plan_id='sweep',
 )
@@ -320,9 +351,10 @@ def test_cost_side_counts_what_a_cancel_would_have_thrown_away():
     )
 
 
-def test_timeout_retries_decompose_the_non_final_attempts_of_every_role():
-    assert _measure().timeout_retries == mod.TimeoutRetries(
+def test_retried_attempts_decompose_the_non_final_attempts_of_every_role_and_count_the_timeouts_apart():
+    assert _measure().retried_attempts == mod.RetriedAttempts(
         attempts=2,
+        timed_out=1,
         held_secs=1250.0,
         share_of_busy=1250.0 / BUSY,
         modules=2,
@@ -338,7 +370,7 @@ def test_an_empty_sample_measures_zero_without_dividing_by_zero():
     m = _measure(mod.Sample(plans=(), window_start='', window_end='', window_days=0.0))
 
     assert (m.busy_secs, m.avoidable_share, m.literal_avoidable_share, m.share_interval) == (0.0, 0.0, 0.0, (0.0, 0.0))
-    assert (m.avoidable_hours_per_day, m.timeout_retries.share_of_busy) == (0.0, 0.0)
+    assert (m.avoidable_hours_per_day, m.retried_attempts.share_of_busy) == (0.0, 0.0)
 
 
 
@@ -408,7 +440,7 @@ def test_cli_prints_one_measurement_and_verdict_per_db_in_argument_order(make_ru
     assert [report['verdict'] for report in reports] == ['thin_data', 'thin_data']
     assert reports[0]['avoidable_share'] == 12.0 / 42.0
     assert reports[0]['cost']['avoidable_legs'] == 1
-    assert reports[0]['timeout_retries']['attempts'] == 0
+    assert reports[0]['retried_attempts']['attempts'] == 0
 
 
 def test_cli_rejects_a_db_without_a_project_name(tmp_path):

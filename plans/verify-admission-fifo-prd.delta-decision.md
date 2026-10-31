@@ -29,7 +29,7 @@ role. The headline numerator is task-role legs only.
 | Imposed wait (avoidable hold time while ≥ 1 other plan's leg waited) | 9,445 s, coverage 1.000 | 0 s |
 | Background (sweep / checkpoint) post-red time, outside scope | 129,385 s = 35.94 h | 0 s |
 | Cost side: avoidable legs / of them queued at the red / avoidable modules that were themselves red / plans that would lose a red | 26 / 20 / 7 / 5 | 0 / 0 / 0 / 0 |
-| Timeout retries: retried attempts / held / share of slot-busy / modules retried / ended green | 44 / 52,889 s = 14.69 h / 5.31 % / 34 / 30 | 1 / 1,552 s / 0.12 % / 1 / 1 |
+| Retried attempts (`retried_attempts`): attempts / of them timed out / held / share of slot-busy / modules retried / ended green | 44 / 44 / 52,889 s = 14.69 h / 5.31 % / 34 / 30 | 1 / 1 / 1,552 s / 0.12 % / 1 / 1 |
 | Verdict (script) | `decline` | `thin_data` |
 
 reify's `thin_data` is structural, not under-sampling. Measured: 600 of its 601 plans have one
@@ -74,7 +74,8 @@ Any figure here would be a join on task id and timestamp, which is a guess.
 ## Timeout retries (filed: `tkt_0RWDTQFWFYP1VM33YFRB7EZHF0`)
 
 Every one of the window's 59 timed-out legs (47 task, 12 background) is the fused-memory test
-leg, held 1,200–1,307 s each. All 44 retried attempts timed out. The ticket asks why that
+leg, held 1,200–1,307 s each. All 44 retried attempts timed out (`retried_attempts.timed_out`,
+which counts timeouts apart from env-recovery and flake reruns). The ticket asks why that
 suite overruns `fused-memory/orchestrator.yaml`'s 1,200 s budget under the slot. It does not
 ask to change the retry.
 

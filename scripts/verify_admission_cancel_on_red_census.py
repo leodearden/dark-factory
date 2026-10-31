@@ -46,7 +46,12 @@ class Leg:
     arrived_at: float
     granted_at: float
     held_secs: float
-    red: bool
+    rc: int
+    timed_out: bool
+
+    @property
+    def red(self) -> bool:
+        return self.rc != 0 or self.timed_out
 
     @property
     def ended_at(self) -> float:
@@ -152,7 +157,8 @@ def _parse_leg(raw: Mapping[str, Any]) -> Leg:
         arrived_at=_epoch(raw['arrived_at']),
         granted_at=_epoch(raw['granted_at']),
         held_secs=float(raw['held_secs']),
-        red=raw['rc'] != 0 or bool(raw['timed_out']),
+        rc=int(raw['rc']),
+        timed_out=bool(raw['timed_out']),
     )
 
 
@@ -165,7 +171,7 @@ def _is_measured(payload: Mapping[str, Any]) -> bool:
 
 
 def _plan_rows(db_path: Path) -> list[tuple[str, dict[str, Any]]]:
-    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    conn = sqlite3.connect(f'{db_path.resolve().as_uri()}?mode=ro', uri=True)
     try:
         rows = conn.execute(
             'SELECT timestamp, data FROM events WHERE event_type = ? ORDER BY id', (PLAN_EVENT_TYPE,),
@@ -214,10 +220,11 @@ class CostSide:
 
 
 @dataclass(frozen=True)
-class TimeoutRetries:
-    """The non-final attempts of every role's modules: timed-out attempts verify retried."""
+class RetriedAttempts:
+    """The non-final attempts of every role's modules, whatever made verify re-run them; `timed_out` counts the timeouts."""
 
     attempts: int
+    timed_out: int
     held_secs: float
     share_of_busy: float
     modules: int
@@ -242,7 +249,7 @@ class Measurement:
     background_avoidable_secs: float
     imposed_wait_secs: float
     cost: CostSide
-    timeout_retries: TimeoutRetries
+    retried_attempts: RetriedAttempts
 
 
 Contribution = tuple[float, float]
@@ -341,11 +348,13 @@ def _cost_side(task_plans: Iterable[Plan]) -> CostSide:
     )
 
 
-def _timeout_retries(plans: Iterable[Plan], busy_secs: float) -> TimeoutRetries:
+def _retried_attempts(plans: Iterable[Plan], busy_secs: float) -> RetriedAttempts:
     retried = [unit for plan in plans for unit in plan_units(plan).values() if unit.retried_attempts]
-    held = math.fsum(leg.held_secs for unit in retried for leg in unit.retried_attempts)
-    return TimeoutRetries(
-        attempts=sum(len(unit.retried_attempts) for unit in retried),
+    attempts = [leg for unit in retried for leg in unit.retried_attempts]
+    held = math.fsum(leg.held_secs for leg in attempts)
+    return RetriedAttempts(
+        attempts=len(attempts),
+        timed_out=sum(leg.timed_out for leg in attempts),
         held_secs=held,
         share_of_busy=_ratio(held, busy_secs),
         modules=len(retried),
@@ -382,7 +391,7 @@ def measure(project: str, sample: Sample, *, resamples: int, seed: int) -> Measu
         ),
         imposed_wait_secs=_imposed_wait_secs(sample.plans),
         cost=_cost_side(task_plans),
-        timeout_retries=_timeout_retries(sample.plans, busy),
+        retried_attempts=_retried_attempts(sample.plans, busy),
     )
 
 
