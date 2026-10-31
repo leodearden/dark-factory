@@ -3843,18 +3843,10 @@ async def test_timeout_marks_run_failed(journal, event_buffer, mock_memory_servi
     This test confirms that after a timeout:
     - The journal run has status 'failed' (not 'running')
     - The buffer events were restored (buffer size == original event count)
-
-    task σ: the failed + restore-drained path is now gated behind
-    ``resume_after_restart=False`` (the True default routes a mid-cycle cancel
-    to the resumable ``interrupted`` path instead — see
-    ``test_run_full_cycle_cancelled_marks_interrupted_and_keeps_events``). This
-    test targets the legacy failed+restore semantics specifically, so it opts
-    out of resume explicitly.
     """
     import asyncio
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness.config.resume_after_restart = False
 
     # Event set by slow_stage_run when it starts — ensures the cancel below
     # fires inside run_full_cycle's protected try (not during pre-try setup),
@@ -5140,19 +5132,18 @@ async def test_cancellation_cleanup_failure_preserves_cancelled_error(
 
 
 @pytest.mark.asyncio
-async def test_run_full_cycle_cancelled_marks_interrupted_and_keeps_events(
+async def test_run_full_cycle_cancelled_marks_failed_and_restores_events(
     journal, event_buffer, mock_memory_service,
 ):
-    """task σ: with resume_after_restart=True, a mid-cycle CancelledError marks the
-    run `interrupted` (not `failed`), leaves the drained events drained (no
-    restore_drained) and the per-run config dir intact (no gc), and preserves the
-    already-completed stage's report — so the startup pass can --resume it."""
+    """Under the default config, a mid-cycle CancelledError ends the run
+    `failed` with a CancelledError `_error` record, re-buffers its drained
+    events and GCs its config dir, while the completed stage's report stays
+    persisted. Nothing writes 'interrupted' (task 5514)."""
     import asyncio
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness.config.resume_after_restart = True
 
-    # Stage 1 completes; Stage 2 is interrupted by a restart (CancelledError).
+    # Stage 1 completes; Stage 2 is cancelled (a restart or the cycle deadline).
     _mock_stage_run(harness.stages[0])
 
     async def cancel_run(events, watermark, prior_reports, run_id, model=None):
@@ -5171,20 +5162,14 @@ async def test_run_full_cycle_cancelled_marks_interrupted_and_keeps_events(
     ) as gc_mock, pytest.raises(asyncio.CancelledError):
         await harness.run_full_cycle('test-project', 'buffer_size:1')
 
-    # Events stay drained (resumed work must not be double-processed).
-    restore_spy.assert_not_awaited()
-    # Transcript kept for --resume — config dir NOT gc'd.
-    assert gc_mock.call_count == 0
-
-    runs = await journal.get_recent_runs('test-project', limit=5)
-    assert len(runs) >= 1
-    run = runs[0]
-    assert run.status == RunStatus.interrupted
-    # The completed Stage 1 report survives for the resume pass to skip it.
+    [run] = await journal.get_recent_runs('test-project', limit=5)
+    assert run.status == RunStatus.failed
+    assert run.stage_reports['_error']['error_type'] == 'CancelledError'
+    assert run.stage_reports['_error']['failed_stage'] == 'task_knowledge_sync'
+    restore_spy.assert_awaited()
+    assert await event_buffer.get_drained_events('test-project', run.id) == []
+    gc_mock.assert_called_once()
     assert 'memory_consolidator' in run.stage_reports
-    # And its drained events are still retrievable (not restored to 'buffered').
-    drained = await event_buffer.get_drained_events('test-project', run.id)
-    assert len(drained) >= 1
 
 
 @pytest.mark.asyncio
@@ -13763,9 +13748,8 @@ async def test_project_loop_timeout_landing_after_the_completion_commit_keeps_ev
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('resume_after_restart', [True, False])
 async def test_project_loop_pre_completion_timeout_restores_only_the_timed_out_run(
-    journal, event_buffer, mock_memory_service, tmp_path, resume_after_restart,
+    journal, event_buffer, mock_memory_service, tmp_path,
 ):
     """Task 6453: a cycle timeout re-buffers the timed-out run's events and
     leaves an earlier completed run's events drained."""
@@ -13774,7 +13758,6 @@ async def test_project_loop_pre_completion_timeout_restores_only_the_timed_out_r
         journal, event_buffer, mock_memory_service, tmp_path,
         full_cycle_deadline=deadline.arm,
     )
-    harness.config.resume_after_restart = resume_after_restart
     await event_buffer.push(_make_event())
     await event_buffer.push(_make_event())
     run_a = await harness.run_full_cycle('test-project', 'seed')
