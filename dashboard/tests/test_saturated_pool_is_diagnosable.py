@@ -23,8 +23,8 @@ import httpx
 import pytest
 
 from dashboard.config import DashboardConfig
+from dashboard.data import escalations, merge_halt, merge_queue, task_runtime
 from dashboard.data import memory as memory_data
-from dashboard.data import merge_halt, merge_queue, task_runtime
 from dashboard.data.metrics import METRICS_SCHEMA, collect_metrics_snapshot
 
 _SATURATED_URL = 'http://saturated-pool.test'
@@ -32,6 +32,7 @@ _FANOUT_LOGGER = 'dashboard.data.mcp_fanout'
 _GATHER_LOGGER = 'dashboard.data.utils'
 _METRICS_LOGGER = 'dashboard.data.metrics'
 _TASK_RUNTIME_LOGGER = 'dashboard.data.task_runtime'
+_ESCALATIONS_LOGGER = 'dashboard.data.escalations'
 _CURATOR_BUDGET = 'dashboard.app._CURATOR_ENDPOINT_TIMEOUT_SECONDS'
 _MEMORY_BUDGET = 'dashboard.api.memory._MEMORY_ENDPOINT_TIMEOUT_SECONDS'
 _SAMPLER_BUDGET = 'dashboard.data.metrics._HTTP_SAMPLER_TIMEOUT_SECONDS'
@@ -228,3 +229,25 @@ async def test_live_merge_queue_probe_names_pool_timeout():
         "this string becomes the 'In queue now' unknown reason; got "
         f'{live["error"]!r}'
     )
+
+
+@pytest.mark.asyncio
+async def test_pins_probe_names_pool_timeout(caplog):
+    memory_data.reset_sessions()
+    try:
+        async with httpx.AsyncClient(transport=_SaturatedPoolTransport()) as client:
+            with caplog.at_level(logging.DEBUG, logger=_ESCALATIONS_LOGGER):
+                result = await escalations.fetch_pins_recovery(
+                    client,
+                    {'saturated': f'{_SATURATED_URL}/mcp'},
+                    per_call_timeout=_FAST_BUDGET_SECONDS,
+                )
+    finally:
+        memory_data.reset_sessions()
+
+    assert result == {'saturated': None}, 'an unread project is UNKNOWN, never an empty map'
+    # This probe's only diagnostic is its DEBUG line, so that is what is read.
+    lines = [r.getMessage() for r in caplog.records if r.name == _ESCALATIONS_LOGGER]
+    assert any(
+        'get_pending_escalations failed' in m and 'PoolTimeout' in m for m in lines
+    ), f'no pins-probe line named PoolTimeout; got {lines}'
