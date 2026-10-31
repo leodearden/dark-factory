@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import ast
 import dataclasses
-import inspect
 import re
 import shutil
 import subprocess
@@ -2259,20 +2258,26 @@ class TestWallClockDeadlineDebtBaseline:
         same guard. Requiredness is the whole guard, so it is pinned here rather
         than trusted.
 
-        Read off the signature rather than exercised, so this pin names only the
-        extension point and its two parameters, and retires with them.
+        Every call passes entry None, so no debt entry is ever built here.
         """
-        parameters = inspect.signature(_checker._apply_debt_budget).parameters
-        for name in ('build_overrun_msg', 'build_slack_msg'):
-            parameter = parameters[name]
-            assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, (
-                f'{name} must be keyword-only, so a stray positional argument can '
-                f'never land in it; got {parameter.kind}'
-            )
-            assert parameter.default is inspect.Parameter.empty, (
-                f'{name} must have no default, so a rule that omits it fails at the '
-                f'call; got default {parameter.default!r}'
-            )
+
+        def _builder(_entry, _found) -> str:
+            return ''
+
+        builders = {'build_overrun_msg': _builder, 'build_slack_msg': _builder}
+        assert (
+            _checker._apply_debt_budget([], None, filename=_NON_DEBT_FILE, **builders) == []
+        ), 'the complete call must succeed, so each TypeError below has one cause'
+        for name in builders:
+            others = {key: value for key, value in builders.items() if key != name}
+            with pytest.raises(TypeError):
+                _checker._apply_debt_budget([], None, filename=_NON_DEBT_FILE, **others)
+            with pytest.raises(TypeError):
+                _checker._apply_debt_budget(
+                    [], None, _builder, filename=_NON_DEBT_FILE, **others
+                )
+        with pytest.raises(TypeError):
+            _checker._apply_debt_budget([], None, _NON_DEBT_FILE, _builder, _builder)
 
 
 class TestWallClockDeadlineDebtSlack:
