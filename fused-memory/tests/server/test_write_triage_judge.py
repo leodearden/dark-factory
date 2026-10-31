@@ -2501,10 +2501,14 @@ class TestTheClientIsReleased:
     """The SDK client is built per middle-band write and must not be leaked.
 
     `_call_llm` constructs `AsyncOpenAI`/`AsyncAnthropic` on every triaged
-    write. Neither defines `__del__` (verified against openai 2.31.0), so an
-    unclosed client abandons an `httpx` connection pool — sockets and TLS
-    state — to the garbage collector, on a path that runs once per write in a
-    single long-lived server process.
+    write. Neither client class defines `__del__`, but the `httpx` wrapper
+    each one holds does: `openai._base_client.AsyncHttpxClientWrapper` and its
+    anthropic twin (see `tests/_fm_helpers.py::reap_leaked_async_httpx_clients`).
+    That finaliser is no substitute for closing. It schedules `aclose()` only
+    if an event loop happens to be running when the garbage collector reaches
+    the client; otherwise the connection pool — sockets and TLS state — is
+    abandoned, on a path that runs once per write in a single long-lived
+    server process.
 
     The per-call CONSTRUCTION is deliberate and stays: a cached client keyed
     to a config that hot-reloads would pin a stale `model`/`api_url` past a
