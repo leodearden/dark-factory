@@ -16704,6 +16704,21 @@ class Harness:
             # fired _resolve_callback for the L2 first, then each member with
             # 'l2-cascade:<id>').  Direct/orphan: NOT l2-cascade AND task_id
             # NOT in _escalation_events (a live workflow owns its own re-pend).
+            #
+            # Live slot with a grant (task 5650): the third arm delivers
+            # `granted_files` and does not re-pend, because the live workflow
+            # owns its own re-pend and a flip here would race it.  It exists
+            # because `_escalation_events` is registered at DISPATCH
+            # (`_register_escalation_event`), so membership answers "a slot is
+            # open", not "a workflow is paused on THIS record" — and
+            # `workflow.py::TaskWorkflow._wait_for_resolution` waits only on
+            # the task's level-0 records.  An L2 resolved against a live task
+            # therefore woke the event, the workflow went back to sleep, and
+            # `TaskWorkflow._collect_granted_files` was never reached: the
+            # grant was recorded and dropped, and the implementer looped
+            # (reify task 4263, measured 2026-09-19).  Gated on a non-empty
+            # grant, the fold's COST GATE lifted to the scheduling boundary, so
+            # a grant-less live resolve still schedules nothing.
             is_l2_cascade = (
                 isinstance(escalation.resolved_by, str)
                 and escalation.resolved_by.startswith('l2-cascade:')
@@ -16727,6 +16742,15 @@ class Harness:
                     self._cascade_unblock_member(escalation),
                     label=(
                         f'orphan-unblock task {escalation.task_id} '
+                        f'(via {escalation.resolved_by})'
+                    ),
+                )
+            elif escalation.granted_files:
+                # Live slot carrying a grant — deliver it, never re-pend.
+                self._schedule_coro_threadsafe(
+                    self._deliver_resume_resolution(escalation, repend=False),
+                    label=(
+                        f'grant-delivery task {escalation.task_id} '
                         f'(via {escalation.resolved_by})'
                     ),
                 )
@@ -17567,6 +17591,12 @@ class Harness:
             return GrantDelivery.NO_PLAN_TO_WIDEN
         return None
 
+    async def _deliver_resume_resolution(self, escalation, *, repend: bool) -> None:
+        """Deliver a resume resolution's scope grant, then re-pend when *repend*."""
+        await self._fold_granted_files_on_repend(escalation.task_id, escalation)
+        if repend:
+            await self._cascade_unblock_member(escalation)
+
     async def _fold_granted_files_on_repend(self, task_id: str, escalation) -> None:
         """Deliver the steward's ``granted_files`` scope grant before a re-pend.
 
@@ -17705,21 +17735,25 @@ class Harness:
                 )
                 return
 
-            plan = arts.read_plan()
-            current = plan.get('files') or []
-            union = current + [f for f in granted if f not in current]
-            if union == current:
-                # The overwhelmingly common case (a resume with no NEW files):
-                # costs neither a plan rewrite nor an update_task round-trip.
-                return
+            # plan_mutex spans the whole read-modify-write: a live workflow's
+            # _set_task_scope can be writing this same plan.json.
+            with arts.plan_mutex():
+                plan = arts.read_plan()
+                current = plan.get('files') or []
+                union = current + [f for f in granted if f not in current]
+                if union == current:
+                    # The overwhelmingly common case (a resume with no NEW
+                    # files): costs neither a plan rewrite nor an update_task
+                    # round-trip.
+                    return
 
-            # Pass the plan's OWN owner id back — see "Ownership" above.
-            arts.set_plan_files(
-                union,
-                plan.get('_session_id')
-                or plan.get('_revalidated_by_session')
-                or f'harness-repend:{task_id}',
-            )
+                # Pass the plan's OWN owner id back — see "Ownership" above.
+                arts.set_plan_files(
+                    union,
+                    plan.get('_session_id')
+                    or plan.get('_revalidated_by_session')
+                    or f'harness-repend:{task_id}',
+                )
             # metadata.files takes only the FILE-LEVEL entries — see "The two
             # halves are written differently" above. plan.json keeps the raw
             # union written just now.
