@@ -16729,7 +16729,7 @@ class Harness:
                 # MCP resolve_issue on a FastMCP worker — where a bare
                 # asyncio.create_task raised "no running event loop").
                 self._schedule_coro_threadsafe(
-                    self._cascade_unblock_member(escalation),
+                    self._deliver_resume_resolution(escalation, repend=True),
                     label=(
                         f'cascade-unblock task {escalation.task_id} '
                         f'(via {escalation.resolved_by})'
@@ -16739,7 +16739,7 @@ class Harness:
                 # Fix #1a — direct/orphan re-pend.  A live workflow owns its
                 # own re-pend (woken by event.set()); only flip when orphaned.
                 self._schedule_coro_threadsafe(
-                    self._cascade_unblock_member(escalation),
+                    self._deliver_resume_resolution(escalation, repend=True),
                     label=(
                         f'orphan-unblock task {escalation.task_id} '
                         f'(via {escalation.resolved_by})'
@@ -17567,7 +17567,7 @@ class Harness:
 
         The W11 ``.task-meta`` SIBLING first, the legacy ``<worktree>/.task``
         second. Without the fallback arm every pre-relocation task would take
-        the "no plan" exit of :meth:`_fold_granted_files_on_repend`.
+        the "no plan" exit of :meth:`_fold_granted_files`.
         :meth:`_resolve_recovery_artifact` is the read-only sibling of the same
         contract, for single artifact paths.
         """
@@ -17585,7 +17585,7 @@ class Harness:
         Called from ``escalation/server.py::resolve_issue`` on a FastMCP worker
         thread, so it stays SYNC and side-effect-free: a worktree dict lookup
         and two ``Path.exists()`` calls. The asynchronous delivery itself can
-        still fall short later; see :meth:`_fold_granted_files_on_repend`.
+        still fall short later; see :meth:`_fold_granted_files`.
         """
         if self._locate_plan_artifacts(task_id) is None:
             return GrantDelivery.NO_PLAN_TO_WIDEN
@@ -17593,14 +17593,14 @@ class Harness:
 
     async def _deliver_resume_resolution(self, escalation, *, repend: bool) -> None:
         """Deliver a resume resolution's scope grant, then re-pend when *repend*."""
-        await self._fold_granted_files_on_repend(escalation.task_id, escalation)
+        await self._fold_granted_files(escalation.task_id, escalation)
         if repend:
             await self._cascade_unblock_member(escalation)
 
-    async def _fold_granted_files_on_repend(self, task_id: str, escalation) -> None:
-        """Deliver the steward's ``granted_files`` scope grant before a re-pend.
+    async def _fold_granted_files(self, task_id: str, escalation) -> None:
+        """Deliver the steward's ``granted_files`` scope grant for a resume resolution.
 
-        The re-pend-path twin of ``workflow.py::TaskWorkflow._collect_granted_
+        The harness-side twin of ``workflow.py::TaskWorkflow._collect_granted_
         files`` + ``_set_task_scope`` (task 3540 / PRD
         ``plans/task-escalation-state-graph-prd.md`` D8, spec E9).
 
@@ -17612,8 +17612,22 @@ class Harness:
         exactly one site: the LIVE in-workflow L0 resume loop. So a grant
         resolved against a task with NO live workflow was recorded and never
         applied — the task re-pended against its ORIGINAL scope and the agent
-        re-escalated for the same files. This closes that gap for the
-        re-pend path.
+        re-escalated for the same files. This closes that gap for every
+        resume-disposition resolution (task 5650): it is reached through
+        :meth:`_deliver_resume_resolution` from all three ``WORKFLOW_RESUME``
+        arms of :meth:`_on_escalation_resolved`, including a LIVE slot.
+
+        Ordering. Task 3540 pinned three constraints on the fold; one survives.
+        It must land BEFORE the status write, because that write makes the row
+        dispatchable and dispatch derives its locks from ``metadata.files`` —
+        preserved by the wrapper's sequencing (fold, then maybe re-pend). The
+        other two, AFTER the re-block guard and AFTER the corroborating read,
+        are RELAXED by task 5650: they made delivery conditional on a flip
+        actually happening, and ``_cascade_unblock_member`` has five early
+        returns before its write. A grant is additive and durable, so a widen
+        without a re-pend is complete, not partial. The read-modify-write of
+        plan.json holds ``TaskArtifacts.plan_mutex``, so neither this fold nor a
+        live workflow writing the same plan can lose the other's update.
 
         Both halves are written, and both are load-bearing:
 
@@ -17653,10 +17667,18 @@ class Harness:
         exactly like an empty/omitted one (sentinel alone, no clobber)". The
         flip and the plan write are unaffected.
 
-        Deliberately does NOT call ``handle_blast_radius_expansion``: the slot
-        exit already released every module lock this task held, so there is no
-        live lock to expand. The next dispatch acquires from the widened
-        ``metadata.files`` through the ordinary path.
+        Deliberately does NOT call ``handle_blast_radius_expansion``. On the
+        re-pend arms (``repend=True``) the slot exit already released every
+        module lock this task held, so there is no live lock to expand, and
+        the next dispatch acquires from the widened ``metadata.files``. On the
+        LIVE arm the slot still holds its ORIGINAL locks, and that API resets
+        the task to pending and releases its locks on conflict — it would tear
+        the running workflow's slot out from under it. The residual: if the
+        live workflow later reaches its resume branch,
+        ``workflow.py::TaskWorkflow._collect_granted_files`` compares against
+        its IN-MEMORY plan, still sees the delta, and ``_set_task_scope``
+        reconciles the locks; if it re-reads plan.json first, the locks catch
+        up only at the next dispatch, from ``metadata.files``.
 
         Ownership: ``set_plan_files`` STAMPS ``_session_id`` when the caller
         does not already own the plan, so the plan's OWN owner id
@@ -17890,27 +17912,19 @@ class Harness:
         status/liveness gate below, because its status is 'infra-hold', never
         'blocked' or 'in-progress' — see the A1 guard.
 
-        Between the corroborating read below and the write, a FULLY authorised
-        re-pend also DELIVERS any ``granted_files`` scope grant the steward
-        stamped on this task's resolved escalations — see
-        :meth:`_fold_granted_files_on_repend`, and the three ordering
-        constraints named at that call site. It sits after the corroboration,
-        not before it, so an aborted resume leaves no partial widen behind.
+        Any ``granted_files`` scope grant is delivered BEFORE this method runs,
+        by :meth:`_deliver_resume_resolution`, whatever this method then
+        decides about the flip — see :meth:`_fold_granted_files`.
 
         TOCTOU note: these are separate MCP round-trips with no atomic
         compare-and-set, so the window cannot be closed — only narrowed. It is
         narrowed by a CORROBORATING ``get_task`` immediately before the write
         (task 3540): status AND claimant liveness are re-derived from that ONE
         snapshot, and a disagreement aborts without writing. The remaining
-        window is (corroborating get_task → [granted-files fold, only when the
-        resolving record actually carries a grant] → set_task_status), versus
-        the previous (get_status → guard get_task → guard update_task →
+        window is (corroborating get_task → set_task_status), versus the
+        previous (get_status → guard get_task → guard update_task →
         set_task_status). Status and claimant also now come from a single
-        snapshot rather than two skewed reads. The fold sits INSIDE the
-        remaining window by choice (review amendment) — see the three ordering
-        constraints at its call site: paying a slightly wider window is the
-        price of never leaving a partial scope widen behind on an aborted
-        resume, and on the common no-grant path it costs nothing at all.
+        snapshot rather than two skewed reads.
 
         Efficiency note (review amendment, task 2200; refreshed by 3540):
         get_task above (the is_infra_held pre-gate AND, since 3540, the
@@ -18076,9 +18090,8 @@ class Harness:
         # guard's own read-and-persist round-trips; re-authorise it here against
         # a single snapshot taken immediately before the write, so the TOCTOU
         # window narrows from (get_status → guard get_task → guard update_task →
-        # set_task_status) to (this read → the granted-files fold, which is
-        # entered only when the resolving record carries a grant →
-        # set_task_status).  Status and claimant liveness are re-derived from
+        # set_task_status) to (this read → set_task_status).  Status and
+        # claimant liveness are re-derived from
         # the SAME row, so they can no longer be two skewed reads that never
         # described the task at the same instant.
         _late = await self.scheduler.get_task(task_id)
@@ -18119,30 +18132,6 @@ class Harness:
                 _resume_target, escalation.resolved_by,
             )
             return
-
-        # Deliver the steward's scope grant BEFORE the row goes re-pendable
-        # (task 3540 / PRD D8, spec E9).  THREE ordering constraints pin this
-        # call site, and all three are load-bearing:
-        #   1. AFTER the re-block guard — a withheld flip re-pends nothing and
-        #      so may widen nothing.
-        #   2. AFTER the corroborating read above (review amendment) — the fold
-        #      is a read-modify-write of two DURABLE artifacts (plan.json and
-        #      metadata.files), so it must be gated by the SAME authorisation
-        #      as the status write.  Folding first would leave a partial widen
-        #      behind on every aborted resume, and in the newly-claimed case
-        #      that plan is already owned in memory by a freshly-dispatched
-        #      TaskWorkflow — two writers, either able to clobber the other.
-        #   3. BEFORE the status write — the status write is what makes the
-        #      task dispatchable again and dispatch derives its locks from
-        #      metadata.files, so a fold landing after it would race the
-        #      scheduler and the redispatched agent could observe the
-        #      unwidened scope.
-        # Best-effort: never raises.  The window between the corroborating read
-        # and the write is now (fold → set_task_status) rather than one hop;
-        # that is the price of making the fold conditional on the same gate,
-        # and it is bounded by a filesystem read-modify-write plus one
-        # update_task, on the rare path where a grant actually exists.
-        await self._fold_granted_files_on_repend(task_id, escalation)
 
         try:
             await self.scheduler.set_task_status(task_id, _resume_target)
