@@ -77,10 +77,7 @@ import sys
 import types
 
 import pytest
-
-# The one config-discovery walk, with its anti-vacuity floors. Resolves because
-# tests/scripts/conftest.py puts this directory on sys.path.
-import test_pytest_per_test_timeout_policy as per_test_timeout_policy
+from pytest_config_discovery import discovered_pytest_configs
 
 SIGNAL_METHOD = 'signal'
 THREAD_METHOD = 'thread'
@@ -452,7 +449,7 @@ def test_the_probes_take_this_runs_per_test_timeout_and_the_child_budget_sits_be
 def test_thread_timeout_method_is_confined_to_the_recorded_configs() -> None:
     thread_configs = {
         name
-        for name, ini_options in per_test_timeout_policy.discovered_pytest_configs().items()
+        for name, ini_options in discovered_pytest_configs().items()
         if ini_options.get('timeout_method') == THREAD_METHOD
     }
     assert thread_configs == THREAD_TIMEOUT_METHOD_CONFIGS, (
