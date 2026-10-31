@@ -29,7 +29,7 @@ async def _poll_until_dead(
 ) -> None:
     """Poll queue stats until at least *expected_dead* items reach status='dead'.
 
-    Mirrors ``test_durable_queue.py:1207-1236``. Fixed sleeps are unsafe here:
+    Mirrors ``test_durable_queue.py::_poll_until_dead``. Fixed sleeps are unsafe here:
     the suite runs under ``-n auto --dist loadgroup`` with a 60s per-test
     timeout that kills the whole worker, and the generous 20s budget means a
     regression fails on the observed COUNT rather than by timing out.
@@ -69,89 +69,80 @@ def _queue(tmp_path, execute, **overrides) -> DurableWriteQueue:
     return DurableWriteQueue(**kwargs)
 
 
-class TestDeadLetterLogNamesOperationAndGroup:
-    """The dead-letter WARNING must name the operation, the group_id and the
-    classification.
-
-    These are the fields a triager needs first, and before this change they had
-    to be re-read from SQLite via get_dead_items — a step that is impossible
-    once the row has been deleted, which is precisely when the log line is all
-    that survives.
-    """
-
-    @pytest.mark.asyncio
-    async def test_dead_letter_warning_names_operation_and_group(
-        self, tmp_path, caplog
-    ):
-        execute = AsyncMock(side_effect=RuntimeError('boom'))
-        q = _queue(tmp_path, execute)
-        await q.initialize()
-        try:
-            with caplog.at_level(
-                logging.WARNING, logger='fused_memory.services.durable_queue'
-            ):
-                await q.enqueue(
-                    group_id='proj-alpha', operation='add_episode',
-                    payload={'content': 'c', 'group_id': 'proj-alpha', 'name': 'ep'},
-                )
-                await _poll_until_dead(
-                    q, group_id='proj-alpha', expected_dead=1, timeout=20.0
-                )
-
-            warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-            assert any(
-                'add_episode' in r.getMessage() and 'proj-alpha' in r.getMessage()
-                for r in warnings
-            ), (
-                'expected the dead-letter WARNING to name both the operation and '
-                'the group_id; got: '
-                f'{[r.getMessage() for r in warnings]}'
+@pytest.mark.asyncio
+async def test_dead_letter_warning_names_operation_and_group(tmp_path, caplog):
+    execute = AsyncMock(side_effect=RuntimeError('boom'))
+    q = _queue(tmp_path, execute)
+    await q.initialize()
+    try:
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.services.durable_queue'
+        ):
+            await q.enqueue(
+                group_id='proj-alpha', operation='add_episode',
+                payload={'content': 'c', 'group_id': 'proj-alpha', 'name': 'ep'},
             )
-            # The pre-existing fields must survive the enrichment.
-            assert any(
-                '5 attempts' in r.getMessage() and 'RuntimeError' in r.getMessage()
-                for r in warnings
-            ), (
-                'the attempt count and error text must still be present; got: '
-                f'{[r.getMessage() for r in warnings]}'
+            await _poll_until_dead(
+                q, group_id='proj-alpha', expected_dead=1, timeout=20.0
             )
-        finally:
-            await q.close()
 
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ('exc', 'label'),
-        [
-            (ConnectionResetError('reset'), 'transient'),
-            (RuntimeError('boom'), 'normal'),
-        ],
-        ids=['transient', 'normal'],
-    )
-    async def test_dead_letter_warning_names_the_classification(
-        self, tmp_path, caplog, exc, label
-    ):
-        """The label names which retry budget the item exhausted, which the
-        attempt count alone cannot tell a triager when the two budgets are
-        equal."""
-        q = _queue(tmp_path, AsyncMock(side_effect=exc), transient_max_attempts=3)
-        await q.initialize()
-        try:
-            with caplog.at_level(
-                logging.WARNING, logger='fused_memory.services.durable_queue'
-            ):
-                await q.enqueue(
-                    group_id='proj-alpha', operation='add_episode',
-                    payload={'content': 'c', 'group_id': 'proj-alpha', 'name': 'ep'},
-                )
-                await _poll_until_dead(
-                    q, group_id='proj-alpha', expected_dead=1, timeout=20.0
-                )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'add_episode' in r.getMessage() and 'proj-alpha' in r.getMessage()
+            for r in warnings
+        ), (
+            'expected the dead-letter WARNING to name both the operation and '
+            'the group_id; got: '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+        assert any(
+            '5 attempts' in r.getMessage() and 'RuntimeError' in r.getMessage()
+            for r in warnings
+        ), (
+            'expected the dead-letter WARNING to carry the attempt count and '
+            f'the error text; got: {[r.getMessage() for r in warnings]}'
+        )
+    finally:
+        await q.close()
 
-            warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-            assert any(f'[{label}]' in r.getMessage() for r in warnings), (
-                f'expected the dead-letter WARNING to label the classification '
-                f'[{label}] so a triager can tell which retry budget ran out; '
-                f'got: {[r.getMessage() for r in warnings]}'
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('exc', 'label', 'budget'),
+    [
+        (ConnectionResetError('reset'), 'transient', 3),
+        (RuntimeError('boom'), 'normal', 5),
+    ],
+    ids=['transient', 'normal'],
+)
+async def test_dead_letter_warning_labels_the_budget_it_exhausted(
+    tmp_path, caplog, exc, label, budget
+):
+    """One WARNING pairs the classification label with the attempt count of
+    the budget the item actually used up, so the label cannot name one budget
+    while the item died on the other."""
+    q = _queue(tmp_path, AsyncMock(side_effect=exc), transient_max_attempts=3)
+    await q.initialize()
+    try:
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.services.durable_queue'
+        ):
+            await q.enqueue(
+                group_id='proj-alpha', operation='add_episode',
+                payload={'content': 'c', 'group_id': 'proj-alpha', 'name': 'ep'},
             )
-        finally:
-            await q.close()
+            await _poll_until_dead(
+                q, group_id='proj-alpha', expected_dead=1, timeout=20.0
+            )
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            f'{budget} attempts' in r.getMessage()
+            and f'[{label}]' in r.getMessage()
+            for r in warnings
+        ), (
+            f'expected one dead-letter WARNING carrying both "{budget} attempts" '
+            f'and [{label}]; got: {[r.getMessage() for r in warnings]}'
+        )
+    finally:
+        await q.close()
