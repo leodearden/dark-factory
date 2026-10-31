@@ -173,7 +173,8 @@ def _supplies(module: _Scope, scope: _Scope, function: str, seen: frozenset[str]
 
 
 class _Definitions:
-    """What each .py file of the measured tree defines, parsed once, on first ask."""
+    """What each .py file of the measured tree defines: a memoising reader that parses a
+    file on first ask. Its cache fills in place, but no answer it gives ever changes."""
 
     def __init__(self, tree_root: Path) -> None:
         self._tree_root = tree_root
@@ -190,7 +191,7 @@ class _Definitions:
     def _module(self, path: str) -> _Scope:
         if path not in self._cache:
             try:
-                body = ast.parse((self._tree_root / path).read_bytes()).body
+                body = ast.parse((self._tree_root / path).read_bytes(), filename=path).body
             except _UNPARSEABLE_SOURCE:
                 body = []
             self._cache[path] = _Scope.of(body)
@@ -233,7 +234,8 @@ class _PytestTree:
         return path in self.tracked and self.definitions.defines(path, classes, function)
 
     def resolve_classname(self, classname: str, function: str, bases: Sequence[str]) -> TestId | None:
-        """The test a junit classname and function name: the first base and cut whose file defines it."""
+        """The test named by a junit classname and function name: the first base and cut whose
+        file defines it."""
         parts = classname.split('.')
         for base in bases:
             for cut in range(len(parts), 0, -1):

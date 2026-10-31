@@ -134,7 +134,7 @@ class TestPytestEvidence:
         assert ev.pytest_evidence(root, root).uncosted_universe == frozenset()
 
 
-D = 'orchestrator/tests/test_d.py'
+TEST_D = 'orchestrator/tests/test_d.py'
 
 
 def _junit_records(
@@ -166,38 +166,56 @@ def _resolve(
 class TestPytestDefinitionScopes:
     def test_the_class_path_must_lead_to_the_function(self, tmp_path):
         source = 'def test_mod():\n    pass\n\n\nclass TestX:\n    def test_meth(self):\n        pass\n'
-        resolved, unresolved = _resolve(tmp_path, {D: source}, [
+        resolved, unresolved = _resolve(tmp_path, {TEST_D: source}, [
             ('tests.test_d', 'test_mod'), ('tests.test_d.TestX', 'test_meth'),
             ('tests.test_d.TestX', 'test_mod'), ('tests.test_d', 'test_meth'),
         ])
-        assert resolved == {f'{D}::test_mod', f'{D}::TestX::test_meth'}
+        assert resolved == {f'{TEST_D}::test_mod', f'{TEST_D}::TestX::test_meth'}
         assert unresolved == {'tests.test_d.TestX::test_mod', 'tests.test_d::test_meth'}
 
     def test_a_nested_class_resolves_only_through_its_full_class_path(self, tmp_path):
         source = 'class TestOuter:\n    class TestInner:\n        def test_n(self):\n            pass\n'
-        resolved, unresolved = _resolve(tmp_path, {D: source}, [
+        resolved, unresolved = _resolve(tmp_path, {TEST_D: source}, [
             ('tests.test_d.TestOuter.TestInner', 'test_n'), ('tests.test_d.TestOuter', 'test_n'),
         ])
-        assert resolved == {f'{D}::TestOuter::TestInner::test_n'}
+        assert resolved == {f'{TEST_D}::TestOuter::TestInner::test_n'}
         assert unresolved == {'tests.test_d.TestOuter::test_n'}
 
     def test_an_async_function_resolves(self, tmp_path):
         source = 'async def test_a():\n    pass\n'
-        resolved, unresolved = _resolve(tmp_path, {D: source}, [('tests.test_d', 'test_a')])
-        assert (resolved, unresolved) == ({f'{D}::test_a'}, set())
+        resolved, unresolved = _resolve(tmp_path, {TEST_D: source}, [('tests.test_d', 'test_a')])
+        assert (resolved, unresolved) == ({f'{TEST_D}::test_a'}, set())
 
     def test_an_unparseable_file_defines_nothing(self, tmp_path):
         resolved, unresolved = _resolve(
-            tmp_path, {D: 'def test_ok(:\n'}, [('tests.test_d', 'test_ok')],
+            tmp_path, {TEST_D: 'def test_ok(:\n'}, [('tests.test_d', 'test_ok')],
         )
         assert (resolved, unresolved) == (set(), {'tests.test_d::test_ok'})
 
     def test_a_module_file_lacking_the_function_yields_to_the_repo_root(self, tmp_path):
         records = _junit_records(tmp_path, {
-            D: 'def test_other():\n    pass\n',
+            TEST_D: 'def test_other():\n    pass\n',
             'tests/test_d.py': 'def test_root_only():\n    pass\n',
         }, [('tests.test_d', 'test_root_only')])
         assert [o.test for o in _observations(records, 'archived-junit')] == [
+            oc.TestId('tests', 'tests/test_d.py::test_root_only'),
+        ]
+
+    def test_a_module_log_failure_credits_the_first_base_whose_file_defines_it(self, tmp_path):
+        git_tree(tmp_path, {
+            'orchestrator/orchestrator.yaml': '',
+            TEST_D: 'def test_both():\n    pass\n',
+            'tests/test_d.py': 'def test_both():\n    pass\n\n\ndef test_root_only():\n    pass\n',
+        })
+        log = (
+            tmp_path / 'data' / 'verify-logs' / 'T1'
+            / 'attempt-1.orchestrator.test-20261001T000000_1Z.log'
+        )
+        log.parent.mkdir(parents=True)
+        log.write_text('FAILED tests/test_d.py::test_both\nFAILED tests/test_d.py::test_root_only\n')
+        records = list(ev.pytest_evidence(tmp_path, tmp_path).records())
+        assert [o.test for o in _observations(records, 'pytest-logs')] == [
+            oc.TestId('orchestrator', f'{TEST_D}::test_both'),
             oc.TestId('tests', 'tests/test_d.py::test_root_only'),
         ]
 
@@ -209,20 +227,26 @@ class TestPytestDefinitionScopes:
             'class TestGrandchild(TestChild):\n    pass\n\n\n'
             'class TestSplice(Contract):\n    pass\n\n\n'
             'class TestLoopA(TestLoopB):\n    pass\n\n\n'
-            'class TestLoopB(TestLoopA):\n    pass\n'
+            'class TestLoopB(TestLoopA):\n    pass\n\n\n'
+            'class TestOuter:\n    class TestInner(_Harness):\n        pass\n'
         )
-        resolved, unresolved = _resolve(tmp_path, {D: source}, [
+        resolved, unresolved = _resolve(tmp_path, {TEST_D: source}, [
             ('tests.test_d.TestChild', 'test_h'),
             ('tests.test_d.TestGrandchild', 'test_h'),
             ('tests.test_d.TestSplice', 'test_contract'),
             ('tests.test_d.TestChild', 'test_absent'),
             ('tests.test_d.TestLoopA', 'test_h'),
+            ('tests.test_d.TestOuter.TestInner', 'test_h'),
+            ('tests.test_d.TestOuter.TestInner', 'test_absent'),
         ])
         assert resolved == {
-            f'{D}::TestChild::test_h', f'{D}::TestGrandchild::test_h',
-            f'{D}::TestSplice::test_contract',
+            f'{TEST_D}::TestChild::test_h', f'{TEST_D}::TestGrandchild::test_h',
+            f'{TEST_D}::TestSplice::test_contract', f'{TEST_D}::TestOuter::TestInner::test_h',
         }
-        assert unresolved == {'tests.test_d.TestChild::test_absent', 'tests.test_d.TestLoopA::test_h'}
+        assert unresolved == {
+            'tests.test_d.TestChild::test_absent', 'tests.test_d.TestLoopA::test_h',
+            'tests.test_d.TestOuter.TestInner::test_absent',
+        }
 
 
 ALPHA = oc.TestId('tests/infra', 'tests/infra/test_alpha.sh')
