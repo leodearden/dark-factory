@@ -37,7 +37,6 @@ from graphiti_core.search.search_utils import calculate_cosine_similarity
 
 pytestmark = [
     falkor_skipif(),
-    pytest.mark.timeout(120),
     pytest.mark.integration,
 ]
 

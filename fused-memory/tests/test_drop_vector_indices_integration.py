@@ -637,7 +637,9 @@ class TestReopenRebuildWindowBudget:
         )
 
 
-# 240, overriding the module-level pytest.mark.timeout(30) for THIS CLASS ONLY
+# 300 -- the --timeout fused-memory/orchestrator.yaml passes, the smallest
+# mark that does not invert it (shared/src/shared/testing_timeout_markers.py)
+# -- overriding the module-level pytest.mark.timeout(30) for THIS CLASS ONLY
 # (pytest-timeout resolves via get_closest_marker, so the module mark still
 # correctly governs TestDropVectorIndicesLive above, which runs on the 1-node
 # live_vector_graph and is fast).
@@ -663,19 +665,19 @@ class TestReopenRebuildWindowBudget:
 #                                                          --------
 #                                                             192s
 #
-# 240 leaves ~48s of slack over that ceiling. The retry phase is the term that
+# 300 leaves ~108s of slack over that ceiling. The retry phase is the term that
 # used to be unbounded: 5 attempts x 4 re-opens x 2 barriers is 240s of budget
 # on its own, which is why _reopen_rebuild_window shrinks each barrier to the
 # wall clock actually left rather than letting the attempt count multiply the
 # per-barrier budget. Whenever any of those constants changes, recompute this
-# sum -- that is the invariant, not the literal 240.
+# sum -- that is the invariant, not the literal 300.
 #
 # MEASURED COST, for contrast with the ceiling above: the realistic post-fix
 # case is ~7s (5 x 2.0s poll + 4 x ~1.3s reopen, reopen measured 1.12-1.42s /
 # median 1.27s, plus the fixture), and 30 consecutive lane-condition trials ran
 # 2.73s min / 3.34s median / 7.64s max in-test. The headroom is for the
 # contended tail, not the expected spend.
-@pytest.mark.timeout(240)
+@pytest.mark.timeout(300)
 class TestDropRebuildWindow:
     """PREMISE PIN for the post-DROP rebuild window — task 4748, de-flaked by task 4972.
 
@@ -788,7 +790,7 @@ class TestDropRebuildWindow:
     * 25 consecutive trials of this test under the lane's exact command,
       loadavg 57-149: 25/25, in-test 1.53s min / 2.10s median / 5.36s max —
       i.e. the raised budgets are pure headroom, not spend, and nothing here
-      comes within 20x of the 240s class mark;
+      comes within 20x of the 300s class mark;
     * the lane's exact confirmation command, loadavg ~99: 63 passed in
       399.29s (63, not 61: the amendment added two deterministic tests for
       the new deadline guard);
