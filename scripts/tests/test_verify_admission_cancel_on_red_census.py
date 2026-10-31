@@ -7,6 +7,7 @@ floats; a leg ends at granted_at + held_secs.
 """
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 from datetime import datetime
 
@@ -337,3 +338,43 @@ def test_an_empty_sample_measures_zero_without_dividing_by_zero():
 
     assert (m.busy_secs, m.avoidable_share, m.literal_avoidable_share, m.share_interval) == (0.0, 0.0, 0.0, (0.0, 0.0))
     assert (m.avoidable_hours_per_day, m.timeout_retries.share_of_busy) == (0.0, 0.0)
+
+
+
+STRADDLING = (0.0, 0.1)
+
+
+def _judged(*, window_days, n, share=0.01, interval=STRADDLING):
+    m = dataclasses.replace(
+        _measure(), window_days=window_days, multi_module_red_plans=n, avoidable_share=share, share_interval=interval,
+    )
+    return mod.verdict(m)
+
+
+def test_decision_constants_are_the_tasks_rule():
+    assert (mod.DECISION_SHARE, mod.MIN_WINDOW_DAYS, mod.MIN_MULTI_MODULE_RED_PLANS) == (0.03, 14.0, 40)
+
+
+def test_a_full_window_decides_on_the_point_estimate():
+    assert _judged(window_days=14.0, n=40, share=0.030) is mod.Verdict.FILE
+    assert _judged(window_days=14.0, n=40, share=0.0299) is mod.Verdict.DECLINE
+
+
+def test_too_few_multi_module_red_plans_is_thin_whatever_the_share_or_window():
+    assert _judged(window_days=14.0, n=39, share=0.5) is mod.Verdict.THIN_DATA
+    assert _judged(window_days=13.7, n=39, interval=(0.035, 0.074)) is mod.Verdict.THIN_DATA
+    assert _judged(window_days=13.7, n=39, interval=(0.0015, 0.023)) is mod.Verdict.THIN_DATA
+
+
+def test_a_short_window_decides_only_when_the_whole_interval_is_on_one_side():
+    assert _judged(window_days=13.7, n=120, interval=(0.0015, 0.023)) is mod.Verdict.DECLINE
+    assert _judged(window_days=13.7, n=120, interval=(0.035, 0.074)) is mod.Verdict.FILE
+    assert _judged(window_days=13.7, n=120, interval=(0.02, 0.04)) is mod.Verdict.THIN_DATA
+
+
+def test_a_zero_length_window_is_thin_even_with_a_decisive_interval():
+    assert _judged(window_days=0.0, n=40, interval=(0.0015, 0.023)) is mod.Verdict.THIN_DATA
+
+
+def test_verdict_values_are_the_json_spellings():
+    assert [v.value for v in mod.Verdict] == ['file', 'decline', 'thin_data']
