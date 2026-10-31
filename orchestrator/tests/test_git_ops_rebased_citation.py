@@ -5,6 +5,10 @@ archived record was replayed onto, read-only and never guessed
 
 from __future__ import annotations
 
+import os
+import shlex
+import shutil
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,6 +70,38 @@ def repo(tmp_path: Path) -> Path:
     return seed_repo(tmp_path / 'repo')
 
 
+async def _land_by_subject_only(repo: Path) -> tuple[str, str]:
+    """A side commit, and the same-subject commit on main whose diff differs."""
+    side = await _side_commit(
+        repo, 'task/9', 'feature2.py', 'version = "side"\n', 'feat(9): only subject',
+    )
+    on_main = await _commit(
+        repo, 'feature2.py', 'version = "rewritten on landing"\n', 'feat(9): only subject',
+    )
+    return side, on_main
+
+
+def _fail_git(monkeypatch: pytest.MonkeyPatch, where: Path, argv_prefix: str) -> None:
+    """Put a ``git`` first on PATH that exits 128 for each call whose arguments
+    start with *argv_prefix*; every other call reaches the real git.
+    ``run_git`` copies ``os.environ`` at each spawn, so GitOps sees it
+    (precedent: test_git_ops_unstack.py::_fail_git)."""
+    real_git = shutil.which('git')
+    assert real_git is not None
+    bin_dir = where / 'bin'
+    bin_dir.mkdir(parents=True)
+    shim = bin_dir / 'git'
+    shim.write_text(
+        '#!/bin/sh\n'
+        f'case "$*" in {shlex.quote(argv_prefix)}*)\n'
+        "  echo 'fatal: injected failure (test fault injection)' >&2; exit 128 ;;\n"
+        'esac\n'
+        f'exec {shlex.quote(real_git)} "$@"\n'
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
+
+
 def _git_config() -> GitConfig:
     return GitConfig(
         main_branch='main', branch_prefix='task/', remote='origin',
@@ -115,12 +151,7 @@ class TestResolveRebasedCitation:
         assert await git_ops.resolve_rebased_citation(lonely) is None
 
     async def test_unique_subject_resolves_when_patch_id_misses(self, repo, git_ops):
-        side = await _side_commit(
-            repo, 'task/9', 'feature2.py', 'version = "side"\n', 'feat(9): only subject',
-        )
-        on_main = await _commit(
-            repo, 'feature2.py', 'version = "rewritten on landing"\n', 'feat(9): only subject',
-        )
+        side, on_main = await _land_by_subject_only(repo)
 
         assert await git_ops.resolve_rebased_citation(side) == {
             'landed': on_main,
@@ -165,3 +196,57 @@ class TestCommitsNamed:
 
         with pytest.raises(GitQueryFailed):
             await GitOps(_git_config(), plain).commits_named(['abc1234'])
+
+
+async def _cite_rebased_s1(repo: Path) -> str:
+    return (await _land_rebased_branch(repo)).s1
+
+
+async def _cite_subject_only_side(repo: Path) -> str:
+    side, _ = await _land_by_subject_only(repo)
+    return side
+
+
+@pytest.mark.asyncio
+class TestFaultsAreNeverReadAsFacts:
+    async def test_a_root_that_is_not_a_repository_raises(self, tmp_path):
+        plain = tmp_path / 'plain'
+        plain.mkdir()
+
+        with pytest.raises(GitQueryFailed):
+            await GitOps(_git_config(), plain).resolve_rebased_citation('a7ceed6597')
+
+    async def test_an_unknown_main_branch_raises(self, repo):
+        landed = await _land_rebased_branch(repo)
+        config = GitConfig(
+            main_branch='no-such-branch', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False,
+        )
+
+        with pytest.raises(GitQueryFailed):
+            await GitOps(config, repo).resolve_rebased_citation(landed.s1)
+
+    @pytest.mark.parametrize(
+        ('argv_prefix', 'cite'),
+        [
+            pytest.param('diff-tree', _cite_rebased_s1, id='diff-tree'),
+            pytest.param('patch-id', _cite_rebased_s1, id='patch-id'),
+            pytest.param('log -p', _cite_rebased_s1, id='log-p'),
+            pytest.param('log -1 --format=%s', _cite_rebased_s1, id='landed-subject'),
+            pytest.param('log --format=%H', _cite_subject_only_side, id='range-subjects'),
+        ],
+    )
+    async def test_a_failing_git_query_mid_lookup_raises(
+        self,
+        repo: Path,
+        git_ops: GitOps,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        argv_prefix: str,
+        cite: Callable[[Path], Awaitable[str]],
+    ):
+        cited = await cite(repo)
+        _fail_git(monkeypatch, tmp_path / 'shim', argv_prefix)
+
+        with pytest.raises(GitQueryFailed):
+            await git_ops.resolve_rebased_citation(cited)
