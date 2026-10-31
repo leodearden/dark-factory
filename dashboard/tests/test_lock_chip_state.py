@@ -33,35 +33,47 @@ from _lock_chip_matrix import (
 )
 
 # ---------------------------------------------------------------------------
-# Precedence-matrix tests (node-vm runtime)
+# lockChipStateFor across the precedence matrix (node-vm runtime)
 # ---------------------------------------------------------------------------
 
-# Each case: the module's lock fields, and the (cls, ownerLabel) task ROW_TASK
-# of ROW_PROJECT must read it as.
-_PRECEDENCE = {
-    'held by self': ({'holder': ROW_TASK, 'holder_project': ROW_PROJECT}, 'lock-mine', None),
-    'held by other': ({'holder': 'other'}, 'lock-taken', 'T-other'),
-    'parked, live owner': ({'parked_by': 'owner', 'parked_owner_live': True}, 'lock-parked', 'T-owner'),
-    'parked, stale owner': ({'parked_by': 'owner', 'parked_owner_live': False}, 'lock-parked', 'T-owner ⚠'),
-    'free': ({}, 'lock-free', None),
-    'held and parked, the holder wins': (
-        {'holder': 'other', 'parked_by': 'owner', 'parked_owner_live': True}, 'lock-taken', 'T-other',
+# Each case: the SCHEDULER.modules entry (None when the scheduler does not list
+# the module), and the (cls, ownerLabel) task ROW_TASK of ROW_PROJECT reads it as.
+_CASES = {
+    'own task, own project': (heatmap_module(holder=ROW_TASK, holder_project=ROW_PROJECT), 'lock-mine', None),
+    'own task, no holder_project': (heatmap_module(holder=ROW_TASK), 'lock-mine', None),
+    'own task id, another project': (
+        heatmap_module(holder=ROW_TASK, holder_project='Q'), 'lock-taken', f'T-{ROW_TASK}',
     ),
+    'another task, own project': (heatmap_module(holder='A', holder_project=ROW_PROJECT), 'lock-taken', 'T-A'),
+    'another task, no holder_project': (heatmap_module(holder='A'), 'lock-taken', 'T-A'),
+    'parked, live owner': (heatmap_module(parked_by='C', parked_owner_live=True), 'lock-parked', 'T-C'),
+    'parked, dead owner': (heatmap_module(parked_by='C', parked_owner_live=False), 'lock-parked', 'T-C ⚠'),
+    'held and parked, the holder wins': (
+        heatmap_module(holder='A', parked_by='C', parked_owner_live=True), 'lock-taken', 'T-A',
+    ),
+    'free': (heatmap_module(), 'lock-free', None),
+    'not listed by the scheduler': (None, 'lock-free', None),
 }
 
 
 @pytest.fixture(scope='module')
-def precedence_states() -> dict[str, dict]:
-    """lockChipStateFor's answer for every _PRECEDENCE case, from one node process."""
-    cases = [(heatmap_module(**fields), ROW_TASK, ROW_PROJECT) for fields, _cls, _owner in _PRECEDENCE.values()]
-    return dict(zip(_PRECEDENCE, lock_chip_states_for(cases), strict=True))
+def chip_states() -> dict[str, dict]:
+    """lockChipStateFor's answer for every _CASES case, from one node process."""
+    cases = [(module, ROW_TASK, ROW_PROJECT) for module, _cls, _owner in _CASES.values()]
+    return dict(zip(_CASES, lock_chip_states_for(cases), strict=True))
 
 
-class TestLockChipStateForPrecedence:
-    @pytest.mark.parametrize('case', list(_PRECEDENCE))
-    def test_precedence(self, precedence_states, case):
-        _fields, cls, owner_label = _PRECEDENCE[case]
-        state = precedence_states[case]
+class TestLockChipStateFor:
+    """lockChipStateFor(module, taskId, project) is the one place a lock is "mine".
+
+    Mine means held by this task id IN this project; a module that names no
+    holder_project is read as the task's own project. A holder outranks a park.
+    """
+
+    @pytest.mark.parametrize('case', list(_CASES))
+    def test_classifies(self, chip_states, case):
+        _module, cls, owner_label = _CASES[case]
+        state = chip_states[case]
         assert (state['cls'], state['ownerLabel']) == (cls, owner_label), f'{case}: {state!r}'
 
 
@@ -93,31 +105,6 @@ def test_lock_chip_state_for_is_the_only_classifier_exported():
         'window.DF_SCHED_UTILS still exports the bare lockChipState, which takes a '
         'caller-computed isMine; lockChipStateFor is the one place a lock is decided to be mine'
     )
-
-
-class TestLockChipStateForDecidesMine:
-    """lockChipStateFor(module, taskId, project) is the one place a lock is "mine".
-
-    Mine means held by this task id IN this project; a module that names no
-    holder_project is read as the task's own project.
-    """
-
-    @pytest.mark.parametrize('fields, cls, owner_label', [
-        ({'holder': ROW_TASK, 'holder_project': ROW_PROJECT}, 'lock-mine', None),
-        ({'holder': ROW_TASK}, 'lock-mine', None),
-        ({'holder': ROW_TASK, 'holder_project': 'Q'}, 'lock-taken', f'T-{ROW_TASK}'),
-        ({'holder': 'A', 'holder_project': ROW_PROJECT}, 'lock-taken', 'T-A'),
-        ({'parked_by': 'C', 'parked_owner_live': False}, 'lock-parked', 'T-C ⚠'),
-        ({}, 'lock-free', None),
-    ], ids=['own task, own project', 'own task, no holder_project',
-            'own task id, another project', 'another task', 'parked, dead owner', 'free'])
-    def test_mine_is_this_task_in_this_project(self, fields, cls, owner_label):
-        [state] = lock_chip_states_for([(heatmap_module(**fields), ROW_TASK, ROW_PROJECT)])
-        assert (state['cls'], state['ownerLabel']) == (cls, owner_label), state
-
-    def test_a_module_the_scheduler_does_not_list_is_free(self):
-        [state] = lock_chip_states_for([(None, ROW_TASK, ROW_PROJECT)])
-        assert state['cls'] == 'lock-free', state
 
 
 # ---------------------------------------------------------------------------
