@@ -151,8 +151,8 @@ def _terminal_get_tasks(calls):
 
 
 # The REAL client's on-demand path, run over a body handed in on stdin. The
-# three scripts load in index.html's order because each destructures the one
-# before it at module scope, and `document` stays undefined on purpose: data.js
+# four scripts load in index.html's order because each later one destructures
+# an earlier one at module scope, and `document` stays undefined on purpose: data.js
 # starts polling only in a real browser document, so without one it loads
 # inert (dashboard/tests/js/_data_loader.mjs::loadDataJs records why).
 _ON_DEMAND_CLIENT = r"""
@@ -161,6 +161,7 @@ const path = require('path');
 const [redux, project] = process.argv.slice(1);
 const body = JSON.parse(fs.readFileSync(0, 'utf8'));
 globalThis.window = { dispatchEvent() {} };
+require(path.join(redux, 'poll_scope.js'));
 require(path.join(redux, 'endpoint_staleness.js'));
 require(path.join(redux, 'datum.js'));
 const api = require(path.join(redux, 'data.js'));
