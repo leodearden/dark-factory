@@ -2,8 +2,11 @@
 
 Injected in place of the production adapters through
 ``MergeLane(..., verifier=FakeVerifier(...), clock=FakeClock(...))``.
-``FakeVerifier`` scripts the verify outcome per task id or in call order,
-and records each scoped verify as a ``ScopedVerifyCall``; ``FakeClock`` is a
+``FakeVerifier`` scripts the verify outcome per task id or in call order
+(``passes``, ``fails``, ``raises``, ``raises_after``, ``hangs_until``,
+``times_out``), and records each scoped verify as a ``ScopedVerifyCall``;
+``FakeRemoteRunner`` is a remote verify host handed to the lane through
+``remote_runners=``; ``FakeClock`` is a
 hand-advanced clock whose ``sleep`` advances it and waits at most
 ``sleep_cap`` of real time, and ``healthy_verify_clock`` one on which an
 in-flight verify keeps writing;
@@ -35,7 +38,7 @@ import contextlib
 import dataclasses
 from collections.abc import AsyncIterator, Collection, Coroutine, Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.merge_lane import MergeLane
@@ -44,6 +47,7 @@ from orchestrator.merge_lane.ports import ClockPort, VerifyPort
 from orchestrator.merge_lane.types import DiskGuardOutcome, MergeOutcome
 from orchestrator.merge_lane.worker import MAIN_HEALTH_PROBE_PENDING_NOTE
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_runner import RunnerUnavailable
 
 
 def lane_entry(lane: MergeLane, request_id: str) -> dict[str, Any] | None:
@@ -121,7 +125,8 @@ class VerifyScript:
     """What one ``FakeVerifier.run_scoped`` call does.
 
     Exactly one of the shapes below applies: return ``result``, raise
-    ``error``, or wait for ``release`` first and then return ``result``.
+    ``error``, wait for ``release`` first and then return ``result``, or
+    wait for ``release`` and then raise ``error``.
     *entered*, when given, is set the moment a call reaches this script,
     before any release wait; it is the arrival half of a release gate.
     """
@@ -156,6 +161,12 @@ def fails(*, category: str, summary: str) -> VerifyScript:
 
 def raises(error: BaseException) -> VerifyScript:
     return VerifyScript(result=passes().result, error=error)
+
+
+def raises_after(
+    release: asyncio.Event, error: BaseException, *, entered: asyncio.Event | None = None,
+) -> VerifyScript:
+    return VerifyScript(result=passes().result, error=error, release=release, entered=entered)
 
 
 def hangs_until(
@@ -303,6 +314,79 @@ class FakeVerifier:
 
 async def _nothing() -> None:
     return None
+
+
+class FakeRemoteRunner:
+    """A remote verify host, duck-typed to ``verify_runner.py::VerifyRunner``.
+
+    Not a ``RemoteRunner``, so ``VerifyRunnerPool.dispatch`` calls it with
+    ``(merge_sha, spec)`` alone and skips the INV-2 code sync. ``calls`` keeps
+    every merge SHA it was asked to verify. A verify waits for *release* when
+    one is given, setting *entered* first. An *unreachable* host raises
+    ``RunnerUnavailable`` and never probes healthy or clean, so the reprobe
+    sweep cannot re-admit it during a test. ``cancel_verify`` answers
+    *cancel_rc*. ``live`` is set while a verify runs, as ``RemoteRunner``'s
+    in-flight id is; ``cancels`` records whether each remote cancel found a
+    verify still live to abort, and ``clean_probes`` counts clean-probes.
+    ``reap_idle_gates`` is the no-op a running lane's reprobe loop calls on
+    every remote.
+
+    It exposes no ``dispatch_in_flight``, which the lane's no-progress abort
+    reads as a live dispatch (``worker.py::SpeculativeMergeWorker._run_inflight_verify``),
+    so a verify held on it is never no-progress-aborted.
+    """
+
+    is_local: ClassVar[bool] = False
+
+    def __init__(
+        self,
+        name: str = 'laptop',
+        *,
+        release: asyncio.Event | None = None,
+        entered: asyncio.Event | None = None,
+        unreachable: bool = False,
+        cancel_rc: int = 0,
+    ) -> None:
+        self.name = name
+        self.release = release
+        self.entered = entered
+        self.unreachable = unreachable
+        self.cancel_rc = cancel_rc
+        self.calls: list[str] = []
+        self.live = False
+        self.cancels: list[bool] = []
+        self.clean_probes = 0
+
+    async def health(self) -> bool:
+        return not self.unreachable
+
+    async def probe_clean(self) -> bool:
+        self.clean_probes += 1
+        return not self.unreachable
+
+    async def cancel_verify(self) -> int:
+        self.cancels.append(self.live)
+        return self.cancel_rc
+
+    async def reap_idle_gates(self) -> None:
+        return None
+
+    async def run_merge_verify(self, merge_sha: str, spec: Any) -> VerifyResult:
+        self.calls.append(merge_sha)
+        if self.unreachable:
+            raise RunnerUnavailable(f'{self.name} is unreachable')
+        self.live = True
+        try:
+            if self.entered is not None:
+                self.entered.set()
+            if self.release is not None:
+                await self.release.wait()
+            return VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='',
+                summary=f'green on {self.name}',
+            )
+        finally:
+            self.live = False
 
 
 class FakeClock:
