@@ -295,7 +295,7 @@ class CodebaseVerifier:
         async def grep_search(pattern: str, path: str = '.', max_results: int = 30) -> dict:
             """Search file contents with regex."""
             search_path = codebase_root / path
-            if not search_path.resolve().is_relative_to(codebase_root):
+            if await asyncio.to_thread(_escapes_root, codebase_root, path):
                 return {'error': 'Path outside codebase root'}
             try:
                 proc = await asyncio.create_subprocess_exec(
