@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 from _process_tree_fakes import claude_process_tree, counting_walks
+from _session_hook_fixtures import isolate_hook_env
 
 from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
@@ -83,6 +84,20 @@ def _isolate_fleet_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
     win over this fixture, which runs first.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+
+def test_isolate_hook_env_clears_every_spawn_var_and_pins_the_fleet_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv('CLAUDE_SPAWN_SESSION_ID', 'leaked-slug')
+    monkeypatch.setenv('CLAUDE_SPAWN_OWNER_PPID', '1')
+    monkeypatch.setenv('CLAUDE_SPAWN_FUTURE_KNOB', 'x')
+
+    isolate_hook_env(monkeypatch, tmp_path / 'fleet')
+
+    assert [k for k in os.environ if k.startswith('CLAUDE_SPAWN_')] == []
+    assert os.environ['CLAUDE_FLEET_ROOT'] == str(tmp_path / 'fleet')
+    assert not (tmp_path / 'fleet').exists()
 
 
 # ---------------------------------------------------------------------------
