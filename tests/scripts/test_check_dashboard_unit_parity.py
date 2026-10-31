@@ -993,11 +993,14 @@ def test_env_matches_directive_not_compared_when_spec_omits_it():
 # ---------------------------------------------------------------------------
 
 
-def _exec_unit(uv_bin: str, repo_root: str, tail: str) -> str:
+def _exec_unit(
+    uv_bin: str, repo_root: str, tail: str, *, run_options: str = "--project dashboard"
+) -> str:
     """A dashboard-service fixture whose ExecStart is a real 4-line continuation.
 
-    The explanatory comment above ExecStart names --timeout-keep-alive in
-    prose, exactly as both real dashboard units do — see the case (e) test.
+    The explanatory comment above ExecStart names --timeout-keep-alive and
+    --no-sync in prose, exactly as both real dashboard units do — see the
+    comment-block tests.
     """
     return f"""\
 [Service]
@@ -1005,7 +1008,8 @@ Type=simple
 WorkingDirectory={repo_root}
 # --timeout-keep-alive 5 is uvicorn's own default, pinned deliberately.
 # --timeout-graceful-shutdown 8 bounds the connection drain.
-ExecStart={uv_bin} run --project dashboard \\
+# --no-sync keeps uv from re-syncing the shared .venv.
+ExecStart={uv_bin} run {run_options} \\
   python -m uvicorn dashboard.app:app \\
   --host 127.0.0.1 --port 8080 \\
   {tail}
@@ -1155,6 +1159,138 @@ def test_exec_start_flag_helper_reads_the_parsed_value():
     assert mod._exec_start_flag(parsed, "timeout-keep-alive") == "5"
     assert mod._exec_start_flag(parsed, "workers") is None
     assert mod._exec_start_flag({}, "host") is None
+
+
+def _switch_spec(mod: types.ModuleType, *switches: str):
+    """A minimal UnitSpec that compares exactly *switches* inside ExecStart."""
+    return mod.UnitSpec(
+        name="fixture.service",
+        repo_relpath="dashboard/fixture.service",
+        exec_start_switches=switches,
+    )
+
+
+_NO_SYNC_RUN = "--no-sync --project dashboard"
+
+
+def test_exec_start_switch_missing_from_installed_is_drift():
+    """The measured 2026-10-05 host shape: the installed `uv run` lacks --no-sync."""
+    mod = _load_checker()
+    spec = _switch_spec(mod, "no-sync")
+
+    drifts = mod.compare_unit(
+        spec,
+        _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS, run_options=_NO_SYNC_RUN),
+        _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS),
+    )
+
+    assert len(drifts) == 1, drifts
+    (drift,) = drifts
+    assert drift.key == "ExecStart --no-sync"
+    assert drift.section == "Service"
+    assert drift.repo_value == "--no-sync"
+    assert drift.installed_value == systemd_unit_parity.ABSENT
+    assert "absent from the installed command" in drift.reason, drift.reason
+
+
+def test_exec_start_switch_present_only_on_installed_is_drift():
+    """Presence is compared symmetrically: an installed-only switch is drift too."""
+    mod = _load_checker()
+    spec = _switch_spec(mod, "no-sync")
+
+    drifts = mod.compare_unit(
+        spec,
+        _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS),
+        _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS, run_options=_NO_SYNC_RUN),
+    )
+
+    assert len(drifts) == 1, drifts
+    (drift,) = drifts
+    assert drift.key == "ExecStart --no-sync"
+    assert drift.repo_value == systemd_unit_parity.ABSENT
+    assert drift.installed_value == "--no-sync"
+    assert "absent from the repo command" in drift.reason, drift.reason
+
+
+def test_exec_start_switches_ignore_host_specific_prefixes():
+    """Differing uv path and repo root are NOT drift when both carry the switch."""
+    mod = _load_checker()
+    spec = _switch_spec(mod, "no-sync")
+
+    drifts = mod.compare_unit(
+        spec,
+        _exec_unit(
+            "/home/leo/.local/bin/uv",
+            "/home/leo/src/dark-factory",
+            _BOTH_FLAGS,
+            run_options=_NO_SYNC_RUN,
+        ),
+        _exec_unit("/usr/local/bin/uv", "/opt/df", _BOTH_FLAGS, run_options=_NO_SYNC_RUN),
+    )
+
+    assert drifts == [], f"Host prefixes must be ignored by construction; got {drifts}"
+
+
+def test_exec_start_switch_absent_from_both_is_not_drift():
+    """A compared switch neither command carries is parity, not a phantom drift."""
+    mod = _load_checker()
+    spec = _switch_spec(mod, "no-sync")
+
+    text = _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS)
+    assert mod.compare_unit(spec, text, text) == []
+
+
+def test_exec_start_switch_lookup_ignores_the_comment_block():
+    """A switch named only in the comment above ExecStart is NOT on the command."""
+    mod = _load_checker()
+    spec = _switch_spec(mod, "no-sync")
+
+    installed = _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS)
+    assert "--no-sync" in installed, "fixture must retain the prose mention"
+
+    drifts = mod.compare_unit(
+        spec,
+        _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS, run_options=_NO_SYNC_RUN),
+        installed,
+    )
+
+    assert len(drifts) == 1, (
+        "The comment's mention of --no-sync must not be mistaken for the switch "
+        f"being present on the command. Got: {drifts}"
+    )
+    assert drifts[0].installed_value == systemd_unit_parity.ABSENT
+
+
+def test_exec_start_switch_does_not_disturb_flag_reading():
+    """A switch beside a flag leaves the flag's argument read correctly.
+
+    The hazard the separate field exists for: `--no-sync --project dashboard`
+    read as a FLAG would take `--project` as no-sync's argument.
+    """
+    mod = _load_checker()
+    spec = mod.UnitSpec(
+        name="fixture.service",
+        repo_relpath="dashboard/fixture.service",
+        exec_start_flags=("project",),
+        exec_start_switches=("no-sync",),
+    )
+    repo = _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS, run_options=_NO_SYNC_RUN)
+
+    assert mod.compare_unit(spec, repo, repo) == []
+
+    drifts = mod.compare_unit(
+        spec,
+        repo,
+        _exec_unit(
+            "/usr/bin/uv", "/opt/df", _BOTH_FLAGS, run_options="--no-sync --project other"
+        ),
+    )
+
+    assert len(drifts) == 1, drifts
+    (drift,) = drifts
+    assert drift.key == "ExecStart --project"
+    assert drift.repo_value == "dashboard"
+    assert drift.installed_value == "other"
 
 
 # ---------------------------------------------------------------------------
@@ -1446,7 +1582,7 @@ _PROBE_DIRECTIVE_FIELDS = {
     "override_directives": (("Service", "Override"),),
     "environment_section": "Service",
 }
-_CONTENT_FIELDS = {"exec_start_flags", "env_matches_directive"}
+_CONTENT_FIELDS = {"exec_start_flags", "exec_start_switches", "env_matches_directive"}
 _NON_COMPARISON_FIELDS = {"name", "repo_relpath", "unchecked_directives"}
 
 
