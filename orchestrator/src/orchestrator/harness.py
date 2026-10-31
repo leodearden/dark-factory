@@ -130,7 +130,7 @@ from orchestrator.merge_lane.worker import (
     reconcile_landed_task,
     select_recovery_winner,
 )
-from orchestrator.module_charter import sanitize_files_for_persist
+from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.module_tagger_prompt import (
     TAGGER_SCHEMA,
     TAGGER_SYSTEM_PROMPT,
@@ -14723,10 +14723,7 @@ class Harness:
         slot_task = self._workflow_slot_tasks.get(task_id)
         if lease is None or slot_task is None or slot_task.done():
             return
-        modules = sorted(
-            module for module, holder in self.scheduler.lock_table.snapshot_holders().items()
-            if holder == task_id
-        )
+        modules = sorted(self._modules_locked_by(task_id))
         stuck = suspended_slot_tasks(slot_task)
         self._force_released_slot_tasks().add(slot_task)
         self._unregister_slot(task_id)
@@ -16722,7 +16719,11 @@ class Harness:
             # grant was recorded and dropped, and the implementer looped
             # (reify task 4263, measured 2026-09-19).  Gated on a non-empty
             # grant, the fold's COST GATE lifted to the scheduling boundary, so
-            # a grant-less live resolve still schedules nothing.
+            # a grant-less live resolve still schedules nothing.  A LEVEL-0
+            # record is left to the live workflow paused on it: its resume
+            # branch delivers the grant through `TaskWorkflow._set_task_scope`,
+            # which also acquires the module locks the grant needs, so a
+            # harness write there could only race it.
             is_l2_cascade = (
                 isinstance(escalation.resolved_by, str)
                 and escalation.resolved_by.startswith('l2-cascade:')
@@ -16749,7 +16750,7 @@ class Harness:
                         f'(via {escalation.resolved_by})'
                     ),
                 )
-            elif escalation.granted_files:
+            elif escalation.granted_files and escalation.level > 0:
                 # Live slot carrying a grant — deliver it, never re-pend.
                 self._schedule_coro_threadsafe(
                     self._deliver_resume_resolution(escalation, repend=False),
@@ -17595,6 +17596,21 @@ class Harness:
             return GrantDelivery.NO_PLAN_TO_WIDEN
         return None
 
+    def _modules_locked_by(self, task_id: str) -> set[str]:
+        """The module locks *task_id* holds in this process's lock table."""
+        return {
+            module for module, holder in self.scheduler.lock_table.snapshot_holders().items()
+            if holder == task_id
+        }
+
+    def _modules_unlocked_by_live_slot(self, task_id: str, files: list[str]) -> list[str]:
+        """Modules *files* need that *task_id*'s LIVE slot does not lock; [] with no live slot."""
+        if task_id not in self._escalation_events:
+            return []
+        held = self._modules_locked_by(task_id)
+        needed = derive_modules(files, self.config.lock_depth, task_id=task_id)
+        return [module for module in needed if module not in held]
+
     async def _deliver_resume_resolution(self, escalation, *, repend: bool) -> None:
         """Deliver a resume resolution's scope grant, then re-pend when *repend*."""
         shortfall = await self._fold_granted_files(escalation.task_id, escalation)
@@ -17693,18 +17709,20 @@ class Harness:
         exactly like an empty/omitted one (sentinel alone, no clobber)". The
         flip and the plan write are unaffected.
 
-        Deliberately does NOT call ``handle_blast_radius_expansion``. On the
-        re-pend arms (``repend=True``) the slot exit already released every
-        module lock this task held, so there is no live lock to expand, and
-        the next dispatch acquires from the widened ``metadata.files``. On the
-        LIVE arm the slot still holds its ORIGINAL locks, and that API resets
-        the task to pending and releases its locks on conflict — it would tear
-        the running workflow's slot out from under it. The residual: if the
-        live workflow later reaches its resume branch,
-        ``workflow.py::TaskWorkflow._collect_granted_files`` compares against
-        its IN-MEMORY plan, still sees the delta, and ``_set_task_scope``
-        reconciles the locks; if it re-reads plan.json first, the locks catch
-        up only at the next dispatch, from ``metadata.files``.
+        Deliberately does NOT call ``handle_blast_radius_expansion``. With no
+        live slot the slot exit already released every module lock this task
+        held, so there is no live lock to expand, and the next dispatch
+        acquires from the widened ``metadata.files``. A LIVE slot still holds
+        its ORIGINAL locks, and that API resets the task to pending and
+        releases its locks on conflict — it would tear the running workflow's
+        slot out from under it. So a live slot is widened only WITHIN the
+        locks it already holds: its implementer's next prompt re-reads
+        plan.json (``workflow.py::TaskWorkflow._live_plan``), and a file in a
+        module it does not lock would let two tasks edit one module. A grant
+        needing such a module widens nothing and returns ``NEEDS_UNHELD_LOCK``;
+        it lands when that workflow next resumes from its own level-0 record,
+        where ``TaskWorkflow._collect_granted_files`` unions every resolved
+        grant and ``_set_task_scope`` acquires the locks.
 
         Ownership: ``set_plan_files`` STAMPS ``_session_id`` when the caller
         does not already own the plan, so the plan's OWN owner id
@@ -17722,8 +17740,9 @@ class Harness:
         escalation already closed and nothing left to advance it, i.e. exactly
         the permanent silent hold INV-4 exists to prevent.
 
-        A shortfall is also RETURNED (``NO_PLAN_TO_WIDEN``, ``WRITE_FAILED``;
-        None means delivered or nothing to deliver), and
+        A shortfall is also RETURNED (``NO_PLAN_TO_WIDEN``,
+        ``NEEDS_UNHELD_LOCK``, ``WRITE_FAILED``; None means delivered or
+        nothing to deliver), and
         :meth:`_deliver_resume_resolution` writes it onto the resolving record
         under ``GRANT_NOT_DELIVERED_MARKER``. ``resolve_issue`` has already
         returned by now, so a log line alone is not a return value (INV-11
@@ -17804,6 +17823,14 @@ class Harness:
                     # files): costs neither a plan rewrite nor an update_task
                     # round-trip.
                     return None
+                unlocked = self._modules_unlocked_by_live_slot(task_id, union[len(current):])
+                if unlocked:
+                    logger.warning(
+                        'granted-files fold: task %s is running without a lock '
+                        'on %s — the grant %s was not widened into its live plan',
+                        task_id, unlocked, granted,
+                    )
+                    return GrantDelivery.NEEDS_UNHELD_LOCK
 
                 # Pass the plan's OWN owner id back — see "Ownership" above.
                 arts.set_plan_files(

@@ -36,8 +36,8 @@ class GrantDelivery(StrEnum):
 
     ``SCHEDULED`` means ROUTED to the harness's delivery path, not landed:
     delivery is asynchronous, and a shortfall found there (``NO_PLAN_TO_WIDEN``,
-    ``WRITE_FAILED``) is appended to the record's resolution under
-    :data:`GRANT_NOT_DELIVERED_MARKER`. Every value other than
+    ``NEEDS_UNHELD_LOCK``, ``WRITE_FAILED``) is appended to the record's
+    resolution under :data:`GRANT_NOT_DELIVERED_MARKER`. Every value other than
     ``NONE_GRANTED`` and ``SCHEDULED`` is a shortfall.
     """
 
@@ -47,6 +47,7 @@ class GrantDelivery(StrEnum):
     RECORD_NOT_OPEN = 'record_not_open'
     NO_ORCHESTRATOR = 'no_orchestrator'
     NO_PLAN_TO_WIDEN = 'no_plan_to_widen'
+    NEEDS_UNHELD_LOCK = 'needs_unheld_lock'
     WRITE_FAILED = 'write_failed'
 
 
@@ -114,6 +115,16 @@ def shortfall_reason(
                 f'architect, or its worktree was reclaimed); add them to its '
                 f'metadata.files by hand if the scope must change before it is '
                 f'next planned.'
+            )
+        case GrantDelivery.NEEDS_UNHELD_LOCK:
+            return (
+                f'granted_files {paths} were recorded but not widened into task '
+                f'{task_id}: its workflow is running without the module lock '
+                f'they need, and widening its live plan would let it edit '
+                f'unlocked code. They land when that workflow next resumes from '
+                f'its own level-0 escalation, which acquires the lock; '
+                f'otherwise, once the task is no longer running, '
+                f'{resume_recourse}.'
             )
         case GrantDelivery.WRITE_FAILED:
             return (

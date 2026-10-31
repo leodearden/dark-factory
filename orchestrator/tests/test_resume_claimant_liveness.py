@@ -43,13 +43,19 @@ from _orch_helpers import (
 from _orch_helpers import (
     claimant_row as _row,
 )
-from escalation.grant_delivery import GRANT_NOT_DELIVERED_MARKER, GrantDelivery
+from escalation.grant_delivery import (
+    GRANT_NOT_DELIVERED_MARKER,
+    GrantDelivery,
+    shortfall_reason,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import _REBLOCK_GUARD_THRESHOLD, Harness
-from orchestrator.module_charter import sanitize_files_for_persist
+from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
+from orchestrator.scheduler import ModuleLockTable
 
 # ``_row`` / ``LIVE_CLAIMANT`` / ``TTL_SECS`` are the SHARED definitions in
 # ``_orch_helpers`` (task 3540 review amendment).  They were cloned here and in
@@ -1133,6 +1139,28 @@ class TestGrantedFilesFoldOnRepend:
         ]
         _status_writes(harness).assert_awaited_once()
 
+    async def test_the_w11_sibling_plan_is_widened_over_a_legacy_one(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """With both plans on disk, the W11 ``.task-meta`` sibling is the one
+        widened and the legacy ``<worktree>/.task`` plan is left untouched:
+        the resolution is new-then-old, so the new location wins."""
+        esc = _esc(
+            task_id='3438', category='scope_violation',
+            granted_files=['pkg/b.py'], resolved_by='steward',
+        )
+        _wire_queue(harness, tmp_path, esc)
+        sibling_path = _seed_plan(harness, files=['pkg/a.py'])
+        legacy_path = _seed_plan(harness, files=['pkg/a.py'], legacy=True)
+        legacy_before = legacy_path.read_text()
+        _wire(harness, _row('blocked', claimant=None, heartbeat=None))
+        harness._escalation_events.pop('3438', None)
+
+        await _drive(harness, esc)
+
+        assert json.loads(sibling_path.read_text())['files'] == ['pkg/a.py', 'pkg/b.py']
+        assert legacy_path.read_text() == legacy_before
+
     async def test_the_fold_lands_before_the_status_write(
         self, harness: Harness, tmp_path: Path
     ):
@@ -1637,61 +1665,59 @@ class TestGrantedFilesFoldOnRepend:
 class TestGrantedFilesDeliveryProbe:
     """Where a grant would land, asked synchronously (task 5650).
 
-    ``Harness._locate_plan_artifacts`` is the one new-then-old plan resolution
-    the fold and the public probe share; ``Harness.granted_files_delivery_
-    blocker`` is what ``escalation/server.py::resolve_issue`` consults to
-    report ``NO_PLAN_TO_WIDEN`` at the API instead of only in a log.
+    ``Harness.granted_files_delivery_blocker`` is what
+    ``escalation/server.py::resolve_issue`` consults to report
+    ``NO_PLAN_TO_WIDEN`` at the API instead of only in a log. It resolves the
+    plan new-then-old, as the fold does; which plan the fold then widens is
+    pinned end-to-end by
+    ``TestGrantedFilesFoldOnRepend.test_the_w11_sibling_plan_is_widened_over_a_legacy_one``.
     """
 
-    def test_a_w11_sibling_plan_is_located_and_unblocked(self, harness: Harness):
+    def test_a_w11_sibling_plan_is_unblocked(self, harness: Harness):
         _seed_plan(harness, files=['pkg/a.py'])
 
-        arts = harness._locate_plan_artifacts('3438')
-
-        assert arts is not None
-        assert arts.read_plan()['files'] == ['pkg/a.py']
         assert harness.granted_files_delivery_blocker('3438') is None
 
-    def test_a_legacy_plan_is_located_and_unblocked(self, harness: Harness):
+    def test_a_legacy_plan_is_unblocked(self, harness: Harness):
         _seed_plan(harness, files=['pkg/a.py'], legacy=True)
 
-        arts = harness._locate_plan_artifacts('3438')
-
-        assert arts is not None
-        assert arts.read_plan()['files'] == ['pkg/a.py']
         assert harness.granted_files_delivery_blocker('3438') is None
 
-    def test_the_w11_sibling_wins_over_the_legacy_plan(self, harness: Harness):
-        _seed_plan(harness, files=['pkg/sibling.py'])
-        _seed_plan(harness, files=['pkg/legacy.py'], legacy=True)
-
-        arts = harness._locate_plan_artifacts('3438')
-
-        assert arts is not None
-        assert arts.read_plan()['files'] == ['pkg/sibling.py']
-
     def test_no_plan_anywhere_is_no_plan_to_widen(self, harness: Harness):
-        assert harness._locate_plan_artifacts('3438') is None
         assert (
             harness.granted_files_delivery_blocker('3438')
             is GrantDelivery.NO_PLAN_TO_WIDEN
         )
 
 
+_LOCK_DEPTH = 2
+_LIVE_PLAN = ['pkg/core/a.py']
+_SAME_MODULE_GRANT = ['pkg/core/b.py']
+_OTHER_MODULE_GRANT = ['pkg/other/c.py']
+
+
 def _live_slot_grant(
-    harness: Harness, tmp_path: Path, granted: list[str],
+    harness: Harness, tmp_path: Path, granted: list[str], *, level: int = 2,
 ) -> tuple[Escalation, asyncio.Event, EscalationQueue]:
     """The reported repro's wiring: an L2 grant resolved against a LIVE task.
 
     The ``_escalation_events`` entry stays PRESENT, the inverse of every
-    re-pend fold test above, which pop it to take the orphan arm.
+    re-pend fold test above, which pop it to take the orphan arm. The slot
+    holds the module lock its plan derives, in a real ``ModuleLockTable``, as
+    a dispatched slot does; the plan itself is seeded by each test.
     """
     esc = _esc(
-        task_id='3438', level=2, category='scope_violation',
+        task_id='3438', level=level, category='scope_violation',
         granted_files=granted, resolved_by='escalation-watcher-auto',
     )
     queue = _wire_queue(harness, tmp_path, esc)
     _wire(harness, _row('in-progress', claimant=LIVE_CLAIMANT, heartbeat='fresh'))
+    harness.config.lock_depth = _LOCK_DEPTH
+    lock_table = ModuleLockTable(
+        OrchestratorConfig(max_per_module=1, lock_depth=_LOCK_DEPTH),
+    )
+    assert lock_table.try_acquire('3438', derive_modules(_LIVE_PLAN, _LOCK_DEPTH))
+    harness.scheduler.lock_table = lock_table
     event = asyncio.Event()
     harness._escalation_events['3438'] = event
     return esc, event, queue
@@ -1707,27 +1733,86 @@ class TestGrantDeliveryOnALiveWorkflow:
     it wakes the event and goes back to sleep without ever reaching
     ``workflow.py::TaskWorkflow._collect_granted_files``: the grant was
     recorded and dropped, and the implementer looped (reify task 4263,
-    measured 2026-09-19).
+    measured 2026-09-19). The harness widens a live slot only within the
+    module locks it holds, and leaves a level-0 grant to the workflow paused
+    on it.
     """
 
     async def test_a_grant_on_a_live_workflow_is_delivered(
         self, harness: Harness, tmp_path: Path
     ):
-        esc, event, _queue = _live_slot_grant(harness, tmp_path, ['pkg/b.py'])
-        plan_path = _seed_plan(harness, files=['pkg/a.py'])
+        esc, event, queue = _live_slot_grant(harness, tmp_path, _SAME_MODULE_GRANT)
+        plan_path = _seed_plan(harness, files=_LIVE_PLAN)
 
         await _drive(harness, esc)
 
-        assert json.loads(plan_path.read_text())['files'] == ['pkg/a.py', 'pkg/b.py']
+        assert json.loads(plan_path.read_text())['files'] == _LIVE_PLAN + _SAME_MODULE_GRANT
         assert len(_files_updates(harness)) == 1
         _status_writes(harness).assert_not_awaited()
+        assert event.is_set(), 'The synchronous wake path must still fire'
+        stored = queue.get(esc.id)
+        assert stored is not None
+        assert GRANT_NOT_DELIVERED_MARKER not in (stored.resolution or '')
+
+    async def test_a_grant_needing_an_unheld_lock_is_not_widened_into_a_live_plan(
+        self, harness: Harness, tmp_path: Path, caplog
+    ):
+        """A running implementer re-reads plan.json for its next prompt
+        (``workflow.py::TaskWorkflow._live_plan``), so widening it with a file
+        in a module the slot does not lock would let two tasks edit one
+        module. The grant stays recorded, the plan and ``metadata.files`` stay
+        as they were, and the record says why."""
+        esc, _event, queue = _live_slot_grant(harness, tmp_path, _OTHER_MODULE_GRANT)
+        plan_path = _seed_plan(harness, files=_LIVE_PLAN)
+        before = plan_path.read_text()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            await _drive(harness, esc)
+
+        assert plan_path.read_text() == before
+        assert _files_updates(harness) == []
+        resolution = _resolution_of(queue, esc)
+        assert GRANT_NOT_DELIVERED_MARKER in resolution
+        reason = shortfall_reason(
+            GrantDelivery.NEEDS_UNHELD_LOCK,
+            task_id='3438', granted_files=_OTHER_MODULE_GRANT,
+        )
+        assert reason is not None and reason in resolution
+        assert any(
+            r.levelno == logging.WARNING and 'pkg/other' in r.getMessage()
+            for r in caplog.records
+        ), 'Expected a WARNING naming the module the slot does not lock'
+        _status_writes(harness).assert_not_awaited()
+
+    async def test_a_grant_on_the_live_workflows_own_level0_is_left_to_it(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """The live workflow paused on its own level-0 record delivers that
+        grant itself: its resume branch unions every resolved grant
+        (``workflow.py::TaskWorkflow._collect_granted_files``) and widens
+        through ``TaskWorkflow._set_task_scope``, which also acquires the
+        locks. The harness writes nothing there, so that branch still finds
+        the delta whether it compares against its in-memory plan or re-reads
+        plan.json."""
+        esc, event, _queue = _live_slot_grant(
+            harness, tmp_path, _OTHER_MODULE_GRANT, level=0,
+        )
+        plan_path = _seed_plan(harness, files=_LIVE_PLAN)
+        before = plan_path.read_text()
+
+        labels = _record_scheduling(harness)
+        await _drive(harness, esc)
+
+        assert labels == [], f'the live L0 grant belongs to its workflow; got {labels}'
+        assert plan_path.read_text() == before
+        assert _files_updates(harness) == []
         assert event.is_set(), 'The synchronous wake path must still fire'
 
     async def test_a_grantless_resolve_on_a_live_workflow_schedules_nothing(
         self, harness: Harness, tmp_path: Path
     ):
         esc, _event, _queue = _live_slot_grant(harness, tmp_path, [])
-        _seed_plan(harness, files=['pkg/a.py'])
+        _seed_plan(harness, files=_LIVE_PLAN)
 
         labels = _record_scheduling(harness)
         await _drive(harness, esc)
@@ -1737,8 +1822,8 @@ class TestGrantDeliveryOnALiveWorkflow:
     async def test_live_delivery_is_scheduled_under_its_own_label(
         self, harness: Harness, tmp_path: Path
     ):
-        esc, _event, _queue = _live_slot_grant(harness, tmp_path, ['pkg/b.py'])
-        _seed_plan(harness, files=['pkg/a.py'])
+        esc, _event, _queue = _live_slot_grant(harness, tmp_path, _SAME_MODULE_GRANT)
+        _seed_plan(harness, files=_LIVE_PLAN)
 
         labels = _record_scheduling(harness)
         await _drive(harness, esc)
@@ -1751,11 +1836,11 @@ class TestGrantDeliveryOnALiveWorkflow:
     async def test_a_live_slot_grant_with_no_plan_is_noted(
         self, harness: Harness, tmp_path: Path
     ):
-        esc, _event, queue = _live_slot_grant(harness, tmp_path, ['pkg/b.py'])
+        esc, _event, queue = _live_slot_grant(harness, tmp_path, _SAME_MODULE_GRANT)
 
         await _drive(harness, esc)
 
         resolution = _resolution_of(queue, esc)
         assert GRANT_NOT_DELIVERED_MARKER in resolution
-        assert 'pkg/b.py' in resolution
+        assert _SAME_MODULE_GRANT[0] in resolution
         _status_writes(harness).assert_not_awaited()
