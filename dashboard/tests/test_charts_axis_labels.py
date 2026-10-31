@@ -195,13 +195,12 @@ def _workflow_panel_format_y(tab_analytics_jsx_body: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Caller-audit extractors (task 4232) — what each LineChart CALL SITE passes.
+# Caller-audit extractors — the props (formatY) and flags (countAxis) that each
+# LineChart and StackedAreaChart CALL SITE passes, read out of the tab sources.
 #
-# The audit's outcome is a per-caller fact, not a property of charts.jsx, so it
-# has to be read out of the tab sources. `_line_chart_format_y` returns None for
-# a site that passes no formatter — a real, load-bearing answer here (three
-# sites must stop relying on the default and one must keep relying on it), which
-# is why a MISSING ELEMENT asserts instead of also returning None.
+# `_line_chart_format_y` returns None for a site that passes no formatter. That
+# None is load-bearing for the esc-per-done ratio guard, which requires the site
+# to keep the default, so a MISSING ELEMENT asserts instead of also returning None.
 # ---------------------------------------------------------------------------
 
 # Every spelling the tabs use: tabs.jsx aliases `LineChart: LC` (and
@@ -276,25 +275,43 @@ def _chart_prop(body: str, tag_re: re.Pattern, anchor: str, prop: str):
     return element[m.end() : i - 1].strip()
 
 
+def _attribute_names_only(element: str) -> str:
+    """`element` with every attribute VALUE blanked to spaces, offsets preserved.
+
+    Blanks braced expressions (``series={[{ countAxis: 1 }]}``) and quoted
+    strings at brace depth 0 (``title="countAxis"``), keeping their delimiters,
+    so what is left to scan is the tag, the attribute names and the ``=`` signs.
+    """
+    depth = 0
+    quote = None
+    kept = []
+    for ch in element:
+        if quote is not None:
+            kept.append(ch if ch == quote else ' ')
+            if ch == quote:
+                quote = None
+        elif depth == 0 and ch in '"\'':
+            quote = ch
+            kept.append(ch)
+        else:
+            if ch == '{':
+                depth += 1
+            kept.append(ch if depth == 0 else ' ')
+            if ch == '}':
+                depth -= 1
+    return ''.join(kept)
+
+
 def _chart_flag(body: str, tag_re: re.Pattern, anchor: str, prop: str) -> bool:
     """Whether the chart call site containing `anchor` carries the bare attribute `prop`.
 
     Only the shorthand form counts (``<LC ... countAxis />``), so presence is the
     whole decision. Any ``prop=`` form RAISES rather than answering: read either
     way, ``countAxis={false}`` or ``countAxis={isCount}`` would be misread. Only
-    brace depth 0 is scanned, so a token inside a braced expression such as
-    ``series={[{ countAxis: 1 }]}`` is not an attribute and does not count.
+    attribute names are scanned (see `_attribute_names_only`), so the token
+    inside a braced expression or a quoted string is not an attribute.
     """
-    element = _anchored_chart_element(body, tag_re, anchor)
-    depth = 0
-    top_level = []
-    for ch in element:
-        if ch == '{':
-            depth += 1
-        top_level.append(ch if depth == 0 else ' ')
-        if ch == '}':
-            depth -= 1
-    attributes = ''.join(top_level)
+    attributes = _attribute_names_only(_anchored_chart_element(body, tag_re, anchor))
     assert re.search(rf'(?<![\w.]){prop}\s*=', attributes) is None, (
         f'the chart element anchored at {anchor!r} assigns `{prop}=...`. The '
         f'caller audit requires the shorthand `{prop}` attribute, so that its '
@@ -956,3 +973,11 @@ def test_chart_flag_extractor_is_discriminating() -> None:
         'the flag extractor reads a countAxis key inside a braced prop expression '
         'as the attribute.'
     )
+
+    for quoted in ('title="per-hour countAxis count"', "aria-label='countAxis={true}'"):
+        assert not _chart_flag(
+            pre_6370.replace(' formatX=', f' {quoted} formatX='),
+            _LINE_CHART_TAG_RE,
+            'd.depth.values',
+            'countAxis',
+        ), f'the flag extractor reads a countAxis inside the quoted value {quoted} as the attribute.'
