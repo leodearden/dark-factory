@@ -39,21 +39,28 @@
 # Exit 0 = knob landed on the target's main, reloaded, and observed in
 # `applied`.  Non-zero = a failure the caller (a deterministic deploy task)
 # escalates born-at-L2; one that did not land names the request's last merge
-# state.
+# state.  Every designed exit before the landing ends its stdout with the
+# JSON verdict `{"failure": <tag>}`, its prose on stderr just before it; the
+# tags come from die() below and scripts/lib/deploy_main_copy.sh.
 set -euo pipefail
 
 KNOB_KEY="merge_deep.chain_cap"
 
-die() { echo "merge-deep-set-cap: $*" >&2; exit 1; }
+die() {
+    local failure="$1"; shift
+    echo "merge-deep-set-cap: $*" >&2
+    printf '{"failure": "%s"}\n' "$failure"
+    exit 1
+}
 
-[ "$#" -eq 3 ] || die "usage: merge-deep-set-cap.sh <cap> <config_yaml_path> <escalation_port>"
+[ "$#" -eq 3 ] || die usage "usage: merge-deep-set-cap.sh <cap> <config_yaml_path> <escalation_port>"
 CAP="$1"; CONFIG="$2"; PORT="$3"
 
 # Canonical spelling only: the yaml edit, commit message and applied check must agree.
 [[ "$CAP" =~ ^(0|[1-9][0-9]*)$ ]] \
-    || die "cap must be a non-negative integer with no leading zero (YAML reads 010 as octal 8), got: $CAP"
-[[ "$PORT" =~ ^[0-9]+$ ]] || die "port must be an integer, got: $PORT"
-[ -f "$CONFIG" ]          || die "config not found: $CONFIG"
+    || die invalid_cap "cap must be a non-negative integer with no leading zero (YAML reads 010 as octal 8), got: $CAP"
+[[ "$PORT" =~ ^[0-9]+$ ]] || die invalid_port "port must be an integer, got: $PORT"
+[ -f "$CONFIG" ]          || die config_not_found "config not found: $CONFIG"
 
 # Step 3's landing and reload run under the SCRIPT's checkout venv and import
 # from the SCRIPT's checkout -- never from $REPO, the config's checkout (the
@@ -67,12 +74,11 @@ PY="$SCRIPT_DIR/../.venv/bin/python3"
 # step 1 edits (EDITED), with the traps that let step 3 cancel on a killpg.
 # shellcheck source=scripts/lib/deploy_main_copy.sh
 source "$SCRIPT_DIR/lib/deploy_main_copy.sh"
-main_copy_failed() { die "$2"; }
-deploy_main_copy "$CONFIG" main_copy_failed
+deploy_main_copy "$CONFIG" die
 
 # 1. Upsert `merge_deep:\n  chain_cap: <cap>` (stdlib python3; line-oriented so
 #    the raw-shell deploy layer needs no yaml library).
-python3 - "$EDITED" "$CAP" <<'PY'
+python3 - "$EDITED" "$CAP" <<'PY' || die config_edit_failed "step 1 could not edit main's ${REL} (reason above)"
 import re, sys
 path, cap = sys.argv[1], sys.argv[2]
 lines = open(path, encoding="utf-8").read().splitlines()
@@ -106,7 +112,7 @@ PY
 
 # 2. Nothing to land is the documented non-idempotence, refused before any MCP call.
 if cmp -s "$MAIN_COPY" "$EDITED"; then
-    die "nothing to land: main already carries ${KNOB_KEY}=${CAP}"
+    die nothing_to_land "nothing to land: main already carries ${KNOB_KEY}=${CAP}"
 fi
 
 # 3. Land the edit through the target's merge queue, then hot-reload the running
