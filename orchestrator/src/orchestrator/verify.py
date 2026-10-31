@@ -2388,6 +2388,10 @@ def _tool_for_cmd(cmd: str | None) -> ToolKind:
     return parse_config_command(cmd).tool
 
 
+# The wire format between `_summarize_checks`, which joins a summary's
+# fragments with it, and `_aggregate_results`, which splits them back out.
+_SUMMARY_FRAGMENT_SEPARATOR = ', '
+
 # task 3173: the substring that marks a summary fragment as a signal-kill
 # note.  Shared by `_killed_leg_note` (producer) and `_aggregate_results`
 # (consumer), so multi-module aggregation — which rebuilds the summary by
@@ -2395,12 +2399,12 @@ def _tool_for_cmd(cmd: str | None) -> ToolKind:
 # 'type errors' — cannot silently drop the one fact that says the run means
 # nothing.  Any new consumer should match on this constant, never a literal.
 #
-# CONSTRAINT ON PRODUCERS: a marker-bearing fragment must not contain ', '.
-# `_summarize_checks` JOINS fragments with ', ' and `_aggregate_results`
-# recovers them with `.split(', ')`, so a comma inside the note splits it in
+# CONSTRAINT ON PRODUCERS: a marker-bearing fragment must not contain
+# `_SUMMARY_FRAGMENT_SEPARATOR`, or `_aggregate_results`'s split cuts it in
 # two and only the marker-bearing half survives — silently truncating the
 # sentence, which is the exact degradation the carry-through exists to
-# prevent.  Separate clauses with '; '.  Pinned by
+# prevent.  Separate clauses with '; ', and pass every interpolated value
+# through `_without_fragment_separator`.  Pinned by
 # test_verify.py::TestKillNoteIsOneAggregationFragment, which fails at the
 # producer rather than letting the consumer degrade quietly.
 SIGNAL_KILL_SUMMARY_MARKER = 'killed by signal'
@@ -2415,8 +2419,7 @@ SIGNAL_KILL_SUMMARY_MARKER = 'killed by signal'
 # truncated run reported ``1 failed, 728 passed, 1 skipped`` where a clean
 # re-run of the identical command reported ``19622 passed, 17 skipped``.
 #
-# Same CONSTRAINT ON PRODUCERS as above: a fragment bearing this marker must
-# not contain ', '.  See `_worker_death_leg_note`.
+# Same CONSTRAINT ON PRODUCERS as above.  See `_worker_death_leg_note`.
 WORKER_DEATH_SUMMARY_MARKER = 'session aborted after worker death'
 
 # Every marker that makes a summary fragment a no-verdict note.
@@ -2430,32 +2433,49 @@ def is_no_verdict_summary(summary: str) -> bool:
     return any(marker in summary for marker in _NO_VERDICT_SUMMARY_MARKERS)
 
 
-def _killed_leg_note(label: str, rc: int, duration: float | None) -> str:
+def _without_fragment_separator(text: str) -> str:
+    """*text* with each separator collapsed, so an interpolated value cannot split its note across the wire join."""
+    return text.replace(_SUMMARY_FRAGMENT_SEPARATOR, _SUMMARY_FRAGMENT_SEPARATOR.strip())
+
+
+def _leg_name(label: str, module: str | None) -> str:
+    """How a no-verdict note names its leg: the module prefix, when there is one, then the slot."""
+    if module is None:
+        return f'{label} leg'
+    return f'{_without_fragment_separator(module)} {label} leg'
+
+
+def _killed_leg_note(
+    label: str, rc: int, duration: float | None, *, module: str | None = None,
+) -> str:
     """Describe a leg that was terminated by an external signal.
 
-    Every clause is a MEASURED fact: which leg, which signal delivered it,
-    how long the process survived, and — the point of the whole exercise —
-    that no verdict exists.  ``duration`` is ``None`` (not ``0.0``) when the
-    caller has no timing in scope, in which case the "after N.NNs" clause is
-    omitted rather than fabricating "after 0.00s".
+    Every clause is a MEASURED fact: which leg (its module, when given, and
+    its slot), which signal delivered it, how long the process survived, and
+    — the point of the whole exercise — that no verdict exists.  ``duration``
+    is ``None`` (not ``0.0``) when the caller has no timing in scope, in which
+    case the "after N.NNs" clause is omitted rather than fabricating "after
+    0.00s".
 
     ``rc`` is asyncio's returncode, i.e. the NEGATIVE signal number, so the
     signal is ``-rc``.
 
-    Clauses are separated by ``'; '`` and the sentence must stay free of
-    ``', '`` — see ``SIGNAL_KILL_SUMMARY_MARKER``'s producer constraint: the
-    ``', '``-joined summary is the wire format between this function and
-    ``_aggregate_results``, and a comma here would silently truncate the note
-    on the way through aggregation.
+    Clauses are separated by ``'; '``: the note must stay one fragment, per
+    ``SIGNAL_KILL_SUMMARY_MARKER``'s producer constraint.
     """
     after = f' after {duration:.2f}s' if duration is not None else ''
     return (
-        f'{label} leg {SIGNAL_KILL_SUMMARY_MARKER} {-rc}{after}; '
+        f'{_leg_name(label, module)} {SIGNAL_KILL_SUMMARY_MARKER} {-rc}{after}; '
         f'no diagnostics produced; verdict indeterminate'
     )
 
 
-def _worker_death_leg_note(label: str) -> str:
+_MAX_NAMED_CRASHED_NODEIDS = 3
+
+
+def _worker_death_leg_note(
+    label: str, *, module: str | None = None, crashed_nodeids: Iterable[str] = (),
+) -> str:
     """Describe a leg whose pytest session was TRUNCATED by a worker death.
 
     The sibling of ``_killed_leg_note`` above, for the second cause of a
@@ -2466,23 +2486,32 @@ def _worker_death_leg_note(label: str) -> str:
     every test still queued on every worker was abandoned and the counts cover
     only what had already finished.
 
-    Every clause is a MEASURED fact, as ``_killed_leg_note``'s are: which leg,
-    that the remaining tests never ran, and that the tally is partial.  It
-    deliberately does NOT quote the tally, and deliberately does not take a
-    duration — the wall-clock time of a truncated run measures nothing anyone
-    should act on.
+    Every clause is a MEASURED fact, as ``_killed_leg_note``'s are: which leg
+    (its module, when given, and its slot), which test each dead worker had
+    in flight (that it was running, not a verdict on it), that the remaining
+    tests never ran, and that the tally is partial.  It deliberately does NOT
+    quote the tally, and deliberately does not take a duration — the
+    wall-clock time of a truncated run measures nothing anyone should act on.
 
-    Clauses are separated by ``'; '`` and the sentence must stay free of
-    ``', '`` — see ``SIGNAL_KILL_SUMMARY_MARKER``'s producer constraint: the
-    ``', '``-joined summary is the wire format between this function and
-    ``_aggregate_results``, and a comma here would silently truncate the note
-    on the way through aggregation, leaving only the marker-bearing half.
-    Pinned by test_verify.py::TestWorkerDeathLegSummary.
+    The note travels into the bench reason and the escalation title, so it
+    names at most ``_MAX_NAMED_CRASHED_NODEIDS`` in-flight tests and counts
+    the rest.
+
+    Clauses are separated by ``'; '``: the note must stay one fragment, per
+    ``SIGNAL_KILL_SUMMARY_MARKER``'s producer constraint.  Pinned by
+    test_verify.py::TestWorkerDeathLegSummary.
     """
-    return (
-        f'{label} leg {WORKER_DEATH_SUMMARY_MARKER}; '
-        f'remaining tests never ran; tally is partial'
-    )
+    in_flight = sorted({
+        _without_fragment_separator(strip_xdist_group_suffix(nodeid)) for nodeid in crashed_nodeids
+    })
+    clauses = [f'{_leg_name(label, module)} {WORKER_DEATH_SUMMARY_MARKER}']
+    if in_flight:
+        named = in_flight[:_MAX_NAMED_CRASHED_NODEIDS]
+        unnamed = len(in_flight) - len(named)
+        more = f' (+{unnamed} more)' if unnamed else ''
+        clauses.append('worker died running ' + ' and '.join(f"'{nodeid}'" for nodeid in named) + more)
+    clauses += ['remaining tests never ran', 'tally is partial']
+    return '; '.join(clauses)
 
 
 class LegSlot(StrEnum):
@@ -2602,6 +2631,7 @@ def _summarize_checks(
     lint_duration: float | None = None,
     type_duration: float | None = None,
     leg_categories: Mapping[LegSlot, FailureCategory] | None = None,
+    module: str | None = None,
 ) -> tuple[bool, str, str, str, list[str]]:
     """Classify the three checks into (passed, category, cause_hint, summary,
     failing_leg_categories).
@@ -2678,6 +2708,9 @@ def _summarize_checks(
     same legs, for a caller that also reads one leg's category: classifying
     scans the leg's whole output, so ``run_verification`` classifies once and
     its env-recovery gate reads the test slot. Omitted, it is computed here.
+
+    ``module`` is the verify's module prefix, named in each no-verdict note;
+    ``None`` for a single-module caller.
     """
     passed = test_rc == 0 and lint_rc == 0 and type_rc == 0
     if passed:
@@ -2714,14 +2747,16 @@ def _summarize_checks(
         # killed leg's captured output can itself carry a bailout marker, and
         # task 3173's wording for that case must not regress.
         if is_external_kill_rc(rc):
-            parts.append(_killed_leg_note(label, rc, duration))
+            parts.append(_killed_leg_note(label, rc, duration, module=module))
         elif label is LegSlot.TEST and _is_worker_death_truncated_session(out):
             if _first_surviving_failure_line(out) is not None:
                 parts.append(tool_verdict)
-            parts.append(_worker_death_leg_note(label))
+            parts.append(_worker_death_leg_note(
+                label, module=module, crashed_nodeids=_crash_attributed_nodeids(out),
+            ))
         else:
             parts.append(tool_verdict)
-    summary = f'Failures: {", ".join(parts)}'
+    summary = f'Failures: {_SUMMARY_FRAGMENT_SEPARATOR.join(parts)}'
     return passed, category, cause_hint, summary, per_check_categories
 
 
@@ -7773,6 +7808,7 @@ async def run_verification(
         lint_duration=attempt.lint.duration_secs,
         type_duration=attempt.type.duration_secs,
         leg_categories=leg_categories,
+        module=module_prefix,
     )
     if timed_out:
         summary = f'Verification timed out after {max_retries} retries' if max_retries > 0 else 'Verification timed out'
@@ -7819,6 +7855,7 @@ async def run_verification(
             lint_duration=attempt.lint.duration_secs,
             type_duration=attempt.type.duration_secs,
             leg_categories=leg_categories,
+            module=module_prefix,
         )
         if timed_out:
             # Distinct wording from the first-pass timeout summary: this
@@ -8129,13 +8166,13 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         # verify silently degraded to a bare 'Failures: ' with no parts at
         # all — erasing the one fact that says the run produced no verdict.
         # Carry every distinct no-verdict note through verbatim, in child
-        # order, de-duplicated (two subprojects killed identically must not
-        # stutter the same sentence twice).
+        # order, de-duplicated: only identical notes collapse (such as two
+        # unlabelled children), since each module's note names its module.
         for r in results:
-            for fragment in r.summary.removeprefix('Failures: ').split(', '):
+            for fragment in r.summary.removeprefix('Failures: ').split(_SUMMARY_FRAGMENT_SEPARATOR):
                 if is_no_verdict_summary(fragment) and fragment not in parts:
                     parts.append(fragment)
-        summary = 'All checks passed' if passed else f'Failures: {", ".join(parts)}'
+        summary = 'All checks passed' if passed else f'Failures: {_SUMMARY_FRAGMENT_SEPARATOR.join(parts)}'
 
     # Collect cause_hint from failing child results; join with ' | '.
     cause_hint = ' | '.join(r.cause_hint for r in results if r.cause_hint)

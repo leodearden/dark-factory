@@ -12,12 +12,14 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 from _serial_recovery_helpers import ORCH_SHAPED_PYPROJECT, ROOT_SHAPED_PYPROJECT, addopts_values
 from _xdist_crash_fixtures import (
+    XDIST_BAILOUT_LINE,
     XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT,
     XDIST_CRASH_ATTRIBUTED_FAILED_LINE,
     XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT,
     XDIST_FAILED_THEN_CRASHED_OUTPUT,
     XDIST_IN_FLIGHT_NODEID,
     XDIST_MAX_WORKERS_REACHED_OUTPUT,
+    XDIST_PARTIAL_TALLY,
     XDIST_Q_KILLED_AFTER_RECOVERED_CRASH_OUTPUT,
     XDIST_Q_MAXFAIL_REAL_FAILED_LINE,
     XDIST_Q_RECOVERED_OUTPUT,
@@ -53,6 +55,7 @@ from orchestrator.verify import (
     _run_cmd,
     _scope_fallback_tool_to_subproject,
     _single_subproject_prefix,
+    _worker_death_leg_note,
     run_full_verification,
     run_scoped_verification,
     run_verification,
@@ -3649,7 +3652,7 @@ class TestWorkerDeathLegSummary:
     """A truncated test leg contributes a worker-death note, not 'tests failed'."""
 
     @staticmethod
-    def _summarize(test_rc: int, test_out: str) -> str:
+    def _summarize(test_rc: int, test_out: str, *, module: str | None = None) -> str:
         """The truncated test leg beside CLEAN lint and type legs."""
         from orchestrator.verify import _summarize_checks
 
@@ -3658,8 +3661,33 @@ class TestWorkerDeathLegSummary:
             0, '', False, 'ruff check',
             0, '', False, 'pyright',
             test_duration=209.67,
+            module=module,
         )
         return summary
+
+    def test_note_names_the_module_and_the_crashed_nodeid(self):
+        summary = self._summarize(1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT, module='orchestrator')
+        assert f'orchestrator test leg {WORKER_DEATH_SUMMARY_MARKER}' in summary, summary
+        assert f"worker died running '{XDIST_IN_FLIGHT_NODEID}'" in summary, summary
+        assert len(summary.removeprefix('Failures: ').split(', ')) == 1, summary
+
+    def test_crashed_nodeid_is_named_under_q(self):
+        summary = self._summarize(1, XDIST_Q_TRUNCATED_OUTPUT, module='orchestrator')
+        assert f"worker died running '{XDIST_IN_FLIGHT_NODEID}'" in summary, summary
+
+    def test_output_without_a_crash_notice_names_no_test(self):
+        summary = self._summarize(1, XDIST_BAILOUT_LINE + XDIST_PARTIAL_TALLY, module='orchestrator')
+        assert f'orchestrator test leg {WORKER_DEATH_SUMMARY_MARKER}' in summary, summary
+        assert 'worker died running' not in summary, summary
+
+    def test_external_kill_names_the_module(self):
+        summary = self._summarize(-9, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT, module='orchestrator')
+        assert 'orchestrator test leg killed by signal 9' in summary, summary
+
+    def test_single_module_caller_names_no_module(self):
+        summary = self._summarize(1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+        note = summary.removeprefix('Failures: ')
+        assert note.startswith(f'test leg {WORKER_DEATH_SUMMARY_MARKER}'), summary
 
     def test_truncated_test_leg_does_not_claim_a_complete_verdict(self):
         """The facet-2 core: 'tests failed' is a claim the gate cannot make."""
@@ -3762,9 +3790,83 @@ class TestWorkerDeathLegSummary:
         assert WORKER_DEATH_SUMMARY_MARKER in fragments[1], f'Unexpected summary: {summary!r}'
 
 
-def _test_leg_result(test_output: str) -> VerifyResult:
-    """A result whose failing TEST leg printed *test_output*, beside clean
-    lint and type legs.
+class TestWorkerDeathLegNoteNamesWhoseLegDied:
+    """The note names the module whose leg died and the test its worker had in flight."""
+
+    def test_unlabelled_note_without_ids_is_byte_identical(self):
+        """A single-module caller passes neither and keeps today's sentence."""
+        assert _worker_death_leg_note('test') == (
+            'test leg session aborted after worker death; remaining tests never ran; tally is partial'
+        )
+
+    def test_module_names_the_leg(self):
+        note = _worker_death_leg_note('test', module='orchestrator')
+        assert note.startswith(f'orchestrator test leg {WORKER_DEATH_SUMMARY_MARKER}'), note
+        assert verify.is_no_verdict_summary(note)
+
+    def test_crashed_nodeid_follows_the_marker_clause(self):
+        note = _worker_death_leg_note('test', crashed_nodeids={XDIST_IN_FLIGHT_NODEID})
+        clause = f"worker died running '{XDIST_IN_FLIGHT_NODEID}'"
+        assert clause in note, note
+        assert (
+            note.index(WORKER_DEATH_SUMMARY_MARKER)
+            < note.index(clause)
+            < note.index('remaining tests never ran')
+        ), note
+
+    def test_parametrized_id_with_the_separator_stays_one_fragment(self):
+        note = _worker_death_leg_note(
+            'test', module='orchestrator', crashed_nodeids={'tests/test_x.py::test_p[a, b]'},
+        )
+        assert ', ' not in note, note
+        assert WORKER_DEATH_SUMMARY_MARKER in note, note
+        assert 'tests/test_x.py::test_p[a,b]' in note, note
+
+    def test_hostile_module_stays_one_fragment(self):
+        note = _worker_death_leg_note('test', module='a, b', crashed_nodeids={XDIST_IN_FLIGHT_NODEID})
+        assert ', ' not in note, note
+
+    def test_xdist_group_suffix_is_stripped(self):
+        note = _worker_death_leg_note('test', crashed_nodeids={'tests/test_x.py::test_y@grp'})
+        assert "'tests/test_x.py::test_y'" in note, note
+        assert '@grp' not in note, note
+
+    def test_several_ids_render_sorted(self):
+        note = _worker_death_leg_note(
+            'test', crashed_nodeids=['tests/test_z.py::test_b', 'tests/test_a.py::test_a'],
+        )
+        assert (
+            "worker died running 'tests/test_a.py::test_a' and 'tests/test_z.py::test_b'" in note
+        ), note
+
+    def test_many_ids_name_the_first_few_and_count_the_rest(self):
+        """The note travels into the bench reason and the escalation title, so
+        a session that lost many workers must not grow it without bound."""
+        nodeids = [f'tests/test_x.py::test_p[case-{i}]' for i in range(6)]
+        note = _worker_death_leg_note('test', module='orchestrator', crashed_nodeids=nodeids)
+        named = verify._MAX_NAMED_CRASHED_NODEIDS
+        for nodeid in nodeids[:named]:
+            assert f"'{nodeid}'" in note, note
+        for nodeid in nodeids[named:]:
+            assert nodeid not in note, note
+        assert f'(+{len(nodeids) - named} more)' in note, note
+        assert note.split(', ') == [note]
+
+    def test_ids_within_the_cap_are_not_counted(self):
+        note = _worker_death_leg_note('test', crashed_nodeids={XDIST_IN_FLIGHT_NODEID})
+        assert 'more)' not in note, note
+
+    def test_labelled_note_with_an_id_is_one_aggregation_fragment(self):
+        """Exactly the parse `_aggregate_results` performs."""
+        note = _worker_death_leg_note(
+            'test', module='orchestrator', crashed_nodeids={XDIST_IN_FLIGHT_NODEID},
+        )
+        assert note.split(', ') == [note]
+
+
+def _test_leg_result(test_output: str, *, module: str | None = None) -> VerifyResult:
+    """A *module*'s result whose failing TEST leg printed *test_output*, beside
+    clean lint and type legs.
 
     Its summary is produced by `_summarize_checks` itself rather than
     hand-written, so these tests cannot drift from the producer: an edit to
@@ -3777,6 +3879,7 @@ def _test_leg_result(test_output: str) -> VerifyResult:
         0, '', False, 'ruff check',
         0, '', False, 'pyright',
         test_duration=209.67,
+        module=module,
     )
     return VerifyResult(
         passed=False,
@@ -3793,7 +3896,7 @@ def _test_leg_result(test_output: str) -> VerifyResult:
 def _worker_death_child(*, module: str = 'orchestrator') -> VerifyResult:
     """A *module*'s child result whose TEST leg was truncated by an xdist
     worker death."""
-    result = _test_leg_result(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+    result = _test_leg_result(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT, module=module)
     return replace(result, cause_hint=f'{module}: {result.cause_hint}')
 
 
@@ -3842,16 +3945,94 @@ class TestAggregateResultsKeepsWorkerDeathNote:
         assert agg.summary != 'Failures: '
 
     def test_duplicate_worker_death_notes_are_not_repeated(self):
-        """Two subprojects truncated identically must not stutter the same
-        sentence twice — the de-duplication the signal-kill carry-through
-        already guarantees."""
+        """Two children of one module truncated identically must not stutter
+        the same sentence twice — the de-duplication the signal-kill
+        carry-through already guarantees."""
+        agg = _aggregate_results([_worker_death_child(), _worker_death_child()])
+        assert agg.summary.count(WORKER_DEATH_SUMMARY_MARKER) == 1, (
+            f'Unexpected summary: {agg.summary!r}'
+        )
+
+    def test_each_modules_worker_death_note_survives_naming_its_module(self):
         agg = _aggregate_results([
             _worker_death_child(),
             _worker_death_child(module='dashboard'),
         ])
-        assert agg.summary.count(WORKER_DEATH_SUMMARY_MARKER) == 1, (
-            f'Unexpected summary: {agg.summary!r}'
+        assert 'orchestrator test leg session aborted after worker death' in agg.summary, agg.summary
+        assert 'dashboard test leg session aborted after worker death' in agg.summary, agg.summary
+
+    def test_note_names_the_dead_leg_beside_a_passing_sibling(self):
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='All checks passed', category='passed',
         )
+        agg = _aggregate_results([passing, _worker_death_child()])
+        assert 'orchestrator test leg' in agg.summary, agg.summary
+        assert XDIST_IN_FLIGHT_NODEID in agg.summary, agg.summary
+        assert verify.is_no_verdict_summary(agg.summary)
+
+
+async def _module_verify_result(worktree: Path, test_command: str, module: str | None) -> VerifyResult:
+    """*test_command* run for real as *module*'s test leg beside clean lint and
+    type legs; *module* None runs the same commands as an unscoped verify."""
+    config = OrchestratorConfig(
+        project_root=worktree,
+        test_command=test_command,
+        lint_command='true',
+        type_check_command='true',
+        verify_timeout_retries=0,
+    )
+    module_config = None if module is None else ModuleConfig(
+        prefix=module, test_command=test_command, lint_command='true', type_check_command='true',
+    )
+    return await run_verification(
+        worktree, config, module_config, allow_cold_cache=False, max_retries=0,
+    )
+
+
+def _worker_death_command(worktree: Path) -> str:
+    output = worktree / 'xdist.out'
+    output.write_text(XDIST_SESSION_ABORTED_OUTPUT)
+    return f'cat {shlex.quote(str(output))}; exit 1'
+
+
+class TestModuleScopedNoVerdictNoteNamesItsModule:
+    """END TO END through `run_verification` against real subprocesses: a
+    module-scoped verify's no-verdict note names the module whose leg died."""
+
+    @pytest.mark.asyncio
+    async def test_worker_death_note_names_the_module_and_the_crashed_nodeid(self, tmp_path: Path):
+        result = await _module_verify_result(tmp_path, _worker_death_command(tmp_path), 'orchestrator')
+        assert f'orchestrator test leg {WORKER_DEATH_SUMMARY_MARKER}' in result.summary, result.summary
+        assert f"worker died running '{XDIST_IN_FLIGHT_NODEID}'" in result.summary, result.summary
+
+    @pytest.mark.asyncio
+    async def test_aggregate_points_at_the_leg_that_died_not_a_sibling(self, tmp_path: Path):
+        """A sibling that failed ORDINARILY keeps its verdict, and the
+        no-verdict note blames only the leg whose worker died."""
+        scripts = await _module_verify_result(
+            tmp_path, "echo 'FAILED tests/test_s.py::test_s'; exit 1", 'scripts',
+        )
+        orchestrator = await _module_verify_result(tmp_path, _worker_death_command(tmp_path), 'orchestrator')
+        agg = _aggregate_results([scripts, orchestrator])
+        fragments = agg.summary.removeprefix('Failures: ').split(', ')
+        no_verdict_notes = [f for f in fragments if verify.is_no_verdict_summary(f)]
+        assert len(no_verdict_notes) == 1, agg.summary
+        assert no_verdict_notes[0].startswith('orchestrator test leg'), agg.summary
+        assert 'scripts test leg' not in agg.summary, agg.summary
+        assert 'tests failed' in fragments, agg.summary
+
+    @pytest.mark.asyncio
+    async def test_signal_kill_note_names_the_module(self, tmp_path: Path):
+        result = await _module_verify_result(tmp_path, 'kill -9 $$', 'orchestrator')
+        assert 'orchestrator test leg killed by signal 9' in result.summary, result.summary
+
+    @pytest.mark.asyncio
+    async def test_unscoped_verify_names_no_module(self, tmp_path: Path):
+        """CONTROL: the same leg with no ModuleConfig keeps the unlabelled subject."""
+        result = await _module_verify_result(tmp_path, _worker_death_command(tmp_path), None)
+        note = result.summary.removeprefix('Failures: ')
+        assert note.startswith(f'test leg {WORKER_DEATH_SUMMARY_MARKER}'), result.summary
 
 
 class TestFailureReportNamesTheAbortedSession:
@@ -11764,13 +11945,13 @@ _KILLED_LINT_CMD = './scripts/verify.sh lint --scope branch --include-infra'
 
 
 def _kill_note_child(*, module: str = 'orchestrator') -> VerifyResult:
-    """A child result whose lint leg was SIGKILLed at 0.31s."""
+    """A *module*'s child result whose lint leg was SIGKILLed at 0.31s."""
     return VerifyResult(
         passed=False,
         test_output='',
         lint_output='DF_VERIFY_ROLE=merge — forcing --scope all\n',
         type_output='',
-        summary=f'Failures: {_killed_leg_note("lint", -9, 0.31010722508654)}',
+        summary=f'Failures: {_killed_leg_note("lint", -9, 0.31010722508654, module=module)}',
         category='infra_kill',
         cause_hint=f'{module}: killed',
         # Task 3173 review amendment: this child's ONE failing leg is the
@@ -11818,10 +11999,15 @@ class TestAggregateResultsKeepsKillNote:
         assert agg.category == 'infra_kill'
 
     def test_duplicate_kill_notes_are_not_repeated(self):
-        """Two subprojects killed identically must not stutter the same
-        sentence twice; ordering stays deterministic."""
-        agg = _aggregate_results([_kill_note_child(), _kill_note_child(module='dashboard')])
+        """Two children of one module killed identically must not stutter the
+        same sentence twice; ordering stays deterministic."""
+        agg = _aggregate_results([_kill_note_child(), _kill_note_child()])
         assert agg.summary.count('killed by signal 9') == 1
+
+    def test_each_modules_kill_note_survives_naming_its_module(self):
+        agg = _aggregate_results([_kill_note_child(), _kill_note_child(module='dashboard')])
+        assert 'orchestrator lint leg killed by signal 9' in agg.summary, agg.summary
+        assert 'dashboard lint leg killed by signal 9' in agg.summary, agg.summary
 
     def test_genuine_multi_child_wording_is_unchanged(self):
         """REGRESSION GUARD: with no kill anywhere, aggregation is
@@ -12055,6 +12241,10 @@ class TestKillNoteIsOneAggregationFragment:
     and `_aggregate_results`, so a kill note must never contain ', '."""
 
     @pytest.mark.parametrize(
+        'module', [None, 'orchestrator', 'foo/bar', 'a, b'],
+        ids=['unlabelled', 'plain', 'nested', 'hostile'],
+    )
+    @pytest.mark.parametrize(
         ('label', 'rc', 'duration'),
         [
             ('test', -9, 900.5),
@@ -12064,13 +12254,38 @@ class TestKillNoteIsOneAggregationFragment:
             ('type', -1, 12.5),
         ],
     )
-    def test_note_never_contains_the_fragment_separator(self, label, rc, duration):
-        note = _killed_leg_note(label, rc, duration)
+    def test_note_never_contains_the_fragment_separator(self, label, rc, duration, module):
+        note = _killed_leg_note(label, rc, duration, module=module)
         assert ', ' not in note, (
             f'a comma+space in the note splits it across `.split(", ")` in '
             f'_aggregate_results and only the {SIGNAL_KILL_SUMMARY_MARKER!r} '
             f'half survives; use "; " to separate clauses. Got: {note!r}'
         )
+
+    def test_module_names_the_killed_leg(self):
+        note = _killed_leg_note('lint', -9, 0.31, module='scripts')
+        assert note.startswith('scripts lint leg killed by signal 9 after 0.31s'), note
+
+    def test_unlabelled_note_is_byte_identical(self):
+        """A single-module caller passes no module and keeps today's sentence."""
+        assert _killed_leg_note('lint', -9, 0.31) == (
+            'lint leg killed by signal 9 after 0.31s; no diagnostics produced; verdict indeterminate'
+        )
+
+    def test_labelled_note_is_still_a_no_verdict_summary(self):
+        assert verify.is_no_verdict_summary(_killed_leg_note('lint', -9, 0.31, module='scripts'))
+
+    def test_summarize_checks_names_the_killed_lint_legs_module(self):
+        from orchestrator.verify import _summarize_checks
+
+        _, _, _, summary, _ = _summarize_checks(
+            0, '', False, 'pytest',
+            -9, '', False, 'ruff check',
+            0, '', False, 'pyright',
+            lint_duration=0.31,
+            module='scripts',
+        )
+        assert 'scripts lint leg killed by signal 9' in summary, summary
 
     def test_note_round_trips_through_the_consumer_split_intact(self):
         """Exactly the parse `_aggregate_results` performs, run against the
