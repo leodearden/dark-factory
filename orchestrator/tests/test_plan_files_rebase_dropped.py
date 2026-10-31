@@ -216,8 +216,8 @@ class TestPlanFilesNotTouchedReason:
         ))
 
         assert reason.startswith(f'{PLAN_FILES_NOT_TOUCHED_REASON_PREFIX}: index.html. ')
-        assert _SHA[:12] in reason
-        assert _SUBJECT in reason
+        assert _DROPPED.label == f'{_SHA[:12]} "{_SUBJECT}"'
+        assert _DROPPED.label in reason
         assert 'written on this branch' in reason
         assert 'dropped by a rebase' in reason
         assert 'already carried' in reason

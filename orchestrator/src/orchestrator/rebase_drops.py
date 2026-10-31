@@ -31,6 +31,10 @@ Accepted residuals:
    branch deleted and re-created before then inherits them.
 3. Records of a rebase the caller later reverts (``BranchResetError`` in
    ``GitOps.rebase_preserving_task_commits``) remain.
+4. The replayed range is every commit on the branch past the target, so a
+   branch stacked on predecessors (a coalesce train tip, a suffix frozen-tip
+   rebase) records a dropped PREDECESSOR commit under its own name.  The
+   subject a message cites still names the task that wrote it.
 
 Records are only consulted for a plan file the branch did NOT touch, so none
 of these can make a passing gate fail, and every message that cites a record
@@ -74,6 +78,11 @@ class DroppedCommit:
     sha: str
     subject: str
     paths: tuple[str, ...]
+
+    @property
+    def label(self) -> str:
+        """How a log line or a block reason names this commit."""
+        return f'{self.sha[:12]} "{self.subject}"'
 
 
 class _GitReadError(RuntimeError):
@@ -196,28 +205,35 @@ async def run_rebase_reporting_drops(
     Each drop is logged as a WARNING and, when a branch is checked out,
     recorded in :class:`RebaseDropLedger`.  A failed rebase is returned as
     is, NOT aborted: the caller owns the abort.  Measuring the drops never
-    raises and never changes ``ok``; a measurement that fails is logged and
-    reports no drops.
+    raises and never changes ``ok``; a measurement that fails before any drop
+    is detected is logged and reports no drops.
     """
-    baseline = await _measured(_read_baseline(run, worktree, onto, upstream), worktree)
+    baseline = await _measured(
+        _read_baseline(run, worktree, onto, upstream), None, 'rebase drops', worktree,
+    )
     argv = ['git', 'rebase', onto] if upstream is None else [
         'git', 'rebase', '--onto', onto, upstream,
     ]
     rc, _, err = await run(argv, cwd=worktree)
     if rc != 0:
         return RebaseRun(ok=False, stderr=err, dropped=())
-    dropped = None
+    dropped: tuple[DroppedCommit, ...] = ()
     if baseline is not None:
-        dropped = await _measured(_report_drops(run, worktree, baseline), worktree)
-    return RebaseRun(ok=True, stderr=err, dropped=dropped or ())
+        dropped = await _measured(
+            _report_drops(run, worktree, baseline), (), 'rebase drops', worktree,
+        )
+    return RebaseRun(ok=True, stderr=err, dropped=dropped)
 
 
-async def _measured(measurement: Awaitable[_T], worktree: Path) -> _T | None:
+async def _measured(
+    measurement: Awaitable[_T], fallback: _T, what: str, worktree: Path,
+) -> _T:
+    """*measurement*'s result, or *fallback* once its failure is logged."""
     try:
         return await measurement
     except Exception as exc:
-        logger.warning('Could not measure rebase drops in %s: %s', worktree, exc)
-        return None
+        logger.warning('Could not measure %s in %s: %s', what, worktree, exc)
+        return fallback
 
 
 async def _read_baseline(
@@ -258,41 +274,64 @@ def _lost(
 async def _report_drops(
     run: GitRunner, worktree: Path, baseline: _Baseline,
 ) -> tuple[DroppedCommit, ...]:
+    """Warn about, then record, each commit the rebase dropped; return them.
+
+    Once a drop is detected it is always warned about.  A later read that
+    fails degrades the report instead of discarding it: an unreadable
+    checkout leaves the drop unrecorded, and unreadable subjects leave the
+    warning naming bare shas and the returned tuple empty.
+    """
     after = await _replayed(run, worktree, f'{baseline.onto_sha}..HEAD')
     lost = _lost(baseline.replayed, after)
     if not lost:
         return ()
-    dropped = await _read_dropped_commits(run, worktree, lost)
-    branch = await _checked_out_branch(run, worktree)
-    _warn_dropped(worktree, branch, baseline.onto_sha, dropped)
-    if branch is not None:
+    checkout = await _measured(
+        _read_checkout(run, worktree), _UNREADABLE_CHECKOUT,
+        'the branch a rebase dropped commits from', worktree,
+    )
+    dropped = await _measured(
+        _read_dropped_commits(run, worktree, lost), None,
+        'the subjects of commits a rebase dropped', worktree,
+    )
+    labels = lost if dropped is None else [commit.label for commit in dropped]
+    _warn_dropped(worktree, checkout.named, baseline.onto_sha, labels)
+    if checkout.branch is not None:
         ledger = RebaseDropLedger(worktree, run)
         await ledger.prune_orphans()
-        await ledger.record(branch, lost)
-    return dropped
+        await ledger.record(checkout.branch, lost)
+    return dropped or ()
 
 
-async def _checked_out_branch(run: GitRunner, worktree: Path) -> str | None:
-    """The branch checked out in *worktree*, or None on a detached HEAD."""
+class _Checkout(NamedTuple):
+    """The branch a drop is recorded under (None: not recorded), and how a
+    warning names the checkout."""
+
+    branch: str | None
+    named: str
+
+
+_UNREADABLE_CHECKOUT = _Checkout(None, 'an unreadable checkout (not recorded)')
+
+
+async def _read_checkout(run: GitRunner, worktree: Path) -> _Checkout:
+    """What is checked out in *worktree*: a branch, or a detached HEAD."""
     command = ('git', 'symbolic-ref', '--quiet', 'HEAD')
     rc, out, err = await run(list(command), cwd=worktree)
     if rc == 1:
-        return None
+        return _Checkout(None, 'detached HEAD (not recorded)')
     if rc != 0:
         raise _GitReadError(command, err)
-    return out.strip().removeprefix(_BRANCH_REF_NAMESPACE)
+    branch = out.strip().removeprefix(_BRANCH_REF_NAMESPACE)
+    return _Checkout(branch, branch)
 
 
 def _warn_dropped(
-    worktree: Path, branch: str | None, onto_sha: str,
-    dropped: Sequence[DroppedCommit],
+    worktree: Path, checkout: str, onto_sha: str, labels: Sequence[str],
 ) -> None:
-    where = branch if branch is not None else 'detached HEAD (not recorded)'
-    commits = '; '.join(f'{c.sha[:12]} "{c.subject}"' for c in dropped)
     logger.warning(
         'Rebase of %s in %s onto %s dropped %d commit(s) because the target '
         'already carried each change: %s',
-        where, worktree, onto_sha[:12], len(dropped), commits,
+        checkout, worktree, onto_sha[:12], len(labels), '; '.join(labels),
     )
 
 

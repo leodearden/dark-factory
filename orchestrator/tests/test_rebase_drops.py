@@ -276,8 +276,7 @@ class TestRunRebaseReportingDrops:
         warnings = _module_warnings(caplog)
         assert len(warnings) == 1, warnings
         assert 'task/1' in warnings[0]
-        assert shape.bump[:12] in warnings[0]
-        assert _BUMP in warnings[0]
+        assert shape.bump_dropped.label in warnings[0]
         assert await _branch_subjects(shape) == [_OWN_A, _OWN_B]
 
     async def test_a_patch_identical_commit_is_reported_and_recorded(
@@ -409,4 +408,58 @@ class TestRunRebaseReportingDrops:
         assert result.dropped == ()
         assert any('could not measure' in w.lower() for w in _module_warnings(caplog))
         await _git(shape.repo, 'merge-base', '--is-ancestor', 'main', 'task/1')
+        assert await _dropped_refs(shape.repo) == []
+
+    async def test_a_detected_drop_with_unreadable_subjects_still_names_and_records_its_sha(
+        self, shape: Shape3490, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        await _commit(shape.repo, 'main: bump and more', {
+            'index.html': 'v=44\n', 'm.txt': 'm\n',
+        })
+
+        async def show_fails(cmd: list[str], cwd: Path | None = None, **kwargs: object):
+            if cmd[:2] == ['git', 'show']:
+                return 128, '', 'fatal: simulated show failure'
+            return await _run(cmd, cwd=cwd)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_drops'):
+            result = await run_rebase_reporting_drops(show_fails, shape.wt, onto='main')
+
+        assert result.ok
+        assert result.dropped == ()
+        warnings = _module_warnings(caplog)
+        assert any(
+            'task/1' in w and shape.bump in w and 'dropped 1 commit' in w
+            for w in warnings
+        ), warnings
+        assert await _dropped_refs(shape.repo) == [
+            RebaseDropLedger(shape.repo, _run).ref_for('task/1', shape.bump),
+        ]
+        assert await _branch_subjects(shape) == [_OWN_A, _OWN_B]
+
+    async def test_a_detected_drop_with_an_unreadable_branch_is_named_but_not_recorded(
+        self, shape: Shape3490, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        await _commit(shape.repo, 'main: bump and more', {
+            'index.html': 'v=44\n', 'm.txt': 'm\n',
+        })
+
+        async def symbolic_ref_fails(
+            cmd: list[str], cwd: Path | None = None, **kwargs: object,
+        ):
+            if cmd[:2] == ['git', 'symbolic-ref']:
+                return 128, '', 'fatal: simulated symbolic-ref failure'
+            return await _run(cmd, cwd=cwd)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_drops'):
+            result = await run_rebase_reporting_drops(
+                symbolic_ref_fails, shape.wt, onto='main',
+            )
+
+        assert result.ok
+        assert result.dropped == (shape.bump_dropped,)
+        warnings = _module_warnings(caplog)
+        assert any(
+            shape.bump_dropped.label in w and 'not recorded' in w for w in warnings
+        ), warnings
         assert await _dropped_refs(shape.repo) == []

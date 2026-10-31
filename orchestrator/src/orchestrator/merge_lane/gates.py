@@ -459,7 +459,7 @@ def _dropped_clause(dropped: dict[str, tuple[DroppedCommit, ...]]) -> str:
     if not dropped:
         return ''
     entries = '; '.join(
-        f'{entry} (by {", ".join(_commit_label(c) for c in commits)})'
+        f'{entry} (by {", ".join(commit.label for commit in commits)})'
         for entry, commits in dropped.items()
     )
     return (
@@ -469,10 +469,6 @@ def _dropped_clause(dropped: dict[str, tuple[DroppedCommit, ...]]) -> str:
         f'current main (a version or cache-buster bump must be recomputed '
         f"past main's value), commit it, and re-submit.  "
     )
-
-
-def _commit_label(commit: DroppedCommit) -> str:
-    return f'{commit.sha[:12]} "{commit.subject}"'
 
 
 def _stale_clause(entries: list[str]) -> str:
@@ -2787,8 +2783,8 @@ async def _check_plan_files_touched_in_branch(
 
     Empty ``plan_files`` returns no entries — vacuously satisfied.
 
-    When *branch* (the full branch name) is given, each untouched entry that
-    is present in the tree is checked against the commits a rebase dropped
+    With *branch* (the full branch name), each untouched entry not classified
+    as missing from the tree is matched against the commits a rebase dropped
     from that branch (``orchestrator/src/orchestrator/rebase_drops.py::RebaseDropLedger``)
     and reported in ``dropped_by_rebase``.  That attribution only explains a
     failure; it never passes the gate.
