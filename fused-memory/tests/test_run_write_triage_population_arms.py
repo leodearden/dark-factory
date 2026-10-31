@@ -20,6 +20,7 @@ import httpx
 import openai
 import pytest
 from _fm_helpers import load_script_module
+from _sdk_client_stubs import sdk_client_double
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.enums import SourceStore
@@ -118,10 +119,8 @@ def _response(
 
 
 def _client(respond: Callable[..., Any]) -> MagicMock:
-    """A fake ``AsyncOpenAI`` that is its own async context manager, as the SDK is."""
-    client = MagicMock()
-    client.__aenter__ = AsyncMock(return_value=client)
-    client.__aexit__ = AsyncMock(return_value=False)
+    """A fake ``AsyncOpenAI`` whose Responses calls *respond* answers."""
+    client = sdk_client_double()
     client.responses.create = AsyncMock(side_effect=respond)
     client.chat.completions.create = AsyncMock()
     return client
