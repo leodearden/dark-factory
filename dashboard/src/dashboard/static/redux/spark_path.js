@@ -415,6 +415,15 @@ function niceCountMax(maxV, ticks) {
   return Math.ceil(maxV / ticks) * ticks;
 }
 
+// ── The axis maximum a charts.jsx chart scales against (task 6370) ─────────
+// A COUNT axis (the chart's `countAxis` prop) snaps up to a whole multiple of
+// the tick count via niceCountMax, so every tick is an exact integer. Every
+// other axis keeps its exact data maximum. Only a literal `true` snaps, because
+// snapping a fraction axis reads 0%..400%.
+function axisMax(dataMax, ticks, countAxis) {
+  return countAxis === true ? niceCountMax(dataMax, ticks) : dataMax;
+}
+
 // ── Line + area path builder for a PADDED chart (charts.jsx's `LineChart`) ─
 // The padded/offset analogue of sparkPaths. `geom` is
 // { x0, y0, width, height, count, min, range }: the plot box starts at
@@ -647,6 +656,7 @@ const SPARK_PATH_API = {
   stepPaths,
   plottableMax,
   axisY,
+  axisMax,
   formatCountTick,
   niceCountMax,
   axisPaths,
