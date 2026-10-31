@@ -5,7 +5,7 @@ import json
 import logging
 import types
 from datetime import UTC, datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -28,6 +28,7 @@ from fused_memory.services.memory_service import (
     _serialize_temporal,
     metadata_row_text,
 )
+from fused_memory.services.write_journal import Mem0IntentStatus
 from fused_memory.utils.referent_verification import ReferentStats
 
 # A realistic stored Qdrant point payload: the mem0-owned keys mem0's own
@@ -137,6 +138,16 @@ def _mocked_service(config) -> MemoryService:
     svc.durable_queue.replay_dead = AsyncMock(return_value=0)
     svc.durable_queue.close = AsyncMock()
     return svc
+
+
+def _mem0_add_journal() -> MagicMock:
+    """A write-journal double covering every call add_memory's Mem0 leg makes."""
+    journal = MagicMock()
+    journal.log_write_op = AsyncMock()
+    journal.log_backend_op = AsyncMock()
+    journal.log_mem0_intent = AsyncMock()
+    journal.resolve_mem0_intent = AsyncMock()
+    return journal
 
 
 class TestScope:
@@ -408,8 +419,9 @@ class TestAddMemory:
         """task 1974: a mem0.add call that returns {'results': []} WITHOUT
         raising is a silent dedup/no-op drop — the exact failure mode that
         made Stage 2's cycle_summary write go fully absent with no trace.
-        It must be logged as a WARNING even though add_memory() itself does
-        not raise and behavior (response/stores_written/journal) is unchanged.
+        add_memory() still does not raise, but the drop is no longer silent:
+        it is logged as a WARNING, and the response does not claim mem0 as
+        written.
         """
         service.mem0.add = AsyncMock(return_value={'results': []})
 
@@ -426,13 +438,12 @@ class TestAddMemory:
                 causation_id='run-x',
             )
 
-        # Behavior must be UNCHANGED — this is observability-only.
         assert result.memory_ids == [], (
             f'Expected memory_ids=[] for an empty mem0 result, got {result.memory_ids!r}'
         )
-        assert SourceStore.mem0 in result.stores_written, (
-            'stores_written must still include mem0 — the write was attempted '
-            'and did not raise; only the returned ids are empty.'
+        assert SourceStore.mem0 not in result.stores_written, (
+            'stores_written must not claim mem0 when Mem0 returned no id — '
+            'nothing was written.'
         )
 
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -487,6 +498,8 @@ class TestAddMemory:
         non-actionable log line for a legitimate infer-driven no-op."""
         monkeypatch.setattr(memory_service, '_MEM0_ADD_INFER_PINNED_FALSE', False)
         service.mem0.add = AsyncMock(return_value={'results': []})
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
 
         with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
             result = await service.add_memory(
@@ -501,15 +514,83 @@ class TestAddMemory:
                 causation_id='run-x',
             )
 
-        # Behavior (response/stores_written) is unaffected by the gate.
+        # Nothing was written whatever the pin, so mem0 is never claimed. With
+        # the pin lifted a zero-id return is a legitimate no-op: no anomaly is
+        # reported and the intent completes.
         assert result.memory_ids == []
-        assert SourceStore.mem0 in result.stores_written
+        assert SourceStore.mem0 not in result.stores_written
+        assert 'empty_result' not in result.message
+        mock_journal.resolve_mem0_intent.assert_awaited_once_with(
+            ANY, Mem0IntentStatus.COMPLETED
+        )
 
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warning_records == [], (
             f'Expected no WARNING once the infer=False pin no longer holds, got: '
             f'{[r.message for r in warning_records]}'
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        (
+            'backend_mock_kwargs',
+            'expected_stores',
+            'expected_message_suffix',
+            'expected_journal_error',
+        ),
+        [
+            pytest.param(
+                {'return_value': {'results': [{'id': 'mem0-1'}]}},
+                [SourceStore.mem0],
+                '',
+                None,
+                id='landed',
+            ),
+            pytest.param(
+                {'side_effect': RuntimeError('qdrant down')},
+                [],
+                ' [mem0_error: qdrant down]',
+                'qdrant down',
+                id='raised',
+            ),
+            pytest.param(
+                {'return_value': {'results': []}},
+                [],
+                ' [empty_result: mem0 add returned zero memory_ids]',
+                'empty_result: mem0 add returned zero memory_ids',
+                id='zero_ids',
+            ),
+        ],
+    )
+    async def test_stores_written_and_journal_stores_reflect_mem0_outcome(
+        self,
+        service,
+        backend_mock_kwargs,
+        expected_stores,
+        expected_message_suffix,
+        expected_journal_error,
+    ):
+        """add_memory says mem0 was written — in the response, the journal and
+        the message — only when Mem0 actually returned an id, and names every
+        failure, a silent zero-id drop included."""
+        service.mem0.add = AsyncMock(**backend_mock_kwargs)
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
+
+        result = await service.add_memory(
+            content='cycle summary',
+            category='observations_and_summaries',
+            project_id='dark_factory',
+            causation_id='c1',
+        )
+
+        expected_store_values = [s.value for s in expected_stores]
+        assert result.stores_written == expected_stores
+        journal_kwargs = mock_journal.log_write_op.call_args[1]
+        assert journal_kwargs['result_summary']['stores'] == expected_store_values
+        assert journal_kwargs['success'] is (expected_journal_error is None)
+        assert journal_kwargs['error'] == expected_journal_error
+        assert result.message == f'Memory queued for {expected_store_values}{expected_message_suffix}'
 
 
 class TestAddSystemRecord:
