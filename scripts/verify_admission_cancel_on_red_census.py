@@ -17,6 +17,7 @@ import sqlite3
 from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,9 @@ SECS_PER_HOUR = 3600.0
 TASK_ROLE = 'task'
 BACKGROUND_ROLE = 'background'
 INTERVAL_QUANTILES = (0.025, 0.975)
+DECISION_SHARE = 0.03
+MIN_WINDOW_DAYS = 14.0
+MIN_MULTI_MODULE_RED_PLANS = 40
 
 
 @dataclass(frozen=True)
@@ -376,3 +380,24 @@ def measure(project: str, sample: Sample, *, resamples: int, seed: int) -> Measu
         cost=_cost_side(task_plans),
         timeout_retries=_timeout_retries(sample.plans, busy),
     )
+
+
+class Verdict(Enum):
+    FILE = 'file'
+    DECLINE = 'decline'
+    THIN_DATA = 'thin_data'
+
+
+def _side_of_decision_share(share: float) -> Verdict:
+    return Verdict.FILE if share >= DECISION_SHARE else Verdict.DECLINE
+
+
+def verdict(m: Measurement) -> Verdict:
+    if m.multi_module_red_plans < MIN_MULTI_MODULE_RED_PLANS or m.window_days <= 0:
+        return Verdict.THIN_DATA
+    if m.window_days >= MIN_WINDOW_DAYS:
+        return _side_of_decision_share(m.avoidable_share)
+    low, high = m.share_interval
+    if _side_of_decision_share(low) is _side_of_decision_share(high):
+        return _side_of_decision_share(low)
+    return Verdict.THIN_DATA
