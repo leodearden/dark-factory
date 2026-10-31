@@ -113,7 +113,7 @@ the same template and changes nothing.
 
 Design notes
 ------------
-- Stdlib-only (argparse, dataclasses, pathlib, re, sys) — runs under plain
+- Stdlib-only (argparse, dataclasses, pathlib, sys) — runs under plain
   python3, exactly like scripts/check_fused_memory_unit_parity.py, whose
   idioms this script follows deliberately rather than inventing a new pattern.
 - No ``--fix``, unlike that precedent.  Propagating repo units into
@@ -138,9 +138,8 @@ no change to this file can affect.
 import argparse
 import dataclasses
 import pathlib
-import re
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Final
 
 from systemd_unit_parity import (
@@ -228,6 +227,11 @@ class UnitSpec:
     # meaningful content checked: the host-specific `uv` path and repo-root
     # prefix are ignored, while a stale --timeout-graceful-shutdown is not.
     exec_start_flags: tuple[str, ...] = ()
+    # Bare names of ARGUMENT-LESS options (no leading '--') compared by
+    # PRESENCE inside [Service] ExecStart. A separate field because the flag
+    # reader takes the next token as the argument: registering no-sync on
+    # exec_start_flags would read `--project` as its value.
+    exec_start_switches: tuple[str, ...] = ()
     # (section, key) pairs that must be present on BOTH sides or NEITHER,
     # registered because their presence on the installed side alone redirects
     # the effective configuration somewhere this checker never reads.
@@ -305,8 +309,9 @@ class UnitSpec:
         enumeration of its directive-level branches, held in step with them by
         tests/scripts/test_check_dashboard_unit_parity.py::test_covered_directives_is_exactly_what_compare_unit_checks.
         The completeness guard and ``__post_init__`` both read it rather than
-        re-deriving the list. exec_start_flags and env_matches_directive cover
-        no directive of their own: they reach tokens inside one, or relate two.
+        re-deriving the list. exec_start_flags, exec_start_switches and
+        env_matches_directive cover no directive of their own: they reach
+        tokens inside one, or relate two.
         """
         covered = {*self.compared, *self.present_only, *self.override_directives}
         if self.environment_section is not None:
@@ -358,6 +363,11 @@ def _render(values: list[str] | None) -> str:
     return " | ".join(values)
 
 
+def _exec_start_argv(service_directives: dict[str, list[str]]) -> tuple[str, ...]:
+    """The whitespace-split parsed [Service] ExecStart; ``_exec_start_flag`` says why parsed."""
+    return tuple(" ".join(service_directives.get("ExecStart", [])).split())
+
+
 def _exec_start_flag(service_directives: dict[str, list[str]], flag: str) -> str | None:
     """Return the argument of ``--<flag>`` in ExecStart, or None if absent.
 
@@ -379,44 +389,68 @@ def _exec_start_flag(service_directives: dict[str, list[str]], flag: str) -> str
     tests/scripts/test_dashboard_service_template.py, whose idiom this
     borrows), so non-numeric flags like ``--host 127.0.0.1`` work too.
     """
-    values = service_directives.get("ExecStart")
-    if not values:
-        return None
-    command = " ".join(values)
-    match = re.search(rf"--{re.escape(flag)}[=\s]+(\S+)", command)
-    return match.group(1) if match else None
+    option = f"--{flag}"
+    argv = _exec_start_argv(service_directives)
+    for index, token in enumerate(argv):
+        if token == option:
+            return argv[index + 1] if index + 1 < len(argv) else None
+        if token.startswith(f"{option}="):
+            return token.removeprefix(f"{option}=") or None
+    return None
 
 
-def _compare_exec_start_flags(
+def _exec_start_switch(service_directives: dict[str, list[str]], switch: str) -> str | None:
+    """Return the literal ``--<switch>`` token if ExecStart carries it, else None.
+
+    Presence is rendered as the token itself, so a drift report shows what is
+    missing rather than a bare boolean.
+    """
+    option = f"--{switch}"
+    return option if option in _exec_start_argv(service_directives) else None
+
+
+_OptionReader = Callable[[dict[str, list[str]], str], str | None]
+
+
+def _compare_exec_start_options(
     spec: UnitSpec,
     repo: dict[str, dict[str, list[str]]],
     installed: dict[str, dict[str, list[str]]],
 ) -> list[Drift]:
-    """Compare each of ``spec.exec_start_flags`` inside [Service] ExecStart."""
+    """Compare ``spec.exec_start_flags`` by argument and ``exec_start_switches`` by presence.
+
+    Both kinds share one drift-building loop; only the reader differs, and a
+    switch's reader can only yield its token or None, so a switch never reaches
+    the argument-differs reason.
+    """
     drifts: list[Drift] = []
     repo_service = repo.get("Service", {})
     installed_service = installed.get("Service", {})
+    options: list[tuple[str, _OptionReader]] = [
+        *((flag, _exec_start_flag) for flag in spec.exec_start_flags),
+        *((switch, _exec_start_switch) for switch in spec.exec_start_switches),
+    ]
 
-    for flag in spec.exec_start_flags:
-        repo_value = _exec_start_flag(repo_service, flag)
-        installed_value = _exec_start_flag(installed_service, flag)
+    for name, read in options:
+        repo_value = read(repo_service, name)
+        installed_value = read(installed_service, name)
         if repo_value == installed_value:
             continue
         if repo_value is None:
-            reason = f"--{flag} present on the installed command, absent from the repo command"
+            reason = f"--{name} present on the installed command, absent from the repo command"
         elif installed_value is None:
-            reason = f"--{flag} present on the repo command, absent from the installed command"
+            reason = f"--{name} present on the repo command, absent from the installed command"
         else:
-            reason = f"--{flag} argument differs between the repo and installed commands"
+            reason = f"--{name} argument differs between the repo and installed commands"
         drifts.append(
             Drift(
                 unit=spec.name,
                 section="Service",
-                # Keyed by FLAG, not by 'ExecStart': the command is long and
+                # Keyed by OPTION, not by 'ExecStart': the command is long and
                 # mostly host-specific, so naming the whole directive would
                 # send the operator back to a manual diff to find the token
                 # that actually moved.
-                key=f"ExecStart --{flag}",
+                key=f"ExecStart --{name}",
                 repo_value=repo_value if repo_value is not None else ABSENT,
                 installed_value=installed_value if installed_value is not None else ABSENT,
                 reason=reason,
@@ -673,7 +707,7 @@ def compare_unit(
             )
         )
 
-    drifts.extend(_compare_exec_start_flags(spec, repo, installed))
+    drifts.extend(_compare_exec_start_options(spec, repo, installed))
     drifts.extend(_compare_environment(spec, repo, installed))
     drifts.extend(_compare_env_matches_directive(spec, repo, installed))
 
