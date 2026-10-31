@@ -127,7 +127,6 @@ def _collect(probe_dir: Path, *extra_args: str) -> str:
     return result.stdout + result.stderr
 
 
-@pytest.mark.timeout(120)
 class TestIntegrationMarkerDeselection:
     def test_integration_marked_tests_deselected_by_default(self, probe_dir: Path) -> None:
         """Without a -m override: not collected by default, and marker is registered."""
@@ -158,7 +157,6 @@ class TestIntegrationMarkerDeselection:
         )
 
 
-@pytest.mark.timeout(120)
 def test_real_embedder_test_gated_by_default_and_selectable_via_marker() -> None:
     """Both real-Qdrant tests in the module must be gated by default and re-selectable.
 
@@ -171,9 +169,6 @@ def test_real_embedder_test_gated_by_default_and_selectable_via_marker() -> None
     Qdrant collection (module-level qdrant_skipif()), and the embeddings test
     additionally makes a real OpenAI network call. Both are therefore
     @pytest.mark.integration and must be deselected by default.
-
-    Collecting the real module imports mem0/qdrant_client, so this gets
-    generous timeout headroom over the file's own default 60s cap.
     """
 
     def _collect_real(*extra_args: str) -> str:
