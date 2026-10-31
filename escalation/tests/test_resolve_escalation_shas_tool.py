@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import subprocess
 import types
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -35,9 +35,14 @@ TWIN_A: dict[str, object] = {'landed': 'a' * 40, 'subject': 'feat: a', 'method':
 
 
 class _StubGitOps:
+    """Every token names a commit."""
+
     def __init__(self, answers: Mapping[str, Mapping[str, object]] | None = None) -> None:
         self._answers = answers or {}
         self.calls: list[str] = []
+
+    async def commits_named(self, tokens: Sequence[str]) -> Mapping[str, str]:
+        return {t: t for t in tokens}
 
     async def resolve_rebased_citation(self, sha: str) -> Mapping[str, object] | None:
         self.calls.append(sha)
