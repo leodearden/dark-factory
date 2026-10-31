@@ -4,7 +4,7 @@ behind resolve_escalation_shas, against a stub resolver (no git, no server).
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping, Sequence
 from typing import Any, cast
 
 import pytest
@@ -15,6 +15,18 @@ from escalation.sha_citations import MAX_CITED_SHAS_RESOLVED, cited_shas, resolv
 SHA_A = 'a7ceed6597'
 SHA_B = '570dc88ad6'
 FULL = '0123456789abcdef0123456789abcdef01234567'
+TWIN_B = {'landed': 'b' * 40, 'subject': 'feat: b', 'method': 'patch-id'}
+
+# Each contributes two SHA-shaped tokens (its 8- and 12-hex segments).
+UUIDS = (
+    '3f2a9c1e-4b7d-4e21-9a0c-5c8d0b7f1a33',
+    '7b1d2e3f-0a9c-4d8e-b7f6-1e2d3c4b5a69',
+    'c0ffee12-3456-4789-abcd-ef0123456789',
+    'deadbeef-cafe-4bab-8e5e-0123456789ab',
+    '1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d',
+    '9f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a',
+)
+NOISE = f"{' '.join(UUIDS)} pid 4194304 on 20261023 hash 9c1e7b4d5a609e21"
 
 
 def _esc(
@@ -33,12 +45,33 @@ def _esc(
 
 
 class _StubResolver:
-    def __init__(self, answers: Mapping[str, Mapping[str, object]]) -> None:
+    """*commits* None means every token names a commit."""
+
+    def __init__(
+        self,
+        answers: Mapping[str, Mapping[str, object]],
+        *,
+        commits: Collection[str] | None = None,
+        faults: Mapping[str, Exception] | None = None,
+        classify_fault: Exception | None = None,
+    ) -> None:
         self._answers = answers
+        self._commits = commits
+        self._faults = faults or {}
+        self._classify_fault = classify_fault
         self.calls: list[str] = []
+        self.classified: list[str] = []
+
+    async def commits_named(self, tokens: Sequence[str]) -> Mapping[str, str]:
+        self.classified = list(tokens)
+        if self._classify_fault is not None:
+            raise self._classify_fault
+        return {t: t for t in tokens if self._commits is None or t in self._commits}
 
     async def resolve_rebased_citation(self, sha: str) -> Mapping[str, object] | None:
         self.calls.append(sha)
+        if sha in self._faults:
+            raise self._faults[sha]
         return self._answers.get(sha)
 
 
@@ -123,3 +156,52 @@ class TestResolveCitedShas:
 
         assert resolver.calls == tokens
         assert result.skipped == ()
+
+
+@pytest.mark.asyncio
+class TestCapCountsOnlyCommits:
+    async def test_tokens_naming_no_commit_do_not_count_against_the_cap(self):
+        resolver = _StubResolver({}, commits={SHA_A, SHA_B})
+
+        result = await resolve_cited_shas(_esc(detail=f'{NOISE} {SHA_A} {SHA_B}'), resolver)
+
+        assert resolver.calls == [SHA_A, SHA_B]
+        assert result.skipped == ()
+
+    async def test_only_commit_tokens_past_the_cap_are_skipped(self):
+        commits = [f'{n:07x}' for n in range(MAX_CITED_SHAS_RESOLVED + 2)]
+        detail = ' '.join(f'{UUIDS[i % len(UUIDS)]} {c}' for i, c in enumerate(commits))
+        resolver = _StubResolver({}, commits=set(commits))
+
+        result = await resolve_cited_shas(_esc(detail=detail), resolver)
+
+        assert resolver.calls == commits[:MAX_CITED_SHAS_RESOLVED]
+        assert result.skipped == tuple(commits[MAX_CITED_SHAS_RESOLVED:])
+
+
+@pytest.mark.asyncio
+class TestFaultsAreFailedNotDropped:
+    async def test_a_lookup_git_could_not_answer_is_failed_not_dropped(self):
+        resolver = _StubResolver(
+            {SHA_B: TWIN_B},
+            faults={SHA_A: RuntimeError('fatal: Unable to create index.lock')},
+        )
+
+        result = await resolve_cited_shas(_esc(detail=f'{SHA_A} {SHA_B}'), resolver)
+
+        assert result.resolved == ({'cited': SHA_B, **TWIN_B},)
+        assert [f['cited'] for f in result.failed] == [SHA_A]
+        assert 'index.lock' in result.failed[0]['error']
+        assert 'RuntimeError' in result.failed[0]['error']
+
+    async def test_when_git_cannot_classify_tokens_every_token_is_failed(self):
+        resolver = _StubResolver(
+            {}, classify_fault=RuntimeError('fatal: not a git repository'),
+        )
+
+        result = await resolve_cited_shas(_esc(detail=f'{SHA_A} {SHA_B}'), resolver)
+
+        assert [f['cited'] for f in result.failed] == [SHA_A, SHA_B]
+        assert result.resolved == ()
+        assert result.skipped == ()
+        assert resolver.calls == []
