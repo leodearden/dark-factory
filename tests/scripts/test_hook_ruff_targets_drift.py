@@ -38,7 +38,19 @@ def _hook_ruff_targets(hook_text: str) -> list[str]:
 
 
 def _gate_ruff_targets(lint_command: str) -> list[str]:
-    label = "dark-factory-orchestrator.yaml lint_command (task 5338)"
+    """The ``ruff check`` leg's positional targets, read with no ``value_flags``.
+
+    So a space-separated flag value on that leg (``--select E,F``) comes back as
+    a phantom target, and the equality assertion reports ``E,F`` MISSING from the
+    hook on a change that broke nothing. Accepted: the live leg carries only bare
+    targets, the same exposure ``test_root_lint_covers_nonmember_py.py::_ruff_targets``
+    records. When the leg gains such a flag, pass a ruff value-flag set here
+    rather than loosening the equality: promote
+    ``test_contributing_lint_command_drift.py::_RUFF_FLAGS_TAKING_A_VALUE`` into
+    ``verify_command_invariants`` beside ``RUFF``, as task 6172 did for
+    ``PYTEST_VALUE_FLAGS``.
+    """
+    label ="dark-factory-orchestrator.yaml lint_command (task 5338)"
     segment = vci.required_segment(lint_command, vci.RUFF, label=label)
     return vci.positional_targets(segment, vci.RUFF, label=label)
 
