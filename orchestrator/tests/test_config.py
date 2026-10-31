@@ -1273,19 +1273,19 @@ class TestMergeVerifyStormGuardFields:
 
 @pytest.mark.usefixtures("code_default_config")
 class TestMergeVerifyBreadthConfig:
-    """merge_verify_breadth (λ): restart-only knob gating the broad merge gate.
+    """merge_verify_breadth: restart-only knob setting the merge gate's breadth.
 
-    Default 'scoped' preserves legacy per-touched-module verify behaviour
-    (byte-identical rollback path). 'full' — flipped later by the σ
-    capstone — runs every REGISTERED module's full suite at merge-role
-    verify. See config.py's merge_verify_breadth field for the restart-only
-    rationale (task point 3 / design decision: mid-process flips could split
-    behaviour across an in-flight merge on the most load-bearing lane).
+    The shipped default is 'full' (task 7008): merge-role verify runs every
+    REGISTERED module's full suite. 'scoped' is the explicit per-project
+    opt-down to the legacy per-touched-module plan. The knob is restart-only
+    because a mid-process flip could split behaviour across an in-flight
+    merge on the most load-bearing lane. The paired task/merge verify policy
+    is stated once, in defaults.yaml's merge_verify_breadth comment.
     """
 
-    def test_defaults_to_scoped(self):
+    def test_defaults_to_full(self):
         config = OrchestratorConfig()
-        assert config.merge_verify_breadth == 'scoped'
+        assert config.merge_verify_breadth == 'full'
 
     def test_full_override_accepted(self):
         config = OrchestratorConfig(merge_verify_breadth='full')
@@ -1304,13 +1304,13 @@ class TestMergeVerifyBreadthConfig:
         """
         assert 'merge_verify_breadth' not in RELOADABLE_FIELDS, (
             'merge_verify_breadth requires a process restart to take effect '
-            '(flipped by the σ capstone, activated by the τ fleet restart) '
+            '(a mid-process flip could split an in-flight merge\'s breadth) '
             'and must NOT be in RELOADABLE_FIELDS'
         )
 
-    def test_defaults_yaml_carries_scoped(self, tmp_path):
+    def test_defaults_yaml_carries_full(self, tmp_path):
         """The shipped defaults.yaml explicitly carries merge_verify_breadth:
-        scoped (same guard pattern as test_defaults_yaml_has_park_stop_block
+        full (same guard pattern as test_defaults_yaml_has_park_stop_block
         above), and that value flows through both a bare OrchestratorConfig()
         and load_config() over an otherwise-empty explicit config file.
         """
@@ -1318,13 +1318,26 @@ class TestMergeVerifyBreadthConfig:
         assert 'merge_verify_breadth' in defaults, (
             "defaults.yaml is missing 'merge_verify_breadth'"
         )
-        assert defaults['merge_verify_breadth'] == 'scoped'
+        assert defaults['merge_verify_breadth'] == 'full'
 
         config = OrchestratorConfig()
-        assert config.merge_verify_breadth == 'scoped'
+        assert config.merge_verify_breadth == 'full'
 
         config_path = tmp_path / 'config.yaml'
         config_path.write_text(yaml.dump({'project_root': str(tmp_path)}))
+        loaded = load_config(config_path)
+        assert loaded.merge_verify_breadth == 'full'
+
+    def test_project_yaml_scoped_opts_down(self, tmp_path):
+        """A project yaml declaring merge_verify_breadth: scoped beats the
+        shipped 'full' default through the real layered load path
+        (defaults.yaml under the project file).
+        """
+        config_path = tmp_path / 'config.yaml'
+        config_path.write_text(yaml.dump({
+            'project_root': str(tmp_path),
+            'merge_verify_breadth': 'scoped',
+        }))
         loaded = load_config(config_path)
         assert loaded.merge_verify_breadth == 'scoped'
 
