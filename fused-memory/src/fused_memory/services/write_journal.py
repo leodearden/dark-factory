@@ -342,6 +342,7 @@ class _PruneStop(StrEnum):
     ROW_BUDGET = 'row budget'
     DEADLINE = 'deadline'
 
+
 #: Parameters: ``(since_iso_timestamp, limit)``.
 OPERATOR_TELEMETRY_QUERY = """
 SELECT

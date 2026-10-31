@@ -170,10 +170,17 @@ taskmaster:
   tool_mode: "all"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# write_journal — RED-TIER / restart-only. The prune runs at startup and every
+# write_journal — RED-TIER / restart-only. Every journal table with a horizon is
+# pruned once at startup (services/journal_retention.py) and write_ops again every
 # prune_interval_seconds (services/write_ops_retention.py); nothing re-reads
 # these values after startup, so a changed leaf is correctly reported
 # restart_required by mcp__escalation__reload_config.
+#
+# backend_ops (task 5551) is the Layer-2 half of each write, so it ages out at
+# write_retention_days. At startup it shares prune_max_rows_per_run and
+# prune_max_seconds with write_ops, taking what write_ops left, so one startup's
+# batched pruning stays inside one deadline. Measured 2026-10-31: 553,525 rows,
+# ~7.3k/day, the oldest from 2026-04-07, so nothing is deleted until ~2028-04.
 #
 # These are the DEPLOYED values, and they are meant to be edited. The fallback
 # for an omitted leaf is config/schema.py::WriteJournalConfig, which is the one
