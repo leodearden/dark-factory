@@ -8,6 +8,7 @@ real SQLite store, event buffer, write journal and ticket store; only the LLM is
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -266,10 +267,10 @@ def combine_into(target_id: str) -> CuratorDecision:
 
 
 async def combine_a_duplicate_into_a_new_stack(
-    build_stack: BuildStack, *, stamped: bool,
+    build_stack: BuildStack, *, stamped: bool, event_queue: Any = None,
 ) -> tuple[Stack, str, dict[str, Any]]:
     curator = curator_returning()
-    stack = await build_stack(curator=curator)
+    stack = await build_stack(curator=curator, event_queue=event_queue)
     target_id = await stack.seed(stamped=stamped)
     curator.curate.side_effect = [combine_into(target_id)]
     result = await submit_and_resolve(
@@ -312,3 +313,67 @@ async def test_a_curator_combine_into_an_unstamped_task_is_not_journalled(
 
     assert result['action'] == 'combine', result
     assert await stack.amended_events() == []
+
+
+class AmendmentJournalOutage:
+    """An event queue whose task_text_amended enqueue raises; every other event is accepted."""
+
+    def __init__(self) -> None:
+        self.events: list[ReconciliationEvent] = []
+
+    def enqueue(self, event: ReconciliationEvent) -> bool:
+        self.events.append(event)
+        if event.type == 'task_text_amended':
+            raise RuntimeError('event queue unavailable')
+        return True
+
+
+async def amend_through_update_task(build_stack: BuildStack, queue: AmendmentJournalOutage) -> str:
+    stack = await build_stack(event_queue=queue)
+    task_id = await stack.seed()
+
+    result = await stack.call('update_task', id=task_id, description=NEW, agent_id=AGENT)
+
+    assert result['amendment_advisory'] == advisory_for(task_id, fields_changed=['description'])
+    stored = await stack.backend.get_task(task_id, stack.root)
+    assert stored['description'] == NEW
+    return task_id
+
+
+async def amend_through_a_combine(build_stack: BuildStack, queue: AmendmentJournalOutage) -> str:
+    stack, target_id, result = await combine_a_duplicate_into_a_new_stack(
+        build_stack, stamped=True, event_queue=queue,
+    )
+
+    assert result['action'] == 'combine', result
+    stored = await stack.backend.get_task(target_id, stack.root)
+    assert (stored['title'], stored['description']) == (COMBINED_TITLE, NEW)
+    listing = await stack.backend.get_tasks(project_root=stack.root)
+    assert [str(task['id']) for task in listing['tasks']] == [target_id]
+    return target_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('amend', 'writer_source'),
+    [(amend_through_update_task, 'update_task'), (amend_through_a_combine, 'curator_combine')],
+    ids=['update_task', 'curator_combine'],
+)
+async def test_a_failed_amendment_journal_does_not_fail_the_landed_write(
+    build_stack: BuildStack,
+    caplog: pytest.LogCaptureFixture,
+    amend: Callable[[BuildStack, AmendmentJournalOutage], Awaitable[str]],
+    writer_source: str,
+) -> None:
+    queue = AmendmentJournalOutage()
+
+    with caplog.at_level(logging.WARNING):
+        task_id = await amend(build_stack, queue)
+
+    assert [event.type for event in queue.events if event.type == 'task_text_amended'] == [
+        'task_text_amended',
+    ]
+    warnings = [
+        record.getMessage() for record in caplog.records if record.levelno == logging.WARNING
+    ]
+    assert any(task_id in message and writer_source in message for message in warnings), warnings
