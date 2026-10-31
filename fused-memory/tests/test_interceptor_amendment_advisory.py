@@ -16,11 +16,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import _init_git_repo
+from _curator_helpers import curator_returning
+from _fm_helpers import _init_git_repo, submit_and_resolve
 from shared.task_text_fingerprint import task_text_fingerprint
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
+from fused_memory.middleware.curator_types import CuratorDecision, RewrittenTask
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.models.reconciliation import ReconciliationEvent
@@ -242,3 +244,71 @@ async def test_a_replayed_write_returns_the_advisory_without_re_journalling(
     assert first['amendment_advisory'] == expected
     assert replayed['amendment_advisory'] == expected
     assert len(await stack.amended_events()) == 1
+
+
+COMBINED_TITLE = 'Planned task, folded with its duplicate'
+
+
+def combine_into(target_id: str) -> CuratorDecision:
+    return CuratorDecision(
+        action='combine',
+        target_id=target_id,
+        target_fingerprint='Planned task',
+        rewritten_task=RewrittenTask(
+            title=COMBINED_TITLE,
+            description=NEW,
+            details='Merged with the duplicate submission.',
+            files_to_modify=['a.py'],
+            priority='medium',
+        ),
+        justification='duplicate of the planned task',
+    )
+
+
+async def combine_a_duplicate_into_a_new_stack(
+    build_stack: BuildStack, *, stamped: bool,
+) -> tuple[Stack, str, dict[str, Any]]:
+    curator = curator_returning()
+    stack = await build_stack(curator=curator)
+    target_id = await stack.seed(stamped=stamped)
+    curator.curate.side_effect = [combine_into(target_id)]
+    result = await submit_and_resolve(
+        stack.interceptor, stack.root,
+        title='Duplicate of the planned task', description='candidate description',
+    )
+    return stack, target_id, result
+
+
+@pytest.mark.asyncio
+async def test_a_curator_combine_into_a_stamped_task_is_journalled(
+    build_stack: BuildStack,
+) -> None:
+    stack, target_id, result = await combine_a_duplicate_into_a_new_stack(
+        build_stack, stamped=True,
+    )
+
+    assert result['action'] == 'combine', result
+    stored = await stack.backend.get_task(target_id, stack.root)
+    [event] = await stack.amended_events()
+    assert payload_of(event) == {
+        'task_id': target_id,
+        'plan_authored_at': AUTHORED_AT,
+        'fields_changed': ['title', 'description', 'details'],
+        'will_replan': True,
+        'plan_text_fp_before': STAMP,
+        'task_text_fp_after': task_text_fingerprint(stored['description'], stored['details']),
+        'writer_source': 'curator_combine',
+        'agent_id': None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_curator_combine_into_an_unstamped_task_is_not_journalled(
+    build_stack: BuildStack,
+) -> None:
+    stack, _target_id, result = await combine_a_duplicate_into_a_new_stack(
+        build_stack, stamped=False,
+    )
+
+    assert result['action'] == 'combine', result
+    assert await stack.amended_events() == []
