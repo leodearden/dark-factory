@@ -1,12 +1,15 @@
 """The hot-reload step of a config-deploy script, shared by
 scripts/merge-deep-set-cap.sh and scripts/merge-pytest-n-ab-switch.sh.
 
-Each of those scripts commits an edit to an orchestrator's config, then runs a
-`python3 -` heredoc that fetches reload_config's report through this module
-and checks only its own knob's disposition in it. Everything before that check
-lives here once: importing the transport, calling reload_config through it,
-confirming the reload committed a re-read of the caller's own config file, and
-the operator-facing diagnostic for each way that can fail.
+Each of those scripts runs a `python3 -` heredoc that first LANDS its edit to
+an orchestrator's config through that project's own merge queue
+(scripts/_merge_queue_landing.py::land_file), never as a direct commit to its
+main, then fetches reload_config's report through this module and checks only
+its own knob's disposition in it. Everything between the landing and that
+check lives here once: importing the transport, calling reload_config through
+it, confirming the reload committed a re-read of the caller's own config file,
+and the operator-facing diagnostic for each way that can fail. The landing
+module shares this module's transport loader, its remedy and `die`.
 
 Two entry points, one fetch:
 
@@ -85,6 +88,21 @@ def load_transport():
     return mcp_session, httpx
 
 
+def transport_not_importable_remedy(exc: ImportError) -> str:
+    """The operator's next step when this interpreter cannot import a module
+    an MCP call needs (the transport, or the landing's merge-state
+    vocabulary): which one, where it looked, and how to get a venv that has
+    them all."""
+    checkout = Path(__file__).resolve().parents[1]
+    return (
+        f"a module the MCP calls need is not importable under {sys.executable}: {exc}\n"
+        f"  looked for shared/ under {checkout / 'shared' / 'src'}, and for httpx in\n"
+        f"  that interpreter's environment\n"
+        f"  remedy: run `uv sync --all-packages` in {checkout} so {checkout / '.venv'}\n"
+        f"  provides httpx, or re-run this script under `uv run --project shared`"
+    )
+
+
 def fetch_reload_report(
     port: str, *, committed_as: str, config_path: str | None,
     timeout: float = RELOAD_REPLY_TIMEOUT_SECS,
@@ -117,16 +135,11 @@ def fetch_reload_report(
 def _call_reload_config(port: str, *, committed_as: str, timeout: float) -> dict:
     """reload_config's unwrapped result, or ReloadNotConfirmed naming why the
     transport could not deliver it."""
-    checkout = Path(__file__).resolve().parents[1]
     try:
         mcp_session, httpx = load_transport()
     except ImportError as exc:
         raise ReloadNotConfirmed(
-            ReloadFailure.TRANSPORT_NOT_IMPORTABLE,
-            f"the MCP reload transport is not importable under {sys.executable}: {exc}\n"
-            f"  looked for shared/ under: {checkout / 'shared' / 'src'}\n"
-            f"  remedy: run `uv sync --all-packages` in {checkout} so {checkout / '.venv'}\n"
-            f"  provides httpx, or re-run this script under `uv run --project shared`",
+            ReloadFailure.TRANSPORT_NOT_IMPORTABLE, transport_not_importable_remedy(exc),
         ) from exc
 
     base_url = f"http://127.0.0.1:{port}"

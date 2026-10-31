@@ -127,6 +127,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'scripts/tests/test_legibility_nightly.py': _SEEDS_ITS_OWN_REPO,
     'scripts/tests/test_merge_deep_set_cap.py': _SEEDS_ITS_OWN_REPO,
     'scripts/tests/test_merge_pytest_n_ab_switch.py': _SEEDS_ITS_OWN_REPO,
+    'scripts/tests/test_merge_queue_landing.py': _SEEDS_ITS_OWN_REPO,
     'shared/tests/test_merge_subject.py': _SEEDS_ITS_OWN_REPO,
     'tests/scripts/test_merge_gate_history_leg.py': (
         "this guard's own synthetic sources: string literals it parses, never runs"

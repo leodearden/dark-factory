@@ -1,12 +1,18 @@
 """Tests for merge-pytest-n-ab-switch.sh — drives the real script via
 subprocess against a REAL loopback stateful escalation MCP on an ephemeral
 port and a REAL temp git repo holding a temp dark-factory-orchestrator.yaml
-(the test_deploy_w11_lane_lifecycle.py idiom), so step 1's YAML editor, step
-2's commit idempotency and step 4's assertion are exercised in COMPOSITION —
-which is where the crash-resume defect lives: file already at the value ->
-nothing to commit -> the reload reports no verify_env change. The server, its
-transport-fault catalogue and the temp-repo helpers live in
+(the test_deploy_w11_lane_lifecycle.py idiom), so step 1's YAML editor, the
+landing's idempotency and the reload's assertion are exercised in
+COMPOSITION — which is where the crash-resume defect lives: main already at
+the value -> nothing to land -> the reload reports no verify_env change. The
+server, its transport-fault catalogue and the temp-repo helpers live in
 config_reload_script_fakes, which owns the measured wire model.
+
+A flip lands through the config checkout's own merge queue, never as a
+direct commit to its main (task 7296): the server's merge tools answer
+through a FakeMergeQueue (merge_queue_fakes) that lands for real in the temp
+repo, and every test asserts the run left the checkout clean, with no deploy
+worktree, branch or scratch behind.
 
 The reload travels over a real socket on purpose. A faked `curl` can only
 ever return what the test author already believes the wire looks like, so it
@@ -19,6 +25,7 @@ one the test itself owns, bound to an ephemeral port.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import types
 from pathlib import Path
@@ -38,9 +45,23 @@ from config_reload_script_fakes import (
     system_python_without_the_transport,
     venvless_checkout_copy,
 )
+from merge_queue_fakes import FakeMergeQueue, assert_target_checkout_clean, deploy_tmpdir_env
 
 SCRIPT = Path(__file__).parent.parent / "merge-pytest-n-ab-switch.sh"
 KEY = "PYTEST_XDIST_AUTO_NUM_WORKERS"
+CONFIG = "dark-factory-orchestrator.yaml"
+FLIP_TO_8 = {"verify_env": {"old": {KEY: "16"}, "new": {KEY: "8"}}}
+DEPLOY_MERGE_SUBJECT = re.compile(r"^Merge task/deploy-merge-pytest-n-8-\d{8}T\d{6}Z into main$")
+DEPLOY_MESSAGE_PREFIX = f"config(ab): merge test leg {KEY}=8 (pytest -n A/B arm switch, "
+
+
+@pytest.fixture(autouse=True)
+def scratch(tmp_path, monkeypatch):
+    """A fresh, empty TMPDIR every run of the script inherits, so a test can
+    assert the run left no scratch behind."""
+    path = deploy_tmpdir_env(tmp_path)["TMPDIR"]
+    monkeypatch.setenv("TMPDIR", path)
+    return Path(path)
 
 
 # ---------------------------------------------------------------------------
@@ -111,39 +132,79 @@ def _failure(proc):
     return verdict["failure"]
 
 
+def _target(queue, report=None, **kwargs):
+    """The config checkout's escalation MCP: *queue* answers the merge tools,
+    *report* answers reload_config."""
+    return FakeEscalationMcp(report, tool_handlers=queue.handlers(), **kwargs)
+
+
+def _tool_names(server):
+    return [name for name, _ in server.tool_calls()]
+
+
+def _assert_left_nothing_behind(repo, scratch):
+    assert_target_checkout_clean(repo)
+    assert list(scratch.iterdir()) == [], f"the run left scratch behind: {list(scratch.iterdir())}"
+
+
 # ---------------------------------------------------------------------------
 # The flip path: a real value change, hot-applied
 # ---------------------------------------------------------------------------
 
-def test_flip_reports_outcome_applied_and_commits(tmp_path):
-    """A genuine 16 -> 8 switch edits the yaml, lands exactly one commit
-    touching only that file, and reports `outcome: applied`."""
+def test_flip_lands_through_the_queue_and_reports_outcome_applied(tmp_path, scratch):
+    """A genuine 16 -> 8 switch lands ONE deploy commit, touching only the
+    yaml, as a merge of a task/deploy-* branch the queue verified; only then
+    does the script reload, and it reports `outcome: applied` with the commit
+    the queue landed it as."""
     config = _make_repo(tmp_path, "16")
     repo = config.parent
     before = head(repo)
+    queue = FakeMergeQueue(repo, states=["verifying", "done"])
 
-    with FakeEscalationMcp(reload_report(
-        reloaded=True,
-        config_path=str(config),
-        applied={"verify_env": {"old": {KEY: "16"}, "new": {KEY: "8"}}},
+    with _target(queue, reload_report(
+        reloaded=True, config_path=str(config), applied=FLIP_TO_8,
     )) as server:
         proc = _run(server, config, "8")
         methods = server.rpc_methods()
+        tools = _tool_names(server)
 
     assert proc.returncode == 0, f"stdout={proc.stdout} stderr={proc.stderr}"
     verdict = _verdict(proc)
     assert verdict["outcome"] == "applied"
     assert verdict["switched_to"] == "8"
-    assert verdict["commit"] != "already-at-8"
-    assert "initialize" in methods, (
-        f"the script never handshook; the server saw {methods}"
+    assert verdict["commit"] == queue.merge_sha == head(repo)
+    assert tools == ["merge_request", "merge_status", "merge_status", "reload_config"], tools
+    assert methods.count("initialize") == len(tools), (
+        f"a tool call skipped the session handshake; the server saw {methods}"
     )
 
-    landed = git(repo, "rev-list", f"{before}..HEAD").split()
-    assert len(landed) == 1, f"expected exactly one new commit, got {landed}"
-    touched = git(repo, "show", "--name-only", "--format=", "HEAD").split()
-    assert touched == ["dark-factory-orchestrator.yaml"]
+    assert DEPLOY_MERGE_SUBJECT.match(git(repo, "log", "-1", "--format=%s", "main").strip())
+    assert git(repo, "rev-list", "--count", f"{before}..main").strip() == "2"
+    assert git(repo, "diff", "--name-only", before, "main").split() == [CONFIG]
+    deploy_commit = git(repo, "rev-parse", "main^2").strip()
+    assert git(repo, "log", "-1", "--format=%s", deploy_commit).startswith(DEPLOY_MESSAGE_PREFIX)
     assert f'{KEY}: "8"' in config.read_text()
+    _assert_left_nothing_behind(repo, scratch)
+
+
+def test_a_flip_the_queue_does_not_land_fails_without_a_reload(tmp_path, scratch):
+    """A request that settles without landing fails with the landing's tag,
+    and the reload, which could only confirm the old value, never runs."""
+    config = _make_repo(tmp_path, "16")
+    repo = config.parent
+    before = head(repo)
+    queue = FakeMergeQueue(repo, states=["verifying", {"state": "conflict", "reason": "conflict in yaml"}])
+
+    with _target(queue, reload_report(config_path=str(config), applied=FLIP_TO_8)) as server:
+        proc = _run(server, config, "8")
+        tools = _tool_names(server)
+
+    assert _failure(proc) == "not_landed"
+    assert "conflict" in proc.stderr, proc.stderr
+    assert not _outcome_verdict_lines(proc)
+    assert "reload_config" not in tools, tools
+    assert head(repo) == before
+    _assert_left_nothing_behind(repo, scratch)
 
 
 # ---------------------------------------------------------------------------
@@ -151,15 +212,16 @@ def test_flip_reports_outcome_applied_and_commits(tmp_path):
 # value, against an orchestrator whose live config already matches it
 # ---------------------------------------------------------------------------
 
-def test_converged_resume_exits_zero_when_reload_reports_no_verify_env_change(tmp_path):
+def test_converged_resume_exits_zero_when_reload_reports_no_verify_env_change(tmp_path, scratch):
     """Re-running the switch for a value the file and the running config
     BOTH already carry is success, not failure.
 
     The reload genuinely happens and genuinely applies other hot leaves, but
     verify_env is equal on both sides so it never appears under `applied` --
     `unchanged` is a bare int count, so absence is the only converged signal
-    on the wire. Nothing to commit is likewise already success (step 2's
-    `already-at-<value>` sentinel); step 4 must reach the same verdict.
+    on the wire. Nothing to land is likewise already success (the
+    `already-at-<value>` sentinel); the reload must reach the same verdict,
+    without submitting anything to the merge queue.
     """
     config = _make_repo(tmp_path, "8", marker=True)
     repo = config.parent
@@ -173,19 +235,22 @@ def test_converged_resume_exits_zero_when_reload_reports_no_verify_env_change(tm
         applied={"max_turns.architect": {"old": 40, "new": 60}},
     )) as server:
         proc = _run(server, config, "8")
+        tools = _tool_names(server)
 
     assert proc.returncode == 0, f"stdout={proc.stdout} stderr={proc.stderr}"
+    assert set(tools) == {"reload_config"}, f"a converged re-run reached the queue: {tools}"
     verdict = _verdict(proc)
     assert "failure" not in verdict, verdict
     assert verdict["outcome"] == "already_converged"
     assert verdict["switched_to"] == "8"
     assert verdict["commit"] == "already-at-8"
 
-    assert head(repo) == before_head, "a converged re-run must commit nothing"
+    assert head(repo) == before_head, "a converged re-run must land nothing"
     assert config.read_bytes() == before_bytes, (
         "the idempotent rewrite must restore the prior A/B marker byte for "
         "byte, not stack a fresh one"
     )
+    _assert_left_nothing_behind(repo, scratch)
 
 
 def test_converged_resume_over_the_real_stateful_transport(tmp_path):
@@ -235,8 +300,8 @@ def test_converged_resume_over_the_real_stateful_transport(tmp_path):
 # to edit a config it cannot find a verify_env block in.
 # ---------------------------------------------------------------------------
 
-def test_dry_run_neither_commits_nor_reloads(tmp_path):
-    """`--dry-run` shows the operator the change and stops there.
+def test_dry_run_neither_lands_nor_reloads(tmp_path, scratch):
+    """`--dry-run` shows the operator the change against main and stops there.
 
     A whole separate exit path -- temp copy, `diff -u`, its own verdict shape
     -- so a regression in it would let a rehearsal diverge from the real run
@@ -256,14 +321,16 @@ def test_dry_run_neither_commits_nor_reloads(tmp_path):
     assert f'+  {KEY}: "8"' in proc.stdout, (
         f"a rehearsal that shows no diff rehearses nothing: {proc.stdout}"
     )
-    assert head(repo) == before_head, "a rehearsal must not commit"
+    assert f"main:{CONFIG}" in proc.stdout, f"the rehearsal's diff is not against main: {proc.stdout}"
+    assert head(repo) == before_head, "a rehearsal must not land anything"
     assert config.read_bytes() == before_bytes, "a rehearsal must not edit in place"
     assert received == [], f"a rehearsal must not reach the orchestrator: {received}"
+    _assert_left_nothing_behind(repo, scratch)
 
 
-def test_a_config_with_no_verify_env_block_is_refused_before_the_commit(tmp_path):
+def test_a_config_with_no_verify_env_block_is_refused_before_the_landing(tmp_path, scratch):
     """Pointed at a config carrying no top-level `verify_env:`, the editor
-    refuses rather than inventing one -- and refuses BEFORE the commit, so a
+    refuses rather than inventing one -- and refuses BEFORE the landing, so a
     config it cannot safely edit leaves no trace in git either.
     """
     repo = init_repo(tmp_path)
@@ -278,15 +345,16 @@ def test_a_config_with_no_verify_env_block_is_refused_before_the_commit(tmp_path
         received = list(server.received)
 
     assert _failure(proc) == "config_edit_refused"
-    assert head(repo) == before_head, "the refusal must precede the commit"
+    assert head(repo) == before_head, "the refusal must precede the landing"
     assert config.read_bytes() == before_bytes
-    assert received == [], f"a refused edit must not reload anything: {received}"
+    assert received == [], f"a refused edit must not reach the orchestrator: {received}"
+    _assert_left_nothing_behind(repo, scratch)
 
 
 @pytest.mark.parametrize("bad_port", ["0", "65536", "99999"])
-def test_an_unconnectable_port_is_refused_before_the_commit(tmp_path, bad_port):
-    """A port outside 1-65535 can never deliver the reload, so it is refused
-    before a value that could never be hot-applied is committed."""
+def test_an_unconnectable_port_is_refused_before_the_landing(tmp_path, scratch, bad_port):
+    """A port outside 1-65535 can never deliver the landing or the reload, so
+    it is refused before anything is landed."""
     config = _make_repo(tmp_path, "16")
     repo = config.parent
     before_head = head(repo)
@@ -295,8 +363,9 @@ def test_an_unconnectable_port_is_refused_before_the_commit(tmp_path, bad_port):
     proc = _run(types.SimpleNamespace(port=bad_port), config, "8")
 
     assert _failure(proc) == "invalid_port"
-    assert head(repo) == before_head, "the refusal must precede the commit"
+    assert head(repo) == before_head, "the refusal must precede the landing"
     assert config.read_bytes() == before_bytes
+    _assert_left_nothing_behind(repo, scratch)
 
 
 # ---------------------------------------------------------------------------
@@ -416,13 +485,16 @@ _UNCORROBORATED_ABSENCE = {
     list(_UNCORROBORATED_ABSENCE.values()),
     ids=list(_UNCORROBORATED_ABSENCE),
 )
-def test_uncorroborated_absence_is_not_convergence(tmp_path, report_fields, failure):
+def test_uncorroborated_absence_is_not_convergence(tmp_path, scratch, report_fields, failure):
     """An absent verify_env that is NOT corroborated by a committed reload of
-    THIS config file must fail, naming which corroborator was missing."""
-    config = _make_repo(tmp_path, "8", marker=True)
+    THIS config file must fail, naming which corroborator was missing, even
+    once the flip has landed."""
+    config = _make_repo(tmp_path, "16")
+    repo = config.parent
     other = _other_projects_config(tmp_path)
+    queue = FakeMergeQueue(repo)
 
-    with FakeEscalationMcp(reload_report(**report_fields(config, other))) as server:
+    with _target(queue, reload_report(**report_fields(config, other))) as server:
         # From the config's own checkout, as an operator runs it -- and the
         # only cwd from which a relative reported config_path could realpath
         # onto ours and falsely corroborate.
@@ -430,6 +502,8 @@ def test_uncorroborated_absence_is_not_convergence(tmp_path, report_fields, fail
 
     assert _failure(proc) == failure
     assert not _converged_verdict_lines(proc)
+    assert _verdict(proc)["commit"] == queue.merge_sha == head(repo)
+    _assert_left_nothing_behind(repo, scratch)
 
 
 @pytest.mark.parametrize(
@@ -438,32 +512,34 @@ def test_uncorroborated_absence_is_not_convergence(tmp_path, report_fields, fail
     ids=list(_CORROBORATOR_BREACHES),
 )
 def test_a_flip_reported_by_an_uncorroborated_reload_is_not_applied(
-    tmp_path, report_fields, failure,
+    tmp_path, scratch, report_fields, failure,
 ):
     """A verify_env flip to our value that is NOT corroborated by a committed
-    reload of THIS config file must fail too. The flip commit has landed, by
-    design, so the failure verdict names it."""
+    reload of THIS config file must fail too. The flip has landed, by design,
+    so the failure verdict names the commit the queue landed it as."""
     config = _make_repo(tmp_path, "16")
     repo = config.parent
     other = _other_projects_config(tmp_path)
+    queue = FakeMergeQueue(repo)
 
-    with FakeEscalationMcp(reload_report(
-        **report_fields(config, other),
-        applied={"verify_env": {"old": {KEY: "16"}, "new": {KEY: "8"}}},
-    )) as server:
+    with _target(queue, reload_report(**report_fields(config, other), applied=FLIP_TO_8)) as server:
         proc = _run(server, config, "8", cwd=config.parent)
 
     assert _failure(proc) == failure
     assert not _outcome_verdict_lines(proc)
-    assert _verdict(proc)["commit"] == head(repo, short=True)
+    assert _verdict(proc)["commit"] == queue.merge_sha == head(repo)
+    _assert_left_nothing_behind(repo, scratch)
 
 
-def test_applied_verify_env_carrying_a_different_value_still_fails(tmp_path):
+def test_applied_verify_env_carrying_a_different_value_still_fails(tmp_path, scratch):
     """The strict branch stays strict: a PRESENT verify_env carrying some
-    other value is a contradiction, never convergence."""
-    config = _make_repo(tmp_path, "8", marker=True)
+    other value is a contradiction, never convergence, even once the flip
+    has landed."""
+    config = _make_repo(tmp_path, "16")
+    repo = config.parent
+    queue = FakeMergeQueue(repo)
 
-    with FakeEscalationMcp(reload_report(
+    with _target(queue, reload_report(
         reloaded=True,
         config_path=str(config),
         applied={"verify_env": {"old": {KEY: "8"}, "new": {KEY: "16"}}},
@@ -472,6 +548,8 @@ def test_applied_verify_env_carrying_a_different_value_still_fails(tmp_path):
 
     assert _failure(proc) == "value_mismatch"
     assert not _converged_verdict_lines(proc)
+    assert _verdict(proc)["commit"] == queue.merge_sha
+    _assert_left_nothing_behind(repo, scratch)
 
 
 # ---------------------------------------------------------------------------
@@ -483,9 +561,9 @@ def test_applied_verify_env_carrying_a_different_value_still_fails(tmp_path):
 # every session-less POST got a 400 before any tool ran, and the script
 # reported `reloaded=None` and blamed an in-orchestrator rollback for it.
 #
-# The fault cases start from a config already at the value, so nothing is
-# committed and the transport fault is the only failure source; the flip-path
-# case at the end of this group owns the committed sha.
+# The fault cases on the flip path arm the fault only once the queue has
+# landed the value, so the fault is the reload's alone and the diagnostic
+# names the landed sha; the converged case lands nothing and names none.
 # ---------------------------------------------------------------------------
 
 def _assert_failed_closed_on_the_transport(proc):
@@ -498,29 +576,12 @@ def _assert_failed_closed_on_the_transport(proc):
 @pytest.mark.parametrize(
     "fault", list(TRANSPORT_FAULTS.values()), ids=list(TRANSPORT_FAULTS)
 )
-def test_a_reload_that_never_reached_the_tool_fails_closed(tmp_path, fault):
-    """Every way the transport can refuse to deliver reload_config."""
-    config = _make_repo(tmp_path, "8", marker=True)
-
-    with FakeEscalationMcp(reload_report(config_path=str(config)), **fault) as server:
-        proc = _run(server, config, "8")
-
-    _assert_failed_closed_on_the_transport(proc)
-
-
-def test_a_dead_socket_fails_closed(tmp_path):
-    """Nothing listening at all -- the connect fails before any request is
-    delivered, and must fail closed the same way."""
-    config = _make_repo(tmp_path, "8", marker=True)
-
-    proc = _run(ClosedPort(), config, "8")
-
-    _assert_failed_closed_on_the_transport(proc)
-
-
-def test_the_transport_diagnostic_keeps_the_committed_shas_remedy(tmp_path):
-    """On the FLIP path the commit HAS landed, so both the failure verdict and
-    the operator's diagnostic name the sha that carries the value.
+def test_a_reload_that_never_reached_the_tool_after_a_landing_fails_closed(
+    tmp_path, scratch, fault,
+):
+    """Every way the transport can refuse to deliver reload_config, once the
+    flip has landed: both the failure verdict and the operator's diagnostic
+    name the sha that carries the value.
 
     That is what the deleted `curl ... || die "... (committed as ${SHA}; the
     value lands at the next restart)"` carried; losing it when curl went away
@@ -528,16 +589,69 @@ def test_the_transport_diagnostic_keeps_the_committed_shas_remedy(tmp_path):
     """
     config = _make_repo(tmp_path, "16")
     repo = config.parent
+    queue = FakeMergeQueue(repo)
 
-    with FakeEscalationMcp(
-        initialize_reply=FakeEscalationMcp.MISSING_SESSION_REPLY,
-    ) as server:
+    with _target(queue, reload_report(config_path=str(config), applied=FLIP_TO_8),
+                 faults_armed=queue.has_landed, **fault) as server:
         proc = _run(server, config, "8")
 
     _assert_failed_closed_on_the_transport(proc)
-    sha = head(repo, short=True)
-    assert _verdict(proc)["commit"] == sha
-    assert sha in proc.stderr, f"stderr={proc.stderr}"
+    landed_as = head(repo)
+    assert _verdict(proc)["commit"] == queue.merge_sha == landed_as
+    assert landed_as in proc.stderr, f"stderr={proc.stderr}"
+    _assert_left_nothing_behind(repo, scratch)
+
+
+def test_a_converged_reload_that_never_reached_the_tool_fails_closed(tmp_path, scratch):
+    """The converged re-run lands nothing, so its reload is the only call a
+    dead socket can refuse."""
+    config = _make_repo(tmp_path, "8", marker=True)
+
+    proc = _run(ClosedPort(), config, "8")
+
+    _assert_failed_closed_on_the_transport(proc)
+    assert _verdict(proc)["commit"] == "already-at-8"
+    _assert_left_nothing_behind(config.parent, scratch)
+
+
+def test_a_dead_socket_fails_a_flip_at_the_landing(tmp_path, scratch):
+    """Nothing listening at all: the flip's submit fails, so nothing landed,
+    no reload was tried and no committed sha may be claimed."""
+    config = _make_repo(tmp_path, "16")
+    repo = config.parent
+    before = head(repo)
+
+    proc = _run(ClosedPort(), config, "8")
+
+    assert _failure(proc) == "transport_failed"
+    assert "merge_request never reached the tool" in proc.stderr, proc.stderr
+    assert _verdict(proc)["commit"] is None
+    assert "lands at the next restart" not in proc.stderr, proc.stderr
+    assert head(repo) == before
+    _assert_left_nothing_behind(repo, scratch)
+
+
+def test_a_git_failure_at_the_landing_still_ends_in_a_verdict(tmp_path, scratch):
+    """No deploy worktree can be added: the run fails with the landing's own
+    tag in its JSON verdict, for the predicate note, not with a traceback."""
+    config = _make_repo(tmp_path, "16")
+    repo = config.parent
+    before = head(repo)
+    blocker = repo / ".git" / "worktrees"
+    blocker.write_text("not a directory\n")
+    queue = FakeMergeQueue(repo)
+
+    with _target(queue, reload_report(config_path=str(config), applied=FLIP_TO_8)) as server:
+        proc = _run(server, config, "8")
+        tools = _tool_names(server)
+    blocker.unlink()
+
+    assert _failure(proc) == "git_failed"
+    assert _verdict(proc)["commit"] is None
+    assert "Traceback" not in proc.stderr, proc.stderr
+    assert tools == [], tools
+    assert head(repo) == before
+    _assert_left_nothing_behind(repo, scratch)
 
 
 # ---------------------------------------------------------------------------
@@ -556,34 +670,36 @@ def test_the_transport_diagnostic_keeps_the_committed_shas_remedy(tmp_path):
 CHECKOUT_VENV_PYTHON = SCRIPT.parent.parent / ".venv" / "bin" / "python3"
 
 
-def test_no_step_runs_under_path_python3_when_the_checkout_venv_exists(tmp_path):
+def test_no_step_runs_under_path_python3_when_the_checkout_venv_exists(tmp_path, scratch):
     """PATH's `python3` cannot run at all; the flip still lands.
 
-    That can only pass if BOTH the YAML edit and the reload resolved the
-    SCRIPT's own checkout venv rather than inheriting PATH.
+    That can only pass if the YAML edit, the landing and the reload all
+    resolved the SCRIPT's own checkout venv rather than inheriting PATH.
     """
     if not CHECKOUT_VENV_PYTHON.exists():
         pytest.skip(f"{CHECKOUT_VENV_PYTHON} is absent (an un-synced worktree)")
 
     config = _make_repo(tmp_path, "16")
+    repo = config.parent
     env = path_python3_that_cannot_run(tmp_path)
+    queue = FakeMergeQueue(repo)
 
-    with FakeEscalationMcp(reload_report(
-        config_path=str(config),
-        applied={"verify_env": {"old": {KEY: "16"}, "new": {KEY: "8"}}},
-    )) as server:
+    with _target(queue, reload_report(config_path=str(config), applied=FLIP_TO_8)) as server:
         proc = _run(server, config, "8", env=env)
 
     assert proc.returncode == 0, f"stdout={proc.stdout} stderr={proc.stderr}"
     assert _verdict(proc)["outcome"] == "applied"
+    assert head(repo) == queue.merge_sha
+    _assert_left_nothing_behind(repo, scratch)
 
 
-def test_an_interpreter_without_the_transport_fails_loud_with_a_remedy(tmp_path):
-    """No venv to fall back on: fail naming the interpreter and the remedy.
+def test_an_interpreter_without_the_transport_fails_loud_before_any_landing(tmp_path, scratch):
+    """No venv to fall back on: fail naming the interpreter and the remedy,
+    before anything is submitted.
 
-    The script is copied into a checkout carrying its real reload step but NO
-    `.venv`, so the bare-`python3` fallback leg is taken. A raw ImportError
-    traceback would leave an operator with no next step.
+    The script is copied into a checkout carrying its real landing and reload
+    steps but NO `.venv`, so the bare-`python3` fallback leg is taken. A raw
+    ImportError traceback would leave an operator with no next step.
     """
     system_python, why = system_python_without_the_transport()
     if system_python is None:
@@ -591,17 +707,24 @@ def test_an_interpreter_without_the_transport_fails_loud_with_a_remedy(tmp_path)
 
     script = venvless_checkout_copy(tmp_path, SCRIPT)
 
-    config = _make_repo(tmp_path, "8", marker=True)
+    config = _make_repo(tmp_path, "16")
+    repo = config.parent
+    before = head(repo)
     env = path_python3_shimmed_to(tmp_path, system_python)
     tried = subprocess.run(
         [system_python, "-c", "import sys; print(sys.executable)"],
         check=True, capture_output=True, text=True,
     ).stdout.strip()
+    queue = FakeMergeQueue(repo)
 
-    with FakeEscalationMcp(reload_report(config_path=str(config))) as server:
-        proc = _run(server, config, "8",
-                    script=script, env=env)
+    with _target(queue, reload_report(config_path=str(config), applied=FLIP_TO_8)) as server:
+        proc = _run(server, config, "8", script=script, env=env)
+        received = list(server.received)
 
     assert _failure(proc) == "transport_not_importable"
-    assert not _converged_verdict_lines(proc)
+    assert not _outcome_verdict_lines(proc)
     assert tried in proc.stderr, f"stderr={proc.stderr}"
+    assert "uv run --project shared" in proc.stderr, f"stderr={proc.stderr}"
+    assert received == [], f"an interpreter without the transport reached the server: {received}"
+    assert head(repo) == before
+    _assert_left_nothing_behind(repo, scratch)

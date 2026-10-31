@@ -1064,6 +1064,29 @@ truncate-at-conflict semantics, and the stale-CAS abort — is
 `plans/deep-merge-ahead-prd.md`; this section is the operator's summary of
 it, not a second copy.
 
+**Deploying a knob flip.** `scripts/merge-deep-set-cap.sh`, like its sibling
+`scripts/merge-pytest-n-ab-switch.sh`, lands its yaml edit through the
+**target project's own merge queue** (`scripts/_merge_queue_landing.py`) and
+hot-reloads only once that landing is confirmed on main. It never commits to
+the target's main directly. Such a commit is drift that queue never verified,
+so every merge in flight there re-verifies in full
+(`orchestrator/src/orchestrator/merge_lane/gates.py::_disjoint_skip_blockers`).
+The landing pays one full merge verify of its own, so it can take hours.
+`MERGE_QUEUE_LANDING_TIMEOUT_SECS` (default 10800) bounds the wait. A
+request still in flight at that ceiling, or when the script is stopped, is
+cancelled. Every outcome short of a confirmed landing exits non-zero, naming
+the request's merge state.
+
+Set a calling deploy task's `before_done.timeout_secs` to at least the
+ceiling plus 300 s, not merely above it. The ceiling is checked only between
+polls, so a queue call in flight when it passes runs to its own reply
+timeout (130 s for the submit, 30 s for a poll), and the cancel after it can
+take 30 s more. The landing step can therefore end about 190 s past the
+ceiling (`scripts/_merge_queue_landing.py::land_file`), and the reload comes
+after a landing. A `before_done` timeout SIGKILLs the process group, so too
+tight a margin kills the script mid-cancel and leaves a live request that
+nothing reports.
+
 ### `resolve_issue` actions
 
 Resolving an L2 escalation takes an `action`, which maps to a specific
