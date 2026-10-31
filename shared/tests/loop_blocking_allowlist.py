@@ -162,22 +162,6 @@ _ESCALATE_ARCHIVE_SCAN_WHY = (
     'with task 4781.'
 )
 
-#: The shared justification of every ``CodebaseVerifier.verify`` LLM-tool row.
-_VERIFIER_LLM_TOOL_IO_WHY = (
-    'ROOT CAUSE (one defect): the async tools '
-    'CodebaseVerifier.verify hands the codebase-verification LLM do '
-    'their filesystem work inline on the loop thread, once per tool '
-    'call the model chooses to make -- an LLM-driven, unbounded call '
-    'count. read_file does full_path.read_text(); glob_search runs '
-    'codebase_root.glob(pattern) with an LLM-CHOSEN pattern and sorts '
-    'every match before keeping 50, so a "**/*" walks the whole '
-    'codebase root. The read_file row is OWNED BY TASK 5270 -- do not '
-    'file again: task 4484 step-9\'s ticket '
-    'tkt_0RT7RM7C7NS1ECYHFBDYP02KDJ became task 5078, coalesced into '
-    '5270. The glob_search row task 5099 added when it widened the '
-    'vocabulary is TASK 6088, filed to fold into the same offload.'
-)
-
 #: Task 5099: an idempotent mkdir of a store's own data dir as it opens.
 _MKDIR_ON_STORE_OPEN_WHY = (
     'ACCEPTED, measured cheap (one cause): one idempotent '
@@ -664,31 +648,10 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     # ---- reconciliation/verify.py ----
     (
         'fused-memory/src/fused_memory/reconciliation/verify.py',
-        'CodebaseVerifier.verify.read_file',
-        'c04bd0d302eb',
-        'filed',
-        _VERIFIER_LLM_TOOL_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/verify.py',
-        'CodebaseVerifier.verify.glob_search',
-        '29916e02709d',
-        'filed',
-        _VERIFIER_LLM_TOOL_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/verify.py',
         'CodebaseVerifier.verify',
         'ab04e5fd6d64',
         'accepted',
         _FIXED_STAT_GUARD_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/verify.py',
-        'CodebaseVerifier.verify.read_file',
-        '8ad4f6cd803f',
-        'filed',
-        _VERIFIER_TOOL_PATH_GUARD_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/verify.py',
