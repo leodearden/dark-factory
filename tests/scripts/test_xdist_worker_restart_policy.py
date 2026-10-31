@@ -5,7 +5,8 @@ carries ``--max-worker-restart=0``, whether or not its own addopts ask for
 xdist: verify injects ``-n`` into every gated pytest leg
 (``orchestrator/src/orchestrator/verify.py::_with_pytest_numprocesses_str``,
 driven by ``verify_admission_pytest_n``), so a thread-method member runs under
-xdist there regardless. Discovered from ``[tool.uv.workspace].members``, so a
+xdist there regardless. The configs come from
+``tests/scripts/pytest_config_discovery.py::discovered_pytest_configs``, so a
 future thread-method member is held to it with no edit here.
 
 WHY. Under thread method pytest-timeout answers a breach by ``os._exit()``ing
@@ -48,12 +49,10 @@ import re
 import shlex
 import subprocess
 import sys
-import tomllib
 from collections.abc import Mapping
 
 import pytest
-
-REPO_ROOT = pathlib.Path(__file__).parents[2]
+from pytest_config_discovery import discovered_pytest_configs
 
 # The ONE accepted spelling. The two-token ``--max-worker-restart 0`` form is
 # refused for the reason ``test_merge_gate_parallelism_config.py::_flag_value``
@@ -62,8 +61,6 @@ RESTART_DISABLED_TOKEN = '--max-worker-restart=0'
 RESTART_FLAG_PREFIX = '--max-worker-restart'
 RESTART_FLAG_SPELLING = re.compile(rf'{re.escape(RESTART_FLAG_PREFIX)}=\d+')
 THREAD_TIMEOUT_METHOD = 'thread'
-
-ROOT_CONFIG_NAME = '.'
 
 # A FLOOR, not an equality: orchestrator and fused-memory at authorship.
 MIN_EXPECTED_THREAD_TIMEOUT_CONFIGS = 2
@@ -82,36 +79,20 @@ INITIAL_WORKERS_ENV = 'XDIST_RESTART_REPRO_INITIAL_WORKERS'
 REPRO_MODULE_COUNT = 20
 
 
-def _pytest_ini_options(pyproject: pathlib.Path) -> dict:
-    if not pyproject.exists():
-        return {}
-    data = tomllib.loads(pyproject.read_text(encoding='utf-8'))
-    return data.get('tool', {}).get('pytest', {}).get('ini_options', {})
-
-
 def _thread_timeout_configs() -> dict[str, str]:
     """Config name -> addopts, for every config running ``timeout_method = "thread"``."""
-    root_data = tomllib.loads((REPO_ROOT / 'pyproject.toml').read_text(encoding='utf-8'))
-    members = root_data.get('tool', {}).get('uv', {}).get('workspace', {}).get('members', [])
-    assert members, (
-        '[tool.uv.workspace].members is empty or missing in the root '
-        'pyproject.toml — this guard reads it to discover which configs to '
-        'check, so it would otherwise pass vacuously.'
-    )
-
-    configs: dict[str, str] = {}
-    for name in [ROOT_CONFIG_NAME, *members]:
-        ini_options = _pytest_ini_options(REPO_ROOT / name / 'pyproject.toml')
-        if ini_options.get('timeout_method') == THREAD_TIMEOUT_METHOD:
-            configs[name] = ini_options.get('addopts', '')
-
+    configs = {
+        name: ini_options.get('addopts', '')
+        for name, ini_options in discovered_pytest_configs().items()
+        if ini_options.get('timeout_method') == THREAD_TIMEOUT_METHOD
+    }
     assert len(configs) >= MIN_EXPECTED_THREAD_TIMEOUT_CONFIGS, (
-        f'only discovered {sorted(configs)} as configs setting '
+        f'only {sorted(configs)} of the discovered pytest configs set '
         f'timeout_method = {THREAD_TIMEOUT_METHOD!r}, expected at least '
-        f'{MIN_EXPECTED_THREAD_TIMEOUT_CONFIGS} (orchestrator and fused-memory '
-        'are the known members). Finding fewer means this discovery walk '
-        'rotted, not that the repo changed: a config that stopped being '
-        'discovered is one nothing here checks any more.'
+        f'{MIN_EXPECTED_THREAD_TIMEOUT_CONFIGS}. Discovery enforces its own '
+        'floor, so this means the thread filter here stopped matching or a '
+        'config left thread: compare against the recorded partition, '
+        'tests/scripts/test_timeout_method_policy.py::THREAD_TIMEOUT_METHOD_CONFIGS.'
     )
     return configs
 
