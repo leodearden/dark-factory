@@ -19,11 +19,24 @@ Subcommands, run from ``fused-memory/``:
   rater saw. The rater's answer in the later round supersedes the earlier line.
 - ``third``: write a shard holding exactly the pairs a decisive tie or an open
   follow-up blocks, for a new third rater each round.
+- ``rerate --brief-version LABEL``: once every keyed shard is rated and no pair
+  awaits a third rater, key a new round of both raters over every pair whose
+  current derivation reads LOSS, under ``--brief``, retiring the earlier third
+  votes on those pairs (``write_triage_rating_rounds.py::ensure_rerate``). A
+  rerun under a keyed label keys nothing new.
 - ``assemble``: map the effective ratings back through the key and write the
   committed corpus:
   ``write_triage_v2_soak_{items.jsonl,verdicts.jsonl,strata.json,derivation.json}``.
-  ``third`` and ``assemble`` refuse while any line awaits a re-ask or any pair
-  lacks a primary or second answer.
+  Once a re-rate is keyed, the verdicts and the derivation are named for the
+  latest one (:func:`rating_suffix`), e.g. ``write_triage_v2_soak_verdicts_v2_2.jsonl``,
+  and assemble refuses a pair reading LOSS outside it; items and strata do not
+  depend on the brief and keep their names.
+  ``third``, ``rerate`` and ``assemble`` refuse while any line awaits a re-ask
+  or any pair lacks a primary or second answer.
+
+Which v1 rows are held is measured on the lines rated under the round-0 brief
+alone, so a partial re-rate under a later brief cannot change it; the check
+over every effective line is reported beside it, as ``effective_lines_check``.
 
 Rater output lives in ``<scratch>/ratings/<shard>.jsonl``, one line per item.
 The shards, re-asks and third rounds are ``write_triage_rating_rounds.py``'s
@@ -298,6 +311,15 @@ def _current_derivation(
     )
 
 
+def current_derivations(
+    items: Iterable[Mapping[str, Any]], verdicts: Iterable[Mapping[str, Any]],
+) -> dict[_rounds.Pair, _rubric.Derivation]:
+    """Each item's (entry, target) pair and its current-basis derivation over *verdicts*."""
+    judgements = _rubric.resolve_judgements(verdicts)
+    return {(item['entry_id'], item['target_id']): _current_derivation(item, judgements)
+            for item in items}
+
+
 def third_round_pairs(
     items: Iterable[Mapping[str, Any]], verdicts: Iterable[Mapping[str, Any]],
 ) -> list[tuple[str, str]]:
@@ -306,9 +328,7 @@ def third_round_pairs(
     Each is blocked by a decisive tie or an open follow-up alone. A pair also
     blocked by an unrated decisive binary is refused.
     """
-    judgements = _rubric.resolve_judgements(verdicts)
-    return _rounds.third_round_blockers(
-        (item['entry_id'], _current_derivation(item, judgements)) for item in items)
+    return _rounds.third_round_blockers(current_derivations(items, verdicts))
 
 
 def extend_sample(
@@ -339,16 +359,21 @@ def assemble(
     adjudications: Mapping[tuple[str, str], Mapping[str, Any] | None],
     rated_rows: Iterable[Mapping[str, Any]],
     child_texts: Mapping[str, str],
+    *,
+    checked_rows: Iterable[Mapping[str, Any]] | None = None,
 ) -> Assembly:
     """Derived rows from the held v1 rows, and every rater answer kept whole.
 
     *adjudications* maps each (entry, target) pair to its soak adjudication, or
     None for an extension item; *child_texts* maps each entry to its full CHILD.
+    The held rows are those :func:`derivation_check` holds over *checked_rows*,
+    by default *rated_rows*; the check over *rated_rows* is reported beside it,
+    and decides nothing.
     A current-basis rater answer on a binary its pair's derived row fixes is
     marked ``non_consumed``, and every LOSS YES row gets DIGEST from ``digest_visible``.
     """
     rated = list(rated_rows)
-    check = derivation_check(adjudications, rated)
+    check = derivation_check(adjudications, rated if checked_rows is None else checked_rows)
     held = held_rows(check)
     fixed = {
         pair: determined for pair, adjudication in adjudications.items()
@@ -366,12 +391,17 @@ def assemble(
                 'min_agreement': DERIVATION_MIN_AGREEMENT,
                 'roles': sorted(map(str, _CHECKED_ROLES)),
             },
-            'rows': {name: {**asdict(row_check), 'binary': str(row_check.binary)}
-                     for name, row_check in check.items()},
+            'rows': _serialised(check),
             'held_rows': sorted(held),
+            'effective_lines_check': _serialised(derivation_check(adjudications, rated)),
             'unreached_follow_ups': _unreached_follow_ups(verdicts),
         },
     )
+
+
+def _serialised(check: Mapping[str, RowCheck]) -> dict[str, dict[str, Any]]:
+    return {name: {**asdict(row_check), 'binary': str(row_check.binary)}
+            for name, row_check in check.items()}
 
 
 def _unreached_follow_ups(verdicts: Iterable[Mapping[str, Any]]) -> list[dict[str, str]]:
@@ -600,67 +630,104 @@ def _shards_command(args: argparse.Namespace) -> dict[str, Any]:
 
 
 @dataclass(frozen=True)
-class _Corpus:
-    """The scratch state of a fully rated soak, and its assembled verdict corpus."""
+class _Keyed:
+    """The scratch, its key, the keyed soak items, and each keyed pair and basis as its raters
+    saw it; no rating is read."""
 
     scratch: _rounds.RatingScratch
     key: dict[str, Any]
     bundle: _SoakBundle
     soak: list[_SoakItem]
-    entries: Mapping[tuple[str, str, str], _rounds.ShardEntry]
-    rated: _rounds.Rated
-    assembly: Assembly
+    entries: Mapping[_rounds.Triple, _rounds.ShardEntry]
 
 
-def _corpus(args: argparse.Namespace) -> _Corpus:
-    """The assembled corpus, refused while any line awaits a re-ask or any pair lacks a rater."""
+def _keyed(args: argparse.Namespace) -> _Keyed:
     bundle = _SoakBundle.read(args.bundle)
     scratch = _rounds.RatingScratch(args.scratch, brief=args.brief)
     key = _soak_key(scratch)
     soak = bundle.keyed_items(key)
-    entries = scratch.entries(_projects(soak))
-    rated = scratch.ratings(key, entries)
-    _rounds.refuse_unfinished(rated, entries)
+    return _Keyed(scratch, key, bundle, soak, scratch.entries(_projects(soak)))
+
+
+@dataclass(frozen=True)
+class _Corpus:
+    """The scratch state of a fully rated soak, and its assembled verdict corpus."""
+
+    keyed: _Keyed
+    rated: _rounds.Rated
+    assembly: Assembly
+
+
+def _corpus(keyed: _Keyed) -> _Corpus:
+    """The assembled corpus, refused while any line awaits a re-ask or any pair lacks a rater."""
+    scratch, key, soak = keyed.scratch, keyed.key, keyed.soak
+    rated = scratch.ratings(key, keyed.entries)
+    _rounds.refuse_unfinished(rated, keyed.entries)
     assembly = assemble(
         {soaked.pair: soaked.adjudication for soaked in soak}, rated.rows,
         {soaked.item['entry_id']: soaked.child_text for soaked in soak},
+        checked_rows=scratch.effective_lines(key, brief_sha256=_rounds.round_0_brief(key)),
     )
-    return _Corpus(scratch, key, bundle, soak, entries, rated, assembly)
+    return _Corpus(keyed, rated, assembly)
+
+
+def _corpus_derivations(corpus: _Corpus) -> dict[_rounds.Pair, _rubric.Derivation]:
+    return current_derivations([soaked.item for soaked in corpus.keyed.soak], corpus.assembly.verdicts)
 
 
 def _reask_command(args: argparse.Namespace) -> dict[str, Any]:
-    scratch = _rounds.RatingScratch(args.scratch, brief=args.brief)
-    key = _soak_key(scratch)
-    entries = scratch.entries(_projects(_SoakBundle.read(args.bundle).keyed_items(key)))
-    return _rounds.reask_round(scratch, key, entries)
+    keyed = _keyed(args)
+    return _rounds.reask_round(keyed.scratch, keyed.key, keyed.entries)
 
 
 def _third_command(args: argparse.Namespace) -> dict[str, Any]:
-    corpus = _corpus(args)
-    blocked = third_round_pairs([soaked.item for soaked in corpus.soak], corpus.assembly.verdicts)
-    return _rounds.third_round(corpus.scratch, corpus.key, corpus.entries, blocked)
+    corpus = _corpus(_keyed(args))
+    keyed = corpus.keyed
+    blocked = third_round_pairs([soaked.item for soaked in keyed.soak], corpus.assembly.verdicts)
+    return _rounds.third_round(keyed.scratch, keyed.key, keyed.entries, blocked)
+
+
+def _rerate_command(args: argparse.Namespace) -> dict[str, Any]:
+    keyed = _keyed(args)
+    return _rounds.ensure_rerate(keyed.scratch, keyed.key, keyed.entries, version=args.brief_version,
+                                 derivations=lambda: _corpus_derivations(_corpus(keyed)))
+
+
+def rating_suffix(key: Mapping[str, Any]) -> str:
+    """The suffix of the brief-dependent output names: none before a re-rate, else the latest
+    re-rate's version (``write_triage_rating_rounds.py::brief_version``) with each '.' as '_'
+    (``v2.2`` gives ``_v2_2``)."""
+    rerates = key.get('rerates', ())
+    return f'_{_rounds.brief_version(rerates[-1]["version"]).replace(".", "_")}' if rerates else ''
 
 
 def _assemble_command(args: argparse.Namespace) -> dict[str, Any]:
-    corpus = _corpus(args)
-    key = corpus.key
+    corpus = _corpus(_keyed(args))
+    key, soak = corpus.keyed.key, corpus.keyed.soak
+    _rounds.refuse_loss_outside_the_latest_rerate(key, _corpus_derivations(corpus))
+    suffix = rating_suffix(key)
+    derivation = corpus.assembly.derivation
     out: Path = args.out_dir
     out.mkdir(parents=True, exist_ok=True)
-    _write_jsonl(out / 'write_triage_v2_soak_items.jsonl', [soaked.item for soaked in corpus.soak])
-    _write_jsonl(out / 'write_triage_v2_soak_verdicts.jsonl', corpus.assembly.verdicts)
+    _write_jsonl(out / 'write_triage_v2_soak_items.jsonl', [soaked.item for soaked in soak])
+    _write_jsonl(out / f'write_triage_v2_soak_verdicts{suffix}.jsonl', corpus.assembly.verdicts)
     _write_json(out / 'write_triage_v2_soak_strata.json', dict(STRATA))
-    _write_json(out / 'write_triage_v2_soak_derivation.json', {
-        **corpus.assembly.derivation,
+    _write_json(out / f'write_triage_v2_soak_derivation{suffix}.json', {
+        **derivation,
+        'check': {**derivation['check'], 'brief_sha256': _rounds.round_0_brief(key)},
         'rating_volume': _rounds.rating_volume(key),
-        'sample': _sample(corpus.bundle, key),
+        'sample': _sample(corpus.keyed.bundle, key),
         'unrecoverable': key['unrecoverable'],
         'attach_time_unrecoverable': sorted(key['attach_time_unrecoverable']),
         'reasked': corpus.rated.reasked,
+        'rerates': [{'version': rerate['version'], 'round': rerate['round'],
+                     'pairs': len(rerate['pairs']), 'brief_sha256': rerate['brief_sha256']}
+                    for rerate in key.get('rerates', ())],
         'shards': {name: {'rater': spec['rater'], 'role': spec['role'], 'round': spec['round'],
-                          'items': len(spec['items'])}
+                          'items': len(spec['items']), 'brief_sha256': spec['brief_sha256']}
                    for name, spec in sorted(key['shards'].items())},
     })
-    return {'items': len(corpus.soak), 'verdicts': len(corpus.assembly.verdicts)}
+    return {'items': len(soak), 'verdicts': len(corpus.assembly.verdicts)}
 
 
 _SAMPLE_COUNTS = ('adjudicated', 'extension', 'unrecoverable')
@@ -690,7 +757,7 @@ def _write_json(path: Path, value: Any) -> None:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     commands = parser.add_subparsers(dest='command', required=True)
-    for name in ('shards', 'reask', 'third', 'assemble'):
+    for name in ('shards', 'reask', 'third', 'rerate', 'assemble'):
         command = commands.add_parser(name)
         command.add_argument('--bundle', type=Path, required=True, metavar='DIR',
                              help="the soak bundle's correctness/ directory (read-only)")
@@ -708,6 +775,9 @@ def _build_parser() -> argparse.ArgumentParser:
                         help='how many restated attaches the extended sample holds')
     shards.add_argument('--amended-total', type=int, default=SAMPLE_TOTAL, metavar='N',
                         help='how many amended attaches the extended sample holds')
+    commands.choices['rerate'].add_argument(
+        '--brief-version', required=True, metavar='LABEL',
+        help="the label of --brief, e.g. v2.2; it names the re-rate and assemble's outputs")
     commands.choices['assemble'].add_argument('--out-dir', type=Path, required=True, metavar='DIR')
     return parser
 
@@ -724,6 +794,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary = _reask_command(args)
     elif args.command == 'third':
         summary = _third_command(args)
+    elif args.command == 'rerate':
+        summary = _rerate_command(args)
     else:
         summary = _assemble_command(args)
     print(json.dumps(summary, indent=2))

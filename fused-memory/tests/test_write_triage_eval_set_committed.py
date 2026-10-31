@@ -240,7 +240,7 @@ class TestTheCommittedRerates:
         rerates = _key().get('rerates', ())
         if not rerates:
             pytest.skip('no re-rate is keyed')
-        reads_loss = _build().pairs_reading_loss(_derivations())
+        reads_loss = _rounds().pairs_reading_loss(_derivations())
         assert reads_loss - {tuple(pair) for pair in rerates[-1]['pairs']} == set()
 
     def test_no_retired_third_rater_votes_on_a_rerated_pair(self) -> None:
