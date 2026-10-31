@@ -823,11 +823,13 @@ _record_gate_downgrade_reason() {
         return 0
     fi
 
-    # CHRONIC. A record whose last transition is older than the bound is not a
-    # claim about a live task any more; it is a claim nobody has rewritten. Two
-    # producers, and the digest's `## Stale lane assignments` census covers only
-    # ONE of them. A lane whose task is still pending/in-progress/blocked is
-    # skipped BY DESIGN by harness.py's terminal-status reclaim, censused for a
+    # CHRONIC. A record whose last write (a lane-state transition, or the
+    # refresh a REUSE dispatch stamps — task 7863) is older than the bound is
+    # not a claim about a live task any more; it is a claim nobody has
+    # rewritten. Two producers, and the digest's `## Stale lane assignments`
+    # census covers only ONE of them. A lane whose task is still
+    # pending/in-progress/blocked is skipped BY DESIGN by harness.py's
+    # terminal-status reclaim, censused for a
     # fortnight, and then finally acted on by this bound — report-before-act,
     # exactly where destruction is riskiest. A release whose durable write hit
     # ENOSPC and was swallowed (fail-open release, invariant I3) is NEVER
@@ -854,8 +856,9 @@ _record_gate_downgrade_reason() {
     # line order — Block S-age-degrade Arm B asserts it directly.
     #
     # ONE warn per affected lane, and the channel stays anomaly-only: a real
-    # producer (LaneLifecycle.transition) always stamps the field, so this
-    # fires only on a record something wrote wrong. Degrading SILENTLY would be
+    # producer (LaneLifecycle.transition or LaneLifecycle.refresh_assigned)
+    # always stamps the field, so this fires only on a record something wrote
+    # wrong. Degrading SILENTLY would be
     # worse than the bound not existing — `downgraded_assigned=0` would read as
     # "nothing was stale" when it means "nothing could be judged".
     # The empty case is tested SEPARATELY and FIRST, because GNU `date -d ''`
