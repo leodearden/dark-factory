@@ -26,6 +26,7 @@ from .metrics import (
 )
 from .plan_predicates import produced_a_plan
 from .stats import mean_ci95
+from .table_render import ci_cell, optional_float_cell, render_fixed_table
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -1255,58 +1256,6 @@ def format_markdown(report: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Shared fixed-width table renderer
-#
-# The single home for the width-computed ljust idiom every deterministic table
-# below shares (recovery / plan-quality / per-config mean / price / composite).
-# It was copied five times before task 3118, which is exactly the drift this
-# invites: the '-'-not-'0.0000' fix had to be applied to two copies by hand and
-# the other three silently kept their trailing padding.
-# ---------------------------------------------------------------------------
-
-def _render_fixed_table(
-    columns: tuple[str, ...],
-    rendered: list[dict[str, str]],
-    *,
-    header: str | None = None,
-) -> list[str]:
-    """Render PRE-STRINGIFIED rows as a fixed-width, byte-deterministic block.
-
-    *rendered* is a list of ``{column: cell}`` dicts whose values are already
-    strings — every value/None/precision decision stays with the caller, which
-    is what keeps this generic. Column widths are the max of the header and all
-    cells, so the block is a function of its input alone: no wall-clock, no
-    dict-order dependence, and the same rows always render byte-identically.
-
-    Returns the block as LINES (optional *header* line, column headers, a dashes
-    rule, then the rows) rather than a joined string, so callers can append
-    further sections — several emit two or three blocks separated by blanks.
-
-    Lines are ``rstrip``ed: trailing padding on the last column is invisible
-    whitespace that makes an otherwise-identical table differ byte-for-byte,
-    and it lets a caller assert on a line's real ending (e.g. the per-config
-    mean block's ``-`` for "nothing scored", which must never read as
-    ``0.0000``).
-    """
-    widths = {
-        col: (
-            max(len(col), *(len(rr[col]) for rr in rendered))
-            if rendered else len(col)
-        )
-        for col in columns
-    }
-
-    def _fmt(cells: dict[str, str]) -> str:
-        return '  '.join(cells[col].ljust(widths[col]) for col in columns).rstrip()
-
-    lines = [header] if header is not None else []
-    lines.append(_fmt({col: col for col in columns}))
-    lines.append('  '.join('-' * widths[col] for col in columns))
-    lines.extend(_fmt(rr) for rr in rendered)
-    return lines
-
-
-# ---------------------------------------------------------------------------
 # recovery_score surface (eval-revival η)
 #
 # An ADDITIVE, interim per-(task_id, config_name) column distinct from the Elo
@@ -1383,7 +1332,7 @@ def format_recovery_table(report: dict[str, Any]) -> str:
         }
         for r in rows
     ]
-    return '\n'.join(_render_fixed_table(
+    return '\n'.join(render_fixed_table(
         _RECOVERY_COLUMNS, rendered, header='recovery_score report:',
     ))
 
@@ -1850,7 +1799,7 @@ def _format_plan_quality_mean_section(report: dict[str, Any]) -> list[str]:
         }
         for c in configs
     ]
-    return _render_fixed_table(
+    return render_fixed_table(
         _PLAN_QUALITY_MEAN_COLUMNS, rendered, header=_PLAN_QUALITY_MEAN_HEADER,
     )
 
@@ -1900,7 +1849,7 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
         }
         for r in rows
     ]
-    lines = _render_fixed_table(
+    lines = render_fixed_table(
         _PLAN_QUALITY_COLUMNS, rendered, header='plan_quality report:',
     )
 
@@ -2048,25 +1997,6 @@ _COMPOSITE_COLUMNS = (
 _PRICE_TABLE_COLUMNS = ('config', 'role', 'input_per_1m', 'output_per_1m')
 
 
-def _ci_cell(ci: dict[str, Any] | None) -> str:
-    """Render a ``mean_ci95`` sub-dict as a ``[lo, hi]`` interval (4 dp)."""
-    if not ci:
-        return '-'
-    return f'[{float(ci.get("lo", 0.0)):.4f}, {float(ci.get("hi", 0.0)):.4f}]'
-
-
-def _optional_float_cell(value: Any, *, precision: int = 4) -> str:
-    """Render an OPTIONAL float cell: fixed precision, or ``-`` when unmeasured.
-
-    The same `-`-not-``0.0000`` idiom as ``_ci_cell`` above and
-    :func:`format_plan_quality_table`'s ``_score_cell``: a cell that measured
-    NOTHING (``None``) must never render as one that scored zero. Task 3099
-    extends the idiom to ``composite`` / ``quality``, which now report ``None``
-    for a config whose every trial was unmeasurable.
-    """
-    return '-' if value is None else f'{float(value):.{precision}f}'
-
-
 def _format_price_table_section(price_table: dict[str, Any]) -> list[str]:
     """Render the ``{config: {role: entry}}`` price table as a deterministic
     block. A listed entry shows its ``input_per_1m`` / ``output_per_1m`` (4 dp);
@@ -2089,7 +2019,7 @@ def _format_price_table_section(price_table: dict[str, Any]) -> list[str]:
                 'input_per_1m': inp,
                 'output_per_1m': outp,
             })
-    return _render_fixed_table(
+    return render_fixed_table(
         _PRICE_TABLE_COLUMNS, rendered, header='price table:',
     )
 
@@ -2141,7 +2071,7 @@ def format_composite_table(report: dict[str, Any]) -> str:
 
     ``composite`` / ``quality`` / ``plan_quality`` / ``plan_rate`` /
     ``cost_per_plan`` all render ``-`` when the row measured nothing
-    (:func:`_optional_float_cell`): "we measured nothing" must never read as "it
+    (:func:`optional_float_cell`): "we measured nothing" must never read as "it
     scored nothing" — nor, for a rate, as the perfect 1.0000 a fabricated
     "planned every time" would show.
     """
@@ -2150,9 +2080,9 @@ def format_composite_table(report: dict[str, Any]) -> str:
     rendered = [
         {
             'config': str(r.get('config', '')),
-            'composite': _optional_float_cell(r.get('composite')),
-            'quality': _optional_float_cell(r.get('quality')),
-            'plan_quality': _optional_float_cell(r.get('plan_quality')),
+            'composite': optional_float_cell(r.get('composite')),
+            'quality': optional_float_cell(r.get('quality')),
+            'plan_quality': optional_float_cell(r.get('plan_quality')),
             'pq_excluded': str(int(r.get('plan_quality_cap_excluded', 0) or 0)),
             'pq_no_plan': str(int(r.get('plan_quality_no_plan', 0) or 0)),
             # NOT the .get-with-0-default its siblings use (task 3628
@@ -2165,20 +2095,20 @@ def format_composite_table(report: dict[str, Any]) -> str:
                 '-' if r.get('plan_quality_judged_without_reference') is None
                 else str(int(r['plan_quality_judged_without_reference']))
             ),
-            'plan_rate': _optional_float_cell(r.get('plan_rate')),
-            'cost_usd': _optional_float_cell(r.get('cost_usd', 0.0)),
-            'cost_per_plan': _optional_float_cell(r.get('cost_per_plan')),
+            'plan_rate': optional_float_cell(r.get('plan_rate')),
+            'cost_usd': optional_float_cell(r.get('cost_usd', 0.0)),
+            'cost_per_plan': optional_float_cell(r.get('cost_per_plan')),
             'cost_source': str(r.get('cost_source', '')),
-            'latency_secs': _optional_float_cell(
+            'latency_secs': optional_float_cell(
                 r.get('latency_secs', 0.0), precision=2,
             ),
-            'ci95_composite': _ci_cell((r.get('ci95') or {}).get('composite')),
+            'ci95_composite': ci_cell((r.get('ci95') or {}).get('composite')),
             'trials': str(r.get('trials', 0)),
             'fixtures': str(r.get('fixtures', 0)),
         }
         for r in configs
     ]
-    lines = _render_fixed_table(
+    lines = render_fixed_table(
         _COMPOSITE_COLUMNS, rendered, header='composite report:',
     )
 
