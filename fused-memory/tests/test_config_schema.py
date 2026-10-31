@@ -4315,6 +4315,7 @@ class TestWriteJournalConfig:
         assert section.prune_max_rows_per_run == 500_000
         assert section.prune_max_seconds == 30.0
         assert section.prune_interval_seconds == 1800.0
+        assert section.referent_findings_retention_days == 365.0
 
     def test_search_rows_outlive_task_read_rows(self):
         section = FusedMemoryConfig().write_journal

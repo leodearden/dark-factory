@@ -18,6 +18,7 @@ from _mem0_intent_fixtures import (
 )
 
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
+from fused_memory.config.schema import WriteJournalConfig
 from fused_memory.services.write_journal import (
     OPERATOR_TELEMETRY_QUERY,
     Mem0IntentStatus,
@@ -2193,9 +2194,9 @@ async def test_a_batch_keeps_its_order_despite_sharing_one_timestamp(journal):
 async def test_a_reader_pages_forward_instead_of_re_reading_the_oldest_page(
     journal,
 ):
-    """The table has no status column to mark a row handled and no prune path,
-    so `limit` alone hands a consumer the SAME oldest page forever once the
-    table outgrows it. `after_seq` is the only thing that advances a reader."""
+    """The table has no status column to mark a row handled, so `limit` alone
+    hands a consumer the SAME oldest page forever once the table outgrows it.
+    `after_seq` is the only thing that advances a reader."""
     await journal.log_referent_findings(
         [_finding_payload(edge_uuid=f'e{n}') for n in range(5)],
         group_id='reify', episode_uuid='ep-1',
@@ -2258,6 +2259,39 @@ async def test_an_empty_batch_touches_nothing(journal, tmp_path):
 
     assert await journal.get_referent_findings() == []
     assert uninitialized.journal_drop_stats()['dropped_total'] == 0
+
+
+@pytest.mark.asyncio
+async def test_prune_referent_findings_ages_out_rows_past_the_horizon(journal):
+    await journal.log_referent_findings(
+        [_finding_payload(edge_uuid='e1'), _finding_payload(edge_uuid='e2')],
+        group_id='g', episode_uuid='old',
+    )
+    await journal.log_referent_findings(
+        [_finding_payload(edge_uuid='e3')], group_id='g', episode_uuid='fresh',
+    )
+    with closing(sqlite3.connect(journal.db_path)) as conn:
+        conn.execute(
+            'UPDATE referent_findings SET created_at = ? WHERE episode_uuid = ?',
+            ('2000-01-01T00:00:00+00:00', 'old'),
+        )
+        conn.commit()
+
+    deleted = await journal.prune_referent_findings(
+        older_than_days=WriteJournalConfig().referent_findings_retention_days,
+    )
+
+    assert deleted == 2
+    assert [r['episode_uuid'] for r in await journal.get_referent_findings()] == ['fresh']
+
+
+@pytest.mark.asyncio
+async def test_prune_referent_findings_never_raises(journal):
+    """A prune hiccup must not crash startup — returns 0, no raise."""
+    await journal.close()
+    assert await journal.prune_referent_findings(
+        older_than_days=WriteJournalConfig().referent_findings_retention_days,
+    ) == 0
 
 
 # ------------------------------------------------------------------
