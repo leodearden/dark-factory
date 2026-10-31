@@ -4,6 +4,7 @@ fused-memory MCP round-trip fails the test at once, even through a retrying call
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import subprocess
 import sys
@@ -11,6 +12,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
+from _live_mcp_guard import assert_no_live_attempts
 from shared.mcp_session import McpSession
 
 import orchestrator.mcp_lifecycle
@@ -69,6 +71,21 @@ async def test_initialize_is_refused_naming_the_url(
     assert 'initialize' in message
     assert url in message
     assert len(forbid_live_mcp) == 1
+    forbid_live_mcp.clear()
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_the_caller_swallows_still_fails_at_teardown(
+    forbid_live_mcp: list[tuple[str, str]], tmp_path,
+) -> None:
+    url = OrchestratorConfig(project_root=tmp_path).fused_memory.url
+    with contextlib.suppress(BaseException):
+        await McpSession(url, client_name='orchestrator').initialize()
+
+    with pytest.raises(AssertionError) as excinfo:
+        assert_no_live_attempts(forbid_live_mcp)
+
+    assert url in str(excinfo.value)
     forbid_live_mcp.clear()
 
 

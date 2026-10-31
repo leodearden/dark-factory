@@ -72,6 +72,15 @@ def install_live_mcp_guard(
     return attempts
 
 
+def assert_no_live_attempts(attempts: list[tuple[str, str]]) -> None:
+    """Fail at teardown if *attempts* is non-empty, i.e. a caller swallowed a refusal."""
+    assert attempts == [], (
+        f'forbid_live_mcp: {len(attempts)} live fused-memory MCP round-trip(s) '
+        f'were attempted (some may have been swallowed by caller exception '
+        f'handling): {attempts!r}'
+    )
+
+
 def _attempt_label(method: str, params: Mapping[str, Any] | None) -> str:
     if method == 'tools/call' and params and 'name' in params:
         return f'{method} {params["name"]!r}'

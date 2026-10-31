@@ -19,7 +19,11 @@ from unittest.mock import AsyncMock, MagicMock
 import _async_mock_orphans
 import pytest
 import pytest_asyncio
-from _live_mcp_guard import REAL_MCP_SESSION_MARKER, install_live_mcp_guard
+from _live_mcp_guard import (
+    REAL_MCP_SESSION_MARKER,
+    assert_no_live_attempts,
+    install_live_mcp_guard,
+)
 
 # Insert this worktree's src directories at the front of sys.path so that
 # `import orchestrator` and `import shared` load the local (possibly modified)
@@ -675,11 +679,7 @@ def forbid_live_mcp(monkeypatch, request):
 
     yield recorder
 
-    assert recorder == [], (
-        f'forbid_live_mcp: {len(recorder)} live fused-memory MCP round-trip(s) '
-        f'were attempted (some may have been swallowed by caller exception '
-        f'handling): {recorder!r}'
-    )
+    assert_no_live_attempts(recorder)
 
 
 @pytest.fixture(autouse=True)
