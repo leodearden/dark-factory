@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from _process_tree_fakes import claude_process_tree
 from _session_hook_fixtures import (
+    assert_hook_env_isolated,
     isolate_hook_env,
     owner_ppid_env,
     stdin_json,
@@ -24,6 +25,10 @@ from orchestrator.session_ownership_probes import EventProbes
 @pytest.fixture(autouse=True)
 def _isolate_hook_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     isolate_hook_env(monkeypatch, tmp_path)
+
+
+def test_hook_env_is_isolated_for_this_module(tmp_path: Path) -> None:
+    assert_hook_env_isolated(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -704,7 +709,7 @@ def test_run_session_start_rebinds_on_an_owner_only_source(
     # which is what makes the re-mint provably the owner's. Source alone is
     # not enough: auto-compaction fires source='compact' unprompted, so a
     # nested claude reaches this path too and must NOT be forgiven -- see
-    # test_session_hooks_bash.py::test_nested_compact_cannot_invert_ownership.
+    # orchestrator/tests/test_session_hooks_bash.py::test_nested_compact_cannot_invert_ownership.
     tree = claude_process_tree(424_242)
     slug = f'session-cockpit-321508{["clear", "compact"].index(source) + 1}'
     sr.write_record(

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 from _process_tree_fakes import claude_process_tree
-from _session_hook_fixtures import isolate_hook_env, owner_ppid_env
+from _session_hook_fixtures import assert_hook_env_isolated, isolate_hook_env, owner_ppid_env
 
 from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
@@ -22,6 +22,10 @@ _HOOKS_DIR = _REPO_ROOT / 'skills' / 'spawn' / 'hooks'
 @pytest.fixture(autouse=True)
 def _isolate_hook_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     isolate_hook_env(monkeypatch, tmp_path)
+
+
+def test_hook_env_is_isolated_for_this_module(tmp_path: Path) -> None:
+    assert_hook_env_isolated(tmp_path)
 
 
 # ---------------------------------------------------------------------------

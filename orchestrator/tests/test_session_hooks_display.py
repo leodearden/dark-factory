@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from _session_hook_fixtures import isolate_hook_env
+from _session_hook_fixtures import assert_hook_env_isolated, isolate_hook_env
 
 from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
@@ -15,6 +15,10 @@ from orchestrator import session_registry as sr
 @pytest.fixture(autouse=True)
 def _isolate_hook_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     isolate_hook_env(monkeypatch, tmp_path)
+
+
+def test_hook_env_is_isolated_for_this_module(tmp_path: Path) -> None:
+    assert_hook_env_isolated(tmp_path)
 
 
 # ---------------------------------------------------------------------------

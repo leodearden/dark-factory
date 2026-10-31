@@ -22,7 +22,12 @@ from pathlib import Path
 
 import pytest
 from _process_tree_fakes import claude_process_tree
-from _session_hook_fixtures import isolate_hook_env, owner_ppid_env, stdin_json
+from _session_hook_fixtures import (
+    assert_hook_env_isolated,
+    isolate_hook_env,
+    owner_ppid_env,
+    stdin_json,
+)
 
 from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
@@ -31,6 +36,10 @@ from orchestrator import session_registry as sr
 @pytest.fixture(autouse=True)
 def _isolate_hook_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     isolate_hook_env(monkeypatch, tmp_path)
+
+
+def test_hook_env_is_isolated_for_this_module(tmp_path: Path) -> None:
+    assert_hook_env_isolated(tmp_path)
 
 
 def test_isolate_hook_env_clears_every_spawn_var_and_pins_the_fleet_root(
@@ -42,8 +51,7 @@ def test_isolate_hook_env_clears_every_spawn_var_and_pins_the_fleet_root(
 
     isolate_hook_env(monkeypatch, tmp_path / 'fleet')
 
-    assert [k for k in os.environ if k.startswith('CLAUDE_SPAWN_')] == []
-    assert os.environ['CLAUDE_FLEET_ROOT'] == str(tmp_path / 'fleet')
+    assert_hook_env_isolated(tmp_path / 'fleet')
     assert not (tmp_path / 'fleet').exists()
 
 
@@ -848,7 +856,7 @@ def test_main_session_start_failure_still_returns_zero_not_one(
     tmp_path: Path,
 ) -> None:
     # Contrast case for
-    # test_session_hooks_install.py::test_main_install_returns_nonzero_on_failure:
+    # orchestrator/tests/test_session_hooks_install.py::test_main_install_returns_nonzero_on_failure:
     # the session-start/notification/stop verbs remain fail-soft (always 0).
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     stdin_json(monkeypatch, {'session_id': 'sess-rc', 'cwd': '/home/leo/src/dark-factory'})

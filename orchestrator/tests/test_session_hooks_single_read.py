@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from _process_tree_fakes import claude_process_tree, counting_walks
 from _session_hook_fixtures import (
+    assert_hook_env_isolated,
     isolate_hook_env,
     launching_record,
     owner_ppid_env,
@@ -25,6 +26,10 @@ from orchestrator.session_ownership_probes import EventProbes, ProcessTree
 @pytest.fixture(autouse=True)
 def _isolate_hook_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     isolate_hook_env(monkeypatch, tmp_path)
+
+
+def test_hook_env_is_isolated_for_this_module(tmp_path: Path) -> None:
+    assert_hook_env_isolated(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +120,7 @@ def test_nested_session_start_walks_proc_at_most_once(tmp_path: Path) -> None:
     """The fork mirror: memoizing must not weaken the nested-inheritor guard.
 
     Mirrors
-    test_session_hooks_launch_window.py::test_nested_session_start_cannot_capture_an_unbound_launching_record
+    orchestrator/tests/test_session_hooks_launch_window.py::test_nested_session_start_cannot_capture_an_unbound_launching_record
     -- the spawn record must be left unbound and LAUNCHING -- while pinning
     that the fork path (ownership verdict, the nested-claude liveness pid,
     and the bind-time stamp) also settles on one walk.
@@ -703,7 +708,7 @@ def test_session_start_first_sight_still_captures_richly(tmp_path: Path) -> None
 # left the second free to succeed and the guard still ran. One snapshot now
 # serves both, and one fault disarms it -- the fault lane never carried a
 # withhold evaluation of its own. The existing fault-lane tests
-# (test_session_hooks_ownership.py::test_run_stop_fail_soft_when_probe_read_raises,
+# (orchestrator/tests/test_session_hooks_ownership.py::test_run_stop_fail_soft_when_probe_read_raises,
 # test_session_start_fault_lane_parity) both use an ABSENT record, so neither
 # exercises the interaction; that gap is why this shipped.
 # ---------------------------------------------------------------------------

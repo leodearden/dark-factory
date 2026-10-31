@@ -32,6 +32,17 @@ def isolate_hook_env(monkeypatch: pytest.MonkeyPatch, fleet_root: Path) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(fleet_root))
 
 
+def assert_hook_env_isolated(fleet_root: Path) -> None:
+    """Fail unless ``isolate_hook_env(..., fleet_root)`` is in effect for the running test.
+
+    Every module that wraps ``isolate_hook_env`` calls this from a test of its
+    own, so a module that loses its wrapper fails rather than silently reading
+    the real fleet root.
+    """
+    assert [k for k in os.environ if k.startswith('CLAUDE_SPAWN_')] == []
+    assert os.environ.get('CLAUDE_FLEET_ROOT') == str(fleet_root)
+
+
 def stdin_json(monkeypatch: pytest.MonkeyPatch, payload: Mapping[str, object]) -> None:
     monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps(payload)))
 
