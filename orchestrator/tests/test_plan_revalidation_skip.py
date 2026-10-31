@@ -1272,3 +1272,32 @@ async def test_revalidation_cancelled_mid_revision_restores_the_done_steps(
         await f.wf._plan()
 
     _assert_restored(f, before)
+
+
+@pytest.mark.parametrize('remedy_passes', [
+    pytest.param(
+        [[_wipe_to('step-9'), _record_drop('step-1', _A, 'esc-4032-1')]],
+        id='unconfirmed',
+    ),
+    pytest.param(
+        [[_wipe_to(), _record_drop('step-1', _A, 'esc-4032-1')], []],
+        id='stepless',
+    ),
+])
+@pytest.mark.asyncio
+async def test_remedy_pass_output_takes_the_same_plan_gates_as_the_first_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    remedy_passes: list[list[ArchitectAction]],
+):
+    f = _beta_fixture(tmp_path, _STEP_1_DONE_STEP_2_PENDING)
+    f.wf.briefing.build_plan_schema_repair_prompt = AsyncMock(return_value='repair')
+    _scripted_architect(f, monkeypatch, [
+        [_wipe_to('step-1', 'step-2'), _confirm], *remedy_passes,
+    ])
+    before = f.artifacts.read_plan()
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    assert _no_plan_counter_writes(f) == [1]
+    _assert_restored(f, before)
