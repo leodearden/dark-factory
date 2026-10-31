@@ -15,7 +15,7 @@ class Mem0AddOutcome:
     empty_result_error: str | None
 
     def __post_init__(self) -> None:
-        if self.empty_result_error is not None and self.memory_ids:
+        if self.empty_result_error is not None and self.landed:
             raise ValueError(
                 'Mem0AddOutcome: an empty_result_error is only valid with zero '
                 f'memory_ids, got memory_ids={self.memory_ids!r} and '
@@ -23,8 +23,12 @@ class Mem0AddOutcome:
             )
 
     @property
+    def landed(self) -> bool:
+        return bool(self.memory_ids)
+
+    @property
     def stores_written(self) -> list[SourceStore]:
-        return [SourceStore.mem0] if self.memory_ids else []
+        return [SourceStore.mem0] if self.landed else []
 
 
 RAISED_MEM0_ADD = Mem0AddOutcome(memory_ids=(), empty_result_error=None)

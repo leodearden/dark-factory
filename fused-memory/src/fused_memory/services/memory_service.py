@@ -7464,7 +7464,6 @@ class MemoryService:
         # guaranteed-persistence system-write path exists to rule out, so it
         # must not be journaled as an unconditional success.
         mem0_ids = list(mem0_outcome.memory_ids)
-        _empty_result = not mem0_outcome.memory_ids
         stores_written = mem0_outcome.stores_written
         if mem0_outcome.empty_result_error:
             logger.warning(
@@ -7493,7 +7492,7 @@ class MemoryService:
                     'memory_ids': mem0_ids,
                     'stores': [s.value for s in stores_written],
                 },
-                success=not _empty_result,
+                success=mem0_outcome.landed,
                 error=_mem0_error or mem0_outcome.empty_result_error,
             )
 
@@ -7507,7 +7506,7 @@ class MemoryService:
             'category': resolved_category.value,
             'content_preview': content[:200],
         }
-        if _empty_result:
+        if not mem0_outcome.landed:
             _event_payload['empty_result'] = True
             if _mem0_error:
                 _event_payload['error'] = _mem0_error

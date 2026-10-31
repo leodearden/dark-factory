@@ -21,6 +21,7 @@ def test_landed_result_claims_mem0_with_its_ids():
 
     assert outcome.memory_ids == ('m-1',)
     assert outcome.empty_result_error is None
+    assert outcome.landed is True
     assert outcome.stores_written == [SourceStore.mem0]
 
 
@@ -31,6 +32,7 @@ def test_anomalous_zero_ids_claims_nothing_and_names_the_operation(operation):
     )
 
     assert outcome.memory_ids == ()
+    assert outcome.landed is False
     assert outcome.stores_written == []
     assert outcome.empty_result_error == (
         f'empty_result: mem0 {operation} returned zero memory_ids'
@@ -44,6 +46,7 @@ def test_legitimate_zero_ids_claims_nothing_without_a_diagnostic():
 
     assert outcome.memory_ids == ()
     assert outcome.empty_result_error is None
+    assert outcome.landed is False
     assert outcome.stores_written == []
 
 
@@ -65,6 +68,7 @@ def test_malformed_entries_do_not_count_as_ids(result, expected_ids):
 def test_raised_add_claims_nothing_and_leaves_the_diagnostic_to_the_exception():
     assert RAISED_MEM0_ADD.memory_ids == ()
     assert RAISED_MEM0_ADD.empty_result_error is None
+    assert RAISED_MEM0_ADD.landed is False
     assert RAISED_MEM0_ADD.stores_written == []
 
 
