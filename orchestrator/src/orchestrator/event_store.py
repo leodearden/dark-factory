@@ -760,6 +760,11 @@ class EventType(StrEnum):
     #   task's current text; the Lever-B skip is declined and the architect told.
     #   data: {drift, plan_text_fp, task_text_fp, plan_session_id}
     plan_text_drift = 'plan_text_drift'
+    # Task 4032 — a revalidated plan dropped a done step without a descope record or newly
+    #   shared a done commit, and one remedy architect pass did not fix it; the prior plan is
+    #   restored and the task takes the no-plan hold.
+    #   data: DoneStepIntegrityVerdict.to_dict()
+    done_step_integrity_refused = 'done_step_integrity_refused'
 
     # Config hot-reload (plans/config-hot-reload-prd.md, task beta) — emitted
     # by Harness.reload_config() on every call, success or failure. Data

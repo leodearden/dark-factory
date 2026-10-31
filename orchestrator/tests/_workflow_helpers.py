@@ -540,6 +540,7 @@ class FakeBriefing:
     async def build_revalidation_prompt(
         self, task: dict, existing_plan: dict, changed_files: list,
         worktree=None, context: str | None = None, *, text_drift=None,
+        integrity_refusal=None,
     ) -> str:
         return f'Revalidate: {task.get("title", "")}'
 

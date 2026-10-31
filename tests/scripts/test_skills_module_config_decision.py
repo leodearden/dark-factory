@@ -197,7 +197,7 @@ SKILLS_CONSUMING_TESTS = (
     # Uses that same real loader's output as its oracle.
     "orchestrator/tests/test_harness_watcher_supervisor.py",
     # EXECUTES the real skills/spawn/hooks/*.sh.
-    "orchestrator/tests/test_session_hooks.py",
+    "orchestrator/tests/test_session_hooks_bash.py",
     # EXECUTES the real skills/spawn/spawn-claude.sh.
     "tests/scripts/test_spawn_claude.py",
     # Reads skills/factory-init/references/supervised-unit.md.

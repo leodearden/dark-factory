@@ -147,6 +147,12 @@ from orchestrator.merge_lane.landing_evidence import (
 )
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
+from orchestrator.plan_descope import (
+    DoneStepIntegrityVerdict,
+    check_done_step_integrity,
+    done_step_items,
+    done_step_records,
+)
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.recut_ruling import ruling_to_enforce
 from orchestrator.review_inputs import gather_review_subject, review_fork_point
@@ -627,6 +633,7 @@ class _BriefingLike(Protocol):
         changed_files: list[str], worktree: Path | None = ...,
         context: str | None = ...,
         *, text_drift: TaskTextDrift | None = ...,
+        integrity_refusal: DoneStepIntegrityVerdict | None = ...,
     ) -> str: ...
     async def build_plan_completion_prompt(
         self, task: dict, partial_plan: dict,
@@ -5214,6 +5221,8 @@ class TaskWorkflow:
         # so the architect can confirm, update, or recreate the plan.
         revalidation = False
         revalidation_changed_files: list[str] = []
+        before_plan: dict | None = None
+        text_drift: TaskTextDrift | None = None
         build_prompt: PromptBuilder
         existing_plan = self.artifacts.read_plan()
         finalized_before_invoke = existing_plan.get('_finalized_at')
@@ -5246,6 +5255,10 @@ class TaskWorkflow:
             and existing_plan.get('_session_id')
             and self._old_plan_base
         ):
+            # Done-step commits a rebase orphaned are remapped before either
+            # the skip or the architect trusts them (task 4032).
+            existing_plan = await self._reconciled_plan()
+            before_plan = existing_plan
             current_main = await self.git_ops.get_main_sha()
             revalidation_changed_files = await self.git_ops.get_changed_files(
                 self._old_plan_base, current_main,
@@ -5309,9 +5322,10 @@ class TaskWorkflow:
             # already-implemented steps via mark_step_committed instead of
             # re-planning them as pending.  Scoped to THIS branch of _plan by
             # design decision — the completion-pass and revalidation branches
-            # above are deliberately left unchanged (both already carry
-            # done-step semantics and explicit "do NOT remove or replace steps
-            # with status done" instructions).  Inert on the common path: on a
+            # above are deliberately left unchanged (both already show the
+            # architect its done steps, and the revalidation branch enforces
+            # their integrity via plan_descope.check_done_step_integrity,
+            # task 4032).  Inert on the common path: on a
             # truly-fresh first dispatch HEAD == base_commit, so the detector
             # returns [] and the briefing is byte-identical to today's.
             #
@@ -5337,6 +5351,80 @@ class TaskWorkflow:
                 )
 
             build_prompt = build_fresh_prompt
+
+        if before_plan is None:
+            if outcome := await self._run_architect_for_plan(build_prompt):
+                return outcome
+            if outcome := await self._validate_prerequisites_or_block('initial plan'):
+                return outcome
+        elif outcome := await self._revise_plan_keeping_done_steps(
+            before_plan, build_prompt, revalidation_changed_files, text_drift,
+        ):
+            return outcome
+
+        # Stamp provenance and acquire lock (run_id — task 3563; see _drive)
+        await self._stamp_architect_plan(finalized_before_invoke)
+        self.artifacts.lock_plan(self.session_id, run_id=self._process_run_id)
+        self.plan = self.artifacts.read_plan()
+
+        if revalidation and self.event_store:
+            plan_file_set = set(self.plan.get('files', []))
+            self.event_store.emit(
+                EventType.plan_revalidated,
+                task_id=self.task_id,
+                data={
+                    'changed_files_count': len(revalidation_changed_files),
+                    'overlap_count': len(
+                        [f for f in revalidation_changed_files
+                         if f in plan_file_set]
+                    ),
+                },
+            )
+
+        plan_files = self.plan.get('files', [])
+        if not plan_files:
+            return await self._handle_no_plan_failure(
+                'Planning failed: plan missing "files"',
+                detail=(
+                    'Architect wrote plan.json without a non-empty "files" array. '
+                    'Files are required to derive module locks.'
+                ),
+            )
+        plan_modules = derive_modules(
+            plan_files, self.config.lock_depth, task_id=self.task_id,
+        )
+        logger.info(
+            f'Task {self.task_id}: derived {len(plan_modules)} modules '
+            f'from {len(plan_files)} files: {plan_modules}'
+        )
+
+        if not (expansion := await self._reconcile_plan_scope(plan_files)).applied:
+            # Annotate the requeue so the per-task retry-cap report can
+            # name *why* — without this, three blast-radius requeues in a
+            # row produce a cap-exhaust report with phase/reason='unknown'
+            # (REVIEW-CYCLE-1; block_phase='plan').
+            return await self._requeue_on_lock_conflict(
+                expansion, plan_files, 'plan_blast_radius_lock_conflict',
+                'Plan expansion',
+            )
+        # self.modules/_module_configs already updated by
+        # _reconcile_plan_scope on success (unchanged if the module set is).
+
+        # Write plan decisions to memory
+        await self._write_decisions_to_memory()
+
+        logger.info(
+            f'Task {self.task_id}: plan created with '
+            f'{len(self.plan.get("prerequisites", []))} prerequisites, '
+            f'{len(self.plan.get("steps", []))} steps'
+        )
+        return WorkflowOutcome.PLANNED
+
+    async def _run_architect_for_plan(
+        self, build_prompt: PromptBuilder,
+    ) -> WorkflowOutcome | None:
+        """Invoke the architect; ``None`` once a finalized plan with steps is in ``self.plan``."""
+        assert self.worktree is not None and self.artifacts is not None
 
         # Snapshot pre-architect open L0 ids so the post-loop check can
         # detect "architect filed an L0 in lieu of writing a plan."  This is
@@ -5575,7 +5663,9 @@ class TaskWorkflow:
         # _finalized_at is an unfinished partial — either the run was cut off
         # mid-build, or the architect skipped the final call.  Route it through
         # the no-plan failure handler (which has cycle detection).  The partial
-        # is left on disk, so the next session's completion pass can resume it.
+        # is left on disk, so the next session's completion pass can resume it,
+        # except on the revalidation path, where the caller restores the
+        # pre-revision plan (task 4032).
         #
         # This runs BEFORE stamp_plan_provenance so a missing confirm_plan is
         # caught here rather than masked by the marker that stamping backfills.
@@ -5590,67 +5680,84 @@ class TaskWorkflow:
                     'a later session will resume and finish it.'
                 ),
             )
+        return None
 
-        if outcome := await self._validate_prerequisites_or_block('initial plan'):
+    async def _revise_plan_keeping_done_steps(
+        self, before: dict, build_prompt: PromptBuilder,
+        changed_files: list[str], text_drift: TaskTextDrift | None,
+    ) -> WorkflowOutcome | None:
+        """Until β and the prerequisite check pass, every exit puts *before* back, so the next dispatch revalidates under β instead of taking the completion pass or fresh-plan branch."""
+        try:
+            outcome = (
+                await self._run_architect_for_plan(build_prompt)
+                or await self._enforce_done_step_integrity(before, changed_files, text_drift)
+                or await self._validate_prerequisites_or_block('initial plan')
+            )
+        except BaseException:
+            self._restore_plan_under_exception(before)
+            raise
+        if outcome is not None:
+            self._restore_plan(before)
+        return outcome
+
+    def _restore_plan_under_exception(self, before: dict) -> None:
+        """Restore *before* while another exception propagates, logging a restore failure instead of raising it over that exception."""
+        try:
+            self._restore_plan(before)
+        except Exception:
+            logger.exception(
+                'Task %s: could not restore the pre-revalidation plan; the revised '
+                'plan stays on disk, done steps to put back by hand: %s',
+                self.task_id, list(done_step_records(before)),
+            )
+
+    async def _enforce_done_step_integrity(
+        self, before: dict, changed_files: list[str], text_drift: TaskTextDrift | None,
+    ) -> WorkflowOutcome | None:
+        """The revalidation β check (``plans/task-amendment-delivery-prd.md`` C5).
+
+        ``None`` lets the revised plan proceed. A refused plan gets one remedy
+        architect pass, gated exactly like the first; if it is still refused,
+        the task takes the no-plan hold. Putting *before* back on disk is the
+        caller's job.
+        """
+        verdict = check_done_step_integrity(before, await self._reconciled_plan())
+        if verdict.passed:
+            return None
+        assert self.worktree is not None
+
+        async def build_remedy_prompt() -> str:
+            return await self.briefing.build_revalidation_prompt(
+                self.task, self._live_plan(), changed_files,
+                worktree=self.worktree, text_drift=text_drift,
+                integrity_refusal=verdict,
+            )
+
+        if outcome := await self._run_architect_for_plan(build_remedy_prompt):
             return outcome
+        verdict = check_done_step_integrity(before, await self._reconciled_plan())
+        if verdict.passed:
+            return None
+        return await self._refuse_done_step_integrity(verdict)
 
-        # Stamp provenance and acquire lock (run_id — task 3563; see _drive)
-        await self._stamp_architect_plan(finalized_before_invoke)
-        self.artifacts.lock_plan(self.session_id, run_id=self._process_run_id)
-        self.plan = self.artifacts.read_plan()
-
-        if revalidation and self.event_store:
-            plan_file_set = set(self.plan.get('files', []))
+    async def _refuse_done_step_integrity(
+        self, verdict: DoneStepIntegrityVerdict,
+    ) -> WorkflowOutcome:
+        logger.warning('Task %s: revalidated plan refused — %s', self.task_id, verdict.reason())
+        if self.event_store:
             self.event_store.emit(
-                EventType.plan_revalidated,
-                task_id=self.task_id,
-                data={
-                    'changed_files_count': len(revalidation_changed_files),
-                    'overlap_count': len(
-                        [f for f in revalidation_changed_files
-                         if f in plan_file_set]
-                    ),
-                },
+                EventType.done_step_integrity_refused, task_id=self.task_id, phase='plan',
+                data=verdict.to_dict(),
             )
-
-        plan_files = self.plan.get('files', [])
-        if not plan_files:
-            return await self._handle_no_plan_failure(
-                'Planning failed: plan missing "files"',
-                detail=(
-                    'Architect wrote plan.json without a non-empty "files" array. '
-                    'Files are required to derive module locks.'
-                ),
-            )
-        plan_modules = derive_modules(
-            plan_files, self.config.lock_depth, task_id=self.task_id,
-        )
-        logger.info(
-            f'Task {self.task_id}: derived {len(plan_modules)} modules '
-            f'from {len(plan_files)} files: {plan_modules}'
+        return await self._handle_no_plan_failure(
+            f'Planning refused: {verdict.reason()}',
+            detail=json.dumps(verdict.to_dict(), indent=2),
         )
 
-        if not (expansion := await self._reconcile_plan_scope(plan_files)).applied:
-            # Annotate the requeue so the per-task retry-cap report can
-            # name *why* — without this, three blast-radius requeues in a
-            # row produce a cap-exhaust report with phase/reason='unknown'
-            # (REVIEW-CYCLE-1; block_phase='plan').
-            return await self._requeue_on_lock_conflict(
-                expansion, plan_files, 'plan_blast_radius_lock_conflict',
-                'Plan expansion',
-            )
-        # self.modules/_module_configs already updated by
-        # _reconcile_plan_scope on success (unchanged if the module set is).
-
-        # Write plan decisions to memory
-        await self._write_decisions_to_memory()
-
-        logger.info(
-            f'Task {self.task_id}: plan created with '
-            f'{len(self.plan.get("prerequisites", []))} prerequisites, '
-            f'{len(self.plan.get("steps", []))} steps'
-        )
-        return WorkflowOutcome.PLANNED
+    def _restore_plan(self, plan: dict) -> None:
+        assert self.artifacts is not None
+        self.artifacts.write_plan(plan)
+        self.plan = plan
 
     def _current_task_text_fp(self) -> str:
         return task_text_fingerprint(self.task.get('description'), self.task.get('details'))
@@ -9688,6 +9795,14 @@ class TaskWorkflow:
 
         return verdict
 
+    async def _reconciled_plan(self) -> dict:
+        """plan.json after :meth:`_reconcile_done_step_commits` has run on it."""
+        assert self.artifacts is not None
+        self.plan = self.artifacts.read_plan()
+        await self._reconcile_done_step_commits()
+        self.plan = self.artifacts.read_plan()
+        return self.plan
+
     async def _reconcile_done_step_commits(self) -> None:
         """Re-point a done step's ``commit`` when a rebase orphaned it.
 
@@ -9759,7 +9874,7 @@ class TaskWorkflow:
         ``base..HEAD`` patch-id map from scratch (~4 subprocesses, one of them
         a full-range ``git log -p``). With N orphans that is N such rebuilds.
         The bill is bounded and only ever charged on the already-degraded
-        orphaned-step path — a clean pass has no ``done_items`` failing the
+        orphaned-step path — a clean pass has no ``done_step_items`` failing the
         ``is_ancestor`` check at all and calls it zero times — and the WIP
         run's own filename union is now materialised lazily so tier 1 hits stop
         paying for it. n is the number of ORPHANED done steps in one pass,
@@ -9884,13 +9999,7 @@ class TaskWorkflow:
                     wip_files = collected
                 return wip_files
 
-            done_items = [
-                item
-                for col in ('prerequisites', 'steps')
-                for item in self.plan.get(col, [])
-                if isinstance(item, dict) and item.get('status') == 'done' and item.get('commit')
-            ]
-            for item in done_items:
+            for item in done_step_items(self.plan):
                 commit = item['commit']
                 if await self.git_ops.is_ancestor(commit, head):
                     continue  # still reachable — nothing to reconcile
