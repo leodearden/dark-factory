@@ -1035,8 +1035,10 @@ def _merge_breadth_is_full(config: OrchestratorConfig | None) -> bool:
     """True iff *config* opts into the broad ``merge_verify_breadth='full'`` gate.
 
     A ``None`` *config* (every role='task' caller, and most existing tests)
-    is treated as the shipped default ('scoped') — never accidentally widens
-    to the broad merge gate.
+    is not full: it carries no module registry for
+    :func:`effective_merge_module_configs` to widen to, so it keeps the legacy
+    per-touched-module shape. Every role='task' caller is unaffected either
+    way, because breadth is merge-role-gated.
     """
     return config is not None and config.merge_verify_breadth == 'full'
 

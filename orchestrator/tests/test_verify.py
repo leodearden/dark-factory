@@ -2996,7 +2996,7 @@ class TestRunVerificationJunitxmlInjection:
         assert result.failing_test_ids is None
 
     async def test_scoped_breadth_does_not_inject_or_collect(self, tmp_path: Path):
-        """merge_verify_breadth='scoped' (the default) — merge role but no injection."""
+        """merge_verify_breadth='scoped' (the per-project opt-down) — merge role but no injection."""
         config = self._make_config(tmp_path, breadth='scoped')
         module_config = self._module_config()
         fake_run_cmd, captured = self._fake_run_cmd_writing_junit()

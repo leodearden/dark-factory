@@ -367,7 +367,7 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     env value agrees with the YAML they write.  The opt-in
     ``code_default_config`` fixture runs after this autouse fixture and still
     wins (re-pointing ORCH_CONFIG_PATH at a guaranteed-absent file) for the
-    default-asserting / scoped-behaviour tests.
+    default-asserting tests.
     """
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
@@ -391,12 +391,12 @@ def code_default_config(monkeypatch, tmp_path):
     live operational overrides (commit b012af0e0e:
     ``merge_verify_breadth='full'``, ``merge_train_former_enabled=true``,
     ``merge_train_coalesce_enabled=true``) then bleed into any bare
-    ``OrchestratorConfig()``.
+    ``OrchestratorConfig()``.  Since task 7008 the code defaults carry
+    ``merge_verify_breadth='full'`` too, so breadth no longer differs between them.
 
-    Tests that assert the CODE DEFAULTS (``defaults.yaml``:
-    ``merge_verify_breadth='scoped'``, trains OFF) — or that exercise the
-    default *scoped* merge-verify behaviour — must construct the config in
-    isolation from those live overrides.  Pointing ``ORCH_CONFIG_PATH`` at a
+    Tests that assert the CODE DEFAULTS (``defaults.yaml``: trains OFF) must be
+    isolated from those live overrides; scoped-merge tests pin breadth to
+    ``'scoped'`` explicitly rather than rely on this hatch.  Pointing ``ORCH_CONFIG_PATH`` at a
     guaranteed-absent file makes ``YamlSettingsSource.__call__`` skip the
     layer-2 project file (its ``.exists()`` is False) and load ONLY the
     package-bundled ``defaults.yaml`` -> pure code defaults.  ``project_root``
@@ -405,7 +405,7 @@ def code_default_config(monkeypatch, tmp_path):
     live tree.
 
     Opt-in via ``@pytest.mark.usefixtures("code_default_config")`` (or a direct
-    request) on exactly the default-asserting / scoped-behaviour tests — NEVER
+    request) on exactly the default-asserting tests — NEVER
     autouse, which would strip config.yaml from the ~10k tests that legitimately
     rely on it.
     """

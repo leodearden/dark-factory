@@ -4316,8 +4316,9 @@ class OrchestratorConfig(BaseSettings):
     # behaviour (disjointness alone clears the gate) if the extra re-verifies
     # ever have to be traded away under load; the P1 arm keyed on
     # ``merge_verify_breadth == 'full'`` is NOT covered by this switch,
-    # because a project that has declared a whole-tree gate has declared the
-    # skip unsound outright.
+    # because a project whose merge gate is whole-tree (breadth 'full', the
+    # shipped default unless it opts down to 'scoped') has made the skip
+    # unsound outright.
     #
     # GREEN TIER (see RELOADABLE_FIELDS below, and OPERATIONS.md
     # section "Config reload vs restart").  Unlike its restart-only

@@ -389,8 +389,10 @@ class MergeVerifySpec:
     is_merge_verify: bool = True
     # Fix (a), task 2822 — the merge-gate PROFILE rides the spec so the remote
     # host runs the identical scope/profile as the dispatching merge gate.
-    # Narrow defaults match the pre-fix behaviour and the OrchestratorConfig
-    # field defaults (merge_verify_workspace=False, merge_verify_breadth='scoped').
+    # The narrow defaults are the wire back-compat value for a spec that does
+    # not carry the profile (a pre-task-2822 dispatcher), not the project
+    # policy: every live dispatcher sets both fields from config in
+    # build_merge_verify_spec.
     merge_verify_workspace: bool = False
     merge_verify_breadth: str = "scoped"
     # INV-1, task 2883 — the global full-gate commands for a zero-module-config
