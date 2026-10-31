@@ -1141,7 +1141,9 @@ def _make_tasks_db(dir_path: Path, rows: list[dict]) -> Path:
     """Copied from scripts/tests/test_audit_wiped_metadata_files.py — the two
     test directories cannot share imports (same note as
     orchestrator/tests/test_deterministic_runner.py:31-32). Schemas mirror the
-    live ones so the audit exercises real column shapes."""
+    live ones so the audit exercises real column shapes; the subset guard below
+    checks ``_TASKS_SCHEMA`` against
+    ``shared/src/shared/task_store_schema.py::TASK_STORE_DDL``."""
     db_path = dir_path / "tasks.db"
     conn = sqlite3.connect(db_path)
     try:

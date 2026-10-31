@@ -592,7 +592,9 @@ def test_evidence_carries_the_deciding_events_fidelity_on_both_axes():
 # only), and the two test directories cannot share imports for the same reason
 # recorded in the header comment above
 # orchestrator/tests/test_deterministic_runner.py::POLLUTED_PREDICATE_OUTPUT.
-# The schemas mirror the live ones so the census exercises real column shapes.
+# The schemas mirror the live ones so the census exercises real column shapes;
+# the subset guard right after ``_make_tasks_db`` checks ``_TASKS_SCHEMA``
+# against ``shared/src/shared/task_store_schema.py::TASK_STORE_DDL``.
 #
 # Two deliberate departures from that sibling:
 #   * ``_make_runs_db`` honours an explicit per-event ``timestamp``, falling
