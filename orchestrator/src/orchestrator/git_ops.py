@@ -2627,6 +2627,10 @@ def _lane_lock_holder_facts(
     return 'kernel FLOCK holders: ' + ', '.join(rendered)
 
 
+class GitQueryFailed(RuntimeError):
+    """git could not answer a query that must succeed; a fault, never a fact."""
+
+
 def _utc_stamp() -> str:
     """The UTC suffix a renamed-aside branch or worktree carries."""
     return datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')
@@ -2679,6 +2683,19 @@ async def _run(
             raise WorktreeMissing(cwd) from e
         raise
     return result.returncode, result.stdout, result.stderr
+
+
+async def _git_query(
+    cmd: list[str], cwd: Path, *, input_text: str | None = None,
+) -> str:
+    """*cmd*'s stdout; raises :class:`GitQueryFailed` when it exits non-zero."""
+    rc, out, err = await _run(cmd, cwd=cwd, input_text=input_text)
+    if rc != 0:
+        raise GitQueryFailed(f"{' '.join(cmd)} exited {rc}: {err.strip()[:200]}")
+    return out
+
+
+_FULL_OID = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
 
 
 def _git_clean_failure_is_benign(stderr: str) -> bool:
@@ -12170,6 +12187,33 @@ class GitOps:
                     ambiguous_pids.add(pid)
                 pid_to_sha[pid] = parts[1]
         return {pid: sha for pid, sha in pid_to_sha.items() if pid not in ambiguous_pids}
+
+    async def commits_named(self, tokens: Sequence[str]) -> dict[str, str]:
+        """{token: full commit sha} for each of *tokens* that names a commit
+        (``<token>^{commit}`` resolves). A token that is missing, ambiguous or
+        a non-commit object is omitted. One ``git cat-file --batch-check`` at
+        project_root whatever the token count. Raises GitQueryFailed when git
+        could not answer."""
+        out = await _git_query(
+            ['git', 'cat-file', '--batch-check=%(objectname)'],
+            cwd=self.project_root,
+            input_text=''.join(f'{t}^{{commit}}\n' for t in tokens),
+        )
+        lines = out.splitlines()
+        if len(lines) != len(tokens):
+            raise GitQueryFailed(
+                f'git cat-file --batch-check answered {len(lines)} lines '
+                f'for {len(tokens)} tokens',
+            )
+        named: dict[str, str] = {}
+        for token, line in zip(tokens, lines, strict=True):
+            if _FULL_OID.fullmatch(line):
+                named[token] = line
+            elif line not in (f'{token}^{{commit}} missing', f'{token}^{{commit}} ambiguous'):
+                raise GitQueryFailed(
+                    f'git cat-file --batch-check answered {line!r} for {token!r}',
+                )
+        return named
 
     async def resolve_rebased_citation(self, sha: str) -> RebasedCitation | None:
         """The commit on main that a cited, since-rebased *sha* landed as, or None.
