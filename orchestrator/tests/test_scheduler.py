@@ -4851,11 +4851,7 @@ class TestBlastRadiusRefinement:
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1, lock_depth=4)
         event_store = _RecordingEventStore()
-        sched = Scheduler(
-            config,
-            event_store=event_store,  # type: ignore[arg-type]
-            mcp_session=HermeticMcpSession(),
-        )
+        sched = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
         sched.finish_startup()
         return sched
 
@@ -4977,15 +4973,18 @@ class TestBlastRadiusRefinement:
         assert lt.try_acquire(
             'other', ['crates/reify-compiler/src/conformance.rs']
         )
-        # 936 can't expand; since update_task → set_task_status hit MCP,
-        # patch scheduler methods to no-ops for this assertion scope.
-        scheduler.update_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
-        scheduler.set_task_status = AsyncMock(return_value=None)  # type: ignore[method-assign]
-        ok = await scheduler.handle_blast_radius_expansion(
-            '936',
-            current=['crates/reify-compiler/src/lib.rs'],
-            needed=['crates/reify-compiler/src/conformance.rs'],
-        )
+        # 936 can't expand; since get_task, update_task and set_task_status
+        # hit MCP, stub all three for this assertion scope.
+        with (
+            patch.object(scheduler, 'get_task', AsyncMock(return_value={'id': '936'})),
+            patch.object(scheduler, 'update_task', AsyncMock(return_value=True)),
+            patch.object(scheduler, 'set_task_status', AsyncMock(return_value=None)),
+        ):
+            ok = await scheduler.handle_blast_radius_expansion(
+                '936',
+                current=['crates/reify-compiler/src/lib.rs'],
+                needed=['crates/reify-compiler/src/conformance.rs'],
+            )
         assert ok.applied is False
         # Full release ran: 936 should no longer hold anything
         assert '936' not in lt._held
