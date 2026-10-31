@@ -214,8 +214,6 @@ class TestTerminalWindow:
         project's snapshot and every banner list used to ride along with it:
         task 5598 measured 3.38 MB for this request, 0.32 MB of it the window.
         """
-        from datetime import datetime
-
         body, _calls = _terminal_render(
             client, monkeypatch, tmp_path, terminal='dark-factory',
             labels=('dark-factory', 'other'),
@@ -306,9 +304,6 @@ class TestTerminalWindow:
         the census. That the reason also names the window size is
         ``TestAcquireTerminalWindow``'s to pin, with a window it chose.
         """
-        import re
-        from datetime import datetime
-
         body, _calls = _terminal_render(
             client, monkeypatch, tmp_path, terminal='dark-factory',
             terminal_rows=[_terminal_row(i) for i in range(100, 110)],
@@ -371,7 +366,9 @@ class TestTerminalWindow:
         assert args.get('statuses') == sorted(TERMINAL)
         assert 'offset' in args, f'a page read names WHICH page it reads: {args}'
         assert args['offset'] == max(0, 10 - args['page_size']), (
-            f'the page must end at the high-id end of the 10 terminal rows: {args}'
+            'the offset must be the window arithmetic over the 10 terminal rows '
+            '(at the shipped window this is 0, so the high-id positioning itself '
+            f'is pinned by TestAcquireTerminalWindow): {args}'
         )
 
     def test_an_unpositionable_window_is_unknown_not_the_oldest_rows(
@@ -619,9 +616,13 @@ class TestAcquireTerminalWindow:
 
         messages = self._task_snapshot_warnings(caplog)
         root = str(dashboard_config.project_root)
+
+        def names_the_counts(message: str) -> bool:
+            numbers = {int(n) for n in re.findall(r'\d+', message.replace(root, ''))}
+            return {12, 3} <= numbers
+
         assert any(
-            root in message and '12' in message and '3' in message
-            for message in messages
+            root in message and names_the_counts(message) for message in messages
         ), f'expected a truncation WARNING naming {root}, 12 and 3, got {messages}'
 
 
@@ -633,10 +634,7 @@ def test_a_terminal_window_that_breaks_the_envelope_is_unknown_not_a_500(
     A ``lower_bound`` datum with no reason breaks the envelope. The key still
     answers, as an explained unknown, with its receipt.
     """
-    import logging
-    from datetime import UTC, datetime
-
-    from dashboard.data.datum import Datum, DatumInvariant, DatumState
+    from dashboard.data.datum import Datum, DatumInvariant
     from dashboard.data.task_snapshot import FRESHNESS_BOUND_SECONDS
 
     label = 'p0'
@@ -670,8 +668,6 @@ def test_a_bug_in_the_window_read_is_unknown_not_a_500(
     an exception that reaches the handler is a bug. The key still answers, as
     an explained unknown with its receipt, and the bug is logged as one.
     """
-    import logging
-
     label = 'p0'
     _install_terminal_roots(client, tmp_path, [label])
     canned = CannedMCP()
