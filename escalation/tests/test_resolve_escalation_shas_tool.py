@@ -33,12 +33,28 @@ SHA_A = 'a7ceed6597'
 SHA_B = '570dc88ad6'
 TWIN_A: dict[str, object] = {'landed': 'a' * 40, 'subject': 'feat: a', 'method': 'patch-id'}
 
+# Each contributes two SHA-shaped tokens (its 8- and 12-hex segments).
+UUIDS = (
+    '3f2a9c1e-4b7d-4e21-9a0c-5c8d0b7f1a33',
+    '7b1d2e3f-0a9c-4d8e-b7f6-1e2d3c4b5a69',
+    'c0ffee12-3456-4789-abcd-ef0123456789',
+    'deadbeef-cafe-4bab-8e5e-0123456789ab',
+    '1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d',
+    '9f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a',
+)
+
 
 class _StubGitOps:
-    """Every token names a commit."""
+    """Every token names a commit; a sha in *faults* raises its exception."""
 
-    def __init__(self, answers: Mapping[str, Mapping[str, object]] | None = None) -> None:
+    def __init__(
+        self,
+        answers: Mapping[str, Mapping[str, object]] | None = None,
+        *,
+        faults: Mapping[str, Exception] | None = None,
+    ) -> None:
         self._answers = answers or {}
+        self._faults = faults or {}
         self.calls: list[str] = []
 
     async def commits_named(self, tokens: Sequence[str]) -> Mapping[str, str]:
@@ -46,6 +62,8 @@ class _StubGitOps:
 
     async def resolve_rebased_citation(self, sha: str) -> Mapping[str, object] | None:
         self.calls.append(sha)
+        if sha in self._faults:
+            raise self._faults[sha]
         return self._answers.get(sha)
 
 
@@ -83,9 +101,20 @@ class TestResolveEscalationShas:
         assert result == {
             'escalation_id': esc.id,
             'resolved_shas': [{'cited': SHA_A, **TWIN_A}],
+            'failed_shas': [],
             'skipped_shas': [],
         }
         assert git_ops.calls == [SHA_A, SHA_B]
+
+    async def test_a_lookup_git_could_not_answer_is_reported_in_failed_shas(self, queue):
+        git_ops = _StubGitOps(faults={SHA_A: RuntimeError('fatal: Unable to create index.lock')})
+        esc = seed_escalation(queue, level=0, task_id='7', detail=f'cites {SHA_A}')
+
+        result = await _resolve(_server(queue, git_ops), esc.id)
+
+        assert result['resolved_shas'] == []
+        assert [f['cited'] for f in result['failed_shas']] == [SHA_A]
+        assert 'index.lock' in result['failed_shas'][0]['error']
 
     async def test_tokens_past_the_cap_are_reported_skipped_and_never_looked_up(self, queue):
         tokens = [f'{n:07x}' for n in range(MAX_CITED_SHAS_RESOLVED + 3)]
@@ -133,10 +162,9 @@ def _commit(repo: Path, relpath: str, text: str, subject: str) -> str:
     return _git(repo, 'rev-parse', 'HEAD')
 
 
-@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
-@pytest.mark.asyncio
-async def test_smoke_a_rebased_citation_resolves_to_its_landed_twin(queue, tmp_path):
-    repo = tmp_path / 'repo'
+def _landed_rebase(repo: Path) -> tuple[str, str]:
+    """A new repo at *repo* whose task/7 commit was rebased and landed on main:
+    (the cited pre-rebase sha, the sha it landed as)."""
     repo.mkdir()
     _git(repo, 'init', '-b', 'main')
     _git(repo, 'config', 'user.email', 'test@test.com')
@@ -149,7 +177,14 @@ async def test_smoke_a_rebased_citation_resolves_to_its_landed_twin(queue, tmp_p
     _git(repo, 'rebase', 'main', 'task/7')
     _git(repo, 'checkout', 'main')
     _git(repo, 'merge', '--ff-only', 'task/7')
-    landed = _git(repo, 'rev-parse', 'HEAD')
+    return cited, _git(repo, 'rev-parse', 'HEAD')
+
+
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
+@pytest.mark.asyncio
+async def test_smoke_a_rebased_citation_resolves_to_its_landed_twin(queue, tmp_path):
+    repo = tmp_path / 'repo'
+    cited, landed = _landed_rebase(repo)
     esc = seed_escalation(queue, level=0, task_id='7', detail=f'orphaned {cited[:10]}')
 
     result = await _resolve(_server(queue, GitOps(GitConfig(), repo)), esc.id)
@@ -158,3 +193,53 @@ async def test_smoke_a_rebased_citation_resolves_to_its_landed_twin(queue, tmp_p
         'cited': cited[:10], 'landed': landed,
         'subject': 'feat(7): add feature', 'method': 'patch-id',
     }]
+
+
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
+@pytest.mark.asyncio
+async def test_smoke_a_git_outage_is_failed_never_a_clean_no_twin(queue, tmp_path):
+    not_a_repo = tmp_path / 'not-a-repo'
+    not_a_repo.mkdir()
+    esc = seed_escalation(queue, level=0, task_id='7', detail=f'cites {SHA_A} and {SHA_B}')
+
+    result = await _resolve(_server(queue, GitOps(GitConfig(), not_a_repo)), esc.id)
+
+    assert result['resolved_shas'] == []
+    assert result['skipped_shas'] == []
+    assert [f['cited'] for f in result['failed_shas']] == [SHA_A, SHA_B]
+
+
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
+@pytest.mark.asyncio
+async def test_smoke_an_unknown_main_branch_fails_the_lookup(queue, tmp_path):
+    repo = tmp_path / 'repo'
+    cited, _ = _landed_rebase(repo)
+    esc = seed_escalation(queue, level=0, task_id='7', detail=f'orphaned {cited[:10]}')
+    git_ops = GitOps(GitConfig(main_branch='no-such-branch'), repo)
+
+    result = await _resolve(_server(queue, git_ops), esc.id)
+
+    assert result['resolved_shas'] == []
+    assert [f['cited'] for f in result['failed_shas']] == [cited[:10]]
+
+
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
+@pytest.mark.asyncio
+async def test_smoke_uuids_and_digit_runs_do_not_crowd_a_real_sha_past_the_cap(queue, tmp_path):
+    repo = tmp_path / 'repo'
+    cited, landed = _landed_rebase(repo)
+    detail = (
+        ' '.join(UUIDS)
+        + ' pid 4194304 on 20261023 hash 9c1e7b4d5a609e21 '
+        + f'orphaned {cited[:10]}'
+    )
+    esc = seed_escalation(queue, level=0, task_id='7', detail=detail)
+
+    result = await _resolve(_server(queue, GitOps(GitConfig(), repo)), esc.id)
+
+    assert result['resolved_shas'] == [{
+        'cited': cited[:10], 'landed': landed,
+        'subject': 'feat(7): add feature', 'method': 'patch-id',
+    }]
+    assert result['skipped_shas'] == []
+    assert result['failed_shas'] == []
