@@ -15,7 +15,8 @@ from __future__ import annotations
 from dataclasses import replace
 
 from _role_splice_contract import (
-    BASH_CAPABLE_UNPINNED_ROLES,
+    READ_ONLY_UNPINNED_ROLES,
+    UNPINNED_ROLES,
     SpliceContract,
     assert_brace_free,
     assert_nonempty,
@@ -28,13 +29,7 @@ from orchestrator.agents.harness_guidance import (
     GREP_LOOKAROUND_GUIDANCE,
     GREP_LOOKAROUND_GUIDANCE_READ_ONLY,
 )
-from orchestrator.agents.roles import ROLES, AgentRole
-
-#: Every role with a literal system_prompt, derived from ROLES.
-_UNPINNED_ROLES = frozenset(name for name, role in ROLES.items() if role.prompt_spec is None)
-
-#: Roles building their own chain around the read-only Grep variant (`judge`).
-_READ_ONLY_ROLES = _UNPINNED_ROLES - BASH_CAPABLE_UNPINNED_ROLES
+from orchestrator.agents.roles import AgentRole
 
 
 def _can_run_every_prescribed_lookup(role: AgentRole) -> bool:
@@ -50,8 +45,8 @@ def _can_run_every_prescribed_lookup(role: AgentRole) -> bool:
 _CONTRACT = SpliceContract(
     constant_name='FILE_LOOKUP_GUIDANCE',
     constant=FILE_LOOKUP_GUIDANCE,
-    roles=_UNPINNED_ROLES,
-    role_set_name='_UNPINNED_ROLES',
+    roles=UNPINNED_ROLES,
+    role_set_name='UNPINNED_ROLES (in _role_splice_contract.py)',
     capability=_can_run_every_prescribed_lookup,
     capability_description=(
         'a literal (non-PromptSpec) system_prompt, `Glob`, `Grep` and a '
@@ -91,33 +86,20 @@ def test_guidance_opens_its_own_section():
     )
 
 
-def test_unpinned_role_set_is_nonempty():
-    """No splice test below can pass vacuously over an emptied derivation.
-
-    `_READ_ONLY_ROLES` is deliberately not required non-empty: it empties
-    legitimately if `judge` ever gains unqualified `Bash`, and the grep
-    module's own tripwire fires for that change.
-    """
-    assert _UNPINNED_ROLES, (
-        'No role has a literal system_prompt, so every splice test here passes '
-        'over an empty set. Check the `prompt_spec is None` derivation.'
-    )
-
-
 def test_every_carrier_can_run_the_lookups():
     """Every derived carrier holds `Glob`, `Grep` and a git-capable `Bash`.
 
-    Not a tautology: `_UNPINNED_ROLES` is derived from the literal prompt
+    Not a tautology: `UNPINNED_ROLES` is derived from the literal prompt
     alone, while the capability also requires the three grants the block
     prescribes.
     """
     _CONTRACT.assert_role_set_matches_capability(
         remedy=(
-            '_UNPINNED_ROLES is derived, not hand-maintained, so a `lost=` role '
+            'UNPINNED_ROLES is derived, not hand-maintained, so a `lost=` role '
             'is a literal-prompt role missing `Glob`, `Grep` or a git-capable '
             '`Bash`: it would be told to run a lookup it cannot run. Grant the '
-            'missing tool, or exclude it from the derivation and from the '
-            'splice together.'
+            'missing tool, or give this block its own narrower role set and '
+            'drop the splice from that role together.'
         ),
     )
 
@@ -184,7 +166,9 @@ def test_guidance_lands_after_the_grep_block_in_bash_roles():
 def test_guidance_lands_after_the_read_only_grep_block():
     """In the read-only roles the block lands after `GREP_LOOKAROUND_GUIDANCE_READ_ONLY`."""
     replace(
-        _CONTRACT, roles=_READ_ONLY_ROLES, role_set_name='_READ_ONLY_ROLES'
+        _CONTRACT,
+        roles=READ_ONLY_UNPINNED_ROLES,
+        role_set_name='READ_ONLY_UNPINNED_ROLES (in _role_splice_contract.py)',
     ).assert_lands_after(
         follows=GREP_LOOKAROUND_GUIDANCE_READ_ONLY,
         follows_name='GREP_LOOKAROUND_GUIDANCE_READ_ONLY',

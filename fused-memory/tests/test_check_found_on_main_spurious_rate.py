@@ -22,7 +22,7 @@ from _fm_helpers import (
     make_zero_byte_task_store,
 )
 
-from fused_memory.utils.target_store_preflight import TargetStoreMissing
+from fused_memory.utils.target_store_preflight import TargetStoreUnpopulated
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'check_found_on_main_spurious_rate.py'
@@ -706,7 +706,7 @@ class TestRunTargetStorePreflight:
     async def test_refuses_a_missing_task_store(self, tmp_path, monkeypatch):
         _install_clean_run_fakes(monkeypatch)
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(_run_args(tmp_path), SINCE)
 
     async def test_refusal_constructs_no_backend(self, tmp_path, monkeypatch):
@@ -715,7 +715,7 @@ class TestRunTargetStorePreflight:
         non-destructive rather than merely noisy."""
         backend_holder = _install_clean_run_fakes(monkeypatch)
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(_run_args(tmp_path), SINCE)
 
         assert 'backend' not in backend_holder
@@ -725,7 +725,7 @@ class TestRunTargetStorePreflight:
         mkdir (see target_store_preflight's "WHY NOT A CAPABILITY PROBE")."""
         _install_clean_run_fakes(monkeypatch)
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(_run_args(tmp_path), SINCE)
 
         assert not (tmp_path / '.taskmaster').exists()
@@ -738,7 +738,7 @@ class TestRunTargetStorePreflight:
         make_zero_byte_task_store(tmp_path)
         backend_holder = _install_clean_run_fakes(monkeypatch)
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(_run_args(tmp_path), SINCE)
 
         assert 'backend' not in backend_holder
@@ -1095,7 +1095,7 @@ class TestMainMalformedSinceExitCode:
 # business-logic 0/1 (see module docstring "Contract").
 # ===========================================================================
 
-class TestMainTargetStoreMissingExitCode:
+class TestMainTargetStoreUnpopulatedExitCode:
     def test_missing_task_store_exits_three(self, tmp_path, monkeypatch):
         """3, and specifically neither 0 nor 1 — the property the reserved code
         exists to buy. Exit 0 would be the false all-clear this guard kills.
@@ -1149,7 +1149,7 @@ class TestMainTargetStoreMissingExitCode:
 # same type raised later (inside _run(), e.g. from build_audit_report) must
 # propagate uncaught rather than be mislabeled as the usage error that
 # mapping names. ValueError->2 is the parse_since case (regression guard for
-# reviewer suggestion #1); TargetStoreMissing->3 is the store-guard case.
+# reviewer suggestion #1); TargetStoreUnpopulated->3 is the store-guard case.
 # ===========================================================================
 
 class TestMainScopedValueErrorHandling:
@@ -1183,9 +1183,9 @@ class TestMainScopedValueErrorHandling:
     def test_internal_runtimeerror_propagates_uncaught_not_mapped_to_exit_3(
         self, monkeypatch, project_root,
     ):
-        """The same guarantee for the TargetStoreMissing->exit-3 catch.
+        """The same guarantee for the TargetStoreUnpopulated->exit-3 catch.
 
-        TargetStoreMissing subclasses RuntimeError, so the way that catch
+        TargetStoreUnpopulated subclasses RuntimeError, so the way that catch
         could go over-broad is by widening to `except RuntimeError` — which
         would swallow an unrelated internal failure into a "mis-targeted
         store" verdict. The store is PRESENT here, so the preflight passes
