@@ -62,11 +62,11 @@ from _fill_drive_harness import (  # noqa: F401,E402
     _teardown_fill_drive,
 )
 from _merge_lane_fakes import FakeVerifier, VerifyScript, fails, hangs_until, passes
+from _merge_worker_drive import make_merge_request
 from _orch_helpers import MERGE_RESULT_TIMEOUT, wait_responsive
 from test_merge_queue_concurrent_verify import (
     _inject_host_allocator,
     _make_branch_with_file,
-    _make_request,
     config,  # noqa: F401 — pytest fixture re-exported from γ harness
     git_config,  # noqa: F401 — pytest fixture re-exported from γ harness
     git_ops,  # noqa: F401 — pytest fixture re-exported from γ harness
@@ -147,7 +147,7 @@ class _Lane:
         worktree = await _make_branch_with_file(
             self.git_ops, f'task/{task_id}', self.branch_file(task_id), f'# {task_id}\n',
         )
-        request = _make_request(task_id, f'task/{task_id}', worktree, self.config)
+        request = make_merge_request(task_id, f'task/{task_id}', worktree, self.config)
         self.requests[task_id] = request
         await self.queue.put(request)
         return request

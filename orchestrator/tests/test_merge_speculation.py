@@ -58,6 +58,11 @@ from _merge_lane_fakes import (
     main_health_probe_spawned,
     passes,
 )
+from _merge_worker_drive import (
+    HEAVY_BARRIER_TEST_TIMEOUT,
+    make_merge_request,
+    stop_merge_worker,
+)
 from _orch_helpers import (  # noqa: F401
     MERGE_GATE_BARRIER_TIMEOUT,
     MERGE_RESULT_TIMEOUT,
@@ -72,13 +77,10 @@ from _verify_result_doubles import (
     format_fail_open_records,
 )
 from test_merge_queue_concurrent_verify import (  # noqa: F401
-    HEAVY_BARRIER_TEST_TIMEOUT,
     _gated_runner,
     _id_liveness_fake_runner,
     _inject_two_host_allocator,
     _make_branch_with_file,
-    _make_request,
-    _stop_worker,
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig  # noqa: F401
@@ -104,9 +106,9 @@ from orchestrator.merge_lane.worker import (
 from orchestrator.verify import VerifyResult  # noqa: F401
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool  # noqa: F401
 
-# Late-arrival integration helpers (task 1862): reuse module-level helpers
-# from test_merge_queue_concurrent_verify.  These are private (_-prefixed)
-# module-level functions so pytest does not collect them as tests.
+# Late-arrival integration helpers (task 1862): reuse the scene helpers from
+# test_merge_queue_concurrent_verify and the worker-drive helpers from
+# _merge_worker_drive.
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -887,8 +889,8 @@ async def _run_spec_scenario(
         lane.MAX_CAS_RETRIES = max_cas_retries
     wt_a = await _make_branch_with_file(git_ops, 'task/spec-a', 'spec_a.py', 'a = 1\n')
     wt_b = await _make_branch_with_file(git_ops, 'task/spec-b', 'spec_b.py', 'b = 2\n')
-    req_a = _make_request('spec-a', 'task/spec-a', wt_a, config)
-    req_b = _make_request('spec-b', 'task/spec-b', wt_b, config)
+    req_a = make_merge_request('spec-a', 'task/spec-a', wt_a, config)
+    req_b = make_merge_request('spec-b', 'task/spec-b', wt_b, config)
 
     lane_task = asyncio.create_task(lane.run())
     try:
@@ -917,7 +919,7 @@ async def _run_spec_scenario(
                 req_b.result, timeout=MERGE_RESULT_TIMEOUT, label='spec-b: MergeOutcome',
             )
     finally:
-        await _stop_worker(lane, lane_task)
+        await stop_merge_worker(lane, lane_task)
     return req_a, req_b
 
 
@@ -1286,9 +1288,10 @@ class TestSpecLaneShadowSafetyValve:
 # Architecture overview
 # ---------------------
 # • spec_git_repo fixture (already defined above) provides the real repo.
-# • _gated_runner / _inject_two_host_allocator / _make_branch_with_file /
-#   _make_request are imported from test_merge_queue_concurrent_verify at the
-#   top of this file (module-level, importable via conftest sys.path setup).
+# • _gated_runner / _inject_two_host_allocator / _make_branch_with_file are
+#   imported from test_merge_queue_concurrent_verify, and make_merge_request
+#   from _merge_worker_drive, at the top of this file (importable via conftest
+#   sys.path setup).
 # • _LateArrivalFakeEventStore records speculative_merge / speculative_discard
 #   events for assertion.
 # • _make_late_arrival_git_config / _make_late_arrival_lane build the
@@ -1495,8 +1498,8 @@ class TestLateArrivalAttaches:
         )
         _inject_two_host_allocator(worker, fake_remote)
 
-        req_a = _make_request('late1-a', 'task/late1-a', wt_a, config)
-        req_b = _make_request('late1-b', 'task/late1-b', wt_b, config)
+        req_a = make_merge_request('late1-a', 'task/late1-a', wt_a, config)
+        req_b = make_merge_request('late1-b', 'task/late1-b', wt_b, config)
 
         # ── Run the harness ────────────────────────────────────────────────────
         worker_task = asyncio.create_task(worker.run())
@@ -1600,7 +1603,7 @@ class TestLateArrivalAttaches:
             # merge-pipeline hang and must report red.  A `suppress(TimeoutError)`
             # would be dead code anyway — `wait_responsive` raises
             # `_pytest.outcomes.Failed`, never `TimeoutError`.  Teardown runs
-            # either way via the `finally:` below (see `_stop_worker`).
+            # either way via the `finally:` below (see `stop_merge_worker`).
             await wait_responsive(
                 req_a.result,
                 timeout=MERGE_RESULT_TIMEOUT,
@@ -1612,7 +1615,7 @@ class TestLateArrivalAttaches:
                 label='late1-b: MergeOutcome',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
 
 # ===========================================================================
@@ -1699,8 +1702,8 @@ class TestLateArrivalCleanCAS:
         )
         _inject_two_host_allocator(worker, gated_remote)
 
-        req_a = _make_request('late3-a', 'task/late3-a', wt_a, config)
-        req_b = _make_request('late3-b', 'task/late3-b', wt_b, config)
+        req_a = make_merge_request('late3-a', 'task/late3-a', wt_a, config)
+        req_b = make_merge_request('late3-b', 'task/late3-b', wt_b, config)
 
         # ── Run harness ────────────────────────────────────────────────────────
         worker_task = asyncio.create_task(worker.run())
@@ -1740,7 +1743,7 @@ class TestLateArrivalCleanCAS:
                 label='late3-b: MergeOutcome',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # ── Assertions ────────────────────────────────────────────────────────
 
@@ -1899,8 +1902,8 @@ class TestLateArrivalFailCascade:
         )
         _inject_two_host_allocator(worker, liveness_remote)
 
-        req_a = _make_request('late5-a', 'task/late5-a', wt_a, config)
-        req_b = _make_request('late5-b', 'task/late5-b', wt_b, config)
+        req_a = make_merge_request('late5-a', 'task/late5-a', wt_a, config)
+        req_b = make_merge_request('late5-b', 'task/late5-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -1951,7 +1954,7 @@ class TestLateArrivalFailCascade:
                 label='late5-a: MergeOutcome',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # The verify-result DOUBLE FIDELITY GUARD that used to sit here — a
         # delegating spy on merge_queue's classify_merge_failure_disposition plus
@@ -2105,8 +2108,8 @@ class TestLateArrivalGuards:
         )
         _inject_two_host_allocator(worker, fake_remote)
 
-        req_a = _make_request('guard7-a', 'task/guard7-a', wt_a, config)
-        req_b = _make_request('guard7-b', 'task/guard7-b', wt_b, config)
+        req_a = make_merge_request('guard7-a', 'task/guard7-a', wt_a, config)
+        req_b = make_merge_request('guard7-b', 'task/guard7-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -2129,7 +2132,7 @@ class TestLateArrivalGuards:
                 label='guard7-b: MergeOutcome',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
 
@@ -2194,8 +2197,8 @@ class TestLateArrivalGuards:
         )
         _inject_two_host_allocator(worker, fake_remote)
 
-        req_a = _make_request('dk7-a', 'task/dk7-a', wt_a, config)
-        req_b = _make_request('dk7-b', 'task/dk7-b', wt_b, config)
+        req_a = make_merge_request('dk7-a', 'task/dk7-a', wt_a, config)
+        req_b = make_merge_request('dk7-b', 'task/dk7-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -2232,7 +2235,7 @@ class TestLateArrivalGuards:
                 label='dk7-b: MergeOutcome',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         assert outcome_b.status == 'done'
 
@@ -2285,8 +2288,8 @@ class TestLateArrivalGuards:
         )
         _inject_two_host_allocator(worker, fake_remote)
 
-        req_a = _make_request('sv7-a', 'task/sv7-a', wt_a, config)
-        req_b = _make_request('sv7-b', 'task/sv7-b', wt_b, config)
+        req_a = make_merge_request('sv7-a', 'task/sv7-a', wt_a, config)
+        req_b = make_merge_request('sv7-b', 'task/sv7-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -2311,7 +2314,7 @@ class TestLateArrivalGuards:
                 label='sv7-b: MergeOutcome',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # B's verify actually RAN — the task-1724 guarantee, observed where it
         # is observable: the injected verify port was asked about B.  The
@@ -2377,8 +2380,8 @@ class TestLateArrivalGuards:
         )
         _inject_two_host_allocator(worker, fake_remote)
 
-        req_a = _make_request('k1-7-a', 'task/k1-7-a', wt_a, config)
-        req_b = _make_request('k1-7-b', 'task/k1-7-b', wt_b, config)
+        req_a = make_merge_request('k1-7-a', 'task/k1-7-a', wt_a, config)
+        req_b = make_merge_request('k1-7-b', 'task/k1-7-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -2413,7 +2416,7 @@ class TestLateArrivalGuards:
                 label='k1-7-b: MergeOutcome',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
 
@@ -2497,7 +2500,7 @@ class TestLateArrivalGuards:
             git_ops, verifier=verifier, speculation_depth=K,
         )
         _inject_two_host_allocator(worker, fake_remote)
-        req_a = _make_request('shutdown-guard-a', 'task/shutdown-guard-a', wt_a, config)
+        req_a = make_merge_request('shutdown-guard-a', 'task/shutdown-guard-a', wt_a, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -2534,7 +2537,7 @@ class TestLateArrivalGuards:
             # breaks out of the loop, and the finally block at :7412 releases the
             # retained permit.
         finally:
-            await _stop_worker(worker, worker_task, join_timeout=10.0)
+            await stop_merge_worker(worker, worker_task, join_timeout=10.0)
 
         # Expected slot value after full shutdown:
         #   retain_value (K-1)
@@ -2672,8 +2675,8 @@ class TestLateArrivalSubmissionOrderCAS:
         )
         _inject_two_host_allocator(worker, gated_remote)
 
-        req_a = _make_request('cas8-a', 'task/cas8-a', wt_a, config)
-        req_b = _make_request('cas8-b', 'task/cas8-b', wt_b, config)
+        req_a = make_merge_request('cas8-a', 'task/cas8-a', wt_a, config)
+        req_b = make_merge_request('cas8-b', 'task/cas8-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -2709,7 +2712,7 @@ class TestLateArrivalSubmissionOrderCAS:
                 label='cas8-b: MergeOutcome',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # ── Assertions ────────────────────────────────────────────────────────
 
@@ -2878,7 +2881,7 @@ class TestJournalLandedThenAdvanceHelper:
 #
 # WHAT THE RULE STILL KEYS ON, and why it must stay that way: the call SHAPE.
 # A load-bearing target is `X.result` (a MergeRequest.result future) or a
-# zero-argument `.wait()` barrier on any receiver; the `_stop_worker` teardown join
+# zero-argument `.wait()` barrier on any receiver; the `stop_merge_worker` teardown join
 # below is exempt because its target is a bare Name, not because anything lists
 # it. No class list and no budget threshold decides which sites are scanned —
 # task 2376's sweep expressed its policy as "literals up to 15" and the lone

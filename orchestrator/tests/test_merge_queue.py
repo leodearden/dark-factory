@@ -34,6 +34,7 @@ from _merge_lane_fakes import (
     times_out,
 )
 from _merge_queue_harness import drive_verify_and_advance
+from _merge_worker_drive import HEAVY_BARRIER_TEST_TIMEOUT
 from _orch_helpers import (
     MERGE_GATE_BARRIER_TIMEOUT,
     MERGE_RESULT_TIMEOUT,
@@ -45,7 +46,6 @@ from _orch_helpers import (
 )
 from _resolution_merges import resolution_merge
 from _verify_result_doubles import fake_verify_result
-from test_merge_queue_concurrent_verify import HEAVY_BARRIER_TEST_TIMEOUT
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
