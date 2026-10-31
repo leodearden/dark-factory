@@ -117,12 +117,50 @@ def _offender_listing(offenders: Mapping[str, list[str]]) -> str:
     )
 
 
-def test_thread_timeout_configs_disable_worker_restarts() -> None:
-    offenders = _restart_offenders({
+def _thread_method_configs(
+    ini_options_by_config: Mapping[str, Mapping],
+) -> dict[str, Mapping]:
+    return {
         name: ini_options
-        for name, ini_options in per_test_timeout_policy.discovered_pytest_configs().items()
+        for name, ini_options in ini_options_by_config.items()
         if ini_options.get('timeout_method') == THREAD_TIMEOUT_METHOD
+    }
+
+
+def test_restart_offenders_name_every_config_without_exactly_the_one_token() -> None:
+    offenders = _restart_offenders({
+        'no-addopts': {},
+        'flag-missing': {'addopts': '-n auto --dist loadgroup'},
+        'two-token-spelling': {'addopts': '-n auto --max-worker-restart 0'},
+        'restarts-permitted': {'addopts': '-n auto --max-worker-restart=1'},
+        'declared-twice': {'addopts': '--max-worker-restart=0 --max-worker-restart=0'},
+        'correct': {'addopts': "-n auto --max-worker-restart=0 -m 'not integration'"},
     })
+
+    assert offenders == {
+        'no-addopts': [],
+        'flag-missing': [],
+        'two-token-spelling': [RESTART_FLAG_PREFIX],
+        'restarts-permitted': ['--max-worker-restart=1'],
+        'declared-twice': [RESTART_DISABLED_TOKEN, RESTART_DISABLED_TOKEN],
+    }
+
+
+def test_the_thread_rule_holds_thread_method_configs_only() -> None:
+    offenders = _restart_offenders(_thread_method_configs({
+        'thread-without-flag': {'timeout_method': 'thread', 'addopts': '-n auto'},
+        'thread-with-flag': {'timeout_method': 'thread', 'addopts': RESTART_DISABLED_TOKEN},
+        'signal-without-flag': {'timeout_method': 'signal', 'addopts': '-n auto'},
+        'method-unset': {'addopts': '-n auto'},
+    }))
+
+    assert offenders == {'thread-without-flag': []}
+
+
+def test_thread_timeout_configs_disable_worker_restarts() -> None:
+    offenders = _restart_offenders(
+        _thread_method_configs(per_test_timeout_policy.discovered_pytest_configs())
+    )
     assert not offenders, (
         f'these configs run timeout_method = {THREAD_TIMEOUT_METHOD!r} but do '
         f'not declare exactly [{RESTART_DISABLED_TOKEN!r}] in addopts (tasks '
