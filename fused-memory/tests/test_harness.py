@@ -22880,11 +22880,14 @@ def test_unrelated_pending_record_on_the_same_task_does_not_suppress_the_filing(
 def test_routed_record_behind_an_unrelated_open_l1_is_not_dismissed_and_folds_next_cycle(
     journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
 ):
-    """The reaper's coverage rule (`escalation/queue.py::EscalationQueue.dismiss_if_covered`, task 5223) is category-scoped like the filer's (test (c)).
+    """Composed filer -> reaper -> filer: an unrelated open L1 cannot start the dismiss-and-refile loop (task 6341).
 
-    So an unrelated L1 dismisses nothing and the next cycle folds onto the
-    surviving L0 (task 6341). With the info-L0 router on, the router owns the
-    record instead: see `orchestrator/tests/test_info_l0_router_harness.py::TestReaperRoutesInfoOrphans::test_an_open_l1_of_another_category_does_not_swallow_an_info_note`.
+    The filer's real record shape meets the reaper's real coverage call
+    (`escalation/queue.py::EscalationQueue.dismiss_if_covered`, task 5223),
+    and the filer's next cycle folds onto the surviving L0. The queue rule on
+    its own is pinned by `escalation/tests/test_queue.py::TestDismissIfCovered::test_no_open_same_category_l1_writes_nothing`;
+    this test pins only the composition. With the info-L0 router on, the router
+    owns the record instead: see `orchestrator/tests/test_info_l0_router_harness.py::TestReaperRoutesInfoOrphans::test_an_open_l1_of_another_category_does_not_swallow_an_info_note`.
     """
     from escalation.models import Escalation  # type: ignore[import-untyped]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
