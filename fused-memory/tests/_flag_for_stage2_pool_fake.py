@@ -1,12 +1,13 @@
-"""A Mem0 stand-in for the flag_for_stage2 relay pool (task 4376).
+"""A filter-honouring Mem0 stand-in for a filter-enumerated marker pool (task 4376).
 
-It honours the metadata filters the retirement path sends, AND-ed within one
-dict as Qdrant's are, and its pool really shrinks on delete. So a test can
-observe which markers a path read and retired, and a repeat run sees what an
-earlier one did. A missing id deletes quietly, as ``delete_memory`` does.
+It honours the metadata filters a sweep sends, AND-ed within one dict as
+Qdrant's are, and its pool really shrinks on delete. So a test can observe
+which markers a path read and retired, and a repeat run sees what an earlier
+one did. A missing id deletes quietly, as ``delete_memory`` does.
 
-Shared by ``test_stages.py`` (the retirement seam against the sweep) and
-``test_targeted.py`` (the done hook that calls it).
+Shared by ``test_stages.py`` (the flag_for_stage2 retirement seam and the
+stage1_flag_marker collector, task 6241) and ``test_targeted.py`` (the done
+hook that calls the retirement seam).
 """
 
 from unittest.mock import AsyncMock
