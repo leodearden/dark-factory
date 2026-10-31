@@ -91,6 +91,7 @@ PURE_STDLIB_LEAVES = (
     'task_claimant',
     'task_metadata_wire',
     'task_statuses',
+    'task_store_schema',
     'task_text_fingerprint',
     'task_transitions',
     'testing_fake_claude',
