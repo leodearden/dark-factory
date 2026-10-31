@@ -795,7 +795,7 @@ closing the cross-group route.
 |---|---|---|
 | The **instrument** | `judge_plan_quality` refuses a non-`is_scorable_plan` artifact up front — before a prompt is built, before `invoke_agent` — and returns the floor's own value | 3303 |
 | The **writer** | `run_architect_eval` gates the judge call site on `is_scorable_plan`, so no new incoherent cell is written | 3302 |
-| The **reader** | `report._plan_quality_score` floors a no-plan cell at read time, because the 2026-07-27 / 07-29 corpus is already on disk carrying the old shape | 3302 |
+| The **reader** | `cell_admission.plan_quality_score` floors a no-plan cell at read time, because the 2026-07-27 / 07-29 corpus is already on disk carrying the old shape | 3302 |
 
 ### The validity bound: judged without a reference (task 3628)
 
@@ -827,7 +827,7 @@ therefore valid ground-truth-independently.
 `EvalMetrics.to_dict` writes the key on *every* architect cell, so a healthy
 cell says `False` explicitly; a cell whose metrics predate task 3628 carries no
 key at all, and its validity was therefore never measured. The report layer
-keeps those apart (`report._judged_without_reference`): one keyless cell in a
+keeps those apart (`cell_admission.judged_without_reference`): one keyless cell in a
 config's admitted pool makes that config's count — and the report-level total —
 `None`, rendered `-`, with `judged_without_reference_unmeasured` carrying how
 many cells drove it and the trailer printing `UNMEASURED` rather than being
@@ -835,7 +835,7 @@ suppressed. Reporting `0` there would let a rebuild over the 2026-07-27 / 07-29
 corpus — the campaign this doc's provenance note says was judged blind on half
 the hard subset — render byte-identically to a campaign graded entirely against
 landed diffs, which is the very degradation σ exists to remove, reintroduced at
-the reader. It is the same read-time discipline `report._plan_quality_score`
+the reader. It is the same read-time discipline `cell_admission.plan_quality_score`
 applies to the no-plan floor, and the same rule
 `scripts/run_fable_trial_v2_campaign.py` (task 3632) states as its rule 3 and
 enforces per cell with `MARKER_KEY not in metrics`; the two consumers of this
@@ -868,9 +868,10 @@ cost_per_plan = (spend over ADMITTED plan-only cells) / (n_admitted - no_plan)
 | `plan_rate` | `plan_rate` (beside `plan_quality_n`, the denominator) | `plan_rate` | `plan_rate` on `format_composite_table` **and** in the `plan_quality by config:` block |
 | `cost_per_plan` | `cost_per_plan` (immediately after `cost_usd`) | — (see below) | `cost_per_plan` on `format_composite_table` |
 
-Both reduce through the shared `report._plan_rate` / `report._cost_per_plan`,
-and `_plan_rate` is called by **both** builders — the `_mean_plan_quality`
-discipline, so the two tables the CLI prints adjacently cannot drift.
+Both reduce through the shared `cell_admission.plan_rate` /
+`cell_admission.cost_per_plan`, and `cell_admission.plan_rate` is called by
+**both** builders — the `cell_admission.mean_plan_quality` discipline, so the
+two tables the CLI prints adjacently cannot drift.
 `cost_per_plan` is composite-row-only because `build_plan_quality_report`
 carries no cost data at all; threading some there would create a *second* cost
 surface free to drift from `cost_usd`.
@@ -895,9 +896,9 @@ arithmetic makes the point — fable read `$3.456`/fixture against the opus-max
 incumbent but `$4.731` per usable plan, i.e. *no cheaper at all*, while failing
 to plan 5× as often. Netting the failed attempts out of the numerator would
 report that illusion rather than remove it. An *unmeasurable* cell's `$0.00` is
-still excluded, for the same reason `_is_unmeasurable` keeps it out of the
-`cost` pool: it is the price of a run that never happened, and letting it in
-would report the cap window as a discount.
+still excluded, for the same reason `cell_admission.is_unmeasurable` keeps it
+out of the `cost` pool: it is the price of a run that never happened, and
+letting it in would report the cap window as a discount.
 
 **`select_survivors` ranks on `plan_rate` as a TIE-BREAK, below
 `plan_quality`** (axes 5–6 of 7; the name tiebreak falls to 7). Not above:
@@ -1201,7 +1202,7 @@ way and neither reading is destroyed. `declined - no_plan_declined` recovers tha
 population exactly.
 
 **planRate is DELIBERATELY unchanged.** `produced_a_plan` is still
-`plan_steps > 0`, `_plan_rate` still reduces the same two numbers, and
+`plan_steps > 0`, `cell_admission.plan_rate` still reduces the same two numbers, and
 `is_scorable_plan` / `score_plan_structure` / `cap_tainted` are untouched — so
 every campaign artifact already committed stays comparable. The split is
 reported ALONGSIDE it, by
