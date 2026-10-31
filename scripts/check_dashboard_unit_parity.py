@@ -52,11 +52,13 @@ are split by CLASS, because one rule cannot fit all of them:
 - **Presence-only** — directives whose value embeds a host path (ExecStart,
   WorkingDirectory, Documentation).  Value-comparing them would report drift
   on every machine that is not this one.  Their meaningful content is reached
-  instead through per-flag ExecStart comparison.
-- **ExecStart flags** — the uvicorn flags are extracted from the
-  continuation-JOINED logical ExecStart of both copies and compared
-  individually, so the ``uv`` binary path and repo root are ignored while a
-  stale ``--timeout-graceful-shutdown`` is not.
+  instead through per-option ExecStart comparison.
+- **ExecStart options** — options are read from the continuation-JOINED
+  logical ExecStart of both copies and compared individually, so the ``uv``
+  binary path and repo root are ignored while a stale
+  ``--timeout-graceful-shutdown`` is not.  Argument-taking flags are compared
+  by value, argument-less switches (``--no-sync``) by presence, and every long
+  option on the committed command must be compared or waived with a reason.
 - **Environment=** — compared by variable-NAME set (a dropped variable is
   always drift), with values compared only for names off
   ``DIVERGENCE_ALLOWLIST``.  That allowlist exists because the one measured
@@ -298,10 +300,17 @@ class UnitSpec:
     # requires every directive in the committed unit to be either in
     # covered_directives() or named here.
     #
-    # That guard is DIRECTIVE-granular. Tokens inside ExecStart are reached
-    # only through exec_start_flags, and nothing enforces that list's
-    # completeness.
+    # That guard is DIRECTIVE-granular. ExecStart's LONG options are held
+    # complete one level down, by
+    # test_every_committed_exec_start_option_is_compared_or_explicitly_unchecked
+    # (see unchecked_exec_start_options); short options and positional
+    # arguments on the command are not reached.
     unchecked_directives: tuple[tuple[str, str, str], ...] = ()
+    # (option name, reason) pairs for long options on the committed ExecStart
+    # that are DELIBERATELY not compared: the option-level counterpart of
+    # unchecked_directives, held to the same rule — keep it small, and keep
+    # every reason specific. No spec needs one today.
+    unchecked_exec_start_options: tuple[tuple[str, str], ...] = ()
 
     def covered_directives(self) -> frozenset[tuple[str, str]]:
         """Every ``(section, key)`` a compare_unit branch checks as a whole directive.
@@ -319,24 +328,43 @@ class UnitSpec:
             covered.add((self.environment_section, "Environment"))
         return frozenset(covered)
 
+    def covered_exec_start_options(self) -> frozenset[str]:
+        """Every ExecStart long option a compare_unit branch checks, by bare name.
+
+        The option-level counterpart of covered_directives(), read by
+        ``__post_init__`` and by
+        tests/scripts/test_check_dashboard_unit_parity.py::test_every_committed_exec_start_option_is_compared_or_explicitly_unchecked.
+        """
+        return frozenset((*self.exec_start_flags, *self.exec_start_switches))
+
     def __post_init__(self) -> None:
         """Reject a registry entry that contradicts itself or could never run.
 
-        ``env_matches_directive`` reads both halves out of
-        ``environment_section``, so registering a pair without setting that
-        field makes the branch a silent no-op: the spec reads as though the
-        value were checked while nothing is compared at all — the one failure
-        mode a gate must not have, and the one its own report cannot reveal.
+        Four rejections, each turning a spec that would check other than it
+        says into an import-time error on the registry, where it is
+        unmissable, instead of a green run:
 
-        A directive both covered by a branch and listed in
-        ``unchecked_directives`` is the same defect from the other side: its
-        reason string tells a reviewer the directive is deliberately not
-        compared while a branch compares it, so the waiver can no longer be
-        trusted to mean what it says.
-
-        Raising turns either into an import-time error on the registry, where
-        it is unmissable, instead of a green run that checked other than it says.
+        - ``env_matches_directive`` without ``environment_section``. Both
+          halves are read out of that section, so the branch would be a silent
+          no-op — the one failure mode a gate must not have, and the one its
+          own report cannot reveal.
+        - A directive both covered by a branch and listed in
+          ``unchecked_directives``. Its reason string tells a reviewer the
+          directive is deliberately not compared while a branch compares it,
+          so the waiver can no longer be trusted to mean what it says.
+        - An option on both ``exec_start_flags`` and ``exec_start_switches``.
+          It either takes an argument or it does not, so one of the two
+          readers would read it wrongly.
+        - An option both covered and listed in
+          ``unchecked_exec_start_options`` — the directive-waiver defect, one
+          level down.
         """
+        self._reject_env_relation_without_section()
+        self._reject_covered_directive_waivers()
+        self._reject_options_of_both_kinds()
+        self._reject_covered_option_waivers()
+
+    def _reject_env_relation_without_section(self) -> None:
         if self.env_matches_directive and self.environment_section is None:
             raise ValueError(
                 f"{self.name}: env_matches_directive="
@@ -344,6 +372,8 @@ class UnitSpec:
                 "be set — both the variable and the directive are read from that "
                 "section, so the comparison would silently check nothing"
             )
+
+    def _reject_covered_directive_waivers(self) -> None:
         covered = self.covered_directives()
         for section, key, reason in self.unchecked_directives:
             if (section, key) in covered:
@@ -352,6 +382,28 @@ class UnitSpec:
                     f"unchecked_directives (reason: {reason!r}) but is also "
                     "covered by a comparison branch — remove one of the two so "
                     "the registry says what it actually checks"
+                )
+
+    def _reject_options_of_both_kinds(self) -> None:
+        for option in self.exec_start_flags:
+            if option in self.exec_start_switches:
+                raise ValueError(
+                    f"{self.name}: --{option} is registered on both "
+                    "exec_start_flags and exec_start_switches — an option either "
+                    "takes an argument (exec_start_flags) or does not "
+                    "(exec_start_switches), so one reader would read it wrongly"
+                )
+
+    def _reject_covered_option_waivers(self) -> None:
+        covered = self.covered_exec_start_options()
+        for option, reason in self.unchecked_exec_start_options:
+            if option in covered:
+                raise ValueError(
+                    f"{self.name}: --{option} is listed in "
+                    f"unchecked_exec_start_options (reason: {reason!r}) but is "
+                    "also compared via exec_start_flags or exec_start_switches — "
+                    "remove one of the two so the registry says what it actually "
+                    "checks"
                 )
 
 
@@ -408,6 +460,21 @@ def _exec_start_switch(service_directives: dict[str, list[str]], switch: str) ->
     """
     option = f"--{switch}"
     return option if option in _exec_start_argv(service_directives) else None
+
+
+def exec_start_option_names(service_directives: dict[str, list[str]]) -> frozenset[str]:
+    """Bare names of every LONG option on [Service] ExecStart.
+
+    ``--name=value`` yields ``name``; a bare ``--`` is skipped. Long options
+    only: short options (``-m``) and positionals (the app target) are not
+    reached. This is the enumeration the option completeness guard reads.
+    """
+    names = (
+        token[2:].partition("=")[0]
+        for token in _exec_start_argv(service_directives)
+        if token.startswith("--")
+    )
+    return frozenset(name for name in names if name)
 
 
 _OptionReader = Callable[[dict[str, list[str]], str], str | None]
