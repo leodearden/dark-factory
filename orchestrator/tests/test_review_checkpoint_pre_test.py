@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec, stamp_stock_routing_config
-from _recording_event_store import _RecordingEventStore
 from pydantic import ValidationError
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
@@ -79,9 +78,7 @@ def _make_checkpoint(tmp_path: Path, commands: list[str]) -> ReviewCheckpoint:
     mcp = MagicMock()
     mcp.mcp_config_json.return_value = {'mcpServers': {}}
 
-    cp = ReviewCheckpoint(config, mcp=mcp, usage_gate=None)
-    cp.event_store = _RecordingEventStore()  # type: ignore[assignment]
-    return cp
+    return ReviewCheckpoint(config, mcp=mcp, usage_gate=None)
 
 
 def _patch_reviewer(monkeypatch) -> AsyncMock:
