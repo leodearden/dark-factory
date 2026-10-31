@@ -42,7 +42,7 @@ from _orch_helpers import (
 from _orch_helpers import (
     claimant_row as _row,
 )
-from escalation.grant_delivery import GrantDelivery
+from escalation.grant_delivery import GRANT_NOT_DELIVERED_MARKER, GrantDelivery
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -926,6 +926,15 @@ def _wire_queue(
     return queue
 
 
+def _resolution_of(queue: EscalationQueue, esc: Escalation) -> str:
+    """The resolving record's stored resolution text, as a steward re-reads it."""
+    stored = queue.get(esc.id)
+    assert stored is not None and stored.resolution is not None, (
+        f'expected a resolution note on {esc.id}; got {stored!r}'
+    )
+    return stored.resolution
+
+
 def _files_updates(harness: Harness) -> list:
     """The ``update_task`` calls carrying a ``files`` payload — i.e. the fold's
     ``metadata.files`` write, as distinct from the re-block guard's
@@ -1303,38 +1312,60 @@ class TestGrantedFilesFoldOnRepend:
             '3438', _resume_target(esc)
         )
 
-    async def test_missing_plan_does_not_block_the_flip(
+    async def test_missing_plan_is_loud_and_does_not_block_the_flip(
         self, harness: Harness, tmp_path: Path, caplog
     ):
-        """No plan.json in EITHER location → skip the fold, still re-pend.
+        """No plan.json in EITHER location → no widen, still re-pend, and the
+        shortfall is operator-visible (task 5650).
 
         A task can legitimately have no plan (it never reached the architect,
-        or its worktree was reclaimed).  There is no scope to widen, and the
-        re-pend is still the right outcome — the grant is not a precondition
-        of the resume.
+        or its worktree was reclaimed), and the grant is not a precondition of
+        the resume (INV-4). But this branch is reached only when a grant
+        exists, so a grant with nowhere to land is a WARNING and a marker note
+        on the resolving record, which is what a steward or watcher re-reads.
         """
         esc = _esc(
             task_id='3438', category='scope_violation',
             granted_files=['pkg/b.py'], resolved_by='steward',
         )
-        _wire_queue(harness, tmp_path, esc)
+        queue = _wire_queue(harness, tmp_path, esc)
         _wire(harness, _row('in-progress', claimant=None, heartbeat=None))
         harness._escalation_events.pop('3438', None)
 
-        with caplog.at_level(logging.DEBUG):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
             await _drive(harness, esc)
 
         assert _files_updates(harness) == [], (
             'metadata.files must not be widened when plan.files could not be — '
             'the two would diverge and trip _check_scope_invariant at merge'
         )
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '3438', _resume_target(esc)
-        )
+        harness.scheduler.set_task_status.assert_awaited_once()  # type: ignore[attr-defined]
         assert any(
-            'plan' in r.getMessage() and '3438' in r.getMessage()
+            r.levelno == logging.WARNING
+            and 'granted-files fold' in r.getMessage()
+            and '3438' in r.getMessage()
             for r in caplog.records
-        ), 'the skipped fold must leave a trace naming the task and the plan'
+        ), 'the undelivered grant must leave a WARNING naming the task'
+        resolution = _resolution_of(queue, esc)
+        assert GRANT_NOT_DELIVERED_MARKER in resolution
+        assert 'pkg/b.py' in resolution
+
+    async def test_a_delivered_grant_leaves_the_resolution_untouched(
+        self, harness: Harness, tmp_path: Path
+    ):
+        esc = _esc(
+            task_id='3438', category='scope_violation',
+            granted_files=['pkg/b.py'], resolved_by='steward',
+        )
+        queue = _wire_queue(harness, tmp_path, esc)
+        _seed_plan(harness, files=['pkg/a.py'])
+        _wire(harness, _row('in-progress', claimant=None, heartbeat=None))
+        harness._escalation_events.pop('3438', None)
+
+        await _drive(harness, esc)
+
+        assert len(_files_updates(harness)) == 1, 'fixture premise: the grant landed'
+        assert GRANT_NOT_DELIVERED_MARKER not in (queue.get(esc.id).resolution or '')
 
     async def test_plan_write_failure_does_not_block_the_flip(
         self, harness: Harness, tmp_path: Path, caplog
@@ -1353,7 +1384,7 @@ class TestGrantedFilesFoldOnRepend:
             task_id='3438', category='scope_violation',
             granted_files=['pkg/b.py'], resolved_by='steward',
         )
-        _wire_queue(harness, tmp_path, esc)
+        queue = _wire_queue(harness, tmp_path, esc)
         _seed_plan(harness, files=['pkg/a.py'])
         _wire(harness, _row('in-progress', claimant=None, heartbeat=None))
         harness._escalation_events.pop('3438', None)
@@ -1383,6 +1414,11 @@ class TestGrantedFilesFoldOnRepend:
             "a dropped grant must be operator-visible — the FOLD's own WARNING, "
             'not merely some WARNING mentioning the task id'
         )
+        resolution = _resolution_of(queue, esc)
+        assert GRANT_NOT_DELIVERED_MARKER in resolution, (
+            'the WRITE_FAILED shortfall must be noted on the resolving record'
+        )
+        assert 'pkg/b.py' in resolution
 
     async def test_metadata_write_failure_does_not_block_the_flip(
         self, harness: Harness, tmp_path: Path, caplog
@@ -1664,7 +1700,9 @@ class TestGrantedFilesDeliveryProbe:
         )
 
 
-def _live_slot_grant(harness: Harness, tmp_path: Path, granted: list[str]) -> tuple[Escalation, asyncio.Event]:
+def _live_slot_grant(
+    harness: Harness, tmp_path: Path, granted: list[str],
+) -> tuple[Escalation, asyncio.Event, EscalationQueue]:
     """The reported repro's wiring: an L2 grant resolved against a LIVE task.
 
     The ``_escalation_events`` entry stays PRESENT, the inverse of every
@@ -1674,11 +1712,11 @@ def _live_slot_grant(harness: Harness, tmp_path: Path, granted: list[str]) -> tu
         task_id='3438', level=2, category='scope_violation',
         granted_files=granted, resolved_by='escalation-watcher-auto',
     )
-    _wire_queue(harness, tmp_path, esc)
+    queue = _wire_queue(harness, tmp_path, esc)
     _wire(harness, _row('in-progress', claimant=LIVE_CLAIMANT, heartbeat='fresh'))
     event = asyncio.Event()
     harness._escalation_events['3438'] = event
-    return esc, event
+    return esc, event, queue
 
 
 @pytest.mark.asyncio
@@ -1697,7 +1735,7 @@ class TestGrantDeliveryOnALiveWorkflow:
     async def test_a_grant_on_a_live_workflow_is_delivered(
         self, harness: Harness, tmp_path: Path
     ):
-        esc, event = _live_slot_grant(harness, tmp_path, ['pkg/b.py'])
+        esc, event, _queue = _live_slot_grant(harness, tmp_path, ['pkg/b.py'])
         plan_path = _seed_plan(harness, files=['pkg/a.py'])
 
         await _drive(harness, esc)
@@ -1710,7 +1748,7 @@ class TestGrantDeliveryOnALiveWorkflow:
     async def test_a_grantless_resolve_on_a_live_workflow_schedules_nothing(
         self, harness: Harness, tmp_path: Path
     ):
-        esc, _event = _live_slot_grant(harness, tmp_path, [])
+        esc, _event, _queue = _live_slot_grant(harness, tmp_path, [])
         _seed_plan(harness, files=['pkg/a.py'])
 
         labels = _record_scheduling(harness)
@@ -1721,7 +1759,7 @@ class TestGrantDeliveryOnALiveWorkflow:
     async def test_live_delivery_is_scheduled_under_its_own_label(
         self, harness: Harness, tmp_path: Path
     ):
-        esc, _event = _live_slot_grant(harness, tmp_path, ['pkg/b.py'])
+        esc, _event, _queue = _live_slot_grant(harness, tmp_path, ['pkg/b.py'])
         _seed_plan(harness, files=['pkg/a.py'])
 
         labels = _record_scheduling(harness)
@@ -1731,3 +1769,15 @@ class TestGrantDeliveryOnALiveWorkflow:
         assert 'grant-delivery task 3438' in labels[0]
         assert 'cascade-unblock' not in labels[0]
         assert 'orphan-unblock' not in labels[0]
+
+    async def test_a_live_slot_grant_with_no_plan_is_noted(
+        self, harness: Harness, tmp_path: Path
+    ):
+        esc, _event, queue = _live_slot_grant(harness, tmp_path, ['pkg/b.py'])
+
+        await _drive(harness, esc)
+
+        resolution = _resolution_of(queue, esc)
+        assert GRANT_NOT_DELIVERED_MARKER in resolution
+        assert 'pkg/b.py' in resolution
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
