@@ -22,7 +22,11 @@ from typing import IO, TYPE_CHECKING, Any, ClassVar, cast
 from escalation.categories import EscalationCategory
 from escalation.classify import is_done_step_commit_orphan
 from escalation.disposition import ExitKind
-from escalation.grant_delivery import GrantDelivery
+from escalation.grant_delivery import (
+    GRANT_NOT_DELIVERED_MARKER,
+    GrantDelivery,
+    shortfall_reason,
+)
 from escalation.models import DeliveredCheckOwner, Escalation
 from escalation.pins import classify_pins
 from shared import delivered_check_polarity
@@ -17593,11 +17597,33 @@ class Harness:
 
     async def _deliver_resume_resolution(self, escalation, *, repend: bool) -> None:
         """Deliver a resume resolution's scope grant, then re-pend when *repend*."""
-        await self._fold_granted_files(escalation.task_id, escalation)
+        shortfall = await self._fold_granted_files(escalation.task_id, escalation)
+        if shortfall is not None:
+            self._note_undelivered_grant(escalation, shortfall)
         if repend:
             await self._cascade_unblock_member(escalation)
 
-    async def _fold_granted_files(self, task_id: str, escalation) -> None:
+    def _note_undelivered_grant(self, escalation, shortfall: GrantDelivery) -> None:
+        """Append *shortfall*'s reason to the resolving record; never raises."""
+        if self._escalation_queue is None:
+            return
+        reason = shortfall_reason(
+            shortfall,
+            task_id=escalation.task_id,
+            granted_files=escalation.granted_files,
+        )
+        try:
+            self._escalation_queue.patch_resolution_metadata(
+                escalation.id,
+                append_to_resolution=f'{GRANT_NOT_DELIVERED_MARKER} {reason}',
+            )
+        except Exception:
+            logger.warning(
+                'grant-delivery: failed to note the undelivered grant on %s for task %s',
+                escalation.id, escalation.task_id, exc_info=True,
+            )
+
+    async def _fold_granted_files(self, task_id: str, escalation) -> GrantDelivery | None:
         """Deliver the steward's ``granted_files`` scope grant for a resume resolution.
 
         The harness-side twin of ``workflow.py::TaskWorkflow._collect_granted_
@@ -17696,6 +17722,14 @@ class Harness:
         escalation already closed and nothing left to advance it, i.e. exactly
         the permanent silent hold INV-4 exists to prevent.
 
+        A shortfall is also RETURNED (``NO_PLAN_TO_WIDEN``, ``WRITE_FAILED``;
+        None means delivered or nothing to deliver), and
+        :meth:`_deliver_resume_resolution` writes it onto the resolving record
+        under ``GRANT_NOT_DELIVERED_MARKER``. ``resolve_issue`` has already
+        returned by now, so a log line alone is not a return value (INV-11
+        ``no-silent-fail-soft``, ``docs/legibility/design-invariants.md``):
+        the record is what a steward or watcher re-reads.
+
         COST GATE (review amendment): the *resolving* record's own
         ``granted_files`` is checked FIRST, and an empty one returns before
         any I/O at all. ``EscalationQueue.get_by_task`` with ``status=None``
@@ -17713,12 +17747,12 @@ class Harness:
         """
         if not getattr(escalation, 'granted_files', None):
             # See "COST GATE" above — the common case, and it costs no I/O.
-            return
+            return None
         queue = getattr(self, '_escalation_queue', None)
         if not queue:
             # Bare-harness / eval mode — nothing to read (mirrors
             # _collect_granted_files' own `if not self.escalation_queue` guard).
-            return
+            return None
         try:
             # Union across the task's WHOLE resolved history, order-preserving
             # — a verbatim structural mirror of _collect_granted_files. Not
@@ -17739,23 +17773,25 @@ class Harness:
                         seen.add(f)
                         granted.append(f)
             if not granted:
-                return
+                return None
 
             arts = self._locate_plan_artifacts(task_id)
             if arts is None:
                 # A task can legitimately have no plan (never reached the
-                # architect, or its worktree was reclaimed). There is no scope
-                # to widen and the re-pend is still correct — the grant is not
-                # a precondition of the resume.
+                # architect, or its worktree was reclaimed), and the re-pend is
+                # still correct — the grant is not a precondition of the resume.
+                # But the COST GATE means this branch is reached only when a
+                # grant exists, so a grant with nowhere to land always deserves
+                # an operator-visible line.
                 wt = self._resolve_task_worktree(task_id)
-                logger.debug(
+                logger.warning(
                     'granted-files fold: task %s has no plan.json at %s or %s '
-                    '— nothing to widen (grant %s)',
+                    '— the grant %s was not delivered',
                     task_id,
                     TaskArtifacts.meta_root_for(self.git_ops.worktree_base, wt.name),
                     wt / '.task', granted,
                 )
-                return
+                return GrantDelivery.NO_PLAN_TO_WIDEN
 
             # plan_mutex spans the whole read-modify-write: a live workflow's
             # _set_task_scope can be writing this same plan.json.
@@ -17767,7 +17803,7 @@ class Harness:
                     # The overwhelmingly common case (a resume with no NEW
                     # files): costs neither a plan rewrite nor an update_task
                     # round-trip.
-                    return
+                    return None
 
                 # Pass the plan's OWN owner id back — see "Ownership" above.
                 arts.set_plan_files(
@@ -17799,12 +17835,12 @@ class Harness:
                 # treated exactly like an empty/omitted one (sentinel alone, no
                 # clobber)"). The flip and the plan write still happen.
                 logger.info(
-                    'granted-files fold: widened task %s plan.files %s → %s '
-                    'before the re-pend; metadata.files unchanged (%s — the '
-                    'grant carries no file-level entry) (grant %s)',
+                    'granted-files fold: widened task %s plan.files %s → %s; '
+                    'metadata.files unchanged (%s — the grant carries no '
+                    'file-level entry) (grant %s)',
                     task_id, current, union, honest, granted,
                 )
-                return
+                return None
             # Same call shape as _check_reblock_guard's persist.
             # metadata_mode='merge': shallow last-write-wins, so the files key
             # is replaced wholesale while sibling metadata keys survive.
@@ -17814,11 +17850,11 @@ class Harness:
                 task_id, {'files': honest}, metadata_mode='merge',
             )
             logger.info(
-                'granted-files fold: widened task %s scope %s → %s before the '
-                're-pend — plan.files got the raw union, metadata.files the '
-                'sanitized %s (grant %s)',
+                'granted-files fold: widened task %s scope %s → %s — plan.files '
+                'got the raw union, metadata.files the sanitized %s (grant %s)',
                 task_id, current, union, honest, granted,
             )
+            return None
         except Exception:
             # Warn-and-continue by design — see the docstring. The plan write
             # precedes the metadata write inside this try, so a failed plan
@@ -17827,9 +17863,10 @@ class Harness:
             # redispatch anyway.
             logger.warning(
                 'granted-files fold: could not deliver the scope grant for '
-                'task %s — re-pending against the unwidened scope (the agent '
-                'will re-escalate)', task_id, exc_info=True,
+                'task %s — its scope may be unwidened (the agent will '
+                're-escalate)', task_id, exc_info=True,
             )
+            return GrantDelivery.WRITE_FAILED
 
     def _flag_repend_while_paused(self, task_id: str, escalation_id: str) -> None:
         """Mark a resolution that re-pended *task_id* into a paused scheduler; never raises."""

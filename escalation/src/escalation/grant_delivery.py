@@ -117,10 +117,10 @@ def shortfall_reason(
             )
         case GrantDelivery.WRITE_FAILED:
             return (
-                f'granted_files {paths} were recorded but did not widen task '
-                f"{task_id}: writing them into its plan.json or metadata.files "
-                f'failed (see the orchestrator log), so it keeps its unwidened '
-                f'scope; widen both by hand, or expect the agent to re-escalate.'
+                f'granted_files {paths} were recorded but may not have widened '
+                f"task {task_id}: writing them into its plan.json or "
+                f'metadata.files failed (see the orchestrator log); check both '
+                f'and widen by hand, or expect the agent to re-escalate.'
             )
         case _:
             assert_never(delivery)
