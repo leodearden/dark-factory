@@ -8,6 +8,7 @@ floats; a leg ends at granted_at + held_secs.
 from __future__ import annotations
 
 import dataclasses
+import json
 import sqlite3
 from datetime import datetime
 
@@ -378,3 +379,50 @@ def test_a_zero_length_window_is_thin_even_with_a_decisive_interval():
 
 def test_verdict_values_are_the_json_spellings():
     assert [v.value for v in mod.Verdict] == ['file', 'decline', 'thin_data']
+
+
+
+def _two_project_dbs(make_runs_db):
+    alpha = make_runs_db([
+        _plan_event('2026-10-17T06:07:41+00:00', 'a1', [
+            _leg_payload('a1', 'a', ARRIVED, GRANTED, 30.0, rc=1),
+            _leg_payload('a1', 'b', ARRIVED, '2026-10-17T06:00:41+00:00', 12.0),
+        ]),
+    ], name='alpha.db')
+    beta = make_runs_db([
+        _plan_event('2026-10-17T06:07:41+00:00', 'b1', [_leg_payload('b1', None, ARRIVED, GRANTED, 9.0)]),
+    ], name='beta.db')
+    return alpha, beta
+
+
+def test_cli_prints_one_measurement_and_verdict_per_db_in_argument_order(make_runs_db, capsys):
+    alpha, beta = _two_project_dbs(make_runs_db)
+
+    rc = mod.main(['--db', f'alpha={alpha}', '--db', f'beta={beta}', '--resamples', '200', '--seed', '7'])
+
+    assert rc == 0
+    reports = json.loads(capsys.readouterr().out)
+    assert [report['project'] for report in reports] == ['alpha', 'beta']
+    measurement_fields = {field.name for field in dataclasses.fields(mod.Measurement)}
+    assert all(measurement_fields <= report.keys() for report in reports)
+    assert [report['verdict'] for report in reports] == ['thin_data', 'thin_data']
+    assert reports[0]['avoidable_share'] == 12.0 / 42.0
+    assert reports[0]['cost']['avoidable_legs'] == 1
+    assert reports[0]['timeout_retries']['attempts'] == 0
+
+
+def test_cli_rejects_a_db_without_a_project_name(tmp_path):
+    with pytest.raises(SystemExit) as exited:
+        mod.main(['--db', str(tmp_path / 'runs.db')])
+
+    assert exited.value.code == 2
+
+
+def test_cli_reports_an_unreadable_db_on_stderr_without_creating_it(tmp_path, capsys):
+    missing = tmp_path / 'absent.db'
+
+    rc = mod.main(['--db', f'gone={missing}'])
+
+    assert rc != 0
+    assert str(missing) in capsys.readouterr().err
+    assert not missing.exists()
