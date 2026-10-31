@@ -111,17 +111,19 @@ def _as_failure_token(value: object) -> str:
     return value.strip()[:_MAX_FAILURE_TOKEN_LEN]
 
 
-def _escapes_root(root: Path, relpath: str) -> bool:
-    """Whether ``root / relpath`` resolves outside ``root``; blocks on a stat/readlink per path component, so a coroutine must reach it through asyncio.to_thread."""
-    return not (root / relpath).resolve().is_relative_to(root)
+def _contained_path(root: Path, relpath: str) -> Path | None:
+    """``root / relpath`` if it resolves inside ``root``, else None; blocks on a stat/readlink per path component, so a coroutine must reach it through asyncio.to_thread."""
+    target = root / relpath
+    return target if target.resolve().is_relative_to(root) else None
 
 
 def _read_codebase_file(root: Path, path: str, max_lines: int) -> dict:
-    """The read_file tool's result for ``path`` under ``root``, at most ``max_lines`` lines."""
-    if _escapes_root(root, path):
+    """The read_file tool's result for ``path`` under ``root``, at most ``max_lines`` lines; blocks on the path check and the file read, so a coroutine must reach it through asyncio.to_thread."""
+    target = _contained_path(root, path)
+    if target is None:
         return {'error': 'Path outside codebase root'}
     try:
-        content = (root / path).read_text()
+        content = target.read_text()
         lines = content.splitlines()
         if len(lines) > max_lines:
             lines = lines[:max_lines]
@@ -294,8 +296,8 @@ class CodebaseVerifier:
 
         async def grep_search(pattern: str, path: str = '.', max_results: int = 30) -> dict:
             """Search file contents with regex."""
-            search_path = codebase_root / path
-            if await asyncio.to_thread(_escapes_root, codebase_root, path):
+            search_path = await asyncio.to_thread(_contained_path, codebase_root, path)
+            if search_path is None:
                 return {'error': 'Path outside codebase root'}
             try:
                 proc = await asyncio.create_subprocess_exec(

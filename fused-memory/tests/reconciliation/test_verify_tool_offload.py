@@ -158,7 +158,7 @@ async def test_glob_search_reports_an_absolute_pattern_instead_of_raising(root: 
 
     result = await tools['glob_search'].function(pattern='/etc/*')
 
-    assert 'error' in result, result
+    assert set(result) == {'error'}, result
 
 
 @pytest.mark.asyncio
