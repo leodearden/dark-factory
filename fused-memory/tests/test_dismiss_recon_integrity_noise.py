@@ -25,7 +25,7 @@ from _fm_helpers import load_script_module
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
-from fused_memory.utils.target_store_preflight import TargetStoreMissing
+from fused_memory.utils.target_store_preflight import TargetStoreUnpopulated
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'dismiss_recon_integrity_noise.py'
 
@@ -79,11 +79,11 @@ class TestRunTargetStorePreflight:
         script looked at it IS the defect, so gating on ``--apply`` would let
         the misleading report print and exit 0.
         """
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             run(tmp_path / 'data' / 'reconciliation' / 'escalations', apply=False)
 
     def test_apply_refuses_a_missing_queue_dir(self, tmp_path: Path):
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             run(tmp_path / 'data' / 'reconciliation' / 'escalations', apply=True)
 
     @pytest.mark.parametrize('apply', [False, True])
@@ -95,7 +95,7 @@ class TestRunTargetStorePreflight:
         """
         target = tmp_path / 'data' / 'reconciliation' / 'escalations'
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             run(target, apply=apply)
 
         assert not target.exists()
@@ -120,7 +120,7 @@ class TestRunTargetStorePreflight:
             ['dismiss_recon_integrity_noise.py', '--queue-dir', str(target)],
         )
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             main()
 
     def test_an_empty_existing_queue_dir_is_refused(self, tmp_path: Path):
@@ -128,7 +128,7 @@ class TestRunTargetStorePreflight:
 
         The predicate is pinned in test_target_store_preflight.py::TestQueueDirArm.
         """
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             run(tmp_path, apply=False)
 
 

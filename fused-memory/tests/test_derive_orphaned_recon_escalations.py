@@ -32,7 +32,7 @@ from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     classify_orphan,
     sweep_orphaned_recon_escalations,
 )
-from fused_memory.utils.target_store_preflight import TargetStoreMissing
+from fused_memory.utils.target_store_preflight import TargetStoreUnpopulated
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'derive_orphaned_recon_escalations.py'
@@ -541,7 +541,7 @@ class TestMissingQueueDirRefusal:
         """The DRY RUN refuses too: its report is exactly as false as an apply."""
         missing = tmp_path / 'data' / 'reconciliation' / 'escalations'
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod.run(
                 queue_dir=missing, project_roots=PROJECT_ROOTS,
                 apply=apply_mode, taskmaster=taskmaster,
@@ -553,7 +553,7 @@ class TestMissingQueueDirRefusal:
         """The queue was never constructed, so the ``mkdir`` never happened."""
         missing = tmp_path / 'data' / 'reconciliation' / 'escalations'
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod.run(
                 queue_dir=missing, project_roots=PROJECT_ROOTS,
                 apply=apply_mode, taskmaster=taskmaster,
@@ -570,7 +570,7 @@ class TestMissingQueueDirRefusal:
         no census read -- which is why this call can pass ``taskmaster=None``
         without touching a live store.
         """
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod.run(
                 queue_dir=tmp_path / 'absent', project_roots=PROJECT_ROOTS,
                 taskmaster=None,
@@ -582,7 +582,7 @@ class TestMissingQueueDirRefusal:
 
         The predicate is pinned in test_target_store_preflight.py::TestQueueDirArm.
         """
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod.run(
                 queue_dir=tmp_path, project_roots=PROJECT_ROOTS, taskmaster=taskmaster,
             )

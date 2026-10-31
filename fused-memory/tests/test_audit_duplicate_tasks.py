@@ -16,7 +16,7 @@ from _fm_helpers import (
     make_zero_byte_task_store,
 )
 
-from fused_memory.utils.target_store_preflight import TargetStoreMissing
+from fused_memory.utils.target_store_preflight import TargetStoreUnpopulated
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_duplicate_tasks.py'
 
@@ -1276,7 +1276,7 @@ class TestRunTargetStorePreflight:
             'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend', factory,
         )
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(_args(tmp_path, apply=apply))
 
         # Refused BEFORE the backend was constructed — reaching get_tasks is
@@ -1293,7 +1293,7 @@ class TestRunTargetStorePreflight:
             _RecordingBackendFactory(),
         )
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(_args(tmp_path, apply=False))
 
         assert not (tmp_path / '.taskmaster').exists()
@@ -1313,7 +1313,7 @@ class TestRunTargetStorePreflight:
             'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend', factory,
         )
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(_args(tmp_path, apply=False))
 
         assert factory.constructions == []
