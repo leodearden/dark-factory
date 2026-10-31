@@ -28,7 +28,7 @@ MERGE_SHA = 'c' * 40
 
 @pytest.mark.asyncio
 async def test_clean_merge_resume_reaches_the_queue_without_a_scope_escalation(
-    tmp_path: Path,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ):
     worktree = tmp_path / 'wt'
     _init_git_repo(worktree)
@@ -68,8 +68,6 @@ async def test_clean_merge_resume_reaches_the_queue_without_a_scope_escalation(
     wf.git_ops.rebase_onto_main = AsyncMock(return_value=False)
     wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
     wf.git_ops.get_merge_commit_diff_files = AsyncMock(return_value=([], None))
-    wf._ensure_steward_started = AsyncMock()
-    wf._await_steward_completion = AsyncMock()
 
     wf.merge_queue = merge_queue = asyncio.Queue()
     requests = []
@@ -91,6 +89,11 @@ async def test_clean_merge_resume_reaches_the_queue_without_a_scope_escalation(
         worker.cancel()
 
     assert [esc.summary for esc in queue.get_by_task(wf.task_id)] == []
+    swallowed_attribute_errors = [
+        record.getMessage() for record in caplog.records
+        if record.exc_info and isinstance(record.exc_info[1], AttributeError)
+    ]
+    assert swallowed_attribute_errors == []
     assert [r.task_files for r in requests] == [PLAN_FILES]
     assert outcome == WorkflowOutcome.DONE
     f.mark_done.assert_awaited_once_with(wf.task_id, kind='merged', sha=MERGE_SHA)
