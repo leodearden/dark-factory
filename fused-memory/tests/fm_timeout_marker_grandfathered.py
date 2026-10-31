@@ -16,16 +16,6 @@ INVERSION_BAND_GRANDFATHERED: frozenset[tuple[str, str]] = frozenset({
     # server/test_write_triage_judge.py -- 2 sites at 120s
     ('server/test_write_triage_judge.py', 'TestTheFrontierArmLive'),
     ('server/test_write_triage_judge.py', 'TestTheShippedWordingLive'),
-    # test_bm25_serving_integration.py -- 1 site at 120s
-    ('test_bm25_serving_integration.py', '<module>'),
-    # test_drop_vector_indices_integration.py -- 1 site at 240s
-    ('test_drop_vector_indices_integration.py', 'TestDropRebuildWindow'),
-    # test_ensure_indices_integration.py -- 1 site at 120s
-    ('test_ensure_indices_integration.py', '<module>'),
-    # test_falkor_edge_search_integration.py -- 1 site at 120s
-    ('test_falkor_edge_search_integration.py', '<module>'),
-    # test_index_provisioning_wiring_integration.py -- 1 site at 120s
-    ('test_index_provisioning_wiring_integration.py', '<module>'),
     # test_integration_marker_config.py -- 2 sites at 120s
     ('test_integration_marker_config.py', 'TestIntegrationMarkerDeselection'),
     (
@@ -45,8 +35,6 @@ INVERSION_BAND_GRANDFATHERED: frozenset[tuple[str, str]] = frozenset({
         'test_project_scope.py',
         'TestProjectScopeTypeGateRejection::test_pyright_rejects_transposition_and_frozen_mutation',
     ),
-    # test_rrf_cross_store_merge.py -- 1 site at 120s
-    ('test_rrf_cross_store_merge.py', '<module>'),
     # test_sqlite_task_backend_crash.py -- 2 sites at 120s and 180s
     ('test_sqlite_task_backend_crash.py', 'test_committed_rows_survive_sigkill'),
     ('test_sqlite_task_backend_crash.py', 'test_repeated_sigkill_cycles_preserve_durability'),

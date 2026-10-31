@@ -57,7 +57,7 @@ FUSED_MEMORY_TIMEOUT_MARKER_GRANDFATHERED = governed_exceptions(
     'inversion guard, exempt from it until migrated; entries may only be removed.',
     sorted('::'.join(site) for site in fm_timeout_marker_grandfathered.INVERSION_BAND_GRANDFATHERED),
     default=Debt(TaskRef(6337)),
-    default_covers=20,
+    default_covers=14,
 )
 
 CANCELLED_PREMISE_BLOCKLIST = governed_exceptions(
