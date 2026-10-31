@@ -52,6 +52,17 @@ const REDUX_DIR = path.resolve(
 // can never be confused with a different tab's fan-in.
 const MERGE_PATH = '/api/v2/dashboard/merge-queue';
 const TASKS_PATH = '/api/v2/dashboard/tasks';
+const ESC_PATH = '/api/v2/dashboard/escalations';
+
+// A multi-endpoint path list, spelled out here rather than read off a surface
+// map: the notice functions decide over whatever paths they are handed, so
+// their decision tests do not depend on which tab polls what.
+const TASKS_TAB_PATHS = Object.freeze([
+  TASKS_PATH,
+  '/api/v2/dashboard/orchestrators',
+  '/api/v2/dashboard/scheduler',
+  '/api/v2/dashboard/invariants',
+]);
 
 const NOW = 1_700_000_000_000;
 
@@ -77,7 +88,7 @@ test('module exposes its documented surface', () => {
 
 test('a healthy tab (failures: 0) produces no notice', () => {
   const notices = staleNoticesForTab({
-    tab: 'merge',
+    paths: [MERGE_PATH],
     stale: staleMap({ [MERGE_PATH]: { failures: 0, lastSuccessAt: NOW - 3000 } }),
     now: NOW,
   });
@@ -87,8 +98,8 @@ test('a healthy tab (failures: 0) produces no notice', () => {
 test('an absent entry (never polled yet) produces no notice', () => {
   // The very first render happens before any fetch resolves, so __stale is
   // `{}`. Claiming staleness there would fire on every page load.
-  assert.deepEqual(staleNoticesForTab({ tab: 'merge', stale: {}, now: NOW }), []);
-  assert.deepEqual(staleNoticesForTab({ tab: 'merge' }), []);
+  assert.deepEqual(staleNoticesForTab({ paths: [MERGE_PATH], stale: {}, now: NOW }), []);
+  assert.deepEqual(staleNoticesForTab({ paths: [MERGE_PATH] }), []);
   assert.deepEqual(staleNoticesForTab({}), []);
   assert.deepEqual(staleNoticesForTab(), []);
 });
@@ -101,7 +112,7 @@ test('a single blip does not trip the indicator (#4791 acceptance 2)', () => {
   // indicator that fires on those is an indicator operators learn to ignore.
   for (const failures of [1, STALE_FAILURE_THRESHOLD - 1]) {
     const notices = staleNoticesForTab({
-      tab: 'merge',
+      paths: [MERGE_PATH],
       stale: staleMap({ [MERGE_PATH]: { failures, lastSuccessAt: NOW - 9000 } }),
       now: NOW,
     });
@@ -111,7 +122,7 @@ test('a single blip does not trip the indicator (#4791 acceptance 2)', () => {
 
 test('reaching the threshold produces exactly one notice', () => {
   const notices = staleNoticesForTab({
-    tab: 'merge',
+    paths: [MERGE_PATH],
     stale: staleMap({
       [MERGE_PATH]: { failures: STALE_FAILURE_THRESHOLD, lastSuccessAt: NOW - 60_000 },
     }),
@@ -126,7 +137,7 @@ test('reaching the threshold produces exactly one notice', () => {
 
 test('past the threshold it stays exactly one notice, not one per failure', () => {
   const notices = staleNoticesForTab({
-    tab: 'merge',
+    paths: [MERGE_PATH],
     stale: staleMap({
       [MERGE_PATH]: { failures: STALE_FAILURE_THRESHOLD + 400, lastSuccessAt: NOW - 71_280_000 },
     }),
@@ -139,7 +150,7 @@ test('past the threshold it stays exactly one notice, not one per failure', () =
 
 test('the notice names the endpoint path and a human age', () => {
   const [notice] = staleNoticesForTab({
-    tab: 'merge',
+    paths: [MERGE_PATH],
     stale: staleMap({
       [MERGE_PATH]: { failures: STALE_FAILURE_THRESHOLD, lastSuccessAt: NOW - 125_000 },
     }),
@@ -184,7 +195,7 @@ test('an endpoint that never succeeded says NEVER, not "0s ago"', () => {
   // documents: a missing timestamp is UNKNOWN, never "just now".
   for (const lastSuccessAt of [0, null, undefined]) {
     const [notice] = staleNoticesForTab({
-      tab: 'merge',
+      paths: [MERGE_PATH],
       stale: staleMap({
         [MERGE_PATH]: { failures: STALE_FAILURE_THRESHOLD, lastSuccessAt },
       }),
@@ -245,28 +256,26 @@ test('every app.jsx tab is mapped — a tab with no entry is silently unmonitore
   }
 });
 
-test('an unknown tab id yields no notice rather than throwing', () => {
-  assert.deepEqual(
-    staleNoticesForTab({
-      tab: 'not-a-tab',
-      stale: staleMap({ [MERGE_PATH]: { failures: 99, lastSuccessAt: 0 } }),
-      now: NOW,
-    }),
-    [],
-  );
+test('missing or non-array paths yield no notice rather than throwing', () => {
+  const wedged = staleMap({ [MERGE_PATH]: { failures: 99, lastSuccessAt: 0 } });
+  assert.deepEqual(staleNoticesForTab({ stale: wedged, now: NOW }), []);
+  assert.deepEqual(staleNoticesForTab({ paths: 'x', stale: wedged, now: NOW }), []);
+  // A tab id is no longer consulted at all: the module holds no tab map, so
+  // the caller hands it the open tab's paths.
+  assert.deepEqual(staleNoticesForTab({ tab: 'merge', stale: wedged, now: NOW }), []);
 });
 
 // ── (f) fan-in and cross-tab isolation ─────────────────────────────────────
 
 test('a multi-endpoint tab yields one notice per FAILING endpoint', () => {
-  const paths = TAB_ENDPOINTS.tasks;
+  const paths = TASKS_TAB_PATHS;
   assert.ok(paths.length > 1,
     `the tasks tab fans in from several endpoints; got ${JSON.stringify(paths)}`);
 
   const all = staleMap(Object.fromEntries(
     paths.map(p => [p, { failures: STALE_FAILURE_THRESHOLD, lastSuccessAt: NOW - 30_000 }]),
   ));
-  const notices = staleNoticesForTab({ tab: 'tasks', stale: all, now: NOW });
+  const notices = staleNoticesForTab({ paths: TASKS_TAB_PATHS, stale: all, now: NOW });
   assert.equal(notices.length, paths.length);
   assert.deepEqual(notices.map(n => n.path).sort(), [...paths].sort());
 
@@ -274,20 +283,20 @@ test('a multi-endpoint tab yields one notice per FAILING endpoint', () => {
   const one = staleMap({
     [TASKS_PATH]: { failures: STALE_FAILURE_THRESHOLD, lastSuccessAt: NOW - 30_000 },
   });
-  const single = staleNoticesForTab({ tab: 'tasks', stale: one, now: NOW });
+  const single = staleNoticesForTab({ paths: TASKS_TAB_PATHS, stale: one, now: NOW });
   assert.equal(single.length, 1);
   assert.equal(single[0].path, TASKS_PATH);
 });
 
-test('a healthy tab shows nothing while a DIFFERENT tab\'s endpoint is wedged', () => {
+test('only the given paths are reported', () => {
   // The whole point of per-endpoint staleness: the 19.8h wedge hit the tasks
   // fan-out while the escalations endpoint stayed current. A global banner
   // would have lied about both.
   const stale = staleMap({
     [TASKS_PATH]: { failures: 400, lastSuccessAt: NOW - 71_280_000 },
   });
-  assert.deepEqual(staleNoticesForTab({ tab: 'esc', stale, now: NOW }), []);
-  assert.equal(staleNoticesForTab({ tab: 'tasks', stale, now: NOW }).length, 1);
+  assert.deepEqual(staleNoticesForTab({ paths: [ESC_PATH], stale, now: NOW }), []);
+  assert.equal(staleNoticesForTab({ paths: [TASKS_PATH], stale, now: NOW }).length, 1);
 });
 
 // ── staleEntryFor ──────────────────────────────────────────────────────────
@@ -302,7 +311,7 @@ test('staleEntryFor reads a path out of the published map and defaults safely', 
 
 test('every notice is a {kind, path, text} triple with kind "stale"', () => {
   const notices = staleNoticesForTab({
-    tab: 'tasks',
+    paths: TASKS_TAB_PATHS,
     stale: staleMap({
       [TASKS_PATH]: { failures: STALE_FAILURE_THRESHOLD, lastSuccessAt: NOW - 45_000 },
     }),
@@ -320,7 +329,7 @@ test('a missing `now` falls back rather than rendering NaN', () => {
   // App passes Date.now(), but this module also runs in the node harness and
   // must never emit "NaNs ago" into the operator's only staleness signal.
   const notices = staleNoticesForTab({
-    tab: 'merge',
+    paths: [MERGE_PATH],
     stale: staleMap({
       [MERGE_PATH]: { failures: STALE_FAILURE_THRESHOLD, lastSuccessAt: NOW - 5000 },
     }),
@@ -440,7 +449,7 @@ const WEDGED = { failures: 3, lastSuccessAt: NOW - 120_000 };
 
 test('the Orchestrators tab watches /scheduler — its Deps/Locks cells read DF.SCHEDULER', () => {
   const notices = staleNoticesForTab({
-    tab: 'orch', stale: staleMap({ [`${DASH}/scheduler`]: WEDGED }), now: NOW,
+    paths: TAB_ENDPOINTS.orch, stale: staleMap({ [`${DASH}/scheduler`]: WEDGED }), now: NOW,
   });
   assert.equal(notices.length, 1, JSON.stringify(notices));
   assert.equal(notices[0].path, `${DASH}/scheduler`);
@@ -448,7 +457,7 @@ test('the Orchestrators tab watches /scheduler — its Deps/Locks cells read DF.
 
 test('the Overview tab watches /merge-queue — its LiveFeed reads MERGE_QUEUE', () => {
   const notices = staleNoticesForTab({
-    tab: 'overview', stale: staleMap({ [MERGE_PATH]: WEDGED }), now: NOW,
+    paths: TAB_ENDPOINTS.overview, stale: staleMap({ [MERGE_PATH]: WEDGED }), now: NOW,
   });
   assert.equal(notices.length, 1, JSON.stringify(notices));
   assert.equal(notices[0].path, MERGE_PATH);
@@ -457,11 +466,11 @@ test('the Overview tab watches /merge-queue — its LiveFeed reads MERGE_QUEUE',
 // ── loadingNoticeForTab: the tab paths that have never delivered since page load ─
 
 test('loadingNoticeForTab is ONE notice naming every tab path with no receipt yet', () => {
-  const notice = loadingNoticeForTab({ tab: 'tasks', receipt: {}, stale: {} });
+  const notice = loadingNoticeForTab({ paths: TASKS_TAB_PATHS, receipt: {}, stale: {} });
   assert.deepEqual(Object.keys(notice).sort(), ['kind', 'paths', 'text']);
   assert.equal(notice.kind, 'loading');
-  assert.deepEqual(notice.paths, TAB_ENDPOINTS.tasks);
-  for (const path of TAB_ENDPOINTS.tasks) {
+  assert.deepEqual(notice.paths, TASKS_TAB_PATHS);
+  for (const path of TASKS_TAB_PATHS) {
     assert.ok(notice.text.includes(path),
       `the loading notice must name ${path}, got: ${notice.text}`);
   }
@@ -469,15 +478,15 @@ test('loadingNoticeForTab is ONE notice naming every tab path with no receipt ye
 
 test('loadingNoticeForTab names only the paths that have not delivered', () => {
   const receipt = { [TASKS_PATH]: { servedAt: null, receivedAt: NOW, window: null } };
-  const notice = loadingNoticeForTab({ tab: 'tasks', receipt, stale: {} });
-  const pending = TAB_ENDPOINTS.tasks.filter(p => p !== TASKS_PATH);
+  const notice = loadingNoticeForTab({ paths: TASKS_TAB_PATHS, receipt, stale: {} });
+  const pending = TASKS_TAB_PATHS.filter(p => p !== TASKS_PATH);
   assert.deepEqual(notice.paths, pending);
   assert.ok(!notice.text.includes(TASKS_PATH), `a delivered path is not loading: ${notice.text}`);
 });
 
 test('loadingNoticeForTab is null once every tab path has delivered', () => {
-  const receipt = Object.fromEntries(TAB_ENDPOINTS.tasks.map(p => [p, { receivedAt: NOW }]));
-  assert.equal(loadingNoticeForTab({ tab: 'tasks', receipt, stale: {} }), null);
+  const receipt = Object.fromEntries(TASKS_TAB_PATHS.map(p => [p, { receivedAt: NOW }]));
+  assert.equal(loadingNoticeForTab({ paths: TASKS_TAB_PATHS, receipt, stale: {} }), null);
 });
 
 test('loadingNoticeForTab defers to the stale notice once an endpoint is stale', () => {
@@ -485,21 +494,22 @@ test('loadingNoticeForTab defers to the stale notice once an endpoint is stale',
   // staleNoticesForTab ("has never delivered data"); a second banner for the
   // same fact would only be noise.
   const stale = staleMap({ [MERGE_PATH]: { failures: STALE_FAILURE_THRESHOLD, lastSuccessAt: 0 } });
-  assert.equal(loadingNoticeForTab({ tab: 'merge', receipt: {}, stale }), null);
+  assert.equal(loadingNoticeForTab({ paths: [MERGE_PATH], receipt: {}, stale }), null);
   const below = staleMap({ [MERGE_PATH]: { failures: STALE_FAILURE_THRESHOLD - 1, lastSuccessAt: 0 } });
-  assert.deepEqual(loadingNoticeForTab({ tab: 'merge', receipt: {}, stale: below }).paths, [MERGE_PATH]);
+  assert.deepEqual(loadingNoticeForTab({ paths: [MERGE_PATH], receipt: {}, stale: below }).paths, [MERGE_PATH]);
 });
 
 test('loadingNoticeForTab reads one pending path in the singular', () => {
-  const notice = loadingNoticeForTab({ tab: 'merge', receipt: {}, stale: {} });
+  const notice = loadingNoticeForTab({ paths: [MERGE_PATH], receipt: {}, stale: {} });
   assert.equal(notice.text, `${MERGE_PATH} has not delivered data yet — loading`);
 });
 
 test('loadingNoticeForTab tolerates every missing input', () => {
-  assert.equal(loadingNoticeForTab({ tab: 'not-a-tab', receipt: {}, stale: {} }), null);
+  assert.equal(loadingNoticeForTab({ paths: 'x', receipt: {}, stale: {} }), null);
+  assert.equal(loadingNoticeForTab({ tab: 'merge', receipt: {}, stale: {} }), null);
   assert.equal(loadingNoticeForTab(), null);
   assert.equal(loadingNoticeForTab({}), null);
-  assert.equal(loadingNoticeForTab({ tab: 'merge' }), null);
+  assert.equal(loadingNoticeForTab({ paths: [MERGE_PATH] }), null);
   assert.equal(loadingNoticeForTab({ receipt: {}, stale: {} }), null);
 });
 
@@ -508,7 +518,9 @@ test('loadingNoticeForTab tolerates every missing input', () => {
 function liveLoadingNotices(win) {
   return Object.fromEntries(Object.keys(TAB_ENDPOINTS).map(tab => [
     tab,
-    loadingNoticeForTab({ tab, receipt: win.DF_DATA.__receipt, stale: win.DF_DATA.__stale }),
+    loadingNoticeForTab({
+      paths: TAB_ENDPOINTS[tab], receipt: win.DF_DATA.__receipt, stale: win.DF_DATA.__stale,
+    }),
   ]));
 }
 
