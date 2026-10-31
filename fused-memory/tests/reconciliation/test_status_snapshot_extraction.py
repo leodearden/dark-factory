@@ -632,8 +632,9 @@ class TestExtractSnapshotEdgeTaskIds:
         [
             # negation / past-exit — refused for free by the closed-class
             # _ADVERB_ALT, exactly as the individual form refuses it (the
-            # asymmetry the module docstring documents: no _GAP_EXCLUDED_ALT
-            # equivalent is needed on a closed-class-connective path).
+            # asymmetry docs/stale-status-snapshot-sweep.md §"Genitive form"
+            # documents: no _GAP_EXCLUDED_ALT equivalent is needed on a
+            # closed-class-connective path).
             "Task 5's status is no longer pending.",
             "Task 5's status is not blocked.",
             "Task 5's status was previously pending.",

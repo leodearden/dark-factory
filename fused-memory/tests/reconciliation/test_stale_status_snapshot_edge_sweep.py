@@ -1177,8 +1177,10 @@ class TestSweepStaleStatusSnapshotEdgesBlockedRuleAndCounters:
         """LIVENESS: the sweep must enter the extraction pipeline exactly ONCE
         per edge, even though there are now TWO marker families.
 
-        Extractor cost is a whole-cycle liveness property in this module (see
-        the module docstring): the extractor runs once per valid edge over the
+        Extractor cost is a whole-cycle liveness property (see
+        status_snapshot_extraction.py's module docstring and
+        docs/stale-status-snapshot-sweep.md §"Extraction cost as a liveness
+        property"): the extractor runs once per valid edge over the
         whole group's edge set — tens of thousands of edges, current figure
         in plans/stale-status-snapshot-sweep-report.md — with no per-edge
         timeout, so one

@@ -1,99 +1,17 @@
 """Stale task-status snapshot Graphiti edge sweep — task 2613.
 
-Stage 1 (``MemoryConsolidator``) has no deterministic sweep that keeps VALID
-(``invalid_at IS NULL``) task-status-snapshot Graphiti edges in sync with the
-tasks they describe. A status-snapshot edge asserts that some task_id is
-currently active/pending/blocked/stalled/in-progress; once that task reaches
-a terminal status (done/cancelled), the edge is stale but nothing retires
-it. The prior
-approach — a manual LLM `search` sweep — was unreliable (run b1408864 found
-only 17 of an estimated 23+ stale edges). This module replaces it with a
-deterministic direct-lookup sweep, mirroring the deterministic-lookup-over-
-semantic-search precedent set by task 1680 (count_memories_by_metadata) and
-task 2107 (degenerate_task_node_sweep).
+Retires VALID (``invalid_at IS NULL``) Graphiti edges whose asserted
+active/pending/blocked/stalled/in-progress status is contradicted by the
+task's live status, read by a direct ``taskmaster.get_statuses`` lookup,
+never by semantic search. Which ids an edge asserts, and under which marker,
+is read by ``status_snapshot_extraction.py``.
 
-Which task ids an edge fact asserts, and under which marker, is read by the
-pure lexical layer in ``status_snapshot_extraction.py``; its docstring holds
-the extraction paths, their invariants and their residuals.
+Fail-safe direction: under-selection self-heals next cycle, while
+over-selection is unrecoverable, since an invalidated Graphiti edge is never
+re-validated. So an edge is retired only on a positively known status.
 
-Standing invariants of the selection and sweep layer:
-
-- Fail-safe direction, throughout the module: under-selection self-heals
-  next cycle (or is caught by Stage 2); over-selection is unrecoverable,
-  since an invalidated Graphiti edge is never re-validated. Every
-  extraction path is deliberately biased toward missing a snapshot over
-  wrongly retiring one.
-- Invalidate-only-on-positively-KNOWN, and an aggregate/plural edge is
-  invalidated as a whole the moment any ONE referenced id contradicts it —
-  see ``select_stale_status_snapshot_edges``. Two rules qualify an edge:
-  the TERMINAL rule (a union-marker id reached done/cancelled) and the
-  BLOCKED-ASSERTION rule (a blocked-asserted id has a positively-known
-  status other than 'blocked'). Neither ever fires on an id whose census
-  value is absent or outside the closed
-  ``shared.task_statuses.TaskStatus`` vocabulary.  The GENERAL rule
-  (asserted status != live status, for every marker) was measured by task
-  4851 and NOT adopted — verdict in
-  ``plans/stale-status-snapshot-sweep-report.md``.  'active' and 'stalled'
-  have no ``TaskStatus`` counterpart, hence no contradiction test, so they
-  stay terminal-rule-only.
-- The sweep is best-effort throughout (mirrors
-  ``degenerate_task_node_sweep``): an edge-enumeration
-  (``get_all_valid_edges``) or status cross-reference (``get_statuses``)
-  failure ends this cycle's sweep early (self-heals next cycle); a
-  per-edge invalidation failure does not — see
-  ``sweep_stale_status_snapshot_edges``.
-- 'blocked' is deliberately NOT added to ``INACTIVE_TASK_STATUSES`` (stays
-  ``{done, cancelled}``), which is what preserves
-  invalidate-only-on-positively-terminal for a genuinely-still-blocked
-  task.  AMENDED, task 3037: a stale blocked assertion IS now retired
-  before its task goes terminal — but by a SEPARATE second rule keyed on
-  the blocked-SCOPED id set (``extract_blocked_assertion_task_ids``), NOT
-  by widening ``INACTIVE_TASK_STATUSES``.  Widening it would make the
-  terminal rule retire every ACTIVE/PENDING snapshot whose task merely
-  became blocked, and — since that rule reads UNION ids — could fire on an
-  id some other marker contributed.  The two rules stay disjoint in what
-  they read: rule 1 union ids against ``INACTIVE_TASK_STATUSES``, rule 2
-  blocked-asserted ids against "positively known and != 'blocked'".
-
-Two hypotheses were investigated and RULED OUT for the task-2613 miss
-rate; do not re-open them:
-
-1. Edge traversal/scope: ``GraphitiBackend.get_all_valid_edges`` runs an
-   unfiltered ``MATCH`` (no entity-type, label, or episode filter),
-   reproduced end-to-end scanning every missed edge and dropping it at
-   extraction — every gap was lexical, not a query-scope gap.
-
-   AMENDED, task 4340 (2026-08-17).  The lexical findings above STAND and
-   are unaffected; what does not stand is the scope of the ruling-out.
-   Those grounds covered query FILTERS only and were silent about
-   server-side TRUNCATION.  Task 4340 measured a FalkorDB
-   ``RESULTSET_SIZE`` cap silently truncating that very query to roughly
-   HALF the valid-edge corpus on dark_factory (exact figures:
-   ``plans/falkordb-resultset-cap-audit.md``, which is the one place they
-   are recorded).  So at the time of the task-2613
-   investigation this sweep saw about half the edges, and the miss rate was
-   computed against a truncated denominator.  ``get_all_valid_edges`` is
-   paginated as of task 4340 and the truncation is gone.
-
-   RE-MEASURED, task 4851, against the complete corpus.  The metric's
-   definition and every figure live in
-   ``plans/stale-status-snapshot-sweep-report.md`` and nowhere else.  The
-   durable finding: at steady state the shipped rules select approximately
-   nothing, because the sweep keeps up.  The facts that still name a
-   now-terminal task are an UPPER bound on misses, and by-eye triage finds
-   them mostly NOT status snapshots at all.  The genuine misses are the
-   fail-safe lexical classes listed under Known residuals.  Do not re-open
-   the LEXICAL hypothesis; do not treat the task-2613 rate as measured on a
-   whole corpus.
-2. A shared blind spot with ``task_count_verification``: that function is
-   an aggregate census-vs-tree consistency check (``task_filter``), not a
-   per-task edge sweep at all — its 'healthy' report was correct, not
-   blind.
-
-``sweep_stale_status_snapshot_edges_for_task`` (task 4851) shares the
-periodic sweep's core, so the one-pass extraction discipline (see
-``status_snapshot_extraction.py``'s docstring) holds for
-it too. Its narrowed read is cheap only for a selective id; see its docstring.
+Design rationale, residuals and measurements:
+``docs/stale-status-snapshot-sweep.md``.
 """
 
 from __future__ import annotations
@@ -117,86 +35,30 @@ from fused_memory.utils.validation import canonicalize_project_id
 
 logger = logging.getLogger(__name__)
 
-# The closed status vocabulary, frozen once at import. Defines "positively
-# known" for the blocked-assertion selection rule — see
-# ``is_blocked_assertion_contradicted``. A census value outside it is treated
-# as UNKNOWN, never as a contradiction. (task 3037)
+# The closed status vocabulary, frozen once at import: what "positively known"
+# means for the blocked-assertion rule. A value outside it is UNKNOWN, never a
+# contradiction.
 _KNOWN_TASK_STATUSES: frozenset[str] = frozenset(TaskStatus)
 
 
 # --------------------------------------------------------------------------- #
-# build_supersede_fact — the superseding temporal_fact's wording (task 3037)
+# build_supersede_fact — the superseding temporal_fact's wording
 # --------------------------------------------------------------------------- #
 
-# RESULTING-STATE-ONLY, and every word of it is load-bearing. Two independent
-# hazards rule out the wordings a reader reaches for first; both were measured
-# on this module's own extractor and on task_filter's write guards, and both
-# are pinned by TestBuildSupersedeFact rather than left as a claim here.
-#
-# (1) 'Task {N} was blocked and is now pending' — FORBIDDEN, twice over.
-#     This module's OWN extractor re-extracts it (measured -> {2848}), so the
-#     superseding fact would satisfy the very selection rule that produced it:
-#     next cycle the sweep would retire it and write a fresh copy, forever.
-#     It is also MIXED TEMPORAL FRAMING, which prompts/stage1.py L326-346
-#     forbids for temporal_facts because Graphiti atomization can re-emit the
-#     stale 'was blocked' fragment as a co-current edge — reintroducing
-#     exactly the assertion this sweep just retired.
-#
-# (2) 'Task {N} is no longer blocked' — also forbidden, but for only ONE of
-#     those reasons, which is why it is worth naming separately: it is
-#     extractor-SAFE (measured -> set()), so an author checking only the
-#     self-churn hazard would conclude it is fine. It is PRIOR-STATE framing,
-#     which the same resulting-state-only rule refuses.
-#     Note what that means operationally: unlike (1), NOTHING executable
-#     rejects this wording — all four of task_filter's write-norm predicates
-#     pass it (asserted in
-#     test_prior_state_negation_is_extractor_safe_but_still_not_the_template).
-#     The prohibition is a prose norm, so this template's compliance with it
-#     rests on review, not on a guard that would catch a regression.
-#
-# The chosen template states the CURRENT state and nothing else, and carries
-# an explicit 'As of <date>' stamp so it reads as a point-in-time observation
-# rather than a standing claim about a live task-table field (the distinction
-# task_filter.frames_live_task_status_as_current_fact enforces).
-#
-# Note the sweep writes in-process via memory_service.add_memory and so
-# BYPASSES the MCP-boundary enforcement at server/tools.py:2856/3061 that
-# would otherwise reject a recon-stage-* writer's malformed framing. The
-# module's compliance therefore rests entirely on this template plus its
-# tests — there is no second line of defence downstream.
+# RESULTING-STATE-ONLY, stamped 'As of <date>'. Never pair it with the prior
+# state: 'was blocked and is now pending' re-extracts as a blocked assertion
+# and would churn forever, and 'is no longer blocked' is prior-state framing
+# that no write guard catches. The sweep writes in-process, bypassing the MCP
+# boundary's framing guards, so this template and TestBuildSupersedeFact are
+# the only defence. See docs/stale-status-snapshot-sweep.md
+# §"The superseding write".
 _SUPERSEDE_FACT_TEMPLATE = 'As of {date}, task {task_id} has status {status}.'
 
 
-# Per-cycle ceiling on superseding add_memory calls (amendment,
-# reviewer_comprehensive performance finding, task 3037).
-#
-# Each superseding write is a real Graphiti write plus an embedding round-trip,
-# awaited SERIALLY inside the per-stale-edge invalidation loop. Its count is
-# bounded only by how many distinct blocked-asserted tasks are contradicted in
-# the cycle — and on the FIRST cycle after this ships, every blocked assertion
-# accumulated in the corpus since the sweep was written becomes eligible at
-# once. This module treats a ~3.3s edge enumeration as a whole-cycle LIVENESS
-# property and carries performance tests to bound regex cost; adding an
-# unbounded number of sequential network writes to the same loop would blow
-# that budget by minutes on the drain cycle.
-#
-# 50 keeps the worst-case added latency in the same order as the enumeration
-# cost the module already budgets for, while sitting far above steady state:
-# once the backlog has drained, a cycle supersedes roughly one fact per task
-# unblocked since the previous cycle — single digits.
-#
-# NO SILENT CAP: truncation is tallied into stats['supersede_skipped'] and
-# logged at WARNING with the count. And it IS a loss, not a deferral — the
-# edges are still invalidated, so they do not re-enumerate next cycle and the
-# skipped facts are never written. That is the same trade the module already
-# takes on a supersede FAILURE (see sweep_stale_status_snapshot_edges'
-# best-effort paragraph): the correctness-bearing half of the step — retiring
-# the contradicted assertion — always completes; only the record of what
-# replaced it is best-effort.
-#
-# The ceiling counts ATTEMPTS, not successes, so a cycle whose writes are all
-# failing cannot spin through an unbounded number of them via the in-cycle
-# retry path either.
+# Per-cycle ceiling on superseding add_memory ATTEMPTS, which are serial
+# network writes inside the invalidation loop. The excess is tallied into
+# stats['supersede_skipped'] and logged; those facts are lost, not deferred.
+# See docs/stale-status-snapshot-sweep.md §"The per-cycle ceiling".
 _MAX_SUPERSEDE_WRITES_PER_CYCLE = 50
 
 
@@ -208,11 +70,10 @@ def build_supersede_fact(task_id: int, status: str, now: datetime) -> str:
         task_id: The task whose blocked assertion was contradicted.
         status: Its CURRENT census status — the resulting state, stated on its
             own. Never paired with the prior state; see
-            ``_SUPERSEDE_FACT_TEMPLATE`` for why.
-        now: The timestamp to stamp the observation with. Always passed in,
-            never read from a module-level clock, so the fact carries the same
-            instant the sweep used as the edge's ``invalid_at`` and a replayed
-            or back-dated run stays reproducible.
+            ``_SUPERSEDE_FACT_TEMPLATE``.
+        now: The timestamp to stamp the observation with: the same instant
+            the sweep used as the edge's ``invalid_at``. Always passed in,
+            never read from a clock.
 
     Pure: no I/O, no side effects.
     """
@@ -255,22 +116,13 @@ def flatten_dedup_edges(grouped: dict[str, list[dict]]) -> list[dict]:
 
 
 def is_blocked_assertion_contradicted(status: str | None) -> bool:
-    """Does *status* positively contradict a 'blocked' assertion? (task 3037)
+    """Does *status* positively contradict a 'blocked' assertion?
 
     True iff *status* is a POSITIVELY KNOWN member of the closed
-    ``shared.task_statuses.TaskStatus`` vocabulary and is not 'blocked'.
-
-    The vocabulary check is what preserves this module's
-    invalidate-only-on-positively-known fail-safe in the same direction the
-    terminal rule already has it. A naive ``status != 'blocked'`` would read
-    every unrecognised value as a contradiction, so a malformed, renamed or
-    sentinel census entry ('unknown', '', a future status this build has not
-    heard of) would RETIRE a live edge — the unrecoverable direction, since an
-    invalidated Graphiti edge is never re-validated. Treating it as unknown
-    instead costs at most one cycle of under-selection.
-
-    ``None`` (id absent from the census entirely) is likewise unknown, which
-    is what makes a transient ``get_statuses`` gap self-healing.
+    ``shared.task_statuses.TaskStatus`` vocabulary and is not 'blocked'. An
+    unrecognised value, or ``None`` (id absent from the census), is unknown,
+    never a contradiction. See ``docs/stale-status-snapshot-sweep.md``
+    §"Selection rules".
 
     Pure: no I/O, no side effects.
     """
@@ -289,68 +141,39 @@ def select_stale_status_snapshot_edges(
     TWO independent selection rules; an edge is selected (stale) when EITHER
     fires.
 
-    1. TERMINAL rule (task 2613). ``extract_snapshot_edge_task_ids`` returns
-       at least one id AND any one of those ids resolves (via *statuses*) to
-       a positively-terminal status (``INACTIVE_TASK_STATUSES`` —
-       done/cancelled). This rule reads the UNION of every status marker, so
-       it covers active/pending/in-progress/stalled assertions too.
+    1. TERMINAL rule. ``extract_snapshot_edge_task_ids`` returns at least one
+       id AND any one of those ids resolves (via *statuses*) to a
+       positively-terminal status (``INACTIVE_TASK_STATUSES`` —
+       done/cancelled). This rule reads the UNION of every status marker.
 
-    2. BLOCKED-ASSERTION rule (task 3037).
-       ``extract_blocked_assertion_task_ids`` returns at least one id AND any
-       one of those ids resolves to a positively-known status that is not
-       'blocked' (``is_blocked_assertion_contradicted``). A blocked assertion
-       is contradicted by ANY non-blocked status, not merely a terminal one:
-       before this rule, 'Task 2848 remains blocked as of 2026-07-22'
-       survived a blocked->pending unblock and stayed live until the task
-       eventually reached done/cancelled.
+    2. BLOCKED-ASSERTION rule. ``extract_blocked_assertion_task_ids`` returns
+       at least one id AND any one of those ids resolves to a positively-known
+       status that is not 'blocked' (``is_blocked_assertion_contradicted``).
 
     In both rules an aggregate/plural edge referencing several ids is selected
-    as a whole the moment ANY single referenced id contradicts it — the
-    snapshot as asserted no longer holds.
-
-    Why rule 2 is a SEPARATE rule keyed on a blocked-SCOPED id set, rather
-    than 'blocked' being added to ``INACTIVE_TASK_STATUSES``: that widening
-    would make rule 1 retire every ACTIVE/PENDING snapshot whose task merely
-    became blocked, and — because rule 1 reads union ids — a blocked-status
-    trigger there could fire on an id some OTHER marker contributed. Rule 2
-    reads only the ids the fact asserts as blocked, which is exactly its
-    scope. The general rule (any asserted status contradicted by the live
-    one) was measured by task 4851 and not adopted; 'active' and 'stalled'
-    have no ``TaskStatus`` counterpart to contradict, so they remain
-    terminal-rule-only — see ``plans/stale-status-snapshot-sweep-report.md``.
-
-    Invalidate-only-on-positively-known, throughout: an id absent from
-    *statuses*, or mapped to a value outside the closed
-    ``shared.task_statuses.TaskStatus`` vocabulary, never contributes to
-    selection under either rule — a transient census gap or a
-    genuinely-still-blocked task can only under-select (self-heals next
-    cycle), never wrongly select a valid edge.
+    as a whole the moment ANY single referenced id contradicts it. An id
+    absent from *statuses*, or mapped outside the closed ``TaskStatus``
+    vocabulary, never contributes to selection. Why rule 2 is a separate
+    rule: ``docs/stale-status-snapshot-sweep.md`` §"Selection rules".
 
     Args:
         edges: Candidate edges (as returned by ``flatten_dedup_edges``).
         statuses: ``{task_id_str: status_str}`` census.
         edge_ids: Optional precomputed ``{edge['uuid']: extract_snapshot_edge_task_ids(fact)}``
-            mapping. A caller that already extracted ids for its own purposes
-            (e.g. ``sweep_stale_status_snapshot_edges``, which needs them to
-            build its candidate-id set) passes this to avoid re-running the
-            extraction regex pipeline a second time per edge. When omitted
-            (the default), ids are computed directly from each edge's fact —
-            unchanged standalone behavior. (amendment, reviewer_comprehensive
-            efficiency finding, task 2613)
+            mapping, so a caller that already extracted ids does not re-run
+            the extraction pipeline. When omitted, ids are computed from each
+            edge's fact.
         blocked_edge_ids: Optional precomputed
             ``{edge['uuid']: extract_blocked_assertion_task_ids(fact)}``
-            mapping, for rule 2. Exactly the same semantics and the same
-            fall-back-to-internal-extraction default as *edge_ids*, so
-            standalone behaviour is unchanged when it is omitted. (task 3037)
+            mapping, for rule 2, with the same semantics and the same default
+            as *edge_ids*.
 
     Pure: no I/O, no side effects.
     """
     selected: list[dict] = []
     for edge in edges:
-        # Each fall-back extracts independently — so a caller that
-        # precomputes BOTH maps (the sweep does) costs zero
-        # extraction-pipeline entries here. Pinned by
-        # test_extraction_runs_exactly_once_per_edge.
+        # Each fall-back extracts independently, so a caller that precomputes
+        # BOTH maps costs zero extraction-pipeline entries here.
         if edge_ids is not None:
             ids = edge_ids.get(edge['uuid'], set())
         else:
@@ -381,23 +204,11 @@ def select_stale_status_snapshot_edges(
 # convention of stamping a stable, identifiable actor.
 _SWEEP_AGENT_ID = 'recon-stage-memory_consolidator'
 
-# The names this sweep's completeness pair carries once MemoryConsolidator has
-# prefixed it onto ``report.stats``.  Exported as symbols rather than left as
-# inline literals at each of producer / consumer / test, matching the
-# :data:`~fused_memory.reconciliation.task_count_snapshot_cadence.SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY`
-# precedent for exactly this stat family — otherwise a rename has to be found
-# by grep across five files, which is how a stat key ends up half-renamed and
-# a consumer starts silently reading `None`.  (amendment,
-# reviewer_comprehensive pattern-consistency finding, task 4386)
-#
-# NOTE the two layers: the sweep's own returned dict uses the SHORT keys
-# ``enumeration_complete`` / ``enumeration_incomplete_kind`` (documented on
-# ``sweep_stale_status_snapshot_edges`` below), and the consolidator projects
-# them onto ``report.stats`` under this module's prefix.  These constants name
-# the ``report.stats`` layer — the one that crosses module boundaries and is
-# read by the ledger, the journal and the judge.  Spelled out as whole
-# literals rather than built by concatenating a prefix, so the shipped key
-# name stays greppable from a log line back to here.
+# The ``report.stats`` names of this sweep's completeness pair, once
+# MemoryConsolidator has prefixed the short keys ``enumeration_complete`` /
+# ``enumeration_incomplete_kind`` that the sweep itself returns. Whole
+# literals, not prefix concatenations, so a key stays greppable from a log
+# line back to here.
 
 STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY: str = (
     'stale_status_snapshot_edges_enumeration_complete'
@@ -442,24 +253,19 @@ async def sweep_stale_status_snapshot_edges(
     """Enumerate valid status-snapshot edges and invalidate the stale ones.
 
     Enumerates ALL currently-valid Graphiti edges for *project_id* via
-    ``memory_service.graphiti.enumerate_all_valid_edges`` (a deterministic bulk
-    query — never the LLM's semantic search), extracts the specific task ids
-    each edge asserts as active/pending/blocked/stalled/in-progress, cross-references those
-    ids' CURRENT status via ``taskmaster.get_statuses`` (a direct status
-    lookup, not semantic search), and invalidates
-    (``memory_service.update_edge(..., invalid_at=...)``) every edge whose
-    asserted status is now contradicted — either by a terminal
-    (done/cancelled) task, or (task 3037) by a blocked assertion whose task
-    now has any other positively-known status. After a successful
+    ``memory_service.graphiti.enumerate_all_valid_edges``, extracts the task
+    ids each edge asserts, cross-references those ids' CURRENT status via
+    ``taskmaster.get_statuses``, and invalidates
+    (``memory_service.update_edge(..., invalid_at=...)``) every edge
+    ``select_stale_status_snapshot_edges`` selects. After a successful
     blocked-rule invalidation it also writes ONE superseding
     resulting-state-only ``temporal_facts`` memory per contradicted task per
-    cycle (``build_supersede_fact``), so the graph records what replaced the
-    retired assertion instead of merely losing it.
+    cycle (``build_supersede_fact``), capped at
+    ``_MAX_SUPERSEDE_WRITES_PER_CYCLE``.
 
     Args:
-        memory_service: Object exposing ``.graphiti.enumerate_all_valid_edges``
-            and
-            ``.update_edge``.
+        memory_service: Object exposing ``.graphiti.enumerate_all_valid_edges``,
+            ``.update_edge`` and ``.add_memory``.
         taskmaster: Object exposing ``.get_statuses``. A falsy value (e.g.
             unavailable backend) short-circuits to all-zero stats.
         project_id: Graphiti group_id to enumerate and invalidate within.
@@ -470,38 +276,16 @@ async def sweep_stale_status_snapshot_edges(
         now: Invalidation timestamp; defaults to ``datetime.now(UTC)``.
         log: Logger to use (default: this module's logger).
 
-    Best-effort (mirrors
-    ``degenerate_task_node_sweep.sweep_degenerate_task_nodes``): a transient
-    backend error enumerating (``enumerate_all_valid_edges``), cross-referencing
-    (``get_statuses``), or invalidating (``update_edge``) is caught, logged,
-    and tallied into ``stats['errors']``. An enumeration or cross-reference
-    failure aborts the rest of this cycle's sweep (there is nothing left to
-    act on without them) and returns the stats gathered so far; a per-edge
-    ``update_edge`` failure does NOT abort the loop — the remaining stale
-    edges are still attempted. A superseding-write (``add_memory``) failure
-    is likewise caught, logged, and tallied — but into ``stats
-    ['supersede_errors']``, and it too leaves the loop running. It degrades
-    only OBSERVABILITY: by the time it runs the edge is already invalidated
-    (the correctness-bearing half of the step), so the graph is left
-    consistent, just without the fact recording what replaced the retired
-    assertion. The missing fact is not retried next cycle — the invalidated
-    edge no longer enumerates — so this is a permanently missing superseding
-    fact rather than a corrupted edge or a repeating failure.
-    ``asyncio.CancelledError``/``KeyboardInterrupt``/``SystemExit`` are
-    re-raised unchanged from BOTH write paths (never swallowed as
-    best-effort).
-
-    Because the missing fact cannot be retried NEXT cycle, the one retry it
-    can still get is in-cycle: the per-task dedupe marker is set on SUCCESS
-    only, so a task named by several stale edges gets a fresh attempt from
-    each until one lands. (amendment, reviewer_comprehensive robustness
-    finding, task 3037)
-
-    The superseding writes are additionally capped per cycle at
-    ``_MAX_SUPERSEDE_WRITES_PER_CYCLE`` so an unbounded backlog cannot turn
-    the invalidation loop into minutes of serial network writes; the excess
-    is tallied into ``stats['supersede_skipped']`` and logged at WARNING
-    rather than dropped silently.
+    Best-effort: an exception from ``enumerate_all_valid_edges``,
+    ``get_statuses`` or ``update_edge`` is caught, logged and tallied into
+    ``stats['errors']``. An enumeration or cross-reference failure ends this
+    cycle's sweep and returns the stats so far; an ``update_edge`` failure
+    does not stop the loop. An ``add_memory`` failure is caught, logged and
+    tallied into ``stats['supersede_errors']`` and does not stop the loop
+    either; it is retried in-cycle from the task's next stale edge, never
+    next cycle. ``asyncio.CancelledError``/``KeyboardInterrupt``/
+    ``SystemExit`` are re-raised unchanged from every path. See
+    ``docs/stale-status-snapshot-sweep.md`` §"Sweep execution".
 
     Returns:
         dict with int counts: ``scanned`` (edges enumerated after dedup),
@@ -515,44 +299,28 @@ async def sweep_stale_status_snapshot_edges(
         ``_MAX_SUPERSEDE_WRITES_PER_CYCLE`` was reached).
 
         Plus two keys describing the READ that produced ``scanned`` rather
-        than counting anything (task 4386):
+        than counting anything:
 
-        ``enumeration_complete`` (``bool | None``) — TRI-STATE, because three
-        outcomes are genuinely distinct and collapsing any pair loses
-        information the reader needs. ``True`` = the read was PROVEN
-        complete; ``False`` = a corpus was observed and it was INCOMPLETE;
-        ``None`` = NO corpus was observed at all, either because this call
-        short-circuited on a falsy *taskmaster*/*project_root* or because the
-        enumeration itself failed (``errors`` tells those two apart). The
-        ONLY predicate a caller may gate on is ``is True``: an ``is not
-        False`` test would admit both UNKNOWN cases, which would let a cycle
-        that never looked pass as one that looked and found everything.
+        ``enumeration_complete`` (``bool | None``) — TRI-STATE. ``True`` =
+        the read was PROVEN complete; ``False`` = a corpus was observed and
+        it was INCOMPLETE; ``None`` = NO corpus was observed at all, either
+        because this call short-circuited on a falsy
+        *taskmaster*/*project_root* or because the enumeration itself failed
+        (``errors`` tells those two apart). The ONLY predicate a caller may
+        gate on is ``is True``.
 
         ``enumeration_incomplete_kind`` (``str | None``) — the backend's
         ``INCOMPLETE_*`` constant (``graphiti_client.py::INCOMPLETE_PAGE_CAP``
-        and siblings), which is the documented STABLE discriminator. Callers
-        should branch on membership in
+        and siblings), the documented STABLE discriminator. Callers should
+        branch on membership in
         ``graphiti_client.py::INCOMPLETE_STRUCTURAL_KINDS`` rather than on a
-        specific kind. ``PagedRead.reason`` is deliberately NOT surfaced: the
-        backend documents its wording as diagnostic prose and an unstable
-        interface, so projecting it into stats would invite consumers to
-        parse it.
+        specific kind. ``PagedRead.reason`` is deliberately NOT surfaced.
 
-        Both keys describe the read, NOT the counted funnel, so they leave
-        the ``invalidated == candidate_edges - errors`` identity below
-        exactly true. An EMPIRICAL incompleteness in particular does not
-        touch ``errors``: the sweep proceeds on what it fetched, and the
-        cycle merely says the corpus was partial.
-
-        ``errors`` stays scoped to the enumerate / cross-reference /
-        INVALIDATE paths, which is what keeps the identity
-        ``invalidated == candidate_edges - errors`` exactly true: every
-        selected edge is either invalidated or tallied there, by the ONE
-        counted invalidation loop. That identity is the structural guard
-        against a future second invalidation site going uncounted (it is
-        pinned by a test), so a NON-invalidation failure mode must never be
-        folded into ``errors`` — the superseding write gets its own
-        ``supersede_errors`` key for exactly that reason. (task 3037)
+        ``invalidated == candidate_edges - errors`` holds exactly: every
+        selected edge is either invalidated or tallied into ``errors`` by the
+        ONE counted invalidation loop, and nothing else is folded into
+        ``errors``. The two read keys and an empirical incompleteness leave
+        it untouched.
 
     Empty *taskmaster*/*project_root* short-circuits to all-zero stats with
     no backend calls. When enumeration yields no candidate ids at all,
@@ -587,15 +355,8 @@ async def sweep_stale_status_snapshot_edges_for_task(
     digit-substring SUPERSET ('1420', dates), made exact by keeping only the
     edges whose extracted ids contain *task_id*. An aggregate edge naming
     *task_id* is judged on ALL its ids, exactly as the periodic sweep would
-    judge it.
-
-    Its cost depends on the id. A multi-digit id reads a handful of rows; a
-    one- or two-digit id, or one that also occurs in dates, reads a sizeable
-    fraction of the corpus (row counts in plans/falkordb-resultset-cap-audit.md).
-    That is accepted because it is bounded by the periodic sweep's full read,
-    runs off any request path, and never overlaps another sweep of the
-    project (``_sweep_lock_for``), so a cascade of transitions queues rather
-    than stacks.
+    judge it. A short or date-like id makes that read large; see
+    ``docs/stale-status-snapshot-sweep.md`` §"The per-task sweep".
 
     Arguments, the best-effort contract and the returned stats are those of
     ``sweep_stale_status_snapshot_edges``, except that ``scanned`` counts the
@@ -620,21 +381,13 @@ async def _read_corpus(
 ) -> _CorpusRead:
     """THE READ: every valid edge, or only those whose fact contains *task_id*.
 
-    Completeness is reported even when the policy aborts the read, and that
-    is load-bearing: ``apply_incompleteness_policy`` RAISES on a structural
-    incompleteness, and an aborted cycle that reported only errors=1 would
-    leave the operator reconstructing the cause from logs — the exact
-    reconstruction the signal exists to remove. (task 4386)
-
-    ``enumerate_*`` NEVER raises — it reports incompleteness as a value — so
-    the fail-closed structural guard has to be applied here, or a page-capped
-    read is taken for the whole corpus and every edge the missing pages carry
-    is scanned as absent: a silently clean cycle that retires nothing. It is
-    deliberately inside the same try, so a structural incompleteness lands in
-    the one handler (``IncompleteEnumerationError`` subclasses ``Exception``
-    precisely so it is caught). An EMPIRICAL incompleteness only warns —
-    through the sweep's injected ``log``, so the message surfaces with the
-    rest of the cycle's diagnostics — and the sweep proceeds on what it got.
+    ``enumerate_*`` never raises, so the fail-closed structural guard
+    (``apply_incompleteness_policy``) is applied here, inside the same try,
+    so a structural incompleteness lands in the one handler. An EMPIRICAL
+    incompleteness only warns, through the injected *log*, and the sweep
+    proceeds on what it got. Completeness is reported even when the policy
+    aborts the read. See ``docs/stale-status-snapshot-sweep.md``
+    §"Read completeness".
     """
     method = (
         'enumerate_all_valid_edges' if task_id is None
@@ -679,18 +432,13 @@ _SWEEP_LOCKS: weakref.WeakKeyDictionary[
 
 
 def _sweep_lock_for(project_id: str) -> asyncio.Lock:
-    """The lock every sweep of *project_id* holds, on the running loop. (task 4851)
+    """The lock every sweep of *project_id* holds, on the running loop.
 
-    One superseding fact per contradicted task holds only if each sweep READS
-    after the previous one's retirements: a retired edge stops enumerating,
-    and that is the whole dedup. Overlapping sweeps of one project would both
-    read the same still-valid edge, both retire it and both write its facts —
-    a cancellation cascade starts one targeted sweep per task without awaiting
-    any, and a full cycle's Stage-1 sweep can start beside them.
-
-    Keyed by the canonical project id, as the graph itself is, and by event
-    loop, because an ``asyncio.Lock`` binds to the first loop that waits on
-    it. Serializes within one process only, which is where both callers run.
+    Each sweep must READ after the previous one's retirements, or two sweeps
+    retire the same edge and both write its superseding facts. Keyed by the
+    canonical project id and by event loop, because an ``asyncio.Lock`` binds
+    to the first loop that waits on it. Serializes within one process only.
+    See ``docs/stale-status-snapshot-sweep.md`` §"The per-project lock".
     """
     locks = _SWEEP_LOCKS.setdefault(asyncio.get_running_loop(), {})
     key = canonicalize_project_id(project_id)
@@ -704,10 +452,8 @@ def _seed_stats() -> dict:
     return {
         'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0,
         'superseded': 0, 'supersede_errors': 0, 'supersede_skipped': 0,
-        # Seeded UNKNOWN, not True: neither key is a count, and until the
-        # enumeration has actually returned nothing has been proven about the
-        # corpus. Every early return therefore reports the honest 'no corpus
-        # observed' rather than a fabricated clean read. (task 4386)
+        # Seeded UNKNOWN, not True: nothing is proven about the corpus until
+        # the enumeration has returned.
         'enumeration_complete': None, 'enumeration_incomplete_kind': None,
     }
 
@@ -729,7 +475,7 @@ async def _sweep_status_snapshot_edges(
     (``_read_corpus``) and THE POST-FILTER right after the single extraction
     pass. Everything else — the status census, selection, the counted
     invalidation loop, the supersede ceiling and the stats — is shared, and
-    runs under ``_sweep_lock_for(project_id)``. (task 4851)
+    runs under ``_sweep_lock_for(project_id)``.
     """
     if not taskmaster or not project_root:
         return _seed_stats()
@@ -760,12 +506,8 @@ async def _sweep_under_lock(
         return stats
     stats['scanned'] = len(corpus.edges)
 
-    # Extract each edge's ids exactly once — ONE by-class pass per edge
-    # yielding BOTH id sets, reused below to build candidate_ids and (via
-    # select_stale_status_snapshot_edges's two precomputation kwargs) for the
-    # final selection, instead of re-running the extraction pipeline per
-    # edge per marker class. (amendment, reviewer_comprehensive efficiency
-    # finding, task 2613; extended to the blocked family, task 3037)
+    # ONE by-class extraction per edge, reused by the post-filter, the census
+    # and selection.
     by_class = {
         edge['uuid']: extract_snapshot_edge_task_ids_by_marker_class(edge.get('fact'))
         for edge in corpus.edges
@@ -774,7 +516,7 @@ async def _sweep_under_lock(
     if task_id is not None:
         # THE POST-FILTER: the narrowed read is a digit-substring superset, so
         # keep only edges that really name the task, judged from the SAME
-        # extraction pass. (task 4851)
+        # extraction pass.
         edges = [edge for edge in edges if task_id in by_class[edge['uuid']].all_ids]
     edge_ids: dict[str, set[int]] = {
         edge['uuid']: by_class[edge['uuid']].all_ids for edge in edges
@@ -783,12 +525,8 @@ async def _sweep_under_lock(
         edge['uuid']: by_class[edge['uuid']].blocked_ids for edge in edges
     }
 
-    # The census must cover BOTH maps' ids. blocked_ids is a subset of
-    # all_ids by construction, so this is currently the union of all_ids
-    # alone — but taking it over both is what keeps the census correct if
-    # that containment ever stops holding, rather than silently
-    # cross-referencing a blocked-asserted id against a status never looked
-    # up (which would read as absent, i.e. under-select).
+    # The census covers BOTH maps' ids, so it stays correct even if
+    # blocked-subset-of-union ever stopped holding.
     candidate_ids: set[int] = set()
     for ids in edge_ids.values():
         candidate_ids |= ids
@@ -818,22 +556,15 @@ async def _sweep_under_lock(
     stats['candidate_edges'] = len(stale)
 
     invalidate_at = now or datetime.now(UTC)
-    # One superseding fact per contradicted TASK per cycle, not per edge: a
-    # contradicted task typically has several blocked-assertion edges (one per
-    # phrasing Graphiti extracted), and writing per edge would emit the
-    # identical fact several times in a single cycle.
+    # One superseding fact per contradicted TASK per cycle, not per edge.
     #
-    # Membership means WRITTEN, not ATTEMPTED. Those coincide except when a
-    # write fails, and there the distinction is the whole point: the sibling
-    # edges of the same task are the only retry this fact can ever get (an
-    # invalidated edge does not re-enumerate next cycle), so a transient
-    # failure must not consume the task's one-write-per-cycle budget.
-    # (amendment, reviewer_comprehensive robustness finding, task 3037)
+    # Membership means WRITTEN, not ATTEMPTED: a task's sibling edges are the
+    # only retry its fact can get, so a failed write must not consume the
+    # task's one write this cycle.
     superseded_ids: set[int] = set()
     # Distinct tasks the per-cycle write ceiling left without a fact, and the
-    # number of add_memory calls issued so far — see
-    # _MAX_SUPERSEDE_WRITES_PER_CYCLE. Attempts, not successes, are what the
-    # ceiling bounds: they are what costs wall-clock.
+    # number of add_memory calls issued so far. The ceiling bounds attempts,
+    # not successes.
     supersede_skipped_ids: set[int] = set()
     supersede_attempts = 0
     for edge in stale:
@@ -856,16 +587,9 @@ async def _sweep_under_lock(
             stats['errors'] += 1
             continue
 
-        # Second half of the deterministic step, gated on a SUCCESSFUL
-        # invalidation and scoped to ids the BLOCKED rule contributed.
-        #
-        # Gating on success is also what bounds the write to exactly ONE per
-        # contradicted task over the fact's whole lifetime: an invalidated
-        # edge drops out of get_all_valid_edges, so it cannot re-present next
-        # cycle. Writing on FAILURE would instead repeat the same fact every
-        # cycle for as long as the invalidation kept failing — and would
-        # meanwhile leave the graph asserting both that the task is blocked
-        # (the edge is still valid) and that it is not.
+        # Only after a SUCCESSFUL invalidation, and only for ids the BLOCKED
+        # rule contributed. Gating on success bounds the write to one per task
+        # over the fact's lifetime: the retired edge never re-enumerates.
         for contradicted_id in sorted(blocked_edge_ids.get(edge['uuid'], set())):
             status = statuses.get(str(contradicted_id))
             if (
