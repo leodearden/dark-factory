@@ -87,13 +87,15 @@ class TestRootScalarsMatchLiveYaml:
 class TestModuleLintCommandsMatchLiveYaml:
     """Each per-module ``lint_command`` is byte-identical to its live YAML value.
 
-    These six share one 2-segment shape — ``uv run --directory M
+    These six share one 3-segment shape — ``uv run --directory M
     ruff check src/ tests/ && python3
-    fused-memory/scripts/check_bare_magicmock_config.py M/tests`` — which is
-    why the corpus can generate them from the module name. ``fused-memory`` is
-    the lone 3-segment chain (it runs a second sibling checker), so it does not
-    fit the comprehension and lives in ``FM_LINT_COMMAND`` instead, covered by
-    ``TestRootScalarsMatchLiveYaml`` above.
+    fused-memory/scripts/check_bare_magicmock_config.py M/tests && python3
+    tests/scripts/raw_envelope_literal_guard.py M`` — which is why the corpus
+    can generate them from the module name. ``fused-memory`` and ``dashboard``
+    are 4-segment chains (each runs a further sibling checker) and ``scripts``
+    is a 2-segment chain, so they do not fit the comprehension and have
+    dedicated constants instead, covered by ``TestRootScalarsMatchLiveYaml``
+    above.
     """
 
     @pytest.mark.parametrize('module', sorted(MODULE_LINT_COMMANDS))
@@ -106,7 +108,7 @@ class TestModuleLintCommandsMatchLiveYaml:
             f'  source: {config_path.relative_to(REPO_ROOT)}::lint_command\n'
             f'  corpus: {MODULE_LINT_COMMANDS[module]!r}\n'
             f'  live:   {live!r}\n'
-            f'FIX: if {module} still shares the common 2-segment shape, the comprehension in '
+            f'FIX: if {module} still shares the common 3-segment shape, the comprehension in '
             f'_verify_config_corpus.py needs updating; if its chain shape has diverged, give '
             f'it a dedicated constant the way fused-memory has FM_LINT_COMMAND, and drop it '
             f'from MODULE_LINT_COMMANDS. Either way also check test_verify_plan.py\'s goldens, '
@@ -133,7 +135,7 @@ class TestCorpusCoversEveryLiveLintCommand:
         assert not uncovered, (
             f'These modules define a lint_command that the verify-config corpus does not '
             f'cover: {sorted(uncovered)}.\n'
-            f'FIX: if the chain matches the common 2-segment shape, add the module name to '
+            f'FIX: if the chain matches the common 3-segment shape, add the module name to '
             f'MODULE_LINT_COMMANDS in orchestrator/tests/_verify_config_corpus.py; if the '
             f'shape differs, give it a dedicated constant the way fused-memory has '
             f'FM_LINT_COMMAND. Then extend the verify-scoper goldens to exercise it — an '
