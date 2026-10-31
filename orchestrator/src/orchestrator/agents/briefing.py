@@ -1523,8 +1523,9 @@ Handle this escalation, then call `resolve_issue` with a summary.
         which raises ``TypeError`` on comparison — so a formatting hiccup
         never silently drops persisted analysis.
 
-        Staleness compares ``timestamp``, which is re-stamped when a re-block
-        is covered by the latest entry (task 3125), while the rendered
+        Staleness compares ``timestamp`` (falling back to ``investigated_at``),
+        which is re-stamped when a re-block is covered by the latest entry
+        (task 3125), while the rendered
         'Investigated at' line shows ``investigated_at``, falling back to
         ``timestamp``.
 
