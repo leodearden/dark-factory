@@ -8,6 +8,7 @@ session double that scripts the get_task reply.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -130,3 +131,38 @@ async def test_data_wrapped_task_row_is_unwrapped(tmp_path: Path) -> None:
     scheduler = _scheduler(tmp_path, session)
 
     assert await scheduler.get_task('42') == row
+
+
+def _warnings_from(caplog: pytest.LogCaptureFixture, *loggers: str) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.levelno >= logging.WARNING and r.name in loggers]
+
+
+@pytest.mark.asyncio
+async def test_error_reply_logs_one_warning_naming_task_and_error_type(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger='orchestrator.scheduler')
+    session = _GetTaskReplySession(_text_only(INVALID_TASK_ID))
+    scheduler = _scheduler(tmp_path, session)
+
+    assert await scheduler.get_task('infra') is None
+
+    records = _warnings_from(caplog, 'orchestrator.scheduler')
+    assert len(records) == 1, [r.getMessage() for r in records]
+    message = records[0].getMessage()
+    assert 'infra' in message
+    assert 'TaskmasterError' in message
+
+
+@pytest.mark.asyncio
+async def test_task_row_logs_no_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger='orchestrator.scheduler')
+    caplog.set_level(logging.WARNING, logger='shared.mcp_envelope')
+    session = _GetTaskReplySession(_text_only(WELL_FORMED_ROW))
+    scheduler = _scheduler(tmp_path, session)
+
+    assert await scheduler.get_task('42') is not None
+
+    assert _warnings_from(caplog, 'orchestrator.scheduler', 'shared.mcp_envelope') == []
