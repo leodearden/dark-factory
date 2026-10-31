@@ -592,6 +592,36 @@ class TestAddMemory:
         assert journal_kwargs['error'] == expected_journal_error
         assert result.message == f'Memory queued for {expected_store_values}{expected_message_suffix}'
 
+    @pytest.mark.asyncio
+    async def test_dual_write_zero_ids_claims_graphiti_alone_and_names_the_drop(
+        self, service
+    ):
+        """A landed Graphiti leg does not mask a zero-id Mem0 leg: the write
+        claims graphiti alone, and the journal and the message both name the
+        Mem0 drop."""
+        service.mem0.add = AsyncMock(return_value={'results': []})
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
+
+        result = await service.add_memory(
+            content='We decided to use PostgreSQL for its JSON support',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            dual_write=True,
+            causation_id='c1',
+        )
+
+        service.durable_queue.enqueue.assert_awaited_once()
+        assert result.stores_written == [SourceStore.graphiti]
+        journal_kwargs = mock_journal.log_write_op.call_args[1]
+        assert journal_kwargs['result_summary']['stores'] == ['graphiti']
+        assert journal_kwargs['success'] is False
+        assert journal_kwargs['error'] == 'empty_result: mem0 add returned zero memory_ids'
+        assert result.message == (
+            "Memory queued for ['graphiti'] "
+            '[empty_result: mem0 add returned zero memory_ids]'
+        )
+
 
 class TestAddSystemRecord:
     """MemoryService.add_system_record — dedup-exempt, Mem0-only (task 2222 / W5-δ)."""
