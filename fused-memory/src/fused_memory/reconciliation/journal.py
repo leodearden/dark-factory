@@ -230,19 +230,15 @@ class ReconciliationJournal:
         *,
         connect: Connector = connect_daemon,
     ):
-        """Store *data_dir* VERBATIM — it may be RELATIVE, and by default is.
+        """Store *data_dir* VERBATIM; nothing coerces it here.
 
-        Nothing coerces it here, and nothing upstream does either (task 4592;
-        why, and the deployment story behind it, at ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir``).
+        A config-sourced value is already absolute: a relative
+        ``reconciliation.data_dir`` is anchored at config load by
+        ``fused-memory/src/fused_memory/config/checkout_anchor.py::anchor_at_checkout``
+        (task 5462; the deployment story is at
+        ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir``).
 
-        In-process that is deliberate: ``initialize`` mkdirs ``data_dir`` and
-        opens ``reconciliation.db`` under it, and
-        ``fused-memory/src/fused_memory/server/main.py`` builds ten sibling paths
-        (``WriteJournal``, ``EventBuffer``, ``TicketStore``, curator/report state,
-        the dead-letter JSONL) the same way — all anchored at the PROCESS cwd, all
-        in this process, so they agree with each other by construction.
-
-        A CROSS-PROCESS consumer must NOT inherit that relativity: a path handed
+        A CROSS-PROCESS consumer must NOT inherit a relative one: a path handed
         to a child is resolved against the CHILD's cwd, so the two would silently
         name different directories. ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir`` is the boundary that absolutizes it for
         the ``CLAUDE_CONFIG_DIR`` chain, and

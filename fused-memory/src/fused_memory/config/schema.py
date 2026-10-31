@@ -15,6 +15,8 @@ from pydantic_settings import (
 )
 from shared.config_models import UsageCapConfig
 
+from fused_memory.config.checkout_anchor import anchor_at_checkout
+
 # The ONE topic-slug namespace (task 3198, PRD D4). Imported from the
 # stdlib-only leaf, NOT from fused_memory.memory_metadata: that module
 # imports backends.mem0_client, which imports THIS module at module scope,
@@ -1470,15 +1472,14 @@ class ReconciliationConfig(BaseModel):
         return data
 
     enabled: bool = Field(default=True)
-    # data_dir MAY be RELATIVE, and the default is (task 4592).  Nothing
-    # absolutizes it, so a standalone/systemd launch anchors it at the PROCESS
-    # cwd; every in-process consumer shares that anchor and so agrees by
-    # construction.  The per-run CLI config dir derived from it does NOT get to
-    # inherit the relativity — it crosses a process boundary as
-    # CLAUDE_CONFIG_DIR — and is absolutized exactly once, at
-    # reconciliation/cli_stage_runner.py::recon_config_base_dir, which carries
-    # the full deployment story and rationale.
-    data_dir: str = Field(default='./data/reconciliation')
+    # A relative value is anchored at the checkout root at load
+    # (config/checkout_anchor.py::anchor_at_checkout), never the process CWD (task 5462).
+    data_dir: str = Field(default='./data/reconciliation', validate_default=True)
+
+    @field_validator('data_dir')
+    @classmethod
+    def _anchor_data_dir(cls, value: str) -> str:
+        return anchor_at_checkout(value)
 
     # Buffer triggers
     buffer_size_threshold: int = Field(default=10)
