@@ -77,6 +77,10 @@ def _globbed_only_alpha(result: dict) -> None:
     assert result['matches'] == ['alpha.py'], result
 
 
+def _grepped_alpha(result: dict) -> None:
+    assert any(line.startswith('alpha.py:') for line in result['results']), result
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ('tool', 'kwargs', 'primitive', 'check_result'),
@@ -87,6 +91,8 @@ def _globbed_only_alpha(result: dict) -> None:
                      id='read_file-resolve'),
         pytest.param('glob_search', {'pattern': '*.py'}, 'glob', _globbed_only_alpha,
                      id='glob_search-glob'),
+        pytest.param('grep_search', {'pattern': 'alpha'}, 'resolve', _grepped_alpha,
+                     id='grep_search-resolve'),
     ],
 )
 async def test_tool_filesystem_work_leaves_the_loop_free(
@@ -153,3 +159,12 @@ async def test_glob_search_reports_an_absolute_pattern_instead_of_raising(root: 
     result = await tools['glob_search'].function(pattern='/etc/*')
 
     assert 'error' in result, result
+
+
+@pytest.mark.asyncio
+async def test_grep_search_refuses_a_path_outside_the_root(root: Path) -> None:
+    tools = await _verifier_tools(root)
+
+    assert await tools['grep_search'].function(pattern='x', path='..') == {
+        'error': 'Path outside codebase root',
+    }
