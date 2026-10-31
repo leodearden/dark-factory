@@ -516,6 +516,50 @@ async def test_own_timeout_kills_a_backgrounded_grandchild(
         _abandon(task, leaked_pid)
 
 
+_EXITING_LEADER_SRC = (
+    'sleep 300 &\n'
+    'echo $! > "$LEAK_PIDFILE"\n'
+    'echo $$ > "$LEADER_PIDFILE"\n'
+    'read _\n'
+)
+
+
+async def test_own_timeout_kills_a_helper_left_by_a_leader_that_already_exited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stdin is piped so the leader, blocked in ``read``, is provably alive when
+    run_git takes its pidfd; it then exits and is reaped, its helper holding the pipes."""
+    script = tmp_path / 'exiting_leader.sh'
+    script.write_text(_EXITING_LEADER_SRC)
+    monkeypatch.setenv('LEAK_PIDFILE', str(tmp_path / 'leaked.pid'))
+    monkeypatch.setenv('LEADER_PIDFILE', str(tmp_path / 'leader.pid'))
+    run_timeout = 3.0
+    task = asyncio.ensure_future(
+        run_git(['sh', str(script)], input_text='go\n', timeout=run_timeout)
+    )
+    leaked_pid = None
+    try:
+        leaked_pid = await asyncio.to_thread(read_leaked_pid, tmp_path / 'leaked.pid')
+        leader_pid = await asyncio.to_thread(read_leaked_pid, tmp_path / 'leader.pid')
+
+        reap_deadline = time.monotonic() + run_timeout - 1.0
+        while read_stat_fields(Path('/proc') / str(leader_pid), skip_malformed=True) is not None:
+            assert time.monotonic() < reap_deadline, (
+                f'leader pid {leader_pid} was not reaped before the timeout, so a killpg by '
+                'number would still reach its helper and this test would prove nothing'
+            )
+            await asyncio.sleep(0.05)
+
+        assert await asyncio.to_thread(_wait_pid_exited, leaked_pid, run_timeout + 5.0), (
+            f'pid {leaked_pid}, a helper left holding the pipes by a leader that had already '
+            'exited and been reaped, survived a timed-out run_git'
+        )
+        result = await task
+        assert result.timed_out
+    finally:
+        _abandon(task, leaked_pid)
+
+
 # ---------------------------------------------------------------------------
 # (k) every child leads its own session, so it has no controlling terminal
 # ---------------------------------------------------------------------------
