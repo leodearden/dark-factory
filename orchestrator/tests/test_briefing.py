@@ -1143,6 +1143,68 @@ class TestPriorProposalStaleness:
         assert isinstance(prompt, str)
         assert 'prior block-time investigation' not in prompt
 
+    # -- (f) rendered 'Investigated at' label --------------------------------
+
+    @pytest.mark.asyncio
+    async def test_investigated_at_line_uses_investigated_at_when_timestamp_restamped(
+        self, briefing: BriefingAssembler,
+    ):
+        task = {
+            'id': '9018',
+            'title': 'Re-affirmed proposal task',
+            'description': 'Demo',
+            'metadata': {
+                'dry_run_proposals': [
+                    {
+                        'proposal_text': 're-affirmed analysis text',
+                        'risk_label': 'low',
+                        'files_referenced': [],
+                        'timestamp': '2026-07-15T00:00:00+00:00',
+                        'investigated_at': '2026-07-13T10:00:00+00:00',
+                    },
+                ],
+                'last_blocked_at': '2026-07-14T00:00:00+00:00',
+            },
+        }
+        prompt = await briefing.build_revalidation_prompt(
+            task,
+            existing_plan={'files': [], 'steps': []},
+            changed_files=[],
+            worktree=None,
+            context='',
+        )
+        assert 're-affirmed analysis text' in prompt
+        assert '**Investigated at:** 2026-07-13T10:00:00+00:00' in prompt
+        assert '2026-07-15T00:00:00+00:00' not in prompt
+
+    @pytest.mark.asyncio
+    async def test_investigated_at_line_falls_back_to_timestamp(
+        self, briefing: BriefingAssembler,
+    ):
+        task = {
+            'id': '9019',
+            'title': 'Legacy proposal task',
+            'description': 'Demo',
+            'metadata': {
+                'dry_run_proposals': [
+                    {
+                        'proposal_text': 'legacy analysis text',
+                        'risk_label': 'low',
+                        'files_referenced': [],
+                        'timestamp': '2026-07-15T00:00:00+00:00',
+                    },
+                ],
+            },
+        }
+        prompt = await briefing.build_revalidation_prompt(
+            task,
+            existing_plan={'files': [], 'steps': []},
+            changed_files=[],
+            worktree=None,
+            context='',
+        )
+        assert '**Investigated at:** 2026-07-15T00:00:00+00:00' in prompt
+
 
 # ---------------------------------------------------------------------------
 # task 2750: build_reviewer_prompt amendment-scope advisory section

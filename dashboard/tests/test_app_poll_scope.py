@@ -221,8 +221,8 @@ process.stdout.write(JSON.stringify({
   reads,
   missing,
   keyToPath,
-  chrome: [...window.DF_ENDPOINT_STALENESS.CHROME_ENDPOINTS],
-  tabs: window.DF_ENDPOINT_STALENESS.TAB_ENDPOINTS,
+  chrome: [...window.DF_POLL_SCOPE.CHROME_ENDPOINTS],
+  tabs: window.DF_POLL_SCOPE.TAB_ENDPOINTS,
 }));
 """
 """Each reader runs twice, with ``null`` and with a seeded project as its second
