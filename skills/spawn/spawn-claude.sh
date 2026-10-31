@@ -22,8 +22,7 @@
 #     inherit the spawner's default model. For other/extra claude flags use
 #     $CLAUDE_SPAWN_CLAUDE_ARGS (a raw passthrough, applied after --model).
 #
-# Self-exit: $CLAUDE_SPAWN_SELF_EXIT=1 (exactly 1) stamps record.self_exit
-#   and adds the exit-requested marker instruction to the trailer.
+# Self-exit: $CLAUDE_SPAWN_SELF_EXIT, default per lane; see skills/spawn/SKILL.md.
 #
 # These, and every other CLAUDE_SPAWN_* var read below, are per-launch
 # INPUTS: consumed by this invocation and then REMOVED from the spawned
@@ -131,8 +130,6 @@ title="$3"
 # positional-arg parse -- 'child' (the default) preserves every existing
 # caller's behavior byte-for-byte.
 spawn_mode="${CLAUDE_SPAWN_MODE:-child}"
-self_exit=""
-[ "${CLAUDE_SPAWN_SELF_EXIT:-}" = "1" ] && self_exit=1
 
 # Runs a spawn_t3_lane.py verb under the same import contract as the hooks
 # (skills/spawn/hooks/session-start.sh). Every verb prints one verdict line:
@@ -218,6 +215,15 @@ resolve_spawn_backend
 if [ "$spawn_backend" = "t3" ]; then
   refuse_inputs_the_t3_lane_cannot_honour
   require_python3_for_the_t3_lane
+fi
+
+# Decided once spawn_backend is known (the default differs per lane) and before
+# the `launching` write below, which stamps record.self_exit from it.
+self_exit=""
+if [ "$spawn_backend" = "t3" ]; then
+  [ "${CLAUDE_SPAWN_SELF_EXIT:-}" = "1" ] && self_exit=1
+else
+  [ "${CLAUDE_SPAWN_SELF_EXIT:-}" != "0" ] && self_exit=1
 fi
 
 # Started-verification watchdog (Attention Rail T4) state: a spawn-time
