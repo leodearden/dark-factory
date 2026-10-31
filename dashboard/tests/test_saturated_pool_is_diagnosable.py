@@ -24,7 +24,7 @@ import pytest
 
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
-from dashboard.data import merge_halt, task_runtime
+from dashboard.data import merge_halt, merge_queue, task_runtime
 from dashboard.data.metrics import METRICS_SCHEMA, collect_metrics_snapshot
 
 _SATURATED_URL = 'http://saturated-pool.test'
@@ -206,4 +206,25 @@ async def test_merge_halt_probe_names_pool_timeout():
     assert entry['offline'] is True
     assert 'PoolTimeout' in entry['error'], (
         f'the halt probe error must name pool saturation; got {entry["error"]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_merge_queue_probe_names_pool_timeout():
+    memory_data.reset_sessions()
+    try:
+        async with httpx.AsyncClient(transport=_SaturatedPoolTransport()) as client:
+            result = await merge_queue.fetch_live_merge_queues(
+                client,
+                {'saturated': f'{_SATURATED_URL}/mcp'},
+                per_call_timeout=_FAST_BUDGET_SECONDS,
+            )
+    finally:
+        memory_data.reset_sessions()
+
+    live = result['saturated']
+    assert live['reachable'] is False
+    assert 'PoolTimeout' in live['error'], (
+        "this string becomes the 'In queue now' unknown reason; got "
+        f'{live["error"]!r}'
     )
