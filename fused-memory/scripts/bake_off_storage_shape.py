@@ -215,6 +215,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import functools
 import hashlib
 import json
 import shutil
@@ -2412,6 +2413,20 @@ def _git_stdout(args: list[str], cwd: Path) -> str | None:
     return completed.stdout.strip() or None
 
 
+def _git_log_last_commit_args(path: str) -> list[str]:
+    return ['log', '-1', '--format=%H', '--', path]
+
+
+@functools.cache
+def _last_touching_commit(head: str, path: str, repo_root: str) -> str | None:
+    """``git log -1`` for *path*, walked once per process per HEAD.
+
+    A path's last-touching commit is a pure function of the history reachable
+    from HEAD, so a moved HEAD re-walks.
+    """
+    return _git_stdout(_git_log_last_commit_args(path), Path(repo_root))
+
+
 def fixture_provenance(paths: list[str | Path]) -> list[dict[str, Any]]:
     """Repo-relative path, content blob and last-touching commit per fixture.
 
@@ -2439,13 +2454,19 @@ def fixture_provenance(paths: list[str | Path]) -> list[dict[str, Any]]:
     audit trail is worse than an absent one, because it looks checkable.
     """
     repo_root = _PACKAGE_ROOT.parent
+    head = _git_stdout(['rev-parse', 'HEAD'], repo_root)
     provenance: list[dict[str, Any]] = []
     for raw in paths:
         path = Path(raw).resolve()
+        # No HEAD means git cannot answer right now; that None is not memoized.
+        commit = (
+            _git_stdout(_git_log_last_commit_args(str(path)), repo_root)
+            if head is None
+            else _last_touching_commit(head, str(path), str(repo_root))
+        )
         provenance.append({
             'path': _repo_relative(path),
-            'commit': _git_stdout(
-                ['log', '-1', '--format=%H', '--', str(path)], repo_root),
+            'commit': commit,
             'blob': _git_stdout(['hash-object', '--', str(path)], repo_root),
         })
     return provenance
