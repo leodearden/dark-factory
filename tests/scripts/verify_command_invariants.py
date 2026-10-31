@@ -51,17 +51,15 @@ degrades to a guard that passes vacuously. If a caller needs behaviour this
 module does not have, add a PARAMETER here rather than a variant there —
 ``path_anchor`` (task 3883) is what that looks like in practice.
 
-THIS MODULE PARSES; IT DOES NOT DECIDE. The five call sites deliberately do not
-agree on semantics, and unifying them would be a behaviour change at four of
-them. So everything that is POLICY stays with its caller and arrives as an
-argument: whether to pass a value-flag set, and which one
-(``_RUFF_FLAGS_TAKING_A_VALUE`` in the CONTRIBUTING guard, the shared
-``PYTEST_VALUE_FLAGS`` at two pytest parses, ``test_scripts_module_config.py``'s
-own deliberately narrow set at a third; :func:`positional_targets`' census
-lists every site), which flag prefixes narrow a target set
-(``_NARROWING_FLAGS``), whether flag scanning covers the whole segment or only
-the checker's own post-anchor arguments, and the skills guard's
-``--directory`` base resolution / ``posixpath.normpath`` / target-EXISTS layer.
+THIS MODULE PARSES; IT DOES NOT DECIDE. This module's callers deliberately do
+not agree on semantics, and unifying them would change behaviour at every
+caller whose choice lost. So everything that is POLICY stays with its caller and
+arrives as an argument: whether to pass a value-flag set, and which one
+(:func:`positional_targets`' census lists every call site's choice), which flag
+prefixes narrow a target set (``_NARROWING_FLAGS``), whether flag scanning
+covers the whole segment or only the checker's own post-anchor arguments, and
+the skills guard's ``--directory`` base resolution / ``posixpath.normpath`` /
+target-EXISTS layer.
 What is shared is only the mechanics of reading a shell command and the facts
 those mechanics need. ``PYTEST_VALUE_FLAGS`` is such a fact — which pytest
 options take a SEPARATE value token is a property of pytest's CLI, so it lives
@@ -212,9 +210,10 @@ def anchor_split(
 
     The ANCHOR is the last whitespace-separated token of *keyword*: ``check`` for
     ``ruff check``, ``pyright`` for ``pyright``, ``pytest`` for ``pytest``. One
-    rule reproduces every anchor the five callers use, two of which spelled it as
-    a hand-rolled ``tokens.index("check")`` and a third as a ``shlex``-tokenised
-    marker window with a raw ``str.endswith`` fallback (task 3883).
+    rule reproduces every anchor its callers use; of the five hand-maintained
+    copies it replaced, two spelled it as a hand-rolled ``tokens.index("check")``
+    and a third as a ``shlex``-tokenised marker window with a raw
+    ``str.endswith`` fallback (task 3883).
 
     THE ANCHOR BELONGS TO NEITHER HALF, and the split is the whole point.
     Everything BEFORE it is the WRAPPER's: in
