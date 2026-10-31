@@ -3428,7 +3428,6 @@ class ReconciliationHarness:
         tier: TierConfig | None = None,
         events: list[ReconciliationEvent] | None = None,
         assembled_payload: AssembledPayload | None = None,
-        resume_run: ReconciliationRun | None = None,
         run_id: str | None = None,
     ) -> ReconciliationRun:
         """Execute the three-stage pipeline for a project.
@@ -3441,17 +3440,6 @@ class ReconciliationHarness:
             assembled_payload: Optional token-budgeted payload from ContextAssembler.
                     When provided, Stage 1 uses this instead of generic
                     time-windowed episode/memory fetches.
-            resume_run: Task σ adopt-and-resume seam.  When set, the cycle reuses
-                    this interrupted run wholesale instead of starting a fresh one:
-                    it keeps ``resume_run.id`` (no ``start_run``), does NOT drain
-                    (the caller MUST supply the run's already-drained ``events`` so
-                    a resumed cycle never double-processes them), skips any stage
-                    whose real ``StageReport`` is already in
-                    ``resume_run.stage_reports`` (its work landed before the
-                    interrupt), and ``--resume``s ONLY the stage matching
-                    ``resume_run.stage_cursor`` by threading
-                    ``resume_run.session_id`` into it.  The remaining stages run
-                    fresh, and the completion/judge/remediation tail is unchanged.
             run_id: caller-minted id for this run, so a caller whose deadline
                     timed out can still scope the restore of its events (task 6453).
         """
@@ -3459,53 +3447,29 @@ class ReconciliationHarness:
         # no buffer drain) if project_id has no KNOWN_PROJECT_ROOTS entry.
         scope = self._known_project_scope_for(project_id)
         project_root = scope.project_root
-        if resume_run is not None and run_id is not None:
-            raise ValueError(
-                'run_full_cycle(resume_run=..., run_id=...) are mutually exclusive: '
-                'a resumed run keeps resume_run.id'
-            )
 
         tier = tier or TierConfig()
         watermark = await self.journal.get_watermark(project_id)
 
-        if resume_run is not None:
-            # Task σ adopt-and-resume: reuse the interrupted run wholesale — no
-            # fresh run row, no re-drain. The startup pass supplies the run's
-            # already-drained events via `events`; re-draining or re-attributing
-            # them would double-process on resume, so both are skipped here.
-            if events is None:
-                raise ValueError(
-                    'run_full_cycle(resume_run=...) requires caller-supplied '
-                    "events (the interrupted run's already-drained events); "
-                    'draining fresh would lose the in-flight batch'
-                )
-            run = resume_run
-            run_id = run.id
-            # The row is 'interrupted' on disk; mark it running in-memory so the
-            # active-run tracker/logs reflect reality and the finally's GC gate
-            # (skip iff status == interrupted) permits the transcript sweep once
-            # this resumed cycle completes.
-            run.status = RunStatus.running
+        run_id = run_id if run_id is not None else str(uuid4())
+        if events is None:
+            events = await self.buffer.drain(project_id, run_id=run_id)
         else:
-            run_id = run_id if run_id is not None else str(uuid4())
-            if events is None:
-                events = await self.buffer.drain(project_id, run_id=run_id)
-            else:
-                await self.buffer.mark_drained_run_id(
-                    project_id, [e.id for e in events], run_id
-                )
-
-            run = ReconciliationRun(
-                id=run_id,
-                project_id=project_id,
-                run_type=RunType.full,
-                trigger_reason=trigger_reason,
-                started_at=datetime.now(UTC),
-                events_processed=len(events),
-                status=RunStatus.running,
-                instance_id=self.buffer.instance_id,
+            await self.buffer.mark_drained_run_id(
+                project_id, [e.id for e in events], run_id
             )
-            await self.journal.start_run(run)
+
+        run = ReconciliationRun(
+            id=run_id,
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason=trigger_reason,
+            started_at=datetime.now(UTC),
+            events_processed=len(events),
+            status=RunStatus.running,
+            instance_id=self.buffer.instance_id,
+        )
+        await self.journal.start_run(run)
 
         logger.info(
             'reconciliation.run_started',
@@ -3516,7 +3480,6 @@ class ReconciliationHarness:
                 'trigger_reason': trigger_reason,
                 'events_to_process': len(events),
                 'model': tier.model,
-                'resumed': resume_run is not None,
             },
         )
 
@@ -3599,18 +3562,6 @@ class ReconciliationHarness:
                 reports = []
                 for stage in stages:
                     stage_key = stage.stage_id.value
-
-                    # Task σ resume: a stage whose real StageReport is already
-                    # persisted on the resumed run completed BEFORE the interrupt
-                    # — skip its subprocess entirely, but thread its persisted
-                    # report into `reports` so later stages still receive it as
-                    # prior context (exactly as a freshly-run stage would).
-                    if resume_run is not None:
-                        prior = run.stage_reports.get(stage_key)
-                        if isinstance(prior, StageReport):
-                            reports.append(prior)
-                            continue
-
                     current_stage_name = stage_key
                     _active.stage(current_stage_name)
 
@@ -3634,8 +3585,7 @@ class ReconciliationHarness:
                     #     is structurally unreachable and ONLY the write-recovered
                     #     arms can fire. Anchoring the flush to the READER's
                     #     dispatch also keeps it correct if the stage list is ever
-                    #     reordered, and it naturally no-ops on a resumed run whose
-                    #     Stage 3 is skipped above.
+                    #     reordered.
                     # (3) WHY THIS IS SAFE: both methods are already never-raise
                     #     (each swallows BaseException), shield their writes, and
                     #     are idempotent on the ledger's 5-part identity
@@ -3645,9 +3595,9 @@ class ReconciliationHarness:
                     #
                     # The finally-block call STAYS: it remains the terminal
                     # backstop for paths this flush cannot reach (a stage that
-                    # raised before Stage 3, an interrupted/resumed run) and the
-                    # last chance after a flush attempt that did not CONFIRM (the
-                    # write-missing predicate excludes only a marker that is True).
+                    # raised before Stage 3) and the last chance after a flush
+                    # attempt that did not CONFIRM (the write-missing predicate
+                    # excludes only a marker that is True).
                     # _run_remediation_pass carries the identical flush; all four
                     # sites go through _flush_cycle_summaries, so the arms and
                     # their load-bearing Stage-1-before-Stage-2 order cannot
@@ -3689,28 +3639,9 @@ class ReconciliationHarness:
                     if isinstance(stage, IntegrityCheck):
                         stage.filtered_task_tree = filtered_task_tree
 
-                    # Task σ resume: --resume ONLY the stage the interrupt caught
-                    # mid-flight (stage_cursor), and only when a session was
-                    # actually captured for it. Pass the kwarg solely on that
-                    # path so every non-resume call site keeps today's signature.
-                    resume_session_id = (
-                        run.session_id
-                        if (
-                            resume_run is not None
-                            and stage_key == run.stage_cursor
-                            and run.session_id
-                        )
-                        else None
+                    report = await stage.run(
+                        events, watermark, reports, run_id, model=tier.model,
                     )
-                    if resume_session_id is not None:
-                        report = await stage.run(
-                            events, watermark, reports, run_id,
-                            model=tier.model, resume_session_id=resume_session_id,
-                        )
-                    else:
-                        report = await stage.run(
-                            events, watermark, reports, run_id, model=tier.model,
-                        )
                     reports.append(report)
                     run.stage_reports[stage_key] = report
 
@@ -3777,9 +3708,9 @@ class ReconciliationHarness:
                 # TERMINAL backstop. Task 4186 hoisted a copy of this call to
                 # the top of the Stage-3 iteration above (the pre-Stage-3
                 # flush); this stays as the last resort for the paths that flush
-                # cannot reach — a stage that raised before Stage 3, an
-                # interrupted/resumed run — and as the second attempt after a
-                # flush attempt that did not CONFIRM. A flush that DID confirm
+                # cannot reach — a stage that raised before Stage 3 — and as
+                # the second attempt after a flush attempt that did not
+                # CONFIRM. A flush that DID confirm
                 # makes it no-op via _cycle_summary_ledger_write_missing's
                 # write-recovered exclusion, so one recovery logs one WARNING.
                 # Stays before update_run_stage_reports so the persisted
@@ -4563,11 +4494,11 @@ class ReconciliationHarness:
         - **Degraded-synth arm** — the ``task_knowledge_sync`` entry is
           present but is NOT a ``StageReport``: the plain-dict shape
           ``run.stage_reports`` (typed ``dict[str, StageReport | dict]``) is
-          allowed to hold. This is production-reachable, not defensive
-          fiction — ``journal`` reconstructs ``StageReport(**v)`` only when
-          the stored value ``isinstance(v, dict) and 'stage' in v``, and
-          otherwise keeps the raw dict, so an adopted/resumed run can carry
-          one. It is the only remaining shape where Stage 2 demonstrably
+          allowed to hold. ``journal`` reconstructs ``StageReport(**v)`` only
+          when the stored value ``isinstance(v, dict) and 'stage' in v``, and
+          otherwise keeps the raw dict, so a run whose reports were read back
+          from the journal can carry one (the resume path task 5514 retired
+          was the production route that did). It is the only remaining shape where Stage 2 demonstrably
           produced a report yet no faithful re-attempt is possible, so it is
           the one place a synthesized row is honest rather than fabricated.
 

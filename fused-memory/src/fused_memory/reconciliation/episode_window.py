@@ -25,9 +25,7 @@ Graphiti write still executing for the project began
   write executes for at most the queue's ``write_timeout_seconds``, so the
   cursor lags only by in-flight writes and never freezes on an empty cycle.
 
-The sample travels in Stage 1's report stats, which persist with the run, so a
-resumed run (task sigma) whose Stage 1 had already finished anchors on what
-that fetch saw.
+The sample travels in Stage 1's report stats.
 
 ``last_memory_timestamp`` is deliberately NOT lowered: mem0 stamps a memory's
 ``created_at`` immediately before inserting it, so a memory is readable as soon
