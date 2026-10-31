@@ -11,8 +11,7 @@ stamp>` branch, in a worktree outside the target checkout, submits it through
 merge_request, polls the request's own handle until it settles, and confirms
 the landing by git: the deploy commit is on main, and the target checkout's
 file is main's. Any other outcome raises `LandingNotConfirmed`, whose
-`.failure` is a wire tag a caller may print. `land_or_exit` is the same call,
-exiting through `_config_reload_gate.die`.
+`.failure` is a wire tag a caller may print.
 
 The deploy branch is torn down once its request can no longer land. A request
 still in flight when the deadline passes, or when SIGTERM/SIGINT arrives, is
@@ -42,7 +41,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from _config_reload_gate import die, load_transport, transport_not_importable_remedy
+from _config_reload_gate import load_transport, transport_not_importable_remedy
 
 try:
     from shared.merge_state import (
@@ -151,15 +150,6 @@ def land_file(
         _deploy_branch(target, base_sha, content, label=label, message=message) as deploy,
     ):
         return _land(queue, target, deploy, deadline, stop, description=message)
-
-
-def land_or_exit(repo: str, path: str, base_sha: str, content: bytes, *, prog: str,
-                 **kwargs: Any) -> Landing:
-    """`land_file`, exiting through `die` with the refusal's detail."""
-    try:
-        return land_file(repo, path, base_sha, content, **kwargs)
-    except LandingNotConfirmed as exc:
-        die(prog, exc.detail)
 
 
 def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: float,
