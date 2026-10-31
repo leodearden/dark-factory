@@ -5173,45 +5173,6 @@ async def test_run_full_cycle_cancelled_marks_failed_and_restores_events(
 
 
 @pytest.mark.asyncio
-async def test_run_full_cycle_cancelled_falls_back_when_resume_disabled(
-    journal, event_buffer, mock_memory_service,
-):
-    """task σ: with resume_after_restart=False, a mid-cycle CancelledError keeps
-    today's behaviour verbatim — status `failed`, restore_drained called, config
-    dir gc'd."""
-    import asyncio
-
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness.config.resume_after_restart = False
-
-    _mock_stage_run(harness.stages[0])
-
-    async def cancel_run(events, watermark, prior_reports, run_id, model=None):
-        raise asyncio.CancelledError()
-
-    harness.stages[1].run = cancel_run
-    _mock_stage_run(harness.stages[2])
-
-    await event_buffer.push(_make_event())
-
-    restore_spy = AsyncMock(side_effect=event_buffer.restore_drained)
-    event_buffer.restore_drained = restore_spy
-
-    with patch(
-        'fused_memory.reconciliation.harness.gc_run_config_dir',
-    ) as gc_mock, pytest.raises(asyncio.CancelledError):
-        await harness.run_full_cycle('test-project', 'buffer_size:1')
-
-    # Legacy path: events restored, config dir GC'd, run failed.
-    restore_spy.assert_awaited()
-    gc_mock.assert_called_once()
-
-    runs = await journal.get_recent_runs('test-project', limit=5)
-    assert len(runs) >= 1
-    assert runs[0].status == RunStatus.failed
-
-
-@pytest.mark.asyncio
 async def test_run_full_cycle_resume_run_skips_completed_and_resumes_cursor(
     journal, event_buffer, mock_memory_service,
 ):
@@ -5789,43 +5750,6 @@ async def test_run_full_cycle_finally_gcs_config_dir_despite_a_second_cancellati
 
 
 @pytest.mark.asyncio
-async def test_run_full_cycle_keeps_interrupted_runs_config_dir_under_a_second_cancellation(
-    journal, event_buffer, mock_memory_service,
-):
-    """Passes before and after task 5128 by design: guards the interrupted
-    gate against a fix that hoists the GC out of it (task σ — an interrupted
-    run's transcript must survive for the startup --resume pass)."""
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness.config.resume_after_restart = True
-
-    stage_entered = asyncio.Event()
-    created_dirs: list = []
-    harness.stages[0].run = _slow_stage(
-        harness.stages[0], stage_entered,
-        on_enter=_config_dir_creator(journal, created_dirs),
-    )
-    _mock_stage_run(harness.stages[1])
-    _mock_stage_run(harness.stages[2])
-
-    await event_buffer.push(_make_event())
-
-    outer_task, injection_fired = await _drive_cancelling_first_stage_report_write(
-        harness, journal, stage_entered,
-        lambda: harness.run_full_cycle('test-project', 'buffer_size:1'),
-    )
-
-    assert injection_fired, (
-        'self_cancelling_update never ran — no second cancellation was '
-        'delivered, so this test would pass vacuously'
-    )
-    assert len(created_dirs) == 1
-    assert outer_task.cancelled()
-    assert created_dirs[0].exists(), (
-        "an interrupted run's config dir must survive for the --resume pass"
-    )
-
-
-@pytest.mark.asyncio
 async def test_remediation_pass_finally_gcs_config_dir_despite_a_second_cancellation(
     journal, event_buffer, mock_memory_service,
 ):
@@ -6376,18 +6300,16 @@ async def test_run_full_cycle_post_completion_failure_keeps_run_completed(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('resume_after_restart', [False, True])
 async def test_run_full_cycle_post_completion_cancellation_keeps_run_completed(
-    journal, event_buffer, mock_memory_service, tmp_path, resume_after_restart,
+    journal, event_buffer, mock_memory_service, tmp_path,
 ):
     """A cancellation landing in the post-completion tail still propagates, but
-    never relabels the durably completed run (interrupted or failed) nor
-    restores its drained events."""
+    never relabels the durably completed run failed nor restores its drained
+    events."""
     harness, esc_queue = _make_completing_harness(
         journal, event_buffer, mock_memory_service, tmp_path,
     )
     assert harness.judge is not None
-    harness.config.resume_after_restart = resume_after_restart
     await event_buffer.push(_make_event())
 
     entered = asyncio.Event()
@@ -6408,16 +6330,14 @@ async def test_run_full_cycle_post_completion_cancellation_keeps_run_completed(
     [row] = await journal.get_recent_runs('test-project', limit=1)
     assert row.status == 'completed'
     assert '_error' not in row.stage_reports
-    assert row.id not in {r.id for r in await journal.get_interrupted_runs()}
     restore_spy.assert_not_awaited()
     assert len(await event_buffer.get_drained_events('test-project', row.id)) == 1
     assert _pending_recon_failures(esc_queue) == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('resume_after_restart', [False, True])
 async def test_run_full_cycle_cancellation_after_the_completion_commit_keeps_run_completed(
-    journal, event_buffer, mock_memory_service, tmp_path, resume_after_restart,
+    journal, event_buffer, mock_memory_service, tmp_path,
 ):
     """A cancellation reaching run_full_cycle after complete_run(run_id,
     'completed') has committed (aiosqlite lands a commit whose awaiter was
@@ -6426,7 +6346,6 @@ async def test_run_full_cycle_cancellation_after_the_completion_commit_keeps_run
     harness, esc_queue = _make_completing_harness(
         journal, event_buffer, mock_memory_service, tmp_path,
     )
-    harness.config.resume_after_restart = resume_after_restart
     await event_buffer.push(_make_event())
 
     entered = asyncio.Event()
@@ -6451,7 +6370,6 @@ async def test_run_full_cycle_cancellation_after_the_completion_commit_keeps_run
     [row] = await journal.get_recent_runs('test-project', limit=1)
     assert row.status == 'completed'
     assert '_error' not in row.stage_reports
-    assert row.id not in {r.id for r in await journal.get_interrupted_runs()}
     restore_spy.assert_not_awaited()
     assert len(await event_buffer.get_drained_events('test-project', row.id)) == 1
     assert (await journal.get_watermark('test-project')).last_full_run_id == row.id
@@ -6492,13 +6410,8 @@ async def test_run_full_cycle_exception_after_the_completion_commit_keeps_run_co
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ('resume_after_restart', 'row_status', 'buffered_after'),
-    [(False, 'failed', 1), (True, 'interrupted', 0)],
-)
 async def test_run_full_cycle_cancellation_relabels_when_the_completion_read_fails(
     journal, event_buffer, mock_memory_service, tmp_path,
-    resume_after_restart, row_status, buffered_after,
 ):
     """The cancelled arm's read of whether the journal already records the run
     completed is best-effort: when it fails, a run cancelled before completion
@@ -6506,7 +6419,6 @@ async def test_run_full_cycle_cancellation_relabels_when_the_completion_read_fai
     harness, _ = _make_completing_harness(
         journal, event_buffer, mock_memory_service, tmp_path,
     )
-    harness.config.resume_after_restart = resume_after_restart
     await event_buffer.push(_make_event())
     _fail_first_call(journal, 'is_run_completed', _sqlite_busy_error)
     entered = asyncio.Event()
@@ -6518,8 +6430,8 @@ async def test_run_full_cycle_cancellation_relabels_when_the_completion_read_fai
         await outer
 
     [row] = await journal.get_recent_runs('test-project', limit=1)
-    assert row.status == row_status
-    assert await event_buffer.count_buffered('test-project') == buffered_after
+    assert row.status == 'failed'
+    assert await event_buffer.count_buffered('test-project') == 1
 
 
 def _lock_restore_drained(event_buffer) -> None:

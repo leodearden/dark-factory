@@ -4046,23 +4046,12 @@ class ReconciliationHarness:
     async def _record_cancelled_run(
         self, run: ReconciliationRun, project_id: str, current_stage_name: str | None,
     ) -> None:
-        """Journal a ``run_full_cycle`` cancelled before durable completion; the
-        caller re-raises, so asyncio cancellation semantics hold
-        (the cycle deadline cancels via CancelledError, which is not an
-        Exception, so without this the row would stay 'running').
-
-        Task σ: when resume_after_restart is enabled, a restart cancelling an
-        in-flight stage is a RESUMABLE interrupt, not a failure. The run is
-        marked `interrupted` and restore_drained is DELIBERATELY skipped — the
-        drained events must stay drained so the startup adopt-and-resume pass
-        can feed a resumed cycle's fresh later stages without double-processing.
-        The (session_id, stage_cursor) snapshot survives on the run row
-        (BaseStage.run skips clear_run_session on cancel), and run_full_cycle's
-        finally skips the config-dir GC for interrupted runs so the transcript
-        survives for --resume. When the knob is off the run is failed and its
-        events restored (a deploy that changed recon prompts/tooling opts out of
-        resume this way, since a --resume'd session finishes under the OLD
-        system prompt by construction).
+        """Journal a ``run_full_cycle`` cancelled before durable completion:
+        failed, with its drained events restored for a later cycle. The caller
+        re-raises, so asyncio cancellation semantics hold (the cycle deadline
+        cancels via CancelledError, which is not an Exception, so without this
+        the row would stay 'running'). A restart cancel and a deadline cancel
+        end alike: 'interrupted' was retired by task 5514.
 
         Every write is best-effort and shielded, so a second cancellation (e.g.
         server shutdown) cannot abort it and a write failure cannot replace the
@@ -4074,17 +4063,6 @@ class ReconciliationHarness:
         run completed.
         """
         run_id = run.id
-        if self.config.resume_after_restart:
-            run.status = RunStatus.interrupted
-            if await self._end_run_unless_completed(
-                run, project_id, current_stage_name,
-                lambda: self._journal_interrupted(run_id),
-            ):
-                logger.warning(
-                    f'Reconciliation run {run_id} INTERRUPTED (resumable) for '
-                    f'{project_id} (stage: {current_stage_name})'
-                )
-            return
         run.status = RunStatus.failed
         run.stage_reports['_error'] = {
             'error_type': 'CancelledError',
@@ -4156,13 +4134,6 @@ class ReconciliationHarness:
             what='is_run_completed', run_id=run_id,
             logger=logger, level=logging.ERROR,
         ) is True
-
-    async def _journal_interrupted(self, run_id: str) -> None:
-        await await_best_effort(
-            self.journal.complete_run(run_id, 'interrupted'),
-            what='complete_run(interrupted)', run_id=run_id,
-            logger=logger, level=logging.ERROR,
-        )
 
     async def _record_deferred_run(
         self,
@@ -4569,9 +4540,7 @@ class ReconciliationHarness:
         The GC runs even when a second cancellation lands mid-write, and that
         cancellation still propagates
         (``tests/test_harness.py::test_run_full_cycle_finally_gcs_config_dir_despite_a_second_cancellation``).
-        An interrupted run keeps its dir for the startup ``--resume`` pass
-        (task σ); its stage transcripts were already copied to the archive by
-        ``stages/base.py::BaseStage.run``. A GC failure is logged, never raised.
+        A GC failure is logged, never raised.
         """
         stage_reports_write = asyncio.ensure_future(
             self.journal.update_run_stage_reports(run.id, run.stage_reports)
@@ -4582,17 +4551,16 @@ class ReconciliationHarness:
         try:
             await asyncio.shield(stage_reports_write)
         finally:
-            if run.status != RunStatus.interrupted:
-                try:
-                    gc_run_config_dir(
-                        self.journal.data_dir, run.id,
-                        archive_root=recon_archive_root(self.config),
-                    )
-                except Exception as gc_err:  # noqa: BLE001
-                    logger.warning(
-                        'gc_run_config_dir failed for %s run %s: %r',
-                        run.run_type, run.id, gc_err,
-                    )
+            try:
+                gc_run_config_dir(
+                    self.journal.data_dir, run.id,
+                    archive_root=recon_archive_root(self.config),
+                )
+            except Exception as gc_err:  # noqa: BLE001
+                logger.warning(
+                    'gc_run_config_dir failed for %s run %s: %r',
+                    run.run_type, run.id, gc_err,
+                )
 
     def _log_stage_reports_write_failure(
         self, run_id: str, task: asyncio.Task,
