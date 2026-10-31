@@ -1,12 +1,23 @@
-"""Thread-method timeouts must run with xdist worker restarts disabled.
+"""xdist worker restarts stay disabled for thread-method configs and for the recorded configs.
 
-THE INVARIANT. Every pytest config that sets ``timeout_method = "thread"``
-carries ``--max-worker-restart=0``, whether or not its own addopts ask for
-xdist: verify injects ``-n`` into every gated pytest leg
-(``orchestrator/src/orchestrator/verify.py::_with_pytest_numprocesses_str``,
-driven by ``verify_admission_pytest_n``), so a thread-method member runs under
-xdist there regardless. Discovered from ``[tool.uv.workspace].members``, so a
-future thread-method member is held to it with no edit here.
+THE INVARIANT has two rules. Both read the configs that
+``test_pytest_per_test_timeout_policy.py::discovered_pytest_configs`` discovers
+from ``[tool.uv.workspace].members``, so a new member is held to them with no
+edit here.
+
+  * Every pytest config that sets ``timeout_method = "thread"`` carries
+    ``--max-worker-restart=0``, whether or not its own addopts ask for xdist:
+    verify injects ``-n`` into every gated pytest leg
+    (``orchestrator/src/orchestrator/verify.py::_with_pytest_numprocesses_str``,
+    driven by ``verify_admission_pytest_n``), so a thread-method member runs
+    under xdist there regardless. No config runs thread since task 6354; the
+    rule holds any future one.
+  * The configs in ``RESTART_DISABLED_CONFIGS``, orchestrator and fused-memory,
+    keep the flag under signal. The timeout method and the restart cap are
+    separate axes, and task 6354 moved only the method: a signal timeout no
+    longer kills a worker, but a segfault, an OOM kill or an ``os._exit`` in
+    code under test still does, and with restarts permitted each replacement
+    re-collects the whole suite.
 
 WHY. Under thread method pytest-timeout answers a breach by ``os._exit()``ing
 the worker, so a worker death is the routine outcome of any over-cap test. With
@@ -32,9 +43,9 @@ before it consults the restart cap, so no green run can turn red. A truncated
 tally is already labelled partial by
 ``orchestrator/src/orchestrator/verify.py::_worker_death_truncation_evidence``.
 
-OUT OF SCOPE: signal-method members. A signal timeout raises inside the test and
-leaves the worker alive, so the case the flag exists for does not arise there.
-That side is
+OUT OF SCOPE: the other signal-method members. orchestrator and fused-memory are
+signal members that DO carry the flag, for the reason above. The other parallel
+members do not, because no measured need was found (task 5408); that side is
 ``test_merge_gate_parallelism_config.py::test_parallel_member_addopts_do_not_copy_max_worker_restart``.
 """
 from __future__ import annotations
@@ -48,12 +59,17 @@ import re
 import shlex
 import subprocess
 import sys
-import tomllib
 from collections.abc import Mapping
 
 import pytest
 
-REPO_ROOT = pathlib.Path(__file__).parents[2]
+# The one config-discovery walk, with its anti-vacuity floors. Resolves because
+# tests/scripts/conftest.py puts this directory on sys.path.
+import test_pytest_per_test_timeout_policy as per_test_timeout_policy
+
+# The configs that keep the flag under timeout_method = "signal". The module
+# docstring states why.
+RESTART_DISABLED_CONFIGS = frozenset({'orchestrator', 'fused-memory'})
 
 # The ONE accepted spelling. The two-token ``--max-worker-restart 0`` form is
 # refused for the reason ``test_merge_gate_parallelism_config.py::_flag_value``
@@ -62,11 +78,6 @@ RESTART_DISABLED_TOKEN = '--max-worker-restart=0'
 RESTART_FLAG_PREFIX = '--max-worker-restart'
 RESTART_FLAG_SPELLING = re.compile(rf'{re.escape(RESTART_FLAG_PREFIX)}=\d+')
 THREAD_TIMEOUT_METHOD = 'thread'
-
-ROOT_CONFIG_NAME = '.'
-
-# A FLOOR, not an equality: orchestrator and fused-memory at authorship.
-MIN_EXPECTED_THREAD_TIMEOUT_CONFIGS = 2
 
 REPRO_INITIAL_WORKERS = 2
 
@@ -82,70 +93,73 @@ INITIAL_WORKERS_ENV = 'XDIST_RESTART_REPRO_INITIAL_WORKERS'
 REPRO_MODULE_COUNT = 20
 
 
-def _pytest_ini_options(pyproject: pathlib.Path) -> dict:
-    if not pyproject.exists():
-        return {}
-    data = tomllib.loads(pyproject.read_text(encoding='utf-8'))
-    return data.get('tool', {}).get('pytest', {}).get('ini_options', {})
-
-
-def _thread_timeout_configs() -> dict[str, str]:
-    """Config name -> addopts, for every config running ``timeout_method = "thread"``."""
-    root_data = tomllib.loads((REPO_ROOT / 'pyproject.toml').read_text(encoding='utf-8'))
-    members = root_data.get('tool', {}).get('uv', {}).get('workspace', {}).get('members', [])
-    assert members, (
-        '[tool.uv.workspace].members is empty or missing in the root '
-        'pyproject.toml — this guard reads it to discover which configs to '
-        'check, so it would otherwise pass vacuously.'
-    )
-
-    configs: dict[str, str] = {}
-    for name in [ROOT_CONFIG_NAME, *members]:
-        ini_options = _pytest_ini_options(REPO_ROOT / name / 'pyproject.toml')
-        if ini_options.get('timeout_method') == THREAD_TIMEOUT_METHOD:
-            configs[name] = ini_options.get('addopts', '')
-
-    assert len(configs) >= MIN_EXPECTED_THREAD_TIMEOUT_CONFIGS, (
-        f'only discovered {sorted(configs)} as configs setting '
-        f'timeout_method = {THREAD_TIMEOUT_METHOD!r}, expected at least '
-        f'{MIN_EXPECTED_THREAD_TIMEOUT_CONFIGS} (orchestrator and fused-memory '
-        'are the known members). Finding fewer means this discovery walk '
-        'rotted, not that the repo changed: a config that stopped being '
-        'discovered is one nothing here checks any more.'
-    )
-    return configs
-
-
 def _restart_tokens(addopts: str) -> list[str]:
     return [token for token in shlex.split(addopts) if token.startswith(RESTART_FLAG_PREFIX)]
 
 
-def test_thread_timeout_configs_disable_worker_restarts() -> None:
+def _restart_offenders(ini_options_by_config: Mapping[str, Mapping]) -> dict[str, list[str]]:
+    """Config name -> its restart tokens, for each config not declaring exactly the one token."""
     declared_by_config = {
-        name: _restart_tokens(addopts)
-        for name, addopts in _thread_timeout_configs().items()
+        name: _restart_tokens(ini_options.get('addopts', ''))
+        for name, ini_options in ini_options_by_config.items()
     }
-    offenders = {
+    return {
         name: declared
         for name, declared in declared_by_config.items()
         if declared != [RESTART_DISABLED_TOKEN]
     }
-    listing = '\n'.join(
+
+
+def _offender_listing(offenders: Mapping[str, list[str]]) -> str:
+    return '\n'.join(
         f'  {name}/pyproject.toml addopts declares {declared!r}'
         for name, declared in sorted(offenders.items())
     )
+
+
+def test_thread_timeout_configs_disable_worker_restarts() -> None:
+    offenders = _restart_offenders({
+        name: ini_options
+        for name, ini_options in per_test_timeout_policy.discovered_pytest_configs().items()
+        if ini_options.get('timeout_method') == THREAD_TIMEOUT_METHOD
+    })
     assert not offenders, (
         f'these configs run timeout_method = {THREAD_TIMEOUT_METHOD!r} but do '
         f'not declare exactly [{RESTART_DISABLED_TOKEN!r}] in addopts (tasks '
         '1907, 5114). A missing -n in addopts does not exempt them: verify '
         'injects one into every gated pytest leg.\n'
-        f'{listing}\n'
+        f'{_offender_listing(offenders)}\n'
         'Without the flag, a worker killed by a thread-method timeout can abort '
         'the whole session with an unattributed INTERNALERROR KeyError at '
         "xdist's _assign_work_unit, which this file's negative control "
         'reproduces. With it, the death becomes the attributed "crashed while '
         'running" + "worker restarting disabled" signature that verify.py\'s '
         'worker-death discriminators key on.'
+    )
+
+
+def test_recorded_configs_keep_worker_restarts_disabled() -> None:
+    configs = per_test_timeout_policy.discovered_pytest_configs()
+    undiscovered = sorted(RESTART_DISABLED_CONFIGS - configs.keys())
+    assert not undiscovered, (
+        f'RESTART_DISABLED_CONFIGS records {undiscovered!r}, but no pytest config '
+        'is discovered under that name. A renamed or removed member must update '
+        'the recorded set in the same change.'
+    )
+    offenders = _restart_offenders({name: configs[name] for name in RESTART_DISABLED_CONFIGS})
+    assert not offenders, (
+        'these configs are recorded in RESTART_DISABLED_CONFIGS but do not '
+        f'declare exactly [{RESTART_DISABLED_TOKEN!r}] in addopts.\n'
+        f'{_offender_listing(offenders)}\n'
+        'They run timeout_method = "signal" since task 6354, which moved only the '
+        'method. Under signal the cap governs the worker deaths that remain '
+        '(segfault, OOM kill, os._exit in code under test). With restarts '
+        'permitted, a replacement worker re-collects the whole suite, and two '
+        'concurrent replacements abort the session with the unattributed '
+        "INTERNALERROR KeyError this file's negative control reproduces. Dropping "
+        'the flag is a separate decision that needs its own measurement: take the '
+        "config out of RESTART_DISABLED_CONFIGS and record why in this file's "
+        'module docstring in the same change.'
     )
 
 
