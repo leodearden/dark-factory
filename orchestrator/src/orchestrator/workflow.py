@@ -3830,9 +3830,12 @@ class TaskWorkflow:
         loop, on the theory that a conflict was what emptied it. That was a
         MISDIAGNOSIS (esc-3388-9): ``plan.files`` was empty on this path
         unconditionally, because the fast path skips every ``read_plan()`` call
-        site and so left ``self.plan`` at its ``__init__`` default. The plan is
-        now read below, which is what actually closes that loop; the probe is
-        retained on its own independent merit.
+        site and so left ``self.plan`` at its ``__init__`` default. Then
+        :meth:`_check_scope_invariant` met an empty plan against a non-empty
+        ``metadata.files`` and filed a blocking L0 on every dispatch, and
+        resolving that L0 via ``resume`` re-stamped the obligation straight back
+        onto this path. The plan is now read below, which is what actually
+        closes that loop; the probe is retained on its own independent merit.
 
         Fail-safe fall-through to the full pipeline (returns ``None``) on a
         missing/non-dict stamp, a rev-parse failure, a HEAD mismatch, a
@@ -3884,9 +3887,9 @@ class TaskWorkflow:
             return None
         # The branch has not MOVED — but has it stopped MERGING?  Main may have
         # advanced underneath it since the steward resolved, introducing a
-        # rebase conflict.  Resuming straight to merge with an empty plan.files
-        # would then trip the merge-entry scope invariant on every dispatch
-        # (task 3024), so probe the merge before honouring the fast-path.
+        # rebase conflict, and a stale obligation must not merge a branch that
+        # no longer applies onto current main.  So probe the merge before
+        # honouring the fast-path.
         try:
             main_sha = await self.git_ops.get_main_sha()
             probe = await self.git_ops.merge_tree_conflicts(main_sha, current_head)
@@ -3910,34 +3913,18 @@ class TaskWorkflow:
             )
             await self._clear_merge_retry_pending()
             return None
-        # Populate self.plan BEFORE jumping to the merge phase (esc-3388-9).
-        # This path skips plan/execute/verify/review, and every
-        # ``self.plan = self.artifacts.read_plan()`` call site lives in the
-        # pipeline it skips — the first is in :meth:`_drive` just BELOW the
-        # call to this method.  So without this read ``self.plan`` is still
-        # the ``__init__`` default ``{}``, and :meth:`_check_scope_invariant`
-        # at merge entry sees an EMPTY plan.files against a non-empty
-        # metadata.files: the task-3429 "an empty plan cannot be verified as
-        # a safe metadata.files superset" arm, which files a blocking L0.
-        # That fired on EVERY dispatch through this fast path — the exact
-        # "loop no escalation action could break" the docstring above warns
-        # about, since resolving the L0 via `resume` re-stamps
-        # merge_retry_pending and lands right back here.
-        #
-        # Task 3024 added the merge_tree_conflicts probe above believing a
-        # rebase conflict was what emptied plan.files.  It is not: plan.files
-        # was empty on this path whether or not the branch conflicted,
-        # because nothing ever read the plan.  The probe is still correct and
-        # is retained on its own merits (a stale obligation must not merge a
-        # branch that no longer applies); it just never addressed this.
+        # Populate self.plan before the merge phase: this path skips every
+        # read_plan() call site (see the docstring's esc-3388-9 paragraph;
+        # pinned end to end by
+        # orchestrator/tests/test_workflow_merge_retry_resume_merge_entry.py).
         plan = self.artifacts.read_plan() if self.artifacts is not None else {}
         if not plan.get('files'):
             # Nothing to verify the merge-entry scope invariant against, so
-            # honouring the fast path would trip it and re-enter the loop
-            # above.  Void the obligation and take the full pipeline, which
-            # re-plans and regenerates plan.json.  Mirrors the
-            # confirmed-conflict arm: an obligation that can never be
-            # satisfied as stamped is cleared rather than preserved.
+            # honouring the fast path would trip it and re-enter the
+            # docstring's esc-3388-9 loop.  Void the obligation and take the
+            # full pipeline, which re-plans and regenerates plan.json.
+            # Mirrors the confirmed-conflict arm: an obligation that can never
+            # be satisfied as stamped is cleared rather than preserved.
             logger.warning(
                 'Task %s: merge_retry_pending HEAD match (%s) but the plan has '
                 'no files (artifacts root=%s) — cannot verify the merge-entry '
