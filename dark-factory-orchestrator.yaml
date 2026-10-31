@@ -429,7 +429,7 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #       skills/escalation-watcher-auto/.
 #   orchestrator/tests/test_harness_watcher_supervisor.py — uses that real
 #       loader's output as its oracle.
-#   orchestrator/tests/test_session_hooks.py      — EXECUTES the real
+#   orchestrator/tests/test_session_hooks_bash.py — EXECUTES the real
 #       skills/spawn/hooks/*.sh.
 #   tests/scripts/test_spawn_claude.py            — EXECUTES the real
 #       skills/spawn/spawn-claude.sh.
