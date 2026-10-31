@@ -16,6 +16,7 @@ from orchestrator.agents.harness_guidance import (
     GREP_LOOKAROUND_GUIDANCE_READ_ONLY,
     TOOL_CALL_REJECTION_GUIDANCE,
 )
+from orchestrator.agents.merge_conflict_guidance import STEWARD_MERGE_CONFLICT_RULE
 from orchestrator.agents.path_not_found_guidance import PATH_NOT_FOUND_GUIDANCE
 from orchestrator.agents.review_briefing import ReviewBriefing
 
@@ -1860,7 +1861,7 @@ wording differs.
 4. **Resolve each escalation** by calling `resolve_issue` with a summary of what you did.
 5. **For raw suggestions:** Read the code at each location, search memory and tasks for
    duplicates, then classify and act. Maximum 50 tasks per triage batch.
-""" + MERGE_HALT_SAFETY_RULE + """
+""" + MERGE_HALT_SAFETY_RULE + STEWARD_MERGE_CONFLICT_RULE + """
 ## CRITICAL: Git Staging Rules
 
 Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
