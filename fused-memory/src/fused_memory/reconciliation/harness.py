@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from shared.cli_invoke import AllAccountsCappedException, read_transcript_records
+from shared.cli_invoke import AllAccountsCappedException
 from shared.project_layout import escalation_queue_dir
 from shared.scheduler_state import SchedulerStateSnapshot
 from shared.storm_counter import StormCounter
@@ -51,7 +51,6 @@ from fused_memory.reconciliation.cli_stage_runner import (
     announce_recon_archive_root,
     gc_run_config_dir,
     recon_archive_root,
-    run_config_dir_path,
 )
 from fused_memory.reconciliation.dangling_citation import dangling_citation_identity
 from fused_memory.reconciliation.drained_event_restore import (
@@ -921,14 +920,6 @@ class ReconciliationHarness:
         # misattribute the cause.  Same in-process-lifetime caveat and
         # rate-limited single-fire semantics.
         self._phantom_citation_drop_storm = StormCounter()
-
-        # Task σ / 2717: rolling-window per-event counter of unresumable/failed
-        # interrupted-run resume attempts (config-driven
-        # resume_failure_storm_threshold / _window_seconds).  Fed from
-        # _resume_interrupted_runs' failed+restore fallback arm so a persistent
-        # resume failure (prompt/tool drift, stale transcripts) surfaces ONE loud
-        # recon_resume_failure_storm escalation instead of silent churn.
-        self._resume_failure_storm = StormCounter()
 
         # Task 3049 lever 1: per-project count of CONSECUTIVE full cycles whose
         # inline remediation tail was deferred because the project was still in
@@ -2256,244 +2247,36 @@ class ReconciliationHarness:
                 },
             )
 
-    async def _resume_interrupted_runs(self) -> None:
-        """One-shot startup pass: adopt and ``--resume`` runs a dead predecessor
-        left ``interrupted`` mid-stage (task σ / 2717).
+    async def _recover_legacy_interrupted_runs(self) -> None:
+        """One-shot startup pass: recover every 'interrupted' row to failed,
+        whatever its owner, lock or age.
 
-        Runs beside :meth:`_recover_predecessor_runs` and BEFORE the age-gated
-        :meth:`_recover_stale_runs` reaper. For each ``interrupted`` run owned by
-        an own-dead-predecessor (``instance_id`` not None and not this instance,
-        with the project lock still corroborating that owner — the same
-        ownership test the predecessor pass uses), the guard rails below decide
-        between two paths:
-
-        * **Resume** — when every guard rail passes, adopt the project lock,
-          source the run's still-drained events read-only via
-          :meth:`EventBuffer.get_drained_events` (restoring them would
-          double-process on resume), and drive a resume-aware
-          :meth:`run_full_cycle` that skips already-completed stages and
-          ``--resume``s the ``stage_cursor`` stage. The adopted lock is released
-          after the resumed cycle — this pass cannot heartbeat it, so holding it
-          would wedge the normal project loop.
-        * **Fallback** — on ANY doubt (see :meth:`_resume_guard_reason`:
-          freshness expired, per-run attempt cap reached, this stage_cursor
-          already resumed once, or the session transcript is missing) route to
-          :meth:`_recover_one_run` with ``disposition='failed'``, which
-          error-stamps the run, restores its drained events, and GCs the config
-          dir — today's failed+restore path, verbatim.
+        Nothing writes 'interrupted' since task 5514 retired resume; this
+        converts the rows a pre-5514 process left behind, through the same
+        :meth:`_recover_one_run` body the other recovery passes use.
         """
-        my_iid = self.buffer.instance_id
         for run in await self.journal.get_interrupted_runs():
-            if run.instance_id is None or run.instance_id == my_iid:
-                continue
             lock_holder, lock_age = await self.buffer.get_lock_status(run.project_id)
-            if lock_holder != run.instance_id:
+            diag = await self._recover_one_run(
+                run, lock_holder, lock_age,
+                disposition='failed',
+                error_type='LegacyInterruptedRunRecovery',
+                error_message=(
+                    'Legacy interrupted run (resume retired, task 5514) '
+                    'recovered at startup'
+                ),
+            )
+            if diag is None:
                 continue
-
-            # ── Master switch (honoured on the RESUMING side too): when a deploy
-            # opts out of resume via resume_after_restart=False — typically
-            # because it changed recon prompts/tooling — a run the OLD
-            # (resume-enabled) process already marked `interrupted` must NOT be
-            # --resume'd into the NEW system prompt (a --resume finishes under the
-            # OLD system prompt by construction). Route it to the same
-            # failed+restore fallback the guard rails use so it is cleaned up
-            # (drained events restored, config dir GC'd) rather than left orphaned
-            # for the age-based reaper. This is a deliberate operator opt-out, NOT
-            # a resume failure, so it deliberately does NOT feed the
-            # _record_resume_failure storm counter.
-            if not self.config.resume_after_restart:
-                diag = await self._recover_one_run(
-                    run, lock_holder, lock_age,
-                    disposition='failed',
-                    error_type='InterruptedRunResumeDisabled',
-                    error_message=(
-                        'resume_after_restart disabled — interrupted run cleaned '
-                        'up via failed+restore instead of --resume (deploy opted '
-                        'out of resuming into a changed prompt/toolset)'
-                    ),
-                )
-                if diag is None:
-                    continue
-                logger.info(
-                    'reconciliation.interrupted_run_resume_disabled',
-                    extra={
-                        'run_id': run.id,
-                        'project_id': run.project_id,
-                        'instance_id': run.instance_id,
-                        'stage_cursor': run.stage_cursor,
-                    },
-                )
-                continue
-
-            # ── Guard rails: on ANY doubt, fall back to the failed+restore
-            # recovery path rather than --resume a stale/unsafe run.  Checked
-            # BEFORE adopting the lock so _recover_one_run's own ownership-scoped
-            # release (lock_holder == run.instance_id) cleans up the dead
-            # predecessor's lock exactly as the predecessor-recovery pass does.
-            unresumable_reason = self._resume_guard_reason(run)
-            if unresumable_reason is not None:
-                diag = await self._recover_one_run(
-                    run, lock_holder, lock_age,
-                    disposition='failed',
-                    error_type='InterruptedRunUnresumable',
-                    error_message=unresumable_reason,
-                )
-                if diag is None:
-                    continue
-                logger.info(
-                    'reconciliation.interrupted_run_unresumable',
-                    extra={
-                        'run_id': run.id,
-                        'project_id': run.project_id,
-                        'instance_id': run.instance_id,
-                        'stage_cursor': run.stage_cursor,
-                        'reason': unresumable_reason,
-                    },
-                )
-                # Rolling-window storm counter: a single unresumable run is
-                # expected operational noise (kept to the INFO log above), but
-                # repeated resume failures across runs — prompt/tool drift or
-                # systematically stale transcripts — fire ONE loud recon-scoped
-                # escalation per window (rate-limited single-fire, mirroring
-                # _record_dead_owner_suppression).
-                storm = self._record_resume_failure(run.project_id)
-                if storm is not None:
-                    window_min = storm['window_seconds'] / 60
-                    proj_label = ', '.join(storm['projects']) or run.project_id
-                    summary = (
-                        f"resume-failure storm: {storm['count']} unresumable "
-                        f"interrupted runs in {window_min:.0f} min "
-                        f"(projects: {proj_label}) — interrupted reconciliation "
-                        f"runs are not resuming (check recon prompt/tool drift or "
-                        f"stale transcripts)"
-                    )
-                    detail = (
-                        f'run_id={run.id} project={run.project_id} '
-                        f'reason={unresumable_reason}'
-                    )
-                    self._escalate(
-                        'recon_resume_failure_storm', run.id, summary, detail,
-                    )
-                continue
-
-            # Persist the incremented resume bookkeeping BEFORE adopting/resuming
-            # so the per-run cap and one-resume-per-stage rails survive a
-            # re-interrupt of this very resume.  Stored out-of-band in
-            # stage_reports['_resume'] (mirroring the '_error' entry) — no new
-            # runs-table column.
-            resume_meta = run.stage_reports.get('_resume')
-            prior_count = (
-                resume_meta.get('count', 0) if isinstance(resume_meta, dict) else 0
+            logger.info(
+                'reconciliation.legacy_interrupted_run_recovered',
+                extra={
+                    'run_id': run.id,
+                    'project_id': run.project_id,
+                    'instance_id': run.instance_id,
+                    'disposition': diag['disposition'],
+                },
             )
-            run.stage_reports['_resume'] = {
-                'count': prior_count + 1,
-                'last_stage': run.stage_cursor,
-            }
-            await self.journal.update_run_stage_reports(run.id, run.stage_reports)
-
-            # Adopt the project lock: release the dead predecessor's corroborated
-            # lock, then re-acquire as this instance so the resumed cycle owns the
-            # project and the reaper cannot clobber it mid-resume.
-            await self.buffer.mark_run_complete(
-                run.project_id, instance_id=run.instance_id,
-            )
-            acquired = await self.buffer.mark_run_active(run.project_id)
-            if not acquired:
-                # Lost the adopt race (not expected at single-instance startup);
-                # leave the run for the age-based backstop rather than resume
-                # without holding the lock.
-                logger.warning(
-                    'reconciliation.resume_adopt_lock_failed run_id=%s project=%s',
-                    run.id, run.project_id,
-                )
-                continue
-
-            try:
-                events = await self.buffer.get_drained_events(run.project_id, run.id)
-                await self.run_full_cycle(
-                    run.project_id, 'resume_after_restart',
-                    resume_run=run, events=events,
-                )
-                logger.info(
-                    'reconciliation.interrupted_run_resumed',
-                    extra={
-                        'run_id': run.id,
-                        'project_id': run.project_id,
-                        'instance_id': run.instance_id,
-                        'stage_cursor': run.stage_cursor,
-                    },
-                )
-            finally:
-                # Release the adopted lock so the normal project loop can
-                # re-acquire — a one-shot startup pass cannot heartbeat it.
-                await self.buffer.mark_run_complete(
-                    run.project_id, instance_id=self.buffer.instance_id,
-                )
-
-    def _resume_guard_reason(self, run: ReconciliationRun) -> str | None:
-        """Return a reason string if *run* is NOT safe to ``--resume``, else None.
-
-        The task σ guard rails, evaluated cheapest-first (all config-driven). On
-        ANY doubt this returns a non-None reason and the caller falls back to
-        :meth:`_recover_one_run` (failed+restore). None means every rail passed
-        and the run may be adopted and resumed.
-
-        Rails:
-        * **freshness** — ``now - run.completed_at`` (the interrupt instant
-          stamped by ``complete_run``) must be within
-          ``resume_freshness_window_seconds``.
-        * **per-run cap** — ``stage_reports['_resume'].count`` must be below
-          ``resume_max_attempts_per_run`` (bounds a resume→re-interrupt loop).
-        * **one-resume-per-stage** — ``stage_reports['_resume'].last_stage``
-          must differ from ``run.stage_cursor`` (never re-resume the same stage).
-        * **transcript-exists** — only when a session was captured
-          (``run.session_id`` non-null): its transcript must still be on disk in
-          the per-run config dir, whose path is derived rather than built as a
-          ``TaskConfigDir``, because a read-only probe must not create the dir
-          it probes for.  ``record_run_session``'s snapshot is
-          best-effort (can go stale after an internal cap retry), so a missing
-          transcript means there is nothing to ``--resume``.  A NULL session_id
-          is NOT a failure — no session was captured (the interrupt landed
-          between stages, or the stage's best-effort ``record_run_session``
-          write failed), so the run resumes with every remaining stage fresh
-          (no --resume), degrading cleanly.
-        """
-        # Freshness — measured from the interrupt instant (completed_at).
-        if run.completed_at is None:
-            return 'run has no completed_at (interrupt instant) — cannot verify freshness'
-        age_secs = (datetime.now(UTC) - run.completed_at).total_seconds()
-        if age_secs > self.config.resume_freshness_window_seconds:
-            return (
-                f'interrupt is {age_secs:.0f}s old (> '
-                f'resume_freshness_window_seconds={self.config.resume_freshness_window_seconds})'
-            )
-
-        # Per-run attempt cap + one-resume-per-stage (out-of-band _resume meta).
-        resume_meta = run.stage_reports.get('_resume')
-        resume_meta = resume_meta if isinstance(resume_meta, dict) else {}
-        count = resume_meta.get('count', 0)
-        if count >= self.config.resume_max_attempts_per_run:
-            return (
-                f'resume attempt cap reached (count={count} >= '
-                f'resume_max_attempts_per_run={self.config.resume_max_attempts_per_run})'
-            )
-        if resume_meta.get('last_stage') == run.stage_cursor:
-            return (
-                f'stage_cursor {run.stage_cursor!r} already resumed once '
-                '(one-resume-per-stage)'
-            )
-
-        # Transcript existence — only meaningful when a session was captured.
-        if run.session_id:
-            config_dir_path = run_config_dir_path(self.journal.data_dir, run.id)
-            transcript = read_transcript_records(config_dir_path, run.session_id)
-            if not transcript:
-                return (
-                    f'session {run.session_id} has no transcript on disk '
-                    f'({config_dir_path}) — unresumable'
-                )
-
-        return None
 
     # ── Dead-owner suppression storm counter ─────────────────────────
 
@@ -2685,40 +2468,6 @@ class ReconciliationHarness:
             self._phantom_citation_drop_storm,
             threshold=_PHANTOM_CITATION_DROP_STORM_THRESHOLD,
             window_seconds=_PHANTOM_CITATION_DROP_STORM_WINDOW_SECONDS,
-            project_id=project_id,
-            now=now,
-        )
-
-    # ── Resume-failure storm counter (task σ / 2717) ───────────────────
-
-    def _record_resume_failure(
-        self, project_id: str, *, now: datetime | None = None
-    ) -> dict | None:
-        """Record one unresumable/failed interrupted-run resume and check for a storm.
-
-        Applied to the failed+restore fallback arm of
-        :meth:`_resume_interrupted_runs`.  Thresholds are the config fields
-        ``resume_failure_storm_threshold`` /
-        ``resume_failure_storm_window_seconds`` (mirroring
-        :meth:`_record_dead_owner_suppression`, which likewise reads config)
-        rather than module constants, so an operator can retune the alarm.  Both
-        are read LIVE on every call rather than captured, so promoting either
-        into ``RELOADABLE_FIELDS`` would work without further edits.
-
-        The rolling-window mechanics live in
-        ``shared.storm_counter.StormCounter`` (INV-5); this method only supplies
-        the knobs and the event.  Returns None below the threshold and None when
-        the alarm already fired within this window, otherwise a storm summary
-        dict with ``count``, ``window_seconds``, and ``projects`` (sorted
-        distinct project labels seen in the window).
-
-        The now= parameter follows the same time-injection convention as the
-        sibling storm counters, for deterministic unit tests.
-        """
-        return self._storm_summary(
-            self._resume_failure_storm,
-            threshold=self.config.resume_failure_storm_threshold,
-            window_seconds=self.config.resume_failure_storm_window_seconds,
             project_id=project_id,
             now=now,
         )
@@ -3199,14 +2948,13 @@ class ReconciliationHarness:
         except Exception as e:
             logger.warning(f'_recover_predecessor_runs at startup failed: {e}')
 
-        # One-shot: adopt and --resume any interrupted runs a dead predecessor
-        # left mid-stage (task σ / 2717), before the age-gated _recover_stale_runs
-        # reaper gets its first tick. Guarded like the predecessor pass above so a
-        # resume hiccup can't crash harness startup.
+        # One-shot: convert every legacy 'interrupted' row to failed (task 5514).
+        # Guarded like the predecessor pass above so a recovery hiccup can't
+        # crash harness startup.
         try:
-            await self._resume_interrupted_runs()
+            await self._recover_legacy_interrupted_runs()
         except Exception as e:
-            logger.warning(f'_resume_interrupted_runs at startup failed: {e}')
+            logger.warning(f'_recover_legacy_interrupted_runs at startup failed: {e}')
 
         # One-shot: re-fire the judge for any run whose verdict a restart dropped
         # in the cycle-end→verdict-commit window (task 2708). The durable
