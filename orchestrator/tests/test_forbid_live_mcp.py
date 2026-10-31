@@ -14,6 +14,8 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.scheduler import Scheduler
 
 _PROMPT_SECS = 5
+_REAL_INITIALIZE = McpSession.initialize
+_REAL_CALL = McpSession.call
 
 
 @pytest.fixture
@@ -63,3 +65,14 @@ async def test_initialize_is_refused_naming_the_url(
     assert url in message
     assert len(forbid_live_mcp) == 1
     forbid_live_mcp.clear()
+
+
+def test_every_test_is_guarded_without_requesting_the_fixture() -> None:
+    assert McpSession.initialize is not _REAL_INITIALIZE
+    assert McpSession.call is not _REAL_CALL
+
+
+@pytest.mark.real_mcp_session
+def test_real_mcp_session_marker_leaves_mcp_session_unpatched() -> None:
+    assert McpSession.initialize is _REAL_INITIALIZE
+    assert McpSession.call is _REAL_CALL
