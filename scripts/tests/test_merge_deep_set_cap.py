@@ -21,6 +21,7 @@ import re
 import signal
 import subprocess
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,8 @@ from config_reload_script_fakes import (
     git,
     head,
     init_repo,
+    last_verdict,
+    outcome_verdict_lines,
     path_python3_shimmed_to,
     reload_report,
     system_python_without_the_transport,
@@ -144,9 +147,9 @@ def test_a_cap_change_lands_through_the_queue_then_is_hot_applied(tmp_path, depl
 
     (submitted,) = queue.calls_to("merge_request")
     assert (f"merge-deep-set-cap: landed task/{submitted['branch']} "
-            f"request_id={queue.request_id} as {queue.merge_sha}") in proc.stdout, proc.stdout
-    assert f"{KNOB} applied old=0 new=6" in proc.stdout, proc.stdout
-    assert proc.stdout.splitlines()[-1].startswith("merge-deep-set-cap: done cap=6")
+            f"request_id={queue.request_id} as {queue.merge_sha}") in proc.stderr, proc.stderr
+    assert f"{KNOB} applied old=0 new=6" in proc.stderr, proc.stderr
+    assert last_verdict(proc) == {"chain_cap": 6, "commit": queue.merge_sha, "outcome": "applied"}
 
     assert methods.count("initialize") == len(tools), (
         f"a tool call skipped the session handshake; the server saw {methods}"
@@ -171,7 +174,9 @@ def test_a_request_the_queue_blocks_fails_naming_the_state_and_reason(tmp_path, 
         proc = _run(server, config, "6", env=deploy_env)
         tools = _tool_names(server)
 
-    assert proc.returncode != 0, f"stdout={proc.stdout}"
+    assert failure_tag(proc) == "not_landed"
+    assert last_verdict(proc)["commit"] is None
+    assert outcome_verdict_lines(proc) == []
     assert "blocked" in proc.stderr and "verify failed: 3 tests" in proc.stderr, proc.stderr
     assert "reload_config" not in tools, tools
     assert head(repo) == before
@@ -189,11 +194,8 @@ def test_a_request_still_live_at_the_ceiling_is_cancelled_and_not_reloaded(tmp_p
         proc = _run(server, config, "6", env=env)
         tools = _tool_names(server)
 
-    assert proc.returncode != 0, f"stdout={proc.stdout}"
-    assert "timed out" in proc.stderr, proc.stderr
-    # A loaded host can spend the whole second before the first poll answers,
-    # leaving the submit's own 'queued' as the last state the script saw.
-    assert any(f"still {live}" in proc.stderr for live in ("queued", "verifying")), proc.stderr
+    assert failure_tag(proc) == "timed_out"
+    assert outcome_verdict_lines(proc) == []
     assert queue.calls_to("merge_cancel") == [{"request_id": queue.request_id}]
     assert "reload_config" not in tools, tools
     assert head(repo) == before
@@ -223,15 +225,17 @@ def test_sigterm_while_the_landing_polls_cancels_it_and_tears_down(tmp_path, dep
                 assert time.monotonic() < deadline, "the script never polled its request"
                 time.sleep(0.02)
             os.killpg(proc.pid, signal.SIGTERM)
-            _, stderr = proc.communicate(timeout=60)
+            stdout, stderr = proc.communicate(timeout=60)
         finally:
             if proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
         tools = _tool_names(server)
 
-    assert proc.returncode != 0, f"stderr={stderr}"
-    assert "SIGTERM" in stderr and "verifying" in stderr, stderr
+    # The TERM trap's own `exit 143` follows the landing step's verdict.
+    stopped = types.SimpleNamespace(returncode=proc.returncode, stdout=stdout, stderr=stderr)
+    assert failure_tag(stopped) == "interrupted"
+    assert outcome_verdict_lines(stopped) == []
     assert queue.calls_to("merge_cancel") == [{"request_id": queue.request_id}], stderr
     assert "reload_config" not in tools, tools
     assert head(repo) == before
@@ -339,7 +343,9 @@ def test_a_dead_socket_fails_at_submit_without_claiming_a_landing(tmp_path, depl
 
     proc = _run(ClosedPort(), config, "6", env=deploy_env)
 
-    assert proc.returncode != 0, f"stdout={proc.stdout}"
+    assert failure_tag(proc) == "transport_failed"
+    assert last_verdict(proc)["commit"] is None
+    assert outcome_verdict_lines(proc) == []
     assert "merge_request never reached the tool" in proc.stderr, proc.stderr
     assert "committed as" not in proc.stderr, proc.stderr
     assert "lands at the next restart" not in proc.stderr, proc.stderr
@@ -351,12 +357,10 @@ def test_a_dead_socket_fails_at_submit_without_claiming_a_landing(tmp_path, depl
 # ---------------------------------------------------------------------------
 # A landed cap whose reload does NOT confirm it live
 #
-# Each case pins its SPECIFIC diagnostic, not merely a non-zero exit, so one
-# failure cannot stand in for another and pass for the wrong reason.
+# Each case pins its SPECIFIC failure tag, not merely a non-zero exit, so one
+# failure cannot stand in for another and pass for the wrong reason. The cap
+# has landed by then, so every verdict names the commit it landed as.
 # ---------------------------------------------------------------------------
-
-TRANSPORT_MARKER = "reload_config never reached the tool"
-
 
 @pytest.mark.parametrize(
     "fault", list(TRANSPORT_FAULTS.values()), ids=list(TRANSPORT_FAULTS)
@@ -376,42 +380,44 @@ def test_a_reload_that_never_reached_the_tool_fails_closed(tmp_path, deploy_env,
                  faults_armed=queue.has_landed, **fault) as server:
         proc = _run(server, config, "6", env=deploy_env)
 
-    assert proc.returncode != 0, f"a transport fault was read as success: {proc.stdout}"
+    assert failure_tag(proc) == "no_reload_report"
+    assert outcome_verdict_lines(proc) == []
     landed_as = head(repo)
     assert queue.has_landed() and landed_as == queue.merge_sha
-    assert TRANSPORT_MARKER in proc.stderr, f"stderr={proc.stderr}"
+    assert last_verdict(proc)["commit"] == queue.merge_sha
     assert landed_as in proc.stderr, f"stderr={proc.stderr}"
     assert "lands at the next restart" in proc.stderr, f"stderr={proc.stderr}"
-    assert "applied disposition missing" not in proc.stderr, (
-        f"a request that never reached the tool was blamed on the disposition: {proc.stderr}"
-    )
     assert "Traceback" not in proc.stderr, f"stderr={proc.stderr}"
     _assert_left_nothing_behind(repo, deploy_env)
 
 
+# id -> (reload-report overrides, the failure tag they must end in).
 DISPOSITION_FAILURES = {
     # The knob present under `applied` at some OTHER value -- a concurrent
     # edit, say -- is not the cap this deploy set.
     "applied_a_different_value": (
-        {"applied": {KNOB: {"old": 0, "new": 32}}}, f"{KNOB} does not carry 6",
+        {"applied": {KNOB: {"old": 0, "new": 32}}}, "value_mismatch",
     ),
     # A cap the reload deferred to a restart is landed but NOT live.
     "restart_required": (
-        {"applied": {}, "restart_required": APPLIED_6}, f"applied disposition missing {KNOB}",
+        {"applied": {}, "restart_required": APPLIED_6}, "restart_required",
     ),
+    # A reload of THIS file that changed nothing about the knob: the cap just
+    # landed, so the landing did not take effect as expected.
+    "knob_absent": ({"applied": {}}, "not_applied"),
     # reload_config's OWN error field: a config that failed to parse, reported
     # by a perfectly successful tools/call.
     "reload_config_error": (
         {"reloaded": False, "error": "load_config: while parsing a block mapping"},
-        "reload_config error",
+        "reload_error",
     ),
 }
 
 
 @pytest.mark.parametrize(
-    "overrides,marker", list(DISPOSITION_FAILURES.values()), ids=list(DISPOSITION_FAILURES)
+    "overrides,tag", list(DISPOSITION_FAILURES.values()), ids=list(DISPOSITION_FAILURES)
 )
-def test_a_landed_cap_the_reload_does_not_apply_fails(tmp_path, deploy_env, overrides, marker):
+def test_a_landed_cap_the_reload_does_not_apply_fails(tmp_path, deploy_env, overrides, tag):
     config = _seeded(tmp_path)
     repo = config.parent
     queue = FakeMergeQueue(repo)
@@ -419,10 +425,54 @@ def test_a_landed_cap_the_reload_does_not_apply_fails(tmp_path, deploy_env, over
     with _target(queue, reload_report(config_path=str(config), **overrides)) as server:
         proc = _run(server, config, "6", env=deploy_env)
 
-    assert proc.returncode != 0, f"stdout={proc.stdout}"
-    assert marker in proc.stderr, f"stderr={proc.stderr}"
-    assert "applied old=" not in proc.stdout, proc.stdout
+    assert failure_tag(proc) == tag
+    assert outcome_verdict_lines(proc) == []
+    assert last_verdict(proc)["commit"] == queue.merge_sha
     assert head(repo) == queue.merge_sha
+    _assert_left_nothing_behind(repo, deploy_env)
+
+
+# id -> (builder taking (this repo's config, tmp_path) and returning
+# reload-report fields that fail to show THIS config file was re-read and
+# committed, the failure tag naming which corroborator is missing). The gate's
+# own suite pins every breach shape; these two prove the script hands the gate
+# its config path and keeps the gate's tag.
+UNCORROBORATED_RELOADS = {
+    # The wrong-port story: another orchestrator's own pending change to the
+    # same cap reports exactly the applied entry this deploy expects.
+    "another_projects_orchestrator": (
+        lambda config, tmp_path: {
+            "reloaded": True, "config_path": str(tmp_path / "other-project" / CONFIG),
+        },
+        "different_config_file",
+    ),
+    # apply_reload rolled every leaf back, so the live config is untouched.
+    "reload_not_committed": (
+        lambda config, tmp_path: {"reloaded": False, "error": None, "config_path": str(config)},
+        "reload_not_committed",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "report_fields,tag", list(UNCORROBORATED_RELOADS.values()), ids=list(UNCORROBORATED_RELOADS)
+)
+def test_a_cap_reported_by_an_uncorroborated_reload_is_not_applied(
+    tmp_path, deploy_env, report_fields, tag,
+):
+    """An `applied` entry carrying our cap is no evidence about OUR file unless
+    the reload committed a re-read of it, so the deploy fails naming the
+    missing corroborator and the commit the cap landed as."""
+    config = _seeded(tmp_path)
+    repo = config.parent
+    queue = FakeMergeQueue(repo)
+
+    with _target(queue, reload_report(**report_fields(config, tmp_path), applied=APPLIED_6)) as server:
+        proc = _run(server, config, "6", env=deploy_env)
+
+    assert failure_tag(proc) == tag
+    assert outcome_verdict_lines(proc) == []
+    assert last_verdict(proc)["commit"] == queue.merge_sha == head(repo)
     _assert_left_nothing_behind(repo, deploy_env)
 
 
@@ -453,7 +503,7 @@ def test_the_landing_ignores_a_path_python3_that_cannot_import_the_transport(tmp
         proc = _run(server, config, "6", env=env)
 
     assert proc.returncode == 0, f"stdout={proc.stdout} stderr={proc.stderr}"
-    assert f"{KNOB} applied old=0 new=6" in proc.stdout, proc.stdout
+    assert last_verdict(proc)["outcome"] == "applied"
     assert head(repo) == queue.merge_sha
     _assert_left_nothing_behind(repo, env)
 
@@ -486,7 +536,8 @@ def test_an_interpreter_without_the_transport_fails_loud_before_any_landing(tmp_
         proc = _run(server, config, "6", script=script, env=env)
         received = list(server.received)
 
-    assert proc.returncode != 0, f"stdout={proc.stdout}"
+    assert failure_tag(proc) == "transport_not_importable"
+    assert outcome_verdict_lines(proc) == []
     assert tried in proc.stderr, f"stderr={proc.stderr}"
     assert "uv run --project shared" in proc.stderr, f"stderr={proc.stderr}"
     assert "Traceback" not in proc.stderr, f"stderr={proc.stderr}"
