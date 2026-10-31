@@ -60,6 +60,7 @@ if str(REPO_ROOT) not in sys.path:
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
 from _git_fixtures import RepoTemplates, session_templates  # noqa: E402
+from _live_mcp_guard import install_live_mcp_guard  # noqa: E402
 from _orch_helpers import (  # noqa: E402
     CLAIMANT_TTL_SECS,
     ExitContractViolationCollector,
@@ -657,68 +658,13 @@ def _hermetic_disk_usage(monkeypatch):
 
 @pytest.fixture
 def forbid_live_mcp(monkeypatch):
-    """Opt-in guard: fail the test if a live fused-memory MCP round-trip is attempted.
+    """Opt-in guard: fail the test at once if it attempts a live fused-memory MCP round-trip.
 
-    Task 2644 — de-flaking harness tests that build a real ``Scheduler`` with
-    no injected ``mcp_session`` and no ``McpLifecycle.start()``.  In that
-    configuration ``Scheduler.dispatch_tool`` (scheduler.py:1787-1794) falls
-    through to the LIVE ``mcp_call(...)`` HTTP branch, which — because the
-    module-global ``mcp_lifecycle._session`` is ``None`` in unit tests —
-    constructs a one-shot ``McpSession`` and calls ``initialize()`` /
-    ``call()`` against the real ``http://localhost:8002``.  Under
-    ``pytest -n auto`` that shared server saturates under load (observed
-    ~100x latency), and these multi-call paths can exceed the suite's 60s
-    per-test timeout — which (``timeout_method='thread'``) ``os._exit()``s
-    the xdist worker rather than just failing the one test.
-
-    Patches the ``McpSession`` CLASS (``shared.mcp_session``) —
-    NOT ``orchestrator.scheduler.mcp_call`` — because ``scheduler.py`` binds
-    ``mcp_call`` via ``from ... import``, a distinct binding from the
-    canonical ``orchestrator.mcp_lifecycle.mcp_call`` (and
-    ``orchestrator.agents.memory_recall.mcp_call``).  Every alias, however,
-    ultimately constructs/uses an ``McpSession`` and issues its first
-    network I/O through ``McpSession.initialize`` -> ``call`` (``call_tool``
-    delegates to ``call``; the one-shot fallback inside ``mcp_call`` applies,
-    as the module-global ``_session`` is ``None`` in unit tests) — patching
-    the class methods is the single binding-independent network chokepoint
-    every alias funnels through.
-
-    RECORDS each attempt into the yielded list (rather than only raising)
-    because the two dominant live seams here swallow exceptions:
-    ``Scheduler.set_task_claimant`` wraps ``dispatch_tool`` in a bare
-    ``try/except`` (and ``Harness._run_slot``'s ``finally`` additionally
-    wraps that call in ``contextlib.suppress(Exception)``), and
-    ``Scheduler.get_tasks`` wraps it in a ``try/except`` that returns
-    ``[]``.  A raise-only spy would be silently absorbed by either path,
-    reproducing a false "zero calls" result.  Recording the attempt at the
-    seam — before/independent of the raise — and asserting the recorder is
-    empty at teardown guarantees a swallowed live round-trip still fails
-    the test.  The raised ``AssertionError`` still gives non-suppressed
-    callers a fast, clear failure message.
-
-    NOT autouse — request by name in tests that inject a hermetic
-    ``mcp_session`` and need a guarantee that they actually did so.
+    Yields the attempt log, which a test provoking an attempt on purpose reads
+    and clears. Teardown fails a test whose caller swallowed the refusal.
+    Mechanism and rationale: ``_live_mcp_guard.py``.
     """
-    recorder: list[tuple[str, str]] = []
-
-    async def _fake_initialize(self) -> None:
-        recorder.append((self.base_url, 'initialize'))
-        raise AssertionError(
-            f'live fused-memory MCP round-trip attempted: initialize at '
-            f'{self.base_url!r} — inject a HermeticMcpSession into the '
-            'Scheduler under test (see _orch_helpers.HermeticMcpSession)'
-        )
-
-    async def _fake_call(self, method: str, params=None, *, timeout: float = 30) -> dict:
-        recorder.append((self.base_url, method))
-        raise AssertionError(
-            f'live fused-memory MCP round-trip attempted: {method!r} at '
-            f'{self.base_url!r} — inject a HermeticMcpSession into the '
-            'Scheduler under test (see _orch_helpers.HermeticMcpSession)'
-        )
-
-    monkeypatch.setattr('shared.mcp_session.McpSession.initialize', _fake_initialize)
-    monkeypatch.setattr('shared.mcp_session.McpSession.call', _fake_call)
+    recorder = install_live_mcp_guard(monkeypatch)
 
     yield recorder
 
