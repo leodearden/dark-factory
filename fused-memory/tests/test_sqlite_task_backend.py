@@ -3153,7 +3153,7 @@ async def test_fresh_db_has_no_parent_id_and_user_version_5(tmp_path):
 def _make_v1_schema_db(db_path: Path) -> None:
     """Create a tasks.db with the v1 schema: no parent_id, NO claimant/candidate_key columns.
 
-    Mirrors ``_SCHEMA_SQL`` as it existed before the claimant / candidate_key
+    Mirrors ``TASK_STORE_DDL`` as it existed before the claimant / candidate_key
     columns were added, stamped ``user_version = 1``. This is the common
     production shape (parent_id already dropped by a prior deploy, later
     columns not yet added) that the v1->v2 and v2->v3 ALTER-TABLE migration
@@ -3332,7 +3332,7 @@ async def test_v2_to_v3_migration_backfills_candidate_key_and_audits_duplicates(
         with caplog.at_level(
             logging.INFO, logger='fused_memory.backends.sqlite_task_backend',
         ):
-            # Triggers connection-open (_SCHEMA_SQL + _migrate).
+            # Triggers connection-open (TASK_STORE_DDL + _migrate).
             await b.get_tasks(project_root=project_root)
         # (h) get_task exposes candidate_key through the normal read path.
         one = await b.get_task('1', project_root=project_root)
@@ -3482,7 +3482,7 @@ async def test_v2_to_v3_migration_clean_audit_logs_info_with_zero_duplicates(
         with caplog.at_level(
             logging.INFO, logger='fused_memory.backends.sqlite_task_backend',
         ):
-            # Triggers connection-open (_SCHEMA_SQL + _migrate).
+            # Triggers connection-open (TASK_STORE_DDL + _migrate).
             await b.get_tasks(project_root=project_root)
     finally:
         await b.close()
@@ -3834,7 +3834,7 @@ async def test_v4_to_v5_backfills_pending_since_from_updated_at(tmp_path, caplog
         with caplog.at_level(
             logging.INFO, logger='fused_memory.backends.sqlite_task_backend',
         ):
-            # Triggers connection-open (_SCHEMA_SQL + _migrate) -- must not raise.
+            # Triggers connection-open (TASK_STORE_DDL + _migrate) -- must not raise.
             await b.get_tasks(project_root=project_root)
     finally:
         await b.close()
@@ -4089,7 +4089,7 @@ async def test_v3_to_v4_self_gating_skips_index_and_escalates_on_residual_duplic
         with caplog.at_level(
             logging.ERROR, logger='fused_memory.backends.sqlite_task_backend',
         ):
-            # Triggers connection-open (_SCHEMA_SQL + _migrate, chaining
+            # Triggers connection-open (TASK_STORE_DDL + _migrate, chaining
             # v1->v2->v3->v4).
             await b.get_tasks(project_root=project_root)  # (a) must not raise
     finally:
