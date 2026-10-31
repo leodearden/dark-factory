@@ -10339,7 +10339,7 @@ async def test_resume_interrupted_runs_does_not_clobber_a_run_its_own_coroutine_
     harness.run_full_cycle = AsyncMock()
     harness.config.resume_after_restart = resume_after_restart
 
-    run = await _setup_interrupted_dead_predecessor_run(
+    run = await _persist_legacy_interrupted_run(
         journal, event_buffer,
         completed_at=datetime.now(UTC) - timedelta(seconds=interrupted_seconds_ago),
     )
@@ -10668,25 +10668,26 @@ async def test_recover_predecessor_runs_skips_null_instance(
 # ── Startup adopt-and-resume of interrupted runs (task σ / 2717) ──────────────
 
 
-async def _setup_interrupted_dead_predecessor_run(
+async def _persist_legacy_interrupted_run(
     journal,
     event_buffer,
     *,
     project_id: str = 'test-project',
     run_id: str = 'run-interrupted-resume',
-    dead_pred_iid: str = 'dead-pred',
+    dead_pred_iid: str | None = 'dead-pred',
+    hold_lock: bool = True,
     session_id: str | None = 'S',
     stage_cursor: str = 'task_knowledge_sync',
     completed_at: datetime | None = None,
     resume_meta: dict | None = None,
     n_events: int = 2,
 ) -> ReconciliationRun:
-    """Persist an ``interrupted`` run owned by a dead predecessor that still holds
-    a fresh corroborating lock (the predecessor-recovery idiom), with Stage 1
-    already reported and its events drained under ``run_id``.
-
-    Shared scaffolding for the resume happy-path (s15) and guard-rail-fallback
-    (s17) tests. Returns the persisted :class:`ReconciliationRun`.
+    """Persist an ``interrupted`` run (the status a pre-5514 process wrote)
+    owned by ``dead_pred_iid``, with Stage 1 already reported and its events
+    drained under ``run_id``. With ``hold_lock`` the dead owner still holds a
+    fresh corroborating lock (the hard-stop shape); without it no lock row
+    exists (the clean-stop shape). Returns the persisted
+    :class:`ReconciliationRun`.
     """
     from fused_memory.models.reconciliation import StageId
 
@@ -10736,6 +10737,8 @@ async def _setup_interrupted_dead_predecessor_run(
     for _ in range(n_events):
         await event_buffer.push(_make_event(project_id))
     await event_buffer.drain(project_id, run_id=run_id)
+    if not hold_lock:
+        return run
 
     # Dead predecessor's surviving lock: acquire as this instance then rewrite
     # instance_id/heartbeat_at so it corroborates the run's claimed owner and is
@@ -10765,7 +10768,7 @@ async def test_resume_interrupted_runs_adopts_and_resumes(
     harness._escalate = MagicMock()
     project_id = 'test-project'
 
-    run = await _setup_interrupted_dead_predecessor_run(journal, event_buffer)
+    run = await _persist_legacy_interrupted_run(journal, event_buffer)
 
     # Stage 1 must be SKIPPED (its report is persisted) — never awaited.
     harness.stages[0].run = AsyncMock()
@@ -10831,6 +10834,68 @@ async def test_resume_interrupted_runs_adopts_and_resumes(
     # released afterward so the project loop is not wedged.
     assert captured.get('lock_holder_during') == event_buffer.instance_id
     assert await event_buffer.get_lock_holder_instance_id(project_id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('lock_state', ['released', 'held_by_dead_owner', 'null_instance'])
+async def test_run_loop_startup_recovers_legacy_interrupted_runs(
+    journal, event_buffer, mock_memory_service, lock_state,
+):
+    """Task 7040: harness startup converts every legacy 'interrupted' row to
+    failed, whatever its owner, lock state or age: its drained events are
+    buffered again, its config dir is GC'd, a dead owner's lock is released,
+    and nothing is resumed."""
+    project_id = 'test-project'
+    dead_iid = None if lock_state == 'null_instance' else 'dead-pred'
+    run = await _persist_legacy_interrupted_run(
+        journal, event_buffer,
+        dead_pred_iid=dead_iid,
+        hold_lock=lock_state == 'held_by_dead_owner',
+    )
+    config_dir = run_config_dir_path(journal.data_dir, run.id)
+    config_dir.mkdir(parents=True)
+    (config_dir / 'settings.json').write_text('{}')
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._start_escalation_server = AsyncMock()
+    harness._stop_escalation_server = AsyncMock()
+    if harness.judge is not None:
+        harness.judge.initialize = AsyncMock()
+    harness.buffer.get_active_projects = AsyncMock(return_value=[])
+    fired = _witness(harness.buffer, 'get_active_projects')
+
+    await _drive_run_loop_until(harness, fired)
+
+    after = await journal.get_run(run.id)
+    assert after is not None
+    assert after.status == RunStatus.failed
+    assert after.stage_reports['_error']['error_type'] == 'LegacyInterruptedRunRecovery'
+    assert await event_buffer.get_drained_events(project_id, run.id) == []
+    assert await event_buffer.count_buffered(project_id) == 2
+    assert not config_dir.exists()
+    assert await event_buffer.get_lock_holder_instance_id(project_id) != 'dead-pred'
+    assert [r.id for r in await journal.get_recent_runs(project_id, limit=10)] == [run.id]
+
+
+@pytest.mark.asyncio
+async def test_run_loop_survives_a_failing_legacy_interrupted_sweep(
+    journal, event_buffer, mock_memory_service,
+):
+    """A legacy-interrupted sweep that raises at startup is logged, and the
+    loop still goes on to discover projects."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._start_escalation_server = AsyncMock()
+    harness._stop_escalation_server = AsyncMock()
+    if harness.judge is not None:
+        harness.judge.initialize = AsyncMock()
+    journal.get_interrupted_runs = AsyncMock(side_effect=RuntimeError('journal exploded'))
+    harness.buffer.get_active_projects = AsyncMock(return_value=[])
+    fired = _witness(harness.buffer, 'get_active_projects')
+
+    await _drive_run_loop_until(harness, fired)
+
+    journal.get_interrupted_runs.assert_awaited()
+    assert harness.buffer.get_active_projects.await_count >= 1
 
 
 @pytest.mark.asyncio
@@ -10941,7 +11006,7 @@ async def test_resume_interrupted_runs_falls_back_when_unresumable(
     elif scenario == 'transcript_missing':
         transcript_return = None
 
-    run = await _setup_interrupted_dead_predecessor_run(
+    run = await _persist_legacy_interrupted_run(
         journal, event_buffer,
         completed_at=completed_at,
         resume_meta=resume_meta,
@@ -11019,7 +11084,7 @@ async def test_resume_interrupted_runs_honours_opt_out_on_resuming_side(
 
     # An otherwise fully-resumable run: fresh interrupt, no cap, transcript on
     # disk — so ONLY the opt-out (not a guard rail) can send it to the fallback.
-    run = await _setup_interrupted_dead_predecessor_run(journal, event_buffer)
+    run = await _persist_legacy_interrupted_run(journal, event_buffer)
 
     # run_full_cycle must NEVER be awaited — the opt-out means no --resume at all.
     harness.run_full_cycle = AsyncMock()
@@ -11142,7 +11207,7 @@ async def test_resume_interrupted_runs_fallback_escalates_resume_failure_storm(
     harness._record_resume_failure = MagicMock(return_value=storm_dict)
 
     # Stale-freshness → guaranteed unresumable → fallback arm runs.
-    run = await _setup_interrupted_dead_predecessor_run(
+    run = await _persist_legacy_interrupted_run(
         journal, event_buffer,
         completed_at=datetime.now(UTC) - timedelta(seconds=7200),
     )
