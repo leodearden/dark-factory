@@ -829,13 +829,13 @@ _record_gate_downgrade_reason() {
     # rewritten. Two producers, and the digest's `## Stale lane assignments`
     # census covers only ONE of them. A lane whose task is still
     # pending/in-progress/blocked is skipped BY DESIGN by harness.py's
-    # terminal-status reclaim, censused for a
-    # fortnight, and then finally acted on by this bound — report-before-act,
-    # exactly where destruction is riskiest. A release whose durable write hit
-    # ENOSPC and was swallowed (fail-open release, invariant I3) is NEVER
-    # censused: that census skips a record whose backing task is terminal, and
-    # a finished task's is. Acting unreported on that one is the intent —
-    # nothing else in the tree ever will.
+    # terminal-status reclaim, censused for a fortnight, and then finally acted
+    # on by this bound — report-before-act, exactly where destruction is
+    # riskiest. A release whose durable write hit ENOSPC and was swallowed
+    # (fail-open release, invariant I3) is NEVER censused: that census skips a
+    # record whose backing task is terminal, and a finished task's is. Acting
+    # unreported on that one is the intent — nothing else in the tree ever
+    # will.
     [ "$MAX_RECORD_AGE_SECS" -gt 0 ] || return 0   # 0 = bound disabled
 
     # FAIL SAFE — preserve, loudly — when the age cannot be judged: an absent
@@ -858,9 +858,9 @@ _record_gate_downgrade_reason() {
     # ONE warn per affected lane, and the channel stays anomaly-only: a real
     # producer (LaneLifecycle.transition or LaneLifecycle.refresh_assigned)
     # always stamps the field, so this fires only on a record something wrote
-    # wrong. Degrading SILENTLY would be
-    # worse than the bound not existing — `downgraded_assigned=0` would read as
-    # "nothing was stale" when it means "nothing could be judged".
+    # wrong. Degrading SILENTLY would be worse than the bound not existing —
+    # `downgraded_assigned=0` would read as "nothing was stale" when it means
+    # "nothing could be judged".
     # The empty case is tested SEPARATELY and FIRST, because GNU `date -d ''`
     # does not fail — it succeeds and answers TODAY, so handing it an absent
     # `updated_at` would read an unstamped record as freshly stamped:
