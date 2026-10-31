@@ -22,10 +22,7 @@
 #     inherit the spawner's default model. For other/extra claude flags use
 #     $CLAUDE_SPAWN_CLAUDE_ARGS (a raw passthrough, applied after --model).
 #
-# Self-exit: record.self_exit and the exit-requested marker instruction in the
-#   trailer follow the lane. tmux and wm: ON unless $CLAUDE_SPAWN_SELF_EXIT is
-#   exactly 0 (unset, empty and any other value mean on). t3: OFF unless
-#   $CLAUDE_SPAWN_SELF_EXIT is exactly 1.
+# Self-exit: $CLAUDE_SPAWN_SELF_EXIT, default per lane; see skills/spawn/SKILL.md.
 #
 # These, and every other CLAUDE_SPAWN_* var read below, are per-launch
 # INPUTS: consumed by this invocation and then REMOVED from the spawned
@@ -220,10 +217,8 @@ if [ "$spawn_backend" = "t3" ]; then
   require_python3_for_the_t3_lane
 fi
 
-# Self-exit follows the lane (Leo's ruling on review-all PRD open question 7):
-# on for tmux and wm unless CLAUDE_SPAWN_SELF_EXIT is exactly 0, off for t3
-# unless it is exactly 1. Decided here, once spawn_backend is known, because
-# the `launching` write below stamps record.self_exit from it.
+# Decided once spawn_backend is known (the default differs per lane) and before
+# the `launching` write below, which stamps record.self_exit from it.
 self_exit=""
 if [ "$spawn_backend" = "t3" ]; then
   [ "${CLAUDE_SPAWN_SELF_EXIT:-}" = "1" ] && self_exit=1
