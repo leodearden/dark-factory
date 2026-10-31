@@ -25,9 +25,8 @@ class TestReviewPreTestConfig:
         assert cfg.pre_test_commands == []
         assert cfg.pre_test_timeout_secs == 1800.0
 
-    def test_commands_preserve_order(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures('code_default_config')
+    def test_commands_preserve_order(self):
         cfg = OrchestratorConfig(review=ReviewConfig(pre_test_commands=['a', 'b']))
         assert cfg.review.pre_test_commands == ['a', 'b']
 
@@ -36,9 +35,8 @@ class TestReviewPreTestConfig:
         with pytest.raises(ValidationError):
             ReviewConfig(pre_test_timeout_secs=bad)
 
-    def test_apply_reload_hot_applies_pre_test_knobs(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures('code_default_config')
+    def test_apply_reload_hot_applies_pre_test_knobs(self):
         live = OrchestratorConfig()
         fresh = OrchestratorConfig(review=ReviewConfig(
             pre_test_commands=['npm run build'], pre_test_timeout_secs=600.0,
