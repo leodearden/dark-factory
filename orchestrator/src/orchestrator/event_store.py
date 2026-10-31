@@ -763,7 +763,7 @@ class EventType(StrEnum):
     # Task 4032 — a revalidated plan dropped a done step without a descope record or newly
     #   shared a done commit, and one remedy architect pass did not fix it; the prior plan is
     #   restored and the task takes the no-plan hold.
-    #   data: DoneStepIntegrityVerdict.to_dict() plus remedy_attempted
+    #   data: DoneStepIntegrityVerdict.to_dict()
     done_step_integrity_refused = 'done_step_integrity_refused'
 
     # Config hot-reload (plans/config-hot-reload-prd.md, task beta) — emitted

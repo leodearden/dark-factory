@@ -5701,37 +5701,28 @@ class TaskWorkflow:
         """The revalidation β check (``plans/task-amendment-delivery-prd.md`` C5).
 
         ``None`` lets the revised plan proceed. A refused plan gets one remedy
-        architect pass; if it is still refused, the task takes the no-plan
-        hold. Putting *before* back on disk is the caller's job.
+        architect pass, gated exactly like the first; if it is still refused,
+        the task takes the no-plan hold. Putting *before* back on disk is the
+        caller's job.
         """
         verdict = check_done_step_integrity(before, await self._reconciled_plan())
         if verdict.passed:
             return None
-        remedy_ran = await self._integrity_remedy_pass(verdict, changed_files, text_drift)
-        if (task_verdict := await self._route_task_verdict_report()) is not None:
-            return task_verdict
-        if remedy_ran:
-            verdict = check_done_step_integrity(before, await self._reconciled_plan())
-            if verdict.passed:
-                return None
-        return await self._refuse_done_step_integrity(verdict)
-
-    async def _integrity_remedy_pass(
-        self, verdict: DoneStepIntegrityVerdict, changed_files: list[str],
-        text_drift: TaskTextDrift | None,
-    ) -> bool:
-        """Show the architect *verdict* once more; whether its run succeeded."""
         assert self.worktree is not None
 
-        async def build_prompt() -> str:
+        async def build_remedy_prompt() -> str:
             return await self.briefing.build_revalidation_prompt(
                 self.task, self._live_plan(), changed_files,
                 worktree=self.worktree, text_drift=text_drift,
                 integrity_refusal=verdict,
             )
 
-        result = await self._invoke(ARCHITECT, build_prompt, self.worktree)
-        return result.success
+        if outcome := await self._run_architect_for_plan(build_remedy_prompt):
+            return outcome
+        verdict = check_done_step_integrity(before, await self._reconciled_plan())
+        if verdict.passed:
+            return None
+        return await self._refuse_done_step_integrity(verdict)
 
     async def _refuse_done_step_integrity(
         self, verdict: DoneStepIntegrityVerdict,
@@ -5740,7 +5731,7 @@ class TaskWorkflow:
         if self.event_store:
             self.event_store.emit(
                 EventType.done_step_integrity_refused, task_id=self.task_id, phase='plan',
-                data={**verdict.to_dict(), 'remedy_attempted': True},
+                data=verdict.to_dict(),
             )
         return await self._handle_no_plan_failure(
             f'Planning refused: {verdict.reason()}',
