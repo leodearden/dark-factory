@@ -18,17 +18,25 @@ Opt out with the ``real_mcp_session`` marker only when the subject under test is
 the real McpSession wire itself, against a ``StubMcpServer``, a patched
 transport or the ``127.0.0.1:1`` sentinel; everything else injects
 ``_orch_helpers.HermeticMcpSession``.
+
+``orchestrator/tests/conftest.py`` imports this module before it puts the
+worktree's src dirs on ``sys.path``, so it imports nothing from ``shared`` or
+``orchestrator`` at runtime and names McpSession by its dotted path; the guard
+is ``orchestrator/tests/test_forbid_live_mcp.py::test_importing_the_guard_loads_no_workspace_package``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import pytest
-from shared.mcp_session import McpSession
+
+if TYPE_CHECKING:
+    from shared.mcp_session import McpSession
 
 REAL_MCP_SESSION_MARKER = 'real_mcp_session'
+_MCP_SESSION = 'shared.mcp_session.McpSession'
 
 
 def install_live_mcp_guard(
@@ -59,8 +67,8 @@ def install_live_mcp_guard(
     ) -> dict:
         refuse(self, _attempt_label(method, params))
 
-    monkeypatch.setattr(McpSession, 'initialize', initialize)
-    monkeypatch.setattr(McpSession, 'call', call)
+    monkeypatch.setattr(f'{_MCP_SESSION}.initialize', initialize)
+    monkeypatch.setattr(f'{_MCP_SESSION}.call', call)
     return attempts
 
 
