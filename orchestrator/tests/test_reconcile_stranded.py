@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -630,18 +630,18 @@ class TestReconcileOneStrandedLandingRejectEmission:
         tid = '9021'
         store = _bind_event_store(harness, tmp_path)
         _on_main_effect_absent(harness, tid)
-        rows_at_revert: list[int] = []
+        scheduler = cast(MagicMock, harness.scheduler)
+        rows_at_write: list[int] = []
 
-        async def _revert(*_args, **_kwargs):
-            rows_at_revert.append(len(landing_reject_rows(store)))
+        async def _record(*_args, **_kwargs):
+            rows_at_write.append(len(landing_reject_rows(store)))
 
-        cast(Any, harness)._revert_in_progress_if_no_live_claimant = AsyncMock(
-            side_effect=_revert,
-        )
+        scheduler.set_task_claimant.side_effect = _record
+        scheduler.set_task_status.side_effect = _record
 
         await harness._reconcile_stranded_in_progress()
 
-        assert rows_at_revert == [1]
+        assert rows_at_write == [1, 1]
 
     async def test_blocked_marker_effect_absent_reject_is_recorded(
         self, harness: Harness, tmp_path: Path,
