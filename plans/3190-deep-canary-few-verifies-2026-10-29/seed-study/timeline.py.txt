@@ -1,0 +1,23 @@
+import json,time,collections,bisect,re,statistics as st
+def pct(xs,q):
+    xs=sorted(xs);k=q*(len(xs)-1);f=int(k);c=min(f+1,len(xs)-1);return xs[f]+(xs[c]-xs[f])*(k-f)
+S=json.load(open('/tmp/3190s/phases.json'))['seeds']
+fp=sorted(float(l.split()[0]) for l in open('/tmp/3190s/fp.list'))
+psi=collections.defaultdict(list)
+rx=re.compile(r"(psi_\w+_avg10)': '([0-9.]+)'")
+seen=set()
+for l in open('/tmp/3190s/ticks.raw',errors='replace'):
+    m=re.search(r'tick ts=(\d+)',l)
+    if not m or m[1] in seen:continue
+    seen.add(m[1]);d=dict(rx.findall(l))
+    if 'psi_io_some_avg10' in d:psi[time.strftime('%m-%d',time.gmtime(int(m[1])))].append(d)
+b=collections.defaultdict(list)
+for s in S:
+    if 'clone0' in s and 'clone1' in s:b[time.strftime('%m-%d',time.gmtime(s['clone0']))].append(s)
+print('day  n  clone:p05/p50/p90  post_p50 cand delta_p50 gen_last units_eod psi_cpu psi_io psi_mem')
+for k in sorted(b):
+    v=b[k];c=[s['clone1']-s['clone0'] for s in v];post=[s['seeded']-s['clone1'] for s in v]
+    nc=[s['ncand'] for s in v if s.get('ncand',0)>300];nd=[s['ndelta'] for s in v if 'ndelta' in s]
+    g=max(s.get('gen') or 0 for s in v);u=bisect.bisect_right(fp,max(s['clone1'] for s in v))
+    p=psi[k];f=lambda q:st.mean(float(x[q]) for x in p)
+    print(k,len(v),f"{pct(c,.05):.0f}/{pct(c,.5):.0f}/{pct(c,.9):.0f}",f"{pct(post,.5):.0f}",max(nc) if nc else '-',f"{pct(nd,.5):.0f}" if nd else '-',g,u,f"{f('psi_cpu_some_avg10'):.0f} {f('psi_io_some_avg10'):.1f} {f('psi_mem_some_avg10'):.1f}")

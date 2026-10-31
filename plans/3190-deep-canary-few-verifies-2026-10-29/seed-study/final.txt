@@ -1,0 +1,21 @@
+10-min bins, loop0 await<100ms only, n= 642
+tps -0.72; r -0.44; w 0.16; aq 0.34; aw 0.58; ut 0.69; 
+clone p50 by loop0 write MB/s, await<100ms band: band bins clone_p50 tps util rMB
+(0, 20) 5 397 2831 83 15
+(20, 40) 272 203 3901 80 20
+(40, 70) 179 157 4196 80 20
+(70, 100) 86 300 2877 88 17
+(100, 150) 94 465 2322 92 14
+(150, 999) 6 409 2268 94 15
+clone p50 by loop0 tps, all bins
+(0, 2000) 65 633 util=95 w=107MB r=11MB
+(2000, 3000) 184 370 util=88 w=85MB r=14MB
+(3000, 4000) 348 208 util=83 w=41MB r=18MB
+(4000, 5000) 316 165 util=79 w=39MB r=20MB
+(5000, 7000) 245 97 util=77 w=50MB r=22MB
+(7000, 20000) 45 47 util=66 w=73MB r=25MB
+time-averaged concurrent verifies (ledger, UTC day): sum wall / day-hours
+10-15..18 1.71
+10-19..21 1.44
+10-22..25 2.1
+10-26..29 1.93
