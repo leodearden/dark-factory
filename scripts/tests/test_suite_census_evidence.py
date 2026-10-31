@@ -1,12 +1,13 @@
 """The evidence readers turn retained verify artefacts into typed census records."""
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
 import suite_census_evidence as ev
 import suite_census_outcomes as oc
-from suite_census_fixtures import nextest_project, pytest_project, write_gz
+from suite_census_fixtures import git_tree, junit_xml, nextest_project, pytest_project, write_gz
 
 PASSED, FAILED, SKIPPED = oc.Outcome.PASSED, oc.Outcome.FAILED, oc.Outcome.SKIPPED
 
@@ -53,6 +54,12 @@ class TestPytestEvidence:
     def test_an_untracked_classname_is_unresolved(self, records):
         assert [raw for raw in _unresolved(records, 'archived-junit') if 'test_gone' in raw]
 
+    def test_a_function_or_class_its_file_does_not_define_is_unresolved(self, records):
+        names = {o.test.name for o in _observations(records, 'archived-junit')}
+        assert not names & {f'{TEST_A}::test_renamed', f'{TEST_A}::TestGone::test_p'}
+        unresolved = set(_unresolved(records, 'archived-junit'))
+        assert {'tests.test_a::test_renamed', 'tests.test_a.TestGone::test_p'} <= unresolved
+
     def test_a_root_relative_classname_falls_back_to_the_repo_root(self, records):
         archived = _observations(records, 'archived-junit')
         (b1,) = [o for o in archived if o.test.name.endswith('test_b1')]
@@ -65,15 +72,27 @@ class TestPytestEvidence:
             (f'{TEST_A}::test_r', FAILED, None),
         ]
 
+    def test_a_log_failure_of_an_undefined_function_is_unresolved(self, records):
+        assert _unresolved(records, 'pytest-logs') == ['tests/test_a.py::TestX::test_removed']
+
     def test_an_ambiguous_flake_id_marks_every_candidate(self, records):
         flakes = _observations(records, 'flake_occurrence')
-        assert sorted((o.test.package, o.test.name, o.outcome) for o in flakes) == [
+        assert sorted(
+            (o.test.package, o.test.name, o.outcome)
+            for o in flakes if o.test.name.endswith('::test_q')
+        ) == [
             ('fused-memory', 'fused-memory/tests/test_a.py::test_q', FAILED),
             ('orchestrator', f'{TEST_A}::test_q', FAILED),
         ]
         assert sorted(_unresolved(records, 'flake_occurrence')) == [
             '<unknown>', 'tests/test_deleted.py::test_x',
         ]
+
+    def test_an_ambiguous_flake_id_credits_only_the_candidates_that_define_it(self, records):
+        flakes = _observations(records, 'flake_occurrence')
+        assert [
+            (o.test.package, o.test.name) for o in flakes if o.test.name.endswith('::test_flaky')
+        ] == [('orchestrator', f'{TEST_A}::TestX::test_flaky')]
 
     def test_every_run_is_contiguous(self, records):
         keys = [(o.source, o.run) for o in records if isinstance(o, oc.Observation)]
@@ -90,7 +109,7 @@ class TestPytestEvidence:
             'archived-junit': (True, 2, '2026-09-30T13:15:43Z', '2026-10-01T00:00:00Z'),
             'live-junit': (True, 2, '2026-10-02T12:00:00Z', '2026-10-03T12:00:00Z'),
             'pytest-logs': (True, 1, '2026-09-20T10:10:10Z', '2026-09-20T10:10:10Z'),
-            'flake_occurrence': (True, 3, '2026-09-01T00:00:00Z', '2026-09-03T00:00:00Z'),
+            'flake_occurrence': (True, 4, '2026-09-01T00:00:00Z', '2026-09-04T00:00:00Z'),
         }
 
     def test_an_absent_runs_db_is_a_window_not_an_error(self, root):
@@ -113,6 +132,74 @@ class TestPytestEvidence:
 
     def test_pytest_has_no_uncosted_universe(self, root):
         assert ev.pytest_evidence(root, root).uncosted_universe == frozenset()
+
+
+D = 'orchestrator/tests/test_d.py'
+
+
+def _junit_records(
+    root: Path, files: Mapping[str, str], cases: Sequence[tuple[str, str]],
+) -> list[oc.Record]:
+    git_tree(root, {'orchestrator/orchestrator.yaml': '', **files})
+    write_gz(
+        root / 'data' / 'verify-logs' / 'T1'
+        / 'attempt-1.orchestrator.junit-20261001T000000_1Z.xml.gz',
+        junit_xml(
+            '2026-10-01T00:00:00+00:00',
+            [(classname, name, 0.1, 'pass') for classname, name in cases],
+        ),
+    )
+    return list(ev.pytest_evidence(root, root).records())
+
+
+def _resolve(
+    root: Path, files: Mapping[str, str], cases: Sequence[tuple[str, str]],
+) -> tuple[set[str], set[str]]:
+    """The archived-junit test names *cases* resolve to, and the raw ids left unresolved."""
+    records = _junit_records(root, files, cases)
+    return (
+        {o.test.name for o in _observations(records, 'archived-junit')},
+        set(_unresolved(records, 'archived-junit')),
+    )
+
+
+class TestPytestDefinitionScopes:
+    def test_the_class_path_must_lead_to_the_function(self, tmp_path):
+        source = 'def test_mod():\n    pass\n\n\nclass TestX:\n    def test_meth(self):\n        pass\n'
+        resolved, unresolved = _resolve(tmp_path, {D: source}, [
+            ('tests.test_d', 'test_mod'), ('tests.test_d.TestX', 'test_meth'),
+            ('tests.test_d.TestX', 'test_mod'), ('tests.test_d', 'test_meth'),
+        ])
+        assert resolved == {f'{D}::test_mod', f'{D}::TestX::test_meth'}
+        assert unresolved == {'tests.test_d.TestX::test_mod', 'tests.test_d::test_meth'}
+
+    def test_a_nested_class_resolves_only_through_its_full_class_path(self, tmp_path):
+        source = 'class TestOuter:\n    class TestInner:\n        def test_n(self):\n            pass\n'
+        resolved, unresolved = _resolve(tmp_path, {D: source}, [
+            ('tests.test_d.TestOuter.TestInner', 'test_n'), ('tests.test_d.TestOuter', 'test_n'),
+        ])
+        assert resolved == {f'{D}::TestOuter::TestInner::test_n'}
+        assert unresolved == {'tests.test_d.TestOuter::test_n'}
+
+    def test_an_async_function_resolves(self, tmp_path):
+        source = 'async def test_a():\n    pass\n'
+        resolved, unresolved = _resolve(tmp_path, {D: source}, [('tests.test_d', 'test_a')])
+        assert (resolved, unresolved) == ({f'{D}::test_a'}, set())
+
+    def test_an_unparseable_file_defines_nothing(self, tmp_path):
+        resolved, unresolved = _resolve(
+            tmp_path, {D: 'def test_ok(:\n'}, [('tests.test_d', 'test_ok')],
+        )
+        assert (resolved, unresolved) == (set(), {'tests.test_d::test_ok'})
+
+    def test_a_module_file_lacking_the_function_yields_to_the_repo_root(self, tmp_path):
+        records = _junit_records(tmp_path, {
+            D: 'def test_other():\n    pass\n',
+            'tests/test_d.py': 'def test_root_only():\n    pass\n',
+        }, [('tests.test_d', 'test_root_only')])
+        assert [o.test for o in _observations(records, 'archived-junit')] == [
+            oc.TestId('tests', 'tests/test_d.py::test_root_only'),
+        ]
 
 
 ALPHA = oc.TestId('tests/infra', 'tests/infra/test_alpha.sh')
