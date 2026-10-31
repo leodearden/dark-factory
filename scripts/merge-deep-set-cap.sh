@@ -61,23 +61,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="$SCRIPT_DIR/../.venv/bin/python3"
 [ -x "$PY" ] || PY=python3
 
-REPO="$(git -C "$(dirname "$CONFIG")" rev-parse --show-toplevel)" \
-    || die "config is not inside a git checkout: $CONFIG"
-REL="$(realpath --relative-to="$(realpath "$REPO")" "$(realpath "$CONFIG")")"
-BASE="$(git -C "$REPO" rev-parse --verify 'main^{commit}')" \
-    || die "no main branch in $REPO"
-
-# Scratch for main's copy and its edit.  Bash runs a TERM/INT trap only once
-# the landing step returns, so a killpg lets that step cancel its request and
-# tear down before this directory goes.
-SCRATCH="$(mktemp -d)"
-trap 'rm -rf "$SCRATCH"' EXIT
-trap 'exit 143' TERM
-trap 'exit 130' INT
-MAIN_COPY="$SCRATCH/main.yaml"
-EDITED="$SCRATCH/edited.yaml"
-git -C "$REPO" show "$BASE:$REL" > "$MAIN_COPY" || die "$REL is not tracked on main ($BASE)"
-cp "$MAIN_COPY" "$EDITED"
+# REPO, REL, BASE, and main's copy of the config (MAIN_COPY) beside the copy
+# step 1 edits (EDITED), with the traps that let step 3 cancel on a killpg.
+# shellcheck source=scripts/lib/deploy_main_copy.sh
+source "$SCRIPT_DIR/lib/deploy_main_copy.sh"
+main_copy_failed() { die "$2"; }
+deploy_main_copy "$CONFIG" main_copy_failed
 
 # 1. Upsert `merge_deep:\n  chain_cap: <cap>` (stdlib python3; line-oriented so
 #    the raw-shell deploy layer needs no yaml library).

@@ -38,7 +38,7 @@
 # its own {dry_run, would_set}), or one carrying `failure: <tag>` on exit 1.
 # `commit` is the sha the queue landed the flip as, `already-at-<value>` when
 # main already carried it, or null when nothing landed. The tags come from
-# die() below, the reload step's fail(),
+# die() below, scripts/lib/deploy_main_copy.sh, the reload step's fail(),
 # scripts/_merge_queue_landing.py::LandingFailure and
 # scripts/_config_reload_gate.py::ReloadFailure.
 set -euo pipefail
@@ -73,23 +73,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHECKOUT="$SCRIPT_DIR/.."
 PY="$CHECKOUT/.venv/bin/python3"
 [ -x "$PY" ] || PY=python3
-REPO="$(cd "$(dirname "$CONFIG")" && git rev-parse --show-toplevel)" || die config_not_in_git "config is not inside a git checkout"
-REL="$(realpath --relative-to="$REPO" "$CONFIG")"
-BASE="$(git -C "$REPO" rev-parse --verify 'main^{commit}')" || die no_main_branch "no main branch in $REPO"
 KEY='PYTEST_XDIST_AUTO_NUM_WORKERS'
 STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-# Scratch for main's copy and its edit. Bash runs a TERM/INT trap only once
-# the landing step returns, so a killpg lets that step cancel its request and
-# tear down before this directory goes.
-SCRATCH="$(mktemp -d)"
-trap 'rm -rf "$SCRATCH"' EXIT
-trap 'exit 143' TERM
-trap 'exit 130' INT
-MAIN_COPY="$SCRATCH/main.yaml"
-EDITED="$SCRATCH/edited.yaml"
-git -C "$REPO" show "$BASE:$REL" > "$MAIN_COPY" || die config_not_on_main "$REL is not tracked on main ($BASE)"
-cp "$MAIN_COPY" "$EDITED"
+# REPO, REL, BASE, and main's copy of the config (MAIN_COPY) beside the copy
+# step 1 edits (EDITED), with the traps that let step 3 cancel on a killpg.
+# shellcheck source=scripts/lib/deploy_main_copy.sh
+source "$SCRIPT_DIR/lib/deploy_main_copy.sh"
+deploy_main_copy "$CONFIG" die
 
 # 1. Rewrite the value inside the top-level `verify_env:` mapping. Line-based
 #    on purpose (no yaml round-trip: the file is 1000 lines of load-bearing
