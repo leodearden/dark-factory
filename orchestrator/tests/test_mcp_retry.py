@@ -34,6 +34,8 @@ from orchestrator.mcp_lifecycle import (
     mcp_call,
 )
 
+pytestmark = pytest.mark.real_mcp_session
+
 OK_BODY = {'jsonrpc': '2.0', 'id': 1, 'result': {'ok': True}}
 
 

@@ -13,6 +13,11 @@ A refusal is ``pytest.fail``. Its ``Failed`` is a ``BaseException``, so the
 ``AssertionError`` the fm-retry loop of ``Scheduler.set_task_status`` slept
 about 120s before the refusal surfaced. Every attempt is also recorded, so the
 fixture's teardown still fails a test whose caller swallows ``BaseException``.
+
+Opt out with the ``real_mcp_session`` marker only when the subject under test is
+the real McpSession wire itself, against a ``StubMcpServer``, a patched
+transport or the ``127.0.0.1:1`` sentinel; everything else injects
+``_orch_helpers.HermeticMcpSession``.
 """
 
 from __future__ import annotations
@@ -23,10 +28,16 @@ from typing import Any, NoReturn
 import pytest
 from shared.mcp_session import McpSession
 
+REAL_MCP_SESSION_MARKER = 'real_mcp_session'
 
-def install_live_mcp_guard(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
-    """Patch McpSession to refuse every round-trip; return the attempt log."""
+
+def install_live_mcp_guard(
+    monkeypatch: pytest.MonkeyPatch, node: pytest.Item,
+) -> list[tuple[str, str]]:
+    """Patch McpSession to refuse every round-trip unless *node* opts out; return the attempt log."""
     attempts: list[tuple[str, str]] = []
+    if node.get_closest_marker(REAL_MCP_SESSION_MARKER):
+        return attempts
 
     def refuse(session: McpSession, what: str) -> NoReturn:
         attempts.append((session.base_url, what))

@@ -60,7 +60,7 @@ if str(REPO_ROOT) not in sys.path:
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
 from _git_fixtures import RepoTemplates, session_templates  # noqa: E402
-from _live_mcp_guard import install_live_mcp_guard  # noqa: E402
+from _live_mcp_guard import REAL_MCP_SESSION_MARKER, install_live_mcp_guard  # noqa: E402
 from _orch_helpers import (  # noqa: E402
     CLAIMANT_TTL_SECS,
     ExitContractViolationCollector,
@@ -554,7 +554,7 @@ def df_warm_lane_script_dir(monkeypatch, tmp_path: Path):
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Refuse an unsafe ``--basetemp``, arm the drain-leak guard, register ``real_psi_reader``.
+    """Refuse an unsafe ``--basetemp``, arm the drain-leak guard, register the opt-out markers.
 
     The ``reject_unsafe_basetemp`` call comes FIRST and is unrelated to the
     marker below: it aborts collection when ``--basetemp`` points inside a live
@@ -579,6 +579,12 @@ def pytest_configure(config: pytest.Config) -> None:
         'patch so it exercises the REAL `shared.psi.read_psi_sample` bound at '
         'Scheduler construction instead of the deterministic idle-sample stub. '
         'Default: autouse idle-PSI patch installed in conftest.py (task 2418).',
+    )
+    config.addinivalue_line(
+        'markers',
+        f'{REAL_MCP_SESSION_MARKER}: opt a test OUT of the autouse forbid_live_mcp '
+        'guard so shared.mcp_session.McpSession runs for real (stub server / '
+        'mocked transport only) — task 7802',
     )
 
 
@@ -656,15 +662,16 @@ def _hermetic_disk_usage(monkeypatch):
     monkeypatch.setattr(shutil, 'disk_usage', ample_disk_usage)
 
 
-@pytest.fixture
-def forbid_live_mcp(monkeypatch):
-    """Opt-in guard: fail the test at once if it attempts a live fused-memory MCP round-trip.
+@pytest.fixture(autouse=True)
+def forbid_live_mcp(monkeypatch, request):
+    """Autouse guard: fail the test at once if it attempts a live fused-memory MCP round-trip.
 
-    Yields the attempt log, which a test provoking an attempt on purpose reads
-    and clears. Teardown fails a test whose caller swallowed the refusal.
-    Mechanism and rationale: ``_live_mcp_guard.py``.
+    A test opts out with the ``real_mcp_session`` marker. Yields the attempt
+    log, which a test provoking an attempt on purpose reads and clears.
+    Teardown fails a test whose caller swallowed the refusal. Mechanism,
+    rationale and when to opt out: ``_live_mcp_guard.py``.
     """
-    recorder = install_live_mcp_guard(monkeypatch)
+    recorder = install_live_mcp_guard(monkeypatch, request.node)
 
     yield recorder
 
