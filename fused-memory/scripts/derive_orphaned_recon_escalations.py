@@ -131,7 +131,7 @@ from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     classify_pending_escalations,
 )
 from fused_memory.utils.target_store_preflight import (
-    TargetStoreMissing,
+    TargetStoreUnpopulated,
     assert_queue_dir_populated,
 )
 
@@ -220,7 +220,7 @@ async def run(
         ``.get()``.  ``reaped`` is simply 0 on a dry run.
 
     Raises:
-        TargetStoreMissing: When *queue_dir* is missing or empty — see the module
+        TargetStoreUnpopulated: When *queue_dir* is missing or empty — see the module
             docstring.  The check lives here rather than in ``main()`` so
             programmatic callers inherit it, and ahead of the backend build so
             a refusal costs nothing and leaves nothing behind.
@@ -334,7 +334,7 @@ def main() -> int:
                 resolved_by=args.resolved_by,
             ),
         )
-    except TargetStoreMissing as exc:
+    except TargetStoreUnpopulated as exc:
         # The refusal is an OPERATOR-facing message about a mis-targeted
         # --queue-dir (or a cwd the relative default does not fit), not a bug:
         # one line on stderr says more than a traceback, and the exit code is
