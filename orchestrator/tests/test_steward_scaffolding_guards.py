@@ -1074,7 +1074,7 @@ class _Adjudicated(NamedTuple):
 # TWO FAMILIES survive here, and they are exceptions for DIFFERENT reasons:
 #   * the canonical constant in `_orch_helpers.py`, which the 16 Family-A sites
 #     now reference rather than re-spell;
-#   * the REVIEW family, five sites that must stay outside pytest's tmp_path
+#   * the REVIEW family, six sites that must stay outside pytest's tmp_path
 #     because `ReviewCheckpoint._run_review` raises ValueError on `/tmp/pytest`.
 #
 # Adding an entry is a DECISION, not a formality — see the failure message.
@@ -1127,6 +1127,15 @@ _ADJUDICATED_TMP_PROJECT_ROOT_LITERALS: dict[str, _Adjudicated] = {
             'same ReviewCheckpoint `/tmp/pytest`-guard family, and censused '
             'rather than renamed, for the same reason as '
             'test_review_checkpoint_cap.py above'
+        ),
+    ),
+    'test_review_checkpoint_pre_test.py': _Adjudicated(
+        sites=1,
+        reason=(
+            'same ReviewCheckpoint `/tmp/pytest`-guard family as '
+            'test_review_checkpoint_cap.py; the pre-test setup commands need a '
+            'real cwd, so the inert MOCK_WORKFLOW_PROJECT_ROOT cannot stand in '
+            '(task 6020)'
         ),
     ),
     'test_task_creation_migration.py': _Adjudicated(

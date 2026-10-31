@@ -536,6 +536,24 @@ class ReviewConfig(BaseModel):
     # incumbent diff-only briefing, or the context-complete 'd2' one. Read
     # fresh at each review, so a reload flips it — or kills it — live.
     reviewer_briefing: ReviewBriefing = Field(default=ReviewBriefing.DIFF_ONLY)
+    pre_test_commands: list[str] = Field(
+        default_factory=list,
+        description=(
+            'Shell commands run in order, in the main checkout (cwd = '
+            'project_root), before each review checkpoint\'s Phase 1 — e.g. '
+            'rebuilding frontend bundles that e2e tests serve.  Fail-soft: a '
+            'failing or timed-out command is logged and reported in the '
+            'reviewer prompt and in the saved review report when one is '
+            'written (a review skipped for capped accounts writes none); it '
+            'never aborts the review, and later commands still run (chain '
+            'dependent steps with && inside one entry).  Empty = no setup step.'
+        ),
+    )
+    pre_test_timeout_secs: float = Field(
+        default=1800.0,
+        gt=0,
+        description='Per-command timeout for review.pre_test_commands.',
+    )
 
 
 _DEFAULT_SKIP_THRESHOLD: dict[str, int] = {
@@ -6680,6 +6698,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'review.full_review_min_interval_secs',
         'review.full_review_min_tasks',
         'review.reviewer_briefing',
+        'review.pre_test_commands',
+        'review.pre_test_timeout_secs',
         # Verify env (fresh config's value already carries the sccache fold)
         'verify_env',
         # Cold-verify shared-venv pre-provision command (task 2997) — green-tier
