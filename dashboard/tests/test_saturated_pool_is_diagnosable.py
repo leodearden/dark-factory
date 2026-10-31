@@ -10,6 +10,10 @@ is exercised rather than stubbed.
 Each per-request budget is a private module constant with no config seam (the
 same constants ``test_app_http_limits.py`` and ``test_metrics_curator.py``
 patch), so the dotted paths below are the one place these tests name them.
+
+One site is the deliberate exception: the Tasks-tab snapshot reports a
+saturated pool as its own budget running out, so its test pins that rather
+than a named ``PoolTimeout``.
 """
 
 from __future__ import annotations
@@ -17,13 +21,14 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+from datetime import UTC, datetime
 
 import aiosqlite
 import httpx
 import pytest
 
 from dashboard.config import DashboardConfig
-from dashboard.data import escalations, merge_halt, merge_queue, task_runtime
+from dashboard.data import escalations, merge_halt, merge_queue, task_runtime, task_snapshot
 from dashboard.data import memory as memory_data
 from dashboard.data.metrics import METRICS_SCHEMA, collect_metrics_snapshot
 
@@ -36,6 +41,7 @@ _ESCALATIONS_LOGGER = 'dashboard.data.escalations'
 _CURATOR_BUDGET = 'dashboard.app._CURATOR_ENDPOINT_TIMEOUT_SECONDS'
 _MEMORY_BUDGET = 'dashboard.api.memory._MEMORY_ENDPOINT_TIMEOUT_SECONDS'
 _SAMPLER_BUDGET = 'dashboard.data.metrics._HTTP_SAMPLER_TIMEOUT_SECONDS'
+_SNAPSHOT_BUDGET = 'dashboard.data.task_snapshot.PER_CALL_TIMEOUT'
 _FAST_BUDGET_SECONDS = 0.05
 
 
@@ -251,3 +257,30 @@ async def test_pins_probe_names_pool_timeout(caplog):
     assert any(
         'get_pending_escalations failed' in m and 'PoolTimeout' in m for m in lines
     ), f'no pins-probe line named PoolTimeout; got {lines}'
+
+
+@pytest.mark.asyncio
+async def test_task_snapshot_reports_a_saturated_pool_as_budget_not_offline(
+    tmp_path, monkeypatch,
+):
+    """A saturated local pool is this process running out of budget, so the
+    Tasks tab must show it degraded, never offline. Converting
+    ``task_snapshot._bounded`` to ``enclosing_deadline`` would let
+    ``first_success`` fold the PoolTimeout into an offline marker and flip this
+    to UNREACHABLE.
+    """
+    monkeypatch.setattr(_SNAPSHOT_BUDGET, _FAST_BUDGET_SECONDS)
+    config = DashboardConfig(project_root=tmp_path, fused_memory_urls=[_SATURATED_URL])
+
+    memory_data.reset_sessions()
+    try:
+        async with httpx.AsyncClient(transport=_SaturatedPoolTransport()) as client:
+            snapshot = await task_snapshot.acquire_snapshot(
+                client, config, tmp_path, now=datetime.now(UTC),
+            )
+    finally:
+        memory_data.reset_sessions()
+
+    assert snapshot.failure is task_snapshot.SnapshotFailure.BUDGET, (
+        f'a saturated pool must read as BUDGET (degraded); got {snapshot.failure!r}'
+    )
