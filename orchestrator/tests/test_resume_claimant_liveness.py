@@ -1599,3 +1599,72 @@ class TestGrantedFilesDeliveryProbe:
             harness.granted_files_delivery_blocker('3438')
             is GrantDelivery.NO_PLAN_TO_WIDEN
         )
+
+
+def _live_slot_grant(harness: Harness, tmp_path: Path, granted: list[str]) -> tuple[Escalation, asyncio.Event]:
+    """The reported repro's wiring: an L2 grant resolved against a LIVE task.
+
+    The ``_escalation_events`` entry stays PRESENT, the inverse of every
+    re-pend fold test above, which pop it to take the orphan arm.
+    """
+    esc = _esc(
+        task_id='3438', level=2, category='scope_violation',
+        granted_files=granted, resolved_by='escalation-watcher-auto',
+    )
+    _wire_queue(harness, tmp_path, esc)
+    _wire(harness, _row('in-progress', claimant=LIVE_CLAIMANT, heartbeat='fresh'))
+    event = asyncio.Event()
+    harness._escalation_events['3438'] = event
+    return esc, event
+
+
+@pytest.mark.asyncio
+class TestGrantDeliveryOnALiveWorkflow:
+    """A grant resolved against a task whose workflow is LIVE is delivered (task 5650).
+
+    ``_escalation_events`` is registered at dispatch, so membership means "a
+    slot is open", not "a workflow is paused on THIS record". The live
+    workflow waits only on its own level-0 records, so an L2 resolved against
+    it wakes the event and goes back to sleep without ever reaching
+    ``workflow.py::TaskWorkflow._collect_granted_files``: the grant was
+    recorded and dropped, and the implementer looped (reify task 4263,
+    measured 2026-09-19).
+    """
+
+    async def test_a_grant_on_a_live_workflow_is_delivered(
+        self, harness: Harness, tmp_path: Path
+    ):
+        esc, event = _live_slot_grant(harness, tmp_path, ['pkg/b.py'])
+        plan_path = _seed_plan(harness, files=['pkg/a.py'])
+
+        await _drive(harness, esc)
+
+        assert json.loads(plan_path.read_text())['files'] == ['pkg/a.py', 'pkg/b.py']
+        assert len(_files_updates(harness)) == 1
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        assert event.is_set(), 'The synchronous wake path must still fire'
+
+    async def test_a_grantless_resolve_on_a_live_workflow_schedules_nothing(
+        self, harness: Harness, tmp_path: Path
+    ):
+        esc, _event = _live_slot_grant(harness, tmp_path, [])
+        _seed_plan(harness, files=['pkg/a.py'])
+
+        labels = _record_scheduling(harness)
+        await _drive(harness, esc)
+
+        assert labels == [], f'a grant-less live resolve must schedule nothing; got {labels}'
+
+    async def test_live_delivery_is_scheduled_under_its_own_label(
+        self, harness: Harness, tmp_path: Path
+    ):
+        esc, _event = _live_slot_grant(harness, tmp_path, ['pkg/b.py'])
+        _seed_plan(harness, files=['pkg/a.py'])
+
+        labels = _record_scheduling(harness)
+        await _drive(harness, esc)
+
+        assert len(labels) == 1, f'expected exactly one scheduled coroutine; got {labels}'
+        assert 'grant-delivery task 3438' in labels[0]
+        assert 'cascade-unblock' not in labels[0]
+        assert 'orphan-unblock' not in labels[0]
