@@ -20,6 +20,9 @@ import {
   orchestratorRow,
   projectRow,
   receiptsFor,
+  schedulerLockRow,
+  schedulerModule,
+  schedulerSnapshot,
   taskCensus,
   tasksSnapshotEntry,
   wireDatum,
@@ -86,6 +89,19 @@ function listFlat(window) {
   window.localStorage.setItem('df.tasksGroupByPrd', JSON.stringify({ [PROJECT]: 'flat' }));
 }
 
+// The Tasks tab's detail pane, opened on `task` by clicking its graph node;
+// undefined unless the pane names that task.
+function taskDetailOf(harness, task) {
+  listFlat(harness.window);
+  const { container } = harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
+  const node = graphNode(container, task);
+  assert.ok(node, 'the task never reached the graph, so it cannot be selected');
+  click(harness.window, node);
+  const detail = container.querySelector('.task-detail');
+  const idText = harness.window.DF_SHELL.taskId(task.id);
+  return detail?.querySelector('.sub')?.textContent.includes(idText) ? detail : undefined;
+}
+
 // Each site's options are the ones its call site passes, and `render` returns
 // the element the badge belongs in: the task's row, node or detail pane.
 const STRAND_SITES = [
@@ -109,16 +125,7 @@ const STRAND_SITES = [
   {
     site: 'tab_tasks.jsx::TaskDetail',
     options: undefined,
-    render(harness, task) {
-      listFlat(harness.window);
-      const { container } = harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
-      const node = graphNode(container, task);
-      assert.ok(node, 'the task never reached the graph, so it cannot be selected');
-      click(harness.window, node);
-      const detail = container.querySelector('.task-detail');
-      const idText = harness.window.DF_SHELL.taskId(task.id);
-      return detail?.querySelector('.sub')?.textContent.includes(idText) ? detail : undefined;
-    },
+    render: taskDetailOf,
   },
 ];
 
@@ -1219,3 +1226,97 @@ for (const { kind, testId, data } of BANNER_CASES) {
     }
   });
 }
+
+// ── Decision 11: the Task-detail Module locks section (task_row_cells.js::locksCellState, scheduler_utils.jsx::lockChipStateFor) ──
+
+function seedTaskWithScheduler(window, task, scheduler) {
+  seedOneTask(window, task);
+  seedDashboardData(window, { SCHEDULER: scheduler, __receipt: receiptsFor(window.DF_DATA_LOADER, ['SCHEDULER']) });
+}
+
+// The "Module locks" label and the element it heads, or null when the pane
+// draws no such section.
+function moduleLocksSection(detail) {
+  const label = [...detail.querySelectorAll('.section-lbl')].find(lbl => lbl.textContent.startsWith('Module locks'));
+  return label ? { label, body: label.nextElementSibling } : null;
+}
+
+// What the section is asked to draw, as the helpers it calls answer it.
+function expectedLocksCell(window, task) {
+  const D = window.DF_DATA;
+  const { locksCellState, schedulerLocksDatum } = window.DF_TASK_ROW_CELLS;
+  return locksCellState(schedulerLocksDatum(D.SCHEDULER, PROJECT, D.__receipt), window.DF_SCHED_UTILS.buildSchedLockInfo(task, D.SCHEDULER));
+}
+
+function lockChips(root) {
+  return [...root.querySelectorAll('.chip')].filter(chip => [...chip.classList].some(cls => cls.startsWith('lock-')));
+}
+
+test("tab_tasks.jsx::TaskDetail draws the Module locks em-dash with locksCellState's reason for a project the scheduler lists offline", t => {
+  const harness = openWindow(t);
+  const task = inProgressTask(false);
+  seedTaskWithScheduler(harness.window, task, schedulerSnapshot({ offlineProjects: [PROJECT] }));
+  const detail = taskDetailOf(harness, task);
+  assert.ok(detail, 'the detail pane never opened on the task');
+
+  const expected = expectedLocksCell(harness.window, task);
+  assert.ok(expected.placeholder, 'locksCellState draws no placeholder for an offline project, so this fixture tests nothing');
+  assert.ok(expected.title, 'locksCellState gives no reason for an offline project, so this fixture tests nothing');
+  const section = moduleLocksSection(detail);
+  assert.ok(section, 'the detail pane draws no Module locks section for a project whose locks are unknown');
+  assert.equal(section.label.textContent, 'Module locks', 'an unknown lock set has no count to show');
+  assert.ok(section.body?.matches('span.chip-empty'), 'the unknown arm must draw a span.chip-empty under the label');
+  assert.equal(section.body.textContent, expected.placeholder);
+  assert.equal(section.body.title, expected.title, "the em-dash must carry locksCellState's reason as its title");
+  assert.deepEqual(lockChips(detail), [], 'a project whose locks are unknown must draw no lock chip');
+});
+
+test('tab_tasks.jsx::TaskDetail draws each lock chip in the class lockChipStateFor answers, for a project the scheduler measured', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const task = inProgressTask(false);
+  const paths = { mine: 'src/mine', taken: 'src/taken', parked: 'src/parked', free: 'src/free' };
+  seedTaskWithScheduler(window, task, schedulerSnapshot({
+    rows: [schedulerLockRow({ project: PROJECT, taskId: task.id, lockSet: Object.values(paths) })],
+    modules: [
+      schedulerModule({ project: PROJECT, path: paths.mine, holder: task.id, holderProject: PROJECT }),
+      schedulerModule({ project: PROJECT, path: paths.taken, holder: '7', holderProject: PROJECT }),
+      schedulerModule({ project: PROJECT, path: paths.parked, parkedBy: '9', parkedOwnerLive: true }),
+    ],
+  }));
+  const detail = taskDetailOf(harness, task);
+  assert.ok(detail, 'the detail pane never opened on the task');
+
+  const lockInfo = window.DF_SCHED_UTILS.buildSchedLockInfo(task, window.DF_DATA.SCHEDULER);
+  assert.equal(expectedLocksCell(window, task).placeholder, null, 'locksCellState reads this measured project as unknown');
+  const expected = new Map(lockInfo.lockSet.map(path => [
+    path,
+    window.DF_SCHED_UTILS.lockChipStateFor(lockInfo.moduleByPath.get(path), task.id, PROJECT),
+  ]));
+  assert.equal(new Set([...expected.values()].map(state => state.cls)).size, 4, 'the four paths must cover four lock classes');
+
+  const section = moduleLocksSection(detail);
+  assert.ok(section, 'the detail pane draws no Module locks section for a task holding locks');
+  assert.equal(section.label.textContent, `Module locks (${lockInfo.lockSet.length})`);
+  assert.ok(section.body && !section.body.matches('.chip-empty') && !section.body.querySelector('.chip-empty'),
+    'a measured project with locks must draw chips, not the em-dash');
+  for (const [path, { cls, ownerLabel }] of expected) {
+    const chip = section.body.querySelector(`.chip[title="${path}"]`);
+    assert.ok(chip, `no chip titled ${path}`);
+    assert.ok(chip.classList.contains(cls), `the ${path} chip is not ${cls}, the class lockChipStateFor answers`);
+    if (cls === 'lock-taken' || cls === 'lock-parked') {
+      assert.ok(chip.querySelector('.holder')?.textContent.includes(ownerLabel), `the ${path} chip does not name ${ownerLabel}`);
+    }
+  }
+});
+
+test('tab_tasks.jsx::TaskDetail draws no Module locks section for a task holding no locks in a project the scheduler measured', t => {
+  const harness = openWindow(t);
+  const task = inProgressTask(false);
+  seedTaskWithScheduler(harness.window, task, schedulerSnapshot());
+  const detail = taskDetailOf(harness, task);
+  assert.ok(detail, 'the detail pane never opened on the task, so the absent section proves nothing');
+
+  assert.equal(expectedLocksCell(harness.window, task).placeholder, null, 'locksCellState reads this measured project as unknown');
+  assert.equal(moduleLocksSection(detail), null, 'a measured project with no locks draws no Module locks section');
+});
