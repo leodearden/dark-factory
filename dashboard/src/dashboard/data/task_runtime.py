@@ -164,21 +164,22 @@ async def _probe_one(
     base_url: str,
     timeout: float,
 ) -> TaskRuntimeSnapshot:
+    operation_bound = enclosing_deadline(timeout)
     try:
         result = await asyncio.wait_for(
             mcp_tool_call(
                 client, base_url, 'get_task_runtime_state', {}, timeout=timeout,
             ),
-            timeout=enclosing_deadline(timeout),
+            timeout=operation_bound,
         )
     except _DEADLINE_EXC as exc:
         # OUR budget expired, not necessarily their outage — see module docstring.
         _log_probe_failure(
             base_url, 'deadline_exceeded',
-            'get_task_runtime_state: deadline_exceeded for %s after %.2fs budget '
-            '(the orchestrator may be healthy; a starved dashboard event loop '
-            'produces this too): %s',
-            base_url, timeout, describe_exc(exc),
+            'get_task_runtime_state: deadline_exceeded for %s (per-request budget '
+            '%.2fs, operation bound %.2fs; the orchestrator may be healthy; a '
+            'starved dashboard event loop produces this too): %s',
+            base_url, timeout, operation_bound, describe_exc(exc),
         )
         return TaskRuntimeSnapshot(offline=True, offline_reason='deadline_exceeded')
     except _UNREACHABLE_EXC as exc:

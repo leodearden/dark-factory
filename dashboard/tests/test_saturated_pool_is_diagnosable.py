@@ -78,6 +78,28 @@ def saturated_app(client, monkeypatch):
     memory_data.reset_sessions()
 
 
+@pytest.fixture()
+async def saturated_client():
+    """An ``httpx.AsyncClient`` over ``_SaturatedPoolTransport``.
+
+    The MCP session cache is process-global and keyed by URL, so it is reset on
+    both sides: no cached session lets a test skip the saturated handshake, and
+    none outlives the test.
+    """
+    memory_data.reset_sessions()
+    async with httpx.AsyncClient(transport=_SaturatedPoolTransport()) as client:
+        yield client
+    memory_data.reset_sessions()
+
+
+@pytest.fixture()
+def fresh_task_runtime_log():
+    """Reset task_runtime's process-global WARNING dedupe on both sides."""
+    task_runtime.reset_probe_log_state()
+    yield
+    task_runtime.reset_probe_log_state()
+
+
 def _warnings(caplog: pytest.LogCaptureFixture, logger_name: str) -> list[str]:
     return [
         r.getMessage()
@@ -129,7 +151,7 @@ def test_memory_route_names_pool_timeout(saturated_app, caplog, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_metrics_memory_and_queue_samplers_name_pool_timeout(
-    tmp_path, caplog, monkeypatch,
+    saturated_client, tmp_path, caplog, monkeypatch,
 ):
     monkeypatch.setattr(_SAMPLER_BUDGET, _FAST_BUDGET_SECONDS)
     monkeypatch.setattr('dashboard.data.metrics.find_running_orchestrators', lambda: [])
@@ -142,18 +164,15 @@ async def test_metrics_memory_and_queue_samplers_name_pool_timeout(
     monkeypatch.setattr('dashboard.data.metrics.get_curator_state', _gate_unread)
     config = DashboardConfig(project_root=tmp_path, fused_memory_urls=[_SATURATED_URL])
 
-    memory_data.reset_sessions()
     conn = await aiosqlite.connect(':memory:')
     try:
         await conn.executescript(METRICS_SCHEMA)
-        async with httpx.AsyncClient(transport=_SaturatedPoolTransport()) as http_client:
-            with caplog.at_level(logging.WARNING):
-                await collect_metrics_snapshot(
-                    conn, config, http_client, recon_db=None, merge_dbs=[],
-                )
+        with caplog.at_level(logging.WARNING):
+            await collect_metrics_snapshot(
+                conn, config, saturated_client, recon_db=None, merge_dbs=[],
+            )
     finally:
         await conn.close()
-        memory_data.reset_sessions()
 
     fanout = _warnings(caplog, _FANOUT_LOGGER)
     for tool in ('get_status', 'get_queue_stats'):
@@ -171,20 +190,15 @@ async def test_metrics_memory_and_queue_samplers_name_pool_timeout(
 
 
 @pytest.mark.asyncio
-async def test_task_runtime_probe_names_pool_timeout_in_the_dashboard_fault_domain(caplog):
-    memory_data.reset_sessions()
-    task_runtime.reset_probe_log_state()
-    try:
-        async with httpx.AsyncClient(transport=_SaturatedPoolTransport()) as client:
-            with caplog.at_level(logging.WARNING):
-                result = await task_runtime.fetch_task_runtime(
-                    client,
-                    {'saturated': f'{_SATURATED_URL}/mcp'},
-                    per_call_timeout=_FAST_BUDGET_SECONDS,
-                )
-    finally:
-        memory_data.reset_sessions()
-        task_runtime.reset_probe_log_state()
+async def test_task_runtime_probe_names_pool_timeout_in_the_dashboard_fault_domain(
+    saturated_client, fresh_task_runtime_log, caplog,
+):
+    with caplog.at_level(logging.WARNING):
+        result = await task_runtime.fetch_task_runtime(
+            saturated_client,
+            {'saturated': f'{_SATURATED_URL}/mcp'},
+            per_call_timeout=_FAST_BUDGET_SECONDS,
+        )
 
     assert result['saturated'].offline_reason == 'deadline_exceeded', (
         "a saturated local pool is the DASHBOARD's fault domain (task 3517), "
@@ -197,17 +211,12 @@ async def test_task_runtime_probe_names_pool_timeout_in_the_dashboard_fault_doma
 
 
 @pytest.mark.asyncio
-async def test_merge_halt_probe_names_pool_timeout():
-    memory_data.reset_sessions()
-    try:
-        async with httpx.AsyncClient(transport=_SaturatedPoolTransport()) as client:
-            result = await merge_halt.get_merge_halt_status(
-                client,
-                {'saturated': f'{_SATURATED_URL}/mcp'},
-                per_call_timeout=_FAST_BUDGET_SECONDS,
-            )
-    finally:
-        memory_data.reset_sessions()
+async def test_merge_halt_probe_names_pool_timeout(saturated_client):
+    result = await merge_halt.get_merge_halt_status(
+        saturated_client,
+        {'saturated': f'{_SATURATED_URL}/mcp'},
+        per_call_timeout=_FAST_BUDGET_SECONDS,
+    )
 
     entry = result['saturated']
     assert entry['offline'] is True
@@ -217,17 +226,12 @@ async def test_merge_halt_probe_names_pool_timeout():
 
 
 @pytest.mark.asyncio
-async def test_live_merge_queue_probe_names_pool_timeout():
-    memory_data.reset_sessions()
-    try:
-        async with httpx.AsyncClient(transport=_SaturatedPoolTransport()) as client:
-            result = await merge_queue.fetch_live_merge_queues(
-                client,
-                {'saturated': f'{_SATURATED_URL}/mcp'},
-                per_call_timeout=_FAST_BUDGET_SECONDS,
-            )
-    finally:
-        memory_data.reset_sessions()
+async def test_live_merge_queue_probe_names_pool_timeout(saturated_client):
+    result = await merge_queue.fetch_live_merge_queues(
+        saturated_client,
+        {'saturated': f'{_SATURATED_URL}/mcp'},
+        per_call_timeout=_FAST_BUDGET_SECONDS,
+    )
 
     live = result['saturated']
     assert live['reachable'] is False
@@ -238,18 +242,13 @@ async def test_live_merge_queue_probe_names_pool_timeout():
 
 
 @pytest.mark.asyncio
-async def test_pins_probe_names_pool_timeout(caplog):
-    memory_data.reset_sessions()
-    try:
-        async with httpx.AsyncClient(transport=_SaturatedPoolTransport()) as client:
-            with caplog.at_level(logging.DEBUG, logger=_ESCALATIONS_LOGGER):
-                result = await escalations.fetch_pins_recovery(
-                    client,
-                    {'saturated': f'{_SATURATED_URL}/mcp'},
-                    per_call_timeout=_FAST_BUDGET_SECONDS,
-                )
-    finally:
-        memory_data.reset_sessions()
+async def test_pins_probe_names_pool_timeout(saturated_client, caplog):
+    with caplog.at_level(logging.DEBUG, logger=_ESCALATIONS_LOGGER):
+        result = await escalations.fetch_pins_recovery(
+            saturated_client,
+            {'saturated': f'{_SATURATED_URL}/mcp'},
+            per_call_timeout=_FAST_BUDGET_SECONDS,
+        )
 
     assert result == {'saturated': None}, 'an unread project is UNKNOWN, never an empty map'
     # This probe's only diagnostic is its DEBUG line, so that is what is read.
@@ -261,25 +260,27 @@ async def test_pins_probe_names_pool_timeout(caplog):
 
 @pytest.mark.asyncio
 async def test_task_snapshot_reports_a_saturated_pool_as_budget_not_offline(
-    tmp_path, monkeypatch,
+    saturated_client, tmp_path, monkeypatch,
 ):
     """A saturated local pool is this process running out of budget, so the
     Tasks tab must show it degraded, never offline. Converting
     ``task_snapshot._bounded`` to ``enclosing_deadline`` would let
     ``first_success`` fold the PoolTimeout into an offline marker and flip this
     to UNREACHABLE.
+
+    The two timers are deliberately EQUAL, as in production: the fake's pool
+    wait reads the same patched ``PER_CALL_TIMEOUT`` through the per-request
+    budget. The outcome is BUDGET only because ``_bounded``'s ``wait_for`` arms
+    its deadline before the request reaches the pool. That ordering is
+    load-bearing: arming the per-request timer first, or moving the per-request
+    budget off ``PER_CALL_TIMEOUT``, would also flip this result.
     """
     monkeypatch.setattr(_SNAPSHOT_BUDGET, _FAST_BUDGET_SECONDS)
     config = DashboardConfig(project_root=tmp_path, fused_memory_urls=[_SATURATED_URL])
 
-    memory_data.reset_sessions()
-    try:
-        async with httpx.AsyncClient(transport=_SaturatedPoolTransport()) as client:
-            snapshot = await task_snapshot.acquire_snapshot(
-                client, config, tmp_path, now=datetime.now(UTC),
-            )
-    finally:
-        memory_data.reset_sessions()
+    snapshot = await task_snapshot.acquire_snapshot(
+        saturated_client, config, tmp_path, now=datetime.now(UTC),
+    )
 
     assert snapshot.failure is task_snapshot.SnapshotFailure.BUDGET, (
         f'a saturated pool must read as BUDGET (degraded); got {snapshot.failure!r}'
