@@ -901,3 +901,85 @@ test('tab_tasks.jsx::TasksTab stores a project grouped by PRD, and removes the k
   assert.ok(groupingButton(container, 'list').classList.contains('on'), 'the project did not return to the flat list');
   assert.ok(!storedKeys(window).includes('df.tasksGroupByPrd'), 'the grouping is back at its default, yet its key is still stored');
 });
+
+// ── Decision 9: a count axis's maximum (spark_path.js::axisMax) ──
+// A chart marked `countAxis` labels its gridlines and draws its data against
+// axisMax's snapped maximum; any other chart keeps its exact data maximum, and
+// formatY only presents the ticks it is handed.
+
+const DATA_MAX = 7;
+
+const COUNT_AXIS_CHARTS = [
+  {
+    name: 'LineChart',
+    props: { series: [{ values: [0, DATA_MAX] }], labels: ['a', 'b'] },
+  },
+  {
+    name: 'StackedAreaChart',
+    props: { stacks: [{ key: 'a', color: 'red', values: [3, DATA_MAX] }], labels: ['a', 'b'] },
+  },
+];
+
+function yTickLabels(container) {
+  return [...container.querySelectorAll('svg text[text-anchor="end"]')].map(text => text.textContent);
+}
+
+function gridlineYs(container) {
+  return [...container.querySelectorAll('svg line')].map(line => Number(line.getAttribute('y1')));
+}
+
+function peakY(container) {
+  const ys = [...container.querySelectorAll('svg path')].flatMap(path =>
+    [...path.getAttribute('d').matchAll(/[ML]\s*[-\d.e]+,([-\d.e]+)/g)].map(match => Number(match[1])),
+  );
+  return Math.min(...ys);
+}
+
+function renderAxis(harness, chart, props) {
+  const { container } = harness.mount(harness.window.DF_CHARTS[chart.name], { ...chart.props, ...props });
+  const labels = yTickLabels(container);
+  const gridYs = gridlineYs(container);
+  return {
+    labels,
+    ticks: labels.length - 1,
+    floor: Math.max(...gridYs),
+    top: Math.min(...gridYs),
+    peak: peakY(container),
+  };
+}
+
+function tickValues(max, ticks) {
+  return Array.from({ length: ticks + 1 }, (_, i) => (max * i) / ticks);
+}
+
+for (const chart of COUNT_AXIS_CHARTS) {
+  test(`charts.jsx::${chart.name} with countAxis labels its gridlines to axisMax's snapped maximum`, t => {
+    const harness = openWindow(t);
+    const axis = renderAxis(harness, chart, { countAxis: true });
+    const max = harness.window.DF_SPARK_PATH.axisMax(DATA_MAX, axis.ticks, true);
+    assert.notEqual(max, DATA_MAX, 'the fixture does not make the snap visible');
+    assert.deepEqual(axis.labels, tickValues(max, axis.ticks).map(String));
+  });
+
+  test(`charts.jsx::${chart.name} with countAxis draws its data on the same snapped scale as its gridlines`, t => {
+    const harness = openWindow(t);
+    const axis = renderAxis(harness, chart, { countAxis: true });
+    const max = harness.window.DF_SPARK_PATH.axisMax(DATA_MAX, axis.ticks, true);
+    assert.equal((axis.floor - axis.peak) / (axis.floor - axis.top), DATA_MAX / max);
+  });
+
+  test(`charts.jsx::${chart.name} without countAxis keeps its exact data maximum`, t => {
+    const harness = openWindow(t);
+    const axis = renderAxis(harness, chart, { formatY: v => String(v) });
+    const max = harness.window.DF_SPARK_PATH.axisMax(DATA_MAX, axis.ticks, false);
+    assert.deepEqual(axis.labels, tickValues(max, axis.ticks).map(String));
+    assert.equal(axis.peak, axis.top, 'the data maximum does not reach the top gridline');
+  });
+
+  test(`charts.jsx::${chart.name} hands a caller's formatY the snapped ticks on a count axis`, t => {
+    const harness = openWindow(t);
+    const axis = renderAxis(harness, chart, { countAxis: true, formatY: v => `${v} ops` });
+    const max = harness.window.DF_SPARK_PATH.axisMax(DATA_MAX, axis.ticks, true);
+    assert.deepEqual(axis.labels, tickValues(max, axis.ticks).map(v => `${v} ops`));
+  });
+}
