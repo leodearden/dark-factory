@@ -72,6 +72,45 @@ above still describe the ported baseline, not the current file:
   `lib_lane_state.sh`, with `lib_live_refs.sh` deliberately PRESENT in the
   fixture so A9's guard cannot account for the result.
 
+**Task 7862** added two more blocks to `test_warm_lane_gc.sh`. They are the
+test half of
+[`orchestrator/scripts/warm-lane/README.md`](../../scripts/warm-lane/README.md)
+"Delta 13", ported from reify `tests/infra/test_warm_lane_gc.sh` at reify
+`e8ae8f9246` (2026-10-17), a later revision than the anchor above:
+
+- **Block S-discard** (43 asserts). reify's S1-S4 are renamed S-discard1-4,
+  because this file's Block S is the record gate. It adds two
+  dark-factory-native pieces with no reify counterpart:
+  - S-discard1's full-line summary assert, which pins that `reset_cold` is
+    appended after `downgraded_assigned`;
+  - S-discard5's three seed-presence-guard arms: a missing seed, a
+    non-executable seed, and `--mount` with no `--seed-script` and no sibling.
+
+  S-discard3's 8 asserts are skipped under uid 0.
+- **Block T** (21 asserts). reify's T1-T4 (the per-lane base-generation pin).
+
+Test-side divergences from that reify revision:
+
+- T2-setup's `holder_wait_for_marker` becomes this file's
+  `_wait_for_reader_lock "$T2_READY" 30`.
+- The reaper's `holder_wait_until_waiter_queued` becomes a local
+  `_wait_until_waiter_queued <slot> 120`. It has reify's `/proc/locks` body in
+  `_wait_for_reader_lock`'s tick shape. reify's `slot_holder_handshake_lib.sh`,
+  and the `load_tolerance_lib.sh` it needs, are not vendored. The deadline is
+  longer than reify's because dark-factory's Pass 1 runs the lane-record read
+  and the `live_ref_present` walk before the reseed.
+- `make_gc_fixture` is imported from that revision. So are the four seed-stub
+  emitters (`_post_clone_abort_seed_stub_body`, `_empty_refusal_seed_stub_body`,
+  `_discard_fail_seed_stub_body`, `_gen_probe_seed_stub_body`) and
+  `_restore_discard_fail_lane`. The older blocks still build their fixtures
+  inline, as at the anchor.
+- Comments that cite reify-only files now say they are reify's.
+
+T2's barrier needs `/tmp` on a filesystem whose `stat` `st_dev` matches the key
+`/proc/locks` prints. That holds on ext4, xfs and tmpfs; this host's `/tmp` is
+ext4. On btrfs or overlayfs the barrier fails CLOSED (T2a red), never as a
+false pass.
+
 Six ported suites carry further dark-factory-native asserts:
 
 - **Task 5940:** `test_provision_warm_lane_fs.sh` N4, `test_warm_lane_disk_guard.sh` A10,
