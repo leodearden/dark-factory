@@ -184,6 +184,48 @@ tasks:
       kind: manual
       reason: release discipline is asserted by executed boundary rows 13, 14 and
         21
+- label: γ2
+  task_id: null
+  title: Re-offer the laptop to a refused verify while it queues locally
+  note: Amendment of 2026-10-31 (PRD decision 14). The config key is δ2's.
+  capabilities:
+  - name: reoffer-interval-on-policy
+    binding: capability→producer — γ2 adds TaskVerifyPolicy.reoffer_interval_secs
+      to task_verify_dispatch.py, whose TaskVerifyPolicy is present on main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: reoffer_interval_secs
+      paths:
+      - orchestrator/src/orchestrator/task_verify_dispatch.py
+      expect: present
+  - name: plan-keyword-on-scoped-verify
+    binding: capability→producer — γ2 adds the admission_plan keyword to
+      verify.py::run_scoped_verification, whose plan stamp is present on main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: admission_plan[:] .*AdmissionPlan \| None'? = None
+      paths:
+      - orchestrator/src/orchestrator/verify.py
+      expect: present
+  - name: granted-plan-read
+    binding: capability→producer — γ2 adds PlanLatch to verify_admission_gate.py and
+      marks it from the returned grant; rows 26, 27, 36, 37 and 43 exercise it.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class PlanLatch[(:]
+      paths:
+      - orchestrator/src/orchestrator/verify_admission_gate.py
+      expect: present
+  - name: safe-withdrawal
+    binding: AdmissionGate._leave, _recorded_admission_plan and _reap are present on
+      main, a probe confirmed the cancel, and rows 26, 31 and 34 exercise it.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behaviour pinned by boundary rows 26, 31 and 34
 - label: δ1
   task_id: 6670
   title: Harness-owned HostAllocator + HostPool, injected into the merge worker (HUB
@@ -284,9 +326,19 @@ tasks:
     delivered_check:
       kind: manual
       reason: payload population is asserted by boundary row 17, not greppable
+  - name: reoffer-interval-config-key
+    binding: capability→producer — δ2 adds verify_task_remote_reoffer_interval_secs
+      to config.py and maps it to γ2's TaskVerifyPolicy field.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: verify_task_remote_reoffer_interval_secs
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
 - label: ι
   task_id: 6672
-  title: Integration gate — all 25 boundary rows against the real Harness, worker,
+  title: Integration gate — all 30 end-to-end boundary rows (the other 14 are pinned at γ2) against the real Harness, worker,
     workflow and verify-task CLI
   capabilities:
   - name: integration-module
@@ -303,7 +355,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: manual
-      reason: the task IS the check suite; its signal is the 25 executed rows
+      reason: the task IS the check suite; its signal is the 30 executed rows
 - label: ε
   task_id: 6673
   title: DF rollout, parity window and the post-6580 baseline (operator gate)

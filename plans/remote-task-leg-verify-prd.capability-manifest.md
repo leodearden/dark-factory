@@ -73,6 +73,15 @@ slot. Up to `max_concurrent_tasks` workflows share one dispatcher (heuristic 7).
 | dispatcher substrate | `verify_plan.py::derive_verify_plan`, `GitOps.has_uncommitted_work`, `RemoteRunner.ensure_gate`, `verify_categories.py` `INFRA_TRANSIENT_CATEGORIES` (all present) | PASS | manual |
 | lease released on every exit | built by γ; rows 13, 14, 21 | PASS | manual |
 
+### γ2 — re-offer while queued (amendment 2026-10-31)
+
+| Capability | Evidence | Verdict | Check |
+|---|---|---|---|
+| re-offer interval on the policy | producer γ2 over `task_verify_dispatch.py::TaskVerifyPolicy` (present) | PASS | grep `reoffer_interval_secs` |
+| plan passed through the local call | producer γ2 over `verify.py::run_scoped_verification`'s plan stamp and `verify_admission_record.py::begin_plan` (present) | PASS | grep `admission_plan: .*AdmissionPlan \| None'? = None` |
+| safe withdrawal of a queued plan | `verify_admission_gate.py::AdmissionGate._leave`, `verify.py::_recorded_admission_plan`, `task_verify_dispatch.py::_reap` (present); probe on the base; rows 26, 31, 34 | PASS | manual |
+| granted-plan read | producer γ2 (`PlanLatch`); rows 26, 27, 36, 37, 43 | PASS | grep `class PlanLatch` |
+
 ### δ1 — harness-owned allocator (hub carry, stage 1)
 
 | Capability | Evidence | Verdict | Check |
@@ -90,13 +99,14 @@ slot. Up to `max_concurrent_tasks` workflows share one dispatcher (heuristic 7).
 | harness passes the dispatcher | producer δ2 at the `harness.py` `build_workflow` call | PASS | grep `task_verify=self\.` in `harness.py` |
 | one task-role verify site | producer task 6580 upstream (edge δ2 → 6580) | PASS | manual |
 | `workflow_verify.runner` populated | field population from γ's keyed decision; row 17 | PASS | manual |
+| re-offer interval config key | producer δ2 in `config.py`; `TaskVerifyPolicy` field from γ2 | PASS | grep `verify_task_remote_reoffer_interval_secs` |
 
 ### ι — integration gate
 
 | Capability | Evidence | Verdict | Check |
 |---|---|---|---|
 | integration module | producer ι; α β γ δ1 δ2 in its closure | PASS | path `orchestrator/tests/test_task_verify_integration.py` |
-| 25 rows green end to end | all producers upstream | PASS | manual |
+| 30 rows green end to end (1–26, 28, 30, 31, 33); 27, 29, 32, 34–44 pinned at γ2 | all producers upstream, γ2 included | PASS | manual |
 
 ### ε — rollout gate (operator)
 
