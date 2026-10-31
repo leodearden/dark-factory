@@ -234,6 +234,9 @@ class TaskBackendProtocol(Protocol):
           preserved; every supplied key overwrites wholesale.
         * ``metadata_mode='additive'`` — recursive list union+dedup,
           scalar/type-collision OLD-wins.  Required by list-append callers.
+          A merge nested too deeply to compute must be refused by raising
+          (e.g. ``MetadataTooDeepError``), never resolved by a fallback that
+          drops stored keys (task 6248).
         * ``metadata_mode='replace'`` — whole-blob overwrite.  Bypasses the
           corrupt-blob guard; the sanctioned repair path.  It is the ONLY mode
           that can retire a key ('merge'/'additive' have no deletion

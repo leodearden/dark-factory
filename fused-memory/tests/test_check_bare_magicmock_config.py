@@ -1977,7 +1977,6 @@ class TestExemptionSeparatorVariants:
 # and is deliberately ABSENT.
 _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_merge_queue_concurrent_verify.py',
-    'orchestrator/tests/test_coalesce_integration_gate.py',
     'orchestrator/tests/test_merge_queue_request_liveness.py',
     'orchestrator/tests/test_offline_lane.py',
     'orchestrator/tests/test_live_merge_worker.py',
@@ -1987,7 +1986,6 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py',
     'orchestrator/tests/test_harness.py',
     'orchestrator/tests/test_invoke.py',
-    'orchestrator/tests/test_merge_queue_coalesce.py',
     'orchestrator/tests/test_merge_queue_deep_integration_gate.py',
     'orchestrator/tests/test_merge_queue_invariant_integration_gate.py',
     'orchestrator/tests/test_merge_skew_tripwire.py',

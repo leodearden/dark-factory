@@ -399,10 +399,6 @@ NEGATED_TERMINAL_RE: re.Pattern[str] = re.compile(
 #   (iii) A missing-space sentence boundary ('done.Task') no longer splits;
 #         rare in LLM prose, and the direction is the same over-firing as (i).
 WIDE_CLAUSE_BOUNDARY_RE: re.Pattern[str] = re.compile(r'\.(?!\w)|[;\n!?]')
-# The old private spelling, kept only for scripts/audit_duplicate_memories.py,
-# which task 4853 could not edit; tkt_0RVBV2PMGFWETFNDCRYB4TRFW1 migrates it
-# and deletes this alias. The allowlist test scans both names.
-_CLAUSE_SPLIT_RE = WIDE_CLAUSE_BOUNDARY_RE
 
 # The ORIGINAL, pre-task-3403 clause alphabet: the fail-safe-STRICT variant,
 # for the consumers that must NOT track WIDE_CLAUSE_BOUNDARY_RE's widening.
