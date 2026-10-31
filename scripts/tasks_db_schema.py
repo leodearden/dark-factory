@@ -208,6 +208,21 @@ def introspect(conn: sqlite3.Connection) -> tuple[Table, ...]:
     return tuple(Table(name=name, columns=_table_columns(conn, name)) for name in names)
 
 
+def introspect_ddl(ddl: str) -> tuple[Table, ...]:
+    """What :func:`introspect` reports for a fresh store built from *ddl*.
+
+    The store lives in memory and is discarded. Callers hand the DDL in as text
+    (``shared/src/shared/task_store_schema.py::TASK_STORE_DDL`` for the fixture
+    subset guards) because this script never imports ``shared``.
+    """
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(ddl)
+        return introspect(conn)
+    finally:
+        conn.close()
+
+
 def columns_outside(
     candidate: Sequence[Table], reference: Sequence[Table]
 ) -> tuple[tuple[str, Column], ...]:

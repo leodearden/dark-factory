@@ -43,6 +43,7 @@ from tasks_db_schema import (
     MainCheckoutUnresolved,
     columns_outside,
     introspect,
+    introspect_ddl,
     main,
     resolve_live_db_path,
 )
@@ -375,20 +376,13 @@ def test_a_column_with_no_declared_type_is_reported_as_unconstrained(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# introspect_ddl(ddl) -> tuple[Table, ...]
 # columns_outside(candidate, reference) -> ((table, Column), ...)
 #
-# Arbitrary inline DDLs only: the property is "every candidate column the
-# reference does not declare identically is reported", whatever the schema.
+# Arbitrary inline DDLs only: the properties are "a DDL is reported exactly as
+# a store built from it is" and "every candidate column the reference does not
+# declare identically is reported", whatever the schema.
 # ---------------------------------------------------------------------------
-
-def _introspected(ddl: str):
-    conn = sqlite3.connect(":memory:")
-    try:
-        conn.executescript(ddl)
-        return introspect(conn)
-    finally:
-        conn.close()
-
 
 def _pair_ddl(note: str = "note TEXT", primary_key: str = "left_id, right_id") -> str:
     return f"""
@@ -412,16 +406,35 @@ def _column(tables, table_name: str, column_name: str):
     return column
 
 
+def test_introspect_ddl_reports_what_introspect_reports_for_a_store_built_from_that_ddl(
+    tmp_path,
+):
+    ddl = _pair_ddl() + "CREATE TABLE loose (anything);"
+    built = tmp_path / "built.db"
+    builder = sqlite3.connect(built)
+    try:
+        builder.executescript(ddl)
+    finally:
+        builder.close()
+    conn = connect_ro(built)
+    try:
+        expected = introspect(conn)
+    finally:
+        conn.close()
+
+    assert introspect_ddl(ddl) == expected
+
+
 def test_columns_outside_an_identical_schema_is_empty():
-    assert columns_outside(_introspected(_pair_ddl()), _introspected(_pair_ddl())) == ()
+    assert columns_outside(introspect_ddl(_pair_ddl()), introspect_ddl(_pair_ddl())) == ()
 
 
 def test_columns_outside_a_superset_schema_is_empty():
-    reference = _introspected(
+    reference = introspect_ddl(
         _pair_ddl(note="note TEXT, added INTEGER") + "CREATE TABLE reference_only (x TEXT);"
     )
 
-    assert columns_outside(_introspected(_pair_ddl()), reference) == ()
+    assert columns_outside(introspect_ddl(_pair_ddl()), reference) == ()
 
 
 @pytest.mark.parametrize(
@@ -437,15 +450,15 @@ def test_columns_outside_a_superset_schema_is_empty():
 def test_columns_outside_reports_the_candidate_column_the_reference_declares_differently(
     candidate_note, reference_note
 ):
-    candidate = _introspected(_pair_ddl(note=candidate_note))
-    reference = _introspected(_pair_ddl(note=reference_note))
+    candidate = introspect_ddl(_pair_ddl(note=candidate_note))
+    reference = introspect_ddl(_pair_ddl(note=reference_note))
 
     assert columns_outside(candidate, reference) == (("pair", _column(candidate, "pair", "note")),)
 
 
 def test_columns_outside_reports_columns_at_a_different_primary_key_position():
-    candidate = _introspected(_pair_ddl())
-    reference = _introspected(_pair_ddl(primary_key="right_id, left_id"))
+    candidate = introspect_ddl(_pair_ddl())
+    reference = introspect_ddl(_pair_ddl(primary_key="right_id, left_id"))
 
     assert columns_outside(candidate, reference) == (
         ("pair", _column(candidate, "pair", "left_id")),
@@ -454,11 +467,11 @@ def test_columns_outside_reports_columns_at_a_different_primary_key_position():
 
 
 def test_columns_outside_reports_every_column_of_a_table_the_reference_lacks_in_declaration_order():
-    candidate = _introspected(
+    candidate = introspect_ddl(
         _pair_ddl() + "CREATE TABLE orphan (zeta TEXT, alpha INTEGER, mid REAL);"
     )
 
-    outside = columns_outside(candidate, _introspected(_pair_ddl()))
+    outside = columns_outside(candidate, introspect_ddl(_pair_ddl()))
 
     assert [(table, column.name) for table, column in outside] == [
         ("orphan", "zeta"),

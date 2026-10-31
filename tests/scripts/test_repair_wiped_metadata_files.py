@@ -103,7 +103,7 @@ from repair_wiped_metadata_files import (
     writable_plan_files,
 )
 from shared.task_store_schema import TASK_STORE_DDL
-from tasks_db_schema import columns_outside, introspect
+from tasks_db_schema import columns_outside, introspect, introspect_ddl
 
 # ---------------------------------------------------------------------------
 # Synthetic candidate builder.
@@ -1176,14 +1176,8 @@ def _make_tasks_db(dir_path: Path, rows: list[dict]) -> Path:
 
 
 def test_make_tasks_db_declares_only_columns_production_declares(tmp_path):
-    fixture_conn = sqlite3.connect(_make_tasks_db(tmp_path, []))
-    production_conn = sqlite3.connect(":memory:")
-    try:
-        production_conn.executescript(TASK_STORE_DDL)
-        assert columns_outside(introspect(fixture_conn), introspect(production_conn)) == ()
-    finally:
-        fixture_conn.close()
-        production_conn.close()
+    with contextlib.closing(sqlite3.connect(_make_tasks_db(tmp_path, []))) as fixture_conn:
+        assert columns_outside(introspect(fixture_conn), introspect_ddl(TASK_STORE_DDL)) == ()
 
 
 def _make_runs_db(dir_path: Path, events: list[dict]) -> Path:
