@@ -48,6 +48,8 @@ Rules the engine and its pure rules keep beyond the PRD's text:
 - R14 a command record that has observed no pass takes its last pass and last green
   head from the command's run records before the pass, so a cutover or a lost store
   keeps a green pass on record.
+- R15 a command whose tick raises is logged and skipped: it adds nothing to the tick's
+  result, and the other commands' ticks go on.
 """
 
 from __future__ import annotations
@@ -214,6 +216,34 @@ class _OpenLaneTaskLookup:
         if self._answer is None:
             self._answer = await self._read()
         return self._answer
+
+
+@dataclass(frozen=True)
+class _FailedTicks:
+    since: datetime
+    count: int
+    escalation_id: str | None = None
+
+
+class _TickFailures:
+    """R15's run of consecutive failed ticks per command, kept in memory for the engine's life."""
+
+    def __init__(self, queue: EscalationQueue | None, now: Callable[[], datetime]) -> None:
+        self._queue = queue
+        self._now = now
+        self._runs: dict[str, _FailedTicks] = {}
+
+    async def failed(self, command: str, exc: Exception) -> None:
+        run = self._runs.get(command)
+        run = _FailedTicks(since=self._now(), count=1) if run is None else replace(run, count=run.count + 1)
+        self._runs[command] = run
+        logger.error(
+            'offline-lane: %s: tick failed (%d in a row); the other commands go on: %s: %s',
+            command, run.count, type(exc).__name__, exc, exc_info=exc if run.count == 1 else None,
+        )
+
+    async def cleared(self, command: str) -> None:
+        self._runs.pop(command, None)
 
 
 @dataclass(frozen=True)
@@ -457,6 +487,7 @@ class LaneEngine:
         self._read_psi = read_psi
         self._store = EpisodeStore(config.project_root, clock=self._now)
         self._records = RunRecordStore(config.project_root, clock=self._now)
+        self._tick_failures = _TickFailures(escalation_queue, self._now)
 
     async def observe(self, observation: PassObservation) -> PassEffect:
         if isinstance(observation.outcome, Outage):
@@ -641,20 +672,32 @@ class LaneEngine:
         filed: list[str] = []
         open_tasks = _OpenLaneTaskLookup(self._open_lane_tasks)
         for command in await asyncio.to_thread(self._store.commands):
-            record = await asyncio.to_thread(self._store.load, command)
-            record, tasks = await self._retry_due_filings(record, open_tasks)
+            try:
+                due_now, tasks = await self._command_ticked(command, head, policy, open_tasks)
+            except Exception as exc:
+                await self._tick_failures.failed(command, exc)
+                continue
+            await self._tick_failures.cleared(command)
             filed.extend(tasks)
-            saved = record
-            record = await self._maintained_stuck_record(record, policy)
-            record, probe_due = await self._probe_loop(record, self._lane_command(command), policy)
-            rechecked = None if probe_due else recheck_due(record, head, policy, self._now())
-            if rechecked is not None:
-                record = rechecked
-            if probe_due or rechecked is not None:
+            if due_now:
                 due.append(command)
-            if record != saved:
-                await self._save(record)
         return TickResult(tuple(due), tuple(filed))
+
+    async def _command_ticked(
+        self, command: str, head: str, policy: LanePolicy, open_tasks: _OpenLaneTaskLookup,
+    ) -> tuple[bool, list[str]]:
+        """One command's tick: whether it is due a pass, and the tasks its due filings filed."""
+        record = await asyncio.to_thread(self._store.load, command)
+        record, tasks = await self._retry_due_filings(record, open_tasks)
+        saved = record
+        record = await self._maintained_stuck_record(record, policy)
+        record, probe_due = await self._probe_loop(record, self._lane_command(command), policy)
+        rechecked = None if probe_due else recheck_due(record, head, policy, self._now())
+        if rechecked is not None:
+            record = rechecked
+        if record != saved:
+            await self._save(record)
+        return probe_due or rechecked is not None, tasks
 
     def _lane_command(self, command: str) -> LaneCommand | None:
         """*command*'s configuration as of now, read on every tick so a reload takes effect."""
