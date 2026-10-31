@@ -291,6 +291,22 @@ def test_a_cap_with_a_leading_zero_is_refused_before_anything_lands(tmp_path, de
     _assert_left_nothing_behind(repo, deploy_env)
 
 
+@pytest.mark.parametrize("bad_port", ["0", "65536", "99999"])
+def test_an_unconnectable_port_is_refused_before_the_landing(tmp_path, deploy_env, bad_port):
+    """A port outside 1-65535 can never deliver the landing or the reload, so
+    it is refused before anything is landed."""
+    config = _seeded(tmp_path)
+    repo = config.parent
+    before = head(repo)
+
+    proc = _run(types.SimpleNamespace(port=bad_port), config, "6", env=deploy_env)
+
+    assert failure_tag(proc) == "invalid_port"
+    assert head(repo) == before
+    assert config.read_text() == SEEDS["block_present"]
+    _assert_left_nothing_behind(repo, deploy_env)
+
+
 def test_a_config_main_does_not_track_is_refused_before_anything_lands(tmp_path, deploy_env):
     """A config file main does not carry has no committed copy to edit, so
     the run is refused with scripts/lib/deploy_main_copy.sh's own tag before
