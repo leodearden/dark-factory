@@ -712,8 +712,18 @@ carries the brief. Check "Always ask — keyed on record content" below first: i
     `main`, the owner's other checks still pass, and the new form still states what the check meant.
     A capability missing from main is case 2 and still goes to Leo (Leo, 2026-10-30,
     solar_challenge esc-224-3 and its six twins: "Always fix this sort of check breakage").
+14. Curating a memory-only follow-up yourself when it was routed to the TDD pipeline (its architect
+    reports it unactionable for want of `update_memory` or `consolidate_memories`), then marking it
+    done `found_on_main` at main's tip, with a note naming the run and the memory ids. Verify
+    yourself first: the trigger the task waits on is on main, and every fact the new text states
+    holds there (read the code it cites, at the lines it cites). Amend in place, or mark records
+    `x_superseded_by` a canonical, and read each one back. Use a `curator-` agent id and a named
+    run id. Never delete a memory: deletion stays on the always-ask list below. A trigger not yet
+    on main means the task is a gate: add the dependency on the code task and `resume`, so it fires
+    again later (Leo, 2026-10-31, solar_challenge_platform esc-1538-2; precedents 1490, 1503, 1498,
+    1545 and 1567).
 
-Lines 11 and 12 are exceptions to the scope-change class below. Cancelling a task WITH dependents
+Lines 11, 12 and 14 are exceptions to the scope-change class below. Cancelling a task WITH dependents
 still goes to Leo.
 
 #### Always ask — keyed on record content
