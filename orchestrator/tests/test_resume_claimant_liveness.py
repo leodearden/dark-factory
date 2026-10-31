@@ -42,6 +42,7 @@ from _orch_helpers import (
 from _orch_helpers import (
     claimant_row as _row,
 )
+from escalation.grant_delivery import GrantDelivery
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -1553,4 +1554,48 @@ class TestGrantedFilesFoldOnRepend:
         assert _files_updates(harness) == []
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             '3438', _resume_target(esc)
+        )
+
+
+class TestGrantedFilesDeliveryProbe:
+    """Where a grant would land, asked synchronously (task 5650).
+
+    ``Harness._locate_plan_artifacts`` is the one new-then-old plan resolution
+    the fold and the public probe share; ``Harness.granted_files_delivery_
+    blocker`` is what ``escalation/server.py::resolve_issue`` consults to
+    report ``NO_PLAN_TO_WIDEN`` at the API instead of only in a log.
+    """
+
+    def test_a_w11_sibling_plan_is_located_and_unblocked(self, harness: Harness):
+        _seed_plan(harness, files=['pkg/a.py'])
+
+        arts = harness._locate_plan_artifacts('3438')
+
+        assert arts is not None
+        assert arts.read_plan()['files'] == ['pkg/a.py']
+        assert harness.granted_files_delivery_blocker('3438') is None
+
+    def test_a_legacy_plan_is_located_and_unblocked(self, harness: Harness):
+        _seed_plan(harness, files=['pkg/a.py'], legacy=True)
+
+        arts = harness._locate_plan_artifacts('3438')
+
+        assert arts is not None
+        assert arts.read_plan()['files'] == ['pkg/a.py']
+        assert harness.granted_files_delivery_blocker('3438') is None
+
+    def test_the_w11_sibling_wins_over_the_legacy_plan(self, harness: Harness):
+        _seed_plan(harness, files=['pkg/sibling.py'])
+        _seed_plan(harness, files=['pkg/legacy.py'], legacy=True)
+
+        arts = harness._locate_plan_artifacts('3438')
+
+        assert arts is not None
+        assert arts.read_plan()['files'] == ['pkg/sibling.py']
+
+    def test_no_plan_anywhere_is_no_plan_to_widen(self, harness: Harness):
+        assert harness._locate_plan_artifacts('3438') is None
+        assert (
+            harness.granted_files_delivery_blocker('3438')
+            is GrantDelivery.NO_PLAN_TO_WIDEN
         )
