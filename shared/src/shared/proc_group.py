@@ -502,11 +502,13 @@ def open_leader_pidfd(proc: asyncio.subprocess.Process) -> Iterator[int | None]:
     """Hold a pidfd naming *proc*, this process's unreaped child, for the block.
 
     Yields None instead when *proc* is already reaped, when its pid now names
-    a process that is not this process's child, or when the kernel lacks
-    pidfds; a leader reaped before the caller regains control from its spawn
-    therefore yields None.  The pidfd is closed when the block exits.
+    a process that is not this process's child, when *proc* does not lead its
+    own process group (a group send through its pidfd would reach nobody), or
+    when the kernel lacks pidfds; a leader reaped before the caller regains
+    control from its spawn therefore yields None.  The pidfd is closed when
+    the block exits.
     """
-    fd = _child_pidfd(proc)
+    fd = _child_leader_pidfd(proc)
     try:
         yield fd
     finally:
@@ -514,23 +516,36 @@ def open_leader_pidfd(proc: asyncio.subprocess.Process) -> Iterator[int | None]:
             os.close(fd)
 
 
-def _child_pidfd(proc: asyncio.subprocess.Process) -> int | None:
-    """A pidfd for *proc* once ``waitid(WNOWAIT)`` confirms it is our unreaped child."""
+def _child_leader_pidfd(proc: asyncio.subprocess.Process) -> int | None:
+    """A pidfd for *proc* once confirmed our unreaped child and the leader of its own group."""
     if proc.returncode is not None:
         return None
     try:
         fd = pidfd_open(proc.pid)
     except OSError:
         return None
-    try:
-        os.waitid(P_PIDFD, fd, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-    except OSError as exc:
-        logger.debug(
-            'open_leader_pidfd: no pidfd for pid %s (%s: %s)', proc.pid, type(exc).__name__, exc
-        )
+    refusal = _leader_pidfd_refusal(fd, proc.pid)
+    if refusal is not None:
+        logger.debug('open_leader_pidfd: no pidfd for pid %s (%s)', proc.pid, refusal)
         os.close(fd)
         return None
     return fd
+
+
+def _leader_pidfd_refusal(fd: int, pid: int) -> str | None:
+    """Why pidfd *fd*, opened on *pid*, cannot stand for a group *pid* leads; None if it can.
+
+    ``waitid(WNOWAIT)`` confirms the child unreaped only after ``getpgid`` has
+    read it, so *pid* still named the pidfd's process when its group was read.
+    """
+    try:
+        pgid = os.getpgid(pid)
+        os.waitid(P_PIDFD, fd, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except OSError as exc:
+        return f'{type(exc).__name__}: {exc}'
+    if pgid != pid:
+        return f'it is a member of group {pgid}, not the leader of its own'
+    return None
 
 
 def _sigkill_group_through_pidfd(leader_pidfd: int, pgid: int) -> SigkillDispatch | None:
