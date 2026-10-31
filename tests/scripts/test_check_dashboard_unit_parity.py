@@ -1631,6 +1631,156 @@ def test_unchecked_directive_that_is_also_covered_is_rejected():
     assert "contradictory waiver" in message, message
 
 
+# The directive-level guard above stops at the directive: ExecStart is one
+# directive, yet it carries several independently meaningful options. The guard
+# below is the same inversion one level down, over the command's LONG options.
+
+
+def test_exec_start_option_names_lists_every_long_option():
+    """Every `--name` on the command, by bare name; nothing else.
+
+    The `=` spelling yields the bare name; `-m` (a short option) and the
+    positionals are not long options; prose in the comment block is not the
+    command.
+    """
+    mod = _load_checker()
+    service = systemd_unit_parity.parse_unit_directives(
+        _exec_unit(
+            "/usr/bin/uv",
+            "/opt/df",
+            "--timeout-graceful-shutdown=8 \\\n  --timeout-keep-alive 5",
+            run_options=_NO_SYNC_RUN,
+        )
+    )["Service"]
+
+    assert mod.exec_start_option_names(service) == frozenset(
+        {"no-sync", "project", "host", "port", "timeout-graceful-shutdown", "timeout-keep-alive"}
+    )
+    assert mod.exec_start_option_names({}) == frozenset()
+
+    prose_only = systemd_unit_parity.parse_unit_directives(
+        _exec_unit("/usr/bin/uv", "/opt/df", "--log-level info")
+    )["Service"]
+    assert mod.exec_start_option_names(prose_only) == frozenset(
+        {"project", "host", "port", "log-level"}
+    ), "options named only in the comment block must not be listed"
+
+
+def _uncompared_exec_start_options(mod: types.ModuleType, spec, service) -> list[str]:
+    """Every long option on *service*'s ExecStart that *spec* neither compares nor waives.
+
+    Takes the spec and the parsed section, as _unregistered_directives does, so
+    the real registry and the throwaway fixture proving the guard fires share
+    one code path.
+    """
+    waived = {name for name, _reason in spec.unchecked_exec_start_options}
+    return sorted(
+        mod.exec_start_option_names(service) - spec.covered_exec_start_options() - waived
+    )
+
+
+def test_every_committed_exec_start_option_is_compared_or_explicitly_unchecked():
+    """COMPLETENESS GUARD, ExecStart option edition: every long option was considered.
+
+    `uv run --no-sync` sat on the committed command uncompared, so an
+    installed copy without it reported parity. The registry staleness guards
+    could not see that: they prove each registered option is on the command,
+    never that each option on the command is registered.
+    """
+    mod = _load_checker()
+
+    for name, spec in mod.UNITS.items():
+        uncompared = _uncompared_exec_start_options(mod, spec, _committed_service(spec))
+        assert uncompared == [], (
+            f"{name}: the committed ExecStart in {spec.repo_relpath} carries "
+            + ", ".join(f"--{option}" for option in uncompared)
+            + " but the registry neither compares nor waives it, so drift in it "
+            "would be reported as parity. Register each on exec_start_flags (it "
+            "takes an argument) or exec_start_switches (it is argument-less), or "
+            "add it to unchecked_exec_start_options with a specific reason."
+        )
+
+
+def test_exec_start_option_guard_fires_on_an_unregistered_option():
+    """The option guard's own proof, in both directions, over the real command.
+
+    The pre-6381 registry is the worked example: it compared four uvicorn
+    flags and nothing of uv's.
+    """
+    mod = _load_checker()
+    pre_6381 = dataclasses.replace(
+        mod.UNITS[_DASHBOARD_SERVICE],
+        exec_start_flags=("timeout-graceful-shutdown", "timeout-keep-alive", "host", "port"),
+        exec_start_switches=(),
+    )
+    service = _committed_service(pre_6381)
+
+    assert _uncompared_exec_start_options(mod, pre_6381, service) == ["no-sync", "project"]
+
+    waived = dataclasses.replace(
+        pre_6381,
+        unchecked_exec_start_options=(
+            ("no-sync", "fixture reason"),
+            ("project", "fixture reason"),
+        ),
+    )
+
+    assert _uncompared_exec_start_options(mod, waived, service) == []
+
+
+def test_unchecked_exec_start_options_all_carry_a_nonempty_reason():
+    """Every option waiver states a reason, as every directive waiver does."""
+    mod = _load_checker()
+
+    for name, spec in mod.UNITS.items():
+        for option, reason in spec.unchecked_exec_start_options:
+            assert reason.strip(), (
+                f"{name}: unchecked_exec_start_options waives --{option} with an "
+                "empty reason. State why it is safe not to compare it."
+            )
+
+
+def test_exec_start_option_on_both_flags_and_switches_is_rejected():
+    """An option cannot both take an argument and be argument-less.
+
+    Registered on both, one of the two readers is reading it wrongly; rejected
+    at construction rather than left to report a misleading drift.
+    """
+    mod = _load_checker()
+
+    with pytest.raises(ValueError) as excinfo:
+        mod.UnitSpec(
+            name="fixture.service",
+            repo_relpath="dashboard/fixture.service",
+            exec_start_flags=("no-sync",),
+            exec_start_switches=("no-sync",),
+        )
+
+    message = str(excinfo.value)
+    assert "fixture.service" in message, message
+    assert "--no-sync" in message, message
+    assert "exec_start_flags" in message, message
+    assert "exec_start_switches" in message, message
+
+
+def test_unchecked_exec_start_option_that_is_also_covered_is_rejected():
+    """An option both compared and waived raises, as a directive does."""
+    mod = _load_checker()
+
+    with pytest.raises(ValueError) as excinfo:
+        mod.UnitSpec(
+            name="fixture.service",
+            repo_relpath="dashboard/fixture.service",
+            exec_start_switches=("no-sync",),
+            unchecked_exec_start_options=(("no-sync", "contradictory waiver"),),
+        )
+
+    message = str(excinfo.value)
+    assert "fixture.service" in message, message
+    assert "--no-sync" in message, message
+    assert "contradictory waiver" in message, message
+
+
 # Every UnitSpec field, sorted by what compare_unit does with it. A field added
 # to UnitSpec fails the cross-check below until it is placed in one of these.
 _PROBE_DIRECTIVE_FIELDS = {
@@ -1640,7 +1790,12 @@ _PROBE_DIRECTIVE_FIELDS = {
     "environment_section": "Service",
 }
 _CONTENT_FIELDS = {"exec_start_flags", "exec_start_switches", "env_matches_directive"}
-_NON_COMPARISON_FIELDS = {"name", "repo_relpath", "unchecked_directives"}
+_NON_COMPARISON_FIELDS = {
+    "name",
+    "repo_relpath",
+    "unchecked_directives",
+    "unchecked_exec_start_options",
+}
 
 
 def test_covered_directives_is_exactly_what_compare_unit_checks():
