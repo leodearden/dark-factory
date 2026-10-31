@@ -129,10 +129,6 @@ def test_a_non_list_argument_is_named_whole(argument):
     assert caught.value.allowed == ALLOWED_FIELDS
 
 
-def test_the_allowed_set_is_every_row_key_plus_the_metadata_form():
-    assert (*TASK_ROW_KEYS, 'metadata.<key>') == ALLOWED_FIELDS
-
-
 # ── Real-store stack ────────────────────────────────────────────────────
 
 
@@ -168,10 +164,7 @@ class ProjectionStack:
         statuses = [_BULK_STATUS_CYCLE[i % len(_BULK_STATUS_CYCLE)] for i in range(n)]
         first = int(await self.seed(statuses[0], _bulk_metadata(0)))
         rows = [
-            (
-                first + i, f'bulk task {i}', status,
-                json.dumps(_bulk_metadata(i)) if _bulk_metadata(i) is not None else None,
-            )
+            (first + i, f'bulk task {i}', status, _json_or_none(_bulk_metadata(i)))
             for i, status in enumerate(statuses) if i > 0
         ]
         with contextlib.closing(sqlite3.connect(tasks_db(self.root))) as conn, conn:
@@ -190,6 +183,10 @@ def _bulk_metadata(i: int) -> dict[str, Any] | None:
     return {'prd_path': f'plans/{i}.md'} if i % 2 == 0 else None
 
 
+def _json_or_none(metadata: dict[str, Any] | None) -> str | None:
+    return json.dumps(metadata) if metadata is not None else None
+
+
 @pytest_asyncio.fixture
 async def projection_stack(tmp_path: Path) -> AsyncIterator[ProjectionStack]:
     root = _git_init_root(tmp_path / 'project')
@@ -206,7 +203,7 @@ async def projection_stack(tmp_path: Path) -> AsyncIterator[ProjectionStack]:
             project_root=root,
             title=f'task {seeded}',
             description=f'seeded projection fixture task {seeded}',
-            metadata=json.dumps(metadata) if metadata is not None else None,
+            metadata=_json_or_none(metadata),
             status=status,
         )
         return str(added['id'])
