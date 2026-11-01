@@ -392,22 +392,22 @@ def code_default_config(monkeypatch, tmp_path):
     ``merge_verify_breadth='full'``, ``merge_train_former_enabled=true``,
     ``merge_train_coalesce_enabled=true``) then bleed into any bare
     ``OrchestratorConfig()``.  Since task 7008 the code defaults carry
-    ``merge_verify_breadth='full'`` too, so breadth no longer differs between them.
+    ``merge_verify_breadth='full'`` too, so breadth no longer differs between
+    them.
 
     Tests that assert the CODE DEFAULTS (``defaults.yaml``: trains OFF) must be
     isolated from those live overrides; scoped-merge tests pin breadth to
-    ``'scoped'`` explicitly rather than rely on this hatch.  Pointing ``ORCH_CONFIG_PATH`` at a
-    guaranteed-absent file makes ``YamlSettingsSource.__call__`` skip the
-    layer-2 project file (its ``.exists()`` is False) and load ONLY the
-    package-bundled ``defaults.yaml`` -> pure code defaults.  ``project_root``
-    still resolves to ``tmp_path`` via ``ORCH_PROJECT_ROOT`` (set by the autouse
-    fixture, which runs first), so bare-config tests still never write into the
-    live tree.
+    ``'scoped'`` explicitly rather than rely on this hatch.  Pointing
+    ``ORCH_CONFIG_PATH`` at a guaranteed-absent file makes
+    ``YamlSettingsSource.__call__`` skip the layer-2 project file (its
+    ``.exists()`` is False) and load ONLY the package-bundled ``defaults.yaml``
+    -> pure code defaults.  ``project_root`` still resolves to ``tmp_path`` via
+    ``ORCH_PROJECT_ROOT`` (set by the autouse fixture, which runs first), so
+    bare-config tests still never write into the live tree.
 
     Opt-in via ``@pytest.mark.usefixtures("code_default_config")`` (or a direct
-    request) on exactly the default-asserting tests — NEVER
-    autouse, which would strip config.yaml from the ~10k tests that legitimately
-    rely on it.
+    request) on exactly the default-asserting tests — NEVER autouse, which
+    would strip config.yaml from the ~10k tests that legitimately rely on it.
     """
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(tmp_path / "no-such-config.yaml"))
     monkeypatch.delenv("ORCH_VERIFY_RUNNERS", raising=False)
