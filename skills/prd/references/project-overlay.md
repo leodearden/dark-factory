@@ -32,6 +32,7 @@ The concrete check that proves an assumed capability exists, with command + pass
 - Language/DSL project: a **grammar gate** — extract syntax fragments to fixtures, parse them; exit 0 = pass. (See reify's `references/grammar-gate.md`.)
 - Web/service project: "the route exists in the router table"; "the migration adds the column".
 - If the project has no such substrate, say so → G3 reduces to the generic manual check.
+- Manifest-pointer resolver (optional): the command that resolves a capability manifest's `grep:` pointers (`gates.md` → *Capability Manifest* → *Evidence pointers*); decompose mode runs it over a new manifest before committing it, and a failure blocks the commit.
 
 ### 4. G1 integration-seam catalogue (optional)
 If the project has a fixed set of legitimate in-system integration seams (dispatch points, route table, plugin registry), list them so an in-system mechanism's named consumer must plug into a catalogued seam, and a NEW seam is flagged as a G4 design question.
