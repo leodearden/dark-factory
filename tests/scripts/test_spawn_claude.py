@@ -2247,17 +2247,15 @@ def test_foreground_claude_descendant_suppresses_flag_without_transcript(
     tmp_path: pathlib.Path,
 ) -> None:
     """A live foreground `claude` descendant with NO transcript must suppress
-    the flag -- exercises _claude_descendant_alive as the LOAD-BEARING
+    the flag -- exercises _payload_claude_alive as the LOAD-BEARING
     evidence (the only positive signal available on this path).
 
     Uses a FOREGROUND launcher (xterm) whose fake claude writes no transcript
     at all under $CLAUDE_PROJECTS_DIR, but stays alive (sleeping) for a fixed
-    6s before exiting -- so the watchdog observes it as a live descendant
-    long before it exits, regardless of grace. Since xterm's fake terminal
-    `exec`s into the payload bash (see _FOREGROUND_TERM_SCRIPT), claude runs
-    as a direct descendant of spawn-claude.sh's own $$ -- unlike a detached
-    launcher (setsid + background job, reparented once the launcher process
-    exits), where this probe is correctly always empty.
+    6s before exiting -- so the watchdog observes it as a live child of the
+    payload shell long before it exits, regardless of grace. The
+    non-descendant lanes are covered by
+    test_live_claude_without_transcript_is_not_flagged_when_payload_is_not_the_launchers_descendant.
 
     Grace is load-adaptive via _set_started_grace (task 3451), the same
     policy as test_transcript_appearance_suppresses_flag. Originally task
@@ -2268,7 +2266,7 @@ def test_foreground_claude_descendant_suppresses_flag_without_transcript(
 
     The fake-claude sleep stays FIXED at 6s, decoupled from the now-larger
     grace: the only validity requirement is that the exit sentinel lands
-    AFTER _claude_descendant_alive observes the live descendant, and since
+    AFTER _payload_claude_alive observes the live claude, and since
     the 6s live window hugely exceeds the watchdog's 0.25s poll interval (and
     the watchdog polls continuously within the grace window), a fixed modest
     sleep keeps the sentinel strictly after evidence while keeping the happy
@@ -2280,7 +2278,7 @@ def test_foreground_claude_descendant_suppresses_flag_without_transcript(
     _write_foreground_terminal(bin_dir, "xterm")
 
     # Fake claude: writes NO transcript anywhere, just stays alive (sleeping)
-    # for a fixed 6s before exiting -- so only _claude_descendant_alive (not
+    # for a fixed 6s before exiting -- so only _payload_claude_alive (not
     # the transcript probe) can suppress the flag.
     claude = bin_dir / "claude"
     claude.write_text("#!/usr/bin/env bash\nsleep 6\nexit 0\n")
