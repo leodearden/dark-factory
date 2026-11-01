@@ -34,7 +34,6 @@ from _gate_fixtures import gated_remote_runner
 from _task_verify_fixtures import VERIFY_MODULE, seed_task_branch_repo
 from shared.verify_admission import acquire_task_slot
 
-import orchestrator.verify as verify_module
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
@@ -1116,14 +1115,14 @@ class TestAGrantedPlanStaysLocal:
     ) -> None:
         rig = _rig(tmp_path)
         rig.legs.block(_TEST)
-        seam = 'orchestrator.verify._verify_admission_active'
-        active = verify_module._verify_admission_active
-        monkeypatch.setattr(seam, lambda _config: False)
-        laptop_holder = rig.hold()
-        await _bounded(laptop_holder.granted.wait())
-        call = rig.start()
-        await _until(lambda: rig.legs.spawned(_TEST), watching=call)
-        monkeypatch.setattr(seam, active)
+        with monkeypatch.context() as admission_off:
+            admission_off.setattr(
+                'orchestrator.verify._verify_admission_active', lambda _config: False,
+            )
+            laptop_holder = rig.hold()
+            await _bounded(laptop_holder.granted.wait())
+            call = rig.start()
+            await _until(lambda: rig.legs.spawned(_TEST), watching=call)
         assert admission_active(rig.config) is True
         [plan] = rig.local.plans
         assert plan is not None and plan.has_been_granted()
