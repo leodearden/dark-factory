@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from shared import proc_liveness
 from shared.project_id import PROJECT_ID_ALIASES, fold_project_token
 
 from orchestrator import session_registry as sr
@@ -11341,3 +11342,6 @@ def test_pid_alive_is_the_public_liveness_probe() -> None:
     assert sr.pid_alive(os.getpid())
     assert not sr.pid_alive(_DEAD_PID)
     assert not sr.pid_alive(0)
+    assert not sr.pid_alive(True)
+    assert not sr.pid_alive(None)
+    assert sr.pid_alive is proc_liveness.pid_alive
