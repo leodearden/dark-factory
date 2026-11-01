@@ -575,7 +575,7 @@ PIDS     := map patch-id → [shas in RANGE]     -- one `git log -p | git patch-
 CHECKED  := { e ∈ plan['_descoped_steps'] : e.disposition ∈ {orphan, revert} }
 MATCHES(e) := { s ∈ RANGE : commits_match(e.commit, s) ∨ pid(s) = pid(e.commit) }
 LANDS(e) := MATCHES(e) ≠ ∅
-m(e)     := the last of MATCHES(e) in RANGE's --topo-order
+m(e)     := the NEWEST of MATCHES(e) (the first that `git log --topo-order` lists)
 RESTORED(e) := for at least one path p that m(e) changed, some commit c in
                `git rev-list --ancestry-path m(e)..branch_head -- p` has
                blob(c, p) = blob(m(e)^, p)            -- absent = absent;
