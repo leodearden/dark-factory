@@ -1102,7 +1102,54 @@ async def test_a_failed_publish_is_classed_on_the_push_channel_and_runs_no_ensur
     exc = await _unavailable(transport)
 
     assert exc.kind == kind
-    assert transport.roles() == ['publish']
+    assert transport.roles() == (['publish'] if kind == 'transport' else ['publish', 'publish'])
+
+
+_LOCKED_GATE_REF = (1, '', f"error: cannot lock ref 'refs/gate/{_SHA}': reference already exists")
+
+
+def _publishes(*replies: tuple[int, str, str]) -> Callable[[], Awaitable[tuple[int, str, str]]]:
+    """A publish reply answering *replies* in turn, then success."""
+    remaining = list(replies)
+
+    async def publish() -> tuple[int, str, str]:
+        return remaining.pop(0) if remaining else (0, '', '')
+
+    return publish
+
+
+@pytest.mark.asyncio
+async def test_a_publish_colliding_on_the_gate_ref_is_retried_once():
+    transport = _Scripted(publish=_publishes(_LOCKED_GATE_REF))
+
+    result = await _scripted_runner(transport).run_merge_verify('mergesha', _spec())
+
+    assert result == _VERDICT
+    assert transport.roles() == ['publish', 'publish', 'ensure', 'verify_push', 'verify', 'delete']
+
+
+@pytest.mark.asyncio
+async def test_two_roles_publishing_one_sha_at_once_both_get_their_verdict():
+    transport = _Scripted(publish=_publishes(_LOCKED_GATE_REF))
+    task_runner, merge_runner = _scripted_runner(transport), _scripted_runner(transport)
+
+    results = await asyncio.gather(
+        task_runner.run_merge_verify('tasksha', _spec()),
+        merge_runner.run_merge_verify('mergesha', _spec()),
+    )
+
+    assert results == [_VERDICT, _VERDICT]
+    assert transport.roles().count('publish') == 3
+
+
+@pytest.mark.asyncio
+async def test_a_publish_refused_twice_is_a_gate_failure_with_no_ensure():
+    transport = _Scripted(publish=_publishes(_LOCKED_GATE_REF, _LOCKED_GATE_REF))
+
+    exc = await _unavailable(transport)
+
+    assert exc.kind == 'gate'
+    assert transport.roles() == ['publish', 'publish']
 
 
 @pytest.mark.asyncio
