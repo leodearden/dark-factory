@@ -1,7 +1,7 @@
 """Autonomous dry-run unblock — fire-and-forget investigation at block time.
 
 Invoked by workflow._mark_blocked when a task transitions to blocked.
-Runs the unblock-auto skill read-only, then persists a proposal entry to
+Runs the unblock-auto skill confined to writing its own config dir, then persists a proposal entry to
 metadata.dry_run_proposals[] via scheduler.update_task(metadata_mode='additive')
 (list-union — preserves prior entries) and trims the list to keep_last entries
 via a separate update_task(default merge — overwrites dry_run_proposals wholesale
@@ -35,6 +35,7 @@ from shared.git_read_rules import git_read_rules
 from shared.transcript_archive import archive_task_transcripts
 
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
+from orchestrator.agents.sandbox_dispatch import resolve_backend_or_refuse
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
 from orchestrator.event_store import EventType
 from orchestrator.merge_lane.completion import merge_completion_eligible
@@ -259,15 +260,16 @@ def _task_context(task: dict[str, Any] | None) -> _TaskContext:
     return _TaskContext('\n'.join(lines), False)
 
 
-# The investigation's enforced envelope: it runs under --permission-mode
-# dontAsk, so the CLI denies, without a prompt, any tool call no allow rule
-# admits. Every entry is therefore a grant, and each must be read-only.
-# Bash(pytest:*) and Bash(cargo:*) are omitted: both write build artefacts or
-# fetch from the network. Git is granted per read-only subcommand, never as a
-# wildcard and never `git branch`, which creates and deletes refs. The
-# file-writing flags of the granted subcommands are denied from
-# shared/src/shared/git_read_rules.py. Residual: `git status` may refresh the
-# index's stat cache, which changes no content.
+# The investigation's CLI envelope: it runs under --permission-mode dontAsk,
+# so the CLI denies, without a prompt, any tool call no allow rule admits.
+# Every entry is therefore a grant of a read. Bash(pytest:*) and Bash(cargo:*)
+# are omitted: both write build artefacts or fetch from the network. Git is
+# granted per read subcommand, never as a wildcard and never `git branch`,
+# which creates and deletes refs; the --output denies come from
+# shared/src/shared/git_read_rules.py and refuse only the plain spelling.
+# These rules are the first gate, not the write boundary: the boundary is the
+# OS sandbox of _investigation_sandbox_modules. Residual: `git status` may
+# refresh the index's stat cache, which changes no content.
 _GIT_READS = git_read_rules('log', 'diff', 'status', 'show', 'rev-parse', 'ls-files')
 
 _ALLOWED_TOOLS: list[str] = [
@@ -308,6 +310,18 @@ _DISALLOWED_TOOLS: list[str] = [
     # Unscoped on purpose: removes the tool from the CLI registry, so no skill loads; SKILL.md invokes none.
     'Skill',
 ]
+
+def _investigation_sandbox_modules(config: Any) -> list[str] | None:
+    """``[]`` confines a claude investigation to writing ``<worktree>/.task``, where its config dir lives; ``None`` leaves it unconfined.
+
+    Raises ``SandboxUnavailable`` when confinement is required and no OS
+    sandbox resolves, so the run is refused rather than launched unconfined.
+    """
+    if not (config.sandbox.enabled and config.unblock_auto.backend == 'claude'):
+        return None
+    resolve_backend_or_refuse()
+    return []
+
 
 # ---------------------------------------------------------------------------
 # In-flight identity
@@ -623,6 +637,8 @@ async def run_dry_run_unblock(
             )
             return
 
+        sandbox_modules = _investigation_sandbox_modules(config)
+
         # Per-investigation isolated CLAUDE_CONFIG_DIR, named distinctly from
         # the main task's `claude-config-{task_id}` dir so this background
         # investigation cannot collide with the blocked task's own session/
@@ -694,6 +710,7 @@ async def run_dry_run_unblock(
                 max_turns=decision.max_turns,
                 max_budget_usd=decision.budget_usd,
                 permission_mode='dontAsk',
+                sandbox_modules=sandbox_modules,
                 allowed_tools=_ALLOWED_TOOLS,
                 disallowed_tools=_DISALLOWED_TOOLS,
                 mcp_config=mcp_config,

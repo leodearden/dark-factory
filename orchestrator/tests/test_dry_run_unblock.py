@@ -34,6 +34,7 @@ from shared.config_dir import TaskConfigDir
 from shared.process_cost import ProcessCostBasis
 from shared.testing import make_gate_mock
 
+from orchestrator.agents import sandbox_dispatch
 from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
 from orchestrator.dry_run_unblock import _TASK_EMPTY_STATE, _TASK_UNAVAILABLE_STATE
 from orchestrator.scheduler import Scheduler
@@ -115,9 +116,10 @@ def _make_config(*, enabled=True, budget_usd=5.0, timeout_seconds=600.0,
                  attended_b3_enabled=False, b3_merge_cap_per_24h=6,
                  b3_proposal_keep_last=5, working_idle_secs=1800.0,
                  invocation_timeout=7200.0, project_root=None,
-                 transcript_archive=None, main_branch='main'):
+                 transcript_archive=None, main_branch='main', sandbox_enabled=False):
     cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     cfg.git.main_branch = main_branch
+    cfg.sandbox.enabled = sandbox_enabled
     cfg.unblock_auto.enabled = enabled
     cfg.unblock_auto.budget_usd = budget_usd
     cfg.unblock_auto.timeout_seconds = timeout_seconds
@@ -2798,7 +2800,7 @@ class _TaskDocScheduler:
         return dict(self._task_doc)
 
 
-async def _capture_investigation_call(tmp_path, scheduler) -> dict:
+async def _capture_investigation_call(tmp_path, scheduler, config=None) -> dict:
     """Run one investigation and return the kwargs handed to the agent."""
     from orchestrator.dry_run_unblock import run_dry_run_unblock
 
@@ -2816,7 +2818,7 @@ async def _capture_investigation_call(tmp_path, scheduler) -> dict:
             detail='All 5 attempts timed out',
             scheduler=scheduler,
             mcp=MagicMock(),
-            config=_make_config(),
+            config=config if config is not None else _make_config(),
         )
     return dict(mock_invoke.call_args.kwargs)
 
@@ -3325,6 +3327,87 @@ class TestInvestigationPermissionEnvelope:
             if not any(_bash_rule_matches(rule, command) for rule in kwargs['disallowed_tools'])
         ]
         assert not undenied, f'file-writing git forms the envelope does not deny: {undenied}'
+
+
+@pytest.fixture
+def landlock_backend():
+    """Prefer landlock for one test, restoring the process-global backend and refusal dedup after."""
+    saved = sandbox_dispatch.get_backend()
+    sandbox_dispatch.reset_escalation_dedupe()
+    sandbox_dispatch.set_backend('landlock')
+    yield
+    sandbox_dispatch.set_backend(saved)
+    sandbox_dispatch.reset_escalation_dedupe()
+
+
+def _landlock_writable_grants(argv: list[str]) -> list[Path]:
+    inner_start = argv.index('--')
+    return [Path(argv[i + 1]) for i in range(inner_start) if argv[i] == '--writable']
+
+
+class TestInvestigationIsConfined:
+    """The CLI matches deny rules against raw command text, so a quoted
+    ``--outp''ut=F`` passes them; the OS sandbox is the write boundary."""
+
+    @pytest.mark.asyncio
+    async def test_enabled_sandbox_confines_the_investigation_to_its_task_dir(
+        self, tmp_path, landlock_backend,
+    ):
+        with patch('orchestrator.agents.landlock.is_landlock_available', return_value=True):
+            kwargs = await _capture_investigation_call(
+                tmp_path, _TaskDocScheduler(), config=_make_config(sandbox_enabled=True),
+            )
+            argv = sandbox_dispatch.wrap_command(
+                ['claude'], kwargs['cwd'], kwargs['sandbox_modules'], kwargs.get('sandbox_extras'),
+            )
+
+        assert kwargs['sandbox_modules'] == []
+        assert not kwargs.get('sandbox_extras')
+        grants = _landlock_writable_grants(argv)
+        assert grants == [tmp_path.resolve() / '.task']
+        assert Path(kwargs['config_dir']).resolve().is_relative_to(grants[0])
+
+    @pytest.mark.asyncio
+    async def test_disabled_sandbox_leaves_the_investigation_unconfined(self, tmp_path):
+        kwargs = await _capture_investigation_call(
+            tmp_path, _TaskDocScheduler(), config=_make_config(sandbox_enabled=False),
+        )
+
+        assert kwargs['sandbox_modules'] is None
+
+    @pytest.mark.asyncio
+    async def test_a_non_claude_backend_keeps_its_own_confinement(self, tmp_path):
+        kwargs = await _capture_investigation_call(
+            tmp_path, _TaskDocScheduler(), config=_make_config(sandbox_enabled=True, backend='codex'),
+        )
+
+        assert kwargs['sandbox_modules'] is None
+
+    @pytest.mark.asyncio
+    async def test_an_unavailable_sandbox_refuses_the_launch(self, tmp_path, landlock_backend):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        scheduler = _TaskDocScheduler()
+        mock_invoke = AsyncMock(return_value=_make_agent_result())
+        with (
+            patch('orchestrator.agents.landlock.is_landlock_available', return_value=False),
+            patch('orchestrator.dry_run_unblock.invoke_agent', new=mock_invoke),
+        ):
+            await run_dry_run_unblock(
+                task_id='42',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='All 5 attempts timed out',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(sandbox_enabled=True),
+            )
+
+        mock_invoke.assert_not_called()
+        entry = _persisted_entry(scheduler)
+        assert entry['status'] == 'investigation_failed'
+        assert entry['risk_label'] == 'human-review-required'
+        assert 'unconfined' in entry['proposal_text']
 
 
 _FENCE = re.compile(r'^```(\w*)\n(.*?)^```', re.MULTILINE | re.DOTALL)
