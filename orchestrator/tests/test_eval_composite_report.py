@@ -271,10 +271,9 @@ class TestBuildCompositeReport:
         # tainted non-architect trial (which has no plan_quality to exclude in
         # the first place) must not inflate the composite counter either
         # (reviewer: docs-accuracy).
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        from orchestrator.evals.report import build_composite_report
 
         results = [
             _mresult('f1', 'mixed', 1, quality=1.0, cost_usd=1.0,
@@ -361,10 +360,9 @@ class TestBuildCompositeReport:
         Follows the cap_excluded agreement assertion's idiom exactly; this is
         the test that stops the composite and θ surfaces diverging.
         """
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        from orchestrator.evals.report import build_composite_report
 
         results = [
             _mresult('f1', 'mixed', 1, quality=1.0, cost_usd=1.0,
@@ -442,10 +440,9 @@ class TestBuildCompositeReport:
         the one where the two could most damagingly disagree, because θ's
         trailer and the composite row are read side by side.
         """
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        from orchestrator.evals.report import build_composite_report
 
         results = [
             _keyless(_mresult('f1', 'legacy', 1, quality=1.0, cost_usd=1.0,
@@ -755,10 +752,9 @@ class TestUnmeasurableCellLeavesEveryPool:
         ``plan_quality`` cells disagree and putting a fabricated number back into
         the figure ``select_survivors`` ranks on.
         """
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        from orchestrator.evals.report import build_composite_report
 
         results = [
             # Tainted, yet carrying a score AND an outlier cost/latency.
@@ -829,10 +825,9 @@ class TestPlanQualityIsTheConfigMean:
     def test_agrees_bit_identically_with_the_plan_quality_surface(self):
         """ONE shared reduction, so ``==`` and not ``approx``: the two surfaces
         must be structurally incapable of drifting, not merely close today."""
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        from orchestrator.evals.report import build_composite_report
 
         results = self._varied()
         row = build_composite_report(results)['configs'][0]
@@ -844,13 +839,13 @@ class TestPlanQualityIsTheConfigMean:
         """``_emit_composite_report`` now prints both tables on one screen, so an
         operator must not be able to read contradictory answers to one question.
         """
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             _PLAN_QUALITY_MEAN_HEADER,
-            build_composite_report,
             build_plan_quality_report,
-            format_composite_table,
             format_plan_quality_table,
         )
+
+        from orchestrator.evals.report import build_composite_report, format_composite_table
 
         results = self._varied()
         composite = _table_row_cells(
@@ -1155,10 +1150,9 @@ class TestNoPlanCellScoresZeroNotTheJudgesNumber:
     def test_both_surfaces_agree_bit_identically(self):
         """The composite row and the θ table are ONE reduction, so the floor
         must be applied where they share it — not on one side only."""
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        from orchestrator.evals.report import build_composite_report
 
         results = [
             _arch('p1', 'arch-noplan', tr, plan_steps=0, plan_quality=0.95,
@@ -1178,10 +1172,9 @@ class TestNoPlanCellScoresZeroNotTheJudgesNumber:
 
     def test_mixed_pool_averages_the_floor_in(self):
         """One no-plan trial among two real ones: (0.0 + 0.6 + 0.6) / 3."""
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        from orchestrator.evals.report import build_composite_report
 
         results = [
             _arch('p1', 'arch-mixed', 1, plan_steps=0, plan_quality=0.9,
@@ -1233,10 +1226,9 @@ class TestNoPlanCellsAreCounted:
         ]
 
     def test_both_surfaces_count_the_floored_cell_and_agree(self):
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        from orchestrator.evals.report import build_composite_report
 
         results = self._one_no_plan_among_two()
         row = build_composite_report(results)['configs'][0]
@@ -1248,10 +1240,9 @@ class TestNoPlanCellsAreCounted:
 
     def test_an_all_planning_config_reports_zero_never_absent(self):
         """A count that vanishes when it is zero cannot be read as 'none'."""
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        from orchestrator.evals.report import build_composite_report
 
         results = [
             _arch('p1', 'arch-real', tr, plan_steps=6, plan_quality=0.6,
@@ -1268,10 +1259,9 @@ class TestNoPlanCellsAreCounted:
         """Disjoint causes, disjoint counts: a transport refusal never got to
         ask the model, so it is not a cell that 'produced no plan' — it is a
         cell we could not measure at all (task 3118)."""
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        from orchestrator.evals.report import build_composite_report
 
         results = [
             # Refused at the transport layer: no score, no plan, EXCLUDED.
@@ -1300,7 +1290,7 @@ class TestNoPlanCellsAreCounted:
     def test_the_theta_mean_table_renders_the_count(self):
         """mean_plan_quality must be readable beside the no-plan cells it
         scored as zeros, not just the n it averaged."""
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             _PLAN_QUALITY_MEAN_HEADER,
             build_plan_quality_report,
             format_plan_quality_table,
@@ -1507,7 +1497,7 @@ class TestBothSurfacesReportTheSamePlanRate:
     """
 
     def test_the_theta_aggregate_carries_the_same_hand_computed_rate(self):
-        from orchestrator.evals.report import build_plan_quality_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         theta = build_plan_quality_report(
             TestPlanRateIsTheReliabilityColumn._one_no_plan_among_three()
@@ -1519,10 +1509,9 @@ class TestBothSurfacesReportTheSamePlanRate:
     def test_agrees_bit_identically_with_the_composite_row(self):
         """``==``, not ``approx``: the point is not that the two surfaces round
         to the same place but that they are the same computation."""
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        from orchestrator.evals.report import build_composite_report
 
         results = TestPlanRateIsTheReliabilityColumn._one_no_plan_among_three()
         row = build_composite_report(results)['configs'][0]
@@ -1537,10 +1526,9 @@ class TestBothSurfacesReportTheSamePlanRate:
         reader who checks the rate against either table's sample gets the same
         answer, which is the whole reason ``plan_quality_n`` is on the row.
         """
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        from orchestrator.evals.report import build_composite_report
 
         results = (
             TestPlanRateIsTheReliabilityColumn
@@ -1559,10 +1547,9 @@ class TestBothSurfacesReportTheSamePlanRate:
         beside it would assert a reliability failure the transport layer never
         let us observe.
         """
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        from orchestrator.evals.report import build_composite_report
 
         results = [
             _arch('p1', 'arch-refused', tr, plan_steps=0, plan_quality=None,
@@ -1770,7 +1757,7 @@ class TestTheReliabilityColumnsAreRendered:
     def test_the_theta_mean_table_renders_the_rate(self):
         """On the θ surface too, beside the n / cap_excluded / no_plan it was
         computed over — the module's report-a-figure-with-its-sample norm."""
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             _PLAN_QUALITY_MEAN_COLUMNS,
             _PLAN_QUALITY_MEAN_HEADER,
             build_plan_quality_report,
@@ -1795,12 +1782,12 @@ class TestTheReliabilityColumnsAreRendered:
 
     def test_rendering_is_byte_deterministic(self):
         """The widened tuples must not cost the surface its byte-stability."""
-        from orchestrator.evals.report import (
-            build_composite_report,
+        from orchestrator.evals.plan_quality_report import (
             build_plan_quality_report,
-            format_composite_table,
             format_plan_quality_table,
         )
+
+        from orchestrator.evals.report import build_composite_report, format_composite_table
 
         results = TestCostPerUsablePlan._three_at_30c_one_planless()
         composite = build_composite_report(results)
@@ -1872,10 +1859,9 @@ class TestTheDiscardedJudgeScoreIsLoggedNotSwallowed:
     def test_a_real_plan_never_warns(self, caplog):
         """The control: the floor — and its warning — fire ONLY on a stepless
         artifact, so a healthy campaign's log stays readable."""
-        from orchestrator.evals.report import (
-            build_composite_report,
-            build_plan_quality_report,
-        )
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
+        from orchestrator.evals.report import build_composite_report
 
         results = [
             _arch('p1', 'arch-real', tr, plan_steps=6, plan_quality=0.9,
@@ -1895,7 +1881,7 @@ class TestTheDiscardedJudgeScoreIsLoggedNotSwallowed:
         :func:`cell_admission.plan_quality_score`, and pinned here so the count
         is a decision rather than an accident.
         """
-        from orchestrator.evals.report import build_plan_quality_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         results = [
             _arch('p1', 'arch-noplan', 1, plan_steps=0, plan_quality=0.9,
@@ -2355,7 +2341,7 @@ class TestJudgedWithoutReferenceRendering:
         assert cells[header.index('pq_no_ref')] == '1'
 
     def test_mean_columns_keep_the_mean_last(self):
-        from orchestrator.evals.report import _PLAN_QUALITY_MEAN_COLUMNS
+        from orchestrator.evals.plan_quality_report import _PLAN_QUALITY_MEAN_COLUMNS
 
         assert 'judged_without_reference' in _PLAN_QUALITY_MEAN_COLUMNS
         # BEFORE the mean it bounds…
@@ -2369,7 +2355,7 @@ class TestJudgedWithoutReferenceRendering:
         assert _PLAN_QUALITY_MEAN_COLUMNS[-1] == 'mean_plan_quality'
 
     def test_plan_quality_mean_section_renders_the_count(self):
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             build_plan_quality_report,
             format_plan_quality_table,
         )
@@ -2384,7 +2370,7 @@ class TestJudgedWithoutReferenceRendering:
         assert cells[header.index('judged_without_reference')] == '1'
 
     def test_trailer_reports_the_total_against_the_scored_pool(self):
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             build_plan_quality_report,
             format_plan_quality_table,
         )
@@ -2412,7 +2398,7 @@ class TestJudgedWithoutReferenceRendering:
         non-zero and when it is unmeasured — suppression is then a behaviour
         rather than a tautology.
         """
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             build_plan_quality_report,
             format_plan_quality_table,
         )
@@ -2428,7 +2414,7 @@ class TestJudgedWithoutReferenceRendering:
 
     def test_a_blind_campaign_does_grow_the_line(self):
         """The suppression's twin: exactly one trailer when the bound is real."""
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             build_plan_quality_report,
             format_plan_quality_table,
         )
@@ -2464,7 +2450,7 @@ class TestJudgedWithoutReferenceRendering:
         assert cells[header.index('pq_no_ref')] == '-'
 
     def test_mean_section_renders_a_dash_for_an_unmeasured_bound(self):
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             build_plan_quality_report,
             format_plan_quality_table,
         )
@@ -2485,7 +2471,7 @@ class TestJudgedWithoutReferenceRendering:
         count alone suppressed the line — making "nothing bounded these scores"
         render exactly like "every score was graded against a landed diff".
         """
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             build_plan_quality_report,
             format_plan_quality_table,
         )
@@ -2582,7 +2568,7 @@ class TestPlanQualityReportSplitsNoPlanByDecline:
     # -- (a) the per-row field -------------------------------------------
 
     def test_every_row_carries_the_persisted_terminal_kind(self):
-        from orchestrator.evals.report import build_plan_quality_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         report = build_plan_quality_report(self._four_cells_three_no_plan())
         by_task = {r['task_id']: r['terminal_kind'] for r in report['rows']}
@@ -2597,7 +2583,7 @@ class TestPlanQualityReportSplitsNoPlanByDecline:
     def test_an_unmeasured_row_carries_none_never_a_fabricated_kind(self):
         """Both unmeasured shapes read ``None``: an implementer cell (the field
         does not apply) and a legacy cell (the field did not exist)."""
-        from orchestrator.evals.report import build_plan_quality_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         results = [
             _mresult('impl', 'impl-cfg', 1, quality=1.0, cost_usd=0.3,
@@ -2619,8 +2605,9 @@ class TestPlanQualityReportSplitsNoPlanByDecline:
     # -- (b) the per-config counts ---------------------------------------
 
     def test_declined_counts_the_explicit_decline_exits_by_kind(self):
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
+
         from orchestrator.evals.metrics import DECLINE_KINDS
-        from orchestrator.evals.report import build_plan_quality_report
 
         cfg = build_plan_quality_report(
             self._four_cells_three_no_plan()
@@ -2644,7 +2631,7 @@ class TestPlanQualityReportSplitsNoPlanByDecline:
         over the admitted pool) so every committed campaign artifact stays
         comparable; the split is reported ALONGSIDE it.
         """
-        from orchestrator.evals.report import build_plan_quality_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         cfg = build_plan_quality_report(
             self._four_cells_three_no_plan()
@@ -2668,7 +2655,7 @@ class TestPlanQualityReportSplitsNoPlanByDecline:
         out of ``plan_rate``'s numerator complement, while ``declined`` records
         the terminal call. ``declined - no_plan_declined`` recovers it exactly.
         """
-        from orchestrator.evals.report import build_plan_quality_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         results = [
             *self._four_cells_three_no_plan(),
@@ -2693,7 +2680,7 @@ class TestPlanQualityReportSplitsNoPlanByDecline:
         ``no_plan`` and ``judged_without_reference``. Counting its stale
         terminal kind would describe a cell the mean beside it never saw.
         """
-        from orchestrator.evals.report import build_plan_quality_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         results = [
             *self._four_cells_three_no_plan(),
@@ -2715,7 +2702,7 @@ class TestPlanQualityReportSplitsNoPlanByDecline:
     def test_a_keyless_cell_is_unmeasured_not_not_declined(self):
         """Absence is not "did not decline" — the ``judged_without_reference``
         rule, applied to the field beside it."""
-        from orchestrator.evals.report import build_plan_quality_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         results = [
             *self._four_cells_three_no_plan(),
@@ -2748,7 +2735,7 @@ class TestPlanQualityReportSplitsNoPlanByDecline:
         second producer persists an architect cell with a null kind, this
         assertion is what keeps the split honest instead of quietly partial.
         """
-        from orchestrator.evals.report import build_plan_quality_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         null_kinded = _kinded(
             _arch('p9', 'arch-split', 1, plan_steps=0, plan_quality=0.0,
@@ -2769,7 +2756,7 @@ class TestPlanQualityReportSplitsNoPlanByDecline:
 
     def test_a_fully_measured_config_reports_zero_unmeasured(self):
         """A count that only appears when it fires cannot be read."""
-        from orchestrator.evals.report import build_plan_quality_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         cfg = build_plan_quality_report(
             self._four_cells_three_no_plan()
@@ -2781,7 +2768,7 @@ class TestPlanQualityReportSplitsNoPlanByDecline:
     # -- (g) report-level totals -----------------------------------------
 
     def test_report_totals_equal_the_per_config_sums(self):
-        from orchestrator.evals.report import build_plan_quality_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         results = [
             *self._four_cells_three_no_plan(),
@@ -2809,7 +2796,7 @@ class TestPlanQualityReportSplitsNoPlanByDecline:
     # -- (h) the rendered surface ----------------------------------------
 
     def test_the_mean_section_renders_a_declined_column(self):
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             _PLAN_QUALITY_MEAN_COLUMNS,
             _PLAN_QUALITY_MEAN_HEADER,
             build_plan_quality_report,
@@ -2843,7 +2830,7 @@ class TestPlanQualityReportSplitsNoPlanByDecline:
     def test_a_config_with_no_declines_renders_zero_not_the_null_sentinel(self):
         """``-`` already means "not an architect run" on this surface; a
         measured zero must not borrow it."""
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             _PLAN_QUALITY_MEAN_HEADER,
             build_plan_quality_report,
             format_plan_quality_table,
@@ -2864,7 +2851,7 @@ class TestPlanQualityReportSplitsNoPlanByDecline:
         assert cells[header.index('declined')] == '0'
 
     def test_the_decline_split_section_names_each_kind_and_count(self):
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             build_plan_quality_report,
             format_plan_quality_table,
         )
@@ -2889,7 +2876,7 @@ class TestPlanQualityReportSplitsNoPlanByDecline:
 
     def test_the_split_section_notes_an_unmeasured_population(self):
         """A PARTIAL split must say so, or it reads as a complete one."""
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             build_plan_quality_report,
             format_plan_quality_table,
         )
@@ -2910,7 +2897,7 @@ class TestPlanQualityReportSplitsNoPlanByDecline:
         assert '1 of 5 scored cell(s)' in line
 
     def test_a_fully_measured_report_grows_no_unmeasured_note(self):
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             build_plan_quality_report,
             format_plan_quality_table,
         )
@@ -2922,7 +2909,7 @@ class TestPlanQualityReportSplitsNoPlanByDecline:
         assert 'terminal kind:' not in out
 
     def test_the_widened_surface_stays_byte_deterministic(self):
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             build_plan_quality_report,
             format_plan_quality_table,
         )
@@ -2936,7 +2923,7 @@ class TestPlanQualityReportSplitsNoPlanByDecline:
 
     def test_no_existing_key_or_number_is_disturbed(self):
         """The split is EXPLANATORY: it moves no cell and changes no number."""
-        from orchestrator.evals.report import build_plan_quality_report
+        from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
         cfg = build_plan_quality_report(
             self._four_cells_three_no_plan()

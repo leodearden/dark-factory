@@ -332,7 +332,7 @@ class TestEmitCompositeReportArchitectSurface:
     def test_architect_surface_reuses_the_plan_quality_table_verbatim(self, capsys):
         """No second rendering path: the emitted section IS
         format_plan_quality_table(build_plan_quality_report(results))."""
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             build_plan_quality_report,
             format_plan_quality_table,
         )
