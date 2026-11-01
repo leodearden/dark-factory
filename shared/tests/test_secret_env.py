@@ -105,7 +105,7 @@ class TestAgentSubprocessEnv:
         child = agent_subprocess_env(_environ_with_secrets())
         assert {k for k in child if is_secret_env_name(k)} == {'CLAUDE_CODE_OAUTH_TOKEN'}
 
-    def test_drops_a_proxied_shells_endpoint_selection_and_keeps_the_session_credential(self):
+    def test_drops_a_proxied_shells_endpoint_selection(self):
         environ = {
             **_environ_with_secrets(),
             'ANTHROPIC_BASE_URL': 'http://127.0.0.1:8317',
@@ -114,7 +114,6 @@ class TestAgentSubprocessEnv:
         child = agent_subprocess_env(environ)
         assert 'ANTHROPIC_BASE_URL' not in child
         assert 'ANTHROPIC_AUTH_TOKEN' not in child
-        assert child['CLAUDE_CODE_OAUTH_TOKEN'] == environ['CLAUDE_CODE_OAUTH_TOKEN']
 
     def test_drops_python_env_selection(self):
         environ = {
@@ -134,21 +133,23 @@ class TestAgentSubprocessEnv:
 
 
 class TestWithoutAgentEndpointVars:
-    def test_drops_the_endpoint_and_python_env_selection_but_keeps_every_credential(self):
+    def test_drops_the_endpoint_and_its_client_key(self):
         environ = {
             **_environ_with_secrets(),
             'ANTHROPIC_BASE_URL': 'http://127.0.0.1:8317',
             'ANTHROPIC_AUTH_TOKEN': 'proxy-' + 'x' * 40,
-            'HF_DOWNLOAD_TOKEN': 'hf-' + 'h' * 40,
-            'VIRTUAL_ENV': '/srv/orch/.venv',
         }
         child = without_agent_endpoint_vars(environ)
         assert 'ANTHROPIC_BASE_URL' not in child
         assert 'ANTHROPIC_AUTH_TOKEN' not in child
+
+    def test_drops_python_env_selection(self):
+        child = without_agent_endpoint_vars({**ORDINARY_ENV, 'VIRTUAL_ENV': '/srv/orch/.venv'})
         assert 'VIRTUAL_ENV' not in child
-        assert child['HF_DOWNLOAD_TOKEN'] == environ['HF_DOWNLOAD_TOKEN']
-        for name, value in _environ_with_secrets().items():
-            assert child[name] == value
+
+    def test_keeps_every_other_credential(self):
+        environ = {**_environ_with_secrets(), 'HF_DOWNLOAD_TOKEN': 'hf-' + 'h' * 40}
+        assert without_agent_endpoint_vars(environ) == environ
 
 
 class TestSecretEnvValues:

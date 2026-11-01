@@ -3607,8 +3607,10 @@ failing recurring `oneshot` stays in `failed` state and silently ends the job.
 
 **API key.** The unit carries `UnsetEnvironment=ANTHROPIC_API_KEY` under the
 policy stated in "Legibility trickle accounts (03:00)" above.
-`nightly_prepare.py` also strips the key from the child's env, whether the
-account came from a lease or was inherited.
+`nightly_prepare.py` builds the child's env as
+`shared.secret_env.agent_subprocess_env` of its own (no API keys or other
+secrets, no endpoint selection, no Python-env selection), with the lease's
+`CLAUDE_CODE_OAUTH_TOKEN` on top.
 
 **First run: arm the timer.** The installer kicks no immediate run, because
 an off-cadence run would spend a Fable budget nobody scheduled.
