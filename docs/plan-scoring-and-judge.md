@@ -1132,6 +1132,63 @@ fabricated zero. They are abandoned, not migrated, and they load as measured.
 A campaign that needs a trustworthy mean must rerun into a fresh
 `--results-dir`.
 
+### Reviewer-trial panel cache and score loop (task 6741)
+
+Code: `reviewer_trial/runner.py::PanelRunKey`, `::run_panel_cached`,
+`::run_trial` and `::run_and_score` (under
+`orchestrator/src/orchestrator/evals/`).
+
+**One keyed panel cache.** `run_panel_cached` is the only panel cache, and
+`run_panel` stamps every result with a `PanelRunKey`. That key holds three
+things: a sha256 of the price table the caller passed (None when the call was
+unpriced), whether a usage gate was offered, and the diff cap. Each key has
+its own file, `<results_dir>/<variant>__<diff>__<key digest>.json`, written
+atomically. A stored panel is reused only when it records the requested
+variant and diff and an equal key. So an entry written by `smoke` or
+`calibrate` (unpriced, ungated, default cap) is never reused by a priced,
+pooled or cap-lifted run such as a campaign. And because the keys do not share
+a file, `full`/`sweep` (unpriced) and `refresh` (priced) each keep their own
+`variant_a` panels rather than re-running and overwriting each other's. A
+corrupt or foreign entry is re-run and overwritten. Before this task, two
+hand-rolled caches reused any parseable file, whatever produced it.
+
+**The key hashes what the caller passed.** `prices=None` and
+`prices=default_price_table()` are different keys, even though
+`orchestrator/agents/invoke.py::_estimate_cost` prices both the same way.
+Treating them as one would re-encode that function's private resolution of
+None in a second place. The worst case is a false miss, which costs a rerun.
+A false hit cannot happen. Because the key is a content digest, an edit to the
+packaged price seeds also invalidates every priced entry stored under the old
+table.
+
+**Backfill (INV-13).** Panel entries written before this task carry no
+`run_key` and sit at the bare `<variant>__<diff>.json`. One is honoured as a
+cache hit for any key whose own file is absent, and it is not migrated. This
+mirrors the task-6736 rule for score files above. Each hit is logged at INFO
+naming the file, and `run_trial` logs one WARNING per call counting the legacy
+panels it reused and naming the directory. The packaged results directory and
+finished campaign directories hold such entries, and treating them as misses
+would re-spend every one of them. To re-measure one, delete it or rerun into a
+fresh `--results-dir`.
+
+**One score loop.** `run_and_score` runs `run_trial`'s panels and then scores
+each one through `scorer.py::score_panel_run`, under the same usage gate as
+the panels. It is the run-and-score loop of every reviewer-trial subcommand
+(`calibrate`, `corpus-sanity`, `full`, `sweep`, `refresh` and `campaign`). Its
+optional `score_dir` is the campaign score cache. A score is stored under
+the same file name as the panel it scored, so it is keyed by that panel's key,
+and a legacy panel's score keeps the bare name. A stored score is reused, an
+unreadable one is re-scored and overwritten, and an unmeasured score is never
+stored, so a rerun measures that cell again.
+
+**Resuming a campaign.** Each trial directory's panels and scores are keyed by
+the invocation that wrote them. Resumed with the options it was started with,
+a campaign only reduces what is on disk. Resumed with a different
+`--pool`/`--no-pool` or `--diff-cap`, it runs and scores new panels beside the
+old ones, and the report reads only the new ones. A campaign whose panels
+predate the key only reduces, whatever options it is resumed with, because a
+legacy panel is reused under every key (see Backfill above).
+
 ### Terminal outcome (`terminal_kind`, task 4760)
 
 The three counts above all describe the *quality* axis. This one describes what
