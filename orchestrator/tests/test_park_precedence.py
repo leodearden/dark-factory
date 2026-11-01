@@ -79,6 +79,45 @@ class TestTheGateOrdersParkOwners:
         assert lt.park_owners_blocking('C', ['m1']) == ['P']
 
 
+def _stack_owners(lt: ModuleLockTable, module: str) -> list[str]:
+    """*module*'s park stack owners, bottom to top."""
+    return [entry['owner'] for entry in lt.snapshot_park_stacks().get(module, [])]
+
+
+class TestInstallFollowsTheSameOrder:
+    def test_a_same_tier_predecessor_shadows_a_followers_park(self):
+        lt = _lt()
+        lt.install_parks('945', ['m1'], 'high')
+
+        assert lt.install_parks('787', ['m1'], 'high') == (['m1'], [('945', ['m1'])])
+        assert _stack_owners(lt, 'm1') == ['945', '787']
+        assert lt.clear_parks_for('787') == [('945', ['m1'])]
+
+    def test_a_same_tier_follower_cannot_shadow_its_predecessor(self):
+        lt = _lt()
+        lt.install_parks('787', ['m1'], 'high')
+
+        assert lt.install_parks('945', ['m1'], 'high') == ([], [])
+        assert _stack_owners(lt, 'm1') == ['787']
+
+        numeric = _lt()
+        numeric.install_parks('9', ['m1'], 'high')
+        assert numeric.install_parks('10', ['m1'], 'high') == ([], [])
+        reversed_order = _lt()
+        reversed_order.install_parks('10', ['m1'], 'high')
+        assert reversed_order.install_parks('9', ['m1'], 'high') == (['m1'], [('10', ['m1'])])
+
+    def test_tied_pin_orders_resolve_by_id(self):
+        lt = _lt()
+        lt.install_parks('20', ['m1'], PinOrder(0))
+        assert lt.install_parks('7', ['m1'], PinOrder(0)) == (['m1'], [('20', ['m1'])])
+
+        reversed_order = _lt()
+        reversed_order.install_parks('7', ['m1'], PinOrder(0))
+        assert reversed_order.install_parks('20', ['m1'], PinOrder(0)) == ([], [])
+        assert _stack_owners(reversed_order, 'm1') == ['7']
+
+
 _WALK_MODULES = ['a', 'a/x', 'a/y', 'b', 'b/x', 'c', 'd']
 _WALK_OWNERS = ['1', '2', '3', '10', 'x', 'y']
 _WALK_PRIORITIES: list[ParkPriority] = [

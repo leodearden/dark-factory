@@ -137,8 +137,8 @@ class TestInstallParksIsIdempotentPerOwner:
         assert _stack(lt, 'm1') == [('T', PRIORITY_RANK['critical'])], (
             'the owner must keep its single critical-rank entry'
         )
-        competitor_installed, _ = lt.install_parks('C', ['m1'], 'critical')
-        assert competitor_installed == [], 'a same-tier competitor must not shadow T'
+        competitor_installed, _ = lt.install_parks('U', ['m1'], 'critical')
+        assert competitor_installed == [], 'a same-tier competitor that T precedes must not shadow T'
         assert _stack(lt, 'm1')[-1] == ('T', PRIORITY_RANK['critical']), (
             'T must stay the active top on m1'
         )
@@ -332,7 +332,7 @@ class TestParkStackInvariants:
         assert lt.try_acquire('H', ['m1']), 'Active-top H must be able to acquire its module'
 
     def test_inv3_same_tier_blocks_install_no_push(self):
-        """INV-3: same-priority existing top BLOCKS a new install (no push, no shadow)."""
+        """INV-3: a same-tier existing top that precedes the installer (A before B) BLOCKS it (no push, no shadow)."""
         lt = _lt()
         lt.install_parks('A', ['m1'], 'medium')
         installed, shadowed = lt.install_parks('B', ['m1'], 'medium')
