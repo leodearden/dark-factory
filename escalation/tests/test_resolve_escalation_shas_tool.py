@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 from _escalation_seed import seed_escalation
+from _sha_noise import NOISE
 
 from escalation.queue import EscalationQueue, iter_all_escalation_paths
 from escalation.server import create_server
@@ -32,16 +33,6 @@ except ImportError:
 SHA_A = 'a7ceed6597'
 SHA_B = '570dc88ad6'
 TWIN_A: dict[str, object] = {'landed': 'a' * 40, 'subject': 'feat: a', 'method': 'patch-id'}
-
-# Each contributes two SHA-shaped tokens (its 8- and 12-hex segments).
-UUIDS = (
-    '3f2a9c1e-4b7d-4e21-9a0c-5c8d0b7f1a33',
-    '7b1d2e3f-0a9c-4d8e-b7f6-1e2d3c4b5a69',
-    'c0ffee12-3456-4789-abcd-ef0123456789',
-    'deadbeef-cafe-4bab-8e5e-0123456789ab',
-    '1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d',
-    '9f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a',
-)
 
 
 class _StubGitOps:
@@ -228,11 +219,7 @@ async def test_smoke_an_unknown_main_branch_fails_the_lookup(queue, tmp_path):
 async def test_smoke_uuids_and_digit_runs_do_not_crowd_a_real_sha_past_the_cap(queue, tmp_path):
     repo = tmp_path / 'repo'
     cited, landed = _landed_rebase(repo)
-    detail = (
-        ' '.join(UUIDS)
-        + ' pid 4194304 on 20261023 hash 9c1e7b4d5a609e21 '
-        + f'orphaned {cited[:10]}'
-    )
+    detail = f'{NOISE} orphaned {cited[:10]}'
     esc = seed_escalation(queue, level=0, task_id='7', detail=detail)
 
     result = await _resolve(_server(queue, GitOps(GitConfig(), repo)), esc.id)
