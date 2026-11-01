@@ -74,6 +74,7 @@ PURE_STDLIB_LEAVES = (
     'neutral_cwd',
     'plan_deviation',
     'proc_group',
+    'proc_liveness',
     'process_cost',
     'process_identity',
     'project_id',
