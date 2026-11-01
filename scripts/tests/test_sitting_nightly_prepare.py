@@ -105,7 +105,7 @@ def _restore_sandbox_backend():
 
 @pytest.fixture
 def host_home(tmp_path, monkeypatch):
-    """A HOME whose ``~/.claude`` login the no-lease path may copy, so no test reads the real one."""
+    """A HOME of the test's own, so the run's ``~/.cache/uv`` grant is observable and no real HOME is touched."""
     home = tmp_path / 'home'
     (home / '.claude').mkdir(parents=True)
     monkeypatch.setenv('HOME', str(home))
@@ -552,20 +552,16 @@ def test_a_real_pool_lease_is_handed_back_before_the_run(tmp_path, monkeypatch, 
     )
 
 
-def test_no_lease_inherits_the_parent_env_and_still_runs(tmp_path, monkeypatch, host_home):
-    monkeypatch.setenv('ANTHROPIC_API_KEY', 'sk-ant-must-not-survive')
-    monkeypatch.setenv('SITTING_TEST_MARKER', 'kept')
-    monkeypatch.setenv('CLAUDE_CODE_OAUTH_TOKEN', 'ambient-login')
+def test_no_lease_skips_the_night_without_launching_the_cli(tmp_path, capsys, host_home):
+    (host_home / '.claude' / '.credentials.json').write_text('{"claudeAiOauth": {"accessToken": "host"}}')
     fake = _fake_claude(tmp_path)
     gate = FakeGate([('max-b', True), ('max-h', True)])
 
-    assert _run(fake, gate=gate) == mod.EXIT_OK
+    assert _run(fake, gate=gate) == mod.EXIT_FAILED
 
-    call = fake.only_call()
-    assert call['env']['CLAUDE_CODE_OAUTH_TOKEN'] == 'ambient-login'
-    assert call['env']['SITTING_TEST_MARKER'] == 'kept'
-    assert not call['env_has']['ANTHROPIC_API_KEY']
-    assert os.environ['ANTHROPIC_API_KEY'] == 'sk-ant-must-not-survive', 'the parent env is not mutated'
+    assert fake.calls() == []
+    assert 'skipping: the nightly never uses the host login' in capsys.readouterr().err
+    assert not list((tmp_path / 'data' / 'sitting' / 'config').rglob('.credentials.json'))
 
 
 def test_the_entry_point_pins_landlock(tmp_path, monkeypatch, capsys):
@@ -590,19 +586,6 @@ def test_the_leased_token_is_the_config_dirs_login_for_the_run_only(tmp_path):
     assert json.loads(call['credentials']) == {'claudeAiOauth': {'accessToken': 'tok-max-h'}}
     assert call['credentials_mode'] == 0o600
     assert not (Path(call['env']['CLAUDE_CONFIG_DIR']) / '.credentials.json').exists()
-
-
-def test_no_lease_copies_the_host_login_into_the_config_dir_for_the_run_only(tmp_path, host_home):
-    (host_home / '.claude' / '.credentials.json').write_text('{"claudeAiOauth": {"accessToken": "host"}}')
-    fake = _fake_claude(tmp_path)
-
-    assert _run(fake, gate=FakeGate([('max-b', True)])) == mod.EXIT_OK
-
-    call = fake.only_call()
-    assert call['credentials'] == '{"claudeAiOauth": {"accessToken": "host"}}'
-    assert call['credentials_mode'] == 0o600
-    assert not (Path(call['env']['CLAUDE_CONFIG_DIR']) / '.credentials.json').exists()
-    assert (host_home / '.claude' / '.credentials.json').exists()
 
 
 # ---------------------------------------------------------------------------

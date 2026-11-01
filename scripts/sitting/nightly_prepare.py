@@ -43,11 +43,10 @@ approved for a headless run, and no other server starts.
 The account comes from the shared pool (``account_pool.build_pool``): one
 lease, read and handed straight back before the run, because nothing in the
 child can settle a slot. The known cost is that this run's spend is invisible
-to the gate. The leased token is written into the run's config dir; with no
-lease, ``_adopt_host_login`` supplies the host's own login instead. Either
-credentials file is removed on every exit that reaches ``run``'s ``finally``;
-a SIGKILL leaves it in place.
-``ANTHROPIC_API_KEY`` is stripped on both paths (OPERATIONS.md §12,
+to the gate. The leased token is written into the run's config dir and
+removed on every exit that reaches ``run``'s ``finally`` (a SIGKILL leaves
+it). With no lease the run is skipped (exit 1): it never uses the host login.
+``ANTHROPIC_API_KEY`` is stripped from the child's env (OPERATIONS.md §12,
 "Legibility trickle accounts (03:00)").
 
 Exit codes: 0 the run completed and recorded something; 1 it failed, timed out,
@@ -131,7 +130,6 @@ NIGHTLY_READ_TOOLS: tuple[str, ...] = (
 TIMESTAMP_FORMAT = '%Y%m%dT%H%M%SZ'
 
 SITTING_DATA_PATH = preparation.DEFAULT_PREPARATION_PATH.parent
-CREDENTIALS_FILE = '.credentials.json'
 
 
 def nightly_allowed_tools(inbox: Path) -> tuple[str, ...]:
@@ -243,12 +241,14 @@ def run(settings: Settings, *, gate: Any = None) -> int:
     config_dir = TaskConfigDir(f'nightly-prepare-{inbox.name}', base_dir=sitting_data / 'config')
     try:
         env = _child_env(gate if gate is not None else account_pool.build_pool(), inbox, config_dir)
+        if env is None:
+            return EXIT_FAILED
         return _run_confined(
             claude=claude, settings=settings, mcp_config=mcp_config, env=env, root=root, inbox=inbox,
             grants=(sitting_data, _ensure_uv_cache()),
         )
     finally:
-        (config_dir.path / CREDENTIALS_FILE).unlink(missing_ok=True)
+        config_dir.remove_credentials()
 
 
 def _ensure_uv_cache() -> Path:
@@ -323,35 +323,22 @@ def _mcp_config(path: Path) -> dict[str, Any]:
     return {'mcpServers': {name: servers[name] for name in NIGHTLY_MCP_SERVERS}}
 
 
-def _child_env(gate: Any, inbox: Path, config_dir: TaskConfigDir) -> dict[str, str]:
+def _child_env(gate: Any, inbox: Path, config_dir: TaskConfigDir) -> dict[str, str] | None:
+    """The CLI's env with a leased account written into *config_dir*, or None when no pool account is free."""
     env = dict(os.environ)
     env.pop('ANTHROPIC_API_KEY', None)
     env[preparation.NIGHTLY_CONFINEMENT_ENV] = str(inbox)
     env['CLAUDE_CONFIG_DIR'] = str(config_dir.path)
     lease = gate.try_lease(reverse=True)
     if lease is None:
-        _log("no pool account available; the run uses this host's own login")
-        _adopt_host_login(config_dir.path)
-        return env
+        _log('no pool account free; skipping: the nightly never uses the host login')
+        return None
     try:
         env['CLAUDE_CODE_OAUTH_TOKEN'] = lease.token
         config_dir.write_credentials(lease.token)
         return env
     finally:
         gate.release_probe_slot(lease.token)
-
-
-def _adopt_host_login(config_dir: Path) -> None:
-    """The no-lease login: a 0600 copy of ``~/.claude``'s credentials, since the sandbox keeps ``~/.claude`` read-only."""
-    source = Path.home() / '.claude' / CREDENTIALS_FILE
-    try:
-        content = source.read_bytes()
-    except OSError as exc:
-        _log(f'the host login is unreadable, so the run starts signed out: {exc}')
-        return
-    fd = os.open(config_dir / CREDENTIALS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, 'wb') as sink:
-        sink.write(content)
 
 
 def _run_bounded(argv: list[str], env: dict[str, str], timeout_secs: float, *, cwd: Path, prompt: str) -> Completed:

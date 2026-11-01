@@ -3555,10 +3555,10 @@ supersedes `data/afk-digest.md`, which was last written 2026-08-19.
    never starts. Its account comes from the shared pool, as a
    lease that is read and handed straight back, so the night's Fable spend
    is invisible to the gate. Its `CLAUDE_CONFIG_DIR` is a per-run directory
-   under `data/sitting/config/`, holding the leased token or, with nothing
-   leasable, a copy of the host's `~/.claude/.credentials.json`; the
-   credentials file is removed on every exit short of a SIGKILL. It stops
-   itself after 2700s.
+   under `data/sitting/config/` holding the leased token, which is removed
+   on every exit short of a SIGKILL. With nothing leasable the night is
+   skipped (`prepare=1`, `no pool account free; skipping`): the run never
+   uses the host's own login. It stops itself after 2700s.
 2. **Render.** This step is deterministic and runs whatever prepare
    returned. Every figure on the page comes from its own fresh measurement
    and carries a stamp, and a store it cannot read is a stated shortfall in
@@ -3598,7 +3598,7 @@ journalctl --user -u return-brief.service -n 100
 systemctl --user list-timers return-brief.timer
 ```
 
-- `prepare=1` means the Fable run failed, timed out, hit a usage limit or
+- `prepare=1` means the Fable run was skipped (no pool account free), failed, timed out, hit a usage limit or
   recorded nothing; its log line carries both stream tails, or, for a run
   that recorded nothing, the counts of what the inbox offered and could not decode. That is
   routine, not an incident:
@@ -3617,8 +3617,7 @@ failing recurring `oneshot` stays in `failed` state and silently ends the job.
 
 **API key.** The unit carries `UnsetEnvironment=ANTHROPIC_API_KEY` under the
 policy stated in "Legibility trickle accounts (03:00)" above.
-`nightly_prepare.py` also strips the key from the child's env, whether the
-account came from a lease or was inherited.
+`nightly_prepare.py` also strips the key from the child's env.
 
 **First run: arm the timer.** The installer kicks no immediate run, because
 an off-cadence run would spend a Fable budget nobody scheduled.
