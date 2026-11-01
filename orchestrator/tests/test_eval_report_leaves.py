@@ -5,11 +5,10 @@ import sys
 import pytest
 
 _REPORT_LEAVES = ('stats', 'table_render', 'prices', 'cell_admission', 'elo_report')
-_REPORT_SIBLINGS = frozenset({'composite_report', 'plan_quality_report'})
 _REPORT_SURFACES = ('plan_quality_report', 'composite_report')
 _EVERY_REPORT_SURFACE = frozenset(
     {'orchestrator.evals.report'}
-    | {f'orchestrator.evals.{sibling}' for sibling in _REPORT_SIBLINGS}
+    | {f'orchestrator.evals.{surface}' for surface in _REPORT_SURFACES}
 )
 
 
@@ -44,10 +43,7 @@ class TestReportSurfacesAreSiblings:
 
     @pytest.mark.parametrize('surface', _REPORT_SURFACES, ids=_REPORT_SURFACES)
     def test_surface_import_leaves_report_and_sibling_unloaded(self, surface: str) -> None:
-        others = {'orchestrator.evals.report'} | {
-            f'orchestrator.evals.{sibling}'
-            for sibling in _REPORT_SIBLINGS - {surface}
-        }
+        others = _EVERY_REPORT_SURFACE - {f'orchestrator.evals.{surface}'}
         assert not _evals_modules_loaded_by(surface) & others
 
 
