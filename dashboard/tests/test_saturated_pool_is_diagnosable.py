@@ -78,7 +78,9 @@ def fresh_mcp_sessions():
     """Reset the process-global MCP session cache on both sides.
 
     It is keyed by URL, so no cached session lets a test skip the saturated
-    handshake, and none outlives the test.
+    handshake, and none outlives the test. The fan-out failure streaks keyed by
+    the same URL are reset with it, so no earlier test demotes an asserted
+    WARNING to DEBUG.
     """
     memory_data.reset_sessions()
     yield
@@ -109,25 +111,23 @@ def _warnings(caplog: pytest.LogCaptureFixture, logger_name: str) -> list[str]:
 
 
 async def _get_saturated_route(
-    path: str,
-    project_root: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    transport: _SaturatedPoolTransport,
+    path: str, project_root: Path, transport: _SaturatedPoolTransport,
 ) -> httpx.Response:
     """GET *path* from the dashboard app, its MCP egress on *transport*, on the calling loop."""
     config = DashboardConfig(project_root=project_root, fused_memory_urls=[_SATURATED_URL])
     pool = DbPool()
     async with httpx.AsyncClient(transport=transport) as mcp:
-        monkeypatch.setattr(app.state, 'config', config, raising=False)
-        monkeypatch.setattr(app.state, 'db', pool, raising=False)
-        monkeypatch.setattr(app.state, 'http_client', mcp, raising=False)
-        try:
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app), base_url='http://test',
-            ) as client:
-                return await client.get(path)
-        finally:
-            await pool.close_all()
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(app.state, 'config', config, raising=False)
+            mp.setattr(app.state, 'db', pool, raising=False)
+            mp.setattr(app.state, 'http_client', mcp, raising=False)
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url='http://test',
+                ) as client:
+                    return await client.get(path)
+            finally:
+                await pool.close_all()
 
 
 @virtual_clock_test
@@ -136,10 +136,7 @@ async def test_curator_legs_name_pool_timeout(fresh_mcp_sessions, tmp_path, capl
 
     with caplog.at_level(logging.WARNING):
         resp = await _get_saturated_route(
-            '/api/v2/dashboard/curator',
-            tmp_path,
-            monkeypatch,
-            _SaturatedPoolTransport(_HOST_STALL_SECONDS),
+            '/api/v2/dashboard/curator', tmp_path, _SaturatedPoolTransport(_HOST_STALL_SECONDS),
         )
 
     assert resp.status_code == 200
@@ -170,7 +167,7 @@ async def test_memory_route_names_pool_timeout(fresh_mcp_sessions, tmp_path, cap
 
     with caplog.at_level(logging.WARNING):
         resp = await _get_saturated_route(
-            '/api/v2/dashboard/memory', tmp_path, monkeypatch, _SaturatedPoolTransport(),
+            '/api/v2/dashboard/memory', tmp_path, _SaturatedPoolTransport(),
         )
 
     assert resp.status_code == 200
