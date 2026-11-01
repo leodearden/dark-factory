@@ -8,7 +8,6 @@ import dataclasses
 import hashlib
 import json
 import logging
-import os
 import re
 import time
 import uuid as uuid_mod
@@ -87,7 +86,11 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageAgentOutcome,
 )
-from fused_memory.models.scope import Scope, build_known_projects_map
+from fused_memory.models.scope import (
+    Scope,
+    build_known_projects_map,
+    configured_primary_root,
+)
 from fused_memory.reconciliation.flag_record_contract import (
     enforce_flag_record_write_contract,
 )
@@ -2237,16 +2240,11 @@ class MemoryService:
         )
 
     def _memory_metadata_project_root(self) -> str:
-        """Project root the unknown-key storm escalation would be filed into.
-
-        Reuses the established resolution (``config.taskmaster.project_root``
-        or empty, see ``reconciliation/harness.py`` and ``server/main.py``)
-        rather than introducing a second notion of "this project's root".
-        Returns ``''`` when unconfigured, which the caller treats as
-        "census only, do not escalate" — there is no queue to file into.
+        """The registry's primary root
+        (``models/scope.py::configured_primary_root``), which the unknown-key
+        storm escalation files into; ``''`` means census only, do not escalate.
         """
-        raw = self.config.taskmaster.project_root if self.config.taskmaster else ''
-        return os.path.expanduser(raw) if raw else ''
+        return configured_primary_root(self.config.taskmaster)
 
     def set_event_buffer(self, buffer: EventBuffer) -> None:
         """Wire the reconciliation event buffer into the service."""
