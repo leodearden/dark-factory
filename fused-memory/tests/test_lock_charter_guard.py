@@ -13,6 +13,10 @@ from pathlib import Path
 import pytest
 import shared.reify_checkout as reify_checkout
 
+from fused_memory.middleware.gitignored_deliverable_guard import (
+    GitignoredDeliverableFinding,
+    gitignored_deliverable_reject,
+)
 from fused_memory.middleware.lock_charter_guard import (
     EXTENSIONLESS_FILENAMES,
     FILE_EXTENSIONS,
@@ -73,7 +77,14 @@ def _resolve_reify_checkout(start: Path | None = None) -> reify_checkout.ReifyCh
     )
 
 
-_LCG_LOGGER = 'fused_memory.middleware.lock_charter_guard'
+_SCHEMA_WARNING = 'task_metadata.schema_warning'
+_SOURCE = 'source=lock_charter_guard.extract_files'
+
+
+def _discard_lines(caplog) -> list[str]:
+    messages = (r.getMessage() for r in caplog.records)
+    return [m for m in messages if _SCHEMA_WARNING in m and _SOURCE in m]
+
 
 # ---------------------------------------------------------------------------
 # Drift guard — two tiers:
@@ -1094,17 +1105,17 @@ class TestExtractFiles:
 
     def test_unparseable_json_warns_and_returns_empty(self, caplog):
         """RED (task 2166 step-9): the str/json branch currently discards silently."""
-        with caplog.at_level(logging.WARNING, logger=_LCG_LOGGER):
+        with caplog.at_level(logging.WARNING):
             result = extract_files('not valid json {{{')
         assert result == []
-        warns = [
-            r for r in caplog.records
-            if r.name == _LCG_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert any('task_metadata.schema_warning' in r.message for r in warns), (
-            f'expected a task_metadata.schema_warning WARNING; got '
-            f'{[r.message for r in warns]!r}'
-        )
+        assert len(_discard_lines(caplog)) == 1
+
+    @pytest.mark.parametrize('metadata', [42, ['a/b.rs']], ids=repr)
+    def test_non_str_unreadable_metadata_warns_and_returns_empty(self, metadata, caplog):
+        with caplog.at_level(logging.WARNING):
+            result = extract_files(metadata)
+        assert result == []
+        assert len(_discard_lines(caplog)) == 1
 
     def test_json_non_dict_returns_empty(self):
         # JSON string that parses to a list, not a dict
@@ -1171,6 +1182,58 @@ class TestLockCharterError:
         result = lock_charter_error(['orchestrator/'])
         assert 'error' in result
         assert result['error_type'] == 'LockCharterViolation'
+
+    @pytest.mark.parametrize(
+        'path',
+        ['tasks.db', '.taskmaster/tasks/tasks.db', 'data/x.sqlite', '.env'],
+    )
+    def test_unrecognised_extension_rejection_names_deterministic_routing(self, path):
+        assert directory_locks([path]) == [path]
+
+        result = lock_charter_error([path])
+
+        assert result['unrecognised_extension_paths'] == [path]
+        assert "task_kind='deterministic'" in result['error']
+        assert "task_kind='deterministic'" in result['hint']
+        assert path in result['hint']
+        assert 'FILE_EXTENSIONS' in result['hint']
+
+    def test_unrecognised_extension_hint_carries_the_gitignored_guard_routing(self):
+        gitignored_hint = gitignored_deliverable_reject(
+            GitignoredDeliverableFinding(ignored_paths=('tasks.db',))
+        )['hint']
+
+        assert gitignored_hint in lock_charter_error(['tasks.db'])['hint']
+
+    @pytest.mark.parametrize(
+        'path',
+        ['crates/', 'orchestrator/', 'src', 'crates/reify-eval/src', 'hooks/some-new-hook', 'tasks.db/'],
+    )
+    def test_genuine_directory_rejection_omits_deterministic_routing(self, path):
+        assert directory_locks([path]) == [path]
+
+        result = lock_charter_error([path])
+
+        assert result['unrecognised_extension_paths'] == []
+        assert 'deterministic' not in result['error']
+        assert 'deterministic' not in result['hint']
+
+    @pytest.mark.parametrize('path', ['README.MD', 'config/app.YAML'])
+    def test_case_variant_of_an_allowlisted_extension_gets_only_the_lowercase_advice(self, path):
+        assert directory_locks([path]) == [path]
+
+        result = lock_charter_error([path])
+
+        assert result['unrecognised_extension_paths'] == []
+        assert 'deterministic' not in result['error'] + result['hint']
+        assert 'lowercase' in result['hint']
+
+    def test_mixed_rejection_lists_only_the_unrecognised_extension_paths(self):
+        result = lock_charter_error(['crates/', 'tasks.db'])
+
+        assert result['directory_paths'] == ['crates/', 'tasks.db']
+        assert result['unrecognised_extension_paths'] == ['tasks.db']
+        assert "task_kind='deterministic'" in result['hint']
 
 
 class TestSkipUnlessCheckout:

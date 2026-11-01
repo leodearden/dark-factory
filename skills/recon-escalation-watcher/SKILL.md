@@ -53,14 +53,13 @@ claude --strict-mcp-config --mcp-config "$DARK_FACTORY_ROOT/recon-watch/mcp.json
   "/recon-escalation-watcher"
 ```
 
-**Default lane: tmux.** This is a long-running loop session (PRD
-`plans/fleet-cockpit-prd.md` §3 fork 1) — run it in the crash-survivable, reattachable tmux lane
-by default: wrap the invocation above via `skills/spawn/spawn-claude.sh` with
-`CLAUDE_SPAWN_BACKEND=tmux` (see that script's header) so the session gets a `display.kind=tmux`
-session-registry record and a `tmux attach`-reattachable window. A killed watcher is reattachable
-with `tmux attach`, and its record persists across the crash. Interactive one-offs are unaffected
-— this watcher never spawns interactive sessions of its own (see the table above: no `/unblock`,
-no worktree).
+**Lane.** This is a long-running loop session (PRD `plans/fleet-cockpit-prd.md` §3 fork 1). The
+operator runs it as a **T3 Code thread** (hosted; no `CLAUDE_SPAWN_BACKEND` needed). Launched from a
+plain terminal, run it in the crash-survivable, reattachable tmux lane: wrap the invocation above via
+`skills/spawn/spawn-claude.sh` with `CLAUDE_SPAWN_BACKEND=tmux` (see that script's header) so the
+session gets a `display.kind=tmux` session-registry record and a `tmux attach`-reattachable window
+that persists across a crash. This watcher never spawns interactive sessions of its own (see the
+table above: no `/unblock`, no worktree).
 
 `recon-watch/mcp.json` (created by the setup; both servers required):
 
@@ -554,14 +553,13 @@ JSON with `description`/`affected_ids`/`actionable`), and `dedupe_count`.
        # dead. This is a SUCCESS, not a failure: do NOT retry (a retry just
        # re-hits the same guard) and do NOT record a task id.
        resolve_issue(..., action='close_only', resolution="Ticket <res['reason']>")   # res["reason"] already reads "refused (no task created): ..."
-   elif res["status"] == "awaiting_curation":
-       # Parked for curation: no task_id yet, NOT a failure. Do NOT re-submit.
+   elif res["status"] in ("pending", "awaiting_curation"):  # open — resolve the SAME ticket again, never re-submit (_shared/ticket-failure-handling.md)
+       # No task_id yet, NOT a failure. Still open after the re-resolve:
        resolve_issue(..., action='resume', resolution="Queued for curation (ticket <sub['ticket']>)")
    elif res["status"] == "failed":
-       # Retryable (`server_restart`, `timeout`): apply
-       # _shared/ticket-failure-handling.md's retry policy (retry
-       # `resolve_ticket` first under `timeout`; re-submit the pair once
-       # under `server_restart`) within its 2-submit/2-resolve cap, then
+       # Retryable (`server_restart`): apply
+       # _shared/ticket-failure-handling.md's retry policy (re-submit the
+       # pair once) within its 2-submit/2-resolve cap, then
        # re-enter this dispatch on the retry's outcome. Once the reason is
        # terminal — or that budget is exhausted — do NOT call resolve_issue:
        # leave the escalation pending. Record res["reason"], tell the human,
@@ -571,9 +569,9 @@ JSON with `description`/`affected_ids`/`actionable`), and `dedupe_count`.
        # See _shared/ticket-failure-handling.md for the full retryable/
        # terminal reason matrix and R4 idempotency guidance.
    else:
-       # Unrecognized status (e.g. `cancelled`, written by cancel_ticket —
-       # the ticket status column has no CHECK constraint, and tools.py's
-       # docstring documents only the four statuses above). Same
+       # `cancelled` (withdrawn by cancel_ticket: terminal, no task_id) or a
+       # status outside _shared/ticket-failure-handling.md's vocabulary (the
+       # ticket status column has no CHECK constraint). Same
        # follow-through as the `failed` arm above (tell the human, file a
        # DecisionRecord, append this esc-id to the exclude file; do NOT call
        # resolve_issue) — plus record the raw `res`, since the status itself
@@ -740,7 +738,7 @@ check ran in. Single normative statement of the rule:
   re-derive it live. **Run from the project root** — `--queue-dir` defaults to
   the relative `./data/reconciliation/escalations`, so the cwd is what decides
   which queue is read; from anywhere else the script refuses with
-  `TargetStoreMissing` rather than manufacturing an empty queue and reporting a
+  `TargetStoreUnpopulated` rather than manufacturing an empty queue and reporting a
   false clean run (see
   `fused-memory/src/fused_memory/utils/target_store_preflight.py`). Pass an
   absolute `--queue-dir` if you cannot control the cwd.
@@ -1014,7 +1012,11 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   its lease-token shape is not a session-registry key. The cockpit's Enter-to-focus follows
   `record_slug`, your session record's key, which `write-decision` stamps itself from `$CLAUDE_PID`;
   there is no shell token to add. If it cannot be resolved the decision is still filed, just
-  unlinked.
+  unlinked, and the verb says so with a line on stderr that starts `write-decision --id <your id>`,
+  names `$CLAUDE_PID` and says `BLANK record_slug` (it carries no `WARNING` prefix). That line alone
+  is not a failed filing: an id on stdout still means the filing landed, and the row is only
+  unfocusable in the cockpit. Re-filing from the same session resolves the same way, so it does not
+  repair the link and is not called for.
 - **`--severity`**: pass through the parked escalation's own severity (`esc.severity` —
   `info`/`blocking`/`critical`/`urgent`). This now weights the cockpit decision-queue rank, so a
   freshly-filed `critical`/`urgent` park surfaces at the top of the queue instead of being buried

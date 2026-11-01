@@ -12,11 +12,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _usage_gate_test_helpers import spawn_fault as _spawn_fault
 
-from shared.cli_invoke import AgentResult
+from shared.cli_invoke import AgentResult, parse_claude_cli_output
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import (
     CAP_HIT_PREFIXES,
     NEAR_CAP_PREFIXES,
+    AuthFailed,
     CapHit,
     CliLocalError,
     NearCap,
@@ -2183,7 +2184,9 @@ class TestRunProbeClassifyInvocationConsistency:
     they still differ is the AUTH_FAILED -> CAPPED demotion, which a "still
     capped" reading would take and a CliLocalError reading must not. The other
     test pins the prefix-only (no confirm keyword) behavior against the
-    classifier as a regression guard.
+    classifier as a regression guard. A third pins AuthFailed precedence: a
+    401/403 result whose body carries a cap prefix is an auth failure, so an
+    AUTH_FAILED account is not demoted to CAPPED.
     """
 
     async def _make_probing_gate(self) -> tuple[UsageGate, AccountState]:
@@ -2234,6 +2237,29 @@ class TestRunProbeClassifyInvocationConsistency:
             'cap-like text as "still capped" and demote AUTH_FAILED -> CAPPED '
             '(CliLocalError precedence, reify-3604)'
         )
+
+    async def test_auth_failure_status_outranks_cap_text_like_the_classifier(self):
+        stdout = json.dumps({
+            'type': 'result',
+            'subtype': 'success',
+            'is_error': True,
+            'api_error_status': 403,
+            'result': "You've used all seats in this organization",
+        })
+        outcome = classify_invocation(
+            parse_claude_cli_output(stdout=stdout, stderr='', returncode=1),
+            strict_confirm=False,
+        )
+        assert isinstance(outcome, AuthFailed)
+
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.auth_failed = True
+        proc = _make_mock_proc(returncode=1, stdout=stdout.encode())
+        with patch('asyncio.create_subprocess_exec', return_value=proc):
+            result = await gate._run_probe(acct)
+        assert result is False
+        assert acct.phase == AccountPhase.AUTH_FAILED
 
 
 # ---------------------------------------------------------------------------

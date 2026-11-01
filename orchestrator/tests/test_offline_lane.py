@@ -302,11 +302,10 @@ class TestOfflineLaneCommandsReload:
             f'missing from RELOADABLE_FIELDS'
         )
 
-    def test_commands_edit_lands_in_applied_candidates(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_commands_edit_lands_in_applied_candidates(self):
         from orchestrator.config import LaneCommand, diff_config
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig(git=GitConfig(offline_lane_commands=[]))
         fresh = OrchestratorConfig(
             git=GitConfig(
@@ -319,11 +318,10 @@ class TestOfflineLaneCommandsReload:
         assert 'git.offline_lane_commands' in diff.applied_candidates
         assert 'git.offline_lane_commands' not in diff.restart_required
 
-    def test_apply_reload_applies_commands_in_place(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_apply_reload_applies_commands_in_place(self):
         from orchestrator.config import LaneCommand, apply_reload
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig(git=GitConfig(offline_lane_commands=[]))
         fresh = OrchestratorConfig(
             git=GitConfig(

@@ -14,6 +14,7 @@ from typing import Any, Final, Literal
 from shared.task_statuses import TaskStatus
 
 from fused_memory.middleware.curation_deferral import DeferReason, deferral_justification
+from fused_memory.utils.clip_disclosure import elide_text
 
 
 class CuratorFailureError(RuntimeError):
@@ -113,7 +114,7 @@ class CandidateTask:
     files_to_modify: list[str] = field(default_factory=list)
     priority: str = DEFAULT_PRIORITY
     spawned_from: str | None = None  # task id of the review-chain anchor
-    spawn_context: str = 'manual'  # review | steward-triage | planning | manual
+    spawn_context: str = 'manual'  # review | steward-triage | planning | agent_followup | manual
     # metadata.execution_class ('code_tdd' | 'operational' | 'decision' | None) —
     # consulted by operational_ask_registry.match_candidate. Its routing axis
     # (task 2687) is DEMOTED (task δ): a tagged operational/decision candidate is
@@ -288,13 +289,15 @@ class PoolWithheld:
     ``create`` or ``combine`` as if the pool were complete.
 
     ``by_source`` counts the eligible entries each cap excluded, keyed by the
-    stream that lost them (``module`` / ``embedding`` / ``dependency``) plus
+    stream that lost them (``sibling`` / ``module`` / ``embedding`` /
+    ``dependency``) plus
     ``total_cap`` for the final ``task_curator.py::_trim_pool`` pass. ``caps``
     carries the configured limits that produced those counts, so a reader can
     tell a pool one entry over its cap from one that lost forty.
 
-    The ``module`` and ``dependency`` counts are corpus-exhaustive — both
-    streams scan every task. The ``embedding`` count is NOT: it is taken over
+    The ``module``, ``sibling`` and ``dependency`` counts are
+    corpus-exhaustive — module and dependency scan every task, and sibling
+    counts come from an exact store lookup. The ``embedding`` count is NOT: it is taken over
     a fixed qdrant retrieval window (``pool_embedding_cap + 20`` points), so
     at most 20 neighbours can ever be reported however many near-duplicates
     the corpus holds. A stream whose count is ceilinged that way is named in
@@ -348,7 +351,8 @@ class PoolWithheld:
         return block
 
 
-POOL_SOURCES: Final = ('anchor', 'module', 'embedding', 'dependency')
+# Strongest-first; task_curator.py::_trim_pool drops in the reverse order.
+POOL_SOURCES: Final = ('anchor', 'sibling', 'module', 'embedding', 'dependency')
 
 
 def empty_pool_sizes() -> dict[str, int]:
@@ -405,24 +409,24 @@ def embedding_text(title: str, description: str, files_to_modify: list[str]) -> 
 
 
 def clip_for_prompt(text: str, cap: int) -> str:
-    """Clip *text* to *cap* characters, marking how much was elided.
+    """Clip *text* to *cap* characters for the curator prompt, marking how much was elided.
 
-    The single owner of truncate-and-mark for the curator prompt. Both sides
-    of that prompt route through it — the POOL side (:meth:`PoolEntry.render`)
-    and the CANDIDATE side (``task_curator.py::_render_candidate_section``,
-    which both the single and batch prompts use) — so the two cannot drift apart
-    (INV-5 ``no-lockstep-duplication``). They previously did: the pool side
-    appended a bare ``…`` while the candidate side clipped silently, so the
-    reading LLM could not tell a short description from a truncated one.
+    The counted marker is owned by ``utils/clip_disclosure.py::elide_text``;
+    this is the curator prompt's single route to it. Both sides of that prompt
+    route through here — the POOL side (:meth:`PoolEntry.render`) and the
+    CANDIDATE side (``task_curator.py::_render_candidate_section``, which both
+    the single and batch prompts use) — so the two cannot drift apart (INV-5
+    ``no-lockstep-duplication``). They previously did: the pool side appended a
+    bare ``…`` while the candidate side clipped silently, so the reading LLM
+    could not tell a short description from a truncated one. Text longer than
+    a non-positive *cap* raises ``ValueError`` rather than rendering a marker.
 
     The elided COUNT is part of the marker because the size of the loss is
     what decides whether it mattered: "2 characters trimmed" and "1827
     characters of concrete file references gone" are not the same event, and
     1827 was the measured mean elision at the pre-2026-09-18 cap.
     """
-    if len(text) <= cap:
-        return text
-    return f'{text[:cap]}…[+{len(text) - cap} chars elided]'
+    return elide_text(text, cap, field='curator_prompt').text
 
 
 def is_combine_eligible_status(status: str) -> bool:

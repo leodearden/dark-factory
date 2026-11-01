@@ -3,7 +3,7 @@
 
 # Verification commands
 # bare-MagicMock config gate (also runs in merge-queue verify; see hooks/project-checks)
-lint_command: "uv run --directory shared ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests"
+lint_command: "uv run --directory shared ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests && python3 tests/scripts/raw_envelope_literal_guard.py shared"
 test_command: "uv run --directory shared pytest tests/ --tb=short -q --timeout=300"
 # --threads 8 (task 5408). THE CANONICAL RATIONALE for this flag across the
 # workspace — sampler/orchestrator.yaml carries the same flag and points here,
@@ -177,7 +177,7 @@ type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 # this block exists to prevent, left uncorrected until this task touched the
 # paragraph. Family band today: tests/scripts 1000/397.47 = 2.52x, scripts
 # 2400/930.59 = 2.58x, dashboard 1700/653.54 = 2.60x, fused-memory
-# 1200/439.80 = 2.73x, escalation 1000/354.56 = 2.82x. shared's own B/W =
+# 4500/1695.08 = 2.65x, escalation 1000/354.56 = 2.82x. shared's own B/W =
 # 800/296.88 = 2.69x now sits inside that band, against today's 600/296.88 =
 # 2.02x — already the family's thinnest before this task, and thinner still
 # once W moved from 219.08 to 296.88.

@@ -31,6 +31,8 @@ class _MalformedReply(ValueError):
 
 
 class TicketStatus(enum.StrEnum):
+    PENDING = "pending"
+    AWAITING_CURATION = "awaiting_curation"
     CREATED = "created"
     COMBINED = "combined"
     REFUSED = "refused"
@@ -68,7 +70,10 @@ class TicketOutcome:
 
     @property
     def undecided(self) -> bool:
-        """The wait expired before the curator decided; the ticket may still be decided."""
+        """The curator has not decided yet; the ticket may still be decided."""
+        if self.status in (TicketStatus.PENDING, TicketStatus.AWAITING_CURATION):
+            return True
+        # A pre-6705 fused-memory answers an expired wait failed/timeout; task 8004 retires this.
         return self.status is TicketStatus.FAILED and self.reason == "timeout"
 
 

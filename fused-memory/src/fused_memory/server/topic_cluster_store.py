@@ -45,6 +45,7 @@ from typing import Any
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 
 from fused_memory.config.schema import ProceduralTopicCluster
+from fused_memory.server.near_duplicate_guard import can_share_one_occurrence
 
 __all__ = [
     'TopicClusterStore',
@@ -311,7 +312,8 @@ def derive_topic_cluster(
       the other, and neither's end overlaps the other's start on a whole word.
       The matcher counts substring hits, so ``git merge-base`` beside
       ``merge-base --is-ancestor`` would let the one construction
-      ``git merge-base --is-ancestor`` reach ``min_phrase_hits`` alone;
+      ``git merge-base --is-ancestor`` reach ``min_phrase_hits`` alone
+      (``near_duplicate_guard.py::can_share_one_occurrence``);
     * at most six phrases, ``min_phrase_hits`` 2 and never any
       ``sufficient_phrases``: promoting a phrase to sufficient is a human
       judgement the schema reserves for identifier-shaped names;
@@ -418,34 +420,10 @@ def _rank(support: dict[str, int]) -> list[str]:
     )
 
 
-def _can_share_one_occurrence(first: str, second: str) -> bool:
-    return (
-        first in second
-        or second in first
-        or _overlaps_on_a_whole_word(first, second)
-        or _overlaps_on_a_whole_word(second, first)
-    )
-
-
-def _overlaps_on_a_whole_word(head: str, tail: str) -> bool:
-    """Whether *head*'s end is *tail*'s start, the shared text being whole words on one side.
-
-    ``git add -f .task/`` and ``.task/plan.json is gitignored`` qualify (the
-    whole word ``.task/`` begins ``tail``'s first word), so the one
-    construction ``git add -f .task/plan.json is gitignored`` holds both. A
-    shared fragment inside a word on BOTH sides (``locks`` / ``set``) does not:
-    only a fused non-word could hold both.
-    """
-    return any(
-        head[-shared:] == tail[:shared] and (head[-shared - 1] == ' ' or tail[shared] == ' ')
-        for shared in range(1, min(len(head), len(tail)))
-    )
-
-
 def _select_non_overlapping(ranked: list[str]) -> list[str]:
     selected: list[str] = []
     for phrase in ranked:
-        if any(_can_share_one_occurrence(phrase, kept) for kept in selected):
+        if any(can_share_one_occurrence(phrase, kept) for kept in selected):
             continue
         selected.append(phrase)
         if len(selected) == _MAX_DERIVED_PHRASES:

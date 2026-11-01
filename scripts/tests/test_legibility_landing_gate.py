@@ -1,17 +1,22 @@
 """Tests for scripts/legibility/landing_gate.py: a project's landing-gate
 command, run in its checkout, says whether a census output may land there
-(task 7448). Real subprocesses through ``sys.executable -c``, a one-commit git
-repo under ``tmp_path`` as the checkout."""
+(task 7448). Real subprocesses (mostly ``sys.executable -c``), a one-commit
+git repo under ``tmp_path`` as the checkout."""
 from __future__ import annotations
 
+import contextlib
+import os
+import shlex
+import signal
 import subprocess
 import sys
-import time
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 from legibility import config, landing_gate
+
+from df_pytest_isolation import read_leaked_pid, wait_pid_gone
 
 GateStatus = landing_gate.GateStatus
 
@@ -137,37 +142,28 @@ def test_a_failed_verdict_describes_its_command_and_exit_code(checkout: Path) ->
     assert sys.executable in described
 
 
-def _running(pid: int) -> bool:
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
-        return False
-    return stat.rsplit(")", 1)[1].split()[0] != "Z"
-
-
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
 def test_a_timeout_kills_every_process_the_command_started(checkout: Path, tmp_path_factory) -> None:
+    """A timeout kills every process the command started, not just the command. The grandchild
+    holds none of the gate's pipes and the foreground is exec'd, so killing only the direct child
+    would leave the grandchild running here rather than stall the gate on pipe EOF."""
     pidfile = tmp_path_factory.mktemp("grandchild") / "pid"
-    grandchild = f"import os, pathlib, time; pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid())); time.sleep(60)"
-    code = (
-        "import pathlib, subprocess, sys, time; "
-        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}]); "
-        f"[time.sleep(0.05) for _ in iter(lambda: pathlib.Path({str(pidfile)!r}).exists(), True)]; "
-        "time.sleep(60)"
-    )
+    command = f"sleep 300 >/dev/null 2>&1 & echo $! > {shlex.quote(str(pidfile))}; exec sleep 60"
+    spec = config.LandingGate(argv=("/bin/sh", "-c", command), timeout_secs=3)
 
-    verdict = landing_gate.run_gate(checkout, _spec(code, timeout_secs=3))
+    verdict = landing_gate.run_gate(checkout, spec)
 
     assert verdict.status is GateStatus.DID_NOT_RUN
-    pid = int(pidfile.read_text())
+    grandchild = read_leaked_pid(pidfile)
     try:
-        deadline = time.monotonic() + 5
-        while _running(pid) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert not _running(pid)
+        assert wait_pid_gone(grandchild, timeout=5), (
+            f"pid {grandchild}, a grandchild the gate command started, is still running after the gate "
+            "timed out: the timeout did not kill the command's whole process group"
+        )
     finally:
-        if _running(pid):
-            subprocess.run(["kill", "-9", str(pid)], check=False)
+        if not wait_pid_gone(grandchild, timeout=0):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(grandchild, signal.SIGKILL)
 
 
 def test_output_that_is_not_utf_8_still_fails_with_its_output(checkout: Path) -> None:

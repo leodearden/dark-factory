@@ -164,6 +164,20 @@ def wire_clear_claim_then_set_status(scheduler_mock: MagicMock) -> None:
     )
 
 
+def wire_live_status_from_get_task(scheduler_mock: MagicMock) -> None:
+    """Answer ``get_status`` on a MagicMock Scheduler from its own ``get_task`` row.
+
+    Mirrors the real Scheduler, where both read the same fused-memory row;
+    ``get_task`` is looked up per call, so a test that reassigns it later flows through.
+    """
+
+    async def _live_status(tid: str) -> str | None:
+        row = await scheduler_mock.get_task(tid)
+        return (row or {}).get('status')
+
+    scheduler_mock.get_status = AsyncMock(side_effect=_live_status)
+
+
 # task 3492/4215: the pyproject-configured default per-test timeout ceiling
 # that every heavy test in this suite must clear.  MIRROR of
 # `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml -- see
@@ -212,15 +226,20 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 # (private sweepers and shared-pass consumers) from source on every run and
 # fails a member that lacks the mark OR pins it below this ceiling.
 #
-# MECHANISM -- why a breach here is far more expensive than a red test:
-#   * `[tool.pytest.ini_options].timeout_method = "thread"` means pytest-timeout
-#     answers a breach by `os._exit()`ing the whole xdist worker ("node down:
-#     Not properly terminated"), NOT by failing the offending test;
-#   * `--max-worker-restart=0` (in `[tool.pytest.ini_options].addopts`, task
-#     1907) then declines to replace that worker, degrading the run to a
-#     TRUNCATED whole-suite session whose surviving failure names some innocent
-#     guard that merely shared the dead worker.
-#   So one slow tree-scan costs a whole verify run AND misattributes the blame.
+# MECHANISM -- what a breach here costs:
+#   * until task 6354, `[tool.pytest.ini_options].timeout_method = "thread"`
+#     meant pytest-timeout answered a breach by `os._exit()`ing the whole xdist
+#     worker ("node down: Not properly terminated"), NOT by failing the
+#     offending test, and `--max-worker-restart=0` (in
+#     `[tool.pytest.ini_options].addopts`, task 1907) then declined to replace
+#     that worker, degrading the run to a TRUNCATED whole-suite session whose
+#     surviving failure named some innocent guard that merely shared the dead
+#     worker.  One slow tree-scan cost a whole verify run AND misattributed the
+#     blame; the measured history below is from that era;
+#   * since task 6354 the method is `signal`: a breach is one false red on the
+#     scanner itself, and the worker lives on.  The ceiling still prevents that
+#     false red.  A breach inside a C or Rust call (complexipy's analysis)
+#     surfaces only once that call returns.
 #
 # MEASURED history of the family:
 #   * unloaded and serial (`-n0`) on a 32-core box: 8.25s/call
@@ -237,7 +256,7 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 #   guard -- which is what makes this a
 #   FAMILY defect rather than three accidents, and why the rest are marked
 #   preemptively: a marked-but-fast test costs nothing, while an
-#   unmarked-and-slow one costs a whole session.
+#   unmarked-and-slow one cost a whole session then, and costs a false red now.
 # The current anchor is
 # test_whole_tree_scan_timeout_guard.py::_MEASURED_UNDER_LOAD_WORST_CASE, which
 # floors the family at test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS.
@@ -273,9 +292,10 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 WHOLE_TREE_SCAN_TEST_TIMEOUT = 1200
 
 # Headroom a per-test ceiling must keep over its family's measured-under-load
-# worst case.  8x rather than 2x: the xdist worker deaths these ceilings exist
-# to prevent were observed at loadavg 250-423, one inflation step past the load
-# at which any measurement has been taken.  Rationale and corpus:
+# worst case.  8x rather than 2x: the breaches these ceilings exist to prevent
+# (xdist worker deaths, in the thread era before task 6354) were observed at
+# loadavg 250-423, one inflation step past the load at which any measurement
+# has been taken.  Rationale and corpus:
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 UNDER_LOAD_HEADROOM_FACTOR = 8
 
@@ -826,10 +846,9 @@ MERGE_RESULT_TIMEOUT = 45
 # task 3980: how far `wait_responsive` below may stretch a wait's REAL wall
 # clock past its nominal, loop-responsive budget.  SINGLE SOURCE of the ratio:
 # the helper's per-call default cap is
-# `min(RESPONSIVE_WAIT_STRETCH * timeout, RESPONSIVE_WAIT_WALL_CAP)`, and
-# test_merge_queue_concurrent_verify.py's AST wait-budget auditor
-# (`_call_wait_budget`) bills a `wait_responsive` site by IMPORTING this same
-# constant.  One definition is what makes the auditor's number an exact upper
+# `min(RESPONSIVE_WAIT_STRETCH * timeout, RESPONSIVE_WAIT_WALL_CAP)`, and the
+# AST wait-budget auditor (`_wait_budget_audit.py::_call_wait_budget`) bills a
+# `wait_responsive` site by IMPORTING this same constant.  One definition is what makes the auditor's number an exact upper
 # bound on the helper rather than an estimate free to drift below it.
 RESPONSIVE_WAIT_STRETCH = 2.0
 
@@ -838,9 +857,8 @@ RESPONSIVE_WAIT_STRETCH = 2.0
 # reviewer can check the arithmetic instead of trusting a number.  It bounds
 # the scaled per-call cap above whatever nominal a call site passes.  Whether
 # the waits a test stacks on it fit that test's timeout mark is checked, not
-# restated here: each guarded module's TestTimeoutMarkCoverage recomputes
-# every class's budget from source
-# (test_merge_queue_concurrent_verify.py::_worst_per_method_wait_budget).
+# restated here: test_wait_budget_coverage_guard.py recomputes every test's
+# budget from source (`_wait_budget_audit.py::item_wait_budgets`).
 # Never-narrow.
 RESPONSIVE_WAIT_WALL_CAP = int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT)  # 90s
 
@@ -866,6 +884,10 @@ RESPONSIVE_WAIT_WALL_CAP = int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT)  
 # If a gate-barrier flake is ever measured, the fix is to make child-process
 # progress observable to the accounting, not to grow this number.  Never-narrow.
 MERGE_GATE_BARRIER_TIMEOUT = MERGE_RESULT_TIMEOUT // 3  # 15s
+
+# Default worker-task join of _merge_worker_drive.py::stop_merge_worker,
+# which `_wait_budget_audit.py::_call_wait_budget` bills for a bare call.
+STOP_WORKER_JOIN_TIMEOUT = 5.0
 
 # task 3307: generous synchronization-barrier ceiling for the workflow
 # CancellationScope tests (test_workflow_cancellation.py).  These barriers
@@ -1001,17 +1023,15 @@ async def wait_responsive(
     Any class using this MUST carry an adequate ``@pytest.mark.timeout`` —
     exactly as ``CANCEL_SCOPE_BARRIER_TIMEOUT`` above already states.  An
     unmarked test runs under ``PYPROJECT_DEFAULT_TIMEOUT`` locally and under
-    ``VERIFY_CLI_PER_TEST_TIMEOUT`` on verify, with ``timeout_method =
-    "thread"`` and ``--max-worker-restart=0``: exceeding the per-test timeout
-    does not fail the test, it ``os._exit()``s the xdist worker, degrading a
-    clean per-test failure into a worker death.  A
-    stretched wait without a paired mark is therefore strictly worse than the
-    flake it fixes.
+    ``VERIFY_CLI_PER_TEST_TIMEOUT`` on verify, and a stretched wait that
+    outlasts that cap fails the test on pytest-timeout's cap rather than on
+    the condition it waits for.  A stretched wait without a paired mark
+    therefore only trades the flake it fixes for a timeout failure at the cap.
 
     The default ``cap`` SCALES WITH THE NOMINAL rather than defaulting flat to
     the 90s ceiling, and that is what makes the paired marks checkable:
-    ``_wait_responsive_budget``'s ``min(nominal * RESPONSIVE_WAIT_STRETCH,
-    RESPONSIVE_WAIT_WALL_CAP)`` is then an EXACT upper bound on this helper,
+    ``_wait_budget_audit.py::_wait_responsive_budget``'s
+    ``min(nominal * RESPONSIVE_WAIT_STRETCH, RESPONSIVE_WAIT_WALL_CAP)`` is then an EXACT upper bound on this helper,
     not an under-count.  With a flat default a ``timeout=15`` site the auditor
     billed at 30s could consume 90s, and TestLateArrivalCleanCAS's true worst
     case would overrun its ``HEAVY_BARRIER_TEST_TIMEOUT`` mark.
@@ -1023,8 +1043,8 @@ async def wait_responsive(
     guard rejects the site rather than under-billing it.
 
     The kwarg is named literally ``timeout`` so task 3492's AST wait-budget
-    scanner (``_call_wait_budget`` in test_merge_queue_concurrent_verify.py)
-    can resolve call sites without a special case.
+    scanner (``_wait_budget_audit.py::_call_wait_budget``) can resolve call
+    sites without a special case.
 
     Accepts a Future, a Task or a coroutine.  When a coroutine is wrapped, the
     wrapper task is cancelled on give-up so nothing leaks into pytest-asyncio

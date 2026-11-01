@@ -203,7 +203,7 @@ async def test_run_eval_forwards_memory_endpoint_to_build_eval_orch_config(tmp_p
     monkeypatch.setattr('orchestrator.evals.runner.build_eval_orch_config', _rec)
     monkeypatch.setattr(
         'orchestrator.evals.runner.load_task',
-        lambda _path: {'id': 't', 'project_root': str(tmp_path)},
+        lambda _path: {'id': 't', 'project_root': str(tmp_path), 'plan': {'steps': [{'id': 's1', 'status': 'pending'}]}},
     )
 
     cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')

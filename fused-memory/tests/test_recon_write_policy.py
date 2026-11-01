@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import subprocess
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
@@ -151,6 +152,15 @@ def _capturing_async_detector(captured: dict, result: bool = False):
         return result
 
     return _spy
+
+
+_SCHEMA_WARNING = 'task_metadata.schema_warning'
+
+
+def _discard_lines(caplog, source: str) -> list[str]:
+    """The census lines that name *source* as the reader that discarded metadata."""
+    messages = (r.getMessage() for r in caplog.records)
+    return [m for m in messages if _SCHEMA_WARNING in m and f'source={source}' in m]
 
 
 # ---------------------------------------------------------------------------
@@ -466,8 +476,8 @@ class TestCheckGate2LiveWorkflow:
         assert captured['kwargs'].get('pure_gate') is False
 
     async def test_gate_2_coerces_json_string_task_metadata(self, monkeypatch):
-        """A JSON-object-string metadata blob is coerced via
-        _coerce_metadata_dict, the module's existing shared idiom."""
+        """A JSON-object-string metadata blob is resolved through
+        metadata_dict.raw_metadata_dict, the shared wire rule."""
         captured = self._capture_detector_kwargs(monkeypatch)
         await _check(
             'set_task_status',
@@ -501,6 +511,30 @@ class TestCheckGate2LiveWorkflow:
         assert captured['kwargs'].get('task_kind') is None
         assert captured['kwargs'].get('pure_gate') is False
         assert verdict.is_rejection is False
+
+    @pytest.mark.parametrize(
+        ('task_metadata', 'census_lines'),
+        [('not json', 1), (42, 1), ('[]', 1), (['a'], 1), (None, 0), ('', 0)],
+        ids=['invalid-json', 'int', 'json-list', 'list', 'none', 'empty-str'],
+    )
+    async def test_gate_2_logs_unreadable_task_metadata_once_and_absent_never(
+        self, monkeypatch, caplog, task_metadata, census_lines
+    ):
+        """Unreadable task_metadata still fails safe toward live, and is
+        logged once under source=recon_write_policy.check; absent metadata
+        is not logged."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+        with caplog.at_level(logging.WARNING):
+            await _check(
+                'set_task_status',
+                task_id='7',
+                live_status='pending',
+                task_metadata=task_metadata,
+            )
+
+        assert captured['kwargs'].get('task_kind') is None
+        assert captured['kwargs'].get('pure_gate') is False
+        assert len(_discard_lines(caplog, 'recon_write_policy.check')) == census_lines
 
 
 # ---------------------------------------------------------------------------
@@ -862,6 +896,13 @@ class TestExtractSnapshotToken:
 
     def test_extract_from_dict_with_empty_string_value_is_none(self):
         assert recon_write_policy.extract_snapshot_token({'snapshot_status': ''}) is None
+
+    @pytest.mark.parametrize('metadata', ['{not json', 42], ids=repr)
+    def test_unreadable_metadata_is_none_and_logs_one_census_line(self, metadata, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert recon_write_policy.extract_snapshot_token(metadata) is None
+        source = 'recon_write_policy.extract_snapshot_token'
+        assert len(_discard_lines(caplog, source)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1305,7 +1346,7 @@ class TestIsTerminalAnnotationExempt:
         ) is False
 
     def test_add_plus_causation_id_via_json_string_metadata_is_true(self):
-        """JSON-string metadata (the _coerce_metadata_dict string-coercion
+        """JSON-string metadata (the raw_metadata_dict string-coercion
         path recon-stage writes can also arrive via) carrying an x_ key plus
         _causation_id must still be exempt — _annotation_content_keys strips
         tracing co-keys from the already-parsed dict, after string
@@ -1314,6 +1355,14 @@ class TestIsTerminalAnnotationExempt:
         assert recon_write_policy.is_terminal_annotation_exempt(
             {'metadata': '{"x_foo": 1, "_causation_id": "run-1"}'},
         ) is True
+
+    def test_unreadable_metadata_is_false_and_logs_one_census_line(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert recon_write_policy.is_terminal_annotation_exempt(
+                {'metadata': '{not json'},
+            ) is False
+        source = 'recon_write_policy.terminal_annotation_merge'
+        assert len(_discard_lines(caplog, source)) == 1
 
 
 # ---------------------------------------------------------------------------

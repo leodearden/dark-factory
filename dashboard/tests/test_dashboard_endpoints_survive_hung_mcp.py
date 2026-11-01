@@ -110,7 +110,6 @@ def hung_mcp(monkeypatch, tmp_path, client):
     """
     import dashboard.api.escalations as _esc
     from dashboard.data import (
-        active_tasks,
         escalation_corpus,
         orchestrator,
         task_lookup,
@@ -133,13 +132,13 @@ def hung_mcp(monkeypatch, tmp_path, client):
 
     # Patch the binding in EVERY module that imported the name by value —
     # patching dashboard.data.tasks.fetch_tasks alone would miss all of them.
-    # ``dashboard.app`` still binds it for the /healthz probe, which this
-    # sweep does not reach. ``dashboard.api.escalations`` binds no task read
+    # ``dashboard.app`` is absent: its /healthz probe reads ``fetch_task_page``
+    # (task 6321) and holds no ``fetch_tasks`` binding, and this sweep does
+    # not reach /healthz anyway. ``dashboard.api.escalations`` binds no task read
     # at all (task 5596): its owner probe reads the snapshot unit's active
     # rows and its cards go through task_lookup. ``dashboard.data.orchestrator``
     # is absent because it binds the name no longer — see _TARGET_MODULES.
     for module_name in (
-        'dashboard.app',
         # The Tasks tab's binding travelled to the snapshot unit with the read
         # itself (task 5587); active_tasks holds no fetch name at all now.
         'dashboard.data.task_snapshot',
@@ -159,17 +158,15 @@ def hung_mcp(monkeypatch, tmp_path, client):
     # against the same hang. At _TINY_BUDGET the deadline would expire inside
     # the snapshot read and the fetch_task seam would never be reached.
     monkeypatch.setattr(task_lookup, 'LOOKUP_BUDGET_SECONDS', 4 * _TINY_BUDGET)
-    # The Tasks tab is already compliant; shrink it too so it does not
-    # dominate the sweep's wall time. PER_CALL_TIMEOUT is shrunk for
-    # the same reason and is NOT optional: it was widened to 4.4 s for real
-    # 5 000-task trees (task 4884), and against a stub that never returns the
-    # sweep would otherwise pay it per call per root.
+    # The Tasks tab is already compliant. Its shares are bounded against the
+    # hang by PER_CALL_TIMEOUT, shrunk here so the tab does not dominate the
+    # sweep's wall time. That is NOT optional: it was widened to 4.4 s for
+    # real 5 000-task trees (task 4884), and against a stub that never
+    # returns the sweep would otherwise pay it per call per root.
     monkeypatch.setattr(task_snapshot, 'PER_CALL_TIMEOUT', _TINY_BUDGET)
-    monkeypatch.setattr(active_tasks, '_TASKS_PER_PROJECT_BUDGET', _TINY_BUDGET)
-    monkeypatch.setattr(active_tasks, '_TASKS_TOTAL_BUDGET', _TINY_BUDGET)
 
     def _clear_caches() -> None:
-        task_snapshot._snapshot_cache_clear()
+        task_snapshot.clear_snapshot_cache()
         task_lookup._lookup_cache_clear()
         escalation_corpus._corpus_cache_clear()
         _esc._analytics_memo_clear()

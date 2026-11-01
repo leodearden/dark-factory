@@ -58,6 +58,11 @@ from _merge_lane_fakes import (
     main_health_probe_spawned,
     passes,
 )
+from _merge_worker_drive import (
+    HEAVY_BARRIER_TEST_TIMEOUT,
+    make_merge_request,
+    stop_merge_worker,
+)
 from _orch_helpers import (  # noqa: F401
     MERGE_GATE_BARRIER_TIMEOUT,
     MERGE_RESULT_TIMEOUT,
@@ -65,20 +70,17 @@ from _orch_helpers import (  # noqa: F401
     pydantic_spec,
     wait_responsive,
 )
+from _verify_result_doubles import (
+    FAIL_OPEN_LOGGERS,
+    fail_open_records,
+    fake_verify_result,
+    format_fail_open_records,
+)
 from test_merge_queue_concurrent_verify import (  # noqa: F401
-    _FAIL_OPEN_LOGGERS,
-    HEAVY_BARRIER_TEST_TIMEOUT,
-    _fail_open_records,
-    _fake_verify_result,
-    _format_fail_open_records,
     _gated_runner,
     _id_liveness_fake_runner,
     _inject_two_host_allocator,
     _make_branch_with_file,
-    _make_request,
-    _stop_worker,
-    _timeout_mark_offenders,
-    _worst_per_method_wait_budget,
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig  # noqa: F401
@@ -104,9 +106,9 @@ from orchestrator.merge_lane.worker import (
 from orchestrator.verify import VerifyResult  # noqa: F401
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool  # noqa: F401
 
-# Late-arrival integration helpers (task 1862): reuse module-level helpers
-# from test_merge_queue_concurrent_verify.  These are private (_-prefixed)
-# module-level functions so pytest does not collect them as tests.
+# Late-arrival integration helpers (task 1862): reuse the scene helpers from
+# test_merge_queue_concurrent_verify and the worker-drive helpers from
+# _merge_worker_drive.
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -887,8 +889,8 @@ async def _run_spec_scenario(
         lane.MAX_CAS_RETRIES = max_cas_retries
     wt_a = await _make_branch_with_file(git_ops, 'task/spec-a', 'spec_a.py', 'a = 1\n')
     wt_b = await _make_branch_with_file(git_ops, 'task/spec-b', 'spec_b.py', 'b = 2\n')
-    req_a = _make_request('spec-a', 'task/spec-a', wt_a, config)
-    req_b = _make_request('spec-b', 'task/spec-b', wt_b, config)
+    req_a = make_merge_request('spec-a', 'task/spec-a', wt_a, config)
+    req_b = make_merge_request('spec-b', 'task/spec-b', wt_b, config)
 
     lane_task = asyncio.create_task(lane.run())
     try:
@@ -917,7 +919,7 @@ async def _run_spec_scenario(
                 req_b.result, timeout=MERGE_RESULT_TIMEOUT, label='spec-b: MergeOutcome',
             )
     finally:
-        await _stop_worker(lane, lane_task)
+        await stop_merge_worker(lane, lane_task)
     return req_a, req_b
 
 
@@ -1286,9 +1288,10 @@ class TestSpecLaneShadowSafetyValve:
 # Architecture overview
 # ---------------------
 # • spec_git_repo fixture (already defined above) provides the real repo.
-# • _gated_runner / _inject_two_host_allocator / _make_branch_with_file /
-#   _make_request are imported from test_merge_queue_concurrent_verify at the
-#   top of this file (module-level, importable via conftest sys.path setup).
+# • _gated_runner / _inject_two_host_allocator / _make_branch_with_file are
+#   imported from test_merge_queue_concurrent_verify, and make_merge_request
+#   from _merge_worker_drive, at the top of this file (importable via conftest
+#   sys.path setup).
 # • _LateArrivalFakeEventStore records speculative_merge / speculative_discard
 #   events for assertion.
 # • _make_late_arrival_git_config / _make_late_arrival_lane build the
@@ -1406,7 +1409,7 @@ def _make_late_arrival_lane(
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # checked by test_wait_budget_coverage_guard.py
 class TestLateArrivalAttaches:
     """Step-1 RED — late arrival B attaches to in-flight predecessor A's merge commit.
 
@@ -1495,8 +1498,8 @@ class TestLateArrivalAttaches:
         )
         _inject_two_host_allocator(worker, fake_remote)
 
-        req_a = _make_request('late1-a', 'task/late1-a', wt_a, config)
-        req_b = _make_request('late1-b', 'task/late1-b', wt_b, config)
+        req_a = make_merge_request('late1-a', 'task/late1-a', wt_a, config)
+        req_b = make_merge_request('late1-b', 'task/late1-b', wt_b, config)
 
         # ── Run the harness ────────────────────────────────────────────────────
         worker_task = asyncio.create_task(worker.run())
@@ -1600,7 +1603,7 @@ class TestLateArrivalAttaches:
             # merge-pipeline hang and must report red.  A `suppress(TimeoutError)`
             # would be dead code anyway — `wait_responsive` raises
             # `_pytest.outcomes.Failed`, never `TimeoutError`.  Teardown runs
-            # either way via the `finally:` below (see `_stop_worker`).
+            # either way via the `finally:` below (see `stop_merge_worker`).
             await wait_responsive(
                 req_a.result,
                 timeout=MERGE_RESULT_TIMEOUT,
@@ -1612,7 +1615,7 @@ class TestLateArrivalAttaches:
                 label='late1-b: MergeOutcome',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
 
 # ===========================================================================
@@ -1621,7 +1624,7 @@ class TestLateArrivalAttaches:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # checked by test_wait_budget_coverage_guard.py
 class TestLateArrivalCleanCAS:
     """Step-3 RED→GREEN — after A lands, B advances via clean CAS (DONE-WHEN 3).
 
@@ -1699,8 +1702,8 @@ class TestLateArrivalCleanCAS:
         )
         _inject_two_host_allocator(worker, gated_remote)
 
-        req_a = _make_request('late3-a', 'task/late3-a', wt_a, config)
-        req_b = _make_request('late3-b', 'task/late3-b', wt_b, config)
+        req_a = make_merge_request('late3-a', 'task/late3-a', wt_a, config)
+        req_b = make_merge_request('late3-b', 'task/late3-b', wt_b, config)
 
         # ── Run harness ────────────────────────────────────────────────────────
         worker_task = asyncio.create_task(worker.run())
@@ -1740,7 +1743,7 @@ class TestLateArrivalCleanCAS:
                 label='late3-b: MergeOutcome',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # ── Assertions ────────────────────────────────────────────────────────
 
@@ -1800,7 +1803,7 @@ class TestLateArrivalCleanCAS:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # checked by test_wait_budget_coverage_guard.py
 class TestLateArrivalFailCascade:
     """Step-5 RED→GREEN — predecessor failing invalidates the late arrival (DONE-WHEN 4).
 
@@ -1858,8 +1861,8 @@ class TestLateArrivalFailCascade:
         # re-verify after the cascade) passes.  Real ``VerifyResult`` values,
         # not doubles: the injected port returns the dataclass the production
         # verifier returns, so no field can be missing or auto-vivified.
-        # ``category='test_failure'`` matches what the retired
-        # ``_fake_verify_result`` double seeded on the failing leg, and sits in
+        # ``category='test_failure'`` matches what the ``fake_verify_result``
+        # double this test used to build seeded on the failing leg, and sits in
         # the same policy bucket as the '' it replaced (in neither
         # INFRA_TRANSIENT_CATEGORIES nor PREEXISTING_BREAK_SKIP_CATEGORIES), so
         # no retry/skip path changes.
@@ -1899,8 +1902,8 @@ class TestLateArrivalFailCascade:
         )
         _inject_two_host_allocator(worker, liveness_remote)
 
-        req_a = _make_request('late5-a', 'task/late5-a', wt_a, config)
-        req_b = _make_request('late5-b', 'task/late5-b', wt_b, config)
+        req_a = make_merge_request('late5-a', 'task/late5-a', wt_a, config)
+        req_b = make_merge_request('late5-b', 'task/late5-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -1951,7 +1954,7 @@ class TestLateArrivalFailCascade:
                 label='late5-a: MergeOutcome',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # The verify-result DOUBLE FIDELITY GUARD that used to sit here — a
         # delegating spy on merge_queue's classify_merge_failure_disposition plus
@@ -2038,7 +2041,7 @@ class TestLateArrivalFailCascade:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # checked by test_wait_budget_coverage_guard.py
 class TestLateArrivalGuards:
     """Step-7 guards — fallback + permit accounting + depth-K + skip_verify + K=1 sanity.
 
@@ -2105,8 +2108,8 @@ class TestLateArrivalGuards:
         )
         _inject_two_host_allocator(worker, fake_remote)
 
-        req_a = _make_request('guard7-a', 'task/guard7-a', wt_a, config)
-        req_b = _make_request('guard7-b', 'task/guard7-b', wt_b, config)
+        req_a = make_merge_request('guard7-a', 'task/guard7-a', wt_a, config)
+        req_b = make_merge_request('guard7-b', 'task/guard7-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -2129,7 +2132,7 @@ class TestLateArrivalGuards:
                 label='guard7-b: MergeOutcome',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
 
@@ -2194,8 +2197,8 @@ class TestLateArrivalGuards:
         )
         _inject_two_host_allocator(worker, fake_remote)
 
-        req_a = _make_request('dk7-a', 'task/dk7-a', wt_a, config)
-        req_b = _make_request('dk7-b', 'task/dk7-b', wt_b, config)
+        req_a = make_merge_request('dk7-a', 'task/dk7-a', wt_a, config)
+        req_b = make_merge_request('dk7-b', 'task/dk7-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -2232,7 +2235,7 @@ class TestLateArrivalGuards:
                 label='dk7-b: MergeOutcome',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         assert outcome_b.status == 'done'
 
@@ -2285,8 +2288,8 @@ class TestLateArrivalGuards:
         )
         _inject_two_host_allocator(worker, fake_remote)
 
-        req_a = _make_request('sv7-a', 'task/sv7-a', wt_a, config)
-        req_b = _make_request('sv7-b', 'task/sv7-b', wt_b, config)
+        req_a = make_merge_request('sv7-a', 'task/sv7-a', wt_a, config)
+        req_b = make_merge_request('sv7-b', 'task/sv7-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -2311,7 +2314,7 @@ class TestLateArrivalGuards:
                 label='sv7-b: MergeOutcome',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # B's verify actually RAN — the task-1724 guarantee, observed where it
         # is observable: the injected verify port was asked about B.  The
@@ -2377,8 +2380,8 @@ class TestLateArrivalGuards:
         )
         _inject_two_host_allocator(worker, fake_remote)
 
-        req_a = _make_request('k1-7-a', 'task/k1-7-a', wt_a, config)
-        req_b = _make_request('k1-7-b', 'task/k1-7-b', wt_b, config)
+        req_a = make_merge_request('k1-7-a', 'task/k1-7-a', wt_a, config)
+        req_b = make_merge_request('k1-7-b', 'task/k1-7-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -2413,7 +2416,7 @@ class TestLateArrivalGuards:
                 label='k1-7-b: MergeOutcome',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
 
@@ -2497,7 +2500,7 @@ class TestLateArrivalGuards:
             git_ops, verifier=verifier, speculation_depth=K,
         )
         _inject_two_host_allocator(worker, fake_remote)
-        req_a = _make_request('shutdown-guard-a', 'task/shutdown-guard-a', wt_a, config)
+        req_a = make_merge_request('shutdown-guard-a', 'task/shutdown-guard-a', wt_a, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -2534,7 +2537,7 @@ class TestLateArrivalGuards:
             # breaks out of the loop, and the finally block at :7412 releases the
             # retained permit.
         finally:
-            await _stop_worker(worker, worker_task, join_timeout=10.0)
+            await stop_merge_worker(worker, worker_task, join_timeout=10.0)
 
         # Expected slot value after full shutdown:
         #   retain_value (K-1)
@@ -2562,7 +2565,7 @@ class TestLateArrivalGuards:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # checked by test_wait_budget_coverage_guard.py
 class TestLateArrivalSubmissionOrderCAS:
     """Step-8 guard — main advances in strict submission order on the late-arrival path.
 
@@ -2672,8 +2675,8 @@ class TestLateArrivalSubmissionOrderCAS:
         )
         _inject_two_host_allocator(worker, gated_remote)
 
-        req_a = _make_request('cas8-a', 'task/cas8-a', wt_a, config)
-        req_b = _make_request('cas8-b', 'task/cas8-b', wt_b, config)
+        req_a = make_merge_request('cas8-a', 'task/cas8-a', wt_a, config)
+        req_b = make_merge_request('cas8-b', 'task/cas8-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -2709,7 +2712,7 @@ class TestLateArrivalSubmissionOrderCAS:
                 label='cas8-b: MergeOutcome',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # ── Assertions ────────────────────────────────────────────────────────
 
@@ -2865,95 +2868,6 @@ class TestJournalLandedThenAdvanceHelper:
 
 
 # ---------------------------------------------------------------------------
-# task 3980: enforced timeout-mark coverage over THIS module's own source
-# ---------------------------------------------------------------------------
-#
-# POLICY (task 4246): this guard deliberately STAYS file-local, and is the one
-# guard in this module that did NOT move into
-# fused-memory/scripts/check_bare_magicmock_config.py alongside
-# `wall-clock-deadline` and `bare-dataclass-double`. Two independent reasons,
-# both hard:
-#
-#   1. It is not an AST-only guard. `_timeout_mark_offenders` resolves each
-#      class through a RUNTIME resolver (`globals().get` below) and reads the
-#      live `cls.pytestmark` marks, and the mark's argument is a Name
-#      (`@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)`), not a literal a
-#      static pass could evaluate. Its budget engine likewise depends on
-#      RESPONSIVE_WAIT_STRETCH / RESPONSIVE_WAIT_WALL_CAP imported from
-#      orchestrator's test helpers. The checker script holds a hard
-#      stdlib-only contract — hooks/project-checks runs it under a bare
-#      `python3` with no uv env resolution — so importing this module's
-#      dependencies there is not an option, and re-deriving the constants
-#      would recreate exactly the drift the imports exist to prevent.
-#
-#   2. It is ALREADY shared, by cross-module import rather than by copy: the
-#      helpers come from test_merge_queue_concurrent_verify (see the imports
-#      at the head of this file), which is why moving it would not remove a
-#      duplicate. It is not the one-copy-per-test-module multiplication that
-#      motivated task 4246; the two guards that WERE that multiplication are
-#      the ones that moved.
-#
-# So the (a)/(b)/(c) choice this task weighed resolved to option (c) — leave it
-# file-local — for this guard alone, and to option (a) — widen the shared
-# checker — for the other two. Do not "finish the job" by moving this one too.
-
-
-class TestTimeoutMarkCoverage:
-    """Enforced invariant: every class in THIS module must have its computed
-    worst-case per-method wait budget cleared by the timeout it actually
-    runs under -- its own ``@pytest.mark.timeout`` mark if it has one, else
-    the ambient budget (see ``_timeout_mark_offenders``).
-
-    Task 3492 built this guard and applied it to
-    test_merge_queue_concurrent_verify.py, but hard-scoped it to that file's
-    own ``Path(__file__)`` -- so THIS module was never covered, despite
-    carrying five classes over the 60s pyproject default with ZERO
-    ``@pytest.mark.timeout`` marks anywhere in the file.
-
-    The helpers are IMPORTED from test_merge_queue_concurrent_verify rather
-    than reimplemented: they are deliberately pure (source text in, offender
-    list out, class resolver injected as ``globals().get``) precisely so they
-    can be driven with foreign input, and a second copy would be free to
-    drift from the marks it audits.
-
-    ``_call_wait_budget`` bills a ``wait_responsive(...)`` site its stretched
-    worst case, ``min(RESPONSIVE_WAIT_STRETCH * timeout,
-    RESPONSIVE_WAIT_WALL_CAP)``.  The helper computes its own default cap from
-    that SAME formula, which is what makes the bill an EXACT upper bound on
-    real wall clock rather than an under-count.  That
-    stretch is why this guard must exist BEFORE any wait in this file is
-    migrated: a stretched wait under an inadequate mark is strictly worse than
-    the flake it fixes.
-    """
-
-    def test_heavy_wait_classes_carry_adequate_timeout_mark(self) -> None:
-        """Every Test* class's computed worst-case per-method wait budget
-        must be cleared by the timeout it actually runs under (its own mark
-        if it has one, else the ambient budget).
-
-        Recomputes every class's budget from source on each run -- the
-        single source of those figures, so none is restated beside a mark.
-        """
-        source = Path(__file__).read_text()
-        budgets = _worst_per_method_wait_budget(source)
-        offenders = _timeout_mark_offenders(budgets, globals().get)
-
-        assert not offenders, (
-            'The following classes have a computed worst-case per-method '
-            'wait budget that the timeout they actually run under (their '
-            'own mark if they have one, else the ambient budget) does not '
-            'clear:\n'
-            + '\n'.join(f'  - {offender}' for offender in offenders)
-            + '\n\nConsequence: pytest-timeout\'s thread method os._exit()s '
-            'the xdist worker under --max-worker-restart=0, so a '
-            'slow-but-correct run reports as a worker death instead of a '
-            'clean per-test failure -- strictly worse than the flake being '
-            'fixed. Add @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT) '
-            'directly above each offending class.'
-        )
-
-
-# ---------------------------------------------------------------------------
 # task 3980's wall-clock guard now lives in the SHARED checker (task 4246)
 # ---------------------------------------------------------------------------
 #
@@ -2967,7 +2881,7 @@ class TestTimeoutMarkCoverage:
 #
 # WHAT THE RULE STILL KEYS ON, and why it must stay that way: the call SHAPE.
 # A load-bearing target is `X.result` (a MergeRequest.result future) or a
-# zero-argument `.wait()` barrier on any receiver; the `_stop_worker` teardown join
+# zero-argument `.wait()` barrier on any receiver; the `stop_merge_worker` teardown join
 # below is exempt because its target is a bare Name, not because anything lists
 # it. No class list and no budget threshold decides which sites are scanned —
 # task 2376's sweep expressed its policy as "literals up to 15" and the lone
@@ -3021,7 +2935,7 @@ class TestTimeoutMarkCoverage:
 @pytest.mark.asyncio
 class TestDispositionDoubleFidelity:
     """Isolated, two-sided proof that a bare verify-result double silently
-    disables merge-disposition classification — and that ``_fake_verify_result``
+    disables merge-disposition classification — and that ``fake_verify_result``
     does not.
 
     WHY THIS EXISTS SEPARATELY from the live guard inside
@@ -3054,7 +2968,7 @@ class TestDispositionDoubleFidelity:
     async def test_fake_verify_result_double_lets_the_classifier_run(
         self, caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """POSITIVE leg: a ``_fake_verify_result`` double classifies normally.
+        """POSITIVE leg: a ``fake_verify_result`` double classifies normally.
 
         Asserts the ABSENCE of a fail-open and the PRESENCE of a real
         ``ClassificationResult`` — deliberately NOT the disposition VALUE. The
@@ -3062,10 +2976,10 @@ class TestDispositionDoubleFidelity:
         short-circuits to INDETERMINATE at the ambiguity clause), so pinning it
         would buy nothing and break on any future evidence-source change.
         """
-        for logger_name in _FAIL_OPEN_LOGGERS:
+        for logger_name in FAIL_OPEN_LOGGERS:
             caplog.set_level(logging.WARNING, logger=logger_name)
 
-        double = _fake_verify_result(
+        double = fake_verify_result(
             passed=False, summary='tests failed', test_output='FAIL',
         )
 
@@ -3073,11 +2987,11 @@ class TestDispositionDoubleFidelity:
             verify_result=cast(VerifyResult, double), **self._ARGS,
         )
 
-        fail_open = _fail_open_records(caplog.records)
+        fail_open = fail_open_records(caplog.records)
         assert not fail_open, (
-            'A _fake_verify_result double must classify cleanly, but the '
+            'A fake_verify_result double must classify cleanly, but the '
             'classifier FAILED OPEN:\n'
-            f'{_format_fail_open_records(fail_open)}\n'
+            f'{format_fail_open_records(fail_open)}\n'
             'If this leg is red, the factory has drifted from VerifyResult '
             '(a new field whose seeded default breaks '
             '_extract_failing_tests_and_candidate_files, most likely), and '
@@ -3111,7 +3025,7 @@ class TestDispositionDoubleFidelity:
         one site it sits above, and Rule B has no per-file baseline that could
         cover the rest (task 4354).
         """
-        for logger_name in _FAIL_OPEN_LOGGERS:
+        for logger_name in FAIL_OPEN_LOGGERS:
             caplog.set_level(logging.WARNING, logger=logger_name)
 
         # The pragma below is a per-SITE suppression — Rule B has no per-file
@@ -3134,7 +3048,7 @@ class TestDispositionDoubleFidelity:
             f'even on fail-open the classifier returns a result; got {result!r}'
         )
 
-        fail_open = _fail_open_records(caplog.records)
+        fail_open = fail_open_records(caplog.records)
         assert fail_open, (
             'MUTATION LEG IS DEAD: a bare MagicMock verify-result double no '
             'longer makes the classifier fail open, so the positive leg above '
@@ -3144,7 +3058,7 @@ class TestDispositionDoubleFidelity:
             'str.join, or the fail-open WARNING text/logger changed. Re-derive '
             'a mutation that DOES break classification and pin that instead — '
             'do NOT delete this leg, and do NOT relax it to a no-op.\n'
-            f'WARNINGs captured on {_FAIL_OPEN_LOGGERS}: '
+            f'WARNINGs captured on {FAIL_OPEN_LOGGERS}: '
             f'{[(r.name, r.getMessage()) for r in caplog.records]!r}'
         )
 
@@ -3155,7 +3069,7 @@ class TestDispositionDoubleFidelity:
         exc_infos = [r.exc_info for r in fail_open if r.exc_info]
         assert exc_infos, (
             'the fail-open WARNING must carry exc_info so an operator can see '
-            f'WHY it degraded; got records={_format_fail_open_records(fail_open)}'
+            f'WHY it degraded; got records={format_fail_open_records(fail_open)}'
         )
         excs = [info[1] for info in exc_infos]
         assert any(isinstance(exc, TypeError) for exc in excs), (

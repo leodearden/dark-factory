@@ -30,6 +30,7 @@ from unittest.mock import MagicMock
 import pytest
 import yaml
 from _orch_helpers import CannedMcpSession, mcp_tool_envelope, pydantic_spec
+from shared.mcp_envelope import EnvelopeParseError
 from shared.task_submit import SubmitFailed, SubmitOutcome, SubmittedTask, SubmittedTicket
 
 from orchestrator.config import OrchestratorConfig
@@ -74,9 +75,8 @@ class TestChronicFlakeConfigDefaults:
         field_info = ChronicFlakeConfig.model_fields['ledger_relpath']
         assert field_info.default == 'data/verify-logs/flaky-ledger.jsonl'
 
-    def test_reachable_as_orchestrator_config_attribute(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_reachable_as_orchestrator_config_attribute(self):
         config = OrchestratorConfig()
         assert config.chronic_flake.enabled is False
         assert config.chronic_flake.threshold == 3
@@ -84,13 +84,12 @@ class TestChronicFlakeConfigDefaults:
         assert config.chronic_flake.rate_limit_days == 7
         assert config.chronic_flake.ledger_relpath == 'data/verify-logs/flaky-ledger.jsonl'
 
-    def test_defaults_yaml_block_round_trips(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_defaults_yaml_block_round_trips(self):
         """The shipped defaults.yaml declares the same chronic_flake: block
         explicitly (including enabled: false) so the feature is discoverable
         and retunable in orchestrator.yaml without guessing at Pydantic
         defaults, mirroring the git:/psi_admission: precedent."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         defaults = _load_package_defaults()
         assert 'chronic_flake' in defaults
@@ -973,7 +972,9 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
 
     @pytest.mark.asyncio
     async def test_get_statuses_dispatches_project_root_and_ids(self):
-        scheduler, client = await self._client({'statuses': {'42': 'pending', '43': 'done'}})
+        scheduler, client = await self._client(
+            mcp_tool_envelope({'statuses': {'42': 'pending', '43': 'done'}}),
+        )
         statuses, error = await client.get_statuses(['42', '43'])
         assert scheduler.calls[0][0] == 'get_statuses'
         assert scheduler.calls[0][1] == {'project_root': '/proj', 'ids': ['42', '43']}
@@ -984,7 +985,7 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
     async def test_get_statuses_coerces_ids_to_str(self):
         """The ledger stores ``owner_task_id`` as TEXT but a caller may hold ints; the
         wire argument must be strings or the tool silently matches nothing."""
-        scheduler, client = await self._client({'statuses': {}})
+        scheduler, client = await self._client(mcp_tool_envelope({'statuses': {}}))
         # DELIBERATE type violation: the point of the test is that a caller
         # holding ints is coerced at the wire, not rejected.
         await client.get_statuses([42, 43])  # type: ignore[arg-type]
@@ -995,34 +996,26 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
         'envelope',
         [
             mcp_tool_envelope({'statuses': {'42': 'pending'}}),
-            {'statuses': {'42': 'pending'}},
-            {'structuredContent': {'statuses': {'42': 'pending'}}},
-            {'result': {'statuses': {'42': 'pending'}}},
-            {'content': [{'type': 'text', 'text': json.dumps({'statuses': {'42': 'pending'}})}]},
+            _jsonrpc_body({
+                'content': [{'type': 'text', 'text': json.dumps({'statuses': {'42': 'pending'}})}],
+            }),
         ],
-        ids=[
-            'production_jsonrpc_body',
-            'direct',
-            'structured_content',
-            'result',
-            'content_text_block',
-        ],
+        ids=['production_jsonrpc_body', 'content_only_eval_stub_body'],
     )
-    async def test_get_statuses_handles_every_envelope_shape(self, envelope):
-        """(a) SUCCESS, ids known.  Every shape ``_unwrap_dispatch_envelope``
-        normalises for id-extraction and search results — one envelope policy, three
-        parsers — reports ``error is None``.
-
-        THE FIRST CASE IS THE ONLY ONE PRODUCTION EVER SENDS, and it is listed first
-        for that reason.  The other four are already-unwrapped spellings this seam
-        tolerates because test fakes produce them (the eval-mode ``_StubMcpSession``
-        does not: it emits the full JSON-RPC body);
-        ``{'result': {'statuses': …}}`` in particular is a shape the transport never
-        emits — the real inner ``result`` carries ``content``/``structuredContent``/
-        ``isError``, never the payload keys directly.  A suite made only of those
-        four is what let the one-level unwrapper ship: it passed every one of them
-        and failed the sole shape that matters."""
+    async def test_get_statuses_reads_every_jsonrpc_body(self, envelope):
+        """(a) SUCCESS, ids known.  Both JSON-RPC bodies that reach this seam report
+        ``error is None``: the transport's, which carries ``structuredContent`` beside
+        the text block, and the eval ``_StubMcpSession``'s, which carries the text
+        block alone."""
         _, client = await self._client(envelope)
+        assert await client.get_statuses(['42']) == ({'42': 'pending'}, None)
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_coerces_returned_keys_to_str(self):
+        """The tool returns JSON, whose keys are strings, but ``structuredContent`` is
+        read first and keeps whatever key type it was handed; the ledger looks the id
+        up as a ``str``."""
+        _, client = await self._client(mcp_tool_envelope({'statuses': {42: 'pending'}}))
         assert await client.get_statuses(['42']) == ({'42': 'pending'}, None)
 
     @pytest.mark.asyncio
@@ -1031,23 +1024,31 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
         know, so a well-formed ``{'statuses': {}}`` is REAL EVIDENCE that the task is
         gone — the one case where an empty mapping means something — and it must arrive
         with ``error is None`` so the ledger still files a replacement."""
-        _, client = await self._client({'statuses': {}})
+        _, client = await self._client(mcp_tool_envelope({'statuses': {}}))
         assert await client.get_statuses(['42']) == ({}, None)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         'envelope',
-        [{'unexpected': 'shape'}, {'statuses': ['not', 'a', 'dict']}, None, ['not', 'a', 'dict']],
-        ids=['unrecognised', 'non_dict_statuses', 'none', 'list'],
+        [
+            mcp_tool_envelope({'unexpected': 'shape'}),
+            mcp_tool_envelope({'statuses': ['not', 'a', 'dict']}),
+            mcp_tool_envelope({'statuses': None}),
+            None,
+            ['not', 'a', 'dict'],
+        ],
+        ids=['missing_key', 'non_dict_statuses', 'null_statuses', 'none', 'list'],
     )
     async def test_get_statuses_unparseable_envelope_reports_an_error(self, envelope):
-        """(c) FAILURE, envelope half.  An envelope this parser does not recognise is
-        NOT a corroborated absence — nothing was read — so it must be reported in band
-        rather than degrade to the same ``{}`` case (b) produces.  Still never raises."""
+        """(c) FAILURE, envelope half.  A response that carries no readable ``statuses``
+        dict is NOT a corroborated absence — nothing was read — so it must be reported
+        in band rather than degrade to the same ``{}`` case (b) produces.  Still never
+        raises, and the parser's own account of the failure is the error's cause."""
         _, client = await self._client(envelope)
         statuses, error = await client.get_statuses(['42'])
         assert statuses == {}
         assert isinstance(error, Exception)
+        assert isinstance(error.__cause__, EnvelopeParseError), error.__cause__
 
     @pytest.mark.asyncio
     async def test_get_statuses_reports_the_raised_object_when_dispatch_raises(self):
@@ -1062,17 +1063,10 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
         assert error is raised
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        'envelope',
-        [mcp_tool_envelope(_GET_STATUSES_REFUSAL), _GET_STATUSES_REFUSAL],
-        ids=['production_jsonrpc_body', 'legacy_bare_payload'],
-    )
-    async def test_get_statuses_refusal_carries_the_servers_text_and_the_key_names(
-        self, envelope,
-    ):
+    async def test_get_statuses_refusal_carries_the_servers_text_and_the_key_names(self):
         """The server's own account of a refusal survives into the error, beside the
         envelope key names, which stay the diagnosis when the SHAPE is the problem."""
-        _, client = await self._client(envelope)
+        _, client = await self._client(mcp_tool_envelope(_GET_STATUSES_REFUSAL))
         statuses, error = await client.get_statuses(['42'])
         assert statuses == {}
         assert 'taskmaster unavailable' in str(error)
@@ -1227,12 +1221,15 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
 
 class TestGetStatusesHasOneParser:
     """The adapter and ``scheduler.py::Scheduler.get_statuses`` read one tool's answer,
-    so they must agree on every JSON-RPC body the transport and the eval stub emit.
+    so they must agree on every response ``dispatch_tool`` can hand back: the JSON-RPC
+    bodies the transport and the eval stub emit, and also the already-unwrapped
+    payloads that no transport emits, which both must refuse alike.
 
     Driven through BOTH public entry points over the SAME real ``Scheduler`` — the
     adapter's production composition (``merge_lane/worker.py``, ``workflow.py``) —
-    rather than by inspecting which parser runs.  The data-wrapped and the
-    structuredContent-vs-text cases are the ones where two independent parsers differ.
+    rather than by inspecting which parser runs.  The data-wrapped, the
+    structuredContent-vs-text and the already-unwrapped cases are the ones where two
+    independent parsers differ.
     """
 
     @pytest.mark.asyncio
@@ -1254,6 +1251,10 @@ class TestGetStatusesHasOneParser:
             mcp_tool_envelope({'statuses': ['not', 'a', 'dict']}),
             _mcp_is_error_body('get_statuses'),
             _JSONRPC_PROTOCOL_ERROR,
+            {'statuses': {'42': 'pending'}},
+            {'structuredContent': {'statuses': {'42': 'pending'}}},
+            {'result': {'statuses': {'42': 'pending'}}},
+            {'content': [{'type': 'text', 'text': json.dumps({'statuses': {'42': 'pending'}})}]},
         ],
         ids=[
             'known_id',
@@ -1265,6 +1266,10 @@ class TestGetStatusesHasOneParser:
             'non_dict_statuses',
             'mcp_is_error',
             'jsonrpc_protocol_error',
+            'bare_payload',
+            'bare_structured_content',
+            'result_without_jsonrpc',
+            'bare_content_list',
         ],
     )
     async def test_adapter_and_scheduler_agree(self, body, tmp_path):
@@ -1640,60 +1645,3 @@ class TestSchedulerClientFindsTasksByMetadata:
     async def test_a_raising_dispatch_is_reported_not_raised(self):
         raised = RuntimeError('mcp down')
         assert await self._find(_StubScheduler(raises=raised)) == ([], raised)
-
-
-class TestExtractStatusesMap:
-    """``_extract_statuses_map``: the ``get_statuses`` response parser, returning the
-    same ``(value, error)`` pair ``scheduler.py::SchedulerFacade.get_statuses`` uses.
-
-    Its whole job is to keep two things that both LOOK like an empty mapping apart:
-    a PRESENT-but-empty ``statuses`` dict (a corroborated absence — the tool answered,
-    and it does not know the id) and an envelope it could not read at all (no answer).
-    Collapsing both to ``{}`` is what let a transient MCP outage read as "the owning
-    task was deleted" one seam away, in ``flake_ledger._ensure_owner_task``.
-    """
-
-    @pytest.mark.parametrize(
-        'envelope',
-        [
-            {'statuses': {'42': 'pending'}},
-            {'structuredContent': {'statuses': {'42': 'pending'}}},
-            {'result': {'statuses': {'42': 'pending'}}},
-            {'content': [{'type': 'text', 'text': json.dumps({'statuses': {'42': 'pending'}})}]},
-        ],
-        ids=['direct', 'structured_content', 'result', 'content_text_block'],
-    )
-    def test_present_mapping_parses_with_no_error(self, envelope):
-        from orchestrator.chronic_flake import _extract_statuses_map
-        assert _extract_statuses_map(envelope) == ({'42': 'pending'}, None)
-
-    def test_present_but_empty_mapping_is_not_an_error(self):
-        """The corroborated absence.  ``error is None`` is what tells the ledger this
-        emptiness is evidence rather than a failure to read."""
-        from orchestrator.chronic_flake import _extract_statuses_map
-        assert _extract_statuses_map({'statuses': {}}) == ({}, None)
-
-    def test_keys_and_values_are_coerced_to_str(self):
-        """The tool returns JSON, but a caller may hand ints; the ledger looks the id
-        up as a ``str``."""
-        from orchestrator.chronic_flake import _extract_statuses_map
-        assert _extract_statuses_map({'statuses': {42: 'pending'}}) == ({'42': 'pending'}, None)
-
-    @pytest.mark.parametrize(
-        'envelope',
-        [
-            {'unexpected': 'shape'},
-            {'statuses': ['not', 'a', 'dict']},
-            {'statuses': None},
-            None,
-            ['not', 'a', 'dict'],
-        ],
-        ids=['missing_key', 'non_dict_statuses', 'null_statuses', 'none', 'list'],
-    )
-    def test_missing_or_non_dict_statuses_reports_an_error(self, envelope):
-        """A MISSING key or a non-dict value means nothing was read.  Construct-don't-
-        raise, matching ``SchedulerFacade``'s ``({}, exception)`` convention."""
-        from orchestrator.chronic_flake import _extract_statuses_map
-        statuses, error = _extract_statuses_map(envelope)
-        assert statuses == {}
-        assert isinstance(error, Exception)

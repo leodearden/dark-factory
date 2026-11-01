@@ -48,7 +48,7 @@ if __name__ == '__main__':
     sys.path.insert(0, str(_HERE.parent.parent))  # scripts/
     sys.path.insert(0, str(_HERE.parents[2] / 'orchestrator' / 'src'))  # <repo>/orchestrator/src
 
-from legibility import census_trigger, config, detectors, inventory  # noqa: E402  # debt: task 6760
+from legibility import alarm, config, detectors, inventory  # noqa: E402  # debt: task 6760
 
 from orchestrator import session_registry  # noqa: E402
 
@@ -512,30 +512,18 @@ def payload_exports_force_persistence(script_text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# escalation — self-contained best-effort escalate_info mirror
+# escalation — the transcript-loss alarm
 # ---------------------------------------------------------------------------
-# Mirrors nightly.py's escalate_info shape by CONVENTION, not import: importing
-# nightly pulls the whole trickle pipeline at module load. Same JSON-RPC
-# tools/call envelope, escalate_info tool, infra_issue/info classification,
-# http://localhost:<port>/mcp URL, and best-effort never-raises contract.
 
-_ESCALATION_TOOL_NAME = 'escalate_info'
-_ESCALATION_AGENT_ROLE = 'legibility-transcript-check'
-_ESCALATION_CATEGORY = 'infra_issue'
-_ESCALATION_SEVERITY = 'info'
-
-
-def _build_escalation_arguments(
+def _findings_message(
     findings: Sequence[MissingTranscript],
-    cfg: config.LegibilityConfig,
+    project_id: str,
     *,
     force_persistence_ok: bool | None = None,
-) -> dict:
-    """Build the ``escalate_info`` MCP tool arguments for a transcript-loss alarm.
+) -> tuple[str, str]:
+    """The ``(summary, detail)`` of a transcript-loss alarm.
 
-    A synthetic ``task_id`` (``legibility-transcript-check-<project_id>``)
-    labels the detector as the source since it is a timer-driven probe, not a
-    Taskmaster task. The ``summary`` names the count of lost sessions; the
+    The ``summary`` names the count of lost sessions; the
     ``detail`` names each finding's slug and real ``cwd`` (plus expected dir,
     ``start_ts``, exit code, ``claude_session_id``,
     ``claude_launch_session_id``, and prompt prefix) so a
@@ -547,11 +535,11 @@ def _build_escalation_arguments(
     count = len(findings)
     summary = (
         f'legibility transcript-loss: {count} completed spawn session(s) ran '
-        f'with NO matching transcript (project {cfg.project_id})'
+        f'with NO matching transcript (project {project_id})'
     )
     detail_lines = [
         f'{count} completed spawn-launched interactive session(s) in project '
-        f'{cfg.project_id!r} produced no plausibly-matching transcript under '
+        f'{project_id!r} produced no plausibly-matching transcript under '
         f'~/.claude/projects — the "session ran, no transcript" regression. '
         f'Per-session (slug / cwd / start_ts / exit_code / expected_dir / '
         f'claude_session_id / claude_launch_session_id / prompt):',
@@ -580,39 +568,7 @@ def _build_escalation_arguments(
             f'preventer guard (CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 in '
             f'spawn-claude.sh): {verdict}'
         )
-    return {
-        'task_id': f'legibility-transcript-check-{cfg.project_id}',
-        'agent_role': _ESCALATION_AGENT_ROLE,
-        'category': _ESCALATION_CATEGORY,
-        'severity': _ESCALATION_SEVERITY,
-        'summary': summary,
-        'detail': '\n'.join(detail_lines),
-    }
-
-
-def _default_poster(url: str, envelope: dict) -> None:
-    """Post *envelope* to *url* over the MCP streamable-HTTP transport.
-
-    Delegates to ``census_trigger.post_mcp_envelope``, which single-sources
-    the whole transport contract for this subsystem: the required
-    Accept/Content-Type pair, the session handshake, and response-body
-    decoding. Raises on any network/HTTP failure; :func:`post_findings`
-    wraps this best-effort.
-
-    Why this is not a bare POST any more (task 3644): the escalation server
-    is a STATEFUL streamable-HTTP server. A session-less ``tools/call`` is
-    rejected at the transport layer, before the tool ever runs, with
-    ``400 Bad Request`` / ``"Missing session ID"`` -- and with
-    :func:`post_findings` swallowing that best-effort, the transcript-loss
-    alarm never reached anyone. ``post_mcp_envelope`` performs the
-    ``initialize`` -> ``notifications/initialized`` handshake on that 400 and
-    retries once, and decodes the SSE-framed reply that server then sends.
-
-    Keeps returning None and discarding the decoded body: the caller only
-    needs "did it land", and preserving the ``(url, envelope) -> None`` seam
-    signature keeps every injected ``poster=`` in the test suite working.
-    """
-    census_trigger.post_mcp_envelope(url, envelope, timeout=10.0)
+    return summary, '\n'.join(detail_lines)
 
 
 def post_findings(
@@ -620,39 +576,20 @@ def post_findings(
     findings: Sequence[MissingTranscript],
     *,
     force_persistence_ok: bool | None = None,
-    poster=None,
+    poster: alarm.Poster | None = None,
 ) -> bool:
-    """Best-effort ``escalate_info`` POST for the transcript-loss alarm.
-
-    Posts an MCP ``tools/call`` JSON-RPC envelope for tool ``escalate_info``
-    to ``http://localhost:<cfg.escalation_port>/mcp`` (via *poster*, default
-    :func:`_default_poster`). NEVER raises: any failure (poster exception,
-    network error) is logged as a warning and swallowed, returning ``False``
-    — a down escalation server must not mask the finding, since
-    :func:`run_check`'s non-zero exit code is the authoritative loud signal
-    regardless of whether this POST succeeded. Returns ``True`` on a
-    successful post.
-    """
-    poster_fn = poster if poster is not None else _default_poster
-    url = f'http://localhost:{cfg.escalation_port}/mcp'
-    arguments = _build_escalation_arguments(
-        findings, cfg, force_persistence_ok=force_persistence_ok,
+    """Raise the transcript-loss alarm at ERROR; True iff it landed. Never raises."""
+    summary, detail = _findings_message(
+        findings, cfg.project_id, force_persistence_ok=force_persistence_ok,
     )
-    envelope = {
-        'jsonrpc': '2.0',
-        'id': 1,
-        'method': 'tools/call',
-        'params': {'name': _ESCALATION_TOOL_NAME, 'arguments': arguments},
-    }
-    try:
-        poster_fn(url, envelope)
-        return True
-    except Exception as exc:  # noqa: BLE001 - best-effort, never propagate
-        logger.warning(
-            'legibility transcript-check: escalation post failed '
-            '(best-effort, run still exits non-zero): %s', exc,
-        )
-        return False
+    return alarm.raise_alarm(
+        alarm.AlarmProject.of(cfg),
+        alarm.AlarmSource.TRANSCRIPT_CHECK,
+        summary,
+        detail,
+        level=logging.ERROR,
+        poster=poster,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -802,9 +739,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     Mirrors ``nightly.py``'s ``run`` subcommand flags. Exactly one of
     ``--config`` or ``--project-id`` identifies the project. Prints the
     one-line reason (to stderr on a non-zero exit, stdout otherwise) and
-    returns :attr:`CheckResult.exit_code`. Uses the default (real httpx)
-    poster — a down escalation server is swallowed best-effort, the non-zero
-    exit remains the authoritative loud signal.
+    returns :attr:`CheckResult.exit_code`. Uses the alarm's default poster —
+    a down escalation server is swallowed best-effort, the non-zero exit
+    remains the authoritative loud signal.
     """
     parser = argparse.ArgumentParser(
         prog='check_transcript_persistence.py',

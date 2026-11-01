@@ -19,9 +19,11 @@ import enum
 import subprocess
 import tokenize
 import tomllib
+from collections import Counter
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from io import StringIO
 from pathlib import Path
+from types import MappingProxyType
 from typing import NamedTuple
 
 # NOTE: module scope imports only the stdlib ON PURPOSE. complexipy and radon
@@ -533,13 +535,106 @@ class PatchCall:
     attribute: str | None
 
 
-def _str_constant(expr: ast.expr) -> str | None:
-    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
-        return expr.value
+_NO_CONSTANTS: Mapping[str, str] = MappingProxyType({})
+
+
+def _static_string(expr: ast.expr, constants: Mapping[str, str]) -> str | None:
+    """*expr*'s value when it is statically a string: a str literal, a name in
+    *constants*, a plain f-string over such values, or ``+`` of two of them."""
+    if isinstance(expr, ast.Constant):
+        return expr.value if isinstance(expr.value, str) else None
+    if isinstance(expr, ast.Name):
+        return constants.get(expr.id)
+    if isinstance(expr, ast.JoinedStr):
+        return _static_f_string(expr, constants)
+    if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+        left = _static_string(expr.left, constants)
+        right = _static_string(expr.right, constants)
+        return None if left is None or right is None else left + right
     return None
 
 
-def _patch_call(node: ast.Call) -> PatchCall | None:
+def _static_f_string(expr: ast.JoinedStr, constants: Mapping[str, str]) -> str | None:
+    """*expr* folded, or None if any placeholder carries a conversion, a format
+    spec, or a value that is not statically a string."""
+    parts: list[str] = []
+    for part in expr.values:
+        if isinstance(part, ast.FormattedValue):
+            if part.conversion != -1 or part.format_spec is not None:
+                return None
+            part = part.value
+        value = _static_string(part, constants)
+        if value is None:
+            return None
+        parts.append(value)
+    return ''.join(parts)
+
+
+_NAMED_BINDERS = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.ExceptHandler,
+    ast.MatchAs,
+    ast.MatchStar,
+)
+
+
+def _bound_names(node: ast.AST) -> Iterator[str]:
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+        yield node.id
+    elif isinstance(node, ast.arg):
+        yield node.arg
+    elif isinstance(node, ast.alias):
+        yield node.asname or node.name.partition('.')[0]
+    elif isinstance(node, _NAMED_BINDERS) and node.name:
+        yield node.name
+
+
+def _assigned_values(node: ast.AST) -> Iterator[tuple[str, ast.expr]]:
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                yield target.id, node.value
+    elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value:
+        yield node.target.id, node.value
+
+
+def string_constants_in_tree(tree: ast.AST) -> dict[str, str]:
+    """Names bound exactly once in *tree*, each mapped to its value when that
+    one binding assigns a static string (see ``_static_string``).
+
+    Order-independent: a value may name a constant bound later in the file.
+    Scope-blind: the census is file-wide, so a binding it cannot see (a
+    ``from m import *`` or a ``globals()`` write) leaves the name resolved.
+    """
+    binding_counts: Counter[str] = Counter()
+    candidates: dict[str, ast.expr] = {}
+    for node in ast.walk(tree):
+        binding_counts.update(_bound_names(node))
+        candidates.update(_assigned_values(node))
+    return _fold_to_fixpoint(
+        {name: expr for name, expr in candidates.items() if binding_counts[name] == 1}
+    )
+
+
+def _fold_to_fixpoint(pending: Mapping[str, ast.expr]) -> dict[str, str]:
+    """Each of *pending* that folds once the names folded before it are known,
+    repeating until a pass folds nothing; every pass shrinks *pending*."""
+    resolved: dict[str, str] = {}
+    while True:
+        folded = {
+            name: value
+            for name, expr in pending.items()
+            if (value := _static_string(expr, resolved)) is not None
+        }
+        if not folded:
+            return resolved
+        resolved.update(folded)
+        pending = {name: expr for name, expr in pending.items() if name not in folded}
+
+
+def _patch_call(node: ast.Call, constants: Mapping[str, str]) -> PatchCall | None:
     func = node.func
     is_setattr = isinstance(func, ast.Attribute) and func.attr == 'setattr'
     is_dotted_patch = isinstance(func, ast.Attribute) and func.attr == 'patch'
@@ -552,22 +647,28 @@ def _patch_call(node: ast.Call) -> PatchCall | None:
             or (isinstance(func.value, ast.Attribute) and func.value.attr == 'patch')
         )
     )
-    target = _str_constant(node.args[0])
+    target = _static_string(node.args[0], constants)
     if target is not None:
         if is_setattr or is_dotted_patch or is_bare_patch:
             return PatchCall(target=target, receiver=None, attribute=None)
         return None
     if (is_setattr or is_patch_object) and len(node.args) >= 2:
-        attribute = _str_constant(node.args[1])
+        attribute = _static_string(node.args[1], constants)
         if attribute is not None:
             return PatchCall(target=None, receiver=node.args[0], attribute=attribute)
     return None
 
 
-def patch_calls_in_tree(node: ast.AST) -> tuple[PatchCall, ...]:
-    """Every patch-shaped call under *node*, in ``ast.walk`` order, duplicates kept."""
+def patch_calls_in_tree(
+    node: ast.AST, *, constants: Mapping[str, str] = _NO_CONSTANTS
+) -> tuple[PatchCall, ...]:
+    """Every patch-shaped call under *node*, in ``ast.walk`` order, duplicates kept.
+
+    A name argument is read only through *constants* (``string_constants_in_tree``
+    builds them for a whole file); the default resolves none.
+    """
     calls = (
-        _patch_call(call)
+        _patch_call(call, constants)
         for call in ast.walk(node)
         if isinstance(call, ast.Call) and call.args
     )
@@ -660,6 +761,10 @@ def patch_targets(
     (``patch.object(m, '_c')``, ``monkeypatch.setattr(m, '_c', v)``) counts
     only when ``m`` IS a member: bound to one by an import, or spelled as one.
 
+    An argument is read as a string when it is statically one: a literal, a
+    name bound once in the file to such a string, or an f-string / ``+`` built
+    from those. So parking a dotted path in a constant does not hide it.
+
     Distinct pairs, not call sites. AST-based, so a docstring or comment quoting
     a dotted path is never mistaken for a real patch site.
     """
@@ -671,7 +776,8 @@ def patch_targets_in_tree(
 ) -> frozenset[PatchTarget]:
     """``patch_targets`` over an already-parsed tree."""
     bindings = _module_bindings(tree, modules)
-    found = (_patch_target(call, bindings, modules) for call in patch_calls_in_tree(tree))
+    calls = patch_calls_in_tree(tree, constants=string_constants_in_tree(tree))
+    found = (_patch_target(call, bindings, modules) for call in calls)
     return frozenset(target for target in found if target is not None and target.leaf)
 
 

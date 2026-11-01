@@ -390,6 +390,15 @@ another project's files. A submission from an **unregistered** filer, or one
 that **mixes** local and foreign files, is **not** tagged and stays a hard
 path-scope reject (the task-2206 anti-bypass guard is preserved).
 
+Ownership of a **relative** `metadata.files` entry is resolved against the
+filing project's own root first: an entry whose leading directory exists in
+the filing project is that project's, even when another registered project
+has a same-named top-level directory (a stream_touch `sessions/…` entry is
+never credited to mission_control). Only an entry whose leading directory
+exists solely in another project makes the task cross-repo; generic names
+such as `docs/` or `src/` count for neither side. The rule has one home:
+`fused-memory/src/fused_memory/middleware/project_prefix_registry.py::ProjectPrefixRegistry.attributed_owner`.
+
 When the marker is present, the orchestrator pre-merge narrowing gate treats
 the task as a cross-repo deliverable: instead of flagging "files not
 touched" and forcing a dishonest plan-narrowing pass, it routes the merge
@@ -694,7 +703,15 @@ they never affect the exit code and no gating test sweeps them.
 mis-authored now carries an `AUTHORING DIAGNOSIS` block in its `detail`,
 naming the code and a remedy. Without it a malformed check and a genuinely
 undelivered capability produce identical records, and they need opposite
-responses.
+responses. Every such escalation also names the check's OWNER, which is the
+dependency whose `metadata.delivered_checks` declares it, never the blocked
+dependent. It says where the check is declared both as data in
+`delivered_check_owner` (`escalation/src/escalation/models.py::DeliveredCheckOwner`:
+the owner task, the check name, and the owner's sidecar with whether it declares
+the check on `main`) and as the `Check owner:` / `Declared in:` / `Sidecar:`
+lines of `detail`, which are rendered from that same value. A stale or
+mis-authored check is corrected at the owner's sites (see "Stale scope paths");
+the blocked dependent is only re-pended.
 
 **Dispatch-time policy**
 
@@ -702,7 +719,7 @@ responses.
 |---|---|
 | All checks DELIVERED on `main@SHA` | Satisfied — dep counts toward dispatch |
 | ≥1 check FAILED, consecutive-fail streak `< grace_cycles` | Withheld; `delivered_check_gate_held` event emitted each held tick (hold-visibility only) |
-| ≥1 check FAILED, streak reaches `grace_cycles` | Born-at-L2 `dependency_capability` escalation naming the failed check/pattern-or-script/dep id/`main` SHA; dependent → `blocked`; streak cleared (re-fires on a later re-crossing) |
+| ≥1 check FAILED, streak reaches `grace_cycles` | Born-at-L2 `dependency_capability` escalation naming the failed check/pattern-or-script/dep id/`main` SHA and the check's owner and declaration sites (`delivered_check_owner`); dependent → `blocked`; streak cleared (re-fires on a later re-crossing) |
 | A check ERRORS (git/script failure) or exceeds `check_timeout_secs` | Fail-safe wait — dep left uncached, **no** streak bump on either counter, retried next tick |
 | `delivered_checks.enabled = false` | Gate entirely inert — no sweep, no cache, no streaks, no escalation; the dep gate takes its legacy arm-off path as if the metadata didn't exist |
 
@@ -970,7 +987,13 @@ satisfied:
 
 A path whose extension is not on the lock-charter allowlist (for example
 `tasks.db`) is refused earlier, as a "directory declaration" with
-`LockCharterViolation`, so this lint never sees it.
+`LockCharterViolation`, so this lint never sees it. That rejection lists
+such paths under `unrecognised_extension_paths`, and its hint gives the same
+`task_kind='deterministic'` routing as this lint. An upper-case spelling of a
+listed extension, such as `README.MD`, is not listed there: it gets only the
+advice to lowercase the extension. Leave a gitignored path out
+of `metadata.files` whatever the `task_kind`: the lock-charter check runs
+first and classifies it as a directory either way.
 
 **Posture.** By default the lint only warns. When the submission succeeds,
 it merges a `gitignored_deliverable_warning` key into the result and logs a
@@ -2127,6 +2150,41 @@ within the grace window.
 a dead holder's row and a lapsed `expires_at` stay `deferred` until someone
 releases them. A session that ends without landing its hold releases it
 first.
+
+### Amending a planned task's text
+
+When a task is planned, the orchestrator stamps a fingerprint of its
+description and details into `metadata.plan_text_fp`, with the plan's time
+in `metadata.plan_authored_at`. An `update_task` that supplies `title`,
+`description`, `details` or `prompt` is compared against that stamp. So is
+a reconciliation write whose audit-trail rotation (§10) rewrote the
+description. If the fingerprint of the post-write description and details
+no longer matches, the result carries `amendment_advisory`:
+
+| Field | Meaning |
+|---|---|
+| `task_id` | the amended task |
+| `plan_authored_at` | when the current plan was written |
+| `fields_changed` | the text fields this write supplied, plus `description` when the rotation rewrote it |
+| `will_replan` | False for a `done` or `cancelled` task, whose amendment reaches no work |
+| `plan_text_fp_before` | the stamped plan fingerprint |
+| `task_text_fp_after` | the fingerprint of the text now stored |
+
+A task with no stamp, a metadata-only write that rotates nothing, and a
+whitespace-only reflow get no advisory. The running agent of an
+`in-progress` task does not see the amendment. Its next dispatch takes the
+revalidation path (task 4031) and re-plans against the new text.
+
+`will_replan` True is a prediction, not an observation. It assumes the
+orchestrator's default `plan_text_fp_gate_enabled: true`, which fused-memory
+cannot read, and a later dispatch. An `in-progress` task whose running agent
+marks it done first never gets one.
+
+Every such amendment also journals a `task_text_amended` reconciliation
+event carrying the advisory plus `writer_source` (`update_task` or
+`curator_combine`) and `agent_id`. That includes a curator combine
+rewriting a planned task's text, which no caller is told about. Contract:
+`plans/task-amendment-delivery-prd.md` §9 C7.
 
 ## 10. Rotating a long-running audit-trail task
 

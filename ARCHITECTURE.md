@@ -190,6 +190,12 @@ for the whole fleet. Entry: `fused-memory/src/fused_memory/server/main.py`
   load-sampler unit. Discovers orchestrator instances by reading each
   registered project's `dark-factory-orchestrator.yaml` (`escalation.port`);
   reads fused-memory and its own SQLite DBs read-only.
+- **Client feed publisher** — `client-feed@<name>.service`, one instance per
+  client project; setup-host renders the template and enables none. It reads
+  that project's `tasks.db` and `runs.db` read-only, its verify archive, its
+  git objects and its `in/` directory, and writes only its `out/`. Invariant
+  and contract: `plans/client-feed-prd.md` §8 and §7. Operating it:
+  [OPERATIONS.md](OPERATIONS.md) §"Client feed".
 - **`scripts/orchestrator-watchdog.py`** — a systemd-timer oneshot
   (`OnBootSec=30`, `OnUnitActiveSec=60`). Its liveness pass TCP-probes each
   orchestrator's escalation port and revives a wedged unit immediately; its
@@ -452,7 +458,12 @@ For a normal task, `TaskWorkflow._drive()`
    `max_amendment_rounds`). Independently, every `review.interval` merges
    (default 40), a `ReviewCheckpoint` runs `deep_reviewer` across recently-
    merged modules for cross-task integration issues, filing its own
-   tasks/escalations if it finds any.
+   tasks/escalations if it finds any. Before its Phase 1 verification the
+   checkpoint runs any project-declared `review.pre_test_commands` (e.g.
+   rebuilding the frontend bundles e2e tests serve) in the main checkout,
+   fail-soft: a failed or timed-out command is reported to the reviewer and
+   in the saved report, never aborting the review
+   (`orchestrator/src/orchestrator/review_pre_test.py`).
 7. **MERGE.** `_submit_to_merge_queue()` hands the branch to the merge lane
    (§5).
 8. **DONE.** `_finalise_merged_done()` refreshes `metadata.files` from the
@@ -828,7 +839,11 @@ path, snapshotting `main` at run start and coalescing advances — it never
 gates a merge, and defaults to disabled (`git.offline_lane_enabled: false`). Each pass writes a record; each failing
 test is a per-test episode that is filed as one fix task once reproduced on
 `git.offline_lane_persist_passes` spaced passes, with one bounded level-1
-escalation if the fix stays unlanded. A command that declares an outage probe
+escalation if the fix stays unlanded. Every non-outage red pass is recorded in
+the flake ledger at call site `offline_lane`, and a cleared test, or a held red
+that failed and passed at one head with no fix task filed, owes flake debt
+whose de-flake task the ledger's drain files (`plans/offline-lane-red-path-prd.md`
+D6). A command that declares an outage probe
 (`outage_probe`) runs it after a red detection, and a probe that exits 75
 naming a dependency makes the pass an outage, which is escalated, not filed.
 The lane re-runs the probe alone until it passes, then closes its own
@@ -1048,13 +1063,18 @@ a defense is active when it isn't:
   effect of the verify test leg's `cd <module> && uv run pytest`
   (`orchestrator/src/orchestrator/verify.py::_preprovision_shared_venv`).
   Either way, there's no `.venv` at all before that first cold verify.
-  The real edge: an agent's Bash subprocess inherits a copy of the
-  orchestrator's environment, including main's `VIRTUAL_ENV`
-  (`orchestrator/src/orchestrator/agents/invoke.py`), so a first-party
+  The real edge: an interactive session's shell keeps its launching
+  shell's environment, often main's `VIRTUAL_ENV`, so a first-party
   `import` there can resolve main's editable source instead of the
-  worktree's edits. Verify is unaffected —
-  `orchestrator/src/orchestrator/verify.py::_target_subprocess_env` strips
-  `VIRTUAL_ENV` so the target always resolves its own `.venv`. See
+  worktree's edits. A dispatched agent's shell carries no Python-env
+  selection (`shared/src/shared/python_env.py::without_python_env_selection`,
+  which Claude spawns reach via
+  `shared/src/shared/secret_env.py::agent_subprocess_env`; task 7399), so it
+  meets this only by naming main's `.venv/bin/python` in a
+  worktree with no `.venv` yet; its bare `python` is the system
+  interpreter. Verify is unaffected —
+  `orchestrator/src/orchestrator/verify.py::_target_subprocess_env` applies
+  the same scrub so the target always resolves its own `.venv`. See
   `### Locating installed code` in `CLAUDE.md` for the one-line
   provenance check.
 - **Verify commands default to repo-wide scope in places**, not always

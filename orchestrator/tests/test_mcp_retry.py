@@ -60,6 +60,7 @@ def _scripted(answers: Any) -> Iterator[tuple[AsyncMock, AsyncMock]]:
         yield client, sleep
 
 
+@pytest.mark.real_mcp_session
 class TestFmSessionRetrySchedule:
     """fm_session rides fm's restart window (task 2706) except at the D8 null sentinel (task 2880)."""
 
@@ -115,6 +116,7 @@ class TestFmSessionRetrySchedule:
         assert client.post.call_count == 5
 
 
+@pytest.mark.real_mcp_session
 @pytest.mark.asyncio
 async def test_fm_session_identifies_as_the_orchestrator():
     with StubMcpServer(stateful=True) as server:
@@ -127,6 +129,7 @@ async def test_fm_session_identifies_as_the_orchestrator():
     assert [r.headers.get('mcp-session-id') for r in requests[1:]] == [minted[0]] * 2
 
 
+@pytest.mark.real_mcp_session
 @pytest.mark.asyncio
 async def test_mcp_call_one_shot_lands_a_write_through_the_shared_session(monkeypatch):
     """With no McpLifecycle singleton, mcp_call builds a one-shot fm_session and

@@ -73,13 +73,25 @@ slot. Up to `max_concurrent_tasks` workflows share one dispatcher (heuristic 7).
 | dispatcher substrate | `verify_plan.py::derive_verify_plan`, `GitOps.has_uncommitted_work`, `RemoteRunner.ensure_gate`, `verify_categories.py` `INFRA_TRANSIENT_CATEGORIES` (all present) | PASS | manual |
 | lease released on every exit | built by γ; rows 13, 14, 21 | PASS | manual |
 
-### δ1 — harness-owned allocator (hub carry, stage 1)
+### γ2 — one task-slot mechanism on every host (amendment 2026-10-31)
 
 | Capability | Evidence | Verdict | Check |
 |---|---|---|---|
-| `merge_lane_wants_host()` | producer δ1 over worker `_redispatch`, `_verifier_queue`, `_pending_verifier_get`, `_merge_ahead_ledger` (present) | PASS | grep `def merge_lane_wants_host\(` |
-| public RU tracker entry | producer δ1 over `_record_runner_recovered` (present); the unavailable side is 6565's public `bench_unavailable_runner` (present) | PASS | grep `def note_runner_recovered\(` |
-| harness owns the pool | producer δ1 in `Harness.__init__`, injected via `Harness._start_merge_worker` (present); `HostPool` from γ upstream | PASS | grep `HostPool\(` in `harness.py` |
+| merge demand gone from the pool | γ landed `MergeDemand` in `verify_hosts.py`; γ2 deletes it (decision 16) | PASS | grep `MergeDemand` absent in `verify_hosts.py` |
+| plan passed through the local call | producer γ2 over `verify.py::run_scoped_verification`'s plan stamp and `verify_admission_record.py::begin_plan` (present) | PASS | grep `admission_plan: .*AdmissionPlan \| None'? = None` |
+| granted-plan read | producer γ2 (`PlanLatch`); rows 26, 27, 37, 38, 44 | PASS | grep `class PlanLatch` |
+| gate pause and wake | producer γ2 (`AdmissionGate.redispatch`, `slots >= 0`); row 32 | PASS | grep `def redispatch\(` |
+| per-request probe | producer γ2 in `verify_runner.py::RemoteRunner.probe_clean`; row 46 | PASS | manual |
+| publish retry | producer γ2 in `verify_runner.py::RemoteRunner.publish_sha`; row 47 | PASS | manual |
+| safe withdrawal of a queued plan | `verify_admission_gate.py::AdmissionGate._leave`, `verify.py::_recorded_admission_plan`, `task_verify_dispatch.py::_reap` (present); probe on the base; rows 26, 31, 35 | PASS | manual |
+
+### δ1 — harness-owned host health (hub carry, stage 1)
+
+| Capability | Evidence | Verdict | Check |
+|---|---|---|---|
+| bench before the first merge | producer δ1 over the worker's lazy allocator build (present); the unavailable side is 6565's public `bench_unavailable_runner` (present) | PASS | grep `def ensure_host_allocator\(` |
+| readmission wakes the gate | producer δ1 at `_readmit_probed_host` (present); `HostPool.note_readmitted` from γ2 upstream | PASS | grep `on_host_readmitted` in `merge_lane/` |
+| harness owns the pool | producer δ1 in `Harness.__init__`, injected via `Harness._start_merge_worker` (present); `HostPool` from γ2 upstream | PASS | grep `HostPool\(` in `harness.py` |
 
 ### δ2 — workflow, config, dispatcher wiring (hub carry, stage 2)
 
@@ -96,7 +108,7 @@ slot. Up to `max_concurrent_tasks` workflows share one dispatcher (heuristic 7).
 | Capability | Evidence | Verdict | Check |
 |---|---|---|---|
 | integration module | producer ι; α β γ δ1 δ2 in its closure | PASS | path `orchestrator/tests/test_task_verify_integration.py` |
-| 25 rows green end to end | all producers upstream | PASS | manual |
+| 32 rows green end to end (1–26, 28, 30, 31, 32, 34, 48); 27, 29, 33, 35–47, 49–51 pinned at γ2 | all producers upstream, γ2 included | PASS | manual |
 
 ### ε — rollout gate (operator)
 
