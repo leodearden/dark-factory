@@ -571,10 +571,23 @@ class TestTheMeasuresOverTheRealCluster:
 
 # ---------------------------------------------------------------------------
 # Test-suite patch targets into lane internals: the ratchet's binding of the
-# patch-target measure to ``LANE_PATCH_MODULES``, driven through its public
-# seam. Every snippet imports a lane module, so it is in the measure's domain.
+# patch-target measure to the lane package and its submodules, driven through
+# its public seam. Every snippet imports a lane module, so it is in the
+# measure's domain.
 
 _LANE_IMPORT = 'from orchestrator.merge_lane.worker import W\n'
+
+#: A synthetic module universe, so these rows do not depend on the real package.
+#: SpeculativeMergeWorker is deliberately absent: a class is not a submodule.
+_LANE_MODULES = frozenset(
+    {
+        'orchestrator.merge_lane',
+        'orchestrator.merge_lane.worker',
+        'orchestrator.merge_lane.gates',
+        'orchestrator.merge_lane.pkg',
+        'orchestrator.merge_lane.pkg.leaf',
+    }
+)
 
 
 class TestLanePatchTargets:
@@ -651,10 +664,54 @@ class TestLanePatchTargets:
                 ['worker.spin'],
                 id='f-string-over-module-constant',
             ),
+            pytest.param(
+                'from orchestrator.merge_lane import gates\n'
+                "monkeypatch.setattr(gates, 'POST_ADVANCE_GATES', x)\n",
+                ['gates.POST_ADVANCE_GATES'],
+                id='from-import-of-a-submodule',
+            ),
+            pytest.param(
+                'from orchestrator.merge_lane import worker\n'
+                "p = patch.object(worker, '_debug', 1)\n",
+                ['worker._debug'],
+                id='from-import-of-a-submodule-private-name',
+            ),
+            pytest.param(
+                'import orchestrator.merge_lane.worker as mq\n'
+                "monkeypatch.setattr(mq, '_x', 1)\n",
+                ['worker._x'],
+                id='import-as-of-a-submodule',
+            ),
+            pytest.param(
+                "patch.object(orchestrator.merge_lane.gates, 'x', 1)\n",
+                ['gates.x'],
+                id='bare-attribute-chain-to-a-submodule',
+            ),
+            pytest.param(
+                'from orchestrator.merge_lane.pkg import leaf\n'
+                "monkeypatch.setattr(leaf, '_y', 1)\n",
+                ['pkg.leaf._y'],
+                id='from-import-of-a-nested-submodule',
+            ),
+            pytest.param(
+                'from orchestrator.merge_lane import gates\n'
+                "monkeypatch.setattr(gates, 'X', 1)\n"
+                "patch('orchestrator.merge_lane.gates.X', y)\n",
+                ['gates.X'],
+                id='object-and-string-forms-share-one-leaf',
+            ),
+            pytest.param(
+                'from orchestrator.merge_lane import SpeculativeMergeWorker\n'
+                "patch.object(SpeculativeMergeWorker, '_x', 1)\n",
+                [],
+                id='non-module-name-from-the-package-not-counted',
+            ),
         ],
     )
     def test_the_lane_binding(self, body: str, expected: list[str]) -> None:
-        measures = metrics.test_file_measures(_LANE_IMPORT + body, path='t.py')
+        measures = metrics.test_file_measures(
+            _LANE_IMPORT + body, path='t.py', lane_modules=_LANE_MODULES
+        )
         assert measures is not None
         assert measures['patch_targets'] == expected
 
@@ -758,8 +815,10 @@ class TestTheTreeAndSourceFormsAgree:
                 id='imports_lane_module',
             ),
             pytest.param(
-                lambda src: metrics.test_file_measures(src, path='t.py'),
-                lambda src, tree: metrics.test_file_measures_in_tree(tree),
+                lambda src: metrics.test_file_measures(
+                    src, path='t.py', lane_modules=_LANE_MODULES
+                ),
+                lambda src, tree: metrics.test_file_measures_in_tree(tree, _LANE_MODULES),
                 id='test_file_measures',
             ),
         ],
@@ -779,7 +838,7 @@ class TestTestFileMeasures:
         # non-lane-importing file can never be summed into the report by
         # accident.
         source = 'import orchestrator.workflow\n\nworker._x\n'
-        assert metrics.test_file_measures(source, path='t.py') is None
+        assert metrics.test_file_measures(source, path='t.py', lane_modules=_LANE_MODULES) is None
 
     def test_a_lane_importing_file_yields_both_measures(self) -> None:
         source = (
@@ -788,7 +847,7 @@ class TestTestFileMeasures:
             "patch('orchestrator.merge_lane.worker.foo', x)\n"
             'worker._a._b\n'
         )
-        assert metrics.test_file_measures(source, path='t.py') == {
+        assert metrics.test_file_measures(source, path='t.py', lane_modules=_LANE_MODULES) == {
             'patch_targets': ['worker.foo'],
             'private_reads': 2,
         }
@@ -799,7 +858,7 @@ class TestTestFileMeasures:
             "patch('orchestrator.merge_lane.worker.z', x)\n"
             "patch('orchestrator.merge_lane.worker.a', x)\n"
         )
-        measures = metrics.test_file_measures(source, path='t.py')
+        measures = metrics.test_file_measures(source, path='t.py', lane_modules=_LANE_MODULES)
         assert measures is not None
         assert measures['patch_targets'] == ['worker.a', 'worker.z']
 
