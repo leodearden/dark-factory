@@ -32,7 +32,7 @@ import pytest
 # Reused from the sibling shipped-script contract, as test_lane_state_lib.py
 # does: the script dir is resolved from __file__, and the env drops the keys
 # that would aim the scripts at the ambient checkout.
-from test_warm_lane_scripts_shipped import (  # noqa: E402
+from test_warm_lane_scripts_shipped import (
     WARM_LANE_SCRIPT_DIR,
     _sanitized_env,
 )
