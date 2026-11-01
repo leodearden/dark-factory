@@ -2196,7 +2196,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         async def boom(*a, **k):  # noqa: ARG001
             raise _ReachedEnqueue
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker.register_and_enqueue_merge_request', boom,
+            'orchestrator.merge_lane.intake.register_and_enqueue_merge_request', boom,
         )
 
         with pytest.raises(_ReachedEnqueue):

@@ -1472,6 +1472,7 @@ class _FlakyRemoteRunner:
         self.verified: list[str] = []
         self.health_calls = 0
         self.entered = False
+        self.unavailable_raised = 0
 
     async def health(self) -> bool:
         self.health_calls += 1
@@ -1484,6 +1485,7 @@ class _FlakyRemoteRunner:
             self.entered = True
             await self.verify_gate.wait()
         if not self.reachable:
+            self.unavailable_raised += 1
             raise RunnerUnavailable(_INCIDENT_RU)
         self.verified.append(merge_sha)
         return _make_result(True)
@@ -1536,7 +1538,7 @@ class TestUnreachableHostCapstone:
     """
 
     @staticmethod
-    async def _strand_the_laptop(lane, queue, git_ops, config, verifier, gate):
+    async def _strand_the_laptop(lane, queue, git_ops, config, verifier, gate, laptop):
         """Park the local anchor, then push a request onto the down laptop.
 
         ``acquire()`` hands out the local host first, so the only way to put
@@ -1550,11 +1552,11 @@ class TestUnreachableHostCapstone:
         req_b = await _submitted(git_ops, config, 'ru-b', 'ru_b.py', 'b = 2\n')
         await queue.put(req_b)
         await _until(
-            lambda: 'leo-laptop' in lane.snapshot()['occupancy']['inflight_by_host'],
-            what='the second request to be dispatched to the laptop',
+            lambda: laptop.unavailable_raised >= 1,
+            what="the second request's verify to reach the down laptop",
         )
-        # The RU verdict is only ADJUDICATED when the head of the in-flight
-        # deque finalizes, so release the parked anchor before waiting on it.
+        # Release the parked anchor so both requests can land, then wait for
+        # the quarantine as the settled state.
         gate.set()
         await _until(
             lambda: bool(_host_row(lane, 'leo-laptop').get('quarantined')),
@@ -1577,7 +1579,7 @@ class TestUnreachableHostCapstone:
             verifier=verifier, escalation_queue=escalations, event_store=events,
         ) as (lane, queue):
             req_a, req_b = await self._strand_the_laptop(
-                lane, queue, host_git_ops, host_config, verifier, gate,
+                lane, queue, host_git_ops, host_config, verifier, gate, laptop,
             )
 
             # (1) the strand is RECORDED and legible in the public host census --
@@ -1621,7 +1623,7 @@ class TestUnreachableHostCapstone:
             verifier=verifier, escalation_queue=escalations, event_store=events,
         ) as (lane, queue):
             req_a, req_b = await self._strand_the_laptop(
-                lane, queue, host_git_ops, host_config, verifier, gate,
+                lane, queue, host_git_ops, host_config, verifier, gate, laptop,
             )
             await wait_responsive(req_a.result, label='stranded-laptop A resolves')
             await wait_responsive(req_b.result, label='stranded-laptop B resolves')
@@ -1693,7 +1695,7 @@ class TestUnreachableHostCapstone:
             verifier=verifier, escalation_queue=escalations, event_store=events,
         ) as (lane, queue):
             req_a, req_b = await self._strand_the_laptop(
-                lane, queue, host_git_ops, config, verifier, gate,
+                lane, queue, host_git_ops, config, verifier, gate, laptop,
             )
 
             row = _host_row(lane, 'leo-laptop')
@@ -1708,6 +1710,12 @@ class TestUnreachableHostCapstone:
 
             assert (await wait_responsive(req_a.result, label='A lands')).status == 'done'
             assert (await wait_responsive(req_b.result, label='B lands')).status == 'done'
+
+            settled = _host_row(lane, 'leo-laptop')
+            assert settled['streak'] == 1, (
+                f'one RU must be recorded exactly once, at bench time or at finalize: {settled!r}'
+            )
+            assert escalations.of_category('verify_host_unreachable') == [], escalations.submitted
 
     async def test_repeated_alarm_opportunities_still_produce_exactly_one_l1(
         self, host_git_ops: GitOps, host_config: OrchestratorConfig,
@@ -1734,7 +1742,7 @@ class TestUnreachableHostCapstone:
             verifier=verifier, escalation_queue=escalations, event_store=events,
         ) as (lane, queue):
             req_a, req_b = await self._strand_the_laptop(
-                lane, queue, host_git_ops, config, verifier, gate,
+                lane, queue, host_git_ops, config, verifier, gate, laptop,
             )
             await wait_responsive(req_a.result, label='A lands')
             await wait_responsive(req_b.result, label='B lands')
@@ -1940,7 +1948,7 @@ class TestUnreachableHostCapstone:
             verifier=verifier, escalation_queue=escalations, event_store=events,
         ) as (lane, queue):
             req_a, req_b = await self._strand_the_laptop(
-                lane, queue, host_git_ops, host_config, verifier, gate,
+                lane, queue, host_git_ops, host_config, verifier, gate, laptop,
             )
             await wait_responsive(req_a.result, label='stranded-laptop A resolves')
             await wait_responsive(req_b.result, label='stranded-laptop B resolves')

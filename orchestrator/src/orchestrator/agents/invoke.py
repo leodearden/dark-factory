@@ -39,7 +39,7 @@ from shared.cli_invoke import (  # noqa: F401
 from shared.proc_group import terminate_process_group
 from shared.process_cost import ProcessCostBasis
 from shared.python_env import without_python_env_selection
-from shared.secret_env import agent_subprocess_env
+from shared.secret_env import agent_subprocess_env, without_agent_endpoint_vars
 
 from orchestrator.agents.sandbox_git_config import sandbox_git_config_env
 
@@ -1230,7 +1230,7 @@ async def _invoke_pi(
 
         cmd.append(prompt)
 
-        env = without_python_env_selection(os.environ)
+        env = without_agent_endpoint_vars(os.environ)
         if oauth_token:
             # Strip a lingering ANTHROPIC_API_KEY so it can't shadow the
             # OAuth token pi is being asked to use (mirrors

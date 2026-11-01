@@ -28,12 +28,12 @@ from _worktree_registrations import lane_admin_dir, registered_worktree_paths
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
+from orchestrator.merge_lane.intake import coalesce_or_enqueue_merge_request
 from orchestrator.merge_lane.types import (
     InFlightMergeRegistry,
     MergeRequest,
     QueuedBranch,
 )
-from orchestrator.merge_lane.worker import coalesce_or_enqueue_merge_request
 from orchestrator.warm_lane_pool import WarmLanePool
 
 

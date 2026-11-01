@@ -2705,7 +2705,7 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
         # ── RU control flow UNCHANGED ──────────────────────────────────────
         assert result is False
         fake_alloc.quarantine_and_release.assert_awaited_once()
-        assert worker._redispatch[0] is remerged
+        assert worker._intake.pending_redispatch()[0] is remerged
         assert not entry.item.request.result.done()
 
     async def test_ru_redispatch_ledger_does_not_accumulate(self, tmp_path):

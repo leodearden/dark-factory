@@ -942,7 +942,7 @@ class MergeRequest:
 
     Contrast with :attr:`enqueued_at`, which is re-stamped on every resubmission
     and held in-memory only (lost on restart).  ζ's aging comparator at
-    ``_pop_next_pickable`` reads this field; ``None`` for legacy in-flight requests
+    ``MergeIntake.pop_next_pickable`` reads this field; ``None`` for legacy in-flight requests
     created before α was deployed (ζ owns the ``enqueued_at`` fallback for those).
     """
     request_id: str = field(
@@ -1610,8 +1610,8 @@ class ItemLifecycleState(StrEnum):
     (merge-queue-reliability PRD scope-4 iota / task 2164, L-1).
 
     Normalizes today's FOUR redundant state encodings — container
-    membership across the five queues (``_queue``/``_lane_buffers``/
-    ``_verifier_queue``/``_redispatch``/``_dispatch_item``), the free-form
+    membership across the five queues (``_queue``/the lane buffers/
+    ``_verifier_queue``/the redispatch park/``_dispatch_item``), the free-form
     ``InflightEntry.phase: str`` field (deleted by task lambda / task 2173 —
     phase is now derived via ``SpeculativeMergeWorker._entry_phase()``), the
     :class:`InflightStatus` sentinel enum above, and the four worker transient side-fields

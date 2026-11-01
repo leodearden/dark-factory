@@ -40,8 +40,8 @@ from orchestrator.merge_lane import (
     landing_evidence,
 )
 from orchestrator.merge_lane import worker as merge_worker
+from orchestrator.merge_lane.intake import register_and_enqueue_merge_request
 from orchestrator.merge_lane.queue_store import MergeQueueStore
-from orchestrator.merge_lane.worker import register_and_enqueue_merge_request
 from shared.merge_state import EPISTEMIC_STATES, OUTCOME_STATES, MergeReason, MergeState
 from shared.merge_subject import format_merge_subject
 

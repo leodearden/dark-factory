@@ -666,14 +666,11 @@ def _drain_residue(worker: SpeculativeMergeWorker) -> set[str]:
     quietly drained away.
     """
     drained: set[str] = set()
-    for lane in ('high', 'normal'):
-        buf = worker._lane_buffers[lane]
-        while buf:
-            req = buf.popleft()  # a deque, not a list — `pop(0)` is a TypeError
-            drained.add(req.task_id)
-            if not req.result.done():
-                req.result.cancel()
-            worker._retire_item(req.request_id)
+    for req in worker._intake.drain_lanes_for_shutdown():
+        drained.add(req.task_id)
+        if not req.result.done():
+            req.result.cancel()
+        worker._retire_item(req.request_id)
     return drained
 
 

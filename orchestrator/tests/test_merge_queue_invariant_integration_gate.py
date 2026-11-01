@@ -119,6 +119,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import AdvanceOutcome, GitOps, MergeResult, _run
 from orchestrator.merge_lane import MergeLane, WaiterRecord
+from orchestrator.merge_lane.intake import coalesce_or_enqueue_merge_request
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import (
     DecidedItem,
@@ -127,7 +128,6 @@ from orchestrator.merge_lane.worker import (
     MergeOutcome,
     MergeRequest,
     RealMergeItem,
-    coalesce_or_enqueue_merge_request,
     item_merge_wt,
 )
 from orchestrator.verify_runner import RunnerUnavailable

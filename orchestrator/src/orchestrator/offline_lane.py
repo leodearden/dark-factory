@@ -285,14 +285,14 @@ class OfflineLaneWorker:
         self._last_run_head = head
 
     async def _poll_tick(self) -> None:
-        """The idle poll: the engine's tick, then the backstop for a missed advance, else the due rechecks."""
+        """The idle poll: the backstop for a missed advance, armed before the engine's tick can raise, then the due rechecks."""
         head = await self.git_ops.get_main_sha()
         if not head:
             return
-        result = await self._engine.tick(head=head)
         if head != self._last_run_head:
             self._dirty = True
-        elif result.commands_due and not self._dirty:
+        result = await self._engine.tick(head=head)
+        if result.commands_due and not self._dirty:
             await self._recheck(head, result.commands_due)
 
     async def _recheck(self, head: str, commands: Collection[str]) -> None:

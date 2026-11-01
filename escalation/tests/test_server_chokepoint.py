@@ -637,13 +637,14 @@ def _stub_patch_content_contained(monkeypatch: pytest.MonkeyPatch, stub: object)
     """Install *stub* where both readers of ``patch_content_contained`` look it up.
 
     The server reads it through the façade, whose home for it is
-    ``orchestrator.merge_lane.landing_evidence``; the worker's
-    ``coalesce_or_enqueue_merge_request`` reads the worker's own binding.
+    ``orchestrator.merge_lane.landing_evidence``; the C3 gate of
+    ``coalesce_or_enqueue_merge_request`` reads it through
+    ``orchestrator.merge_lane.tip_relation.resolve_divergent``.
     """
     import orchestrator.merge_lane.landing_evidence as landing_evidence
-    import orchestrator.merge_lane.worker as worker
+    import orchestrator.merge_lane.tip_relation as tip_relation
 
-    for module in (worker, landing_evidence):
+    for module in (tip_relation, landing_evidence):
         monkeypatch.setattr(module, 'patch_content_contained', stub)
 
 
@@ -2081,10 +2082,8 @@ class TestMergeCancel:
             EventStore,
             EventType,
         )
-        from orchestrator.merge_lane.worker import (
-            TerminalOutcomeRecord,
-            TerminalOutcomeRetention,
-        )
+        from orchestrator.merge_lane.types import TerminalOutcomeRecord
+        from orchestrator.merge_lane.worker import TerminalOutcomeRetention
 
         event_store = EventStore(db_path=tmp_path / 'events-cancel.db', run_id='cancel')
         event_store.emit(
@@ -2308,7 +2307,7 @@ class TestBoundaryTableMcpSurface:
 
         queued_spy: list[int] = []
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker._emit_merge_queued',
+            'orchestrator.merge_lane.intake._emit_merge_queued',
             lambda *a, **kw: queued_spy.append(1),
         )
 
@@ -2779,7 +2778,7 @@ class TestBoundaryTableMcpSurface:
         """
         coalesced_spy: list[int] = []
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker._emit_merge_coalesced',
+            'orchestrator.merge_lane.intake.emit_merge_coalesced',
             lambda *a, **kw: coalesced_spy.append(1),
         )
 
@@ -3714,10 +3713,8 @@ class TestBoundary9CancelRetire:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from orchestrator.event_store import EventStore  # type: ignore[reportMissingImports]
-        from orchestrator.merge_lane.worker import (
-            TerminalOutcomeRecord,
-            TerminalOutcomeRetention,
-        )
+        from orchestrator.merge_lane.types import TerminalOutcomeRecord
+        from orchestrator.merge_lane.worker import TerminalOutcomeRetention
 
         TIP = 'b9b9b9b9deadbeef'
         # Planted AFTER the first dispatch (models the verify worktree the worker

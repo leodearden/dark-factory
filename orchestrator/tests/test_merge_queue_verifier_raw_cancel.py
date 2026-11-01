@@ -155,7 +155,7 @@ class TestRawCancelTerminatesParkedVerifierLoop:
              ``_pending_verifier_get`` and parks in the fill-ahead race;
           2. releasing the gate hands that race to the verify, so FINALIZE-HEAD
              finalizes the head and the getter survives;
-          3. the next iteration finds ``_redispatch`` empty, the pending getter
+          3. the next iteration finds the redispatch park empty, the pending getter
              not done and ``_inflight`` now empty -- so it falls through to
              FINALIZE-HEAD's ``else:`` and awaits the REUSED getter.
 
@@ -174,7 +174,7 @@ class TestRawCancelTerminatesParkedVerifierLoop:
         # files no spurious L1 illegal_lifecycle_transition escalation (task
         # 2169 registry).
         worker._register_item(item, initial=ItemLifecycleState.AWAITING_VERIFY)
-        # QUEUE-sourced, NOT _redispatch: the getter-reuse branch only ever
+        # QUEUE-sourced, NOT the redispatch park: the getter-reuse branch only ever
         # harvests from _verifier_queue.
         await worker._verifier_queue.put(item)
 

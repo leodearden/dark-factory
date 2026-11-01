@@ -1585,6 +1585,25 @@ class EscalationQueue:
                 results.append(esc)
         return results
 
+    def get_pending_by_task(self) -> dict[str, list[Escalation]]:
+        """``get_pending`` grouped by task id, deduplicated as ``get_by_task`` is.
+
+        For any task id, ``result.get(task_id, [])`` is row for row what
+        ``get_by_task(task_id, status='pending')`` returns over the same
+        listing, whose first-copy-wins dedup on ``Escalation.id`` is scoped to
+        one task. One listing serves every task, which is the point: the root
+        also holds thousands of ``.lock`` and ``.seq`` sidecars, so a per-task
+        call pays for the glob each time (task 8073).
+        """
+        grouped: dict[str, list[Escalation]] = {}
+        seen: set[tuple[str, str]] = set()
+        for esc in self.get_pending():
+            if (esc.task_id, esc.id) in seen:
+                continue
+            seen.add((esc.task_id, esc.id))
+            grouped.setdefault(esc.task_id, []).append(esc)
+        return grouped
+
     def resolve(
         self, escalation_id: str, resolution: str, dismiss: bool = False,
         *, resolved_by: str | None = None, resolution_turns: int | None = None,

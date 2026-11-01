@@ -1555,10 +1555,10 @@ class _GateScene:
 
         ``enqueue_merge_request`` is what registers ``_on_finalized``, and
         ``merge_finalized`` has no other emit site — so a scene that stuffed
-        ``_lane_buffers`` directly would make every landing assertion blind to
+        the lane buffers directly would make every landing assertion blind to
         the payload this gate exists to read.
         """
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         for tid in task_ids:
             self.reqs[tid] = _make_req(tid, tid, self.config, self.repo)
@@ -1618,7 +1618,7 @@ class _GateScene:
         )
         # The head leaves the buffers the way the merger takes it — it must not
         # still be queued when `chain_snapshot` runs, or it would chain itself.
-        popped = req if req is not None else worker._pop_next_pickable()
+        popped = req if req is not None else worker._intake.pop_next_pickable()
         assert popped is not None and popped.task_id == head_tid, (
             f'expected {head_tid} to be the pickable head, got '
             f'{None if popped is None else popped.task_id}'
@@ -1730,7 +1730,7 @@ class _GateScene:
         head_mc = await _merge_commit_off_main(
             self.repo, f'task/{head_tid}', f'head-{head_tid}',
         )
-        popped = worker._pop_next_pickable()
+        popped = worker._intake.pop_next_pickable()
         assert popped is not None and popped.task_id == head_tid, (
             f'expected {head_tid} to be the pickable head, got '
             f'{None if popped is None else popped.task_id}'
@@ -1815,7 +1815,7 @@ class _GateScene:
             self.repo, f'task/{spec_tid}', self.head_mc,
             f'{tag}-r{self._round_no}',
         )
-        popped = worker._pop_next_pickable()
+        popped = worker._intake.pop_next_pickable()
         assert popped is not None and popped.task_id == spec_tid, (
             f'expected {spec_tid} to be the pickable spec item, got '
             f'{None if popped is None else popped.task_id}'
@@ -2778,7 +2778,7 @@ class TestRow3HalvingIsolatesTheBadItem:
         pending: MergeRequest | None = None
         for _ in range(max_rounds):
             if pending is None:
-                nxt = worker._pop_next_pickable()
+                nxt = worker._intake.pop_next_pickable()
                 if nxt is None:
                     break
             else:
@@ -2801,7 +2801,7 @@ class TestRow3HalvingIsolatesTheBadItem:
             # drained perfectly.  Probe once more before failing — a pop that
             # returns None consumes nothing, and on the failing branch the
             # consumed item does not matter.
-            leftover = pending if pending is not None else worker._pop_next_pickable()
+            leftover = pending if pending is not None else worker._intake.pop_next_pickable()
             if leftover is not None:
                 pytest.fail(
                     f'the queue never drained in {max_rounds} rounds (task '
@@ -3157,7 +3157,7 @@ class TestRow8DeepFailsNeverFeedTheThrashLadder:
         The head is re-dispatched by OBJECT on round 2 rather than re-popped:
         a red tip REQUEUES its dispatching request onto ``_queue`` (deliberately
         NOT back into a lane buffer — draining it would make the head a member
-        of its own next chain), so ``_pop_next_pickable`` would hand back a
+        of its own next chain), so ``pop_next_pickable`` would hand back a
         FOLLOWER and the second round would be a different scenario entirely.
         """
         scene = await _make_gate_scene(
@@ -3770,7 +3770,7 @@ class TestRow7KillSwitchByteIdentity:
         # every enqueued request holds THIS object by reference.
         scene.config.verify_cross_check_remote_green = False
         for tag in ('r1', 'r2', 'r3'):
-            nxt = scene.worker._pop_next_pickable()
+            nxt = scene.worker._intake.pop_next_pickable()
             assert nxt is not None, (
                 f'the queue ran dry before round {tag}: a 3-round claim needs '
                 f'three real rounds, not a short run that passes vacuously'
@@ -4755,7 +4755,7 @@ class TestRow4ConflictTruncatesSilently:
         )
 
         # ── ...and then takes the ORDINARY sequential path and lands ────────
-        nxt = worker._pop_next_pickable()
+        nxt = worker._intake.pop_next_pickable()
         assert nxt is two, (
             f'item 2 must be the next pickable, at its original lane index; '
             f'got {None if nxt is None else nxt.task_id!r}'
@@ -5014,7 +5014,7 @@ class TestDeepGateCapstone:
         # it for the same determinism reason it was pinned at the top.
         scene.config.verify_cross_check_remote_green = False
 
-        nxt = worker._pop_next_pickable()
+        nxt = worker._intake.pop_next_pickable()
         assert nxt is scene.reqs['110']
         r6 = await scene.round_(tag='reload+truncate', head_tid='110', req=nxt)
         assert r6['chain'] is not None and 1 + len(r6['chain'].links) == 12, (
