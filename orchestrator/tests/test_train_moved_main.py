@@ -19,8 +19,13 @@ from unittest.mock import AsyncMock, call, patch
 
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
-from _merge_lane_fakes import lane_scene_config, make_lane, merge_through_lane
-from _merge_lane_verifier_doubles import ScriptedVerifier
+from _merge_lane_fakes import (
+    FakeVerifier,
+    delegates_to,
+    lane_scene_config,
+    make_lane,
+    merge_through_lane,
+)
 from _orch_helpers import git_env_with_ceiling
 from _recording_event_store import _RecordingEventStore
 from df_pytest_isolation import git_redirect_env
@@ -201,8 +206,8 @@ class _VerifyCall:
 
 
 class _VerifyDouble:
-    """The train's scoped verify, injected through ``ScriptedVerifier``, that
-    can move main while it runs.
+    """The train's scoped verify, injected through ``FakeVerifier``'s
+    ``delegates_to``, that can move main while it runs.
 
     Call *n* (1-based) records what it saw, then commits a drift with
     *mover* when *n* is in *move_on*, then answers red when *n* is in
@@ -249,7 +254,7 @@ async def _run_train(
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
         scene.git_ops, queue,
-        verifier=ScriptedVerifier(verify.run_scoped_verification), event_store=store,
+        verifier=FakeVerifier(delegates_to(verify.run_scoped_verification)), event_store=store,
     )
     return await merge_through_lane(lane, queue, train.request)
 

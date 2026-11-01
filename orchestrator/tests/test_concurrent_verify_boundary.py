@@ -32,7 +32,7 @@ from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier
+from _merge_lane_fakes import FakeVerifier, delegates_to
 from _merge_lane_verifier_doubles import ScriptedVerifier
 from _merge_worker_drive import HEAVY_BARRIER_TEST_TIMEOUT, stop_merge_worker
 from _orch_helpers import MERGE_GATE_BARRIER_TIMEOUT, wait_responsive
@@ -98,7 +98,7 @@ def _make_spanning_local_verify(
     name: str = 'local',
     passed: bool = True,
 ) -> Any:
-    """Return the per-call impl for ``ScriptedVerifier``.
+    """Return the delegate for ``FakeVerifier``'s ``delegates_to``.
 
     Records a verify span and gates on *gate_release*; the lane reaches it
     through the injected ``VerifyPort``, not through a patch.
@@ -239,7 +239,7 @@ class TestB1OverlapOrderedAdvance:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
             git_ops, q, on_merge_landed=_on_landed,
-            verifier=ScriptedVerifier(local_verify),
+            verifier=FakeVerifier(delegates_to(local_verify)),
         )
         _inject_two_host_allocator(worker, spanning_remote)
 
