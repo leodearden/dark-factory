@@ -12834,19 +12834,19 @@ class TestKnownProjectsInjection:
     def test_harness_accepts_known_projects_kwarg_and_uses_it(
         self, journal, event_buffer, mock_memory_service, monkeypatch
     ):
-        """Injected known_projects dict wins; build_known_projects_map is NOT called.
+        """Injected known_projects dict wins; configured_known_projects_map is NOT called.
 
-        Patching build_known_projects_map to raise proves that the DI path skips
+        Patching configured_known_projects_map to raise proves that the DI path skips
         the env-var-consulting factory entirely — not just that the result differs.
         """
 
         def _must_not_be_called(*args, **kwargs):
             raise AssertionError(
-                "build_known_projects_map must not be called when known_projects is injected"
+                "configured_known_projects_map must not be called when known_projects is injected"
             )
 
         monkeypatch.setattr(
-            'fused_memory.reconciliation.harness.build_known_projects_map',
+            'fused_memory.reconciliation.harness.configured_known_projects_map',
             _must_not_be_called,
         )
 
