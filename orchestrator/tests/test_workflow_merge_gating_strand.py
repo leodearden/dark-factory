@@ -319,6 +319,31 @@ def _time_the_wait(workflow: TaskWorkflow) -> dict[str, float]:
     return timing
 
 
+def _file_gating_l0_after_the_wait(
+    workflow: TaskWorkflow, queue: EscalationQueue, task_id: str,
+) -> None:
+    """File a plain blocking L0 the moment ``_wait_for_resolution`` returns.
+
+    That is the window AFTER the wait's tail read: the tail gates only what
+    ``_needs_human`` selects, and the wait loop only re-polls level 0 before
+    it returns, so a plain blocking L0 landing here is seen by nothing but the
+    merge-entry handler's single-shot ``_is_gating_escalation`` re-check.
+    Deterministic, with no sleeps: the record exists before the handler reads
+    the queue again.
+
+    Install this BEFORE :func:`_time_the_wait`, so the timer wraps it and still
+    counts entries into the wait.
+    """
+    original = workflow._wait_for_resolution
+
+    async def _then_file() -> tuple[CarriedResolution, ...]:
+        carried = await original()
+        _submit_gating_l0(queue, task_id)
+        return carried
+
+    workflow._wait_for_resolution = _then_file  # type: ignore[method-assign]
+
+
 def _steward_wait_timeouts(store: _RecordingEventStore) -> list[dict]:
     """Every ``escalation_resolved`` event carrying the give-up marker.
 
@@ -1458,6 +1483,78 @@ class TestGateReFireIsBounded:
         assert len(chained.instances) <= 1, (
             f'the handler must not loop back into the machinery and build a '
             f'second steward; built {len(chained.instances)}'
+        )
+
+    async def test_gating_record_filed_after_the_wait_parks_with_l1(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        """The shape only the post-wait single-shot re-check can stop.
+
+        The steward resolves the entry L0, so the wait returns normally.  A
+        plain blocking L0 then lands after the wait's tail read: the tail does
+        not gate it (it is not ``_needs_human``), and the wait loop has already
+        exited.  At merge entry there is no later gate, so without the re-check
+        this record is merged straight past (D4).  The re-check must park the
+        row with an L1 for a human, stop and clear the still-live steward
+        BEFORE parking (``_mark_blocked(escalate_to_human=True)`` spawns the
+        dry-run investigator in the same worktree), and not buy a second wait
+        (spec S5).
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        task_id = task_assignment.task_id
+        worktree = await _make_advanced_worktree(git_ops, task_id)
+        wf, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, worktree,
+        )
+        _wire_resolve_callback(queue, wf)
+        submit = _stub_merge_internals(wf, monkeypatch)
+
+        events: list[str] = []
+        wf._steward_factory = _make_journalling_resolving_steward(
+            queue, task_id, events,
+        )
+        record_status = scheduler.set_task_status
+
+        async def _journalled_set_task_status(task_id_, status, *args, **kwargs):
+            events.append(f'status:{status}')
+            return await record_status(task_id_, status, *args, **kwargs)
+
+        scheduler.set_task_status = _journalled_set_task_status  # type: ignore[method-assign]
+
+        _file_gating_l0_after_the_wait(wf, queue, task_id)
+        timing = _time_the_wait(wf)
+
+        _submit_gating_l0(queue, task_id)
+
+        outcome = await asyncio.wait_for(wf._run_merge_phase(f'task/{task_id}'), 20)
+
+        assert submit.await_count == 0, (
+            'D4 stop-the-line: a gating record filed after the wait is still '
+            'open at the re-check — the merge must not proceed past it'
+        )
+        assert outcome is not None
+        assert scheduler.statuses.get(task_id, [])[-1:] == ['blocked'], (
+            f'the re-check must park the row visibly; got '
+            f'{scheduler.statuses.get(task_id)}'
+        )
+        assert timing.get('calls') == 1, (
+            f'the re-check is single-shot; entered the steward wait '
+            f'{timing.get("calls")} time(s)'
+        )
+        assert events.count('steward:start') == 1, (
+            f'the park must not build a fresh steward; journal: {events}'
+        )
+        assert 'steward:stop' in events, (
+            f'the re-check arm must stop the live steward; journal: {events}'
+        )
+        assert events.index('steward:stop') < events.index('status:blocked'), (
+            f'the steward was still live when the row was parked — two agents, '
+            f'one worktree; journal: {events}'
+        )
+        assert wf._steward is None
+        assert queue.has_open_l1(task_id), (
+            'the park must reach a human as an L1, not a fresh L0 for the '
+            'steward that just cleared the gate'
         )
 
 
