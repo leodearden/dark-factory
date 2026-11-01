@@ -4,7 +4,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shlex
+import shutil
 import stat
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -23,14 +26,6 @@ def _build_nested_tree(root: Path) -> None:
     read_only = root / 'c' / 'read_only.txt'
     read_only.write_text('ro')
     read_only.chmod(stat.S_IRUSR)
-
-
-def _build_wide_tree(root: Path, file_count: int) -> None:
-    per_dir = 100
-    for index in range(file_count):
-        bucket = root / f'd{index // per_dir:03d}'
-        bucket.mkdir(parents=True, exist_ok=True)
-        (bucket / f'f{index:05d}').write_bytes(b'x')
 
 
 def _make_undeletable(root: Path) -> Path:
@@ -79,27 +74,71 @@ async def test_an_absent_path_is_already_removed(tmp_path: Path, ignore_errors: 
     await remove_tree(tmp_path / 'never-existed', ignore_errors=ignore_errors)
 
 
+class _GatedRm:
+    """An ``rm`` first on PATH that runs the real one only after :meth:`release`."""
+
+    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        real_rm = shutil.which('rm')
+        assert real_rm is not None
+        bin_dir = tmp_path / 'gated-bin'
+        bin_dir.mkdir()
+        self._started = tmp_path / 'rm-started'
+        self._gate = tmp_path / 'rm-gate'
+        os.mkfifo(self._gate)
+        script = bin_dir / 'rm'
+        script.write_text(
+            '#!/bin/sh\n'
+            f': > {shlex.quote(str(self._started))}\n'
+            f'read -r line < {shlex.quote(str(self._gate))}\n'
+            f'exec {shlex.quote(real_rm)} "$@"\n'
+        )
+        script.chmod(0o755)
+        monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
+        self._writer: int | None = None
+
+    @property
+    def started(self) -> bool:
+        return self._started.exists()
+
+    def release(self) -> None:
+        if self._writer is None:
+            self._writer = os.open(self._gate, os.O_RDWR)
+            os.write(self._writer, b'\n')
+
+    def close(self) -> None:
+        if self._writer is not None:
+            os.close(self._writer)
+
+
+@pytest.fixture
+def gated_rm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_GatedRm]:
+    gate = _GatedRm(tmp_path, monkeypatch)
+    try:
+        yield gate
+    finally:
+        gate.release()
+        gate.close()
+
+
 @pytest.mark.asyncio
-async def test_the_loop_keeps_running_while_a_tree_is_removed(tmp_path: Path) -> None:
-    root = tmp_path / 'wide'
-    _build_wide_tree(root, file_count=2000)
-    sightings: list[bool] = []
+async def test_the_loop_keeps_running_while_a_tree_is_removed(
+    tmp_path: Path, gated_rm: _GatedRm,
+) -> None:
+    root = tmp_path / 'tree'
+    _build_nested_tree(root)
     removal = asyncio.ensure_future(remove_tree(root))
 
-    async def ticker() -> None:
-        while not removal.done():
-            sightings.append(root.exists())
-            await asyncio.sleep(0)
+    while not gated_rm.started:
+        assert not removal.done(), 'remove_tree finished without running rm'
+        await asyncio.sleep(0)
 
-    await asyncio.gather(removal, ticker())
+    # The loop got here while the rm child was alive and parked on the gate.
+    assert root.exists()
+    assert not removal.done()
+    gated_rm.release()
+    await removal
 
-    assert not root.exists()
-    # An inline delete behind one yield (`await asyncio.sleep(0)` then
-    # shutil.rmtree) lets exactly one tick see the tree.
-    assert sightings.count(True) > 2, (
-        f'only {sightings.count(True)} loop tick(s) observed the tree before '
-        'remove_tree finished: the deletion held the event loop thread'
-    )
+    assert not os.path.lexists(root)
 
 
 @pytest.mark.asyncio
