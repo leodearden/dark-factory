@@ -28,7 +28,11 @@ from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware import dead_letter_escalator
 from fused_memory.middleware import mem0_update_storm_escalator as storm_mod
 from fused_memory.models.enums import MemoryCategory, SourceStore
-from fused_memory.models.scope import Scope, resolve_project_id_for_root
+from fused_memory.models.scope import (
+    Scope,
+    configured_primary_root,
+    resolve_project_id_for_root,
+)
 from fused_memory.services import memory_service
 from fused_memory.services.memory_service import (
     MemoryService,
@@ -12781,6 +12785,33 @@ class TestMemoryMetadataValidationAtSeam:
         assert project_id == 'dark_factory'
         assert agent_id == 'claude-drifter'
         assert keys == ['drifting_key']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_storm_escalation_root_is_the_registry_normalised_root(
+        self, service, entry_point, tmp_path
+    ):
+        """The storm escalation files under the same root the project registry holds."""
+        target = tmp_path / 'Target-Proj'
+        target.mkdir()
+        link = tmp_path / 'Link-Proj'
+        link.symlink_to(target)
+        service.config.taskmaster = TaskmasterConfig(project_root=str(link))
+        filed = []
+
+        def _fake_filer(project_root, *, project_id, agent_id, keys):
+            filed.append(project_root)
+            return 'esc-memory-metadata-unknown-key-storm-1'
+
+        crossing = MagicMock()
+        crossing.record = MagicMock(return_value=True)
+        service._metadata_storm_detector = crossing
+
+        with patch.object(memory_service, 'file_unknown_key_storm_escalation', _fake_filer):
+            await _mm_write(service, entry_point, metadata={'drifting_key': 1})
+
+        assert filed == [str(target.resolve())]
+        assert filed[0] == configured_primary_root(service.config.taskmaster)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
