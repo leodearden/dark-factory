@@ -224,8 +224,10 @@ class TestInstallParksPreemption:
         assert lt.has_parks('L')  # L is retained in the shadow stack (INV-5)
         # H's park on m1 means L cannot acquire m1 while H is on top (INV-2).
         assert not lt.try_acquire('L', ['m1'])
-        # L's park on m2 remains — H cannot acquire m2.
-        assert not lt.try_acquire('H', ['m2'])
+        # L's park on m2 remains: a parkless task cannot acquire m2, while H
+        # outranks it and passes it (task 7799, INV-8).
+        assert not lt.try_acquire('X', ['m2'])
+        assert lt.park_owners_blocking('H', ['m2']) == []
         # After H completes (clear), L is RESTORED as the active top on m1 (INV-4).
         lt.clear_parks_for('H')
         assert lt.try_acquire('L', ['m1'])
