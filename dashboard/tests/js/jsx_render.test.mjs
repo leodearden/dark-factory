@@ -386,10 +386,60 @@ for (const bucketMinutes of [60, null]) {
     const titles = [...container.querySelectorAll('.panel-head > .title')]
       .map(title => title.textContent)
       .filter(text => text.startsWith('Merge attempts'));
-    const caption = harness.window.DF_MERGE_QUEUE.depthBucketCaption(block.depth);
+    const caption = harness.window.DF_MERGE_QUEUE.depthBucketCaption(block.depth.value);
     assert.deepEqual(titles, [`Merge attempts · ${caption}`]);
   });
 }
+
+// ── An unread runs.db (merge_queue.js::attemptsOver, worstP95Over, projectAttempts) ──
+// A project whose runs.db could not be read renders every runs.db reading as
+// unknown: no measured-looking 0, and no chart drawn over nothing.
+
+function mountMergeTab(t, block) {
+  const harness = openWindow(t);
+  seedDashboardData(harness.window, {
+    MERGE_QUEUE: { [PROJECT]: block },
+    __receipt: receiptsFor(harness.window.DF_DATA_LOADER, ['MERGE_QUEUE']),
+  });
+  const { container } = harness.mount(harness.window.DF_TABS.MergeTab, { projectFilter: [] });
+  return { harness, container };
+}
+
+function panelTitled(container, prefix) {
+  const titles = [...container.querySelectorAll('.panel-head > .title')].filter(title => title.textContent.startsWith(prefix));
+  assert.equal(titles.length, 1, `expected exactly one panel titled "${prefix}…"`);
+  return titles[0].closest('.panel');
+}
+
+test('tabs.jsx::MergeTab renders an unread runs.db as unknown, never as measured zeros', t => {
+  const { harness, container } = mountMergeTab(t, mergeQueueBlock({ bucketMinutes: 60, unread: true }));
+  const DF = harness.window.DF_DATA;
+  const { attemptsOver, worstP95Over, projectAttempts } = harness.window.DF_MERGE_QUEUE;
+  const { datumView, EM_DASH } = harness.window.DF_DATUM;
+
+  const merges = datumView(attemptsOver(DF, null)).text;
+  assert.equal(merges, EM_DASH);
+  assert.equal(statTile(container, 'Merges (window)').querySelector('.val').textContent, merges);
+  const worst = datumView(worstP95Over(DF, null)).text;
+  assert.equal(worst, EM_DASH);
+  assert.equal(statTile(container, 'p95 latency · worst project').querySelector('.val').textContent, worst);
+
+  const pips = [...container.querySelectorAll('.pip')].map(pip => pip.textContent);
+  assert.ok(pips.includes(`${datumView(projectAttempts(DF, PROJECT)).text} attempts`), JSON.stringify(pips));
+  assert.ok(!pips.some(text => text.startsWith('0 attempts')), `an unread project reads a measured 0: ${JSON.stringify(pips)}`);
+  for (const prefix of ['Outcomes', 'Merge attempts']) {
+    assert.equal(panelTitled(container, prefix).querySelector('svg'), null, `${prefix} draws a chart over an unread window`);
+  }
+});
+
+test('tabs.jsx::MergeTab counts a measured window\'s attempts with attemptCount', t => {
+  const block = mergeQueueBlock({ bucketMinutes: 60, outcomes: { done: 3, conflict: 2 } });
+  const { harness, container } = mountMergeTab(t, block);
+
+  const count = harness.window.DF_MERGE_QUEUE.attemptCount(block.attempts.value);
+  assert.equal(count, 5);
+  assert.equal(statTile(container, 'Merges (window)').querySelector('.val').textContent, String(count));
+});
 
 // ── Decision 6: a render throw is contained, and its notice is render_failure.js's ──
 // React's development build reports every throw a boundary catches on
