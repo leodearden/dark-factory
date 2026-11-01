@@ -919,6 +919,26 @@ class TestReconcileStrandedInProgress:
         # No revert must have been logged ('reverted task' matches the stable log format)
         assert not any('reverted task' in r.message for r in caplog.records)
 
+    @pytest.mark.parametrize('owner_pid', [10**20, True], ids=['unrepresentable', 'json-true'])
+    async def test_corrupt_owner_pid_reads_as_no_claimant_and_reverts(
+        self, harness: Harness, owner_pid: object
+    ):
+        """One corrupt lock degrades to 'no plan-lock claimant'; startup step 2d survives."""
+        harness.scheduler.get_statuses.return_value = ({'43': 'in-progress'}, None)  # type: ignore[attr-defined]
+        worktree_path = harness.git_ops.worktree_base / '43'
+        worktree_path.mkdir(parents=True)
+        lock_dir = _resolver_lock_dir(worktree_path)
+        lock_dir.mkdir(parents=True)
+        (lock_dir / 'plan.lock').write_text(json.dumps({
+            'session_id': '43-abcd1234',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': owner_pid,
+        }))
+
+        await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_called_once_with('43', 'pending')  # type: ignore[attr-defined]
+
     async def test_revert_unlinks_the_vestigial_worktree_lock(
         self, harness: Harness
     ):

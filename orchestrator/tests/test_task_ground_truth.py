@@ -1011,6 +1011,29 @@ class TestDeriveTruthLiveClaimant:
 
         assert report.live_claimant is None
 
+    @pytest.mark.parametrize('owner_pid', [10**20, True], ids=['unrepresentable', 'json-true'])
+    async def test_corrupt_owner_pid_in_a_fresh_lock_is_not_a_live_claimant(
+        self, tmp_path: Path, owner_pid: object,
+    ) -> None:
+        """A pid no process can hold reads as no claimant, without raising.
+
+        10**20 overflows the C pid_t, and a JSON ``true`` must not become pid 1.
+        The lock is fresh, so only the pid judgment can produce the None.
+        """
+        _write_plan_lock(tmp_path, {
+            'session_id': 'sess-corrupt-abc123',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': owner_pid,
+            'run_id': 'run-corrupt',
+        })
+        task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: tmp_path)
+
+        report = await resolver.derive_truth('41')
+
+        assert report.live_claimant is None
+
     async def test_no_claimant_and_no_plan_lock_returns_none(self) -> None:
         task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
