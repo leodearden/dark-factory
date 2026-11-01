@@ -8,10 +8,12 @@ import pytest
 from pydantic import ValidationError
 from shared.project_layout import known_project_roots
 
+from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.models.scope import (
     KNOWN_PROJECT_ROOTS_ENV,
     Scope,
     build_known_projects_map,
+    configured_primary_root,
     is_phantom_project_root,
     known_project_roots_from_env,
     read_declared_project_id,
@@ -465,6 +467,47 @@ class TestBuildKnownProjectsMap:
             m for m in self._scope_warnings(caplog) if str(ghost) in m
         ]
         assert len(naming_ghost) == 1
+
+
+class TestConfiguredPrimaryRoot:
+    """configured_primary_root is the one normalisation of
+    taskmaster.project_root that every project-registry consumer uses."""
+
+    def test_no_taskmaster_section_means_no_primary_root(self):
+        assert configured_primary_root(None) == ''
+
+    def test_empty_project_root_means_no_primary_root(self):
+        assert configured_primary_root(TaskmasterConfig(project_root='')) == ''
+
+    def test_tilde_is_expanded_and_resolved(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('HOME', str(tmp_path))
+        (tmp_path / 'proj').mkdir()
+        taskmaster = TaskmasterConfig(project_root='~/proj')
+        assert configured_primary_root(taskmaster) == str(
+            (tmp_path / 'proj').resolve()
+        )
+
+    def test_default_dot_denotes_the_process_cwd(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert configured_primary_root(TaskmasterConfig()) == str(
+            tmp_path.resolve()
+        )
+
+    def test_relative_root_resolves_against_the_cwd(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / 'sub').mkdir()
+        taskmaster = TaskmasterConfig(project_root='sub')
+        assert configured_primary_root(taskmaster) == str(
+            (tmp_path / 'sub').resolve()
+        )
+
+    def test_symlinked_root_resolves_to_its_target(self, tmp_path):
+        target = tmp_path / 'target'
+        target.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(target)
+        taskmaster = TaskmasterConfig(project_root=str(link))
+        assert configured_primary_root(taskmaster) == str(target.resolve())
 
 
 class TestScopeCanonicalizesProjectId:
