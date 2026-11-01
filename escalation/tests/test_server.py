@@ -50,13 +50,13 @@ from escalation.server import (
 try:
     from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
     from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.types import TerminalOutcomeRecord
     from orchestrator.merge_lane.worker import (
         MergeRequest,
         QueuedBranch,
         RealMergeItem,
         SpeculativeItem,
         SpeculativeMergeWorker,
-        TerminalOutcomeRecord,
         TerminalOutcomeRetention,
     )
     _ORCHESTRATOR_AVAILABLE = True
@@ -4028,10 +4028,8 @@ class TestMergeRequestDedup:
         """
         import asyncio
 
-        from orchestrator.merge_lane import worker as _mq_mod
-        from orchestrator.merge_lane.worker import (
-            MergeDispatchResult,
-        )
+        from orchestrator.merge_lane import intake
+        from orchestrator.merge_lane.types import MergeDispatchResult
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -4047,7 +4045,7 @@ class TestMergeRequestDedup:
             )
 
         monkeypatch.setattr(
-            _mq_mod, 'coalesce_or_enqueue_merge_request', _fake_coalesce,
+            intake, 'coalesce_or_enqueue_merge_request', _fake_coalesce,
         )
 
         server = create_server(
@@ -4388,10 +4386,8 @@ class TestMergeRequestDedup:
         import asyncio
         from pathlib import Path as _Path
 
-        from orchestrator.merge_lane.worker import (
-            MergeRequest,
-            register_and_enqueue_merge_request,
-        )
+        from orchestrator.merge_lane.intake import register_and_enqueue_merge_request
+        from orchestrator.merge_lane.worker import MergeRequest
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -4525,13 +4521,14 @@ def _stub_patch_content_contained(monkeypatch: pytest.MonkeyPatch, stub: object)
     """Install *stub* where both readers of ``patch_content_contained`` look it up.
 
     The server reads it through the façade, whose home for it is
-    ``orchestrator.merge_lane.landing_evidence``; the worker's
-    ``coalesce_or_enqueue_merge_request`` reads the worker's own binding.
+    ``orchestrator.merge_lane.landing_evidence``; the C3 gate of
+    ``coalesce_or_enqueue_merge_request`` reads it through
+    ``orchestrator.merge_lane.tip_relation.resolve_divergent``.
     """
     import orchestrator.merge_lane.landing_evidence as landing_evidence
-    import orchestrator.merge_lane.worker as worker
+    import orchestrator.merge_lane.tip_relation as tip_relation
 
-    for module in (worker, landing_evidence):
+    for module in (tip_relation, landing_evidence):
         monkeypatch.setattr(module, 'patch_content_contained', stub)
 
 
@@ -5893,12 +5890,12 @@ class TestGetMergeQueue:
             f'wip_overlap, got: {bad_states}'
         )
 
-        # (5) The halt reverses cleanly — retirement did not corrupt
-        # _lane_halt.
+        # (5) The halt reverses cleanly — retirement did not corrupt the
+        # lane halt state.
         worker.unhalt_wip()
         assert not worker.is_wip_halted, (
             'Expected is_wip_halted False after unhalt_wip() — retirement '
-            'must not have corrupted _lane_halt'
+            'must not have corrupted the lane halt state'
         )
 
 

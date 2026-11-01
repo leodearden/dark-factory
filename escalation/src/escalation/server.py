@@ -3999,7 +3999,7 @@ def create_server(
 
         Named ``lane``, not ``merge_lane``, because that is the word the whole
         merge-queue boundary already uses: ``MergeRequest.lane``,
-        ``orchestrator/src/orchestrator/merge_queue.py::MERGE_LANES``, and the
+        ``orchestrator/src/orchestrator/merge_lane/intake.py::MERGE_LANES``, and the
         ``lane`` field ``get_merge_queue`` emits per queue item.  The TASK
         METADATA key stays ``merge_lane`` because task metadata is one flat
         global namespace in which a bare ``lane`` would collide with the warm,

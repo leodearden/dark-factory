@@ -3236,7 +3236,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -3305,7 +3305,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -3373,7 +3373,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,

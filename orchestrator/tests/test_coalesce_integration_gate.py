@@ -174,11 +174,8 @@ class TestScenario1:
 
         from orchestrator.event_store import EventStore
         from orchestrator.harness import build_train_callback_factory
-        from orchestrator.merge_lane.worker import (
-            MergeOutcome,
-            SpeculativeMergeWorker,
-            enqueue_merge_request,
-        )
+        from orchestrator.merge_lane.intake import enqueue_merge_request
+        from orchestrator.merge_lane.worker import MergeOutcome, SpeculativeMergeWorker
 
         # 3 disjoint-file branches (each touches a unique file → line-stackable).
         # Branch names are BARE (no 'task/' prefix): create_worktree('ig1') creates
@@ -244,7 +241,7 @@ class TestScenario1:
                 with _release_on_exit(gate_release):
                     # Wait for gated verify.  When gate_entered fires:
                     #   • _maybe_coalesce_waiting_singles has run — all 3 singles resolved
-                    #     MergeOutcome('superseded') and the GroupMergeRequest is in _lane_buffers.
+                    #     MergeOutcome('superseded') and the GroupMergeRequest is in the lane buffers.
                     #   • _do_train_merge has picked up the GroupMergeRequest (registry
                     #     entry at ItemLifecycleState.MERGING),
                     #     completed rebase + merge, and is now suspended inside
@@ -383,7 +380,7 @@ class TestScenario2:
     Three branches: s21 and s22 are disjoint (unique files → stackable);
     s23 adds the SAME file as s21 (file_overlap.py) → get_changed_line_ranges
     returns old-side point range (0,0) on file_overlap.py for BOTH s21 and s23
-    → _line_ranges_stackable returns False → _select_train_members rejects s23.
+    → line_ranges_stackable returns False → select_train_members rejects s23.
 
     Assertions:
       (a) the formed train has exactly 2 members (s21 + s22), NOT s23
@@ -399,7 +396,7 @@ class TestScenario2:
 
     GREEN (step-4): s23 now adds file_overlap.py (same filename as s21) so
     parse_diff_line_ranges maps it to (0,0) on file_overlap.py — same as s21's
-    range — and _line_ranges_stackable returns False.  The coalescing pass forms
+    range — and line_ranges_stackable returns False.  The coalescing pass forms
     a 2-member train from s21+s22 and leaves s23 solo in the buffer.
     """
 
@@ -420,7 +417,7 @@ class TestScenario2:
         #        (0,0) on file_overlap.py → intersects s21's range → NOT stackable.
         #        git diff main...task/ig_s23 shows file_overlap.py as a pure insertion
         #        (@@ -0,0 +1,1 @@) → parse_diff_line_ranges maps it to (0,0).
-        #        _line_ranges_stackable({'file_overlap.py': [(0,0)]}, {'file_overlap.py': [(0,0)]})
+        #        line_ranges_stackable({'file_overlap.py': [(0,0)]}, {'file_overlap.py': [(0,0)]})
         #        → shared_files={'file_overlap.py'}, 0<=0 and 0<=0 → NOT stackable.
         wt1 = await _make_branch_with_file(git_ops, 'ig_s21', 'file_overlap.py', 'x = 1\n')
         wt2 = await _make_branch_with_file(git_ops, 'ig_s22', 'file_s22.py',      'y = 2\n')
@@ -706,7 +703,7 @@ class TestScenario4:
       not req.result.cancelled()  — detached waiter
       not isinstance(req, GroupMergeRequest)
     Plus structural exclusion: a MERGING-registered request is absent from
-    _lane_buffers.
+    the lane buffers.
 
     Setup:
       req_in_flight: MergeRequest registered at ItemLifecycleState.MERGING
@@ -719,19 +716,19 @@ class TestScenario4:
     direct _maybe_coalesce_waiting_singles() call level with real EventStore +
     factory, establishing that the pass correctly classifies each candidate type.
 
-    Driver: direct registry-registration + _lane_buffers manipulation → call
+    Driver: direct registry-registration + lane-buffer manipulation → call
     _maybe_coalesce_waiting_singles() with real EventStore + factory.
 
     Assertions:
       (a) req_in_flight's future is UNRESOLVED after the pass (not touched)
       (b) req_in_flight's task_id is NOT in the train's member_task_ids
       (c) req_cancelled's future remains CANCELLED — set_result never called
-      (d) req_cancelled still in _lane_buffers (not absorbed)
+      (d) req_cancelled still in the lane buffers (not absorbed)
       (e) train forms from req4a + req4b only; exactly 2 members
       (f) train_coalesced event records only req4a + req4b in member_task_ids
 
     GREEN (step-8): req_in_flight is registered at MERGING and NOT placed
-    in _lane_buffers (structural exclusion: absent from buffer).
+    in the lane buffers (structural exclusion: absent from buffer).
     req_cancelled.result.cancel() is called before the pass so the cancelled()
     check filters it out.  Only req4a+req4b are eligible → 2-member train.
     """
@@ -776,7 +773,7 @@ class TestScenario4:
 
         # GREEN (step-8): req_in_flight is registered at MERGING — NOT in the buffer.
         # Structural exclusion: _maybe_coalesce_waiting_singles only scans
-        # _lane_buffers['normal']; a MERGING-registered request is invisible to the pass.
+        # the normal lane buffer; a MERGING-registered request is invisible to the pass.
         worker._register_item(req_in_flight, initial=ItemLifecycleState.MERGING)
 
         # Simulate a detached waiter: cancel req_cancelled's future before
@@ -786,7 +783,7 @@ class TestScenario4:
         assert req_cancelled.result.cancelled(), 'precondition: future must be cancelled'
 
         # Lane buffer: cancelled request + 2 live singles (req_in_flight is absent).
-        worker._lane_buffers['normal'].extend([req_cancelled, req4a, req4b])
+        worker._intake.replace_lane('normal', [req_cancelled, req4a, req4b])
 
         result = await worker._maybe_coalesce_waiting_singles()
         assert result is True, 'pass must form a train from the eligible candidates'
@@ -798,7 +795,7 @@ class TestScenario4:
         )
 
         # (b) req_in_flight's task_id absent from the formed train.
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
         assert len(trains) == 1, f'Expected 1 train; got {len(trains)}'
         assert 'ig_inf' not in trains[0].member_task_ids, (

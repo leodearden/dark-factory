@@ -114,6 +114,7 @@ from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.main_tip_sweep_cadence import MainSweepColdControl, SweepSeedMode
 from orchestrator.mcp_lifecycle import McpLifecycle
 from orchestrator.merge_deferred_recovery import AbandonedMemberSweep
+from orchestrator.merge_lane import enqueue_merge_request
 from orchestrator.merge_lane.landed_outbox import MergeProvenance
 from orchestrator.merge_lane.landing_evidence import (
     LandingEvidenceVerdict,
@@ -124,11 +125,10 @@ from orchestrator.merge_lane.landing_evidence import (
 )
 from orchestrator.merge_lane.queue_store import MergeQueueStore, recover_pending_merges
 from orchestrator.merge_lane.skew_tripwire import emit_pipeline_landing_tripwire
+from orchestrator.merge_lane.tip_relation import select_recovery_winner
 from orchestrator.merge_lane.worker import (
-    enqueue_merge_request,
     reconcile_landed_outbox,
     reconcile_landed_task,
-    select_recovery_winner,
 )
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.module_tagger_prompt import (

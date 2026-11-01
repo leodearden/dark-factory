@@ -31,7 +31,7 @@ and parks it for re-dispatch (``snapshot()['entries']`` reports that item as
 ``awaiting_host``). That leaves both host slots free with one parked item, so
 the next fill pass is exactly the redispatch-sourced-dispatch window the guard
 governs. Verified as a genuine fence, not just a green test: restoring the
-pre-3276 clause (``if not is_from_verifier_queue and not self._redispatch:
+pre-3276 clause (``if not is_from_verifier_queue and not self._intake.pending_redispatch():
 fill_done = True``) makes
 ``test_second_host_dispatched_from_ready_queue_in_same_fill_pass`` and
 ``test_late_arrival_dispatched_to_free_host_while_head_verify_runs`` fail with
