@@ -1700,6 +1700,22 @@ class GitQueryFailed(RuntimeError):
     """A read-only git lookup could not answer, as distinct from answering "none"."""
 
 
+class CitationPatternInvalid(ValueError):
+    """A citation lookup's pattern is not a valid Python ``re``: a caller's error, not git's."""
+
+    def __init__(self, pattern: str) -> None:
+        super().__init__(f'citation pattern is not a valid Python re; raising: {pattern!r}')
+        self.pattern = pattern
+
+
+async def _none_if_query_failed(lookup: Awaitable[str | None]) -> str | None:
+    """Await a checked lookup and read :class:`GitQueryFailed` as no answer (the fail-safe twins)."""
+    try:
+        return await lookup
+    except GitQueryFailed:
+        return None
+
+
 class WorktreeMissing(FileNotFoundError):
     """Raised when a subprocess cannot start because its ``cwd`` does not exist.
 
@@ -9355,24 +9371,19 @@ class GitOps:
     ) -> str | None:
         """Return the tip of ``refs/heads/<full_branch>`` iff it has no commit outside *base_ref*.
 
-        ``git rev-list --count <base_ref>..<tip> == 0``, i.e. the tip is
-        reachable from *base_ref*: the branch holds no work of its own. The REF
+        The tip is an ancestor of *base_ref* (so
+        ``git rev-list --count <base_ref>..<tip>`` is 0): the branch holds no
+        work of its own. The REF
         is measured, not a worktree's HEAD, because the ref is what
         ``merge_lane/landing_evidence.py::branch_is_degenerate`` reads; a HEAD
         left detached by a failed rebase says nothing about it.
 
-        **Fail-safe ``None``** on any git error or unparseable output, the same
-        direction as :meth:`_branch_has_commits_beyond_main`'s ``True``: a
-        caller may only treat a branch as empty when git proved it.
+        **Fail-safe ``None``** on any git error (:meth:`is_ancestor` answers
+        False), the same direction as :meth:`_branch_has_commits_beyond_main`'s
+        ``True``: a caller may only treat a branch as empty when git proved it.
         """
         tip = await self.resolve_branch_sha(full_branch)
-        if not tip:
-            return None
-        tip = tip.strip()
-        rc, out, _ = await _run(
-            ['git', 'rev-list', '--count', f'{base_ref}..{tip}'], cwd=self.project_root,
-        )
-        return tip if rc == 0 and out.strip() == '0' else None
+        return tip if tip and await self.is_ancestor(tip, base_ref) else None
 
     async def _orphan_has_commits(self, full_branch: str) -> bool:
         """Whether *full_branch* exists AND carries commits beyond main.
@@ -9876,10 +9887,7 @@ class GitOps:
         body-quoting commit hide the real marker — the same accepted tradeoff
         as :meth:`find_task_citation_commit`.
         """
-        try:
-            return await self.find_merge_marker_checked(branch)
-        except GitQueryFailed:
-            return None
+        return await _none_if_query_failed(self.find_merge_marker_checked(branch))
 
     async def find_merge_marker_checked(self, branch: str) -> str | None:
         """:meth:`_scan_merge_marker`, but a git failure raises :class:`GitQueryFailed`.
@@ -10014,10 +10022,16 @@ class GitOps:
             pattern fails to compile as a Python ``re``.
         """
         try:
-            return await self.find_task_citation_commit_checked(
-                tid, pattern_template=pattern_template,
+            return await _none_if_query_failed(
+                self.find_task_citation_commit_checked(tid, pattern_template=pattern_template),
             )
-        except GitQueryFailed:
+        except CitationPatternInvalid as exc:
+            logger.warning(
+                'find_task_citation_commit: pattern_template is not a '
+                'valid Python re pattern (tid=%s); treating as '
+                'no-citation (fail-safe): %r',
+                tid, exc.pattern,
+            )
             return None
 
     async def find_task_citation_commit_checked(
@@ -10025,8 +10039,9 @@ class GitOps:
     ) -> str | None:
         """:meth:`find_task_citation_commit`, but a failed lookup raises :class:`GitQueryFailed`.
 
-        Raises on a git failure or an override that is not a valid Python
-        ``re``; a disabled pattern (``''``) still answers None. For a caller
+        Raises :class:`GitQueryFailed` on a git failure and
+        :class:`CitationPatternInvalid` on an override that is not a valid
+        Python ``re``; a disabled pattern (``''``) still answers None. For a caller
         that writes on a miss and so must not read "could not look" as "no
         citation".
         """
@@ -10041,13 +10056,7 @@ class GitOps:
         try:
             compiled = re.compile(pattern_str)
         except re.error as exc:
-            logger.warning(
-                'find_task_citation_commit: pattern_template is not a '
-                'valid Python re pattern (tid=%s); treating as '
-                'no-citation (fail-safe): %r',
-                tid, pattern_str,
-            )
-            raise GitQueryFailed(f'citation pattern does not compile: {pattern_str!r}') from exc
+            raise CitationPatternInvalid(pattern_str) from exc
         rc, out, err = await _run(
             [
                 'git', 'log', self.config.main_branch,
@@ -10060,15 +10069,9 @@ class GitOps:
         )
         if rc != 0:
             raise GitQueryFailed(f'citation walk for {tid} failed (rc={rc}): {err.strip()}')
-        if not out:
-            return None
-        for record in out.split('\0'):
-            if not record:
-                continue
-            sha, _, subject = record.partition('\x1f')
-            if compiled.search(subject):
-                return sha.strip()
-        return None
+        records = (record.partition('\x1f') for record in filter(None, out.split('\0')))
+        cited = filter(lambda record: compiled.search(record[2]), records)
+        return next((sha.strip() for sha, _, _ in cited), None)
 
     async def rebase_onto_main(self, worktree: Path, onto: str | None = None) -> bool:
         """Rebase the task branch in *worktree* onto *onto* (default: main).

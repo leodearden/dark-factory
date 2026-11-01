@@ -34,11 +34,17 @@ def _make_workflow(
     *,
     project_root: Path,
     task_id: str = '101',
+    recorded_base: str | None = None,
 ) -> TaskWorkflow:
-    """Return a minimal TaskWorkflow with scheduler/git_ops mocked."""
+    """Return a minimal TaskWorkflow with scheduler/git_ops mocked.
+
+    *recorded_base* is the task's ``metadata.branch_base_sha`` as dispatched.
+    """
     assignment = MagicMock()
     assignment.task_id = task_id
     assignment.task = {'id': task_id, 'title': 'T', 'description': 'd'}
+    if recorded_base is not None:
+        assignment.task['metadata'] = {'branch_base_sha': recorded_base}
     assignment.modules = ['mod_a']
 
     _spec = pydantic_spec(OrchestratorConfig)
@@ -66,7 +72,18 @@ def _make_workflow(
         briefing=MagicMock(),
         mcp=MagicMock(),
     )
+    wf._sync_worktree_venvs = AsyncMock()
     return wf
+
+
+async def _setup(wf: TaskWorkflow) -> None:
+    """Dispatch-time setup, with the .task/ contamination scan stubbed."""
+    with patch('orchestrator.workflow._run', new=AsyncMock(return_value=(0, '', ''))):
+        await wf._setup_worktree_and_artifacts('101')
+
+
+async def _restamp(wf: TaskWorkflow) -> bool:
+    return await wf._restamp_branch_base_if_no_own_commits()
 
 
 @pytest.mark.asyncio
@@ -78,10 +95,8 @@ async def test_setup_worktree_restamps_a_branch_without_own_commits(tmp_path: Pa
         return_value=WorktreeInfo(path=tmp_path, base_commit=base_sha)
     )
     wf.git_ops.branch_tip_if_no_commits_beyond = AsyncMock(return_value=base_sha)
-    wf._sync_worktree_venvs = AsyncMock()
 
-    with patch('orchestrator.workflow._run', new=AsyncMock(return_value=(0, '', ''))):
-        await wf._setup_worktree_and_artifacts('101')
+    await _setup(wf)
 
     cast(AsyncMock, wf.scheduler.update_task).assert_awaited_once_with(
         '101', {'branch_base_sha': base_sha}, append=False
@@ -100,9 +115,8 @@ async def test_setup_worktree_external_worktree_only_seeds_its_head(tmp_path: Pa
     fake_proc.returncode = 0
     fake_proc.communicate = AsyncMock(return_value=(base_sha.encode() + b'\n', b''))
 
-    with patch('asyncio.create_subprocess_exec', new=AsyncMock(return_value=fake_proc)), \
-         patch('orchestrator.workflow._run', new=AsyncMock(return_value=(0, '', ''))):
-        await wf._setup_worktree_and_artifacts('101')
+    with patch('asyncio.create_subprocess_exec', new=AsyncMock(return_value=fake_proc)):
+        await _setup(wf)
 
     cast(AsyncMock, wf.git_ops.branch_tip_if_no_commits_beyond).assert_not_awaited()
     cast(AsyncMock, wf.scheduler.update_task).assert_awaited_once_with(
@@ -131,11 +145,10 @@ async def test_setup_worktree_external_rev_parse_failure_logs_warning_and_falls_
     )
 
     with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'), \
-         patch('asyncio.create_subprocess_exec', new=AsyncMock(return_value=fake_proc)), \
-         patch('orchestrator.workflow._run', new=AsyncMock(return_value=(0, '', ''))):
-        await wf._setup_worktree_and_artifacts('101')
+         patch('asyncio.create_subprocess_exec', new=AsyncMock(return_value=fake_proc)):
+        await _setup(wf)
 
-    assert wf._base_commit is None, f'expected _base_commit is None, got {wf._base_commit!r}'
+    assert wf._base_commit is None
     cast(AsyncMock, wf.scheduler.update_task).assert_not_awaited()
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1, f'expected 1 warning, got {len(warnings)}: {[r.getMessage() for r in warnings]}'
@@ -155,16 +168,12 @@ async def test_setup_worktree_update_task_soft_fail_logs_and_continues(
         return_value=WorktreeInfo(path=tmp_path, base_commit=base_sha)
     )
     wf.git_ops.branch_tip_if_no_commits_beyond = AsyncMock(return_value=base_sha)
-    wf._sync_worktree_venvs = AsyncMock()
     wf.scheduler.update_task = AsyncMock(side_effect=Exception('mcp down'))
 
-    with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'), \
-         patch('orchestrator.workflow._run', new=AsyncMock(return_value=(0, '', ''))):
-        await wf._setup_worktree_and_artifacts('101')
+    with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
+        await _setup(wf)
 
-    assert wf._base_commit == base_sha, (
-        f'expected _base_commit={base_sha!r}, got {wf._base_commit!r}'
-    )
+    assert wf._base_commit == base_sha
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1, f'expected 1 warning, got {len(warnings)}: {[r.getMessage() for r in warnings]}'
     msg = warnings[0].getMessage()
@@ -211,19 +220,15 @@ async def _commit_own_work(git_ops: GitOps, worktree: Path) -> str | None:
 def _workflow_on(
     git_ops: GitOps, tmp_path: Path, *, recorded_base: str | None = None,
 ) -> TaskWorkflow:
-    wf = _make_workflow(project_root=tmp_path)
-    if recorded_base is not None:
-        wf._recorded_branch_base = recorded_base
+    wf = _make_workflow(project_root=tmp_path, recorded_base=recorded_base)
     wf.git_ops.config = git_ops.config
     wf.git_ops.branch_tip_if_no_commits_beyond = git_ops.branch_tip_if_no_commits_beyond
-    wf._sync_worktree_venvs = AsyncMock()
     return wf
 
 
 async def _dispatch(wf: TaskWorkflow, info: WorktreeInfo) -> None:
     wf.git_ops.create_worktree = AsyncMock(return_value=info)
-    with patch('orchestrator.workflow._run', new=AsyncMock(return_value=(0, '', ''))):
-        await wf._setup_worktree_and_artifacts('101')
+    await _setup(wf)
 
 
 @pytest.mark.asyncio
@@ -330,8 +335,8 @@ class TestRestampAfterRebase:
         assert await real_git_ops.rebase_onto_main(info.path)
         wf = _workflow_on(real_git_ops, tmp_path, recorded_base=info.base_commit)
 
-        assert await wf._restamp_branch_base_if_no_own_commits() is True
-        assert await wf._restamp_branch_base_if_no_own_commits() is True
+        assert await _restamp(wf) is True
+        assert await _restamp(wf) is True
 
         cast(AsyncMock, wf.scheduler.update_task).assert_awaited_once_with(
             '101', {'branch_base_sha': later_main}, append=False,
@@ -346,7 +351,7 @@ class TestRestampAfterRebase:
         assert await real_git_ops.rebase_onto_main(info.path)
         wf = _workflow_on(real_git_ops, tmp_path, recorded_base=info.base_commit)
 
-        assert await wf._restamp_branch_base_if_no_own_commits() is False
+        assert await _restamp(wf) is False
 
         cast(AsyncMock, wf.scheduler.update_task).assert_not_awaited()
 
@@ -364,7 +369,7 @@ class TestRestampAfterRebase:
         wf.scheduler.update_task = AsyncMock(**reply)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
-            assert await wf._restamp_branch_base_if_no_own_commits() is True
+            assert await _restamp(wf) is True
 
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1 and 'branch_base_sha' in warnings[0], warnings
@@ -376,7 +381,7 @@ class TestRestampAfterRebase:
         wf.git_ops.branch_tip_if_no_commits_beyond = AsyncMock(side_effect=OSError('gone'))
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
-            assert await wf._restamp_branch_base_if_no_own_commits() is False
+            assert await _restamp(wf) is False
 
         cast(AsyncMock, wf.scheduler.update_task).assert_not_awaited()
         assert any(r.levelno == logging.WARNING for r in caplog.records)

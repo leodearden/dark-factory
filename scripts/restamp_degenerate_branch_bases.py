@@ -25,9 +25,10 @@ orchestrator's own, in their checked form
 ``branch_base_sha = <tip>``.
 
 ``--check`` (the default) reports and never dials the MCP server. ``--apply``
-re-reads each eligible task through the MCP ``get_task`` tool immediately
-before writing, skips it unless it is still pending with the census's recorded
-base and still judges eligible at the same tip, writes through ``update_task``
+re-judges each eligible task against git, then re-reads it through the MCP
+``get_task`` tool immediately before writing, and skips it unless it still
+judges eligible at the same tip and is still pending with the census's
+recorded base. It writes through ``update_task``
 ('merge' mode), classifies every reply with ``write_failure_reason`` and
 re-reads the task to confirm the stored value. Exit status: 0 success, 1 any
 write failure, 2 unreadable task store.
@@ -61,7 +62,7 @@ from migrate_metadata_modules_to_files import (
     write_failure_reason,
 )
 from orchestrator.config import load_config
-from orchestrator.git_ops import GitOps, GitQueryFailed
+from orchestrator.git_ops import CitationPatternInvalid, GitOps, GitQueryFailed
 
 CONFIG_FILENAME = 'dark-factory-orchestrator.yaml'
 
@@ -123,7 +124,7 @@ async def judge_branch(
             str(task_id), pattern_template=git_ops.config.commit_citation_pattern,
         ):
             return verdict(Exclusion.CITATION)
-    except GitQueryFailed:
+    except (GitQueryFailed, CitationPatternInvalid):
         return verdict(Exclusion.GIT_ERROR)
     return verdict(None)
 
@@ -180,22 +181,28 @@ async def _read_task(client: FusedMemoryClient, project_root: Path, task_id: int
 async def restamp_one(
     client: FusedMemoryClient, git_ops: GitOps, project_root: Path, prior: BranchVerdict,
 ) -> str | None:
-    """Re-check *prior* against the live task, write its tip, confirm; return why not, or None.
+    """Re-check *prior*, write its tip, confirm; return why it failed, or None.
 
-    A task that is no longer pending, whose recorded base moved, or that no
-    longer judges eligible at the census's tip is skipped (reported, not a
-    failure): something else has touched it since the census.
+    A task that no longer judges eligible at the census's tip, is no longer
+    pending, or whose recorded base moved is skipped (reported, not a
+    failure): something else has touched it since the census. The slow git
+    re-judge runs first, so only one MCP round trip separates the status read
+    from the write.
     """
+    verdict = await judge_branch(
+        git_ops, prior.task_id, {'branch_base_sha': prior.recorded_base},
+    )
+    if verdict.tip != prior.tip or not verdict.eligible:
+        print(f'  skip {prior.task_id}: changed since the census ({verdict.exclusion})')
+        return None
     task = await _read_task(client, project_root, prior.task_id)
     if isinstance(task, str):
         return f'pre-write read failed: {task}'
-    metadata = _metadata_of(task)
-    if task.get('status') != 'pending' or metadata.get('branch_base_sha') != prior.recorded_base:
+    if (
+        task.get('status') != 'pending'
+        or _metadata_of(task).get('branch_base_sha') != prior.recorded_base
+    ):
         print(f'  skip {prior.task_id}: status or recorded base changed since the census')
-        return None
-    verdict = await judge_branch(git_ops, prior.task_id, metadata)
-    if verdict.tip != prior.tip or not verdict.eligible:
-        print(f'  skip {prior.task_id}: changed since the census ({verdict.exclusion})')
         return None
     reply = await call_tool_with_retry(client, 'update_task', {
         'id': str(prior.task_id),
