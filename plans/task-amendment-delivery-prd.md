@@ -622,7 +622,8 @@ Known residuals, accepted:
   lifetime, since the reflog keeps it alive. γ counts every unresolvable `CHECKED`
   entry so the rate is visible.
 - A `revert` that restored one path of X but left the descoped change in another
-  passes, and so does a revert that was performed and then re-applied.
+  passes, and so does a revert followed by a re-apply in different content (a
+  patch-equivalent re-apply becomes m(e) and needs its own restore).
 
 Fail-open on git error — but **with a streak counter, not bare** (G7 redesign at
 decompose, INV-4 `storm-escape-required`; see task 4033). The sibling gates' documented
