@@ -2221,14 +2221,17 @@ class ReconciliationConfig(BaseModel):
             '(orchestrator/src/orchestrator/mcp_lifecycle.py::ORCHESTRATOR_MCP_IDENTITY), '
             'because fused-memory serves stateless HTTP, where a tools/call '
             'session never receives an InitializeRequest and '
-            'server/tools.py::_resolve_identity has no clientInfo to fall '
+            'fused-memory/src/fused_memory/server/tools.py::_resolve_identity '
+            'has no clientInfo to fall '
             "back to — which is why 'orchestrator' is the "
             'sole default. DENY-ON-MISSING is the consumer contract: a caller '
             'matching no prefix is refused, and an EMPTY list denies every '
             'caller (the live kill switch for the provenance kind). The '
-            'finished one-shot scripts/cgl_eta_finalize_gate.py (which sends '
-            "no agent_id; its clientInfo is 'cgl-sched-gate') is deliberately "
-            'NOT in the default — it has '
+            'finished one-shot fused-memory/scripts/cgl_eta_finalize_gate.py '
+            '(which sends no agent_id; its clientInfo is '
+            "'cgl-sched-gate', advertised by "
+            'fused-memory/scripts/cgl_eta_scheduler_gate.py::McpClient) is '
+            'deliberately NOT in the default — it has '
             'already run, and shipping a retired caller in an allowlist is how '
             'an allowlist stops meaning anything. NOTE: the identity this bar '
             'reads is SELF-REPORTED, so it deters a cooperating caller rather '
