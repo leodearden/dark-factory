@@ -251,6 +251,17 @@ class TestVerifyScriptDelegate:
 
         assert entered_when_delegated == [True]
 
+    def test_a_script_that_both_raises_and_delegates_is_rejected_at_construction(self):
+        async def delegate(*args: object, **kwargs: object) -> VerifyResult:
+            return passes().result
+
+        error = RuntimeError('scripted boom')
+
+        with pytest.raises(ValueError, match=r"raise RuntimeError\('scripted boom'\).*delegate"):
+            dataclasses.replace(delegates_to(delegate), error=error)
+        with pytest.raises(ValueError, match='delegate'):
+            dataclasses.replace(raises(error), delegate=delegate)
+
 
 class TestNextScriptSeam:
     @pytest.mark.asyncio

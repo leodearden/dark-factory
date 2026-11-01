@@ -128,11 +128,12 @@ def lane_scene_config(
 class VerifyScript:
     """What one ``FakeVerifier.run_scoped`` call does.
 
-    Exactly one of the shapes below applies: return ``result``, raise
-    ``error``, wait for ``release`` first and then return ``result``, or
-    hand the call to ``delegate`` and return what it returns.
-    *entered*, when given, is set the moment a call reaches this script,
-    before any release wait; it is the arrival half of a release gate.
+    A call that reaches this script sets *entered*, when given (the arrival
+    half of a release gate), then waits for *release*, when given. It then
+    ends in exactly one way: it raises *error*, or returns what *delegate*
+    returns, or returns *result*. *error* and *delegate* each end the call,
+    so construction rejects a script carrying both. A call that raises or
+    delegates never returns *result*.
     """
 
     result: VerifyResult
@@ -140,6 +141,13 @@ class VerifyScript:
     release: asyncio.Event | None = None
     entered: asyncio.Event | None = None
     delegate: ScopedVerify | None = None
+
+    def __post_init__(self) -> None:
+        if self.error is not None and self.delegate is not None:
+            raise ValueError(
+                f'a VerifyScript cannot both raise {self.error!r} and '
+                f'delegate to {self.delegate!r}: each one ends the call',
+            )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -195,8 +203,9 @@ class FakeVerifier:
     scripted with ``delegates_to(fn)``, and is recorded like any other call.
     It records every task id it was asked about in ``verified`` and what each
     call was handed in ``verify_calls``, one ``ScopedVerifyCall`` per entry
-    into the BASE ``run_scoped`` (an override that does not delegate records
-    only ``verified``/``entered_count``, through ``_note_entry``).
+    into the BASE ``run_scoped`` (an override that does not call
+    ``super().run_scoped`` records only ``verified``/``entered_count``,
+    through ``_note_entry``).
     ``await_entry(n)`` waits for the *n*-th entry into ``run_scoped``, which
     is how a test waits for a scripted hang to be genuinely under way before
     it probes the lane -- per CALL, so a test that drives two verifies can
