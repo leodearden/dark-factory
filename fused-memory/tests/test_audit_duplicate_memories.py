@@ -3456,6 +3456,20 @@ class TestComputeClusterMetricsConsolidationNetDelta:
         _metrics, details = compute_cluster_metrics(records, {_PK: _plan_slice()}, {})
         assert details['categories'][_PK]['consolidation_events'][0]['absorbed'] == 0
 
+    @pytest.mark.parametrize('malformed', ['true', 1])
+    def test_malformed_canonical_marker_is_not_a_consolidation_event(self, malformed):
+        records = {
+            _PK: [
+                _dated('c', 'x', '2026-01-01T00:00:00+00:00',
+                       metadata={'topic': 'venv', 'canonical': malformed}),
+                _dated('after', 'y', '2026-01-02T00:00:00+00:00', metadata={'topic': 'venv'}),
+            ],
+        }
+        metrics, details = compute_cluster_metrics(records, {_PK: _plan_slice()}, {})
+
+        assert details['categories'][_PK]['consolidation_events'] == []
+        assert _by_id(metrics)[f'consolidation_net_delta.{_PK}'].n == 0
+
     def test_untopiced_event_uses_its_cluster_as_the_peer_set(self):
         records = {
             _PK: [
