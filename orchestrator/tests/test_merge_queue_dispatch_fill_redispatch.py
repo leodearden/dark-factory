@@ -44,6 +44,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import functools
+import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
@@ -77,6 +79,7 @@ from test_merge_queue_rebased_landing_dead_base import _git_until_it_takes, _lan
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import MERGE_WORKER_SHUTDOWN_REASON, MergeLane, MergeRequest
+from orchestrator.remote_gate import RunnerUnavailableKind
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator, HostLease, RunnerUnavailable
 
@@ -466,8 +469,9 @@ class TestCascadeAntiDeadlockPreserved:
 # task 5303 (3277 + 4929): a host that becomes usable while the head verifies
 # ---------------------------------------------------------------------------
 
-#: A head whose local verify hangs until ``local_gate``, which these tests never
-#: release -- so any dispatch they observe happened while it was still verifying.
+#: A head whose local verify hangs until ``local_gate``, which these tests release
+#: only after their last dispatch observation -- so any dispatch they observe
+#: happened while it was still verifying.
 LONG_HEAD = 'hf-head'
 #: The item waiting for the second host.
 WAITER = 'hf-waiter'
@@ -483,10 +487,17 @@ def _hosts_of(lane: _Lane) -> dict[str, list[str]]:
     return lane.worker.snapshot()['occupancy']['inflight_by_host']
 
 
-def _unavailable_once_remote(release: asyncio.Event, name: str = 'laptop') -> MagicMock:
-    """A fake RemoteRunner whose FIRST verify raises RunnerUnavailable once the
-    runner's ``unavailable_gate`` is set; every later verify hangs until
-    *release*, like :func:`_hanging_remote`.
+def _remote_row(lane: _Lane) -> dict[str, Any]:
+    """The second host's row of the public host census."""
+    return next(h for h in lane.worker.snapshot()['hosts'] if h['name'] == lane.remote.name)
+
+
+def _unavailable_once_remote(
+    release: asyncio.Event, name: str = 'laptop', *, kind: RunnerUnavailableKind = 'transport',
+) -> MagicMock:
+    """A fake RemoteRunner whose FIRST verify raises RunnerUnavailable of *kind*
+    once the runner's ``unavailable_gate`` is set; every later verify hangs
+    until *release*, like :func:`_hanging_remote`.
     """
     calls = 0
     unavailable_gate = asyncio.Event()
@@ -496,7 +507,7 @@ def _unavailable_once_remote(release: asyncio.Event, name: str = 'laptop') -> Ma
         calls += 1
         if calls == 1:
             await unavailable_gate.wait()
-            raise RunnerUnavailable('laptop dropped off the network')
+            raise RunnerUnavailable('laptop dropped off the network', kind=kind)
         await release.wait()
         return passes().result
 
@@ -521,9 +532,10 @@ class TestHostFreedWhileHeadVerifies:
     """A host that becomes usable mid-head-verify is used within one poll
     slice, not after the head's verify finishes -- task 5303 (3277, 4929).
 
-    Every head here verifies on local and is never released, so a dispatch
-    observed at all is a dispatch bounded by ``VERIFY_ABANDON_POLL_SECS``
-    rather than by the head's verify.
+    Every head here verifies on local and is not released before the
+    dispatch under test is observed, so a dispatch observed at all is a
+    dispatch bounded by ``VERIFY_ABANDON_POLL_SECS`` rather than by the
+    head's verify.
     """
 
     async def test_cleared_quarantine_dispatches_waiting_item_beside_verifying_head(
@@ -709,6 +721,131 @@ class TestHostFreedWhileHeadVerifies:
                 f'its merge() Future was never resolved; {lane.observed()}'
             )
             assert _hosts_of(lane) == {}, lane.observed()
+
+    async def test_a_benched_follower_frees_its_host_while_the_head_verifies(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Task 7266, the dead-lease strand: WAITER's verify raises
+        RunnerUnavailable on the laptop while LONG_HEAD verifies on local.
+        The laptop must be benched and its slot freed at bench time, so the
+        reprobe primitive can readmit it and it serves a verify while the
+        head still verifies -- and verdicts still land in submission order.
+        """
+        prefer_local = config.model_copy(update={'verify_host_policy': 'prefer_local'})
+        async with _running_lane(git_ops, prefer_local, remote=_unavailable_once_remote) as lane:
+            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            resolved: list[str] = []
+
+            async def _enqueue_tracked(task_id: str) -> None:
+                request = await lane.enqueue(task_id)
+                request.result.add_done_callback(lambda _f: resolved.append(task_id))
+
+            await _enqueue_tracked(LONG_HEAD)
+            await lane.settle(
+                lambda: _hosts_of(lane) == {'local': [LONG_HEAD]},
+                expected=f'{LONG_HEAD} verifying on local',
+                why='prefer_local hands the first verify the local host.',
+            )
+            await _enqueue_tracked(WAITER)
+            await lane.settle(
+                lambda: _hosts_of(lane) == {'local': [LONG_HEAD], lane.remote.name: [WAITER]},
+                expected=f'{WAITER} verifying on the laptop beside {LONG_HEAD}',
+                why='local is busy with the head, so the follower overflows to the laptop.',
+            )
+
+            lane.remote.unavailable_gate.set()
+            await lane.settle(
+                lambda: (
+                    _remote_row(lane)['quarantined'] is True
+                    and _remote_row(lane)['slot_state'] == 'free'
+                    and _hosts_of(lane) == {'local': [LONG_HEAD]}
+                ),
+                expected='the laptop benched with its slot free while the head verifies',
+                why=(
+                    "the dead-lease strand: the RunnerUnavailable verdict is held "
+                    "in _inflight under its dead lease until the head's in-order "
+                    "finalize, so the laptop stays BUSY, untracked and unreprobeable."
+                ),
+            )
+            assert not lane.requests[LONG_HEAD].result.done(), lane.observed()
+            assert not lane.requests[WAITER].result.done(), lane.observed()
+            assert lane.states()[LONG_HEAD] == 'verifying', lane.observed()
+
+            assert lane.worker.readmit_host(lane.remote.name, now=time.time()) is True, (
+                f'a passing reprobe could not readmit the benched laptop; {_remote_row(lane)!r}'
+            )
+
+            await _enqueue_tracked(SECOND)
+            await lane.settle(
+                lambda: bool(_hosts_of(lane).get(lane.remote.name)),
+                expected='the readmitted laptop serving a verify while the head verifies',
+                why='a readmitted host must be usable within one poll slice.',
+            )
+            assert lane.states()[LONG_HEAD] == 'verifying', lane.observed()
+
+            lane.local_gate.set()
+            lane.remote_gate.set()
+            for task_id in (LONG_HEAD, WAITER, SECOND):
+                outcome = await wait_responsive(
+                    lane.requests[task_id].result, label=f'{task_id} outcome',
+                )
+                assert outcome.status == 'done', (task_id, outcome)
+            assert resolved == [LONG_HEAD, WAITER, SECOND], (
+                f'verdicts must land in submission order, got {resolved!r}'
+            )
+
+            row = _remote_row(lane)
+            assert row['quarantined'] is False and row['streak'] is None, (
+                f"{WAITER}'s in-order finalize re-benched a host already benched "
+                f'and readmitted: {row!r}'
+            )
+
+    async def test_a_head_failure_cascade_keeps_the_benched_followers_skew_bench(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Task 7266, second defect: when the head FAILS after its follower's
+        verify benched the laptop, the cascade must keep the follower's skew
+        bench (kind and all) and send no cancel RPC to the benched host.
+        """
+        prefer_local = config.model_copy(update={'verify_host_policy': 'prefer_local'})
+        wire_shape_remote = functools.partial(_unavailable_once_remote, kind='wire_shape')
+        async with _running_lane(git_ops, prefer_local, remote=wire_shape_remote) as lane:
+            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            await lane.enqueue(HEAD)
+            await lane.settle(
+                lambda: _hosts_of(lane) == {'local': [HEAD]},
+                expected=f'{HEAD} verifying on local',
+                why='prefer_local hands the first verify the local host.',
+            )
+            await lane.enqueue(WAITER)
+            await lane.settle(
+                lambda: _hosts_of(lane) == {'local': [HEAD], lane.remote.name: [WAITER]},
+                expected=f'{WAITER} verifying on the laptop beside {HEAD}',
+                why='local is busy with the head, so the follower overflows to the laptop.',
+            )
+
+            lane.remote.unavailable_gate.set()
+            await lane.settle(
+                lambda: _hosts_of(lane) == {'local': [HEAD]},
+                expected=f"the laptop's dead lease released while {HEAD} verifies",
+                why=(
+                    "the dead-lease strand: the RunnerUnavailable verdict is held "
+                    "in _inflight under its dead lease until the head's in-order "
+                    "finalize."
+                ),
+            )
+
+            lane.head_gate.set()
+            lane.local_gate.set()
+            waiter = await wait_responsive(lane.requests[WAITER].result, label=f'{WAITER} outcome')
+            assert waiter.status == 'done', waiter
+            head = await wait_responsive(lane.requests[HEAD].result, label=f'{HEAD} outcome')
+            assert head.status != 'done', head
+
+            row = _remote_row(lane)
+            assert (row['quarantine_class'], row['kind']) == ('skew', 'wire_shape'), row
+            assert row['slot_state'] == 'free', row
+            lane.remote.cancel_verify.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
