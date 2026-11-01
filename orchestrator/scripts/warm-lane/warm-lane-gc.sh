@@ -281,6 +281,7 @@
 #       * awk's early exit only fires once EVERY candidate is found, so the
 #         common case (free entry, about to be reclaimed) always pays the full
 #         walk — and that is exactly the verdict that must be fresh.
+#     Task 8089 narrowed the fd/cwd walk; current figures: lib_live_refs.sh's MEASURED COST.
 #     AMENDED by task 3075: every measurement above STANDS, but the per-lane
 #     budget changed and the reversal now runs the OTHER WAY. Pass 1 pays a ~1ms
 #     record read (one file read + a couple of seds) for EVERY lane, and the

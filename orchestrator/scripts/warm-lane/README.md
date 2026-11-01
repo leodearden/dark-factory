@@ -37,7 +37,9 @@ hermeticity seam only** — production never sets it. See the autouse
 `test_warm_lane_script_resolution.py` pin the *shipped* and *resolution* halves
 of the contract above. `test_lane_state_lib.py` pins `lib_lane_state.sh` —
 including the INV-5 drift gate that fails the build if `PROTECTED_PREFIXES`
-gains a band the library's static fallback does not cover. The **behaviour** of
+gains a band the library's static fallback does not cover.
+`test_live_refs_lib.py` pins `lib_live_refs.sh`'s reference detection and its
+scan footprint, at the merge gate. The **behaviour** of
 every invocable script here is
 covered by the ported bash tests in `orchestrator/tests/warm-lane/` — see
 [that directory's README](../../tests/warm-lane/README.md) for provenance, the
@@ -1463,6 +1465,29 @@ every reify lane therefore also resets as today, visible as
 
 - `orchestrator/tests/warm-lane/test_warm_lane_gc.sh` Block V (V1-V9) and A12;
 - `test_warm_lane_gc_sweep.sh` Block Z (Z1-Z6).
+
+### Delta 15 — `lib_live_refs.sh`: the fd/cwd pass enumerates only `/proc/<pid>/cwd` and `/proc/<pid>/fd`
+
+Added by **task 8089**. Offline pass `20261101T113026-1bafdf` killed
+`test_warm_lane_gc.sh` at its 900 s budget with `Results: 449 passed, 0 failed`
+already printed: nothing failed, the suite was slow. An instrumented 307 s run
+spent 164 s in 86 fd/cwd scans and 65 s in 79 maps scans.
+
+- **Equivalence.** On a real `/proc` the old `find /proc -maxdepth 3 …`
+  expression can match only `/proc/<pid>/cwd` and `/proc/<pid>/fd/*`. The rest
+  of its depth-3 walk (`attr/`, `net/`, `ns/`, `map_files/`, `fdinfo/`,
+  `/proc/sys/…`) matched nothing and was pure cost. The new producer hands
+  `find` exactly those links as starting points. The awk matcher is unchanged.
+- **`xargs` + `sh -c 'exec find "$@" …'`**, not a bare glob as `find`'s argv,
+  which would `E2BIG` at very large process counts and fail OPEN.
+- **Not `find -files0-from`**: findutils ≥ 4.9 only, and an older `find`
+  prints nothing, which fails open the same way.
+
+reify's original still carries the depth-3 walk. Current per-call figures live
+in `lib_live_refs.sh`'s MEASURED COST block.
+
+**Pinned by:** `orchestrator/tests/test_live_refs_lib.py` — `TestScanFootprint`
+for what a negative verdict may list, `TestReferenceDetection` for the verdicts.
 
 ## Sibling-seed defaults, and who resolves them
 
