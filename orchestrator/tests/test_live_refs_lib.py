@@ -6,8 +6,8 @@ coverage there runs only on the offline lane.  These cases run at the merge
 gate against the SHIPPED lib, never a copy:
 
 * ``TestReferenceDetection`` pins the verdicts against real helper processes:
-  a cwd hit, an open-fd hit, a miss, the ``_lane-1``/``_lane-10`` name-prefix
-  boundary and the batch subset.
+  a cwd hit, an open-fd hit, an mmap hit, a miss, the ``_lane-1``/``_lane-10``
+  name-prefix boundary and the batch subset.
 * ``TestScanFootprint`` pins what a negative verdict may read.  The verdict
   needs only ``/proc/<pid>/cwd``, ``/proc/<pid>/fd/*`` and ``/proc/<pid>/maps``,
   so the only directories it may list are ``/proc`` and ``/proc/<pid>/fd``.  It
@@ -21,6 +21,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator
@@ -47,6 +48,22 @@ _RUN_TIMEOUT_S = 120
 _VERDICT_LINE = re.compile(r'^rc=(\d+)$', re.M)
 
 _FD_DIR = re.compile(r'/proc/\d+/fd')
+
+#: ``mmap.mmap`` keeps a private dup of the fd it maps, so every fd on the file
+#: is closed afterwards: the mapping is then the helper's only reference to it.
+_MAP_THEN_CLOSE_FDS = """
+import mmap, os, sys, time
+path = sys.argv[1]
+with open(path, 'rb') as mapped:
+    mapping = mmap.mmap(mapped.fileno(), 0, prot=mmap.PROT_READ)
+for fd in os.listdir('/proc/self/fd'):
+    try:
+        if os.readlink(f'/proc/self/fd/{fd}') == path:
+            os.close(int(fd))
+    except OSError:
+        pass
+time.sleep(300)
+"""
 
 
 def _run_sourced(
@@ -102,17 +119,34 @@ def _link_is(link: str, target: Path) -> Callable[[], bool]:
     return resolved
 
 
+def _mapped_with_no_fd_open(pid: int, path: Path) -> Callable[[], bool]:
+    def resolved() -> bool:
+        fd_dir = f'/proc/{pid}/fd'
+        try:
+            maps = Path(f'/proc/{pid}/maps').read_text()
+            fd_targets = {os.readlink(f'{fd_dir}/{fd}') for fd in os.listdir(fd_dir)}
+        except OSError:
+            return False
+        return str(path) in maps and str(path) not in fd_targets
+    return resolved
+
+
 Spawn = Callable[..., subprocess.Popen[bytes]]
 
 
 @pytest.fixture
 def helpers() -> Iterator[Spawn]:
-    """Start long-lived ``sleep`` processes; kill and reap every one after."""
+    """Start long-lived helper processes; kill and reap every one after."""
     started: list[subprocess.Popen[bytes]] = []
 
-    def spawn(*, cwd: Path, stdout: IO[bytes] | int = subprocess.DEVNULL) -> subprocess.Popen[bytes]:
+    def spawn(
+        *,
+        cwd: Path,
+        stdout: IO[bytes] | int = subprocess.DEVNULL,
+        argv: tuple[str, ...] = ('sleep', '300'),
+    ) -> subprocess.Popen[bytes]:
         proc = subprocess.Popen(
-            ['sleep', '300'],
+            argv,
             cwd=str(cwd),
             stdin=subprocess.DEVNULL,
             stdout=stdout,
@@ -167,6 +201,29 @@ class TestReferenceDetection:
 
         assert _live_ref_present(lane) == 0
 
+    def test_a_process_mapping_a_file_inside_the_dir_is_live(
+        self, tmp_path: Path, helpers: Spawn,
+    ) -> None:
+        root = tmp_path.resolve()
+        lane = root / '_lane-1'
+        mapped = lane / 'target' / 'libdep.so'
+        mapped.parent.mkdir(parents=True)
+        mapped.write_bytes(b'\0' * 4096)
+        elsewhere = root / 'elsewhere'
+        elsewhere.mkdir()
+
+        proc = helpers(
+            cwd=elsewhere,
+            argv=(sys.executable, '-c', _MAP_THEN_CLOSE_FDS, str(mapped)),
+        )
+        _wait_until(
+            _mapped_with_no_fd_open(proc.pid, mapped),
+            f'helper mapping {mapped} with no fd open on it',
+        )
+        assert os.readlink(f'/proc/{proc.pid}/cwd') == str(elsewhere)
+
+        assert _live_ref_present(lane) == 0
+
     def test_an_unreferenced_dir_is_not_live(self, tmp_path: Path) -> None:
         lane = tmp_path.resolve() / '_lane-1'
         lane.mkdir()
@@ -218,8 +275,8 @@ class TestScanFootprint:
         trace_file = tmp_path / 'trace'
         proc = _run_sourced(
             f'live_ref_present {shlex.quote(str(unreferenced))}; echo "rc=$?"',
-            prefix=(strace, '-f', '-qq', '-e', 'trace=getdents64', '-y',
-                    '-o', str(trace_file)),
+            prefix=(strace, '-f', '--seccomp-bpf', '-qq', '-e', 'trace=getdents64',
+                    '-y', '-o', str(trace_file)),
         )
 
         trace = trace_file.read_text() if trace_file.exists() else ''
@@ -233,7 +290,10 @@ class TestScanFootprint:
             )
         assert _verdict(proc) == 1
 
-        listed = re.findall(r'getdents64\(\d+<([^>]*)>', trace)
+        listed = [
+            d for d in re.findall(r'getdents64\(\d+<([^>]*)>', trace)
+            if d == '/proc' or d.startswith('/proc/')
+        ]
         assert '/proc' in listed and any(_FD_DIR.fullmatch(d) for d in listed), (
             'the trace shows no listing of /proc and /proc/<pid>/fd, so it '
             f'cannot speak for the scan; listed={sorted(set(listed))[:20]}'
