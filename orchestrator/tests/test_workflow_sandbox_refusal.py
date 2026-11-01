@@ -20,14 +20,12 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from escalation.queue import EscalationQueue
 
 from orchestrator.agents import sandbox_dispatch
-from orchestrator.config import OrchestratorConfig
-from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.workflow import TaskWorkflow
 from orchestrator.workflow_types import WorkflowState, WorkflowStateMachine
@@ -204,42 +202,3 @@ class TestEmitSandboxUnavailable:
         wf = _make_bare_workflow(tmp_path, worktree=tmp_path)  # event_store=None
         # Must not raise when there is no event store wired up.
         wf._emit_sandbox_unavailable('debugger', 'auto')
-
-
-class _ProposalScheduler:
-    def __init__(self) -> None:
-        self.updates: list[dict] = []
-
-    async def get_task(self, task_id):
-        return {'title': 'T', 'metadata': {}}
-
-    async def update_task(self, task_id, metadata, **kwargs):
-        self.updates.append(metadata)
-        return True
-
-
-class TestDryRunRefusalFilesTheOutageEscalation:
-    """A dry run that refuses first holds the escalate-once token, so it must file the escalation."""
-
-    @pytest.mark.asyncio
-    async def test_a_refused_dry_run_files_the_single_escalation(self, tmp_path):
-        wf = _make_bare_workflow(tmp_path, worktree=tmp_path)
-        sandbox_dispatch.set_backend('landlock')
-        scheduler = _ProposalScheduler()
-        with patch('orchestrator.agents.landlock.is_landlock_available', return_value=False):
-            await run_dry_run_unblock(
-                task_id='2908',
-                worktree=str(tmp_path),
-                reason='verify exhausted',
-                detail='',
-                scheduler=scheduler,
-                mcp=MagicMock(),
-                config=OrchestratorConfig(),
-                sandbox_guard=wf._guard_sandbox,
-            )
-
-        assert wf.escalation_queue is not None
-        pending = wf.escalation_queue.get_pending()
-        assert len(pending) == 1
-        assert 'unblock_auto' in pending[0].summary
-        assert scheduler.updates[0]['dry_run_proposals'][0]['status'] == 'investigation_failed'

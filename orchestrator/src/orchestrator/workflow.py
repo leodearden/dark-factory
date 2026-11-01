@@ -16639,8 +16639,7 @@ class TaskWorkflow:
             f'on this host). First refusal: role {role_name}, task {self.task_id}'
         )
         detail_msg = (
-            f'Sandboxing is required (sandbox.enabled, for a sandboxed role or the '
-            f'dry-run investigation) but the '
+            f'Sandboxing is required (sandbox.enabled + role.sandboxed) but the '
             f'configured backend={backend_state!r} resolved to no available OS '
             f'sandbox (landlock/bwrap) on this host, so sandboxed dispatch is '
             f'REFUSED fail-closed (PRD D4, mirrors recon '
@@ -18111,7 +18110,6 @@ class TaskWorkflow:
                     usage_gate=self.usage_gate,
                     cost_store=self.cost_store,
                     block_class=block_class,
-                    sandbox_guard=self._guard_sandbox,
                 ),
                 name=investigation_task_name(self.task_id),
             )

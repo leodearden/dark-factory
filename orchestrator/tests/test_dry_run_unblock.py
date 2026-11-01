@@ -3411,34 +3411,39 @@ class TestInvestigationIsConfined:
         assert 'unconfined' in entry['proposal_text']
 
     @pytest.mark.asyncio
-    async def test_the_callers_sandbox_guard_decides_the_refusal(self, tmp_path):
+    async def test_a_refused_dry_run_leaves_the_outage_escalation_to_the_role_dispatches(
+        self, tmp_path, landlock_backend,
+    ):
         from orchestrator.dry_run_unblock import run_dry_run_unblock
 
-        guarded: list[str] = []
-
-        def refusing_guard(role_name: str) -> str:
-            guarded.append(role_name)
-            raise sandbox_dispatch.SandboxUnavailable(
-                'no sandbox here', should_escalate=True, backend_state='landlock',
-            )
-
-        scheduler = _TaskDocScheduler()
-        mock_invoke = AsyncMock(return_value=_make_agent_result())
-        with patch('orchestrator.dry_run_unblock.invoke_agent', new=mock_invoke):
+        with (
+            patch('orchestrator.agents.landlock.is_landlock_available', return_value=False),
+            patch('orchestrator.dry_run_unblock.invoke_agent', new=AsyncMock()),
+        ):
             await run_dry_run_unblock(
                 task_id='42',
                 worktree=str(tmp_path),
                 reason='verify exhausted',
                 detail='All 5 attempts timed out',
-                scheduler=scheduler,
+                scheduler=_TaskDocScheduler(),
                 mcp=MagicMock(),
                 config=_make_config(sandbox_enabled=True),
-                sandbox_guard=refusing_guard,
+            )
+            with pytest.raises(sandbox_dispatch.SandboxUnavailable) as refusal:
+                sandbox_dispatch.resolve_backend_or_refuse()
+
+        assert refusal.value.should_escalate is True
+
+    @pytest.mark.asyncio
+    async def test_backend_none_is_the_escape_hatch_and_runs_unconfined(self, tmp_path, landlock_backend, caplog):
+        sandbox_dispatch.set_backend('none')
+        with caplog.at_level(logging.WARNING, logger='orchestrator.agents.sandbox_dispatch'):
+            kwargs = await _capture_investigation_call(
+                tmp_path, _TaskDocScheduler(), config=_make_config(sandbox_enabled=True),
             )
 
-        assert guarded == ['unblock_auto']
-        mock_invoke.assert_not_called()
-        assert _persisted_entry(scheduler)['status'] == 'investigation_failed'
+        assert kwargs['sandbox_modules'] is None
+        assert any('UNSANDBOXED' in record.getMessage() for record in caplog.records)
 
 
 _FENCE = re.compile(r'^```(\w*)\n(.*?)^```', re.MULTILINE | re.DOTALL)

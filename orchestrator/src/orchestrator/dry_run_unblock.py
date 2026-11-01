@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -38,7 +37,12 @@ from shared.git_read_rules import git_read_rules
 from shared.transcript_archive import archive_task_transcripts
 
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
-from orchestrator.agents.sandbox_dispatch import resolve_backend_or_refuse
+from orchestrator.agents.sandbox_dispatch import (
+    SandboxUnavailable,
+    get_backend,
+    resolve_active_backend,
+    resolve_backend_or_refuse,
+)
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
 from orchestrator.event_store import EventType
 from orchestrator.merge_lane.completion import merge_completion_eligible
@@ -314,22 +318,26 @@ _DISALLOWED_TOOLS: list[str] = [
     'Skill',
 ]
 
-def _investigation_sandbox_modules(
-    config: Any, sandbox_guard: Callable[[str], str] | None,
-) -> list[str] | None:
+def _investigation_sandbox_modules(config: Any) -> list[str] | None:
     """``[]`` confines a claude investigation to writing ``<worktree>/.task``, where its config dir lives; ``None`` leaves it unconfined.
 
-    *sandbox_guard* raises ``SandboxUnavailable`` when no OS sandbox resolves,
-    so the run is refused rather than launched unconfined; without one, the
-    refusal files no escalation.
+    Raises ``SandboxUnavailable`` when confinement is required and no OS
+    sandbox resolves, so the run is refused rather than launched unconfined.
     """
     # gemini and pi stay unconfined: their CLIs' config-dir write sets are not mapped.
     if not (config.sandbox.enabled and config.unblock_auto.backend == 'claude'):
         return None
-    if sandbox_guard is None:
-        resolve_backend_or_refuse()
-    else:
-        sandbox_guard('unblock_auto')
+    backend = get_backend()
+    if backend == 'none':
+        resolve_backend_or_refuse()  # the operator's escape hatch: logs the workflow's WARN and never refuses
+        return None
+    # Non-consuming check: the outage escalation is TaskWorkflow._guard_sandbox's, so no dry run spends its escalate-once token.
+    if resolve_active_backend() == 'none':
+        raise SandboxUnavailable(
+            f'Sandboxing is required for the dry-run investigation but backend={backend!r} resolved to no '
+            f'available OS sandbox (landlock/bwrap); refusing to run it unconfined.',
+            should_escalate=False, backend_state=backend,
+        )
     return []
 
 
@@ -553,7 +561,6 @@ async def run_dry_run_unblock(
     usage_gate: Any = None,
     cost_store: Any = None,
     block_class: BlockClass | None = None,
-    sandbox_guard: Callable[[str], str] | None = None,
 ) -> None:
     """Investigate a blocked task and write a proposal to metadata.
 
@@ -565,10 +572,6 @@ async def run_dry_run_unblock(
     explicitly (e.g. workflow._spawn_dry_run_unblock classifies `reason`
     up front); when omitted (None), it is derived via
     ``classify_block_reason(reason)`` as a defensive fallback.
-
-    *sandbox_guard* is the workflow's fail-closed sandbox check
-    (``workflow.py::TaskWorkflow._guard_sandbox``), so a refusal here files
-    the host's sandbox-outage escalation when it holds the escalate-once token.
     """
     import time
 
@@ -652,7 +655,7 @@ async def run_dry_run_unblock(
             )
             return
 
-        sandbox_modules = _investigation_sandbox_modules(config, sandbox_guard)
+        sandbox_modules = _investigation_sandbox_modules(config)
 
         # Per-investigation isolated CLAUDE_CONFIG_DIR, named distinctly from
         # the main task's `claude-config-{task_id}` dir so this background

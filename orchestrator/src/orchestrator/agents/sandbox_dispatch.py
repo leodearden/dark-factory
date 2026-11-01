@@ -175,8 +175,7 @@ def resolve_backend_or_refuse() -> Backend:
     if should:
         _escalated_backend_state = _preferred
     raise SandboxUnavailable(
-        f'Sandboxing is required (sandbox.enabled, for a sandboxed role or the '
-        f'dry-run investigation) but the '
+        f'Sandboxing is required (sandbox.enabled + role.sandboxed) but the '
         f'configured backend={_preferred!r} resolved to no available OS '
         f'sandbox (landlock/bwrap). Refusing to launch the agent unconfined '
         f'(fail-closed, PRD D4). Install/enable landlock or bwrap, or set '
