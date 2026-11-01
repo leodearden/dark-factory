@@ -14,7 +14,6 @@ from collections import Counter
 from collections.abc import Awaitable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any, TypedDict, TypeVar, cast
 from urllib.parse import urlparse
 
@@ -101,7 +100,7 @@ from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.backends.timeout_budget import await_within
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
-from fused_memory.models.scope import build_known_projects_map, known_project_roots_from_env
+from fused_memory.models.scope import configured_known_projects_map
 from fused_memory.utils.async_utils import gather_or_raise
 from fused_memory.utils.toolcall_xml_leak import has_toolcall_xml_leak
 from fused_memory.utils.validation import canonicalize_project_id
@@ -1119,17 +1118,12 @@ _RANKED_ENTITY_NODES_CENSUS = _RANKED_ENTITY_NODES_MATCH + 'RETURN count(*)'
 
 
 def _derive_registered_graph_ids(config: FusedMemoryConfig) -> frozenset[str]:
-    """The project registry's ids: ``build_known_projects_map`` over its two inputs.
+    """The provisioning scope: the ids of models/scope.py::configured_known_projects_map.
 
-    The inputs are the taskmaster project_root and DASHBOARD_KNOWN_PROJECT_ROOTS,
-    the builder and inputs ``server/main.py`` uses for its own map.  The
-    primary-root normalisation below restates main.py's; nothing shared enforces
-    that the two stay equal.
+    Derived here, by the same rule, because GraphitiBackend is built inside
+    MemoryService before server/main.py's registry snapshot exists.
     """
-    primary = config.taskmaster.project_root if config.taskmaster else ''
-    if primary:
-        primary = str(Path(primary).expanduser().resolve())
-    return frozenset(build_known_projects_map(primary, known_project_roots_from_env()))
+    return frozenset(configured_known_projects_map(config.taskmaster))
 
 
 class GraphitiBackend:
