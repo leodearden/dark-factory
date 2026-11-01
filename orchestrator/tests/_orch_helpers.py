@@ -212,15 +212,20 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 # source on every run and fails a scanner that lacks the mark OR pins it below
 # this ceiling.
 #
-# MECHANISM -- why a breach here is far more expensive than a red test:
-#   * `[tool.pytest.ini_options].timeout_method = "thread"` means pytest-timeout
-#     answers a breach by `os._exit()`ing the whole xdist worker ("node down:
-#     Not properly terminated"), NOT by failing the offending test;
-#   * `--max-worker-restart=0` (in `[tool.pytest.ini_options].addopts`, task
-#     1907) then declines to replace that worker, degrading the run to a
-#     TRUNCATED whole-suite session whose surviving failure names some innocent
-#     guard that merely shared the dead worker.
-#   So one slow tree-scan costs a whole verify run AND misattributes the blame.
+# MECHANISM -- what a breach here costs:
+#   * until task 6354, `[tool.pytest.ini_options].timeout_method = "thread"`
+#     meant pytest-timeout answered a breach by `os._exit()`ing the whole xdist
+#     worker ("node down: Not properly terminated"), NOT by failing the
+#     offending test, and `--max-worker-restart=0` (in
+#     `[tool.pytest.ini_options].addopts`, task 1907) then declined to replace
+#     that worker, degrading the run to a TRUNCATED whole-suite session whose
+#     surviving failure named some innocent guard that merely shared the dead
+#     worker.  One slow tree-scan cost a whole verify run AND misattributed the
+#     blame; the measured history below is from that era;
+#   * since task 6354 the method is `signal`: a breach is one false red on the
+#     scanner itself, and the worker lives on.  The ceiling still prevents that
+#     false red.  A breach inside a C or Rust call (complexipy's analysis)
+#     surfaces only once that call returns.
 #
 # MEASURED history of the family:
 #   * unloaded and serial (`-n0`) on a 32-core box: 8.25s/call
@@ -237,7 +242,7 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 #   guard -- which is what makes this a
 #   FAMILY defect rather than three accidents, and why the rest are marked
 #   preemptively: a marked-but-fast test costs nothing, while an
-#   unmarked-and-slow one costs a whole session.
+#   unmarked-and-slow one cost a whole session then, and costs a false red now.
 # The current anchor is
 # test_whole_tree_scan_timeout_guard.py::_MEASURED_UNDER_LOAD_WORST_CASE, which
 # floors the family at test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS.
@@ -273,9 +278,10 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 WHOLE_TREE_SCAN_TEST_TIMEOUT = 1200
 
 # Headroom a per-test ceiling must keep over its family's measured-under-load
-# worst case.  8x rather than 2x: the xdist worker deaths these ceilings exist
-# to prevent were observed at loadavg 250-423, one inflation step past the load
-# at which any measurement has been taken.  Rationale and corpus:
+# worst case.  8x rather than 2x: the breaches these ceilings exist to prevent
+# (xdist worker deaths, in the thread era before task 6354) were observed at
+# loadavg 250-423, one inflation step past the load at which any measurement
+# has been taken.  Rationale and corpus:
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 UNDER_LOAD_HEADROOM_FACTOR = 8
 
@@ -1003,12 +1009,10 @@ async def wait_responsive(
     Any class using this MUST carry an adequate ``@pytest.mark.timeout`` —
     exactly as ``CANCEL_SCOPE_BARRIER_TIMEOUT`` above already states.  An
     unmarked test runs under ``PYPROJECT_DEFAULT_TIMEOUT`` locally and under
-    ``VERIFY_CLI_PER_TEST_TIMEOUT`` on verify, with ``timeout_method =
-    "thread"`` and ``--max-worker-restart=0``: exceeding the per-test timeout
-    does not fail the test, it ``os._exit()``s the xdist worker, degrading a
-    clean per-test failure into a worker death.  A
-    stretched wait without a paired mark is therefore strictly worse than the
-    flake it fixes.
+    ``VERIFY_CLI_PER_TEST_TIMEOUT`` on verify, and a stretched wait that
+    outlasts that cap fails the test on pytest-timeout's cap rather than on
+    the condition it waits for.  A stretched wait without a paired mark
+    therefore only trades the flake it fixes for a timeout failure at the cap.
 
     The default ``cap`` SCALES WITH THE NOMINAL rather than defaulting flat to
     the 90s ceiling, and that is what makes the paired marks checkable:

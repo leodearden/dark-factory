@@ -49,7 +49,7 @@ from typing import Any, Generic, TypeVar
 
 import httpx
 from shared.process_identity import Liveness
-from shared.task_statuses import ACTIVE, TERMINAL
+from shared.task_statuses import ACTIVE, TERMINAL, TaskStatus
 
 from dashboard.config import DashboardConfig
 from dashboard.data.census import (
@@ -164,6 +164,10 @@ newer than the cache allows, so its cadence is not the one that governs here.
 
 _RETENTION_BOUND_SECONDS = 24 * 60 * 60
 """How old a last-good value may be and still be served as ``stale``."""
+
+ROW_READ_STATUSES: frozenset[TaskStatus] = ACTIVE
+"""The statuses the unit's rows half asks for, applied server-side as
+``WHERE status IN (...)``."""
 
 
 class SnapshotFailure(enum.StrEnum):
@@ -533,7 +537,7 @@ async def _read_unit(
         _bounded(
             fetch_tasks(
                 client, config, project_root,
-                statuses=sorted(ACTIVE),
+                statuses=sorted(ROW_READ_STATUSES),
                 timeout=PER_CALL_TIMEOUT,
             ),
             label='active rows',

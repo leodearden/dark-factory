@@ -132,13 +132,13 @@ def hung_mcp(monkeypatch, tmp_path, client):
 
     # Patch the binding in EVERY module that imported the name by value —
     # patching dashboard.data.tasks.fetch_tasks alone would miss all of them.
-    # ``dashboard.app`` still binds it for the /healthz probe, which this
-    # sweep does not reach. ``dashboard.api.escalations`` binds no task read
+    # ``dashboard.app`` is absent: its /healthz probe reads ``fetch_task_page``
+    # (task 6321) and holds no ``fetch_tasks`` binding, and this sweep does
+    # not reach /healthz anyway. ``dashboard.api.escalations`` binds no task read
     # at all (task 5596): its owner probe reads the snapshot unit's active
     # rows and its cards go through task_lookup. ``dashboard.data.orchestrator``
     # is absent because it binds the name no longer — see _TARGET_MODULES.
     for module_name in (
-        'dashboard.app',
         # The Tasks tab's binding travelled to the snapshot unit with the read
         # itself (task 5587); active_tasks holds no fetch name at all now.
         'dashboard.data.task_snapshot',

@@ -446,10 +446,11 @@ class QueueConfig(BaseModel):
 # --- Write journal ---
 
 class WriteJournalConfig(BaseModel):
-    """Retention horizons and prune budgets for the ``write_ops`` journal.
+    """Retention horizons and prune budgets for the write journal's tables.
 
-    RESTART-ONLY BY CONSTRUCTION. The prune runs at startup and every
-    ``prune_interval_seconds`` (``services/write_ops_retention.py``), and both
+    RESTART-ONLY BY CONSTRUCTION. Every table with a horizon is pruned once at
+    startup (``services/journal_retention.py``) and ``write_ops`` again every
+    ``prune_interval_seconds`` (``services/write_ops_retention.py``); both
     capture this section once at startup, so nothing re-reads it afterwards.
     ``config/reload.py::RELOADABLE_FIELDS`` is an opt-in allowlist and this
     section is deliberately absent from it, which makes a changed leaf report
@@ -472,7 +473,8 @@ class WriteJournalConfig(BaseModel):
     #: (task 3214), both of which evaluate over trailing baseline windows.
     search_retention_days: float = Field(default=365.0, gt=0)
     #: Writes — the durable audit trail joined by ``causation_id``; 0.73% of
-    #: volume, so a long horizon costs essentially nothing.
+    #: volume, so a long horizon costs essentially nothing. Also governs
+    #: ``backend_ops``, the Layer-2 half of each write.
     write_retention_days: float = Field(default=730.0, gt=0)
     #: Rows deleted per transaction. Each batch commits separately so the
     #: write lock is released between batches, which makes one batch the
@@ -480,16 +482,22 @@ class WriteJournalConfig(BaseModel):
     #: that in the ``write_journal`` block of ``fused-memory/config/config.yaml``.
     prune_batch_size: int = Field(default=500, gt=0)
     #: Ceiling on one sweep. A backlog drains over successive passes and each
-    #: partial run says so at WARNING.
+    #: partial run says so at WARNING. The startup sweep shares it across
+    #: ``write_ops`` and ``backend_ops``.
     prune_max_rows_per_run: int = Field(default=500_000, gt=0)
     #: Wall-clock ceiling on one sweep, checked between batches. This is the
     #: bound that actually matters: the watchdog's startup grace is a TIME
-    #: budget, and rows-per-second is not knowable in advance.
+    #: budget, and rows-per-second is not knowable in advance. The startup
+    #: sweep shares it across ``write_ops`` and ``backend_ops``.
     prune_max_seconds: float = Field(default=30.0, gt=0)
     #: Seconds between background prune passes, each bounded by the same
     #: ``prune_max_seconds`` / ``prune_max_rows_per_run``. The sizing basis is
     #: in the ``write_journal`` block of ``fused-memory/config/config.yaml``.
     prune_interval_seconds: float = Field(default=1800.0, gt=0)
+    #: ``referent_findings``, a diagnosis log whose reader (the phase-5 replay
+    #: pass) re-verifies every row against the live graph, so a long horizon
+    #: loses nothing.
+    referent_findings_retention_days: float = Field(default=365.0, gt=0)
 
     @model_validator(mode='after')
     def _validate_search_outlives_reads(self) -> 'WriteJournalConfig':
