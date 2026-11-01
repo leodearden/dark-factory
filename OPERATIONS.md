@@ -2792,11 +2792,15 @@ check `applied`/`restart_required` on your reload call, per
 | `watcher_daily_cost_ceiling_usd` | `50.0` | All `escalation-watcher` (L1 auto-triage) invocations for the day |
 | `orch_daily_cost_ceiling_usd` | `200.0` | All orchestrator invocations (every role) for the day |
 
-**Multi-account failover (`usage_cap.*`)** is entirely optional — a
-single-user setup works fine on plain CLI OAuth login with no accounts
-file configured. If you do configure a pool
+**Multi-account failover (`usage_cap.*`)** is on in every shipped config. A
+pool whose roster resolves no token is EMPTY, and every invocation then raises
+in `UsageGate.before_invoke`: the gate never adopts the operator's `~/.claude`
+login unless told to (ruling 2026-11-01, task 8161). A single-user setup has two
+supported routes: `usage_cap.enabled: false`, or
+`usage_cap.fallback_to_default_credential: true` (interactive or single-user
+only: the whole fleet then rides that login). The pool
 (`usage_cap.accounts_file` → an external YAML of `oauth_token_env` entries
-resolved from `.env`), it gives the orchestrator per-account failover when
+resolved from `.env`) gives the orchestrator per-account failover when
 one account gets capped, plus the per-(account, model) scoped-cap
 dimension described in [§7](#7-model-routing). This whole block is
 restart-tier, not hot-reloadable.
