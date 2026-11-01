@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import time
 from datetime import UTC, datetime
 
 import aiosqlite
@@ -43,16 +44,23 @@ _MEMORY_BUDGET = 'dashboard.api.memory._MEMORY_ENDPOINT_TIMEOUT_SECONDS'
 _SAMPLER_BUDGET = 'dashboard.data.metrics._HTTP_SAMPLER_TIMEOUT_SECONDS'
 _SNAPSHOT_BUDGET = 'dashboard.data.task_snapshot.PER_CALL_TIMEOUT'
 _FAST_BUDGET_SECONDS = 0.05
+_HOST_STALL_SECONDS = memory_data.enclosing_deadline(_FAST_BUDGET_SECONDS)
 
 
 class _SaturatedPoolTransport(httpx.AsyncBaseTransport):
     """httpcore on a full pool: wait out THIS request's pool budget, then raise.
 
-    The message is empty because that is how httpcore raises it.
+    The message is empty because that is how httpcore raises it. A non-zero
+    *host_stall_seconds* blocks the loop thread before raising, as a starved
+    xdist worker does: the wall clock moves while the event loop cannot run.
     """
+
+    def __init__(self, host_stall_seconds: float = 0.0) -> None:
+        self._host_stall_seconds = host_stall_seconds
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         await asyncio.sleep(request.extensions['timeout']['pool'])
+        time.sleep(self._host_stall_seconds)
         raise httpx.PoolTimeout('')
 
 
@@ -110,6 +118,11 @@ def _warnings(caplog: pytest.LogCaptureFixture, logger_name: str) -> list[str]:
 
 def test_curator_legs_name_pool_timeout(saturated_app, caplog, monkeypatch):
     monkeypatch.setattr(_CURATOR_BUDGET, _FAST_BUDGET_SECONDS)
+    monkeypatch.setattr(
+        saturated_app.app.state,
+        'http_client',
+        httpx.AsyncClient(transport=_SaturatedPoolTransport(_HOST_STALL_SECONDS)),
+    )
 
     with caplog.at_level(logging.WARNING):
         resp = saturated_app.get('/api/v2/dashboard/curator')
