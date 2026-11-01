@@ -175,8 +175,10 @@ tasks:
         verdict: PASS
         delivered_check:
           kind: grep
-          pattern: "_descoped_steps"
+          pattern: "_descoped_steps|DESCOPED_STEPS_KEY"
           paths: ["orchestrator/src/orchestrator/merge_lane/gates.py"]
+          # 2026-11-01: DESCOPED_STEPS_KEY added; γ's task text requires the
+          # SPOT spelling, which never writes the bare literal.
           expect: present
           # RED today: 0 hits.  Deliberately scoped to merge_lane/gates.py and NOT
           # to orchestrator/src/: β lands the same key in workflow.py, which
