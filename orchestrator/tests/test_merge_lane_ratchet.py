@@ -752,6 +752,50 @@ class TestLanePatchTargets:
         assert 'worker.run_scoped_verification' in union
 
 
+_LANE_SRC = 'orchestrator/src/orchestrator/merge_lane'
+
+
+class TestLanePatchModules:
+    def test_the_package_and_every_module_under_it_on_disk(self, tmp_path: Path) -> None:
+        root = _committed_tree(
+            tmp_path,
+            {
+                f'{_LANE_SRC}/__init__.py': '',
+                f'{_LANE_SRC}/gates.py': '',
+                f'{_LANE_SRC}/pkg/__init__.py': '',
+                f'{_LANE_SRC}/pkg/leaf.py': '',
+            },
+        )
+        assert metrics.lane_patch_modules(root) == {
+            'orchestrator.merge_lane',
+            'orchestrator.merge_lane.gates',
+            'orchestrator.merge_lane.pkg',
+            'orchestrator.merge_lane.pkg.leaf',
+        }
+
+    def test_a_tree_without_the_package_still_names_the_package(self, tmp_path: Path) -> None:
+        root = _committed_tree(tmp_path, {'README.md': 'x\n'})
+        assert metrics.lane_patch_modules(root) == {metrics.LANE_PACKAGE}
+
+    def test_a_module_outside_the_package_is_refused_by_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            metrics, 'LANE_PACKAGE_GLOB', 'orchestrator/src/orchestrator/elsewhere/**/*.py'
+        )
+        root = _committed_tree(
+            tmp_path, {'orchestrator/src/orchestrator/elsewhere/x.py': ''}
+        )
+        with pytest.raises(metrics.RatchetError) as excinfo:
+            metrics.lane_patch_modules(root)
+        assert 'orchestrator.elsewhere.x' in str(excinfo.value)
+        assert metrics.LANE_PACKAGE in str(excinfo.value)
+
+    def test_the_glob_is_the_cluster_spec_entry(self) -> None:
+        assert metrics.LANE_PACKAGE_GLOB == _MERGE_LANE_GLOB
+        assert metrics.LANE_PACKAGE_GLOB in metrics.CLUSTER_PATHS
+
+
 # ---------------------------------------------------------------------------
 # Lane-importing test files.
 
@@ -1186,6 +1230,28 @@ class TestTestTreeSweep:
         assert block['complete'] is True
         assert block['unreadable'] == []
         assert block['test_tree'] == {'requested': 1, 'resolved': 0}
+
+    def test_a_patch_through_a_submodule_binding_is_counted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The module set comes from the swept root's own tree, not the checkout.
+        monkeypatch.setattr(metrics, 'TESTS_ROOT', 'orchestrator/tests')
+        root = _committed_tree(
+            tmp_path,
+            {
+                'orchestrator/src/orchestrator/merge_lane/__init__.py': '',
+                'orchestrator/src/orchestrator/merge_lane/gates.py': '',
+                'orchestrator/tests/test_g.py': (
+                    'from orchestrator.merge_lane import gates\n\n'
+                    'def test_g(monkeypatch):\n'
+                    "    monkeypatch.setattr(gates, 'POST_ADVANCE_GATES', [])\n"
+                ),
+            },
+        )
+        sweep = metrics.sweep_repo(root)
+        assert sweep.tests['orchestrator/tests/test_g.py']['patch_targets'] == [
+            'gates.POST_ADVANCE_GATES'
+        ]
 
     def test_an_unreadable_cluster_path_is_not_masked_by_a_clean_sweep(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
