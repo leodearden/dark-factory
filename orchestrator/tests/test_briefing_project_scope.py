@@ -404,6 +404,29 @@ class TestDistilledRendering:
             for line in context.splitlines()
         ), context
 
+    async def test_the_briefing_shows_a_parent_only_contesting_child_in_full(
+        self, briefing: BriefingAssembler,
+    ):
+        """A correction whose parent alone matched the query still reaches the
+        agent whole and marked as contesting it, not as a cut digest under it."""
+        results = json.loads(recorded_search_text('child-also-matched'))['results']
+        parent = next(entry for entry in results if 'grouped' in entry)
+        contesting = next(
+            child for child in parent['grouped']['amendments'] if child.get('contested')
+        )
+        full_body = next(entry['content'] for entry in results if entry['id'] == contesting['id'])
+
+        context = await _recall(
+            briefing, _answering(recorded_search_envelope('only-parent-matched')),
+        )
+
+        assert any(
+            line.startswith('  - [contests its parent · ') and line.endswith(f'] {full_body}')
+            for line in context.splitlines()
+        ), context
+        assert contesting['digest'].endswith('…')
+        assert contesting['digest'] not in context
+
     async def test_the_section_headings_come_from_the_specs(
         self, briefing: BriefingAssembler,
     ):
