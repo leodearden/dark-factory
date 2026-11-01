@@ -1449,7 +1449,7 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # plus the operator tool `escalation/src/escalation/server.py::
         # merge_relane` (task 5246, either value, on every task it re-lanes);
         # reader `orchestrator/src/orchestrator/merge_queue.py::
-        # lane_for_task_metadata` -> `_normalize_lane`, consumed at
+        # lane_for_task_metadata` -> `intake.py::normalize_lane`, consumed at
         # `orchestrator/src/orchestrator/workflow.py::TaskWorkflow::
         # _submit_to_merge_queue` to set `MergeRequest.lane` and -- as of this
         # task -- by `escalation/src/escalation/merge_lane_resolution.py::

@@ -382,11 +382,12 @@ tracker's state as read-only properties (`suffix_conflict_graph`, `suffix_confli
 `last_known_main_sha`, `bounce_registry`), plus `note_main_sha()` and the two thin async methods
 `recompute_suffix_conflict_graph()` and `bounce_conflicting_suffix_items()`.
 
-**Reach-back convention:** the two tracker methods resolve the three lane constants they read
-through a function-local deferred import rather than a top-level one. `MERGE_LANES` comes from
-`merge_lane/intake.py`; `MERGE_BOUNCE_CAP` and `NEEDS_REBASE_REASON_PREFIX` come from
-`merge_lane/worker.py`. This keeps `suffix_graph.py` free of any top-level import of the worker,
-which would be a cycle, since the worker imports this module.
+**Reach-back convention:** `MERGE_LANES` is a module-top import from `merge_lane/intake.py`, which
+loads neither the worker nor `suffix_graph.py`. The two tracker methods resolve the two
+worker-resident constants they read, `MERGE_BOUNCE_CAP` and `NEEDS_REBASE_REASON_PREFIX` (both in
+`merge_lane/worker.py`), through a function-local deferred import (`_worker_constants()`). This keeps
+`suffix_graph.py` free of any top-level import of the worker, which would be a cycle, since the
+worker imports this module.
 
 | Symbol | Location | Description |
 |--------|----------|--------------|
