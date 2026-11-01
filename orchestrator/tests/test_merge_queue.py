@@ -9280,7 +9280,9 @@ class TestMergedBranchTipCarryThroughRebuild:
         With the PRIMARY fix, it is carried through.
 
         advance_main is mocked: first call → 'cas_failed', second call → 'advanced'.
-        _resolve_second_parent is patched to None (eliminate term-1).
+        The retried advance lands a single-parent (rebase-flattened) commit, as
+        advance_main's CAS-retry rebase does, so advanced_sha^2 does not exist
+        (term-1 = None).
         req.snapshot_tip is None by default (eliminate term-3).
         So only term-2 (merged_branch_tip from the rebuilt item) can provide the tip.
 
@@ -9309,6 +9311,21 @@ class TestMergedBranchTipCarryThroughRebuild:
         assert merge_result.merge_worktree is not None
         actual_merge_commit = merge_result.merge_commit
         worker._register_owned_merge_worktree(merge_result.merge_worktree)
+
+        rc, out, err = await _run(
+            [
+                'git', 'commit-tree', f'{actual_merge_commit}^{{tree}}',
+                '-p', base_sha, '-m', 'Flattened landing (test)',
+            ],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+        flattened = out.strip()
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', '-q', f'{flattened}^2'],
+            cwd=git_ops.project_root,
+        )
+        assert rc != 0, 'the flattened landing must have no second parent'
 
         req = _make_request(branch, branch, branch_wt, config)
         # req.snapshot_tip = None by default → term-3 = None
@@ -9339,17 +9356,12 @@ class TestMergedBranchTipCarryThroughRebuild:
             advance_calls[0] += 1
             if advance_calls[0] == 1:
                 return AdvanceOutcome('cas_failed')
-            return AdvanceOutcome('advanced', advanced_sha=actual_merge_commit)
+            return AdvanceOutcome('advanced', advanced_sha=flattened)
 
         pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
         with (
             patch.object(git_ops, 'advance_main', side_effect=_fake_advance),
             patch.object(git_ops, 'get_main_sha', AsyncMock(return_value=base_sha)),
-            # Eliminate term-1 so only term-2 (merged_branch_tip) can provide the tip.
-            patch(
-                'orchestrator.merge_lane.gates._resolve_second_parent',
-                AsyncMock(return_value=None),
-            ),
             patch(
                 'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 side_effect=_spy_equiv,
@@ -9364,7 +9376,8 @@ class TestMergedBranchTipCarryThroughRebuild:
         assert advanced, 'Expected True (main advanced)'
         outcome = req.result.result()
         assert outcome.status == 'done', f'unexpected outcome: {outcome!r}'
-        # Term-1 = None (patched); term-3 = None (snapshot_tip default).
+        # Term-1 = None (the retried advance landed a single-parent, rebase-flattened
+        # commit, so advanced_sha^2 does not exist); term-3 = None (snapshot_tip default).
         # RED: without PRIMARY fix, cas_failed rebuild drops merged_branch_tip
         # → merged_tip=None ≠ ORIGINAL_TIP.
         assert captured_equiv_kw.get('merged_tip') == ORIGINAL_TIP, (
