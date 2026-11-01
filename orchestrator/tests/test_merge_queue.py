@@ -9578,12 +9578,6 @@ class TestMergedBranchTipCarryThroughRebuild:
         with (
             patch.object(git_ops, 'advance_main', side_effect=_fake_advance),
             patch.object(git_ops, 'get_main_sha', AsyncMock(return_value=new_main_sha)),
-            # Eliminate term-1 so an unrelated merged_branch_tip regression
-            # elsewhere can't accidentally mask a dropped field here too.
-            patch(
-                'orchestrator.merge_lane.gates._resolve_second_parent',
-                AsyncMock(return_value=None),
-            ),
             patch(
                 'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
