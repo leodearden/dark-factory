@@ -122,6 +122,7 @@ __all__ = [
     "RemoteRunner",
     "RemoteVerifySubcommand",
     "REMOTE_VERIFY_PROCESS_PATTERN",
+    "remote_verify_process_pattern",
     "RunnerUnavailable",
     "RunnerUnavailableKind",
     "ConcurrentDispatchError",
@@ -1244,6 +1245,15 @@ RemoteVerifySubcommand = Literal['verify-merge', 'verify-task']
 REMOTE_VERIFY_PROCESS_PATTERN: str = '|'.join(get_args(RemoteVerifySubcommand))
 
 
+def remote_verify_process_pattern(request_id: str) -> str:
+    """The pgrep pattern of request *request_id*'s remote verify, of either subcommand.
+
+    The subcommand alternation keeps a ``cancel-verify --request-id <id>`` from
+    matching, and the ``)`` after it keeps the probing command line from matching itself.
+    """
+    return f'({REMOTE_VERIFY_PROCESS_PATTERN}) .*--request-id {request_id}'
+
+
 @dataclass(frozen=True)
 class _DispatchOutcome:
     result: VerifyResult
@@ -2166,22 +2176,21 @@ class RemoteRunner:
             return 1  # non-zero → caller treats as cancel failure
 
     async def probe_clean(self) -> bool:
-        """Probe whether any remote verify (any RemoteVerifySubcommand) is still running.
+        """Probe whether the request this runner last cancelled still runs on its host.
 
-        Issues: ssh <_SSH_BASE_OPTS> <host> pgrep -f 'verify-merge|verify-task'
-        (REMOTE_VERIFY_PROCESS_PATTERN, quoted: '|' is a remote-shell metacharacter)
-
-        Returns:
-            True  — rc == 1 (pgrep found no match; host is clean)
-            False — rc == 0 (process still running) or rc >= 2 (error / ssh failure)
-                    Conservative: any non-1 rc keeps the slot PARKED.
+        Only that request is probed (``remote_verify_process_pattern``), so a
+        PARKED merge slot clears while a sibling task verify or another
+        project's verify runs there; with nothing cancelled there is nothing to
+        probe and no ssh is issued. Clean only when pgrep finds no match (rc 1):
+        any other rc, or an ssh failure, keeps the slot PARKED.
         """
+        request_id = self._cancelled_request_id
+        if request_id is None:
+            return True
+        pattern = remote_verify_process_pattern(request_id)
         try:
             rc, _, _ = await self._run(
-                [
-                    'ssh', *_SSH_BASE_OPTS, self._ssh_host,
-                    f'pgrep -f {shlex.quote(REMOTE_VERIFY_PROCESS_PATTERN)}',
-                ]
+                ['ssh', *_SSH_BASE_OPTS, self._ssh_host, f'pgrep -f {shlex.quote(pattern)}'],
             )
             return rc == 1
         except Exception:
