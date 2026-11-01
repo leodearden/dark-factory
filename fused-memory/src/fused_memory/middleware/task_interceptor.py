@@ -5379,7 +5379,7 @@ class TaskInterceptor:
             # Call curate_batch_prepared — one LLM round-trip for all candidates.
             if curator is not None and non_none_prepared:
                 try:
-                    batch_decisions = await curator.curate_batch_prepared(
+                    batch_decisions = await curator.curate_prepared(
                         non_none_prepared,
                         project_id,
                         project_root,
