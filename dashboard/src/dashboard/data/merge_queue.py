@@ -562,28 +562,12 @@ async def speculative_stats(
 # 5b. Train throughput stats
 # ---------------------------------------------------------------------------
 
-# All-zeros default dict for train_throughput_stats (returned when db is None
-# or when an exception occurs inside the query).
-_TRAIN_THROUGHPUT_DEFAULT: dict = {
-    'trains_landed': 0,
-    'tasks_landed_via_trains': 0,
-    'train_verifies_per_landed_task': 0.0,
-    'baseline_solo_landed': 0,
-    'baseline_verifies_per_landed_task': 0.0,
-    'verifies_per_landed_task_delta': 0.0,
-    'train_cas_retry_rate': 0.0,
-    'baseline_cas_retry_rate': 0.0,
-    'cas_retry_rate_delta': 0.0,
-    'improved': False,
-}
-
-
 async def train_throughput_stats(
     db: aiosqlite.Connection | None,
     *,
     hours: int = 24,
     now: datetime | None = None,
-) -> dict:
+) -> Datum[dict]:
     """Throughput amortisation metrics derived from the events table.
 
     Reads train_merged + merge_attempt rows in the look-back window and computes:
@@ -599,17 +583,21 @@ async def train_throughput_stats(
     - cas_retry_rate_delta: baseline − train
     - improved: True when verifies_per_landed_task_delta > 0
 
-    Returns the all-zeros default when db is None or on exception.
-
     Args:
-        db: aiosqlite connection, or None (returns all-zeros dict).
+        db: aiosqlite connection, or None (no runs.db is open for the project).
         hours: Look-back window in hours (default 24).
         now: Reference timestamp. When None, uses datetime.now(UTC).
-    """
-    if db is None:
-        return dict(_TRAIN_THROUGHPUT_DEFAULT)
 
-    async def _query(conn: aiosqlite.Connection) -> dict:
+    Returns:
+        One ``Datum`` over those keys, FRESH at *now* when the window was read
+        — a readable empty window is measured zeros. With no runs.db, or when
+        the read fails, the Datum is UNKNOWN with a reason saying which.
+    """
+    bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
+    if db is None:
+        return unknown_datum('no runs.db is open for this project', bound)
+
+    async def _query(conn: aiosqlite.Connection) -> Datum[dict]:
         since = _cutoff_iso(hours, now=now)
         # --- train_merged rows ---
         train_merged_rows = list(await conn.execute_fetchall(
@@ -703,7 +691,7 @@ async def train_throughput_stats(
             and verifies_per_landed_task_delta > 0
         )
 
-        return {
+        stats = {
             'trains_landed': trains_landed,
             'tasks_landed_via_trains': tasks_landed_via_trains,
             'train_verifies_per_landed_task': train_verifies_per_landed_task,
@@ -715,8 +703,12 @@ async def train_throughput_stats(
             'cas_retry_rate_delta': cas_retry_rate_delta,
             'improved': improved,
         }
+        return Datum(stats, resolve_now(now), DatumState.FRESH, None, bound)
 
-    return await with_db(db, _query, dict(_TRAIN_THROUGHPUT_DEFAULT))
+    return await with_db(
+        db, _query,
+        unknown_datum('the train_merged and merge_attempt events could not be read from runs.db', bound),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -798,19 +790,18 @@ async def build_per_project_merge_queue(
 ) -> dict[str, dict]:
     """Build per-project merge queue stats by querying each project's DB independently.
 
-    For each ``(pid, db)`` pair, gathers the per-DB stats concurrently. Pairs
-    with ``db=None`` produce empty/default stats (the per-DB functions handle
-    None gracefully by returning declared defaults). All per-project gathers
-    also run concurrently across projects via a single top-level
-    :func:`asyncio.gather`.
+    For each ``(pid, db)`` pair, gathers the per-DB stats concurrently. All
+    per-project gathers also run concurrently across projects via a single
+    top-level :func:`asyncio.gather`.
 
     ``recent`` is the newest :data:`RECENT_MERGES_CAP` merge_attempt rows in
     the same ``hours`` window every other leg uses, and ``recent_total`` is
     how many that window holds (see :func:`recent_merges`).
 
-    ``depth_timeseries``, ``attempts``, ``speculative`` and ``recent_total``
-    are Datums: a leg that raises, or a project whose whole build fails,
-    serves them UNKNOWN with a reason rather than zeros that read as measured.
+    ``depth_timeseries``, ``attempts``, ``recent_total``, ``speculative`` and
+    ``train_throughput`` are Datums: a ``db=None`` pair, a leg that raises, or
+    a project whose whole build fails serves them UNKNOWN with a reason rather
+    than zeros that read as measured.
 
     Args:
         project_dbs: List of ``(project_root_str, connection_or_None)`` tuples
@@ -822,8 +813,9 @@ async def build_per_project_merge_queue(
         Dict ``{pid: {depth_timeseries, attempts, recent, recent_total, speculative, train_events, train_throughput}}``,
         where ``depth_timeseries`` is a ``Datum[DepthSeries]`` whose series
         carries its ``bucket_minutes``, ``attempts`` a ``Datum[MergeAttempts]``
-        (the shaper projects its outcome chart and latency), ``speculative`` a
-        ``Datum[dict]`` and ``recent_total`` a ``Datum[int]``.
+        (the shaper projects its outcome chart and latency), ``recent_total``
+        a ``Datum[int]``, and ``speculative`` and ``train_throughput`` each a
+        ``Datum[dict]``.
     """
     bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
 
@@ -864,7 +856,11 @@ async def build_per_project_merge_queue(
                 f'{pid}/speculative',
             )
             train_events_list = safe_gather_result(train_r, [], f'{pid}/train_events')
-            train_throughput = safe_gather_result(throughput_r, dict(_TRAIN_THROUGHPUT_DEFAULT), f'{pid}/train_throughput')
+            train_throughput = _leg_or_unread(
+                throughput_r,
+                lambda cause: unknown_datum(f'{pid} train throughput could not be read: {cause}', bound),
+                f'{pid}/train_throughput',
+            )
             return pid, {
                 'depth_timeseries': depth,
                 'attempts': attempts,
@@ -890,7 +886,7 @@ async def build_per_project_merge_queue(
                 'recent_total': unread,
                 'speculative': unread,
                 'train_events': [],
-                'train_throughput': dict(_TRAIN_THROUGHPUT_DEFAULT),
+                'train_throughput': unread,
             }
 
     results = await asyncio.gather(*[_one_project(pid, db) for pid, db in project_dbs])
