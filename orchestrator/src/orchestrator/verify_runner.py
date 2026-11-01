@@ -1113,6 +1113,9 @@ async def env_probe_local_run(
 #: reused descriptor.
 HEARTBEAT_STOP_JOIN_SECS: float = 5.0
 
+#: Pause before ``RemoteRunner.publish_sha``'s one retry of a refused publish.
+_PUBLISH_RETRY_DELAY_SECS: float = 1.0
+
 
 async def _default_ssh_heartbeat_run(
     argv: list[str],
@@ -1504,12 +1507,26 @@ class RemoteRunner:
         the gates are cloned from whatever this runner's project remote is, and
         it delivers a sha origin has never seen.  Near-free when the remote
         already holds the objects.
+
+        ensure-gate.sh deletes ``refs/gate/<sha>`` after every ensure, so two
+        roles publishing one sha collide on ``cannot lock ref`` (classed gate).
+        A non-transport failure is retried once: the retry finds the ref present
+        or absent, and a real refusal fails twice.
         """
         sha = self.deployed_sha.sha
-        await self._push(
-            f'{self._ssh_host}:{self._df_remote_checkout}', f'{sha}:refs/gate/{sha}',
-            cwd=self._code_checkout,
-        )
+        target = f'{self._ssh_host}:{self._df_remote_checkout}'
+        refspec = f'{sha}:refs/gate/{sha}'
+        try:
+            await self._push(target, refspec, cwd=self._code_checkout)
+        except RunnerUnavailable as exc:
+            if exc.kind == 'transport':
+                raise
+            logger.info(
+                'RemoteRunner %r: publish of gate sha %s refused, retrying once: %s',
+                self.name, sha, exc,
+            )
+            await asyncio.sleep(_PUBLISH_RETRY_DELAY_SECS)
+            await self._push(target, refspec, cwd=self._code_checkout)
 
     async def reap_idle_gates(self) -> None:
         """Launch ``remote_gate/reap-gates.sh`` detached on the remote; never raises.
