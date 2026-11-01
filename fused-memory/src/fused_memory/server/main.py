@@ -638,8 +638,8 @@ async def run_server():
         ScopeViolationEscalator,
     )
     from fused_memory.models.scope import (
-        build_known_projects_map,
-        known_project_roots_from_env,
+        configured_known_projects_map,
+        configured_primary_root,
     )
 
     curator_escalator = CuratorEscalator(
@@ -652,17 +652,12 @@ async def run_server():
     # configured falls back to the built-in single-project dark_factory
     # registry (ProjectPrefixRegistry.default(), task 2208) — the guard
     # always runs, just against a smaller registry.
-    _primary_root = (
-        config.taskmaster.project_root if config.taskmaster else ''
-    ) or ''
-    if _primary_root:
-        _primary_root = str(Path(_primary_root).expanduser().resolve())
-    _extra_roots = known_project_roots_from_env()
-    # Single source of truth for the project registry — derived once and used to
-    # build the path-scope guard (ProjectPrefixRegistry), then passed through to
-    # ReconciliationHarness and TicketJanitor so all three consumers share the
-    # same snapshot (task 1164).
-    _known_projects_map = build_known_projects_map(_primary_root, _extra_roots)
+    _primary_root = configured_primary_root(config.taskmaster)
+    # The registry's derivation rule lives in
+    # models/scope.py::configured_known_projects_map (GraphitiBackend calls it
+    # too).  This SNAPSHOT is shared with ProjectPrefixRegistry, MemoryService,
+    # ReconciliationHarness and TicketJanitor (task 1164).
+    _known_projects_map = configured_known_projects_map(config.taskmaster)
     # Task 3088: the same snapshot, injected into MemoryService so update_memory's
     # storm escalator can resolve a project_root. Deliberately HERE — before the
     # `if config.reconciliation ... enabled:` block below — because the alarm is
@@ -1960,18 +1955,16 @@ def _build_ticket_janitor(
 ) -> TicketJanitor | None:
     """The ticket janitor, wired to drain parked tickets through *task_interceptor*; None when disabled."""
     from fused_memory.middleware.ticket_janitor import TicketJanitor
+    from fused_memory.models.scope import configured_primary_root
 
     janitor_cfg = getattr(config.curator, 'janitor', None)
     if janitor_cfg is None or not janitor_cfg.enabled:
         return None
-    primary_root = (config.taskmaster.project_root if config.taskmaster else '') or ''
-    if primary_root:
-        primary_root = str(Path(primary_root).expanduser().resolve())
     return TicketJanitor(
         ticket_store,
         cooldown_secs=janitor_cfg.cooldown_seconds,
         batch_limit=janitor_cfg.batch_limit,
-        primary_project_root=primary_root,
+        primary_project_root=configured_primary_root(config.taskmaster),
         liveness_probe=task_interceptor.is_worker_alive if task_interceptor is not None else None,
         signal_ticket_resolved=(
             task_interceptor._signal_ticket_event if task_interceptor is not None else None
