@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.git_ops import WorktreeKind
+from orchestrator.git_ops import GitOps, WorktreeKind
 from orchestrator.verify import VerifyResult
 
 PROBE_MODULES = {
@@ -46,7 +46,7 @@ class MainProbeHarness:
         self.worktrees: list[tuple[WorktreeKind, str, bool]] = []
         self.module_runs: list[tuple[ModuleConfig, dict]] = []
         self.whole_tree_runs: list[dict] = []
-        self.git_ops = MagicMock()
+        self.git_ops = MagicMock(spec=GitOps)
         self.git_ops.ephemeral_worktree = self._ephemeral_worktree
         self.git_ops.get_main_sha = AsyncMock(return_value=main_sha)
         self._probe_dir = probe_dir
