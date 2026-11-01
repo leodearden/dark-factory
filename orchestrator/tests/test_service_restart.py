@@ -10,7 +10,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from df_pytest_isolation import wait_pid_gone
+from df_pytest_isolation import read_proc_state
 
 from orchestrator.service_restart import (
     DEFAULT_FLEET_LEASE_MAX_AGE_SECS,
@@ -2268,7 +2268,11 @@ def _reliably_dead_pid() -> int:
     """A pid that is definitively not running, for the crash-safety tests."""
     proc = subprocess.Popen(['true'])
     proc.wait()
-    assert wait_pid_gone(proc.pid), 'the probe child must be reaped before use'
+    state = read_proc_state(proc.pid)
+    assert state is None, (
+        f'pid {proc.pid} still has a /proc entry {state} after proc.wait() reaped it; '
+        'os.kill(pid, 0), which the lease liveness check uses, would read it as alive'
+    )
     return proc.pid
 
 

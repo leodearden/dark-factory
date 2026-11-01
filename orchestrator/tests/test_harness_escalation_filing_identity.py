@@ -316,7 +316,6 @@ class TestEscalationServerWiring:
         """Exactly as the sibling ``task_status_lookup=`` argument already is."""
         h = _build_harness(mock_orch_config)
         h._escalation_queue = MagicMock()
-        mock_orch_config.escalation.queue_dir = str(tmp_path / 'esc')
         mock_orch_config.escalation.host = '127.0.0.1'
         mock_orch_config.escalation.port = 0
 

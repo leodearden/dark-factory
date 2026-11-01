@@ -62,10 +62,10 @@ _CONFIG_PATH = 'reconciliation.deterministic_provenance_allowed_agent_prefixes'
 
 #: The gated kind family, DERIVED from the shared Literal rather than
 #: hand-listed — the same single-source-of-truth argument
-#: ``task_interceptor._DONE_PROVENANCE_KINDS`` records. Deriving makes a 5th
-#: `deterministic-*` kind added to ``DoneProvenance.kind`` gated BY DEFAULT
-#: (the fail-closed direction) instead of silently escaping the bar until
-#: someone notices a second list has drifted.
+#: ``middleware/task_interceptor.py::_render_done_provenance_kinds`` records.
+#: Deriving makes a 5th `deterministic-*` kind added to ``DoneProvenance.kind``
+#: gated BY DEFAULT (the fail-closed direction) instead of silently escaping
+#: the bar until someone notices a second list has drifted.
 DETERMINISTIC_PROVENANCE_KINDS: frozenset[str] = frozenset(
     kind
     for kind in get_args(DoneProvenance.model_fields['kind'].annotation)
@@ -143,7 +143,7 @@ def resolve_deterministic_provenance_authorization(
     This is only ONE of the two bars PRD D11 specifies. The other — an
     unconditional refusal for a ``recon-stage-`` caller, which no config edit
     may defeat — is evaluated FIRST and separately in
-    ``middleware/task_interceptor.py::_validate_done_provenance``, because it
+    ``middleware/task_interceptor.py::_provenance_caller_refusal``, because it
     is config-free by design.
     """
     prefixes = resolve_deterministic_provenance_allowed_prefixes(config)

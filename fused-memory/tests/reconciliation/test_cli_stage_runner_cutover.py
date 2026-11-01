@@ -347,14 +347,40 @@ class TestReconConfigDirHelpers:
         cfg = TaskConfigDir(task_id=run_id, base_dir=recon_config_base_dir(tmp_path))
         assert cfg.path.exists()
 
-        gc_run_config_dir(tmp_path, run_id)
+        gc_run_config_dir(tmp_path, run_id, archive_root=None)
         assert not cfg.path.exists()
 
     def test_gc_is_noop_when_absent(self, tmp_path):
         from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
 
         # No dir created — GC must be a silent no-op (ignore_errors), never raise.
-        gc_run_config_dir(tmp_path, 'never-created')
+        gc_run_config_dir(tmp_path, 'never-created', archive_root=None)
+
+    def test_run_config_dir_path_matches_task_config_dir_path(self, tmp_path):
+        """The pure derivation names exactly the dir ``TaskConfigDir`` builds."""
+        from shared.config_dir import TaskConfigDir
+
+        from fused_memory.reconciliation.cli_stage_runner import (
+            recon_config_base_dir,
+            run_config_dir_path,
+        )
+
+        run_id = 'run-abc123'
+        cfg = TaskConfigDir(task_id=run_id, base_dir=recon_config_base_dir(tmp_path))
+        assert run_config_dir_path(tmp_path, run_id) == cfg.path
+
+    def test_run_config_dir_path_does_not_create_anything(self, tmp_path):
+        """Deriving the path is a read: a probe must not resurrect the dir."""
+        from fused_memory.reconciliation.cli_stage_runner import (
+            recon_config_base_dir,
+            run_config_dir_path,
+        )
+
+        path = run_config_dir_path(tmp_path, 'never-created')
+
+        assert not path.exists()
+        assert not recon_config_base_dir(tmp_path).exists()
+        assert list(tmp_path.iterdir()) == []
 
     def test_recon_config_base_dir_absolutizes_a_relative_data_dir(
         self, tmp_path, monkeypatch
@@ -435,7 +461,7 @@ class TestReconConfigDirHelpers:
         doomed.mkdir(parents=True)
 
         monkeypatch.chdir(tmp_path)
-        gc_run_config_dir(Path('data/reconciliation'), 'r1')
+        gc_run_config_dir(Path('data/reconciliation'), 'r1', archive_root=None)
 
         assert not doomed.exists(), (
             f'GC must remove the cwd-anchored dir the creator built; {doomed} '
@@ -556,6 +582,303 @@ class TestReconConfigDirHelpers:
         assert str(cfg.path) in writable_vals, (
             f'The absolute config dir must be granted in the argv the child runs; '
             f'got {writable_vals!r}'
+        )
+
+
+class TestReconTranscriptArchiveKey:
+    """The archive key a recon run files its transcripts under (task 3972)."""
+
+    RUN_ID = 'd6782083-9319-48fa-b72c-1730fd9b1a35'
+
+    def test_key_is_run_id_namespaced(self):
+        from fused_memory.reconciliation.cli_stage_runner import (
+            recon_transcript_archive_key,
+        )
+
+        assert (
+            recon_transcript_archive_key(self.RUN_ID)
+            == 'recon-d6782083-9319-48fa-b72c-1730fd9b1a35'
+        )
+
+    def test_key_is_a_single_path_segment(self):
+        """``scripts/legibility/inventory.py::_archive_enc`` reads the
+        archive-root-relative ``parts[1]`` as ``<enc>``; a key with an extra
+        segment would land the archives on disk but make them unenumerable."""
+        import os
+        from pathlib import PurePosixPath
+
+        from fused_memory.reconciliation.cli_stage_runner import (
+            recon_transcript_archive_key,
+        )
+
+        key = recon_transcript_archive_key(self.RUN_ID)
+
+        assert len(PurePosixPath(key).parts) == 1
+        assert '/' not in key
+        assert os.sep not in key
+
+    def test_key_does_not_collide_with_orchestrator_task_ids(self):
+        """Orchestrator task-id dirs in the shared archive root are bare numbers."""
+        from fused_memory.reconciliation.cli_stage_runner import (
+            recon_transcript_archive_key,
+        )
+
+        assert not recon_transcript_archive_key('4578').isdigit()
+        assert not recon_transcript_archive_key(self.RUN_ID).isdigit()
+
+
+class TestReconArchiveRoot:
+    """recon_archive_root: the one composition home for the recon archive root."""
+
+    LOGGER = 'fused_memory.reconciliation.cli_stage_runner'
+
+    def test_composes_against_explore_codebase_root(self, tmp_path):
+        from fused_memory.config.schema import ReconciliationConfig
+        from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
+
+        cfg = ReconciliationConfig(explore_codebase_root=str(tmp_path))
+
+        assert recon_archive_root(cfg) == (
+            tmp_path / 'data' / 'orchestrator' / 'agent-transcripts'
+        )
+
+    def test_disabled_returns_none_and_creates_nothing(self, tmp_path):
+        from fused_memory.config.schema import ReconciliationConfig
+        from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
+
+        cfg = ReconciliationConfig(
+            explore_codebase_root=str(tmp_path), transcript_archive_enabled=False,
+        )
+
+        assert recon_archive_root(cfg) is None
+        assert list(tmp_path.iterdir()) == []
+
+    def test_malformed_config_returns_none_and_warns(self, tmp_path, caplog):
+        """A config regression disables archival loudly rather than raising on
+        the recon dispatch path. ``object.__setattr__`` lands the value
+        unvalidated, as an in-place ``apply_reload`` mutation does: no
+        validate_assignment."""
+        import logging
+
+        from fused_memory.config.schema import ReconciliationConfig
+        from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
+
+        cfg = ReconciliationConfig(explore_codebase_root=str(tmp_path))
+        object.__setattr__(cfg, 'transcript_archive_root', None)
+
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER):
+            result = recon_archive_root(cfg)
+
+        assert result is None
+        warnings = [
+            r for r in caplog.records
+            if r.name == self.LOGGER and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1, [r.getMessage() for r in warnings]
+
+    def test_returns_a_path_not_a_string(self, tmp_path):
+        from fused_memory.config.schema import ReconciliationConfig
+        from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
+
+        cfg = ReconciliationConfig(explore_codebase_root=str(tmp_path))
+
+        assert isinstance(recon_archive_root(cfg), Path)
+
+    def _announced(self, caplog, cfg):
+        import logging
+
+        from fused_memory.reconciliation.cli_stage_runner import (
+            announce_recon_archive_root,
+        )
+
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            announce_recon_archive_root(cfg)
+        return [
+            (r.levelno, r.getMessage())
+            for r in caplog.records if r.name == self.LOGGER
+        ]
+
+    def test_announce_logs_an_absolute_root_at_info(self, tmp_path, caplog):
+        import logging
+
+        from fused_memory.config.schema import ReconciliationConfig
+
+        cfg = ReconciliationConfig(explore_codebase_root=str(tmp_path))
+        root = tmp_path / 'data' / 'orchestrator' / 'agent-transcripts'
+
+        assert self._announced(caplog, cfg) == [
+            (logging.INFO, f'recon transcript archive root: {root}'),
+        ]
+        assert list(tmp_path.iterdir()) == []
+
+    def test_announce_warns_with_the_cwd_resolution_of_a_relative_root(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The shipped ``${PROJECT_ROOT:.}`` with PROJECT_ROOT unset."""
+        import logging
+
+        from fused_memory.config.schema import ReconciliationConfig
+
+        monkeypatch.chdir(tmp_path)
+        cfg = ReconciliationConfig(explore_codebase_root='.')
+
+        [(level, message)] = self._announced(caplog, cfg)
+
+        assert level == logging.WARNING
+        assert str(tmp_path / 'data' / 'orchestrator' / 'agent-transcripts') in message
+        assert list(tmp_path.iterdir()) == []
+
+    def test_announce_reports_disabled(self, tmp_path, caplog):
+        import logging
+
+        from fused_memory.config.schema import ReconciliationConfig
+
+        cfg = ReconciliationConfig(
+            explore_codebase_root=str(tmp_path), transcript_archive_enabled=False,
+        )
+
+        assert self._announced(caplog, cfg) == [
+            (logging.INFO, 'recon transcript archival: disabled'),
+        ]
+
+
+class TestGcArchivesBeforeDelete:
+    """gc_run_config_dir moves a run's transcripts into the archive before it
+    destroys the per-run config dir (task 3972)."""
+
+    RUN_ID = 'd6782083-9319-48fa-b72c-1730fd9b1a35'
+    SID = '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0'
+    ENC = '-home-leo-src-dark-factory'
+    TRANSCRIPT = b'{"type":"user","message":"hello"}\n{"type":"assistant"}\n'
+
+    def _plant(self, tmp_path):
+        from fused_memory.reconciliation.cli_stage_runner import run_config_dir_path
+
+        data_dir = tmp_path / 'data'
+        config_dir = run_config_dir_path(data_dir, self.RUN_ID)
+        session_dir = config_dir / 'projects' / self.ENC
+        session_dir.mkdir(parents=True)
+        transcript = session_dir / f'{self.SID}.jsonl'
+        transcript.write_bytes(self.TRANSCRIPT)
+        (config_dir / '.credentials.json').write_text('{"token": "secret"}')
+        return data_dir, config_dir, transcript
+
+    def _archived(self, archive_root):
+        return archive_root / f'recon-{self.RUN_ID}' / self.ENC / f'{self.SID}.jsonl'
+
+    def test_transcript_is_archived_then_the_dir_is_destroyed(self, tmp_path):
+        from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
+
+        data_dir, config_dir, _ = self._plant(tmp_path)
+        archive_root = tmp_path / 'archive'
+
+        gc_run_config_dir(data_dir, self.RUN_ID, archive_root=archive_root)
+
+        assert self._archived(archive_root).read_bytes() == self.TRANSCRIPT
+        assert not config_dir.exists()
+
+    def test_archive_layout_is_key_enc_sid(self, tmp_path):
+        """Exactly ``<key>/<enc>/<sid>.jsonl``: an extra key segment would leave
+        the archive unenumerable by ``scripts/legibility/inventory.py::_archive_enc``."""
+        from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
+
+        data_dir, _, _ = self._plant(tmp_path)
+        archive_root = tmp_path / 'archive'
+
+        gc_run_config_dir(data_dir, self.RUN_ID, archive_root=archive_root)
+
+        [archived] = list(archive_root.rglob('*.jsonl'))
+        assert archived.relative_to(archive_root).parts == (
+            f'recon-{self.RUN_ID}', self.ENC, f'{self.SID}.jsonl',
+        )
+
+    def test_only_jsonl_under_projects_is_archived(self, tmp_path):
+        from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
+
+        data_dir, _, _ = self._plant(tmp_path)
+        archive_root = tmp_path / 'archive'
+
+        gc_run_config_dir(data_dir, self.RUN_ID, archive_root=archive_root)
+
+        assert list(archive_root.rglob('.credentials.json')) == []
+
+    def test_no_archive_root_keeps_todays_rmtree_behaviour(self, tmp_path):
+        from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
+
+        data_dir, config_dir, _ = self._plant(tmp_path)
+        archive_root = tmp_path / 'archive'
+
+        gc_run_config_dir(data_dir, self.RUN_ID, archive_root=None)
+
+        assert not config_dir.exists()
+        assert not archive_root.exists()
+
+    def test_a_call_that_omits_archive_root_destroys_nothing(self, tmp_path):
+        """A forwarded call omitting or positionally passing archive_root is refused before any rmtree."""
+        from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
+
+        data_dir, config_dir, transcript = self._plant(tmp_path)
+        forwarded_without_root: dict[str, Path | None] = {}
+        forwarded_root_positionally: list[Path | None] = [None]
+
+        with pytest.raises(TypeError):
+            gc_run_config_dir(data_dir, self.RUN_ID, **forwarded_without_root)
+        with pytest.raises(TypeError):
+            gc_run_config_dir(
+                data_dir, self.RUN_ID, *forwarded_root_positionally, **forwarded_without_root,
+            )
+
+        assert transcript.read_bytes() == self.TRANSCRIPT
+        assert config_dir.is_dir()
+
+    def test_is_still_a_noop_when_the_dir_is_absent(self, tmp_path):
+        from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
+
+        archive_root = tmp_path / 'archive'
+
+        gc_run_config_dir(tmp_path / 'data', 'never-created', archive_root=archive_root)
+
+        assert not archive_root.exists()
+
+    def test_never_raises_on_an_unwritable_archive_root(self, tmp_path):
+        """The un-archivable transcript is HELD while the credential is still
+        purged, and gc stays total so it cannot mask a run's terminal outcome."""
+        import os
+
+        from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
+
+        if os.geteuid() == 0:
+            pytest.skip('chmod does not bind root')
+
+        data_dir, config_dir, transcript = self._plant(tmp_path)
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir()
+        archive_root.chmod(0o500)
+        try:
+            gc_run_config_dir(data_dir, self.RUN_ID, archive_root=archive_root)
+        finally:
+            archive_root.chmod(0o700)
+
+        assert transcript.read_bytes() == self.TRANSCRIPT
+        assert not (config_dir / '.credentials.json').exists()
+
+    @pytest.mark.parametrize('mock_cls', [MagicMock, AsyncMock])
+    def test_a_mock_data_dir_with_archival_touches_no_filesystem(
+        self, tmp_path, monkeypatch, mock_cls
+    ):
+        """Archival passes the mock through ``Path(...)``, whose ``__fspath__``
+        coercion yields a relative path; nothing may land under the cwd."""
+        from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
+
+        monkeypatch.chdir(tmp_path)
+
+        gc_run_config_dir(
+            mock_cls().data_dir, 'run-x', archive_root=tmp_path / 'archive',
+        )
+
+        assert list(tmp_path.iterdir()) == [], (
+            f'archival with a mock data_dir created '
+            f'{[p.name for p in tmp_path.iterdir()]!r} under the cwd'
         )
 
 

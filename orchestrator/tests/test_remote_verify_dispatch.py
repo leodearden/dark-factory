@@ -21,7 +21,8 @@ from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 
 import pytest
-from _xdist_crash_fixtures import XDIST_SESSION_ABORTED_OUTPUT
+from _gate_fixtures import gate_argv, gated_remote_runner
+from _xdist_crash_fixtures import XDIST_IN_FLIGHT_NODEID, XDIST_SESSION_ABORTED_OUTPUT
 
 from orchestrator import verify
 from orchestrator.config import OrchestratorConfig
@@ -118,6 +119,7 @@ class _FakeTransport:
         ssh_rc: int = 0,
         ssh_stderr: str = '',
         push_rc: int = 0,
+        push_stderr: str = 'push rejected',
         push_error: OSError | None = None,
         ssh_error: OSError | None = None,
         hold_ssh: bool = False,
@@ -127,6 +129,7 @@ class _FakeTransport:
         self.ssh_rc = ssh_rc
         self.ssh_stderr = ssh_stderr
         self.push_rc = push_rc
+        self.push_stderr = push_stderr
         self.push_error = push_error
         self.ssh_error = ssh_error
         self.hold_ssh = hold_ssh
@@ -140,7 +143,7 @@ class _FakeTransport:
                 return 0, '', ''
             if self.push_error is not None:
                 raise self.push_error
-            return self.push_rc, '', 'push rejected' if self.push_rc else ''
+            return self.push_rc, '', self.push_stderr if self.push_rc else ''
         if self.ssh_error is not None:
             raise self.ssh_error
         if self.hold_ssh:
@@ -173,7 +176,7 @@ def _remote_runner(
     main_branch: str | None = None,
     config_path: str | None = None,
 ) -> RemoteRunner:
-    return RemoteRunner(
+    return gated_remote_runner(
         name='laptop',
         ssh_host='laptop.local',
         git_remote='origin',
@@ -215,7 +218,7 @@ class TestRunnerUnavailableKind:
     def test_bare_construction_is_transport(self):
         assert RunnerUnavailable().kind == 'transport'
 
-    @pytest.mark.parametrize('kind', ['transport', 'unparseable', 'no_verdict', 'wire_shape'])
+    @pytest.mark.parametrize('kind', ['transport', 'gate', 'unparseable', 'no_verdict', 'wire_shape'])
     def test_every_vocabulary_kind_is_accepted(self, kind: RunnerUnavailableKind):
         assert RunnerUnavailable('x', kind=kind).kind == kind
 
@@ -235,11 +238,22 @@ class TestDispatchFailureKinds:
         return excinfo.value.kind
 
     @pytest.mark.asyncio
-    async def test_push_rejection_is_transport_and_no_ssh_is_issued(self):
+    async def test_push_rejection_is_gate_and_no_verify_ssh_is_issued(self):
+        """A host that refuses the verify ref is reached: 'gate' (task 6565, Q1 ruling)."""
         transport = _FakeTransport(push_rc=1)
 
-        assert await self._kind_of(transport) == 'transport'
+        assert await self._kind_of(transport) == 'gate'
         assert transport.ssh_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_push_connect_failure_is_transport(self):
+        transport = _FakeTransport(
+            push_rc=128,
+            push_stderr='ssh: connect to host laptop.local port 22: Connection timed out\n'
+                        'fatal: Could not read from remote repository.',
+        )
+
+        assert await self._kind_of(transport) == 'transport'
 
     @pytest.mark.asyncio
     async def test_push_spawn_failure_is_transport(self):
@@ -248,6 +262,11 @@ class TestDispatchFailureKinds:
     @pytest.mark.asyncio
     async def test_ssh_exit_255_is_transport(self):
         assert await self._kind_of(_FakeTransport(ssh_rc=255, ssh_stderr='refused')) == 'transport'
+
+    @pytest.mark.asyncio
+    async def test_ssh_exit_other_than_255_is_gate(self):
+        """The host was reached and the verify command failed there (design D5)."""
+        assert await self._kind_of(_FakeTransport(ssh_rc=1, ssh_stderr='Error: x')) == 'gate'
 
     @pytest.mark.asyncio
     async def test_ssh_spawn_failure_is_transport(self):
@@ -374,14 +393,14 @@ class TestRunTaskVerifyTransport:
         )
         [ssh_argv] = transport.ssh_calls()
         assert ssh_argv[-2] == 'laptop.local'
-        parsed = shlex.split(ssh_argv[-1])
+        parsed = gate_argv(ssh_argv[-1])
         assert parsed == [
-            'orchestrator', 'verify-task', '--sha', _TIP,
+            'verify-task', '--sha', _TIP,
             '--spec', task_spec_to_json(spec),
             '--config', '/etc/orch.yaml',
             '--request-id', 'fixed-id',
         ]
-        assert task_spec_from_json(parsed[5]) == spec
+        assert task_spec_from_json(parsed[4]) == spec
         assert transport.deleted_refs() == ['refs/merge-verify/fixed-id']
 
     @pytest.mark.asyncio
@@ -422,11 +441,22 @@ class TestRunTaskVerifyTransport:
         assert await self._kind_of(_FakeTransport(ssh_rc=255, ssh_stderr='refused')) == 'transport'
 
     @pytest.mark.asyncio
-    async def test_push_rejection_is_transport_and_no_ssh_is_issued(self):
+    async def test_push_rejection_is_gate_and_no_verify_ssh_is_issued(self):
+        """A host that refuses the verify ref is reached: 'gate' (task 6565, Q1 ruling)."""
         transport = _FakeTransport(push_rc=1)
 
-        assert await self._kind_of(transport) == 'transport'
+        assert await self._kind_of(transport) == 'gate'
         assert transport.ssh_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_push_connect_failure_is_transport(self):
+        transport = _FakeTransport(
+            push_rc=128,
+            push_stderr='ssh: connect to host laptop.local port 22: Connection timed out\n'
+                        'fatal: Could not read from remote repository.',
+        )
+
+        assert await self._kind_of(transport) == 'transport'
 
     @pytest.mark.asyncio
     async def test_non_json_stdout_is_unparseable(self):
@@ -438,7 +468,7 @@ class TestRunTaskVerifyTransport:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('produce', [_signal_killed_result, _xdist_worker_death_result])
-    async def test_executed_no_verdict_result_is_unavailable_and_unarchived(
+    async def test_executed_no_verdict_result_is_unavailable_and_archived(
         self, tmp_path: Path, produce: Callable[[Path], Awaitable[VerifyResult]],
     ):
         worktree = tmp_path / 'worktree'
@@ -447,7 +477,13 @@ class TestRunTaskVerifyTransport:
         transport = _FakeTransport(ssh_stdout=result_to_json(await produce(worktree)))
 
         assert await self._kind_of(transport, archive_root) == 'no_verdict'
-        assert list(archive_root.rglob('*')) == []
+
+        task_dir = archive_root / '6667'
+        record = json.loads(_one(task_dir, 'attempt-4.remote-laptop.no-verdict-*.json').read_text())
+        assert record['sha'] == _TIP
+        assert record['attempt_id'] == 4
+        assert record['role'] == 'task'
+        assert list(task_dir.glob('*pass-summary*')) == []
 
     @pytest.mark.asyncio
     async def test_task_id_disagreeing_with_the_spec_is_refused_before_any_push(self):
@@ -551,6 +587,87 @@ class TestRunTaskVerifyArchive:
         summary = json.loads(_one(task_dir, 'attempt-1.remote-laptop.summary-*.json').read_text())
         assert summary['role'] == 'merge'
         assert list(task_dir.glob('attempt-4.*')) == []
+
+
+class TestNoVerdictArchive:
+    @pytest.mark.asyncio
+    async def test_merge_no_verdict_archives_the_worker_death_line(self, tmp_path: Path):
+        worktree = tmp_path / 'worktree'
+        worktree.mkdir()
+        executed = await _xdist_worker_death_result(worktree)
+        transport = _FakeTransport(ssh_stdout=result_to_json(executed), ssh_stderr='LAPTOP LOG')
+
+        with pytest.raises(RunnerUnavailable) as excinfo:
+            await _remote_runner(transport).run_merge_verify(
+                'abc123', _merge_spec(), task_id='6667', archive_root=tmp_path / 'archive',
+            )
+
+        assert excinfo.value.kind == 'no_verdict'
+        task_dir = tmp_path / 'archive' / '6667'
+        test_log = _one(task_dir, 'attempt-1.remote-laptop.test-*.log').read_text()
+        assert f"crashed while running '{XDIST_IN_FLIGHT_NODEID}'" in test_log
+        assert _one(task_dir, 'attempt-1.remote-laptop-*.stderr.log').read_text() == 'LAPTOP LOG'
+        summary = json.loads(_one(task_dir, 'attempt-1.remote-laptop.summary-*.json').read_text())
+        assert summary['role'] == 'merge'
+        record = json.loads(_one(task_dir, 'attempt-1.remote-laptop.no-verdict-*.json').read_text())
+        assert {key: record[key] for key in (
+            'sha', 'runner', 'ssh_host', 'task_id', 'attempt_id', 'role', 'summary',
+        )} == {
+            'sha': 'abc123',
+            'runner': 'laptop',
+            'ssh_host': 'laptop.local',
+            'task_id': '6667',
+            'attempt_id': 1,
+            'role': 'merge',
+            'summary': executed.summary,
+        }
+        assert list(task_dir.glob('*pass-summary*')) == []
+        assert transport.deleted_refs() == ['refs/merge-verify/fixed-id']
+        message = str(excinfo.value)
+        for path in task_dir.iterdir():
+            assert str(path) in message
+
+    @pytest.mark.asyncio
+    async def test_task_no_verdict_archives_the_worker_death_line(self, tmp_path: Path):
+        worktree = tmp_path / 'worktree'
+        worktree.mkdir()
+        executed = await _xdist_worker_death_result(worktree)
+        transport = _FakeTransport(ssh_stdout=result_to_json(executed), ssh_stderr='LAPTOP LOG')
+
+        with pytest.raises(RunnerUnavailable) as excinfo:
+            await _remote_runner(transport).run_task_verify(
+                _task_spec(), task_id='6667', archive_root=tmp_path / 'archive',
+            )
+
+        assert excinfo.value.kind == 'no_verdict'
+        task_dir = tmp_path / 'archive' / '6667'
+        test_log = _one(task_dir, 'attempt-4.remote-laptop.test-*.log').read_text()
+        assert f"crashed while running '{XDIST_IN_FLIGHT_NODEID}'" in test_log
+        assert _one(task_dir, 'attempt-4.remote-laptop-*.stderr.log').read_text() == 'LAPTOP LOG'
+        summary = json.loads(_one(task_dir, 'attempt-4.remote-laptop.summary-*.json').read_text())
+        assert summary['role'] == 'task'
+        message = str(excinfo.value)
+        for path in task_dir.iterdir():
+            assert str(path) in message
+
+    @pytest.mark.asyncio
+    async def test_unwritable_archive_root_still_raises_no_verdict(self, tmp_path: Path):
+        worktree = tmp_path / 'worktree'
+        worktree.mkdir()
+        archive_root = tmp_path / 'archive'
+        archive_root.write_text('a file, so no archive directory can be made under it')
+        executed = await _xdist_worker_death_result(worktree)
+        transport = _FakeTransport(ssh_stdout=result_to_json(executed), ssh_stderr='LAPTOP LOG')
+        runner = _remote_runner(transport)
+
+        with pytest.raises(RunnerUnavailable) as excinfo:
+            await runner.run_merge_verify(
+                'abc123', _merge_spec(), task_id='6667', archive_root=archive_root,
+            )
+
+        assert excinfo.value.kind == 'no_verdict'
+        assert 'archived at' not in str(excinfo.value)
+        assert runner.dispatch_in_flight is False
 
 
 class TestExclusiveDispatchAcrossPaths:

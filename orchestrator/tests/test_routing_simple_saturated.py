@@ -30,6 +30,8 @@ import pytest
 from orchestrator.config import OrchestratorConfig
 from orchestrator.routing import RoleDefaults, RouteInputs, resolve_route
 
+pytestmark = pytest.mark.usefixtures("code_default_config")
+
 RULE_ID = 'simple-saturated-full-path'
 
 # Deliberately nonsense -- config always wins for the architect role (it has a
@@ -41,16 +43,6 @@ _SENTINEL_ROLE_DEFAULTS = RoleDefaults(
     model='role-default-sentinel', effort='role-default-sentinel',
     budget_usd=-1.0, max_turns=-1,
 )
-
-
-@pytest.fixture(autouse=True)
-def _isolated_config_env(monkeypatch, tmp_path):
-    """Every OrchestratorConfig() built here reads ONLY the package's shipped
-    defaults.yaml -- no stray project config.yaml, no ambient
-    ORCH_CONFIG_PATH. Mirrors test_routing_retry_tier_up.py's convention.
-    """
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
 
 
 def _inputs(role_name: str, *, simple_saturated: bool) -> RouteInputs:

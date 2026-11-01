@@ -2,8 +2,9 @@
 
 ALARM ONLY. Nothing here deletes a row or rewrites the file. The retention
 prune is ``services/write_journal.py::WriteJournal.prune_write_ops``, and the
-volume fix and reclaim are task 5405's. The measured basis of both ceilings
-lives in the ``write_journal_growth_alarm`` block of
+reclaim is ``fused-memory/scripts/roll_up_journal_reads.py`` (runbook:
+``fused-memory/scripts/README_roll_up_journal_reads.md``). The measured basis
+of both ceilings lives in the ``write_journal_growth_alarm`` block of
 ``fused-memory/config/config.yaml``.
 """
 
@@ -49,14 +50,16 @@ _ANCHOR_TASK_IDS = {
 
 _SUGGESTED_ACTIONS = {
     JournalCeiling.FILE_SIZE: (
-        'Check whether prune_write_ops is keeping up: its startup WARNING reports '
-        'the rows/sec it achieved and which horizon is still behind. Then decide '
-        'between an offline VACUUM (fused-memory stopped) and a deliberately raised '
-        f'max_file_bytes, recording the reason in {_BASIS}.'
+        'Check whether prune_write_ops is keeping up: its WARNING (logged at '
+        'startup and on every periodic pass) reports the rows/sec it achieved and '
+        'which horizon is still behind. Then decide between an offline VACUUM '
+        '(fused-memory stopped) and a deliberately raised max_file_bytes, '
+        f'recording the reason in {_BASIS}.'
     ),
     JournalCeiling.INSERT_RATE: (
-        'Find which operation and agent drove the trailing-24 h insert count, e.g. '
-        "via the dashboard memory panel's operations and agent breakdowns. Then "
+        'Find which operation and agent drove the trailing-24 h insert count: '
+        'SELECT operation, agent_id, COUNT(*) FROM write_ops WHERE created_at >= '
+        "<24 h ago> GROUP BY 1, 2 ORDER BY 3 DESC, read-only. Then "
         'decide whether it is a regression to fix at its source or a new baseline '
         f'that needs max_rows_inserted_per_day re-anchored in {_BASIS}.'
     ),
@@ -115,8 +118,9 @@ def emit_journal_growth_escalation(
         f'limit={breach.limit}',
         f'db_path={db_path}',
         f'basis={_BASIS}',
-        'This alarm deleted nothing. The file shrinks only via an offline VACUUM, '
-        'and task 5405 owns the read-row rollup and reclaim.',
+        'This alarm deleted nothing. The file shrinks only via an offline VACUUM: '
+        'fused-memory/scripts/roll_up_journal_reads.py reclaim, runbook '
+        'fused-memory/scripts/README_roll_up_journal_reads.md.',
     ))
     return file_folded_escalation(
         project_root,

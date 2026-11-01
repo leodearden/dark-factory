@@ -3,8 +3,9 @@
 Routing rule: a probe that answers ``owns`` routes the item to the brief's
 standing footer; ``mentions`` is evidence the agent must read before putting the
 item to Leo. The asymmetry is deliberate. Every ``owns`` source is a structured
-field (a session record and its ``result.md`` ``outcome:`` header,
-``x_coalesced_into``, the ruling keys, the follow-up keys); the one
+field (a session record and its ``result.md`` ``outcome:`` header, a deferred
+row's carried_by record, then legacy ``x_coalesced_into`` while the row records
+no hold, the ruling keys, the follow-up keys); the one
 ``mentions``-only source, the handover file, is prose, and routing on its
 headings would be an ad-hoc parser.
 
@@ -25,11 +26,16 @@ from typing import Any, Literal
 
 from _task_db_scan import TaskDbUnreadable, connect_ro, tasks_db_path
 from orchestrator.session_registry import (
+    OWNING_OUTCOMES,
     RESULT_FILENAME,
     TERMINAL_STATUSES,
+    ResultOutcome,
     SessionRecord,
-    normalize_project_token,
+    parse_result_outcome,
 )
+from shared.project_id import fold_project_token
+from shared.task_deferral import CarriedByDeferral, InvalidRecord, parse_record
+from shared.task_statuses import TaskStatus
 from sitting.inventory import ItemKey, OpenItem, Shortfall, cited_ids, parse_stamp
 
 ProbeStatus = Literal['owns', 'mentions', 'empty', 'unavailable']
@@ -38,12 +44,10 @@ PROBES: tuple[str, ...] = (
     'spawned_session', 'unblock_run', 'coalesce_fold', 'task_ruling', 'spawned_followup', 'handover',
 )
 RULING_METADATA_KEYS: tuple[str, ...] = ('x_ruling', 'x_operator_ruling', 'x_ruled_by')
-COALESCE_KEY = 'x_coalesced_into'
+LEGACY_COALESCE_KEY = 'x_coalesced_into'
 FOLLOWUP_KEYS: tuple[str, ...] = ('x_origin_escalation', 'origin_escalation')
 HANDOVER_CANDIDATES: tuple[str, ...] = ('data/escalations/l2-handover.md', 'plans/l2-watcher-handover-*.md')
 
-RESULT_OUTCOMES: tuple[str, ...] = ('done', 'blocked', 'abandoned', 'handed-off')
-OWNING_OUTCOMES = frozenset({'done', 'handed-off'})
 TERMINAL_TASK_STATUSES = frozenset({'done', 'cancelled'})
 UNBLOCK_ROLE = 'unblock'
 
@@ -127,28 +131,13 @@ def index_sessions(sessions_root: Path) -> SessionIndex:
         if record.escalation_id:
             by_escalation[record.escalation_id].append(session)
         if record.task_id:
-            by_task[(normalize_project_token(record.project), str(record.task_id))].append(session)
+            by_task[(fold_project_token(record.project), str(record.task_id))].append(session)
     return SessionIndex(
         root, True,
         MappingProxyType({key: tuple(found) for key, found in by_escalation.items()}),
         MappingProxyType({key: tuple(found) for key, found in by_task.items()}),
         tuple(shortfalls),
     )
-
-
-def parse_result_outcome(text: str) -> str | None:
-    """The spawn contract's ``outcome:`` header value, or None when absent or not a contract outcome."""
-    lines = text.lstrip().splitlines()
-    if lines and lines[0].strip() == '---':
-        lines = lines[1:]
-    for line in lines:
-        if not line.strip() or line.strip() == '---':
-            return None
-        key, sep, value = line.partition(':')
-        if sep and key.strip() == 'outcome':
-            outcome = value.strip()
-            return outcome if outcome in RESULT_OUTCOMES else None
-    return None
 
 
 def load_task_rows(project_root: Path | str, task_ids: Iterable[str] | None = None) -> TaskRows:
@@ -234,19 +223,60 @@ def _probe_coalesce_fold(item: OpenItem, task_rows: TaskRows, measured_at: str) 
     subject = _subject_row(probe, item, task_rows, measured_at)
     if isinstance(subject, ProbeResult):
         return subject
-    target_id = subject.metadata.get(COALESCE_KEY)
-    if target_id is None:
-        return ProbeResult(probe, 'empty', measured_at, evidence=f'task {subject.id} carries no {COALESCE_KEY}')
-    target = task_rows.rows.get(str(target_id))
+    claim = _carrier_claim(subject)
+    if isinstance(claim, _Unclaimed):
+        return ProbeResult(probe, 'empty', measured_at, evidence=claim.evidence)
+    target = task_rows.rows.get(claim.carrier_id)
     status = target.status if target is not None else ''
     title = target.title if target is not None else 'not in the store'
     return ProbeResult(
         probe, 'owns', measured_at,
-        owner=f'task {target_id} ({status or "unknown"}): {title}',
-        evidence=f'task {subject.id} {COALESCE_KEY}={target_id!r}',
-        owner_task_id=str(target_id),
+        owner=f'task {claim.carrier_id} ({status or "unknown"}): {title}',
+        evidence=claim.evidence,
+        owner_task_id=claim.carrier_id,
         owner_task_status=status,
     )
+
+
+@dataclass(frozen=True)
+class _CarrierClaim:
+    carrier_id: str
+    evidence: str
+
+
+@dataclass(frozen=True)
+class _Unclaimed:
+    evidence: str
+
+
+def _carrier_claim(row: TaskRow) -> _CarrierClaim | _Unclaimed:
+    """The carrier claiming *row* and the evidence for it, or why nothing claims it.
+
+    The record first, then the legacy key: the order of
+    scripts/exception_owner_liveness.py::TaskRow.successor.
+    """
+    deferred = row.status == TaskStatus.DEFERRED
+    record = parse_record(row.metadata.get('deferral')) if deferred else None
+    legacy = row.metadata.get(LEGACY_COALESCE_KEY)
+    if isinstance(record, CarriedByDeferral):
+        return _CarrierClaim(
+            str(record.carrier_task_id), f'task {row.id} deferral.carrier_task_id={record.carrier_task_id}'
+        )
+    if record is not None and not isinstance(record, InvalidRecord):
+        history = f'; its {LEGACY_COALESCE_KEY}={legacy!r} is history, not a claim' if legacy is not None else ''
+        return _Unclaimed(f'task {row.id} is held {record.kind.value}{history}')
+    if legacy is None:
+        return _Unclaimed(f'task {row.id} carries no {LEGACY_COALESCE_KEY}')
+    return _CarrierClaim(
+        str(legacy), f'task {row.id} {LEGACY_COALESCE_KEY}={legacy!r}{_unrecorded_note(deferred, record)}'
+    )
+
+
+def _unrecorded_note(deferred: bool, record: InvalidRecord | None) -> str:
+    """Why a deferred row's legacy key speaks for it: no record, or one that does not parse."""
+    if not deferred:
+        return ''
+    return ' (deferral record unreadable)' if isinstance(record, InvalidRecord) else ' (no deferral recorded)'
 
 
 def _probe_task_ruling(item: OpenItem, task_rows: TaskRows, measured_at: str) -> ProbeResult:
@@ -339,7 +369,7 @@ def _judge_session(probe: str, session: IndexedSession, measured_at: str) -> Pro
     return ProbeResult(probe, 'mentions', measured_at, owner=f'session {session.slug}', evidence=evidence)
 
 
-def _read_outcome(session: IndexedSession) -> str | None:
+def _read_outcome(session: IndexedSession) -> ResultOutcome | None:
     path = Path(session.record.result_file) if session.record.result_file else session.record_dir / RESULT_FILENAME
     try:
         return parse_result_outcome(path.read_text(encoding='utf-8'))
@@ -348,7 +378,7 @@ def _read_outcome(session: IndexedSession) -> str | None:
 
 
 def _same_project(session: IndexedSession, item: OpenItem) -> bool:
-    return normalize_project_token(session.record.project) in ('', item.project)
+    return fold_project_token(session.record.project) in ('', item.project)
 
 
 def _started_at_or_after(session: IndexedSession, filed: datetime | None) -> bool:

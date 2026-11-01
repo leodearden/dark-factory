@@ -15,6 +15,7 @@ from shared.cli_invoke import read_transcript_records
 from shared.config_dir import TaskConfigDir
 from shared.jcodemunch_launch import jcodemunch_server_config
 from shared.safe_io import load_json_or_warn
+from shared.transcript_archive import archive_task_transcripts
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
@@ -32,7 +33,9 @@ from fused_memory.reconciliation.citation_verifier import (
 )
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE_REPORT_SCHEMA,
+    recon_archive_root,
     recon_config_base_dir,
+    recon_transcript_archive_key,
     run_stage_via_cli,
 )
 from fused_memory.reconciliation.sqlite_failures import await_best_effort
@@ -89,10 +92,11 @@ class BaseStage:
         self.config = config
         self.scope = scope
         # Cross-project routing: dict[project_id, project_root] of every
-        # project the harness knows about (including this one).  Stage 2
-        # surfaces this to the LLM so it can re-route a finding to the
-        # correct project_root when the scope demands.  Empty until the
-        # harness sets it per cycle.
+        # project the harness knows about (including this one).  Stages 2 and
+        # 3 surface this to the LLM through
+        # reconciliation/known_projects_section.py::render_known_projects_section
+        # so it can re-route a finding to the correct project_root when the
+        # scope demands.  Empty until the harness sets it per cycle.
         self.known_projects: dict[str, str] = known_projects or {}
         self._usage_gate = usage_gate
         self._escalation_url: str | None = None
@@ -348,6 +352,7 @@ class BaseStage:
             cancelled = True
             raise
         finally:
+            self._archive_stage_transcripts(config_dir, run_id)
             if not cancelled:
                 await self._write_session_snapshot_best_effort(
                     'clear_run_session', run_id, self.journal.clear_run_session(run_id),
@@ -559,6 +564,27 @@ class BaseStage:
             write,
             what=f'Stage {self.stage_id.value} session-snapshot write {op}',
             run_id=run_id, logger=logger, level=logging.WARNING,
+        )
+
+    def _archive_stage_transcripts(self, config_dir: TaskConfigDir, run_id: str) -> None:
+        """Producer half of recon transcript archival (task 3972).
+
+        COPIES, so the σ ``--resume`` seam can still read the source. Runs on
+        every exit, cancellation included, because interrupted runs skip the
+        teardown half (``cli_stage_runner.py::gc_run_config_dir``) and
+        fused-memory has no boot-time orphan sweeper. ``session_id=None``
+        archives the whole per-run dir, so a resumed session's file and
+        subagent transcripts are covered; ``_archive_one``'s mtime-equality
+        skip makes repeats nearly free. Synchronous and total by contract.
+        """
+        archive_root = recon_archive_root(self.config)
+        if archive_root is None:
+            return
+        archive_task_transcripts(
+            config_dir.path,
+            recon_transcript_archive_key(run_id),
+            None,
+            archive_root=archive_root,
         )
 
     def _build_recovery_prompt(self, run_id: str, stage_payload: str) -> str:

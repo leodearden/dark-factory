@@ -13,6 +13,7 @@ from unittest.mock import patch
 import pytest
 from _escalation_server_capture import create_server_kwargs
 from escalation.store_identity import StoreIdentity
+from shared.project_layout import escalation_queue_dir
 
 from orchestrator.harness import Harness
 
@@ -30,9 +31,7 @@ def _build_harness(mock_orch_config) -> Harness:
 async def test_create_server_receives_a_project_store_identity(
     mock_orch_config, tmp_path: Path,
 ) -> None:
-    configured_queue_dir = tmp_path / 'esc'
     mock_orch_config.fused_memory.project_id = 'test-project'
-    mock_orch_config.escalation.queue_dir = str(configured_queue_dir)
     mock_orch_config.escalation.host = '127.0.0.1'
     mock_orch_config.escalation.port = 0
     h = _build_harness(mock_orch_config)
@@ -48,4 +47,4 @@ async def test_create_server_receives_a_project_store_identity(
     assert identity.kind == 'project'
     assert identity.project_id == 'test-project'
     assert identity.project_root == mock_orch_config.project_root.resolve()
-    assert identity.queue_dir == configured_queue_dir.resolve()
+    assert identity.queue_dir == escalation_queue_dir(tmp_path).resolve()

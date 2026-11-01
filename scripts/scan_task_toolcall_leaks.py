@@ -11,8 +11,8 @@ safe-vs-irreversible handling already applied to tasks 2080 and 2865) —
 never bulk-edited by this script.
 
 Background: a recurring recon Stage-2 serialization bug leaks a stray
-``</description>``/``</parameter>``/``</details>`` closing tag, followed by
-a real newline and one or more serialized ``<parameter name="...">``
+``\x3c/description>``/``\x3c/parameter>``/``\x3c/details>`` closing tag, followed by
+a real newline and one or more serialized ``\x3cparameter name="...">``
 tool-call fragments, into a task's description/details column. First seen
 as an apparent one-off on task 2080 (2026-07-04); recurred on task 2865 and,
 per a live read-only probe run while planning this task, on ~32 further
@@ -21,12 +21,12 @@ one-off manual fix.
 
 The discriminator (``LEAK_TAIL``) requires one or more REAL whitespace
 characters (``\\s+``) between the stray closing tag and the
-``<parameter name="...">`` fragment — a closing tag immediately followed by
-``<parameter`` with zero whitespace in between does not match. This
+``\x3cparameter name="...">`` fragment — a closing tag immediately followed by
+``\x3cparameter`` with zero whitespace in between does not match. This
 deliberately excludes prose that merely *mentions* the leak shape (e.g.
 tasks 2938/2939, which quote the ESCAPED literal ``\\n`` — two characters,
 backslash then ``n``, which is NOT a real whitespace character — and
-continue with trailing prose afterward): a naive ``<parameter name=``
+continue with trailing prose afterward): a naive ``\x3cparameter name=``
 substring scan over-reports on exactly this shape. Once those two
 conditions hold (the closing-tag literal, then real whitespace), the
 capture group extends greedily to end-of-string (``.*$``); that greedy
@@ -209,8 +209,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "READ-ONLY sweep for leaked serialized tool-call XML fragments in "
-            "Taskmaster task text (e.g. a stray </description> followed by a "
-            'serialized <parameter name="..."> tool-call fragment). '
+            "Taskmaster task text (e.g. a stray \x3c/description> followed by a "
+            'serialized \x3cparameter name="..."> tool-call fragment). '
             "Detection/reporting only -- never mutates task text."
         ),
         # The 0/1/2/3 codes are RETURNED BY run_scan_cli() in _task_db_scan.py,

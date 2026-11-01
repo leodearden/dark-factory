@@ -1,9 +1,9 @@
 /* Escalations tab — read-only queue view.
  *
- * No JS test runner for .jsx in this project (see scheduler_drawer.jsx
- * comment) — but the pure decisions lifted OUT of this file are covered
- * by `node --test` under dashboard/tests/js/. Wiring contracts are
- * verified via Python tests in dashboard/tests/test_tab_escalations.py.
+ * Its render decisions are exercised in a jsdom window by
+ * dashboard/tests/js/jsx_render.test.mjs; the pure decisions lifted OUT of
+ * this file are covered by `node --test` under dashboard/tests/js/, and the
+ * remaining wiring contracts by dashboard/tests/test_tab_escalations.py.
  *
  * Load order: tabs.jsx → tab_escalations.jsx → app.jsx
  * Export:     window.DF_TABS.EscalationsTab  (additive mutation of the object
@@ -31,6 +31,8 @@ const {
 } = window.DF_ESCALATION_VIEWS;
 // The cross-tab focus lookup, keyed on (queue, id) — escalation_focus.js.
 const { findEscalationRow } = window.DF_ESCALATION_FOCUS;
+// A dependency_capability record's check owner — escalation_check_owner.js.
+const { checkOwnerPanel } = window.DF_ESCALATION_CHECK_OWNER;
 // The persisted UI-preference hooks — persisted_state.js.
 const { createPersistedHooks } = window.DF_PERSISTED_STATE;
 const { usePersistedState, useOpenSet } = createPersistedHooks(React);
@@ -646,12 +648,49 @@ function EscalationsTab({ projectFilter, focus, onFocusConsumed }) {
   );
 }
 
+// ── CheckOwnerSection — who declares a failing delivered check, and where ──
+// It leads the sidebar because the owner's sites are the ones to edit; the
+// record's own task is the dependent, which is only re-pended.
+
+function CheckOwnerSection({ panel }) {
+  const owner = `T-${taskId(panel.ownerTaskId)}`;
+  return (
+    <div className="sched-drawer-section" data-testid="esc-check-owner">
+      <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Delivered check owner</div>
+      <div data-testid="esc-check-owner-owner" style={{ fontSize: 12, color: 'var(--fg-1)', marginBottom: 6 }}>
+        Owning task: <span className="mono">{owner}</span>, the dependency that declares{' '}
+        <span className="mono">{panel.checkName}</span>
+      </div>
+      <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 2 }}>Declaration sites (edit these)</div>
+      <div data-testid="esc-check-owner-metadata" style={{ fontSize: 12, color: 'var(--fg-1)' }}>
+        <span className="mono">{owner}</span> metadata.delivered_checks entry{' '}
+        <span className="mono">{panel.checkName}</span>
+      </div>
+      <div data-testid="esc-check-owner-sidecar" style={{ fontSize: 12, color: 'var(--fg-1)' }}>
+        {panel.sidecarPath ? (
+          <>
+            sidecar <span className="mono">{panel.sidecarPath}</span>{' '}
+            <span className={`badge ${panel.sidecarTone}`} style={{ fontSize: 10 }}>{panel.sidecarCaption}</span>
+          </>
+        ) : panel.sidecarCaption}
+      </div>
+      {panel.dependentTaskId && (
+        <div data-testid="esc-check-owner-dependent" style={{ fontSize: 12, color: 'var(--fg-1)', marginTop: 6 }}>
+          Blocked dependent: <span className="mono">T-{taskId(panel.dependentTaskId)}</span>, the task this record
+          is filed for. Re-pend it once the check passes on main; never edit its checks.
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── EscalationSidebar — read-only detail panel ──
 
 function EscalationSidebar({ row, onClose }) {
   if (!row) return null;
   const card = taskCard(row, DF.__receipt, Date.now());
   const task = card.task;
+  const checkOwner = checkOwnerPanel(row);
   return (
     <div className="sched-drawer" role="dialog" aria-label={`Escalation detail for ${row.id}`}>
       {/* Header */}
@@ -679,6 +718,8 @@ function EscalationSidebar({ row, onClose }) {
 
       {/* Body */}
       <div className="sched-drawer-body">
+        {checkOwner && <CheckOwnerSection panel={checkOwner} />}
+
         {/* Detail */}
         {row.detail && (
           <div className="sched-drawer-section">

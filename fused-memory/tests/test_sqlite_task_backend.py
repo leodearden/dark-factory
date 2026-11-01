@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any, cast
 
@@ -36,10 +37,13 @@ from fused_memory.backends.sqlite_task_backend import (
 from fused_memory.backends.task_backend_errors import (
     AppendUnsupportedFieldError,
     DoneProvenanceWriteAuthorityError,
+    MetadataNotAnObjectError,
+    MetadataTooDeepError,
     StatusWriteAuthorityError,
     TaskmasterError,
     TaskNotFoundError,
     done_provenance_via_update_task_error,
+    metadata_not_an_object_error,
     status_via_update_task_error,
 )
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -1142,20 +1146,6 @@ async def test_update_task_allows_metadata_without_done_provenance(backend, proj
     assert task['metadata']['files'] == ['src']
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize('bad_metadata', ['not json{', json.dumps(['a', 'list'])])
-async def test_update_task_done_provenance_floor_skips_unparseable_metadata(
-    backend, project_root, bad_metadata,
-):
-    """Parse-safety guard: unparseable or non-dict metadata does not trip the
-    done_provenance floor — mirrors the interceptor's
-    _reject_done_provenance_in_update_metadata, which returns None (no
-    reject) on a JSON error or non-dict payload."""
-    await backend.add_task(project_root=project_root, title='x')
-    # Must not raise DoneProvenanceWriteAuthorityError.
-    await backend.update_task('1', project_root=project_root, metadata=bad_metadata)
-
-
 _STORED_DONE_PROVENANCE = {'kind': 'merged', 'commit': 'a' * 40}
 
 
@@ -1336,6 +1326,236 @@ async def test_update_task_replace_done_provenance_on_missing_task_reports_not_f
         )
     assert not isinstance(exc.value, DoneProvenanceWriteAuthorityError)
     assert 'No tasks found' in exc.value.message
+
+
+# ── update_task: non-object metadata floor (task 6130) ──
+
+_NON_OBJECT_MODES = pytest.mark.parametrize(
+    'mode_kwargs',
+    [
+        {},
+        {'metadata_mode': 'merge'},
+        {'metadata_mode': 'additive'},
+        {'append': True},
+        {'metadata_mode': 'replace'},
+    ],
+    ids=['default', 'merge', 'additive', 'append-shim', 'replace'],
+)
+
+
+@pytest.mark.asyncio
+@_NON_OBJECT_MODES
+@pytest.mark.parametrize(
+    ('payload', 'received'),
+    [
+        ('[]', 'array'),
+        ('null', 'null'),
+        ('not json{', 'invalid_json'),
+        ('["a"]', 'array'),
+    ],
+)
+async def test_update_task_non_object_metadata_never_drops_stored_done_provenance(
+    backend, project_root, mode_kwargs, payload, received,
+):
+    """A payload that is not a JSON object has no keys to merge. Treated as a
+    last-write-wins replacement it wiped the whole stored blob, done_provenance
+    and files included, in every mode; it is refused instead and nothing is
+    written."""
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src']}),
+    )
+    before = (await backend.get_task('1', project_root=project_root))['metadata']
+    with pytest.raises(MetadataNotAnObjectError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root, metadata=payload, **mode_kwargs,
+        )
+    assert exc.value.to_error_dict() == metadata_not_an_object_error('1', received)
+    after = (await backend.get_task('1', project_root=project_root))['metadata']
+    assert after == before
+    assert after['done_provenance'] == _STORED_DONE_PROVENANCE
+    assert after['files'] == ['src']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('payload', 'received'),
+    [
+        ('not json{', 'invalid_json'),
+        ('[]', 'array'),
+        (json.dumps(['a', 'list']), 'array'),
+        ('null', 'null'),
+        ('"bare"', 'string'),
+        ('7', 'number'),
+        ('true', 'boolean'),
+    ],
+)
+async def test_update_task_rejects_non_object_metadata_on_task_without_done_provenance(
+    backend, project_root, payload, received,
+):
+    """The refusal is about the payload's shape, not about done_provenance: a
+    row that holds none is protected too, and the error is not reported as a
+    done_provenance write."""
+    await backend.add_task(
+        project_root=project_root, title='x', metadata=json.dumps({'files': ['src']}),
+    )
+    before = (await backend.get_task('1', project_root=project_root))['metadata']
+    with pytest.raises(MetadataNotAnObjectError) as exc:
+        await backend.update_task('1', project_root=project_root, metadata=payload)
+    assert not isinstance(exc.value, DoneProvenanceWriteAuthorityError)
+    assert exc.value.received == received
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata'] == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'mode_kwargs', [{}, {'metadata_mode': 'replace'}], ids=['default', 'replace'],
+)
+async def test_update_task_non_object_metadata_rejection_precedes_existence_check(
+    backend, project_root, mode_kwargs,
+):
+    """Refusing a non-object payload needs no stored state, so it runs before
+    the row lookup in every mode, replace included, unlike the done_provenance
+    passthrough, which needs the stored value."""
+    with pytest.raises(MetadataNotAnObjectError) as exc:
+        await backend.update_task(
+            '999', project_root=project_root, metadata='[]', **mode_kwargs,
+        )
+    assert exc.value.to_error_dict() == metadata_not_an_object_error('999', 'array')
+    assert 'No tasks found' not in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_update_task_non_object_metadata_is_typed_under_enforce_mode(
+    tmp_path, project_root,
+):
+    """Production runs task_metadata.enforce=true, where the post-merge
+    validator used to be the first thing to refuse and raised a raw TypeError.
+    The typed refusal comes first."""
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    backend = SqliteTaskBackend(cfg, task_metadata_enforce=True)
+    await backend.start()
+    try:
+        await backend.add_task(
+            project_root=project_root, title='x',
+            metadata=json.dumps({
+                'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src'],
+            }),
+        )
+        before = (await backend.get_task('1', project_root=project_root))['metadata']
+        with pytest.raises(MetadataNotAnObjectError) as exc:
+            await backend.update_task('1', project_root=project_root, metadata='[]')
+        assert exc.value.received == 'array'
+        task = await backend.get_task('1', project_root=project_root)
+        assert task['metadata'] == before
+    finally:
+        await backend.close()
+
+
+# ── update_task: additive merge too deep to recurse (task 6248) ──
+
+
+def _nested(depth: int, leaf: str) -> dict:
+    """``{'k': {'k': ... leaf}}``, built with a loop: a recursive builder would
+    hit the very recursion limit these tests exercise."""
+    value: Any = leaf
+    for _ in range(depth):
+        value = {'k': value}
+    return value
+
+
+def _too_deep_to_merge() -> int:
+    """Deeper than any stack can recurse, still well within json's C limits."""
+    return sys.getrecursionlimit() + 100
+
+
+async def _seed_row_with_deep_key(
+    backend: SqliteTaskBackend, project_root: str, depth: int,
+) -> dict:
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({
+            'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src'],
+            'x_deep': _nested(depth, 'old'),
+        }),
+    )
+    return (await backend.get_task('1', project_root=project_root))['metadata']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'mode_kwargs',
+    [{'metadata_mode': 'additive'}, {'append': True}],
+    ids=['additive', 'append-shim'],
+)
+async def test_update_task_additive_merge_too_deep_never_drops_stored_done_provenance(
+    backend, project_root, mode_kwargs,
+):
+    """A key path nested past the recursion limit used to fall back to
+    last-write-wins, keeping only the payload's keys: done_provenance and files
+    were wiped while update_task reported success. It is refused instead and
+    nothing is written."""
+    depth = _too_deep_to_merge()
+    before = await _seed_row_with_deep_key(backend, project_root, depth)
+    with pytest.raises(MetadataTooDeepError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'x_deep': _nested(depth, 'new')}), **mode_kwargs,
+        )
+    assert exc.value.task_id == '1'
+    assert isinstance(exc.value, TaskmasterError)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    after = (await backend.get_task('1', project_root=project_root))['metadata']
+    assert after['done_provenance'] == _STORED_DONE_PROVENANCE
+    assert after['files'] == ['src']
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_update_task_additive_merge_too_deep_is_typed_under_enforce_mode(
+    tmp_path, project_root,
+):
+    """Production runs task_metadata.enforce=true; its validation does not mask
+    the loss, so the refusal must hold there too."""
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    backend = SqliteTaskBackend(cfg, task_metadata_enforce=True)
+    await backend.start()
+    try:
+        depth = _too_deep_to_merge()
+        before = await _seed_row_with_deep_key(backend, project_root, depth)
+        with pytest.raises(MetadataTooDeepError):
+            await backend.update_task(
+                '1', project_root=project_root,
+                metadata=json.dumps({'x_deep': _nested(depth, 'new')}),
+                metadata_mode='additive',
+            )
+        after = (await backend.get_task('1', project_root=project_root))['metadata']
+        assert after['done_provenance'] == _STORED_DONE_PROVENANCE
+        assert after['files'] == ['src']
+        assert after == before
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_update_task_merge_mode_overwrites_a_too_deep_key_and_keeps_done_provenance(
+    backend, project_root,
+):
+    """Pins the remedy the refusal's message names: metadata_mode='merge'
+    replaces the deep key wholesale without recursing, and every other stored
+    key survives. Merge mode never reaches the recursive merge, so this is a
+    contract test for that advice, not a regression test for the refusal."""
+    depth = _too_deep_to_merge()
+    await _seed_row_with_deep_key(backend, project_root, depth)
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'x_deep': _nested(depth, 'new')}), metadata_mode='merge',
+    )
+    after = (await backend.get_task('1', project_root=project_root))['metadata']
+    assert after['done_provenance'] == _STORED_DONE_PROVENANCE
+    assert after['files'] == ['src']
+    assert after['x_deep'] == _nested(depth, 'new')
 
 
 @pytest.mark.asyncio
@@ -2048,40 +2268,25 @@ def test_drop_reserved_control_keys_no_op_when_absent():
     assert dropped == set()
 
 
-def test_strip_reserved_control_keys_strips_from_json_object_string():
-    """(c) String wrapper strips reserved keys from a JSON-object string and re-serializes."""
+def test_strip_reserved_control_keys_drops_reserved_keys_and_warns(caplog):
+    """(c) The logging wrapper drops reserved keys and names them in a WARNING."""
     from fused_memory.backends.sqlite_task_backend import _strip_reserved_control_keys
 
-    incoming = json.dumps({'append': True, 'metadata_mode': 'merge', 'source': 'x'})
-    result = _strip_reserved_control_keys(incoming)
-    assert json.loads(result) == {'source': 'x'}
+    incoming = {'append': True, 'metadata_mode': 'merge', 'source': 'x'}
+    with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        result = _strip_reserved_control_keys(incoming)
+    assert result == {'source': 'x'}
+    assert "['append', 'metadata_mode']" in caplog.text
 
 
-def test_strip_reserved_control_keys_no_op_returns_equivalent_when_absent():
-    """(c) No reserved keys present: the (re-serialized) payload is unchanged in content."""
+def test_strip_reserved_control_keys_no_op_returns_same_dict_when_absent(caplog):
+    """(c) No reserved keys present: the same dict comes back and nothing is logged."""
     from fused_memory.backends.sqlite_task_backend import _strip_reserved_control_keys
 
-    incoming = json.dumps({'source': 'x'})
-    result = _strip_reserved_control_keys(incoming)
-    assert json.loads(result) == {'source': 'x'}
-
-
-def test_strip_reserved_control_keys_passthrough_on_corrupt_json():
-    """(d) Fail-safe: a corrupt/non-JSON string is returned UNCHANGED (identity-preserving),
-    matching _merge_metadata's corrupt-incoming last-write-wins fallback."""
-    from fused_memory.backends.sqlite_task_backend import _strip_reserved_control_keys
-
-    incoming = 'NOT_JSON'
-    assert _strip_reserved_control_keys(incoming) is incoming
-
-
-@pytest.mark.parametrize('incoming', ['[1,2]', '"s"'])
-def test_strip_reserved_control_keys_passthrough_on_non_dict_json(incoming):
-    """(d) Fail-safe: valid-but-non-dict JSON is returned UNCHANGED, matching
-    _merge_metadata's non-dict-incoming fallback (returns incoming verbatim)."""
-    from fused_memory.backends.sqlite_task_backend import _strip_reserved_control_keys
-
-    assert _strip_reserved_control_keys(incoming) is incoming
+    incoming = {'source': 'x'}
+    with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        assert _strip_reserved_control_keys(incoming) is incoming
+    assert 'reserved control-flag' not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -2948,7 +3153,7 @@ async def test_fresh_db_has_no_parent_id_and_user_version_5(tmp_path):
 def _make_v1_schema_db(db_path: Path) -> None:
     """Create a tasks.db with the v1 schema: no parent_id, NO claimant/candidate_key columns.
 
-    Mirrors ``_SCHEMA_SQL`` as it existed before the claimant / candidate_key
+    Mirrors ``TASK_STORE_DDL`` as it existed before the claimant / candidate_key
     columns were added, stamped ``user_version = 1``. This is the common
     production shape (parent_id already dropped by a prior deploy, later
     columns not yet added) that the v1->v2 and v2->v3 ALTER-TABLE migration
@@ -3127,7 +3332,7 @@ async def test_v2_to_v3_migration_backfills_candidate_key_and_audits_duplicates(
         with caplog.at_level(
             logging.INFO, logger='fused_memory.backends.sqlite_task_backend',
         ):
-            # Triggers connection-open (_SCHEMA_SQL + _migrate).
+            # Triggers connection-open (TASK_STORE_DDL + _migrate).
             await b.get_tasks(project_root=project_root)
         # (h) get_task exposes candidate_key through the normal read path.
         one = await b.get_task('1', project_root=project_root)
@@ -3277,7 +3482,7 @@ async def test_v2_to_v3_migration_clean_audit_logs_info_with_zero_duplicates(
         with caplog.at_level(
             logging.INFO, logger='fused_memory.backends.sqlite_task_backend',
         ):
-            # Triggers connection-open (_SCHEMA_SQL + _migrate).
+            # Triggers connection-open (TASK_STORE_DDL + _migrate).
             await b.get_tasks(project_root=project_root)
     finally:
         await b.close()
@@ -3629,7 +3834,7 @@ async def test_v4_to_v5_backfills_pending_since_from_updated_at(tmp_path, caplog
         with caplog.at_level(
             logging.INFO, logger='fused_memory.backends.sqlite_task_backend',
         ):
-            # Triggers connection-open (_SCHEMA_SQL + _migrate) -- must not raise.
+            # Triggers connection-open (TASK_STORE_DDL + _migrate) -- must not raise.
             await b.get_tasks(project_root=project_root)
     finally:
         await b.close()
@@ -3884,7 +4089,7 @@ async def test_v3_to_v4_self_gating_skips_index_and_escalates_on_residual_duplic
         with caplog.at_level(
             logging.ERROR, logger='fused_memory.backends.sqlite_task_backend',
         ):
-            # Triggers connection-open (_SCHEMA_SQL + _migrate, chaining
+            # Triggers connection-open (TASK_STORE_DDL + _migrate, chaining
             # v1->v2->v3->v4).
             await b.get_tasks(project_root=project_root)  # (a) must not raise
     finally:
@@ -6744,6 +6949,29 @@ def test_merge_metadata_mode_merge_existing_none_returns_incoming():
     """mode='merge' with existing_raw=None returns incoming (no existing data)."""
     incoming = json.dumps({'k': 'v'})
     assert _merge_metadata(None, incoming, mode='merge') == incoming
+
+
+@pytest.mark.parametrize('mode', ['merge', 'additive', 'replace'])
+@pytest.mark.parametrize(
+    ('payload', 'received'),
+    [('[]', 'array'), ('null', 'null'), ('not json{', 'invalid_json')],
+)
+def test_merge_metadata_refuses_non_object_incoming_in_every_mode(mode, payload, received):
+    """A non-object incoming payload is never returned as the new blob, whether
+    or not there is an existing blob to preserve (task 6130)."""
+    existing = json.dumps({
+        'done_provenance': {'kind': 'merged', 'commit': 'a' * 40}, 'files': ['src'],
+    })
+    with pytest.raises(MetadataNotAnObjectError) as exc:
+        _merge_metadata(
+            existing, payload, mode=mode, project_root='/p', tag='master', task_id=1,
+        )
+    assert exc.value.received == received
+    with pytest.raises(MetadataNotAnObjectError) as exc_no_existing:
+        _merge_metadata(
+            None, payload, mode=mode, project_root='/p', tag='master', task_id=1,
+        )
+    assert exc_no_existing.value.received == received
 
 
 # ── update_task end-to-end: default-merge + metadata_mode (step-5 RED / step-6 GREEN) ──

@@ -11,7 +11,7 @@ import collections
 import dataclasses
 import logging
 from collections.abc import Callable, Collection, Iterable
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from escalation.models import Escalation
 
@@ -20,6 +20,7 @@ from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.halt import HaltState
 from orchestrator.merge_lane.intake import emit_merge_coalesced, normalize_lane
 from orchestrator.merge_lane.types import (
+    GroupMergeRequest,
     ItemLifecycleState,
     MergeBounceRegistry,
     MergeOutcome,
@@ -189,6 +190,16 @@ def _aging_key(req: MergeRequest) -> tuple[float, str]:
     return (ts, req.request_id)
 
 
+def answers_to(req: MergeRequest, request_id: str | None, task_id: str | None) -> bool:
+    """Whether *req* is the queue entry an operator named: by its own request id,
+    or by a task id it carries — its own, or a coalesced member's (task 5246)."""
+    if request_id is not None:
+        return req.request_id == request_id
+    return req.task_id == task_id or (
+        isinstance(req, GroupMergeRequest) and task_id in req.member_task_ids
+    )
+
+
 class MergeIntake:
     """The merger's per-lane buffers, the front-priority redispatch park and the
     two-layer suffix-conflict tracker over the buffered suffix.
@@ -211,8 +222,9 @@ class MergeIntake:
         event_store: EventStore | None,
         escalation_queue: Any,
         git_ops: Callable[[], GitOps],
-        frozen_prefix: Callable[[], tuple[str, ...]],
+        frozen_requests: Callable[[], tuple[MergeRequest, ...]],
         frozen_prefix_tip: Callable[[str], str],
+        retire_item: Callable[[str], None],
         assert_merger_owns: Callable[[str], None],
     ) -> None:
         self._queue = queue
@@ -243,8 +255,8 @@ class MergeIntake:
         self._redispatch: collections.deque[SpeculativeItem] = collections.deque()
         # δ=1988 — the two-layer suffix-conflict graph + bounce state (conflict
         # graph over the unfrozen suffix, debounce signature, cached main SHA,
-        # per-branch bounce counter). git_ops/frozen_prefix/frozen_prefix_tip
-        # are narrow callables that RE-READ the worker's live attribute on every
+        # per-branch bounce counter). git_ops/frozen_requests/frozen_prefix_tip/
+        # retire_item are narrow callables that RE-READ the worker's live attribute on every
         # call, so the tracker stays correct if the worker's `_git_ops` is ever
         # reassigned after construction. See suffix_graph.py's module docstring
         # + SuffixConflictTracker docstring for the full
@@ -252,8 +264,9 @@ class MergeIntake:
         self._suffix_tracker = SuffixConflictTracker(
             git_ops=git_ops,
             lane_buffers=lambda: self._lane_buffers,
-            frozen_prefix=frozen_prefix,
+            frozen_requests=frozen_requests,
             frozen_prefix_tip=frozen_prefix_tip,
+            retire_item=retire_item,
         )
 
     # ── reads ──────────────────────────────────────────────────────────────
@@ -261,6 +274,16 @@ class MergeIntake:
     def buffered(self, lane: str) -> tuple[MergeRequest, ...]:
         """The requests waiting in *lane*, FIFO."""
         return tuple(self._lane_buffers[lane])
+
+    def queued_arrivals(self) -> list[MergeRequest]:
+        """Requests still on the external queue, not yet drained into a lane buffer.
+
+        Peeks CPython's ``asyncio.Queue`` item deque, read-only: the queue has no
+        public peek, and a side-list kept at every put/get site would be a
+        second copy to keep in step.
+        """
+        pending: collections.deque[MergeRequest | None] = vars(self._queue)['_queue']
+        return [req for req in pending if req is not None]
 
     def pending_redispatch(self) -> tuple[SpeculativeItem, ...]:
         """The parked redispatch items, in the order they will be dispatched."""
@@ -576,6 +599,7 @@ class MergeIntake:
         """
         if self._admission_halted():
             return None
+        self._rebucket_relaned_requests()
         graph = self._suffix_tracker.graph
         for lane in self._lanes:  # high → normal
             if self._halt.is_lane_halted(lane):
@@ -615,7 +639,72 @@ class MergeIntake:
             return popped
         return None
 
+    def _rebucket_relaned_requests(self) -> None:
+        """Move each buffered request whose ``lane`` was changed by
+        :meth:`relane_waiting` into that lane's buffer, at its aging position
+        (task 5246).
+
+        Runs on the merger task, the buffers' owner, so it never lands inside
+        an await that holds a view of them (the coalescing pass does).  The
+        aging position, not the tail, because a moved request has no arrival
+        slot in its new lane: placing it by first submission (the key
+        :meth:`pop_next_pickable` orders conflicting requests by) means a
+        promoted old fix is not queued behind younger high-lane work.
+        """
+        for lane in self._lanes:
+            buf = self._lane_buffers[lane]
+            strays = [req for req in buf if normalize_lane(req.lane) != lane]
+            if not strays:
+                continue
+            self._assert_merger_owns('_lane_buffers')
+            for req in strays:
+                buf.remove(req)
+                target = self._lane_buffers[normalize_lane(req.lane)]
+                key = _aging_key(req)
+                idx = next(
+                    (i for i, queued in enumerate(target) if _aging_key(queued) > key),
+                    len(target),
+                )
+                target.insert(idx, req)
+
     # ── lane-buffer requests from the other concerns ───────────────────────
+
+    def relane_waiting(
+        self, lane: Literal['normal', 'high'], request_id: str | None, task_id: str | None,
+    ) -> tuple[MergeRequest, Literal['normal', 'high']] | None:
+        """Set *lane* on the undecided request still waiting for the merger that
+        :func:`answers_to` (*request_id*, *task_id*); return it with its former lane.
+
+        Searches the lane buffers, then the not-yet-drained arrivals.  Only
+        ``req.lane`` changes here, plus a solo request's journal record so a
+        restart keeps it (a train is never journaled).  The move between
+        buffers is the merger's own, at the top of :meth:`pop_next_pickable`.
+        Returns None when nothing waiting answers to that id.  No await: lookup
+        and write are one atomic step on the loop.
+        """
+        waiting = [
+            *(req for ln in self._lanes for req in self._lane_buffers[ln]),
+            *self.queued_arrivals(),
+        ]
+        target = next(
+            (req for req in waiting
+             if not req.result.done() and answers_to(req, request_id, task_id)),
+            None,
+        )
+        if target is None:
+            return None
+        from_lane = target.lane
+        target.lane = lane
+        if self._merge_store is not None and target.request_id in self._journaled_request_ids:
+            try:
+                self._merge_store.record(target)
+            except Exception:
+                logger.warning(
+                    'merge_queue: relane: store.record failed for %s',
+                    target.request_id, exc_info=True,
+                )
+        return target, from_lane
+
 
     def take_buffered(self, task_id: str) -> tuple[str, int, MergeRequest] | None:
         """Remove and return the first lane-buffered request for *task_id*.

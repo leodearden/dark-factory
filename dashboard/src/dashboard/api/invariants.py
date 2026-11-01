@@ -73,6 +73,10 @@ async def api_invariants(request: Request) -> JSONResponse:
             for root, db_path, conn in zip(roots, db_paths, conns, strict=True)
         )
     )
+    labels = config.project_labels
     return JSONResponse(
-        {'INVARIANTS': [record.to_wire() for record in records], 'served_at': now.isoformat()}
+        {
+            'INVARIANTS': [record.to_wire(labels) for record in records],
+            'served_at': now.isoformat(),
+        }
     )

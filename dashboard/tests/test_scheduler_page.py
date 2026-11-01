@@ -391,7 +391,7 @@ async def test_collect_scheduler_state_happy_path(dummy_client, dummy_config):
 
     from dashboard.data.scheduler import collect_scheduler_state
 
-    project = dummy_config.project_root.name  # _project_label result
+    project = dummy_config.project_root.name  # a lone root's label is its basename
 
     snapshot = _scheduler_snapshot(
         skip_counts={'1': 2},
@@ -3540,8 +3540,8 @@ async def test_two_same_basename_roots_each_keep_their_own_snapshot(
 
     A label-keyed join would emit one root's pin entry under the other's
     ``project_root``, and the React drawer's override POSTs would then target
-    the wrong project.  No task rows are returned: the row filter is still
-    label-keyed, and this test is about the per-root SNAPSHOT join only.
+    the wrong project.  No task rows are returned: this test is about the
+    per-root SNAPSHOT join only.
     """
     from unittest.mock import AsyncMock, patch
 

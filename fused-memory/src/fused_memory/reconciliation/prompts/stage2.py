@@ -50,6 +50,7 @@ from fused_memory.reconciliation.recon_self_model import (
 from fused_memory.reconciliation.stale_gate_citation_guard import (
     render_gate_citation_section,
 )
+from fused_memory.reconciliation.task_filter import ACTIVE_TASK_TREE_HEADER
 
 STAGE2_SYSTEM_PROMPT = f"""\
 You are a Task-Knowledge Sync agent operating in sleep mode. Your role is to reconcile \
@@ -99,6 +100,7 @@ Interpreting the status:
 - `status="combined"` — candidate was merged into an existing task; a `task_id` is still \
 returned. Treat as success, not failure.
 - `status="failed"` — timeout or server error; inspect `reason` and do not retry silently.
+- `status="awaiting_curation"` — NON-terminal: the curator could not judge the submission yet (`reason` says why), so the ticket is durably parked and retried automatically until it gets a verdict. NO `task_id` is returned yet. Do not re-submit it, do not count it, and do not flag it as a discrepancy.
 - `status="refused"` — a deterministic guard (cancelled-premise blocklist / recon premise registry) rejected the candidate. NO task was created and NO `task_id` is returned. This is an intended, terminal outcome — not an error and not a discrepancy. Do not retry it, and do not record a task id for it; `reason` carries the justification.
 
 {render_finding_provenance_section(can_file_tasks=True)}
@@ -454,11 +456,12 @@ After `mcp__fused-memory__resolve_ticket` returns `status="created"` or \
 `status="combined"` with a `task_id`, treat as authoritative success — increment \
 `tasks_created` for `created` and `tasks_combined` for `combined` (never \
 `tasks_created`: a combined candidate mints no new task id). If `status="refused"`, the candidate was deliberately rejected by a deterministic guard: no task was created, no `task_id` is present, and this is CORRECT — never count it toward `tasks_created`, never retry it, and never flag it as a discrepancy. \
+If `status="awaiting_curation"`, the ticket is parked, not lost: no `task_id` is present yet, and this is CORRECT — never count it toward `tasks_created`, never re-submit it, and never flag it as a discrepancy. \
 Otherwise, if `task_id` is missing from the `resolve_ticket` response, \
 skip the `tasks_created` increment and flag the discrepancy in your structured report. \
 `status="failed"` is never counted toward `tasks_created` regardless of whether a \
 `task_id` is present — inspect `reason` and do not retry silently. \
-If the status is anything other than `created`/`combined`/`failed`/`refused` but a `task_id` \
+If the status is anything other than `created`/`combined`/`failed`/`refused`/`awaiting_curation` but a `task_id` \
 is present, call \
 `mcp__fused-memory__get_task` with that id to verify — only count if it returns a \
 valid record, otherwise flag the discrepancy.
@@ -860,14 +863,18 @@ lifecycle; the rules below say how to confirm it.
    whose carrier is still non-terminal.
 
 **Only act on stranded / complete-but-unmerged findings when NO live signal is present** \
-— i.e., the task has no live row in `### Live-Workflow Signals`, or `get_task` shows \
-no live claimant for it (the tie-breaker above), and its work has not landed. \
+— i.e., the `{ACTIVE_TASK_TREE_HEADER}` lists the task and it has no live \
+row in `### Live-Workflow Signals`, or `get_task` shows no live claimant for it (the \
+tie-breaker above), and its work has not landed. \
 That is the genuinely stranded case (e.g. esc-3803: orchestrator crashed, worktree \
 abandoned) that legitimately needs operator attention.
 
-If `### Live-Workflow Signals` is absent from the payload, no task is live this cycle — \
-neither through a per-task signal nor through the project-wide lock — and none has \
-landing evidence; no live-workflow suppression applies.
+If `### Live-Workflow Signals` is absent from the payload, no task the \
+`{ACTIVE_TASK_TREE_HEADER}` lists is live this cycle — neither through a per-task signal \
+nor through the project-wide lock — and none of them has landing evidence; no \
+live-workflow suppression applies to them. The section says nothing about a task that \
+tree does not list; for such a task, follow the rule above on which tasks the section \
+probes.
 """
 
 

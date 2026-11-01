@@ -6,7 +6,8 @@ implementer marks steps done via ``mark_step_done`` and records where a
 step's text proved wrong via ``record_step_deviation``.  On revalidation
 (blast-radius requeue), the architect uses ``update_plan_metadata``,
 ``remove_plan_step``, ``replace_plan_step``, and ``confirm_plan`` to
-update an existing plan without recreating it from scratch.  All writes
+update an existing plan without recreating it from scratch, and
+``record_descoped_step`` when it genuinely drops a done step.  All writes
 go through ``TaskArtifacts`` methods, preserving ``_session_id`` and
 enforcing correct schema.
 
@@ -80,6 +81,7 @@ from __future__ import annotations
 import argparse
 import ast
 import copy
+import functools
 import inspect
 import json
 import logging
@@ -90,7 +92,7 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, NamedTuple
+from typing import Any, Concatenate, NamedTuple, ParamSpec, TypeVar
 
 from fastmcp import FastMCP
 from shared.mcp_markup_middleware import (
@@ -98,9 +100,11 @@ from shared.mcp_markup_middleware import (
     RepairPolicy,
     accepts_markup_override,
 )
+from shared.mcp_missing_arguments import MissingArgumentMiddleware
 from shared.plan_deviation import DeviationRecord, UnknownDeviationKind
 from shared.toolcall_markup import detect_for, repair
 
+from orchestrator import plan_descope
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import markup_journal, markup_sink, plan_markup_stamp
 
@@ -983,6 +987,25 @@ def _read_plan_repaired(artifacts: TaskArtifacts) -> tuple[dict, list[dict[str, 
     return repaired, reportable
 
 
+_P = ParamSpec('_P')
+_R = TypeVar('_R')
+
+
+def _plan_mutation(
+    fn: Callable[Concatenate[TaskArtifacts, _P], _R],
+) -> Callable[Concatenate[TaskArtifacts, _P], _R]:
+    """The whole mutator, including the repair write-back in ``_read_plan_repaired``
+    and any nested TaskArtifacts write, is ONE critical section against every
+    other plan.json writer."""
+
+    @functools.wraps(fn)
+    def mutation(artifacts: TaskArtifacts, /, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        with artifacts.plan_mutex():
+            return fn(artifacts, *args, **kwargs)
+
+    return mutation
+
+
 def _with_markup_repairs(
     response: dict[str, Any], facts: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -1028,6 +1051,7 @@ def _step_type_refusal(step_type: str) -> dict[str, Any] | None:
     }
 
 
+@_plan_mutation
 def _create_plan(
     artifacts: TaskArtifacts,
     task_id: str,
@@ -1059,8 +1083,9 @@ def _create_plan(
     #
     # THE BOOKKEEPING READ BELOW IS NOT A BREACH OF THAT INSTRUCTION. It goes
     # through a plain `artifacts.read_plan()` for the same reason, and it
-    # touches exactly ONE machine-written key — the guard's own
-    # `_markup_rejections` block — and no prose field at all. Do not "simplify"
+    # touches only the guard's own `_markup_rejections` block and the C4
+    # descope record (`plan_descope.DESCOPE_PLAN_KEYS`), whose prose already
+    # passed the inbound guard on `record_descoped_step`. Do not "simplify"
     # it onto `_read_plan_repaired`.
     files = _coerce_files(files)
     plan = {
@@ -1111,6 +1136,10 @@ def _create_plan(
         if carried is not None:
             plan[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY] = carried
         plan_markup_stamp.drain_pending(plan)
+        # The descope record is the one trace of a done step a revalidation
+        # dropped; a wholesale overwrite must not erase it.
+        if isinstance(existing, dict):
+            plan.update(plan_descope.descope_record_of(existing))
     except Exception:
         # BOOKKEEPING CAN NEVER FAIL A create_plan. The counter is a legibility
         # aid; the plan is the work. Losing the count is a cost an operator
@@ -1119,10 +1148,11 @@ def _create_plan(
             'markup stamp: could not carry the rejection counter into the new '
             'plan for %s; the plan itself is unaffected', task_id,
         )
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return {'status': 'ok', 'task_id': task_id}
 
 
+@_plan_mutation
 def _add_plan_step(
     artifacts: TaskArtifacts,
     step_id: str,
@@ -1157,13 +1187,14 @@ def _add_plan_step(
         'status': 'pending',
         'commit': None,
     })
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'step_id': step_id, 'total_steps': len(plan['steps'])},
         markup_facts,
     )
 
 
+@_plan_mutation
 def _add_prerequisite(
     artifacts: TaskArtifacts,
     prereq_id: str,
@@ -1192,10 +1223,11 @@ def _add_prerequisite(
         'commit': None,
         'tests': [],
     })
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _with_markup_repairs({'status': 'ok', 'prereq_id': prereq_id}, markup_facts)
 
 
+@_plan_mutation
 def _add_design_decision(
     artifacts: TaskArtifacts,
     decision: str,
@@ -1209,13 +1241,14 @@ def _add_design_decision(
         'decision': decision,
         'rationale': rationale,
     })
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'total_decisions': len(plan['design_decisions'])},
         markup_facts,
     )
 
 
+@_plan_mutation
 def _add_reuse_item(
     artifacts: TaskArtifacts,
     what: str,
@@ -1231,12 +1264,13 @@ def _add_reuse_item(
         'where': where,
         'how': how,
     })
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'total_reuse': len(plan['reuse'])}, markup_facts
     )
 
 
+@_plan_mutation
 def _drop_plan_file(
     artifacts: TaskArtifacts,
     path: str,
@@ -1323,7 +1357,7 @@ def _drop_plan_file(
         'path': path,
         'reason': reason,
     })
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _with_markup_repairs(
         {
             'status': 'ok',
@@ -1341,6 +1375,7 @@ def _drop_plan_file(
 _REPAIRABLE_PLAN_FIELDS = _build_repairable_plan_fields()
 
 
+@_plan_mutation
 def _mark_step_done(
     artifacts: TaskArtifacts,
     step_id: str,
@@ -1420,6 +1455,7 @@ def _session_identity_in_hand(artifacts: TaskArtifacts, plan: dict) -> str | Non
     return None
 
 
+@_plan_mutation
 def _record_step_deviation(
     artifacts: TaskArtifacts,
     step_id: str,
@@ -1467,11 +1503,73 @@ def _record_step_deviation(
     )
 
 
+def _descope_refusal(exc: plan_descope.InvalidDescopeRecord) -> dict[str, Any]:
+    refusal: dict[str, Any] = {'status': 'error', 'message': str(exc), 'field': exc.field}
+    if exc.field == 'disposition':
+        refusal['allowed_dispositions'] = sorted(plan_descope.DESCOPE_DISPOSITIONS)
+    return refusal
+
+
+def _upsert_descoped_step(entries: object, entry: plan_descope.DescopedStep) -> list:
+    """*entries* without any record of *entry*'s ``plan_descope.same_done_record``, then *entry*."""
+    def same_pair(old: object) -> bool:
+        if not isinstance(old, dict):
+            return False
+        old_id, old_commit = old.get('step_id'), old.get('commit')
+        return (
+            isinstance(old_id, str)
+            and isinstance(old_commit, str)
+            and plan_descope.same_done_record((old_id, old_commit), entry.done_record)
+        )
+
+    kept = [old for old in entries if not same_pair(old)] if isinstance(entries, list) else []
+    return [*kept, entry.to_dict()]
+
+
+@_plan_mutation
+def _record_descoped_step(
+    artifacts: TaskArtifacts,
+    step_id: str,
+    commit: str,
+    disposition: str,
+    authority: str,
+    note: str,
+) -> dict[str, Any]:
+    plan, markup_facts = _read_plan_repaired(artifacts)
+    if not plan:
+        return {'status': 'error', 'message': 'No plan exists.'}
+
+    try:
+        entry = plan_descope.DescopedStep(
+            step_id=step_id,
+            commit=commit,
+            disposition=disposition,
+            authority=authority,
+            note=note,
+        )
+    except plan_descope.InvalidDescopeRecord as exc:
+        return _with_markup_repairs(_descope_refusal(exc), markup_facts)
+
+    entries = _upsert_descoped_step(plan.get(plan_descope.DESCOPED_STEPS_KEY), entry)
+    plan[plan_descope.DESCOPED_STEPS_KEY] = entries
+    plan[plan_descope.RESCOPED_AT_KEY] = datetime.now(UTC).isoformat()
+    plan[plan_descope.RESCOPED_BY_KEY] = (
+        _session_identity_in_hand(artifacts, plan) or plan_descope.RESCOPED_BY_UNKNOWN
+    )
+    plan[plan_descope.RESCOPED_NOTE_KEY] = note
+    artifacts.write_plan(plan, mutex_held=True)
+    return _with_markup_repairs(
+        {'status': 'ok', 'step_id': step_id, 'commit': commit, 'descoped_steps': len(entries)},
+        markup_facts,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Revalidation helpers
 # ---------------------------------------------------------------------------
 
 
+@_plan_mutation
 def _update_plan_metadata(
     artifacts: TaskArtifacts,
     files: list[str] | str | None = None,
@@ -1486,7 +1584,7 @@ def _update_plan_metadata(
         _forget_redeclared_drops(plan)
     if analysis is not None:
         plan['analysis'] = analysis
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _with_markup_repairs(
         {
             'status': 'ok',
@@ -1509,6 +1607,7 @@ def _forget_redeclared_drops(plan: dict) -> None:
     ]
 
 
+@_plan_mutation
 def _remove_plan_step(
     artifacts: TaskArtifacts,
     step_id: str,
@@ -1532,7 +1631,7 @@ def _remove_plan_step(
                         markup_facts,
                     )
                 items.pop(i)
-                artifacts.write_plan(plan)
+                artifacts.write_plan(plan, mutex_held=True)
                 return _with_markup_repairs(
                     {'status': 'ok', 'removed': step_id, 'collection': collection},
                     markup_facts,
@@ -1544,6 +1643,7 @@ def _remove_plan_step(
     )
 
 
+@_plan_mutation
 def _replace_plan_step(
     artifacts: TaskArtifacts,
     step_id: str,
@@ -1573,7 +1673,7 @@ def _replace_plan_step(
                     )
                 item['type'] = step_type
                 item['description'] = description
-                artifacts.write_plan(plan)
+                artifacts.write_plan(plan, mutex_held=True)
                 return _with_markup_repairs(
                     {'status': 'ok', 'replaced': step_id}, markup_facts
                 )
@@ -1584,6 +1684,7 @@ def _replace_plan_step(
     )
 
 
+@_plan_mutation
 def _confirm_plan(
     artifacts: TaskArtifacts,
 ) -> dict[str, Any]:
@@ -1665,7 +1766,7 @@ def _confirm_plan(
     # moment the plan was first frozen.
     plan['_finalized_at'] = now
     plan['_revalidated_at'] = now
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _respond({
         'status': 'ok',
         'finalized': True,
@@ -1898,7 +1999,9 @@ def _mark_step_committed(
 
     Guards on a real on-branch reachability check for *sha* (corroborate-before-
     acting) before delegating the status/commit/description-tag mutation to
-    :meth:`TaskArtifacts.mark_step_committed`. Returns the Contract A1 shapes:
+    :meth:`TaskArtifacts.mark_step_committed`. The probe reads no plan, so it
+    runs BEFORE ``plan_mutex()``: no plan writer waits on its git subprocess.
+    Returns the Contract A1 shapes:
     ``{'ok': True, 'step_id', 'status': 'done'}`` on success (``status`` is the
     step's NEW status), and ``{'ok': False, 'status': 'error', 'message': ...}``
     on a non-resolving sha or an unknown ``step_id``.
@@ -1927,8 +2030,10 @@ def _mark_step_committed(
     # ``artifacts.mark_step_committed`` reaches disk on its own. Repairing here
     # first means the write-back has already landed when the delegate re-reads,
     # so its mutation applies to the repaired document rather than racing it.
-    _, markup_facts = _read_plan_repaired(artifacts)
-    if not artifacts.mark_step_committed(step_id, sha):
+    with artifacts.plan_mutex():
+        _, markup_facts = _read_plan_repaired(artifacts)
+        committed = artifacts.mark_step_committed(step_id, sha)
+    if not committed:
         return _with_markup_repairs(
             {
                 'ok': False,
@@ -1958,9 +2063,6 @@ def _mark_step_committed(
 # the functions), so a test that substitutes either one still steers the sink
 # a `create_server` already built.
 
-#: Where the queue lives under project_root — see ``markup_sink``.
-_MARKUP_QUEUE_DIRNAME = markup_sink.MARKUP_QUEUE_DIRNAME
-
 #: Filed-by attribution. Names the GUARD, not the leaking agent.
 _MARKUP_AGENT_ROLE = 'plan-tools-markup-guard'
 
@@ -1981,7 +2083,7 @@ _ESCALATION_FALLBACK_CATEGORY = markup_sink.ESCALATION_FALLBACK_CATEGORY
 #: plan-tools' declaration of its own channel. Every field is stated here
 #: rather than defaulted in ``markup_sink``: adding a server must be a decision
 #: at every axis, not an inheritance of this server's answers.
-_MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
+MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
     server_label='plan-tools',
     agent_role=_MARKUP_AGENT_ROLE,
     residue_anchor_task_id=_MARKUP_RESIDUE_ANCHOR_TASK_ID,
@@ -2002,7 +2104,7 @@ _MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
     ),
 )
 
-_ESCALATION_FALLBACK_SUMMARY = _MARKUP_SINK_SPEC.fallback_summary
+_ESCALATION_FALLBACK_SUMMARY = MARKUP_SINK_SPEC.fallback_summary
 
 
 def _markup_project_root(worktree: Path) -> Path | None:
@@ -2054,7 +2156,7 @@ def _markup_escalation_sink(
     """
     return markup_sink.make_escalation_sink(
         worktree=artifacts.worktree,
-        spec=_MARKUP_SINK_SPEC,
+        spec=MARKUP_SINK_SPEC,
         subject_task_id=lambda: _markup_subject_task_id(artifacts),
         # Resolved through THIS module's globals per call, so a test that
         # substitutes either seam steers an already-built sink.
@@ -2083,7 +2185,7 @@ def _markup_fact_journal(
     """
     return markup_journal.make_fact_journal(
         worktree=artifacts.worktree,
-        server_label=_MARKUP_SINK_SPEC.server_label,
+        server_label=MARKUP_SINK_SPEC.server_label,
         subject_task_id=lambda: _markup_subject_task_id(artifacts),
         resolve_root=lambda worktree: _markup_project_root(worktree),
     )
@@ -2283,6 +2385,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             fact_sink=_markup_fact_sink(artifacts),
         )
     )
+    mcp.add_middleware(MissingArgumentMiddleware())
 
     @mcp.tool()
     @accepts_markup_override
@@ -2478,6 +2581,37 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             artifacts, step_id, kind, observed, expected, action_taken,
             prose_only, note,
         )
+
+    @mcp.tool()
+    @accepts_markup_override
+    def record_descoped_step(
+        step_id: str,
+        commit: str,
+        disposition: str,
+        authority: str,
+        note: str,
+    ) -> dict[str, Any]:
+        """Record a done step that this revalidation drops from the plan.
+
+        Use it when the revised plan genuinely no longer keeps a done step
+        with its commit (for example after ``create_plan`` replaced the
+        steps). A revalidation that drops a done step without this record is
+        refused. Recording the same ``(step_id, commit)`` again replaces the
+        earlier record.
+
+        Args:
+            step_id: The dropped step or prerequisite ID (e.g. "step-1").
+            commit: The commit the dropped step recorded.
+            disposition: One of ``orphan`` (the commit stays on the branch,
+                owned by no step), ``revert`` (the commit's change is to be
+                undone) or ``ride-along`` (the commit stays and ships as is).
+            authority: The escalation id or human ratification marker that
+                authorises the drop.
+            note: Why the step no longer belongs to the plan.
+        """
+        # Flat str parameters DELIBERATELY, as drop_plan_file: only flat
+        # strings get MarkupGuardMiddleware's inbound coverage.
+        return _record_descoped_step(artifacts, step_id, commit, disposition, authority, note)
 
     @mcp.tool()
     @accepts_markup_override

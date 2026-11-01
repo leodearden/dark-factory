@@ -1,4 +1,5 @@
-"""The ``submit_task`` argument blocks of the offline lane's fix tasks (PRD 5.5)."""
+"""The offline lane fix task's metadata (PRD 5.5): the builders write it, and
+``covering_lane_task`` recognises it on a task that is already filed."""
 
 from __future__ import annotations
 
@@ -10,7 +11,10 @@ from typing import Any
 MAX_TESTS_SHOWN = 10
 FAILURE_LINE_MAX_CHARS = 300
 HEAD_PREFIX_CHARS = 12
+SPAWN_CONTEXT_KEY = 'spawn_context'
 SPAWN_CONTEXT = 'offline_lane_red'
+LANE_METADATA_KEY = 'x_offline_lane'
+LEGACY_NODES_KEY = 'failing_tests'
 MERGE_LANE = 'normal'
 UNKNOWN = 'unknown'
 NO_FAILURE_LINE = '(no failure line)'
@@ -146,9 +150,9 @@ def _lane_metadata(
     prior_task_ids: Sequence[str],
 ) -> dict[str, Any]:
     return {
-        'spawn_context': SPAWN_CONTEXT,
+        SPAWN_CONTEXT_KEY: SPAWN_CONTEXT,
         'merge_lane': MERGE_LANE,
-        'x_offline_lane': {
+        LANE_METADATA_KEY: {
             'command': command,
             'leg': leg,
             'nodes': list(nodes),
@@ -279,3 +283,28 @@ def build_lane_command_task_arguments(
             prior_task_ids=prior_task_ids,
         ),
     }
+
+
+def _covered_nodes(metadata: Mapping[str, Any], command: str) -> Sequence[str]:
+    lane = metadata.get(LANE_METADATA_KEY)
+    if isinstance(lane, Mapping):
+        nodes = lane.get('nodes')
+        return nodes if lane.get('command') == command and isinstance(nodes, list) else ()
+    legacy = metadata.get(LEGACY_NODES_KEY)
+    return legacy if isinstance(legacy, list) else ()
+
+
+def covering_lane_task(
+    tasks: Mapping[str, Mapping[str, Any]], command: str, node: str,
+) -> str | None:
+    """The first of *tasks* (task id to task, in lookup order) whose lane metadata
+    covers *node* of *command*. A pre-cutover task names no command, so its
+    ``failing_tests`` cover a node of any command.
+    """
+    for task_id, task in tasks.items():
+        metadata = task.get('metadata')
+        if not isinstance(metadata, Mapping) or metadata.get(SPAWN_CONTEXT_KEY) != SPAWN_CONTEXT:
+            continue
+        if node in _covered_nodes(metadata, command):
+            return task_id
+    return None

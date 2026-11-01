@@ -1,11 +1,15 @@
 """E2E + concurrency stress tests — MemoryService wired to a real DurableWriteQueue.
 
 Only Graphiti/Mem0 backends are mocked; the queue uses real SQLite via tmp_path.
+integrated_service's queue commits skip fsync (synchronous=OFF), so its drains
+are not bounded by host-disk latency; see
+test_integrated_service_queue_commits_do_not_wait_on_the_disk.
 """
 
 from __future__ import annotations
 
 import asyncio
+import collections
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -48,10 +52,36 @@ async def integrated_service(mock_config):
 
     # Real initialize — creates DurableWriteQueue with real SQLite
     await svc.initialize()
+    queue = svc.durable_queue
+    assert queue is not None, 'MemoryService.initialize() built no DurableWriteQueue'
+    # Rationale: test_integrated_service_queue_commits_do_not_wait_on_the_disk
+    async with queue._require_access().write() as db:
+        await db.execute('PRAGMA synchronous=OFF')
 
     yield svc
 
     await svc.close()
+
+
+@pytest.mark.asyncio
+async def test_integrated_service_queue_commits_do_not_wait_on_the_disk(
+    integrated_service,
+):
+    """integrated_service's queue runs with PRAGMA synchronous=OFF.
+
+    Tests on this fixture bound their drains by wall clock. Under
+    synchronous=FULL every queue commit is an fsync, whose latency is set by
+    whatever else is writing to the host disk, not by the code under test.
+    No test on this fixture kills the process, so none needs power-loss
+    durability.
+    """
+    rows = await integrated_service.durable_queue._require_access().read_all(
+        'PRAGMA synchronous'
+    )
+    assert rows[0][0] == 0, (
+        f'integrated_service queue reports PRAGMA synchronous={rows[0][0]}, '
+        'expected 0 (OFF): its drains would wait on host-disk fsync latency'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -488,8 +518,9 @@ class TestConcurrencyStress:
         svc = integrated_service
         svc.graphiti.add_episode = AsyncMock(return_value={'ok': True})
 
+        projects = ['alpha', 'beta', 'gamma']
         tasks = []
-        for project in ['alpha', 'beta', 'gamma']:
+        for project in projects:
             for i in range(20):
                 tasks.append(
                     svc.add_memory(
@@ -514,6 +545,13 @@ class TestConcurrencyStress:
         )
         assert stats['counts'].get('completed', 0) == 60
         assert svc.graphiti.add_episode.call_count == 60
+
+        for project in projects:
+            project_stats = await svc.durable_queue.get_stats(group_id=project)
+            assert project_stats['counts'] == {'completed': 20}, project
+        assert collections.Counter(
+            c.kwargs['group_id'] for c in svc.graphiti.add_episode.call_args_list
+        ) == {p: 20 for p in projects}
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(30)

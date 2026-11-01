@@ -110,10 +110,12 @@ BASELINE_PATH = 'scripts/inline_suppression_baseline.json'
 RATIFIED_SUPPRESSION_CLASSES: Mapping[SuppressionClass, Policy] = MappingProxyType({})
 """Blanket rulings, keyed by class — SHIPPED EMPTY, and the OPERATOR's (PRD D9).
 
-Rows are ruled by task 5603 and applied by task 5609.  An implementer adding a
-row here would be ratifying a blanket exception on the operator's behalf, which
-is the one thing D9 reserves.  :func:`main` hands it to :func:`classify`, and
-nothing reads it as a global.
+The operator ruled it empty on day one
+(``docs/legibility/inv12-day-one-rulings.md``, Part 3 Q1), so each new
+suppression carries its own inline disposition.  A row stays the operator's
+alone to add: an implementer adding one here would be ratifying a blanket
+exception on the operator's behalf, which is the one thing D9 reserves.
+:func:`main` hands it to :func:`classify`, and nothing reads it as a global.
 """
 
 

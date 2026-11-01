@@ -1,0 +1,12 @@
+{
+  "task_id": "6862",
+  "reason": "new lane-importing test file test_offline_lane_policy_reload.py enters the ratchet with one private read, OfflineLaneWorker._run_once; test_offline_lane.py already reads _run_once about 20 times among its 38 private reads, and the worker has no public single-pass entry point",
+  "measures": [
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6556,
+      "current": 6557
+    }
+  ]
+}

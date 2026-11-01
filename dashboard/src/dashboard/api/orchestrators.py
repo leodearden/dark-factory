@@ -50,7 +50,7 @@ async def api_orchestrators(request: Request) -> JSONResponse:
         {
             **redux_api.shape_orchestrators(
                 orchestrators,
-                known_project_roots=config.all_project_roots,
+                labels=config.project_labels,
                 running_spark=running_spark,
             ),
             'served_at': served_at.isoformat(),

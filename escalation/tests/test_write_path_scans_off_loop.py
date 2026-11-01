@@ -28,7 +28,7 @@ import threading
 from typing import Any
 
 import pytest
-from _filing_tools import call_blocker, call_info
+from _filing_tools import call_blocker, call_info, call_promote
 from _pending_tool_fixtures import _file
 
 from escalation.models import Escalation
@@ -232,22 +232,6 @@ class TestLoopStaysLiveDuringDedupeScan:
 MINT_KEY = '5648'
 
 
-async def _promote(server, **kwargs):
-    """Invoke ``promote_to_l2`` on *server* and return its response dict.
-
-    Local to this module ON PURPOSE.  ``_filing_tools`` shares the call SHAPE
-    of the two async FILING tools and says explicitly that the KWARGS are not
-    shared because each suite's carry local meaning — which is true here twice
-    over: the mint suite needs a ``task_id`` that is a fresh id-namespace key,
-    and the promote-scan suite needs ``severity`` OMITTED so the member
-    derivation it is measuring actually runs.  Only one other module owns such
-    a helper (``test_server.py::_promote_to_l2``), so this is the second, which
-    is below the third-copy threshold that moved the filing dance out.
-    """
-    tool = await server.get_tool('promote_to_l2')
-    return await tool.fn(**kwargs)
-
-
 # The three minting tools under one signature, so the parametrized test below
 # dispatches over them without a per-tool branch.  Each carries its OWN kwargs
 # — they are not a shared constant, because only `promote_to_l2` has members to
@@ -275,7 +259,7 @@ async def _mint_via_info(server, member_id: str):
 
 
 async def _mint_via_promote(server, member_id: str):
-    return await _promote(
+    return await call_promote(
         server,
         task_id=MINT_KEY,
         agent_role='escalation-watcher-auto',
@@ -307,7 +291,7 @@ def _seed_for_recovery_branch(queue: EscalationQueue) -> str:
     def _esc(esc_id: str, task_id: str, summary: str) -> Escalation:
         return Escalation(
             id=esc_id, task_id=task_id, agent_role='implementer',
-            severity='info', category=DEDUPED_CATEGORY, summary=summary,
+            severity='blocking', category=DEDUPED_CATEGORY, summary=summary,
         )
 
     archived = _esc(f'esc-{MINT_KEY}-1', MINT_KEY, 'an older filing under this key')
@@ -405,13 +389,15 @@ PROMOTE_ROOT_CAUSE = 'falkordb connection pool exhausted'
 
 
 def _file_member_l1s(queue: EscalationQueue, *ids: str) -> list[str]:
-    """Submit one pending L1 per id at severity ``'info'`` and return the ids.
+    """Submit one pending L1 per id at severity ``'critical'`` and return the ids.
 
-    ``'info'`` rather than the default, because it is what makes the
+    ``'critical'`` rather than the default, because it is what makes the
     derivation OBSERVABLE: ``_derive_l2_severity`` returns max(member
     severities), and the create path fails safe UP to ``'blocking'`` when the
     members say nothing.  Only an inherited value that is NOT ``'blocking'``
-    distinguishes "the derivation ran" from "the derivation was skipped".
+    distinguishes "the derivation ran" from "the derivation was skipped" — and
+    it must not be ``'info'`` either, since a silent all-info promote is
+    refused rather than minted (task 5222).
 
     Ids are explicit so no ``.seq`` counter is written and the setup cannot
     perturb what the mint under test observes.
@@ -419,7 +405,7 @@ def _file_member_l1s(queue: EscalationQueue, *ids: str) -> list[str]:
     for esc_id in ids:
         queue.submit(Escalation(
             id=esc_id, task_id=MINT_KEY, agent_role='implementer',
-            severity='info', category='design_concern',
+            severity='critical', category='design_concern',
             summary=f'member {esc_id} saw a refused connection', level=1,
         ))
     return list(ids)
@@ -442,7 +428,7 @@ class TestPromoteScanThread:
         # Only what the TOOL does is measured; the seeding above ran here.
         queue.threads.clear()
 
-        result = await _promote(
+        result = await call_promote(
             server,
             task_id=MINT_KEY,
             agent_role='escalation-watcher-auto',
@@ -461,7 +447,7 @@ class TestPromoteScanThread:
         # max(member severities), not the fail-safe 'blocking' — which is what
         # proves _derive_l2_severity really ran on the worker rather than being
         # skipped into the CREATE path's fail-safe.
-        assert result['severity'] == 'info', result
+        assert result['severity'] == 'critical', result
 
 
 @pytest.mark.asyncio
@@ -482,7 +468,7 @@ class TestConcurrentPromotesStillMintOneL2:
         server = create_server(queue, startup_sweep=False)
 
         def _promote_one(member_ids, summary):
-            return _promote(
+            return call_promote(
                 server,
                 task_id=MINT_KEY,
                 agent_role='escalation-watcher-auto',

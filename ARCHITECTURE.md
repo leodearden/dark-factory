@@ -190,16 +190,23 @@ for the whole fleet. Entry: `fused-memory/src/fused_memory/server/main.py`
   load-sampler unit. Discovers orchestrator instances by reading each
   registered project's `dark-factory-orchestrator.yaml` (`escalation.port`);
   reads fused-memory and its own SQLite DBs read-only.
+- **Client feed publisher** — `client-feed@<name>.service`, one instance per
+  client project; setup-host renders the template and enables none. It reads
+  that project's `tasks.db` and `runs.db` read-only, its verify archive, its
+  git objects and its `in/` directory, and writes only its `out/`. Invariant
+  and contract: `plans/client-feed-prd.md` §8 and §7. Operating it:
+  [OPERATIONS.md](OPERATIONS.md) §"Client feed".
 - **`scripts/orchestrator-watchdog.py`** — a systemd-timer oneshot
   (`OnBootSec=30`, `OnUnitActiveSec=60`). Its liveness pass TCP-probes each
   orchestrator's escalation port and revives a wedged unit immediately; its
   separate staleness pass *intends* at most one fleet-wide redeploy per 8
   hours (shared clock file `data/orchestrator/last_redeploy_orchestrator.json`,
   plus an in-flight lease), delegating to
-  `scripts/restart-all-orchestrators.sh --drain`, a two-stage drain that
-  halts merge admission and holds each unit's restart while a merge verify is
-  in flight, until it ends or passes its own deadline (a sweep-wide cap bounds
-  the wait; units on pre-5371 code keep the old merge-idle gate). Full
+  `scripts/restart-all-orchestrators.sh --drain`, a two-stage drain that,
+  as the sweep reaches each unit, halts its merge admission and holds its
+  restart while one of its merge verifies is in flight, until it ends or
+  passes its own deadline (a per-unit cap and a sweep-wide ceiling bound the
+  wait; units on pre-5371 code keep the old merge-idle gate). Full
   redeploy story (liveness vs. staleness vs. coordinator) in
   [OPERATIONS.md](OPERATIONS.md).
 
@@ -342,7 +349,12 @@ Tasks reach the queue through `mcp__fused-memory__submit_task`
   (`{"ticket": "tkt_..."}`) and returns immediately; an async `TaskCurator`
   (`fused-memory/src/fused_memory/middleware/task_curator.py`) dedupes,
   combines, or creates the real task row in the SQLite backend
-  (`<project_root>/.taskmaster/tasks/tasks.db`).
+  (`<project_root>/.taskmaster/tasks/tasks.db`). When the curator cannot judge
+  a submission (the reasons are
+  `fused-memory/src/fused_memory/middleware/curation_deferral.py::DeferReason`),
+  the ticket parks as `awaiting_curation` and the ticket janitor retries it
+  until it gets a verdict; every create the curator did not judge is marked
+  `metadata.dedupe_skipped`.
 - **`planning_mode=True` path.** Used by `/prd` batch decomposition: writes
   the task directly in status `deferred`, bypassing the curator, so a whole
   batch of interdependent tasks can be authored and wired together (deps,
@@ -354,16 +366,16 @@ fire-and-forget follow-up tasks via `submit_task` as they work.
 
 ### 3.3 Scheduler tick
 
-`Scheduler.acquire_next()` runs a **21-phase pipeline** every tick
+`Scheduler.acquire_next()` runs a **22-phase pipeline** every tick
 (`orchestrator/src/orchestrator/scheduler.py`, `_TICK_PHASE_ORDER`):
 
 ```
-backfill_dep_status → backfill_terminal_dep_records → drain_park_eviction →
-park_gc → stale_sweep → cooldown_gc → redispatch_stranded_blocked →
-external_dep_policy → delivered_check_gate → stamp_milestone →
-override_snapshot_gc → reserve_now → override_diff → compute_priorities →
-build_candidates → landed_outbox_gate → starvation → empty_candidate_gate →
-psi_gate → select_pins → select_scored
+backfill_dep_status → backfill_terminal_dep_records → stale_sweep →
+cooldown_gc → redispatch_stranded_blocked → external_dep_policy →
+delivered_check_gate → drain_park_eviction → park_gc → stamp_milestone →
+override_snapshot_gc → compute_priorities → reserve_now → override_diff →
+build_candidates → landed_outbox_gate → already_landed_gate → starvation →
+empty_candidate_gate → psi_gate → select_pins → select_scored
 ```
 
 The first phase that short-circuits ends the tick early; otherwise
@@ -419,9 +431,11 @@ For a normal task, `TaskWorkflow._drive()`
    `integration test`, `design ... new`, `implement ... new feature`) and
    `metadata.force_full_path` isn't set, `_run_simple_task()` runs: **one**
    Sonnet agent (role `simple_task`) explores, plans, implements, and
-   commits in a single session. Success falls through to VERIFY; a terminal
-   outcome (done/blocked) ends the workflow there; anything else discards
-   the plan and runs the full architect path instead.
+   commits in a single session. Success falls through to VERIFY; any other
+   verdict ends the dispatch there — done, blocked, or a requeue when the
+   plan's file scope needs a module lock another task holds. Only a give-up
+   (no plan, no step marked done, agent failure) discards the plan and runs
+   the full architect path instead.
 3. **PLAN.** `architect` explores the codebase, verifies its premises, and
    builds a step-by-step TDD plan (alternating test-step, implementation-
    step) via plan-tools (`create_plan`/`add_plan_step`/`confirm_plan`).
@@ -444,7 +458,12 @@ For a normal task, `TaskWorkflow._drive()`
    `max_amendment_rounds`). Independently, every `review.interval` merges
    (default 40), a `ReviewCheckpoint` runs `deep_reviewer` across recently-
    merged modules for cross-task integration issues, filing its own
-   tasks/escalations if it finds any.
+   tasks/escalations if it finds any. Before its Phase 1 verification the
+   checkpoint runs any project-declared `review.pre_test_commands` (e.g.
+   rebuilding the frontend bundles e2e tests serve) in the main checkout,
+   fail-soft: a failed or timed-out command is reported to the reviewer and
+   in the saved report, never aborting the review
+   (`orchestrator/src/orchestrator/review_pre_test.py`).
 7. **MERGE.** `_submit_to_merge_queue()` hands the branch to the merge lane
    (§5).
 8. **DONE.** `_finalise_merged_done()` refreshes `metadata.files` from the
@@ -820,7 +839,11 @@ path, snapshotting `main` at run start and coalescing advances — it never
 gates a merge, and defaults to disabled (`git.offline_lane_enabled: false`). Each pass writes a record; each failing
 test is a per-test episode that is filed as one fix task once reproduced on
 `git.offline_lane_persist_passes` spaced passes, with one bounded level-1
-escalation if the fix stays unlanded. A command that declares an outage probe
+escalation if the fix stays unlanded. Every non-outage red pass is recorded in
+the flake ledger at call site `offline_lane`, and a cleared test, or a held red
+that failed and passed at one head with no fix task filed, owes flake debt
+whose de-flake task the ledger's drain files (`plans/offline-lane-red-path-prd.md`
+D6). A command that declares an outage probe
 (`outage_probe`) runs it after a red detection, and a probe that exits 75
 naming a dependency makes the pass an outage, which is escalated, not filed.
 The lane re-runs the probe alone until it passes, then closes its own
@@ -829,7 +852,20 @@ runbook in `OPERATIONS.md`).
 Operators can inspect and pause the merge lane directly: `get_merge_queue()`
 gives a live snapshot (lane states, conflict graph, frozen prefix, metrics)
 that the event store alone can't reconstruct; `halt_merge_queue`/
-`unhalt_merge_queue`/`get_merge_halt_status` are operator-only controls.
+`unhalt_merge_queue`/`get_merge_halt_status` are operator-only controls, as is
+`merge_relane`, which moves a request still waiting for the merger (or a
+coalesced member's whole train) between the normal and high lanes.
+
+A remote verify host never runs whatever code its checkout happens to hold.
+Each dispatcher pushes its own deployed commit to the host as `refs/gate/<sha>`
+and verifies in an immutable per-sha gate checkout built from it
+(`orchestrator/src/orchestrator/remote_gate.py`, `remote_gate/ensure-gate.sh`),
+reached through the host's `orchestrator` shim via `ORCH_GATE_BIN`. Before any
+verify is spent a `gate-identity` handshake compares the gate's commit and
+verify-wire fingerprint with the dispatcher's. A host that fails it, or whose
+verify yields no usable verdict, is benched in the `skew` class (distinct from
+an unreachable `ru` bench) and re-admitted by a passing `ensure-gate`; see
+`OPERATIONS.md` §"Reading a verify-host bench".
 
 ---
 
@@ -1027,13 +1063,18 @@ a defense is active when it isn't:
   effect of the verify test leg's `cd <module> && uv run pytest`
   (`orchestrator/src/orchestrator/verify.py::_preprovision_shared_venv`).
   Either way, there's no `.venv` at all before that first cold verify.
-  The real edge: an agent's Bash subprocess inherits a copy of the
-  orchestrator's environment, including main's `VIRTUAL_ENV`
-  (`orchestrator/src/orchestrator/agents/invoke.py`), so a first-party
+  The real edge: an interactive session's shell keeps its launching
+  shell's environment, often main's `VIRTUAL_ENV`, so a first-party
   `import` there can resolve main's editable source instead of the
-  worktree's edits. Verify is unaffected —
-  `orchestrator/src/orchestrator/verify.py::_target_subprocess_env` strips
-  `VIRTUAL_ENV` so the target always resolves its own `.venv`. See
+  worktree's edits. A dispatched agent's shell carries no Python-env
+  selection (`shared/src/shared/python_env.py::without_python_env_selection`,
+  which Claude spawns reach via
+  `shared/src/shared/secret_env.py::agent_subprocess_env`; task 7399), so it
+  meets this only by naming main's `.venv/bin/python` in a
+  worktree with no `.venv` yet; its bare `python` is the system
+  interpreter. Verify is unaffected —
+  `orchestrator/src/orchestrator/verify.py::_target_subprocess_env` applies
+  the same scrub so the target always resolves its own `.venv`. See
   `### Locating installed code` in `CLAUDE.md` for the one-line
   provenance check.
 - **Verify commands default to repo-wide scope in places**, not always

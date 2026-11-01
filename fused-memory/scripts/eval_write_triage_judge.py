@@ -46,7 +46,6 @@ Usage
 from __future__ import annotations
 
 import contextlib
-import importlib.util
 import json
 import logging
 import sys
@@ -56,6 +55,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fused_memory.server.write_triage import OUTCOME_STORED
+from fused_memory.utils.script_loader import load_script
 
 logger = logging.getLogger(__name__)
 
@@ -72,24 +72,6 @@ _DEFAULT_REPORT_PATH = str(
 )
 
 
-def _load_script(path: Path, mod_name: str) -> types.ModuleType:
-    """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
 def _load_calibrate() -> types.ModuleType:
     """Load leaf alpha's script as a module.
 
@@ -101,7 +83,7 @@ def _load_calibrate() -> types.ModuleType:
     a fifth label fails loudly at
     ``eval_write_triage_cases.py::build_judge_cases``.
     """
-    return _load_script(_CALIBRATE_PATH, 'calibrate_write_triage')
+    return load_script(_CALIBRATE_PATH, 'calibrate_write_triage')
 
 
 _calibrate = _load_calibrate()
@@ -115,13 +97,13 @@ if TYPE_CHECKING:
     import eval_write_triage_live_judge as _live_judge
     import eval_write_triage_scoring as _scoring
 else:
-    _scoring = _load_script(
+    _scoring = load_script(
         _PACKAGE_ROOT / 'scripts' / 'eval_write_triage_scoring.py', 'eval_write_triage_scoring',
     )
-    _cases = _load_script(
+    _cases = load_script(
         _PACKAGE_ROOT / 'scripts' / 'eval_write_triage_cases.py', 'eval_write_triage_cases',
     )
-    _live_judge = _load_script(
+    _live_judge = load_script(
         _PACKAGE_ROOT / 'scripts' / 'eval_write_triage_live_judge.py',
         'eval_write_triage_live_judge',
     )
@@ -139,7 +121,7 @@ def load_retrieval() -> types.ModuleType:
     Deliberately NOT loaded at import: it pulls in the server's retrieval
     stack, and the whole pure core below is testable without it.
     """
-    return _load_script(_RETRIEVAL_PATH, 'eval_write_triage_retrieval')
+    return load_script(_RETRIEVAL_PATH, 'eval_write_triage_retrieval')
 
 
 _WORDING_PATH = _PACKAGE_ROOT / 'scripts' / 'write_triage_judge_wording.py'
@@ -151,7 +133,7 @@ def load_wording() -> types.ModuleType:
     Loaded at import, unlike the retrieval edge: it pulls in only the judge
     module, and the guard's default wording is one of its names.
     """
-    return _load_script(_WORDING_PATH, 'write_triage_judge_wording')
+    return load_script(_WORDING_PATH, 'write_triage_judge_wording')
 
 
 _wording = load_wording()

@@ -168,6 +168,8 @@ When the scheduler acquires a lock for a task touching `crates/reify-core/src/fo
 3. the resolved module's `max_per_module`
 4. the top-level config's `max_per_module`
 
+The same limit governs fairness and pin parks. A park counts as a hold by its owner on the parked module, so a request conflicting with it is refused once the requested module is at its limit counting that park; the park also keeps its owner one slot on the parked module itself. So a limit-1 module's park admits no new holder, while a limit-N module still admits N-1 other holders past it (`orchestrator/src/orchestrator/scheduler.py::ModuleLockTable._iter_blocking_park_owners`).
+
 Two depth traps follow from the path being normalized *before* either lookup runs:
 
 - A `module_overrides` key with *more* than `lock_depth` components (e.g. a hypothetical `crates/reify-core/tests` entry under the default `lock_depth=2`) can never match: the lookup key is always truncated to `lock_depth` components first, so a task touching `crates/reify-core/tests/foo.rs` normalizes to `crates/reify-core` and never probes the longer key. This is silent — nothing warns you, so an override pasted in with the wrong number of path components just does nothing (see `analyze_modules.py`'s `# a clipped lock key is not a key` comment).

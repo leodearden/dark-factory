@@ -193,6 +193,7 @@ def test_each_control_is_the_metered_incumbent_embedder(arm_id, scratch):
     assert expected.preregistration_sha is None
 
 
+@pytest.mark.reads_git_history
 def test_the_candidates_preregistration_sha_carries_the_doc_and_precedes_head():
     assert {_run(arm_id).spec.preregistration_sha for arm_id in CANDIDATES} == {
         PREREGISTRATION_SHA

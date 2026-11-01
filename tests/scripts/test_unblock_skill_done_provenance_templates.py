@@ -69,18 +69,9 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 # reason outside its scope.
 _GUARDED_DOCS: tuple[str, ...] = ("skills/unblock/SKILL.md",)
 
-# Keys the write chokepoint documents as accepted but the model does not
-# DECLARE — they ride on `extra='allow'`. See the schema block in
-# `fused-memory/src/fused_memory/middleware/task_interceptor.py`'s
-# `_validate_done_provenance`: `transient_unit` (str) and `fire_delay_secs`
-# (int) are read off the raw payload for kind='deterministic-deploy-scheduled'.
-# Unioned into the recognised vocabulary below so a payload carrying them is
-# EXTRACTED and checked rather than silently dropped by the key-subset filter.
-_CHOKEPOINT_EXTRA_KEYS = frozenset({"transient_unit", "fire_delay_secs"})
-
 # The recognised key vocabulary, DERIVED from the live model rather than
 # hand-listed, so a field added to DoneProvenance is picked up here for free.
-_PROVENANCE_FIELDS = frozenset(DoneProvenance.model_fields) | _CHOKEPOINT_EXTRA_KEYS
+_PROVENANCE_FIELDS = frozenset(DoneProvenance.model_fields)
 
 # Bounded lookahead for the balanced-brace walk: an unbalanced `{` in prose
 # must abandon that start, never run away over the rest of the file.
@@ -429,17 +420,16 @@ def test_extractor_ignores_non_objects_and_unparseable_braces() -> None:
     assert found == []
 
 
-def test_extractor_keeps_chokepoint_extra_keys_that_the_model_does_not_declare() -> None:
-    """`transient_unit`/`fire_delay_secs` ride on `extra='allow'`.
+def test_extractor_keeps_scheduled_deploy_evidence_keys_the_model_declares() -> None:
+    """`transient_unit`/`fire_delay_secs` are declared `DoneProvenance` fields.
 
-    They are documented as accepted by `_validate_done_provenance` but are not
-    declared fields, so a key-subset filter built from `model_fields` ALONE
-    would silently drop this payload — an unanchored one would then be checked
-    by nothing at all.
+    The key-subset filter is built from `model_fields` alone, so this payload
+    is extracted only while the model declares both keys; if either stopped
+    being a field, an unanchored payload carrying it would be checked by
+    nothing at all.
     """
-    assert not _CHOKEPOINT_EXTRA_KEYS & frozenset(DoneProvenance.model_fields), (
-        "these keys became real model fields — drop them from "
-        "_CHOKEPOINT_EXTRA_KEYS rather than carrying a stale union."
+    assert {"transient_unit", "fire_delay_secs"} <= frozenset(
+        DoneProvenance.model_fields
     )
     found = _fixture(
         'Stamp `{"kind": "deterministic-deploy-scheduled", "unit": "orch.service", '

@@ -6,6 +6,7 @@ requires-python = ">=3.11,<4"
 
 [tool.uv.workspace]
 members = [
+    "client-feed",
     "cockpit",
     "dashboard",
     "escalation",
@@ -31,6 +32,7 @@ extraPaths = [
     "scripts",
     "scripts/legibility",
     "scripts/local-model-serving",
+    "client-feed/src",
     "cockpit/src",
     "dashboard/src",
     "escalation/src",

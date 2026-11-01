@@ -26,6 +26,16 @@ import pytest
 from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler, fixed_prompt
 
 from orchestrator.agents.invoke import AgentResult
+from orchestrator.agents.review_briefing import ReviewBriefing
+from orchestrator.agents.roles import (
+    MERGER,
+    REVIEWER_COMPREHENSIVE,
+    ROLES,
+    SIMPLE_TASK,
+    AgentRole,
+    reviewers_for,
+)
+from orchestrator.agents.write_set import compute_write_set
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
@@ -36,8 +46,6 @@ class TestAgentRoleCapabilityFields:
     """AgentRole gains mcp_families/sandboxed fields with safe defaults."""
 
     def test_defaults_are_empty_family_set_and_unsandboxed(self):
-        from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
-
         role = AgentRole(name='probe', system_prompt='x')
 
         assert role.mcp_families == frozenset()
@@ -53,8 +61,6 @@ class TestImportTimeCapabilityAssertion:
     """
 
     def test_plan_tools_tool_without_plan_tools_family_raises(self):
-        from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
-
         with pytest.raises(ValueError, match='plan_tools'):
             AgentRole(
                 name='probe',
@@ -63,8 +69,6 @@ class TestImportTimeCapabilityAssertion:
             )
 
     def test_fused_memory_tool_without_orchestrator_family_raises(self):
-        from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
-
         with pytest.raises(ValueError, match='orchestrator'):
             AgentRole(
                 name='probe',
@@ -73,8 +77,6 @@ class TestImportTimeCapabilityAssertion:
             )
 
     def test_escalation_tool_without_orchestrator_family_raises(self):
-        from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
-
         with pytest.raises(ValueError, match='orchestrator'):
             AgentRole(
                 name='probe',
@@ -83,8 +85,6 @@ class TestImportTimeCapabilityAssertion:
             )
 
     def test_plan_tools_tool_with_matching_family_succeeds(self):
-        from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
-
         role = AgentRole(
             name='probe',
             system_prompt='x',
@@ -95,8 +95,6 @@ class TestImportTimeCapabilityAssertion:
         assert role.mcp_families == frozenset({'plan_tools'})
 
     def test_orchestrator_tools_with_matching_family_succeed(self):
-        from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
-
         role = AgentRole(
             name='probe',
             system_prompt='x',
@@ -111,7 +109,6 @@ class TestImportTimeCapabilityAssertion:
     def test_declaring_family_with_no_matching_tool_is_allowed(self):
         """judge shape: mcp_families={'orchestrator'} but no fm/esc tool in
         allowed_tools — the assertion is a lower bound, never the reverse."""
-        from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
 
         role = AgentRole(
             name='judge_like',
@@ -135,8 +132,6 @@ class TestFamilyToolPrefixesDriftGuard:
     reopened for a hypothetical future family)."""
 
     def test_declaring_an_unmapped_family_raises(self):
-        from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
-
         with pytest.raises(ValueError, match='unmapped_family'):
             AgentRole(
                 name='probe',
@@ -150,8 +145,6 @@ class TestRolesModuleImportsCleanly:
     import time — importing the module must not raise."""
 
     def test_roles_import_succeeds_and_is_populated(self):
-        from orchestrator.agents.roles import ROLES  # noqa: PLC0415
-
         # >= / superset (not ==) so a legitimate new role doesn't force an
         # edit here — this test's contract is "these roles must still
         # exist", not "exactly these roles exist forever".
@@ -181,8 +174,6 @@ class TestShippedRoleCapabilityDeclarations:
 
     @pytest.mark.parametrize('role_name', sorted(EXPECTED))
     def test_role_declares_expected_families_and_sandbox(self, role_name):
-        from orchestrator.agents.roles import ROLES  # noqa: PLC0415
-
         role = ROLES[role_name]
         expected_families, expected_sandboxed = self.EXPECTED[role_name]
 
@@ -200,13 +191,10 @@ class TestShippedRoleCapabilityDeclarations:
         prompt embeds escalation/memory instructions AND requires a
         plan-tools-registered plan, so it must declare BOTH families or the
         Lever-C fast-path falls through to the architect silently."""
-        from orchestrator.agents.roles import SIMPLE_TASK  # noqa: PLC0415
 
         assert SIMPLE_TASK.mcp_families == frozenset({'orchestrator', 'plan_tools'})
 
     def test_implementer_debugger_and_simple_task_are_sandboxed(self):
-        from orchestrator.agents.roles import ROLES  # noqa: PLC0415
-
         sandboxed_names = {name for name, role in ROLES.items() if role.sandboxed}
 
         assert sandboxed_names == {'implementer', 'debugger', 'simple_task'}
@@ -218,7 +206,6 @@ class TestShippedRoleCapabilityDeclarations:
         """reviewer/judge/merger each get a mcp__verdict-tools__* grant in
         allowed_tools (PRD task β — verdict-tools stdio server wiring,
         task 2482)."""
-        from orchestrator.agents.roles import ROLES  # noqa: PLC0415
 
         role = ROLES[role_name]
         assert any(t.startswith('mcp__verdict-tools__') for t in role.allowed_tools), (
@@ -234,8 +221,6 @@ class TestInverseCapabilityInvariant:
     the now-deleted _PLAN_TOOLS_ROLES / _MCP_CONFIG_ROLES tuples)."""
 
     def test_every_role_allowing_plan_tools_declares_plan_tools_family(self):
-        from orchestrator.agents.roles import ROLES  # noqa: PLC0415
-
         for name, role in ROLES.items():
             allows_plan_tools = any(
                 t.startswith('mcp__plan-tools__') for t in role.allowed_tools
@@ -247,8 +232,6 @@ class TestInverseCapabilityInvariant:
                 )
 
     def test_every_role_allowing_orchestrator_tools_declares_orchestrator_family(self):
-        from orchestrator.agents.roles import ROLES  # noqa: PLC0415
-
         for name, role in ROLES.items():
             allows_orchestrator = any(
                 t.startswith(('mcp__fused-memory__', 'mcp__escalation__'))
@@ -264,7 +247,6 @@ class TestInverseCapabilityInvariant:
     def test_every_role_allowing_verdict_tools_declares_verdict_tools_family(self):
         """PRD task β (task 2482): the same inverse invariant, extended to the
         new verdict_tools family."""
-        from orchestrator.agents.roles import ROLES  # noqa: PLC0415
 
         for name, role in ROLES.items():
             allows_verdict_tools = any(
@@ -416,8 +398,6 @@ class TestInvokeDerivesGatingFromRole:
         sandbox_extras == compute_write_set(cwd).writable_paths(). Still gated
         off role.sandboxed, not role.name.
         """
-        from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
-        from orchestrator.agents.write_set import compute_write_set  # noqa: PLC0415
 
         role = AgentRole(
             name='probe_sbx', system_prompt='x', allowed_tools=[], sandboxed=True,
@@ -446,8 +426,6 @@ class TestInvokeDerivesGatingFromRole:
         (worktree root + carve-outs) from compute_write_set(cwd) — the single
         source of truth (INV-5). This is the α3 SIGNAL: a live wrap_command for
         these roles now carries the full contract set."""
-        from orchestrator.agents.roles import ROLES  # noqa: PLC0415
-        from orchestrator.agents.write_set import compute_write_set  # noqa: PLC0415
 
         role = ROLES[role_name]
         call_kwargs, _workflow, cwd = await _invoke_probe(role, config, git_ops, task_assignment)
@@ -467,7 +445,6 @@ class TestInvokeDerivesGatingFromRole:
     ):
         """probe_plan: name is not in the historical _PLAN_TOOLS_ROLES tuple,
         but declares mcp_families={'plan_tools'}."""
-        from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
 
         role = AgentRole(
             name='probe_plan', system_prompt='x', allowed_tools=[],
@@ -489,7 +466,6 @@ class TestInvokeDerivesGatingFromRole:
     ):
         """probe_orch: name is not in the historical _MCP_CONFIG_ROLES tuple,
         but declares mcp_families={'orchestrator'}."""
-        from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
 
         role = AgentRole(
             name='probe_orch', system_prompt='x', allowed_tools=[],
@@ -510,7 +486,6 @@ class TestInvokeDerivesGatingFromRole:
         """Negative control: a role declaring neither family and unsandboxed
         gets no sandbox modules and no plan-tools server wired, exactly as
         it would under the old name-based gates (name matches nothing)."""
-        from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
 
         role = AgentRole(name='probe_bare', system_prompt='x', allowed_tools=[])
         call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
@@ -535,7 +510,6 @@ class TestInvokeDerivesGatingFromRole:
     ):
         """probe_verdict: name is none of the shipped verdict-emitting roles,
         but declares mcp_families={'verdict_tools'} (PRD task β, task 2482)."""
-        from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
 
         role = AgentRole(
             name='probe_verdict', system_prompt='x', allowed_tools=[],
@@ -560,7 +534,6 @@ class TestInvokeDerivesGatingFromRole:
         skeleton path is what makes the server reachable at all — proving a
         role outside every other MCP gate is still reachable by verdict-tools
         (PRD task β, task 2482)."""
-        from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE  # noqa: PLC0415
 
         call_kwargs, _workflow, _cwd = await _invoke_probe(
             REVIEWER_COMPREHENSIVE, config, git_ops, task_assignment,
@@ -587,7 +560,6 @@ class TestInvokeDerivesGatingFromRole:
         """MERGER already declares 'orchestrator' (for jcodemunch); the
         verdict-tools gate must ADD its server alongside the
         orchestrator-assembled ones, not replace them (PRD task β, task 2482)."""
-        from orchestrator.agents.roles import MERGER  # noqa: PLC0415
 
         call_kwargs, _workflow, _cwd = await _invoke_probe(
             MERGER, config, git_ops, task_assignment, mcp=_FakeMcpWithFusedMemory(),
@@ -601,4 +573,125 @@ class TestInvokeDerivesGatingFromRole:
         )
         assert 'verdict-tools' in servers, (
             f"Expected 'verdict-tools' added alongside it, got {list(servers)!r}."
+        )
+
+
+@pytest.mark.asyncio
+class TestInvokeScopesSelfContainedRolesStrictly:
+    """A role whose every MCP server _invoke spawns per invocation runs with
+    --strict-mcp-config under the PRODUCTION config, so the CLI does not
+    union in the ambient project/user .mcp.json (task 3849).
+
+    The ``config`` fixture leaves strict_mcp_config at its False production
+    default, so strictness here can only come from the role. Config-level
+    strictness is pinned by
+    test_eval_mcp_isolation.py::test_invoke_strict_config_scopes_every_role.
+    """
+
+    @pytest.mark.parametrize('briefing', list(ReviewBriefing))
+    async def test_shipped_reviewers_are_strictly_scoped_to_their_verdict_server(
+        self, briefing, config, git_ops, task_assignment,
+    ):
+        roster = reviewers_for(briefing)
+        assert roster, f'reviewers_for({briefing!r}) is empty; nothing to pin.'
+        for role in roster:
+            call_kwargs, _workflow, _cwd = await _invoke_probe(
+                role, config, git_ops, task_assignment,
+            )
+
+            assert call_kwargs['strict_mcp_config'] is True, (
+                f'{briefing.value}/{role.name}: expected strict_mcp_config=True, got '
+                f"{call_kwargs['strict_mcp_config']!r}. A verdict-only role must not "
+                'inherit the ambient .mcp.json merge: the merged registry defers '
+                'submit_review_verdict behind ToolSearch and the reviewer exhausts '
+                'its turns before submitting (task 3849).'
+            )
+            servers = set(call_kwargs['mcp_config']['mcpServers'])
+            assert servers == {'verdict-tools'}, (
+                f'{briefing.value}/{role.name}: expected the strict surface to be '
+                f'exactly {{"verdict-tools"}}, got {servers!r}.'
+            )
+
+    @pytest.mark.parametrize(
+        'families',
+        [
+            frozenset({'verdict_tools'}),
+            frozenset({'plan_tools'}),
+            frozenset({'plan_tools', 'verdict_tools'}),
+        ],
+        ids=['verdict_tools', 'plan_tools', 'plan_and_verdict_tools'],
+    )
+    async def test_self_contained_probe_role_is_strictly_scoped(
+        self, families, config, git_ops, task_assignment,
+    ):
+        """The rule keys off the role's families, not the reviewer's name."""
+
+        role = AgentRole(
+            name='probe_self_contained', system_prompt='x', allowed_tools=[],
+            mcp_families=families,
+        )
+        call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
+
+        assert call_kwargs['strict_mcp_config'] is True, (
+            f'mcp_families={set(families)!r}: every server is spawned per '
+            'invocation, so the role must run with strict_mcp_config=True rather '
+            f"than the ambient .mcp.json merge; got {call_kwargs['strict_mcp_config']!r}."
+        )
+
+    async def test_orchestrator_and_verdict_role_keeps_the_ambient_merge(
+        self, config, git_ops, task_assignment,
+    ):
+        call_kwargs, _workflow, _cwd = await _invoke_probe(
+            MERGER, config, git_ops, task_assignment, mcp=_FakeMcpWithFusedMemory(),
+        )
+
+        assert call_kwargs['strict_mcp_config'] is False, (
+            "MERGER declares the 'orchestrator' family, whose sessions may rely on "
+            'ambient servers the orchestrator does not assemble; strict scoping '
+            f"would strip them. Got strict_mcp_config={call_kwargs['strict_mcp_config']!r}."
+        )
+
+    async def test_orchestrator_family_role_keeps_the_ambient_merge(
+        self, config, git_ops, task_assignment,
+    ):
+        role = AgentRole(
+            name='probe_orch', system_prompt='x', allowed_tools=[],
+            mcp_families=frozenset({'orchestrator'}),
+        )
+        call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
+
+        assert call_kwargs['strict_mcp_config'] is False, (
+            "An 'orchestrator'-family role keeps the ambient .mcp.json merge: "
+            "project-local ambient servers such as reify's reify-debug cannot be "
+            'declared by any generic role, so strict scoping would silently remove '
+            f"them. Got strict_mcp_config={call_kwargs['strict_mcp_config']!r}."
+        )
+
+    async def test_family_less_role_keeps_the_ambient_merge(
+        self, config, git_ops, task_assignment,
+    ):
+        role = AgentRole(name='probe_bare', system_prompt='x', allowed_tools=[])
+        call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
+
+        assert call_kwargs['strict_mcp_config'] is False, (
+            'A role declaring no MCP family has no per-invocation server, so its '
+            'only MCP surface is the ambient one; strict scoping would remove it. '
+            f"Got strict_mcp_config={call_kwargs['strict_mcp_config']!r}."
+        )
+
+    async def test_grant_outside_declared_families_keeps_the_ambient_merge(
+        self, config, git_ops, task_assignment,
+    ):
+        role = AgentRole(
+            name='probe_verdict_jcm', system_prompt='x',
+            allowed_tools=['mcp__verdict-tools__*', 'mcp__jcodemunch__*'],
+            mcp_families=frozenset({'verdict_tools'}),
+        )
+        call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
+
+        assert call_kwargs['strict_mcp_config'] is False, (
+            'The role grants mcp__jcodemunch__*, which only the orchestrator-'
+            'assembled or the ambient config serves; strict scoping would silently '
+            'strip a granted tool. Got '
+            f"strict_mcp_config={call_kwargs['strict_mcp_config']!r}."
         )

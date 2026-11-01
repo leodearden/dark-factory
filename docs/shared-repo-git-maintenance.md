@@ -99,6 +99,44 @@ auto-staged into another task's merge with no conflict raised (e.g. on
 `git config --show-origin --get rerere.enabled` prints `command line:` and
 `false`.
 
+## The ratchet-baseline merge driver, and the rerere hazard it leaves
+
+**What.** `.gitattributes` maps `orchestrator/tests/merge_lane_ratchet_baseline.json`
+to `merge=ratchet-baseline`, and `python3 scripts/merge_lane_ratchet_merge.py install`
+writes `merge.ratchet-baseline.driver` into the shared `.git/config` (every
+linked worktree reads it; `scripts/setup-host.sh` step 9 runs it on a new host).
+The driver composes the two sides' moves of each count instead of conflicting on
+the row (task 7298). Never leave a `merge.ratchet-baseline` section without its
+`driver` key: git then DIES on every merge of the baseline (exit 128, "lacks
+command line") instead of falling back to a conflict. Remove the whole section
+(`git config --remove-section merge.ratchet-baseline`) to uninstall.
+
+**Where it acts.** git reads the attribute from the WORKING TREE of the checkout
+it merges in, never from the trees being merged. So the lane's probe
+(`git merge-tree` at `project_root`) composes only once `.gitattributes` is on
+main and `project_root` has re-synced; a `_merge-*` worktree and a task
+worktree's rebase read their own checkout's copy. While the driver runs under the
+probe, git leaves transient `.merge_file_*` files in `project_root`; they are
+untracked, and `advance_main` parks only on tracked dirty files.
+
+**The rerere hazard stays wherever the driver does not compose.** rerere is ON
+in this repo's `.git/config` (`rerere.enabled` and `rerere.autoupdate`), and
+unsandboxed git -- the merge lane included -- keeps it. A clean driver merge
+leaves no conflict, so rerere has nothing to record or replay. But on a host
+where the driver is not installed, or where it refuses a pair and writes git's
+own text merge with markers, the baseline conflicts as it always did, and
+`rerere.autoupdate` can replay and stage a recorded resolution of an earlier,
+unrelated baseline conflict without a conflict being raised. A replayed
+baseline is a stale measurement: the gate's
+`test_baseline_matches_a_fresh_measurement` goes red on it, so it is loud, but
+only at verify. Resolve a baseline conflict by regenerating, never by accepting
+what rerere staged.
+
+**Verify.** `git config --get merge.ratchet-baseline.driver` prints
+`python3 -B scripts/merge_lane_ratchet_merge.py merge %O %A %B`, and
+`git check-attr merge -- orchestrator/tests/merge_lane_ratchet_baseline.json`
+prints `ratchet-baseline`.
+
 ## See also
 
 - `plans/os-sandbox-worktree-containment-prd.md` — task α5 (Shared-repo git
@@ -108,6 +146,8 @@ auto-staged into another task's merge with no conflict raised (e.g. on
   call site.
 - `orchestrator/src/orchestrator/harness.py` — the `Harness.run()` startup
   call.
+- `scripts/merge_lane_ratchet_merge.py` — the ratchet-baseline merge driver,
+  its rules and its `install` verb (task 7298).
 - `orchestrator/src/orchestrator/agents/sandbox_git_config.py` — the sandbox
   git-config policy; `orchestrator/tests/test_landlock.py::TestLandlockSandboxedConflictedMerge`
   — its real-kernel regression test.

@@ -33,9 +33,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from escalation.models import Escalation
 
-from orchestrator.config import DeliveredChecksConfig, RecoveryEmissionConfig
+from orchestrator.already_landed_tick_view import AlreadyLandedTickView
+from orchestrator.config import (
+    DeliveredChecksConfig,
+    OrchestratorConfig,
+    RecoveryEmissionConfig,
+)
 from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.git_ops import GitOps
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.landing_evidence import LandingEvidenceVerdict
 
@@ -2474,3 +2480,181 @@ class TestAlreadyLandedGateReleasesItsVetoStreak:
         )
 
         assert await h._already_landed_dispatch_gate('42') is True
+
+
+_ABSENT_VIEW = AlreadyLandedTickView(local_branches=frozenset({'main'}))
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedGateTickView:
+    """Task 4900: the gate takes the scheduler's candidate dict as ``task=``
+    and the per-tick branch snapshot as ``tick_view=``. The snapshot may only
+    make the gate abstain (see ``already_landed_tick_view``'s docstring)."""
+
+    async def test_a_supplied_task_replaces_the_get_task_read(
+        self, mock_orch_config,
+    ) -> None:
+        h = _wired_marker_harness(
+            mock_orch_config,
+            marker_sha='b' * 40,
+            branch_base_sha='e' * 40,
+            marker_is_ancestor_of_base=True,
+        )
+        h.scheduler.get_task = AsyncMock(return_value={'id': '42', 'metadata': {}})
+
+        result = await h._already_landed_dispatch_gate(
+            '42', task={'id': '42', 'metadata': {'branch_base_sha': 'e' * 40}},
+        )
+
+        assert result is False, 'the supplied branch_base_sha drives the stale-marker veto'
+        cast(AsyncMock, h.scheduler.get_task).assert_not_awaited()
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    async def test_without_a_supplied_task_get_task_is_read_once(
+        self, mock_orch_config,
+    ) -> None:
+        h = _wired_absent_branch_harness(mock_orch_config)
+
+        await h._already_landed_dispatch_gate('42')
+
+        cast(AsyncMock, h.scheduler.get_task).assert_awaited_once_with('42')
+
+    async def test_absent_and_unmarked_abstains_without_a_ref_read(
+        self, mock_orch_config,
+    ) -> None:
+        h = _wired_absent_branch_harness(mock_orch_config)
+
+        result = await h._already_landed_dispatch_gate('42', tick_view=_ABSENT_VIEW)
+
+        assert result is False
+        cast(AsyncMock, h.git_ops.resolve_branch_sha).assert_not_awaited()
+        cast(AsyncMock, h.git_ops.is_ancestor).assert_not_awaited()
+        cast(AsyncMock, h.git_ops.branch_content_in_main).assert_not_awaited()
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    async def test_absent_but_marked_rereads_and_follows_a_recreated_branch(
+        self, mock_orch_config,
+    ) -> None:
+        """The stale-absence hazard: the marker sends the gate back to a fresh
+        ref read, which finds the branch, so the marker can never flip it."""
+        h = _wired_absent_branch_harness(mock_orch_config)
+        h.git_ops.find_merge_marker = AsyncMock(return_value='b' * 40)
+        h.git_ops.resolve_branch_sha = AsyncMock(return_value='f' * 40)
+        h.git_ops.is_ancestor = AsyncMock(return_value=False)
+
+        result = await h._already_landed_dispatch_gate('42', tick_view=_ABSENT_VIEW)
+
+        assert result is False
+        cast(AsyncMock, h.git_ops.resolve_branch_sha).assert_awaited_once()
+        cast(AsyncMock, h.git_ops.branch_content_in_main).assert_awaited_once()
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    async def test_absent_but_marked_and_confirmed_absent_flips_on_the_marker(
+        self, mock_orch_config,
+    ) -> None:
+        marker_sha = 'b' * 40
+        h = _wired_marker_harness(
+            mock_orch_config,
+            marker_sha=marker_sha,
+            branch_base_sha='e' * 40,
+            marker_is_ancestor_of_base=False,
+        )
+
+        result = await h._already_landed_dispatch_gate('42', tick_view=_ABSENT_VIEW)
+
+        assert result is True
+        cast(AsyncMock, h.git_ops.resolve_branch_sha).assert_awaited_once()
+        call_args = cast(AsyncMock, h._mark_in_progress_done).await_args
+        assert call_args is not None
+        assert call_args.args[1] == marker_sha
+        assert call_args.args[3] == 'dispatch-gate-marker-found'
+
+    async def test_a_listed_branch_takes_todays_flow(self, mock_orch_config) -> None:
+        h = _wired_ancestry_harness(mock_orch_config)
+        view = AlreadyLandedTickView(local_branches=frozenset({'main', 'task/42'}))
+
+        result = await h._already_landed_dispatch_gate('42', tick_view=view)
+
+        assert result is True
+        cast(AsyncMock, h.git_ops.resolve_branch_sha).assert_awaited_once()
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+
+    async def test_an_unknown_enumeration_takes_todays_flow(
+        self, mock_orch_config,
+    ) -> None:
+        h = _wired_absent_branch_harness(mock_orch_config)
+
+        result = await h._already_landed_dispatch_gate(
+            '42', tick_view=AlreadyLandedTickView(local_branches=None),
+        )
+
+        assert result is False
+        cast(AsyncMock, h.git_ops.resolve_branch_sha).assert_awaited_once()
+        cast(AsyncMock, h.git_ops.find_merge_marker).assert_awaited_once()
+
+    async def test_the_arbitration_hold_still_wins_over_the_view(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        h = _wired_ancestry_harness(mock_orch_config)
+        _let_mark_in_progress_done_run_for_real(h, tmp_path)
+        h.git_ops.find_merge_marker = AsyncMock(return_value=None)
+        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        h.scheduler.get_task = AsyncMock(
+            return_value={'id': '42', 'metadata': {'reopen_at': _STALE_REOPEN_AT}},
+        )
+        _wire_stale_evidence_mark_done(h, evidence_commit='a' * 40)
+        ProvenanceConflictSink(escalation_queue=h._escalation_queue).record(
+            task_id='42',
+            evidence_commit='a' * 40,
+            evidence_committed_at='2026-07-10T00:00:00+00:00',
+            reopen_at=_STALE_REOPEN_AT,
+            agent_id='claude-merge-worker',
+            gate_source='merge-queue',
+        )
+        h._provenance_conflict_sink = ProvenanceConflictSink(
+            escalation_queue=h._escalation_queue,
+        )
+
+        result = await h._already_landed_dispatch_gate('42', tick_view=_ABSENT_VIEW)
+
+        assert result is True, 'a contested task stays withheld whatever the view says'
+
+    async def test_the_escalation_veto_still_fires_and_emits_before_the_view(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h.git_ops.find_merge_marker = AsyncMock(return_value=None)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-9', level=2),
+        )
+
+        result = await h._already_landed_dispatch_gate('42', tick_view=_ABSENT_VIEW)
+
+        assert result is False
+        rows = _recovery_rows(h)
+        assert [r['event_type'] for r in rows] == [EventType.recovery_vetoed.value]
+        assert rows[0]['data']['reason'] == 'escalation_pinned'
+
+    async def test_the_consult_reads_its_view_through_the_late_bound_git_ops(
+        self, tmp_path,
+    ) -> None:
+        h = Harness(OrchestratorConfig(project_root=tmp_path))
+        branch = f'{h.git_ops.config.branch_prefix}9'
+        git_ops_double = MagicMock(spec=GitOps)
+        git_ops_double.config = h.git_ops.config
+        git_ops_double.list_local_branches = AsyncMock(return_value=frozenset({'main'}))
+        git_ops_double.find_merge_marker = AsyncMock(return_value=None)
+        h.git_ops = git_ops_double
+
+        gated = await h.scheduler._consult_already_landed([{'id': '9', 'metadata': {}}])
+
+        assert gated == set()
+        git_ops_double.list_local_branches.assert_awaited_once_with()
+        git_ops_double.find_merge_marker.assert_awaited_once_with(
+            branch, gate_on_existing_ref=False,
+        )
+        git_ops_double.resolve_branch_sha.assert_not_awaited()

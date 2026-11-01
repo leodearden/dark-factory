@@ -339,7 +339,7 @@ class TestProjectTokenCanonicalization:
     once, in registry_reader's module docstring.
 
     What these tests pin is the MECHANISM: every scanned record's .project
-    goes through session_registry.normalize_project_token (task 3807's one
+    goes through shared.project_id.fold_project_token (task 3807's one
     canonical fold) inside _read_record_soft -- the single parse step shared
     by scan_sessions and SessionScanner.scan -- so both scan paths, and the
     mtime cache behind SessionScanner, yield one bucket by construction.
@@ -411,7 +411,7 @@ class TestProjectTokenCanonicalization:
 
     def test_synthetic_and_basename_tail_tokens_stay_distinct(self, tmp_path):
         """Collapse guard, mirroring
-        test_normalize_project_token_does_not_merge_solar_challenge_platform:
+        shared/tests/test_project_id.py::TestFoldProjectToken::test_never_merges_two_projects_sharing_a_prefix:
         the fold merges SPELLINGS, never distinct projects. The registry's
         long tail of synthetic tokens (fm-neutral-classifier-cwd-*,
         _lane-<n>, run-<hex>, bare task ids) and cwd-basename tokens ('tmp',

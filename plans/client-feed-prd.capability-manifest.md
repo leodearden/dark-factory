@@ -102,3 +102,46 @@ tasks (the dashboard PRD-lanes PRD measured 255 direct holders on 2026-10-09).
   ε (no `record_property`).
 - The orchestrator does not read `user_observable_signal` / `consumer_ref` / `grammar_confirmed`; they
   are substrate for a future tracking-infra session.
+
+## Revision 2026-10-23: the client defect bridge (PRD §14)
+
+Gate task 7062 (esc-7062-1). Six new blocks in the sidecar, σ1a, σ1b, σ2, σ3, σ4 and σ5, stamped by
+their own `commit_planning`. `signal_leaves` is now `["ζ", "σ3"]`. As of main `384a6dc454`
+(2026-10-23).
+
+**Verdict summary: 16 bindings, all PASS.**
+
+- 10 are mechanical checks: 8 grep `present` and 2 path `present`.
+- 5 are manual.
+- 1 is a substrate binding with no check.
+- Polarity: every `present` pattern and path is absent on main today. Checked by hand at authoring.
+
+**G3 substrate**, verified by two seats and the critic against code on 2026-10-22/23:
+
+- `shared.defects.mint_portal_ref` and its token/count grammar.
+- `submit_task(planning_mode=True)`, which writes the row `deferred`, bypasses the curator, and runs
+  the creation floor before the planning split.
+- `lookup_defect_ref` and `find_tasks_by_metadata`, which see every status.
+- `commit_planning`.
+- `SyncMcpSession`.
+- The markup guard, which refuses as a `TOOL_ERROR` and is installed only by
+  `fused_memory.server.main._install_tool_dispatch_guards`.
+- The fixture in `fused-memory/tests/test_defect_write_tools.py`, which builds the real tool layer
+  that B36 serves.
+- On the portal side: `DefectReport` in `Block.history`, `FeedBinding.project_id`, `BACKENDS["api"]`,
+  and the docstring of `claude_code.py`.
+
+**G6:**
+
+- No signal asserts a measured number.
+- `filer_grace_seconds` = 600 and σ5's threshold of 10 are policy values, marked provisional in §14.10.
+- Each rejection capability is observed to fire by a named B-row:
+  - the contract's `extra` rejection, B23;
+  - the import boundary, B24;
+  - the lock, B28;
+  - the markup guard, B35 and B36.
+
+**G7:** walked against `docs/legibility/design-invariants.md` in §14.8. There is no hit and no waiver.
+
+**Filed batch:** see the stamped ids in the sidecar. The amendments to ε 6972, ζ 6973 and ι 7057 are
+recorded in PRD §14.8.

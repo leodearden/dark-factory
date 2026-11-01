@@ -146,9 +146,11 @@ def _run_script(
 def test_the_shipped_class_table_is_empty(tmp_path: Path):
     """D9 — the valve is the OPERATOR's, and it ships shut.
 
-    The rows are ruled by task 5603 and applied by task 5609; an implementer adding one here
-    would be ratifying a blanket exception on the operator's behalf, which is
-    the one thing D9 reserves.
+    The operator ruled the table empty on day one
+    (docs/legibility/inv12-day-one-rulings.md, Part 3 Q1), so each new
+    suppression carries its own inline disposition.  A row stays the operator's
+    alone to add: an implementer adding one here would be ratifying a blanket
+    exception on the operator's behalf, which is the one thing D9 reserves.
     """
     del tmp_path
     assert dict(inline_suppressions.RATIFIED_SUPPRESSION_CLASSES) == {}

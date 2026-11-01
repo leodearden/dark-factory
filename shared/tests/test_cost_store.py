@@ -1352,41 +1352,6 @@ def _invocation_column_specs(path: Path) -> dict[str, tuple[int, str | None]]:
         conn.close()
 
 
-class _RowsCursor:
-    """A cursor stand-in that reports a fixed row set."""
-
-    def __init__(self, rows: list) -> None:
-        self._rows = rows
-
-    async def fetchall(self) -> list:
-        return self._rows
-
-    async def close(self) -> None:
-        pass
-
-
-def _probe_reports_pre_4826_columns(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make ``PRAGMA table_info(invocations)`` omit the task-4826 columns even
-    when the table has them: the stale view a store holds when a concurrent
-    open adds them between its probe and its ``ALTER``."""
-    real_execute = aiosqlite.Connection.execute
-
-    def execute(self, sql, *args, **kwargs):
-        result = real_execute(self, sql, *args, **kwargs)
-        if sql != 'PRAGMA table_info(invocations)':
-            return result
-
-        async def stale_probe() -> _RowsCursor:
-            cursor = await result
-            rows = await cursor.fetchall()
-            await cursor.close()
-            return _RowsCursor([r for r in rows if r[1] not in _NEW_INVOCATION_COLUMNS_SET])
-
-        return stale_probe()
-
-    monkeypatch.setattr(aiosqlite.Connection, 'execute', execute)
-
-
 def _invocation_kwargs(**overrides: Any) -> dict[str, Any]:
     """A complete, valid ``save_invocation`` keyword set; *overrides* win."""
     kwargs: dict[str, Any] = {
@@ -1535,31 +1500,10 @@ class TestInvocationsMigration:
 
         assert _invocation_columns(db) == before
 
-    async def test_column_added_concurrently_after_the_probe_is_tolerated(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    ):
-        """The probe-then-ALTER race between two processes opening one runs.db.
-
-        Another open adds the columns after this store's ``table_info`` probe
-        found them missing, so this store's ``ALTER`` meets SQLite's real
-        ``duplicate column name`` error — which must not fail the open.
-        """
-        db = tmp_path / 'raced.db'
-        async with CostStore(db):  # the concurrent open that added the columns
-            pass
-        _probe_reports_pre_4826_columns(monkeypatch)
-
-        async with CostStore(db) as store:
-            await store.save_invocation(**_invocation_kwargs(model_id='claude-opus-5'))
-
-        columns = _invocation_columns(db)
-        assert columns.count('model_id') == 1, columns
-        assert columns.count('capped_reason') == 1, columns
-
     async def test_other_operational_error_fails_the_open_and_leaves_it_closed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
-        """Any OperationalError but a duplicate column propagates from
+        """An ALTER failure that leaves the columns absent propagates from
         ``open()``, and the store is left closed — so a later open succeeds
         instead of raising "already opened" on a half-open store."""
         db = tmp_path / 'legacy.db'

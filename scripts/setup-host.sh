@@ -154,7 +154,10 @@ info "Starting backing stores (FalkorDB + Qdrant)"
 mkdir -p "$REPO_ROOT/fused-memory/data/falkordb"
 mkdir -p "$REPO_ROOT/fused-memory/data/qdrant"
 
-docker compose -f "$COMPOSE_FILE" up -d falkordb qdrant
+# Through the AOF gate, never a bare compose-up: on a host that already has a
+# falkordb container, a compose-up recreates it onto whatever AOF is on disk
+# (task 6330). The gate creates it on a fresh host and refuses over stale data.
+python3 "$REPO_ROOT/scripts/falkordb_aof_gate.py" --compose-file "$COMPOSE_FILE"
 
 # Wait for healthy
 for i in $(seq 1 30); do
@@ -178,14 +181,13 @@ for i in $(seq 1 30); do
 done
 
 # ---------------------------------------------------------------------------
-# 3. Python subprojects — uv sync (dependency order)
+# 3. Python workspace — uv sync --all-packages
 # ---------------------------------------------------------------------------
-info "Syncing Python subprojects"
+info "Syncing Python workspace (all members)"
 
-for proj in shared escalation fused-memory orchestrator dashboard; do
-  (cd "$REPO_ROOT/$proj" && uv sync --quiet)
-  ok "$proj"
-done
+# A member-scoped sync is exact and prunes the other members from the shared .venv; see scripts/sync-orchestrator-env.sh.
+(cd "$REPO_ROOT" && uv sync --all-packages --quiet)
+ok "Python workspace synced (every member, client-feed included)"
 
 # ---------------------------------------------------------------------------
 # 4. Systemd user unit for fused-memory
@@ -336,7 +338,7 @@ fi
 # ---------------------------------------------------------------------------
 # The install is gated PER UNIT (task 4198). Each unit is judged on its own
 # parity verdict, so a finding on one no longer declines the install of all
-# sixteen. The POLICY is unchanged and still ratified — a unit that did not clear
+# eighteen. The POLICY is unchanged and still ratified — a unit that did not clear
 # is never overwritten without DF_INSTALL_ORCH_UNITS=1, because a difference
 # does not tell you which side is stale — only the blast radius shrinks.
 #
@@ -437,7 +439,7 @@ install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.p
 # a second run would only restate what the copy just did.)
 #
 # NON-FATAL, but not merely advisory: a finding never aborts this script (the
-# sections below still run, and two of the sixteen registered units carry a
+# sections below still run, and two of the eighteen registered units carry a
 # standing, deliberate finding on this host — re-measured 2026-09-05, see the
 # checker's KNOWN RED section) — it makes the install of THAT UNIT opt-in
 # instead. A bare warning would not be an intervention point
@@ -515,6 +517,7 @@ _orch_units=(
   orchestrator-solar-challenge-platform.service  # joined 2026-06-21, escalation 8107
   orchestrator-know-live.service                 # escalation 8105; committed since e5273d8623, wired in by task 3641 (its absence was an omission, not a policy)
   orchestrator-pump-web-ui.service               # joined 2026-07-17, escalation 8108; ran on the host with no committed template until task 3641 transcribed it
+  orchestrator-stream-touch.service              # joined 2026-10-22, escalation 8110 (project_id stream_touch)
   orchestrator-watchdog.service                  # static (no [Install]) — pulled in by the .timer, so the enable loop below skips it
   orchestrator-watchdog.timer                    # 60s liveness probe + dead-enabled revival: the safety net that revives an orchestrator killed by e.g. a boot-race dependency cancel
   orchestrator-dark-factory.socket               # holds escalation port 8102 across a restart (socket activation)
@@ -524,6 +527,7 @@ _orch_units=(
   orchestrator-solar-challenge-platform.socket   # holds escalation port 8107 across a restart
   orchestrator-know-live.socket                  # holds escalation port 8105 across a restart
   orchestrator-pump-web-ui.socket                # holds escalation port 8108 across a restart
+  orchestrator-stream-touch.socket               # holds escalation port 8110 across a restart
 )
 
 # `.socket` is not in the shared lock-charter extension allowlist, so each
@@ -802,7 +806,7 @@ else
 
   # Reports what was ACTUALLY done, not what was attempted: with a per-unit
   # gate a partial install is now a normal outcome, and an unqualified success
-  # line would read as "all sixteen" on a run that installed one. Counted from the
+  # line would read as "all eighteen" on a run that installed one. Counted from the
   # units that COPIED, so a failed `cp` is never reported as an install.
   if [ "${#_orch_installed_units[@]}" -eq 0 ]; then
     warn "NO orchestrator unit was installed — every copy that cleared the gate"
@@ -1109,6 +1113,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 7a. Client-feed publisher unit template (rendered, never enabled)
+# ---------------------------------------------------------------------------
+info "Installing the client-feed publisher unit template"
+
+# One instance per client project is enabled by hand: OPERATIONS.md §"Client feed".
+_cf_render_script="$REPO_ROOT/scripts/render_systemd_unit.py"
+if python3 "$_cf_render_script" \
+     --unit      client-feed \
+     --template  "$REPO_ROOT/scripts/client-feed.service.template" \
+     --repo-root "$REPO_ROOT" \
+     --uv-path   "$UV_PATH" \
+     --output    "$UNIT_DIR/client-feed@.service"; then
+  systemctl --user daemon-reload
+  ok "client-feed@.service installed; no instance enabled (one per client project, by hand: OPERATIONS.md §\"Client feed\")"
+else
+  fail "client-feed@.service render FAILED — see the [client_feed_unit_render] report above."
+  fail "  Any installed $UNIT_DIR/client-feed@.service was left untouched."
+fi
+
+# ---------------------------------------------------------------------------
 # 8. Claude Code skill symlinks
 # ---------------------------------------------------------------------------
 info "Creating Claude Code skill symlinks"
@@ -1178,6 +1202,15 @@ if [ -x "$REPO_ROOT/hooks/setup.sh" ]; then
   ok "Git hooks configured"
 else
   warn "hooks/setup.sh not found or not executable"
+fi
+
+# dark-factory's own merge driver for the ratchet baseline (.gitattributes names
+# it). hooks/setup.sh is a generic bootstrap any repo can copy, so this lives
+# here. Without it a two-branch baseline merge conflicts instead of composing.
+if (cd "$REPO_ROOT" && python3 scripts/merge_lane_ratchet_merge.py install); then
+  ok "Ratchet-baseline merge driver installed"
+else
+  warn "Ratchet-baseline merge driver NOT installed -- baseline merges will conflict"
 fi
 
 # ---------------------------------------------------------------------------

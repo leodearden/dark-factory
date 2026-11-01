@@ -10,8 +10,9 @@ deliberately absent from ``config/usage-accounts.yaml`` so orchestrator
 automation cannot spend it — and an eval run that appends it back to its
 own roster defeats exactly that. Evals have NO dedicated account: they
 draw on the shared pool like the rest of the fleet and tolerate cap/429
-events via ``invoke_with_cap_retry``'s 48h patience plus session
-``--resume`` (``orchestrator.evals.runner``).
+events via ``invoke_with_cap_retry``'s shared default cap-wait patience
+(``shared/src/shared/cli_invoke.py::_DEFAULT_CAP_WAIT_SANITY_SECS``) plus
+session ``--resume`` (``orchestrator.evals.runner``).
 
 WHY THIS GUARD LIVES HERE AND NOT ONLY IN THE LAUNCHER'S UNIT TESTS.
 ``scripts/rerun_cap_tainted.sh`` duplicated the injection INLINE, as a

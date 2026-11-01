@@ -22,8 +22,10 @@ import contextlib
 import logging
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from _overreach_shadow_fixtures import judged_edge, judged_episode, non_judging_shadow
 from shared.async_sqlite_base import CheckpointResult
 
 from fused_memory.server import main as server_main
@@ -31,6 +33,7 @@ from fused_memory.server.tools import (
     _checkpoint_overrides_db_if_exists,
     _open_overrides_db,
 )
+from fused_memory.services.overreach_shadow import SIDECAR_FILENAME, OverreachShadowStore
 
 
 @pytest.fixture(autouse=True)
@@ -222,6 +225,39 @@ async def test_collect_targets_omits_recon_ledger_when_none_or_no_checkpoint():
         recon_ledger=NoCheckpoint(),
     )
     assert 'recon_ledger' not in {name for name, _ in targets_no_checkpoint}
+
+
+def _collect_with_memory_service(memory_service) -> list[tuple[str, object]]:
+    return server_main._collect_checkpoint_targets(
+        taskmaster=None,
+        recon_journal=None,
+        event_buffer=None,
+        ticket_store=None,
+        write_journal=None,
+        memory_service=memory_service,
+    )
+
+
+@pytest.mark.asyncio
+async def test_collect_targets_checkpoints_the_overreach_shadow_sidecar(tmp_path: Path) -> None:
+    store = await OverreachShadowStore.open(tmp_path / 'sidecar')
+    await store.record(episode=judged_episode(), judgements=[judged_edge('e1', 'overreach')])
+    shadow = non_judging_shadow(store)
+    try:
+        targets = _collect_with_memory_service(SimpleNamespace(overreach_shadow=shadow))
+        assert 'overreach_shadow' in {name for name, _ in targets}
+
+        await server_main._run_checkpoint_cycle(targets)
+
+        assert server_main._CHECKPOINT_STATUS['overreach_shadow']['busy'] == 0
+        assert (tmp_path / 'sidecar' / f'{SIDECAR_FILENAME}-wal').stat().st_size == 0
+    finally:
+        await shadow.close()
+
+
+def test_collect_targets_omits_an_absent_overreach_shadow() -> None:
+    targets = _collect_with_memory_service(SimpleNamespace(overreach_shadow=None))
+    assert 'overreach_shadow' not in {name for name, _ in targets}
 
 
 # ---------------------------------------------------------------------------

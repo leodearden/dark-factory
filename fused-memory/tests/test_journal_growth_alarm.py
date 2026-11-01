@@ -178,14 +178,31 @@ class TestGrowthSampleRowsInserted:
     @pytest.mark.asyncio
     async def test_counts_rows_logged_through_the_journal(self, journal):
         seed_ops(journal.db_path, _seconds_after_t0(1, 2, 3))
-        for operation in ('get_task', 'get_statuses'):
+        for operation, kind in (('search', 'read'), ('add_memory', 'write')):
             await journal.log_write_op(
-                write_op_id=str(uuid.uuid4()), operation=operation, kind='read'
+                write_op_id=str(uuid.uuid4()), operation=operation, kind=kind
             )
 
         sample = await journal.growth_sample(since=_an_hour_ago())
 
         assert sample.rows_inserted == 2
+
+    @pytest.mark.asyncio
+    async def test_counted_reads_insert_no_rows_while_search_and_writes_each_count_one(
+        self, journal
+    ):
+        since = _an_hour_ago()
+        for operation in ('get_task', 'get_statuses', 'get_entity'):
+            await journal.log_write_op(
+                write_op_id=str(uuid.uuid4()), operation=operation, kind='read'
+            )
+        assert (await journal.growth_sample(since=since)).rows_inserted == 0
+
+        await journal.log_write_op(write_op_id=str(uuid.uuid4()), operation='search', kind='read')
+        assert (await journal.growth_sample(since=since)).rows_inserted == 1
+
+        await journal.log_write_op(write_op_id=str(uuid.uuid4()), operation='add_memory')
+        assert (await journal.growth_sample(since=since)).rows_inserted == 2
 
     @pytest.mark.asyncio
     async def test_a_terminal_first_row_overcounts_by_its_latency_inserts(self, journal):
@@ -271,9 +288,10 @@ def _size_words(sample: JournalGrowthSample) -> list[str]:
 
 
 async def _log_reads(journal: WriteJournal, count: int) -> None:
+    """Search reads: the read kind that still journals one write_ops row each."""
     for _ in range(count):
         await journal.log_write_op(
-            write_op_id=str(uuid.uuid4()), operation='get_task', kind='read'
+            write_op_id=str(uuid.uuid4()), operation='search', kind='read'
         )
 
 
@@ -446,7 +464,7 @@ class TestEscalation:
 
 class TestEscalationFailSoft:
     @pytest.mark.asyncio
-    async def test_without_the_escalation_package_the_warning_still_fires(
+    async def test_without_the_escalation_package_both_the_breach_and_the_lost_escalation_warn(
         self, journal, tmp_path, caplog, monkeypatch
     ):
         monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
@@ -460,7 +478,10 @@ class TestEscalationFailSoft:
         breaches = await alarm.check()
 
         assert [b.ceiling for b in breaches] == [JournalCeiling.FILE_SIZE]
-        assert len(_warnings(caplog)) == 1
+        messages = _warnings(caplog)
+        assert len(messages) == 2
+        assert sum('file-size ceiling' in m for m in messages) == 1
+        assert sum('escalation package unavailable' in m for m in messages) == 1
 
 
 class _FakeClock:

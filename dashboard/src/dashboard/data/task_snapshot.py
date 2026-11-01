@@ -48,7 +48,8 @@ from types import MappingProxyType
 from typing import Any, Generic, TypeVar
 
 import httpx
-from shared.task_statuses import ACTIVE, TERMINAL
+from shared.process_identity import Liveness
+from shared.task_statuses import ACTIVE, TERMINAL, TaskStatus
 
 from dashboard.config import DashboardConfig
 from dashboard.data.census import (
@@ -58,6 +59,7 @@ from dashboard.data.census import (
     build_census,
 )
 from dashboard.data.datum import Datum, DatumState, aged_at, unknown_datum, validate_datum
+from dashboard.data.deferral_summary import read_liveness, session_holders
 from dashboard.data.mcp_fanout import TTLCache
 from dashboard.data.tasks import (
     fetch_statuses,
@@ -129,11 +131,11 @@ lands, narrowing the STATUSES does not narrow the WORK.
 WHY THIS IS TASKS-TAB-LOCAL rather than a bump of the shared
 ``tasks.DEFAULT_PER_CALL_TIMEOUT``: that constant feeds
 ``tasks.DEFAULT_WHOLE_OPERATION_BUDGET``, which
-``task_lookup.LOOKUP_BUDGET_SECONDS`` and ``escalations._TASK_CARDS_BUDGET``
-both bind BY REFERENCE (task 4788). Raising the shared default to fix the
-Tasks tab would silently widen unrelated route budgets, neither of which
-fetches a 5 000-task tree. ``test_tasks_budget.py`` assertion (e) pins both
-halves.
+``task_lookup.LOOKUP_BUDGET_SECONDS`` (task 4788) and
+``task_prose._TASK_PROSE_BUDGET`` both bind BY REFERENCE. Raising the shared
+default to fix the Tasks tab would silently widen unrelated route budgets,
+none of which fetches a 5 000-task tree. ``test_tasks_budget.py`` assertion
+(e) pins both halves.
 """
 
 SNAPSHOT_TTL_SECONDS = 15.0
@@ -162,6 +164,10 @@ newer than the cache allows, so its cadence is not the one that governs here.
 
 _RETENTION_BOUND_SECONDS = 24 * 60 * 60
 """How old a last-good value may be and still be served as ``stale``."""
+
+ROW_READ_STATUSES: frozenset[TaskStatus] = ACTIVE
+"""The statuses the unit's rows half asks for, applied server-side as
+``WHERE status IN (...)``."""
 
 
 class SnapshotFailure(enum.StrEnum):
@@ -245,6 +251,10 @@ class TaskSnapshot:
             dependency chips.
         failure: Why this unit is not wholly measured; see
             :class:`SnapshotFailure`.
+        holder_liveness: Each deferred held_by_session row's holder liveness,
+            read from /proc once per unit. RAW MATERIAL like ``status_map``,
+            not part of the wire shape. Empty when the unit read none, which
+            every reader takes as "not read", never as "live".
     """
 
     census: Datum[TaskCensus]
@@ -254,6 +264,7 @@ class TaskSnapshot:
     skew_seconds: int | None
     status_map: Mapping[int, str]
     failure: SnapshotFailure
+    holder_liveness: Mapping[int, Liveness | None] = MappingProxyType({})
 
     def to_wire(self) -> dict[str, object]:
         """Render the five contract keys; the raw map stops here."""
@@ -296,12 +307,12 @@ class _LastGood:
 _last_good: dict[str, dict[str, _LastGood]] = {}
 
 
-def _snapshot_cache_clear() -> None:
-    """Clear the snapshot unit cache AND the last-good store (test/admin hook).
+def clear_snapshot_cache() -> None:
+    """Clear the snapshot unit cache AND the last-good store.
 
     Both, because a test that clears only the TTL would still be served the
     previous test's values as ``stale`` — the one thing a clear hook exists to
-    prevent.
+    prevent. ``active_tasks.reset_task_snapshot_state`` composes it.
     """
     _snapshot_cache.clear()
     _last_good.clear()
@@ -320,6 +331,14 @@ async def _bounded(coro: Awaitable[Any], *, label: str) -> _HalfRead[Any]:
     expiry means this process ran out of budget and the server may be perfectly
     healthy. Collapsing them is what made the 2026-07-30 event get misdiagnosed
     as an orchestrator outage.
+
+    The ``wait_for`` is deliberately bounded at ``PER_CALL_TIMEOUT`` itself, NOT
+    at ``memory.py::enclosing_deadline``. The equal bound keeps every
+    client-side timeout, a saturated pool included, in ``BUDGET``; a larger one
+    would let the fan-out fold it into an offline marker, reported as
+    ``UNREACHABLE``. ``PER_CALL_TIMEOUT`` is also the operation term in
+    ``test_tasks_budget.py``'s assertion (a). Pinned by
+    ``test_saturated_pool_is_diagnosable.py::test_task_snapshot_reports_a_saturated_pool_as_budget_not_offline``.
     """
     try:
         result = await asyncio.wait_for(coro, PER_CALL_TIMEOUT)
@@ -459,6 +478,7 @@ def _assemble(
     failure: SnapshotFailure,
     now: datetime,
     project_root: str,
+    holder_liveness: Mapping[int, Liveness | None] = MappingProxyType({}),
 ) -> TaskSnapshot:
     """Turn a rows ``Datum`` and a map outcome into one stamped, contract-checked unit.
 
@@ -488,6 +508,7 @@ def _assemble(
             dict(map_half.value) if isinstance(map_half.value, Mapping) else {}
         ),
         failure=failure,
+        holder_liveness=MappingProxyType(dict(holder_liveness)),
     )
     # Check the contract HERE, where the producer still has the context to
     # name what it built, rather than letting a break surface as a shaping
@@ -516,7 +537,7 @@ async def _read_unit(
         _bounded(
             fetch_tasks(
                 client, config, project_root,
-                statuses=sorted(ACTIVE),
+                statuses=sorted(ROW_READ_STATUSES),
                 timeout=PER_CALL_TIMEOUT,
             ),
             label='active rows',
@@ -527,10 +548,19 @@ async def _read_unit(
         ),
     )
     root = str(project_root)
+    rows = _datum(rows_half, now=now, project_root=root, name='rows')
     return _assemble(
-        _datum(rows_half, now=now, project_root=root, name='rows'),
-        map_half, failure=rows_half.failure, now=now, project_root=root,
+        rows, map_half, failure=rows_half.failure, now=now, project_root=root,
+        holder_liveness=await _read_holder_liveness(rows),
     )
+
+
+async def _read_holder_liveness(rows: Datum[list[dict]]) -> Mapping[int, Liveness | None]:
+    """Read every deferred session holder's liveness, on a worker thread: /proc reads block."""
+    holders = session_holders(rows.value or [])
+    if not holders:
+        return {}
+    return await asyncio.to_thread(read_liveness, holders)
 
 
 def unmeasured_snapshot(
@@ -712,6 +742,17 @@ answer crosses the wire as ``LOWER_BOUND`` rather than as a plain list.
 """
 
 
+def measured_status_map(snapshot: TaskSnapshot) -> Mapping[int, str] | None:
+    """*snapshot*'s ``{id: status}`` map, or ``None`` if it did not measure one.
+
+    A failed map half leaves ``status_map`` empty. Offered as carrier statuses,
+    that empty map would read every carrier as missing.
+    """
+    if snapshot.census.state is not DatumState.FRESH:
+        return None
+    return snapshot.status_map
+
+
 def measured_terminal_total(snapshot: TaskSnapshot) -> int | None:
     """*snapshot*'s terminal population, or ``None`` if it did not measure one.
 
@@ -734,8 +775,12 @@ async def acquire_terminal_window(
     *,
     now: datetime,
     terminal_total: int | None,
+    window: int = _TERMINAL_FETCH_WINDOW,
 ) -> Datum[list[dict]]:
-    """Read the newest :data:`_TERMINAL_FETCH_WINDOW` terminal rows, or say why not.
+    """Read the newest *window* terminal rows (default :data:`_TERMINAL_FETCH_WINDOW`), or say why not.
+
+    *window* is injectable so a caller (a test) can size it without touching
+    the module constant.
 
     Lives beside the unit because it is the same datum family read through the
     same access implementation, under the third slot of
@@ -768,6 +813,8 @@ async def acquire_terminal_window(
     Benign race: *terminal_total* was measured by a different read, so a task
     completing between the two shifts the window by a row.
     """
+    if window < 1:
+        raise ValueError(f'window must be at least 1, got {window!r}')
     if terminal_total is None:
         return unknown_datum(
             'the terminal window cannot be positioned without a measured '
@@ -776,7 +823,6 @@ async def acquire_terminal_window(
             FRESHNESS_BOUND_SECONDS,
         )
 
-    window = _TERMINAL_FETCH_WINDOW
     if terminal_total > window:
         logger.warning(
             'project root %s: %d terminal (done+cancelled) tasks exceed the '

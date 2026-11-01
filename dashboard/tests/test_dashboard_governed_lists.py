@@ -19,7 +19,7 @@ LEGACY_CONFIG_NAMES = governed_exceptions(
     'fallback after the canonical dark-factory-orchestrator.yaml, for a project not yet '
     'migrated to the canonical name.',
     list(_LEGACY_CONFIG_NAMES),
-    default=Debt(TaskRef(5603)),
+    default=Debt(TaskRef(7138)),
     default_covers=3,
 )
 

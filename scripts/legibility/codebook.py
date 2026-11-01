@@ -96,6 +96,21 @@ class NeverDeleteError(Exception):
 # them here — additionalProperties defaults to permissive (open-world).
 # ---------------------------------------------------------------------------
 
+_RUN_ID_SCHEMA = {"type": "string", "minLength": 1}
+
+# How an attach put a sighting or a candidate where it is
+# (plans/census-incremental-prd.md C1, L6). Checked at write by
+# validate_coding_record and at rest by validate.
+_ATTACHED_BY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "method": {"enum": ["session", "title", "key", "similarity"]},
+        "score": {"type": "number"},
+        "run_id": _RUN_ID_SCHEMA,
+    },
+    "required": ["method", "run_id"],
+}
+
 _SIGHTING_SCHEMA = {
     "type": "object",
     "properties": {
@@ -110,6 +125,8 @@ _SIGHTING_SCHEMA = {
         "invariant_violated": {"type": ["string", "null"]},
         "note": {"type": "string"},
         "evidence_quote": {"type": "string"},
+        "attached_by": _ATTACHED_BY_SCHEMA,
+        "verifier_tags": {"type": "array", "items": {"type": "string"}, "minItems": 1},
     },
     "required": ["date", "project", "session", "origin_phase", "manifested_phase"],
 }
@@ -118,8 +135,6 @@ _SIGHTING_SCHEMA = {
 # docs/quality-findings-contract.md §1, §2, §8). The finding identity fields
 # are checked by finding_identity_errors, not by these schemas.
 _FINDING_KEY_SCHEMA = {"type": "string", "pattern": KEY_PATTERN}
-
-_RUN_ID_SCHEMA = {"type": "string", "minLength": 1}
 
 FILED_TICKET_RESOLUTIONS = ("created", "combined", "refused", "failed", "existing")
 
@@ -140,6 +155,17 @@ _FILED_TICKET_SCHEMA = {
     "required": ["ticket", "project_root", "run_id", "finding_key", "task_id", "resolution", "step"],
 }
 
+# A task in a project's store: the corrections op's `outcome_of_task` and each
+# item of an entry's `corrected_by`.
+_TASK_REF_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "project_root": {"type": "string", "minLength": 1},
+        "task_id": {"type": "integer"},
+    },
+    "required": ["project_root", "task_id"],
+}
+
 _ENTRY_SCHEMA = {
     "type": "object",
     "properties": {
@@ -157,6 +183,7 @@ _ENTRY_SCHEMA = {
         "filed_tickets": {"type": "array", "items": _FILED_TICKET_SCHEMA},
         "fixed_at_sha": {"type": "string", "pattern": r"^[0-9a-f]{7,40}$"},
         "accepted_by": {"type": "integer"},
+        "corrected_by": {"type": "array", "items": _TASK_REF_SCHEMA},
     },
     "required": [
         "id",
@@ -177,15 +204,7 @@ _CANDIDATE_SCHEMA = {
         "first_seen": {"type": "string"},
         "disposition": {"enum": DISPOSITIONS},
         "sightings": {"type": "array", "items": _SIGHTING_SCHEMA},
-        "attached_by": {
-            "type": "object",
-            "properties": {
-                "method": {"enum": ["session", "title", "key", "similarity"]},
-                "score": {"type": "number"},
-                "run_id": _RUN_ID_SCHEMA,
-            },
-            "required": ["method", "run_id"],
-        },
+        "attached_by": _ATTACHED_BY_SCHEMA,
         "adjudicated_with": {"type": "string", "pattern": _CANDIDATE_ID_RE.pattern},
     },
     "required": ["id", "title", "first_seen", "disposition", "sightings"],
@@ -229,6 +248,7 @@ _MATCH_SCHEMA = {
         "manifested_phase": {"enum": PHASES},
         "invariant_violated": {"type": ["string", "null"]},
         "note": {"type": "string"},
+        "attached_by": _ATTACHED_BY_SCHEMA,
     },
     "required": ["entry_id"],
 }
@@ -252,6 +272,7 @@ _CORRECTION_SCHEMA = {
         "status": {"enum": STATUSES},
         "origin_phase": {"enum": PHASES},
         "manifested_phase": {"enum": PHASES},
+        "outcome_of_task": _TASK_REF_SCHEMA,
     },
     "required": ["entry_id", "note"],
 }
@@ -265,6 +286,7 @@ _CANDIDATE_RECORD_SCHEMA = {
         "origin_phase": {"enum": PHASES},
         "manifested_phase": {"enum": PHASES},
         "evidence_quote": {"type": "string"},
+        "attached_by": _ATTACHED_BY_SCHEMA,
     },
     "required": ["title"],
 }
@@ -506,8 +528,8 @@ def validate(codebook: dict) -> list[str]:
 
 def _build_sighting(payload: dict, *, session: str, date: str, project: str) -> dict:
     """Build a sighting dict from a match/candidate payload + record header
-    fields. invariant_violated/note/evidence_quote are included only when
-    truthy (never emitted as an explicit null/empty key)."""
+    fields. invariant_violated/note/evidence_quote/attached_by are included
+    only when truthy (never emitted as an explicit null/empty key)."""
     sighting = {
         "date": date,
         "project": project,
@@ -524,6 +546,9 @@ def _build_sighting(payload: dict, *, session: str, date: str, project: str) -> 
     evidence_quote = payload.get("evidence_quote")
     if evidence_quote:
         sighting["evidence_quote"] = evidence_quote
+    attached_by = payload.get("attached_by")
+    if attached_by:
+        sighting["attached_by"] = copy.deepcopy(attached_by)
     return sighting
 
 
@@ -896,7 +921,9 @@ def _apply_coding_record(
     path — the merger never fabricates an entry. The whole op (field writes
     and sighting alike) is gated by the same per-entry `session` dedup the
     match path uses, so re-running `apply` over an already-merged record is
-    exactly a no-op.
+    exactly a no-op. An `outcome_of_task` names the task whose whole outcome
+    for the entry this correction is; it is recorded on the entry's
+    `corrected_by`, which `scripts/legibility/disposition.py` reads.
 
     That dedup admits one sighting per (session, entry), so a record carrying
     two ops for the SAME entry can land only one of them. Corrections are
@@ -980,6 +1007,15 @@ def _apply_coding_record(
         sightings.append(
             _build_sighting(correction, session=session, date=date, project=project)
         )
+        outcome_of_task = correction.get("outcome_of_task")
+        if outcome_of_task:
+            task_ref = {
+                "project_root": outcome_of_task["project_root"],
+                "task_id": outcome_of_task["task_id"],
+            }
+            corrected_by = entry.setdefault("corrected_by", [])
+            if task_ref not in corrected_by:
+                corrected_by.append(task_ref)
         corrections_applied += 1
 
     for match in record.get("matches", []) or []:
@@ -1092,6 +1128,65 @@ def validate_coding_record(record: dict) -> list[str]:
     stores it as absent through screen_invariant_slugs.
     """
     return _schema_errors(record, CODING_RECORD_SCHEMA)
+
+
+# ---------------------------------------------------------------------------
+# Reading records: their sessions, fixed entries, the pending candidate of a
+# title, and an entry through the candidate promoted to it
+# ---------------------------------------------------------------------------
+
+def sessions_of(record: Mapping[str, Any]) -> list[str]:
+    """The session of each of *record*'s sightings, in order, repeats kept."""
+    return [
+        sighting["session"]
+        for sighting in record.get("sightings") or []
+        if isinstance(sighting, Mapping) and isinstance(sighting.get("session"), str)
+    ]
+
+
+FIXED_STATUSES = frozenset({"fixed", "retired"})
+"""Entry statuses a re-observation contradicts: fixed by a task, or retired
+because the census verifier reported it fixed. Nothing attaches to such an
+entry; a cluster re-observing one is surfaced (plans/census-incremental-prd.md
+L5, consumers)."""
+
+
+def is_fixed(entry: Mapping[str, Any]) -> bool:
+    return entry.get("status") in FIXED_STATUSES
+
+
+def pending_titled(codebook: Mapping[str, Any], title: str | None) -> str | None:
+    """The id of the first ``pending`` candidate titled exactly *title*: the
+    key :func:`apply_coding_records` groups new candidates by, so a cluster
+    built from a raw coding record resolves to the candidate the merge gave it.
+
+    None is a normal outcome, not an impossibility: when every candidate of
+    the title is already adjudicated, the merge declines to fabricate a pending
+    twin (task 4144) and routes the recurrence to the standing record. A
+    caller surfaces a None rather than skipping it in silence."""
+    for candidate in codebook.get("candidates") or []:
+        if candidate.get("title") == title and candidate.get("disposition") == "pending":
+            return candidate.get("id")
+    return None
+
+
+def promoted_from(codebook: Mapping[str, Any], entry_id: str) -> dict | None:
+    """The candidate promoted to entry *entry_id* as its own entry: linked by
+    ``promoted_to`` and neither attached nor adjudicated onto it."""
+    for candidate in codebook.get("candidates") or []:
+        if (
+            candidate.get("promoted_to") == entry_id
+            and "attached_by" not in candidate
+            and "adjudicated_with" not in candidate
+        ):
+            return candidate
+    return None
+
+
+def entry_field(codebook: Mapping[str, Any], entry: Mapping[str, Any], field: str) -> str | None:
+    """*entry*'s *field* (``cause`` or ``area``): its own when a correction has
+    written it, else that of the candidate it was promoted from."""
+    return entry.get(field) or (promoted_from(codebook, entry["id"]) or {}).get(field)
 
 
 # ---------------------------------------------------------------------------

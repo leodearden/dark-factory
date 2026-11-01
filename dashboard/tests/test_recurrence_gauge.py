@@ -20,6 +20,7 @@ from dashboard.data.db import DbPool
 from dashboard.data.escalation_corpus import PendingEscalations
 from dashboard.data.recurrence_gauge import ChainEntry, ChainState, chain_state, classify_chains
 from dashboard.data.root_invariants import scan_root_invariants
+from dashboard.project_labels import ProjectLabels
 
 NOW = datetime(2026, 10, 12, 12, 0, tzinfo=UTC)
 HOUR = timedelta(hours=1)
@@ -284,7 +285,7 @@ async def _scan_root(root: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
         )
     finally:
         await pool.close_all()
-    return record.to_wire()
+    return record.to_wire(ProjectLabels.of_roots(()))
 
 
 async def test_an_ok_root_lists_its_chains_with_their_states(tmp_path):
@@ -321,7 +322,7 @@ async def test_an_unopened_root_makes_no_chain_claim(tmp_path):
     record = await scan_root_invariants(
         root, _db_path(root), None, now=NOW, pending_escalations=PendingEscalations({})
     )
-    assert record.to_wire()['chains'] is None
+    assert record.to_wire(ProjectLabels.of_roots(()))['chains'] is None
 
 
 async def test_an_unchanged_database_is_scanned_once_and_classified_at_each_now(tmp_path):

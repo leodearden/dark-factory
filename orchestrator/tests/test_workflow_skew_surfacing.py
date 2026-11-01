@@ -93,6 +93,13 @@ class TestWorkflowVerifyProducerEmit:
             'tip_sha': 'cafef00d',
             'base_sha': 'deadbeef',
             'branch': f'{wf.config.git.branch_prefix}{wf.task_id}',
+            # task 5651: this workflow holds no VerifyResult, so every verdict fact is None.
+            'site': 'implement',
+            'duration_ms': None,
+            'slot_wait_secs': None,
+            'plan_hash': None,
+            'cache_mode': None,
+            'units': None,
         }
 
     def test_verify_checkpoint_hit_suppresses_workflow_verify_emit(self, tmp_path: Path):

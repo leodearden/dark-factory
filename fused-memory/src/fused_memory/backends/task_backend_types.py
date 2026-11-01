@@ -15,11 +15,32 @@ class AddTaskResult(TypedDict):
     message: str
 
 
+class DefectWriteResult(TypedDict):
+    """``apply_defect_events``' reply: both defect keys as stored after the write."""
+
+    id: str
+    message: str
+    defects: list[dict[str, Any]]
+    defect_test_retirements: list[dict[str, Any]]
+
+
+class AmendmentAdvisory(TypedDict):
+    """A write changed a planned task's text; plans/task-amendment-delivery-prd.md §9 C7."""
+
+    task_id: str
+    plan_authored_at: str | None
+    fields_changed: list[str]
+    will_replan: bool
+    plan_text_fp_before: str
+    task_text_fp_after: str
+
+
 class UpdateTaskResult(TypedDict):
     id: str
     message: str
     updated: bool
     updated_task: dict | None
+    amendment_advisory: NotRequired[AmendmentAdvisory]
 
 
 class SetTaskStatusResult(TypedDict):
@@ -106,6 +127,8 @@ class MetadataLookupResult(TypedDict):
 
 __all__ = [
     'AddTaskResult',
+    'AmendmentAdvisory',
+    'DefectWriteResult',
     'DependencyResult',
     'GetTasksResult',
     'MetadataLookupResult',

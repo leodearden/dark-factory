@@ -57,13 +57,14 @@ KEEPS ITS PIN and does not self-heal — its exit is a human, or the shared
 resolved, or the orphan-L0 reaper promotes a dead-filer L0 to L1 and a human
 consumes it).
 
-That "does not self-heal" property is a statement about a pin OUTSIDE
-``orchestrator.recovery_pins.MERGE_REMEDIABLE_ESC_CATEGORIES``, and the
-APPLIER is what makes it
-unconditionally true: a row pinned only by a merge-remediable escalation would
-be picked straight back up by the blocked-arm upgrade clauses on the next
-sweep, so ``Harness._reconcile_one_stranded`` holds those rows at their
-pre-3539 LEAVE instead of converting them (amendment pass, review finding #3).
+That "does not self-heal" property is a statement about a pin OUTSIDE the set
+the blocked arm relaxes on — ``orchestrator.recovery_pins.MERGE_REMEDIABLE_ESC_CATEGORIES``
+off main, ``ON_MAIN_REMEDIABLE_ESC_CATEGORIES`` on main — and the APPLIER is
+what makes it unconditionally true: a row pinned only by a record the blocked
+arm relaxes on would be picked straight back up by its upgrade clauses on the
+next sweep, so ``Harness._reconcile_one_stranded`` holds those rows at their
+pre-3539 LEAVE instead of converting them, asking :func:`report_blocked_arm_would_move`
+(amendment pass, review finding #3).
 This table cannot express that — it keys on a BOOLEAN ``has_open_escalation``
 and stays pure and config-free — which is exactly why the scoping lives with
 the two sibling sweep-side clauses rather than here. The escalation veto itself is unchanged (no
@@ -124,12 +125,14 @@ __all__ = [
     'ClaimantSource',
     'EscalationRef',
     'LeaveReason',
+    'ON_MAIN_BRANCH_KINDS',
     'RecoveryAction',
     'TaskGroundTruth',
     'TruthReport',
     'classify_recovery',
     'leave_reason',
     'recovery_shape_str',
+    'report_blocked_arm_would_move',
     'report_pins_blocked_done_flip',
     'report_pins_blocked_recovery',
     'report_pins_recovery',
@@ -149,6 +152,15 @@ class BranchStateKind(enum.StrEnum):
     EXISTS_OFF_MAIN = 'exists_off_main'
     GONE_WITH_MERGE_MARKER = 'gone_with_merge_marker'
     GONE_NO_MARKER = 'gone_no_marker'
+
+
+#: The branch shapes that are evidence the work is ON MAIN.  The one definition
+#: behind the blocked arm's MARK_DONE upgrade and the question of whether that
+#: upgrade would fire (:func:`report_blocked_arm_would_move`).
+ON_MAIN_BRANCH_KINDS: frozenset[BranchStateKind] = frozenset({
+    BranchStateKind.ON_MAIN,
+    BranchStateKind.GONE_WITH_MERGE_MARKER,
+})
 
 
 class ClaimantSource(enum.StrEnum):
@@ -266,8 +278,12 @@ class EscalationRef:
     means "unknown"; ``orchestrator.recovery_emission.escalation_ages_secs``
     maps that to a ``None`` age rather than dropping the id.
 
-    All three added fields are DEFAULTED so every existing construction site
-    keeps working untouched.
+    ``members`` carries an L2's held member ids, so
+    ``escalation.pins.pinned_only_by_human_parked`` can see a promoted hold
+    without a second read.
+
+    Every field after ``level`` is DEFAULTED so every existing construction
+    site keeps working untouched.
     """
 
     id: str
@@ -276,6 +292,7 @@ class EscalationRef:
     severity: str = ''
     filing_claimant_run_id: str | None = None
     created_at: str | None = None
+    members: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -735,9 +752,11 @@ class TaskGroundTruth:
     ) -> tuple[list[EscalationRef], bool]:
         """Map *tid*'s pending escalations to refs, plus the store's readability.
 
-        ``severity``, ``filing_claimant_run_id`` and ``created_at`` travel with
-        each ref so consumers can feed ``escalation.pins.classify_pins``
-        directly, and age a hold, without re-reading the store (spec
+        ``severity``, ``filing_claimant_run_id``, ``created_at`` and
+        ``members`` travel with each ref so consumers can feed
+        ``escalation.pins.classify_pins`` and
+        ``escalation.pins.pinned_only_by_human_parked`` directly, and age a
+        hold, without re-reading the store (spec
         ``docs/task-escalation-state-spec.md`` S6/E7).  ``row.severity or ''``
         normalises a null/absent severity to the unknown-severity sentinel, so
         the classifier reaches its documented fail-safe-to-pinning branch
@@ -777,6 +796,7 @@ class TaskGroundTruth:
                 severity=row.severity or '',
                 filing_claimant_run_id=row.filing_claimant_run_id,
                 created_at=getattr(row, 'timestamp', None),
+                members=tuple(row.members or ()),
             )
             for row in rows
         ], False
@@ -887,12 +907,12 @@ _RECOVERY: dict[_RecoveryShape, RecoveryAction] = {
     # READ THAT PARENTHESIS AS THE PRECONDITION IT IS, not as a property of
     # every converting row (amendment pass, review finding #3). It holds for a
     # `task_failure` pin — the measured 3717 population — and NOT for a
-    # `stranded_blocked` one, which `only_merge_remediable` accepts, so the
-    # next sweep's blocked-arm clauses would move the converted row again
-    # (MARK_DONE on main, RE_FILE off it). The applier therefore holds
-    # merge-remediable-pinned rows at their pre-3539 LEAVE and only genuinely
-    # at-rest rows reach the conversion; see the scoping clause in
-    # `Harness._reconcile_one_stranded`.
+    # `stranded_blocked` one (or, on main, a `preexisting_main_break` one),
+    # which `only_merge_remediable` accepts, so the next sweep's blocked-arm
+    # clauses would move the converted row again (MARK_DONE on main, RE_FILE
+    # off it). The applier therefore holds such rows at their pre-3539 LEAVE
+    # and only genuinely at-rest rows reach the conversion; the scoping clause
+    # in `Harness._reconcile_one_stranded` asks `report_blocked_arm_would_move`.
     #
     # Every CONVERT row is keyed `TaskStatus.IN_PROGRESS` BY CONSTRUCTION.
     # That single fact does two jobs: a converted (`blocked`) task can never
@@ -1179,8 +1199,9 @@ def report_pins_blocked_recovery(report: TruthReport) -> bool:
 def report_pins_blocked_done_flip(report: TruthReport) -> bool:
     """Do *report*'s open records forbid flipping a BLOCKED task to done?
 
-    :func:`report_pins_blocked_recovery`'s deliberately-more-conservative twin;
-    they differ on exactly one input class.  See
+    :func:`report_pins_blocked_recovery`'s twin; they differ on exactly two
+    input classes (a dead-filer L0, and a ``preexisting_main_break``-only pin,
+    which only the done-flip relaxes).  See
     :func:`orchestrator.recovery_pins.records_pin_blocked_done_flip`.
     """
     return records_pin_blocked_done_flip(
@@ -1188,6 +1209,28 @@ def report_pins_blocked_done_flip(report: TruthReport) -> bool:
         report.open_escalations,
         live_claimant=report.live_claimant is not None,
         live_claimant_id=_live_claimant_id(report),
+    )
+
+
+def report_blocked_arm_would_move(report: TruthReport) -> bool:
+    """Would a blocked-arm upgrade clause move a BLOCKED row with these records?
+
+    The blocked arm's own question, asked about a row that is NOT yet blocked:
+    "if this were status ``blocked`` next sweep, would the self-heal clauses of
+    ``Harness._reconcile_one_stranded`` act on it?"  True when the recovery
+    predicate lets go (the EXISTS_OFF_MAIN re-file clause may fire), or when the
+    branch is ON MAIN and the done-flip predicate lets go.  The CONVERT scoping
+    clause consumes it so a converted row can only ever be one that ``blocked``
+    genuinely rests (task 3539 amendment).
+
+    One function so the clause never re-spells the two predicates: they diverge
+    on exactly the rows task 4645 enumerates, and the clause must follow both.
+    """
+    if not report_pins_blocked_recovery(report):
+        return True
+    return (
+        report.branch_state.kind in ON_MAIN_BRANCH_KINDS
+        and not report_pins_blocked_done_flip(report)
     )
 
 

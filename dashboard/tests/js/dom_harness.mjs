@@ -1,7 +1,9 @@
 // A browser page for the dashboard's .jsx, in node: each call builds a fresh
 // jsdom window and loads index.html's local scripts into it the way the
-// browser does, on the browser's exact React bytes and Babel build. Render
-// tests mount one real tab into it and query the DOM it produces.
+// browser does, on the browser's exact Babel build and the development build
+// of the exact React package the browser loads. Render tests mount one real
+// tab into it with mount(), or the whole page app.jsx bootstraps with
+// mountPage(), and query the DOM it produces.
 //
 // A helper module, not a test: the `*.test.mjs` glob skips it.
 // dom_harness.test.mjs holds its contract.
@@ -24,12 +26,19 @@ import { servingEndpoint } from './wire_fixtures.mjs';
 
 export const NPM_CI = 'npm ci --no-audit --no-fund';
 
-// The CDN builds index.html loads that the harness takes from node_modules.
-export const REACT_BUILDS = ['react', 'react-dom'];
+// Each React package index.html loads, and the build of it the harness runs.
+// dom_harness.test.mjs says why it is the development build.
+const REACT_DEVELOPMENT_BUILDS = Object.freeze({
+  react: 'umd/react.development.js',
+  'react-dom': 'umd/react-dom.development.js',
+});
+
+export const REACT_BUILDS = Object.keys(REACT_DEVELOPMENT_BUILDS);
 
 // app.jsx is the page bootstrap: at load it mounts the whole <App/> into
-// #root, which would bring every tab's effects into every window. Render tests
-// mount one tab each instead.
+// #root, which would bring every tab's effects into every window. So it is
+// excluded from the LOAD, and run only on demand by mountPage(); most render
+// tests mount one tab each instead.
 const EXCLUDED_SCRIPTS = ['app.jsx'];
 
 function npmCiRemedy(root) {
@@ -79,22 +88,25 @@ function loadJsdom() {
   return jsdomModule;
 }
 
-// The installed copy of the build index.html loads for `pkg`, compiled once,
-// and only after its sha384 equals the tag's integrity attribute.
+// The development build of the React package index.html loads for `pkg`,
+// compiled once, and only after the installed copy of the browser's build
+// matches the tag's integrity attribute.
 const reactScripts = new Map();
 
 function reactScript(pkg) {
   if (!reactScripts.has(pkg)) {
     const { url, pathInPackage, integrity } = cdnScriptTag(pkg);
-    const file = path.join(toolchainPackageDir(pkg), pathInPackage);
-    const digest = sha384Digest(file);
+    const packageDir = toolchainPackageDir(pkg);
+    const servedBuild = path.join(packageDir, pathInPackage);
+    const digest = sha384Digest(servedBuild);
     if (digest !== integrity) {
       throw new Error(
-        `${file} (${digest}) is not the build index.html loads (${url}, ${integrity}), so the harness ` +
-          `would render with a different React than the browser. ${npmCiRemedy(REPO_ROOT)}`,
+        `${servedBuild} (${digest}) is not the build index.html loads (${url}, ${integrity}), so node_modules ` +
+          `holds a different ${pkg} package than the browser loads. ${npmCiRemedy(REPO_ROOT)}`,
       );
     }
-    reactScripts.set(pkg, new vm.Script(fs.readFileSync(file, 'utf8'), { filename: url }));
+    const developmentBuild = path.join(packageDir, REACT_DEVELOPMENT_BUILDS[pkg]);
+    reactScripts.set(pkg, new vm.Script(fs.readFileSync(developmentBuild, 'utf8'), { filename: developmentBuild }));
   }
   return reactScripts.get(pkg);
 }
@@ -158,6 +170,8 @@ function capturedConsoleErrors(VirtualConsole) {
 // served file. Returns the window and what was loaded, plus:
 //   consoleErrors — everything the window wrote to console.error, live;
 //   mount(Component, props) — renders into a fresh container under act();
+//   mountPage() — runs the excluded scripts into a fresh #root under act(),
+//     as index.html does, at most once per window; returns that #root;
 //   close() — unmounts every root, then closes the window and its timers.
 // Any script that fails to evaluate fails the build.
 export function buildDashboardWindow({ readSource = readServedSource } = {}) {
@@ -215,6 +229,26 @@ export function buildDashboardWindow({ readSource = readServedSource } = {}) {
     return handle;
   }
 
+  let pageRoot = null;
+
+  // app.jsx owns the createRoot it renders into, so no handle is tracked:
+  // window.close() is what stops the page's timers.
+  function mountPage() {
+    if (pageRoot) throw new Error(`mountPage() already ran ${excluded.join(', ')} into this window's #root`);
+    const { React, document } = window;
+    pageRoot = document.createElement('div');
+    pageRoot.id = 'root';
+    document.body.appendChild(pageRoot);
+    const context = dom.getInternalVMContext();
+    for (const src of excluded) {
+      const script = servedScript(src, readSource(src), compileAsScriptTag);
+      React.act(() => {
+        script.runInContext(context);
+      });
+    }
+    return pageRoot;
+  }
+
   let closed = false;
 
   function close() {
@@ -227,7 +261,7 @@ export function buildDashboardWindow({ readSource = readServedSource } = {}) {
     }
   }
 
-  return { window, loaded: scripts.map(({ src }) => src), excluded, consoleErrors, mount, close };
+  return { window, loaded: scripts.map(({ src }) => src), excluded, consoleErrors, mount, mountPage, close };
 }
 
 // Lands `patch` in the window's DF_DATA as a poll would. Its `__receipt`

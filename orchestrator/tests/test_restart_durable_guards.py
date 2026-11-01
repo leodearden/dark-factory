@@ -595,14 +595,15 @@ class TestOfflineLaneEpisodeRecordSurvivesRedeploy:
         episode = host.record().episodes[_LANE_NODE]
         assert (episode.planning_committed, episode.filing_due) == (True, False)
 
-    async def test_an_unreadable_record_costs_at_most_one_duplicate_and_says_so(
+    async def test_an_unreadable_record_files_no_duplicate_while_its_task_is_open_and_says_so(
         self, tmp_path: Path, caplog,
     ):
-        """Scenario 21: the record is lost while its task is open."""
+        """Scenario 21: the record is lost while its task is open, so the task is found by its metadata."""
         host = _LaneHost(tmp_path)
         first = host.process()
         await first.red_pass()
         await first.red_pass()
+        filed = host.record().episodes[_LANE_NODE].covering_task_id
         episodes_file = guard_state.guard_path(tmp_path, EPISODES_FILE)
         assert episodes_file is not None
         episodes_file.write_text('{ not json', encoding='utf-8')
@@ -612,35 +613,39 @@ class TestOfflineLaneEpisodeRecordSurvivesRedeploy:
         for _ in range(4):
             await redeployed.red_pass()
 
-        assert len(host.store.submitted) == 2
+        assert len(host.store.submitted) == 1
+        assert host.record().episodes[_LANE_NODE].covering_task_id == filed
         assert any(
             record.levelno >= logging.WARNING and EPISODES_FILE in record.getMessage()
             for record in caplog.records
         )
 
     @pytest.mark.parametrize(
-        ('idle', 'submitted'),
-        [(timedelta(days=14) - timedelta(minutes=1), 1), (timedelta(days=14), 2)],
+        ('idle', 'looked_up'),
+        [(timedelta(days=14) - timedelta(minutes=1), False), (timedelta(days=14), True)],
         ids=['kept', 'expired'],
     )
     async def test_the_record_expires_fourteen_days_after_its_last_write(
-        self, tmp_path: Path, idle: timedelta, submitted: int,
+        self, tmp_path: Path, idle: timedelta, looked_up: bool,
     ):
         """Kept, the binding still covers the test, so two spaced reds file
-        nothing; expired, the record is gone and they file a fresh task that
-        names no prior one."""
+        nothing and look nothing up; expired, the record is gone, and the two
+        spaced reds find the still-open task by its metadata and adopt it."""
         host = _LaneHost(tmp_path)
         first = host.process()
         await first.red_pass()
         await first.red_pass()
+        filed = host.record().episodes[_LANE_NODE].covering_task_id
+        del host.store.log[:]
 
         host.clock.advance(seconds=idle.total_seconds())
         redeployed = host.process()
         await redeployed.red_pass(minutes=0)
         await redeployed.red_pass()
 
-        assert len(host.store.submitted) == submitted
-        assert host.store.submitted[-1]['metadata']['x_offline_lane']['prior_task_ids'] == []
+        assert len(host.store.submitted) == 1
+        assert host.record().episodes[_LANE_NODE].covering_task_id == filed
+        assert ('find_tasks_by_metadata' in host.store.log) is looked_up
 
 
 # ---------------------------------------------------------------------------

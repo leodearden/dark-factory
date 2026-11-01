@@ -45,6 +45,7 @@ __all__ = [
     'DeferralInvalidReason',
     'DeferralKind',
     'DeferralRecord',
+    'DeferralRefusalCode',
     'DeferralRequest',
     'HeldBySessionDeferral',
     'HeldBySessionRequest',
@@ -100,6 +101,15 @@ class DeferralInvalidReason(StrEnum):
     NOT_PLANNING_HOLD = 'not_planning_hold'
     CAS_NEEDS_SINGLE_ID = 'cas_needs_single_id'
     INVALID_VALUE = 'invalid_value'
+
+
+class DeferralRefusalCode(StrEnum):
+    """PRD §5.3's `error` codes: the wire vocabulary of every deferral refusal."""
+
+    REQUIRED = 'deferral_required'
+    INVALID = 'deferral_invalid'
+    CHANGED = 'deferral_changed'
+    WRITE_AUTHORITY = 'deferral_write_authority'
 
 
 class LapseCause(StrEnum):

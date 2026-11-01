@@ -46,6 +46,8 @@ inject their own fakes.
 The pure/impure split mirrors ``near_duplicate_guard``: pure synchronous
 selectors and defensive ``getattr``-at-every-hop config resolvers, with the
 one async retrieval helper and the async orchestrator kept separate from them.
+The attach guard (task 7158) follows the same split: :class:`AttachGuard` owns
+its rules purely, and only the lookup of an unretrieved parent's cosine is I/O.
 """
 
 from __future__ import annotations
@@ -53,12 +55,14 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from shared.storm_counter import StormCounter
 
+from fused_memory.memory_metadata import normalize_supersedes
 from fused_memory.middleware._folded_escalation import file_folded_escalation
-from fused_memory.models.enums import MEM0_PRIMARY
+from fused_memory.models.enums import MEM0_PRIMARY, SourceStore
 from fused_memory.server.grouped_read import (
     CHILD_KINDS,
     CONTESTED_METADATA_KEY,
@@ -136,7 +140,9 @@ FAIL_OPEN_ESCALATION_ID_KEY = 'triage_fail_open_escalation_id'
 #: flagged in a way nothing reads.
 #: ``tests/server/test_add_memory_write_triage_gate.py`` pins this set against
 #: the keys ``tools.py`` actually writes, so a FOURTH key added to the attach
-#: without widening this set fails there rather than silently.
+#: without widening this set fails there rather than silently. The
+#: triage-contest marker is the one exception: see that suite's
+#: ``TestOnlyTriageWritesTheTriageContestMarker``.
 ATTACH_OWNED_KEYS: frozenset[str] = frozenset({
     PARENT_ID_KEY, 'kind', CONTESTED_METADATA_KEY,
 })
@@ -237,6 +243,20 @@ def attach_write_landed(result: Any) -> bool:
     return not (isinstance(memory_ids, list | tuple) and not memory_ids)
 
 
+def attach_write_durable(result: Any) -> bool:
+    """Did the ATTACH child write persist, or is its Mem0 leg durably queued for retry?
+
+    :func:`attach_write_landed`, plus a Mem0 leg ``MemoryService.add_memory``
+    deferred for server-side retry: the queued intent already carries the
+    triage-stamped parent link, so the retry creates exactly the child the ack
+    names.
+    """
+    pending = getattr(result, 'stores_pending_retry', None)
+    return attach_write_landed(result) or (
+        isinstance(pending, list | tuple) and SourceStore.mem0 in pending
+    )
+
+
 # --- config defaults --------------------------------------------------------
 
 #: Default when config is absent/partial/non-bool. OFF is the safe direction
@@ -326,19 +346,46 @@ def resolve_bands(memory_service: Any) -> tuple[float | None, float | None]:
     re-calibration must take effect on a running server without a restart.
     """
     return (
-        _coerce_band(_write_triage_attr(memory_service, 't_high')),
-        _coerce_band(_write_triage_attr(memory_service, 't_low')),
+        _number_or_none(_write_triage_attr(memory_service, 't_high')),
+        _number_or_none(_write_triage_attr(memory_service, 't_low')),
     )
 
 
-def _coerce_band(value: Any) -> float | None:
-    """One band edge as a float, or ``None`` for anything that is not a number."""
+def resolve_min_parent_cosine(memory_service: Any) -> float | None:
+    """Read the attach-guard floor from *memory_service*'s config, live per write.
+
+    An absent or non-numeric leaf reads as ``None``, i.e. the rule OFF: an
+    unreadable config leaves the pre-guard routing in place, the same rule as
+    the ``enabled`` flag's. The shipped default lives only in the schema.
+    """
+    return _number_or_none(_write_triage_attr(memory_service, 'min_parent_cosine'))
+
+
+def resolve_hoist_max_cosine_gap(memory_service: Any) -> float | None:
+    """Read the attach-guard hoist gap from *memory_service*'s config, live per write.
+
+    Same reading as :func:`resolve_min_parent_cosine`: an absent or
+    non-numeric leaf is ``None``, the rule OFF.
+    """
+    return _number_or_none(_write_triage_attr(memory_service, 'hoist_max_cosine_gap'))
+
+
+def _number_or_none(value: Any) -> float | None:
+    """*value* as a float, or ``None`` for anything that is not a number (``bool`` included)."""
     if isinstance(value, int | float) and not isinstance(value, bool):
         return float(value)
     return None
 
 
 # --- pure band routing ------------------------------------------------------
+
+
+class AttachRefusal(StrEnum):
+    """Why an attach was refused and the write stored standalone (task 7158)."""
+
+    BELOW_MIN_PARENT_COSINE = 'below_min_parent_cosine'
+    HOIST_COSINE_GAP = 'hoist_cosine_gap'
+    TARGET_COSINE_UNAVAILABLE = 'target_cosine_unavailable'
 
 
 @dataclass(frozen=True)
@@ -367,6 +414,67 @@ class BandDecision:
     judged_candidate_id: str | None = None
     #: Where the evidence behind this decision was clipped; ``()`` when nowhere.
     truncation_facts: tuple[TruncationFact, ...] = ()
+    #: The band winner's own slate id, before hoisting; ``None`` when no band
+    #: attached anything.
+    winner_id: str | None = None
+    #: Why the attach guard refused this write's attach; empty when it did not.
+    attach_refusals: frozenset[AttachRefusal] = frozenset()
+
+    @property
+    def attach_source_id(self) -> str | None:
+        """The slate record the attach target was derived from, before hoisting."""
+        return self.judged_candidate_id if self.judged_candidate_id is not None else self.winner_id
+
+
+@dataclass(frozen=True)
+class AttachGuard:
+    """Which attach-guard rules are in force for one write, and what they refuse.
+
+    The FLOOR refuses any attach whose target's cosine to the write is below
+    ``min_parent_cosine``. The HOIST GAP refuses, in the judge band only, a
+    hoist whose parent's cosine is more than ``hoist_max_cosine_gap`` below
+    the matched child's. ``None`` switches a rule off. The evidence for each
+    value is its field description on ``config/schema.py::WriteTriageConfig``.
+    """
+
+    min_parent_cosine: float | None
+    hoist_max_cosine_gap: float | None
+
+    def _gap_applies(self, *, hoisted: bool, judged: bool) -> bool:
+        return hoisted and judged and self.hoist_max_cosine_gap is not None
+
+    def needs_target_cosine(self, *, hoisted: bool, judged: bool) -> bool:
+        """Does any rule in force need the target's cosine to decide this attach?"""
+        return self.min_parent_cosine is not None or self._gap_applies(hoisted=hoisted, judged=judged)
+
+    def refusals(
+        self,
+        *,
+        source_cosine: float | None,
+        target_cosine: float | None,
+        hoisted: bool,
+        judged: bool,
+    ) -> frozenset[AttachRefusal]:
+        """Every rule this attach trips; an unscorable target trips them all as one reason."""
+        if not self.needs_target_cosine(hoisted=hoisted, judged=judged):
+            return frozenset()
+        if target_cosine is None:
+            return frozenset({AttachRefusal.TARGET_COSINE_UNAVAILABLE})
+        refused: set[AttachRefusal] = set()
+        if self.min_parent_cosine is not None and target_cosine < self.min_parent_cosine:
+            refused.add(AttachRefusal.BELOW_MIN_PARENT_COSINE)
+        gap = self.hoist_max_cosine_gap if self._gap_applies(hoisted=hoisted, judged=judged) else None
+        if gap is not None and source_cosine is not None and target_cosine < source_cosine - gap:
+            refused.add(AttachRefusal.HOIST_COSINE_GAP)
+        return frozenset(refused)
+
+
+def resolve_attach_guard(memory_service: Any) -> AttachGuard:
+    """The attach guard *memory_service*'s config puts in force, read live per write."""
+    return AttachGuard(
+        min_parent_cosine=resolve_min_parent_cosine(memory_service),
+        hoist_max_cosine_gap=resolve_hoist_max_cosine_gap(memory_service),
+    )
 
 
 def declares_attach_keys(metadata: Any) -> bool:
@@ -417,7 +525,26 @@ def declares_attach_keys(metadata: Any) -> bool:
     return any(key in metadata for key in ATTACH_OWNED_KEYS)
 
 
-def _canonical_id_of(result: MemoryResult) -> str:
+def declares_supersession(metadata: Any) -> bool:
+    """True when the CALLER's own *metadata* declares a non-empty ``supersedes``.
+
+    A supersession is a new standalone record plus a mark on each record it
+    replaces (``services/supersession_mark.py::mark_superseded``), never an
+    attach under one (ruling 5c). The replaced record is the likeliest
+    candidate a correction restates, so attaching would make the retired
+    record the parent of its own replacement and invert the supersession.
+
+    Presence of a non-empty declaration is the test, well-formed or not, for
+    the reason :func:`declares_attach_keys` gives about a malformed
+    ``parent_id``: a caller bug is for ``memory_metadata`` validation to
+    report, not for triage to quietly convert into an attach.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    return bool(normalize_supersedes(metadata.get('supersedes')))
+
+
+def canonical_id_of(result: MemoryResult) -> str:
     """The id a write should attach to for *result* — hoisting a CHILD.
 
     A sighting or amendment record is itself attached to something, and
@@ -438,7 +565,9 @@ def _canonical_id_of(result: MemoryResult) -> str:
     parent id whose record was since deleted. That is at worst the
     pre-existing dangling-parent condition ``grouped_read`` already tolerates,
     whereas attaching to a child creates a guaranteed-broken grandchild that
-    one-level grouping can NEVER fold.
+    one-level grouping can NEVER fold. With the attach guard on, an unscorable
+    (deleted) parent now refuses to ``stored`` instead
+    (:attr:`AttachRefusal.TARGET_COSINE_UNAVAILABLE`).
 
     The child rule mirrors ``grouped_read._parent_id_in_meta`` rule-for-rule —
     a child ``kind`` AND a non-empty ``str`` ``parent_id``, with a malformed
@@ -507,7 +636,7 @@ def decide_band(
 
     ``canonical_id`` is a CANONICAL id, not merely "the winning result's id":
     a winner that is itself a sighting or amendment child is HOISTED to its
-    parent by :func:`_canonical_id_of`, so the attach can never produce a
+    parent by :func:`canonical_id_of`, so the attach can never produce a
     grandchild that one-level grouping cannot fold. Only the attach TARGET
     moves — ``similarity`` stays the winner's own measured cosine, because
     that is the evidence actually observed against the submitted text.
@@ -535,11 +664,13 @@ def decide_band(
     # from t_low up. See the docstring: this is measured, not a fallback.
     if t_high is not None and similarity >= t_high:
         return BandDecision(
-            OUTCOME_RESTATED, _canonical_id_of(best), similarity, t_high, t_low,
+            OUTCOME_RESTATED, canonical_id_of(best), similarity, t_high, t_low,
+            winner_id=best.id,
         )
 
     return BandDecision(
-        OUTCOME_JUDGE, _canonical_id_of(best), similarity, t_high, t_low,
+        OUTCOME_JUDGE, canonical_id_of(best), similarity, t_high, t_low,
+        winner_id=best.id,
     )
 
 
@@ -648,9 +779,11 @@ _FAIL_OPEN_STORM_WINDOW_SECONDS = 3600.0
 
 _FAIL_OPEN_HINT = (
     'add_memory write triage failed open repeatedly: every write in this '
-    'window was stored WITHOUT triage, i.e. with the pre-triage behaviour. No '
-    'write was lost or blocked (contract C1), but no restatement was detected '
-    'either. Check candidate retrieval (MemoryService.search / mem0 '
+    'window proceeded WITHOUT triage, i.e. with the pre-triage behaviour. No '
+    'write was blocked (contract C1), but no restatement was detected either, '
+    "and whether each write's Mem0 leg landed is recorded in the mem0 intent "
+    "journal (write_journal.db's mem0_intents table), not by this alarm. "
+    'Check candidate retrieval (MemoryService.search / mem0 '
     'reachability) and the judge. To stop triage deliberately rather than '
     'letting it degrade silently, set write_triage.enabled: false — it is '
     'green-tier hot-reloadable via reload_config.'
@@ -785,11 +918,12 @@ async def triage_write(
     judge: Any = None,
     allow_near_duplicate: bool = False,
     caller_owns_attach_keys: bool = False,
+    caller_declares_supersession: bool = False,
 ) -> BandDecision:
     """Route one ``add_memory`` write. NEVER raises, NEVER blocks, NEVER errors.
 
-    Force-store → retrieve → band → (judge slot) → decision. Every stage is
-    wrapped after the force-store checks: any
+    Force-store → retrieve → band → (judge slot) → guard → decision. Every
+    stage is wrapped after the force-store checks: any
     exception whatsoever yields :data:`OUTCOME_STORED` plus exactly one
     counted fail-open and a logged warning with ``exc_info``. Nothing escapes,
     because C1 is absolute — from the caller's side a fail-open is
@@ -805,11 +939,12 @@ async def triage_write(
     fail-open — so a changed ``MemoryService.search`` signature surfaces as a
     storm escalation rather than as a stream of errored writes.
 
-    *allow_near_duplicate* and *caller_owns_attach_keys* are passed IN rather
-    than recomputed: ``add_memory`` already derives both from the metadata it
-    holds, and a second derivation here is a second place for them to disagree
-    about who is exempt. :func:`declares_attach_keys` is the one spelling of
-    the *caller_owns_attach_keys* predicate.
+    *allow_near_duplicate*, *caller_owns_attach_keys* and
+    *caller_declares_supersession* are passed IN rather than recomputed:
+    ``add_memory`` already derives them from the metadata it holds, and a
+    second derivation here is a second place for them to disagree about who is
+    exempt. :func:`declares_attach_keys` and :func:`declares_supersession` are
+    the one spellings of the last two predicates.
 
     There is deliberately no recon-stage arm. It was retired by task 3134
     (leaf iota) once Stage-1 consolidation moved onto ``consolidate_memories``,
@@ -848,6 +983,11 @@ async def triage_write(
         #
         # Returned before retrieval for the same reason as the flag above: no
         # candidate can change the answer, so no round-trip is spent asking.
+        return BandDecision(OUTCOME_STORED, None, None, None, None)
+
+    if caller_declares_supersession:
+        # A correction is never filed under the record it retires; see
+        # declares_supersession.
         return BandDecision(OUTCOME_STORED, None, None, None, None)
 
     try:
@@ -893,9 +1033,34 @@ async def triage_write(
         _record_fail_open(counter, project_id, exc, stage='retrieve')
         return BandDecision(OUTCOME_STORED, None, None, None, None)
 
-    if decision.outcome != OUTCOME_JUDGE:
-        return decision
+    judged = decision.outcome == OUTCOME_JUDGE
+    if judged:
+        decision = await _judge_band(
+            memory_service, decision, results, counter, judge,
+            content=content, project_id=project_id,
+        )
 
+    try:
+        return await _guard_attach(
+            memory_service, decision, results,
+            content=content, project_id=project_id, judged=judged,
+        )
+    except Exception as exc:  # C1: nothing escapes this path.
+        _record_fail_open(counter, project_id, exc, stage='attach_guard')
+        return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
+
+
+async def _judge_band(
+    memory_service: Any,
+    decision: BandDecision,
+    results: SearchResults,
+    counter: TriageFailOpenCounter,
+    judge: Any,
+    *,
+    content: str,
+    project_id: str,
+) -> BandDecision:
+    """The middle band's judge slot: the judged decision, or ``stored`` plus one counted fail-open."""
     try:
         answer = await (judge or _stub_judge)(
             memory_service=memory_service,
@@ -918,6 +1083,97 @@ async def triage_write(
     except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
         _record_fail_open(counter, project_id, exc, stage='judge')
         return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
+
+
+async def _guard_attach(
+    memory_service: Any,
+    decision: BandDecision,
+    results: Sequence[MemoryResult],
+    *,
+    content: str,
+    project_id: str,
+    judged: bool,
+) -> BandDecision:
+    """*decision*, or ``stored`` with its :class:`AttachRefusal` reasons when the guard refuses its attach.
+
+    A refusal is a measured fact about the corpus, not a dependency failure,
+    so it never touches the fail-open counter; a lookup that raises propagates
+    to the caller, which counts it.
+    """
+    target_id = decision.canonical_id
+    if target_id is None:
+        return decision
+    guard = resolve_attach_guard(memory_service)
+    source_id = decision.attach_source_id
+    hoisted = target_id != source_id
+    if not guard.needs_target_cosine(hoisted=hoisted, judged=judged):
+        return decision
+    source_cosine = _slate_cosine(results, source_id)
+    target_cosine = (
+        await _parent_cosine(
+            memory_service, target_id, results, content=content, project_id=project_id,
+        )
+        if hoisted
+        else source_cosine
+    )
+    refusals = guard.refusals(
+        source_cosine=source_cosine, target_cosine=target_cosine, hoisted=hoisted, judged=judged,
+    )
+    if not refusals:
+        return decision
+    _log_attach_refusal(
+        decision, refusals,
+        target_cosine=target_cosine, source_cosine=source_cosine,
+        judged=judged, guard=guard, project_id=project_id,
+    )
+    return replace(decision, outcome=OUTCOME_STORED, canonical_id=None, attach_refusals=refusals)
+
+
+async def _parent_cosine(
+    memory_service: Any,
+    parent_id: str,
+    results: Sequence[MemoryResult],
+    *,
+    content: str,
+    project_id: str,
+) -> float | None:
+    """The write's cosine to *parent_id*: from the slate when retrieved, else ONE by-id lookup.
+
+    ``None`` when the parent is not in the store. A lookup error propagates.
+    """
+    cosine = _slate_cosine(results, parent_id)
+    if cosine is not None:
+        return cosine
+    scores = await memory_service.cosine_to_memories(
+        query=content, memory_ids=[parent_id], project_id=project_id,
+    )
+    return _number_or_none(scores.get(parent_id))
+
+
+def _slate_cosine(results: Sequence[MemoryResult], memory_id: str | None) -> float | None:
+    """The retrieved cosine of *memory_id*, or ``None`` when it was not retrieved with one."""
+    return next((cosine_of(result) for result in results if result.id == memory_id), None)
+
+
+def _log_attach_refusal(
+    decision: BandDecision,
+    refusals: frozenset[AttachRefusal],
+    *,
+    target_cosine: float | None,
+    source_cosine: float | None,
+    judged: bool,
+    guard: AttachGuard,
+    project_id: str,
+) -> None:
+    """One INFO line per refused attach: each rule's rate is measured from these."""
+    logger.info(
+        'write_triage attach refused: project=%s outcome=%s reasons=%s target=%r '
+        'target_cosine=%s source=%r source_cosine=%s judged=%s min_parent_cosine=%s '
+        'hoist_max_cosine_gap=%s; write stored standalone (not a fail-open)',
+        project_id, decision.outcome, ','.join(sorted(refusals)), decision.canonical_id,
+        target_cosine, decision.attach_source_id, source_cosine, judged,
+        guard.min_parent_cosine, guard.hoist_max_cosine_gap,
+    )
 
 
 def _retrieval_cap_facts(
@@ -944,7 +1200,7 @@ def _apply_judge_verdict(
     *answer* is what the judge returned — a :class:`TriageJudgeVerdict` (its
     ``usage`` is ignored here), any ``(outcome, candidate_id)`` pair, or a bare
     outcome word naming no candidate. A verdict naming a candidate attaches to that retrieved record,
-    hoisted by :func:`_canonical_id_of` exactly as the band's winner is; one
+    hoisted by :func:`canonical_id_of` exactly as the band's winner is; one
     naming none attaches to the band's winner. ``stored`` attaches nothing, so
     it carries no canonical a caller could mistake for an endorsement.
 
@@ -976,7 +1232,7 @@ def _apply_judge_verdict(
     return replace(
         decision,
         outcome=verdict.outcome,
-        canonical_id=_canonical_id_of(judged),
+        canonical_id=canonical_id_of(judged),
         judged_candidate_id=verdict.candidate_id,
     )
 
@@ -1091,14 +1347,23 @@ def emit_triage_fail_open_storm_escalation(
         # honest and points at the co-affected queues, rather than blaming
         # whichever write happened to cross the threshold.
         f'projects_in_window={storm.get("projects")!r}',
+        f'mem0_intents_in_window={storm.get("mem0_intents_in_window")!r}',
         '',
         'add_memory write triage (PRD leaf beta, task 3127) FAILED OPEN '
-        'repeatedly inside one rolling window. This is a DEGRADATION, not a '
-        'data-loss incident, and the distinction decides the remediation:',
+        'repeatedly inside one rolling window. This is a DEGRADATION; data loss '
+        'is ruled out only when the counts above show no failed or dead Mem0 '
+        'intents, and the distinction decides the remediation:',
         '',
-        '  * Every write in the window still LANDED — stored WITHOUT triage, '
-        'i.e. with the pre-triage behaviour. No write was lost and no write '
-        'was blocked (contract C1 holds on every fail-open path).',
+        '  * Triage blocked no write (contract C1 holds on every fail-open '
+        'path): each one proceeded WITHOUT triage, i.e. with the pre-triage '
+        'behaviour. This alarm does not by itself prove each write LANDED: a '
+        "write's Mem0 leg can fail independently of triage, and the outage that "
+        'breaks candidate retrieval (embeddings) usually breaks the Mem0 write '
+        'too. mem0_intents_in_window counts every Mem0-primary write created in '
+        'the window by status, not only the fail-opens: completed = landed; '
+        'retrying = queued for server-side retry; pending = in flight; '
+        'failed/dead = did NOT land. None means the count was unavailable: '
+        "query write_journal.db's mem0_intents table by status and created_at.",
         '  * What was lost is DETECTION: no restatement was recognised, so '
         'writes that should have been attached as sightings of an existing '
         'memory were stored as new standalone entries instead. Nothing is '

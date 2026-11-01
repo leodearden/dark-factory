@@ -85,6 +85,12 @@ class RecordingLifecycle:
     def live_request(self, request_id: str) -> MergeRequest | None:
         return self.live.get(request_id)
 
+    def retire(self, request_id: str) -> None:
+        current = self.states.get(request_id)
+        if current is not None and current != ItemLifecycleState.TERMINAL:
+            self.note_transition(request_id, current, ItemLifecycleState.TERMINAL)
+        self.live.pop(request_id, None)
+
     def port(self) -> IntakeLifecycle:
         return IntakeLifecycle(
             current=self.current,
@@ -137,8 +143,9 @@ def build_scene(tmp_path: Path, *, assert_merger_owns: Callable[[str], None]) ->
         event_store=events,
         escalation_queue=None,
         git_ops=lambda: git_ops,
-        frozen_prefix=lambda: (),
+        frozen_requests=lambda: (),
         frozen_prefix_tip=lambda sha: sha,
+        retire_item=lifecycle.retire,
         assert_merger_owns=assert_merger_owns,
     )
     return Scene(

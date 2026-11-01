@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _orch_helpers import pydantic_spec
 
+from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.review_suggestions.disposition import SuggestionDisposition
@@ -59,6 +60,7 @@ def _make_workflow(
     config.max_amendment_rounds = max_amendment_rounds
     config.lock_depth = 2
     config.project_root = tmp_path / 'proj'
+    config.review.reviewer_briefing = ReviewBriefing.DIFF_ONLY
     # Real reviewer model string so _reviewer_config_fingerprint() (task 2749
     # amendment) yields a deterministic, non-None digest instead of choking on
     # an unserialisable auto-child MagicMock.  The fingerprint reads the

@@ -795,9 +795,8 @@ def _depth_distribution(
 ) -> dict[str, Any]:
     """Histogram ``data['depth']`` with a None-safe ``int()`` coercion.
 
-    Mirrors `analyze_speculation_depth.py::compute_per_depth`: an absent, None
-    or unparseable depth is SKIPPED and counted in ``n_skipped`` rather than
-    raising or landing in a 0 bucket.  Historical (pre-task-2340) `merge_verify`
+    An absent, None or unparseable depth is SKIPPED and counted in
+    ``n_skipped`` rather than raising or landing in a 0 bucket.  Historical (pre-task-2340) `merge_verify`
     rows carry no depth at all.
     """
     counts: Counter[int] = Counter()
@@ -1060,11 +1059,12 @@ def compute_speculation(
 # Section: queue depth and the outcome/state mixes.
 # ---------------------------------------------------------------------------
 
-# Mirrors `merge_types.py::_NON_TERMINAL_OUTCOMES` — the OutcomeKind members
+# Mirrors `orchestrator/src/orchestrator/merge_lane/types.py::_NON_TERMINAL_OUTCOMES` — the OutcomeKind members
 # for which the attempt/merge is still live. Copied as literal strings, NOT
 # imported: scripts/ must stay importable without the orchestrator package
 # (this module's test gate runs under `uv run --project shared`). The set is
-# documented there as a FROZEN CONTRACT, already mirrored by the dashboard.
+# documented there as a FROZEN CONTRACT that names this copy as its mirror,
+# so a change there must update this set in the same commit.
 _NON_TERMINAL_OUTCOMES = frozenset({
     'cas_retry', 'gate_retry', 'post_merge_generation_chained',
     'plan_files_narrowed',

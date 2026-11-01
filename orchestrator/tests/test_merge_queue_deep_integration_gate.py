@@ -160,12 +160,13 @@ place to build.
 
 PROVENANCE
 ----------
-The repo fixtures, ``_make_*`` builders, git helpers, spies, permit census and
-durable-tier readers this file shares with test_merge_queue_deep_landing.py
-live in ``_merge_deep_scene.py``, imported by bare module name;
-test_merge_deep_scene_dedup.py guards that single home.  An earlier draft of
-this note claimed the absent ``__init__.py`` forced them to be cloned here, and
-that premise was false: flat ``_``-prefixed helper modules import by bare name.
+The repo fixtures, ``_make_*`` builders, git helpers, verify doubles, spies,
+permit census and durable-tier readers this file imports live in
+``_merge_deep_scene.py``, the scene layer every deep merge-ahead test module
+shares, imported by bare module name; test_merge_deep_scene_dedup.py guards
+that single home.  An earlier draft of this note claimed the absent
+``__init__.py`` forced them to be cloned here, and that premise was false:
+flat ``_``-prefixed helper modules import by bare name.
 
 Every helper still defined here is either a gate variant of a same-named helper
 elsewhere, or original to this file:
@@ -175,8 +176,6 @@ elsewhere, or original to this file:
   _make_worker                   | a gate variant defaulting to the production
                                  |   ``VerifyPort`` (task 5028); deep_landing's
                                  |   builds a fake-verified lane by design.
-  _fail_verify_result,           | gate-only since deep_landing dropped its
-  _spy_post_merge_verify         |   copies (task 5033).
   _finalized_rows                | the original sqlite reader; deep_landing's
                                  |   delegates to its own ``_event_rows``.
   -------------------------------+-------------------------------------------
@@ -274,7 +273,7 @@ HARNESS NOTES
     test_merge_queue_reachback_patch_guard.py freezes the
     ``orchestrator.merge_lane.worker.<private>`` reach-back surface.  The sanctioned
     module-level exceptions are ``build_chain``, ``_run_post_merge_verify``,
-    ``release_chain_build_lane`` and ``CHAIN_BUILD_TIMEOUT_SECS``.
+    ``release_chain_build_lane``.
   * ``fused-memory/scripts/check_bare_magicmock_config.py`` forbids a bare
     ``MagicMock()`` bound to a config-named variable — use ``_make_config(...)``.
   * No new pytest marker is introduced, so ``orchestrator/pyproject.toml`` stays
@@ -296,6 +295,7 @@ from _merge_deep_scene import (
     _drain_residue,
     _ephemeral_merge_wt,
     _events_for_task,
+    _fail_verify_result,
     _local_lease,
     _make_config,
     _make_git_ops,
@@ -308,8 +308,9 @@ from _merge_deep_scene import (
     _shared_txt_with,
     _spy_advance_main,
     _spy_chain_lane_release,
-    git_repo,  # noqa: F401 — pytest fixture used by name, resolved from the shared deep scene
+    _StubRemoteAllocator,
 )
+from _merge_deep_scene import git_repo as git_repo
 from _merge_lane_census import lanes_by_task, queued_in_lane
 
 # task 5333: Row 7 ALONE is sized by measurement (DEEP_GATE_SCENE_TEST_TIMEOUT);
@@ -415,16 +416,6 @@ def _conflicting_branch_content(
 # ── verify verdicts ──────────────────────────────────────────────────────────
 
 
-def _fail_verify_result():
-    """A failing :class:`VerifyResult` — a RED tip verdict."""
-    from orchestrator.verify import VerifyResult
-
-    return VerifyResult(
-        passed=False, test_output='tip is red', lint_output='', type_output='',
-        summary='fail', category='',
-    )
-
-
 def _timed_out_verify_result():
     """A :class:`VerifyResult` that TIMED OUT — a red that names no culprit.
 
@@ -523,44 +514,6 @@ def _verdict_from_tree(bad_file: str):
 
 
 # ── dispatch-scene spies ─────────────────────────────────────────────────────
-
-
-def _spy_post_merge_verify(
-    monkeypatch, outcome=None, *, raises=None,
-    park: set[str] | None = None,
-    parked: asyncio.Event | None = None,
-) -> list[dict]:
-    """Replace ``_run_post_merge_verify`` with a recorder returning *outcome*.
-
-    ``outcome=None`` is a PASS in this function's vocabulary; a
-    :class:`VerifyResult` is a FAIL.  *raises* makes the verify blow up
-    instead, which is the third exit — the one that stays NON-adopting.
-
-    *park* names task ids whose verify NEVER RETURNS — the shape a live head
-    has while the speculative slot verifies the chain tip.  *parked*, when
-    given, is set the moment such a call is entered, so a test can wait for the
-    swap to have happened rather than sleeping for it.  The park is ONE-SHOT
-    per task id, deliberately.
-    """
-    calls: list[dict] = []
-    parked_once: set[str] = set()
-
-    async def _recording(git_ops, req, merge_wt, **kwargs):
-        calls.append({'task_id': req.task_id, 'merge_wt': merge_wt, **kwargs})
-        if park is not None and req.task_id in park and req.task_id not in parked_once:
-            parked_once.add(req.task_id)
-            if parked is not None:
-                parked.set()
-            # Never completes on its own: δ's teardown is what ends it.
-            await asyncio.Event().wait()
-        if raises is not None:
-            raise raises
-        return outcome
-
-    monkeypatch.setattr(
-        'orchestrator.merge_lane.worker._run_post_merge_verify', _recording,
-    )
-    return calls
 
 
 def _capture_verify_timeouts(monkeypatch) -> list[float]:
@@ -1470,59 +1423,6 @@ def _gate_followers(n: int, *, start: int = 102) -> tuple[str, ...]:
     return tuple(str(start + i) for i in range(n))
 
 
-class _StubRemoteAllocator:
-    """Minimal HostAllocator stand-in handing out ONE remote lease at a time.
-
-    REMOTE deliberately (cloned from test_merge_queue_deep_dispatch.py): a
-    remote lease makes ``_run_post_merge_verify`` build its pool from the
-    injected runner instead of a real ``LocalRunner``, so
-    ``VerifyRunnerPool.dispatch`` — the single ``merge_verify`` emission site —
-    genuinely runs and genuinely emits.  Stubbing ``_run_post_merge_verify``
-    wholesale (what ``remote=False`` does) emits no event at all and would make
-    every ``chain_items`` telemetry assertion vacuous.
-    """
-
-    def __init__(self, lease) -> None:
-        self._lease = lease
-        self._held = False
-
-    def free_host_count(self) -> int:
-        return 0 if self._held else 1
-
-    async def acquire(self, _local_factory, *, policy):
-        if self._held:
-            return None
-        self._held = True
-        return self._lease
-
-    async def release(self, _lease) -> None:
-        self._held = False
-
-    async def cancel_and_release(self, _lease) -> bool:
-        self._held = False
-        return True
-
-    # -- the read side `snapshot()` goes through --------------------------------
-    # Minimal, but not optional: `SpeculativeMergeWorker.snapshot()` reads
-    # `host_names` UNCONDITIONALLY for `occupancy.hosts_total`
-    # (merge_queue.py::SpeculativeMergeWorker.snapshot), so a stub without it
-    # makes the worker's own public observation surface unreadable on a remote
-    # scene -- an AttributeError from inside snapshot(), not a failed claim.
-    #
-    # `host_states()` is deliberately NOT provided: the `hosts` block is built
-    # by `_host_states_block`, whose first statement is
-    # `if not isinstance(self._host_allocator, HostAllocator): return []`.
-    # That gate is a TYPE check by design (its docstring: the doubles "answer
-    # every attribute, so hasattr/duck-typing would let them crash or inject
-    # garbage"), so for THIS duck-typed stub the block is `[]` whatever the
-    # stub offers -- and an assertion written against `hosts` here would be
-    # permanently vacuous.
-
-    @property
-    def host_names(self) -> list[str]:
-        return [self._lease.name]
-
-
 def _verify_rows(db_path: Path) -> list[dict]:
     """Return every ``merge_verify`` row's parsed ``data`` dict, in order.
 
@@ -2033,7 +1933,7 @@ def _scripted_remote_runner(scene: _GateScene, script, name='gate-runner'):
         a verdict whose SHAPE is the claim rather than its polarity — a
         ``timed_out=True`` result, say — and injecting it here rather than by
         replacing ``_run_post_merge_verify`` (the ``outcome=`` vocabulary
-        :func:`_spy_post_merge_verify` uses) is what leaves the real
+        ``_merge_deep_scene.py::_spy_post_merge_verify`` uses) is what leaves the real
         function's ``timeouts``/``enospc_retries`` bookkeeping in the loop.
         A stub in its place would be asserting the test's own arithmetic.
     """
@@ -2170,7 +2070,7 @@ async def _make_gate_scene(
     Module-level monkeypatching is confined to (a) the four
     ``orchestrator.merge_lane.worker`` names test_merge_queue_reachback_patch_guard.py
     sanctions — ``build_chain``, ``_run_post_merge_verify``,
-    ``release_chain_build_lane`` and ``CHAIN_BUILD_TIMEOUT_SECS`` — and (b)
+    ``release_chain_build_lane`` — and (b)
     ``orchestrator.verify._run_cmd`` (:func:`_capture_verify_timeouts`), a
     public name one layer BELOW the port that no ``VerifyPort`` leg covers.
     The scoped verdict itself is NOT patched at all any more: both seams that
@@ -2393,8 +2293,8 @@ class TestDeepScaleBuild:
 # The ONE boundary row with zero coverage anywhere in the tree: a repo-wide
 # search for the merge-verify cold budget, for a 16-item chain, or for a
 # verify timeout on a deep round returns nothing in either upstream deep
-# module.  The only build-side deadline that IS tested is the 120 s
-# CHAIN_BUILD_TIMEOUT_SECS, and only as a unit.
+# module.  The only build-side deadline that IS tested is
+# merge_deep.chain_build_timeout_secs, and only as a unit.
 #
 # The row's claim, stated as three separate ones so a failure names WHICH:
 #
@@ -2527,13 +2427,13 @@ class TestRow11TimeoutMargin:
     async def test_the_sixteen_item_build_finishes_far_inside_its_deadline(
         self, git_repo: Path, tmp_path: Path, monkeypatch,
     ) -> None:
-        """(b) A real 15-link build costs milliseconds against a 120 s deadline.
+        """(b) A real 15-link build costs milliseconds against the 1800 s deadline.
 
-        ``CHAIN_BUILD_TIMEOUT_SECS`` bounds the WHOLE build, and the build is a
+        ``merge_deep.chain_build_timeout_secs`` bounds the WHOLE build, and the build is a
         synchronous stall on the dispatch path — no other item can dispatch
         while it runs — so the margin is the claim, not the wall clock.  The
         assertion is deliberately an ORDER-OF-MAGNITUDE one (30 s against a
-        120 s deadline, for a build the replay study measured at ~1–2 s per
+        1800 s deadline, for a build the replay study measured at ~1–2 s per
         6-chain): a tight bound here would be a flake generator on a loaded
         box, while a loose one still catches the regression that matters — a
         build that went superlinear in depth and started eating the deadline.
@@ -2554,16 +2454,15 @@ class TestRow11TimeoutMargin:
             f'expected a 15-link build, got '
             f'{None if chain is None else len(chain.links)}'
         )
-        assert merge_queue.CHAIN_BUILD_TIMEOUT_SECS == 120.0, (
-            f'the build deadline moved: {merge_queue.CHAIN_BUILD_TIMEOUT_SECS!r}'
-        )
+        deadline = scene.config.merge_deep.chain_build_timeout_secs
+        assert deadline == 1800.0, f'the build deadline moved: {deadline!r}'
         assert isinstance(chain.build_ms, int) and chain.build_ms > 0, (
             f'a real build must stamp a positive integer build_ms, got '
             f'{chain.build_ms!r}'
         )
         assert chain.build_ms < 30_000, (
             f'a 15-link build took {chain.build_ms} ms against a '
-            f'{merge_queue.CHAIN_BUILD_TIMEOUT_SECS} s deadline — the margin '
+            f'{deadline} s deadline — the margin '
             f'this row asserts is gone'
         )
 
@@ -3683,6 +3582,15 @@ def _gate_sequence_transcript(scene: _GateScene) -> list[dict]:
 # comparison against a re-run would go green for two runs that were identically
 # WRONG.
 #
+# Why ``halving_state: None`` in every round is not an artifact of this worker
+# never having been deep: a fresh — or restarted — worker starts at ``None``
+# (test_merge_queue_deep_dispatch.py::TestChainHalvingWorkerState::
+# test_state_is_none_at_construction), and at cap=0 ``select_chain_depth``
+# returns ``None`` before halving state is read
+# (test_merge_queue_deep_dispatch.py::TestSelectChainDepth::
+# test_cap_zero_is_the_kill_switch_for_every_input).  So no state a previous
+# process left behind can move this transcript.
+#
 # Why the POSITIVE CONTROL is mandatory.  A golden of absences passes trivially
 # over an inert scene.  The SAME script over the SAME seeded queue at cap=6
 # must produce a transcript that differs in every one of those fields — which
@@ -3828,8 +3736,9 @@ class TestRow7KillSwitchByteIdentity:
         a copy of that instrument here is what would let the two budgets drift
         apart.  What is local to THIS scene is the size of the seam that a
         single-seam instrument would have missed: ``create_subprocess_exec``
-        carries the bulk (231 / 110 / 110), and each of these three tests
-        makes exactly 3 ``create_subprocess_shell`` calls on top.
+        carries the bulk (231 for the cap-six control, 110 for the golden),
+        and each test here makes exactly 3 ``create_subprocess_shell`` calls
+        on top.
         """
         spawns = count_git_spawns(monkeypatch)
         yield
@@ -3938,46 +3847,6 @@ class TestRow7KillSwitchByteIdentity:
             f'the golden proves cap=0 never does); got '
             f'{transcript[1]["halving_state"]!r}'
         )
-
-    async def test_a_restarted_worker_inherits_no_halving_suspicion(
-        self, git_repo: Path, tmp_path: Path, monkeypatch,
-    ) -> None:
-        """The golden survives a worker restart, for a STRUCTURAL reason.
-
-        ``halving_state: None`` appears in all three golden rounds, and a
-        reader could reasonably suspect that is an artifact of THIS worker
-        never having been deep.  It is not: a freshly constructed worker starts
-        at ``None``, and at cap=0 ``select_chain_depth`` short-circuits on the
-        cap BEFORE halving state is consulted at all — so no state a previous
-        process could have left behind can change the transcript.
-        """
-        from orchestrator.merge_lane.worker import select_chain_depth
-
-        scene = await self._sequence(
-            git_repo, tmp_path, monkeypatch,
-            chain_cap=0, db_name='gate-row7-restart.db',
-        )
-        assert scene.worker._chain_halving_state is None, (
-            f'the kill-switched run armed the bisector: '
-            f'{scene.worker._chain_halving_state!r}'
-        )
-
-        restarted = _make_worker(scene.git_ops)
-        assert restarted._chain_halving_state is None, (
-            f'a fresh worker must start with no suspicion; got '
-            f'{restarted._chain_halving_state!r}'
-        )
-        assert restarted._n_failed is False and restarted._remerge_occurred is False
-
-        # ...and the cap short-circuit makes the point unconditional: NO
-        # halving state, inherited or otherwise, can produce a chain at cap=0.
-        for queue_len in (1, 2, 8, 32):
-            for state in (None, 1, 2, 4, 16):
-                assert select_chain_depth(0, queue_len, state) is None, (
-                    f'select_chain_depth(0, {queue_len}, {state}) returned '
-                    f'{select_chain_depth(0, queue_len, state)!r} — the kill '
-                    f'switch must be unconditional'
-                )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

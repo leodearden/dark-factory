@@ -193,29 +193,26 @@ both fakes parse argv and discard the unit token outright: the name never
 reaches the factory, only the real subprocess.  That divergence is deliberate;
 do not "fix" it back into line with the others.
 
-WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO, and why the rest are
-deliberately not.  Nine conftests import from this module; the git ceiling and
-the deploy-clock guard are in all nine.  ``_df_no_leaked_drain_processes`` is
-wired only into the ROOT conftest (covering ``tests/``) and
-``scripts/tests/conftest.py`` — exactly the two rootdirs that spawn the drain
-script, and the two the incident came from.  Task 3799's
-``_df_fleet_dir_redirect`` / ``_df_no_synthetic_heartbeats_in_live_fleet``
-started on those same two and gained a THIRD in task 3951:
-``orchestrator/tests/conftest.py``, which is the fleet heartbeat's PRODUCER
-rootdir rather than a drain-script spawner (see the next two paragraphs).  Of
-the seven subproject rootdirs (``cockpit``, ``dashboard``, ``escalation``,
-``fused-memory``, ``orchestrator``, ``sampler``, ``shared``) that run as their
-own pytest sessions from their own venvs, ``orchestrator`` therefore now carries
-the fleet-dir pair and the remaining six carry neither; none carries the
-drain-process guard, so the root conftest does not reach them: no token is
-stamped, and ``leaked_drain_processes`` fails CLOSED on an absent token, so
-those sessions report all-clear unconditionally rather than falsely.  That is a
-real gap, not a proof of safety: ``orchestrator`` was the one to watch, since
-``orchestrator/src/orchestrator/service_restart.py`` is the PRODUCTION caller of
-the drain script and its tests today only assert on config strings.  Widening
-the drain-process wiring is a mechanical edit to those seven files and is out of
-task 3798's locked scope; until then, read a green subproject run as
-"unmeasured", never as "no leak".
+WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO.  Ten conftests
+import from this module; the git ceiling and the deploy-clock guard are in
+all ten.  ``_df_no_leaked_drain_processes`` is armed in nine: bound by
+import in the ROOT conftest (covering ``tests/``) and
+``scripts/tests/conftest.py`` — the two rootdirs that spawn the drain
+script — and armed by :func:`arm_leaked_drain_process_guard` in the seven
+subproject rootdirs (``cockpit``, ``dashboard``, ``escalation``,
+``fused-memory``, ``orchestrator``, ``sampler``, ``shared``), each of which
+runs as its own pytest session and so stamps its own token.  In those nine a
+green run means the teardown sweep ran; see ``_df_no_leaked_drain_processes``
+for its detection window.  The tenth, ``client-feed``, does not arm this
+guard, so no sweep runs there and a green ``client-feed`` run is unmeasured.
+
+Task 3799's ``_df_fleet_dir_redirect`` / ``_df_no_synthetic_heartbeats_in_live_fleet``
+pair is a SEPARATE defence, bound in three rootdirs: root ``tests/``,
+``scripts/tests/`` and ``orchestrator/tests/``.  The last is the fleet
+heartbeat's PRODUCER rootdir rather than a drain-script spawner (see the next
+two paragraphs).  The other six subproject rootdirs above carry neither; that
+gap is still open and is out of this module's scope to close, since none of
+those six subprojects drives the fleet heartbeat producer path.
 
 THE WRITE-SIDE GAP IN THAT RATIONALE, stated explicitly rather than left to be
 rediscovered.  "The rootdirs that spawn the drain script" is the right criterion
@@ -299,7 +296,7 @@ import uuid
 import warnings
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
-from typing import Any, assert_never
+from typing import Any, NamedTuple, assert_never
 
 import pytest
 
@@ -1709,6 +1706,49 @@ def run_in_new_session_until(
     return RunUntilOutcome(completed, stopped_on_condition=True)
 
 
+def run_in_new_session_while_progressing(
+    cmd: list[str],
+    *,
+    progress: Callable[[], object],
+    stall_timeout: float,
+    env: dict[str, str] | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    text: bool = True,
+) -> subprocess.CompletedProcess:
+    """:func:`run_in_new_session` whose deadline counts only time WITHOUT progress.
+
+    The clock re-arms whenever *progress* returns a value unequal to its
+    previous one, so a slow child that is still advancing is never killed and
+    a stuck one is, *stall_timeout* seconds after its last change. *progress*
+    is called every ``_CONDITION_POLL_SLICE_SECS`` and must be cheap and safe
+    to call while the child runs.
+
+    Raises ``TimeoutExpired`` (``timeout == stall_timeout``, partial output
+    attached) on a stall; an exception from *progress* stops the group and
+    propagates.
+    """
+    last: object = object()
+    last_change = time.monotonic()
+
+    def stalled() -> bool:
+        nonlocal last, last_change
+        current = progress()
+        if current != last:
+            last, last_change = current, time.monotonic()
+            return False
+        return time.monotonic() - last_change >= stall_timeout
+
+    outcome = run_in_new_session_until(
+        cmd, condition=stalled, timeout=math.inf, env=env, cwd=cwd, text=text,
+    )
+    if outcome.stopped_on_condition:
+        raise subprocess.TimeoutExpired(
+            cmd, stall_timeout,
+            output=outcome.completed.stdout, stderr=outcome.completed.stderr,
+        )
+    return outcome.completed
+
+
 def _spawn_in_new_session(
     cmd: list[str],
     *,
@@ -1789,6 +1829,11 @@ def _kill_process_group(p: subprocess.Popen, pgid: int) -> None:
     ``TimeoutExpired``, and masking that with a signalling error would replace
     a legible timeout with a confusing one. ``ProcessLookupError`` is the
     ordinary case of a child that exited between the timeout and the signal.
+
+    The ``Popen`` sibling of
+    ``shared/src/shared/proc_group.py::sigkill_process_group``, ported rather
+    than imported per this module's import constraint (see the module
+    docstring), so a fix to either belongs in both.
     """
     reason = _unsafe_pgid_reason(pgid)
     if reason is not None:
@@ -1807,7 +1852,9 @@ def _kill_process_group(p: subprocess.Popen, pgid: int) -> None:
 # Three test modules prove "a timeout reaches the grandchild too", one per
 # spawner plus this module's own. They need the same three things: a script that
 # forks a survivor, a way to learn that survivor's pid, and a way to wait for it
-# to die. Those live HERE for exactly the reason `run_in_new_session` does —
+# to die. The wait counts a zombie as dead; a caller that needs the pid to name
+# no process at all checks `read_proc_state(pid) is None` instead. Those live
+# HERE for exactly the reason `run_in_new_session` does —
 # `tests/scripts/` and `scripts/tests/` cannot import each other's test modules,
 # so a copy in each is a copy that can only be kept in step by hand. Centralising
 # the spawn while leaving its probes triplicated would just move the "which of
@@ -1858,27 +1905,80 @@ def read_leaked_pid(pidfile: Path, *, timeout: float = 10.0) -> int:
         time.sleep(0.05)
 
 
-def pid_is_gone(pid: int) -> bool:
-    """Whether *pid* no longer exists. Signal 0 is the standard liveness probe."""
+class ProcState(NamedTuple):
+    """A pid's ``/proc/<pid>/stat`` state letter and parent pid."""
+
+    state: str
+    ppid: int
+
+    @property
+    def exited(self) -> bool:
+        """A zombie has terminated and is only awaiting its (possibly reparented) parent's reap."""
+        return self.state in ('Z', 'X')
+
+
+def read_proc_state(pid: int, *, _proc_root: Path = Path('/proc')) -> ProcState | None:
+    """*pid*'s :class:`ProcState`, or None when it has no ``/proc`` entry at all.
+
+    None means neither running nor a zombie; an unreadable entry raises its
+    ``OSError`` and a malformed one ``ValueError``, rather than reading as gone.
+    Parsed after the LAST ``') '`` exactly as
+    :func:`orchestrator.verify_cancel.read_ppid_map` does, since ``comm`` may
+    hold spaces or parens, and decoded with replacement as ``comm`` is arbitrary
+    bytes.  A stdlib port of
+    ``shared/src/shared/proc_group.py::read_stat_fields`` (see the module
+    docstring's import constraint); ``_proc_root`` is a test seam.
+    """
+    stat = _proc_root / str(pid) / 'stat'
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        # Alive and owned by someone else — a pid the kernel already recycled.
-        return False
-    return False
+        raw = stat.read_bytes().decode('utf-8', 'replace')
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    try:
+        fields = raw.rsplit(') ', 1)[1].split()
+        return ProcState(state=fields[0], ppid=int(fields[1]))
+    except (IndexError, ValueError) as exc:
+        raise ValueError(f'unparseable {stat}: {raw!r}') from exc
+
+
+def wait_pids_exited(
+    pids: set[int],
+    *,
+    timeout: float,
+    interval: float = 0.05,
+    _read_state: Callable[[int], ProcState | None] = read_proc_state,
+    _clock: Callable[[], float] = time.monotonic,
+) -> dict[int, ProcState]:
+    """Poll until every pid in *pids* has exited; return the still-RUNNING ones.
+
+    Each survivor maps to its last observed :class:`ProcState`; an empty dict
+    means every pid exited.  A zombie counts as exited: reaping a reparented
+    orphan is its subreaper's job (``systemd --user`` on this fleet), not the
+    code under test's -- the same criterion as
+    ``orchestrator/tests/test_verify_cancel.py::_is_running`` (task 3955).
+
+    The verdict is always the probe of the returning iteration, so a caller
+    descheduled across the deadline never asserts on a stale observation;
+    ``timeout=0`` is exactly one probe.
+    """
+    deadline = _clock() + timeout
+    while True:
+        running = {
+            pid: state for pid in pids
+            if (state := _read_state(pid)) is not None and not state.exited
+        }
+        if not running or _clock() >= deadline:
+            return running
+        time.sleep(interval)
 
 
 def wait_pid_gone(pid: int, *, timeout: float = 3.0) -> bool:
-    """Poll for *pid* to disappear, allowing for SIGKILL delivery and reaping."""
-    deadline = time.monotonic() + timeout
-    while True:
-        if pid_is_gone(pid):
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.05)
+    """Poll until *pid* has exited; False if it is still running at *timeout*.
+
+    Exited means no ``/proc`` entry, or a zombie (:attr:`ProcState.exited`)
+    awaiting its possibly-reparented parent's reap.  ``timeout=0`` is one probe.
+    """
+    return not wait_pids_exited({pid}, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -2143,6 +2243,25 @@ def _df_no_leaked_drain_processes():
                 with contextlib.suppress(OSError):
                     os.kill(pid, signal.SIGKILL)
             pytest.fail(reason, pytrace=False)
+
+
+_LEAKED_DRAIN_GUARD_PLUGIN = 'df-leaked-drain-process-guard'
+
+
+class _LeakedDrainProcessGuardPlugin:
+    """The plugin :func:`arm_leaked_drain_process_guard` registers: that guard alone."""
+
+    _df_no_leaked_drain_processes = _df_no_leaked_drain_processes
+
+
+def arm_leaked_drain_process_guard(config: pytest.Config) -> None:
+    """Arm :func:`_df_no_leaked_drain_processes` for this session, from ``pytest_configure``.
+
+    Idempotent, because a session that collects several test roots runs each
+    root's ``pytest_configure``.
+    """
+    if not config.pluginmanager.has_plugin(_LEAKED_DRAIN_GUARD_PLUGIN):
+        config.pluginmanager.register(_LeakedDrainProcessGuardPlugin, _LEAKED_DRAIN_GUARD_PLUGIN)
 
 
 # ---------------------------------------------------------------------------

@@ -866,6 +866,34 @@ class TestStoreGC:
         finally:
             store.close()
 
+    def test_rows_gcd_at_quiescence_stay_gcd_when_the_run_id_is_reused(self, tmp_path):
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        store = ReconReportStore(tmp_path / 'recon_report_state.db')
+        store.open()
+        t = [0.0]
+        try:
+            state = self._make_state(store, t)
+            run_id = 'gc-reuse-run'
+            state.start_report(run_id=run_id, stage='memory_consolidator', project_id='dark_factory')
+            self._add(state, run_id, 'stage1 finding')
+            state.complete(run_id, 's1 done')
+            state.start_report(run_id=run_id, stage='task_knowledge_sync', project_id='dark_factory')
+            self._add(state, run_id, 'stage2 finding')
+            state.complete(run_id, 's2 done')
+
+            t[0] = 301.0
+            assert state.tick() == 2
+            assert run_id not in self._run_ids_in_store(store)
+
+            state.start_report(run_id=run_id, stage='remediation', project_id='dark_factory')
+
+            assert {
+                r['stage'] for r in store.load_all() if r['run_id'] == run_id
+            } == {'remediation'}
+        finally:
+            store.close()
+
     def test_tick_with_store_none_does_not_raise_and_evicts(self, tmp_path):
         """tick()'s GC hook is a full no-op when store is None: eviction still
         happens (byte-identical count) and nothing raises."""

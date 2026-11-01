@@ -16,6 +16,22 @@
       "severity": "suggestion",
       "description": "The class docstring still reads 'Tests for the three dedicated CLI-timeout / claim-recovery fields on ReconciliationConfig', but the claim-recovery field was removed, leaving only the two CLI-timeout fields; the docstring is now inaccurate.",
       "mutation_type": "style"
+    },
+    {
+      "id": "mined_909_pool_01",
+      "location": "fused-memory/src/fused_memory/config/schema.py:202",
+      "category": "silent_config_key_removal",
+      "severity": "suggestion",
+      "description": "ReconciliationConfig uses pydantic's default extra='ignore' (and the root settings model sets extra='ignore'), so an operator config that still sets `reconciliation.stale_claim_recovery_seconds` now loads with the key silently dropped and no deprecation signal. No in-repo config sets the key, so nothing breaks; the knob was already ineffective before removal.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_909_pool_02",
+      "location": "fused-memory/src/fused_memory/reconciliation/harness.py:432-439",
+      "category": "rejected_alternative_rationale_comment",
+      "severity": "suggestion",
+      "description": "The rewritten startup-sweep comment in harness.py and the two rewritten test docstrings in test_harness.py (~2360-2366, ~2394-2399) each argue against a time-based horizon that no longer exists in the code, so the same rationale lives in three places and defends a road not taken rather than stating the behaviour.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

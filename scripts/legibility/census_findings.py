@@ -146,6 +146,7 @@ class FindingRow:
     statement: str
     proposal: str | None
     verdict: FindingVerdict
+    disposition: str
     first_seen: str | None
     last_seen: tuple[str, ...]
     supersedes: tuple[str, ...]
@@ -155,10 +156,6 @@ class FindingRow:
         if self.verdict is FindingVerdict.CONFIRMED:
             return ["agent-transcripts", "present-tree"]
         return ["agent-transcripts"]
-
-    @property
-    def disposition(self) -> str:
-        return "refuted" if self.verdict is FindingVerdict.REFUTED else "open"
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -193,7 +190,12 @@ def _statement(record: Mapping[str, Any], cause: str | None, reason: str | None)
 
 
 def _entry_row(
-    entry: Mapping[str, Any], *, statement: str, proposal: str | None, finding_verdict: FindingVerdict,
+    entry: Mapping[str, Any],
+    *,
+    statement: str,
+    proposal: str | None,
+    finding_verdict: FindingVerdict,
+    disposition: str,
 ) -> FindingRow:
     return FindingRow(
         record_id=entry["id"],
@@ -202,27 +204,32 @@ def _entry_row(
         statement=statement,
         proposal=proposal,
         verdict=finding_verdict,
+        disposition=disposition,
         first_seen=entry.get("first_seen_run"),
         last_seen=tuple(entry.get("last_seen_runs") or ()),
         supersedes=tuple(entry.get("supersedes") or ()),
     )
 
 
-def confirmed_row(entry: Mapping[str, Any], found: verdict.Verdict, cause: str | None) -> FindingRow:
+def confirmed_row(
+    entry: Mapping[str, Any], found: verdict.Verdict, cause: str | None, *, disposition: str,
+) -> FindingRow:
     return _entry_row(
         entry,
         statement=_statement(entry, cause, found.reason),
         proposal=None if found.remediation is None else found.remediation.change,
         finding_verdict=FindingVerdict.CONFIRMED,
+        disposition=disposition,
     )
 
 
-def observed_row(entry: Mapping[str, Any], cause: str | None) -> FindingRow:
+def observed_row(entry: Mapping[str, Any], cause: str | None, *, disposition: str) -> FindingRow:
     return _entry_row(
         entry,
         statement=_statement(entry, cause, None),
         proposal=None,
         finding_verdict=FindingVerdict.UNVERIFIED,
+        disposition=disposition,
     )
 
 
@@ -236,6 +243,7 @@ def refuted_row(
         statement=_statement(candidate, cause, found.reason),
         proposal=None,
         verdict=FindingVerdict.REFUTED,
+        disposition="refuted",
         first_seen=run_id,
         last_seen=(run_id,),
         supersedes=(),
@@ -260,10 +268,12 @@ def finding_rows(
     sighted: Sequence[str],
     run_id: str,
     cause_of: Callable[[Mapping[str, Any]], str | None],
+    disposition_of: Callable[[Mapping[str, Any]], str],
 ) -> list[FindingRow]:
     """The run's contract §1 rows: confirmed per promotion, refuted per
     verdict-bearing rejection, unverified per keyed entry re-sighted and not
-    promoted this run, stated by *cause_of* that entry."""
+    promoted this run, stated by *cause_of* that entry. An entry's row
+    carries the contract §7 disposition *disposition_of* gives it."""
     entries = {entry["id"]: entry for entry in cb.get("entries") or []}
     candidates = {candidate["id"]: candidate for candidate in cb.get("candidates") or []}
     promoted_ids = {adjudication.record_id for adjudication in promoted}
@@ -272,9 +282,12 @@ def finding_rows(
         if entry_id not in promoted_ids and has_identity(entries[entry_id])
     ]
     return [
-        *(confirmed_row(entries[a.record_id], a.found, a.cause) for a in promoted),
+        *(
+            confirmed_row(entries[a.record_id], a.found, a.cause, disposition=disposition_of(entries[a.record_id]))
+            for a in promoted
+        ),
         *(refuted_row(candidates[a.record_id], a.found, a.cause, run_id=run_id) for a in refuted),
-        *(observed_row(entry, cause_of(entry)) for entry in observed),
+        *(observed_row(entry, cause_of(entry), disposition=disposition_of(entry)) for entry in observed),
     ]
 
 

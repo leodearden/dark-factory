@@ -1,0 +1,24 @@
+{
+  "task_id": "5471",
+  "reason": "Net-additive fix, not a failed refactor. Task 5471: SpeculativeMergeWorker._spawn_main_health_fix_task now delegates to the shared per-signature fix-main filer (main_health_fix_owner) so a pre-existing test_failure red main gets a schedulable owner task alongside its escalation; the cognitive rise on _spawn_main_health_fix_task (1->2) and SpeculativeMergeWorker.__init__ (9->10) is the owner wiring and filer injection, and the private_reads rise is the owner-seam reads in the merge-lane worker. The filing logic itself lives outside the ratchet cluster in main_health_fix_owner.py.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::__init__",
+      "baseline": 9,
+      "current": 10
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_spawn_main_health_fix_task",
+      "baseline": 1,
+      "current": 2
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6568,
+      "current": 6581
+    }
+  ]
+}

@@ -52,7 +52,8 @@
 #                          Required unless --mount is given (or env override set).
 #   --base-target SYMLINK  Symlink at <base>/target → <base>/target.gen.N.
 #                          Required unless --mount is given (or env override set).
-#                          Resolved to its concrete .gen.N dir before invoking α.
+#                          Resolved to its concrete .gen.N dir per lane,
+#                          immediately before each α reseed.
 #   --main-ref REF         Git ref for "main" branch (default: main).
 #   --lane-glob GLOB       Glob matching pool-lane entries (default: _lane-*,_spec-*).
 #                          Matched entries are reset via α, not removed.
@@ -87,7 +88,10 @@
 #                          REIFY_WARM_LANE_GC_EXTRA_PROTECT_GLOB (any non-empty
 #                          value = on). Off by default.
 #   --seed-script PATH     Path to the α seed primitive (default: sibling seed-warm-lane.sh).
-#                          Overridable for hermetic testing.
+#                          Overridable for hermetic testing. A seed script that
+#                          is missing or not executable is never invoked and
+#                          never discards: the lane is preserved with target/
+#                          untouched (README.md "Delta 13").
 #   --disk-pressure        Fast-path: reclaim a lane by `rm -rf <lane>/target`
 #                          instead of invoking the α reflink-reseed clone — no
 #                          transient 2×-space requirement. Valid because
@@ -291,13 +295,16 @@
 #     pre-mark live entries was CONSIDERED and rejected: it costs one extra full
 #     scan and only breaks even once ≥2 entries are live at pass start, which a
 #     pool at rest never is.
-#   - α reuse: resolve base symlink → concrete gen, hold flock -s during α call
-#     (D8 reader-refcount seam; same contract as the acquire path).
+#   - α reuse: the base symlink is resolved to its concrete gen PER LANE, and
+#     flock -s is held on that gen during that lane's α call (D8 reader-refcount
+#     seam; same contract as the acquire path). If no gen can be pinned the seed
+#     is not invoked and the lane is left cold (reset_cold). Rationale for the
+#     per-lane pin and the re-check once locked: test_warm_lane_gc.sh Block T.
 #   - Safety-ranked order: reset lanes first (cheap), then remove orphans (destructive).
 #   - Stdout: machine-readable summary line only —
 #     `reclaim: reset=N removed=N preserved=N preserved_live_ref=N
-#     preserved_assigned=N downgraded_assigned=N`. New fields are APPENDED so
-#     prefix-matching consumers keep working.
+#     preserved_assigned=N downgraded_assigned=N reset_cold=N`. New fields are
+#     APPENDED so prefix-matching consumers keep working.
 #     Stderr: all diagnostics (info/ok/warn/err).
 
 set -euo pipefail
@@ -386,6 +393,9 @@ Usage: $(basename "$0") reclaim --mount WORKTREE_BASE [OPTIONS]
                           without restating the default list (default:
                           REIFY_WARM_LANE_GC_EXTRA_PROTECT_GLOB). Off by default.
     --seed-script PATH    Path to α seed primitive (default: sibling seed-warm-lane.sh).
+                          A missing or non-executable seed script is never
+                          invoked and never discards: the lane is preserved
+                          with target/ untouched (README.md "Delta 13").
     --disk-pressure       Fast-path: reclaim via \`rm -rf <lane>/target\` instead
                           of the α reflink-reseed clone (default:
                           REIFY_WARM_LANE_GC_DISK_PRESSURE). Off by default.
@@ -415,7 +425,7 @@ Usage: $(basename "$0") reclaim --mount WORKTREE_BASE [OPTIONS]
 
   Output:
     stdout: machine-readable summary:
-            reclaim: reset=N removed=M preserved=K preserved_live_ref=L preserved_assigned=A downgraded_assigned=D
+            reclaim: reset=N removed=M preserved=K preserved_live_ref=L preserved_assigned=A downgraded_assigned=D reset_cold=C
             (L is the share of K held back by a live process reference — the
              only preserve reason that can shield an entry indefinitely)
             (A is the share of K held back by dark-factory's own durable lane
@@ -429,13 +439,22 @@ Usage: $(basename "$0") reclaim --mount WORKTREE_BASE [OPTIONS]
              DOWNGRADED — read, believed, and then deliberately made
              non-decisive. Downgrade means the lane FALLS THROUGH to the
              live-reference gate; it is NOT a reclaim, so a downgraded lane
-             ended the pass in one of THREE states: reset, preserved via
-             preserved_live_ref, or preserved because the reset itself failed
-             (either branch — the disk-pressure rm or the seed script).
+             ended the pass in one of THREE states: reset (warm, or cold —
+             see C), preserved via preserved_live_ref, or preserved because
+             the reset did not happen — the disk-pressure rm failed, the seed
+             script was not invocable, or the discard after a refusing seed
+             failed.
              A and D partition the assigned lanes that REACHED the Pass-1
              record gate — an assigned lane the protect glob skipped in the
              enumeration loop, or the flock gate preserved first, is in
              NEITHER, so A+D is not the pass's whole assigned population.)
+            (C is the share of N left COLD because the α seed REFUSED — its
+             uncertified target/ discarded here, or nothing staged to
+             discard — or because no base generation could be pinned to seed
+             from; reify PRD docs/prds/warm-lane-pool-cow-seeding.md §9.5
+             inv.13. A seed script that is missing or not executable is never
+             invoked, so its lane is in K, not in N or C: README.md
+             "Delta 13".)
     stderr: all diagnostics.
 EOF
 }
@@ -455,6 +474,9 @@ SEED_SCRIPT="${REIFY_WARM_LANE_GC_SEED_SCRIPT:-}"
 DISK_PRESSURE="${REIFY_WARM_LANE_GC_DISK_PRESSURE:-}"
 # Staleness bound on the Pass-1 record gate (task 5504); defaulted below.
 MAX_RECORD_AGE_DAYS="${REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS:-}"
+# Resolve→lock→verify rounds _reseed_lane_pinned makes before giving up on a lane.
+# A constant, not a knob: it only has to stop a dangling base from looping.
+readonly _BASE_GEN_PIN_ATTEMPTS=3
 
 # ── arg parsing ────────────────────────────────────────────────────────────────
 SUBCOMMAND=""
@@ -801,17 +823,19 @@ _record_gate_downgrade_reason() {
         return 0
     fi
 
-    # CHRONIC. A record whose last transition is older than the bound is not a
-    # claim about a live task any more; it is a claim nobody has rewritten. Two
-    # producers, and the digest's `## Stale lane assignments` census covers only
-    # ONE of them. A lane whose task is still pending/in-progress/blocked is
-    # skipped BY DESIGN by harness.py's terminal-status reclaim, censused for a
-    # fortnight, and then finally acted on by this bound — report-before-act,
-    # exactly where destruction is riskiest. A release whose durable write hit
-    # ENOSPC and was swallowed (fail-open release, invariant I3) is NEVER
-    # censused: that census skips a record whose backing task is terminal, and
-    # a finished task's is. Acting unreported on that one is the intent —
-    # nothing else in the tree ever will.
+    # CHRONIC. A record whose last write (a lane-state transition, or the
+    # refresh a REUSE dispatch stamps — task 7863) is older than the bound is
+    # not a claim about a live task any more; it is a claim nobody has
+    # rewritten. Two producers, and the digest's `## Stale lane assignments`
+    # census covers only ONE of them. A lane whose task is still
+    # pending/in-progress/blocked is skipped BY DESIGN by harness.py's
+    # terminal-status reclaim, censused for a fortnight, and then finally acted
+    # on by this bound — report-before-act, exactly where destruction is
+    # riskiest. A release whose durable write hit ENOSPC and was swallowed
+    # (fail-open release, invariant I3) is NEVER censused: that census skips a
+    # record whose backing task is terminal, and a finished task's is. Acting
+    # unreported on that one is the intent — nothing else in the tree ever
+    # will.
     [ "$MAX_RECORD_AGE_SECS" -gt 0 ] || return 0   # 0 = bound disabled
 
     # FAIL SAFE — preserve, loudly — when the age cannot be judged: an absent
@@ -832,10 +856,11 @@ _record_gate_downgrade_reason() {
     # line order — Block S-age-degrade Arm B asserts it directly.
     #
     # ONE warn per affected lane, and the channel stays anomaly-only: a real
-    # producer (LaneLifecycle.transition) always stamps the field, so this
-    # fires only on a record something wrote wrong. Degrading SILENTLY would be
-    # worse than the bound not existing — `downgraded_assigned=0` would read as
-    # "nothing was stale" when it means "nothing could be judged".
+    # producer (LaneLifecycle.transition or LaneLifecycle.refresh_assigned)
+    # always stamps the field, so this fires only on a record something wrote
+    # wrong. Degrading SILENTLY would be worse than the bound not existing —
+    # `downgraded_assigned=0` would read as "nothing was stale" when it means
+    # "nothing could be judged".
     # The empty case is tested SEPARATELY and FIRST, because GNU `date -d ''`
     # does not fail — it succeeds and answers TODAY, so handing it an absent
     # `updated_at` would read an unstamped record as freshly stamped:
@@ -854,6 +879,39 @@ _record_gate_downgrade_reason() {
     fi
     return 0
 }
+
+# ── seed-presence guard (dark-factory only) ────────────────────────────────────
+# True when SEED_SCRIPT can be invoked at all. The single home of the predicate
+# that keeps an ABSENT seed from reaching the discard below: dark-factory ships no
+# seed-warm-lane.sh, so the sibling default is routinely missing, and bash's
+# 126/127 for it is a non-zero status no seed ever produced. Why, and why it is
+# checked ahead of everything else in the α branch: README.md "Delta 13".
+_seed_script_invocable() { [ -f "$SEED_SCRIPT" ] && [ -x "$SEED_SCRIPT" ]; }
+
+# ── per-lane base-generation pin ───────────────────────────────────────────────
+# Print the concrete target.gen.N BASE_TARGET points at right now. The single
+# home of the D8 resolve rule: the seed needs the concrete path, because cp -a
+# copies a symlink rather than its target.
+_resolve_base_gen() { readlink -f "$BASE_TARGET" 2>/dev/null; }
+
+# _reseed_lane_pinned <lane>: reseed <lane> from the gen BASE_TARGET resolves to
+# now, under that gen's D8 reader lock (FD 9, scoped to this ( ) body). The gen is
+# re-checked once locked; why, and why per lane: test_warm_lane_gc.sh Block T.
+_reseed_lane_pinned() (
+    local lane="$1" gen="" attempt
+    for (( attempt = 1; attempt <= _BASE_GEN_PIN_ATTEMPTS; attempt++ )); do
+        gen="$(_resolve_base_gen)" || break
+        [ -d "$gen" ] || continue
+        if exec 9>>"${gen}.lock" && flock -s 9 && [ -d "$gen" ]; then
+            info "pinned base gen $gen for ${lane##*/}"
+            "$SEED_SCRIPT" "$gen" "$lane" --fresh-checkout --assume-lane-lock-held
+            return
+        fi
+        exec 9>&-
+    done
+    err "cannot pin a base generation for ${lane##*/}: $BASE_TARGET resolves to ${gen:-<unresolvable>}, which is missing or could not be locked"
+    return 1
+)
 
 # ── reclaim subcommand ─────────────────────────────────────────────────────────
 _do_reclaim() {
@@ -903,19 +961,33 @@ _do_reclaim() {
     # thing an operator wants to see explicitly rather than infer from a
     # preserved_assigned that quietly stopped rising.
     local downgraded_assigned_count=0
+    # Sub-count of reset_count left COLD rather than warm: lanes a REFUSING α
+    # seed left with no usable target/ — whether it aborted fail-closed onto the
+    # uncertified clone this script then discarded (§9.5 inv.13 caller
+    # obligation) or refused before staging one at all, leaving nothing to
+    # discard — and lanes for which no base generation could be pinned, so no
+    # seed ran at all. These are not distinguishable from here (see the discard
+    # branch) and need not be: what the count names is the lane's OUTCOME — reset to
+    # nothing — not which guard produced it. Reported separately because a bare
+    # reset=N cannot distinguish a lane reset WARM — the normal, valuable
+    # outcome — from one reset to nothing, and a fail-closed seed abort is
+    # rarely per-lane: inv.12 predicts that a bad base generation makes EVERY
+    # acquire against it abort identically, degrading the whole pool to cold
+    # fallback. A rising reset_cold is that degradation becoming visible; the
+    # per-lane warns on stderr name WHICH lanes and carry the seed's own [error]
+    # lines, which name the offending paths. A seed that could not be invoked at
+    # all is NOT counted here: its lane is preserved (see _seed_script_invocable).
+    local reset_cold_count=0
 
     info "warm-lane-gc.sh reclaim: worktrees_dir=$WORKTREES_DIR  base_target=$BASE_TARGET  main_ref=$MAIN_REF"
 
-    # Resolve the base-target symlink to its concrete gen dir (D8 seam).
-    # α requires the concrete path — cp -a copies the symlink otherwise.
-    local resolved_gen
-    if ! resolved_gen="$(readlink -f "$BASE_TARGET" 2>/dev/null)"; then
+    # Argument check only. readlink -f fails when a directory on the path is
+    # missing but accepts a missing final component, so a dangling base passes
+    # here and is handled per lane by _reseed_lane_pinned.
+    if ! _resolve_base_gen >/dev/null; then
         err "Cannot resolve base-target symlink: $BASE_TARGET"
         return 1  # runtime error; exit 2 is reserved for usage/wiring errors
     fi
-    local gen_lock="${resolved_gen}.lock"
-    touch "$gen_lock" 2>/dev/null || true
-    info "  resolved_gen=$resolved_gen  gen_lock=$gen_lock"
 
     # Enumerate all immediate subdirs in the worktrees-dir.
     # We collect entries first so we can do safety-ranked two-pass order:
@@ -1173,25 +1245,91 @@ _do_reclaim() {
             fi
         else
             # Invoke α while the lane lock is held in the parent shell (FD 8;
-            # the action subshell inherits it, the parent still owns the lock)
+            # the helper's subshell inherits it, the parent still owns the lock)
             # AND a shared gen lock is held on FD 9 (flock -s; D8 reader-refcount
-            # seam). Pass --assume-lane-lock-held: seed-warm-lane.sh acquires the
+            # seam) — both via _reseed_lane_pinned, which passes
+            # --assume-lane-lock-held: seed-warm-lane.sh acquires the
             # lane lock BY DEFAULT under --fresh-checkout (esc-5214/task 5354
             # fail-safe), and its own FD-9 acquire would BOTH self-refuse against
             # gc's FD-8 lane lock AND clobber gc's FD-9 gen lock. The opt-out
             # makes seed skip its own acquire; gc's held locks already provide the
             # inv.2 one-consumer exclusivity + the gen reader-refcount.
             info "  resetting lane: $name"
-            if (
-                exec 9>"$gen_lock"
-                flock -s 9
-                "$SEED_SCRIPT" "$resolved_gen" "$lane" --fresh-checkout --assume-lane-lock-held
-            ) 2>&1 | while IFS= read -r line; do warn "  [seed] $line"; done; then
+            if ! _seed_script_invocable; then
+                # No seed can run, so none can certify or refuse: the discard
+                # below would destroy target/ for a certification nobody was
+                # asked to make. The warn keeps the pre-guard prefix, which
+                # git_ops.py::GitOps._run_warm_lane_gc_reclaim's WARNING quotes
+                # for exactly this case. README.md "Delta 13".
+                warn "  reset failed for $name (seed-script error); continuing — $SEED_SCRIPT is not an executable file, so it was not invoked and nothing was discarded"
+                preserved_count=$((preserved_count + 1))
+            elif _reseed_lane_pinned "$lane" 2>&1 | while IFS= read -r line; do warn "  [seed] $line"; done; then
                 ok "  reset lane: $name"
                 reset_count=$((reset_count + 1))
             else
-                warn "  reset failed for $name (seed-script error); continuing"
-                preserved_count=$((preserved_count + 1))
+                # Also reached when no gen could be pinned, so no seed ran.
+                #
+                # A non-zero α exit means the seed did NOT certify this lane, and
+                # its three fail-closed post-conditions all fire AFTER target/ has
+                # been replaced with the CoW clone — so the abort lands ONTO the
+                # hazardous state it just refused to certify. The seed
+                # deliberately leaves that clone in place (it refuses, it does not
+                # repair), which makes discarding it the caller's obligation:
+                # reify's docs/prds/warm-lane-pool-cow-seeding.md §9.5 inv.13,
+                # "Caller obligation on the fail-closed path", is the single
+                # normative home for the ruling.
+                #
+                # Keyed on the EXIT STATUS, not on the seed's stdout, and that is
+                # the same predicate: seed-warm-lane.sh runs under
+                # `set -euo pipefail` and writes stdout exactly once, at its
+                # terminal echo, so `err …; return 1` yields non-zero exit and
+                # empty stdout together. Observing that stdout is not open to us
+                # anyway — the α call's whole output is piped through the [seed]
+                # warn loop above, to protect this script's own single-line
+                # stdout contract.
+                warn "  reset did not certify $name; discarding any target/ it left behind"
+                # Probe BEFORE the rm: `rm -rf` exits 0 on a missing path, so its
+                # own status cannot tell "removed the uncertified target/" from
+                # "there was nothing there". A seed can refuse with the lane
+                # already empty — it moves the old target/ into its reseed trash
+                # BEFORE staging the clone, so any guard firing in that window
+                # (base absent, a build-flag mismatch, a usage error) leaves
+                # nothing behind. Reporting a discard that never happened would be
+                # a plain falsehood in the operator's log; the probe picks the
+                # wording. Note the converse is NOT knowable here: a target/ that
+                # IS present may be the fail-closed CoW clone or the lane's own
+                # pre-existing target/ (a refusal before the trash-move), hence
+                # "uncertified target/" rather than "clone" — either way the seed
+                # did not certify it and gc's job on this branch is to reset.
+                local had_target=0
+                [ -e "$lane/target" ] && had_target=1
+                local rm_err
+                if rm_err="$(rm -rf "$lane/target" 2>&1)"; then
+                    if [ "$had_target" = "1" ]; then
+                        warn "  discarded uncertified target/: $lane/target (§9.5 inv.13 caller obligation; lane left cold-but-safe)"
+                    else
+                        warn "  nothing to discard at $lane/target — the seed refused leaving none (§9.5 inv.13 caller obligation; lane left cold-but-safe)"
+                    fi
+                    # Counted identically on both wordings: the lane is left COLD
+                    # by a REFUSING seed either way, which is what reset_cold
+                    # names (see its declaration). A refusal that staged nothing
+                    # is if anything MORE likely to be inv.12's pool-wide
+                    # degradation than a per-lane one, so excluding it would hide
+                    # the signal the sub-count exists for.
+                    reset_count=$((reset_count + 1))
+                    reset_cold_count=$((reset_cold_count + 1))
+                else
+                    # The discard we just took on as an obligation did not happen,
+                    # so the clone survives. Count `preserved` and continue the
+                    # sweep — the same accounting the disk-pressure rm-failure
+                    # branch above uses, for the same reason: the lane was left
+                    # untouched, so calling it reset would be a lie. Deliberately
+                    # NOT reset_count/reset_cold_count, and deliberately not an
+                    # abort (per-candidate failures warn + continue).
+                    warn "  discard failed for $name: ${rm_err:-<rm produced no output>}; continuing"
+                    warn "  $lane/target RETAINS an uncertified clone — the next consumer must not build in it"
+                    preserved_count=$((preserved_count + 1))
+                fi
             fi
         fi
         exec 8>&-  # release lane lock; NOT removed — persists as per-lane mutex
@@ -1277,15 +1415,17 @@ _do_reclaim() {
     done
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    # preserved_live_ref, preserved_assigned and downgraded_assigned are
-    # APPENDED, never interposed: existing consumers match the
+    # preserved_live_ref, preserved_assigned, downgraded_assigned and
+    # reset_cold are APPENDED, never interposed: existing consumers match the
     # reset=/removed=/preserved= prefix (and the
     # `preserved=N preserved_live_ref=M preserved_assigned=A` adjacency), so a
-    # trailing field extends the line without breaking them.
-    printf 'reclaim: reset=%d removed=%d preserved=%d preserved_live_ref=%d preserved_assigned=%d downgraded_assigned=%d\n' \
+    # trailing field extends the line without breaking them. reify's copy puts
+    # reset_cold straight after preserved_live_ref, because it has neither
+    # record-gate field; here those two predate it (README.md "Delta 13").
+    printf 'reclaim: reset=%d removed=%d preserved=%d preserved_live_ref=%d preserved_assigned=%d downgraded_assigned=%d reset_cold=%d\n' \
         "$reset_count" "$removed_count" "$preserved_count" "$preserved_live_ref_count" \
-        "$preserved_assigned_count" "$downgraded_assigned_count"
-    ok "reclaim complete: reset=$reset_count removed=$removed_count preserved=$preserved_count preserved_live_ref=$preserved_live_ref_count preserved_assigned=$preserved_assigned_count downgraded_assigned=$downgraded_assigned_count"
+        "$preserved_assigned_count" "$downgraded_assigned_count" "$reset_cold_count"
+    ok "reclaim complete: reset=$reset_count removed=$removed_count preserved=$preserved_count preserved_live_ref=$preserved_live_ref_count preserved_assigned=$preserved_assigned_count downgraded_assigned=$downgraded_assigned_count reset_cold=$reset_cold_count"
 }
 
 # ── dispatch ───────────────────────────────────────────────────────────────────

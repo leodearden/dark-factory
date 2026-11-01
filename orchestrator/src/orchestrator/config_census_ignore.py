@@ -56,6 +56,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import yaml
+from shared.project_layout import tasks_db
 from shared.task_statuses import TERMINAL
 
 logger = logging.getLogger(__name__)
@@ -341,11 +342,6 @@ def _warn_once(path: str, message: str, *args: Any) -> None:
     logger.warning(message, *args)
 
 
-def tasks_db_path(project_root: Path | str) -> Path:
-    """Conventional task-store location for *project_root*."""
-    return Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
-
-
 def read_task_statuses(project_root: Path | str) -> dict[int, TaskCiteStatus] | None:
     """Read ``{id: TaskCiteStatus}`` for the ``master`` tag, or ``None``.
 
@@ -367,7 +363,7 @@ def read_task_statuses(project_root: Path | str) -> dict[int, TaskCiteStatus] | 
     a broad ``except Exception: return None`` — the latter is what
     ``shared/tests/test_silent_fallthrough_gate.py`` exists to ratchet against.
     """
-    db = tasks_db_path(project_root)
+    db = tasks_db(project_root)
     if not db.exists():
         logger.debug('census-ignore audit: no task store at %s', db)
         return None

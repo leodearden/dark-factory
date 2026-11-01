@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import functools
 import gc
 import inspect
 import json
@@ -18,13 +17,11 @@ import os
 import threading
 import time
 import types
-import weakref
-from collections import deque
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
-from unittest.mock import AsyncMock, AsyncMockMixin, MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from pydantic import BaseModel
@@ -167,6 +164,20 @@ def wire_clear_claim_then_set_status(scheduler_mock: MagicMock) -> None:
     )
 
 
+def wire_live_status_from_get_task(scheduler_mock: MagicMock) -> None:
+    """Answer ``get_status`` on a MagicMock Scheduler from its own ``get_task`` row.
+
+    Mirrors the real Scheduler, where both read the same fused-memory row;
+    ``get_task`` is looked up per call, so a test that reassigns it later flows through.
+    """
+
+    async def _live_status(tid: str) -> str | None:
+        row = await scheduler_mock.get_task(tid)
+        return (row or {}).get('status')
+
+    scheduler_mock.get_status = AsyncMock(side_effect=_live_status)
+
+
 # task 3492/4215: the pyproject-configured default per-test timeout ceiling
 # that every heavy test in this suite must clear.  MIRROR of
 # `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml -- see
@@ -201,15 +212,20 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 # source on every run and fails a scanner that lacks the mark OR pins it below
 # this ceiling.
 #
-# MECHANISM -- why a breach here is far more expensive than a red test:
-#   * `[tool.pytest.ini_options].timeout_method = "thread"` means pytest-timeout
-#     answers a breach by `os._exit()`ing the whole xdist worker ("node down:
-#     Not properly terminated"), NOT by failing the offending test;
-#   * `--max-worker-restart=0` (in `[tool.pytest.ini_options].addopts`, task
-#     1907) then declines to replace that worker, degrading the run to a
-#     TRUNCATED whole-suite session whose surviving failure names some innocent
-#     guard that merely shared the dead worker.
-#   So one slow tree-scan costs a whole verify run AND misattributes the blame.
+# MECHANISM -- what a breach here costs:
+#   * until task 6354, `[tool.pytest.ini_options].timeout_method = "thread"`
+#     meant pytest-timeout answered a breach by `os._exit()`ing the whole xdist
+#     worker ("node down: Not properly terminated"), NOT by failing the
+#     offending test, and `--max-worker-restart=0` (in
+#     `[tool.pytest.ini_options].addopts`, task 1907) then declined to replace
+#     that worker, degrading the run to a TRUNCATED whole-suite session whose
+#     surviving failure named some innocent guard that merely shared the dead
+#     worker.  One slow tree-scan cost a whole verify run AND misattributed the
+#     blame; the measured history below is from that era;
+#   * since task 6354 the method is `signal`: a breach is one false red on the
+#     scanner itself, and the worker lives on.  The ceiling still prevents that
+#     false red.  A breach inside a C or Rust call (complexipy's analysis)
+#     surfaces only once that call returns.
 #
 # MEASURED history of the family:
 #   * unloaded and serial (`-n0`) on a 32-core box: 8.25s/call
@@ -226,7 +242,7 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 #   guard -- which is what makes this a
 #   FAMILY defect rather than three accidents, and why the rest are marked
 #   preemptively: a marked-but-fast test costs nothing, while an
-#   unmarked-and-slow one costs a whole session.
+#   unmarked-and-slow one cost a whole session then, and costs a false red now.
 # The current anchor is
 # test_whole_tree_scan_timeout_guard.py::_MEASURED_UNDER_LOAD_WORST_CASE, which
 # floors the family at test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS.
@@ -262,9 +278,10 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 WHOLE_TREE_SCAN_TEST_TIMEOUT = 1200
 
 # Headroom a per-test ceiling must keep over its family's measured-under-load
-# worst case.  8x rather than 2x: the xdist worker deaths these ceilings exist
-# to prevent were observed at loadavg 250-423, one inflation step past the load
-# at which any measurement has been taken.  Rationale and corpus:
+# worst case.  8x rather than 2x: the breaches these ceilings exist to prevent
+# (xdist worker deaths, in the thread era before task 6354) were observed at
+# loadavg 250-423, one inflation step past the load at which any measurement
+# has been taken.  Rationale and corpus:
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 UNDER_LOAD_HEADROOM_FACTOR = 8
 
@@ -815,10 +832,9 @@ MERGE_RESULT_TIMEOUT = 45
 # task 3980: how far `wait_responsive` below may stretch a wait's REAL wall
 # clock past its nominal, loop-responsive budget.  SINGLE SOURCE of the ratio:
 # the helper's per-call default cap is
-# `min(RESPONSIVE_WAIT_STRETCH * timeout, RESPONSIVE_WAIT_WALL_CAP)`, and
-# test_merge_queue_concurrent_verify.py's AST wait-budget auditor
-# (`_call_wait_budget`) bills a `wait_responsive` site by IMPORTING this same
-# constant.  One definition is what makes the auditor's number an exact upper
+# `min(RESPONSIVE_WAIT_STRETCH * timeout, RESPONSIVE_WAIT_WALL_CAP)`, and the
+# AST wait-budget auditor (`_wait_budget_audit.py::_call_wait_budget`) bills a
+# `wait_responsive` site by IMPORTING this same constant.  One definition is what makes the auditor's number an exact upper
 # bound on the helper rather than an estimate free to drift below it.
 RESPONSIVE_WAIT_STRETCH = 2.0
 
@@ -827,9 +843,8 @@ RESPONSIVE_WAIT_STRETCH = 2.0
 # reviewer can check the arithmetic instead of trusting a number.  It bounds
 # the scaled per-call cap above whatever nominal a call site passes.  Whether
 # the waits a test stacks on it fit that test's timeout mark is checked, not
-# restated here: each guarded module's TestTimeoutMarkCoverage recomputes
-# every class's budget from source
-# (test_merge_queue_concurrent_verify.py::_worst_per_method_wait_budget).
+# restated here: test_wait_budget_coverage_guard.py recomputes every test's
+# budget from source (`_wait_budget_audit.py::item_wait_budgets`).
 # Never-narrow.
 RESPONSIVE_WAIT_WALL_CAP = int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT)  # 90s
 
@@ -855,6 +870,10 @@ RESPONSIVE_WAIT_WALL_CAP = int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT)  
 # If a gate-barrier flake is ever measured, the fix is to make child-process
 # progress observable to the accounting, not to grow this number.  Never-narrow.
 MERGE_GATE_BARRIER_TIMEOUT = MERGE_RESULT_TIMEOUT // 3  # 15s
+
+# Default worker-task join of _merge_worker_drive.py::stop_merge_worker,
+# which `_wait_budget_audit.py::_call_wait_budget` bills for a bare call.
+STOP_WORKER_JOIN_TIMEOUT = 5.0
 
 # task 3307: generous synchronization-barrier ceiling for the workflow
 # CancellationScope tests (test_workflow_cancellation.py).  These barriers
@@ -990,17 +1009,15 @@ async def wait_responsive(
     Any class using this MUST carry an adequate ``@pytest.mark.timeout`` —
     exactly as ``CANCEL_SCOPE_BARRIER_TIMEOUT`` above already states.  An
     unmarked test runs under ``PYPROJECT_DEFAULT_TIMEOUT`` locally and under
-    ``VERIFY_CLI_PER_TEST_TIMEOUT`` on verify, with ``timeout_method =
-    "thread"`` and ``--max-worker-restart=0``: exceeding the per-test timeout
-    does not fail the test, it ``os._exit()``s the xdist worker, degrading a
-    clean per-test failure into a worker death.  A
-    stretched wait without a paired mark is therefore strictly worse than the
-    flake it fixes.
+    ``VERIFY_CLI_PER_TEST_TIMEOUT`` on verify, and a stretched wait that
+    outlasts that cap fails the test on pytest-timeout's cap rather than on
+    the condition it waits for.  A stretched wait without a paired mark
+    therefore only trades the flake it fixes for a timeout failure at the cap.
 
     The default ``cap`` SCALES WITH THE NOMINAL rather than defaulting flat to
     the 90s ceiling, and that is what makes the paired marks checkable:
-    ``_wait_responsive_budget``'s ``min(nominal * RESPONSIVE_WAIT_STRETCH,
-    RESPONSIVE_WAIT_WALL_CAP)`` is then an EXACT upper bound on this helper,
+    ``_wait_budget_audit.py::_wait_responsive_budget``'s
+    ``min(nominal * RESPONSIVE_WAIT_STRETCH, RESPONSIVE_WAIT_WALL_CAP)`` is then an EXACT upper bound on this helper,
     not an under-count.  With a flat default a ``timeout=15`` site the auditor
     billed at 30s could consume 90s, and TestLateArrivalCleanCAS's true worst
     case would overrun its ``HEAVY_BARRIER_TEST_TIMEOUT`` mark.
@@ -1012,8 +1029,8 @@ async def wait_responsive(
     guard rejects the site rather than under-billing it.
 
     The kwarg is named literally ``timeout`` so task 3492's AST wait-budget
-    scanner (``_call_wait_budget`` in test_merge_queue_concurrent_verify.py)
-    can resolve call sites without a special case.
+    scanner (``_wait_budget_audit.py::_call_wait_budget``) can resolve call
+    sites without a special case.
 
     Accepts a Future, a Task or a coroutine.  When a coroutine is wrapped, the
     wrapper task is cancelled on give-up so nothing leaks into pytest-asyncio
@@ -1079,7 +1096,7 @@ _BASEMODEL_PROPS: frozenset[str] = frozenset(
 _BASEMODEL_ATTRS: frozenset[str] = frozenset(dir(BaseModel))
 
 
-def idle_psi_sample() -> PsiSample:
+def idle_psi_sample(*, project_id: str | None = None) -> PsiSample:
     """Return the hermetic default PSI reading: idle and read_ok.
 
     Task 2418 — fix for the scheduler-test xdist flake where the dispatch-
@@ -1106,6 +1123,10 @@ def idle_psi_sample() -> PsiSample:
     scheduler.py) exactly — tests that need a specific (e.g. saturated)
     reading still reassign ``scheduler._read_psi_sample`` post-construction,
     which overrides this default same as before.
+
+    ``project_id`` is accepted and ignored: ``Scheduler.__init__`` binds the
+    module-level reader with its project_id (task 3590), and conftest
+    substitutes this function for that reader BEFORE construction.
     """
     return PsiSample(
         cpu_some10=0.0,
@@ -1255,81 +1276,6 @@ class HermeticMcpSession:
             f'HermeticMcpSession: unknown tool {name!r} — add a branch in '
             'call_tool if this tool is needed by the test'
         )
-
-
-_created_mock_call_coroutines: deque[weakref.ref] = deque()
-
-
-def track_async_mock_coroutines() -> None:
-    """Register every AsyncMock call coroutine at creation, for ``drain_async_mock_coroutines``.
-
-    The registry holds weak references, so an orphan that ref-counting reclaims
-    still warns inside the test that leaked it; only an orphan kept alive by a
-    reference cycle survives to the drain.  ``deque.append`` is atomic, so a
-    background thread calling an AsyncMock can never corrupt a drain in progress.
-
-    A silent no-op here would hand the task-1714 order-dependent failures back
-    to innocent tests, so this refuses to start when ``_execute_mock_call`` is
-    no longer a coroutine function.  That AsyncMock calls still GO THROUGH it is
-    pinned by test_async_mock_coroutine_isolation.py, which plants an orphan and
-    requires the drain to find it without searching the heap.
-    """
-    create_coroutine = AsyncMockMixin._execute_mock_call
-    if not inspect.iscoroutinefunction(create_coroutine):
-        raise RuntimeError(
-            'unittest.mock.AsyncMockMixin._execute_mock_call is no longer a '
-            'coroutine function, so AsyncMock call coroutines cannot be tracked '
-            'at creation — re-derive track_async_mock_coroutines against this '
-            "interpreter's unittest.mock before trusting the suite's verdicts"
-        )
-
-    @functools.wraps(create_coroutine)
-    def create_tracked_coroutine(self, /, *args, **kwargs):
-        coroutine = create_coroutine(self, *args, **kwargs)
-        _created_mock_call_coroutines.append(weakref.ref(coroutine))
-        return coroutine
-
-    # pyright reads this package as Python 3.11; markcoroutinefunction arrived in 3.12.
-    AsyncMockMixin._execute_mock_call = inspect.markcoroutinefunction(  # pyright: ignore[reportAttributeAccessIssue]
-        create_tracked_coroutine
-    )
-
-
-def drain_async_mock_coroutines() -> int:
-    """Close every AsyncMock call coroutine created since the last drain and never awaited.
-
-    Task 1714 / esc-1702-13.  Calling an AsyncMock without awaiting the result
-    leaves an ``_execute_mock_call`` coroutine in CORO_CREATED.  Held in a
-    reference cycle (common in mock object graphs) it outlives its test and is
-    finalized by whichever later test the garbage collector happens to run in,
-    where ``RuntimeWarning("coroutine '...' was never awaited")`` — promoted to
-    an error by orchestrator/pyproject.toml — fails that innocent test.
-    ``.close()`` on a CORO_CREATED coroutine finalizes it without the warning,
-    so closing each test's orphans at its own boundary keeps them out of its
-    siblings.
-
-    Only coroutines registered by ``track_async_mock_coroutines`` are touched:
-    a forgotten ``await`` on product code still trips filterwarnings=error.
-    The cost is proportional to the AsyncMock calls made since the last drain.
-    Its predecessor searched ``gc.get_objects()`` instead, which with the whole
-    suite collected was 88% of a full run's CPU (task 5668).
-
-    Returns the number of coroutines closed.
-    """
-    closed = 0
-    for _ in range(len(_created_mock_call_coroutines)):
-        coroutine = _created_mock_call_coroutines.popleft()()
-        if coroutine is not None and inspect.getcoroutinestate(coroutine) == inspect.CORO_CREATED:
-            coroutine.close()
-            closed += 1
-    if closed:
-        _log.debug(
-            'drain_async_mock_coroutines: closed %d orphaned AsyncMock '
-            '_execute_mock_call coroutine(s) — consider auditing un-awaited '
-            'AsyncMock calls in the preceding test',
-            closed,
-        )
-    return closed
 
 
 async def reap_leaked_aiosqlite_connections() -> int:
@@ -2378,8 +2324,8 @@ def mcp_tool_envelope(payload: object) -> dict:
     """The JSON-RPC body ``Scheduler.dispatch_tool`` ACTUALLY returns for a
     successful ``tools/call``, wrapping *payload* — the tool's own return value.
 
-    ``dispatch_tool`` hands back ``McpSession._raw_call``'s parsed response
-    verbatim (``mcp_lifecycle.py::McpSession.call_tool`` returns it unmodified),
+    ``dispatch_tool`` hands back ``shared.mcp_session.McpSession.call``'s parsed response
+    verbatim (``shared/src/shared/mcp_session.py::McpSession.call_tool`` returns it unmodified),
     so a fake that answers with a bare ``{'statuses': …}`` is speaking a shape the
     transport never emits.  That substitution is not a harmless simplification: it
     is what let a one-level envelope unwrapper in

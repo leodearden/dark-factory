@@ -67,7 +67,7 @@ def _ranks(scheduler: Scheduler, module: str) -> list[tuple[str, int]]:
 
 
 def _psi_sample(*, cpu_some10: float) -> PsiSample:
-    """A readable PSI sample: saturated when *cpu_some10* is past 85, else idle."""
+    """A readable PSI sample: saturated when *cpu_some10* is past this file's explicit 85.0."""
     return PsiSample(
         cpu_some10=cpu_some10, mem_some10=0.0, mem_full10=0.0, io_some10=0.0, read_ok=True
     )
@@ -713,7 +713,7 @@ async def test_psi_held_tick_neither_grants_nor_revokes(tmp_path):
     F is a free task that dispatches on tick 1, putting one task in flight so
     the hold's anti-deadlock floor does not suppress it.
     """
-    w = _3659_world(tmp_path, psi_admission=PsiAdmissionConfig())
+    w = _3659_world(tmp_path, psi_admission=PsiAdmissionConfig(cpu_some_avg10=85.0))
     w.scheduler.get_tasks = AsyncMock(
         return_value=[*_3659_tasks(), make_task('F', 'low', ['f.py'])]
     )
@@ -867,7 +867,7 @@ async def test_a_psi_held_tick_neither_emits_nor_resets_pin_blocked(tmp_path):
     """F dispatches on tick 1 so one task is in flight and the hold can engage."""
     w = _one_blocked_pin_world(
         tmp_path, _Clock(), make_task('F', 'low', ['f.py']),
-        psi_admission=PsiAdmissionConfig(),
+        psi_admission=PsiAdmissionConfig(cpu_some_avg10=85.0),
     )
     result = await w.scheduler.acquire_next()
     assert result is not None and result.task_id == 'F', 'premise: F is in flight'

@@ -16,6 +16,38 @@
       "severity": "suggestion",
       "description": "Non-http schemes such as 'mailto:' and 'tel:' do not start with '#' or '/', so they are treated as external and receive target=_blank + rel=noopener noreferrer, which is meaningless (and slightly odd) for these link types. Not harmful, but the external/internal split ignores non-navigational schemes.",
       "mutation_type": "logic"
+    },
+    {
+      "id": "mined_1236_pool_01",
+      "location": "dashboard/src/dashboard/static/redux/tab_tasks.jsx:228-238",
+      "category": "comments_stance",
+      "severity": "suggestion",
+      "description": "The change adds roughly a dozen comment lines around a few lines of logic in MarkdownText: a 'Behavioral invariants (no JS test runner; verified manually per task spec)' a-d list that restates the short-circuit comment above it and the in-loop comment below it (the '//' protocol-relative rule is stated twice), plus reviewer-facing verification notes that belong in the commit/task record and will drift.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1236_pool_02",
+      "location": "dashboard/src/dashboard/static/redux/tab_tasks.jsx:231,236",
+      "category": "misleading_comment",
+      "severity": "suggestion",
+      "description": "The comments call root-relative '/path' links 'SPA-internal'/'SPA-relative', but the redux dashboard has no client-side router, so such a link performs a full same-tab page load that leaves the dashboard and discards its state. The behaviour (same tab) matches the task; the wording misdescribes it.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1236_pool_03",
+      "location": "dashboard/src/dashboard/static/redux/tab_tasks.jsx:239",
+      "category": "string_prefix_url_classification",
+      "severity": "suggestion",
+      "description": "Same-tab vs new-tab is decided by raw string prefixes (startsWith('#') or startsWith('/') && !startsWith('//')), which does not match how browsers resolve hrefs: an href such as '/\\evil.example' or '/<tab>/evil.example' (reachable via raw HTML in markdown, which DOMPurify keeps) passes the check yet resolves to an external host, so it navigates off-site in the same tab without target/rel; absolute same-origin URLs are conversely treated as external. Impact is low (no new window, so no opener exposure), but the stated invariant that protocol-relative/external links are rewritten does not hold.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1236_pool_04",
+      "location": "dashboard/src/dashboard/static/redux/tab_tasks.jsx:239",
+      "category": "missing_test_coverage",
+      "severity": "suggestion",
+      "description": "The new link-classification rules and the no-anchor short-circuit have no automated coverage; verification is manual only, and the predicate is an inline lambda that cannot be exercised in isolation. The dashboard has no JS test runner and the task's test_strategy was empty, so this is a tooling gap rather than an undelivered requirement.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

@@ -36,21 +36,24 @@ from pathlib import Path
 from typing import Any
 
 from shared.eval_lane import eval_lane_provenance
-from shared.mcp_markup_middleware import MARKUP_RECURRENCE_ROUTING
+from shared.mcp_markup_middleware import (
+    MARKUP_RECURRENCE_ROUTING,
+    MARKUP_RESIDUE_ERROR_TYPES,
+    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+)
+from shared.project_layout import escalation_queue_dir
 
 logger = logging.getLogger(__name__)
-
-#: Where the queue lives under project_root — the same relative path
-#: ``markup_tripwire._QUEUE_DIRNAME`` uses, so every guard files into ONE queue.
-MARKUP_QUEUE_DIRNAME = 'data/escalations'
 
 #: Rendered as the subject when there is no plan to read it from and the
 #: worktree has no name either. Never a guess — an explicit "nobody knows".
 MARKUP_UNATTRIBUTED_SUBJECT = 'unattributed'
 
-#: The two record kinds the middleware emits through this one channel. Matched
-#: by name rather than by shape: a record kind that grew a key later must not
-#: silently start taking the other branch.
+#: The REFUSAL residue kind and the burst kind. Matched by name rather than by
+#: shape: a record kind that grew a key later must not silently start taking
+#: the other branch. Residue is dispatched on the middleware's own
+#: ``MARKUP_RESIDUE_ERROR_TYPES`` set, which also holds FORWARD_REPAIR's
+#: dropped-slice kind.
 MARKUP_RESIDUE_ERROR_TYPE = 'mcp_markup_unrepairable'
 MARKUP_STORM_ERROR_TYPE = 'mcp_markup_storm'
 
@@ -139,10 +142,11 @@ class MarkupSinkSpec:
     #: the two indistinguishable to a reader.
     storm_anchor_task_id: str
 
-    #: What the refusal COST, in one sentence, rendered into the residue
-    #: record's body. Server-specific because the loss is: a refused plan-tools
-    #: call writes nothing to plan.json, while a refused verdict-tools call
-    #: strands a review gate and destroys a reviewer's findings list.
+    #: What the refusal COST, in one sentence, rendered only into a REFUSED
+    #: residue record's body. Server-specific because the loss is: a refused
+    #: plan-tools call writes nothing to plan.json, while a refused
+    #: verdict-tools call strands a review gate and destroys a reviewer's
+    #: findings list.
     refusal_consequence: str
 
     #: What an ACTIVE burst threatens if the guard is disabled, in one
@@ -284,12 +288,42 @@ def open_escalation_channel(project_root: Path) -> tuple[Any, Any] | None:
         )
         return None
     try:
-        return Escalation, EscalationQueue(project_root / MARKUP_QUEUE_DIRNAME)
+        return Escalation, EscalationQueue(escalation_queue_dir(project_root))
     except Exception:
         logger.exception(
             'markup guard: failed to open the escalation queue under %s', project_root,
         )
         return None
+
+
+def _residue_outcome(record: Mapping[str, Any], spec: MarkupSinkSpec) -> str:
+    """What happened to the call, in the record kind's OWN terms."""
+    error_type = record.get('error_type')
+    if error_type == MARKUP_RESIDUE_ERROR_TYPE:
+        return (
+            f'The {spec.server_label} MCP boundary guard refused this tool call: '
+            'the value below carries raw tool-call envelope markup whose own '
+            'boundary cannot be determined, so no repair was attempted. '
+            + spec.refusal_consequence +
+            ' Guessing would have silently dropped whatever arguments hide in '
+            'the residue.'
+        )
+    if error_type == MARKUP_UNRECOVERED_PARAM_ERROR_TYPE:
+        return (
+            f'The {spec.server_label} MCP boundary guard FORWARDED this tool '
+            'call WITHOUT the field named above. The value below was recovered '
+            'from leaked tool-call envelope markup but could not be typed '
+            "against that parameter's declared schema, so it was dropped rather "
+            'than passed through untyped. This record was filed before the call '
+            'ran, so whether it then succeeded is not known here; if it did, '
+            'whatever it wrote is missing this value.'
+        )
+    return (
+        f'This sink does not recognise the record kind {error_type!r}, so it '
+        "states no outcome for the call. The record's summary and suggested "
+        "action, where the middleware supplied them, are the middleware's own "
+        'account of what happened.'
+    )
 
 
 def residue_detail(
@@ -298,10 +332,12 @@ def residue_detail(
     """The residue record's body — flat fields, then the payload VERBATIM.
 
     The raw value is rendered last, unquoted and unescaped, because it is the
-    ONLY surviving copy of data the caller may never be able to resend: the
-    call was refused, so none of it reached the server's store. Everything
-    above it is diagnostic and is written with ``!r`` so an empty or ``None``
-    field reads as itself rather than as a blank line.
+    ONLY surviving copy of data the caller may never be able to resend: a
+    refused call wrote none of it, and a forwarded call ran without it.
+    The outcome paragraph between them is the record kind's own
+    (:func:`_residue_outcome`). Everything above it is diagnostic and is
+    written with ``!r`` so an empty or ``None`` field reads as itself rather
+    than as a blank line.
 
     ``subject_task_id`` is rendered here BECAUSE the record's own ``task_id``
     field is the non-gating anchor — this is the only place a reader learns
@@ -320,12 +356,7 @@ def residue_detail(
         f'agent_id={record.get("agent_id")!r}',
         f'project={record.get("project")!r}',
         '',
-        f'The {spec.server_label} MCP boundary guard refused this tool call: '
-        'the value below carries raw tool-call envelope markup whose own '
-        'boundary cannot be determined, so no repair was attempted. '
-        + spec.refusal_consequence +
-        ' Guessing would have silently dropped whatever arguments hide in the '
-        'residue.',
+        _residue_outcome(record, spec),
         '',
         'Recover the payload below for the caller if it is still needed, then '
         'chase the harness serialization leak that produced it and '
@@ -570,11 +601,14 @@ def file_storm(
             # burst is invisible — the failure the attribution work exists to
             # end, reintroduced by the dedup.
             #
-            # This line inherits the same reachability limit the record's own
-            # prose states about the guard's other lines (task 4744 owns that
-            # channel), so it is a floor and not the fix: the FIX an operator
-            # has is in the message — resolving the open record lets the next
-            # burst file under its own subject.
+            # On a per-agent stdio site (plan-tools and verdict-tools today)
+            # this line goes to the subprocess's stderr, which the spawning
+            # CLI keeps nowhere durable: neither journald nor the CLI's own
+            # MCP log cache holds tool-time stderr. The fold is a sink event,
+            # not a middleware fact, so the site's markup journal never
+            # records it either. On such a site the line is a floor and not
+            # the fix: the FIX an operator has is in the message — resolving
+            # the open record lets the next burst file under its own subject.
             logger.error(
                 'markup guard: markup_guard_storm SUPPRESSED — %s is already '
                 'open naming subject_task_id=%r, so this burst from '
@@ -606,10 +640,10 @@ def file_storm(
         detail=storm_detail(record, subject_task_id, spec),
         # Leads with the attribution the record now CARRIES. It used to lead
         # with "identify the leaking caller from the guard's log lines", an
-        # instruction that on this server cannot be followed at all — a
-        # per-agent stdio subprocess's stderr is consumed by the spawning CLI
-        # and never reaches journald — and that anywhere else expires inside
-        # this host's ~72h `journald --user` window, while the measured
+        # instruction that cannot be followed at all on a per-agent stdio
+        # site — whose stderr the spawning CLI consumes and never forwards to
+        # journald — and that on any other site expires inside this host's
+        # ~72h `journald --user` window, while the measured
         # esc-plan-tools-markup-storm-* records were read at 6-7 days old.
         suggested_action=(
             f'the record names its caller: subject_task_id={subject_task_id!r}, '
@@ -663,7 +697,7 @@ def make_escalation_sink(
     nothing was filed (the queue could not take it, or the record came from the
     eval lane — see below).
 
-    AN EVAL-LANE RECORD IS NOT FILED AT ALL, of either kind (task 6479).
+    AN EVAL-LANE RECORD IS NOT FILED AT ALL, of any kind (task 6479).
     plan-tools is injected into every eval cell, an eval worktree is a linked
     worktree of the main checkout, and both filers reach the queue through a
     direct ``submit`` that bypasses the eval-lane gate in
@@ -689,11 +723,11 @@ def make_escalation_sink(
     plan-tools ``create_plan`` refused before any plan exists is the case. So
     it is evaluated per record, on the worker thread, never at wiring time.
 
-    It serves BOTH record kinds, not residue alone. A burst alarm whose only
-    route to the caller was a grep of the guard's log lines was undischargeable
-    on this server — a per-agent stdio subprocess's stderr is consumed by the
-    spawning CLI and never reaches journald — so the storm branch reads the
-    same thunk, and this is the axis that resolves for it.
+    It serves every record kind, the burst alarm included, not residue alone.
+    A burst alarm whose only route to the caller was a grep of the guard's log
+    lines was undischargeable on a per-agent stdio site — whose stderr the
+    spawning CLI consumes and never forwards to journald — so the storm branch
+    reads the same thunk, and this is the axis that resolves for it.
 
     ASYNC, with every blocking step on a worker thread. The middleware calls
     this from inside the server's event loop, and one record can run a
@@ -750,7 +784,7 @@ def make_escalation_sink(
                 return file_storm(
                     escalation_cls, queue, worktree, subject, record, spec,
                 )
-            if error_type != MARKUP_RESIDUE_ERROR_TYPE:
+            if error_type not in MARKUP_RESIDUE_ERROR_TYPES:
                 # A kind the middleware grew later. FILE IT rather than
                 # dropping it: silently discarding a record kind is the
                 # fail-soft this PRD exists to end, and an unfamiliar record in
@@ -758,7 +792,8 @@ def make_escalation_sink(
                 logger.warning(
                     'markup guard: filing an unrecognised record kind %r as '
                     'residue — the middleware emits something this sink does '
-                    'not know about', error_type,
+                    'not know about (known: %s)', error_type,
+                    sorted(MARKUP_RESIDUE_ERROR_TYPES | {MARKUP_STORM_ERROR_TYPE}),
                 )
             return file_residue(
                 escalation_cls, queue, worktree, subject, record, spec,

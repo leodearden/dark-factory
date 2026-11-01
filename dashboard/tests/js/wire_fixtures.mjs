@@ -61,10 +61,10 @@ export function receiptsFor(loader, keys, win = '24h') {
   return Object.fromEntries(keys.map(key => [servingEndpoint(loader, key, win).stateKey, receipt]));
 }
 
-// `count` hourly sample labels ending at WIRE_AS_OF, oldest first.
-function sampleLabels(count) {
+// `count` sample labels `stepMinutes` apart ending at WIRE_AS_OF, oldest first.
+function sampleLabels(count, stepMinutes = 60) {
   const newest = Date.parse(WIRE_AS_OF);
-  return Array.from({ length: count }, (_, i) => new Date(newest - (count - 1 - i) * 3_600_000).toISOString());
+  return Array.from({ length: count }, (_, i) => new Date(newest - (count - 1 - i) * stepMinutes * 60_000).toISOString());
 }
 
 // One burndown block, as data/redux_api.py::shape_burndown serves BURNDOWN and
@@ -133,6 +133,93 @@ export function escalationAnalytics(projects) {
       workflow: {},
       terminal: 0,
     })),
+  };
+}
+
+// One ESCALATIONS row, as data/redux_api.py::shape_escalations serves it: the
+// escalation record's fields plus `project` and its task card `task`, never
+// `project_root`. `deliveredCheckOwner` is emitted only when given, so leaving
+// it out is real absence (a record written before task 7514), not an
+// undefined-valued key; pass null for a record that has the key but no owner.
+export function escalationRow({
+  id, taskId, level = 2, status = 'pending', severity = 'critical', category = 'dependency_capability',
+  summary, detail = '', project, deliveredCheckOwner, task,
+}) {
+  const row = {
+    id,
+    task_id: taskId,
+    level,
+    status,
+    severity,
+    category,
+    summary,
+    detail,
+    project,
+    task: task ?? wireDatum({ id: Number(taskId), title: `task ${taskId}`, status: 'blocked' }),
+  };
+  return deliveredCheckOwner === undefined ? row : { ...row, delivered_check_owner: deliveredCheckOwner };
+}
+
+const ESCALATION_LEVELS = [0, 1, 2];
+const ESCALATION_STATUSES = ['pending', 'resolved', 'dismissed'];
+
+// data/escalations.py::_bucket's counts over `rows`.
+function escalationSummary(rows) {
+  const tally = (keys, field) => Object.fromEntries(keys.map(key => [key, rows.filter(row => row[field] === key).length]));
+  return { by_level: tally(ESCALATION_LEVELS, 'level'), by_status: tally(ESCALATION_STATUSES, 'status'), skipped_count: 0 };
+}
+
+// The corpus views over `rows` with nothing archived: every pending row is
+// both in the live queue and open in history.
+function escalationViews(rows) {
+  const pending = rows.filter(row => row.status === 'pending').length;
+  return { queue_pending: wireDatum(pending), open_in_history: wireDatum(pending) };
+}
+
+// The ESCALATIONS payload, as data/redux_api.py::shape_escalations serves it:
+// one orchestrator subsection per `{project, rows}`, none with skipped files,
+// and every count and view computed from the rows. Those counts re-derive the
+// server's; boundary_wire_fixtures.test.mjs checks them against a served body
+// only for one pending row, so rows the server counts differently (archived,
+// non-pending) are not covered.
+export function escalationsPayload(subsections) {
+  const allRows = subsections.flatMap(({ rows }) => rows);
+  return {
+    subsections: subsections.map(({ project, rows }) => ({
+      id: project,
+      label: project,
+      kind: 'orchestrator',
+      escalations: rows,
+      skipped: [],
+      summary: escalationSummary(rows),
+      views: escalationViews(rows),
+    })),
+    summary: escalationSummary(allRows),
+    views: escalationViews(allRows),
+  };
+}
+
+// One MERGE_QUEUE[project] block, as data/redux_api.py::shape_merge_queue
+// serves it: a measured, empty queue whose depth series holds `buckets` labels
+// ending at WIRE_AS_OF, `bucketMinutes` apart, every count zero but the newest.
+// A null `bucketMinutes` is a series that names no width; its labels are then
+// hourly.
+export function mergeQueueBlock({ bucketMinutes = null, buckets = 3 } = {}) {
+  const labels = sampleLabels(buckets, bucketMinutes ?? 60);
+  return {
+    depth: { labels, values: labels.map((_, i) => (i === buckets - 1 ? 1 : 0)), bucket_minutes: bucketMinutes },
+    outcomes: { labels: [], values: [], colors: [] },
+    latency: { p50: 0, p95: 0, p99: 0, mean_ms: 0, with_duration: 0, without_duration: 0 },
+    recent: [],
+    active: [],
+    recent_total: wireDatum(0),
+    speculative: wireDatum({ hit_count: 0, discard_count: 0, total: 0, hit_rate: null }),
+    in_queue: wireDatum(0),
+    live_probe_configured: true,
+    active_spark: { labels: [], values: [] },
+    halt: { offline: true },
+    train_events: [],
+    metrics: {},
   };
 }
 

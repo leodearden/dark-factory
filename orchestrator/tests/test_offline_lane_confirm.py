@@ -27,12 +27,14 @@ from orchestrator.offline_lane_confirm import (
     Confirmed,
     ConfirmMode,
     ConfirmTarget,
+    InconclusiveReason,
     Outage,
     PassOutcome,
     Unconfirmable,
     UnconfirmableReason,
     confirm,
     confirm_mode,
+    inconclusive_reason,
     outcome_from_json,
     outcome_to_json,
     partition,
@@ -349,6 +351,76 @@ class TestPartition:
         )
 
 
+_A = 'tests/t.py::test_a'
+_PARTITION_CASES = {
+    'compatible_failure': (_run((_A, 'failed')), _rerun((_A, 'failed'))),
+    'error_after_failed': (_run((_A, 'failed')), _rerun((_A, 'error'), outcomes={_A: 'passed'})),
+    'passed_in_incomplete_session': (_run((_A, 'failed')), _rerun(outcomes={_A: 'passed'}, session_complete=False)),
+    'skipped_in_complete_session': (_run((_A, 'failed')), _rerun(outcomes={_A: 'skipped'}, session_complete=True)),
+    'absent_from_outcomes': (
+        _run(('tests/t.py::test_steady', 'failed'), ('tests/t.py::test_flaky', 'failed')),
+        _rerun(
+            ('tests/t.py::test_steady', 'failed'),
+            returncode=2,
+            outcomes={'tests/t.py::test_other': 'passed'},
+            session_complete=True,
+        ),
+    ),
+    'complete_session_unnamed': (_run((_A, 'failed')), _rerun(session_complete=True)),
+    'incomplete_session_unnamed': (_run((_A, 'failed')), _rerun(session_complete=False)),
+    'detection_order': (
+        _run(('tests/t.py::test_c', 'failed'), (_A, 'failed'), ('tests/t.py::test_b', 'failed'), (_A, 'error')),
+        _rerun(
+            ('tests/t.py::test_z', 'failed'),
+            ('tests/t.py::test_b', 'failed'),
+            ('tests/t.py::test_c', 'failed'),
+            outcomes={_A: 'passed'},
+        ),
+    ),
+}
+
+
+class TestInconclusiveReason:
+    """Why the confirm left a node it did not reproduce inconclusive; ``None`` when it cleared it."""
+
+    def test_a_confirm_naming_it_with_another_kind_differs(self) -> None:
+        assert inconclusive_reason(_A, _rerun((_A, 'error'))) is InconclusiveReason.CONFIRM_KIND_DIFFERS
+
+    def test_per_test_evidence_of_a_skip_did_not_pass(self) -> None:
+        rerun = _rerun(outcomes={_A: 'skipped'}, session_complete=True)
+        assert inconclusive_reason(_A, rerun) is InconclusiveReason.CONFIRM_DID_NOT_PASS
+
+    def test_per_test_evidence_without_the_node_did_not_pass(self) -> None:
+        rerun = _rerun(outcomes={'tests/t.py::test_other': 'passed'}, session_complete=True)
+        assert inconclusive_reason(_A, rerun) is InconclusiveReason.CONFIRM_DID_NOT_PASS
+
+    def test_no_evidence_and_an_incomplete_session_is_incomplete(self) -> None:
+        rerun = _rerun(session_complete=False)
+        assert inconclusive_reason(_A, rerun) is InconclusiveReason.CONFIRM_SESSION_INCOMPLETE
+
+    @pytest.mark.parametrize(
+        'rerun',
+        [_rerun(outcomes={_A: 'passed'}, session_complete=False), _rerun(session_complete=True)],
+        ids=['evidence_passed', 'complete_session_unnamed'],
+    )
+    def test_a_cleared_node_has_no_reason(self, rerun: RunRecord) -> None:
+        assert inconclusive_reason(_A, rerun) is None
+
+    def test_the_reasons_are_their_wire_names(self) -> None:
+        assert [reason.value for reason in InconclusiveReason] == [
+            'confirm_kind_differs', 'confirm_did_not_pass', 'confirm_session_incomplete',
+        ]
+
+    @pytest.mark.parametrize('case', list(_PARTITION_CASES))
+    def test_a_node_is_inconclusive_exactly_when_unreproduced_with_a_reason(self, case: str) -> None:
+        detect, rerun = _PARTITION_CASES[case]
+        reproduced, _, inconclusive = partition(detect, rerun)
+
+        for node in {failure.node for failure in detect.failures}:
+            expected = node not in reproduced and inconclusive_reason(node, rerun) is not None
+            assert (node in inconclusive) == expected, node
+
+
 class TestConfirmUnconfirmable:
     @pytest.mark.asyncio
     async def test_no_detect_record(self, tmp_path: Path) -> None:
@@ -565,6 +637,12 @@ class TestJunitNodeOutcomes:
             'tests/test_a.py::test_c': 'skipped',
         }
 
+    def test_an_xdist_loadgroup_name_resolves_to_the_plain_node_id(self, tmp_path: Path) -> None:
+        (tmp_path / 'tests').mkdir()
+        (tmp_path / 'tests' / 'test_a.py').write_text('')
+        report = _junit_report(tmp_path / 'r.xml', '<testcase classname="tests.test_a" name="test_b@grp"/>')
+        assert junit_node_outcomes(report, tmp_path) == {'tests/test_a.py::test_b': 'passed'}
+
     def test_no_report_is_none(self, tmp_path: Path) -> None:
         assert junit_node_outcomes(tmp_path / 'absent.xml', tmp_path) is None
 
@@ -601,6 +679,16 @@ class TestJunitFailingNodeIds:
             tmp_path / 'r.xml', '<testcase classname="" name="tests.t"><error message="collect"/></testcase>',
         )
         assert junit_failing_node_ids(report, tmp_path) == frozenset({'tests/t.py'})
+
+    def test_xdist_loadgroup_names_resolve_to_plain_node_ids(self, tmp_path: Path) -> None:
+        (tmp_path / 'tests').mkdir()
+        (tmp_path / 'tests' / 't.py').write_text('')
+        report = _junit_report(
+            tmp_path / 'r.xml', _failing_case('tests.t', 'test_a[1]@grp'), _failing_case('tests.t.TestK', 'test_e@grp'),
+        )
+        assert junit_failing_node_ids(report, tmp_path) == frozenset(
+            {'tests/t.py::test_a[1]', 'tests/t.py::TestK::test_e'},
+        )
 
     def test_a_failing_test_whose_classname_names_no_file_leaves_the_report_unable_to_say(
         self, tmp_path: Path,
@@ -757,6 +845,23 @@ class TestRealPytestGenericLeg:
         evidence = _confirm_record(store, LANE.name)
         assert evidence.junit_path == str(require_current_pass(store, LANE.name).junit_path(Phase.CONFIRM))
         assert evidence.outcomes == {node_id('test_flaky'): 'passed'}
+
+    @pytest.mark.asyncio
+    async def test_an_xdist_loadgroup_detection_is_confirmed_by_its_plain_node_id(
+        self, tmp_path: Path, store: RunRecordStore,
+    ) -> None:
+        project = lane_project(tmp_path / 'wt', 'test_grouped_flaky', 'test_ok')
+        (project / 'pyproject.toml').write_text(
+            '[tool.pytest.ini_options]\naddopts = "-p no:cacheprovider -n 2 --dist loadgroup"\n',
+        )
+
+        detect = await _detect(store, LANE, project)
+        assert [f.node for f in detect.failures] == [node_id('test_grouped_flaky')]
+
+        outcome = await _confirm(store, LANE, project, detect)
+
+        assert outcome == Confirmed(ConfirmMode.NARROWED, (), (node_id('test_grouped_flaky'),), ())
+        assert _confirm_record(store, LANE.name).outcomes == {node_id('test_grouped_flaky'): 'passed'}
 
     @pytest.mark.asyncio
     async def test_7_an_opaque_confirm_red_only_on_another_test_reproduces_only_the_detected_one(

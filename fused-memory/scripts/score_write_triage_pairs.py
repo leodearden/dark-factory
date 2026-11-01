@@ -627,7 +627,7 @@ def score_pairs(
     - ``outcome``: one of ``write_triage.py::TRIAGE_OUTCOMES``.
     - ``judged_candidate_id``: the record the judge's verdict names, hoisted to
       the canonical record production attaches to
-      (``write_triage.py::_canonical_id_of``, task 6007). None when nothing
+      (``write_triage.py::canonical_id_of``, task 6007). None when nothing
       was attached.
     - ``band_winner_id``: the write's nearest neighbour on the frozen slate.
     - ``parse_failure``: the judge's reply could not be parsed, and triage
@@ -1054,17 +1054,17 @@ def _paired_error(
         'n_common': len(common),
         'only_arm': len(only_arm),
         'only_reference': len(only_reference),
-        'mcnemar_p': _mcnemar_exact(len(only_arm), len(only_reference)),
+        'mcnemar_p': mcnemar_exact(len(only_arm), len(only_reference)),
         'parent_sign_test': {
             'groups_favouring_arm': favouring_arm,
             'groups_favouring_reference': favouring_reference,
-            'p': _mcnemar_exact(favouring_arm, favouring_reference),
+            'p': mcnemar_exact(favouring_arm, favouring_reference),
         },
     }
 
 
-def _mcnemar_exact(only_first: int, only_second: int) -> float:
-    """Two-sided exact McNemar (sign) test p on the discordant counts."""
+def mcnemar_exact(only_first: int, only_second: int) -> float:
+    """Two-sided exact McNemar (sign) test p on the discordant counts, rounded to 4 places."""
     discordant = only_first + only_second
     if discordant == 0:
         return 1.0

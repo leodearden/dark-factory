@@ -14,13 +14,15 @@ Asserts that:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from escalation.models import Escalation
+from escalation.models import DeliveredCheckOwner, Escalation
 from escalation.queue import EscalationQueue
 
+from orchestrator import delivered_check_owner
 from orchestrator.config import OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.liveness import MergeLivenessConfigError
@@ -43,6 +45,13 @@ def _install_mock_escalation_queue(harness: Harness) -> MagicMock:
     mock_queue.make_id.return_value = 'esc-test-external-1'
     harness._escalation_queue = mock_queue
     return mock_queue
+
+
+def _delivered_check_callback(harness: Harness) -> Callable[..., Awaitable[None]]:
+    """The wired ``on_delivered_check_block`` callback, asserted installed."""
+    callback = harness.scheduler._callbacks.on_delivered_check_block
+    assert callback is not None
+    return callback
 
 
 # ---------------------------------------------------------------------------
@@ -194,8 +203,7 @@ class TestHarnessDeliveredCheckBlockWiring:
         _install_mock_escalation_queue(harness)
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
 
-        assert harness.scheduler._callbacks.on_delivered_check_block is not None
-        await harness.scheduler._callbacks.on_delivered_check_block(
+        await _delivered_check_callback(harness)(
             '42',
             summary=self._SUMMARY,
             detail='detail',
@@ -211,8 +219,7 @@ class TestHarnessDeliveredCheckBlockWiring:
         mock_queue = _install_mock_escalation_queue(harness)
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
 
-        assert harness.scheduler._callbacks.on_delivered_check_block is not None
-        await harness.scheduler._callbacks.on_delivered_check_block(
+        await _delivered_check_callback(harness)(
             '42',
             summary=self._SUMMARY,
             detail='detail',
@@ -242,35 +249,49 @@ class TestHarnessDeliveredCheckBlockWiring:
 
     @pytest.mark.asyncio
     async def test_callback_deduplicates_on_open_l2(self, tmp_path: Path) -> None:
-        """Second invocation with an open L2 must NOT submit a duplicate escalation."""
+        """Second invocation with an open L2 must NOT submit a duplicate escalation,
+        and must not pay for the owner's sidecar read either."""
         harness = _make_harness(tmp_path)
         mock_queue = _install_mock_escalation_queue(harness)
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
+        owner: DeliveredCheckOwner = {
+            'task_id': '5',
+            'check_name': 'cap',
+            'sidecar': {'path': 'docs/x.capability-manifest.yaml', 'on_main': 'unverified'},
+        }
+        verified: list[DeliveredCheckOwner] = []
 
-        assert harness.scheduler._callbacks.on_delivered_check_block is not None
+        def _record_verify(owner_arg: DeliveredCheckOwner, **_kwargs) -> DeliveredCheckOwner:
+            verified.append(owner_arg)
+            return owner_arg
 
-        # First call — no open L2 yet → submits
-        mock_queue.get_by_task.return_value = []
-        await harness.scheduler._callbacks.on_delivered_check_block(
-            '42',
-            summary=self._SUMMARY,
-            detail='detail',
-            category='dependency_capability',
-        )
+        callback = _delivered_check_callback(harness)
+        with patch.object(delivered_check_owner, 'verify_check_owner', _record_verify):
+            # First call — no open L2 yet → submits
+            mock_queue.get_by_task.return_value = []
+            await callback(
+                '42',
+                summary=self._SUMMARY,
+                detail='detail',
+                category='dependency_capability',
+                owner=owner,
+            )
 
-        # Second call — an open L2 now exists → must NOT submit again
-        mock_queue.get_by_task.return_value = [MagicMock()]
-        await harness.scheduler._callbacks.on_delivered_check_block(
-            '42',
-            summary=self._SUMMARY,
-            detail='detail',
-            category='dependency_capability',
-        )
+            # Second call — an open L2 now exists → must NOT submit again
+            mock_queue.get_by_task.return_value = [MagicMock()]
+            await callback(
+                '42',
+                summary=self._SUMMARY,
+                detail='detail',
+                category='dependency_capability',
+                owner=owner,
+            )
 
         assert mock_queue.submit.call_count == 1, (
             f'Should deduplicate: submit called {mock_queue.submit.call_count} times '
             f'(expected exactly 1)'
         )
+        assert verified == [owner], 'the deduped call must not read the owner sidecar'
         # Dedupe must be scoped to level=2 + agent_role — NOT the broad
         # has_open_l1 the external-dep filer uses (that would mask/be masked
         # by an unrelated open L1/L2 for the same task).
@@ -286,12 +307,61 @@ class TestHarnessDeliveredCheckBlockWiring:
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
 
         # Must not raise even without a queue.
-        assert harness.scheduler._callbacks.on_delivered_check_block is not None
-        await harness.scheduler._callbacks.on_delivered_check_block(
+        await _delivered_check_callback(harness)(
             '99',
             summary=self._SUMMARY,
             detail='detail',
             category='dependency_capability',
+        )
+
+    @pytest.mark.asyncio
+    async def test_callback_records_and_renders_the_check_owner(self, tmp_path: Path) -> None:
+        """Called with the failed descriptor and the owner (sidecar None, so
+        no git read), the filed record carries the owner as data and the
+        owner block in its detail."""
+        harness = _make_harness(tmp_path)
+        mock_queue = _install_mock_escalation_queue(harness)
+        harness.scheduler.set_task_status = AsyncMock(return_value=True)
+        owner: DeliveredCheckOwner = {'task_id': '5', 'check_name': 'cap', 'sidecar': None}
+
+        await _delivered_check_callback(harness)(
+            '42',
+            summary=self._SUMMARY,
+            detail='detail',
+            category='dependency_capability',
+            check={'name': 'cap', 'kind': 'path', 'expect': 'present', 'paths': ['x.py']},
+            owner=owner,
+        )
+
+        submitted: Escalation = mock_queue.submit.call_args.args[0]
+        assert submitted.delivered_check_owner == owner
+        assert 'Check owner: task 5' in submitted.detail
+        assert submitted.detail.splitlines()[-1].endswith(
+            'set task 42 back to pending once the check passes on main.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_legacy_call_keeps_the_re_pend_recipe_without_an_owner(
+        self, tmp_path: Path
+    ) -> None:
+        """A caller that predates the owner kwargs still gets Resolved-6's
+        manual re-pend recipe, and the record carries no owner."""
+        harness = _make_harness(tmp_path)
+        mock_queue = _install_mock_escalation_queue(harness)
+        harness.scheduler.set_task_status = AsyncMock(return_value=True)
+
+        await _delivered_check_callback(harness)(
+            '42',
+            summary=self._SUMMARY,
+            detail='detail',
+            category='dependency_capability',
+        )
+
+        submitted: Escalation = mock_queue.submit.call_args.args[0]
+        assert submitted.delivered_check_owner is None
+        assert submitted.detail == (
+            'detail\nBlocked dependents are NOT auto-re-pended — set task 42 back to '
+            'pending once the check passes on main.'
         )
 
 
@@ -377,7 +447,9 @@ class TestHarnessMergeLivenessGuard:
         = 600 < 8100 → safe).  Guards against a future refactor accidentally
         re-coupling K to the liveness check.
         """
-        r1 = VerifyRunnerConfig(name='r1', ssh_host='h1.local', git_remote='remote1')
+        r1 = VerifyRunnerConfig(
+            name='r1', ssh_host='h1.local', git_remote='remote1', df_checkout_path='/df',
+        )
         config = OrchestratorConfig(
             project_root=tmp_path,
             verify_runners=[r1],                           # → K = 1 + 1 = 2

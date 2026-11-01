@@ -551,22 +551,25 @@ class TestCliThreadsScope:
         assert acct.scope_caps[SCOPE].capped is True
         assert acct.phase == AccountPhase.AVAILABLE
 
-    async def test_non_claude_backend_bypasses_scope(self):
+    async def test_non_claude_failure_caps_neither_scope_nor_account(self):
         gate = make_gate(['a'])
-        acct = gate._accounts[0]
+        invoke_fn = AsyncMock(side_effect=_fake_cap_invoke)
 
-        with pytest.raises(AllAccountsCappedException):
-            await invoke_with_cap_retry(
-                gate,
-                'lbl',
-                invoke_fn=_fake_cap_invoke,
-                backend='codex',
-                max_cap_retries=1,
-                model=SCOPE,  # same model string, but codex → no scope derived
-                prompt='hi',
-            )
+        got = await invoke_with_cap_retry(
+            gate,
+            'lbl',
+            invoke_fn=invoke_fn,
+            backend='codex',
+            max_cap_retries=1,
+            model=SCOPE,  # same model string, but codex → no scope derived
+            prompt='hi',
+        )
 
-        # B8: a non-claude backend never derives scope, so attribution is
-        # account-level (scope-blind), exactly as today.
-        assert acct.scope_caps == {}
-        assert acct.phase == AccountPhase.CAPPED
+        # B8: codex never derives a scope, and the heuristic cap net serves
+        # only ACCOUNT_POOL_BACKENDS, so the failure is returned as-is after
+        # one dispatch: neither the scope nor the Claude account is capped.
+        assert got.success is False
+        assert invoke_fn.await_count == 1
+        assert gate.scope_status() == {}
+        assert gate.capped_account_names == ()
+        assert gate.active_account_name == 'a'

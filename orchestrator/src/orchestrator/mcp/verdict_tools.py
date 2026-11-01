@@ -36,6 +36,7 @@ from shared.mcp_markup_middleware import (
     RepairPolicy,
     accepts_markup_override,
 )
+from shared.mcp_missing_arguments import MissingArgumentMiddleware
 
 from orchestrator.artifacts import TaskArtifacts, _validate_verdict_role
 from orchestrator.mcp import markup_journal, markup_sink
@@ -180,7 +181,7 @@ _SINGLETON_ROLE_TOOLS = frozenset({'judge', 'triage', 'merger'})
 #: Every field is stated here rather than defaulted inside ``markup_sink``:
 #: adding a server to the shared channel must be a decision at every axis, not
 #: an inheritance of plan-tools' answers.
-_MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
+MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
     server_label='verdict-tools',
     agent_role='verdict-tools-markup-guard',
     residue_anchor_task_id='verdict-tools-markup-residue',
@@ -218,11 +219,6 @@ _MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
 )
 
 
-def _markup_project_root(worktree: Path) -> Path | None:
-    """verdict-tools' seam onto :func:`markup_sink.resolve_project_root`."""
-    return markup_sink.resolve_project_root(worktree)
-
-
 def _markup_subject_task_id(artifacts: TaskArtifacts) -> str:
     """Which task's verdict call leaked — the SUBJECT, not the routing key.
 
@@ -250,6 +246,7 @@ def _markup_subject_task_id(artifacts: TaskArtifacts) -> str:
 
 def _markup_fact_journal(
     artifacts: TaskArtifacts,
+    resolve_project_root: Callable[[Path], Path | None],
 ) -> Callable[[dict[str, Any]], Awaitable[str | None]]:
     """Build verdict-tools' DURABLE fact channel (task 4917).
 
@@ -265,27 +262,34 @@ def _markup_fact_journal(
     stays the single owner of the label and ``verdict-tools.jsonl`` cannot come
     to disagree with the storm record that points at it.
 
-    ``resolve_root`` is routed through THIS module's ``_markup_project_root``
-    global (a lambda closing over the NAME, not the function), exactly as the
-    escalation sink's is, so a test that substitutes that seam steers a journal
-    ``create_server`` has already built. It is also why one patch steers both
-    channels to the same project root — which is the correct coupling: a
-    residue record and the journal line about it belong in the same checkout.
+    *resolve_project_root* is the caller's resolver, passed through unchanged.
 
     ``subject_task_id`` stays a THUNK, evaluated per record on the worker
     thread: a verdict can be refused before its plan is readable.
     """
     return markup_journal.make_fact_journal(
         worktree=artifacts.worktree,
-        server_label=_MARKUP_SINK_SPEC.server_label,
+        server_label=MARKUP_SINK_SPEC.server_label,
         subject_task_id=lambda: _markup_subject_task_id(artifacts),
-        resolve_root=lambda worktree: _markup_project_root(worktree),
+        resolve_root=resolve_project_root,
     )
 
 
-def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> FastMCP:
+def create_server(
+    artifacts: TaskArtifacts,
+    role: str,
+    session_id: str = '',
+    *,
+    resolve_project_root: Callable[[Path], Path | None] = (
+        markup_sink.resolve_project_root
+    ),
+) -> FastMCP:
     """Create the verdict-tools MCP server with EXACTLY ONE tool registered,
     selected by *role*.
+
+    *resolve_project_root* maps the worktree to the checkout whose escalation
+    queue and markup journal both channels file into; it runs lazily, on the
+    first markup event, never at construction.
     """
     mcp = FastMCP('verdict-tools')
 
@@ -387,22 +391,21 @@ def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> 
     # deliberate here for the same reason it is on plan-tools (task 4744), and
     # a review that re-derives this trade should stop at this paragraph.
     #
-    # Both injected channels resolve their project root through the one
-    # `_markup_project_root` seam. Behaviour-identical when unpatched (the seam
-    # just forwards to what was already the default), and the correct coupling:
-    # a residue record and the journal line about it belong in the same
-    # checkout, so two independently-resolved roots cannot silently disagree.
+    # One injected resolver feeds both channels, so a residue record and the
+    # journal line about it land in the same checkout: two independently
+    # resolved roots could silently disagree.
     mcp.add_middleware(MarkupGuardMiddleware(
         policy=RepairPolicy.FORWARD_REPAIR,
         exempt_tools=frozenset(),
-        fact_sink=_markup_fact_journal(artifacts),
+        fact_sink=_markup_fact_journal(artifacts, resolve_project_root),
         escalation_sink=markup_sink.make_escalation_sink(
             worktree=artifacts.worktree,
-            spec=_MARKUP_SINK_SPEC,
+            spec=MARKUP_SINK_SPEC,
             subject_task_id=lambda: _markup_subject_task_id(artifacts),
-            resolve_root=lambda worktree: _markup_project_root(worktree),
+            resolve_root=resolve_project_root,
         ),
     ))
+    mcp.add_middleware(MissingArgumentMiddleware())
 
     if role == 'judge':
         @mcp.tool()

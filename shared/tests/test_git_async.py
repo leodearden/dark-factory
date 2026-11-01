@@ -129,6 +129,17 @@ async def test_child_env_forces_c_locale() -> None:
     assert result.stdout == 'C:C'
 
 
+async def test_an_unpinned_child_inherits_the_callers_locale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('LANG', 'en_GB.UTF-8')
+    monkeypatch.delenv('LC_ALL', raising=False)
+
+    result = await run_git(['sh', '-c', 'echo "${LC_ALL-unset}:$LANG"'], pin_c_locale=False)
+
+    assert result.stdout == 'unset:en_GB.UTF-8'
+
+
 # ---------------------------------------------------------------------------
 # (e) optional stdin feeding
 # ---------------------------------------------------------------------------

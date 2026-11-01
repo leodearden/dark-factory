@@ -5,9 +5,9 @@ pattern, e.g. ``(n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)``.  Once
 the provisioned range indices exist (task 3708,
 ``docs/prds/falkordb-index-provisioning.md``), FalkorDB plans that as a full
 Entity label scan driving one index scan per row, which overruns the server's
-query TIMEOUT on production graphs.  Every edge leg here instead binds each
-edge's endpoints from its own topology, which FalkorDB plans with no per-row
-scan, and returns each edge once in its stored start -> end orientation.
+query TIMEOUT on production graphs.  Every edge leg here instead reads its edges
+through :func:`fused_memory.backends.falkor_entity_edges.read_entity_edges`,
+which FalkorDB plans with no per-row scan.
 
 Dispatch contract: ``graphiti_core.search.search_utils`` hands five legs to
 ``driver.search_interface`` UNCONDITIONALLY, with no NotImplementedError
@@ -24,35 +24,11 @@ from typing import Any
 
 from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.search_interface.search_interface import SearchInterface
-from graphiti_core.edges import EntityEdge, get_entity_edge_from_record
 from graphiti_core.graph_queries import get_relationships_query, get_vector_cosine_func_query
-from graphiti_core.models.edges.edge_db_queries import get_entity_edge_return_query
 from graphiti_core.search import search_utils
 from graphiti_core.search.search_filters import edge_search_filter_query_constructor
 
-
-async def _entity_edges(
-    driver: GraphDriver,
-    edges: str,
-    filter_queries: list[str],
-    order_by: str | None = None,
-    **params: Any,
-) -> list[EntityEdge]:
-    """Run *edges* (Cypher leaving ``e`` bound, one row per edge) and return up to ``$limit`` of them.
-
-    Endpoints are bound from the edge's own topology rather than re-matched, and
-    held to ``:Entity`` as graphiti's stock pattern does.  The projection and
-    record parsing are graphiti's own.
-    """
-    ranking = f' ORDER BY {order_by}' if order_by else ''
-    cypher = (
-        f'{edges} WITH *, startNode(e) AS n, endNode(e) AS m'
-        f' WHERE {" AND ".join(["n:Entity", "m:Entity", *filter_queries])}'
-        f' RETURN {get_entity_edge_return_query(driver.provider)}{ranking} LIMIT $limit'
-    )
-    records, _, _ = await driver.execute_query(cypher, routing_='r', **params)
-    return [get_entity_edge_from_record(record, driver.provider) for record in records]
-
+from fused_memory.backends.falkor_entity_edges import read_entity_edges
 
 # The origin labels graphiti's SearchInterface.edge_bfs_search documents.
 _BFS_ORIGIN_LABELS = ('Entity', 'Episodic')
@@ -109,7 +85,7 @@ class FalkorEdgeSearch(SearchInterface):
         fulltext_hits = get_relationships_query(
             'edge_name_and_fact', limit=limit, provider=driver.provider
         )
-        return await _entity_edges(
+        return await read_entity_edges(
             driver,
             f'{fulltext_hits} YIELD relationship AS e, score',
             filter_queries,
@@ -145,7 +121,7 @@ class FalkorEdgeSearch(SearchInterface):
                 filter_queries.append('m.uuid = $target_uuid')
 
         score = get_vector_cosine_func_query('e.fact_embedding', '$search_vector', driver.provider)
-        return await _entity_edges(
+        return await read_entity_edges(
             driver,
             f'MATCH ()-[e:RELATES_TO]->(){group_filter}'
             f' WITH e, {score} AS score WHERE score > $min_score',
@@ -176,7 +152,7 @@ class FalkorEdgeSearch(SearchInterface):
             filter_queries.append('e.group_id IN $group_ids')
             filter_params['group_ids'] = group_ids
 
-        return await _entity_edges(
+        return await read_entity_edges(
             driver,
             _bfs_reached_edges(bfs_max_depth),
             filter_queries,

@@ -385,6 +385,7 @@ class TestNicePrefixIntegration:
         assert captured_cmds[2] == ADMISSION_TYPE_CMD
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestVerifyAdmissionSlotsDirDefault:
     """Golden construction invariants for the per-project default of
     ``verify_admission_slots_dir`` (task 2501).
@@ -403,9 +404,7 @@ class TestVerifyAdmissionSlotsDirDefault:
         digest = hashlib.sha256(str(project_root.resolve()).encode()).hexdigest()[:12]
         return f'/tmp/df-verify-slots-{os.getuid()}-{digest}'
 
-    def test_distinct_project_roots_yield_distinct_slots_dirs(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_distinct_project_roots_yield_distinct_slots_dirs(self, tmp_path):
         proj_a = tmp_path / 'proj_a'
         proj_b = tmp_path / 'proj_b'
         config_a = OrchestratorConfig(project_root=proj_a)
@@ -415,9 +414,7 @@ class TestVerifyAdmissionSlotsDirDefault:
         assert config_a.verify_admission_slots_dir == self._expected_slots_dir(proj_a)
         assert config_b.verify_admission_slots_dir == self._expected_slots_dir(proj_b)
 
-    def test_same_project_root_yields_identical_slots_dir(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_same_project_root_yields_identical_slots_dir(self, tmp_path):
         proj = tmp_path / 'proj'
         config_1 = OrchestratorConfig(project_root=proj)
         config_2 = OrchestratorConfig(project_root=proj)
@@ -425,9 +422,7 @@ class TestVerifyAdmissionSlotsDirDefault:
         assert config_1.verify_admission_slots_dir == config_2.verify_admission_slots_dir
         assert config_1.verify_admission_slots_dir == self._expected_slots_dir(proj)
 
-    def test_explicit_override_preserved_verbatim(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_explicit_override_preserved_verbatim(self, tmp_path):
         config = OrchestratorConfig(
             project_root=tmp_path / 'proj',
             verify_admission_slots_dir='/explicit/override',
@@ -435,9 +430,7 @@ class TestVerifyAdmissionSlotsDirDefault:
 
         assert config.verify_admission_slots_dir == '/explicit/override'
 
-    def test_default_is_not_host_global_and_stays_uid_scoped(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_default_is_not_host_global_and_stays_uid_scoped(self, tmp_path):
         config = OrchestratorConfig(project_root=tmp_path / 'proj')
         old_host_global = f'/tmp/df-verify-slots-{os.getuid()}'
 

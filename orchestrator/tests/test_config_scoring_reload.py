@@ -14,6 +14,8 @@ from orchestrator.config import (
     AGE_BUDGET,
     AGE_HALF_SECS,
     CONTINUITY_CREDIT,
+    CONTINUITY_CREDIT_MAX_AGE_SECS,
+    CONTINUITY_PROBE_TTL_SECS,
     CPM_BUDGET,
     CPM_D_CAP,
     RELOADABLE_FIELDS,
@@ -61,6 +63,12 @@ class TestDefaults:
 
         assert cfg.continuity_credit < _continuity_bound(cfg)
 
+    def test_continuity_probe_leaves_default_to_the_mandated_literals(self):
+        cfg = ScoringConfig()
+
+        assert cfg.continuity_probe_ttl_secs == 300.0 == CONTINUITY_PROBE_TTL_SECS
+        assert cfg.continuity_credit_max_age_secs == 604800.0 == CONTINUITY_CREDIT_MAX_AGE_SECS
+
 
 class TestBudgetSumInvariant:
     """I-1: the three bonus budgets together can never push a task across a tier."""
@@ -79,9 +87,8 @@ class TestBudgetSumInvariant:
 
         assert cfg.cpm_budget + cfg.age_budget + cfg.continuity_credit == TIER_WIDTH - 1
 
-    def test_rejected_when_loaded_through_orchestrator_config(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_rejected_when_loaded_through_orchestrator_config(self):
         with pytest.raises(ValidationError):
             OrchestratorConfig.model_validate({'scoring': {'age_budget': 900.0}})
 
@@ -112,13 +119,25 @@ def test_a_d_cap_below_one_is_rejected(bad_cap):
         ScoringConfig(cpm_d_cap=bad_cap)
 
 
+class TestContinuityProbeBounds:
+    """C3: the probe TTL floor bounds git occupancy under any tuning; credit must lapse."""
+
+    def test_a_probe_ttl_below_the_floor_is_rejected(self):
+        with pytest.raises(ValidationError, match='continuity_probe_ttl_secs'):
+            ScoringConfig(continuity_probe_ttl_secs=59.0)
+
+    def test_a_probe_ttl_at_the_floor_is_accepted(self):
+        assert ScoringConfig(continuity_probe_ttl_secs=60.0).continuity_probe_ttl_secs == 60.0
+
+    @pytest.mark.parametrize('bad_age', [0, -1.0])
+    def test_a_non_positive_credit_max_age_is_rejected(self, bad_age):
+        with pytest.raises(ValidationError, match='continuity_credit_max_age_secs'):
+            ScoringConfig(continuity_credit_max_age_secs=bad_age)
+
+
+@pytest.mark.usefixtures("code_default_config")
 class TestScoringReloadDisposition:
     """D8: every scoring knob is green-tier, so a retune costs a reload, not a fleet restart."""
-
-    @pytest.fixture(autouse=True)
-    def _no_config_file(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
 
     @pytest.mark.parametrize('leaf', list(ScoringConfig.model_fields))
     def test_every_leaf_is_reloadable(self, leaf):

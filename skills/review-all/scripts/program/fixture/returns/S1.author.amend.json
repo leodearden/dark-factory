@@ -1,0 +1,73 @@
+{
+  "schema": "review-all-prd-return/1",
+  "run_id": "review-all-fixture-20261019",
+  "stream": "S1",
+  "pass": "author",
+  "session": {
+    "kind": "agent",
+    "title": "prd:fixture S1"
+  },
+  "prd_path": "plans/review-all-fixture-s1-prd.md",
+  "manifest_path": "plans/review-all-fixture-s1-prd.capability-manifest.md",
+  "sidecar_path": "plans/review-all-fixture-s1-prd.capability-manifest.yaml",
+  "commits": [],
+  "open_questions": [
+    {
+      "id": "Q1",
+      "question": "Does alpha or beta own seam contract C1?",
+      "options": [
+        "alpha owns C1",
+        "beta owns C1"
+      ],
+      "recommendation": "alpha owns C1",
+      "needs_human": true,
+      "source": "author"
+    },
+    {
+      "id": "Q2",
+      "question": "Should the alpha shim be retired before S2 releases C1?",
+      "options": [
+        "retire now",
+        "hold until S2 releases C1"
+      ],
+      "recommendation": "hold until S2 releases C1",
+      "needs_human": true,
+      "lead_rulable": false,
+      "source": "critic"
+    },
+    {
+      "id": "Q3",
+      "question": "Name the new module new_name.py or renamed.py?",
+      "options": [
+        "new_name.py",
+        "renamed.py"
+      ],
+      "recommendation": "new_name.py",
+      "needs_human": false,
+      "lead_rulable": true,
+      "source": "author"
+    }
+  ],
+  "rulings_in_session": [],
+  "seam_dependencies": [
+    {
+      "stream": "S2",
+      "contract": "C1"
+    }
+  ],
+  "xrefs": [
+    {
+      "to": "S2",
+      "text": "S2 consumes C2 once S1's alpha task 101 lands."
+    }
+  ],
+  "lead_actions": [],
+  "notes": "Draft authored in agent mode; two design questions for the sitting.",
+  "touches": [
+    "src/fixture/alpha.py",
+    "src/fixture/beta.py",
+    "src/fixture/seam.py",
+    "src/fixture/old_name.py",
+    "src/fixture/removed.py"
+  ]
+}

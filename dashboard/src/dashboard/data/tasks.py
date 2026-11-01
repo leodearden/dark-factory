@@ -443,7 +443,7 @@ async def _fanout_read(
     return await first_success(
         config.fused_memory_urls,
         _call,
-        log_label=fanout_label(label, read.project_root),
+        log_label=fanout_label(label, read.project_root, config.project_labels),
         offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
     )
 
@@ -571,13 +571,11 @@ async def fetch_tasks(
     **Server-side narrowing.**  *statuses* is forwarded to the ``get_tasks``
     MCP tool and is added to the arguments dict only when actually requested,
     so a caller that narrows nothing sends a dict byte-identical to the
-    pre-narrowing shape — the one full-tree caller,
-    ``app._fanout_probe_completion``, is unaffected.  It is a REAL server-side
-    row filter — it becomes ``WHERE tag = ? AND status IN (...)`` in SQL, so
-    narrowing with it cuts backend work, not just wire bytes.  ``None`` (the
-    default) means "no filter"; an EMPTY LIST is a valid, distinct "return
-    nothing" request
-    and is therefore SENT rather than dropped — which is why every guard on
+    pre-narrowing shape.  It is a REAL server-side row filter — it becomes
+    ``WHERE tag = ? AND status IN (...)`` in SQL, so narrowing with it cuts
+    backend work, not just wire bytes.  ``None`` (the default) means "no
+    filter"; an EMPTY LIST is a valid, distinct "return nothing" request and
+    is therefore SENT rather than dropped — which is why every guard on
     this path tests ``is not None`` and never truthiness, ``frozenset()``
     being falsy.  A bare string is rejected server-side with a
     ``ValidationError``.  Because the ``IN`` list is order-insensitive,
@@ -596,9 +594,10 @@ async def fetch_tasks(
     ``asyncio.wait_for``, and the two layers are complementary rather than
     redundant. ``task_snapshot._bounded`` does so around each of the snapshot
     unit's reads. The one caller deliberately left unbounded is
-    ``app._fanout_probe_completion``: the /healthz probe keeps its read
-    outstanding so a wedge stays observable, and
-    ``app._MCP_PROBE_OUTSTANDING_LIMIT`` turns that read's age into a verdict.
+    ``app.py::_fanout_probe_completion``, whose read is a one-row
+    :func:`fetch_task_page`: the /healthz probe keeps its read outstanding so
+    a wedge stays observable, and ``app.py::_MCP_PROBE_OUTSTANDING_LIMIT``
+    turns that read's age into a verdict.
     """
     read = _TasksRead(
         str(project_root),
@@ -721,7 +720,7 @@ async def fetch_statuses(
     return await first_success(
         config.fused_memory_urls,
         _call,
-        log_label=fanout_label('fetch_statuses', project_root_str),
+        log_label=fanout_label('fetch_statuses', project_root_str, config.project_labels),
         offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
     )
 
@@ -799,7 +798,7 @@ async def _read_task(
     return await first_success(
         config.fused_memory_urls,
         _call,
-        log_label=fanout_label(log_name, root),
+        log_label=fanout_label(log_name, root, config.project_labels),
         offline_result=lambda errs: TaskReadOffline('; '.join(errs)),
     )
 
@@ -827,10 +826,11 @@ async def fetch_task_prose(
 ) -> TaskProseRead:
     """Read ONE task's description/details for the Tasks tab's Task Detail pane.
 
-    The ACTIVE_TASKS rows omit both fields; the pane fetches them here for the
-    selected task only. Each outcome is its own type because the route answers
-    each with a different status: :class:`TaskProse`, :class:`TaskNotFound`
-    or :class:`TaskReadOffline`, classified by :func:`_read_task`.
+    The task rows (``TASKS_SNAPSHOT[p].rows``) omit both fields; the pane
+    fetches them here for the selected task only. Each outcome is its own type
+    because the route answers each with a different status:
+    :class:`TaskProse`, :class:`TaskNotFound` or :class:`TaskReadOffline`,
+    classified by :func:`_read_task`.
 
     *timeout* is per HTTP request; the caller bounds the whole read.
     Uncached, deliberately: a primary-key lookup fetched only on selection.

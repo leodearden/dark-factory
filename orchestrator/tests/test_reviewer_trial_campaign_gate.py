@@ -19,7 +19,6 @@ from shared.testing import make_gate_mock
 
 import orchestrator.evals.reviewer_trial.__main__ as trial_cli
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest
-from orchestrator.evals.reviewer_trial.runner import PanelRunResult
 from orchestrator.evals.reviewer_trial.scorer import ScoringResult
 from orchestrator.evals.reviewer_trial.variants import FABLE_EVIDENCE_VARIANTS
 
@@ -33,7 +32,7 @@ class _CampaignHarness:
         self.gate = make_gate_mock()
         self.factory = MagicMock(return_value=self.gate)
         monkeypatch.setattr('shared.usage_gate.UsageGate', self.factory)
-        monkeypatch.setattr('orchestrator.evals.runner.UsageGate', self.factory)
+        monkeypatch.setattr('orchestrator.evals.eval_gate.UsageGate', self.factory)
         monkeypatch.setattr(trial_cli, '_load_corpus', lambda: SimpleNamespace(diffs=[]))
         self.trial_saw = _NOT_CALLED
 
@@ -111,22 +110,16 @@ def test_a_pooled_campaign_scores_through_its_gate(monkeypatch, tmp_path):
         description='d', ground_truth=[],
     )
     monkeypatch.setattr(trial_cli, '_load_corpus', lambda: CorpusManifest(diffs=[diff]))
+    loop_saw: list[object] = []
 
-    async def one_panel(*_args, usage_gate=None, **_kwargs):
-        h.trial_saw = usage_gate
-        return [PanelRunResult(variant_name=arm, diff_id='d1', total_cost_usd=1.0)]
+    async def scoring_loop(_variants, _corpus, *, usage_gate=None, **_kwargs):
+        loop_saw.append(usage_gate)
+        return [ScoringResult(variant_name=arm, diff_id='d1', f1=0.5)]
 
-    monkeypatch.setattr('orchestrator.evals.reviewer_trial.runner.run_trial', one_panel)
-    scorer_saw: list[object] = []
-
-    async def recording_score(run, corpus_diff, *, usage_gate=None):
-        scorer_saw.append(usage_gate)
-        return ScoringResult(variant_name=run.variant_name, diff_id=run.diff_id, f1=0.5)
-
-    monkeypatch.setattr('orchestrator.evals.reviewer_trial.scorer.score_panel_run', recording_score)
+    monkeypatch.setattr('orchestrator.evals.reviewer_trial.runner.run_and_score', scoring_loop)
 
     result = h.invoke('--pool')
 
     assert result.exit_code == 0, f'{result.output}\n{result.exception!r}'
-    assert scorer_saw == [h.gate], f'the matcher was handed {scorer_saw!r}, not the campaign gate'
+    assert loop_saw == [h.gate], f'the score loop was handed {loop_saw!r}, not the campaign gate'
     h.gate.shutdown.assert_awaited_once()

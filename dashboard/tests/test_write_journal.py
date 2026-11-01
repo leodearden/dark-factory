@@ -2,15 +2,40 @@
 
 from __future__ import annotations
 
+import ast
 import logging
 import sqlite3
+from collections import Counter
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 import pytest
 
-WRITE_OPS_SCHEMA = """
+_FUSED_MEMORY = Path(__file__).resolve().parents[2] / 'fused-memory'
+_READ_ROLLUP_SOURCE = _FUSED_MEMORY / 'src' / 'fused_memory' / 'services' / 'read_rollup.py'
+_ROLL_UP_SCRIPT_SOURCE = _FUSED_MEMORY / 'scripts' / 'roll_up_journal_reads.py'
+
+
+def _fused_memory_str_constant(source: Path, name: str) -> str:
+    """The module-level str literal *name* assigned in *source*, read with ast
+    because the dashboard package does not depend on fused-memory."""
+    for node in ast.parse(source.read_text()).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == name for target in node.targets
+        ):
+            value = ast.literal_eval(node.value)
+            assert isinstance(value, str), f'{source}: {name} is not a str literal'
+            return value
+    raise AssertionError(f'{source} no longer assigns {name}')
+
+
+def _read_op_counts_ddl() -> str:
+    return _fused_memory_str_constant(_READ_ROLLUP_SOURCE, 'READ_OP_COUNTS_SCHEMA_SQL')
+
+
+PRE_ROLLUP_WRITE_OPS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS write_ops (
     id TEXT PRIMARY KEY,
     causation_id TEXT,
@@ -47,43 +72,9 @@ CREATE INDEX IF NOT EXISTS idx_wo_agent_time ON write_ops(agent_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_wo_created ON write_ops(created_at);
 """
 
-
-@pytest.fixture()
-def journal_db(tmp_path):
-    """Create a write_journal DB with sample data spanning several hours."""
-    db_path = tmp_path / 'write_journal.db'
-    conn = sqlite3.connect(str(db_path))
-    conn.executescript(WRITE_OPS_SCHEMA)
-
-    now = datetime.now(UTC)
-    rows = [
-        # Recent reads
-        ('op-1', 'search', 'dark_factory', 'claude-interactive', 'read',
-         (now - timedelta(hours=1)).isoformat()),
-        ('op-2', 'search', 'dark_factory', 'claude-interactive', 'read',
-         (now - timedelta(hours=1, minutes=30)).isoformat()),
-        ('op-3', 'get_entity', 'dark_factory', 'claude-interactive', 'read',
-         (now - timedelta(hours=2)).isoformat()),
-        # Recent writes
-        ('op-4', 'add_memory', 'dark_factory', 'claude-interactive', 'write',
-         (now - timedelta(hours=1)).isoformat()),
-        ('op-5', 'add_memory', 'dark_factory', 'recon-stage-consolidator', 'write',
-         (now - timedelta(hours=3)).isoformat()),
-        ('op-6', 'delete_memory', 'dark_factory', 'recon-stage-consolidator', 'write',
-         (now - timedelta(hours=3)).isoformat()),
-        # Old data (>24h) — should be excluded
-        ('op-7', 'search', 'dark_factory', 'claude-interactive', 'read',
-         (now - timedelta(hours=25)).isoformat()),
-    ]
-    for op_id, operation, project_id, agent_id, kind, created_at in rows:
-        conn.execute(
-            'INSERT INTO write_ops (id, operation, project_id, agent_id, kind, created_at)'
-            ' VALUES (?, ?, ?, ?, ?, ?)',
-            (op_id, operation, project_id, agent_id, kind, created_at),
-        )
-    conn.commit()
-    conn.close()
-    return db_path
+# Every fixture journal also carries the read rollup table (task 5405), except
+# the deploy-window journals built from PRE_ROLLUP_WRITE_OPS_SCHEMA directly.
+WRITE_OPS_SCHEMA = PRE_ROLLUP_WRITE_OPS_SCHEMA + _read_op_counts_ddl()
 
 
 @pytest.fixture()
@@ -95,13 +86,6 @@ def empty_journal_db(tmp_path):
     conn.commit()
     conn.close()
     return db_path
-
-
-@pytest.fixture()
-async def journal_conn(journal_db):
-    async with aiosqlite.connect(str(journal_db)) as conn:
-        conn.row_factory = aiosqlite.Row
-        yield conn
 
 
 @pytest.fixture()
@@ -299,43 +283,6 @@ class TestGetMemoryOps:
         validate_datum(result, served_at=_OPS_NOW)
 
 
-class TestGetAgentBreakdown:
-    @pytest.mark.asyncio
-    async def test_returns_all_agents(self, journal_conn):
-        from dashboard.data.write_journal import get_agent_breakdown
-
-        result = await get_agent_breakdown(journal_conn)
-        assert set(result['labels']) == {'claude-interactive', 'recon-stage-consolidator'}
-
-    @pytest.mark.asyncio
-    async def test_sorted_by_count_desc(self, journal_conn):
-        from dashboard.data.write_journal import get_agent_breakdown
-
-        result = await get_agent_breakdown(journal_conn)
-        assert result['values'] == sorted(result['values'], reverse=True)
-
-    @pytest.mark.asyncio
-    async def test_excludes_old_data(self, journal_conn):
-        from dashboard.data.write_journal import get_agent_breakdown
-
-        result = await get_agent_breakdown(journal_conn)
-        assert sum(result['values']) == 6
-
-    @pytest.mark.asyncio
-    async def test_empty_db(self, empty_journal_conn):
-        from dashboard.data.write_journal import get_agent_breakdown
-
-        result = await get_agent_breakdown(empty_journal_conn)
-        assert result == {'labels': [], 'values': []}
-
-    @pytest.mark.asyncio
-    async def test_missing_db(self):
-        from dashboard.data.write_journal import get_agent_breakdown
-
-        result = await get_agent_breakdown(None)
-        assert result == {'labels': [], 'values': []}
-
-
 @pytest.fixture()
 async def no_table_conn(tmp_path):
     """Connection to an empty DB with no write_ops table."""
@@ -366,7 +313,7 @@ def _assert_unknown_memory_ops(result, *reason_fragments):
 
 
 class TestDataLayerErrorHandling:
-    """Verify both write_journal functions handle errors at data layer."""
+    """Verify get_memory_ops handles errors at the data layer."""
 
     @pytest.mark.asyncio
     async def test_memory_ops_is_unknown_on_none_db(self):
@@ -375,24 +322,12 @@ class TestDataLayerErrorHandling:
         _assert_unknown_memory_ops(result, 'write journal')
 
     @pytest.mark.asyncio
-    async def test_agents_returns_default_on_none_db(self):
-        from dashboard.data.write_journal import get_agent_breakdown
-        result = await get_agent_breakdown(None)
-        assert result == {'labels': [], 'values': []}
-
-    @pytest.mark.asyncio
     async def test_memory_ops_is_unknown_naming_the_operational_error(
         self, no_table_conn,
     ):
         from dashboard.data.write_journal import get_memory_ops
         result = await get_memory_ops(no_table_conn, now=_OPS_NOW)
         _assert_unknown_memory_ops(result, 'OperationalError', 'no such table')
-
-    @pytest.mark.asyncio
-    async def test_agents_returns_default_on_operational_error(self, no_table_conn):
-        from dashboard.data.write_journal import get_agent_breakdown
-        result = await get_agent_breakdown(no_table_conn)
-        assert result == {'labels': [], 'values': []}
 
     @pytest.mark.asyncio
     async def test_memory_ops_is_unknown_naming_the_os_error(self, tmp_path):
@@ -409,30 +344,16 @@ class TestDataLayerErrorHandling:
                 result = await get_memory_ops(conn, now=_OPS_NOW)
         _assert_unknown_memory_ops(result, 'OSError', 'disk I/O error')
 
-    @pytest.mark.asyncio
-    async def test_agents_returns_default_on_os_error(self, tmp_path):
-        from dashboard.data.write_journal import get_agent_breakdown
-        db_path = tmp_path / 'test.db'
-        sqlite3.connect(str(db_path)).close()
-        async with aiosqlite.connect(str(db_path)) as conn:
-            conn.row_factory = aiosqlite.Row
-            mock_cursor = AsyncMock()
-            mock_cursor.__aenter__ = AsyncMock(return_value=mock_cursor)
-            mock_cursor.__aexit__ = AsyncMock(return_value=False)
-            mock_cursor.fetchall = AsyncMock(side_effect=OSError('disk I/O error'))
-            with patch.object(conn, 'execute', return_value=mock_cursor):
-                result = await get_agent_breakdown(conn)
-        assert result == {'labels': [], 'values': []}
 
 
-def _seed_write_ops(db_path, rows):
+def _seed_write_ops(db_path, rows, *, schema=WRITE_OPS_SCHEMA):
     """Create a write_ops SQLite DB at *db_path* seeded with *rows*.
 
     Each row is ``(op_id, operation, project_id, agent_id, kind, created_at)``,
     matching the column order used throughout this module's fixtures.
     """
     conn = sqlite3.connect(str(db_path))
-    conn.executescript(WRITE_OPS_SCHEMA)
+    conn.executescript(schema)
     for op_id, operation, project_id, agent_id, kind, created_at in rows:
         conn.execute(
             'INSERT INTO write_ops (id, operation, project_id, agent_id, kind, created_at)'
@@ -492,24 +413,6 @@ class TestNowThreading:
             result = await _ops_value(conn)
         assert sum(result.reads) == 1
 
-    @pytest.mark.asyncio
-    async def test_agent_breakdown_uses_provided_now_at_minute_boundary(self, tmp_path):
-        """get_agent_breakdown(now=fixed): fixed-24h+1min is counted, fixed-24h-1min is not."""
-        from dashboard.data.write_journal import get_agent_breakdown
-
-        db_path = tmp_path / 'agents_fixed_now_boundary.db'
-        cutoff = self.FIXED_NOW - timedelta(hours=24)
-        just_inside = cutoff + timedelta(minutes=1)
-        just_outside = cutoff - timedelta(minutes=1)
-        _seed_write_ops(db_path, [
-            ('in-1', 'search', 'dark_factory', 'agent-a', 'read', just_inside.isoformat()),
-            ('out-1', 'search', 'dark_factory', 'agent-a', 'read', just_outside.isoformat()),
-        ])
-
-        async with aiosqlite.connect(str(db_path)) as conn:
-            conn.row_factory = aiosqlite.Row
-            result = await get_agent_breakdown(conn, now=self.FIXED_NOW)
-        assert sum(result['values']) == 1
 
 
 # Deliberately UNEQUAL per-operation weights (sum to 500, matching the
@@ -583,10 +486,10 @@ class TestMemoryOpsQueryPlan:
 
         db_path = tmp_path / 'ops_plan.db'
         _seed_ops_breakdown_plan_fixture(db_path)
-        window = (
-            _PLAN_FIXTURE_BASE.isoformat(),
-            (_PLAN_FIXTURE_BASE + timedelta(days=21)).isoformat(),
-        )
+        window = {
+            'start': _PLAN_FIXTURE_BASE.isoformat(),
+            'end': (_PLAN_FIXTURE_BASE + timedelta(days=21)).isoformat(),
+        }
 
         async with (
             aiosqlite.connect(str(db_path)) as conn,
@@ -600,14 +503,24 @@ class TestMemoryOpsQueryPlan:
             f'created_at must be the seek constraint, got: {plan}'
         )
         assert 'SCAN' not in plan, f'still full-scanning write_ops: {plan}'
+        assert 'SEARCH read_op_counts USING PRIMARY KEY (hour_start>? AND hour_start<?)' in plan, (
+            f'the rollup arm must range-seek its primary key on hour_start, got: {plan}'
+        )
 
 
-async def _memory_ops_with_sql(conn, sql, monkeypatch, **kwargs):
-    """get_memory_ops with its query swapped for *sql* (hinted vs unhinted)."""
-    from dashboard.data import write_journal
+def _drop_created_index(db_path):
+    conn = sqlite3.connect(str(db_path))
+    conn.execute('DROP INDEX idx_wo_created')
+    conn.commit()
+    conn.close()
 
-    monkeypatch.setattr(write_journal, 'MEMORY_OPS_SQL', sql)
-    return await _ops_value(conn, **kwargs)
+
+async def _hinted_and_unhinted_values(db_path, **kwargs):
+    """get_memory_ops on *db_path*, then again once idx_wo_created is dropped,
+    which is the only journal the unhinted statement is ever run against."""
+    hinted = await _ops_value_at(db_path, **kwargs)
+    _drop_created_index(db_path)
+    return hinted, await _ops_value_at(db_path, **kwargs)
 
 
 class TestMemoryOpsResultEquivalence:
@@ -615,36 +528,28 @@ class TestMemoryOpsResultEquivalence:
 
     Passes by construction today, because "the results are unchanged" IS the
     property under test; it goes red if a future edit makes the hinted and
-    unhinted SQL disagree. Compares whole MemoryOps values, so the series,
-    the labels and the by_operation ORDER (count desc, ties by label) all
-    have to agree — including on tied counts, where SQL's own row order is
+    unhinted statements disagree. Compares whole MemoryOps values, so the
+    series, the labels and the by_operation ORDER (count desc, ties by label)
+    all have to agree — including on tied counts, where SQL's own row order is
     unspecified and the two plans walk different indexes.
     """
 
     @pytest.mark.asyncio
-    async def test_hinted_and_unhinted_agree(self, tmp_path, monkeypatch):
-        from dashboard.data.write_journal import MEMORY_OPS_SQL, MEMORY_OPS_SQL_UNHINTED
-
+    async def test_hinted_and_unhinted_agree(self, tmp_path):
         db_path = tmp_path / 'ops_equivalence.db'
         _seed_ops_breakdown_plan_fixture(db_path)
-        window = {'hours': _PLAN_FIXTURE_HOURS, 'now': _PLAN_FIXTURE_NOW}
 
-        async with aiosqlite.connect(str(db_path)) as conn:
-            conn.row_factory = aiosqlite.Row
-            hinted = await _memory_ops_with_sql(conn, MEMORY_OPS_SQL, monkeypatch, **window)
-            unhinted = await _memory_ops_with_sql(
-                conn, MEMORY_OPS_SQL_UNHINTED, monkeypatch, **window,
-            )
+        hinted, unhinted = await _hinted_and_unhinted_values(
+            db_path, hours=_PLAN_FIXTURE_HOURS, now=_PLAN_FIXTURE_NOW,
+        )
 
         assert hinted == unhinted
         assert hinted.by_operation == tuple(_OPS_BREAKDOWN_WEIGHTS.items())
         assert sum(hinted.reads) + sum(hinted.writes) == 500
 
     @pytest.mark.asyncio
-    async def test_hinted_and_unhinted_agree_on_ties(self, tmp_path, monkeypatch):
+    async def test_hinted_and_unhinted_agree_on_ties(self, tmp_path):
         """Tied counts come back in label order from both plans."""
-        from dashboard.data.write_journal import MEMORY_OPS_SQL, MEMORY_OPS_SQL_UNHINTED
-
         db_path = tmp_path / 'ops_equivalence_ties.db'
         rows = [
             (
@@ -658,14 +563,10 @@ class TestMemoryOpsResultEquivalence:
             for i in range(250)
         ]
         _seed_write_ops(db_path, rows)
-        window = {'hours': _PLAN_FIXTURE_HOURS, 'now': _PLAN_FIXTURE_NOW}
 
-        async with aiosqlite.connect(str(db_path)) as conn:
-            conn.row_factory = aiosqlite.Row
-            hinted = await _memory_ops_with_sql(conn, MEMORY_OPS_SQL, monkeypatch, **window)
-            unhinted = await _memory_ops_with_sql(
-                conn, MEMORY_OPS_SQL_UNHINTED, monkeypatch, **window,
-            )
+        hinted, unhinted = await _hinted_and_unhinted_values(
+            db_path, hours=_PLAN_FIXTURE_HOURS, now=_PLAN_FIXTURE_NOW,
+        )
 
         assert hinted == unhinted
         assert hinted.by_operation == tuple((f'operation-{i}', 50) for i in range(5))
@@ -700,10 +601,7 @@ class TestMemoryOpsMissingIndexFallback:
             indexed = await _ops_value(conn, now=now)
 
         # WRITE_OPS_SCHEMA minus idx_wo_created — the coupling breaks here.
-        setup_conn = sqlite3.connect(str(db_path))
-        setup_conn.execute('DROP INDEX idx_wo_created')
-        setup_conn.commit()
-        setup_conn.close()
+        _drop_created_index(db_path)
 
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
@@ -720,3 +618,313 @@ class TestMemoryOpsMissingIndexFallback:
             and 'idx_wo_created' in record.getMessage()
             for record in caplog.records
         ), f'expected an ERROR naming idx_wo_created, got: {caplog.record_tuples}'
+
+
+def _seed_read_op_counts(db_path, rows):
+    """Insert ``(hour_start, project_id, agent_id, operation, count)`` rows."""
+    conn = sqlite3.connect(str(db_path))
+    conn.executemany(
+        'INSERT INTO read_op_counts (hour_start, project_id, agent_id, operation, count)'
+        ' VALUES (?, ?, ?, ?, ?)',
+        [(at.isoformat(), project, agent, operation, count)
+         for at, project, agent, operation, count in rows],
+    )
+    conn.commit()
+    conn.close()
+
+
+async def _ops_value_at(db_path, **kwargs):
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        return await _ops_value(conn, **kwargs)
+
+
+def _seed_ops_rows(db_path, *, schema=WRITE_OPS_SCHEMA):
+    _seed_write_ops(db_path, [
+        (op_id, operation, project, agent, kind, at.isoformat())
+        for op_id, operation, project, agent, kind, at in _OPS_ROWS
+    ], schema=schema)
+
+
+class TestMemoryOpsReadRollup:
+    """Every read is journalled exactly once — a write_ops row or a
+    read_op_counts count (task 5405) — so the panel ADDS the two sources."""
+
+    @pytest.mark.asyncio
+    async def test_rollup_counts_add_to_raw_rows_of_the_same_hour_and_operation(
+        self, tmp_path,
+    ):
+        db_path = tmp_path / 'rollup_adds.db'
+        _seed_ops_rows(db_path)
+        raw_only = await _ops_value_at(db_path, hours=24, now=_OPS_NOW)
+        _seed_read_op_counts(db_path, [
+            (_OPS_FLOOR, 'dark_factory', '', 'get_entity', 5),
+        ])
+
+        ops = await _ops_value_at(db_path, hours=24, now=_OPS_NOW)
+
+        assert ops.reads[-1] == raw_only.reads[-1] + 5 == 6
+        assert dict(ops.by_operation)['get_entity'] == 6
+        assert ops.writes == raw_only.writes
+        assert ops.other == raw_only.other
+
+    @pytest.mark.asyncio
+    async def test_rollup_window_includes_its_start_hour_and_excludes_both_outside_hours(
+        self, tmp_path,
+    ):
+        db_path = tmp_path / 'rollup_edges.db'
+        _seed_write_ops(db_path, [])
+        _seed_read_op_counts(db_path, [
+            (_OPS_WINDOW_START, 'p', '', 'get_task', 2),
+            (_OPS_WINDOW_START - timedelta(hours=1), 'p', '', 'get_task', 30),
+            (_OPS_FLOOR + timedelta(hours=1), 'p', '', 'get_task', 400),
+        ])
+
+        ops = await _ops_value_at(db_path, hours=24, now=_OPS_NOW)
+
+        assert ops.reads[0] == 2
+        assert sum(ops.reads) == 2
+        assert ops.by_operation == (('get_task', 2),)
+
+    @pytest.mark.asyncio
+    async def test_rollup_sums_every_project_and_agent_row_of_one_hour_and_operation(
+        self, tmp_path,
+    ):
+        db_path = tmp_path / 'rollup_grain.db'
+        _seed_write_ops(db_path, [])
+        hour = _OPS_FLOOR - timedelta(hours=3)
+        _seed_read_op_counts(db_path, [
+            (hour, 'p', '', 'get_statuses', 1),
+            (hour, 'p', 'agent-a', 'get_statuses', 2),
+            (hour, 'q', '', 'get_statuses', 4),
+            (hour, '', 'agent-b', 'get_statuses', 8),
+        ])
+
+        ops = await _ops_value_at(db_path, hours=24, now=_OPS_NOW)
+
+        assert ops.reads[_ops_bucket(hour)] == 15
+        assert ops.by_operation == (('get_statuses', 15),)
+
+    @pytest.mark.asyncio
+    async def test_rollup_empty_operation_is_unknown(self, tmp_path):
+        db_path = tmp_path / 'rollup_unknown.db'
+        _seed_write_ops(db_path, [])
+        _seed_read_op_counts(db_path, [(_OPS_FLOOR, 'p', '', '', 3)])
+
+        ops = await _ops_value_at(db_path, hours=24, now=_OPS_NOW)
+
+        assert ops.by_operation == (('unknown', 3),)
+
+    @pytest.mark.asyncio
+    async def test_series_still_reconcile_with_by_operation(self, tmp_path):
+        db_path = tmp_path / 'rollup_reconcile.db'
+        _seed_ops_rows(db_path)
+        _seed_read_op_counts(db_path, [
+            (_OPS_FLOOR, 'dark_factory', '', 'get_entity', 5),
+            (_OPS_WINDOW_START, 'dark_factory', '', 'get_task', 7),
+            (_OPS_FLOOR - timedelta(hours=6), '', '', '', 11),
+        ])
+
+        ops = await _ops_value_at(db_path, hours=24, now=_OPS_NOW)
+
+        series_total = sum(ops.reads) + sum(ops.writes) + sum(ops.other)
+        assert series_total == sum(count for _, count in ops.by_operation) == 9 + 23
+
+
+_MOVE_BASE = datetime(2026, 10, 2, 13, 0, tzinfo=UTC)
+
+
+def _equivalence_rows():
+    """Raw rows across hours, projects and agents: count-only reads, search
+    reads and writes, at minute offsets inside each hour."""
+    rows = []
+    for i in range(120):
+        at = _MOVE_BASE + timedelta(minutes=3 * i + 1)
+        operation, kind = [
+            ('get_task', 'read'), ('get_statuses', 'read'), (None, 'read'),
+            ('search', 'read'), ('add_memory', 'write'),
+        ][i % 5]
+        project = ['dark_factory', 'reify', None][(i // 10) % 3]
+        agent = ['agent-a', None][(i // 20) % 2]
+        rows.append((f'eq-{i}', operation, project, agent, kind, at))
+    return rows
+
+
+def _is_count_only(operation, kind):
+    return kind == 'read' and operation != 'search'
+
+
+class TestMemoryOpsRollupEquivalence:
+    """Moving successful non-search reads from write_ops into read_op_counts —
+    what the history migration does — leaves the panel's numbers unchanged."""
+
+    @pytest.mark.asyncio
+    async def test_moving_reads_into_the_rollup_renders_identical_numbers(self, tmp_path):
+        db_path = tmp_path / 'rollup_move.db'
+        rows = _equivalence_rows()
+        _seed_write_ops(db_path, [
+            (op_id, operation, project, agent, kind, at.isoformat())
+            for op_id, operation, project, agent, kind, at in rows
+        ])
+        now = _MOVE_BASE + timedelta(hours=26, minutes=10)
+        before = await _ops_value_at(db_path, hours=28, now=now)
+
+        moved = [row for row in rows if _is_count_only(row[1], row[4])]
+        counts = Counter(
+            (at.replace(minute=0, second=0, microsecond=0), project or '', agent or '',
+             operation or '')
+            for _, operation, project, agent, _, at in moved
+        )
+        conn = sqlite3.connect(str(db_path))
+        conn.executemany('DELETE FROM write_ops WHERE id = ?', [(row[0],) for row in moved])
+        conn.commit()
+        conn.close()
+        _seed_read_op_counts(db_path, [(*key, count) for key, count in counts.items()])
+        after = await _ops_value_at(db_path, hours=28, now=now)
+
+        assert moved and len(counts) < len(moved)
+        assert after == before
+        assert sum(before.reads) == 96
+
+
+async def _memory_ops_logged(db_path, caplog, level):
+    """get_memory_ops on *db_path* and this module's log records at *level* and up."""
+    from dashboard.data import write_journal
+
+    caplog.clear()
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        with caplog.at_level(level, logger='dashboard.data.write_journal'):
+            result = await write_journal.get_memory_ops(conn, hours=24, now=_OPS_NOW)
+    return result, [
+        record for record in caplog.records if record.name == 'dashboard.data.write_journal'
+    ]
+
+
+def _naming_rollup_table(records):
+    return [record for record in records if 'read_op_counts' in record.getMessage()]
+
+
+class TestMemoryOpsMissingRollupTableFallback:
+    """The deploy window (task 5405): the dashboard restarts on merge, while
+    fused-memory may run an older build for hours. Its journal has no
+    read_op_counts and journals every read per row, so the raw arm alone is
+    EXACT — a fresh reading, never an unknown one."""
+
+    @pytest.fixture(autouse=True)
+    def _first_sighting_in_this_process(self, monkeypatch):
+        from dashboard.data import write_journal
+
+        monkeypatch.setattr(write_journal, '_missing_rollup_table_noted', False)
+
+    @pytest.fixture()
+    async def expected(self, tmp_path):
+        with_table = tmp_path / 'with_rollup.db'
+        _seed_ops_rows(with_table)
+        return await _ops_value_at(with_table, hours=24, now=_OPS_NOW)
+
+    @pytest.fixture()
+    def pre_rollup_journal(self, tmp_path):
+        without_table = tmp_path / 'pre_rollup.db'
+        _seed_ops_rows(without_table, schema=PRE_ROLLUP_WRITE_OPS_SCHEMA)
+        return without_table
+
+    @pytest.mark.asyncio
+    async def test_journal_without_rollup_table_reads_raw_rows_fresh(
+        self, pre_rollup_journal, expected, caplog,
+    ):
+        from dashboard.data.datum import DatumState, validate_datum
+
+        result, records = await _memory_ops_logged(pre_rollup_journal, caplog, logging.INFO)
+
+        assert result.state is DatumState.FRESH
+        assert result.value == expected
+        validate_datum(result, served_at=_OPS_NOW)
+        assert [record.levelno for record in _naming_rollup_table(records)] == [logging.INFO], (
+            f'expected one INFO naming read_op_counts, got: {caplog.record_tuples}'
+        )
+        assert all(record.levelno < logging.WARNING for record in records)
+
+    @pytest.mark.asyncio
+    async def test_later_polls_note_the_missing_table_at_debug_only(
+        self, pre_rollup_journal, caplog,
+    ):
+        """The table appears only when fused-memory restarts, up to ~8 h of
+        polls later, so only the first sighting is INFO-worthy news."""
+        await _memory_ops_logged(pre_rollup_journal, caplog, logging.DEBUG)
+
+        for _ in range(2):
+            _, records = await _memory_ops_logged(pre_rollup_journal, caplog, logging.DEBUG)
+            assert [record.levelno for record in _naming_rollup_table(records)] == [
+                logging.DEBUG
+            ], caplog.record_tuples
+
+    @pytest.mark.asyncio
+    async def test_journal_missing_both_rollup_table_and_index_reads_raw_rows_fresh(
+        self, pre_rollup_journal, expected, caplog,
+    ):
+        """SQLite names the missing table before the missing index, so the
+        two fallbacks must compose rather than the first one's retry failing."""
+        from dashboard.data.datum import DatumState
+
+        _drop_created_index(pre_rollup_journal)
+
+        result, records = await _memory_ops_logged(pre_rollup_journal, caplog, logging.INFO)
+
+        assert result.state is DatumState.FRESH, result.reason
+        assert result.value == expected
+        assert _naming_rollup_table(records)
+        assert any(
+            record.levelno == logging.ERROR and 'idx_wo_created' in record.getMessage()
+            for record in records
+        ), caplog.record_tuples
+
+
+class TestMigrationVerifyOracleMatchesPanel:
+    """roll_up_journal_reads.py's ``verify`` restates this panel's numbers in
+    SQL (``_PANEL_COUNTS_SQL``), because fused-memory cannot import the
+    dashboard. This holds that copy to get_memory_ops over one journal, so a
+    change to either side's bucketing cannot leave verify checking the old
+    shape."""
+
+    @pytest.mark.asyncio
+    async def test_oracle_and_panel_agree_per_hour_and_per_operation(self, tmp_path):
+        db_path = tmp_path / 'oracle.db'
+        _seed_ops_rows(db_path)
+        _seed_write_ops(db_path, [
+            ('blank-op', '', 'dark_factory', None, 'read',
+             (_OPS_FLOOR - timedelta(hours=2)).isoformat()),
+        ])
+        _seed_read_op_counts(db_path, [
+            (_OPS_FLOOR, 'dark_factory', '', 'get_entity', 5),
+            (_OPS_WINDOW_START, 'dark_factory', 'agent-a', 'get_task', 7),
+            (_OPS_FLOOR - timedelta(hours=6), '', '', '', 11),
+            (_OPS_WINDOW_START - timedelta(hours=1), 'p', '', 'get_task', 30),
+            (_OPS_FLOOR + timedelta(hours=1), 'p', '', 'get_task', 400),
+        ])
+        panel = await _ops_value_at(db_path, hours=24, now=_OPS_NOW)
+
+        conn = sqlite3.connect(str(db_path))
+        oracle_rows = conn.execute(
+            _fused_memory_str_constant(_ROLL_UP_SCRIPT_SOURCE, '_PANEL_COUNTS_SQL'),
+            {
+                'start': _OPS_WINDOW_START.isoformat(),
+                'end': (_OPS_FLOOR + timedelta(hours=1)).isoformat(),
+            },
+        ).fetchall()
+        conn.close()
+
+        series: dict[str, Counter[str]] = {'read': Counter(), 'write': Counter(), 'other': Counter()}
+        by_operation: Counter[str] = Counter()
+        for hour, kind, operation, n in oracle_rows:
+            series[kind if kind in ('read', 'write') else 'other'][hour] += n
+            by_operation[operation] += n
+        hour_keys = [
+            (_OPS_WINDOW_START + timedelta(hours=i)).strftime('%Y-%m-%dT%H:00')
+            for i in range(24)
+        ]
+        assert panel.reads == tuple(series['read'][hour] for hour in hour_keys)
+        assert panel.writes == tuple(series['write'][hour] for hour in hour_keys)
+        assert panel.other == tuple(series['other'][hour] for hour in hour_keys)
+        assert dict(panel.by_operation) == dict(by_operation)
+        assert dict(panel.by_operation)['unknown'] == 1 + 1 + 11

@@ -1,6 +1,6 @@
-// The jsdom render harness's own contract (dom_harness.mjs), starting with the
-// toolchain identity guard: the harness must run the exact React bytes the
-// browser runs, or it lies about what the browser renders.
+// The jsdom render harness's own contract (dom_harness.mjs). Its identity guard holds the installed
+// react and react-dom to the packages the browser loads (their copy of index.html's build must hash
+// to the tag's integrity); the harness renders with each package's development build.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -120,6 +120,26 @@ test('the window runs React at the version index.html loads', t => {
   assert.equal(window.ReactDOM.version, cdnScriptTag('react-dom').version);
 });
 
+test("the window runs React's development build, so a broken React rule reaches consoleErrors", t => {
+  const { window, consoleErrors, mount } = openWindow(t);
+  const { React } = window;
+  const items = withKeys => ['a', 'b'].map(id => React.createElement('li', withKeys ? { key: id } : null, id));
+  const Keyed = () => React.createElement('ul', null, items(true));
+  const Keyless = () => React.createElement('ul', null, items(false));
+
+  mount(Keyed);
+  assert.deepEqual(consoleErrors, [], 'a keyed list must render silently, or the check below proves nothing');
+
+  mount(Keyless);
+  assert.ok(
+    consoleErrors.some(entry => entry.includes('unique "key" prop')),
+    'a keyless list rendered without React\'s key warning. The browser loads the production build, which is ' +
+      "silent about key, prop and hook misuse, so jsx_render.test.mjs's consoleErrors assertion is the one place " +
+      'those warnings still fail a change, and only the development build supports the synchronous act() that ' +
+      'mount() renders through.',
+  );
+});
+
 test('the load writes nothing to console.error', t => {
   const { consoleErrors } = openWindow(t);
   assert.deepEqual(consoleErrors, []);
@@ -150,6 +170,64 @@ test('close() leaves no live timer behind, though data.js starts polling on load
   } finally {
     harness.close();
   }
+  assert.equal(liveTimerCount(), before, 'a timer outlived close(); it would hold `node --test` open');
+});
+
+// ── The whole page app.jsx bootstraps, on request ─────────────────────────
+
+test('mountPage() runs app.jsx into a #root element, as index.html does', t => {
+  const { window, consoleErrors, mountPage } = openWindow(t);
+
+  const root = mountPage();
+
+  assert.equal(root.id, 'root');
+  assert.equal(root.parentElement, window.document.body);
+  const app = root.querySelector('.app');
+  assert.ok(app, 'app.jsx rendered no .app into #root');
+  assert.ok(app.querySelectorAll('.rail-nav button').length > 0, 'the page renders no rail buttons');
+  for (const region of ['.stat-strip', '.toolbar', '.body']) {
+    assert.ok(app.querySelector(region), `the page renders no ${region}`);
+  }
+  assert.equal(app.querySelector('.crumbs .here')?.textContent, 'Overview', "App's initial tab is Overview");
+  assert.deepEqual(consoleErrors, []);
+});
+
+test('mountPage() refuses a second mount in one window, and leaves the first page intact', t => {
+  const { window, mountPage } = openWindow(t);
+  const root = mountPage();
+
+  assert.throws(() => mountPage(), /app\.jsx/);
+
+  assert.equal(window.document.querySelectorAll('#root').length, 1, 'a refused mount must add no second #root');
+  assert.equal(window.document.getElementById('root'), root);
+  assert.ok(root.querySelector('.app .rail-nav button'), 'a refused mount must leave the first page rendering');
+});
+
+// jsdom's window.postMessage (the tweaks panel posts on mount) delivers on a
+// one-shot node setTimeout(0) outside the window's own timers, which close()
+// cannot reach. It fires on the next turn, so each count waits that one turn:
+// the baseline too, since an earlier test's page may have posted.
+function nextTurn() {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
+
+test('close() after mountPage() leaves no live timer behind, though the page arms its own', async () => {
+  await nextTurn();
+  const before = liveTimerCount();
+  const harness = buildDashboardWindow();
+  let loaded;
+  try {
+    loaded = liveTimerCount();
+    harness.mountPage();
+    assert.ok(
+      liveTimerCount() > loaded,
+      "the mounted page armed no timer of its own (App's LiveClock ticks every second), so the check below " +
+        'would prove nothing',
+    );
+  } finally {
+    harness.close();
+  }
+  await nextTurn();
   assert.equal(liveTimerCount(), before, 'a timer outlived close(); it would hold `node --test` open');
 });
 
