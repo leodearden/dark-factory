@@ -21,6 +21,7 @@ import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import Any
 
 
 def sse_frame(payload):
@@ -276,7 +277,7 @@ TRANSPORT_FAULTS = {
 
 # FastMCP's shape for a raised ToolError: the request reached the tool, which
 # ran and failed, so unlike every TRANSPORT_FAULTS entry it may have acted.
-TOOL_RAISED = {"tool_call_reply": TOOL_IS_ERROR}
+TOOL_RAISED: dict[str, Any] = {"tool_call_reply": TOOL_IS_ERROR}
 
 
 class ClosedPort:
