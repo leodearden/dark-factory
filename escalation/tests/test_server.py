@@ -26,12 +26,13 @@ from _resolve_issue_call import call_resolve_issue
 from shared.merge_state import MergeReason
 
 from escalation import server as escalation_server
+from escalation.amendments import MAX_AMENDMENTS
 from escalation.canonical import canonical_root_cause
 from escalation.dedupe import DedupeConfig, summary_dedupe_key
 from escalation.grant_delivery import GrantDelivery
 from escalation.merge_status_answer import hint_for
 from escalation.models import Escalation
-from escalation.queue import _MAX_AMENDMENTS, EscalationQueue
+from escalation.queue import EscalationQueue
 from escalation.server import (
     _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID,
     _AMENDMENT_TRUNCATION_STORM_THRESHOLD,
@@ -3122,7 +3123,7 @@ class TestAmendmentTruncationStorm:
 
         # Fill the amendment list exactly to the cap — no truncation yet, so
         # nothing may be filed.  Bound derived from the NAME, never the value.
-        for i in range(_MAX_AMENDMENTS):
+        for i in range(MAX_AMENDMENTS):
             filled = await self._fold(server, f'fill-{i}')
             assert filled['status'] == 'updated', f'Expected a fold, got {filled}'
         at_cap = queue.get(l2_id)
@@ -3202,7 +3203,7 @@ class TestAmendmentTruncationStorm:
         assert crossed['status'] == 'updated', f'Expected a fold, got {crossed}'
         assert crossed['id'] == l2_id
         assert crossed['amendment_recorded'] is True, f'framing must still land: {crossed}'
-        assert crossed['amendments'] == _MAX_AMENDMENTS, (
+        assert crossed['amendments'] == MAX_AMENDMENTS, (
             f'the list stays capped while truncating: {crossed}'
         )
         assert crossed['severity'] == 'blocking', f'severity must still report: {crossed}'
@@ -3246,7 +3247,7 @@ class TestAmendmentTruncationStorm:
         assert created['status'] == 'created', f'Unexpected first result: {created}'
 
         # Fill to the cap, then burst past the threshold on server #1.
-        for i in range(_MAX_AMENDMENTS + _AMENDMENT_TRUNCATION_STORM_THRESHOLD):
+        for i in range(MAX_AMENDMENTS + _AMENDMENT_TRUNCATION_STORM_THRESHOLD):
             await self._fold(server, f'first-{i}')
         known = pending_ids()
         assert len(known) == 2, (
@@ -7454,9 +7455,11 @@ class TestPromoteToL2CanonicalFold:
     ):
         """The over-fold evidence trail: the incoming spelling lands in `amendments`.
 
-        This is also what proves ``_framing_view`` was NOT canonicalised — if it
-        had been, a spelling-only difference would read as a REPEAT and be
-        suppressed, emptying the slot task 3997 built for exactly this.
+        This is also what proves
+        ``escalation/src/escalation/amendments.py::_framing_view`` was NOT
+        canonicalised — if it had been, a spelling-only difference would read
+        as a REPEAT and be suppressed, emptying the slot task 3997 built for
+        exactly this.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)

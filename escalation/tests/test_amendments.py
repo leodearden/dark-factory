@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
 from escalation.amendments import (
     MAX_AMENDMENT_DETAIL_CHARS,
     MAX_AMENDMENT_LINE_CHARS,
@@ -31,7 +32,6 @@ from escalation.amendments import (
     elide,
     has_framing,
 )
-
 from escalation.models import Escalation
 
 
