@@ -70,6 +70,7 @@ if str(_REPO_ROOT / 'scripts' / 'legibility') not in sys.path:
 from legibility import account_pool  # noqa: E402
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
 from shared.cli_invoke import build_claude_argv  # noqa: E402
+from shared.git_read_rules import git_read_rules  # noqa: E402
 from sitting import inventory, preparation  # noqa: E402  # debt: task 6760
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG = 0, 1, 2
@@ -87,12 +88,13 @@ NIGHTLY_MCP_SERVERS: tuple[str, ...] = ('escalation', 'fused-memory')
 PREPARE_COMMAND = 'uv run --frozen --project shared python scripts/sitting/prepare_sitting.py'
 """The one shell spelling the run may execute; repo-relative, so the child runs in the run's root."""
 
+_GIT_READS = git_read_rules('show', 'log')
+
 NIGHTLY_READ_TOOLS: tuple[str, ...] = (
     'Read',
     'Grep',
     'Glob',
-    'Bash(git show:*)',
-    'Bash(git log:*)',
+    *_GIT_READS.allow,
     f'Bash({PREPARE_COMMAND} brief --json:*)',
     'mcp__escalation__get_escalation',
     'mcp__escalation__get_pending_escalations',
@@ -119,6 +121,7 @@ def nightly_allowed_tools(inbox: Path) -> tuple[str, ...]:
 
 NIGHTLY_DENIED_TOOLS: tuple[str, ...] = (
     'NotebookEdit',
+    *_GIT_READS.deny,
     'mcp__escalation__resolve_issue',
     'mcp__escalation__stamp_triage',
     'mcp__escalation__promote_to_l2',

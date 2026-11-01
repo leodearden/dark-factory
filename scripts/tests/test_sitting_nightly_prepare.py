@@ -358,6 +358,20 @@ def test_the_only_bash_allowed_is_git_show_git_log_and_the_two_prepare_subcomman
     assert mod.PREPARE_COMMAND.endswith(' scripts/sitting/prepare_sitting.py')
 
 
+def test_every_allowed_git_read_has_its_output_flag_denied(tmp_path):
+    fake = _fake_claude(tmp_path)
+
+    _run(fake)
+
+    argv = fake.only_call()['argv']
+    allowed = _flag_values(argv, '--allowed-tools')
+    denied = _flag_values(argv, '--disallowed-tools')
+    git_reads = {match.group(1) for tool in allowed if (match := re.fullmatch(r'Bash\(git (\S+):\*\)', tool))}
+    assert git_reads
+    for sub in git_reads:
+        assert f'Bash(git {sub} *--output*)' in denied
+
+
 def test_every_allowed_mcp_tool_is_a_read():
     reads = [tool.rsplit('__', 1)[1] for tool in mod.NIGHTLY_READ_TOOLS if tool.startswith('mcp__')]
 
