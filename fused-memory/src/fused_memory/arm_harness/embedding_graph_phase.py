@@ -15,8 +15,8 @@ from fused_memory.arm_harness.arm_backend import build_scratch_indices
 from fused_memory.arm_harness.arm_embedder import ArmEmbedder, QueryEmbedError
 from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec
 from fused_memory.arm_harness.checks import check_index_configuration
-from fused_memory.arm_harness.fork_slot import ServerInfo
 from fused_memory.arm_harness.graph_copy import (
+    GraphCopyClient,
     GraphReembed,
     adopt_group_id,
     copy_reference_graph,
@@ -76,13 +76,8 @@ class ArmScratchGraph(Protocol):
     async def copy(self, clone: str, /) -> object: ...
 
 
-class ArmGraphClient(Protocol):
+class ArmGraphClient(GraphCopyClient, Protocol):
     """The slice of falkordb's async FalkorDB client a run uses."""
-
-    @property
-    def connection(self) -> ServerInfo: ...
-
-    async def list_graphs(self) -> list[str]: ...
 
     def select_graph(self, graph_id: str, /) -> ArmScratchGraph: ...
 
