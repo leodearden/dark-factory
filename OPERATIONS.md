@@ -376,10 +376,9 @@ cost and scope with a red-conditioned sample.
 
 Three things a census must not assume:
 
-- **Junit exists only under `merge_verify_breadth: full`.** The shipped
-  default (`config.py`) is `scoped`; this repo's
-  `dark-factory-orchestrator.yaml` opts in. A project on the default
-  archives plans and logs but no junit at all.
+- **Junit exists only under `merge_verify_breadth: full`.** That is the
+  shipped default (`orchestrator/src/orchestrator/defaults.yaml`). A project
+  that opts down to `scoped` archives plans and logs but no junit at all.
 - **The stem joins per-ATTEMPT, not per-module.** Merge verifies carry no
   attempt id, so their files stem at `attempt-1`. Logs and junit carry a
   `.<module>` infix; the plan does not — under per-module fan-out one plan
@@ -817,9 +816,10 @@ list `/home/leo`) and step 7 (the canary feed).
 
 - Test and criteria evidence exists for pytest projects only: junit
   injection is pytest-only (PRD §2).
-- Per-test results for merge runs exist only when the client project's
-  `dark-factory-orchestrator.yaml` sets `merge_verify_breadth: full`.
-  Otherwise only task legs carry `test_results`.
+- Per-test results for merge runs exist unless the client project's
+  `dark-factory-orchestrator.yaml` opts down to
+  `merge_verify_breadth: scoped`. On such a project only task legs carry
+  `test_results`.
 
 ---
 
