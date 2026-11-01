@@ -4520,7 +4520,9 @@ class TaskWorkflow:
         # there is no later gate, so without this such a record is merged
         # straight past.  Re-uses the SAME _is_gating_escalation predicate
         # rather than an equivalent inline condition, so there is exactly one
-        # gate policy in this file.
+        # gate policy in this file.  Pinned by orchestrator/tests/
+        # test_workflow_merge_gating_strand.py::TestGateReFireIsBounded::
+        # test_gating_record_filed_after_the_wait_parks_with_l1.
         #
         # Deliberately NOT a loop back into the machinery.  Boundedness (spec
         # S5): the whole merge-entry gate path must cost at most ONE steward

@@ -591,9 +591,11 @@ def _make_chained_gating_steward(queue: EscalationQueue, task_id: str) -> type:
     fresh level-0 is still within the WAIT's reach — its loop re-polls level-0
     on every wake, inside the SAME deadline — so this shape costs exactly one
     window and then parks via the expiry branch.  Contrast
-    :func:`_make_chained_l2_steward`, whose follow-on is invisible to the wait
-    entirely.  Between them they cover both halves of the single-shot bound
-    (spec S5).
+    :func:`_make_chained_l2_steward`, whose follow-on the wait LOOP never
+    polls; the wait's tail hands it off instead.  Neither shape reaches the
+    merge-entry handler's post-wait re-check:
+    ``TestGateReFireIsBounded::test_gating_record_filed_after_the_wait_parks_with_l1``
+    pins that arm.
 
     Runs in the background after a short delay for the same reason
     :func:`_make_chained_l2_steward` does: a synchronous ``start()`` would
@@ -1375,6 +1377,13 @@ class TestGateReFireIsBounded:
     by the time the merge-entry handler looks again there is a NEW gating
     record open that nothing has waited on.
 
+    Three shapes, each parking through a different arm:
+
+    * a chained born-at-L2 — the wait's tail hands it off (``_HumanHandoff``);
+    * a chained plain L0 — the wait loop re-polls it, then the wait expires;
+    * a plain L0 filed after the wait returns — only the handler's post-wait
+      single-shot re-check sees it.
+
     Both properties matter:
 
     * D4 stop-the-line still holds — nothing merges past an open gating
@@ -1442,7 +1451,8 @@ class TestGateReFireIsBounded:
         the SAME deadline, then parked by the expiry branch.  Pinned here so
         the two chained shapes stay legibly distinct — this one costs one
         window and needs no re-check; the L2 one above is stopped by the
-        wait's tail and costs none."""
+        wait's tail and costs none.  The re-check's own pin is
+        :meth:`test_gating_record_filed_after_the_wait_parks_with_l1`."""
         queue = EscalationQueue(tmp_path / 'queue')
         task_id = task_assignment.task_id
         worktree = await _make_advanced_worktree(git_ops, task_id)
