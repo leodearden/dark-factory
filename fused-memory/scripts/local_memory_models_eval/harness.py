@@ -107,6 +107,7 @@ from fused_memory.arm_harness.embedding_run_manifest import (
     EmbeddingRunManifest,
     load_embedding_run_manifest,
 )
+from fused_memory.arm_harness.fork_slot import ServerInfo
 from fused_memory.arm_harness.graph_copy import ReembedCensusError
 from fused_memory.arm_harness.incumbent_cost import (
     INCUMBENT_COST_FILENAME,
@@ -253,6 +254,9 @@ class ScratchGraph(ArmScratchGraph, Protocol):
 
 
 class ScratchGraphClient(Protocol):
+    @property
+    def connection(self) -> ServerInfo: ...
+
     async def list_graphs(self) -> list[str]: ...
 
     def select_graph(self, graph_id: str, /) -> ScratchGraph: ...
