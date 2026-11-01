@@ -80,7 +80,7 @@ logger = logging.getLogger(__name__)
 
 
 OrchestratorDetector = Callable[[str], bool]
-"""Callable that takes a project_root path and returns True iff orchestrator is live."""
+"""Blocking callable: project_root -> True iff an orchestrator is live. Called through asyncio.to_thread."""
 
 TimeProvider = Callable[[], float]
 
@@ -731,7 +731,7 @@ class BacklogPolicy:
         """
         limit = self.hard_limit_for(project_id)
         project_root = self.project_root_for(project_id)
-        if project_root is not None and self._detector(project_root):
+        if project_root is not None and await asyncio.to_thread(self._detector, project_root):
             path = await self._maybe_write_escalation(_EscalationFiling(
                 project_id=project_id,
                 project_root=project_root,
