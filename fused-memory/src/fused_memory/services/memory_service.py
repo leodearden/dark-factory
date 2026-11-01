@@ -116,6 +116,7 @@ from fused_memory.services.classification_fallback_alarm import (
 )
 from fused_memory.services.completion_claim_gate import UNVERIFIED_CLAIM_TAG
 from fused_memory.services.durable_queue import DeadLetterEvent, DurableWriteQueue
+from fused_memory.services.mem0_add_outcome import RAISED_MEM0_ADD, read_mem0_add_result
 from fused_memory.services.mem0_write_retry import (
     DEFAULT_MEM0_RETRY_POLICY,
     Mem0RetryPassSummary,
@@ -6930,6 +6931,7 @@ class MemoryService:
         _graphiti_error = None
         _mem0_error = None
         _mem0_pending = None
+        _mem0_empty_result: str | None = None
 
         # Graphiti: enqueue via durable queue (async, but durably persisted)
         if write_graphiti:
@@ -7038,19 +7040,24 @@ class MemoryService:
                     payload={'content': content[:200]},
                     coro=self.mem0.add(content=content, scope=scope, metadata=meta),
                 )
-                mem0_ids = [
-                    r['id']
-                    for r in (mem0_result or {}).get('results', [])
-                    if isinstance(r, dict) and 'id' in r
-                ]
-                memory_ids.extend(mem0_ids)
-                stores_written.append(SourceStore.mem0)
-                # In-request call resolved without raising → stamp terminal.
+                mem0_outcome = read_mem0_add_result(
+                    mem0_result,
+                    operation='add',
+                    zero_ids_anomalous=_MEM0_ADD_INFER_PINNED_FALSE,
+                )
+                memory_ids.extend(mem0_outcome.memory_ids)
+                stores_written.extend(mem0_outcome.stores_written)
+                _mem0_empty_result = mem0_outcome.empty_result_error
                 if self._write_journal and intent_id:
-                    await self._write_journal.resolve_mem0_intent(
-                        intent_id, Mem0IntentStatus.COMPLETED
-                    )
-                if not mem0_ids and _MEM0_ADD_INFER_PINNED_FALSE:
+                    if _mem0_empty_result:
+                        await self._write_journal.resolve_mem0_intent(
+                            intent_id, Mem0IntentStatus.FAILED, reason=_mem0_empty_result
+                        )
+                    else:
+                        await self._write_journal.resolve_mem0_intent(
+                            intent_id, Mem0IntentStatus.COMPLETED
+                        )
+                if _mem0_empty_result:
                     # mem0.add() did not raise but returned no results — a silent
                     # dedup/infer no-op drop (task 1974). Under the pinned
                     # infer=False, a successful write always returns exactly one
@@ -7102,8 +7109,8 @@ class MemoryService:
                     'stores': [s.value for s in stores_written],
                     'stores_pending': [s.value for s in stores_pending_retry],
                 },
-                success=not (_graphiti_error or _mem0_error),
-                error=_graphiti_error or _mem0_error,
+                success=not (_graphiti_error or _mem0_error or _mem0_empty_result),
+                error=_graphiti_error or _mem0_error or _mem0_empty_result,
             )
 
         await self._emit_event(ReconciliationEvent(
@@ -7125,6 +7132,8 @@ class MemoryService:
             msg += f' [graphiti_error: {_graphiti_error}]'
         if _mem0_error:
             msg += f' [mem0_error: {_mem0_error}]'
+        if _mem0_empty_result:
+            msg += f' [{_mem0_empty_result}]'
         if _mem0_pending:
             msg += f' [mem0_pending_retry: {_mem0_pending}]'
         if classification_fallback is not None:
@@ -7422,8 +7431,7 @@ class MemoryService:
             find_canonical=self.get_memories_by_metadata,
         )
 
-        mem0_result = None
-        mem0_ids: list[str] = []
+        mem0_outcome = RAISED_MEM0_ADD
         _mem0_error: str | None = None
         try:
             mem0_result = await self._journaled_backend_call(
@@ -7434,11 +7442,9 @@ class MemoryService:
                 payload={'content': content[:200]},
                 coro=self.mem0.add_system_record(content=content, scope=scope, metadata=meta),
             )
-            mem0_ids = [
-                r['id']
-                for r in (mem0_result or {}).get('results', [])
-                if isinstance(r, dict) and 'id' in r
-            ]
+            mem0_outcome = read_mem0_add_result(
+                mem0_result, operation='add_system_record', zero_ids_anomalous=True
+            )
         except Exception as e:
             # Mirrors add_memory's try/except around its Mem0 branch (task
             # 2222 amendment): without this, a raised exception would skip
@@ -7457,11 +7463,9 @@ class MemoryService:
         # empty-result check, task 1974) — and silence is exactly what this
         # guaranteed-persistence system-write path exists to rule out, so it
         # must not be journaled as an unconditional success.
-        _empty_result = not mem0_ids
-        # mem0 is claimed only when it returned an id (task 4045).
-        stores_written: list[SourceStore] = [] if _empty_result else [SourceStore.mem0]
-        _empty_result_error = 'empty_result: mem0 add_system_record returned zero memory_ids'
-        if _empty_result and not _mem0_error:
+        mem0_ids = list(mem0_outcome.memory_ids)
+        stores_written = mem0_outcome.stores_written
+        if mem0_outcome.empty_result_error:
             logger.warning(
                 'MemoryService.add_system_record: mem0 add_system_record '
                 'returned zero memory_ids (silent empty-result drop on the '
@@ -7488,11 +7492,8 @@ class MemoryService:
                     'memory_ids': mem0_ids,
                     'stores': [s.value for s in stores_written],
                 },
-                success=not _empty_result,
-                error=(
-                    _mem0_error if _mem0_error else
-                    (_empty_result_error if _empty_result else None)
-                ),
+                success=mem0_outcome.landed,
+                error=_mem0_error or mem0_outcome.empty_result_error,
             )
 
         # An empty result (whether from a caught exception above or a
@@ -7505,7 +7506,7 @@ class MemoryService:
             'category': resolved_category.value,
             'content_preview': content[:200],
         }
-        if _empty_result:
+        if not mem0_outcome.landed:
             _event_payload['empty_result'] = True
             if _mem0_error:
                 _event_payload['error'] = _mem0_error
@@ -7523,8 +7524,8 @@ class MemoryService:
         msg = f'Memory queued for {[s.value for s in stores_written]}'
         if _mem0_error:
             msg += f' [mem0_error: {_mem0_error}]'
-        elif _empty_result:
-            msg += f' [{_empty_result_error}]'
+        elif mem0_outcome.empty_result_error:
+            msg += f' [{mem0_outcome.empty_result_error}]'
 
         return AddMemoryResponse(
             memory_ids=mem0_ids,
