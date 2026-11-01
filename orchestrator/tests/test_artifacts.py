@@ -1399,6 +1399,30 @@ class TestReviews:
         with pytest.raises(ReviewPayloadError, match='NEEDS_CHANGES'):
             artifacts.aggregate_reviews()
 
+    def test_aggregate_reviews_keeps_errored_review_records(self, artifacts: TaskArtifacts):
+        clean = {'reviewer': 'reviewer1', 'verdict': 'PASS', 'issues': [], 'summary': 'OK'}
+        errored = {
+            'reviewer': 'reviewer2',
+            'verdict': 'ERROR',
+            'issues': [],
+            'summary': 'Reviewer emitted no/invalid verdict: ',
+            'failure': {'kind': 'turn_cap', 'detail': 'agent hit max_turns', 'api_error_status': None},
+        }
+        artifacts.write_review('reviewer1', clean)
+        artifacts.write_review('reviewer2', errored)
+
+        agg = artifacts.aggregate_reviews()
+
+        assert agg.errored_reviews == {'reviewer2': errored}
+        assert agg.reviewer_errors == ['reviewer2']
+        assert agg.reviews == {'reviewer1': clean}
+
+    def test_errored_reviews_defaults_empty(self):
+        agg = ReviewAggregation(
+            has_blocking_issues=False, blocking_issues=[], suggestions=[], reviews={},
+        )
+        assert agg.errored_reviews == {}
+
 
 class TestBlockingDependency:
     """Round-trip and edge-case tests for the architect's

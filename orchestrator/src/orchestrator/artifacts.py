@@ -297,6 +297,7 @@ class ReviewAggregation:
     suggestions: list[dict]
     reviews: dict[str, dict]
     reviewer_errors: list[str] = field(default_factory=list)
+    errored_reviews: dict[str, dict] = field(default_factory=dict)
 
     @property
     def all_reviewers_errored(self) -> bool:
@@ -1102,16 +1103,21 @@ class TaskArtifacts:
         return reviews
 
     def aggregate_reviews(self) -> ReviewAggregation:
-        """Aggregate every review as ``orchestrator/review_payload.py::normalize_review`` reads it."""
+        """Aggregate every review as ``orchestrator/review_payload.py::normalize_review`` reads it.
+
+        ERROR reviews are kept out of ``reviews`` and returned verbatim in
+        ``errored_reviews`` (``reviewer_errors`` is its names), so the review
+        arm can read each errored reviewer's failure record.
+        """
         reviews = self.read_reviews()
         blocking = []
         suggestions = []
-        errors = []
+        errored_reviews = {}
 
         for reviewer_name, review in reviews.items():
             payload = normalize_review(review)
             if payload.verdict is Verdict.ERROR:
-                errors.append(reviewer_name)
+                errored_reviews[reviewer_name] = review
             blocking.extend(
                 {**issue, 'reviewer': reviewer_name} for issue in payload.blocking_issues
             )
@@ -1119,13 +1125,14 @@ class TaskArtifacts:
                 {**issue, 'reviewer': reviewer_name} for issue in payload.suggestions
             )
 
-        clean = {k: v for k, v in reviews.items() if k not in errors}
+        clean = {k: v for k, v in reviews.items() if k not in errored_reviews}
         return ReviewAggregation(
             has_blocking_issues=len(blocking) > 0,
             blocking_issues=blocking,
             suggestions=suggestions,
             reviews=clean,
-            reviewer_errors=errors,
+            reviewer_errors=list(errored_reviews),
+            errored_reviews=errored_reviews,
         )
 
     def validate_plan_prerequisites(self) -> None:
