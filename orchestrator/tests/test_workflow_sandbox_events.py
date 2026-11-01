@@ -170,7 +170,7 @@ class TestInvokeWiresEnsureSandboxDirs:
         # config/git_ops/scheduler/briefing, and cwd must be a worktree.
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
         config = OrchestratorConfig(
             project_root=repo,
             max_concurrent_tasks=1,

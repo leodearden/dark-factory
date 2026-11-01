@@ -240,8 +240,9 @@ class TestEscalateInfoContract:
     def test_every_escalating_role_carries_the_contract(self):
         _ESCALATE_INFO_CONTRACT.assert_every_role_carries(
             remedy=(
-                'Render ESCALATE_INFO_CONTRACT into ESCALATION_LADDER_CORE, which '
-                'every escalating role carries.'
+                'Render ESCALATE_INFO_CONTRACT into both escalation sections, '
+                'ESCALATION_LADDER_CORE and INFO_ONLY_ESCALATION_INSTRUCTIONS; '
+                'every escalating role carries one of them.'
             ),
         )
 

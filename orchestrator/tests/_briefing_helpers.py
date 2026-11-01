@@ -97,11 +97,12 @@ def _mcp_search_envelope(results: list[dict]) -> dict:
 
 
 CONTESTING_CHILD_FIXTURES = Path(__file__).parent / 'fixtures' / 'grouped_search_contesting_child'
+SUPERSEDED_CHILD_FIXTURES = Path(__file__).parent / 'fixtures' / 'grouped_search_superseded_child'
 
 
-def recorded_search_text(name: str) -> str:
+def recorded_search_text(name: str, *, fixtures: Path = CONTESTING_CHILD_FIXTURES) -> str:
     """The recorded ``search`` reply *name*, verbatim; see that directory's PROVENANCE.md."""
-    return (CONTESTING_CHILD_FIXTURES / f'{name}.json').read_text(encoding='utf-8')
+    return (fixtures / f'{name}.json').read_text(encoding='utf-8')
 
 
 def recorded_search_envelope(name: str) -> dict:

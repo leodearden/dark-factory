@@ -9,6 +9,8 @@ suite instead of a scoped subset.
 
 from __future__ import annotations
 
+import pytest
+
 from orchestrator.config import (
     RELOADABLE_FIELDS,
     OrchestratorConfig,
@@ -17,9 +19,8 @@ from orchestrator.config import (
 )
 
 
-def test_code_default_is_off(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+@pytest.mark.usefixtures("code_default_config")
+def test_code_default_is_off():
     assert OrchestratorConfig().pre_merge_reverify is False
 
 
@@ -31,9 +32,8 @@ def test_retry_bound_stays_restart_only():
     assert 'max_pre_merge_retries' not in RELOADABLE_FIELDS
 
 
-def test_edit_lands_in_applied_candidates_not_restart_required(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+@pytest.mark.usefixtures("code_default_config")
+def test_edit_lands_in_applied_candidates_not_restart_required():
     diff = diff_config(
         OrchestratorConfig(pre_merge_reverify=False),
         OrchestratorConfig(pre_merge_reverify=True),
@@ -42,9 +42,8 @@ def test_edit_lands_in_applied_candidates_not_restart_required(monkeypatch, tmp_
     assert 'pre_merge_reverify' not in diff.restart_required
 
 
-def test_apply_reload_flips_the_live_object_in_place(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+@pytest.mark.usefixtures("code_default_config")
+def test_apply_reload_flips_the_live_object_in_place():
     live = OrchestratorConfig()
     report = apply_reload(live, OrchestratorConfig(pre_merge_reverify=True))
     assert report['reloaded'] is True

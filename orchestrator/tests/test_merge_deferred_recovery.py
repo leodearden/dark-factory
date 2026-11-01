@@ -51,10 +51,8 @@ from orchestrator.merge_lane import (
     MergeRequest,
     QueuedBranch,
 )
-from orchestrator.merge_lane.worker import (
-    SpeculativeMergeWorker,
-    coalesce_or_enqueue_merge_request,
-)
+from orchestrator.merge_lane.intake import coalesce_or_enqueue_merge_request
+from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 from orchestrator.scheduler import train_order_key
 
 NOW = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)

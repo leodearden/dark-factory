@@ -57,8 +57,8 @@ loudly if it ever arises.
 WHY ``sys.executable``, AND WHY ``timeout=60`` INSTEAD OF A WALL-CLOCK ASSERT.
 Two separate hazards. (1) ``verify._target_subprocess_env`` — cited by SYMBOL,
 since its line has already moved once (3473 -> 3609) between this plan's two
-revisions — strips ``_VENV_ISOLATION_KEYS`` including ``VIRTUAL_ENV`` and calls
-``_strip_venv_bin_from_path`` so a target resolves its own ``.venv``. A test that
+revisions — builds on ``shared.python_env.without_python_env_selection``, which
+drops ``VIRTUAL_ENV`` and the venv's ``bin`` from PATH, so a target resolves its own ``.venv``. A test that
 shelled out to a bare ``python`` off PATH could therefore hit a system
 interpreter with no uvicorn installed and go FALSELY red under verify;
 ``sys.executable`` is the interpreter already running pytest, correct in the main

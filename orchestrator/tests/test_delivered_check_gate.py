@@ -1804,7 +1804,7 @@ class TestBuildDeliveredCheckEscalation:
         assert 'src/' in detail
         assert 'present' in detail
         assert 'FAILED' in detail
-        assert 'set task 10 back to pending' in detail
+        assert detail.splitlines()[-1] == 'observed: FAILED'
 
     def test_script_kind_detail_names_script_and_args_not_pattern(self):
         check = {
@@ -1833,7 +1833,7 @@ class TestBuildDeliveredCheckEscalation:
         assert 'exit_zero' in detail
         assert 'FAILED' in detail
         assert 'pattern' not in detail, 'script-kind detail must not mention pattern'
-        assert 'set task 11 back to pending' in detail
+        assert detail.splitlines()[-1] == 'observed: FAILED'
 
     def test_path_kind_detail_names_paths_and_expect_not_pattern(self):
         """A path descriptor has no ``pattern``; the binary that used to
@@ -3025,6 +3025,14 @@ class TestDeliveredCheckGraceEscalation:
         assert 'cap-one' in call_kwargs['summary']
         assert '20' in call_kwargs['summary']
         assert 'sha1' in call_kwargs['summary']
+        # The scheduler hands over the failed descriptor and the DEPENDENCY
+        # (not the blocked dependent) as the check's owner.
+        assert call_kwargs['check'] == dep['metadata']['delivered_checks'][0]
+        assert call_kwargs['owner'] == {
+            'task_id': '20',
+            'check_name': 'cap-one',
+            'sidecar': None,
+        }
         assert scheduler._streak_delivered_fail.value(('10', '20')) == 0
         # No held event on the escalation (3rd) tick — only ticks 1 and 2.
         assert len(self._held_events(scheduler)) == 2

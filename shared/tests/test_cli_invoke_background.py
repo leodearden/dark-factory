@@ -475,7 +475,7 @@ class TestForegroundBgLogReadIsAReap:
         recommends ("use Read on that file path") → False.
 
         This is also the shape
-        orchestrator/src/orchestrator/agents/roles.py::WAIT_PATTERN_GUIDANCE
+        orchestrator/src/orchestrator/agents/harness_guidance.py::WAIT_PATTERN_GUIDANCE
         now steers every Bash-capable role into (task 5332), which is why
         correcting those prompts needed no change to the detector. Keep it: it
         is the executable form of that claim, and narrowing

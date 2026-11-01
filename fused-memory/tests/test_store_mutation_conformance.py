@@ -772,6 +772,7 @@ EXPECTED_GUARDED_SCRIPTS: frozenset[str] = frozenset({
     'normalize_topic_slugs.py',
     'prune_recon_cycle_summaries.py',
     'purge_knowlive_namespace.py',
+    'replay_failed_mem0_intents.py',
     'retro_stamp_topics.py',
     'sweep_orphan_flag_markers.py',
     'sweep_toolcall_xml_leak.py',

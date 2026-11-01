@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Literal
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S, GitOps, _run
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
+from orchestrator.merge_lane.outcome_facts import ConflictEvidence
 from orchestrator.merge_lane.reverify_gate_decision import (
     MAX_LOGGED_OVERLAP_PATHS,
     GateClearance,
@@ -192,6 +193,7 @@ def _emit_merge_attempt(
     probe_host: Literal['local', 'remote'] | None = None,
     skew_evidence: SkewEvidence | None = None,
     gate_clearance: GateClearance | None = None,
+    conflict_evidence: ConflictEvidence | None = None,
 ) -> None:
     """Emit a ``merge_attempt`` event for the given outcome.
 
@@ -249,6 +251,12 @@ def _emit_merge_attempt(
     call site), no key is added -- existing callers' payloads stay
     byte-identical.
 
+    *conflict_evidence* is the conflicted paths of a ``conflict`` outcome
+    (task 7302), written through :meth:`ConflictEvidence.to_event_payload` so
+    this row spells them exactly as the workflow's ``merge_blocked`` row does.
+    When omitted (every non-conflict call site), no key is added -- existing
+    callers' payloads stay byte-identical.
+
     This helper is deliberately disposition-AGNOSTIC about evidence: it writes
     whatever bundle it is handed, and deciding *when* to emit at all is the
     caller's guard. That is what lets one code path serve both the
@@ -280,6 +288,8 @@ def _emit_merge_attempt(
                 # Recorded unconditionally: a reader never has to know the cap
                 # to tell a short citation from a truncated one.
                 data[f'{key}_total'] = len(items)
+        if conflict_evidence is not None:
+            data.update(conflict_evidence.to_event_payload())
         event_store.emit(
             EventType.merge_attempt, task_id=task_id, phase='merge',
             data=data, duration_ms=duration_ms,
@@ -1318,17 +1328,6 @@ async def _map_advance_failure(
             f'{f" (+{len(at_risk) - 20} more)" if len(at_risk) > 20 else ""}.'
             if at_risk else ''
         )
-        # WORDING CONSTRAINT — do not reintroduce the token 'ff' (as in
-        # "stood off") or the word 'advanced' anywhere in this reason.
-        # workflow.py's blocked path infers the merge-failure review category
-        # with a bare substring test
-        # (`'ff' in reason.lower() or 'advanced' in reason.lower()`
-        # -> category 'merge_ff_failed'), which then flows into
-        # `_write_merge_failure_review`, the merge_blocked event's
-        # data.category, and the signature-aware L1 dedup key.  "stood off"
-        # matched it, durably filing every index-lock stand-off as a
-        # fast-forward failure.  Pinned by
-        # test_reason_is_not_miscategorised_as_a_ff_failure.
         return MergeOutcome(
             'blocked',
             reason=(
@@ -1910,7 +1909,7 @@ async def _resolve_already_landed_branch(
     evidence exactly: 3604's landed file set equals its 3 declared plan
     files, 3572's equals its 7.
 
-    **4. SURVIVAL** — :meth:`GitOps.commit_effect_present_in_main` says the
+    **4. SURVIVAL** — ``describe_commit_effect_in_main(...).present`` says the
     attributing commit's own effect is STILL PRESENT at main's current HEAD
     (amendment pass, review finding #1).  Signals 1-3 are all statements about
     IMMUTABLE HISTORY: a merge commit stays an ancestor of main forever, and
@@ -2082,13 +2081,23 @@ async def _resolve_already_landed_branch(
     # the reconcile sweep applies before MARK_DONE (harness.py, the FIX 1'
     # effect-present refinement), so the two seams answer "is it still there"
     # identically instead of drifting.
-    if not await git_ops.commit_effect_present_in_main(landed_sha):
+    effect = await git_ops.describe_commit_effect_in_main(landed_sha)
+    if not effect.present:
         logger.warning(
             'already-landed: landing %s (mechanism=%s) for task_id=%s is an '
-            'ancestor of main but its effect is NOT present at current HEAD '
-            '(post-hoc revert) — failing closed rather than telling an '
-            'operator to close a task whose work is no longer on main',
-            landed_sha, mechanism, task_id,
+            'ancestor of main but the effect check did not confirm it '
+            'survives at current HEAD (failure=%s aggregate_survival=%s '
+            'added_lines_total=%s aggregate_threshold=%s '
+            'worst_guarded_path=%s worst_guarded_survival=%s '
+            'per_file_threshold=%s vacuous_paths=%s) — this check cannot '
+            'tell a genuine revert from a heavy later rewrite of the same '
+            'lines; failing closed rather than telling an operator to close '
+            'a task whose work may no longer be on main',
+            landed_sha, mechanism, task_id, effect.failure,
+            effect.aggregate_survival, effect.added_lines_total,
+            effect.aggregate_threshold, effect.worst_guarded_path,
+            effect.worst_guarded_survival, effect.per_file_threshold,
+            list(effect.vacuous_paths),
         )
         return None
 

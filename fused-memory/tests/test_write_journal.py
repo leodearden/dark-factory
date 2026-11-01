@@ -3,15 +3,27 @@
 import asyncio
 import json
 import logging
+import sqlite3
 import uuid
-from datetime import UTC, datetime
+from contextlib import closing
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 import pytest_asyncio
+from _mem0_intent_fixtures import (
+    mem0_intent_row,
+    seed_mem0_intent,
+    set_mem0_intent_created_at,
+)
 
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
-from fused_memory.services.write_journal import OPERATOR_TELEMETRY_QUERY, WriteJournal
+from fused_memory.config.schema import WriteJournalConfig
+from fused_memory.services.write_journal import (
+    OPERATOR_TELEMETRY_QUERY,
+    Mem0IntentStatus,
+    WriteJournal,
+)
 from fused_memory.utils.canonical_labels import Referent
 from fused_memory.utils.referent_verification import ReferentFinding
 
@@ -829,6 +841,212 @@ async def test_prune_mem0_intents_never_raises(journal):
     assert await journal.prune_mem0_intents() == 0
 
 
+# The mem0_intents DDL as it stood before task 7397 added attempts and
+# next_attempt_at, copied literally so the migration is tested against the
+# shape a live pre-change journal actually has.
+_PRE_7397_MEM0_INTENTS_DDL = """
+CREATE TABLE IF NOT EXISTS mem0_intents (
+    id TEXT PRIMARY KEY,
+    write_op_id TEXT,
+    causation_id TEXT,
+    project_id TEXT,
+    agent_id TEXT,
+    session_id TEXT,
+    category TEXT,
+    payload_digest TEXT,
+    content TEXT,
+    metadata TEXT DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending',
+    reason TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_mi_status ON mem0_intents(status);
+CREATE INDEX IF NOT EXISTS idx_mi_write_op ON mem0_intents(write_op_id);
+"""
+
+
+class TestMem0IntentRetrySchedule:
+    """The journal surface for Mem0 writes deferred for server-side retry (task 7397)."""
+
+    def test_status_vocabulary(self):
+        assert {s.name: s.value for s in Mem0IntentStatus} == {
+            'PENDING': 'pending',
+            'RETRYING': 'retrying',
+            'COMPLETED': 'completed',
+            'FAILED': 'failed',
+            'DEAD': 'dead',
+        }
+
+    @pytest.mark.asyncio
+    async def test_fresh_intent_has_no_attempts_and_no_schedule(self, journal):
+        row = await mem0_intent_row(journal, await seed_mem0_intent(journal))
+        assert row['attempts'] == 0
+        assert row['next_attempt_at'] is None
+
+    @pytest.mark.asyncio
+    async def test_migration_adds_columns_to_a_pre_change_database(self, tmp_path):
+        data_dir = tmp_path / 'wj'
+        data_dir.mkdir()
+        with closing(sqlite3.connect(data_dir / 'write_journal.db')) as conn, conn:
+            conn.executescript(_PRE_7397_MEM0_INTENTS_DDL)
+            conn.execute(
+                "INSERT INTO mem0_intents (id, write_op_id, content, status, created_at) "
+                "VALUES ('old-1', 'wo-1', 'old content', 'pending', ?)",
+                (datetime.now(UTC).isoformat(),),
+            )
+        j = WriteJournal(data_dir)
+        await j.initialize()
+        try:
+            row = await mem0_intent_row(j, 'old-1')
+            assert row['attempts'] == 0
+            assert row['next_attempt_at'] is None
+            assert await j.schedule_mem0_retry(
+                'old-1', reason='rate_limited', retry_at=datetime.now(UTC)
+            )
+        finally:
+            await j.close()
+
+    @pytest.mark.asyncio
+    async def test_schedule_moves_pending_to_retrying_and_counts_attempts(self, journal):
+        intent_id = await seed_mem0_intent(journal)
+        first_at = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
+        reason = 'rate_limited: RateLimitError: 429'
+
+        assert await journal.schedule_mem0_retry(intent_id, reason=reason, retry_at=first_at)
+
+        row = await mem0_intent_row(journal, intent_id)
+        assert row['status'] == 'retrying'
+        assert row['attempts'] == 1
+        assert row['next_attempt_at'] == first_at.isoformat(timespec='microseconds')
+        assert row['reason'] == reason
+        assert row['resolved_at'] is None
+
+        second_at = first_at + timedelta(seconds=60)
+        assert await journal.schedule_mem0_retry(
+            intent_id, reason=reason, retry_at=second_at
+        )
+        row = await mem0_intent_row(journal, intent_id)
+        assert row['attempts'] == 2
+        assert row['next_attempt_at'] == second_at.isoformat(timespec='microseconds')
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('terminal', ['completed', 'failed', 'dead'])
+    async def test_schedule_refuses_terminal_rows(self, journal, terminal):
+        intent_id = await seed_mem0_intent(journal)
+        await journal.resolve_mem0_intent(intent_id, terminal, reason='terminal')
+        before = await mem0_intent_row(journal, intent_id)
+
+        assert not await journal.schedule_mem0_retry(
+            intent_id, reason='late', retry_at=datetime.now(UTC)
+        )
+        assert await mem0_intent_row(journal, intent_id) == before
+
+    @pytest.mark.asyncio
+    async def test_schedule_refuses_unknown_id(self, journal):
+        assert not await journal.schedule_mem0_retry(
+            'no-such-intent', reason='r', retry_at=datetime.now(UTC)
+        )
+        assert await journal.get_mem0_intents() == []
+
+    @pytest.mark.asyncio
+    async def test_due_retries_are_the_retrying_rows_scheduled_by_now(self, journal):
+        now = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
+        due_later_first = await seed_mem0_intent(journal)
+        due_earlier_second = await seed_mem0_intent(journal)
+        due_third = await seed_mem0_intent(journal)
+        not_yet_due = await seed_mem0_intent(journal)
+        await seed_mem0_intent(journal)  # stays pending
+        schedule = {
+            due_later_first: now - timedelta(seconds=10),
+            due_earlier_second: now - timedelta(seconds=20),
+            due_third: now,
+            not_yet_due: now + timedelta(seconds=1),
+        }
+        for intent_id, retry_at in schedule.items():
+            assert await journal.schedule_mem0_retry(
+                intent_id, reason='r', retry_at=retry_at
+            )
+
+        due = await journal.get_due_mem0_retries(now=now, limit=10)
+        assert [r['id'] for r in due] == [due_earlier_second, due_later_first, due_third]
+
+        capped = await journal.get_due_mem0_retries(now=now, limit=2)
+        assert [r['id'] for r in capped] == [due_earlier_second, due_later_first]
+
+    @pytest.mark.asyncio
+    async def test_resolve_reports_whether_it_updated(self, journal):
+        intent_id = await seed_mem0_intent(journal)
+        assert await journal.resolve_mem0_intent(intent_id, Mem0IntentStatus.COMPLETED)
+        assert not await journal.resolve_mem0_intent(
+            'no-such-intent', Mem0IntentStatus.COMPLETED
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolve_with_expected_status_is_a_compare_and_set(self, journal):
+        completed_id = await seed_mem0_intent(journal)
+        await journal.resolve_mem0_intent(completed_id, 'completed', reason='landed')
+        failed_id = await seed_mem0_intent(journal)
+        await journal.resolve_mem0_intent(failed_id, 'failed', reason='429')
+        completed_before = await mem0_intent_row(journal, completed_id)
+
+        assert not await journal.resolve_mem0_intent(
+            completed_id,
+            Mem0IntentStatus.COMPLETED,
+            reason='replayed',
+            expected_status=Mem0IntentStatus.FAILED,
+        )
+        assert await mem0_intent_row(journal, completed_id) == completed_before
+
+        assert await journal.resolve_mem0_intent(
+            failed_id,
+            Mem0IntentStatus.COMPLETED,
+            reason='replayed',
+            expected_status=Mem0IntentStatus.FAILED,
+        )
+        failed_after = await mem0_intent_row(journal, failed_id)
+        assert failed_after['status'] == 'completed'
+        assert failed_after['reason'] == 'replayed'
+
+    @pytest.mark.asyncio
+    async def test_count_by_status_covers_only_the_window(self, journal):
+        since = datetime.now(UTC) - timedelta(minutes=5)
+        for status in [
+            Mem0IntentStatus.COMPLETED,
+            Mem0IntentStatus.COMPLETED,
+            Mem0IntentStatus.FAILED,
+            Mem0IntentStatus.RETRYING,
+            Mem0IntentStatus.PENDING,
+        ]:
+            await seed_mem0_intent(journal, status=status, retry_at=since)
+        await seed_mem0_intent(
+            journal,
+            status=Mem0IntentStatus.DEAD,
+            created_at=since - timedelta(hours=2),
+        )
+
+        counts = await journal.count_mem0_intents_by_status(since=since)
+
+        assert counts == {'completed': 2, 'failed': 1, 'pending': 1, 'retrying': 1}
+        assert list(counts) == sorted(counts)
+
+    @pytest.mark.asyncio
+    async def test_retrying_rows_are_never_pruned(self, journal):
+        intent_id = await seed_mem0_intent(journal)
+        await journal.schedule_mem0_retry(
+            intent_id, reason='r', retry_at=datetime.now(UTC)
+        )
+        set_mem0_intent_created_at(journal, intent_id, datetime(2000, 1, 1, tzinfo=UTC))
+
+        assert await journal.prune_mem0_intents(older_than_days=0) == 0
+        assert await journal.prune_mem0_intents(
+            older_than_days=0, statuses=('completed', 'failed', 'retrying')
+        ) == 0
+        row = await mem0_intent_row(journal, intent_id)
+        assert row['status'] == 'retrying'
+        assert row['resolved_at'] is None
+
+
 # ------------------------------------------------------------------
 # idempotent_ops: client-supplied idempotency keys (task 2712)
 # ------------------------------------------------------------------
@@ -1399,7 +1617,7 @@ async def test_record_terminal_outcome_returns_false_and_logs_on_db_error(
 # ------------------------------------------------------------------
 # write_ops retention (task 3212 item 4)
 #
-# Unlike its two siblings this prune runs against a table measured at
+# Unlike its single-DELETE siblings this prune runs against a table measured at
 # 35.4M rows / 16 GB on 2026-09-11, so it is BATCHED and doubly bounded —
 # by a row budget and by a wall-clock deadline. Both bounds are asserted
 # here, because an unbounded startup DELETE would hold the write lock past
@@ -1622,6 +1840,156 @@ def test_prune_write_ops_takes_every_bound_from_its_caller():
         'config/schema.py::WriteJournalConfig, and server/main.py already '
         'passes all six from there.'
     )
+
+
+# ------------------------------------------------------------------
+# backend_ops retention (task 5551)
+#
+# Every backend_ops row is the Layer-2 half of a write, so it ages out at the
+# write horizon and through the same batched, doubly bounded drain as write_ops:
+# SQLite's write lock covers the whole file, so a long DELETE here would drop
+# journal rows exactly as one on write_ops would.
+# ------------------------------------------------------------------
+
+
+async def _prune_backend(journal, **overrides):
+    """Run the backend_ops prune at the SHIPPED bounds, overriding only what a test is about."""
+    from fused_memory.services.write_journal import prune_deadline
+
+    config = WriteJournalConfig()
+    bounds = {
+        'older_than_days': config.write_retention_days,
+        'batch_size': config.prune_batch_size,
+        'max_rows': config.prune_max_rows_per_run,
+        'deadline': prune_deadline(config.prune_max_seconds),
+    }
+    return await journal.prune_backend_ops(**{**bounds, **overrides})
+
+
+async def _aged_backend_op(journal, *, age_days: float) -> str:
+    write_op_id = str(uuid.uuid4())
+    await journal.log_backend_op(write_op_id=write_op_id, backend='mem0', operation='add')
+    with closing(sqlite3.connect(journal.db_path)) as conn:
+        conn.execute(
+            'UPDATE backend_ops SET created_at = ? WHERE write_op_id = ?',
+            (_days_ago(age_days), write_op_id),
+        )
+        conn.commit()
+    return write_op_id
+
+
+def _surviving_backend_write_op_ids(journal) -> set[str]:
+    with closing(sqlite3.connect(journal.db_path)) as conn:
+        return {row[0] for row in conn.execute('SELECT write_op_id FROM backend_ops')}
+
+
+@pytest.mark.asyncio
+async def test_backend_ops_prune_batch_seeks_created_at(journal):
+    from fused_memory.services.write_journal import BACKEND_OPS_PRUNE_BATCH_SQL
+
+    with closing(sqlite3.connect(journal.db_path)) as conn:
+        plan = conn.execute(
+            f'EXPLAIN QUERY PLAN {BACKEND_OPS_PRUNE_BATCH_SQL}',
+            ('2026-01-01T00:00:00+00:00', '2026-02-01T00:00:00+00:00', 1),
+        ).fetchall()
+    details = [row[3] for row in plan]
+    assert (
+        'SEARCH backend_ops USING INDEX idx_bo_created (created_at>? AND created_at<?)'
+        in details
+    ), (
+        f'the backend_ops batch plans as {details}. Unless the created_at seek is '
+        'bounded on both sides, a batch re-walks every row an earlier batch passed over.'
+    )
+    assert not any('TEMP B-TREE' in detail for detail in details), (
+        'the backend_ops batch sorts instead of reading created_at order off the index'
+    )
+
+
+@pytest.mark.asyncio
+async def test_prune_backend_ops_ages_out_rows_past_the_write_horizon(journal):
+    fresh = await _aged_backend_op(journal, age_days=0)
+    inside = await _aged_backend_op(journal, age_days=100)
+    await _aged_backend_op(journal, age_days=800)
+
+    deleted = await _prune_backend(journal)
+
+    assert deleted == 1
+    assert _surviving_backend_write_op_ids(journal) == {fresh, inside}
+
+
+@pytest.mark.asyncio
+async def test_prune_backend_ops_row_budget_bounds_a_single_run(journal, caplog):
+    from fused_memory.services import write_journal as wj
+
+    for _ in range(5):
+        await _aged_backend_op(journal, age_days=800)
+
+    with caplog.at_level(logging.WARNING, logger=wj.logger.name):
+        deleted = await _prune_backend(journal, batch_size=1, max_rows=2)
+
+    assert deleted == 2
+    assert len(_surviving_backend_write_op_ids(journal)) == 3
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any('backend_ops' in message for message in warnings), (
+        f'exhausting the row budget with rows still eligible must be loud: {warnings}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_spent_row_budget_is_reported_as_not_attempted(journal, caplog):
+    """A row budget spent before the prune starts shows nothing about the horizon,
+    so the WARNING must not claim a backlog."""
+    from fused_memory.services import write_journal as wj
+
+    await _aged_backend_op(journal, age_days=800)
+
+    with caplog.at_level(logging.WARNING, logger=wj.logger.name):
+        deleted = await _prune_backend(journal, max_rows=0)
+
+    assert deleted == 0
+    assert len(_surviving_backend_write_op_ids(journal)) == 1
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any('not attempted' in message for message in warnings), warnings
+    assert not any('stopped' in message for message in warnings), warnings
+
+
+@pytest.mark.asyncio
+async def test_the_next_backend_ops_prune_drains_what_the_row_budget_left(journal):
+    for _ in range(4):
+        await _aged_backend_op(journal, age_days=800)
+
+    assert await _prune_backend(journal, batch_size=1, max_rows=2) == 2
+    assert await _prune_backend(journal, batch_size=1, max_rows=2) == 2
+    assert not _surviving_backend_write_op_ids(journal), (
+        'a prune resumed past rows its row budget left behind'
+    )
+
+
+@pytest.mark.asyncio
+async def test_prune_backend_ops_deadline_bounds_a_single_run(journal, caplog):
+    """The deadline is checked between full batches against a monotonic clock,
+    so a zero budget runs exactly one batch."""
+    from fused_memory.services import write_journal as wj
+
+    for _ in range(5):
+        await _aged_backend_op(journal, age_days=800)
+
+    with caplog.at_level(logging.WARNING, logger=wj.logger.name):
+        deleted = await _prune_backend(
+            journal, batch_size=1, max_rows=1_000_000, deadline=wj.prune_deadline(0),
+        )
+
+    assert deleted == 1
+    assert len(_surviving_backend_write_op_ids(journal)) == 4
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any('deadline' in message for message in warnings), warnings
+
+
+@pytest.mark.asyncio
+async def test_prune_backend_ops_never_raises(journal):
+    """A prune hiccup must not crash startup — returns 0, no raise."""
+    await journal.close()
+    assert await _prune_backend(journal) == 0
 
 
 # ------------------------------------------------------------------
@@ -1976,9 +2344,9 @@ async def test_a_batch_keeps_its_order_despite_sharing_one_timestamp(journal):
 async def test_a_reader_pages_forward_instead_of_re_reading_the_oldest_page(
     journal,
 ):
-    """The table has no status column to mark a row handled and no prune path,
-    so `limit` alone hands a consumer the SAME oldest page forever once the
-    table outgrows it. `after_seq` is the only thing that advances a reader."""
+    """The table has no status column to mark a row handled, so `limit` alone
+    hands a consumer the SAME oldest page forever once the table outgrows it.
+    `after_seq` is the only thing that advances a reader."""
     await journal.log_referent_findings(
         [_finding_payload(edge_uuid=f'e{n}') for n in range(5)],
         group_id='reify', episode_uuid='ep-1',
@@ -2041,6 +2409,39 @@ async def test_an_empty_batch_touches_nothing(journal, tmp_path):
 
     assert await journal.get_referent_findings() == []
     assert uninitialized.journal_drop_stats()['dropped_total'] == 0
+
+
+@pytest.mark.asyncio
+async def test_prune_referent_findings_ages_out_rows_past_the_horizon(journal):
+    await journal.log_referent_findings(
+        [_finding_payload(edge_uuid='e1'), _finding_payload(edge_uuid='e2')],
+        group_id='g', episode_uuid='old',
+    )
+    await journal.log_referent_findings(
+        [_finding_payload(edge_uuid='e3')], group_id='g', episode_uuid='fresh',
+    )
+    with closing(sqlite3.connect(journal.db_path)) as conn:
+        conn.execute(
+            'UPDATE referent_findings SET created_at = ? WHERE episode_uuid = ?',
+            ('2000-01-01T00:00:00+00:00', 'old'),
+        )
+        conn.commit()
+
+    deleted = await journal.prune_referent_findings(
+        older_than_days=WriteJournalConfig().referent_findings_retention_days,
+    )
+
+    assert deleted == 2
+    assert [r['episode_uuid'] for r in await journal.get_referent_findings()] == ['fresh']
+
+
+@pytest.mark.asyncio
+async def test_prune_referent_findings_never_raises(journal):
+    """A prune hiccup must not crash startup — returns 0, no raise."""
+    await journal.close()
+    assert await journal.prune_referent_findings(
+        older_than_days=WriteJournalConfig().referent_findings_retention_days,
+    ) == 0
 
 
 # ------------------------------------------------------------------
