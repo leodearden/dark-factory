@@ -688,6 +688,7 @@ def _make(
     config.steward_completion_timeout = 300.0
     config.project_root = project_root
     config.git.branch_prefix = 'task/'
+    config.git.main_branch = 'main'
     config.review.reviewer_briefing = ReviewBriefing.DIFF_ONLY
 
     set_task_status = AsyncMock()

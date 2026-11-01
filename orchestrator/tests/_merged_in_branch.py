@@ -7,10 +7,13 @@ point (``main_tip``) is the branch's own work alone.
 """
 from __future__ import annotations
 
+import re
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+
+_DIFF_HEADER = re.compile(r'^diff --git a/.+ b/(.+)$', re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -58,3 +61,8 @@ def branch_with_main_merged_in(
     return MergedInBranch(
         repo=repo, worktree=worktree, creation_sha=creation_sha, main_tip=main_tip,
     )
+
+
+def diffed_paths(diff: str) -> set[str]:
+    """The post-image paths named by a unified diff's ``diff --git`` headers."""
+    return set(_DIFF_HEADER.findall(diff))
