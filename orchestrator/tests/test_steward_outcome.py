@@ -18,6 +18,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec
+from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 
 from orchestrator import workflow_types
 from orchestrator.artifacts import TaskArtifacts
@@ -294,8 +296,9 @@ class TestAwaitStewardCompletionIsEscalationScoped:
     The steward works pending L0s oldest-first, so it can still be busy with
     an older L0 A when ``_mark_blocked`` files B and starts waiting.  A's
     outcome must be discarded rather than resolve B's wait; only B's own
-    outcome, the grace deadline or a cancel ends it.  ``escalation_id=None``
-    is the explicit unscoped mode, where any publication ends the wait.
+    outcome, B's own record found closed by a non-sweep resolver, the grace
+    deadline or a cancel ends it.  ``escalation_id=None`` is the explicit
+    unscoped mode, where any publication ends the wait.
     """
 
     @staticmethod
@@ -420,3 +423,122 @@ class TestAwaitStewardCompletionIsEscalationScoped:
         )
 
         assert outcome == StewardResolved('x')
+
+
+@pytest.mark.asyncio
+class TestScopedWaitSettlesOnTheAwaitedRecord:
+    """Task 5563 review fix: a scoped wait for B also settles when B's own
+    record is found closed by a non-sweep resolver, because B can be closed
+    without an envelope ever being published for it.
+
+    The steward agent is shown the task's other pending L0s and told to
+    resolve each one, so it can close B while handling the older A, and
+    ``TaskSteward`` publishes only for A.  A human or dashboard close of B
+    publishes nothing either.  The record is read after each burst with
+    nothing in scope and once at the deadline, never on cancel.
+    """
+
+    @staticmethod
+    def _workflow_with_two_l0s(
+        tmp_path: Path, *, timeout: float,
+    ) -> tuple[
+        TaskWorkflow, EscalationQueue, asyncio.Queue[PublishedStewardOutcome],
+        Escalation, Escalation,
+    ]:
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.config.steward_completion_timeout = timeout
+        queue = EscalationQueue(tmp_path / 'queue')
+        wf.escalation_queue = queue
+        channel: asyncio.Queue[PublishedStewardOutcome] = asyncio.Queue()
+        wf._steward_outcome_channel = channel
+        wf.scheduler.get_status = AsyncMock(return_value='blocked')
+        wf._worktree_has_wip_commits = AsyncMock(return_value=False)
+        older, awaited = (
+            Escalation(
+                id=queue.make_id('2248'),
+                task_id='2248',
+                agent_role='implementer',
+                severity='blocking',
+                category=category,
+                summary=summary,
+            )
+            for category, summary in (
+                ('design_concern', 'older blocker'),
+                ('task_failure', 'suffix item needs rebase'),
+            )
+        )
+        queue.submit(older)
+        queue.submit(awaited)
+        return wf, queue, channel, older, awaited
+
+    @pytest.mark.parametrize(('resolved_by', 'dismiss'), [
+        ('claude-task-2248-steward', False),
+        ('claude-task-2248-steward', True),
+        ('interactive', False),
+    ])
+    async def test_foreign_outcome_settles_on_the_awaited_record(
+        self, tmp_path: Path, resolved_by: str, dismiss: bool,
+    ):
+        wf, queue, channel, older, awaited = self._workflow_with_two_l0s(
+            tmp_path, timeout=30.0,
+        )
+        queue.resolve(
+            awaited.id, 'fixed by the rebase', dismiss=dismiss, resolved_by=resolved_by,
+        )
+        channel.put_nowait(
+            PublishedStewardOutcome(older.id, StewardResolved('older fixed')),
+        )
+
+        outcome = await asyncio.wait_for(
+            wf._await_steward_completion(escalation_id=awaited.id), 5,
+        )
+
+        assert outcome == StewardResolved('fixed by the rebase')
+
+    async def test_sweep_close_does_not_settle_the_wait(self, tmp_path: Path):
+        wf, queue, channel, older, awaited = self._workflow_with_two_l0s(
+            tmp_path, timeout=0.3,
+        )
+        queue.resolve(
+            awaited.id, 'aged out', dismiss=True, resolved_by='auto-dismissed',
+        )
+        channel.put_nowait(
+            PublishedStewardOutcome(older.id, StewardResolved('older fixed')),
+        )
+
+        outcome = await asyncio.wait_for(
+            wf._await_steward_completion(escalation_id=awaited.id), 5,
+        )
+
+        assert outcome == StewardInterrupted('timeout', wip_commits_present=False)
+
+    async def test_deadline_consults_the_awaited_record(self, tmp_path: Path):
+        wf, queue, _channel, _older, awaited = self._workflow_with_two_l0s(
+            tmp_path, timeout=0.2,
+        )
+        queue.resolve(awaited.id, 'fixed by the rebase', resolved_by='interactive')
+
+        outcome = await asyncio.wait_for(
+            wf._await_steward_completion(escalation_id=awaited.id), 5,
+        )
+
+        assert outcome == StewardResolved('fixed by the rebase')
+
+    async def test_cancel_does_not_consult_the_awaited_record(self, tmp_path: Path):
+        """A slot told to stop must not requeue, whatever B's record says."""
+        wf, queue, _channel, _older, awaited = self._workflow_with_two_l0s(
+            tmp_path, timeout=5.0,
+        )
+        queue.resolve(awaited.id, 'fixed by the rebase', resolved_by='interactive')
+
+        async def _cancel_later() -> None:
+            await asyncio.sleep(0.05)
+            wf._cancel_event.set()
+
+        canceller = asyncio.create_task(_cancel_later())
+        outcome = await asyncio.wait_for(
+            wf._await_steward_completion(escalation_id=awaited.id), 5,
+        )
+        await canceller
+
+        assert outcome == StewardInterrupted('timeout', wip_commits_present=False)

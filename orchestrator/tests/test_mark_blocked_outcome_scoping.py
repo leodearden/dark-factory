@@ -7,14 +7,16 @@ shared channel first.  Before task 5563 that outcome ended B's wait, and
 
 The invariant pinned here, through the real ``_mark_blocked`` with a real
 ``EscalationQueue`` and a real worktree: an outcome published for escalation X
-never resolves the wait for escalation Y.  Only B's own outcome, the grace
-deadline, or a cancel ends it.
+never resolves the wait for escalation Y.  Only B's own outcome, B's own
+record found closed by a non-sweep resolver, the grace deadline, or a cancel
+ends it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+from enum import Enum, auto
 from pathlib import Path
 
 import pytest
@@ -38,6 +40,17 @@ from orchestrator.workflow_types import PublishedStewardOutcome, StewardResolved
 TASK_ID = '42'
 FOLD_CATEGORY = 'preexisting_main_break'
 FOLD_FINGERPRINT = 'fp-5563'
+
+
+class NewL0Handling(Enum):
+    """What the fake steward does about the L0 ``_mark_blocked`` files while
+    it is still working the older one."""
+
+    UNTOUCHED = auto()
+    # Closed after the older L0, with its own envelope.
+    RESOLVED_AFTER_OLDER = auto()
+    # Closed alongside the older L0; only the older L0's envelope is published.
+    CLOSED_WITH_OLDER = auto()
 
 
 @pytest.fixture
@@ -83,14 +96,20 @@ def _submit_l0(
 
 
 def _make_busy_on_older_l0_steward(
-    queue: EscalationQueue, older_id: str, *, then_resolve_new: bool,
+    queue: EscalationQueue,
+    older_id: str,
+    *,
+    new_l0: NewL0Handling,
+    new_l0_closer: str = 'fake-steward',
+    new_l0_dismiss: bool = False,
 ) -> type:
     """A steward class still working the OLDER L0 when ``_mark_blocked`` waits.
 
-    It resolves *older_id* first and publishes that outcome tagged with
-    *older_id*, as ``TaskSteward`` does.  With *then_resolve_new* it then
-    resolves every other pending L0, publishing one envelope per record tagged
-    with that record's own id.
+    It resolves *older_id* and publishes that outcome tagged with *older_id*,
+    as ``TaskSteward`` does.  *new_l0* says what it does about every other
+    pending L0 (see :class:`NewL0Handling`); whenever it closes one, it calls
+    ``resolve()`` with *new_l0_closer* as ``resolved_by`` and *new_l0_dismiss*
+    as ``dismiss``.
 
     The class is itself the ``steward_factory``; every built instance lands in
     ``instances``, so teardown can stop them without reaching into the workflow.
@@ -110,21 +129,36 @@ def _make_busy_on_older_l0_steward(
         def set_wip_probe(self, probe) -> None:  # noqa: ARG002
             pass
 
-        def _resolve_and_publish(self, esc_id: str, text: str) -> None:
-            queue.resolve(esc_id, text, resolved_by='fake-steward')
+        def _publish(self, esc_id: str, text: str) -> None:
             assert self._outcome_channel is not None
             self._outcome_channel.put_nowait(
                 PublishedStewardOutcome(esc_id, StewardResolved(text)),
             )
 
+        def _close_other_pending(self) -> list[str]:
+            closed = [
+                esc.id
+                for esc in queue.get_by_task(TASK_ID, status='pending', level=0)
+                if esc.id != older_id
+            ]
+            for esc_id in closed:
+                queue.resolve(
+                    esc_id, f'fixed {esc_id}',
+                    dismiss=new_l0_dismiss, resolved_by=new_l0_closer,
+                )
+            return closed
+
         async def _run(self) -> None:
             await asyncio.sleep(0.05)
-            self._resolve_and_publish(older_id, 'older fixed')
-            if not then_resolve_new:
+            if new_l0 is NewL0Handling.CLOSED_WITH_OLDER:
+                self._close_other_pending()
+            queue.resolve(older_id, 'older fixed', resolved_by='fake-steward')
+            self._publish(older_id, 'older fixed')
+            if new_l0 is not NewL0Handling.RESOLVED_AFTER_OLDER:
                 return
             await asyncio.sleep(0.2)
-            for esc in queue.get_by_task(TASK_ID, status='pending', level=0):
-                self._resolve_and_publish(esc.id, f'fixed {esc.id}')
+            for esc_id in self._close_other_pending():
+                self._publish(esc_id, f'fixed {esc_id}')
 
         async def start(self) -> None:
             self._work = asyncio.create_task(self._run())
@@ -193,7 +227,7 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
         queue = EscalationQueue(tmp_path / 'queue')
         older = _submit_l0(queue, category='design_concern', summary='older blocker')
         steward_cls = _make_busy_on_older_l0_steward(
-            queue, older.id, then_resolve_new=False,
+            queue, older.id, new_l0=NewL0Handling.UNTOUCHED,
         )
         workflow, scheduler = await _build_workflow(
             git_repo, task_assignment, queue, steward_cls, completion_timeout=0.5,
@@ -229,7 +263,7 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
         queue = EscalationQueue(tmp_path / 'queue')
         older = _submit_l0(queue, category='design_concern', summary='older blocker')
         steward_cls = _make_busy_on_older_l0_steward(
-            queue, older.id, then_resolve_new=True,
+            queue, older.id, new_l0=NewL0Handling.RESOLVED_AFTER_OLDER,
         )
         workflow, _scheduler = await _build_workflow(
             git_repo, task_assignment, queue, steward_cls, completion_timeout=5.0,
@@ -260,7 +294,7 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
             dedupe_fingerprint=FOLD_FINGERPRINT,
         )
         steward_cls = _make_busy_on_older_l0_steward(
-            queue, older.id, then_resolve_new=True,
+            queue, older.id, new_l0=NewL0Handling.RESOLVED_AFTER_OLDER,
         )
         workflow, _scheduler = await _build_workflow(
             git_repo, task_assignment, queue, steward_cls, completion_timeout=5.0,
@@ -287,3 +321,69 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
             'the wait must be scoped to the record the filing landed in (the '
             'parent), so only its resolution may requeue'
         )
+
+    async def test_new_l0_closed_while_steward_handles_older_requeues_before_the_timeout(
+        self, git_repo, task_assignment, tmp_path,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        older = _submit_l0(queue, category='design_concern', summary='older blocker')
+        steward_cls = _make_busy_on_older_l0_steward(
+            queue, older.id,
+            new_l0=NewL0Handling.CLOSED_WITH_OLDER,
+            new_l0_closer='claude-task-42-steward',
+        )
+        workflow, _scheduler = await _build_workflow(
+            git_repo, task_assignment, queue, steward_cls, completion_timeout=30.0,
+        )
+
+        try:
+            outcome = await asyncio.wait_for(
+                workflow._mark_blocked('Suffix item needs rebase onto frozen-prefix tip'),
+                5,
+            )
+        finally:
+            await _stop_all(steward_cls)
+
+        assert outcome == WorkflowOutcome.REQUEUED, (
+            'the steward closed the new L0 while handling the older one; its '
+            'closed record must settle the wait without an envelope of its own'
+        )
+        [new_id] = _new_l0_ids(queue, older.id)
+        new = queue.get(new_id)
+        assert new is not None
+        assert new.status == 'resolved'
+        assert new.resolved_by == 'claude-task-42-steward', (
+            'no fall-through dismissal may overwrite the steward\'s close '
+            f'(resolved_by={new.resolved_by!r})'
+        )
+        assert queue.get_by_task(TASK_ID, level=1) == [], (
+            'no human-facing L1 for an escalation the steward already resolved'
+        )
+
+    async def test_new_l0_swept_while_steward_handles_older_does_not_requeue(
+        self, git_repo, task_assignment, tmp_path,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        older = _submit_l0(queue, category='design_concern', summary='older blocker')
+        steward_cls = _make_busy_on_older_l0_steward(
+            queue, older.id,
+            new_l0=NewL0Handling.CLOSED_WITH_OLDER,
+            new_l0_closer='auto-dismissed',
+            new_l0_dismiss=True,
+        )
+        workflow, scheduler = await _build_workflow(
+            git_repo, task_assignment, queue, steward_cls, completion_timeout=0.5,
+        )
+
+        try:
+            outcome = await asyncio.wait_for(
+                workflow._mark_blocked('Suffix item needs rebase onto frozen-prefix tip'),
+                10,
+            )
+        finally:
+            await _stop_all(steward_cls)
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            'a sweep close carries no finding, so it must not settle the wait'
+        )
+        assert 'pending' not in scheduler.statuses.get(TASK_ID, [])
