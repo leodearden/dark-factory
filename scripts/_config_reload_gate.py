@@ -53,6 +53,7 @@ class ReloadFailure(str, Enum):  # noqa: UP042 - see docstring
     TRANSPORT_NOT_IMPORTABLE = "transport_not_importable"
     NO_RELOAD_REPORT = "no_reload_report"
     REPLY_TIMED_OUT = "reload_reply_timed_out"
+    RELOAD_RAISED = "reload_raised"
     RELOAD_ERROR = "reload_error"
     RELOAD_NOT_COMMITTED = "reload_not_committed"
     DIFFERENT_CONFIG_FILE = "different_config_file"
@@ -134,7 +135,7 @@ def fetch_reload_report(
 
 def _call_reload_config(port: str, *, committed_as: str, timeout: float) -> dict:
     """reload_config's unwrapped result, or ReloadNotConfirmed naming why the
-    transport could not deliver it."""
+    call returned none."""
     try:
         mcp_session, httpx = load_transport()
     except ImportError as exc:
@@ -149,23 +150,42 @@ def _call_reload_config(port: str, *, committed_as: str, timeout: float) -> dict
         ) as session:
             return session.call_tool("reload_config", {})
     except mcp_session.McpCallError as exc:
-        # Only a READ timeout follows a completely sent request. A connect,
-        # write or pool timeout leaves the server no complete request to run,
-        # so those are a reload that never reached the tool. Either way the
-        # live config is UNKNOWN, and a deploy gate must not pass on an unknown.
-        if isinstance(exc.__cause__, httpx.ReadTimeout):
-            raise ReloadNotConfirmed(
-                ReloadFailure.REPLY_TIMED_OUT,
-                f"no reply from {base_url} within {timeout}s to a request already sent; the transport "
-                f"cannot tell whether that was the session handshake or reload_config itself, so "
-                f"the tool may have run and applied the change, and the live config is unknown "
-                f"(committed as {committed_as}; re-run to converge, or the value lands at the next restart)",
-            ) from exc
-        raise ReloadNotConfirmed(
-            ReloadFailure.NO_RELOAD_REPORT,
-            f"reload_config never reached the tool at {base_url}: {exc.kind}: {exc} "
-            f"(committed as {committed_as}; the value lands at the next restart)",
+        raise _not_confirmed_by(
+            exc, mcp_session=mcp_session, httpx=httpx, base_url=base_url,
+            timeout=timeout, committed_as=committed_as,
         ) from exc
+
+
+def _not_confirmed_by(
+    exc, *, mcp_session, httpx, base_url: str, timeout: float, committed_as: str,
+) -> ReloadNotConfirmed:
+    """The refusal for a reload_config call that raised *exc*: the tool ran
+    and failed, its reply was lost after a full send, or the request never
+    reached the tool."""
+    if exc.kind is mcp_session.McpFailureKind.TOOL_ERROR:
+        return ReloadNotConfirmed(
+            ReloadFailure.RELOAD_RAISED,
+            f"reload_config ran and failed at {base_url}: {exc} (it may have applied the change "
+            f"before failing, so the live config is unknown; committed as {committed_as}; "
+            f"re-run to converge, or the value lands at the next restart)",
+        )
+    # Only a READ timeout follows a completely sent request. A connect, write
+    # or pool timeout leaves the server no complete request to run, so those
+    # are a reload that never reached the tool. Whenever the tool may have
+    # run, the live config is UNKNOWN, and a deploy gate must not pass on that.
+    if isinstance(exc.__cause__, httpx.ReadTimeout):
+        return ReloadNotConfirmed(
+            ReloadFailure.REPLY_TIMED_OUT,
+            f"no reply from {base_url} within {timeout}s to a request already sent; the transport "
+            f"cannot tell whether that was the session handshake or reload_config itself, so "
+            f"the tool may have run and applied the change, and the live config is unknown "
+            f"(committed as {committed_as}; re-run to converge, or the value lands at the next restart)",
+        )
+    return ReloadNotConfirmed(
+        ReloadFailure.NO_RELOAD_REPORT,
+        f"reload_config never reached the tool at {base_url}: {exc.kind}: {exc} "
+        f"(committed as {committed_as}; the value lands at the next restart)",
+    )
 
 
 def _confirm_reread_of(config_path: str, report: dict) -> None:
