@@ -1755,12 +1755,15 @@ def _emit_composite_report(results, price_table) -> None:
     architect rows emits the composite table alone, so the existing
     ``eval-matrix`` / ``eval-confirm`` end-to-end surfaces are unchanged.
     """
+    from orchestrator.evals.composite_report import (
+        build_composite_report,
+        format_composite_table,
+    )
     from orchestrator.evals.metrics import RoleUnderTest
     from orchestrator.evals.plan_quality_report import (
         build_plan_quality_report,
         format_plan_quality_table,
     )
-    from orchestrator.evals.report import build_composite_report, format_composite_table
 
     report = build_composite_report(results, price_table=price_table)
     click.echo(format_composite_table(report))

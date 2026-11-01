@@ -23,8 +23,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from .composite_report import build_composite_report, format_composite_table
 from .metrics import RoleUnderTest
-from .report import build_composite_report, format_composite_table
 
 if TYPE_CHECKING:
     from .results import EvalResult

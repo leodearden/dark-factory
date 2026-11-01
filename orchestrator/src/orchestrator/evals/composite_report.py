@@ -1,4 +1,6 @@
-"""The composite and methodology report surfaces over persisted eval cells."""
+"""The per-config composite report over persisted eval cells, as rows, a ranked
+survivor set, a per-stage methodology nest and a deterministic table.
+"""
 
 from __future__ import annotations
 
