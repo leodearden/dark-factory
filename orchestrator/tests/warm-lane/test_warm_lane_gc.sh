@@ -4127,8 +4127,8 @@ assert "X-band7: summary shows removed=1 (the stale stock band)" \
 # environment-free root arithmetic (`<lib dir>/../../..`) lands on `/`, whose
 # missing orchestrator/src/orchestrator/git_ops.py witness makes the bridge
 # return non-zero. gc.sh does NOT source lib_portable.sh (that is
-# warm-lane-audit.sh's), so the two siblings copied here are exactly the two it
-# needs.
+# warm-lane-audit.sh's), so the three siblings copied here are exactly the three
+# it needs.
 #
 # The mount is deliberately MINIMAL — one protected entry, one control orphan,
 # no pool lanes and no .lane-state records — so that the bridge is the only
@@ -4143,9 +4143,10 @@ _TMPDIRS+=("$XD_DIR")
 cp "$SCRIPT" "$XD_DIR/warm-lane-gc.sh"
 cp "$WARM_LANE_SCRIPTS_DIR/lib_live_refs.sh" "$XD_DIR/lib_live_refs.sh"
 cp "$WARM_LANE_SCRIPTS_DIR/lib_lane_state.sh" "$XD_DIR/lib_lane_state.sh"
+cp "$WARM_LANE_SCRIPTS_DIR/lib_lane_seed.sh" "$XD_DIR/lib_lane_seed.sh"
 
-assert "X-degrade: fixture — both siblings gc.sh sources are present (so no sourcing guard fires)" \
-    bash -c '[ -f "$1/lib_live_refs.sh" ] && [ -f "$1/lib_lane_state.sh" ]' _ "$XD_DIR"
+assert "X-degrade: fixture — all three siblings gc.sh sources are present (so no sourcing guard fires)" \
+    bash -c '[ -f "$1/lib_live_refs.sh" ] && [ -f "$1/lib_lane_state.sh" ] && [ -f "$1/lib_lane_seed.sh" ]' _ "$XD_DIR"
 assert "X-degrade: fixture — no dark-factory checkout at the relocated copy's resolved root (the bridge MUST degrade)" \
     bash -c '[ ! -f "$(cd "$1/../../.." && pwd)/orchestrator/src/orchestrator/git_ops.py" ]' _ "$XD_DIR"
 
