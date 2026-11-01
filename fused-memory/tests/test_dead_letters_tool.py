@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _dead_letter_helpers import seed_dead_letters
+from _dead_letter_helpers import parked_buffer, seed_dead_letters
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -185,17 +185,6 @@ def _make_failing_buf() -> AsyncMock:
     """A mock EventBuffer whose push raises non-retriable ValueError."""
     buf = AsyncMock()
     buf.push = AsyncMock(side_effect=ValueError('schema mismatch'))
-    return buf
-
-
-def _make_parked_buf(released: asyncio.Event) -> AsyncMock:
-    """A mock EventBuffer whose push parks until *released* is set — holds the drainer still."""
-
-    async def _park(_event):
-        await released.wait()
-
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=_park)
     return buf
 
 
@@ -868,7 +857,7 @@ class TestReplayEventDeadLettersTool:
         dl = tmp_path / 'dl.jsonl'
         ej = tmp_path / 'ej.db'
         released = asyncio.Event()
-        buf = _make_parked_buf(released)
+        buf = parked_buffer(released)
         eq = EventQueue(
             buf,
             dead_letter_path=dl,
@@ -925,7 +914,7 @@ class TestReplayEventDeadLettersTool:
         """
         dl = tmp_path / 'dl.jsonl'
         released = asyncio.Event()
-        buf = _make_parked_buf(released)
+        buf = parked_buffer(released)
         eq = EventQueue(
             buf,
             dead_letter_path=dl,

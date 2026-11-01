@@ -3,11 +3,14 @@
 ``seed_dead_letters`` writes records in the on-disk format that reading,
 counting and replay consume. ``hold_fifo`` makes a dead-letter path whose
 appends cannot finish until the test releases it, which is how a test proves
-an append ran off the caller's thread.
+an append ran off the caller's thread. ``parked_buffer`` is an EventBuffer
+double whose push waits until the test releases it, which holds the drainer
+still; it is the drainer-side counterpart of ``hold_fifo``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
@@ -15,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock
 
 if TYPE_CHECKING:
     from fused_memory.models.reconciliation import ReconciliationEvent
@@ -71,3 +75,14 @@ class HeldFifo:
 
 def hold_fifo(path: Path) -> HeldFifo:
     return HeldFifo(path).start()
+
+
+def parked_buffer(released: asyncio.Event) -> AsyncMock:
+    """A mock EventBuffer whose push parks until *released* is set — holds the drainer still."""
+
+    async def _park(_event):
+        await released.wait()
+
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=_park)
+    return buf
