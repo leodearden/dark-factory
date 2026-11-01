@@ -111,6 +111,22 @@ T2's barrier needs `/tmp` on a filesystem whose `stat` `st_dev` matches the key
 ext4. On btrfs or overlayfs the barrier fails CLOSED (T2a red), never as a
 false pass.
 
+**Task 7859** added dark-factory-native blocks with no reify counterpart. They
+are the test half of
+[`orchestrator/scripts/warm-lane/README.md`](../../scripts/warm-lane/README.md)
+"Delta 14":
+
+- **Block V** in `test_warm_lane_gc.sh` (85 asserts) pins the Pass-1
+  skip-unchanged gate (V1-V9), with **A12** (3 asserts) for its sibling lib
+  `lib_lane_seed.sh`. It builds an "unchanged" lane deterministically, with no
+  sleep: every dir under `target/` is aged 100s back and the stamp's
+  `exited_at` is 50s back.
+- **Block Z** in `test_warm_lane_gc_sweep.sh` (28 asserts) pins
+  `REIFY_WARM_LANE_GC_SWEEP_MODE=trash-and-emergency` (Z1-Z6). Z6 drives the
+  real gc.sh with no seed script.
+
+Neither block has a skip guard.
+
 Six ported suites carry further dark-factory-native asserts:
 
 - **Task 5940:** `test_provision_warm_lane_fs.sh` N4, `test_warm_lane_disk_guard.sh` A10,
