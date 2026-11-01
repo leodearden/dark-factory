@@ -37,6 +37,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
+from _mock_openai_server import mock_openai_server
 from _sdk_client_stubs import sdk_client_double
 
 from fused_memory.config.reload import apply_reload
@@ -1492,7 +1493,7 @@ def _openai_client(
 def _chat_client(content: str | None, usage: object = None) -> MagicMock:
     """A fake ``AsyncOpenAI`` for an ``openai_generic`` endpoint: chat.completions only.
 
-    Same construction shape as ``test_classifier.py::_make_mock_client`` — the
+    Same construction shape as ``_sdk_client_stubs.py::completion_client`` — the
     established openai double in this repo, plus the async-CM protocol the
     client is used through. Without *usage* the response's ``usage`` is the
     unspecced Mock's own auto-attribute, which reports no usable usage.
@@ -1805,7 +1806,7 @@ class TestTheJudgeEndpointOnOneRealConfig:
 
     @pytest.mark.asyncio
     async def test_the_judge_client_gets_the_judge_url_and_the_classifier_never_does(
-        self,
+        self, monkeypatch,
     ) -> None:
         cfg = _real_config(judge_api_url=_JUDGE_URL)
 
@@ -1813,16 +1814,17 @@ class TestTheJudgeEndpointOnOneRealConfig:
         assert judge_ctor.call_args.kwargs['base_url'] == _JUDGE_URL
         assert judge_ctor.call_args.kwargs['api_key'] == 'sk-main'
 
-        main_client = _chat_client(
-            '{"primary": "procedural_knowledge", "confidence": 0.9}',
-        )
-        with patch(
-            'fused_memory.routing.classifier.AsyncOpenAI', return_value=main_client,
-        ) as main_ctor:
-            result = await WriteClassifier(cfg).classify('some content')
-        assert main_ctor.called
-        assert result.primary is MemoryCategory.procedural_knowledge
-        assert _JUDGE_URL not in main_ctor.call_args.kwargs.values()
+        with mock_openai_server() as server:
+            monkeypatch.setenv('OPENAI_BASE_URL', server.base_url)
+            server.chat_content = '{"primary": "procedural_knowledge", "confidence": 0.9}'
+            classifier = WriteClassifier(cfg)
+            try:
+                result = await classifier.classify('some content')
+            finally:
+                await classifier.close()
+
+            assert result.primary is MemoryCategory.procedural_knowledge
+            assert len(server.requests_to('/chat/completions')) == 1
 
         assert cfg.llm.providers.openai is not None
         assert cfg.llm.providers.openai.api_url == _MAIN_URL
