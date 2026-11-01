@@ -4446,7 +4446,7 @@ class TestAddMembersToL2:
         l2 = self._framed_l2(queue)
         over = 50  # comfortably past every cap, whatever they are retuned to
 
-        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+        with caplog.at_level(logging.WARNING, logger='escalation.amendments'):
             result = queue.add_members_to_l2(
                 l2.id, [],
                 root_cause='R' * (MAX_AMENDMENT_LINE_CHARS + over),
@@ -4493,7 +4493,9 @@ class TestAddMembersToL2:
         )
         assert self._on_disk(queue, l2.id).amendments_chars_elided == expected
         assert any(
-            'elided' in r.getMessage() for r in caplog.records
+            'elided' in r.getMessage()
+            for r in caplog.records
+            if r.name == 'escalation.amendments'
         ), 'elision must also be loud in the log'
 
         # (e) elision does not defeat repeat detection: the SAME oversized
