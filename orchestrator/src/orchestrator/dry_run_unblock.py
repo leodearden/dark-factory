@@ -31,6 +31,7 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import TaskConfigDir
 from shared.git_async import GitResult, run_git
+from shared.git_read_rules import git_read_rules
 from shared.transcript_archive import archive_task_transcripts
 
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
@@ -263,20 +264,17 @@ def _task_context(task: dict[str, Any] | None) -> _TaskContext:
 # admits. Every entry is therefore a grant, and each must be read-only.
 # Bash(pytest:*) and Bash(cargo:*) are omitted: both write build artefacts or
 # fetch from the network. Git is granted per read-only subcommand, never as a
-# wildcard and never `git branch`, which creates and deletes refs. A prefix
-# rule admits any flag after its subcommand, so the one file-writing flag of
-# diff, log and show, --output, is denied below wherever it appears. Residual:
-# `git status` may refresh the index's stat cache, which changes no content.
+# wildcard and never `git branch`, which creates and deletes refs. The
+# file-writing flags of the granted subcommands are denied from
+# shared/src/shared/git_read_rules.py. Residual: `git status` may refresh the
+# index's stat cache, which changes no content.
+_GIT_READS = git_read_rules('log', 'diff', 'status', 'show', 'rev-parse', 'ls-files')
+
 _ALLOWED_TOOLS: list[str] = [
     'Read',
     'Glob',
     'Grep',
-    'Bash(git log:*)',
-    'Bash(git diff:*)',
-    'Bash(git status:*)',
-    'Bash(git show:*)',
-    'Bash(git rev-parse:*)',
-    'Bash(git ls-files:*)',
+    *_GIT_READS.allow,
     'mcp__fused-memory__search',
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
@@ -296,9 +294,7 @@ _DISALLOWED_TOOLS: list[str] = [
     'Bash(git clean:*)',
     'Bash(git merge:*)',
     'Bash(git rebase:*)',
-    'Bash(git diff *--output*)',
-    'Bash(git log *--output*)',
-    'Bash(git show *--output*)',
+    *_GIT_READS.deny,
     'mcp__fused-memory__set_task_status',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__delete_memory',
