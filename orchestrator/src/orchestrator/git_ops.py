@@ -9346,6 +9346,29 @@ class GitOps:
         except ValueError:
             return True
 
+    async def head_if_no_commits_beyond(
+        self, worktree: Path, base_ref: str,
+    ) -> str | None:
+        """Return *worktree*'s HEAD sha iff HEAD carries zero commits beyond *base_ref*.
+
+        "Zero commits beyond" is ``git rev-list --count <base_ref>..HEAD == 0``:
+        the branch checked out in *worktree* holds no work of its own over
+        *base_ref*, so its tip is itself a valid ``branch_base_sha``
+        (``merge_lane/landing_evidence.py::branch_is_degenerate``).
+
+        **Fail-safe ``None``** on any git error or unparseable output, the same
+        direction as :meth:`_branch_has_commits_beyond_main`'s ``True``: a
+        caller may only treat a branch as empty when git proved it.
+        """
+        rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        head = out.strip()
+        if rc != 0 or not head:
+            return None
+        rc, out, _ = await _run(
+            ['git', 'rev-list', '--count', f'{base_ref}..{head}'], cwd=worktree,
+        )
+        return head if rc == 0 and out.strip() == '0' else None
+
     async def _orphan_has_commits(self, full_branch: str) -> bool:
         """Whether *full_branch* exists AND carries commits beyond main.
 

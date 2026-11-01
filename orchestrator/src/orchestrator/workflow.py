@@ -2674,6 +2674,66 @@ class TaskWorkflow:
             },
         )
 
+    async def _restamp_branch_base_if_no_own_commits(self, base_ref: str) -> bool:
+        """Re-stamp ``branch_base_sha`` to the tip when the branch holds no work of its own.
+
+        Invariant (task 7332): ``branch_base_sha`` is the tip the branch had
+        when it last carried zero commits of its own, so
+        ``git rev-list --count <base>..<tip> == 0`` exactly when the branch is
+        degenerate (``merge_lane/landing_evidence.py::branch_is_degenerate``).
+        A branch with commits of its own never has its base moved: that would
+        hide its work from the already-landed checks.
+
+        Call after anything this workflow does that can move its branch's tip
+        (creation, reuse, warm-lane seed, rebase).  *base_ref* is what "its
+        own" is measured against: the fork point ``create_worktree`` returned,
+        or main after a rebase onto main.  Returns whether the branch had no
+        own commits.  Never raises: an unreadable branch counts as having
+        commits, so nothing is moved.
+        """
+        assert self.worktree is not None
+        try:
+            tip = await self.git_ops.head_if_no_commits_beyond(self.worktree, base_ref)
+        except Exception:
+            logger.warning(
+                'Task %s: could not tell whether the branch has commits beyond '
+                '%s; branch_base_sha left as recorded',
+                self.task_id, base_ref, exc_info=True,
+            )
+            return False
+        if tip is None:
+            return False
+        await self._write_branch_base_sha(tip, overwrite=True)
+        return True
+
+    async def _write_branch_base_sha(self, sha: str, *, overwrite: bool) -> None:
+        """Write ``metadata.branch_base_sha``; a failure is logged and never raised.
+
+        ``overwrite=False`` writes with ``append=True`` (fused-memory's
+        'additive' mode, scalar OLD-wins), so it only seeds an absent base:
+        that is how a branch carrying work keeps the base its work sits on.
+        ``overwrite=True`` uses the default 'merge' mode, which replaces it.
+        Without a recorded base the already-landed checks fall back to the
+        citation guard alone.
+        """
+        try:
+            written = await self.scheduler.update_task(
+                self.task_id, {'branch_base_sha': sha}, append=not overwrite,
+            )
+        except Exception:
+            logger.warning(
+                'Task %s: failed to record branch_base_sha=%s; '
+                'reconciler will fall back to citation-grep guard',
+                self.task_id, sha, exc_info=True,
+            )
+            return
+        if not written:
+            logger.warning(
+                'Task %s: branch_base_sha=%s write was refused; '
+                'reconciler will fall back to citation-grep guard',
+                self.task_id, sha,
+            )
+
     async def _setup_worktree_and_artifacts(self, branch_name: str) -> None:
         """Set in-progress, create/inspect the worktree, init artifacts, scrub .task/.
 
@@ -2773,26 +2833,10 @@ class TaskWorkflow:
             else:
                 base_commit = stdout.decode().strip()
         self._base_commit = base_commit
-        # Record branch_base_sha in task metadata immediately after branch
-        # creation so _reconcile_one_stranded (harness.py) can detect
-        # zero-commit branches that sit on a main ancestor (Guard 3 in
-        # the is_ancestor fast-path) and stale merge-markers from prior
-        # incarnations of the same task id (stale-marker check).
-        # Soft-fail: a transient update_task failure degrades gracefully
-        # to citation-grep alone (Guards 1+2) instead of crashing setup.
-        if base_commit:
-            try:
-                await self.scheduler.update_task(
-                    self.task_id,
-                    {'branch_base_sha': base_commit},
-                    append=True,
-                )
-            except Exception:
-                logger.warning(
-                    'Task %s: failed to record branch_base_sha=%s; '
-                    'reconciler will fall back to citation-grep guard',
-                    self.task_id, base_commit,
-                )
+        if base_commit and not await self._restamp_branch_base_if_no_own_commits(
+            base_commit,
+        ):
+            await self._write_branch_base_sha(base_commit, overwrite=False)
         # Colocate the per-task Claude config dir inside the worktree so
         # the session JSONL travels with the worktree.  Crash recovery
         # needs both the sidecar and the session file together to resume.
@@ -3988,6 +4032,7 @@ class TaskWorkflow:
             main_before = await self.git_ops.get_main_sha()
             if not await self.git_ops.rebase_onto_main(self.worktree):
                 return False  # true conflict — queue will detect it
+            await self._restamp_branch_base_if_no_own_commits(self.git_ops.config.main_branch)
             if (
                 self.config.pre_merge_reverify
                 and not await self._post_rebase_reverify_passed()
@@ -7416,6 +7461,7 @@ class TaskWorkflow:
             new_main_sha = await self.git_ops.get_main_sha()
             if rebased:
                 self.artifacts.update_base_commit(new_main_sha)
+                await self._restamp_branch_base_if_no_own_commits(self.git_ops.config.main_branch)
             else:
                 logger.warning(
                     'Task %s: rebase onto main failed during blocking-dep '
@@ -10527,6 +10573,7 @@ class TaskWorkflow:
             return None
 
         self.artifacts.update_base_commit(current_main)
+        await self._restamp_branch_base_if_no_own_commits(self.git_ops.config.main_branch)
 
         # Re-derive any plan step whose status regressed to (or never
         # advanced past) "pending" even though it's genuinely complete on
@@ -12914,6 +12961,7 @@ class TaskWorkflow:
 
         # Rebase onto current main so MERGER works on up-to-date state
         await self.git_ops.rebase_onto_main(self.worktree)
+        await self._restamp_branch_base_if_no_own_commits(self.git_ops.config.main_branch)
         # I-FRESH: never consume a stale verdict from a prior invocation on
         # this same worktree (mirrors steward.py's pre-triage clear).
         self.artifacts.clear_verdict('merger')

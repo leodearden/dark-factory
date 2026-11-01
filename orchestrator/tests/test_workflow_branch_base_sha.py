@@ -1,13 +1,15 @@
-"""Tests that _setup_worktree_and_artifacts writes branch_base_sha to task metadata.
+"""Tests that the workflow keeps metadata.branch_base_sha true for its branch.
 
-Two paths are exercised:
+Two dispatch paths are exercised:
   (a) create_worktree path — the normal task-start flow where git_ops.create_worktree
       is called and WorktreeInfo.base_commit is used.
   (b) external-worktree path — eval mode where self.worktree is already set and
       the base commit is obtained via `git rev-parse HEAD`.
 
-Both paths must call scheduler.update_task(task_id, {'branch_base_sha': base_commit},
-append=True) immediately after self._base_commit is set.
+A branch with commits of its own only SEEDS the base (append=True, OLD-wins).
+A branch with no commits of its own has the base re-stamped to its tip
+(append=False, an overwrite) at dispatch and after every rebase (task 7332), so
+branch_is_degenerate keeps recognising it after the orchestrator moved it.
 """
 
 from __future__ import annotations
@@ -18,10 +20,11 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 from _orch_helpers import pydantic_spec
 
-from orchestrator.config import OrchestratorConfig
-from orchestrator.git_ops import WorktreeInfo
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps, WorktreeInfo
 from orchestrator.workflow import TaskWorkflow
 
 
@@ -52,6 +55,7 @@ def _make_workflow(
 
     git_ops = MagicMock()
     git_ops.worktree_base = project_root / '.worktrees'
+    git_ops.head_if_no_commits_beyond = AsyncMock(return_value=None)
 
     wf = TaskWorkflow(
         assignment=assignment,
@@ -195,3 +199,171 @@ async def test_setup_worktree_update_task_soft_fail_logs_and_continues(
     cast(AsyncMock, wf.scheduler.update_task).assert_awaited_once_with(
         '101', {'branch_base_sha': base_sha}, append=True
     )
+
+
+# ── task 7332: re-stamp the base of a branch the orchestrator moved ─────────
+
+
+@pytest.fixture
+def real_git_ops(tmp_path: Path) -> GitOps:
+    config = GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+    )
+    return GitOps(config, seed_repo(tmp_path / 'repo'))
+
+
+async def _advance_main_by_landing(git_ops: GitOps, tid: str) -> str:
+    """Land a one-file ``task/<tid>`` on main and return main's new sha."""
+    info = await git_ops.create_worktree(tid)
+    (info.path / f'{tid}.py').write_text(f'{tid} = True\n')
+    await git_ops.commit(info.path, f'Add {tid}')
+    result = await git_ops.merge_to_main(info.path, tid)
+    assert result.success and result.merge_commit and result.merge_worktree
+    assert (await git_ops.advance_main(result.merge_commit)).result == 'advanced'
+    await git_ops.cleanup_merge_worktree(result.merge_worktree)
+    await git_ops.cleanup_worktree(info.path, tid)
+    return await git_ops.get_main_sha()
+
+
+def _workflow_on(git_ops: GitOps, worktree: Path, tmp_path: Path) -> TaskWorkflow:
+    wf = _make_workflow(project_root=tmp_path)
+    wf.worktree = worktree
+    wf.git_ops.head_if_no_commits_beyond = git_ops.head_if_no_commits_beyond
+    return wf
+
+
+@pytest.mark.asyncio
+class TestHeadIfNoCommitsBeyond:
+    async def test_a_branch_without_commits_of_its_own_answers_its_tip(
+        self, real_git_ops: GitOps,
+    ):
+        info = await real_git_ops.create_worktree('101')
+
+        assert await real_git_ops.head_if_no_commits_beyond(info.path, 'main') == (
+            await real_git_ops.get_main_sha()
+        )
+
+    async def test_a_branch_with_a_commit_of_its_own_answers_none(
+        self, real_git_ops: GitOps,
+    ):
+        info = await real_git_ops.create_worktree('101')
+        (info.path / 'work.py').write_text('work = 1\n')
+        await real_git_ops.commit(info.path, 'impl(101): work')
+
+        assert await real_git_ops.head_if_no_commits_beyond(info.path, 'main') is None
+
+    async def test_an_unresolvable_base_answers_none(self, real_git_ops: GitOps):
+        info = await real_git_ops.create_worktree('101')
+
+        assert await real_git_ops.head_if_no_commits_beyond(
+            info.path, 'no-such-ref',
+        ) is None
+
+
+@pytest.mark.asyncio
+class TestRedispatchRestampsAMovedZeroCommitBranch:
+    async def test_a_zero_commit_branch_moved_onto_a_later_main_is_restamped(
+        self, real_git_ops: GitOps, tmp_path: Path,
+    ):
+        await real_git_ops.create_worktree('101')
+        later_main = await _advance_main_by_landing(real_git_ops, '900')
+        reused = await real_git_ops.create_worktree('101')
+        wf = _workflow_on(real_git_ops, reused.path, tmp_path)
+        wf.worktree = None
+        wf.git_ops.create_worktree = AsyncMock(return_value=reused)
+        wf._sync_worktree_venvs = AsyncMock()
+
+        with patch('orchestrator.workflow._run', new=AsyncMock(return_value=(0, '', ''))):
+            await wf._setup_worktree_and_artifacts('task/101')
+
+        assert reused.base_commit == later_main
+        cast(AsyncMock, wf.scheduler.update_task).assert_awaited_once_with(
+            '101', {'branch_base_sha': later_main}, append=False,
+        )
+
+    async def test_a_branch_with_commits_of_its_own_only_seeds_its_base(
+        self, real_git_ops: GitOps, tmp_path: Path,
+    ):
+        first = await real_git_ops.create_worktree('101')
+        (first.path / 'work.py').write_text('work = 1\n')
+        await real_git_ops.commit(first.path, 'impl(101): work')
+        await _advance_main_by_landing(real_git_ops, '900')
+        reused = await real_git_ops.create_worktree('101')
+        wf = _workflow_on(real_git_ops, reused.path, tmp_path)
+        wf.worktree = None
+        wf.git_ops.create_worktree = AsyncMock(return_value=reused)
+        wf._sync_worktree_venvs = AsyncMock()
+
+        with patch('orchestrator.workflow._run', new=AsyncMock(return_value=(0, '', ''))):
+            await wf._setup_worktree_and_artifacts('task/101')
+
+        cast(AsyncMock, wf.scheduler.update_task).assert_awaited_once_with(
+            '101', {'branch_base_sha': reused.base_commit}, append=True,
+        )
+
+
+@pytest.mark.asyncio
+class TestRestampAfterRebase:
+    async def test_a_zero_commit_branch_rebased_onto_main_is_restamped(
+        self, real_git_ops: GitOps, tmp_path: Path,
+    ):
+        info = await real_git_ops.create_worktree('101')
+        later_main = await _advance_main_by_landing(real_git_ops, '900')
+        assert await real_git_ops.rebase_onto_main(info.path)
+        wf = _workflow_on(real_git_ops, info.path, tmp_path)
+
+        assert await wf._restamp_branch_base_if_no_own_commits('main') is True
+
+        cast(AsyncMock, wf.scheduler.update_task).assert_awaited_once_with(
+            '101', {'branch_base_sha': later_main}, append=False,
+        )
+
+    async def test_a_branch_with_commits_of_its_own_keeps_its_base(
+        self, real_git_ops: GitOps, tmp_path: Path,
+    ):
+        info = await real_git_ops.create_worktree('101')
+        (info.path / 'work.py').write_text('work = 1\n')
+        await real_git_ops.commit(info.path, 'impl(101): work')
+        await _advance_main_by_landing(real_git_ops, '900')
+        assert await real_git_ops.rebase_onto_main(info.path)
+        wf = _workflow_on(real_git_ops, info.path, tmp_path)
+
+        assert await wf._restamp_branch_base_if_no_own_commits('main') is False
+
+        cast(AsyncMock, wf.scheduler.update_task).assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        'reply',
+        [{'side_effect': RuntimeError('mcp down')}, {'return_value': False}],
+        ids=['raises', 'refused'],
+    )
+    async def test_a_failed_restamp_write_is_logged_and_never_raised(
+        self, real_git_ops: GitOps, tmp_path: Path,
+        caplog: pytest.LogCaptureFixture, reply: dict,
+    ):
+        info = await real_git_ops.create_worktree('101')
+        wf = _workflow_on(real_git_ops, info.path, tmp_path)
+        wf.scheduler.update_task = AsyncMock(**reply)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
+            assert await wf._restamp_branch_base_if_no_own_commits('main') is True
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1 and 'branch_base_sha' in warnings[0], warnings
+
+    async def test_an_unreadable_branch_is_logged_and_never_restamped(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        wf = _make_workflow(project_root=tmp_path)
+        wf.worktree = tmp_path
+        wf.git_ops.head_if_no_commits_beyond = AsyncMock(side_effect=OSError('gone'))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
+            assert await wf._restamp_branch_base_if_no_own_commits('main') is False
+
+        cast(AsyncMock, wf.scheduler.update_task).assert_not_awaited()
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
