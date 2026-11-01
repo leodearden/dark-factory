@@ -866,7 +866,7 @@ class TestReconcileStrandedInProgress:
         self, harness: Harness, owner_pid: object
     ):
         """One corrupt lock degrades to 'no plan-lock claimant'; startup step 2d survives."""
-        harness.scheduler.get_statuses.return_value = ({'43': 'in-progress'}, None)  # type: ignore[attr-defined]
+        cast(AsyncMock, harness.scheduler.get_statuses).return_value = ({'43': 'in-progress'}, None)
         worktree_path = harness.git_ops.worktree_base / '43'
         worktree_path.mkdir(parents=True)
         lock_dir = _resolver_lock_dir(worktree_path)
@@ -879,7 +879,7 @@ class TestReconcileStrandedInProgress:
 
         await harness._reconcile_stranded_in_progress()
 
-        harness.scheduler.set_task_status.assert_called_once_with('43', 'pending')  # type: ignore[attr-defined]
+        cast(AsyncMock, harness.scheduler.set_task_status).assert_called_once_with('43', 'pending')
 
     async def test_revert_unlinks_the_vestigial_worktree_lock(
         self, harness: Harness
