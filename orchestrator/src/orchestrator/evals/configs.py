@@ -13,6 +13,7 @@ always loses to an existing ``config.prices`` entry).
 
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from orchestrator.config import default_price_table
@@ -470,9 +471,10 @@ def get_config_by_name(name: str) -> EvalConfig | None:
     """Look up an eval config by name (implementer, architect, OR ν/ξ candidates).
 
     ν's ``claude_endpoint_candidates()`` and ξ's ``codex_pi_candidates()``
-    bundles are searched LAST since they are function calls (built fresh per
-    call) rather than a static list — cheap at CLI/driver lookup frequency,
-    and keeps this the single by-name resolver for every eval config family
+    bundles are searched LAST, and built only when no static config matched:
+    they are built fresh per call, and building a ν bundle logs a WARNING for
+    each missing credential or base URL, which a static lookup must not emit.
+    This stays the single by-name resolver for every eval config family
     (avoids a second, per-selector lookup path).
 
     ``JUDGE_EVAL_CONFIGS`` (ο) is DELIBERATELY absent from the search list —
@@ -486,12 +488,15 @@ def get_config_by_name(name: str) -> EvalConfig | None:
     ("Unknown config") — a graceful, no-silent-misbehavior failure — rather
     than mis-running. See ``JUDGE_EVAL_CONFIGS`` below and design decision 4.
     """
-    for cfg in [
-        *EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS,
-        *claude_endpoint_candidates(), *codex_pi_candidates(),
-    ]:
-        if cfg.name == name:
-            return cfg
+    families: tuple[Callable[[], list[EvalConfig]], ...] = (
+        lambda: [*EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS],
+        claude_endpoint_candidates,
+        codex_pi_candidates,
+    )
+    for build_family in families:
+        for cfg in build_family():
+            if cfg.name == name:
+                return cfg
     return None
 
 
@@ -631,6 +636,14 @@ KIMI_BASE_URL = 'https://api.moonshot.ai/anthropic'
 GLM_BASE_URL = 'https://api.z.ai/api/anthropic'
 ZAI_CODING_BASE_URL = 'https://api.z.ai/api/coding/paas/v4'
 
+# MiMo's Anthropic-protocol base URL is an env var, not a literal: a Token Plan
+# (tp-) key answers only on its account region's cluster,
+# https://token-plan-{cn|sgp|ams}.xiaomimimo.com/anthropic, unknown until the
+# plan is bought, and a pay-as-you-go (sk-) key's
+# https://api.xiaomimimo.com/anthropic does not accept it. See
+# plans/live-shadow-eval-prd.md decision 12.
+MIMO_BASE_URL_ENV = 'MIMO_ANTHROPIC_BASE_URL'
+
 # Per-provider ANTHROPIC_AUTH_TOKEN source env var name. Never a secret
 # literal in source — the value itself is read from the operator's
 # environment at bundle-build time (see the bundle builder below).
@@ -638,6 +651,7 @@ GLM_AUTH_TOKEN_ENV = 'ZAI_API_KEY'
 DEEPSEEK_AUTH_TOKEN_ENV = 'DEEPSEEK_API_KEY'
 MINIMAX_AUTH_TOKEN_ENV = 'MINIMAX_API_KEY'
 KIMI_AUTH_TOKEN_ENV = 'MOONSHOT_API_KEY'
+MIMO_AUTH_TOKEN_ENV = 'MIMO_API_KEY'
 
 # Provider model ids, used verbatim as the Claude Code ``model`` value AND
 # (see CANDIDATE_ENDPOINT_PRICES below) as the price-table key — the two MUST
@@ -647,6 +661,12 @@ GLM_MODEL = 'glm-5.3'
 GLM_FLASH_MODEL = 'glm-5.3-flash'
 DEEPSEEK_MODEL = 'deepseek-v4'
 KIMI_MODEL = 'kimi-latest'
+MIMO_PRO_MODEL = 'mimo-v2.6-pro'
+MIMO_FLASH_MODEL = 'mimo-v2.6-flash'
+
+
+def _mimo_base_url() -> str:
+    return os.environ.get(MIMO_BASE_URL_ENV, '').strip()
 
 
 def _claude_endpoint_config(
@@ -655,7 +675,7 @@ def _claude_endpoint_config(
     """Build one non-incumbent Claude-format-endpoint candidate bundle.
 
     Mirrors ``_vllm_config``'s env-dict builder pattern: ``ANTHROPIC_BASE_URL``
-    is the public literal *base_url*; ``ANTHROPIC_AUTH_TOKEN`` is read from
+    is *base_url*; ``ANTHROPIC_AUTH_TOKEN`` is read from
     *auth_token_env* via ``os.environ.get`` at CALL time (never baked into
     source as a secret), so an operator supplies it via the environment and a
     test can monkeypatch it and observe the value flow through.
@@ -665,9 +685,20 @@ def _claude_endpoint_config(
     it), a missing token HERE means the run cannot authenticate against the
     provider at all, so a WARNING is logged at build time rather than only
     surfacing later as an opaque 401/auth error mid-run.
+
+    A blank *base_url* means the endpoint is unknown, so the bundle carries no
+    credential: the key is never read, let alone sent to an unknown endpoint.
     """
-    auth_token = os.environ.get(auth_token_env, '')
-    if not auth_token:
+    auth_token = os.environ.get(auth_token_env, '') if base_url else ''
+    if not base_url:
+        logger.warning(
+            "ν candidate %r has no base URL — ANTHROPIC_AUTH_TOKEN is left "
+            "blank, so the shadow credential gate "
+            "(shadow_eval.py::candidate_has_credentials) skips it as "
+            "no_credentials and no key goes to an unknown endpoint.",
+            name,
+        )
+    elif not auth_token:
         logger.warning(
             "ν candidate %r: %s is not set in the environment — "
             "ANTHROPIC_AUTH_TOKEN will be empty and the %s endpoint will "
@@ -684,11 +715,12 @@ def _claude_endpoint_config(
 
 
 def claude_endpoint_candidates() -> list[EvalConfig]:
-    """Incumbents (native cloud Opus/Sonnet) + the five non-incumbent bundles.
+    """Incumbents (native cloud Opus/Sonnet) + the non-incumbent endpoint bundles.
 
     Each non-incumbent bundle is a (harness, model) candidate — Claude Code
-    driving MiniMax M3 / GLM-5.3 / GLM-5.3-Flash / DeepSeek V4 / Kimi via
-    their official Anthropic-format endpoint (PRD C5). ADDITIVE to
+    driving MiniMax M3 / GLM-5.3 / GLM-5.3-Flash / DeepSeek V4 / Kimi /
+    MiMo V2.6 Pro / MiMo V2.6 Flash via their official Anthropic-format
+    endpoint (PRD C5). ADDITIVE to
     :func:`ofat_candidates`:
     the non-incumbent bundles are NOT added there, since its implementer
     subset asserts every cloud incumbent carries no proxy ``env_overrides``
@@ -700,6 +732,7 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
     its provider's AUTH_TOKEN env var fresh rather than caching a stale/empty
     value from import time.
     """
+    mimo_base_url = _mimo_base_url()
     return [
         *_cloud_implementer_incumbents(),
         _claude_endpoint_config(
@@ -721,6 +754,14 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
         _claude_endpoint_config(
             'kimi-endpoint', KIMI_MODEL,
             base_url=KIMI_BASE_URL, auth_token_env=KIMI_AUTH_TOKEN_ENV,
+        ),
+        _claude_endpoint_config(
+            'mimo-v2.6-pro-endpoint', MIMO_PRO_MODEL,
+            base_url=mimo_base_url, auth_token_env=MIMO_AUTH_TOKEN_ENV,
+        ),
+        _claude_endpoint_config(
+            'mimo-v2.6-flash-endpoint', MIMO_FLASH_MODEL,
+            base_url=mimo_base_url, auth_token_env=MIMO_AUTH_TOKEN_ENV,
         ),
     ]
 
@@ -754,6 +795,10 @@ CANDIDATE_ENDPOINT_PRICES: dict[str, CandidateEndpointPrice] = {
     GLM_FLASH_MODEL: CandidateEndpointPrice(0.15, 0.50, CostBasis.SUBSCRIPTION),
     DEEPSEEK_MODEL: CandidateEndpointPrice(0.28, 0.42, CostBasis.METERED),
     KIMI_MODEL: CandidateEndpointPrice(0.60, 2.50, CostBasis.METERED),
+    # Imputed list prices from https://mimo.mi.com/docs/en-US/pricing, retrieved
+    # 2026-10-31; the Token Plan bills credits (PRD decision 16).
+    MIMO_PRO_MODEL: CandidateEndpointPrice(0.435, 0.87, CostBasis.SUBSCRIPTION),
+    MIMO_FLASH_MODEL: CandidateEndpointPrice(0.14, 0.28, CostBasis.SUBSCRIPTION),
 }
 
 
