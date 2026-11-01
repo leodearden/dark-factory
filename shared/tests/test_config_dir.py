@@ -162,6 +162,19 @@ class TestSweepStalePidDirsSelection:
         assert live.exists()
         assert (live / '.credentials.json').exists()
 
+    def test_reclaims_dir_whose_trailing_digits_overflow_pid_t(self, tmp_path):
+        """Digits no pid_t can hold name no live process, so the dir is reclaimed.
+
+        The overflow must not abort the sweep: the dead-pid sibling goes too.
+        """
+        unrepresentable = plant(tmp_path, f'{PROBE_PREFIX}work-{10**20}')
+        dead_sibling = plant(tmp_path, f'{PROBE_PREFIX}work-{find_dead_pid()}')
+
+        sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path)
+
+        assert not dead_sibling.exists()
+        assert not unrepresentable.exists()
+
     def test_keeps_dir_with_no_parseable_trailing_pid(self, tmp_path):
         """Never delete what we cannot attribute to a process."""
         unattributable = plant(tmp_path, f'{PROBE_PREFIX}nopid')
