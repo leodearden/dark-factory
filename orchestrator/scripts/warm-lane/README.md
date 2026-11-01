@@ -1482,6 +1482,9 @@ spent 164 s in 86 fd/cwd scans and 65 s in 79 maps scans.
   which would `E2BIG` at very large process counts and fail OPEN.
 - **Not `find -files0-from`**: findutils ≥ 4.9 only, and an older `find`
   prints nothing, which fails open the same way.
+- **`warm-lane-gc.sh`** carries a comment-only pointer at the end of its
+  header's COST REVERSAL bullet, to the figures in `lib_live_refs.sh`; no code
+  change.
 
 reify's original still carries the depth-3 walk. Current per-call figures live
 in `lib_live_refs.sh`'s MEASURED COST block.

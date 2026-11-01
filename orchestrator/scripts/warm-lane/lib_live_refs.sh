@@ -102,10 +102,10 @@ _live_refs_env_probe() {
 }
 
 # _live_refs_scan_fdcwd RP... — the cwd + open-fd HALF of the scan. Split out of
-# live_referenced_paths (task 5572 review) with its logic byte-identical, purely
-# so live_ref_present can take a verdict from this pass alone and skip the mmap
-# pass on a hit. Not a public entry point: callers want live_referenced_paths or
-# live_ref_present, which run both halves.
+# live_referenced_paths (task 5572 review) purely so live_ref_present can take a
+# verdict from this pass alone and skip the mmap pass on a hit; its producer was
+# since narrowed by task 8089 (README Delta 15). Not a public entry point:
+# callers want live_referenced_paths or live_ref_present, which run both halves.
 _live_refs_scan_fdcwd() {
     [ $# -gt 0 ] || return 0
 
