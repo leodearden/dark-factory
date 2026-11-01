@@ -22,6 +22,7 @@ import apply_return
 import sessions
 import state
 from sessions import SpawnedSession, Standing
+from shared.proc_liveness import pid_alive
 
 from shared import safe_io
 
@@ -34,7 +35,6 @@ from orchestrator.session_registry import (
     CorruptSessionRecord,
     ResultOutcome,
     SessionRecord,
-    _pid_alive,
     parse_result_outcome,
     parse_spawn_identity,
     read_record,
@@ -181,7 +181,7 @@ def is_over(record: SessionRecord) -> bool:
     if record.status in TERMINAL_STATUSES:
         return True
     owner = record.claude_owner_pid
-    return record.exit_requested_at is not None and owner is not None and not _pid_alive(owner)
+    return record.exit_requested_at is not None and owner is not None and not pid_alive(owner)
 
 
 def is_final(outcome: ResultOutcome | None, *, over: bool) -> bool:
