@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, cast
 from unittest.mock import AsyncMock
@@ -11,6 +13,7 @@ import pytest
 import pytest_asyncio
 from _fastmcp_tool_result import tool_result_dict
 from _fm_helpers import _init_git_repo
+from _fused_memory_tool_surface import FUSED_MEMORY_TOOL_PREFIX, registered_fused_memory_tools
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import CuratorConfig, TaskmasterConfig
@@ -29,7 +32,9 @@ from fused_memory.middleware.ticket_store import (
     TicketStatus,
     TicketStore,
 )
+from fused_memory.reconciliation import recon_self_model
 from fused_memory.reconciliation.event_buffer import EventBuffer
+from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 from fused_memory.server.tools import create_mcp_server
 
 WAIT_SECONDS = 30.0
@@ -273,3 +278,44 @@ class TestResolveTicketReportsTheRow:
         answer = await bare.resolve_ticket('tkt_' + '0' * 26, stack.root, timeout_seconds=1)
 
         assert answer == {'status': 'failed', 'reason': 'ticket_store not configured'}
+
+
+def _unnamed(text: str, values: Iterable[str]) -> list[str]:
+    """The *values* *text* does not name as a quoted token (backtick, single or double quote)."""
+    return sorted(
+        str(value) for value in values
+        if not re.search(rf"[`'\"]{re.escape(value)}[`'\"]", text)
+    )
+
+
+def _tool_description(name: str) -> str:
+    return registered_fused_memory_tools()[f'{FUSED_MEMORY_TOOL_PREFIX}{name}'].description or ''
+
+
+def _stage2_slice(start: str, end: str) -> str:
+    prompt = build_stage2_system_prompt('dark_factory')
+    begin = prompt.index(start)
+    return prompt[begin:prompt.index(end, begin + len(start))]
+
+
+ALL_STATUSES = frozenset(TicketStatus)
+ALL_RESOLVE_REASONS = frozenset(ResolveReason)
+
+RUNTIME_SITES: dict[str, tuple[Callable[[], str], frozenset[str]]] = {
+    'mcp-resolve_ticket': (lambda: _tool_description('resolve_ticket'), ALL_STATUSES | ALL_RESOLVE_REASONS),
+    'mcp-list_tickets': (lambda: _tool_description('list_tickets'), ALL_STATUSES),
+    'stage2-status-list': (lambda: _stage2_slice('Interpreting the status:', '\n\n'), ALL_STATUSES),
+    'stage2-verifying-rule': (
+        lambda: _stage2_slice('## Verifying Task Operations', '\n## '), frozenset(OPEN_TICKET_STATUSES),
+    ),
+    'recon-self-model': (lambda: recon_self_model.MCP_CALL_SIGNATURES['resolve_ticket'], ALL_STATUSES),
+}
+
+
+class TestVocabularyParityRuntimeSites:
+    """Each artifact fused-memory serves names the live vocabulary it must (B5)."""
+
+    @pytest.mark.parametrize('site', sorted(RUNTIME_SITES))
+    def test_site_names_the_vocabulary(self, site):
+        text_of, required = RUNTIME_SITES[site]
+        assert _unnamed(text_of(), required) == [], f'{site} does not name these values'
