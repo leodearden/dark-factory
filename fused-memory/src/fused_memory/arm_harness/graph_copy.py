@@ -59,6 +59,8 @@ FORK_POLL_INTERVAL_S = 2.0
 So COPY_ATTEMPTS bounds refusals, not seconds: however long a BGSAVE runs, it costs
 one refused copy, and the copy is reissued once the child has exited.
 """
+FORK_WAIT_REPORT_EVERY_POLLS = 30
+"""A wait on a held fork is logged when its holders change, and again every this many polls."""
 
 
 class ScratchGraph(Protocol):
@@ -220,23 +222,25 @@ async def _copy_through_fork_refusals(
 async def _wait_for_free_fork(
     server: ServerInfo, sleep: Sleep, reference: str, target: str
 ) -> _ForkWait:
-    await sleep(FORK_POLL_INTERVAL_S)
-    slept_s = FORK_POLL_INTERVAL_S
-    holding = await read_fork_holders(server)
-    if holding:
-        logger.info(
-            'GRAPH.COPY %r -> %r was refused while %s held the fork; waiting for it to exit',
-            reference,
-            target,
-            ', '.join(sorted(holding)),
-        )
-    seen = holding
-    while holding:
+    seen: frozenset[ForkHolder] = frozenset()
+    previous: frozenset[ForkHolder] = frozenset()
+    polls = 0
+    while True:
         await sleep(FORK_POLL_INTERVAL_S)
-        slept_s += FORK_POLL_INTERVAL_S
+        polls += 1
         holding = await read_fork_holders(server)
+        if not holding:
+            return _ForkWait(polls * FORK_POLL_INTERVAL_S, seen)
+        if holding != previous or polls % FORK_WAIT_REPORT_EVERY_POLLS == 0:
+            logger.info(
+                'GRAPH.COPY %r -> %r has waited %.0fs since its refusal; %s holds the fork',
+                reference,
+                target,
+                polls * FORK_POLL_INTERVAL_S,
+                ', '.join(sorted(holding)),
+            )
+        previous = holding
         seen |= holding
-    return _ForkWait(slept_s, seen)
 
 
 def _is_fork_refusal(error: ResponseError) -> bool:

@@ -1,6 +1,7 @@
 """An arm's re-embedded copy of the frozen reference graph (arm_harness/graph_copy.py)."""
 
 import copy
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
@@ -11,7 +12,7 @@ from redis.exceptions import ResponseError
 from arm_harness._fakes import PROTECTED_GRAPHS, FakeForkServer
 from fused_memory.arm_harness import graph_copy
 from fused_memory.arm_harness.arm_embedder import DocumentEmbeddings
-from fused_memory.arm_harness.fork_slot import ForkHolder
+from fused_memory.arm_harness.fork_slot import ForkHolder, ForkSlotUnreadable
 from fused_memory.arm_harness.graph_copy import (
     GraphReembed,
     ReembedCensusError,
@@ -133,6 +134,15 @@ class FakeGraphClient:
     def select_graph(self, name: str) -> FakeGraph:
         self.calls.append(('select_graph', name))
         return self.graphs[name]
+
+
+class FlaglessForkServer(FakeForkServer):
+    """A server whose INFO persistence reply omits the module-fork flag."""
+
+    async def info(self, section: str, /) -> dict[str, int]:
+        reply = await super().info(section)
+        del reply[ForkHolder.MODULE_FORK.value]
+        return reply
 
 
 def _reference_graph(
@@ -388,6 +398,51 @@ async def test_a_copy_that_gives_up_names_the_children_it_waited_out_and_the_tim
     assert refused.attempts == graph_copy.COPY_ATTEMPTS
     assert refused.waited_s == sum(server.waits)
     assert TARGET not in client.graphs
+
+
+@pytest.mark.asyncio
+async def test_a_refused_copy_on_a_server_whose_fork_slot_is_unreadable_is_not_retried():
+    server = FlaglessForkServer()
+    client = FakeGraphClient(server)
+    _reference_graph(client, copy_errors=[_fork_refusal()])
+
+    with pytest.raises(ForkSlotUnreadable) as caught:
+        await copy_reference_graph(client, REFERENCE, TARGET, sleep=server.sleep)
+
+    assert caught.value.missing == (ForkHolder.MODULE_FORK.value,)
+    assert len(_copy_calls(client)) == 1
+    assert TARGET not in client.graphs
+
+
+@pytest.mark.asyncio
+async def test_a_long_wait_is_logged_when_its_holders_change_and_at_a_coarse_cadence(caplog):
+    every = graph_copy.FORK_WAIT_REPORT_EVERY_POLLS
+    interval = graph_copy.FORK_POLL_INTERVAL_S
+    save_ends = (2 * every + 5) * interval
+    rewrite_ends = save_ends + 5 * interval
+    server = FakeForkServer(
+        [(ForkHolder.RDB_SAVE, 0.0, save_ends), (ForkHolder.AOF_REWRITE, save_ends, rewrite_ends)]
+    )
+    client = FakeGraphClient(server)
+    _reference_graph(client)
+    caplog.set_level(logging.INFO, logger=graph_copy.__name__)
+
+    await copy_reference_graph(client, REFERENCE, TARGET, sleep=server.sleep)
+
+    messages = [
+        record.getMessage() for record in caplog.records if record.name == graph_copy.__name__
+    ]
+    expected = [
+        (ForkHolder.RDB_SAVE, interval),
+        (ForkHolder.RDB_SAVE, every * interval),
+        (ForkHolder.RDB_SAVE, 2 * every * interval),
+        (ForkHolder.AOF_REWRITE, save_ends),
+    ]
+    assert len(messages) == len(expected)
+    for message, (holder, waited_s) in zip(messages, expected, strict=True):
+        assert holder.value in message
+        assert f'waited {waited_s:.0f}s' in message
+    assert len(_copy_calls(client)) == 2
 
 
 # --- group id ---------------------------------------------------------------------------
