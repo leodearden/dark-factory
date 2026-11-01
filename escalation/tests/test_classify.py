@@ -12,6 +12,7 @@ from escalation.classify import (
     DONE_STEP_COMMIT_ORPHAN_CLASS,
     INFO_L0_MECHANICAL_ROLES,
     classify_resolver_tier,
+    closed_by_non_sweep_resolver,
     default_resolution_class_for_resolver,
     effective_benign,
     info_l0_mechanical_class,
@@ -25,6 +26,7 @@ def _make_escalation(
     *,
     status: str = 'pending',
     resolution_class: str | None = None,
+    resolved_by: str | None = None,
 ) -> Escalation:
     esc = Escalation(
         id=esc_id,
@@ -36,6 +38,7 @@ def _make_escalation(
     )
     esc.status = status
     esc.resolution_class = resolution_class
+    esc.resolved_by = resolved_by
     return esc
 
 
@@ -198,6 +201,38 @@ class TestDefaultResolutionClassForResolver:
     def test_random_role_defaults_none(self):
         """resolved_by='random-role' (other-auto tier) defaults to None."""
         assert default_resolution_class_for_resolver('random-role') is None
+
+
+class TestClosedByNonSweepResolver:
+    """closed_by_non_sweep_resolver(record): terminal, and closed outside the reaper-sweep tier."""
+
+    def test_pending_record_is_never_closed(self):
+        """A pending record is not closed, whatever its resolved_by stamp says."""
+        record = _make_escalation(status='pending', resolved_by='claude-task-42-steward')
+        assert closed_by_non_sweep_resolver(record) is False
+
+    def test_steward_resolved_counts(self):
+        record = _make_escalation(status='resolved', resolved_by='claude-task-42-steward')
+        assert closed_by_non_sweep_resolver(record) is True
+
+    def test_steward_dismissed_counts(self):
+        """resolve_issue's close_only and abandon actions dismiss rather than resolve."""
+        record = _make_escalation(status='dismissed', resolved_by='claude-task-42-steward')
+        assert closed_by_non_sweep_resolver(record) is True
+
+    def test_human_resolved_counts(self):
+        record = _make_escalation(status='resolved', resolved_by='interactive')
+        assert closed_by_non_sweep_resolver(record) is True
+
+    def test_unattributed_close_counts(self):
+        """An agent close the steward has not yet attributed lands in tier 'unknown'."""
+        record = _make_escalation(status='resolved', resolved_by=None)
+        assert closed_by_non_sweep_resolver(record) is True
+
+    @pytest.mark.parametrize('resolved_by', ['auto-dismissed', 'harness-orphan-reaper'])
+    def test_reaper_sweep_dismissal_does_not_count(self, resolved_by):
+        record = _make_escalation(status='dismissed', resolved_by=resolved_by)
+        assert closed_by_non_sweep_resolver(record) is False
 
 
 # ---------------------------------------------------------------------------
