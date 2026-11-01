@@ -11,7 +11,6 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -147,7 +146,62 @@ def _vestigial_lock_dir(worktree: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def harness(tmp_path: Path, mock_orch_config):
+def scheduler_double() -> MagicMock:
+    """The Scheduler stand-in the `harness` fixture installs, typed as the MagicMock it is."""
+    scheduler = MagicMock()
+    # Wire real (non-auto-mock) liveness-accessor behaviour (task 2235:
+    # harness.py now calls scheduler.is_dispatched/.is_actively_held/
+    # .workflow_cancel_recent/.note_workflow_cancelled/.clear_workflow_cancel
+    # instead of reaching into _dispatched/lock_table._held/_workflow_cancel_at
+    # directly) so the mid-run sweep and stranded-blocked gate tests below
+    # exercise real semantics instead of an auto-mocked (always-truthy) stub.
+    wire_scheduler_liveness_mock(scheduler)
+    wire_clear_claim_then_set_status(scheduler)
+    wire_live_status_from_get_task(scheduler)
+    scheduler.get_tasks = AsyncMock(return_value=[])
+    scheduler.get_statuses = AsyncMock(return_value=({}, None))
+    scheduler.set_task_status = AsyncMock()
+
+    # mark_done forwards to set_task_status so the existing assertions on
+    # set_task_status.call_args_list / set_task_status.assert_awaited_once_with
+    # still cover the recovery-done path after the harness was refactored to
+    # use Scheduler.mark_done as a thin wrapper.
+    async def _fake_mark_done(tid, *, kind, sha, note=None):
+        provenance = {'kind': kind, 'commit': sha}
+        if note is not None:
+            provenance['note'] = note
+        await scheduler.set_task_status(
+            tid, 'done', done_provenance=provenance,
+        )
+    scheduler.mark_done = AsyncMock(side_effect=_fake_mark_done)
+
+    # Default: get_task synthesizes {'status': ..., 'metadata': {}} from
+    # whatever get_statuses() is currently configured to return for that tid
+    # (task 2243, W10-θ2: TaskGroundTruth.derive_truth's db_status is sourced
+    # from get_task(tid)['status'] — a DIFFERENT accessor than the per-tid
+    # `status` string the sweep loop itself reads from get_statuses(). In
+    # production both reflect the same row; the fixture keeps them
+    # consistent by construction here rather than requiring every test to
+    # duplicate the status in two places). Falls back to None (no row) when
+    # get_statuses' return_value isn't a plain (dict, err) tuple or has no
+    # entry for tid — matching the old unconditional-None default for any
+    # test that doesn't care. Individual tests that need branch_base_sha (or
+    # any other task-row shape) override get_task explicitly and are
+    # responsible for including a matching 'status' key themselves.
+    def _default_get_task(tid: str) -> dict | None:
+        try:
+            statuses, _err = scheduler.get_statuses.return_value
+        except (TypeError, ValueError):
+            return None
+        status = statuses.get(tid) if isinstance(statuses, dict) else None
+        return None if status is None else {'status': status, 'metadata': {}}
+    scheduler.get_task = AsyncMock(side_effect=_default_get_task)
+
+    return scheduler
+
+
+@pytest.fixture
+def harness(tmp_path: Path, mock_orch_config, scheduler_double: MagicMock):
     """Create a Harness with mocked internals for unit testing reconciliation."""
     with patch('orchestrator.harness.McpLifecycle'), \
          patch('orchestrator.harness.Scheduler'), \
@@ -168,32 +222,7 @@ def harness(tmp_path: Path, mock_orch_config):
     h.config.convert_to_blocked_enforce = False
 
     # Replace scheduler with async mocks
-    h.scheduler = MagicMock()
-    # Wire real (non-auto-mock) liveness-accessor behaviour (task 2235:
-    # harness.py now calls scheduler.is_dispatched/.is_actively_held/
-    # .workflow_cancel_recent/.note_workflow_cancelled/.clear_workflow_cancel
-    # instead of reaching into _dispatched/lock_table._held/_workflow_cancel_at
-    # directly) so the mid-run sweep and stranded-blocked gate tests below
-    # exercise real semantics instead of an auto-mocked (always-truthy) stub.
-    wire_scheduler_liveness_mock(h.scheduler)
-    wire_clear_claim_then_set_status(h.scheduler)
-    wire_live_status_from_get_task(h.scheduler)
-    h.scheduler.get_tasks = AsyncMock(return_value=[])
-    h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
-    h.scheduler.set_task_status = AsyncMock()
-
-    # mark_done forwards to set_task_status so the existing assertions on
-    # set_task_status.call_args_list / set_task_status.assert_awaited_once_with
-    # still cover the recovery-done path after the harness was refactored to
-    # use Scheduler.mark_done as a thin wrapper.
-    async def _fake_mark_done(tid, *, kind, sha, note=None):
-        provenance = {'kind': kind, 'commit': sha}
-        if note is not None:
-            provenance['note'] = note
-        await h.scheduler.set_task_status(
-            tid, 'done', done_provenance=provenance,
-        )
-    h.scheduler.mark_done = AsyncMock(side_effect=_fake_mark_done)
+    h.scheduler = scheduler_double
 
     # Keep worktree_base real (under tmp_path) so we can create fake worktrees
     h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()
@@ -228,28 +257,6 @@ def harness(tmp_path: Path, mock_orch_config):
     h.git_ops.find_task_citation_commit = AsyncMock(
         return_value='deadbeef' + 'a' * 32,
     )
-
-    # Default: get_task synthesizes {'status': ..., 'metadata': {}} from
-    # whatever get_statuses() is currently configured to return for that tid
-    # (task 2243, W10-θ2: TaskGroundTruth.derive_truth's db_status is sourced
-    # from get_task(tid)['status'] — a DIFFERENT accessor than the per-tid
-    # `status` string the sweep loop itself reads from get_statuses(). In
-    # production both reflect the same row; the fixture keeps them
-    # consistent by construction here rather than requiring every test to
-    # duplicate the status in two places). Falls back to None (no row) when
-    # get_statuses' return_value isn't a plain (dict, err) tuple or has no
-    # entry for tid — matching the old unconditional-None default for any
-    # test that doesn't care. Individual tests that need branch_base_sha (or
-    # any other task-row shape) override get_task explicitly and are
-    # responsible for including a matching 'status' key themselves.
-    def _default_get_task(tid: str) -> dict | None:
-        try:
-            statuses, _err = cast(AsyncMock, h.scheduler.get_statuses).return_value
-        except (TypeError, ValueError):
-            return None
-        status = statuses.get(tid) if isinstance(statuses, dict) else None
-        return None if status is None else {'status': status, 'metadata': {}}
-    h.scheduler.get_task = AsyncMock(side_effect=_default_get_task)
 
     # Default: warm_lane_ref_is_degenerate returns False (task 2112 angle B) so
     # the metadata-independent fallback never fires for existing tests and the
@@ -863,10 +870,10 @@ class TestReconcileStrandedInProgress:
 
     @pytest.mark.parametrize('owner_pid', [10**20, True], ids=['unrepresentable', 'json-true'])
     async def test_corrupt_owner_pid_reads_as_no_claimant_and_reverts(
-        self, harness: Harness, owner_pid: object
+        self, harness: Harness, scheduler_double: MagicMock, owner_pid: object
     ):
         """One corrupt lock degrades to 'no plan-lock claimant'; startup step 2d survives."""
-        cast(AsyncMock, harness.scheduler.get_statuses).return_value = ({'43': 'in-progress'}, None)
+        scheduler_double.get_statuses.return_value = ({'43': 'in-progress'}, None)
         worktree_path = harness.git_ops.worktree_base / '43'
         worktree_path.mkdir(parents=True)
         lock_dir = _resolver_lock_dir(worktree_path)
@@ -879,7 +886,7 @@ class TestReconcileStrandedInProgress:
 
         await harness._reconcile_stranded_in_progress()
 
-        cast(AsyncMock, harness.scheduler.set_task_status).assert_called_once_with('43', 'pending')
+        scheduler_double.set_task_status.assert_called_once_with('43', 'pending')
 
     async def test_revert_unlinks_the_vestigial_worktree_lock(
         self, harness: Harness
