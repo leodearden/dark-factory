@@ -1,6 +1,6 @@
 ---
 name: spawn
-description: "Spawn a new Claude Code CLI session in a new terminal window with a given prompt. Use when another skill (such as escalation-watcher) needs to hand a task off to a fresh interactive Claude session running in its own terminal — for example, spawning `/unblock <task>` so a human can drive it. Triggers on phrases like 'spawn a claude session', 'open a new terminal with claude', 'launch /unblock in a new window'. NOT for: running arbitrary shell commands in a new terminal, or invoking Claude inside the current session (use a sub-agent for that)."
+description: "Spawn a new Claude Code CLI session in a new terminal window with a given prompt. Use when another skill (such as escalation-watcher) needs to hand a task off to a fresh interactive Claude session running in its own terminal — for example, spawning `/unblock <task>` so a human can drive it. Triggers on phrases like 'spawn a claude session', 'open a new terminal with claude', 'launch /unblock in a new window'. ALSO triggers on the bare word 'handoff' (e.g. 'handoff', 'then handoff', 'handoff when done'): it is shorthand for 'when done, stop, /reflect, then /spawn a sibling /escalation-watcher' — see the `handoff` section. NOT for: running arbitrary shell commands in a new terminal, or invoking Claude inside the current session (use a sub-agent for that)."
 ---
 
 # Spawn
@@ -8,6 +8,8 @@ description: "Spawn a new Claude Code CLI session in a new terminal window with 
 A one-shot helper that opens a new terminal window and launches an independent `claude` CLI session inside it with a given prompt. The spawn happens via a background Bash task that **blocks until the spawned session exits**, so the caller can treat the background task's completion as a reliable "session finished" signal — even on emulators (gnome-terminal, konsole, macOS Terminal) whose launcher process normally detaches immediately. The spawned session is otherwise fully independent — separate terminal, separate Claude conversation, separate tool state.
 
 Use this whenever a skill needs to hand a task off to a fresh interactive Claude — most commonly, escalation-watcher spawning `/unblock <task_id>` so a human can drive resolution in a dedicated window. When the spawner is itself a T3 Code thread the session lives in a T3 thread instead of a window — see [T3 lane](#t3-lane).
+
+**If Leo says "handoff"**, that one word is a full instruction, not a request to spawn whatever is under discussion: follow [`handoff`](#handoff--stop-reflect-then-spawn-a-sibling-escalation-watcher).
 
 ## Resolving the prompt for a fresh context
 
@@ -205,6 +207,21 @@ A session that has produced a **durable artifact** — a committed PRD, a distil
 3. Exit cleanly — do not wait for the sibling to finish.
 
 Worked example: `/prd` author mode, once the PRD is committed, may spawn `/prd decompose <path>` as a sibling and hand off rather than continuing inline (see `skills/prd/references/author-mode.md` Stage 11). The same shape applies to an investigate→fix handoff: a session that distills a root-cause and fix plan spawns the implementer as a sibling pointed at the plan, instead of implementing the fix itself in an already-long-running investigation session.
+
+## `handoff` — stop, reflect, then spawn a sibling escalation-watcher
+
+When Leo says **"handoff"** (alone, or as "then handoff", "handoff when done"), it means exactly: **when done, stop, `/reflect`, and then `/spawn` (sibling) `/escalation-watcher`.** No confirmation question; the word is the go. Steps, in this order:
+
+1. **When done.** Finish the work currently in hand — "handoff" is not an interrupt. If nothing is in progress, start at step 2 now. Work that can't finish this session (blocked, waiting on Leo) ends here too: leave it parked, and note it in step 5.
+2. **Stop.** End every loop, watcher arm and background task this session started, each through its own task id — never by process name. Leave sessions this one spawned running; they are named in step 5. If this session is itself an escalation-watcher, "stop" is that skill's full **Stopping** procedure (`skills/escalation-watcher/SKILL.md`, "Stopping": tidy, write `l2-handover.md`, release the lease, `/reflect`). The lease must be released before step 4, or the successor's `lease-claim` finds it held.
+3. **`/reflect`** — invoke it through the Skill tool. Skip it only if step 2's Stopping procedure already ran it; never run it twice.
+4. **Spawn the successor watcher as a sibling** — `CLAUDE_SPAWN_MODE=sibling`, prompt `/escalation-watcher` **verbatim**. The successor reads the predecessor's `l2-handover.md` itself, so don't enrich the prompt. Arguments:
+   - `<cwd>`: the **main** checkout root of the project this session is watching or working on, never a `.worktrees/<id>` path (the T3 lane refuses one). For dark-factory that is `/home/leo/src/dark-factory`.
+   - `<title>`: `escalation-watcher:<project_id> handoff`.
+   - Lane: leave `CLAUDE_SPAWN_BACKEND` unset from a T3 thread; from a plain terminal set `CLAUDE_SPAWN_BACKEND=tmux`, as "Launching this watcher" in the escalation-watcher skill requires.
+   - Run the Bash call in the **foreground** (sibling mode returns once the child has started). Never use `setsid` or launch it in parallel with another spawn: from T3 such a launch can die silently with no thread.
+   - Expect exit `0`. Then find the child's record (newest `<fleet_root>/sessions/*/record.json` carrying this title). On the T3 lane, check that `display.t3_thread_id` is set. A non-zero exit, or an unset thread id, means no successor is running: tell Leo the queue is unwatched. Don't retry blind.
+5. **Hand back.** If this session has a result file (`$CLAUDE_SPAWN_RESULT_FILE`, or via `self-record` on the T3 lane), write it with `outcome: handed-off` and `action_needed` naming the successor. Close with one message: the successor's link (`t3-thread://v1/<thread id>` on the T3 lane, else its record slug), the handover path and lease result if step 2 ran Stopping, and anything left parked in step 1. Then do no further work.
 
 ## When NOT to use
 
