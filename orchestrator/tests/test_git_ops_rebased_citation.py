@@ -5,14 +5,12 @@ archived record was replayed onto, read-only and never guessed
 
 from __future__ import annotations
 
-import os
-import shlex
-import shutil
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from _git_fault_shim import fail_git
 from _git_fixtures import seed_repo
 
 from orchestrator.config import GitConfig
@@ -81,30 +79,9 @@ async def _land_by_subject_only(repo: Path) -> tuple[str, str]:
     return side, on_main
 
 
-def _fail_git(monkeypatch: pytest.MonkeyPatch, where: Path, argv_prefix: str) -> None:
-    """Put a ``git`` first on PATH that exits 128 for each call whose arguments
-    start with *argv_prefix*; every other call reaches the real git.
-    ``run_git`` copies ``os.environ`` at each spawn, so GitOps sees it
-    (precedent: test_git_ops_unstack.py::_fail_git)."""
-    real_git = shutil.which('git')
-    assert real_git is not None
-    bin_dir = where / 'bin'
-    bin_dir.mkdir(parents=True)
-    shim = bin_dir / 'git'
-    shim.write_text(
-        '#!/bin/sh\n'
-        f'case "$*" in {shlex.quote(argv_prefix)}*)\n'
-        "  echo 'fatal: injected failure (test fault injection)' >&2; exit 128 ;;\n"
-        'esac\n'
-        f'exec {shlex.quote(real_git)} "$@"\n'
-    )
-    shim.chmod(0o755)
-    monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
-
-
-def _git_config() -> GitConfig:
+def _git_config(main_branch: str = 'main') -> GitConfig:
     return GitConfig(
-        main_branch='main', branch_prefix='task/', remote='origin',
+        main_branch=main_branch, branch_prefix='task/', remote='origin',
         worktree_dir='.worktrees', push_after_advance=False,
     )
 
@@ -218,22 +195,19 @@ class TestFaultsAreNeverReadAsFacts:
 
     async def test_an_unknown_main_branch_raises(self, repo):
         landed = await _land_rebased_branch(repo)
-        config = GitConfig(
-            main_branch='no-such-branch', branch_prefix='task/', remote='origin',
-            worktree_dir='.worktrees', push_after_advance=False,
-        )
+        git_ops = GitOps(_git_config(main_branch='no-such-branch'), repo)
 
         with pytest.raises(GitQueryFailed):
-            await GitOps(config, repo).resolve_rebased_citation(landed.s1)
+            await git_ops.resolve_rebased_citation(landed.s1)
 
     @pytest.mark.parametrize(
-        ('argv_prefix', 'cite'),
+        ('argv_glob', 'cite'),
         [
-            pytest.param('diff-tree', _cite_rebased_s1, id='diff-tree'),
-            pytest.param('patch-id', _cite_rebased_s1, id='patch-id'),
-            pytest.param('log -p', _cite_rebased_s1, id='log-p'),
-            pytest.param('log -1 --format=%s', _cite_rebased_s1, id='landed-subject'),
-            pytest.param('log --format=%H', _cite_subject_only_side, id='range-subjects'),
+            pytest.param('diff-tree*', _cite_rebased_s1, id='diff-tree'),
+            pytest.param('patch-id*', _cite_rebased_s1, id='patch-id'),
+            pytest.param('log -p*', _cite_rebased_s1, id='log-p'),
+            pytest.param('log -1 --format=%s*', _cite_rebased_s1, id='landed-subject'),
+            pytest.param('log --format=%H*', _cite_subject_only_side, id='range-subjects'),
         ],
     )
     async def test_a_failing_git_query_mid_lookup_raises(
@@ -242,11 +216,11 @@ class TestFaultsAreNeverReadAsFacts:
         git_ops: GitOps,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        argv_prefix: str,
+        argv_glob: str,
         cite: Callable[[Path], Awaitable[str]],
     ):
         cited = await cite(repo)
-        _fail_git(monkeypatch, tmp_path / 'shim', argv_prefix)
+        fail_git(monkeypatch, tmp_path / 'bin', argv_glob)
 
         with pytest.raises(GitQueryFailed):
             await git_ops.resolve_rebased_citation(cited)
