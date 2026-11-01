@@ -1586,22 +1586,18 @@ class EscalationQueue:
         return results
 
     def get_pending_by_task(self) -> dict[str, list[Escalation]]:
-        """Every pending escalation in the queue root, grouped by task id.
+        """``get_pending`` grouped by task id, deduplicated as ``get_by_task`` is.
 
         For any task id, ``result.get(task_id, [])`` is row for row what
         ``get_by_task(task_id, status='pending')`` returns over the same
-        listing: the root-only glob, the same scan read, and its
-        first-copy-wins dedup on ``Escalation.id`` scoped to one task. One
-        listing serves every task, which is the point: the root also holds
-        thousands of ``.lock`` and ``.seq`` sidecars, so a per-task call pays
-        for the glob each time (task 8073).
+        listing, whose first-copy-wins dedup on ``Escalation.id`` is scoped to
+        one task. One listing serves every task, which is the point: the root
+        also holds thousands of ``.lock`` and ``.seq`` sidecars, so a per-task
+        call pays for the glob each time (task 8073).
         """
         grouped: dict[str, list[Escalation]] = {}
         seen: set[tuple[str, str]] = set()
-        for path in self.queue_dir.glob('esc-*.json'):
-            esc, reason = read_escalation_for_scan(path, context='queue.get_pending_by_task')
-            if reason != 'ok' or esc is None or esc.status != 'pending':
-                continue
+        for esc in self.get_pending():
             if (esc.task_id, esc.id) in seen:
                 continue
             seen.add((esc.task_id, esc.id))

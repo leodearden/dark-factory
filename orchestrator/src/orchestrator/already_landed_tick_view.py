@@ -16,13 +16,13 @@ branch-existence gate).
 ``PendingEscalationsByTask`` is one read of the pending escalation store per
 consult, grouped by task id (task 8073). For a task id it lists exactly the rows
 ``escalation/src/escalation/queue.py::EscalationQueue.get_by_task`` returns with
-``status='pending'``, and a task id it lacks has no pending rows. It is as old as
-the consult when the gate reaches a late candidate, so the any-level
-escalation veto (task 3534) and the arbitration hold see the store as it was
-when the consult began, not when the candidate is judged. That window is at
-most one consult phase: minutes before task 7332, tens of seconds after it.
-A record filed inside the window can no longer veto that candidate's auto-done
-in this consult; a record resolved inside it holds the candidate one consult
+``status='pending'``, and a task id it lacks has no pending rows. It is up to
+one consult old when the gate judges a candidate, so the any-level escalation
+veto (task 3534) and the arbitration hold decide on the store as it was when
+the consult began. The snapshot can only over-hold: before any done-flip the
+gate re-reads that task's pending rows and abstains on any record the snapshot
+lacked, or on a failed read, so a record filed during the consult still vetoes
+the flip. A record resolved during the consult holds its task one consult
 longer.
 
 ``AlreadyLandedGate`` is the gate's call contract, the signature the
@@ -38,12 +38,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, TypeAlias
 
-from escalation.models import Escalation
-
 if TYPE_CHECKING:
+    from escalation.models import Escalation
+
     from orchestrator.git_ops import GitOps
 
-PendingEscalationsByTask: TypeAlias = Mapping[str, Sequence[Escalation]]
+PendingEscalationsByTask: TypeAlias = 'Mapping[str, Sequence[Escalation]]'
 
 
 @dataclass(frozen=True)

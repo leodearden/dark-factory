@@ -13929,7 +13929,9 @@ class Harness:
         ``get_by_task(task_id, status='pending')`` read: a task id it lacks
         has no pending rows, and ``None`` means this gate reads the store
         itself, so ``rows is None`` still arises exactly when a read failed.
-        Its staleness bound is stated in the same module.
+        Because the snapshot can be a whole consult old, every flip arm
+        re-reads the task's pending rows just before its done-write and
+        abstains on anything new (:meth:`_no_escalation_filed_since_snapshot`).
         """
         branch = f'{self.git_ops.config.branch_prefix}{task_id}'
         if task is None:
@@ -13949,6 +13951,7 @@ class Harness:
         ):
             return True
 
+        snapshot_ids: frozenset[str] | None = None
         if self._escalation_queue is not None:
             # An open escalation at ANY level (not just L1 — the resolver's
             # row (f) folds every level) is the deliberate
@@ -13960,39 +13963,41 @@ class Harness:
             # path skips claimant resolution entirely for an identical result.
             from escalation.pins import classify_pins  # noqa: PLC0415
 
-            try:
-                rows = (
-                    self._escalation_queue.get_by_task(task_id, status='pending')
-                    if pending_escalations is None
-                    else list(pending_escalations.get(task_id, ()))
-                )
-            except Exception:
-                # `classify_pins`'s store-correctness contract, obligation 2:
-                # a read that FAILED must be passed as `records=None`, never
-                # substituted with `[]` — a false "no open escalations" is
-                # exactly the esc-3163 collapse (a genuinely-pinned task
-                # routed down the act-anyway branch).  Letting it propagate
-                # instead would make the disposition invisible: the
-                # scheduler's generic `_consult_already_landed` catch-all
-                # logs a traceback and fails open for the WHOLE gate, so
-                # "never phantom-done on an unreadable store" would be
-                # incidental rather than local and testable.
-                #
-                # `except Exception` is broad on purpose: `get_by_task`
-                # already absorbs per-file JSON/type errors internally, so
-                # what reaches here is filesystem-level (OSError) or an
-                # unexpected store-implementation fault — neither of which
-                # may abort a dispatch tick.
-                logger.warning(
-                    'already-landed dispatch gate: could not READ the '
-                    'escalation store for task %s — treating as '
-                    'store_unavailable and vetoing the auto-done flip '
-                    '(never phantom-done on an unreadable store); '
-                    'dispatching normally',
-                    task_id,
-                    exc_info=True,
-                )
-                rows = None
+            if pending_escalations is not None:
+                rows = list(pending_escalations.get(task_id, ()))
+                snapshot_ids = frozenset(e.id for e in rows)
+            else:
+                try:
+                    rows = self._escalation_queue.get_by_task(
+                        task_id, status='pending',
+                    )
+                except Exception:
+                    # `classify_pins`'s store-correctness contract, obligation 2:
+                    # a read that FAILED must be passed as `records=None`, never
+                    # substituted with `[]` — a false "no open escalations" is
+                    # exactly the esc-3163 collapse (a genuinely-pinned task
+                    # routed down the act-anyway branch).  Letting it propagate
+                    # instead would make the disposition invisible: the
+                    # scheduler's generic `_consult_already_landed` catch-all
+                    # logs a traceback and fails open for the WHOLE gate, so
+                    # "never phantom-done on an unreadable store" would be
+                    # incidental rather than local and testable.
+                    #
+                    # `except Exception` is broad on purpose: `get_by_task`
+                    # already absorbs per-file JSON/type errors internally, so
+                    # what reaches here is filesystem-level (OSError) or an
+                    # unexpected store-implementation fault — neither of which
+                    # may abort a dispatch tick.
+                    logger.warning(
+                        'already-landed dispatch gate: could not READ the '
+                        'escalation store for task %s — treating as '
+                        'store_unavailable and vetoing the auto-done flip '
+                        '(never phantom-done on an unreadable store); '
+                        'dispatching normally',
+                        task_id,
+                        exc_info=True,
+                    )
+                    rows = None
 
             pinned = classify_pins(task_id, rows, live_claimant=False)
 
@@ -14152,6 +14157,8 @@ class Harness:
                 task_id, metadata, site='dispatch-gate-already-on-main',
             ) is not None:
                 return False
+            if not self._no_escalation_filed_since_snapshot(task_id, snapshot_ids):
+                return False
             await self._mark_in_progress_done(
                 task_id, verdict.evidence_sha,
                 'reconcile: pre-dispatch check found branch already on main',
@@ -14185,6 +14192,8 @@ class Harness:
                     task_id, metadata, site='dispatch-gate-marker-found',
                 ) is not None:
                     return False
+                if not self._no_escalation_filed_since_snapshot(task_id, snapshot_ids):
+                    return False
                 await self._mark_in_progress_done(
                     task_id, marker,
                     'reconcile: pre-dispatch check found merge marker on main',
@@ -14213,6 +14222,8 @@ class Harness:
                 task_id, metadata, site='dispatch-gate-content-equivalent',
             ) is not None:
                 return False
+            if not self._no_escalation_filed_since_snapshot(task_id, snapshot_ids):
+                return False
             await self._mark_in_progress_done(
                 task_id, verdict.evidence_sha,
                 'reconcile: pre-dispatch check found content-equivalent '
@@ -14222,6 +14233,42 @@ class Harness:
             return True
 
         return False
+
+    def _no_escalation_filed_since_snapshot(
+        self, task_id: str, snapshot_ids: frozenset[str] | None,
+    ) -> bool:
+        """False when the already-landed gate must abstain from a done-flip it
+        decided on a consult snapshot (task 8073).
+
+        *snapshot_ids* are the pending escalation ids the gate's veto read in
+        the consult's snapshot, or ``None`` when it read the store itself. A
+        fresh read that finds an id the snapshot lacked, or that fails, means
+        the veto decided on rows that are no longer the store's, so the gate
+        abstains and the next consult re-judges the task.
+        """
+        if snapshot_ids is None or self._escalation_queue is None:
+            return True
+        try:
+            fresh = self._escalation_queue.get_by_task(task_id, status='pending')
+        except Exception:
+            logger.warning(
+                'already-landed dispatch gate: could not re-read the escalation '
+                'store for task %s before its done-flip — abstaining (never '
+                'phantom-done on an unreadable store); dispatching normally',
+                task_id,
+                exc_info=True,
+            )
+            return False
+        filed_since = sorted({e.id for e in fresh} - snapshot_ids)
+        if filed_since:
+            logger.info(
+                'already-landed dispatch gate: task %s gained pending '
+                'escalation(s) %s since the consult snapshot — abstaining from '
+                'the done-flip; the next consult re-judges it',
+                task_id,
+                ', '.join(filed_since),
+            )
+        return not filed_since
 
     def _file_unattributed_landing_escalation(
         self, task_id: str, branch: str, verdict: LandingEvidenceVerdict,

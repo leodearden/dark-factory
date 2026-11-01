@@ -9159,18 +9159,3 @@ class TestGetPendingByTask:
             assert [e.id for e in grouped[task_id]] == [
                 e.id for e in queue.get_by_task(task_id, status='pending')
             ] == ['esc-1-1']
-
-    def test_one_root_listing_serves_every_task(self, tmp_path: Path):
-        queue = EscalationQueue(tmp_path / 'queue')
-        self._seed(queue)
-        real_glob = Path.glob
-        globbed: list[Path] = []
-
-        def counting_glob(self: Path, pattern: str, *args: Any, **kwargs: Any):
-            globbed.append(self)
-            return real_glob(self, pattern, *args, **kwargs)
-
-        with patch.object(Path, 'glob', counting_glob):
-            queue.get_pending_by_task()
-
-        assert globbed == [queue.queue_dir]

@@ -2742,7 +2742,9 @@ class TestAlreadyLandedGatePendingEscalationSnapshot:
         assert expected is expected_result
         assert result is expected_result
         assert cast(AsyncMock, from_snapshot._mark_in_progress_done).await_count == expected_marks
-        cast(MagicMock, from_snapshot._escalation_queue).get_by_task.assert_not_called()
+        assert cast(
+            MagicMock, from_snapshot._escalation_queue,
+        ).get_by_task.call_count == expected_marks, 'one fresh re-read per flip, none to veto'
         assert _disposition_trail(from_snapshot) == _disposition_trail(per_candidate)
 
     async def test_a_task_absent_from_the_snapshot_has_no_pending_rows(
@@ -2751,7 +2753,7 @@ class TestAlreadyLandedGatePendingEscalationSnapshot:
         """Absent means ``[]``, never ``None``: the store WAS read, so the
         unreadable-store veto must not fire, and nothing re-reads it."""
         h = _emitting_harness(mock_orch_config, tmp_path)
-        _matrix_store_failure(h)
+        _matrix_clean(h)
 
         result = await h._already_landed_dispatch_gate(
             '42', pending_escalations={'7': [_open_escalation('esc-7-1', level=2)]},
@@ -2759,8 +2761,55 @@ class TestAlreadyLandedGatePendingEscalationSnapshot:
 
         assert result is True
         cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
-        cast(MagicMock, h._escalation_queue).get_by_task.assert_not_called()
         assert _recovery_rows(h) == []
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_a_record_filed_after_the_snapshot_stops_every_flip_arm(
+        self, mock_orch_config, arm,
+    ) -> None:
+        h, _meta = _arm_harness(mock_orch_config, arm, metadata={})
+        h._escalation_queue = _queue_with_open(_open_escalation('esc-42-9', level=2))
+
+        with patch(_GATE_TARGET, AsyncMock(return_value=None)):
+            result = await h._already_landed_dispatch_gate('42', pending_escalations={})
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        cast(MagicMock, h._escalation_queue).get_by_task.assert_called_once_with(
+            '42', status='pending',
+        )
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_a_failed_re_read_before_the_flip_abstains(
+        self, mock_orch_config, arm, caplog,
+    ) -> None:
+        h, _meta = _arm_harness(mock_orch_config, arm, metadata={})
+        _matrix_store_failure(h)
+
+        with patch(_GATE_TARGET, AsyncMock(return_value=None)), \
+                caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            result = await h._already_landed_dispatch_gate('42', pending_escalations={})
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        assert any('could not re-read' in r.getMessage() for r in caplog.records)
+
+    async def test_a_record_resolved_after_the_snapshot_still_holds_the_flip_only_once(
+        self, mock_orch_config,
+    ) -> None:
+        """Over-holding is the snapshot's only error: the stale pin vetoes this
+        consult, and the next consult's fresh snapshot lets the task flip."""
+        h = _wired_ancestry_harness(mock_orch_config)
+        _matrix_clean(h)
+        pinned = _open_escalation('esc-42-9', level=2)
+
+        held = await h._already_landed_dispatch_gate(
+            '42', pending_escalations={'42': [pinned]},
+        )
+        flipped = await h._already_landed_dispatch_gate('42', pending_escalations={})
+
+        assert (held, flipped) == (False, True)
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
 
     async def test_the_harness_reader_groups_the_live_store_and_skips_an_unwired_one(
         self, tmp_path,
@@ -2810,3 +2859,26 @@ class TestAlreadyLandedGatePendingEscalationSnapshot:
             assert any(
                 f'could not READ the escalation store for task {tid}' in m for m in messages
             ), messages
+
+    async def test_an_undecodable_record_fails_the_snapshot_and_the_fallback_alike(
+        self, tmp_path, caplog,
+    ) -> None:
+        """A scan error outside the queue's parse tuple (here the
+        UnicodeDecodeError, a ValueError, of a non-UTF-8 record) propagates
+        from both reads, so the snapshot is ``None`` and each candidate lands
+        on store_unavailable exactly as before task 8073."""
+        queue = _CountingQueue(tmp_path / 'esc')
+        (queue.queue.queue_dir / 'esc-9-1.json').write_bytes(b'\xff\xfe not utf-8')
+        h = _consulting_harness(tmp_path, queue)
+
+        with caplog.at_level(logging.WARNING):
+            gated = await h.scheduler._consult_already_landed([{'id': '9', 'metadata': {}}])
+
+        assert gated == set()
+        assert (queue.snapshot_reads, queue.per_task_reads) == (1, 1)
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('pending escalation snapshot' in m for m in messages), messages
+        assert any(
+            'could not READ the escalation store for task 9' in m for m in messages
+        ), messages
