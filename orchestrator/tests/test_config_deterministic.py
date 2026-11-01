@@ -36,12 +36,8 @@ class TestBounds:
         assert DeterministicConfig(predicate_recheck_stall_cap=1).predicate_recheck_stall_cap == 1
 
 
+@pytest.mark.usefixtures('code_default_config')
 class TestReloadDisposition:
-    @pytest.fixture(autouse=True)
-    def _no_config_file(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-
     @pytest.mark.parametrize('leaf', list(DeterministicConfig.model_fields))
     def test_every_leaf_is_reloadable(self, leaf):
         assert f'deterministic.{leaf}' in RELOADABLE_FIELDS
