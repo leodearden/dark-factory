@@ -1726,6 +1726,7 @@ class TestBuildPerProjectMergeQueue:
         ('recent_merges', 'recent_total', 'speculative'),
         ('queue_depth_timeseries', 'depth_timeseries', 'speculative'),
         ('merge_attempts', 'attempts', 'speculative'),
+        ('train_throughput_stats', 'train_throughput', 'speculative'),
     ])
     async def test_a_raising_leg_serves_unknown_not_zeros(self, tmp_path, leg, field, sibling):
         """A leg that raises is a hole in its own field; its siblings stay measured."""
@@ -1768,7 +1769,7 @@ class TestBuildPerProjectMergeQueue:
 
         project = result['/tmp/P']
         assert project['recent'] == []
-        for field in ('speculative', 'recent_total', 'depth_timeseries', 'attempts'):
+        for field in ('speculative', 'recent_total', 'depth_timeseries', 'attempts', 'train_throughput'):
             assert project[field].state is DatumState.UNKNOWN, field
             assert 'RuntimeError: boom' in (project[field].reason or ''), field
             validate_datum(project[field], now)
@@ -2489,35 +2490,33 @@ class TestTrainThroughputStats:
     step-12: aggregator wiring.
     """
 
-    async def test_none_db_returns_all_zeros_default(self):
-        """train_throughput_stats(None) returns the all-zeros default dict."""
+    async def test_none_db_is_unknown(self):
+        """A project with no runs.db open has no throughput, not an all-zeros one."""
         from dashboard.data.merge_queue import train_throughput_stats
 
-        result = await train_throughput_stats(None)
+        now = datetime(2026, 1, 10, 12, 0, 0, tzinfo=UTC)
+        assert_unread(await train_throughput_stats(None, now=now), now, 'no runs.db is open')
 
-        assert set(result.keys()) == _TRAIN_THROUGHPUT_DEFAULT_KEYS, (
-            f"expected keys {_TRAIN_THROUGHPUT_DEFAULT_KEYS}, got: {set(result.keys())}"
-        )
-        assert result['trains_landed'] == 0
-        assert result['tasks_landed_via_trains'] == 0
-        assert result['train_verifies_per_landed_task'] == 0.0
-        assert result['baseline_solo_landed'] == 0
-        assert result['baseline_verifies_per_landed_task'] == 0.0
-        assert result['verifies_per_landed_task_delta'] == 0.0
-        assert result['train_cas_retry_rate'] == 0.0
-        assert result['baseline_cas_retry_rate'] == 0.0
-        assert result['cas_retry_rate_delta'] == 0.0
-        assert result['improved'] is False
+    async def test_a_failed_read_is_unknown(self, tableless_runs_conn):
+        """with_db swallows the OperationalError; its default must still say the read failed."""
+        from dashboard.data.merge_queue import train_throughput_stats
+
+        now = datetime(2026, 1, 10, 12, 0, 0, tzinfo=UTC)
+        assert_unread(await train_throughput_stats(tableless_runs_conn, now=now), now)
 
     async def test_empty_db_returns_all_zeros_default(self, tmp_path):
-        """train_throughput_stats(db) on an empty events table returns the all-zeros default."""
+        """A readable empty events table is a measured all-zeros window."""
         from dashboard.data.merge_queue import train_throughput_stats
 
         db_path = _make_db(tmp_path, 'empty.db', [])
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
-            result = await train_throughput_stats(conn)
+            datum = await train_throughput_stats(conn)
 
+        assert datum.state is DatumState.FRESH
+        assert datum.freshness_bound_seconds == merge_queue.RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
+        result = datum.value
+        assert result is not None
         assert set(result.keys()) == _TRAIN_THROUGHPUT_DEFAULT_KEYS
         assert result['trains_landed'] == 0
         assert result['tasks_landed_via_trains'] == 0
@@ -2587,7 +2586,7 @@ class TestTrainThroughputStats:
         db_path = _make_db(tmp_path, 'verifies.db', events)
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
-            result = await train_throughput_stats(conn, hours=24, now=now)
+            result = fresh_read(await train_throughput_stats(conn, hours=24, now=now), now)
 
         assert result['trains_landed'] == 1
         assert result['tasks_landed_via_trains'] == 2
@@ -2673,7 +2672,7 @@ class TestTrainThroughputStats:
         db_path = _make_db(tmp_path, 'cas_retry.db', events)
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
-            result = await train_throughput_stats(conn, hours=24, now=now)
+            result = fresh_read(await train_throughput_stats(conn, hours=24, now=now), now)
 
         assert result['tasks_landed_via_trains'] == 2
         assert result['baseline_solo_landed'] == 2
@@ -2703,8 +2702,8 @@ class TestAggregatorTrainThroughput:
     - populated with a train_merged row: trains_landed=1, tasks_landed=2
     """
 
-    async def test_none_db_includes_train_throughput_zeros(self):
-        """db=None project includes train_throughput with all-zeros default."""
+    async def test_none_db_train_throughput_is_unknown(self):
+        """A db=None project's train_throughput is an unknown Datum, not all-zeros."""
         from datetime import UTC, datetime
 
         from dashboard.data.merge_queue import build_per_project_merge_queue
@@ -2719,10 +2718,7 @@ class TestAggregatorTrainThroughput:
         assert 'train_throughput' in result['/tmp/proj-none'], (
             "expected 'train_throughput' key in per-project result (got None-db path)"
         )
-        tt = result['/tmp/proj-none']['train_throughput']
-        assert tt['trains_landed'] == 0
-        assert tt['tasks_landed_via_trains'] == 0
-        assert tt['improved'] is False
+        assert_unread(result['/tmp/proj-none']['train_throughput'], now, 'no runs.db is open')
 
     async def test_populated_db_includes_train_throughput(self, tmp_path):
         """DB with a train_merged row → train_throughput has trains_landed=1."""
@@ -2753,7 +2749,7 @@ class TestAggregatorTrainThroughput:
         assert 'train_throughput' in result['/tmp/proj-train'], (
             "expected 'train_throughput' key in per-project result"
         )
-        tt = result['/tmp/proj-train']['train_throughput']
+        tt = fresh_read(result['/tmp/proj-train']['train_throughput'], now)
         assert tt['trains_landed'] == 1
         assert tt['tasks_landed_via_trains'] == 2
 
