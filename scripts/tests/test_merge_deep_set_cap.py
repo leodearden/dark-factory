@@ -84,6 +84,21 @@ def _run(server, config, cap, *, env, script=SCRIPT):
     )
 
 
+def _run_merged(server, config, cap, *, env):
+    """`_run` with stderr folded into stdout, as the deterministic runner reads
+    a deploy (orchestrator/src/orchestrator/deterministic_runner.py)."""
+    return subprocess.run(
+        ["bash", str(SCRIPT), cap, str(config), str(server.port)],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120,
+    )
+
+
+def _assert_prose_then_verdict(merged):
+    """The merged stream carries the script's prose, and its verdict is last."""
+    *before, _ = [line for line in merged.stdout.splitlines() if line.strip()]
+    assert any(line.startswith("merge-deep-set-cap: ") for line in before), merged.stdout
+
+
 def _seeded(tmp_path, seed="block_present"):
     """A committed temp repo carrying SEEDS[*seed*]. Returns the yaml path."""
     return commit_config(init_repo(tmp_path), SEEDS[seed])
@@ -197,6 +212,7 @@ def test_a_request_still_live_at_the_ceiling_is_cancelled_and_not_reloaded(tmp_p
 
     assert failure_tag(proc) == "timed_out"
     assert outcome_verdict_lines(proc) == []
+    assert any(f"still {live}" in proc.stderr for live in ("queued", "verifying")), proc.stderr
     assert queue.calls_to("merge_cancel") == [{"request_id": queue.request_id}]
     assert "reload_config" not in tools, tools
     assert head(repo) == before
@@ -289,6 +305,30 @@ def test_a_cap_with_a_leading_zero_is_refused_before_anything_lands(tmp_path, de
     assert config.read_text() == SEEDS["block_present"]
     assert received == [], f"a refused cap reached the server: {received}"
     _assert_left_nothing_behind(repo, deploy_env)
+
+
+def test_a_refusal_ends_the_merged_stream_with_its_verdict(tmp_path, deploy_env):
+    """The runner reads one merged stream, so bash `die` writes its prose
+    before its verdict: the other order ends that stream with prose."""
+    config = _seeded(tmp_path)
+
+    merged = _run_merged(types.SimpleNamespace(port=1), config, "06", env=deploy_env)
+
+    _assert_prose_then_verdict(merged)
+    assert failure_tag(merged) == "invalid_cap"
+
+
+def test_a_landing_failure_ends_the_merged_stream_with_its_verdict(tmp_path, deploy_env):
+    """Step 3's `fail()` keeps the same order, and the teardown after it adds
+    nothing to the stream."""
+    config = _seeded(tmp_path)
+    queue = FakeMergeQueue(config.parent, states=[{"state": "blocked", "reason": "verify failed"}])
+
+    with _target(queue, reload_report(config_path=str(config), applied=APPLIED_6)) as server:
+        merged = _run_merged(server, config, "6", env=deploy_env)
+
+    _assert_prose_then_verdict(merged)
+    assert failure_tag(merged) == "not_landed"
 
 
 @pytest.mark.parametrize("bad_port", ["0", "65536", "99999"])
