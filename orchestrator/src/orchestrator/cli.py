@@ -1577,10 +1577,10 @@ def _run_single_eval(
     """
     from orchestrator.evals.configs import EVAL_CONFIGS, get_config_by_name
     from orchestrator.evals.eval_gate import campaign_usage_gate
+    from orchestrator.evals.measurement import format_invocation_errors
     from orchestrator.evals.metrics import RoleUnderTest
     from orchestrator.evals.report import (
         build_plan_quality_report,
-        format_invocation_errors,
         format_plan_quality_table,
     )
     from orchestrator.evals.runner import run_architect_eval, run_eval

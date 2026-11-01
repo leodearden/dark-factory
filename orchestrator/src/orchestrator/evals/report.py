@@ -19,7 +19,7 @@ from .cell_admission import (
     plan_quality_score,
     plan_rate,
 )
-from .measurement import UnmeasuredCause
+from .measurement import UnmeasuredCause, format_invocation_errors
 from .metrics import (
     DECLINE_KINDS,
     RoleUnderTest,
@@ -34,7 +34,6 @@ from .table_render import ci_cell, optional_float_cell, render_fixed_table
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
-    from .measurement import UnmeasuredRecord
     from .results import EvalResult
 
 
@@ -866,15 +865,6 @@ _PLAN_QUALITY_MEAN_COLUMNS = (
 # stays cause-neutral rather than asserting a cap.
 _CAP_EXCLUDED_CELL = 'excluded'
 _PLAN_QUALITY_MEAN_HEADER = 'plan_quality by config:'
-
-
-def format_invocation_errors(
-    records: Sequence[UnmeasuredRecord] | None,
-) -> str | None:
-    """*records* on one line as ``stage:cause: reason``, ``'; '``-joined; ``None`` if none."""
-    if not records:
-        return None
-    return '; '.join(f"{r['stage']}:{r['cause']}: {r['reason']}" for r in records)
 
 
 def _exclusion_cause(row: dict[str, Any]) -> UnmeasuredCause:
