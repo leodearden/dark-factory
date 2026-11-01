@@ -244,7 +244,7 @@ which was chosen** rather than picking one. Performing reverts is out of scope (
 3. **γ — the disposition gate**, at merge *submission* time: a done step that β let
    drop with `disposition: orphan` or `revert` must not land on main. γ refuses a
    branch that still carries an `orphan` commit (by sha or by patch-equivalent), or
-   that carries a `revert` commit with no later commit touching its paths. Commits
+   that carries a `revert` commit none of whose paths was restored. Commits
    that no plan step owns are not refused (D14).
 4. **δ — write-boundary advisory + event** in fused-memory, so an amendment to a
    planned task says so at the moment it is written.
@@ -340,11 +340,14 @@ re-pending. That is a pre-existing owned-and-bounded hold with a storm escape, s
 reuses it rather than adding a second failure path (INV-4, INV-5, INV-7 all
 satisfied by reuse). **γ is different (amended 2026-11-01, D14).** γ refuses in the
 *merge* phase, where the no-plan path's key (the main SHA) and its exit owner (the
-architect) do not apply. It routes through the merge phase's own bounded ledger
-instead: `retry_ledger.consecutive_merge_thrash` / `last_merge_outcome_signature`
-(`shared/src/shared/task_metadata.py`, bound `max_consecutive_merge_thrash`). Its exit
-owner is whoever drops, reverts or truthfully re-records the commit — the in-place
-remedy first, then the steward, then a human at the bound.
+architect) do not apply. It refuses exactly as the sibling plan-files gate does, via
+`TaskWorkflow._mark_blocked(..., merge_phase=True)`, with a deterministic reason
+(sha, step and disposition only, so the outcome signature is stable). The merge-phase
+loop's existing bounds then hold it: `TaskWorkflow._check_merge_outcome_thrash`
+(`retry_ledger.consecutive_merge_thrash`, bound `max_consecutive_merge_thrash`) and
+`max_merge_retries`. γ never writes that ledger itself. Its exit owner is whoever
+drops, reverts or truthfully re-records the commit — the in-place remedy first, then
+the steward, then a human at the bound.
 
 **D14 — γ checks that descope dispositions are true; it does not check commit
 ownership** (Leo, 2026-11-01, ruling on esc-4033-2, option D3). The original C6
@@ -419,7 +422,7 @@ splitting rather than by sequencing, removing the block instead of inheriting it
 |---|---|---|---|---|
 | **α** | Task-text fingerprint gates plan-revalidation skip | `shared/`, `orchestrator/` | Amend a planned task's `description`; redispatch; the dispatch takes the **architect revalidation** path (event `plan_revalidated`) instead of emitting `phase_skipped{reason:'revalidation_skipped_no_overlap'}`, and the resulting briefing contains the amended text | — |
 | **β** | Done-step integrity + sanctioned descope on the revalidation path | `orchestrator/` | A revalidation that drops a done step **without** a recorded disposition is refused with a structured reason; one that records `disposition` proceeds and the plan retains `_rescoped_at`/`_rescoped_by`/`_rescoped_note` + the dropped `(step_id, commit)`; a plan with duplicate done-step SHAs is refused | **3651**, α |
-| **γ** | Disposition gate at submission: no `orphan`/`revert`-descoped commit lands (D14) | `orchestrator/` | Submitting a merge for a branch that still carries a commit recorded `disposition: orphan`, or a `revert` commit with no later commit touching its paths, is refused **at `_submit_to_merge_queue`** (before enqueue), with the sha, step and disposition in the reason. A branch whose only unexplained commits are unowned (`amend:`, gate fixes) submits normally | β |
+| **γ** | Disposition gate at submission: no `orphan`/`revert`-descoped commit lands (D14) | `orchestrator/` | Submitting a merge for a branch that still carries a commit recorded `disposition: orphan`, or a `revert` commit none of whose paths was restored, is refused **at `_submit_to_merge_queue`** (before enqueue), with the sha, step and disposition in the reason. A branch whose only unexplained commits are unowned (`amend:`, gate fixes) submits normally | β |
 | **δ** | Write-boundary amendment advisory + event | `fused-memory/`, `shared/` | `update_task` changing `description`/`details` on a task whose `metadata.plan_text_fp` disagrees returns `amendment_advisory` in its result, and emits a structured `task_text_amended` event carrying the writer source | α |
 | **ε** | Curator combine: execution-time predicate matches selection | `fused-memory/` | A combine whose live target is `in-progress` (or holds a claimant) is refused and the candidate is filed as its own task; `data/combine_audit.jsonl` records the refusal | — |
 | **ζ** | One-off plan-fingerprint migration sweep | `scripts/` | Every live plan under `.worktrees/.task-meta/*/plan.json` carries `_task_text_fp`; plans whose text has moved carry the forcing sentinel; the script reports counts per class — **re-derived at run time, not hard-coded at 27** (G6 relaxation at decompose: 27 is an authoring-time measurement, so asserting it as a signal would bake in a stale number; retained only as a sanity band — cf. open question 3 and INV-3) | α |
@@ -566,17 +569,20 @@ the sibling gate.
 ```
 base     := merge-base(main, branch_head)     -- NOT the workflow's _base_commit,
                                                --   which a rebase leaves stale
-RANGE    := the commits of base..branch_head   -- one `git log`, computed once
-PIDS     := the patch-id multiset of RANGE     -- one `git log -p | git patch-id
+RANGE    := the commits of base..branch_head, --topo-order, computed once
+PIDS     := map patch-id → [shas in RANGE]     -- one `git log -p | git patch-id
                                                --   --stable`, duplicates KEPT
 CHECKED  := { e ∈ plan['_descoped_steps'] : e.disposition ∈ {orphan, revert} }
-LANDS(e) := some s ∈ RANGE with commits_match(e.commit, s)
-            OR pid(e.commit) ∈ PIDS
-TOUCHED_AFTER(e) := some commit in RANGE, after the one LANDS found, modifies
-            at least one path e.commit modified
+MATCHES(e) := { s ∈ RANGE : commits_match(e.commit, s) ∨ pid(s) = pid(e.commit) }
+LANDS(e) := MATCHES(e) ≠ ∅
+m(e)     := the last of MATCHES(e) in RANGE's --topo-order
+RESTORED(e) := for at least one path p that m(e) changed,
+               blob(branch_head, p) = blob(m(e)^, p)   -- absent = absent;
+               paths from `git diff-tree -r --no-commit-id --name-only
+               --no-renames m(e)`, so both sides of a rename count
 γ PASSES iff for every e ∈ CHECKED:
             orphan:  ¬LANDS(e)
-            revert:  ¬LANDS(e)  ∨  TOUCHED_AFTER(e)
+            revert:  ¬LANDS(e)  ∨  RESTORED(e)
 ```
 
 Each rule, and why it has that shape:
@@ -586,11 +592,13 @@ Each rule, and why it has that shape:
   patch-equivalent in the task's merged range.
 - **`revert`** is checked only for being *performed*, not for exact content. The
   dropped step can be a fraction of its commit. The corpus's one `revert` precedent
-  (3225/3507, §2.8) restores two of `a7e3bee902`'s four files on purpose, by hand,
-  with no `This reverts commit` line, and is no inverse patch. So no mechanical
-  content test can tell a correct partial revert from an incomplete one. γ catches a
-  `revert` that was recorded but never done, and the reviewer, who sees the full
-  diff, judges the rest.
+  (3225/3507, §2.8) restores part of `a7e3bee902` by hand, with no `This reverts
+  commit` line, and is no inverse patch. Its census JSON is back to the pre-X blob
+  byte for byte (`b13bce0b51`), while the script, the test and the `.md` are not. So
+  RESTORED asks only that at least one of X's paths is back to its pre-X content.
+  That passes the precedent. It refuses a `revert` recorded with no file actually
+  restored, even when later kept work edited X's files. Whether the *right* subset
+  was restored is the reviewer's judgement, made from the full diff.
 - **`ride-along`** says the commit does land, so γ never checks it. A commit that no
   plan step owns and no disposition names is **never** refused (D14).
 - **Sha matching** goes through `plan_descope.commits_match`, because a recorded sha
@@ -610,7 +618,8 @@ Known residuals, accepted:
   unseen, because its patch-id cannot be computed. This is unlikely within one task's
   lifetime, since the reflog keeps it alive. γ counts every unresolvable `CHECKED`
   entry so the rate is visible.
-- A `revert` that was performed and then re-applied passes.
+- A `revert` that restored one path of X but left the descoped change in another
+  passes, and so does a revert that was performed and then re-applied.
 
 Fail-open on git error — but **with a streak counter, not bare** (G7 redesign at
 decompose, INV-4 `storm-escape-required`; see task 4033). The sibling gates' documented
@@ -674,8 +683,8 @@ measured 20.2% rate an operator needs a counter, not just a log line.
 | 8 | Recorded descope proceeds (2971 replay) | dropped step recorded with `disposition: orphan` + authority | accepted; plan retains `_rescoped_*` and `_descoped_steps` |
 | 9 | Phantom-done wipe proceeds (3143 replay) | 19 done steps dropped, all recorded, SHAs unresolvable | accepted — unresolvable is expected, not a failure |
 | 10 | Duplicate done SHAs refused | two done steps share a commit | refused (closes the sha-duplication hole) |
-| 11 | A descope that is not honoured is refused | (a) plan records `(step-1, X)` with `disposition: orphan`, and the branch carries X or a rebased patch-equivalent of it; (b) X recorded `disposition: revert`, present, and no later branch commit touches any of X's paths | `_submit_to_merge_queue` refuses **before** enqueue in both cases; the reason names X, step-1 and the disposition |
-| 12 | Honoured dispositions and unowned commits proceed | (a) the same record with X absent from the branch; (b) X recorded `disposition: revert`, present, followed by a partial hand revert touching one of X's paths (the 3225/3507 shape); (c) X present but recorded `ride-along`; (d) unowned `amend:` commits and no `_descoped_steps`; (e) a branch rebased onto a main that carries a patch-equivalent of an orphaned X, X itself absent from `merge-base..head` | submission proceeds in all five |
+| 11 | A descope that is not honoured is refused | (a) plan records `(step-1, X)` with `disposition: orphan`, and the branch carries X or a rebased patch-equivalent of it; (b) X recorded `disposition: revert`, present, and none of X's paths restored; (c) as (b), but a later kept step edits one of X's files without restoring it | `_submit_to_merge_queue` refuses **before** enqueue in both cases; the reason names X, step-1 and the disposition |
+| 12 | Honoured dispositions and unowned commits proceed | (a) the same record with X absent from the branch; (b) X recorded `disposition: revert`, present, followed by a partial hand revert restoring one of X's paths to its pre-X blob (the 3225/3507 replay: `a7e3bee902` / `934ce79426`); (c) X present but recorded `ride-along`; (d) unowned `amend:` commits and no `_descoped_steps`; (e) a branch rebased onto a main that carries a patch-equivalent of an orphaned X, X itself absent from `merge-base..head` | submission proceeds in all five |
 | 13 | fused-memory advisory returned | `update_task(description=…)` on a task whose `metadata.plan_text_fp` disagrees | result carries `amendment_advisory`; `task_text_amended` event emitted |
 | 14 | δ does no filesystem/git I/O | advisory path exercised under load | no filesystem or git call on the fused-memory loop thread (INV-8; D10) |
 | 15 | Combine into `in-progress` refused (2951 replay) | live target `in-progress` at execution; snapshot said `pending` | combine aborts; candidate filed as its own task; refusal recorded in the combine audit |
