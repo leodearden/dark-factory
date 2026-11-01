@@ -1696,6 +1696,10 @@ class ConflictProbe(NamedTuple):
     conflicted_paths: list[str]
 
 
+class GitQueryFailed(RuntimeError):
+    """A read-only git lookup could not answer, as distinct from answering "none"."""
+
+
 class WorktreeMissing(FileNotFoundError):
     """Raised when a subprocess cannot start because its ``cwd`` does not exist.
 
@@ -9346,28 +9350,29 @@ class GitOps:
         except ValueError:
             return True
 
-    async def head_if_no_commits_beyond(
-        self, worktree: Path, base_ref: str,
+    async def branch_tip_if_no_commits_beyond(
+        self, full_branch: str, base_ref: str,
     ) -> str | None:
-        """Return *worktree*'s HEAD sha iff HEAD carries zero commits beyond *base_ref*.
+        """Return the tip of ``refs/heads/<full_branch>`` iff it has no commit outside *base_ref*.
 
-        "Zero commits beyond" is ``git rev-list --count <base_ref>..HEAD == 0``:
-        the branch checked out in *worktree* holds no work of its own over
-        *base_ref*, so its tip is itself a valid ``branch_base_sha``
-        (``merge_lane/landing_evidence.py::branch_is_degenerate``).
+        ``git rev-list --count <base_ref>..<tip> == 0``, i.e. the tip is
+        reachable from *base_ref*: the branch holds no work of its own. The REF
+        is measured, not a worktree's HEAD, because the ref is what
+        ``merge_lane/landing_evidence.py::branch_is_degenerate`` reads; a HEAD
+        left detached by a failed rebase says nothing about it.
 
         **Fail-safe ``None``** on any git error or unparseable output, the same
         direction as :meth:`_branch_has_commits_beyond_main`'s ``True``: a
         caller may only treat a branch as empty when git proved it.
         """
-        rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
-        head = out.strip()
-        if rc != 0 or not head:
+        tip = await self.resolve_branch_sha(full_branch)
+        if not tip:
             return None
+        tip = tip.strip()
         rc, out, _ = await _run(
-            ['git', 'rev-list', '--count', f'{base_ref}..{head}'], cwd=worktree,
+            ['git', 'rev-list', '--count', f'{base_ref}..{tip}'], cwd=self.project_root,
         )
-        return head if rc == 0 and out.strip() == '0' else None
+        return tip if rc == 0 and out.strip() == '0' else None
 
     async def _orphan_has_commits(self, full_branch: str) -> bool:
         """Whether *full_branch* exists AND carries commits beyond main.
@@ -9871,7 +9876,19 @@ class GitOps:
         body-quoting commit hide the real marker — the same accepted tradeoff
         as :meth:`find_task_citation_commit`.
         """
-        rc, out, _ = await _run(
+        try:
+            return await self.find_merge_marker_checked(branch)
+        except GitQueryFailed:
+            return None
+
+    async def find_merge_marker_checked(self, branch: str) -> str | None:
+        """:meth:`_scan_merge_marker`, but a git failure raises :class:`GitQueryFailed`.
+
+        For a caller that must tell "main has no marker for *branch*" from
+        "main's history could not be read", e.g. one that writes on a miss.
+        Always scans (never the index) and never gates on the branch ref.
+        """
+        rc, out, err = await _run(
             [
                 'git', 'log', self.config.main_branch,
                 '--fixed-strings', f'--grep={branch}',
@@ -9880,7 +9897,7 @@ class GitOps:
             cwd=self.project_root,
         )
         if rc != 0:
-            return None
+            raise GitQueryFailed(f'merge-marker scan for {branch} failed (rc={rc}): {err.strip()}')
         return _merge_markers_by_branch(out, self.config.main_branch).get(branch)
 
     async def _build_merge_marker_index(self) -> dict[str, str] | None:
@@ -9942,6 +9959,9 @@ class GitOps:
     ) -> str | None:
         """Search main's history for a commit whose SUBJECT cites *tid*.
 
+        The fail-safe face of :meth:`find_task_citation_commit_checked`: a git
+        failure or an uncompilable override reads as no citation.
+
         Used by the reconciler to gate the ``is_ancestor==True`` fast-path:
         ``is_ancestor`` returns True trivially for zero-commit branches
         whose tip equals the main HEAD at branch-create time, which
@@ -9993,6 +10013,23 @@ class GitOps:
             cites the task, the pattern is disabled, or an override
             pattern fails to compile as a Python ``re``.
         """
+        try:
+            return await self.find_task_citation_commit_checked(
+                tid, pattern_template=pattern_template,
+            )
+        except GitQueryFailed:
+            return None
+
+    async def find_task_citation_commit_checked(
+        self, tid: str, *, pattern_template: str | None = None,
+    ) -> str | None:
+        """:meth:`find_task_citation_commit`, but a failed lookup raises :class:`GitQueryFailed`.
+
+        Raises on a git failure or an override that is not a valid Python
+        ``re``; a disabled pattern (``''``) still answers None. For a caller
+        that writes on a miss and so must not read "could not look" as "no
+        citation".
+        """
         template = (
             pattern_template
             if pattern_template is not None
@@ -10003,15 +10040,15 @@ class GitOps:
         pattern_str = template.format(tid=re.escape(tid))
         try:
             compiled = re.compile(pattern_str)
-        except re.error:
+        except re.error as exc:
             logger.warning(
                 'find_task_citation_commit: pattern_template is not a '
                 'valid Python re pattern (tid=%s); treating as '
                 'no-citation (fail-safe): %r',
                 tid, pattern_str,
             )
-            return None
-        rc, out, _ = await _run(
+            raise GitQueryFailed(f'citation pattern does not compile: {pattern_str!r}') from exc
+        rc, out, err = await _run(
             [
                 'git', 'log', self.config.main_branch,
                 '--extended-regexp',
@@ -10021,7 +10058,9 @@ class GitOps:
             ],
             cwd=self.project_root,
         )
-        if rc != 0 or not out:
+        if rc != 0:
+            raise GitQueryFailed(f'citation walk for {tid} failed (rc={rc}): {err.strip()}')
+        if not out:
             return None
         for record in out.split('\0'):
             if not record:

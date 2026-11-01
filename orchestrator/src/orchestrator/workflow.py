@@ -1431,6 +1431,10 @@ class TaskWorkflow:
         # can diff base..merge_sha and write the actually-changed paths instead
         # of the architect's plan.files (which the merge may have squashed).
         self._base_commit: str | None = None
+        recorded_base = (self.task.get('metadata') or {}).get('branch_base_sha')
+        self._recorded_branch_base: str | None = (
+            recorded_base if isinstance(recorded_base, str) else None
+        )
         self._merge_sha: str | None = None  # merge commit SHA set by _submit_to_merge_queue on success
         # Set exclusively by _finalise_recovery_done — 'journal' (MergeProvenance
         # hit) or 'fallback' (_has_prior_implementation heuristic).  Stays None
@@ -2674,36 +2678,40 @@ class TaskWorkflow:
             },
         )
 
-    async def _restamp_branch_base_if_no_own_commits(self, base_ref: str) -> bool:
+    async def _restamp_branch_base_if_no_own_commits(self) -> bool:
         """Re-stamp ``branch_base_sha`` to the tip when the branch holds no work of its own.
 
         Invariant (task 7332): ``branch_base_sha`` is the tip the branch had
-        when it last carried zero commits of its own, so
-        ``git rev-list --count <base>..<tip> == 0`` exactly when the branch is
-        degenerate (``merge_lane/landing_evidence.py::branch_is_degenerate``).
-        A branch with commits of its own never has its base moved: that would
-        hide its work from the already-landed checks.
+        when it last carried no commit of its own, so a branch with no work
+        reads as degenerate (tip == base,
+        ``merge_lane/landing_evidence.py::branch_is_degenerate``) however often
+        the orchestrator has moved it. A branch with commits of its own never
+        has its base moved: that would hide its work from the already-landed
+        checks.
 
-        Call after anything this workflow does that can move its branch's tip
-        (creation, reuse, warm-lane seed, rebase).  *base_ref* is what "its
-        own" is measured against: the fork point ``create_worktree`` returned,
-        or main after a rebase onto main.  Returns whether the branch had no
-        own commits.  Never raises: an unreadable branch counts as having
-        commits, so nothing is moved.
+        "Its own" is measured on ``refs/heads/task/<id>`` against main: no own
+        commit means the tip is reachable from main. Call after anything this
+        workflow does that moves the branch (dispatch, a successful rebase).
+        Returns whether the branch has no own commits, i.e. whether its
+        recorded base is now its tip. Never raises: an unreadable branch counts
+        as having commits, so nothing is moved.
         """
-        assert self.worktree is not None
+        full_branch = f'{self.git_ops.config.branch_prefix}{self.task_id}'
         try:
-            tip = await self.git_ops.head_if_no_commits_beyond(self.worktree, base_ref)
+            tip = await self.git_ops.branch_tip_if_no_commits_beyond(
+                full_branch, self.git_ops.config.main_branch,
+            )
         except Exception:
             logger.warning(
-                'Task %s: could not tell whether the branch has commits beyond '
-                '%s; branch_base_sha left as recorded',
-                self.task_id, base_ref, exc_info=True,
+                'Task %s: could not tell whether %s has commits of its own; '
+                'branch_base_sha left as recorded',
+                self.task_id, full_branch, exc_info=True,
             )
             return False
         if tip is None:
             return False
-        await self._write_branch_base_sha(tip, overwrite=True)
+        if tip != self._recorded_branch_base:
+            await self._write_branch_base_sha(tip, overwrite=True)
         return True
 
     async def _write_branch_base_sha(self, sha: str, *, overwrite: bool) -> None:
@@ -2733,6 +2741,8 @@ class TaskWorkflow:
                 'reconciler will fall back to citation-grep guard',
                 self.task_id, sha,
             )
+        elif overwrite:
+            self._recorded_branch_base = sha
 
     async def _setup_worktree_and_artifacts(self, branch_name: str) -> None:
         """Set in-progress, create/inspect the worktree, init artifacts, scrub .task/.
@@ -2817,11 +2827,12 @@ class TaskWorkflow:
             # Soft-fail: log and fall through rather than raising, so a
             # misconfigured eval-mode worktree degrades gracefully to
             # citation-grep alone instead of crashing setup.
-            # NOTE: unlike the update_task soft-fail below (which keeps a valid
-            # SHA in memory because only the metadata write failed), this path
-            # has no SHA to record — _base_commit is left None so consumers
-            # gating on `is not None` (e.g. the merge-queue plan-files-touched
-            # check at line 3062) skip cleanly instead of receiving an empty-SHA.
+            # NOTE: unlike a failed branch_base_sha write (_write_branch_base_sha,
+            # which keeps a valid SHA in memory because only the metadata write
+            # failed), this path has no SHA to record — _base_commit is left
+            # None so consumers gating on `is not None` (e.g. the plan-files-
+            # touched check in _submit_to_merge_queue) skip cleanly instead of
+            # receiving an empty SHA.
             if proc.returncode != 0:
                 logger.warning(
                     'Task %s: git rev-parse HEAD failed in external worktree '
@@ -2833,8 +2844,10 @@ class TaskWorkflow:
             else:
                 base_commit = stdout.decode().strip()
         self._base_commit = base_commit
-        if base_commit and not await self._restamp_branch_base_if_no_own_commits(
-            base_commit,
+        # An eval worktree is not a task branch the orchestrator moved: seed only.
+        if base_commit and (
+            self._worktree_external
+            or not await self._restamp_branch_base_if_no_own_commits()
         ):
             await self._write_branch_base_sha(base_commit, overwrite=False)
         # Colocate the per-task Claude config dir inside the worktree so
@@ -4032,7 +4045,7 @@ class TaskWorkflow:
             main_before = await self.git_ops.get_main_sha()
             if not await self.git_ops.rebase_onto_main(self.worktree):
                 return False  # true conflict — queue will detect it
-            await self._restamp_branch_base_if_no_own_commits(self.git_ops.config.main_branch)
+            await self._restamp_branch_base_if_no_own_commits()
             if (
                 self.config.pre_merge_reverify
                 and not await self._post_rebase_reverify_passed()
@@ -7461,7 +7474,7 @@ class TaskWorkflow:
             new_main_sha = await self.git_ops.get_main_sha()
             if rebased:
                 self.artifacts.update_base_commit(new_main_sha)
-                await self._restamp_branch_base_if_no_own_commits(self.git_ops.config.main_branch)
+                await self._restamp_branch_base_if_no_own_commits()
             else:
                 logger.warning(
                     'Task %s: rebase onto main failed during blocking-dep '
@@ -10573,7 +10586,7 @@ class TaskWorkflow:
             return None
 
         self.artifacts.update_base_commit(current_main)
-        await self._restamp_branch_base_if_no_own_commits(self.git_ops.config.main_branch)
+        await self._restamp_branch_base_if_no_own_commits()
 
         # Re-derive any plan step whose status regressed to (or never
         # advanced past) "pending" even though it's genuinely complete on
@@ -12960,8 +12973,8 @@ class TaskWorkflow:
         )
 
         # Rebase onto current main so MERGER works on up-to-date state
-        await self.git_ops.rebase_onto_main(self.worktree)
-        await self._restamp_branch_base_if_no_own_commits(self.git_ops.config.main_branch)
+        if await self.git_ops.rebase_onto_main(self.worktree):
+            await self._restamp_branch_base_if_no_own_commits()
         # I-FRESH: never consume a stale verdict from a prior invocation on
         # this same worktree (mirrors steward.py's pre-triage clear).
         self.artifacts.clear_verdict('merger')
