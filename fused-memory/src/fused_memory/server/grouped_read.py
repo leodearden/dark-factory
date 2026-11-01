@@ -88,6 +88,22 @@ _DIGEST_ELLIPSIS = '…'
 #: the search and get_memory_by_id tools pass the live value.
 _DEFAULT_CONTESTED_TEXT_CHARS: int = WriteTriageConfig.model_fields['judge_field_chars'].default
 
+
+def _require_positive_text_cap(contested_text_chars: object) -> None:
+    """Reject a bad cap at the entry point, ahead of any fault containment.
+
+    Inside the child reads a bad cap would be reported as ``children_unavailable``
+    — a caller's error mistaken for a backend fault.
+    """
+    if (
+        not isinstance(contested_text_chars, int)
+        or isinstance(contested_text_chars, bool)
+        or contested_text_chars <= 0
+    ):
+        raise ValueError(
+            f'contested_text_chars must be a positive int, got {contested_text_chars!r}'
+        )
+
 #: Max digests listed for one canonical.  A wider fan-out is reported by the
 #: EXACT count plus a ``truncated`` marker rather than by a longer list.
 _AMENDMENT_DIGEST_CAP = 10
@@ -323,8 +339,10 @@ async def build_grouped_document(
     exactly so this distinction survives; collapsing it here would tell an
     operator a canonical has no children because a backend timed out.  Nothing
     partial is returned alongside the marker, so no consumer can read half a
-    grouping as a whole one.
+    grouping as a whole one.  A bad *contested_text_chars* is the caller's
+    error, not a read fault, so it raises ``ValueError`` instead.
     """
+    _require_positive_text_cap(contested_text_chars)
     try:
         return await _read_grouped_document(
             service, project_id, canonical_id, contested_text_chars,
@@ -688,6 +706,7 @@ async def group_search_results(
         own warning) — this function returns a plain ``list``.  Read those
         attributes BEFORE calling it.
     """
+    _require_positive_text_cap(contested_text_chars)
     hits = list(results)
     # NON-EMPTY is part of "usable id" everywhere in this module: mem0 hits are
     # built with ``id=item.get('id', '')``, so '' is reachable, and it is not an
@@ -858,6 +877,7 @@ async def group_memory_document(
     satisfy D6 — a child's content is never unreachable — one by keeping the
     child, the other by surfacing the group.
     """
+    _require_positive_text_cap(contested_text_chars)
     parent_id = _parent_id_in_meta(record.get('metadata'))
     if parent_id is None:
         return await build_grouped_document(

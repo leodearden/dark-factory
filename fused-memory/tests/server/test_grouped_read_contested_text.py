@@ -194,6 +194,45 @@ class TestTheGroupedEntryPointsForwardTheCap:
         assert entry['content'] == _cut_at(50)
 
 
+_ENTRY_POINTS = [
+    pytest.param(
+        lambda service, cap: build_grouped_document(
+            service, PROJECT_ID, P, contested_text_chars=cap,
+        ),
+        id='build_grouped_document',
+    ),
+    pytest.param(
+        lambda service, cap: group_search_results(
+            service, PROJECT_ID, [_parent_hit()], contested_text_chars=cap,
+        ),
+        id='group_search_results',
+    ),
+    pytest.param(
+        lambda service, cap: group_memory_document(
+            service, PROJECT_ID, PLAIN_ID, _PLAIN_RECORD, contested_text_chars=cap,
+        ),
+        id='group_memory_document',
+    ),
+]
+
+
+class TestABadCapIsTheCallersErrorNotABackendFault:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('read', _ENTRY_POINTS)
+    @pytest.mark.parametrize('cap', [0, -1, True, 50.0])
+    async def test_it_is_rejected_by_name_before_any_child_read(
+        self, read: Any, cap: Any,
+    ) -> None:
+        service = _service([_PLAIN_ROW, _contesting_row()], {P: _PARENT_RECORD})
+
+        with pytest.raises(ValueError, match=rf'contested_text_chars.*{cap!r}'):
+            await read(service, cap)
+
+        service.count_memories_by_metadata.assert_not_awaited()
+        service.get_memories_by_metadata.assert_not_awaited()
+        service.get_memory_by_id.assert_not_awaited()
+
+
 def _tool_service(judge_field_chars: int) -> AsyncMock:
     """A parent-only search corpus whose live config names *judge_field_chars*."""
     service = _service([_PLAIN_ROW, _contesting_row()], {P: _PARENT_RECORD})
