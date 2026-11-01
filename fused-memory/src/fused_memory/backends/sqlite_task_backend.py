@@ -33,6 +33,7 @@ from shared.defects import (
     DeclareEvent,
     OutcomeEvent,
 )
+from shared.elision import elide_at_word
 from shared.project_id import normalize_project_id
 from shared.project_layout import tasks_db
 from shared.sqlite_column_migration import add_column_if_missing
@@ -63,6 +64,7 @@ from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
     MetadataNotAnObjectError,
+    MetadataTooDeepError,
     StatusWriteAuthorityError,
     TaskmasterError,
     TaskNotFoundError,
@@ -171,6 +173,8 @@ CREATE TABLE IF NOT EXISTS id_counters (
 """
 
 DEFAULT_TAG = 'master'
+
+_PROMPT_TITLE_MAX = 200
 
 # Sentinel distinguishing "leave the claimant column untouched" (default) from
 # "clear it to NULL" (explicit None). Module-level and private — never
@@ -3174,14 +3178,11 @@ class SqliteTaskBackend:
                 f'{sorted(s.value for s in _VALID_STATUSES)}.',
             )
 
-        # SqliteTaskBackend has no LLM — derive title/description from prompt
-        # when the caller only supplied a prompt. The first non-empty line is
-        # the title; the full text is the description.
         if not title and prompt:
             for line in prompt.splitlines():
                 stripped = line.strip()
                 if stripped:
-                    title = stripped[:200]
+                    title = elide_at_word(stripped, _PROMPT_TITLE_MAX)
                     break
             description = description or prompt
         if not title:
@@ -4699,6 +4700,9 @@ def _merge_metadata(
     * ``'additive'`` — existing recursive ``_merge_values`` semantics: list
       union+dedup, dict-recursive, scalar/type-collision OLD-wins.  Keeps the
       legacy ``memory_hints`` list-shape normalisation before the dict union.
+      A collision nested too deeply for the recursive merge raises
+      :class:`MetadataTooDeepError` (nothing written) rather than falling
+      back to last-write-wins.
 
     For ``'merge'`` and ``'additive'``, a corrupt *existing* blob raises
     :class:`TaskmasterError` (``TASKMASTER_TOOL_ERROR``) — refusing to clobber
@@ -4712,7 +4716,8 @@ def _merge_metadata(
     :class:`MetadataNotAnObjectError` — the same rule, through the same
     helper (:func:`_metadata_object_or_raise`), as update_task's floor.
     """
-    new = _metadata_object_or_raise(incoming, None if task_id is None else str(task_id))
+    task_ref = None if task_id is None else str(task_id)
+    new = _metadata_object_or_raise(incoming, task_ref)
     # replace (or no existing data): return incoming verbatim, no guard.
     if existing_raw is None or mode == 'replace':
         return incoming
@@ -4749,8 +4754,7 @@ def _merge_metadata(
     try:
         merged = _merge_values(old, new)
     except RecursionError:
-        # Pathologically deep metadata; fall back to last-write-wins.
-        return incoming
+        raise MetadataTooDeepError(task_ref) from None
     return json.dumps(merged)
 
 

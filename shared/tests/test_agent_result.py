@@ -130,31 +130,6 @@ class TestExtractAgentVerdictEdgeCases:
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warning_records, 'falsy verdict must trigger a WARNING (not a silent success)'
 
-    def test_tuple_misuse_emits_distinct_warning(self, caplog):
-        """2-tuple from AgentLoop.run() → a distinct 'unpack' WARNING, failure result.
-
-        A caller who forgets to unpack (result_dict, journal) and passes the whole
-        tuple must get a loud, actionable message rather than a silent failure with
-        an unhelpful error_summary token.
-        """
-        with caplog.at_level(logging.WARNING):
-            result = extract_agent_verdict(
-                ({'verdict': 'confirmed'}, ['journal_entry']),
-                default_verdict='inconclusive',
-                error_summary='forgot_to_unpack',
-            )
-
-        assert result.failed is True
-        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert warning_records, 'expected WARNING on 2-tuple input'
-        assert any(
-            'tuple' in r.message.lower() or 'unpack' in r.message.lower()
-            for r in warning_records
-        ), (
-            'WARNING must mention the tuple/unpack so the caller knows how to fix it; '
-            f'got: {[r.message for r in warning_records]}'
-        )
-
     def test_truthy_verdict_takes_precedence_over_warning_key(self, caplog):
         """When both 'verdict' (truthy) and 'warning' are present, verdict wins silently.
 

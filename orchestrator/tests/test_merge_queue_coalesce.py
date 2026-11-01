@@ -27,7 +27,12 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_worker
+from _live_merge_worker import (
+    REAL_GIT_MERGE_RESULT_TIMEOUT,
+    REAL_GIT_TRAIN_MAX_WALL_S,
+    REAL_GIT_TRAIN_TIMEOUT,
+    running_merge_worker,
+)
 from _merge_lane_fakes import FakeClock, FakeVerifier, hangs_until
 from _orch_helpers import make_placeholder_future, wait_responsive
 
@@ -2877,7 +2882,12 @@ class TestCoalesceAfterHealthyMerge:
                     f'got {outcome.status!r}'
                 )
 
-            warm_outcome = await asyncio.wait_for(warm_req.result, timeout=120)
+            warm_outcome = await wait_responsive(
+                warm_req.result,
+                timeout=REAL_GIT_TRAIN_TIMEOUT,
+                max_wall_s=REAL_GIT_TRAIN_MAX_WALL_S,
+                label='warm-up hm0 landed beside the coalesced train',
+            )
             assert warm_outcome.status == 'done', (
                 f'warm-up merge must land cleanly; got {warm_outcome.status!r}'
             )

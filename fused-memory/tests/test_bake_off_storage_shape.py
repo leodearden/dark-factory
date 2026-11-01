@@ -29,9 +29,12 @@ tests assert exact values with no tolerances.
 """
 from __future__ import annotations
 
+import dataclasses
 import functools
 import re
+import subprocess
 import types
+import uuid
 from collections.abc import Container
 from pathlib import Path
 
@@ -3286,6 +3289,106 @@ class TestAuditRecallOverTheCommittedFixture:
         assert first == second
 
 
+import copy  # noqa: E402
+
+
+def _count_detector_calls(monkeypatch, mod) -> list:
+    """Every call the real audit detector receives, appended as it happens.
+
+    ``functools.wraps`` is load-bearing: ``resolve_audit_threshold`` reads the
+    detector's default through ``inspect.signature``, which follows
+    ``__wrapped__``.  The counter is a new detector, so ``memoized_audit_recall``
+    holds nothing for it yet and its first audit always reaches it.
+    """
+    audit = mod.load_audit_script()
+    detector = audit.find_near_duplicate_memory_groups
+    calls: list = []
+
+    @functools.wraps(detector)
+    def _counted(*args, **kwargs):
+        calls.append(args)
+        return detector(*args, **kwargs)
+
+    monkeypatch.setattr(audit, 'find_near_duplicate_memory_groups', _counted)
+    return calls
+
+
+def _corpus_no_other_test_has_audited() -> list[dict]:
+    """The memo is process-wide and shared by every test on an xdist worker,
+    so each test audits content of its own."""
+    corpus = copy.deepcopy(_SYNTHETIC_CORPUS)
+    corpus[-1]['content'] += f' {uuid.uuid4().hex}'
+    return corpus
+
+
+class TestAuditRecallIsComputedOncePerContent:
+    """`memoized_audit_recall` pays the O(n^2) sweep once per distinct input."""
+
+    def test_equal_records_run_the_detector_once(self, monkeypatch):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        calls = _count_detector_calls(monkeypatch, mod)
+
+        first = mod.memoized_audit_recall(records, 0.85)
+        second = mod.memoized_audit_recall(copy.deepcopy(records), 0.85)
+
+        assert len(calls) == 1
+        assert first == second == mod.audit_recall_over_labeled_fixture(
+            records, 0.85,
+        )
+
+    def test_a_changed_record_is_audited_afresh(self, monkeypatch):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        calls = _count_detector_calls(monkeypatch, mod)
+        changed = copy.deepcopy(records)
+        changed[0]['content'] += ' (edited)'
+
+        mod.memoized_audit_recall(records, 0.85)
+        mod.memoized_audit_recall(changed, 0.85)
+
+        assert len(calls) == 2
+
+    def test_a_different_threshold_is_audited_afresh(self, monkeypatch):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        calls = _count_detector_calls(monkeypatch, mod)
+
+        mod.memoized_audit_recall(records, 0.85)
+        mod.memoized_audit_recall(records, 0.5)
+
+        assert len(calls) == 2
+
+    def test_mutating_a_result_does_not_reach_the_next_caller(self):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        first = mod.memoized_audit_recall(records, 0.85)
+        pristine = copy.deepcopy(first)
+
+        first['true_dup']['pairs'] = -1
+
+        assert mod.memoized_audit_recall(records, 0.85) == pristine
+
+    def test_a_swapped_detector_neither_reads_nor_leaves_a_remembered_result(
+        self, monkeypatch,
+    ):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        audit = mod.load_audit_script()
+        real = mod.memoized_audit_recall(records, 0.85)
+
+        with monkeypatch.context() as swapped:
+            swapped.setattr(
+                audit, 'find_near_duplicate_memory_groups',
+                lambda memories, threshold: [],
+            )
+            stubbed = mod.memoized_audit_recall(records, 0.85)
+
+        assert real['groups_found'] == 1
+        assert stubbed['groups_found'] == 0
+        assert mod.memoized_audit_recall(records, 0.85) == real
+
+
 # ===========================================================================
 # step-17 — the report: build_report + render_markdown
 # ===========================================================================
@@ -4153,6 +4256,49 @@ class TestTheTwoArtifactsAreWrittenAsAPair:
         )
 
 
+
+
+@dataclasses.dataclass(frozen=True)
+class _GitShim:
+    """A real ``git`` first on PATH that logs every argv before running it.
+
+    While ``failing_walks`` exists, every ``git log`` exits 1 instead.
+    """
+
+    log: Path
+    failing_walks: Path
+
+    @classmethod
+    def install(cls, tmp_path: Path, monkeypatch) -> _GitShim:
+        import os
+        import shutil
+
+        real = shutil.which('git')
+        if real is None:
+            pytest.skip('no git on PATH')
+        shim = cls(log=tmp_path / 'git.log', failing_walks=tmp_path / 'fail-walks')
+        executable = tmp_path / 'bin' / 'git'
+        executable.parent.mkdir()
+        executable.write_text(
+            '#!/bin/sh\n'
+            f'printf \'%s\\n\' "$*" >> "{shim.log}"\n'
+            f'if [ "$1" = log ] && [ -e "{shim.failing_walks}" ]; then exit 1; fi\n'
+            f'exec "{real}" "$@"\n'
+        )
+        executable.chmod(0o755)
+        monkeypatch.setenv(
+            'PATH', f'{executable.parent}{os.pathsep}{os.environ["PATH"]}',
+        )
+        return shim
+
+    def calls(self, subcommand: str) -> list[str]:
+        logged = self.log.read_text() if self.log.exists() else ''
+        return [
+            line for line in logged.splitlines()
+            if line.startswith(f'{subcommand} ')
+        ]
+
+
 class TestFixtureProvenance:
     """The blind-authoring audit trail is git history; the report cites it."""
 
@@ -4179,6 +4325,75 @@ class TestFixtureProvenance:
 
         assert not provenance[0]['path'].startswith('/')
 
+    def test_a_committed_fixtures_blob_is_the_one_heads_tree_holds(self):
+        entry = _mod().fixture_provenance([ARM_CLAIMS_PATH])[0]
+
+        held = subprocess.run(
+            ['git', 'rev-parse', '--verify', '--quiet', f'HEAD:{entry["path"]}'],
+            cwd=ARM_CLAIMS_PATH.parent, capture_output=True, text=True,
+            check=True,
+        )
+
+        assert entry['blob'] == held.stdout.strip()
+
+    def test_the_blob_identifies_content_not_path(self, tmp_path):
+        first, twin, other = (tmp_path / name for name in (
+            'first.jsonl', 'twin.jsonl', 'other.jsonl'))
+        first.write_text('{"same": true}\n')
+        twin.write_text('{"same": true}\n')
+        other.write_text('{"same": false}\n')
+
+        provenance = _mod().fixture_provenance([first, twin, other])
+
+        assert provenance[0]['blob']
+        assert provenance[0]['blob'] == provenance[1]['blob']
+        assert provenance[2]['blob'] != provenance[0]['blob']
+        assert [entry['commit'] for entry in provenance] == [None, None, None]
+
+    def test_a_path_git_cannot_read_reports_no_blob_rather_than_a_wrong_one(
+        self, tmp_path,
+    ):
+        provenance = _mod().fixture_provenance([tmp_path / 'missing.jsonl'])
+
+        assert provenance[0]['blob'] is None
+
+    def test_a_second_stamp_of_the_same_paths_does_not_walk_history_again(
+        self, tmp_path, monkeypatch,
+    ):
+        """Observed through a real git shim on PATH.  At most one walk per
+        path, because an earlier test on this worker may already have
+        stamped these paths."""
+        shim = _GitShim.install(tmp_path, monkeypatch)
+        paths = [ARM_CLAIMS_PATH, QUERY_SET_PATH]
+
+        first = _mod().fixture_provenance(paths)
+        second = _mod().fixture_provenance(paths)
+
+        assert first == second
+        assert all(len(entry['commit']) == 40 for entry in second)
+        # Every stamp hashes every path, so the shim saw all four blobs.
+        assert len(shim.calls('hash-object')) == 4
+        assert len(shim.calls('log')) <= 2, shim.calls('log')
+
+    def test_a_walk_that_failed_is_asked_again_rather_than_remembered(
+        self, tmp_path, monkeypatch,
+    ):
+        """A walk can fail transiently, e.g. the 30s timeout under load.  Its
+        None must not stand in for the commit for the rest of the process.
+        Stamps this test module, which no other test stamps, so no earlier
+        test can have filled the memo for it."""
+        shim = _GitShim.install(tmp_path, monkeypatch)
+        this_module = Path(__file__)
+
+        shim.failing_walks.touch()
+        failed = _mod().fixture_provenance([this_module])
+        shim.failing_walks.unlink()
+        answered = _mod().fixture_provenance([this_module])
+
+        assert failed[0]['commit'] is None
+        assert len(answered[0]['commit']) == 40
+        assert len(shim.calls('log')) == 2, shim.calls('log')
+
 
 # ===========================================================================
 # step-19 — the live driver's wiring, exercised WITHOUT a network
@@ -4199,7 +4414,6 @@ class TestFixtureProvenance:
 # markers PER-TEST.  Everything here runs in the merge lane.
 
 import asyncio  # noqa: E402
-import copy  # noqa: E402
 
 
 class _FakeConfig(types.SimpleNamespace):
@@ -5098,6 +5312,21 @@ class TestRunBakeOffWiring:
                 assert metric in report['arms'][arm]
         assert report['protocol']['distractor_slab_size'] == 12
         assert report['protocol']['embedder_model'] == 'text-embedding-3-small'
+
+    async def test_a_second_run_does_not_re_audit_the_same_alpha_fixture(
+        self, monkeypatch,
+    ):
+        """cluster_limit does not shrink the audit: it sweeps the whole alpha
+        fixture, so every run of the same fixture would otherwise repay it."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        calls = _count_detector_calls(monkeypatch, mod)
+
+        first = await mod.run_bake_off(**_SIX_ARM_RUN)
+        second = await mod.run_bake_off(**_SIX_ARM_RUN)
+
+        assert len(calls) == 1
+        assert first['audit_recall'] == second['audit_recall']
 
 
 # ===========================================================================

@@ -222,16 +222,12 @@ class TestComposeFixMainBrief:
 
     def test_title_starts_with_fix_main(self) -> None:
         from orchestrator.main_health_fix_owner import compose_fix_main_brief
-        title, _ = compose_fix_main_brief(
-            'compile_error', 'error TS2322: StatusBar.tsx', 'tsc failed\n<report>',
-        )
+        title, _ = compose_fix_main_brief('compile_error', 'error TS2322: StatusBar.tsx')
         assert title.startswith('fix main:'), f'Title must start with "fix main:"; got {title!r}'
 
     def test_title_contains_relevant_identifier(self) -> None:
         from orchestrator.main_health_fix_owner import compose_fix_main_brief
-        title, _ = compose_fix_main_brief(
-            'compile_error', 'error TS2322: StatusBar.tsx', 'tsc failed\n<report>',
-        )
+        title, _ = compose_fix_main_brief('compile_error', 'error TS2322: StatusBar.tsx')
         # Either the cause_hint or the category must appear somewhere in the title
         assert ('StatusBar.tsx' in title or 'compile_error' in title or 'TS2322' in title), (
             f'Expected identifier in title; got {title!r}'
@@ -239,46 +235,31 @@ class TestComposeFixMainBrief:
 
     def test_title_bounded_length(self) -> None:
         from orchestrator.main_health_fix_owner import compose_fix_main_brief
-        title, _ = compose_fix_main_brief(
-            'compile_error', 'error TS2322: StatusBar.tsx', 'tsc failed\n<report>',
-        )
+        title, _ = compose_fix_main_brief('compile_error', 'error TS2322: StatusBar.tsx')
         assert len(title) <= 120, f'Title must be ≤120 chars; got {len(title)}: {title!r}'
 
     def test_title_non_empty(self) -> None:
         from orchestrator.main_health_fix_owner import compose_fix_main_brief
-        title, _ = compose_fix_main_brief('compile_error', 'hint', 'detail')
+        title, _ = compose_fix_main_brief('compile_error', 'hint')
         assert title, 'Title must be non-empty'
 
     def test_description_contains_category(self) -> None:
         from orchestrator.main_health_fix_owner import compose_fix_main_brief
-        _, description = compose_fix_main_brief(
-            'compile_error', 'error TS2322: StatusBar.tsx', 'tsc failed\n<report>',
-        )
+        _, description = compose_fix_main_brief('compile_error', 'error TS2322: StatusBar.tsx')
         assert 'compile_error' in description, (
             f'Description must contain category; got {description!r}'
         )
 
     def test_description_contains_cause_hint(self) -> None:
         from orchestrator.main_health_fix_owner import compose_fix_main_brief
-        _, description = compose_fix_main_brief(
-            'compile_error', 'error TS2322: StatusBar.tsx', 'tsc failed\n<report>',
-        )
+        _, description = compose_fix_main_brief('compile_error', 'error TS2322: StatusBar.tsx')
         assert 'error TS2322' in description or 'StatusBar.tsx' in description, (
             f'Description must contain cause_hint; got {description!r}'
         )
 
-    def test_description_contains_detail(self) -> None:
-        from orchestrator.main_health_fix_owner import compose_fix_main_brief
-        _, description = compose_fix_main_brief(
-            'compile_error', 'error TS2322: StatusBar.tsx', 'tsc failed\n<report>',
-        )
-        assert 'tsc failed' in description or 'report' in description, (
-            f'Description must contain (truncated) detail; got {description!r}'
-        )
-
     def test_description_non_empty(self) -> None:
         from orchestrator.main_health_fix_owner import compose_fix_main_brief
-        _, description = compose_fix_main_brief('compile_error', 'hint', 'detail')
+        _, description = compose_fix_main_brief('compile_error', 'hint')
         assert description, 'Description must be non-empty'
 
 

@@ -22,6 +22,7 @@ import uuid as uuid_mod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 
@@ -226,6 +227,8 @@ CREATE INDEX IF NOT EXISTS idx_bo_created ON backend_ops(created_at);
 -- mem0 write (the happy path logs 'pending' then stamps 'completed'), so
 -- terminal completed/failed rows are aged out by WriteJournal.prune_mem0_intents
 -- (run at startup after recovery); 'dead' rows are preserved for manual replay.
+-- 'retrying' rows (task 7397: a transient provider failure, re-issued at
+-- next_attempt_at) keep resolved_at NULL and so are never pruned.
 CREATE TABLE IF NOT EXISTS mem0_intents (
     id TEXT PRIMARY KEY,
     write_op_id TEXT,
@@ -240,7 +243,9 @@ CREATE TABLE IF NOT EXISTS mem0_intents (
     status TEXT NOT NULL DEFAULT 'pending',
     reason TEXT,
     created_at TEXT NOT NULL,
-    resolved_at TEXT
+    resolved_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_mi_status ON mem0_intents(status);
 CREATE INDEX IF NOT EXISTS idx_mi_write_op ON mem0_intents(write_op_id);
@@ -403,6 +408,24 @@ async def _read_int(access: AtomicConnection, sql: str) -> int:
     return row[0]
 
 
+class Mem0IntentStatus(StrEnum):
+    """The ``mem0_intents.status`` vocabulary.
+
+    ``RETRYING`` is a write whose Mem0 leg failed on a transient provider error
+    and is re-issued at ``next_attempt_at`` (``services/mem0_write_retry.py``).
+    """
+
+    PENDING = 'pending'
+    RETRYING = 'retrying'
+    COMPLETED = 'completed'
+    FAILED = 'failed'
+    DEAD = 'dead'
+
+
+def _schedule_timestamp(moment: datetime) -> str:
+    return moment.isoformat(timespec='microseconds')
+
+
 class WriteJournal:
     """Two-layer write journal backed by SQLite (WAL mode)."""
 
@@ -522,6 +545,14 @@ class WriteJournal:
             # row's duration is unknown, so it stays NULL.
             if await add_column_if_missing(db, 'backend_ops', 'duration_ms', 'REAL'):
                 logger.info('Migration: added duration_ms column to backend_ops')
+
+            if await add_column_if_missing(
+                db, 'mem0_intents', 'attempts', 'INTEGER NOT NULL DEFAULT 0'
+            ):
+                logger.info('Migration: added attempts column to mem0_intents')
+
+            if await add_column_if_missing(db, 'mem0_intents', 'next_attempt_at', 'TEXT'):
+                logger.info('Migration: added next_attempt_at column to mem0_intents')
 
             # Indexes on new columns (safe after migration ensures columns exist)
             await db.execute(
@@ -1008,23 +1039,93 @@ class WriteJournal:
             logger.error(f'Failed to log mem0_intent {intent_id}: {e}')
 
     async def resolve_mem0_intent(
-        self, intent_id: str, status: str, reason: str | None = None
-    ) -> None:
+        self,
+        intent_id: str,
+        status: str,
+        reason: str | None = None,
+        *,
+        expected_status: str | None = None,
+    ) -> bool:
         """Stamp a mem0_intent terminal (``completed``|``failed``|``dead``).
 
-        Fire-and-forget — logs loudly on failure but never raises.
+        With ``expected_status`` the stamp is a compare-and-set: it applies only
+        to a row currently in that status. Returns whether a row was updated.
+
+        Fire-and-forget — logs loudly on failure and returns ``False``, never
+        raises.
         """
+        sql = 'UPDATE mem0_intents SET status = ?, reason = ?, resolved_at = ? WHERE id = ?'
+        params: tuple[str | None, ...] = (
+            status,
+            reason,
+            datetime.now(UTC).isoformat(),
+            intent_id,
+        )
+        if expected_status is not None:
+            sql += ' AND status = ?'
+            params = (*params, expected_status)
         try:
             async with self._require_access().write() as db:
-                await db.execute(
-                    'UPDATE mem0_intents SET status = ?, reason = ?, resolved_at = ? '
-                    'WHERE id = ?',
-                    (status, reason, datetime.now(UTC).isoformat(), intent_id),
-                )
+                cursor = await db.execute(sql, params)
+                return cursor.rowcount == 1
         except Exception as e:
             logger.error(
                 f'Failed to resolve mem0_intent {intent_id} -> {status}: {e}'
             )
+            return False
+
+    async def schedule_mem0_retry(
+        self, intent_id: str, *, reason: str, retry_at: datetime
+    ) -> bool:
+        """Move a ``pending`` or ``retrying`` intent to ``retrying`` at ``retry_at``.
+
+        Increments ``attempts``. A compare-and-set: an unknown id or a terminal
+        row is left unchanged and ``False`` is returned. ``resolved_at`` stays
+        NULL, which is what keeps :meth:`prune_mem0_intents` off the row.
+
+        Fire-and-forget — logs loudly on failure and returns ``False``, never
+        raises.
+        """
+        try:
+            async with self._require_access().write() as db:
+                cursor = await db.execute(
+                    'UPDATE mem0_intents SET status = ?, attempts = attempts + 1, '
+                    'next_attempt_at = ?, reason = ? '
+                    'WHERE id = ? AND status IN (?, ?)',
+                    (
+                        Mem0IntentStatus.RETRYING,
+                        _schedule_timestamp(retry_at),
+                        reason,
+                        intent_id,
+                        Mem0IntentStatus.PENDING,
+                        Mem0IntentStatus.RETRYING,
+                    ),
+                )
+                return cursor.rowcount == 1
+        except Exception as e:
+            logger.error(f'Failed to schedule retry of mem0_intent {intent_id}: {e}')
+            return False
+
+    async def get_due_mem0_retries(self, *, now: datetime, limit: int) -> list[dict]:
+        """Return up to ``limit`` ``retrying`` intents due by ``now``, soonest first."""
+        rows = await self._require_access().read_all(
+            'SELECT * FROM mem0_intents WHERE status = ? AND next_attempt_at <= ? '
+            'ORDER BY next_attempt_at LIMIT ?',
+            (Mem0IntentStatus.RETRYING, _schedule_timestamp(now), limit),
+        )
+        return [dict(row) for row in rows]
+
+    async def count_mem0_intents_by_status(self, *, since: datetime) -> dict[str, int]:
+        """Count intents created at or after ``since``, keyed by status in sorted order.
+
+        Raises on a read error: the caller chooses the fallback.
+        """
+        rows = await self._require_access().read_all(
+            'SELECT status, COUNT(*) FROM mem0_intents WHERE created_at >= ? '
+            'GROUP BY status ORDER BY status',
+            (_schedule_timestamp(since),),
+        )
+        return {row[0]: row[1] for row in rows}
 
     async def record_terminal_outcome(
         self,
@@ -1146,6 +1247,9 @@ class WriteJournal:
         dead-lettered intent carries the full content needed for manual replay
         and is an operator-visible signal, so it must not be silently aged
         out. Override ``statuses`` to include it explicitly.
+
+        ``retrying`` rows are excluded whatever ``statuses`` says: they are not
+        terminal and keep ``resolved_at`` NULL until their retry resolves them.
 
         Fire-and-forget — logs loudly on failure but never raises, so a prune
         hiccup cannot crash startup.

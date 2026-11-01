@@ -1,0 +1,1 @@
+{"v":1,"ts_ns":1792762174697568000,"pid":2763079,"event":"slot_timeout","reason":"test_slot","slots":8,"waited":1800,"disposition":"fatal","lock":"/tmp/reify-test-semaphore.lock","emitter":"lib_test_semaphore.sh"}

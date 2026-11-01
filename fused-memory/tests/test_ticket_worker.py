@@ -1245,14 +1245,16 @@ async def test_per_project_ticket_queues_do_not_serialise(
     project-b's tickets from being processed.
 
     With a single global worker (old impl) project-b's ticket sits behind
-    project-a's blocked curator.curate() and resolve_ticket(project_b) times
-    out. With per-project workers, project-b drains independently.
+    project-a's blocked curator.curate() and never leaves 'pending', so the
+    project-b poll fails. With per-project workers, project-b drains
+    independently.
 
     Sequence:
     1. Submit ticket for project-a — worker picks it up and blocks inside curate().
     2. Submit ticket for project-b — served by a separate worker.
-    3. resolve_ticket(project_b, timeout=1.0) returns before the timeout.
-    4. Unblock project-a's curator, then resolve_ticket(project_a) also completes.
+    3. project-b's ticket reaches 'created' while project-a's is still 'pending'.
+    4. Park resolve_ticket(project_a), unblock project-a's curator, and the
+       waiter returns 'created'.
     5. Assert len(interceptor._worker_tasks) == 2 and worker names are distinct.
     """
     # Asyncio event to block project-a's curator
@@ -1279,6 +1281,7 @@ async def test_per_project_ticket_queues_do_not_serialise(
 
     ti = TaskInterceptor(taskmaster, None, event_buffer, ticket_store=ticket_store)
 
+    resolve_a: asyncio.Task[dict] | None = None
     try:
         with patch.object(
             type(ti), '_get_curator',
@@ -1289,34 +1292,44 @@ async def test_per_project_ticket_queues_do_not_serialise(
             assert submit_a.get('ticket', '').startswith('tkt_'), f'Got: {submit_a}'
             ticket_a = submit_a['ticket']
 
-            # Wait for worker-a to actually be inside the blocking curate()
-            # call before submitting project-b. This is an exact barrier
-            # rather than a scheduling-yield sleep: under xdist CPU
-            # oversubscription a fixed sleep's window could close before
-            # worker-a is even scheduled, silently degrading this test to
-            # asserting a weaker, already-true premise (task 3901 sweep).
-            await asyncio.wait_for(curate_a_entered.wait(), timeout=5.0)
+            # Exact barrier: worker-a is inside the blocking curate() call
+            # before project-b is submitted. A fixed sleep can end before
+            # worker-a is scheduled under xdist, silently weakening the test
+            # (task 3901 sweep).
+            await poll_until(
+                curate_a_entered.is_set,
+                message='worker-a never entered curate()',
+            )
 
             # (2) Submit project-b — must get an independent worker
             submit_b = await ti.submit_task(project_root=project_root_b, title='Task B')
             assert submit_b.get('ticket', '').startswith('tkt_'), f'Got: {submit_b}'
             ticket_b = submit_b['ticket']
 
-            # (3) project-b resolves within timeout (1.0 s) while project-a is blocked
-            result_b = await asyncio.wait_for(
-                ti.resolve_ticket(ticket_b, project_root_b, timeout_seconds=None),
-                timeout=2.0,
+            # (3) project-b's ticket is terminal while project-a's is still pending
+            row_b = await _poll_ticket_resolved(
+                ticket_store, ticket_b, what='the project-b ticket',
             )
-            assert result_b.get('status') == 'created', (
-                f'project-b should resolve while project-a is blocked: {result_b!r}'
+            assert row_b['status'] == 'created', (
+                f'project-b should resolve while project-a is blocked: {row_b!r}'
+            )
+            row_a = await ticket_store.get(ticket_a)
+            assert row_a['status'] == 'pending', (
+                'project-a must still be blocked in curate() when project-b '
+                f'resolves: {row_a!r}'
             )
 
-            # (4) Unblock project-a and wait for its resolution
-            unblock_a.set()
-            result_a = await asyncio.wait_for(
+            # (4) The project-a waiter parks before the unblock, so worker-a's
+            # signal is what wakes it.
+            resolve_a = asyncio.create_task(
                 ti.resolve_ticket(ticket_a, project_root_a, timeout_seconds=None),
-                timeout=5.0,
             )
+            unblock_a.set()
+            await poll_until(
+                resolve_a.done,
+                message='resolve_ticket(project-a) did not return after unblock',
+            )
+            result_a = resolve_a.result()
             assert result_a.get('status') == 'created', (
                 f'project-a should resolve after unblock: {result_a!r}'
             )
@@ -1341,6 +1354,10 @@ async def test_per_project_ticket_queues_do_not_serialise(
     finally:
         # Clean up all per-project workers
         unblock_a.set()  # ensure worker-a is not stuck
+        if resolve_a is not None and not resolve_a.done():
+            resolve_a.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await resolve_a
         tasks = list(ti._worker_tasks.values())
         for t in tasks:
             if not t.done():

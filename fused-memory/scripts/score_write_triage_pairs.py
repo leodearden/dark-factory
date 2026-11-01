@@ -1054,17 +1054,17 @@ def _paired_error(
         'n_common': len(common),
         'only_arm': len(only_arm),
         'only_reference': len(only_reference),
-        'mcnemar_p': _mcnemar_exact(len(only_arm), len(only_reference)),
+        'mcnemar_p': mcnemar_exact(len(only_arm), len(only_reference)),
         'parent_sign_test': {
             'groups_favouring_arm': favouring_arm,
             'groups_favouring_reference': favouring_reference,
-            'p': _mcnemar_exact(favouring_arm, favouring_reference),
+            'p': mcnemar_exact(favouring_arm, favouring_reference),
         },
     }
 
 
-def _mcnemar_exact(only_first: int, only_second: int) -> float:
-    """Two-sided exact McNemar (sign) test p on the discordant counts."""
+def mcnemar_exact(only_first: int, only_second: int) -> float:
+    """Two-sided exact McNemar (sign) test p on the discordant counts, rounded to 4 places."""
     discordant = only_first + only_second
     if discordant == 0:
         return 1.0

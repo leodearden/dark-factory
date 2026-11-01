@@ -37,6 +37,7 @@ from escalation.queue import (
     AmendmentOutcome,
     EscalationQueue,
     ResolveOutcome,
+    amendment_room,
     iter_all_escalation_paths,
 )
 
@@ -320,6 +321,102 @@ class TestDismissAllPendingAgeAware:
         assert strand is not None
         assert strand.resolution is not None
         assert 'severity=blocking' in strand.resolution
+
+
+class TestDismissAllPendingKeep:
+    """``keep`` spares the L0s its predicate selects from the startup sweep.
+
+    The info-L0 router routes info notes before the amnesty and leaves some of
+    them pending (a curator hold, or one it could not route); the sweep that
+    follows must not dismiss those unread (plans/info-l0-disposition-router-prd.md
+    boundary #16).
+    """
+
+    THRESHOLD_SECS = 600.0
+
+    def _seed(self, tmp_path: Path) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_aged_escalation('esc-1-1', age_secs=90.0, task_id='1', severity='info'))
+        queue.submit(_aged_escalation('esc-2-1', age_secs=75480.0, task_id='2', severity='info'))
+        queue.submit(_aged_escalation('esc-3-1', age_secs=75480.0, task_id='3'))
+        queue.submit(_aged_escalation('esc-4-1', age_secs=90.0, task_id='4'))
+        queue.submit(_aged_escalation('esc-5-1', age_secs=75480.0, task_id='5', level=1))
+        return queue
+
+    @staticmethod
+    def _is_info(esc: Escalation) -> bool:
+        return esc.severity == 'info'
+
+    def test_kept_records_stay_pending_and_are_not_counted(self, tmp_path: Path):
+        queue = self._seed(tmp_path)
+
+        count = queue.dismiss_all_pending(
+            'Stale from prior run', strand_age_secs=self.THRESHOLD_SECS, keep=self._is_info,
+        )
+
+        assert count == 2
+        for kept_id in ('esc-1-1', 'esc-2-1'):
+            kept = queue.get(kept_id)
+            assert kept is not None
+            assert (kept.status, kept.resolution, kept.resolution_class) == ('pending', None, None)
+
+    def test_records_not_kept_are_swept_with_age_suffix_and_strand_stamp(self, tmp_path: Path):
+        queue = self._seed(tmp_path)
+
+        queue.dismiss_all_pending(
+            'Stale from prior run', strand_age_secs=self.THRESHOLD_SECS, keep=self._is_info,
+        )
+
+        strand, fresh = queue.get('esc-3-1'), queue.get('esc-4-1')
+        assert strand is not None and fresh is not None
+        assert (strand.status, strand.resolution_class) == ('dismissed', 'stale-strand')
+        assert (fresh.status, fresh.resolution_class) == ('dismissed', 'benign')
+        assert _pending_secs(fresh.resolution or '') is not None
+
+    def test_keep_none_sweeps_every_pending_l0_as_before(self, tmp_path: Path):
+        queue = self._seed(tmp_path)
+
+        count = queue.dismiss_all_pending('Stale from prior run', keep=None)
+
+        assert count == 4
+        for esc_id in ('esc-1-1', 'esc-2-1', 'esc-3-1', 'esc-4-1'):
+            swept = queue.get(esc_id)
+            assert swept is not None
+            assert swept.status == 'dismissed'
+
+    @pytest.mark.parametrize('keep', [None, lambda esc: True])
+    def test_level_1_is_preserved_either_way(self, tmp_path: Path, keep):
+        queue = self._seed(tmp_path)
+
+        queue.dismiss_all_pending('Stale from prior run', keep=keep)
+
+        level_1 = queue.get('esc-5-1')
+        assert level_1 is not None
+        assert level_1.status == 'pending'
+
+
+class TestAmendmentRoom:
+    """``amendment_room`` is zero exactly when the next amend would shed the oldest."""
+
+    @staticmethod
+    def _room(queue: EscalationQueue) -> int:
+        record = queue.get('esc-1-1')
+        assert record is not None
+        return amendment_room(record)
+
+    def test_room_counts_down_to_the_amend_that_sheds(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1', level=1))
+
+        rooms = []
+        for i in range(_MAX_AMENDMENTS):
+            rooms.append(self._room(queue))
+            assert queue.amend('esc-1-1', summary=f'pass {i}', agent_role='test')['dropped'] == 0
+
+        assert rooms == list(range(_MAX_AMENDMENTS, 0, -1))
+        assert self._room(queue) == 0
+        assert queue.amend('esc-1-1', summary='one more', agent_role='test')['dropped'] == 1
+        assert self._room(queue) == 0
 
 
 class TestDismissAllPendingAgeAwareDegrades:
@@ -6819,6 +6916,65 @@ class TestHasOpenL1CategoryFilter:
         assert queue.has_open_l1('T', category='merge_error') is False
 
 
+class TestDismissIfCovered:
+    """``dismiss_if_covered`` dismisses an L0 under an open L1 of its own
+    category only, and tells that L1 what it absorbed (unblock-4917)."""
+
+    RESOLVER = 'harness-orphan-reaper'
+
+    @staticmethod
+    def _l0(queue: EscalationQueue, category: str) -> Escalation:
+        esc = _make_esc_with_category('esc-T-9', 'T', category, level=0)
+        esc.summary, esc.detail = 'disk quota hit', 'df shows 100%'
+        queue.submit(esc)
+        return esc
+
+    @staticmethod
+    def _get(queue: EscalationQueue, esc_id: str) -> Escalation:
+        esc = queue.get(esc_id)
+        assert esc is not None
+        return esc
+
+    def test_a_same_category_l1_covers_and_carries_the_dismissed_record(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_esc_with_category('esc-T-1', 'T', 'infra_issue'))
+        l0 = self._l0(queue, 'infra_issue')
+
+        assert queue.dismiss_if_covered(l0, resolver=self.RESOLVER) == ['esc-T-1']
+
+        dismissed = self._get(queue, l0.id)
+        assert (dismissed.status, dismissed.resolved_by) == ('dismissed', self.RESOLVER)
+        assert 'esc-T-1' in (dismissed.resolution or '')
+        (amendment,) = self._get(queue, 'esc-T-1').amendments
+        assert amendment['agent_role'] == self.RESOLVER
+        carried = amendment['summary'] + amendment['detail']
+        assert all(fact in carried for fact in (l0.id, 'disk quota hit', 'df shows 100%'))
+
+    @pytest.mark.parametrize(('category', 'status'), [
+        ('task_failure', 'pending'), ('infra_issue', 'resolved'),
+    ], ids=['another-category', 'closed-l1'])
+    def test_no_open_same_category_l1_writes_nothing(self, tmp_path: Path, category, status):
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_esc_with_category('esc-T-1', 'T', category, status=status))
+        l0 = self._l0(queue, 'infra_issue')
+
+        assert queue.dismiss_if_covered(l0, resolver=self.RESOLVER) == []
+
+        assert self._get(queue, l0.id).status == 'pending'
+        assert self._get(queue, 'esc-T-1').amendments == []
+
+    def test_a_legacy_category_is_matched_without_raising(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        for esc_id, level in (('esc-T-1', 1), ('esc-T-9', 0)):
+            legacy = _make_esc_with_category(esc_id, 'T', 'retired_category', level=level)
+            (queue.queue_dir / f'{esc_id}.json').write_text(legacy.to_json())
+
+        assert queue.dismiss_if_covered(self._get(queue, 'esc-T-9'), resolver=self.RESOLVER) == [
+            'esc-T-1',
+        ]
+        assert self._get(queue, 'esc-T-9').status == 'dismissed'
+
+
 class TestMultipleCoOpenL1Resolution:
     """Signature-aware dedup permits N co-open L1s per task; resolving one must
     leave the task blocked until the others are resolved (task 2757; reviewer
@@ -8926,3 +9082,25 @@ class TestLateResolutionBounds:
         assert record.late_resolutions_chars_elided == 3 * overshoot, (
             f'expected a running total: {record.late_resolutions_chars_elided!r}'
         )
+
+
+class TestTripFactsPersistence:
+    """A pause detector's structured trip facts survive the real queue writer."""
+
+    def test_ewa_rate_trip_round_trips_through_disk(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-orchestrator-1', task_id='orchestrator')
+        esc.ewa_rate_trip = {
+            'ewa': 73.59,
+            'threshold': 24.6,
+            'ratio': 82.0,
+            'window_secs': 3600.0,
+            'dones_in_window': 1,
+            'submissions_in_step': 82,
+        }
+
+        esc_id = queue.submit(esc)
+
+        stored = queue.get(esc_id)
+        assert stored is not None
+        assert stored.ewa_rate_trip == esc.ewa_rate_trip

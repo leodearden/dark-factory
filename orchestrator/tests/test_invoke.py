@@ -19,6 +19,8 @@ from _orch_helpers import make_gate_yielding as _make_gate_yielding  # centraliz
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
 from shared.invocation_outcome import CapHit
+from shared.process_cost import ProcessCostBasis
+from shared.testing_fake_claude import install_fake_claude_cli
 from shared.testing_stdin import STDIN_STARVATION_STUB, make_starving_exec
 from shared.usage_gate import AccountLease, InvokeSlot
 
@@ -2320,3 +2322,73 @@ class TestStdinStarvationRaceLocal:
             f'stdin_data=None must inherit stdin; got {captured_kwargs["stdin"]!r}'
         )
 
+
+_CUMULATIVE_COST_SESSIONS = (
+    Path(__file__).resolve().parents[2]
+    / 'shared' / 'tests' / 'fixtures' / 'cumulative_cost' / 'sessions.json'
+)
+_STEWARD_4895 = '59607ecd-9ecd-4f90-9ce6-bc71a7fb33e9'
+
+
+@pytest.mark.asyncio
+class TestClaudeResumePriorForwarding:
+    """invoke_agent hands the resumed session's prior total to both claude sub-paths.
+
+    The fake ``claude`` (``shared.testing_fake_claude``, selected through
+    ``CLAUDE_BINARY``) answers the second process of steward session 59607ecd,
+    whose reported total is cumulative; each sub-path's own parse must charge
+    only that process's spend.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fake_claude(self, tmp_path, monkeypatch) -> None:
+        sessions = json.loads(_CUMULATIVE_COST_SESSIONS.read_text())
+        resume = json.dumps(sessions[_STEWARD_4895][1]['stdout'])
+        fake = install_fake_claude_cli(tmp_path / 'fake-claude', [resume])
+        monkeypatch.setenv('CLAUDE_BINARY', str(fake.executable))
+        monkeypatch.delenv('DF_AGENT_CPU_GOVERN', raising=False)
+
+    @staticmethod
+    def _sandbox_active():
+        return (
+            patch(
+                'orchestrator.agents.sandbox_dispatch.resolve_active_backend',
+                return_value='bwrap',
+            ),
+            patch(
+                'orchestrator.agents.sandbox_dispatch.wrap_command',
+                side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
+            ),
+        )
+
+    async def test_unsandboxed_resume_is_charged_its_session_delta(self, tmp_path) -> None:
+        result = await invoke_agent(
+            prompt='p', system_prompt='s', cwd=tmp_path, backend='claude',
+            resume_session_id=_STEWARD_4895, resume_prior_total_cost_usd=2.288609,
+        )
+
+        assert result.cost_usd == pytest.approx(1.1174095, abs=1e-6)
+        assert result.cost_basis is ProcessCostBasis.SESSION_DELTA
+
+    async def test_sandboxed_resume_is_charged_its_session_delta(self, tmp_path) -> None:
+        backend_patch, wrap_patch = self._sandbox_active()
+        with backend_patch, wrap_patch:
+            result = await invoke_agent(
+                prompt='p', system_prompt='s', cwd=tmp_path, backend='claude',
+                sandbox_modules=['x'],
+                resume_session_id=_STEWARD_4895, resume_prior_total_cost_usd=2.288609,
+            )
+
+        assert result.cost_usd == pytest.approx(1.1174095, abs=1e-6)
+        assert result.cost_basis is ProcessCostBasis.SESSION_DELTA
+
+    async def test_sandboxed_resume_without_prior_is_a_usage_estimate(self, tmp_path) -> None:
+        backend_patch, wrap_patch = self._sandbox_active()
+        with backend_patch, wrap_patch:
+            result = await invoke_agent(
+                prompt='p', system_prompt='s', cwd=tmp_path, backend='claude',
+                sandbox_modules=['x'], resume_session_id=_STEWARD_4895,
+            )
+
+        assert result.cost_usd == pytest.approx(1.1174095, abs=1e-6)
+        assert result.cost_basis is ProcessCostBasis.USAGE_ESTIMATE

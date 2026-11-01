@@ -573,6 +573,10 @@ async def run_server():
     await memory_service.initialize()
 
     # Initialize write journal
+    from fused_memory.services.mem0_write_retry import (
+        DEFAULT_MEM0_RETRY_POLICY,
+        run_periodic_mem0_retry,
+    )
     from fused_memory.services.write_journal import WriteJournal
     from fused_memory.services.write_ops_retention import (
         prune_write_ops_pass,
@@ -814,6 +818,7 @@ async def run_server():
             burst_cooldown_seconds=config.reconciliation.burst_cooldown_seconds,
             stale_lock_seconds=config.reconciliation.stale_lock_seconds,
             queue_stats_fn=memory_service.durable_queue.get_stats if memory_service.durable_queue else None,
+            coalesce_task_events=config.reconciliation.coalesce_task_events,
         )
         await event_buffer.initialize()
 
@@ -1167,6 +1172,18 @@ async def run_server():
         config.write_journal.prune_max_rows_per_run,
     )
 
+    mem0_retry_task = asyncio.create_task(
+        run_periodic_mem0_retry(
+            memory_service.retry_due_mem0_intents,
+            interval_seconds=DEFAULT_MEM0_RETRY_POLICY.poll_interval_seconds,
+        ),
+    )
+    logger.info(
+        '  Mem0 write retry loop: every %.0fs, up to %d due intents per pass',
+        DEFAULT_MEM0_RETRY_POLICY.poll_interval_seconds,
+        DEFAULT_MEM0_RETRY_POLICY.batch_size,
+    )
+
     remint_sweep_task: asyncio.Task[None] | None = _start_remint_sweep(
         taskmaster,
         task_interceptor.remint_broken_recurrence_chains,
@@ -1349,6 +1366,9 @@ async def run_server():
         write_ops_prune_task.cancel()
         with contextlib.suppress(BaseException):
             await write_ops_prune_task
+        mem0_retry_task.cancel()
+        with contextlib.suppress(BaseException):
+            await mem0_retry_task
         if remint_sweep_task is not None:
             remint_sweep_task.cancel()
             with contextlib.suppress(BaseException):
@@ -1413,6 +1433,9 @@ def _collect_checkpoint_targets(
     pe = getattr(memory_service, 'planned_episode_registry', None)
     if pe is not None and hasattr(pe, 'checkpoint'):
         targets.append(('planned_episode_registry', pe.checkpoint))
+    shadow = getattr(memory_service, 'overreach_shadow', None)
+    if shadow is not None and hasattr(shadow, 'checkpoint'):
+        targets.append(('overreach_shadow', shadow.checkpoint))
     if known_projects:
         for project_id, root in known_projects.items():
             targets.append((

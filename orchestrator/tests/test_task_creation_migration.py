@@ -177,6 +177,32 @@ class TestFollowupFilingPrompts:
         assert 'Call `resolve_ticket`' not in IMPLEMENTER.system_prompt
 
 
+class TestOperationalAskRouting:
+    """The follow-up block names the real entry point for operational asks.
+
+    An operational ask is filed with ``submit_task`` plus
+    ``metadata.execution_class='operational'``, which the submit boundary
+    turns into a deterministic, born-at-L2 human gate.
+    """
+
+    def test_operational_asks_are_filed_with_execution_class(self):
+        assert '"execution_class": "operational"' in _FOLLOWUP_FILING_INSTRUCTIONS, (
+            'the follow-up block must show the execution_class metadata key: '
+            'the old carve-out sent operational asks away from the only '
+            'working filing path without naming an entry point, so they were '
+            "dropped — the dead end that stranded esc-5984-2's post-merge check"
+        )
+
+    def test_operational_route_points_at_the_authoring_reference(self):
+        doc = 'docs/task-authoring.md'
+        assert doc in _FOLLOWUP_FILING_INSTRUCTIONS, (
+            f'the operational-ask route must cite {doc}, the home of its rationale'
+        )
+        assert (Path(__file__).resolve().parents[2] / doc).is_file(), (
+            f'{doc} is cited by _FOLLOWUP_FILING_INSTRUCTIONS but does not exist'
+        )
+
+
 class TestStewardSweepUp:
     """STEWARD prompt must carry the workflow-end info-note sweep-up (Source 3).
 

@@ -378,8 +378,41 @@ class TestShardFailureStorm:
         assert storm['model'] == 'opus'
         assert storm['shards_total'] == 4
         assert storm['shards_failed'] == 2
+        assert set(storm) == {
+            'count', 'threshold', 'labels', 'shards_failed', 'model', 'shards_total',
+        }
         assert _failures(verdicts)[4:] == [AdjudicationFailure.NOT_ATTEMPTED] * 4
         assert all(verdict.verdict is None for verdict in verdicts)
+
+    @pytest.mark.asyncio
+    async def test_the_storm_names_only_the_current_runs_failures(self):
+        """cli-fail, success, parse-fail, parse-fail: the success ended the first
+        run, so the storm's labels are the second run's alone, while
+        shards_failed counts every failed shard of the call."""
+        def mixed(call: int, shard: Shard) -> ShardReply:
+            if call == 0:
+                return ShardReply(success=False, detail='down')
+            if call == 1:
+                return _valid(call, shard)
+            return ShardReply(success=True, structured_output=[])
+
+        storms: list[Mapping[str, Any]] = []
+        ask = FakeAsker(mixed)
+
+        verdicts = await _adjudicate(
+            _pairs(10), ask, failure_streak=2, on_failure_storm=storms.append,
+        )
+
+        assert len(ask.shards) == 4
+        (storm,) = storms
+        assert storm['labels'] == ['parse_failure']
+        assert storm['count'] == 2
+        assert storm['shards_failed'] == 3
+        not_attempted = verdicts[8:]
+        assert _failures(not_attempted) == [AdjudicationFailure.NOT_ATTEMPTED] * 2
+        assert {verdict.detail for verdict in not_attempted} == {
+            'adjudication stopped after 3 failed shards',
+        }
 
     @pytest.mark.asyncio
     async def test_a_success_between_failures_resets_the_streak(self):

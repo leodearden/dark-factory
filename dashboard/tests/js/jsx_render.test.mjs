@@ -8,10 +8,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { caughtFrom } from './_caught.mjs';
 import { buildDashboardWindow, seedDashboardData } from './dom_harness.mjs';
 import {
   burndownBlock,
   escalationAnalytics,
+  escalationRow,
+  escalationsPayload,
   mergeQueueBlock,
   openEscalationItem,
   orchestratorRow,
@@ -19,6 +22,7 @@ import {
   receiptsFor,
   taskCensus,
   tasksSnapshotEntry,
+  wireDatum,
 } from './wire_fixtures.mjs';
 
 const PROJECT = 'p';
@@ -386,3 +390,514 @@ for (const bucketMinutes of [60, null]) {
     assert.deepEqual(titles, [`Merge attempts · ${caption}`]);
   });
 }
+
+// ── Decision 6: a render throw is contained, and its notice is render_failure.js's ──
+// React's development build reports every throw a boundary catches on
+// console.error: jsdom's report of the replayed throw (its stack, or
+// 'undefined' for a non-Error), then a note naming the boundary that caught
+// it. So these tests cannot assert an empty console. They assert that every
+// report is of a throw RenderFailureBoundary caught, and nothing else.
+
+const CAUGHT_NOTE = 'using the error boundary you provided, ';
+const UNCAUGHT_NOTE = 'Consider adding an error boundary';
+
+function assertReportsOnlyContainedThrows(consoleErrors) {
+  const caughtNotes = consoleErrors.filter(entry => entry.includes(CAUGHT_NOTE));
+  assert.ok(caughtNotes.length > 0, `no throw was reported as caught by a boundary: ${JSON.stringify(consoleErrors)}`);
+  for (const note of caughtNotes) {
+    assert.ok(note.includes(`${CAUGHT_NOTE}RenderFailureBoundary.`), `a boundary other than RenderFailureBoundary caught: ${note}`);
+  }
+  for (const entry of consoleErrors) {
+    assert.ok(!entry.includes(UNCAUGHT_NOTE), `a throw escaped every boundary: ${entry}`);
+    assert.ok(!entry.startsWith('Warning:'), `React warned beside the contained throw: ${entry}`);
+  }
+}
+
+// Like openWindow, but the test asserts the window's reports itself.
+function openContainingWindow(t) {
+  const harness = buildDashboardWindow();
+  t.after(() => harness.close());
+  return harness;
+}
+
+const UNIT_NOTICE_TESTID = 'unit-render-failure-banner';
+const SIBLING_TESTID = 'boundary-sibling';
+
+function noticeLines(notice) {
+  return [...notice.children].map(line => line.textContent);
+}
+
+// The boundary around `child`, beside a sibling that is outside it.
+function mountInsideBoundary(harness, child) {
+  const { React, DF_SHELL, DF_RENDER_FAILURE } = harness.window;
+  const describe = thrown => DF_RENDER_FAILURE.tabRenderFailureNotice('Overview', thrown);
+  const Page = () =>
+    React.createElement(
+      'div',
+      null,
+      React.createElement(DF_SHELL.RenderFailureBoundary, { describe, testId: UNIT_NOTICE_TESTID }, child),
+      React.createElement('span', { 'data-testid': SIBLING_TESTID }, 'outside the boundary'),
+    );
+  const { container } = harness.mount(Page);
+  return { container, describe };
+}
+
+function assertSiblingRenders(container) {
+  assert.equal(container.querySelector(`[data-testid="${SIBLING_TESTID}"]`)?.textContent, 'outside the boundary');
+}
+
+test('shell.jsx::RenderFailureBoundary contains a real DatumReading throw and renders its describe() notice', t => {
+  const harness = openContainingWindow(t);
+  const { React, DF_SHELL, DF_DATUM } = harness.window;
+  const { container, describe } = mountInsideBoundary(harness, React.createElement(DF_SHELL.DatumReading, { datum: 42 }));
+
+  const expected = describe(caughtFrom(() => DF_DATUM.datumView(42)));
+  const notices = container.querySelectorAll(`[data-testid="${UNIT_NOTICE_TESTID}"]`);
+  assert.equal(notices.length, 1, 'the boundary must render exactly one notice in place of the throwing child');
+  assert.equal(notices[0].getAttribute('role'), 'alert');
+  assert.deepEqual(noticeLines(notices[0]), [expected.text, expected.detail]);
+  assertSiblingRenders(container);
+  assertReportsOnlyContainedThrows(harness.consoleErrors);
+});
+
+test('shell.jsx::RenderFailureBoundary fails over on a thrown null, leaving describing it to describe()', t => {
+  const harness = openContainingWindow(t);
+  function ThrowsNull() {
+    throw null;
+  }
+  const { container, describe } = mountInsideBoundary(harness, harness.window.React.createElement(ThrowsNull));
+
+  const expected = describe(null);
+  const notices = container.querySelectorAll(`[data-testid="${UNIT_NOTICE_TESTID}"]`);
+  assert.equal(notices.length, 1, 'a falsy throw must still fail over to the notice');
+  assert.deepEqual(noticeLines(notices[0]), [expected.text, expected.detail]);
+  assertSiblingRenders(container);
+  assertReportsOnlyContainedThrows(harness.consoleErrors);
+});
+
+test('shell.jsx::RenderFailureBoundary renders a healthy child unchanged, with no notice', t => {
+  const harness = openContainingWindow(t);
+  const { React } = harness.window;
+  const { container } = mountInsideBoundary(harness, React.createElement('em', { 'data-testid': 'healthy' }, 'fine'));
+
+  assert.equal(container.querySelector('[data-testid="healthy"]')?.textContent, 'fine');
+  assert.equal(container.querySelector(`[data-testid="${UNIT_NOTICE_TESTID}"]`), null);
+  assertSiblingRenders(container);
+  assert.deepEqual(harness.consoleErrors, []);
+});
+
+// ── The page app.jsx bootstraps: each fault stays in its own region ──
+// Every fault lands as a malformed payload a poll could deliver, then App's
+// own re-render signal; nothing patches a component or writes DF_DATA directly.
+
+const NOTICE_SELECTOR = '[data-testid$="-render-failure-banner"]';
+
+// Lands `payloads` as one poll would: each key with its endpoint's receipt.
+function landPayloads(window, payloads) {
+  seedDashboardData(window, { ...payloads, __receipt: receiptsFor(window.DF_DATA_LOADER, Object.keys(payloads)) });
+}
+
+// The page mounted, after landing `seed` (if any) before the first render.
+function openPage(t, seed = null) {
+  const harness = openContainingWindow(t);
+  if (seed) landPayloads(harness.window, seed);
+  return { ...harness, root: harness.mountPage() };
+}
+
+// A poll landing on the mounted page, then App's re-render signal.
+function landPoll(window, payloads) {
+  landPayloads(window, payloads);
+  window.React.act(() => window.dispatchEvent(new window.Event('df-data-refresh')));
+}
+
+function railButton(root, label) {
+  const button = [...root.querySelectorAll('.rail-nav button')].find(candidate =>
+    [...candidate.children].some(part => part.textContent === label),
+  );
+  assert.ok(button, `the rail has no "${label}" button`);
+  return button;
+}
+
+function openTab(page, label) {
+  click(page.window, railButton(page.root, label));
+}
+
+function failureNotices(root) {
+  return [...root.querySelectorAll(NOTICE_SELECTOR)];
+}
+
+function crumb(root) {
+  return root.querySelector('.crumbs .here')?.textContent;
+}
+
+function assertOneNotice(page, testId, expectedText) {
+  const notices = failureNotices(page.root);
+  assert.deepEqual(notices.map(notice => notice.dataset.testid), [testId]);
+  const [text, detail] = noticeLines(notices[0]);
+  assert.equal(text, expectedText);
+  assert.ok(
+    page.consoleErrors.some(entry => entry.startsWith(detail)),
+    `the notice's detail "${detail}" heads none of the reported throws: ${JSON.stringify(page.consoleErrors)}`,
+  );
+  return detail;
+}
+
+function bodyHoldsTabContent(root) {
+  const body = root.querySelector('.body');
+  return !!body && [...body.children].some(child => !child.matches('[data-testid$="-banner"]'));
+}
+
+const CHROME_REGIONS = {
+  'navigation rail': root => root.querySelectorAll('.rail-nav button').length > 0,
+  'status strip': root => !!root.querySelector('.stat-strip'),
+  toolbar: root => {
+    const toolbar = root.querySelector('.toolbar');
+    return !!toolbar && !toolbar.matches(NOTICE_SELECTOR);
+  },
+};
+
+function assertChromeRenders(root, except = null) {
+  for (const [region, renders] of Object.entries(CHROME_REGIONS)) {
+    if (region !== except) assert.ok(renders(root), `the ${region} no longer renders`);
+  }
+}
+
+test('app.jsx contains a tab throw to the tab, and a fresh boundary retries it after a tab switch', t => {
+  const page = openPage(t, { ESCALATION_ANALYTICS: escalationAnalytics([{ project: PROJECT, openItems: [null] }]) });
+  const { tabRenderFailureNotice } = page.window.DF_RENDER_FAILURE;
+
+  openTab(page, 'Analytics');
+  const detail = assertOneNotice(page, 'tab-render-failure-banner', tabRenderFailureNotice('Analytics', undefined).text);
+  assert.ok(detail.startsWith('TypeError'), detail);
+  assertChromeRenders(page.root);
+
+  openTab(page, 'Costs');
+  assert.deepEqual(failureNotices(page.root), []);
+  assert.equal(crumb(page.root), 'Costs');
+
+  landPoll(page.window, { ESCALATION_ANALYTICS: escalationAnalytics([{ project: PROJECT, openItems: [] }]) });
+  openTab(page, 'Analytics');
+  assert.deepEqual(failureNotices(page.root), [], 'the fixed tab still shows the notice: no fresh boundary retried it');
+  assert.ok(bodyHoldsTabContent(page.root), 'the fixed tab rendered no content');
+  assertReportsOnlyContainedThrows(page.consoleErrors);
+});
+
+// One fault per chrome region, each a payload a poll could land, and each
+// reaching only that region's render on the Costs tab, which reads none of
+// the faulted keys.
+const CHROME_FAULTS = [
+  {
+    region: 'navigation rail',
+    testId: 'rail-render-failure-banner',
+    // An object where the pending count belongs.
+    payloads: () => ({ ESCALATIONS: { summary: { by_status: { pending: { count: 3 } } } } }),
+  },
+  {
+    region: 'status strip',
+    testId: 'status-strip-render-failure-banner',
+    // A fresh Datum with no value, which datum.py forbids: the topbar's write
+    // queue reading then throws inside DatumReading.
+    payloads: () => ({ MEMORY_STATUS: { queue: { stats: wireDatum(null) } } }),
+  },
+  {
+    region: 'toolbar',
+    testId: 'toolbar-render-failure-banner',
+    payloads: () => ({ PROJECTS: [null] }),
+  },
+];
+
+for (const { region, testId, payloads } of CHROME_FAULTS) {
+  test(`app.jsx contains a ${region} throw to the ${region}, and every other region renders on`, t => {
+    const page = openPage(t);
+    openTab(page, 'Costs');
+
+    landPoll(page.window, payloads());
+
+    const { chromeRenderFailureNotice } = page.window.DF_RENDER_FAILURE;
+    assertOneNotice(page, testId, chromeRenderFailureNotice(region, undefined).text);
+    assert.equal(crumb(page.root), 'Costs');
+    assert.ok(bodyHoldsTabContent(page.root), 'the open tab stopped rendering');
+    assertChromeRenders(page.root, region);
+    assertReportsOnlyContainedThrows(page.consoleErrors);
+  });
+}
+
+test("app.jsx leaves a full-page notice naming the error when App's own body throws, not an empty #root", t => {
+  const harness = openContainingWindow(t);
+  // A malformed /orchestrators payload: App's body filters it while deriving
+  // the topbar summary, above every region boundary.
+  landPayloads(harness.window, { ORCHESTRATORS: {} });
+
+  let root;
+  assert.doesNotThrow(() => {
+    root = harness.mountPage();
+  });
+
+  const page = { ...harness, root };
+  const { pageRenderFailureNotice } = page.window.DF_RENDER_FAILURE;
+  const detail = assertOneNotice(page, 'page-render-failure-banner', pageRenderFailureNotice(undefined).text);
+  assert.equal(failureNotices(root)[0].getAttribute('role'), 'alert');
+  assert.ok(detail.startsWith('TypeError'), detail);
+  assert.equal(root.querySelector('.app'), null, 'the page that threw must not render beside its notice');
+  assertReportsOnlyContainedThrows(page.consoleErrors);
+});
+
+// ── Decision 7: the sidebar's check-owner section (escalation_check_owner.js::checkOwnerPanel) ──
+// A dependency_capability record names two tasks: its own task_id is the
+// blocked dependent, and delivered_check_owner.task_id is the owner whose
+// declaration sites are edited. The fixture ids differ, so a swap is caught.
+
+const CHECK_OWNER_TASK = '7514';
+const CHECK_DEPENDENT_TASK = '7600';
+const CHECK_SIDECAR_PATH = 'plans/x.capabilities.yaml';
+
+function checkOwnerRow(deliveredCheckOwner) {
+  return escalationRow({
+    id: `esc-${CHECK_DEPENDENT_TASK}-1`,
+    taskId: CHECK_DEPENDENT_TASK,
+    summary: 'delivered check graph-index-provisioned fails on main',
+    project: PROJECT,
+    deliveredCheckOwner,
+  });
+}
+
+function declaredCheckOwner(sidecar) {
+  return { task_id: CHECK_OWNER_TASK, check_name: 'graph-index-provisioned', sidecar };
+}
+
+function shownTaskId(window, id) {
+  return `T-${window.DF_SHELL.taskId(id)}`;
+}
+
+// Land `row` as the only escalation, open the tab, click the row, and return
+// the sidebar it opens.
+function openSidebar(harness, row) {
+  const { window } = harness;
+  seedDashboardData(window, {
+    ESCALATIONS: escalationsPayload([{ project: PROJECT, rows: [row] }]),
+    __receipt: receiptsFor(window.DF_DATA_LOADER, ['ESCALATIONS']),
+  });
+  const { container } = harness.mount(window.DF_TABS.EscalationsTab, { projectFilter: [] });
+  const tableRow = [...container.querySelectorAll('tbody tr')].find(
+    tr => tr.querySelector('td')?.textContent === shownTaskId(window, row.task_id),
+  );
+  assert.ok(tableRow, "the escalation's row did not render, so its sidebar cannot be opened");
+  click(window, tableRow);
+  const dialog = container.querySelector('[role="dialog"]');
+  assert.ok(dialog, 'clicking the row opened no sidebar');
+  return dialog;
+}
+
+function oneByTestId(root, testId) {
+  const found = root.querySelectorAll(`[data-testid="${testId}"]`);
+  assert.equal(found.length, 1, `expected exactly one [data-testid="${testId}"], found ${found.length}`);
+  return found[0];
+}
+
+test("tab_escalations.jsx::EscalationSidebar renders checkOwnerPanel's owner, check, declaration sites and dependent", t => {
+  const harness = openWindow(t);
+  const row = checkOwnerRow(declaredCheckOwner({ path: CHECK_SIDECAR_PATH, on_main: 'declares' }));
+  const dialog = openSidebar(harness, row);
+
+  const panel = harness.window.DF_ESCALATION_CHECK_OWNER.checkOwnerPanel(row);
+  const owner = shownTaskId(harness.window, panel.ownerTaskId);
+  const dependent = shownTaskId(harness.window, panel.dependentTaskId);
+  assert.notEqual(owner, dependent, 'the fixture must make the owner and the dependent differ');
+  const section = oneByTestId(dialog, 'esc-check-owner');
+
+  const ownerLine = oneByTestId(section, 'esc-check-owner-owner').textContent;
+  assert.ok(ownerLine.includes(owner) && ownerLine.includes(panel.checkName), ownerLine);
+  assert.ok(!ownerLine.includes(dependent), `the owner line names the dependent: ${ownerLine}`);
+
+  const metadataSite = oneByTestId(section, 'esc-check-owner-metadata').textContent;
+  assert.ok(metadataSite.includes(owner) && metadataSite.includes(panel.checkName), metadataSite);
+
+  const sidecarSite = oneByTestId(section, 'esc-check-owner-sidecar').textContent;
+  assert.ok(sidecarSite.includes(panel.sidecarPath) && sidecarSite.includes(panel.sidecarCaption), sidecarSite);
+
+  const dependentLine = oneByTestId(section, 'esc-check-owner-dependent').textContent;
+  assert.ok(dependentLine.includes(dependent), dependentLine);
+  assert.ok(!dependentLine.includes(owner), `the dependent line names the owner: ${dependentLine}`);
+});
+
+test("tab_escalations.jsx::EscalationSidebar tones an unverified sidecar's caption with checkOwnerPanel's tone", t => {
+  const harness = openWindow(t);
+  const row = checkOwnerRow(declaredCheckOwner({ path: CHECK_SIDECAR_PATH, on_main: 'unverified' }));
+  const dialog = openSidebar(harness, row);
+
+  const panel = harness.window.DF_ESCALATION_CHECK_OWNER.checkOwnerPanel(row);
+  assert.ok(panel.sidecarTone, 'the fixture must be a toned sidecar state');
+  const captions = [...oneByTestId(dialog, 'esc-check-owner-sidecar').querySelectorAll('span')].filter(
+    span => span.textContent === panel.sidecarCaption,
+  );
+  assert.equal(captions.length, 1, 'the sidecar site must render its caption in exactly one span');
+  assert.ok(captions[0].classList.contains(panel.sidecarTone), captions[0].className);
+});
+
+test("tab_escalations.jsx::EscalationSidebar renders checkOwnerPanel's no-sidecar caption and no sidecar path", t => {
+  const harness = openWindow(t);
+  const row = checkOwnerRow(declaredCheckOwner(null));
+  const dialog = openSidebar(harness, row);
+
+  const panel = harness.window.DF_ESCALATION_CHECK_OWNER.checkOwnerPanel(row);
+  assert.equal(panel.sidecarPath, null);
+  const sidecarSite = oneByTestId(dialog, 'esc-check-owner-sidecar');
+  assert.ok(sidecarSite.textContent.includes(panel.sidecarCaption), sidecarSite.textContent);
+  assert.equal(sidecarSite.querySelector('.mono'), null, 'a site with no sidecar renders no sidecar path');
+  assert.ok(!dialog.textContent.includes(CHECK_SIDECAR_PATH), 'the sidebar names a sidecar path it was not given');
+  oneByTestId(dialog, 'esc-check-owner-owner');
+});
+
+test("tab_escalations.jsx::EscalationSidebar renders a sidecar with no path or on_main as a sidecar, in checkOwnerPanel's words", t => {
+  const harness = openWindow(t);
+  const row = checkOwnerRow(declaredCheckOwner({}));
+  const dialog = openSidebar(harness, row);
+
+  const panel = harness.window.DF_ESCALATION_CHECK_OWNER.checkOwnerPanel(row);
+  const sidecarSite = oneByTestId(dialog, 'esc-check-owner-sidecar');
+  assert.equal(sidecarSite.querySelector('.mono')?.textContent, panel.sidecarPath, 'a pathless sidecar must keep its path slot');
+  assert.ok(sidecarSite.textContent.includes(panel.sidecarCaption), sidecarSite.textContent);
+  assert.ok(!dialog.textContent.includes('undefined'), dialog.textContent);
+});
+
+test('tab_escalations.jsx::EscalationSidebar renders no check-owner section without an owner, the same for an absent key as for null', t => {
+  const absentHarness = openWindow(t);
+  const absent = checkOwnerRow(undefined);
+  assert.equal('delivered_check_owner' in absent, false, 'the fixture must make absence real, not undefined-valued');
+  const absentDialog = openSidebar(absentHarness, absent);
+  assert.equal(absentHarness.window.DF_ESCALATION_CHECK_OWNER.checkOwnerPanel(absent), null);
+  assert.equal(absentDialog.querySelector('[data-testid="esc-check-owner"]'), null);
+
+  const nullHarness = openWindow(t);
+  const nullDialog = openSidebar(nullHarness, checkOwnerRow(null));
+
+  assert.equal(nullDialog.innerHTML, absentDialog.innerHTML);
+});
+
+// ── Decision 8: the Tasks tab's preferences go through persisted_state.js ──
+// A key exists only while its value differs from its default, and a write the
+// browser refuses is reported on console.warn rather than swallowed.
+
+const TASKS_PREFERENCE_KEYS = ['df.tasksOpen', 'df.tasksGroupByPrd', 'df.tasks.views'];
+
+function storedKeys(window) {
+  const { localStorage } = window;
+  return Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i));
+}
+
+function viewButton(window, container, key) {
+  const { label } = window.DF_TASK_SNAPSHOT.CENSUS_VIEWS.find(view => view.key === key);
+  const buttons = [...container.querySelectorAll('.seg button')].filter(button => button.textContent === label);
+  assert.equal(buttons.length, 1, `expected one '${label}' view button`);
+  return buttons[0];
+}
+
+function mountTasks(harness) {
+  const task = inProgressTask(false);
+  seedOneTask(harness.window, task);
+  const handle = harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
+  assert.ok(graphNode(handle.container, task), 'the seeded task never reached the graph');
+  return handle;
+}
+
+function projectHead(container) {
+  const heads = [...container.querySelectorAll('.proj-head')].filter(head => head.querySelector('.name')?.textContent === PROJECT);
+  assert.equal(heads.length, 1, `expected one header for project ${PROJECT}`);
+  return heads[0];
+}
+
+// Fills storage until jsdom's own quota refuses a single character more, and
+// returns the error that refusal threw.
+function fillStorageToQuota(storage) {
+  let refusal = null;
+  let written = 0;
+  for (let size = 1 << 20; size >= 1; size >>= 1) {
+    const chunk = 'x'.repeat(size);
+    for (;;) {
+      try {
+        storage.setItem(`fill.${written}`, chunk);
+        written += 1;
+      } catch (error) {
+        refusal = error;
+        break;
+      }
+    }
+  }
+  return refusal;
+}
+
+test('tab_tasks.jsx::TasksTab stores none of its preferences while each is at its default', t => {
+  const harness = openWindow(t);
+  mountTasks(harness);
+
+  const stored = storedKeys(harness.window);
+  assert.deepEqual(TASKS_PREFERENCE_KEYS.filter(key => stored.includes(key)), []);
+});
+
+test('tab_tasks.jsx::TasksTab reports a preference it cannot store on console.warn, and the view still flips', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const refusal = fillStorageToQuota(window.localStorage);
+  assert.equal(refusal?.name, 'QuotaExceededError', 'the fill did not reach the storage quota');
+  const warnings = [];
+  window.console.warn = (...args) => warnings.push(args);
+
+  const { container } = mountTasks(harness);
+  click(window, viewButton(window, container, 'terminal'));
+
+  assert.ok(viewButton(window, container, 'terminal').classList.contains('on'), 'the terminal view did not flip on');
+  assert.ok(
+    warnings.some(([message, error]) => String(message).includes('df.tasks.views') && error?.name === 'QuotaExceededError'),
+    `no console.warn named 'df.tasks.views' with its QuotaExceededError: ${JSON.stringify(warnings.map(([message]) => String(message)))}`,
+  );
+});
+
+test('tab_tasks.jsx::TasksTab stores a flipped view, seeds the next mount with it, and removes the key when flipped back', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const first = mountTasks(harness);
+  click(window, viewButton(window, first.container, 'terminal'));
+  assert.equal(JSON.parse(window.localStorage.getItem('df.tasks.views'))?.terminal, true, 'the flipped view was not stored');
+  first.unmount();
+
+  const { container } = mountTasks(harness);
+  assert.ok(viewButton(window, container, 'terminal').classList.contains('on'), 'the stored view did not seed the next mount');
+  click(window, viewButton(window, container, 'terminal'));
+  assert.ok(!storedKeys(window).includes('df.tasks.views'), 'the view is back at its default, yet its key is still stored');
+});
+
+test('tab_tasks.jsx::TasksTab folds a project on its first header click, and the fold seeds the next mount', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const first = mountTasks(harness);
+  assert.equal(projectHead(first.container).dataset.open, 'true', 'a project with no stored flag did not start open');
+  click(window, projectHead(first.container));
+  assert.equal(projectHead(first.container).dataset.open, 'false', 'one header click did not fold the project');
+  assert.ok(storedKeys(window).includes('df.tasksOpen'), 'the fold was not stored');
+  first.unmount();
+
+  // A folded project renders no graph, so this mount cannot go through mountTasks.
+  const { container } = harness.mount(window.DF_TASKS.TasksTab, TAB_PROPS);
+  assert.equal(projectHead(container).dataset.open, 'false', 'the stored fold did not seed the next mount');
+  click(window, projectHead(container));
+  assert.equal(projectHead(container).dataset.open, 'true', 'one header click did not unfold the project');
+  assert.ok(!storedKeys(window).includes('df.tasksOpen'), 'the project is back at its default-open, yet its key is still stored');
+});
+
+function groupingButton(container, label) {
+  const buttons = [...projectHead(container).querySelectorAll('.seg button')].filter(button => button.textContent === label);
+  assert.equal(buttons.length, 1, `expected one '${label}' grouping button`);
+  return buttons[0];
+}
+
+test('tab_tasks.jsx::TasksTab stores a project grouped by PRD, and removes the key when it is listed flat again', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const { container } = mountTasks(harness);
+  click(window, groupingButton(container, 'by PRD'));
+  assert.equal(JSON.parse(window.localStorage.getItem('df.tasksGroupByPrd'))?.[PROJECT], 'prd', 'the by-PRD grouping was not stored');
+
+  click(window, groupingButton(container, 'list'));
+  assert.ok(groupingButton(container, 'list').classList.contains('on'), 'the project did not return to the flat list');
+  assert.ok(!storedKeys(window).includes('df.tasksGroupByPrd'), 'the grouping is back at its default, yet its key is still stored');
+});

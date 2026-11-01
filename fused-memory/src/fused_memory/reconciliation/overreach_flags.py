@@ -56,7 +56,10 @@ async def fetch_overreach_flags(
 async def acknowledge_overreach_flags(
     shadow: OverreachFlagSource | None, page: OverreachFlagPage | None,
 ) -> None:
-    """Record that a completed cycle was shown *page*; a failure (warned) re-offers it next cycle."""
+    """Record that Stage 1 was shown *page*, once complete_run has made the cycle durable.
+
+    A failure (warned) re-offers the page next cycle.
+    """
     if shadow is None or page is None:
         return
     try:

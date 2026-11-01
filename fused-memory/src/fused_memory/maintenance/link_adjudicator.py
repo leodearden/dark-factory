@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
 from shared.cli_invoke import AgentResult, invoke_with_cap_retry, no_mcp_servers_config
 from shared.neutral_cwd import neutral_cli_cwd
-from shared.storm_counter import StormCounter
+from shared.streak import KeyedStreaks
 
 from fused_memory.maintenance.link_heal import Verdict
 
@@ -169,9 +169,6 @@ StormHook: TypeAlias = Callable[[Mapping[str, Any]], None]
 ShardVerdicts: TypeAlias = dict[str, tuple[Verdict, str]]
 ShardFailure: TypeAlias = tuple[AdjudicationFailure, str]
 
-#: A streak is consecutive shards of one run, so its window must outlast any run.
-_STREAK_WINDOW_SECONDS = 7 * 24 * 3600.0
-
 
 async def adjudicate_links(
     pairs: Sequence[LinkPair],
@@ -192,18 +189,39 @@ async def adjudicate_links(
     _refuse_duplicate_keys(pairs)
     ask = ask if ask is not None else ClaudeShardAsker()
     chunks = _chunks(pairs, shard_size)
-    streak = _ShardFailureStreak(failure_streak)
+    failures: KeyedStreaks[None] = KeyedStreaks(threshold=failure_streak)
+    failed_shards: list[ShardFailure] = []
     verdicts: list[LinkVerdict] = []
     for index, chunk in enumerate(chunks):
         outcome = await _judge_chunk(ask, chunk, model=model, field_chars=field_chars)
         verdicts.extend(_link_verdicts(chunk, model, outcome))
-        storm = streak.observe(outcome)
-        if storm is not None:
+        if not isinstance(outcome, tuple):
+            failures.success(None)
+            continue
+        failed_shards.append(outcome)
+        step = failures.failure(None)
+        if step.fired:
             if on_failure_storm is not None:
+                storm = _storm_summary(
+                    failed_shards[-step.count:],
+                    threshold=failure_streak,
+                    shards_failed=len(failed_shards),
+                )
                 on_failure_storm({**storm, 'model': model, 'shards_total': len(chunks)})
-            verdicts.extend(_not_attempted(chunks[index + 1:], model, streak.shards_failed))
+            verdicts.extend(_not_attempted(chunks[index + 1:], model, len(failed_shards)))
             break
     return verdicts
+
+
+def _storm_summary(
+    run: Sequence[ShardFailure], *, threshold: int, shards_failed: int,
+) -> dict[str, Any]:
+    return {
+        'count': len(run),
+        'threshold': threshold,
+        'labels': sorted({failure.value for failure, _ in run}),
+        'shards_failed': shards_failed,
+    }
 
 
 def _refuse_duplicate_keys(pairs: Sequence[LinkPair]) -> None:
@@ -322,28 +340,6 @@ def _not_attempted(
         for chunk in chunks
         for pair in chunk
     ]
-
-
-class _ShardFailureStreak:
-    """Consecutive failed shards, on a latched StormCounter that a success replaces."""
-
-    def __init__(self, threshold: int) -> None:
-        self._threshold = threshold
-        self._counter = StormCounter(fire_mode='latched')
-        self.shards_failed = 0
-
-    def observe(self, outcome: ShardVerdicts | ShardFailure) -> dict[str, Any] | None:
-        """The storm summary on the shard that completes the streak, else ``None``."""
-        if not isinstance(outcome, tuple):
-            self._counter = StormCounter(fire_mode='latched')
-            return None
-        self.shards_failed += 1
-        storm = self._counter.record(
-            threshold=self._threshold,
-            window_seconds=_STREAK_WINDOW_SECONDS,
-            label=outcome[0].value,
-        )
-        return None if storm is None else {**storm, 'shards_failed': self.shards_failed}
 
 
 #: Never 1; see reconciliation/judge.py::_JUDGE_CLI_MAX_TURNS for why.

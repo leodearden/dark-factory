@@ -831,7 +831,7 @@ function ReconTab({ projectFilter, search }) {
         </div>
         <div className="panel-body flush">
           <table className="tbl">
-            <thead><tr><th>Run</th><th>Project</th><th>Trigger</th><th>Type</th><th>Status</th><th className="num">Events</th><th className="num">Duration</th><th>When</th><th className="num">Journal</th></tr></thead>
+            <thead><tr><th>Run</th><th>Project</th><th>Trigger</th><th>Type</th><th>Status</th><th className="num">Events</th><th className="num">Duration</th><th>When</th></tr></thead>
             <tbody>
               {runs.map(rn => (
                 <tr key={rn.id}>
@@ -843,7 +843,6 @@ function ReconTab({ projectFilter, search }) {
                   <td className="num">{rn.events_processed ?? rn.events ?? 0}</td>
                   <td className="num">{rn.duration_seconds != null ? `${rn.duration_seconds.toFixed(1)}s` : '—'}</td>
                   <td style={{ color: 'var(--fg-3)' }}>{window.DF_SHELL.timeago(rn.started_at)}</td>
-                  <td className="num"><span className="badge accent">{rn.journal_entry_count ?? 0}</span></td>
                 </tr>
               ))}
             </tbody>

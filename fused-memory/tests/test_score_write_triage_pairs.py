@@ -3,7 +3,7 @@
 The scorer judges each arm by the pair it attached a write to, read against a
 blind verdict corpus (one or more raters per (entry, target) pair). These
 tests reach it only through its public surface: ``resolve_verdicts``,
-``score_pairs`` and the ``main`` CLI.
+``score_pairs``, ``mcnemar_exact`` and the ``main`` CLI.
 
 The script is loaded by path (``scripts/`` is not a package), lazily through
 ``_mod()``, exactly as ``test_eval_write_triage_judge.py`` does.
@@ -504,6 +504,30 @@ class TestPairedVsReference:
         cases = _replaced(SYNTH_CASES, 'cand', 'w7', band_winner_id='p9')
         with pytest.raises(ValueError, match="'w7'"):
             _score(cases, SYNTH_VERDICTS)
+
+
+class TestMcNemarExact:
+    """p = min(1, 2 * sum_{k <= min(b, c)} C(b + c, k) / 2^(b + c)), to 4 places."""
+
+    def test_no_discordant_pairs_is_p_one(self) -> None:
+        assert _mod().mcnemar_exact(0, 0) == 1.0
+
+    @pytest.mark.parametrize(('only_first', 'only_second', 'expected'), [
+        (0, 5, 0.0625),
+        (5, 0, 0.0625),
+        (1, 9, 0.0215),
+        (9, 1, 0.0215),
+    ])
+    def test_the_test_is_two_sided_and_symmetric(
+        self, only_first: int, only_second: int, expected: float,
+    ) -> None:
+        assert _mod().mcnemar_exact(only_first, only_second) == expected
+
+    def test_p_is_rounded_to_four_places(self) -> None:
+        assert _mod().mcnemar_exact(0, 10) == 0.002
+
+    def test_p_is_clamped_to_one(self) -> None:
+        assert _mod().mcnemar_exact(3, 3) == 1.0
 
 
 class TestRefusal:

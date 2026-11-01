@@ -173,8 +173,11 @@ own checkout (`shared.project_layout.default_project_root` is banned in `client_
 12. **Reveal budget** (design note §5): counted set = visible production files not matching free,
     never-reveal or generated globs (`linguist-generated` honoured); lines = non-blank lines, a line
     over `max_line_bytes` counting as ⌈bytes/max⌉; budget = `reveal_proportion × counted lines added or
-    changed since delivered_commit` (all counted lines when null); each reveal costs
-    `max(file_lines, reveal_floor_lines)`; granted when `spent + cost ≤ budget`. Reveal identity is
+    changed since delivered_commit` (all counted lines when null); a path in the counted set costs
+    `max(its chargeable lines, reveal_floor_lines)` and a path outside it costs 0; a request that adds
+    nothing to `spent` (a path outside the counted set, or one already revealed) is granted whatever
+    `spent` is, and any other is granted when `spent + cost ≤ budget` (where this is implemented:
+    §12, the 2026-10-22 δ entry (b) and the 2026-10-25 entry (a)). Reveal identity is
     the path until a delete event; a recreated path needs a new reveal; renames follow git's default
     detection; a deleted file emits a final `file_revealed {deleted: true}` and stops counting.
 13. **Hostile requests are refused with typed reasons.** A requested path must appear in
@@ -268,8 +271,9 @@ whole `criteria_declared` map. Rewritten atomically after every pass that append
 
 ### 7.4 `in/inbox.jsonl` (portal → publisher)
 
-`{seq, at, type: "reveal_requested", path}`. Answered with `file_revealed` or `reveal_refused`. A second line
-type, `defect_reported`, is added by §14.3.
+`{seq, at, type: "reveal_requested", path}`. Answered with `file_revealed` or `reveal_refused`. A request
+for a path already revealed and still revealable appends nothing, because the feed already holds its
+content at head (§12, 2026-10-25 entry (b)). A second line type, `defect_reported`, is added by §14.3.
 
 ### 7.5 `in/engagement.json` (portal → publisher)
 
@@ -597,13 +601,65 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     repository holds, so read as vendored it disables reveals. A test that needs a usable engagement
     sets it to null after reading the vendored file (`client-feed/tests/test_in_v1_fixture.py`).
 
+- 2026-10-25, from task 7484. These bind ζ (6973) and the portal:
+  - (a) A request that adds nothing to `spent_lines` is granted whatever `spent_lines` is: a path
+    outside the counted set, or one already revealed. Any other request must fit what is left of
+    the budget (`client-feed/src/client_feed/budget.py::CountedSet.grantable`). Follow-head never
+    refuses for budget (δ entry (f)), so `spent_lines` can exceed `budget_lines`. A free file is
+    still granted then, and B14's `spent_lines` is unchanged by its grant.
+  - (b) A granted request for a path already in the revealed set emits no event, so a portal retry
+    or a double-click appends nothing. Within a pass, follow-head runs before the inbox is answered,
+    and it has already re-emitted at head every revealed file whose blob changed
+    (`client-feed/src/client_feed/reveals.py::_follow_events`). The feed therefore already holds
+    head's content for every revealed path. The request is still judged first, so a refusal is
+    emitted exactly as before (`client-feed/src/client_feed/reveals.py::_answer`). A consumer that
+    tracks pending requests therefore settles one when its path is in `state.revealed` or a
+    `reveal_refused` answers it, and never waits for a `file_revealed` per request. An explicit
+    `already_revealed` acknowledgement would need a contract revision.
+  - (c) git output that does not parse is a `GitError` of the command that wrote it, and it
+    degrades `git` like any other git failure
+    (`client-feed/src/client_feed/sources/git.py::_parsing`). Every `git cat-file --batch` read is
+    bounded by `GIT_TIMEOUT_SECS`, as every one-shot git call is. The bound applies per read, so the
+    caller's work between reads never counts against it. A read that outlasts it kills the session
+    and fails as `timed out` (`client-feed/src/client_feed/sources/git.py::blob_reader`).
+
+- 2026-10-29, from η (task 6974). These bind σ2 and the portal's deploy/ README:
+  - (a) The publisher unit is `client-feed@<name>.service`, rendered from
+    `scripts/client-feed.service.template`. Its ExecStart is `uv run --no-sync --project client-feed
+    client-feed publish --config %h/.config/client-feed/%i.yaml`, so an instance's config is
+    `~/.config/client-feed/<name>.yaml`. Operating it: `OPERATIONS.md` §"Client feed".
+  - (b) It is rendered through `scripts/render_systemd_unit.py::UNITS` entry `client-feed`, whose
+    family is None: it has no Environment= policy and preserves nothing. `scripts/setup-host.sh`
+    section 7a renders it, runs `daemon-reload` on success, and never enables or starts an
+    instance.
+  - (c) setup-host section 3 now runs one `uv sync --all-packages` from the repo root, in place of
+    its per-member `uv sync` loop. A member-scoped sync is exact and prunes the other members from
+    the one shared `.venv`, so the loop left only the last member's closure installed (measured
+    2026-10-29, uv 0.11.6, in a throwaway two-member workspace: after `uv sync --all-packages`,
+    `cd b && uv sync` left only `b`). Appending `client-feed` to the loop, as the task text read,
+    would have pruned the dashboard.
+  - (d) The worked policy for this repository is `client-feed/examples/dark-factory.yaml`,
+    validated by `client-feed/tests/test_policy_example.py`.
+  - (e) A clean stop exits 0 through `uv run`, so the unit carries no `SuccessExitStatus=`. The
+    publisher's handler only sets its stop Event, and the process exits once the pass in progress
+    completes (`client-feed/src/client_feed/cli.py::_publish_until_signalled`). A `uv run` child of
+    that shape gave uv rc 0 in 6 of 6 trials, whether SIGTERM reached uv alone or the whole process
+    group, as systemd's control-group kill sends it (measured 2026-10-29, uv 0.11.6). The shape
+    matters: in one trial, a child that called `sys.exit(0)` inside its handler gave 143 when the
+    whole group was signalled. A likely cause, not verified: uv forwards the SIGTERM it receives,
+    and that duplicate lands after the interpreter has dropped the handler. Re-measure before
+    changing the handler.
+  - (f) For σ2: the filer's template is another `UNITS` entry with its own explicit `--unit` call
+    site in setup-host. `tests/scripts/test_render_systemd_unit.py::test_setup_host_renders_each_unit_from_the_template_its_spec_names`
+    pairs each registry key with that call site.
+
 ## 13. Open questions (tactical)
 
 1. **Tree-snapshot cost on large repos.** Suggested: snapshot only on head change; blob line counts
    cached by sha in `cursor.json`; last-change dates from the commits walked since the previous
    snapshot. Decide in β2/γ.
-2. **One unit per project or one unit with a list.** Suggested: `client-feed@<name>.service` instance
-   per project, `--config ~/.config/client-feed/<name>.yaml`. Decide in η.
+2. **One unit per project or one unit with a list.** **Decided by η (6974):** one instance per
+   project, `client-feed@<name>.service`, `--config %h/.config/client-feed/<name>.yaml`.
 3. **Default globs** for visible, test, docs and generated sets. Suggested as in §7.2 and §7.6, with
    `visible_globs` having no default (a policy must name it). Decide in β2.
 4. **`excerpt` rule for PRDs** whose first paragraph is a status line. **Decided by β1 (6968):** the

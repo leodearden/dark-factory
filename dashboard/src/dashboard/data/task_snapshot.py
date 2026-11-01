@@ -131,11 +131,11 @@ lands, narrowing the STATUSES does not narrow the WORK.
 WHY THIS IS TASKS-TAB-LOCAL rather than a bump of the shared
 ``tasks.DEFAULT_PER_CALL_TIMEOUT``: that constant feeds
 ``tasks.DEFAULT_WHOLE_OPERATION_BUDGET``, which
-``task_lookup.LOOKUP_BUDGET_SECONDS`` and ``escalations._TASK_CARDS_BUDGET``
-both bind BY REFERENCE (task 4788). Raising the shared default to fix the
-Tasks tab would silently widen unrelated route budgets, neither of which
-fetches a 5 000-task tree. ``test_tasks_budget.py`` assertion (e) pins both
-halves.
+``task_lookup.LOOKUP_BUDGET_SECONDS`` (task 4788) and
+``task_prose._TASK_PROSE_BUDGET`` both bind BY REFERENCE. Raising the shared
+default to fix the Tasks tab would silently widen unrelated route budgets,
+none of which fetches a 5 000-task tree. ``test_tasks_budget.py`` assertion
+(e) pins both halves.
 """
 
 SNAPSHOT_TTL_SECONDS = 15.0
@@ -303,12 +303,12 @@ class _LastGood:
 _last_good: dict[str, dict[str, _LastGood]] = {}
 
 
-def _snapshot_cache_clear() -> None:
-    """Clear the snapshot unit cache AND the last-good store (test/admin hook).
+def clear_snapshot_cache() -> None:
+    """Clear the snapshot unit cache AND the last-good store.
 
     Both, because a test that clears only the TTL would still be served the
     previous test's values as ``stale`` — the one thing a clear hook exists to
-    prevent.
+    prevent. ``active_tasks.reset_task_snapshot_state`` composes it.
     """
     _snapshot_cache.clear()
     _last_good.clear()
@@ -327,6 +327,14 @@ async def _bounded(coro: Awaitable[Any], *, label: str) -> _HalfRead[Any]:
     expiry means this process ran out of budget and the server may be perfectly
     healthy. Collapsing them is what made the 2026-07-30 event get misdiagnosed
     as an orchestrator outage.
+
+    The ``wait_for`` is deliberately bounded at ``PER_CALL_TIMEOUT`` itself, NOT
+    at ``memory.py::enclosing_deadline``. The equal bound keeps every
+    client-side timeout, a saturated pool included, in ``BUDGET``; a larger one
+    would let the fan-out fold it into an offline marker, reported as
+    ``UNREACHABLE``. ``PER_CALL_TIMEOUT`` is also the operation term in
+    ``test_tasks_budget.py``'s assertion (a). Pinned by
+    ``test_saturated_pool_is_diagnosable.py::test_task_snapshot_reports_a_saturated_pool_as_budget_not_offline``.
     """
     try:
         result = await asyncio.wait_for(coro, PER_CALL_TIMEOUT)
@@ -763,8 +771,12 @@ async def acquire_terminal_window(
     *,
     now: datetime,
     terminal_total: int | None,
+    window: int = _TERMINAL_FETCH_WINDOW,
 ) -> Datum[list[dict]]:
-    """Read the newest :data:`_TERMINAL_FETCH_WINDOW` terminal rows, or say why not.
+    """Read the newest *window* terminal rows (default :data:`_TERMINAL_FETCH_WINDOW`), or say why not.
+
+    *window* is injectable so a caller (a test) can size it without touching
+    the module constant.
 
     Lives beside the unit because it is the same datum family read through the
     same access implementation, under the third slot of
@@ -797,6 +809,8 @@ async def acquire_terminal_window(
     Benign race: *terminal_total* was measured by a different read, so a task
     completing between the two shifts the window by a row.
     """
+    if window < 1:
+        raise ValueError(f'window must be at least 1, got {window!r}')
     if terminal_total is None:
         return unknown_datum(
             'the terminal window cannot be positioned without a measured '
@@ -805,7 +819,6 @@ async def acquire_terminal_window(
             FRESHNESS_BOUND_SECONDS,
         )
 
-    window = _TERMINAL_FETCH_WINDOW
     if terminal_total > window:
         logger.warning(
             'project root %s: %d terminal (done+cancelled) tasks exceed the '

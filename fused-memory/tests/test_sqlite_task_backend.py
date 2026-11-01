@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any, cast
 
@@ -37,6 +38,7 @@ from fused_memory.backends.task_backend_errors import (
     AppendUnsupportedFieldError,
     DoneProvenanceWriteAuthorityError,
     MetadataNotAnObjectError,
+    MetadataTooDeepError,
     StatusWriteAuthorityError,
     TaskmasterError,
     TaskNotFoundError,
@@ -1449,6 +1451,111 @@ async def test_update_task_non_object_metadata_is_typed_under_enforce_mode(
         assert task['metadata'] == before
     finally:
         await backend.close()
+
+
+# ── update_task: additive merge too deep to recurse (task 6248) ──
+
+
+def _nested(depth: int, leaf: str) -> dict:
+    """``{'k': {'k': ... leaf}}``, built with a loop: a recursive builder would
+    hit the very recursion limit these tests exercise."""
+    value: Any = leaf
+    for _ in range(depth):
+        value = {'k': value}
+    return value
+
+
+def _too_deep_to_merge() -> int:
+    """Deeper than any stack can recurse, still well within json's C limits."""
+    return sys.getrecursionlimit() + 100
+
+
+async def _seed_row_with_deep_key(
+    backend: SqliteTaskBackend, project_root: str, depth: int,
+) -> dict:
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({
+            'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src'],
+            'x_deep': _nested(depth, 'old'),
+        }),
+    )
+    return (await backend.get_task('1', project_root=project_root))['metadata']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'mode_kwargs',
+    [{'metadata_mode': 'additive'}, {'append': True}],
+    ids=['additive', 'append-shim'],
+)
+async def test_update_task_additive_merge_too_deep_never_drops_stored_done_provenance(
+    backend, project_root, mode_kwargs,
+):
+    """A key path nested past the recursion limit used to fall back to
+    last-write-wins, keeping only the payload's keys: done_provenance and files
+    were wiped while update_task reported success. It is refused instead and
+    nothing is written."""
+    depth = _too_deep_to_merge()
+    before = await _seed_row_with_deep_key(backend, project_root, depth)
+    with pytest.raises(MetadataTooDeepError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'x_deep': _nested(depth, 'new')}), **mode_kwargs,
+        )
+    assert exc.value.task_id == '1'
+    assert isinstance(exc.value, TaskmasterError)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    after = (await backend.get_task('1', project_root=project_root))['metadata']
+    assert after['done_provenance'] == _STORED_DONE_PROVENANCE
+    assert after['files'] == ['src']
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_update_task_additive_merge_too_deep_is_typed_under_enforce_mode(
+    tmp_path, project_root,
+):
+    """Production runs task_metadata.enforce=true; its validation does not mask
+    the loss, so the refusal must hold there too."""
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    backend = SqliteTaskBackend(cfg, task_metadata_enforce=True)
+    await backend.start()
+    try:
+        depth = _too_deep_to_merge()
+        before = await _seed_row_with_deep_key(backend, project_root, depth)
+        with pytest.raises(MetadataTooDeepError):
+            await backend.update_task(
+                '1', project_root=project_root,
+                metadata=json.dumps({'x_deep': _nested(depth, 'new')}),
+                metadata_mode='additive',
+            )
+        after = (await backend.get_task('1', project_root=project_root))['metadata']
+        assert after['done_provenance'] == _STORED_DONE_PROVENANCE
+        assert after['files'] == ['src']
+        assert after == before
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_update_task_merge_mode_overwrites_a_too_deep_key_and_keeps_done_provenance(
+    backend, project_root,
+):
+    """Pins the remedy the refusal's message names: metadata_mode='merge'
+    replaces the deep key wholesale without recursing, and every other stored
+    key survives. Merge mode never reaches the recursive merge, so this is a
+    contract test for that advice, not a regression test for the refusal."""
+    depth = _too_deep_to_merge()
+    await _seed_row_with_deep_key(backend, project_root, depth)
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'x_deep': _nested(depth, 'new')}), metadata_mode='merge',
+    )
+    after = (await backend.get_task('1', project_root=project_root))['metadata']
+    assert after['done_provenance'] == _STORED_DONE_PROVENANCE
+    assert after['files'] == ['src']
+    assert after['x_deep'] == _nested(depth, 'new')
 
 
 @pytest.mark.asyncio

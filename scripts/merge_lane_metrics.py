@@ -112,9 +112,10 @@ class AppendOnlyViolation(RatchetError):
 
     A ``RatchetError`` subclass, so nothing that already catches one changes
     behaviour; a DISTINCT type, because the two are read differently at a
-    boundary. ``scripts/check_staged_ratchet_raise.py`` exits 1 for this (the
-    committer did something the ratchet forbids and can fix) and 2 for its
-    siblings (the gate could not do its job). Collapsing them would leave a
+    boundary. ``scripts/check_staged_ratchet_raise.py`` and
+    ``scripts/check_ratchet_advance.py`` exit 1 for this (the change did
+    something the ratchet forbids and can fix) and 2 for its siblings (the gate
+    could not do its job). Collapsing them would leave a
     caller that reasonably treats 2 as "instrument down, retry or ignore"
     waving a rewritten ledger through.
     """
@@ -579,6 +580,12 @@ LEGACY_LEDGER_RELPATH = 'orchestrator/tests/merge_lane_ratchet_authorized_raises
 #: RESOLVES, which a bare string literal in the prose left unchecked.
 COMMIT_GATE_RELPATH = 'scripts/check_staged_ratchet_raise.py'
 
+#: The landing-time auditor ``hooks/reference-transaction`` runs on every move of
+#: main, named here for the same reasons as ``COMMIT_GATE_RELPATH``: the remedy
+#: sends a blocked reader to it, and a constant is what lets a test assert the
+#: path RESOLVES.
+ADVANCE_GATE_RELPATH = 'scripts/check_ratchet_advance.py'
+
 #: THE ONE COPY of what to do when a measure rose. Composed into every site
 #: that tells an agent it may not raise -- ``BASELINE_README`` (and so the
 #: committed bytes a blocked reader opens), ``main()``'s ``--check`` trailer,
@@ -617,13 +624,18 @@ RAISE_REMEDY = (
     'honest move the expensive one. Reaching FURTHER back is refused, because '
     'every image in between is a value the ratchet moved through and returning '
     'behind them re-absorbs every measure they lowered.\n'
-    'RESIDUAL, so you do not trust more than is true: `git rebase` and a CLEAN '
-    'merge -- including one the ratchet-baseline merge driver resolved -- do '
-    'not run pre-commit at all, and the merge worker advances main with `git '
-    'update-ref`, which runs no hooks. A raise introduced before this guard '
-    'existed and replayed across its introduction still reaches main '
-    'unexamined. Closing that needs a merge-lane or reference-transaction gate, '
-    'not this one. --authorize-raise is the way past.'
+    'WHERE A RAISE LANDS: `git rebase` and a CLEAN merge -- including one the '
+    'ratchet-baseline merge driver resolved -- skip pre-commit, so a raise they '
+    'carry is caught where it LANDS instead. hooks/reference-transaction runs '
+    f'{ADVANCE_GATE_RELPATH} on every move of main, the merge worker\'s `git '
+    'update-ref` included, and refuses a move whose baseline rises over the '
+    "merge base's beyond what the entry files the move adds cover. The remedy "
+    "is to record the raise on the branch, against main's baseline, with the "
+    'flags above.\n'
+    'RESIDUAL, so you do not trust more than is true: creating main afresh, git '
+    'run with core.hooksPath pointed elsewhere, a git older than 2.28, and a '
+    'move made from a checkout whose hooks/ lacks the file all reach main '
+    'unaudited. --authorize-raise is the way past.'
 )
 
 #: Emitted as the baseline's leading key, so the rule is in the file a reader
@@ -845,16 +857,17 @@ def write_baseline(
     can see it.
 
     THAT HOLE IS NOW CLOSED ELSEWHERE, and deliberately elsewhere. Closing it
-    means comparing against the copy in git HEAD, which is a dependency on git
-    this instrument does not have:
-    ``scripts/check_staged_ratchet_raise.py`` holds every git invocation that
-    reads history or the index, runs in pre-commit on every branch, and calls
-    ``compare_baseline_files`` here for the comparison itself, so there is one
-    definition of "did a measure rise" and only one file that knows what a
-    commit is. The boundary is still drawn rather than overclaimed -- the write
-    gate stops a raise being ABSORBED, the commit gate stops one being STAGED,
-    and neither sees a raise replayed by a rebase or landed by the merge
-    worker's hook-free ``update-ref``.
+    means comparing against the copy git holds, which is a dependency on git
+    this instrument does not have: ``scripts/ratchet_revisions.py`` holds every
+    git invocation that reads history or the index, and the two gates built on
+    it call ``compare_baseline_files`` here for the comparison itself, so there
+    is one definition of "did a measure rise".
+    ``scripts/check_staged_ratchet_raise.py`` runs in pre-commit on every
+    branch; ``scripts/check_ratchet_advance.py`` runs from
+    ``hooks/reference-transaction`` on every move of main, which is where a
+    raise replayed by a rebase or landed by the merge worker's ``update-ref``
+    is seen. The write gate stops a raise being ABSORBED, the commit gate one
+    being STAGED, the advance gate one LANDING.
 
     A MALFORMED destination propagates ``load_baseline``'s ``RatchetError``
     rather than being overwritten: a previous baseline you cannot read is one
@@ -1599,8 +1612,9 @@ def compare_baseline_files(previous: Path, current: Path) -> list[Violation]:
     nothing to compare and resets every frozen measure. This face compares two
     committed IMAGES instead, which is the shape a raise actually arrives in:
     a diff. It is what ``scripts/check_staged_ratchet_raise.py`` audits a staged
-    commit with -- and being two images rather than a measurement, it runs no
-    complexipy, reads no tree, and still consults no git.
+    commit with, and ``scripts/check_ratchet_advance.py`` a move of main -- and
+    being two images rather than a measurement, it runs no complexipy, reads no
+    tree, and still consults no git.
 
     Both images load through ``load_baseline``, so a missing or malformed one is
     that function's named hard failure rather than a silent empty-baseline pass.
@@ -1623,7 +1637,7 @@ def _merged_value(base: Any, ours: Any, theirs: Any) -> Any:
 
     Each side's own move stands, up or down, and a deletion stands unless the
     other side moved the entry (a modify/delete keeps the modification). Where
-    both sides moved one measure, the higher side bounds it.
+    both sides moved one measure, :func:`_both_moved_bound` bounds it.
     """
     if ours == base:
         return theirs
@@ -1633,7 +1647,25 @@ def _merged_value(base: Any, ours: Any, theirs: Any) -> Any:
         return theirs if ours is None else ours
     if isinstance(ours, dict) and isinstance(theirs, dict):
         return _merged_mapping(base if isinstance(base, dict) else {}, ours, theirs)
-    return max(ours, theirs, key=_magnitude)
+    return _both_moved_bound(base, ours, theirs)
+
+
+def _both_moved_bound(base: Any, ours: Any, theirs: Any) -> Any:
+    """The most a measure both sides moved can honestly hold.
+
+    That is the higher side, or both sides' moves composed over *base* where
+    that is higher: ``ours + theirs - base``, or for a name list the 3-way set
+    merge, whose absent *base* is the empty list. A count with no *base* has
+    nothing to compose over.
+    """
+    if isinstance(ours, list):
+        before, mine, other = set(base or ()), set(ours), set(theirs)
+        composed = sorted((mine & other) | (mine - before) | (other - before))
+    elif base is None:
+        return max(ours, theirs, key=_magnitude)
+    else:
+        composed = ours + theirs - base
+    return max(ours, theirs, composed, key=_magnitude)
 
 
 def _merged_mapping(base: dict, ours: dict, theirs: dict) -> dict:
@@ -1662,9 +1694,9 @@ def compare_merged_baseline_files(
 
     The bound is what git does to the file text, applied per measure against the
     merge *base*: a measure only one side moved stands at that side's value, up
-    or down, and one both sides moved is bounded by the higher side. An absent
-    *base* is the empty image git merges unrelated histories against, and an
-    absent parent moved nothing, so it stands in as the base.
+    or down, and one both sides moved is bounded by :func:`_both_moved_bound`.
+    An absent *base* is the empty image git merges unrelated histories against,
+    and an absent parent moved nothing, so it stands in as the base.
 
     NOT "clean against either parent": that admits keeping one side's stale
     value over the other side's lowering, which is an unrecorded widening on

@@ -358,6 +358,7 @@ class FalkorDBProviderConfig(BaseModel):
     # database is ignored in shared-server mode — graph name is derived from
     # group_id at request time.  Kept for backward-compat with existing configs.
     database: str | None = None
+    expected_graph_timeout_ms: int = 30000
 
 
 class GraphitiBackendConfig(BaseModel):
@@ -874,10 +875,10 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
        ``eval worktree``) at ``min_phrase_hits=2``, so a note that merely
        named the eval worktree in both spellings scored 2 and was blocked
        with no plan-tools / venv / shadowing content in it at all. This is
-       the same defect class the no-nesting invariant test guards
-       (``test_no_seeded_phrase_nests_inside_another_in_the_same_cluster``)
+       the same defect class the one-occurrence invariant test guards
+       (``test_no_two_seeded_phrases_can_share_one_occurrence``)
        but it slips past that test, because the two spellings are siblings
-       rather than one nesting inside the other. The matcher-level fix --
+       that no single occurrence holds together. The matcher-level fix --
        counting spelling variants of one concept once -- is task 4179 and
        is deliberately NOT part of this seed.
 
@@ -1136,10 +1137,13 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # ("Default 2 so a single incidental keyword never triggers a
             # false block"). Omitting them costs zero coverage: every corpus
             # entry containing a flag-suffixed form also contains bare
-            # 'ruff format'. The hazard is generic to the matcher rather than
-            # special to this seed, so the guarding invariant test (no phrase
-            # nests inside another in the same cluster) is asserted over ALL
-            # seeded clusters, not just this one.
+            # 'ruff format'. The rule is wider than nesting: no two phrases
+            # may share one occurrence, which also covers one phrase's end
+            # overlapping another's start on a whole word: bare 'format-clean'
+            # beside 'ruff format' would let 'ruff format-clean' score 2 hits.
+            # The hazard is generic to the matcher rather than special to
+            # this seed, so test_no_two_seeded_phrases_can_share_one_occurrence
+            # asserts it over ALL seeded clusters, not just this one.
             #
             # GENERIC-TOKEN EXCLUSIONS (the venv-shadowing over-match lesson
             # -- see this module's seed docstring): 'lint_command',
@@ -1179,7 +1183,7 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
                 'ruff check',
                 'enforced gate',
                 'enforced lint gate',
-                'format-clean',
+                'not format-clean',
             ],
             min_phrase_hits=2,
             hint=(
@@ -1279,7 +1283,7 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # single occurrence would score three distinct hits and satisfy
             # min_phrase_hits alone. Same hazard as 'ruff format --check'
             # above; asserted over ALL clusters by
-            # test_no_seeded_phrase_nests_inside_another_in_the_same_cluster.
+            # test_no_two_seeded_phrases_can_share_one_occurrence.
             #
             # THREE ACCEPTED RESIDUALS, all PINNED by positive tests so a
             # future tuner can tell them from a regression:
@@ -1442,6 +1446,9 @@ class ReconciliationConfig(BaseModel):
     # Buffer triggers
     buffer_size_threshold: int = Field(default=10)
     max_staleness_seconds: int = Field(default=1800)
+    # Task 4278 (recon lever 3): fold repeat task events per task at push time.
+    # Restart-only: EventBuffer captures it at construction.
+    coalesce_task_events: bool = Field(default=True)
 
     # WP-B: fire-and-forget in-memory event queue sits in front of the
     # SQLite event buffer on the MCP write path. Capacity bounds how many
@@ -1622,7 +1629,9 @@ class ReconciliationConfig(BaseModel):
             'only remedy if the archive root breaks: fused-memory installs no '
             'archival-failure storm consumer. Green-tier for that reason; both '
             'archive leaves are read live per stage and per GC through '
-            'reconciliation/cli_stage_runner.py::recon_archive_root.'
+            'reconciliation/cli_stage_runner.py::recon_archive_root. It also '
+            "governs TaskCurator's per-process config-dir archival (task 6008): "
+            'off, the dead-PID sweep removes curator config dirs unarchived.'
         ),
     )
     transcript_archive_root: str = Field(
@@ -1631,7 +1640,8 @@ class ReconciliationConfig(BaseModel):
             'Archive root, resolved against explore_codebase_root (NOT data_dir). '
             "The default deliberately equals the orchestrator's archive root, "
             "which docs/legibility/legibility.yaml's agent_transcript_roots "
-            'already mines.'
+            'already mines. TaskCurator archives its config-dir transcripts '
+            'here too, keyed fm-curator-<pid> (task 6008).'
         ),
     )
 
@@ -1755,7 +1765,6 @@ class ReconciliationConfig(BaseModel):
         return self
 
     # Safety
-    max_mutations_per_stage: int = Field(default=50)
     halt_on_judge_serious: bool = Field(default=True)
 
     # Done-provenance gate — when True, set_task_status(done) rejects calls
@@ -1962,7 +1971,16 @@ class ReconciliationConfig(BaseModel):
     opus_memory_limit: int = Field(default=1000)
 
     # Token-budget context assembly
-    token_budget: int = Field(default=65_000)
+    token_budget: int = Field(
+        default=130_000,
+        description=(
+            'Bound on the estimated tokens (len // 4) of one backlog chunk\'s '
+            'Stage-1 payload: its events plus their deduplicated context. '
+            'Consumed only by the opus-tier BacklogIterator, via '
+            'ContextAssembler, and sized together with context_assembler\'s '
+            'per-item caps (plans/recon-evidence-caps-measurement-2026-10.md).'
+        ),
+    )
     context_search_limit: int = Field(default=5)
     context_fetch_batch_size: int = Field(default=10)
 
@@ -2301,12 +2319,15 @@ class CuratorConfig(BaseModel):
     # 8 leaves headroom for harder combine-vs-create decisions.
     max_turns: int = Field(default=8, ge=3)
 
-    # Corpus caps — see design notes in shared/docs (the four-stream pool).
+    # Corpus caps — see design notes in shared/docs (the pool streams).
     #
-    # pool_total_cap is UNREACHABLE at these stock values, and that is worth
-    # knowing before tuning any of them: a maximal pool is anchor(<=1) + 15 +
-    # 10 + 3 = 29 <= 30, so ``_trim_pool``'s ``len(pool) <= total_cap``
-    # short-circuits on every call. The binding constraints are the three
+    # For a pool without siblings, pool_total_cap is UNREACHABLE at these
+    # stock values, and that is worth knowing before tuning any of them: a
+    # maximal such pool is anchor(<=1) + 15 + 10 + 3 = 29 <= 30, so
+    # ``_trim_pool``'s ``len(pool) <= total_cap`` short-circuits. An
+    # agent-followup candidate with two or more siblings does reach the trim
+    # at stock caps, and the trim then takes dependency entries first. The
+    # binding constraints are the three
     # STREAM caps, which is where a genuinely overlapping task is actually
     # lost — the module stream especially, since it is ordered by status and
     # priority rather than relevance (see the lock_depth note below).
@@ -2322,6 +2343,15 @@ class CuratorConfig(BaseModel):
     pool_embedding_cap: int = Field(default=10)
     pool_dependency_cap: int = Field(default=3)
     pool_total_cap: int = Field(default=30)
+    # Caps the sibling stream (task 6227): an agent-followup candidate's
+    # non-cancelled tasks that share its metadata.spawned_from. 10 comes from
+    # the live store, measured 2026-10-30: 1,406 agent_followup parents, 2,140
+    # follow-ups, 484 parents with more than one; non-cancelled per parent p90
+    # 3, p99 4, max 11; one parent exceeds 10. Siblings count toward
+    # pool_total_cap but are trimmed after every stream except the anchor, so
+    # none is ever cut while 1 + pool_sibling_cap <= pool_total_cap
+    # (``test_config_schema.py::TestCuratorSiblingCap``). 0 disables the stream.
+    pool_sibling_cap: int = Field(default=10, ge=0)
 
     # COARSE FALLBACK ONLY — this is not the depth the curator normally uses.
     # Module-pool keys must match the *scheduler's* lock_depth to be
@@ -2382,8 +2412,8 @@ class CuratorConfig(BaseModel):
     # (get_tasks over the whole tree + an embedder call + a qdrant query).
     # That path now hands the prepared bundle to ``curate``, so a smaller
     # batch no longer costs a rebuild.
-    entry_description_chars: int = Field(default=2000)
-    entry_details_chars: int = Field(default=1500)
+    entry_description_chars: int = Field(default=2000, ge=1)
+    entry_details_chars: int = Field(default=1500, ge=1)
 
     # Batch-curator knobs — the worker drains up to batch_max tickets per
     # round-trip; timeout, turns, and budget scale linearly with N and are
@@ -2451,13 +2481,13 @@ class CuratorConfig(BaseModel):
     # degrade-to-create contract.
     # Open after this many CONSECUTIVE ZOT curator LLM failures (reset on
     # any successful LLM call; a non-ZOT failure neither increments nor
-    # resets it — see task_curator.py::TaskCurator._consecutive_zero_output_timeouts).
+    # resets it — see middleware/zero_output_breaker.py::ZeroOutputBreaker).
     zero_output_breaker_threshold: int = Field(default=2, ge=1)
     # How long the breaker stays open / short-circuits to action='create'
     # before allowing a half-open probe; a successful LLM call (including a
     # concurrent batch round-trip) closes the breaker early rather than
     # waiting out the cooldown — see
-    # task_curator.py::TaskCurator._reset_zero_output_breaker and
+    # middleware/zero_output_breaker.py::ZeroOutputBreaker.close and
     # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker.
     zero_output_breaker_cooldown_seconds: float = Field(default=600.0, gt=0)
     # Post-ZOT duplicate sweep (fused_memory/middleware/curator_zot_duplicate_sweep.py).
@@ -2873,8 +2903,10 @@ class WriteTriageConfig(BaseModel):
         ge=1,
         description=(
             'Per-field character cap applied to the new entry and to every '
-            'candidate before the judge sees them; a cut field is marked '
-            '`…[elided]` so the model knows it is reading a truncation. Why '
+            'candidate before the judge sees them; a cut field is marked with '
+            'how many characters were elided (utils/clip_disclosure.py::elide_text), '
+            'so the model knows it is reading a truncation and how much is '
+            'missing. Why '
             '4000 replaced 1,200 — the measured recall loss at the old cap and '
             'the call cost at the new one — is the decision record '
             'calibration/write_triage_judge_field_chars_report.md. Bounded ge=1 '

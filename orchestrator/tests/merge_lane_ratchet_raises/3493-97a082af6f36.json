@@ -1,0 +1,24 @@
+{
+  "task_id": "3493",
+  "reason": "get_changed_files now binds git diff's rc/stderr and WARNs on failure (fail-open [] kept); closes the silent-[] defect sibling tasks 1809/1825 fixed elsewhere",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1479,
+      "current": 1480
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::get_changed_files",
+      "baseline": 2,
+      "current": 3
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5020,
+      "current": 5021
+    }
+  ]
+}

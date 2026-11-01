@@ -66,8 +66,9 @@ is fully loaded). Lazy imports are an established pattern in this codebase.
 
 from __future__ import annotations
 
-import json
 from typing import Any
+
+from fused_memory.middleware.metadata_dict import raw_metadata_dict
 
 __all__ = [
     'OPERATIONAL_LLM_GATE_MARKER_KEY',
@@ -82,29 +83,6 @@ __all__ = [
 OPERATIONAL_LLM_GATE_MARKER_KEY = 'x_operational_llm_gate'
 
 _COERCED_EXECUTION_CLASSES: frozenset[str] = frozenset({'operational', 'decision'})
-
-
-def _parse_metadata(metadata: Any) -> dict:
-    """Return *metadata* as a dict (best-effort; unknown shapes → empty dict).
-
-    Mirrors ``execution_class_guard._parse_metadata``. None → {}; empty string
-    → {}; dict → returned as-is (used only to READ declared fields, never
-    mutated here); JSON string → parsed dict, or {} if the parse fails or
-    yields a non-dict; anything else → {}.
-    """
-    if metadata is None:
-        return {}
-    if isinstance(metadata, dict):
-        return metadata
-    if isinstance(metadata, str):
-        if not metadata:
-            return {}
-        try:
-            parsed = json.loads(metadata)
-        except json.JSONDecodeError:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
 
 
 def inject_operational_routing(metadata: str | dict[str, Any] | None) -> Any:
@@ -122,7 +100,7 @@ def inject_operational_routing(metadata: str | dict[str, Any] | None) -> Any:
     Args:
         metadata: Incoming task metadata (dict, JSON string, or None).
     """
-    parsed = _parse_metadata(metadata)
+    parsed = raw_metadata_dict(metadata, source='operational_routing_guard')
     execution_class = parsed.get('execution_class')
     if execution_class not in _COERCED_EXECUTION_CLASSES:
         # code_tdd / absent / anything not operational|decision → untouched.

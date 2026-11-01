@@ -884,6 +884,18 @@ this one result list" — no pointer-shape knowledge at runtime at all.
   not gauge them.
 - **3 `hand`** — single-entry dark_factory topics.
 
+### Also read by E2
+
+The E2 storage-shape bake-off (`fused-memory/scripts/bake_off_storage_shape.py`)
+reads only each `curator_gate` entry's `provenance.cluster_id` → `topic`,
+which lands in its arm records' metadata. Its committed fetch cache
+(`e2_fetch_cache.json`) therefore pins this file through the per-shape corpus
+fingerprint, not through the file's bytes; the merge lane asserts that in
+`fused-memory/tests/test_bake_off_fetch_cache.py::TestMeasurementAnchor::test_the_committed_fixtures_still_materialize_the_cached_corpus`.
+An E1-only edit or a canonical re-key needs no E2 re-pin. An edit that moves a
+fingerprint, such as renaming a `curator_gate` topic, needs a live
+`--dump-fetches` re-seed.
+
 ### What the registry does **not** cover (`_disclosures`)
 
 The committed topics are a *selection*. `scripts/memory_eval_retrieval_probe.py

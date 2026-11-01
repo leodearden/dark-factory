@@ -195,8 +195,8 @@ class TestCompareMergedBaselineFiles:
     MERGE_HEAD moved is a raise; read against either parent, keeping one side's
     stale value re-absorbs the other side's lowering. The bound is what git does
     to the file text, applied per measure against the merge base: a measure one
-    side moved stands at that side's value, up or down, and where both moved,
-    the higher side bounds it.
+    side moved stands at that side's value, up or down, and one both sides moved
+    is bounded by scripts/merge_lane_metrics.py::_both_moved_bound.
 
     The seed's numbers: a.py cognitive 120, b.py cognitive 30, total:cognitive 150.
     """
@@ -284,14 +284,16 @@ class TestCompareMergedBaselineFiles:
             ('total:function_local_imports', metrics.CLUSTER_TOTAL_KEY, 3, 4),
         ]
 
-    def test_where_both_sides_moved_a_measure_the_higher_bounds_it(
-        self, tmp_path: Path
+    @pytest.mark.parametrize('raised_by', ['ours', 'theirs'])
+    def test_where_the_sides_moved_a_measure_oppositely_the_higher_side_bounds_it(
+        self, tmp_path: Path, raised_by: str
     ) -> None:
         seed = synthetic_report()
-        ours = self._moved(('a.py', 'cognitive', 110))
-        theirs = self._moved(('a.py', 'cognitive', 125))
+        raised = self._moved(('a.py', 'cognitive', 125))
+        lowered = self._moved(('a.py', 'cognitive', 110))
+        ours, theirs = (raised, lowered) if raised_by == 'ours' else (lowered, raised)
 
-        assert self._bounded(tmp_path, theirs, base=seed, ours=ours, theirs=theirs) == []
+        assert self._bounded(tmp_path, raised, base=seed, ours=ours, theirs=theirs) == []
         assert self._bounded(
             tmp_path,
             self._moved(('a.py', 'cognitive', 126)),
@@ -301,6 +303,50 @@ class TestCompareMergedBaselineFiles:
         ) == [
             ('cognitive', 'a.py', 125, 126),
             ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 155, 156),
+        ]
+
+    def test_where_both_sides_raised_a_measure_the_raises_compose(
+        self, tmp_path: Path
+    ) -> None:
+        seed = synthetic_report()
+        ours = self._moved(('a.py', 'cognitive', 125))
+        theirs = self._moved(('a.py', 'cognitive', 123))
+
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'cognitive', 128)),
+            base=seed,
+            ours=ours,
+            theirs=theirs,
+        ) == []
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'cognitive', 129)),
+            base=seed,
+            ours=ours,
+            theirs=theirs,
+        ) == [
+            ('cognitive', 'a.py', 128, 129),
+            ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 158, 159),
+        ]
+
+    def test_where_both_sides_lowered_a_measure_the_higher_still_bounds_it(
+        self, tmp_path: Path
+    ) -> None:
+        seed = synthetic_report()
+        ours = self._moved(('a.py', 'cognitive', 115))
+        theirs = self._moved(('a.py', 'cognitive', 110))
+
+        assert self._bounded(tmp_path, theirs, base=seed, ours=ours, theirs=theirs) == []
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'cognitive', 116)),
+            base=seed,
+            ours=ours,
+            theirs=theirs,
+        ) == [
+            ('cognitive', 'a.py', 115, 116),
+            ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 145, 146),
         ]
 
     def test_moves_on_different_paths_add_up_in_the_derived_total(
@@ -337,7 +383,7 @@ class TestCompareMergedBaselineFiles:
             tmp_path, theirs, base=synthetic_report(), ours=ours, theirs=theirs
         ) == []
 
-    def test_an_absent_base_bounds_each_measure_by_the_higher_parent(
+    def test_an_absent_base_bounds_each_count_by_the_higher_parent(
         self, tmp_path: Path
     ) -> None:
         # No common ancestor, or no baseline at it: git merges such histories
@@ -400,6 +446,40 @@ class TestCompareMergedBaselineFiles:
         assert self._bounded(tmp_path, ours, base=seed, ours=ours, theirs=theirs) == []
         assert ('patch_targets', 't1.py', 3, 4) in self._bounded(
             tmp_path, widened, base=seed, ours=ours, theirs=theirs
+        )
+
+    def test_a_name_set_both_sides_widened_is_bounded_by_their_set_merge(
+        self, tmp_path: Path
+    ) -> None:
+        # 'qux', added by both sides, counts once, so name lists carry no
+        # overlap slack.
+        seed, ours, theirs = synthetic_report(), synthetic_report(), synthetic_report()
+        ours['tests']['t1.py']['patch_targets'] = ['foo', 'bar', 'qux', 'zap']
+        theirs['tests']['t1.py']['patch_targets'] = ['foo', 'bar', 'qux', 'wib']
+        merged = copy.deepcopy(ours)
+        merged['tests']['t1.py']['patch_targets'].append('wib')
+        widened = copy.deepcopy(merged)
+        widened['tests']['t1.py']['patch_targets'].append('extra')
+
+        assert self._bounded(tmp_path, merged, base=seed, ours=ours, theirs=theirs) == []
+        assert ('patch_targets', 't1.py', 5, 6) in self._bounded(
+            tmp_path, widened, base=seed, ours=ours, theirs=theirs
+        )
+
+    def test_an_absent_base_bounds_a_name_set_by_both_sides_names(
+        self, tmp_path: Path
+    ) -> None:
+        ours, theirs = synthetic_report(), synthetic_report()
+        ours['tests']['t1.py']['patch_targets'] = ['foo', 'bar', 'qux']
+        theirs['tests']['t1.py']['patch_targets'] = ['foo', 'bar', 'zap']
+        merged = copy.deepcopy(ours)
+        merged['tests']['t1.py']['patch_targets'].append('zap')
+        widened = copy.deepcopy(merged)
+        widened['tests']['t1.py']['patch_targets'].append('extra')
+
+        assert self._bounded(tmp_path, merged, base=None, ours=ours, theirs=theirs) == []
+        assert ('patch_targets', 't1.py', 4, 5) in self._bounded(
+            tmp_path, widened, base=None, ours=ours, theirs=theirs
         )
 
 

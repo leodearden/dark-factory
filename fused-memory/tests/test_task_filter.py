@@ -3412,9 +3412,7 @@ class TestClauseSplitRe:
 
     def test_clause_split_re_has_no_out_of_module_consumers(self):
         """WIDE_CLAUSE_BOUNDARY_RE is for ALLOWLISTED consumers only — scanned,
-        not asserted in prose. The scan also covers its old private spelling,
-        _CLAUSE_SPLIT_RE, which task_filter keeps as an alias until
-        tkt_0RVBV2PMGFWETFNDCRYB4TRFW1 migrates its last importer.
+        not asserted in prose.
 
         Widening the splitter is only defensible because of who reads it: both
         consumers (find_conflicting_task_status_ids,
@@ -3478,7 +3476,7 @@ class TestClauseSplitRe:
 
         package_root = Path(__file__).resolve().parents[1]
         # Every file allowed to reference the widened constant in CODE.
-        names = {'WIDE_CLAUSE_BOUNDARY_RE', '_CLAUSE_SPLIT_RE'}
+        name = 'WIDE_CLAUSE_BOUNDARY_RE'
         allowlist = {
             'src/fused_memory/reconciliation/task_filter.py',
             'scripts/audit_duplicate_memories.py',
@@ -3496,11 +3494,11 @@ class TestClauseSplitRe:
                 tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
                 for node in ast.walk(tree):
                     if (
-                        (isinstance(node, ast.Name) and node.id in names)
-                        or (isinstance(node, ast.Attribute) and node.attr in names)
+                        (isinstance(node, ast.Name) and node.id == name)
+                        or (isinstance(node, ast.Attribute) and node.attr == name)
                         or (
                             isinstance(node, ast.ImportFrom)
-                            and any(alias.name in names for alias in node.names)
+                            and any(alias.name == name for alias in node.names)
                         )
                     ):
                         consumers.add(path.relative_to(package_root).as_posix())

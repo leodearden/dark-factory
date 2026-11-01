@@ -6,6 +6,8 @@ metadata.dry_run_proposals[] via scheduler.update_task(metadata_mode='additive')
 (list-union — preserves prior entries) and trims the list to keep_last entries
 via a separate update_task(default merge — overwrites dry_run_proposals wholesale
 while preserving sibling keys like memory_hints/files).
+A re-block whose branch content (a rebase-stable ``git patch-id``) and reason
+match the latest entry skips the investigation and only re-stamps that entry.
 Never mutates task state; all writes go through the parent process.
 """
 
@@ -28,10 +30,12 @@ from shared.cli_invoke import (
     is_zero_output_timeout,
 )
 from shared.config_dir import TaskConfigDir
+from shared.git_async import GitResult, run_git
 from shared.transcript_archive import archive_task_transcripts
 
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
+from orchestrator.event_store import EventType
 from orchestrator.merge_lane.completion import merge_completion_eligible
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
@@ -67,6 +71,7 @@ DRY_RUN_PROPOSAL_SCHEMA: dict[str, Any] = {
 
 _RISK_LABELS: frozenset[str] = frozenset({'low', 'medium', 'human-review-required'})
 _HUMAN_REVIEW_REQUIRED: str = 'human-review-required'
+_INFRA_FAILURE_STATUS: str = 'infra_failure'
 
 # Transient HOST infra wedges (e.g. a pre-turn-1 kill at the
 # UnblockAutoConfig.timeout ceiling -> empty stdout + timed_out) are
@@ -309,11 +314,38 @@ _DISALLOWED_TOOLS: list[str] = [
 ]
 
 # ---------------------------------------------------------------------------
+# In-flight identity
+# ---------------------------------------------------------------------------
+
+def investigation_task_name(task_id: str) -> str:
+    """The asyncio task name every spawner registers an investigation under."""
+    return f'unblock-auto-{task_id}'
+
+
+def investigation_in_flight(task_id: str) -> bool:
+    """Whether an investigation for *task_id* is running on the current loop.
+
+    The event loop lives exactly as long as the orchestrator process, which is
+    how long an investigation can live, so the scan sees runs started by any
+    earlier TaskWorkflow instance for the task and by the merge lane. With no
+    running loop it answers False.
+    """
+    try:
+        running = asyncio.all_tasks()
+    except RuntimeError:
+        return False
+    name = investigation_task_name(task_id)
+    return any(t.get_name() == name and not t.done() for t in running)
+
+
+# ---------------------------------------------------------------------------
 # SHA capture helper
 # ---------------------------------------------------------------------------
 
-async def _capture_worktree_shas(worktree: str) -> tuple[str | None, str | None]:
-    """Capture HEAD and main branch SHAs from the worktree via git.
+async def _capture_worktree_shas(
+    worktree: str, main_branch: str,
+) -> tuple[str | None, str | None]:
+    """Capture the HEAD and *main_branch* SHAs from the worktree via git.
 
     Fully defensive: any non-zero exit code, subprocess exception, or
     non-repo worktree yields None for that sha — never raises.
@@ -334,8 +366,140 @@ async def _capture_worktree_shas(worktree: str) -> tuple[str | None, str | None]
         except Exception:
             return None
 
-    head_sha, main_sha = await asyncio.gather(_rev_parse('HEAD'), _rev_parse('main'))
+    head_sha, main_sha = await asyncio.gather(_rev_parse('HEAD'), _rev_parse(main_branch))
     return head_sha, main_sha
+
+
+_EMPTY_BRANCH_PATCH_ID = '0' * 40
+"""The branch_patch_id of a branch that carries no change relative to main."""
+
+
+def _git_failure(step: str, result: GitResult) -> RuntimeError:
+    timed_out = ' (timed out)' if result.timed_out else ''
+    return RuntimeError(
+        f'{step} exited {result.returncode}{timed_out}: {result.stderr.strip()}',
+    )
+
+
+async def _capture_branch_patch_id(
+    worktree: str, *, main_branch: str, task_id: str,
+) -> str | None:
+    """Rebase-stable identity of the branch's committed change set relative to
+    *main_branch*.
+
+    ``git patch-id --stable`` ignores line numbers and whitespace, so a clean
+    rebase onto an advanced main keeps it. Any failure, a non-repo worktree or
+    a missing *main_branch* ref included, yields None and is logged at WARNING,
+    because None turns coverage dedup off for the run.
+    """
+    merge_base_range = f'{main_branch}...HEAD'
+    try:
+        diff = await run_git([
+            'git', '-C', worktree, 'diff', '--binary', '--no-color',
+            '--no-ext-diff', '--no-textconv', merge_base_range,
+        ])
+        if not diff.ok:
+            raise _git_failure(f'git diff {merge_base_range}', diff)
+        if not diff.stdout:
+            return _EMPTY_BRANCH_PATCH_ID
+        patch_id = await run_git(
+            ['git', '-C', worktree, 'patch-id', '--stable'], input_text=diff.stdout,
+        )
+        if not patch_id.ok:
+            raise _git_failure('git patch-id --stable', patch_id)
+        tokens = patch_id.stdout.split()
+        if not tokens:
+            raise RuntimeError('git patch-id produced no output')
+        return tokens[0]
+    except Exception as exc:
+        logger.warning(
+            'dry_run_unblock: branch patch-id unavailable for task %s '
+            '(worktree %s); coverage dedup is off for this run: %s',
+            task_id, worktree, exc,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Coverage by the latest proposal
+# ---------------------------------------------------------------------------
+
+def _latest_proposal_covers(
+    proposals: list[Any], *, branch_patch_id: str | None, block_reason: str,
+    head_sha: str | None,
+) -> bool:
+    """Whether the latest entry already investigated this content and reason.
+
+    Only the latest entry counts, because the briefing and b3_gate both read
+    ``dry_run_proposals[-1]``. An unknown identity never covers. An
+    infra_failure entry never covers either: the wedge is retryable and
+    concluded nothing. A low-risk entry covers only at its own HEAD, because
+    b3_gate.check_proposal step 6 aborts once HEAD has moved.
+    """
+    if branch_patch_id is None or not proposals:
+        return False
+    latest = proposals[-1]
+    if not isinstance(latest, dict):
+        return False
+    return (
+        latest.get('branch_patch_id') == branch_patch_id
+        and latest.get('block_reason') == block_reason
+        and latest.get('status') != _INFRA_FAILURE_STATUS
+        and (latest.get('risk_label') != 'low' or latest.get('head_sha') == head_sha)
+    )
+
+
+async def _reaffirm_latest_proposal(
+    scheduler: Any, task_id: str, proposals: list[Any],
+) -> None:
+    """Move the covering entry's ``timestamp`` to now. Best-effort.
+
+    ``_mark_blocked`` has just stamped ``last_blocked_at``, and the briefing
+    hides an entry stamped before it. ``investigated_at``, the age b3_gate
+    reads, is left alone. The default merge mode overwrites only this key.
+    """
+    reaffirmed = {**proposals[-1], 'timestamp': _now_iso()}
+    try:
+        await scheduler.update_task(
+            task_id, {'dry_run_proposals': [*proposals[:-1], reaffirmed]},
+        )
+    except Exception as exc:
+        logger.warning(
+            'dry_run_unblock: re-stamping the covering proposal failed for '
+            'task %s (best-effort, continuing): %s',
+            task_id, exc,
+        )
+
+
+async def _skip_covered_reblock(
+    *, scheduler: Any, event_store: Any, task_id: str, proposals: list[Any],
+    branch_patch_id: str | None, block_reason: str,
+) -> None:
+    """Record a re-block the latest proposal covers, in place of investigating it.
+
+    The ``phase_skipped`` row keeps each skip countable in runs.db, which is
+    where a re-block loop is measured from once the skip makes it cost nothing.
+    """
+    logger.info(
+        'dry_run_unblock: task %s re-blocked on unchanged content '
+        '(branch_patch_id=%s) for the same reason %r; the latest '
+        'proposal already covers it, skipping the investigation',
+        task_id, branch_patch_id, block_reason,
+    )
+    await _reaffirm_latest_proposal(scheduler, task_id, proposals)
+    if event_store:
+        event_store.emit(
+            EventType.phase_skipped,
+            task_id=task_id,
+            phase='blocked',
+            role='unblock_auto',
+            data={
+                'reason': 'dry_run_covered',
+                'block_reason': block_reason,
+                'branch_patch_id': branch_patch_id,
+                'covering_investigated_at': proposals[-1].get('investigated_at'),
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -384,13 +548,17 @@ async def run_dry_run_unblock(
     import time
 
     ua_cfg = config.unblock_auto
+    main_branch = config.git.main_branch
     start_time = time.monotonic()
     project_id = getattr(getattr(config, 'fused_memory', None), 'project_id', '') or ''
     run_id = getattr(event_store, 'run_id', '') or ''
 
     # Capture worktree SHAs before invoke_agent so both the success and
     # exception paths can stamp the same anchor values.
-    head_sha, main_sha = await _capture_worktree_shas(worktree)
+    head_sha, main_sha = await _capture_worktree_shas(worktree, main_branch)
+    branch_patch_id = await _capture_branch_patch_id(
+        worktree, main_branch=main_branch, task_id=task_id,
+    )
 
     config_dir: TaskConfigDir | None = None
     preserve_config_dir = False
@@ -398,17 +566,9 @@ async def run_dry_run_unblock(
     # including an exception raised ahead of the task fetch.
     task_context_unavailable = False
     try:
-        # Per-investigation isolated CLAUDE_CONFIG_DIR, named distinctly from
-        # the main task's `claude-config-{task_id}` dir so this background
-        # investigation cannot collide with the blocked task's own session/
-        # credentials. Passing config_dir + session_id to invoke_with_cap_retry
-        # (below) revives the startup-wedge fast-kill in
-        # shared/cli_invoke.py._run_subprocess — without both, `_grace_spent`
-        # is forced True and a pre-turn-1 wedge burns the full timeout ceiling.
-        config_dir = TaskConfigDir(f'{task_id}-unblock', base_dir=Path(worktree) / '.task')
-
-        # Fetched ONCE, above the prompt build, so the single fetch serves both
-        # the prompt's task-context block and the route resolution below.
+        # Fetched ONCE, above everything else in this try, so the single fetch
+        # serves the coverage check, the prompt's task-context block and the
+        # route resolution below.
         # A failure degrades this investigation in two ways that are invisible
         # at the call site — no task text in the prompt, and the task's
         # model_overrides['unblock_auto'] routing pin silently dropped — so it
@@ -454,6 +614,27 @@ async def run_dry_run_unblock(
         # rather than degrading it.
         raw_md = task_doc.get('metadata') if task_doc else None
         md = raw_md if isinstance(raw_md, dict) else {}
+
+        proposals = md.get('dry_run_proposals')
+        if isinstance(proposals, list) and _latest_proposal_covers(
+            proposals, branch_patch_id=branch_patch_id, block_reason=reason,
+            head_sha=head_sha,
+        ):
+            await _skip_covered_reblock(
+                scheduler=scheduler, event_store=event_store, task_id=task_id,
+                proposals=proposals, branch_patch_id=branch_patch_id,
+                block_reason=reason,
+            )
+            return
+
+        # Per-investigation isolated CLAUDE_CONFIG_DIR, named distinctly from
+        # the main task's `claude-config-{task_id}` dir so this background
+        # investigation cannot collide with the blocked task's own session/
+        # credentials. Passing config_dir + session_id to invoke_with_cap_retry
+        # (below) revives the startup-wedge fast-kill in
+        # shared/cli_invoke.py._run_subprocess — without both, `_grace_spent`
+        # is forced True and a pre-turn-1 wedge burns the full timeout ceiling.
+        config_dir = TaskConfigDir(f'{task_id}-unblock', base_dir=Path(worktree) / '.task')
 
         system_prompt = _load_skill_system_prompt()
         user_prompt = (
@@ -782,6 +963,9 @@ async def run_dry_run_unblock(
     # convention _failure_diagnostics sets, so a consumer never has to
     # distinguish an absent key from an old entry from a healthy one.
     entry['task_context_unavailable'] = task_context_unavailable
+    # The coverage key the next re-block is compared against; stamped from
+    # the dispatch-time capture and, like the SHAs, outside the agent schema.
+    entry['branch_patch_id'] = branch_patch_id
     # DIAGNOSTIC ONLY, and deferred on purpose — not an oversight. Review asked
     # why b3_gate fails closed on an undeterminable AGE (step 7b) while an
     # undeterminable TASK still certifies FRESH. Both offered remedies conflict
@@ -821,9 +1005,9 @@ async def run_dry_run_unblock(
     # Concurrency note: this read-modify-write is not atomic. If another writer
     # mutates the task metadata between get_task and the trim update_task, that
     # concurrent change is clobbered (stale-plus-trimmed blob wins).
-    # Concurrent dry-runs on the same blocked task are extremely unlikely — the
-    # scheduler dispatches at most one hook per task — so this is acceptable as
-    # a best-effort trim. A missed trim cycle is preferable to coordination
+    # Concurrent dry-runs on the same blocked task do not happen: both spawners
+    # skip while investigation_in_flight(task_id) holds for the whole event
+    # loop — so this is acceptable as a best-effort trim. A missed trim cycle is preferable to coordination
     # overhead.
     try:
         keep_last = ua_cfg.b3_proposal_keep_last
@@ -843,7 +1027,6 @@ async def run_dry_run_unblock(
 
     if event_store and result is not None:
         try:
-            from orchestrator.event_store import EventType
             event_store.emit(
                 EventType.invocation_end,
                 task_id=task_id,
@@ -856,6 +1039,8 @@ async def run_dry_run_unblock(
                     'risk_label': entry.get('risk_label', _HUMAN_REVIEW_REQUIRED),
                     'success': getattr(result, 'success', False),
                     'status': entry.get('status', 'ok'),
+                    'cost_basis': str(getattr(result, 'cost_basis', 'reported')),
+                    'cost_delta_clamped': bool(getattr(result, 'cost_delta_clamped', False)),
                 },
             )
         except Exception as exc:
@@ -905,7 +1090,7 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
                     f'wall / task is slow)'
                 )
             return {
-                'status': 'infra_failure',
+                'status': _INFRA_FAILURE_STATUS,
                 'proposal_text': proposal_text,
                 'risk_label': _HUMAN_REVIEW_REQUIRED,
                 'files_referenced': [],
@@ -977,7 +1162,7 @@ def _cap_exhausted_entry(
     """
     now = _now_iso()
     return {
-        'status': 'infra_failure',
+        'status': _INFRA_FAILURE_STATUS,
         'proposal_text': (
             f'Infra wedge (retryable, not a human-review conclusion): '
             f'{_cap_wedge(exc, disp)} ({exc.elapsed_secs:.1f}s elapsed)'
