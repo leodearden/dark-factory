@@ -1,4 +1,4 @@
-"""Tests for the read router heuristics."""
+"""Tests for ReadRouter: heuristic routing and LLM routing over an injected client."""
 
 import pytest
 from _sdk_client_stubs import completion_client

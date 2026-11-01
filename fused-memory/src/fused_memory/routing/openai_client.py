@@ -1,4 +1,4 @@
-"""The routing layer's one AsyncOpenAI, shared by ReadRouter and WriteClassifier."""
+"""The routing layer's AsyncOpenAI ownership policy; ReadRouter and WriteClassifier each hold their own LazyOpenAIClient."""
 
 from openai import AsyncOpenAI
 
@@ -6,7 +6,7 @@ from fused_memory.config.schema import FusedMemoryConfig
 
 
 class LazyOpenAIClient:
-    """The routing layer's one AsyncOpenAI: injected, or built on first get(); close() releases it either way.
+    """Lazily builds, caches and releases one AsyncOpenAI for its owner; an injected client is owned the same way.
 
     Built from llm.providers.openai.api_key with no base_url, so the SDK's OPENAI_BASE_URL fallback picks the endpoint.
     """
