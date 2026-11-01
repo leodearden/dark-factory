@@ -181,13 +181,6 @@ def _make_recon_event(project_id: str) -> ReconciliationEvent:
     )
 
 
-def _make_failing_buf() -> AsyncMock:
-    """A mock EventBuffer whose push raises non-retriable ValueError."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('schema mismatch'))
-    return buf
-
-
 # ── step-11 tests ──────────────────────────────────────────────────────────
 
 
@@ -198,29 +191,9 @@ class TestGetDeadLettersEventQueue:
     async def test_event_queue_items_filtered_by_project_id(self, tmp_path):
         """Items from event_queue filtered by project_id; each has required fields."""
         dl = tmp_path / 'dl.jsonl'
-        released = asyncio.Event()
-        buf = parked_buffer(released)
-        eq = EventQueue(
-            buf,
-            dead_letter_path=dl,
-            maxsize=100,
-            retry_initial_seconds=0.01,
-            retry_max_seconds=0.05,
-            shutdown_flush_seconds=1.0,
-        )
-        await eq.start()
-        try:
-            # Enqueue 3 events for proj-a, 2 for proj-b
-            for _ in range(3):
-                eq.enqueue(_make_recon_event('proj-a'))
-            for _ in range(2):
-                eq.enqueue(_make_recon_event('proj-b'))
-            # Wait for drainer to dead-letter all of them
-            await asyncio.wait_for(eq._queue.join(), timeout=2.0)
-            assert eq.stats()['dead_letters'] == 5
-        finally:
-            released.set()
-            await eq.close()
+        seed_dead_letters(dl, [_make_recon_event('proj-a') for _ in range(3)])
+        seed_dead_letters(dl, [_make_recon_event('proj-b') for _ in range(2)])
+        eq = EventQueue(AsyncMock(), dead_letter_path=dl)
 
         svc = AsyncMock()
         svc.durable_queue = None
@@ -247,26 +220,9 @@ class TestGetDeadLettersEventQueue:
     async def test_event_queue_merges_with_durable_queue_without_project_id(self, tmp_path):
         """Without project_id, items from both sources appear in the result."""
         dl = tmp_path / 'dl2.jsonl'
-        released = asyncio.Event()
-        buf = parked_buffer(released)
-        eq = EventQueue(
-            buf,
-            dead_letter_path=dl,
-            maxsize=100,
-            retry_initial_seconds=0.01,
-            retry_max_seconds=0.05,
-            shutdown_flush_seconds=1.0,
-        )
-        await eq.start()
-        try:
-            for _ in range(3):
-                eq.enqueue(_make_recon_event('proj-a'))
-            for _ in range(2):
-                eq.enqueue(_make_recon_event('proj-b'))
-            await asyncio.wait_for(eq._queue.join(), timeout=2.0)
-        finally:
-            released.set()
-            await eq.close()
+        seed_dead_letters(dl, [_make_recon_event('proj-a') for _ in range(3)])
+        seed_dead_letters(dl, [_make_recon_event('proj-b') for _ in range(2)])
+        eq = EventQueue(AsyncMock(), dead_letter_path=dl)
 
         svc = _make_mock_service(get_dead_items_return=_FAKE_DEAD_ITEMS)
         server = create_mcp_server(svc, event_queue=eq)
@@ -756,27 +712,9 @@ class TestGetStatusToolDeadLetters:
     async def test_get_status_includes_event_queue_dead_letter_count(self, tmp_path):
         """event_queue dead-letters for a project are counted in dead_letters."""
         dl_path = tmp_path / 'dl.jsonl'
-        released = asyncio.Event()
-        buf = parked_buffer(released)
-        eq = EventQueue(
-            buf,
-            dead_letter_path=dl_path,
-            maxsize=100,
-            retry_initial_seconds=0.01,
-            retry_max_seconds=0.05,
-            shutdown_flush_seconds=1.0,
-        )
-        await eq.start()
-        try:
-            for _ in range(3):
-                eq.enqueue(_make_recon_event('proj-a'))
-            for _ in range(2):
-                eq.enqueue(_make_recon_event('proj-b'))
-            await asyncio.wait_for(eq._queue.join(), timeout=2.0)
-            assert eq.stats()['dead_letters'] == 5
-        finally:
-            released.set()
-            await eq.close()
+        seed_dead_letters(dl_path, [_make_recon_event('proj-a') for _ in range(3)])
+        seed_dead_letters(dl_path, [_make_recon_event('proj-b') for _ in range(2)])
+        eq = EventQueue(AsyncMock(), dead_letter_path=dl_path)
 
         svc = _make_status_mock_service(queue_counts={'dead': 0})
         server = create_mcp_server(svc, event_queue=eq)
@@ -798,24 +736,8 @@ class TestGetStatusToolDeadLetters:
     async def test_get_status_dead_letters_total_matches_get_dead_letters(self, tmp_path):
         """get_status dead_letters.total equals len(get_dead_letters.items) for same project."""
         dl_path = tmp_path / 'dl.jsonl'
-        released = asyncio.Event()
-        buf = parked_buffer(released)
-        eq = EventQueue(
-            buf,
-            dead_letter_path=dl_path,
-            maxsize=100,
-            retry_initial_seconds=0.01,
-            retry_max_seconds=0.05,
-            shutdown_flush_seconds=1.0,
-        )
-        await eq.start()
-        try:
-            for _ in range(3):
-                eq.enqueue(_make_recon_event('proj-a'))
-            await asyncio.wait_for(eq._queue.join(), timeout=2.0)
-        finally:
-            released.set()
-            await eq.close()
+        seed_dead_letters(dl_path, [_make_recon_event('proj-a') for _ in range(3)])
+        eq = EventQueue(AsyncMock(), dead_letter_path=dl_path)
 
         # Service reports 2 durable dead for proj-a; get_dead_letters returns 2 items
         svc = _make_status_mock_service(queue_counts={'dead': 2})
