@@ -62,7 +62,12 @@ from _fm_helpers import (
 )
 from _graphiti_fake import FakeGraphitiClient
 
-from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.backends.graphiti_client import (
+    GraphitiBackend,
+    build_embedder,
+    build_llm_client,
+)
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
 
@@ -821,6 +826,41 @@ async def _live_episodic_count(graph_name: str, episode_uuid: str) -> tuple[int,
         await client.aclose()
 
 
+def _live_config(base: FusedMemoryConfig) -> FusedMemoryConfig:
+    config = base.model_copy(deep=True)
+    # mock_config's api_keys are the literal string 'test-key'. Clearing them
+    # makes the OpenAI clients fall back to the real OPENAI_API_KEY env var —
+    # the idiom test_recon_dedup_premise.py:130-133 established for the two
+    # tests in this suite that need real embeddings.
+    llm_provider = config.llm.providers.openai
+    embedder_provider = config.embedder.providers.openai
+    assert llm_provider is not None and embedder_provider is not None
+    llm_provider.api_key = None
+    embedder_provider.api_key = None
+    config.graphiti.falkordb.uri = f'redis://{FALKOR_HOST}:{FALKOR_PORT}'
+    return config
+
+
+def test_the_live_config_runs_graphiti_on_the_configured_clients(mock_config, monkeypatch):
+    monkeypatch.setenv('OPENAI_API_KEY', 'sk-hermetic-not-a-real-key')
+    config = _live_config(mock_config)
+
+    llm = build_llm_client(config)
+    assert llm is not None, (
+        'build_llm_client returned None, so graphiti_core.Graphiti substitutes '
+        'its default OpenAIClient(), whose small model is the hard-coded '
+        'gpt-4.1-nano (now 404 model_not_found, task 8072), not llm.model.'
+    )
+    assert (llm.model, llm.small_model) == (config.llm.model, config.llm.model)
+
+    embedder = build_embedder(config)
+    assert embedder is not None
+    assert (embedder.config.embedding_model, embedder.config.embedding_dim) == (
+        config.embedder.model,
+        config.embedder.dimensions,
+    )
+
+
 @falkor_skipif()
 @pytest.mark.integration
 @pytest.mark.skipif(
@@ -850,14 +890,7 @@ async def test_the_write_creates_a_real_episodic_node_in_falkordb(mock_config):
 
     graph_name = unique_graph_name('3561_episode_uuid')
 
-    config = mock_config.model_copy(deep=True)
-    # mock_config's api_keys are the literal string 'test-key'. Clearing them
-    # makes the OpenAI clients fall back to the real OPENAI_API_KEY env var —
-    # the idiom test_recon_dedup_premise.py:130-133 established for the two
-    # tests in this suite that need real embeddings.
-    config.llm.providers.openai.api_key = None
-    config.embedder.providers.openai.api_key = None
-    config.graphiti.falkordb.uri = f'redis://{FALKOR_HOST}:{FALKOR_PORT}'
+    config = _live_config(mock_config)
 
     backend = GraphitiBackend(config)
     # skip_maintenance=True is load-bearing, not an optimisation: the default
