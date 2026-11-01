@@ -10425,6 +10425,18 @@ def create_mcp_server(
         :mod:`fused_memory.server.markup_guard` for the authoritative pattern
         list and rationale.
 
+        A write that supplies ``title``/``description``/``details``/``prompt``
+        to an already-planned task (or a recon write whose audit-trail rotation
+        rewrote the description), where the task's ``metadata.plan_text_fp``
+        no longer matches the post-write description+details fingerprint,
+        returns ``amendment_advisory`` {task_id, plan_authored_at,
+        fields_changed, will_replan, plan_text_fp_before, task_text_fp_after}.
+        A running agent does not see the amendment; the task re-plans at its
+        next dispatch. ``will_replan`` is False for a done/cancelled task,
+        because the amendment reaches no work; True assumes the orchestrator's
+        default plan-fingerprint gate and a later dispatch. See
+        docs/task-authoring.md §9.
+
         Args:
             id: Task ID to update
             project_root: Absolute path to project root

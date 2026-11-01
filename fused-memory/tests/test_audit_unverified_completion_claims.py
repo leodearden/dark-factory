@@ -18,6 +18,7 @@ import pytest
 from _distinct_git_repo import init_distinct_git_repo
 from _fm_helpers import load_script_module
 from shared.project_layout import tasks_db
+from shared.task_store_schema import TASK_STORE_DDL
 
 from fused_memory.backends.falkor_read_only import RO_COMMAND
 
@@ -1748,21 +1749,18 @@ class TestProbeBuilders:
     async def test_task_status_probe_reads_the_real_schema(self, tmp_path) -> None:
         """Statuses come back per (project, id), scoped to the master tag.
 
-        The fixture database is created from the BACKEND's own ``_SCHEMA_SQL``,
-        so this test fails if the read's SQL ever drifts from the schema the
-        backend writes — the silent-all-unverifiable regression.
+        The fixture database is created from
+        ``shared.task_store_schema.TASK_STORE_DDL``, the DDL the backend creates
+        every store with, so this test fails if the read's SQL ever drifts from
+        the schema the backend writes — the silent-all-unverifiable regression.
         """
         import sqlite3  # noqa: PLC0415
-
-        from fused_memory.backends.sqlite_task_backend import (  # noqa: PLC0415
-            _SCHEMA_SQL,
-        )
 
         root = tmp_path / 'proj'
         db_path = tasks_db(root)
         db_path.parent.mkdir(parents=True)
         conn = sqlite3.connect(db_path)
-        conn.executescript(_SCHEMA_SQL)
+        conn.executescript(TASK_STORE_DDL)
         conn.executemany(
             'INSERT INTO tasks (tag, id, title, status, updated_at) '
             'VALUES (?, ?, ?, ?, ?)',
