@@ -59,15 +59,9 @@ The ingredients stay public — :data:`MCP_POST_HEADERS`,
 non-``tools/call`` request or a hand-built envelope.
 
 ``shared.mcp_session``'s ``McpSession`` and ``SyncMcpSession`` (the
-session-handshake transports) consume :data:`MCP_POST_HEADERS`,
-:func:`mcp_endpoint_url` and :func:`decode_mcp_response_body`, so neither
-holds a copy of them.
-
-ONE TWIN REMAINS.  ``dashboard/src/dashboard/data/memory.py`` still carries
-its own ``MCP_HEADERS``, ``_parse_mcp_response`` and ``_parse_sse_response``.
-The dependency direction already allows it to import this module instead;
-that file was simply outside task 4819's module locks.  Until it is migrated,
-a change to the headers or the decoder here must be mirrored there.
+session-handshake transports) and ``dashboard.data.memory``'s ``McpSession``
+consume :data:`MCP_POST_HEADERS`, :func:`mcp_endpoint_url` and
+:func:`decode_mcp_response_body`, so none of them holds a copy.
 
 Public API::
 
@@ -77,6 +71,7 @@ Public API::
         check_mcp_post_response,
         decode_mcp_response_body,
         mcp_endpoint_url,
+        mcp_server_base,
         mcp_tool_call_payload,
         open_mcp_client,
         post_mcp_tool_call,
@@ -111,6 +106,7 @@ __all__ = [
     'check_mcp_post_response',
     'decode_mcp_response_body',
     'mcp_endpoint_url',
+    'mcp_server_base',
     'mcp_tool_call_payload',
     'open_mcp_client',
     'post_mcp_tool_call',
@@ -146,6 +142,11 @@ def mcp_endpoint_url(base_url: str) -> str:
     'http://127.0.0.1:8002/mcp'
     """
     return f"{base_url.rstrip('/')}/mcp"
+
+
+def mcp_server_base(endpoint_url: str) -> str:
+    """The inverse of :func:`mcp_endpoint_url`: the server base of an MCP endpoint URL."""
+    return endpoint_url.rstrip('/').removesuffix('/mcp')
 
 
 def decode_mcp_response_body(resp: Any) -> Any:

@@ -14,6 +14,9 @@ than erroring out at import time.
 from __future__ import annotations
 
 import json
+import logging
+
+import pytest
 
 
 class TestInjectOperationalRoutingMatrix:
@@ -224,3 +227,36 @@ class TestInjectOperationalRoutingMatrix:
         )
 
         assert OPERATIONAL_LLM_GATE_MARKER_KEY.startswith('x_')
+
+
+_SCHEMA_WARNING = 'task_metadata.schema_warning'
+_SOURCE = 'source=operational_routing_guard'
+
+
+def _discard_lines(caplog) -> list[str]:
+    messages = (r.getMessage() for r in caplog.records)
+    return [m for m in messages if _SCHEMA_WARNING in m and _SOURCE in m]
+
+
+class TestUnreadableMetadataIsDiscardedLoudly:
+    """Unreadable metadata takes the non-coercion branch, and is logged."""
+
+    def test_malformed_string_is_returned_unchanged_and_logs_one_census_line(self, caplog):
+        from fused_memory.middleware.operational_routing_guard import (
+            inject_operational_routing,
+        )
+
+        original = '{not json'
+        with caplog.at_level(logging.WARNING):
+            assert inject_operational_routing(original) is original
+        assert len(_discard_lines(caplog)) == 1
+
+    @pytest.mark.parametrize('metadata', [None, ''])
+    def test_absent_metadata_logs_no_census_line(self, metadata, caplog):
+        from fused_memory.middleware.operational_routing_guard import (
+            inject_operational_routing,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            assert inject_operational_routing(metadata) is metadata
+        assert _discard_lines(caplog) == []

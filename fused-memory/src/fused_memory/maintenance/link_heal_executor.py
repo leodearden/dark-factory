@@ -46,6 +46,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from shared.safe_io import atomic_write_text
+from shared.streak import KeyedStreaks
 
 from fused_memory.maintenance.link_adjudicator import LinkAdjudicator, LinkPair, LinkVerdict
 from fused_memory.maintenance.link_heal import (
@@ -758,25 +759,37 @@ def _check_approval(approved: str, pending: Sequence[ActionRow]) -> None:
 
 @dataclass
 class _Drain:
-    """What one apply run's drain has come to so far."""
+    """What one apply run's drain has come to so far; the drain is one failure run."""
 
+    failures: KeyedStreaks[None]
     outcomes: Counter[ActionState] = field(default_factory=Counter)
     writes: int = 0
-    streak: int = 0
     last_failure: Mapping[str, Any] | None = None
     not_attempted: int = 0
     stopped_by: str | None = None
 
-    def record(self, outcome: _Outcome) -> None:
-        """A failure extends the streak, an applied heal resets it, a skip leaves it."""
+    @classmethod
+    def for_limit(cls, limit: int) -> _Drain:
+        return cls(failures=KeyedStreaks(threshold=limit))
+
+    @property
+    def streak(self) -> int:
+        return self.failures.count(None)
+
+    def record(self, outcome: _Outcome) -> bool:
+        """Count *outcome*; True when this failure brings the streak to the limit.
+
+        A failure extends the streak, an applied heal resets it, a skip leaves it.
+        """
         self.outcomes[outcome.state] += 1
         if outcome.wrote:
             self.writes += 1
         if outcome.state is ActionState.FAILED:
-            self.streak += 1
             self.last_failure = outcome.detail
-        elif outcome.state is ActionState.APPLIED:
-            self.streak = 0
+            return self.failures.failure(None).fired
+        if outcome.state is ActionState.APPLIED:
+            self.failures.success(None)
+        return False
 
     def stop(self, *, not_attempted: int) -> None:
         self.stopped_by = STREAK_STOP
@@ -793,15 +806,14 @@ async def _drain(
     streak_limit: int,
 ) -> _Drain:
     """Heal *pending* in order until *cap* write attempts or *streak_limit* failures."""
-    drain = _Drain()
+    drain = _Drain.for_limit(streak_limit)
     for index, row in enumerate(pending):
         if cap is not None and drain.writes >= cap:
             outcome = _Outcome(ActionState.SKIPPED_CAP)
         else:
             outcome = await _heal_one(row.planned, store=store, run_id=run_id)
         ledger.set_outcome(row.action_id, outcome.state, run_id, outcome.detail)
-        drain.record(outcome)
-        if drain.streak >= streak_limit:
+        if drain.record(outcome):
             drain.stop(not_attempted=len(pending) - index - 1)
             break
     return drain
@@ -966,10 +978,9 @@ async def run_undo(
     """A writing run taking back every heal *target* still has applied, newest first."""
     heals = target.heals[::-1]
     run_id = ledger.start_run(RunSource.UNDO, writes=True)
-    drain = _Drain()
+    drain = _Drain.for_limit(limits.write_failure_streak)
     for index, row in enumerate(heals):
-        drain.record(await _undo_heal(row, store=store, ledger=ledger, run_id=run_id))
-        if drain.streak >= limits.write_failure_streak:
+        if drain.record(await _undo_heal(row, store=store, ledger=ledger, run_id=run_id)):
             drain.stop(not_attempted=len(heals) - index - 1)
             break
     counts = _drain_counts(heals, drain)

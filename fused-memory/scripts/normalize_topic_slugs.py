@@ -76,6 +76,9 @@ Dry run is the default — the operator runbook
    markdown.  Nothing is modified.  ``--project-root`` REPLACES the default
    (this checkout alone), so a swept corpus whose checkout is not named is a
    ``gate_census_incomplete`` gap: the dry run exits 1 and names it.
+   ``--topic <legacy value>`` (repeatable) narrows the write set to the named
+   legacy spellings; it is how one registry topic is normalized without
+   sweeping the whole project.
 
 2. **Read the refusal buckets and resolve them BY HAND.**  ``slug_collision``,
    ``canonical_collision``, ``topic_unfoldable`` and ``gate_ambiguous`` are
@@ -205,6 +208,7 @@ __all__ = [
     'resolve_exit_code',
     'resolve_gate_roots',
     'resolve_projects',
+    'resolve_topics',
     'run',
     'run_live',
     'rename_one',
@@ -566,12 +570,22 @@ class Rename:
 # Pure core — planning
 # ---------------------------------------------------------------------------
 
+def _in_selection(legacy_topic: object, topics: frozenset[str] | None) -> bool:
+    """Whether a ``--topic`` selection covers *legacy_topic*.
+
+    ``None`` is no selection and covers every value.  A selection holds only
+    strings, so a non-string topic (a ``topic_unfoldable`` entry) is never in one.
+    """
+    return topics is None or (isinstance(legacy_topic, str) and legacy_topic in topics)
+
+
 def plan_renames(
     records,
     *,
     project_id: str,
     occupied_topics=None,
     canonical_ids_by_topic=None,
+    topics: frozenset[str] | None = None,
 ) -> tuple[list[Rename], list[dict]]:
     """Decide what to rename in one project's records, and what to refuse.
 
@@ -611,6 +625,9 @@ def plan_renames(
     Args:
         records: Scroll-shaped record dicts for ONE project.
         project_id: The corpus they came from; stamped onto every row.
+        topics: The legacy values whose verdicts to return; ``None`` returns
+            every verdict.  It narrows the verdicts only: a selected value
+            that an unselected spelling contests is still refused.
 
     Returns:
         ``(renames, skips)`` — frozen :class:`Rename` rows, and report-ready
@@ -621,7 +638,9 @@ def plan_renames(
 
     # --- pass 1: what does the corpus already look like? -------------------
     # Built BEFORE any verdict, from the whole record set, so no decision can
-    # depend on the order the backend happened to page records back in.
+    # depend on the order the backend happened to page records back in.  It
+    # ignores *topics* for the same reason: the planner must see every legacy
+    # value to know which targets are contested.
     #
     #   observed_topics       every topic value present, conforming or not
     #   canonical_ids_by_topic  which records under a topic claim canonical
@@ -683,7 +702,7 @@ def plan_renames(
     for record in records:
         metadata = record.get('metadata') or {}
         topic = metadata.get('topic')
-        if not _is_non_conforming_topic(topic):
+        if not _is_non_conforming_topic(topic) or not _in_selection(topic, topics):
             continue
 
         memory_id = record.get('id')
@@ -1102,6 +1121,12 @@ async def census_consolidation_gates(client, roots) -> GateCensus:
     )
 
 
+def _gate_topic(task: dict) -> object:
+    """The ``topic`` of a gate task's block, or ``None`` when it carries no block."""
+    block = (task.get('metadata') or {}).get(GATE_METADATA_KEY)
+    return block.get('topic') if isinstance(block, dict) else None
+
+
 def pair_gate_blocks(renames, gate_tasks) -> tuple[list[GateGroup], list[dict]]:
     """Pair each slug's renames with the consolidation gate filed against it.
 
@@ -1145,11 +1170,7 @@ def pair_gate_blocks(renames, gate_tasks) -> tuple[list[GateGroup], list[dict]]:
     # every verdict below is a property of the corpus rather than of read order.
     gates_by_topic: dict[tuple[str, str], list[dict]] = {}
     for task in gate_tasks or ():
-        metadata = task.get('metadata') or {}
-        block = metadata.get(GATE_METADATA_KEY)
-        if not isinstance(block, dict):
-            continue
-        topic = block.get('topic')
+        topic = _gate_topic(task)
         if not isinstance(topic, str) or not topic:
             continue
         key = (str(task.get('project_id') or ''), topic)
@@ -1646,6 +1667,42 @@ class GateCensusIncomplete(RuntimeError):
         self.gaps = gaps
 
 
+def _selection_defect(topic: object) -> str | None:
+    """Why *topic* cannot be a selected legacy value, or ``None`` if it can."""
+    if not isinstance(topic, str):
+        return 'not a string'
+    if is_valid_topic_slug(topic):
+        return 'already conforms; name the legacy value that folds onto it'
+    if derive_topic_slug(topic) is None:
+        return 'has no fold'
+    return None
+
+
+def _refuse_invalid_selection(topics: frozenset[str] | None) -> None:
+    """Raise ``ValueError`` unless *topics* is ``None`` or names foldable legacy values.
+
+    Passing the target slug instead of its source is the likely typo.  Left
+    unrefused, it would plan nothing and exit 0, which reads as a clean run.
+    A legacy value no record carries is NOT refused: a re-run after a
+    successful ``--apply`` legitimately finds the value drained.
+    """
+    if topics is None:
+        return
+    if not topics:
+        raise ValueError(
+            'empty topic selection: name at least one legacy topic value, or '
+            'omit --topic to migrate every non-conforming value')
+    defects = sorted(
+        f'{topic!r} ({defect})'
+        for topic in topics
+        if (defect := _selection_defect(topic)) is not None
+    )
+    if defects:
+        raise ValueError(
+            'a topic selection names LEGACY source values, never target slugs; '
+            'refused: ' + ', '.join(defects))
+
+
 def _census_gaps(gates: GateCensus, projects) -> list[dict]:
     """Every reason this sweep cannot trust its gate pairing, as report entries.
 
@@ -1678,6 +1735,7 @@ async def run(
     client: Any = None,
     page_size: int = DEFAULT_PAGE_SIZE,
     max_pages: int = DEFAULT_MAX_PAGES,
+    topics: frozenset[str] | None = None,
 ) -> dict:
     """Enumerate, plan, pair, write, verify — and report all of it.
 
@@ -1705,11 +1763,20 @@ async def run(
             ``gate_census_incomplete`` instead.  Only the swept projects'
             gates are paired — another project's gate is neither this run's
             work nor its orphan.
+        topics: The legacy values to migrate.  ``None`` (default) migrates
+            every non-conforming value.  A selection narrows the renames, the
+            plan-time refusals and the gate pairing to these values, so an
+            unselected gate is neither paired nor an orphan.  Enumeration,
+            coverage, the collision index and ``baseline_delta`` stay
+            corpus-wide, so a selected value contested by an unselected
+            spelling is still refused.  An invalid selection raises
+            ``ValueError`` before anything is read.
 
     Returns:
         The report dict — rendered by :func:`render_json` /
         :func:`render_markdown` and graded by :func:`resolve_exit_code`.
     """
+    _refuse_invalid_selection(topics)
     gaps = _census_gaps(gates, projects)
 
     # Fail-CLOSED capability preflight: ONE probe per run, ABOVE the scroll.
@@ -1802,13 +1869,18 @@ async def run(
             project_id=project_id,
             occupied_topics=enumerated['occupied_topics'],
             canonical_ids_by_topic=enumerated['canonical_ids_by_topic'],
+            topics=topics,
         )
         _record_skips(plan_skips)
         all_renames.extend(renames)
 
     groups, gate_skips = pair_gate_blocks(
         all_renames,
-        [task for task in gates.tasks if task.get('project_id') in projects],
+        [
+            task for task in gates.tasks
+            if task.get('project_id') in projects
+            and _in_selection(_gate_topic(task), topics)
+        ],
     )
     _record_skips(gate_skips)
 
@@ -1862,6 +1934,7 @@ async def run(
             'listed project is enumerated by scroll, not addressed by id'
         ),
         'projects': list(projects),
+        'topic_selection': None if topics is None else sorted(topics),
         'coverage': coverage,
         'coverage_complete': coverage_complete,
         'candidate_count': candidate_count,
@@ -1970,6 +2043,16 @@ def _render_gate_census(census: dict) -> str:
     )
 
 
+def _render_topic_selection(selection: list[str] | None) -> str:
+    if selection is None:
+        return '**Topic selection:** every non-conforming value'
+    return (
+        f'**Topic selection:** {", ".join(f"`{topic}`" for topic in selection)} '
+        '(renames, refusals and gate pairing are narrowed to these; enumeration '
+        'and the collision check stay corpus-wide)'
+    )
+
+
 def render_markdown(report: dict) -> str:
     """The human-readable artifact.
 
@@ -1985,6 +2068,7 @@ def render_markdown(report: dict) -> str:
         '',
         f'**Mode:** {mode}',
         f'**Projects:** {", ".join(report.get("projects") or [])}',
+        _render_topic_selection(report.get('topic_selection')),
         (
             '**Scope:** corpus-wide — every record in every census category '
             'of every listed project is enumerated by scroll, not addressed '
@@ -2138,6 +2222,15 @@ def resolve_gate_roots(args) -> tuple[str, ...]:
     return tuple(dict.fromkeys(args.project_roots))
 
 
+def resolve_topics(args) -> frozenset[str] | None:
+    """``--topic`` REPLACES "every value"; absent, it is ``None``, never empty.
+
+    The rule :func:`resolve_projects` follows: naming a legacy value narrows
+    the write set and never widens it.  :func:`run` validates the values.
+    """
+    return None if args.topics is None else frozenset(args.topics)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -2160,6 +2253,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f'Checkout whose task store the consolidation-gate census reads; '
              f'repeatable, one per swept project. Replaces the default '
              f'({", ".join(DEFAULT_GATE_ROOTS)}) rather than extending it.',
+    )
+    parser.add_argument(
+        '--topic', dest='topics', action='append', default=None,
+        help='Legacy (non-conforming) topic value to migrate; repeatable. '
+             'Replaces the default (every non-conforming value) rather than '
+             'extending it. Name the SOURCE value, never its target slug.',
     )
     parser.add_argument(
         '--server-url', default=None,
@@ -2230,6 +2329,7 @@ async def run_live(args, *, open_memory_service, open_client) -> dict:
                 apply=args.apply,
                 client=client,
                 gates=census,
+                topics=resolve_topics(args),
             )
 
 

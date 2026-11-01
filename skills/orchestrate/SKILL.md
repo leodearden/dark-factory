@@ -171,10 +171,8 @@ elif resolve["status"] == "refused":
     # is no task_id. Intended outcome — record resolve["reason"] and move on.
     # Do NOT retry and do NOT record a task id.
     note_refused(resolve["reason"])
-elif resolve["status"] == "awaiting_curation":
-    # The curator could not judge it yet: the ticket is durably parked and
-    # retried until it gets a verdict. No task_id yet. Do NOT re-submit; see
-    # skills/_shared/ticket-failure-handling.md.
+elif resolve["status"] in ("pending", "awaiting_curation"):  # open — resolve the SAME ticket again, never re-submit (skills/_shared/ticket-failure-handling.md)
+    # No task_id yet. Still open after the re-resolve: record the ticket id.
     note_parked(ticket)
 elif resolve["status"] == "failed":
     # On `failed`: surface the reason to the user and skip this task (user can
@@ -529,7 +527,7 @@ All paths below operate on the **target** project (`$TARGET_PROJECT`), not dark-
    ```
    `kind` is **required** — `_validate_done_provenance` (`fused-memory/src/fused_memory/middleware/task_interceptor.py`) rejects a kind-less blob with `done_provenance.kind is required`, and `DoneProvenance.kind` (`shared/src/shared/task_metadata.py`) has no default. Use `{"kind": "merged", "commit": "<sha>"}` when this branch supplied the merge you just performed — **the normal case here**, since step 5 merged by hand; use `{"kind": "found_on_main", "commit": "<sha>", "note": "<why>"}` when the work was already on main.
 
-   **Hand-merge carve-out — read this before reaching for the ladder.** `git merge --no-ff` in step 5 writes the subject `Merge branch 'task/<task-id>'`, which the orchestrator-shaped `--grep="Merge task/<task-id> into main"` marker deliberately does **not** match. So on this path the marker search comes back **empty on a merge that plainly landed** — expected, not a signal. The commit to stamp is the one step 5 captured: `{"kind": "merged", "commit": "$MERGE_SHA"}`. It is attributable because step 5 proved its **second parent is this branch's tip** — that is what makes it a merge commit that brought *this* branch in, not whatever has landed on main since — and it was captured on `main`. **This path is explicitly not subject to the citation gate** in the shared doc below, which governs the fast-forward path only. If step 5's chain printed no `MERGE_SHA=`, this carve-out does **not** apply: fall through to **If `MERGE_SHA` is not in hand** below, which re-derives from the hand-merge subject, proves containment, and already bans a bare `git rev-parse HEAD`.
+   **Hand-merge carve-out — read this before reaching for the ladder.** `git merge --no-ff` in step 5 writes the subject `Merge branch 'task/<task-id>'`, which the orchestrator-shaped marker subject `Merge task/<task-id> into main` deliberately does **not** match. So on this path the marker search comes back **empty on a merge that plainly landed** — expected, not a signal. The commit to stamp is the one step 5 captured: `{"kind": "merged", "commit": "$MERGE_SHA"}`. It is attributable because step 5 proved its **second parent is this branch's tip** — that is what makes it a merge commit that brought *this* branch in, not whatever has landed on main since — and it was captured on `main`. **This path is explicitly not subject to the citation gate** in the shared doc below, which governs the fast-forward path only. If step 5's chain printed no `MERGE_SHA=`, this carve-out does **not** apply: fall through to **If `MERGE_SHA` is not in hand** below, which re-derives from the hand-merge subject, proves containment, and already bans a bare `git rev-parse HEAD`.
 
    **If `MERGE_SHA` is not in hand** — step 6 reached in a fresh shell, a resumed session, or a merge performed earlier — do **not** substitute `git rev-parse HEAD`. Re-derive by the *hand-merge* subject and prove containment first:
    ```bash

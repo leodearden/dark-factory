@@ -44,6 +44,7 @@ __all__ = [
     "STATE_TO_STATUS",
     "BlockDisposition",
     "CancellationScope",
+    "DryRunSpawn",
     "IllegalTransition",
     "RequeueKind",
     "StewardBudgetExhausted",
@@ -176,6 +177,22 @@ class RequeueKind(enum.Enum):
     CANCEL = 'cancel'
 
 
+class DryRunSpawn(enum.Enum):
+    """When ``TaskWorkflow._mark_blocked`` spawns an unblock_auto dry-run."""
+
+    OUTSIDE_MERGE_PHASE = 'outside_merge_phase'
+    """Spawn only on the ``merge_phase=False`` path. The default."""
+
+    POST_MERGE_RED_MAIN = 'post_merge_red_main'
+    """Also spawn when ``merge_phase=True``. Valid only for a reason starting
+    with ``POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX``, whose main has already
+    advanced, so the proposal is anchored to post-merge SHAs."""
+
+    NEVER = 'never'
+    """The caller's own agent already reached the verdict an investigation
+    would only re-derive."""
+
+
 @dataclass(frozen=True)
 class BlockDisposition:
     """The disposition ``classify_failure`` resolves a failure exception to.
@@ -289,6 +306,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         WorktreeConflictError,
         WorktreeMissing,
     )
+    from orchestrator.lane_branch_holder import BranchCheckedOutElsewhere
     from orchestrator.recut_ruling import RecutRulingUnreadable, RecutRulingViolation
     from orchestrator.verify import VerifyInfraError
 
@@ -586,6 +604,22 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.BLOCK,
             counts_against_requeue_cap=True,
             reason_prefix='Re-cut ruling unreadable',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # Raised by acquire_warm_lane before any lane is touched, and
+        # deliberately NOT a WarmLaneRequeue so it can never feed the
+        # task-4930 steal-retry loop. A foreign worktree, a quarantined lane
+        # or a refused detach does not clear on its own. A lane the pool holds
+        # (REFUSE_HELD_LANE) can: a steal race, or a 4930 retry still holding a
+        # declined lane, frees it within seconds. That case blocks and
+        # escalates all the same, as the generic acquire FAULT did before
+        # task 5565.
+        BranchCheckedOutElsewhere: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Task branch checked out in another worktree',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         # ── BD-2 completeness rows: exported by the 4 covered modules, but

@@ -49,12 +49,6 @@ def lane_git(**overrides) -> GitConfig:
     )
 
 
-@pytest.fixture
-def isolated_config_source(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-
-
 class RedLane:
     """A worker whose every pass is red, over a real config it shares with the test."""
 
@@ -89,9 +83,10 @@ def fresh_config(tmp_path: Path, **git_overrides) -> OrchestratorConfig:
     return OrchestratorConfig(project_root=tmp_path, git=lane_git(**git_overrides))
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_a_reload_raising_persist_passes_holds_the_next_spaced_red_and_files_on_the_third(
-    tmp_path: Path, isolated_config_source: None,
+    tmp_path: Path,
 ):
     live = live_config(tmp_path)
     lane = RedLane(tmp_path, live)
@@ -109,8 +104,9 @@ async def test_a_reload_raising_persist_passes_holds_the_next_spaced_red_and_fil
     assert len(lane.client.submitted) == 1, 'the third spaced pass files exactly one task'
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
-async def test_without_a_reload_the_second_spaced_red_files(tmp_path: Path, isolated_config_source: None):
+async def test_without_a_reload_the_second_spaced_red_files(tmp_path: Path):
     lane = RedLane(tmp_path, live_config(tmp_path))
 
     await lane.red_pass_after(0)
@@ -120,9 +116,10 @@ async def test_without_a_reload_the_second_spaced_red_files(tmp_path: Path, isol
     assert len(lane.client.submitted) == 1, 'the control: at the default 2 the second spaced pass files'
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_a_reload_widening_recheck_secs_stops_the_next_pass_counting_at_thirty_minutes(
-    tmp_path: Path, isolated_config_source: None,
+    tmp_path: Path,
 ):
     live = live_config(tmp_path)
     lane = RedLane(tmp_path, live)
@@ -137,9 +134,10 @@ async def test_a_reload_widening_recheck_secs_stops_the_next_pass_counting_at_th
     assert len(lane.client.submitted) == 1, 'a pass past the reloaded spacing is the second counted pass'
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_a_reload_shrinking_red_unlanded_hours_expires_the_held_episode(
-    tmp_path: Path, isolated_config_source: None,
+    tmp_path: Path,
 ):
     live = live_config(tmp_path)
     lane = RedLane(tmp_path, live)
@@ -160,6 +158,7 @@ def test_the_policy_knobs_are_reloadable_and_the_retired_knob_is_not(path: str):
     assert RETIRED_KNOB not in RELOADABLE_FIELDS
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.parametrize(
     ('leaf', 'new_value'),
     [
@@ -169,7 +168,7 @@ def test_the_policy_knobs_are_reloadable_and_the_retired_knob_is_not(path: str):
     ],
 )
 def test_diff_config_reports_each_policy_knob_as_applied_not_restart_required(
-    tmp_path: Path, isolated_config_source: None, leaf: str, new_value: float,
+    tmp_path: Path, leaf: str, new_value: float,
 ):
     diff = diff_config(live_config(tmp_path), fresh_config(tmp_path, **{leaf: new_value}))
 

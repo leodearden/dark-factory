@@ -14,12 +14,20 @@ wired for the live transport (a ``verdict-tools`` MCP server, no
 
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
+from collections.abc import Iterator, Sequence
+from dataclasses import asdict
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _eval_refusal import answered, refused_agent_result
+from _orch_helpers import build_usage_gate
+from shared.cli_invoke import AgentResult
+from shared.config_models import AccountConfig
 from shared.usage_gate import UsageGate
 from test_reviewer_trial_checkout import _CHANGE_AT_BASE, _commit, _git, _Source
 
@@ -27,7 +35,7 @@ from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.agents.roles import build_reviewer_role
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import OrchestratorConfig, project_review_config
+from orchestrator.config import OrchestratorConfig, default_price_table, project_review_config
 from orchestrator.evals.reviewer_trial.checkout import (
     FixtureEnrichmentMissing,
     fixture_checkout,
@@ -37,21 +45,27 @@ from orchestrator.evals.reviewer_trial.corpus import (
     CorpusManifest,
     FixtureContext,
     FixtureTaskRecord,
+    GroundTruthIssue,
 )
 from orchestrator.evals.reviewer_trial.runner import (
     DIFF_CAP_CHARS,
     REVIEW_SCHEMA,
+    PanelRunKey,
     PanelRunResult,
     _run_single_reviewer,
+    run_and_score,
     run_panel,
+    run_panel_cached,
     run_trial,
 )
+from orchestrator.evals.reviewer_trial.scorer import ScoringResult
 from orchestrator.evals.reviewer_trial.variants import (
     ReviewerSpec,
     VariantConfig,
     with_briefing,
 )
 from orchestrator.review_inputs import gather_review_subject
+from orchestrator.review_payload import Verdict, normalize_review
 
 
 @pytest.fixture
@@ -147,14 +161,16 @@ def _parse_verdict_tools_target(mcp_config: dict) -> tuple[Path, str]:
     return meta_root, role
 
 
-def _make_verdict_writing_invoke(verdict: str = 'PASS', success: bool = True, write: bool = True):
+def _make_verdict_writing_invoke(
+    verdict: str = 'PASS', success: bool = True, write: bool = True, issues: Sequence[dict] = (),
+):
     """Build an ``invoke_agent`` side effect that simulates a live reviewer:
     asserts the call was wired for the verdict-tools transport (a
     ``verdict-tools`` MCP server, no ``output_schema``), then — unless
     *write* is False — writes a verdict envelope to the invocation's own
     ``--meta-root`` (via ``TaskArtifacts.write_verdict``, exactly like the
-    real ``submit_review_verdict`` tool), before returning a mock
-    ``AgentResult`` with the given *success*.
+    real ``submit_review_verdict`` tool) carrying *issues*, before returning a
+    mock ``AgentResult`` with the given *success*.
     """
     async def _invoke(**kwargs):
         mcp_config = kwargs.get('mcp_config')
@@ -168,7 +184,7 @@ def _make_verdict_writing_invoke(verdict: str = 'PASS', success: bool = True, wr
         )
         if write:
             meta_root, role = _parse_verdict_tools_target(mcp_config)
-            payload = {'reviewer': role, 'verdict': verdict, 'issues': [], 'summary': 'Trial verdict.'}
+            payload = {'reviewer': role, 'verdict': verdict, 'issues': list(issues), 'summary': 'Trial verdict.'}
             envelope = {
                 'role': role,
                 'schema_version': 1,
@@ -222,6 +238,71 @@ class TestPanelRunResult:
         assert result.errors == []
 
 
+def _full_panel_result(run_key: PanelRunKey | None) -> PanelRunResult:
+    return PanelRunResult(
+        variant_name='v1',
+        diff_id='d1',
+        reviews={'r1': _make_review('r1'), 'r2': _make_review('r2', 'ISSUES_FOUND')},
+        total_cost_usd=1.25,
+        wall_clock_ms=4321,
+        errors=['r3: no result'],
+        run_key=run_key,
+    )
+
+
+class TestPanelRunResultFromDict:
+    @pytest.mark.parametrize('run_key', [
+        PanelRunKey.of(prices=default_price_table(), usage_gate=None, diff_cap_chars=0),
+        None,
+    ])
+    def test_round_trips_asdict(self, run_key: PanelRunKey | None) -> None:
+        result = _full_panel_result(run_key)
+        assert PanelRunResult.from_dict(asdict(result)) == result
+
+    def test_a_legacy_record_loads_with_defaults_and_no_key(self) -> None:
+        loaded = PanelRunResult.from_dict({'variant_name': 'v1', 'diff_id': 'd1'})
+        assert loaded == PanelRunResult(variant_name='v1', diff_id='d1')
+        assert loaded.run_key is None
+
+    @pytest.mark.parametrize('missing', ['variant_name', 'diff_id'])
+    def test_a_record_missing_its_identity_raises(self, missing: str) -> None:
+        record = asdict(_full_panel_result(None))
+        del record[missing]
+        with pytest.raises(KeyError):
+            PanelRunResult.from_dict(record)
+
+
+class TestPanelRunKey:
+    def test_equal_price_tables_give_equal_keys(self) -> None:
+        first = PanelRunKey.of(prices=default_price_table(), usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS)
+        second = PanelRunKey.of(prices=default_price_table(), usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS)
+        assert first == second
+
+    @staticmethod
+    def _one_rate_changed() -> dict:
+        prices = default_price_table()
+        model = sorted(prices)[0]
+        rate = sorted(prices[model])[0]
+        prices[model][rate] += 1.0
+        return prices
+
+    @pytest.mark.parametrize('change', [
+        pytest.param(lambda: {'prices': None}, id='unpriced'),
+        pytest.param(lambda: {'prices': TestPanelRunKey._one_rate_changed()}, id='one-rate-changed'),
+        pytest.param(lambda: {'usage_gate': cast(UsageGate, object())}, id='gated'),
+        pytest.param(lambda: {'diff_cap_chars': 0}, id='cap-lifted'),
+    ])
+    def test_each_component_changes_the_key(self, change) -> None:
+        baseline = {'prices': default_price_table(), 'usage_gate': None, 'diff_cap_chars': DIFF_CAP_CHARS}
+        assert PanelRunKey.of(**{**baseline, **change()}) != PanelRunKey.of(**baseline)
+
+    def test_round_trips_asdict(self) -> None:
+        key = PanelRunKey.of(
+            prices=default_price_table(), usage_gate=cast(UsageGate, object()), diff_cap_chars=0,
+        )
+        assert PanelRunKey.from_dict(asdict(key)) == key
+
+
 class TestRunSingleReviewerLiveTransport:
     """(b)/(c): _run_single_reviewer emits via the live verdict-tools
     transport and reads its result back from the verdict artifact, with a
@@ -245,8 +326,8 @@ class TestRunSingleReviewerLiveTransport:
 
         assert name == 'r1'
         assert review is not None
-        assert review['verdict'] in {'PASS', 'ISSUES_FOUND'}
-        assert review['reviewer'] == 'reviewer_r1'
+        assert review.verdict is Verdict.PASS
+        assert review.reviewer == 'reviewer_r1'
         assert cost == 0.50
         # The verdict path is directly observable at the injected meta_root.
         assert (tmp_path / 'verdicts' / 'reviewer_r1.json').exists()
@@ -266,7 +347,7 @@ class TestRunSingleReviewerLiveTransport:
             _name, review, _cost = await _run_single_reviewer(spec, diff, meta_root=tmp_path)
 
         assert review is not None
-        assert review['verdict'] == 'ISSUES_FOUND'
+        assert review.verdict is Verdict.ISSUES_FOUND
 
     @pytest.mark.asyncio
     async def test_missing_verdict_yields_error_disposition(self, tmp_path) -> None:
@@ -288,7 +369,9 @@ class TestRunSingleReviewerLiveTransport:
 
         assert name == 'r1'
         assert review is not None
-        assert review['verdict'] == 'ERROR'
+        assert review.verdict is Verdict.ERROR
+        assert review.issues == ()
+        assert review.reviewer == 'reviewer_r1'
 
     @pytest.mark.asyncio
     async def test_unsuccessful_result_yields_error_even_if_verdict_written(self, tmp_path) -> None:
@@ -309,7 +392,29 @@ class TestRunSingleReviewerLiveTransport:
             _name, review, _cost = await _run_single_reviewer(spec, diff, max_retries=1, meta_root=tmp_path)
 
         assert review is not None
-        assert review['verdict'] == 'ERROR'
+        assert review.verdict is Verdict.ERROR
+        assert review.issues == ()
+        assert review.reviewer == 'reviewer_r1'
+
+    @pytest.mark.asyncio
+    async def test_an_off_contract_inner_verdict_is_no_verdict(self, tmp_path) -> None:
+        spec = ReviewerSpec(name='r1', model='sonnet', specialization='Testing.')
+        diff = CorpusDiff(
+            diff_id='d1', language='python', source='synthetic',
+            diff_text='diff', description='Test', ground_truth=[],
+        )
+
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_make_verdict_writing_invoke(verdict='NEEDS_CHANGES'),
+        ):
+            name, review, _cost = await _run_single_reviewer(spec, diff, max_retries=1, meta_root=tmp_path)
+
+        assert name == 'r1'
+        assert review is not None
+        assert review.verdict is Verdict.ERROR
+        assert review.issues == ()
+        assert review.reviewer == 'reviewer_r1'
 
     @pytest.mark.asyncio
     async def test_defaults_to_fresh_meta_root_when_uninjected(self) -> None:
@@ -330,7 +435,7 @@ class TestRunSingleReviewerLiveTransport:
 
         assert name == 'r1'
         assert review is not None
-        assert review['verdict'] == 'PASS'
+        assert review.verdict is Verdict.PASS
 
     @pytest.mark.asyncio
     async def test_cost_accumulates_across_retries(self, tmp_path) -> None:
@@ -355,7 +460,7 @@ class TestRunSingleReviewerLiveTransport:
 
         assert name == 'r1'
         assert review is not None
-        assert review['verdict'] == 'PASS'
+        assert review.verdict is Verdict.PASS
         # attempt 1 (no verdict → retried) + attempt 2 (valid) each cost 0.50;
         # the returned cost must sum BOTH, not report only the final 0.50.
         assert cost == pytest.approx(1.0)
@@ -383,8 +488,19 @@ class TestRunPanel:
         assert result.diff_id == 'd1'
         assert 'r1' in result.reviews
         assert result.reviews['r1']['verdict'] == 'PASS'
+        assert result.reviews['r1'] == normalize_review(result.reviews['r1']).to_record()
         assert result.total_cost_usd == 0.50
         assert result.errors == []
+
+    @pytest.mark.asyncio
+    async def test_stamps_the_key_it_ran_under(self, source: _Source) -> None:
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_make_verdict_writing_invoke(verdict='PASS'),
+        ):
+            result = await run_panel(_one_reviewer(), _diff_in(source), stagger_secs=0, diff_cap_chars=123)
+
+        assert result.run_key == PanelRunKey.of(prices=None, usage_gate=None, diff_cap_chars=123)
 
     @pytest.mark.asyncio
     async def test_multiple_reviewers(self, source: _Source) -> None:
@@ -452,6 +568,7 @@ class TestRunPanel:
 
         assert 'r1' in result.reviews
         assert result.reviews['r1']['verdict'] == 'ERROR'
+        assert result.reviews['r1'] == normalize_review(result.reviews['r1']).to_record()
         assert result.errors == []
 
 
@@ -804,8 +921,408 @@ class TestTrialFixtureReadiness:
 
         assert [(r.variant_name, r.diff_id) for r in results] == [(diff_only.name, 'fx_nobase')]
         assert mock_invoke.await_count == 1
-        assert sorted(p.name for p in results_dir.glob('*.json')) == [
-            f'{diff_only.name}__fx_nobase.json',
+        assert [(p.variant_name, p.diff_id) for p in _stored_panels(results_dir)] == [
+            (diff_only.name, 'fx_nobase'),
         ]
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert any(reason in message and d2.name in message for message in warnings), warnings
+
+
+_GATE = cast(UsageGate, object())
+
+
+@contextlib.contextmanager
+def _counted_reviewers() -> Iterator[list[str]]:
+    """Patch both reviewer dispatch paths with a PASS-verdict writer; yield every dispatch, in order."""
+    dispatched: list[str] = []
+    write_verdict = _make_verdict_writing_invoke(verdict='PASS')
+
+    async def _invoke(**kwargs):
+        dispatched.append('ungated')
+        return await write_verdict(**kwargs)
+
+    async def _cap_retry(usage_gate, label, *, invoke_fn, backend, **kwargs):
+        dispatched.append('gated')
+        return await write_verdict(**kwargs)
+
+    with (
+        patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', side_effect=_invoke),
+        patch('orchestrator.evals.reviewer_trial.runner.invoke_with_cap_retry', side_effect=_cap_retry),
+    ):
+        yield dispatched
+
+
+def _full_style() -> dict:
+    return {'prices': default_price_table(), 'usage_gate': _GATE, 'diff_cap_chars': 0}
+
+
+def _stored_panels(results_dir: Path) -> list[PanelRunResult]:
+    return [PanelRunResult.from_dict(json.loads(p.read_text())) for p in sorted(results_dir.glob('*.json'))]
+
+
+def _stored_scores(score_dir: Path) -> list[ScoringResult]:
+    return [ScoringResult.from_dict(json.loads(p.read_text())) for p in sorted(score_dir.glob('*.json'))]
+
+
+def _only_entry(directory: Path) -> Path:
+    [entry] = directory.glob('*.json')
+    return entry
+
+
+_SMOKE_KEY = PanelRunKey.of(prices=None, usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS)
+
+
+def _write_legacy_panel(results_dir: Path, legacy: PanelRunResult) -> Path:
+    """Store *legacy* as a panel written before task 6741: no run_key, at the bare cell name."""
+    results_dir.mkdir(parents=True, exist_ok=True)
+    record = asdict(legacy)
+    del record['run_key']
+    entry = results_dir / f'{legacy.variant_name}__{legacy.diff_id}.json'
+    entry.write_text(json.dumps(record))
+    return entry
+
+
+class TestPanelCache:
+    """run_panel_cached reuses a stored panel only when it was produced under the same key."""
+
+    @pytest.mark.asyncio
+    async def test_a_full_style_run_never_reuses_a_smoke_entry(self, source: _Source, tmp_path: Path) -> None:
+        variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
+
+        with _counted_reviewers() as dispatched:
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **_full_style())
+
+        assert dispatched == ['ungated', 'gated']
+        assert {p.run_key for p in _stored_panels(results_dir)} == {_SMOKE_KEY, PanelRunKey.of(**_full_style())}
+
+    @pytest.mark.asyncio
+    async def test_each_key_keeps_its_own_slot(self, source: _Source, tmp_path: Path) -> None:
+        variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
+
+        with _counted_reviewers() as dispatched:
+            for _ in range(2):
+                await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+                await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **_full_style())
+
+        assert dispatched == ['ungated', 'gated']
+
+    @pytest.mark.asyncio
+    async def test_an_identical_call_is_served_from_the_cache(self, source: _Source, tmp_path: Path) -> None:
+        variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
+
+        with _counted_reviewers() as dispatched:
+            first = await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+            second = await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+
+        assert dispatched == ['ungated']
+        assert second == first
+
+    @pytest.mark.parametrize('change', [
+        pytest.param(lambda: {'prices': default_price_table()}, id='prices'),
+        pytest.param(lambda: {'usage_gate': _GATE}, id='gate'),
+        pytest.param(lambda: {'diff_cap_chars': 0}, id='cap'),
+    ])
+    @pytest.mark.asyncio
+    async def test_any_one_changed_component_reruns(self, source: _Source, tmp_path: Path, change) -> None:
+        variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
+
+        with _counted_reviewers() as dispatched:
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **change())
+
+        assert len(dispatched) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_keyless_legacy_entry_is_honoured_and_named_quietly(
+        self, source: _Source, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
+        legacy = PanelRunResult(
+            variant_name=variant.name, diff_id=diff.diff_id,
+            reviews={'r1': _make_review('r1')}, total_cost_usd=0.75, wall_clock_ms=10,
+        )
+        entry = _write_legacy_panel(results_dir, legacy)
+
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.evals.reviewer_trial.runner'),
+            _counted_reviewers() as dispatched,
+        ):
+            result = await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **_full_style())
+
+        assert dispatched == []
+        assert result == legacy
+        infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert any(str(entry) in message for message in infos), infos
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.asyncio
+    async def test_a_corrupt_legacy_entry_is_rerun(self, source: _Source, tmp_path: Path) -> None:
+        variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
+        results_dir.mkdir()
+        (results_dir / f'{variant.name}__{diff.diff_id}.json').write_text('{not json')
+
+        with _counted_reviewers() as dispatched:
+            result = await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+
+        assert dispatched == ['ungated']
+        assert result.run_key == _SMOKE_KEY
+
+    @pytest.mark.parametrize('stored', [
+        pytest.param(lambda variant, diff: '{not json', id='corrupt'),
+        pytest.param(
+            lambda variant, diff: json.dumps(asdict(PanelRunResult(
+                variant_name='another_variant', diff_id=diff.diff_id, run_key=_SMOKE_KEY,
+            ))),
+            id='foreign-variant',
+        ),
+        pytest.param(
+            lambda variant, diff: json.dumps(asdict(PanelRunResult(
+                variant_name=variant.name, diff_id='another_diff', run_key=_SMOKE_KEY,
+            ))),
+            id='foreign-diff',
+        ),
+    ])
+    @pytest.mark.asyncio
+    async def test_a_corrupt_or_foreign_entry_is_rerun_and_overwritten(
+        self, source: _Source, tmp_path: Path, stored,
+    ) -> None:
+        variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
+
+        with _counted_reviewers() as dispatched:
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+            entry = _only_entry(results_dir)
+            entry.write_text(stored(variant, diff))
+            result = await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+
+        assert dispatched == ['ungated', 'ungated']
+        assert PanelRunResult.from_dict(json.loads(entry.read_text())) == result
+        assert (result.variant_name, result.diff_id) == (variant.name, diff.diff_id)
+
+    @pytest.mark.asyncio
+    async def test_run_trial_reruns_a_smoke_entry_under_a_full_style_key(
+        self, source: _Source, tmp_path: Path,
+    ) -> None:
+        variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
+        corpus = CorpusManifest(diffs=[diff])
+
+        with _counted_reviewers() as dispatched:
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+            await run_trial([variant], corpus, results_dir=results_dir, **_full_style())
+            assert dispatched == ['ungated', 'gated']
+            await run_trial([variant], corpus, results_dir=results_dir, **_full_style())
+
+        assert dispatched == ['ungated', 'gated']
+
+    @pytest.mark.asyncio
+    async def test_run_trial_summarises_its_legacy_hits_in_one_warning(
+        self, source: _Source, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        variant, results_dir = _one_reviewer(), tmp_path / 'results'
+        diffs = [_diff_in(source, diff_id='d1'), _diff_in(source, diff_id='d2')]
+        for diff in diffs:
+            _write_legacy_panel(results_dir, PanelRunResult(variant_name=variant.name, diff_id=diff.diff_id))
+
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.evals.reviewer_trial.runner'),
+            _counted_reviewers() as dispatched,
+        ):
+            await run_trial([variant], CorpusManifest(diffs=diffs), results_dir=results_dir, stagger_secs=0)
+
+        assert dispatched == []
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert 'Reused 2 legacy panel' in warning and str(results_dir) in warning, warning
+
+    @pytest.mark.asyncio
+    async def test_run_trial_threads_its_stagger_to_each_panel(self, source: _Source, tmp_path: Path) -> None:
+        with (
+            _counted_reviewers(),
+            patch('orchestrator.evals.reviewer_trial.runner.run_panel', wraps=run_panel) as spy,
+        ):
+            await run_trial(
+                [_one_reviewer()], CorpusManifest(diffs=[_diff_in(source)]),
+                results_dir=tmp_path / 'results', stagger_secs=0,
+            )
+
+        assert spy.await_args is not None
+        assert spy.await_args.kwargs['stagger_secs'] == 0
+
+
+_BLOCKING_ISSUE = {
+    'severity': 'blocking', 'location': 'a.py:1', 'category': 'bug', 'description': 'x is wrong',
+}
+
+
+def _scored_diff(source: _Source, diff_id: str, marker: str) -> CorpusDiff:
+    """A fixture with one planted blocking issue, whose matcher prompt carries *marker*."""
+    return CorpusDiff(
+        diff_id=diff_id, language='python', source='synthetic', diff_text=marker,
+        description='Test', cwd=source.root,
+        ground_truth=[GroundTruthIssue(
+            id=f'{diff_id}_gt', location='a.py:1', category='bug', severity='blocking',
+            description='x is wrong', mutation_type='logic',
+        )],
+    )
+
+
+class TestRunAndScore:
+    """run_and_score runs every panel through the cache, then scores each, caching measured scores only."""
+
+    @staticmethod
+    def _corpus(source: _Source) -> CorpusManifest:
+        return CorpusManifest(diffs=[
+            _scored_diff(source, 'd_ok', 'OK_MARKER'),
+            _scored_diff(source, 'd_refused', 'REFUSED_MARKER'),
+        ])
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _panels_and_matcher() -> Iterator[list[str]]:
+        """Reviewers find the blocking issue; the matcher matches OK_MARKER's and refuses REFUSED_MARKER's.
+
+        Yields the marker of every matcher prompt, in order.
+        """
+        matched: list[str] = []
+
+        async def matcher(**kwargs: object):
+            refused = 'REFUSED_MARKER' in str(kwargs['prompt'])
+            matched.append('REFUSED_MARKER' if refused else 'OK_MARKER')
+            if refused:
+                return refused_agent_result()
+            return answered({'matches': [{
+                'reviewer_issue_index': 0, 'ground_truth_id': 'd_ok_gt',
+                'confidence': 0.9, 'reasoning': 'same bug',
+            }]}, cost_usd=0.1)
+
+        with (
+            patch(
+                'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+                side_effect=_make_verdict_writing_invoke('ISSUES_FOUND', issues=[_BLOCKING_ISSUE]),
+            ),
+            patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', matcher),
+        ):
+            yield matched
+
+    @pytest.mark.asyncio
+    async def test_one_score_per_panel_in_trial_order(self, source: _Source, tmp_path: Path) -> None:
+        variants = [_one_reviewer('a_panel'), _one_reviewer('b_panel')]
+        seen: list[ScoringResult] = []
+
+        with self._panels_and_matcher():
+            scores = await run_and_score(
+                variants, self._corpus(source), results_dir=tmp_path / 'results',
+                stagger_secs=0, on_scored=seen.append,
+            )
+
+        assert [(s.variant_name, s.diff_id) for s in scores] == [
+            ('a_panel', 'd_ok'), ('a_panel', 'd_refused'), ('b_panel', 'd_ok'), ('b_panel', 'd_refused'),
+        ]
+        assert seen == scores
+        assert scores[0].f1 == 1.0 and scores[0].unmeasured is None
+        assert scores[1].unmeasured is not None
+
+    @pytest.mark.asyncio
+    async def test_a_score_dir_caches_measured_scores_only(self, source: _Source, tmp_path: Path) -> None:
+        variant, corpus = _one_reviewer(), self._corpus(source)
+        results_dir, score_dir = tmp_path / 'results', tmp_path / 'scores'
+
+        with self._panels_and_matcher() as matched:
+            first = await run_and_score(
+                [variant], corpus, results_dir=results_dir, score_dir=score_dir, stagger_secs=0,
+            )
+            assert matched == ['OK_MARKER', 'REFUSED_MARKER']
+            second = await run_and_score(
+                [variant], corpus, results_dir=results_dir, score_dir=score_dir, stagger_secs=0,
+            )
+
+        assert _stored_scores(score_dir) == [first[0]]
+        assert matched == ['OK_MARKER', 'REFUSED_MARKER', 'REFUSED_MARKER']
+        assert second[0] == first[0]
+        assert second[1].unmeasured is not None
+
+    @pytest.mark.asyncio
+    async def test_a_corrupt_stored_score_is_rescored_and_overwritten(self, source: _Source, tmp_path: Path) -> None:
+        variant, corpus = _one_reviewer(), self._corpus(source)
+        results_dir, score_dir = tmp_path / 'results', tmp_path / 'scores'
+
+        with self._panels_and_matcher() as matched:
+            await run_and_score([variant], corpus, results_dir=results_dir, score_dir=score_dir, stagger_secs=0)
+            _only_entry(score_dir).write_text('{"variant_name": "r1_pa')
+            second = await run_and_score(
+                [variant], corpus, results_dir=results_dir, score_dir=score_dir, stagger_secs=0,
+            )
+
+        assert matched == ['OK_MARKER', 'REFUSED_MARKER', 'OK_MARKER', 'REFUSED_MARKER']
+        assert second[0].unmeasured is None
+        assert _stored_scores(score_dir) == [second[0]]
+
+    @pytest.mark.asyncio
+    async def test_a_panel_rerun_under_a_new_key_is_rescored(self, source: _Source, tmp_path: Path) -> None:
+        variant, corpus = _one_reviewer(), CorpusManifest(diffs=[_scored_diff(source, 'd_ok', 'OK_MARKER')])
+        dirs = {'results_dir': tmp_path / 'results', 'score_dir': tmp_path / 'scores', 'stagger_secs': 0}
+
+        with self._panels_and_matcher() as matched:
+            await run_and_score([variant], corpus, **dirs)
+            await run_and_score([variant], corpus, diff_cap_chars=0, **dirs)
+            assert matched == ['OK_MARKER', 'OK_MARKER']
+            await run_and_score([variant], corpus, **dirs)
+            await run_and_score([variant], corpus, diff_cap_chars=0, **dirs)
+
+        assert matched == ['OK_MARKER', 'OK_MARKER']
+        assert len(_stored_scores(dirs['score_dir'])) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_legacy_panel_reuses_its_legacy_score(self, source: _Source, tmp_path: Path) -> None:
+        variant, results_dir, score_dir = _one_reviewer(), tmp_path / 'results', tmp_path / 'scores'
+        _write_legacy_panel(results_dir, PanelRunResult(variant_name=variant.name, diff_id='d_ok'))
+        score_dir.mkdir()
+        legacy_score = ScoringResult(variant_name=variant.name, diff_id='d_ok', f1=0.25, cost_usd=1.5)
+        (score_dir / f'{variant.name}__d_ok.json').write_text(json.dumps(asdict(legacy_score)))
+
+        with self._panels_and_matcher() as matched, _counted_reviewers() as dispatched:
+            scores = await run_and_score(
+                [variant], CorpusManifest(diffs=[_scored_diff(source, 'd_ok', 'OK_MARKER')]),
+                results_dir=results_dir, score_dir=score_dir, stagger_secs=0,
+            )
+
+        assert (dispatched, matched) == ([], [])
+        assert scores == [legacy_score]
+
+    @pytest.mark.asyncio
+    async def test_without_a_score_dir_every_run_rescores(self, source: _Source, tmp_path: Path) -> None:
+        variant, corpus, results_dir = _one_reviewer(), self._corpus(source), tmp_path / 'results'
+
+        with self._panels_and_matcher() as matched:
+            await run_and_score([variant], corpus, results_dir=results_dir, stagger_secs=0)
+            await run_and_score([variant], corpus, results_dir=results_dir, stagger_secs=0)
+
+        assert matched == ['OK_MARKER', 'REFUSED_MARKER', 'OK_MARKER', 'REFUSED_MARKER']
+        assert {p.parent for p in tmp_path.rglob('*.json')} == {results_dir}
+
+    @pytest.mark.asyncio
+    async def test_a_usage_gate_reaches_the_panels_and_the_matcher(self, source: _Source, tmp_path: Path) -> None:
+        gate = build_usage_gate([AccountConfig(name='max-a', oauth_token_env='CLAUDE_OAUTH_A')], ['tok-a'])
+        reviewer_calls: list[dict] = []
+        matcher_calls: list[dict] = []
+        write_verdict = _make_verdict_writing_invoke('ISSUES_FOUND', issues=[_BLOCKING_ISSUE])
+
+        async def reviewer(**kwargs):
+            reviewer_calls.append(kwargs)
+            await write_verdict(**kwargs)
+            return AgentResult(success=True, output='', cost_usd=0.5, duration_ms=1000, turns=1)
+
+        async def matcher(**kwargs: object):
+            matcher_calls.append(kwargs)
+            return answered({'matches': []})
+
+        with (
+            patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', side_effect=reviewer),
+            patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', matcher),
+        ):
+            await run_and_score(
+                [_one_reviewer()], CorpusManifest(diffs=[_scored_diff(source, 'd_ok', 'OK_MARKER')]),
+                results_dir=tmp_path / 'results', stagger_secs=0, usage_gate=gate,
+            )
+
+        assert [c['oauth_token'] for c in reviewer_calls] == ['tok-a']
+        assert [c['oauth_token'] for c in matcher_calls] == ['tok-a']

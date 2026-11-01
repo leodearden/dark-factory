@@ -90,7 +90,7 @@ from fused_memory.reconciliation.task_filter import (  # noqa: E402
     TASK_REF_RE,
 )
 from fused_memory.utils.target_store_preflight import (  # noqa: E402
-    TargetStoreMissing,
+    TargetStoreUnpopulated,
     assert_task_store_populated,
 )
 
@@ -530,7 +530,7 @@ async def _main(argv: list[str] | None = None) -> int:
     for _graph, root in projects:
         try:
             assert_task_store_populated(root, operation='measure_stale_status_snapshot_sweep')
-        except TargetStoreMissing as refusal:
+        except TargetStoreUnpopulated as refusal:
             logger.error('%s', refusal)
             return EXIT_BAD_INPUT
 

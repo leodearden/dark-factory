@@ -21,7 +21,7 @@ test_command: "uv run --directory cockpit pytest tests/ --tb=short -q"
 # long as lint_command keeps being invoked that way — same assumption
 # shared/orchestrator.yaml and dashboard/orchestrator.yaml make for their
 # identical chained check_bare_magicmock_config.py call.
-lint_command: "uv run --directory cockpit ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py cockpit/tests"
+lint_command: "uv run --directory cockpit ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py cockpit/tests && python3 tests/scripts/raw_envelope_literal_guard.py cockpit"
 type_check_command: "uv run --directory cockpit pyright src/ tests/"
 
 # Per-module verify budget (task 3473). Before this, cockpit declared nothing

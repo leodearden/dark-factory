@@ -82,14 +82,13 @@ class TestRoutingConfigDefaults:
         assert cfg.rules == []
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestOrchestratorConfigRoundTripsWithNewFields:
     """(e) An OrchestratorConfig() with the new routing fields still
     round-trips ``_validate_models_in_allowlist`` (no regression from
     extending RoutingConfig)."""
 
-    def test_default_orchestrator_config_constructs_ok(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_default_orchestrator_config_constructs_ok(self):
         cfg = OrchestratorConfig()
         assert cfg.routing.ladder == list(DEFAULT_LADDER)
         assert cfg.routing.per_model_daily_ceiling_usd == {}
@@ -108,9 +107,7 @@ class TestOrchestratorConfigRoundTripsWithNewFields:
             'simple-saturated-full-path', 'retry-tier-up',
         ]
 
-    def test_orchestrator_config_with_rule_constructs_ok(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_orchestrator_config_with_rule_constructs_ok(self):
         cfg = OrchestratorConfig(
             routing=RoutingConfig(
                 rules=[

@@ -13,10 +13,10 @@ re-derivable. It does four things:
 * validate a hand-adjudicated verdict file and report rates with Wilson CIs.
 
 Read-only by construction: the graph is read over GRAPH.RO_QUERY only, through
-fused_memory.backends.graphiti_client._paged_ro_query, never through
+fused_memory/backends/falkor_read_only.py::ReadOnlyGraphReader, never through
 MemoryService, GraphitiBackend or graphiti_core's FalkorDriver (see
-scripts/audit_wrong_binding_edges.py::RO_COMMAND for why each is excluded).
-There is no mutation flag.
+fused_memory/backends/falkor_read_only.py::RO_COMMAND for why each is
+excluded). There is no mutation flag.
 
 Usage (from fused-memory/)::
 
@@ -52,12 +52,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from fused_memory.backends.graphiti_client import (
-    _DEFAULT_READ_PAGE_SIZE,
-    _RESULTSET_SIZE,
-    PagedRead,
-    _paged_ro_query,
-)
+from fused_memory.backends.falkor_read_only import PagedQuery, ReadOnlyGraphReader
+from fused_memory.backends.graphiti_client import PagedRead
 from fused_memory.reconciliation.task_filter import (
     is_batch_plan_framing,
     is_proposed_resolution_framing,
@@ -780,30 +776,25 @@ def detector_catch(
 
 
 # --------------------------------------------------------------------------- #
-# The read seam: GRAPH.RO_QUERY through the shared paged primitive
+# The read seam: GRAPH.RO_QUERY through the shared read-only reader
 # --------------------------------------------------------------------------- #
 
 DEFAULT_GRAPHS: tuple[str, ...] = ('dark_factory', 'reify')
 
-_EPISODE_MATCH = 'MATCH (e:Episodic) '
-EPISODE_PAGE_CYPHER = (
-    _EPISODE_MATCH + 'RETURN e.uuid, e.source_description, e.created_at, e.content '
-    'ORDER BY e.uuid SKIP {skip} LIMIT {limit}'
+EPISODE_READ = PagedQuery(
+    match='MATCH (e:Episodic)',
+    row='e',
+    returns=('e.uuid', 'e.source_description', 'e.created_at', 'e.content'),
 )
-EPISODE_CENSUS_CYPHER = _EPISODE_MATCH + 'RETURN count(*)'
 
-_EDGE_MATCH = 'MATCH (a)-[r:RELATES_TO]->(b) '
-EDGE_PAGE_CYPHER = (
-    _EDGE_MATCH + 'RETURN r.uuid, r.fact, a.name, b.name, r.episodes, r.invalid_at, '
-    'r.expired_at ORDER BY r.uuid SKIP {skip} LIMIT {limit}'
+EDGE_READ = PagedQuery(
+    match='MATCH (a)-[r:RELATES_TO]->(b)',
+    row='r',
+    returns=('r.uuid', 'r.fact', 'a.name', 'b.name', 'r.episodes', 'r.invalid_at', 'r.expired_at'),
 )
 """ALL edges, live or not: durability is a measured output. No embedding projected.
-The directed pattern yields one row per edge, so ``r.uuid`` is a total order (see
-graphiti_client.py::_paged_ro_query on why that is load-bearing)."""
-EDGE_CENSUS_CYPHER = _EDGE_MATCH + 'RETURN count(r)'
-"""``count(r)``, not ``count(*)``: with ``r`` unreferenced FalkorDB counts connected
-(a, b) PAIRS, so multi-edges vanish (2026-10-01, dark_factory: 19,409 vs 20,491
-edges) and a census that low would pass a read truncated by the difference."""
+The columns are in ``_edge_from_row``'s unpacking order. The census is ``count(r)``;
+see fused_memory/backends/falkor_read_only.py::PagedQuery for why."""
 
 
 def _text(value: Any) -> str | None:
@@ -830,44 +821,28 @@ def _edge_from_row(graph: str, row: list) -> Edge:
 class GraphReader:
     """One graph's episodes and edges, each with its completeness proof.
 
-    Read-only rests on ``_paged_ro_query`` issuing ``ro_query`` (GRAPH.RO_QUERY is
-    server-enforced read-only); the tests' double raises on ``query``. The
-    RO-proxy seam copied into three other scripts is deliberately not copied a
-    fourth time: consolidating it is a filed follow-up.
+    Reads go through the shared guarded seam,
+    fused_memory/backends/falkor_read_only.py::ReadOnlyGraphReader. None paging
+    knobs mean that seam's defaults.
     """
 
     def __init__(
         self, *, graph: Any | None = None, graph_name: str = DEFAULT_GRAPHS[0],
-        uri: str | None = None, page_size: int = _DEFAULT_READ_PAGE_SIZE,
-        resultset_size: int = _RESULTSET_SIZE,
+        uri: str | None = None, page_size: int | None = None,
+        resultset_size: int | None = None,
     ) -> None:
-        self._graph = graph
         self.graph_name = graph_name
-        self.uri = uri
-        self.page_size = page_size
-        self.resultset_size = resultset_size
-
-    def _resolve_graph(self) -> Any:
-        """Open a ``falkordb.asyncio`` client lazily, never graphiti's FalkorDriver."""
-        if self._graph is None:
-            from falkordb.asyncio import FalkorDB  # noqa: PLC0415
-
-            client = FalkorDB.from_url(self.uri) if self.uri else FalkorDB()
-            self._graph = client.select_graph(self.graph_name)
-        return self._graph
-
-    async def _read(self, page: str, census: str) -> PagedRead:
-        return await _paged_ro_query(
-            self._resolve_graph(), page, census,
-            page_size=self.page_size, resultset_size=self.resultset_size,
+        self._reader = ReadOnlyGraphReader(
+            graph_name=graph_name, graph=graph, uri=uri,
+            page_size=page_size, resultset_size=resultset_size,
         )
 
     async def fetch_episodes(self) -> tuple[list[Episode], PagedRead]:
-        read = await self._read(EPISODE_PAGE_CYPHER, EPISODE_CENSUS_CYPHER)
+        read = await self._reader.read_paged(EPISODE_READ)
         return [_episode_from_row(self.graph_name, row) for row in read.rows], read
 
     async def fetch_edges(self) -> tuple[list[Edge], PagedRead]:
-        read = await self._read(EDGE_PAGE_CYPHER, EDGE_CENSUS_CYPHER)
+        read = await self._reader.read_paged(EDGE_READ)
         return [_edge_from_row(self.graph_name, row) for row in read.rows], read
 
 

@@ -27,6 +27,8 @@ from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_n
 from orchestrator.branch_stack import PreStackTip
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
+from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
+from orchestrator.merge_lane.reverify_gate_decision import GateClearance
 from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
 
@@ -1193,6 +1195,14 @@ class MergeOutcome:
     nothing emits no value at all rather than a ``0``.  See
     test_merge_queue_deep_landing.py, which asserts the encoding through a
     verbatim transcription of that predicate rather than restating it."""
+    block_category: MergeBlockCategory = MergeBlockCategory.MERGE_ERROR
+    """The category the workflow files a generic ``blocked`` outcome under,
+    stated by the producer rather than inferred from ``reason`` (task 7302)."""
+    conflict_evidence: ConflictEvidence | None = None
+    """The paths a ``conflict`` outcome, a train whose tip merge conflicted, or
+    a needs-rebase bounce conflicted on, recorded into runs.db; ``None`` when
+    no conflict was probed, the probe failed open, or git could not name the
+    paths (task 7302)."""
 
 
 @dataclass
@@ -1587,11 +1597,11 @@ _NON_TERMINAL_OUTCOMES: frozenset[OutcomeKind] = frozenset({
 ``plan_files_narrowed``: a mid-submission waypoint — enqueue / ``merge_queued``
 follows in the same flow.
 
-FROZEN CONTRACT: this exact set is mirrored by the dashboard's
-``_ACTIVE_ONLY`` allowlist (``dashboard/src/dashboard/data/merge_queue.py``),
-which has no import on this module. Changing this set REQUIRES updating that
-allowlist in the same change — see the pinning test in
-``tests/test_outcome_kind.py::TestOutcomeKindFrozenContract``.
+FROZEN CONTRACT: ``scripts/merge_lane_throughput.py::_NON_TERMINAL_OUTCOMES``
+mirrors this exact set as literal strings and does not import this module, so
+nothing fails on its side if this set changes. Changing this set REQUIRES
+updating that mirror in the same change — the pinning test is
+``orchestrator/tests/test_outcome_kind.py::TestOutcomeKindFrozenContract``.
 """
 
 
@@ -1719,6 +1729,46 @@ class VerifyBaseFacts:
     merge_base_sha: str | None
 
 
+@dataclass(frozen=True)
+class LandingCandidate:
+    """A verified tree the finalize CAS loop is landing on main (task 6155).
+
+    ``item.base_sha`` is the main the CAS expects, ``sha`` the tree it moves
+    main onto, and ``verified_commit`` the merge commit whose verify passed.
+    ``merge_wt`` and ``spec_warm`` travel together, as ``_release_or_cleanup``
+    needs both.
+    """
+
+    item: RealMergeItem
+    sha: str
+    merge_wt: Path
+    spec_warm: bool
+    warm_results: Mapping[str, str]
+    verified_commit: str
+
+    def reanchored(self, item: RealMergeItem, sha: str) -> LandingCandidate:
+        """The same verified tree, landing *sha* as the rebuilt *item*."""
+        return LandingCandidate(
+            item=item, sha=sha, merge_wt=self.merge_wt, spec_warm=self.spec_warm,
+            warm_results=self.warm_results, verified_commit=self.verified_commit,
+        )
+
+
+@dataclass(frozen=True)
+class PendingGate:
+    """A head's gate re-verify of its rebased tree, running while the head
+    stays parked at the front of ``_inflight`` (task 6155).
+
+    ``candidate`` is what the CAS was landing when it rebased; ``rebased_sha``
+    onto ``rebased_onto`` is what the gate is re-verifying.
+    """
+
+    task: asyncio.Task[MergeOutcome | GateClearance]
+    candidate: LandingCandidate
+    rebased_sha: str
+    rebased_onto: str
+
+
 @dataclass
 class InflightEntry:
     """An in-flight verify entry held in SpeculativeMergeWorker._inflight deque.
@@ -1801,6 +1851,10 @@ class InflightEntry:
                      to classification, published by the verify itself
                      through :class:`InflightEntrySlot` (task 5447).  ``None``
                      until resolved, and always ``None`` for passthroughs.
+    gate           : the :class:`PendingGate` this head is parked on while its
+                     rebased tree re-verifies, or ``None`` (task 6155).  While
+                     it is set the entry keeps its lease and permit, and the
+                     next ``_finalize_inflight`` call resumes the CAS from it.
     """
 
     item: SpeculativeItem
@@ -1818,6 +1872,21 @@ class InflightEntry:
     verify_wt: VerifyWorktreeHandle | None = None  # δ (task 3186): the verify's POST-swap worktree
     spec_warm: bool = False                 # δ (task 3186): warmth of an ADOPTED head's published merge_wt
     verify_base: VerifyBaseFacts | None = None
+    gate: PendingGate | None = None
+
+    @property
+    def pending_task(self) -> asyncio.Task[object] | None:
+        """The task finalize waits for: the parked gate's, else the verify's."""
+        return self.gate.task if self.gate is not None else self.verify_task
+
+    @property
+    def in_verify_frontier(self) -> bool:
+        """True while finalize has a verify or a gate re-verify to wait on.
+
+        A head adopted on tip authority has no verify task, yet stays in the
+        frontier while its gate runs (task 6155).  A passthrough has neither.
+        """
+        return self.pending_task is not None
 
     @property
     def vacated(self) -> bool:

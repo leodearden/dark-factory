@@ -13,6 +13,7 @@ from typing import Any
 from shared.briefing_queries import BriefingScope
 from shared.task_text_fingerprint import TaskTextDrift
 
+from orchestrator.agents.harness_guidance import WAIT_PATTERN_REMINDER
 from orchestrator.agents.memory_recall import MemoryRecall
 from orchestrator.agents.review_briefing import (
     ReviewSubject,
@@ -20,8 +21,8 @@ from orchestrator.agents.review_briefing import (
     render_context_complete_review,
     review_action_section,
 )
-from orchestrator.agents.roles import WAIT_PATTERN_REMINDER
 from orchestrator.config import OrchestratorConfig
+from orchestrator.plan_descope import DESCOPE_DISPOSITIONS, DoneStepIntegrityVerdict
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,31 @@ _TEXT_DRIFT_NOTICES = {
         'confirm_plan() only if it already covers it.'
     ),
 }
+
+
+
+def _integrity_refusal_section(verdict: DoneStepIntegrityVerdict | None) -> str:
+    """The refused done-step changes of a prior revalidation pass, or ''."""
+    if verdict is None:
+        return ''
+    lines = [
+        f'- `{step_id}` @ `{commit}` was dropped without a descope record'
+        for step_id, commit in verdict.undisposed_drops
+    ]
+    lines += [
+        f'- `{dup.commit}` is now the commit of done steps '
+        + ', '.join(f'`{step_id}`' for step_id in dup.step_ids)
+        for dup in verdict.introduced_duplicates
+    ]
+    lines += [f'- invalid descope record: {message}' for message in verdict.invalid_descope_records]
+    return (
+        '## Your Revised Plan Was Refused\n\n'
+        + '\n'.join(lines)
+        + '\n\nRestore each dropped step (`add_plan_step`, then `mark_step_committed` '
+        'when its commit is on the branch) or record it with `record_descoped_step`; '
+        'mark a step done only at its own commit. Then call `confirm_plan()`.\n\n'
+    )
+
 
 _DELIVERED_CHECK_FIELDS_BY_KIND = {
     'grep': ('pattern', 'expect', 'paths'),
@@ -494,6 +520,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         context: str | None = None,
         *,
         text_drift: TaskTextDrift | None = None,
+        integrity_refusal: DoneStepIntegrityVerdict | None = None,
     ) -> str:
         """Build prompt for the architect to revalidate a plan after blast-radius requeue.
 
@@ -534,6 +561,8 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         plan_json = json.dumps(existing_plan, indent=2)
         notice = _TEXT_DRIFT_NOTICES[text_drift] if text_drift is not None else ''
         text_drift_section = f'{notice}\n\n' if notice else ''
+        refusal_section = _integrity_refusal_section(integrity_refusal)
+        dispositions = ', '.join(f'`{d}`' for d in sorted(DESCOPE_DISPOSITIONS))
 
         return f"""\
 {preamble}
@@ -558,7 +587,7 @@ and either confirm it, update it, or recreate it from scratch.
 
 {files_section}
 
-## Action
+{refusal_section}## Action
 
 1. Read the overlapping files (if any) to understand what changed.
 2. Decide whether your plan is still valid.
@@ -569,7 +598,13 @@ and either confirm it, update it, or recreate it from scratch.
       and/or `add_plan_step(step_id, step_type, description)` to adjust the plan in place.
    c. **Plan is invalid**: call `create_plan(...)` to start fresh, then add steps as usual.
 4. Ensure the `files` list is exhaustive — it drives concurrency locks.
-5. Do NOT remove or replace steps with status "done".
+5. Keep every step with status "done" with its commit. If the revised plan
+   genuinely drops one (e.g. `create_plan` replaced the steps), record it with
+   `record_descoped_step(step_id, commit, disposition, authority, note)`:
+   disposition is one of {dispositions}; authority is an escalation id or a
+   human ratification marker. A revalidation that drops a done step without
+   that record, or newly marks a step done at another done step's commit, is
+   refused.
 """
 
     async def build_plan_completion_prompt(
@@ -1489,6 +1524,12 @@ Handle this escalation, then call `resolve_issue` with a summary.
         which raises ``TypeError`` on comparison — so a formatting hiccup
         never silently drops persisted analysis.
 
+        Staleness compares ``timestamp`` (falling back to ``investigated_at``),
+        which is re-stamped when a re-block is covered by the latest entry
+        (task 3125), while the rendered
+        'Investigated at' line shows ``investigated_at``, falling back to
+        ``timestamp``.
+
         Called only from retry/resume prompt builders
         (``build_revalidation_prompt``, ``build_resume_prompt``) and, behind
         ``include_prior_proposals=True``, from ``build_architect_prompt``'s
@@ -1506,12 +1547,13 @@ Handle this escalation, then call `resolve_issue` with a summary.
         proposal_text = proposal.get('proposal_text', '')
         risk_label = proposal.get('risk_label', '')
         files_referenced = proposal.get('files_referenced') or []
-        created_at = proposal.get('timestamp') or proposal.get('investigated_at') or ''
+        stamped_at = proposal.get('timestamp') or proposal.get('investigated_at') or ''
+        investigated_at = proposal.get('investigated_at') or proposal.get('timestamp') or ''
 
         last_blocked_at = (task.get('metadata') or {}).get('last_blocked_at')
-        if created_at and last_blocked_at:
+        if stamped_at and last_blocked_at:
             try:
-                is_stale = datetime.fromisoformat(created_at) < datetime.fromisoformat(last_blocked_at)
+                is_stale = datetime.fromisoformat(stamped_at) < datetime.fromisoformat(last_blocked_at)
             except (ValueError, TypeError):
                 pass  # fail open — never silently drop persisted analysis
             else:
@@ -1533,7 +1575,7 @@ A prior block-time investigation concluded the following; verify against the cur
 **Proposal:** {proposal_text}
 **Risk:** {risk_label}
 **Files referenced:** {files_str}
-**Investigated at:** {created_at}
+**Investigated at:** {investigated_at}
 """
 
     def _format_task(

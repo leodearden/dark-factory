@@ -38,6 +38,7 @@ from orchestrator.agents.memory_recall import MEMORY_CONTEXT_CAVEAT
 from orchestrator.agents.roles import ARCHITECT
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import plan_tools
+from orchestrator.plan_descope import DESCOPE_DISPOSITIONS, check_done_step_integrity
 
 
 @pytest.fixture
@@ -884,6 +885,71 @@ class TestRevalidationTextDriftNotice:
         assert prompt == await self._prompt(briefing, None)
 
 
+def _done(step_id: str, commit: str) -> dict:
+    return {'id': step_id, 'description': step_id, 'status': 'done', 'commit': commit}
+
+
+_INTEGRITY_BEFORE = {
+    'files': ['orchestrator'],
+    'steps': [_done('step-1', 'abc1234def'), _done('step-2', 'ddd4444eee')],
+}
+_INTEGRITY_AFTER = {
+    'files': ['orchestrator'],
+    'steps': [
+        {'id': 'step-1', 'description': 'step-1', 'status': 'pending'},
+        _done('step-2', 'ddd4444eee'),
+        _done('step-3', 'ddd4444eee'),
+    ],
+}
+
+
+def _lines_naming(prompt: str, *needles: str) -> list[str]:
+    return [line for line in prompt.splitlines() if all(n in line for n in needles)]
+
+
+@pytest.mark.asyncio
+class TestRevalidationDoneStepIntegrity:
+    """Task 4032: a dropped done step has a sanctioned route, and a refusal names the pairs."""
+
+    async def _prompt(self, briefing: BriefingAssembler, **kwargs) -> str:
+        return await briefing.build_revalidation_prompt(
+            {'id': '4032', 'title': 'T', 'description': 'D'},
+            existing_plan=_INTEGRITY_AFTER,
+            changed_files=[],
+            worktree=None,
+            context='',
+            **kwargs,
+        )
+
+    async def test_action_list_names_the_record_tool_and_every_disposition(
+        self, briefing: BriefingAssembler,
+    ):
+        action = (await self._prompt(briefing)).split('## Action', 1)[1]
+        assert 'record_descoped_step' in action
+        for disposition in DESCOPE_DISPOSITIONS:
+            assert disposition in action
+
+    async def test_refusal_lists_the_undisposed_drop_and_the_introduced_duplicate(
+        self, briefing: BriefingAssembler,
+    ):
+        verdict = check_done_step_integrity(_INTEGRITY_BEFORE, _INTEGRITY_AFTER)
+        assert not verdict.passed
+
+        prompt = await self._prompt(briefing, integrity_refusal=verdict)
+
+        [drop_line] = _lines_naming(prompt, 'step-1', 'abc1234def')
+        [duplicate_line] = _lines_naming(prompt, 'ddd4444eee', 'step-2', 'step-3')
+        action_at = prompt.index('## Action')
+        assert prompt.index(drop_line) < action_at
+        assert prompt.index(duplicate_line) < action_at
+
+    async def test_no_refusal_renders_no_refusal_section(self, briefing: BriefingAssembler):
+        prompt = await self._prompt(briefing, integrity_refusal=None)
+        assert prompt == await self._prompt(briefing)
+        assert _lines_naming(prompt, 'step-1', 'abc1234def') == []
+        assert _lines_naming(prompt, 'ddd4444eee', 'step-2', 'step-3') == []
+
+
 @pytest.mark.asyncio
 class TestResumePriorProposal:
     """Resume golden test.
@@ -1099,6 +1165,68 @@ class TestPriorProposalStaleness:
         )
         assert isinstance(prompt, str)
         assert 'prior block-time investigation' not in prompt
+
+    # -- (f) rendered 'Investigated at' label --------------------------------
+
+    @pytest.mark.asyncio
+    async def test_investigated_at_line_uses_investigated_at_when_timestamp_restamped(
+        self, briefing: BriefingAssembler,
+    ):
+        task = {
+            'id': '9018',
+            'title': 'Re-affirmed proposal task',
+            'description': 'Demo',
+            'metadata': {
+                'dry_run_proposals': [
+                    {
+                        'proposal_text': 're-affirmed analysis text',
+                        'risk_label': 'low',
+                        'files_referenced': [],
+                        'timestamp': '2026-07-15T00:00:00+00:00',
+                        'investigated_at': '2026-07-13T10:00:00+00:00',
+                    },
+                ],
+                'last_blocked_at': '2026-07-14T00:00:00+00:00',
+            },
+        }
+        prompt = await briefing.build_revalidation_prompt(
+            task,
+            existing_plan={'files': [], 'steps': []},
+            changed_files=[],
+            worktree=None,
+            context='',
+        )
+        assert 're-affirmed analysis text' in prompt
+        assert '**Investigated at:** 2026-07-13T10:00:00+00:00' in prompt
+        assert '2026-07-15T00:00:00+00:00' not in prompt
+
+    @pytest.mark.asyncio
+    async def test_investigated_at_line_falls_back_to_timestamp(
+        self, briefing: BriefingAssembler,
+    ):
+        task = {
+            'id': '9019',
+            'title': 'Legacy proposal task',
+            'description': 'Demo',
+            'metadata': {
+                'dry_run_proposals': [
+                    {
+                        'proposal_text': 'legacy analysis text',
+                        'risk_label': 'low',
+                        'files_referenced': [],
+                        'timestamp': '2026-07-15T00:00:00+00:00',
+                    },
+                ],
+            },
+        }
+        prompt = await briefing.build_revalidation_prompt(
+            task,
+            existing_plan={'files': [], 'steps': []},
+            changed_files=[],
+            worktree=None,
+            context='',
+        )
+        assert '**Investigated at:** 2026-07-15T00:00:00+00:00' in prompt
 
 
 # ---------------------------------------------------------------------------

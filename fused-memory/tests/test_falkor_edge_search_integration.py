@@ -19,15 +19,14 @@ import math
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
-from typing import Any
 
 import pytest
 import pytest_asyncio
-from _falkor_index_live import injected_driver, live_backends, scratch_graphs
+from _falkor_index_live import live_backends, scratch_graphs
+from _falkor_plans import explain, non_leaf_scans, spy_on_queries
 from _fm_helpers import await_index_operational, falkor_skipif
 from _query_recorder import IssuedQuery, recording_driver
 from falkordb.asyncio.graph import AsyncGraph
-from falkordb.execution_plan import ExecutionPlan
 from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.edges import EntityEdge
@@ -175,7 +174,7 @@ async def seed_ring(scratch, live_backend_factory) -> Callable[[int], Awaitable[
         return SeededGraph(
             name=name,
             graph=graph,
-            driver=injected_driver(backend).clone(name),
+            driver=live_backend_factory.driver_of(backend).clone(name),
             entity_edges={edge.uuid: edge for edge in ring},
             off_label_edge=off_label_edge,
         )
@@ -187,19 +186,6 @@ async def seed_ring(scratch, live_backend_factory) -> Callable[[int], Awaitable[
 
 
 SearchLeg = Callable[[GraphDriver], Awaitable[list[EntityEdge]]]
-
-
-def spy_on_queries(driver: GraphDriver) -> list[IssuedQuery]:
-    """Record every query *driver* issues while still executing it."""
-    issued: list[IssuedQuery] = []
-    execute = driver.execute_query
-
-    async def spy(cypher: str, **params: Any):
-        issued.append(IssuedQuery(cypher, params))
-        return await execute(cypher, **params)
-
-    driver.execute_query = spy  # pyright: ignore[reportAttributeAccessIssue]
-    return issued
 
 
 async def issued_by_hardened_driver(seeded: SeededGraph, leg: SearchLeg) -> IssuedQuery:
@@ -222,23 +208,6 @@ def without_search_interface(driver: GraphDriver) -> GraphDriver:
     builtin = copy.copy(driver)
     builtin.search_interface = None
     return builtin
-
-
-async def explain(graph: AsyncGraph, query: IssuedQuery) -> ExecutionPlan:
-    params = {key: value for key, value in query.params.items() if key != 'routing_'}
-    return await graph.explain(query.cypher, params)
-
-
-def non_leaf_scans(plan: ExecutionPlan) -> list[str]:
-    """Scan operators that have children; each is re-executed once per input row."""
-    found: list[str] = []
-    pending = [plan.structured_plan]
-    while pending:
-        operation = pending.pop()
-        if operation.name.endswith('Scan') and operation.children:
-            found.append(operation.name)
-        pending.extend(operation.children)
-    return found
 
 
 # --- BM25 leg -----------------------------------------------------------------

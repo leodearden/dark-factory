@@ -87,9 +87,8 @@ class TestBudgetSumInvariant:
 
         assert cfg.cpm_budget + cfg.age_budget + cfg.continuity_credit == TIER_WIDTH - 1
 
-    def test_rejected_when_loaded_through_orchestrator_config(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_rejected_when_loaded_through_orchestrator_config(self):
         with pytest.raises(ValidationError):
             OrchestratorConfig.model_validate({'scoring': {'age_budget': 900.0}})
 
@@ -136,13 +135,9 @@ class TestContinuityProbeBounds:
             ScoringConfig(continuity_credit_max_age_secs=bad_age)
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestScoringReloadDisposition:
     """D8: every scoring knob is green-tier, so a retune costs a reload, not a fleet restart."""
-
-    @pytest.fixture(autouse=True)
-    def _no_config_file(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
 
     @pytest.mark.parametrize('leaf', list(ScoringConfig.model_fields))
     def test_every_leaf_is_reloadable(self, leaf):

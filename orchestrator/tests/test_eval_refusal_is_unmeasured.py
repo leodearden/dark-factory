@@ -48,7 +48,7 @@ def _refused_panel_cell() -> tuple[PanelRunResult, CorpusDiff]:
     run = PanelRunResult(
         variant_name='v1', diff_id='d1', total_cost_usd=2.0, wall_clock_ms=300,
         reviews={
-            'r1': {'verdict': 'NEEDS_CHANGES', 'issues': [_REVIEWER_ISSUE]},
+            'r1': {'verdict': 'ISSUES_FOUND', 'issues': [_REVIEWER_ISSUE]},
             'r2': {'verdict': 'ERROR', 'issues': []},
         },
     )

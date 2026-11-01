@@ -61,22 +61,38 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from shared.psi import PsiSample, cpu_some10_or_none, read_psi_sample
 from shared.task_statuses import OwnerLiveness, TaskStatus, owner_liveness
 from shared.task_submit import SubmitFailed, SubmitOutcome, SubmittedTask, SubmittedTicket
 
-from orchestrator.flake_ledger import FlakeLedgerTaskClient, fix_contained, resolving_commit
+from orchestrator.flake_ledger import (
+    DebtContext,
+    DebtTrigger,
+    FlakeCallSite,
+    FlakeLedgerTaskClient,
+    FlakeSuppression,
+    fix_contained,
+    ledger_db_path,
+    read_debt_many,
+    resolving_commit,
+)
+from orchestrator.flake_recorder import record_call_site_observations
 from orchestrator.offline_lane_confirm import Confirmed, Outage, Unconfirmable, outcome_from_json
 from orchestrator.offline_lane_episode_state import (
+    Applied,
     CommandRecord,
+    CoveringStatuses,
     CoveringVerdict,
     Episode,
     EpisodeStore,
     LanePolicy,
+    OfferedDebt,
     PassEffect,
     PassObservation,
     PassReads,
     apply_outage,
     apply_pass,
+    is_live_owner,
     recheck_due,
     reproduce_for,
     reproduced_nodes,
@@ -110,6 +126,15 @@ from orchestrator.offline_lane_filing import (
     build_lane_fix_task_arguments,
     covering_lane_task,
 )
+from orchestrator.offline_lane_ledger import (
+    DebtDecision,
+    Recovery,
+    debt_context,
+    debt_decision,
+    pass_suppressions,
+    recent_occurrences,
+    recoveries,
+)
 from orchestrator.offline_lane_records import (
     RECORD_RETENTION,
     PassRecord,
@@ -131,6 +156,7 @@ UNKNOWN_MODE = 'unknown'
 UNKNOWN_STATUS = 'unknown'
 CLOSED_ESCALATION_STATES = frozenset({'resolved', 'dismissed'})
 DEFERRED_STATUS = 'deferred'
+_NO_TASK_CLIENT = 'no task client'
 _OPEN_STATUSES = tuple(sorted(s.value for s in TaskStatus if owner_liveness(s) is OwnerLiveness.OPEN))
 
 
@@ -420,6 +446,7 @@ class LaneEngine:
         escalation_queue: EscalationQueue | None,
         now: Callable[[], datetime] | None = None,
         probe_runner: ProbeSeam = run_probe,
+        read_psi: Callable[[], PsiSample] = read_psi_sample,
     ) -> None:
         self._config = config
         self._git = git
@@ -427,6 +454,7 @@ class LaneEngine:
         self._queue = escalation_queue
         self._now = now or _utc_now
         self._probe_runner = probe_runner
+        self._read_psi = read_psi
         self._store = EpisodeStore(config.project_root, clock=self._now)
         self._records = RunRecordStore(config.project_root, clock=self._now)
 
@@ -438,8 +466,10 @@ class LaneEngine:
         open_tasks = _OpenLaneTaskLookup(self._open_lane_tasks)
         record, filed = await self._retry_due_filings(record, open_tasks)
         record = await self._with_recorded_history(record, observation)
-        reads, statuses = await self._pass_reads(record, observation)
+        covering = await self._covering_statuses(record)
+        reads, statuses = await self._pass_reads(record, observation, covering)
         applied = apply_pass(record, observation, reads, policy, self._now())
+        offered, undecided = await self._recorded_in_ledger(record, applied, observation, covering)
         record = applied.record
         await self._save(record)
         unfinished = {
@@ -457,7 +487,136 @@ class LaneEngine:
             record, probed = await self._probe_answered(record, observation, observation.probe)
         if record != saved:
             await self._save(record)
-        return replace(applied.effect, tasks_filed=(*filed, *opened), escalations_raised=(*raised, *probed))
+        return replace(
+            applied.effect,
+            tasks_filed=(*filed, *opened),
+            escalations_raised=(*raised, *probed),
+            debts_offered=offered,
+            debts_undecided=undecided,
+        )
+
+    async def _recorded_in_ledger(
+        self, before: CommandRecord, applied: Applied, observation: PassObservation, covering: CoveringStatuses,
+    ) -> tuple[tuple[OfferedDebt, ...], tuple[str, ...]]:
+        """D6: what this pass tells the flake ledger, written before the episodes' new state and any filing.
+
+        A red pass's call comes first, so its rows land before any recovery's item.  Returns
+        the debts offered and the tests left undecided by an unreadable covering status.
+        """
+        offered: tuple[OfferedDebt, ...] = ()
+        undecided: tuple[str, ...] = ()
+        if isinstance(observation.outcome, Confirmed | Unconfirmable):
+            offered, undecided = await self._red_recorded(before, observation, covering)
+        found = recoveries(before, applied.effect.episodes_ended, observation)
+        return (*offered, *await self._recoveries_recorded(found, observation, covering)), undecided
+
+    async def _recoveries_recorded(
+        self, found: Sequence[Recovery], observation: PassObservation, covering: CoveringStatuses,
+    ) -> tuple[OfferedDebt, ...]:
+        """One recorder call per evidence head, in first-seen order, carrying the recoveries that owe debt there."""
+        by_head: dict[str, dict[str, DebtContext]] = {}
+        for recovery in found:
+            node, episode = recovery.node, recovery.episode
+            if debt_decision(node, observation.command, episode, covering) is DebtDecision.ELIGIBLE:
+                context = await self._debt_context(node, DebtTrigger.recovered, observation, episode, current=None)
+                by_head.setdefault(recovery.evidence_head, {})[node] = context
+        for head, eligible in by_head.items():
+            await self._record((), eligible, head=head, observation=observation)
+        return tuple(
+            OfferedDebt(node, DebtTrigger.recovered, head) for head, eligible in by_head.items() for node in eligible
+        )
+
+    async def _red_recorded(
+        self, before: CommandRecord, observation: PassObservation, covering: CoveringStatuses,
+    ) -> tuple[tuple[OfferedDebt, ...], tuple[str, ...]]:
+        """The red pass's one recorder call: its suppressions, and its cleared tests that owe debt."""
+        eligible, undecided = await self._cleared_debts(before, observation, covering)
+        record_dir = str(self._records.pass_directory(observation.command, observation.pass_id))
+        suppressions = pass_suppressions(observation, record_dir=record_dir, psi_cpu_some10=self._pressure())
+        await self._record(suppressions, eligible, head=observation.head, observation=observation)
+        offered = tuple(OfferedDebt(node, DebtTrigger.cleared, observation.head) for node in eligible)
+        return offered, undecided
+
+    async def _record(
+        self,
+        suppressions: Sequence[FlakeSuppression],
+        eligible: Mapping[str, DebtContext],
+        *,
+        head: str,
+        observation: PassObservation,
+    ) -> None:
+        """One recorder call at *head*, at *observation*'s start: *suppressions* and the due items of *eligible*."""
+        await record_call_site_observations(
+            suppressions,
+            call_site=FlakeCallSite.offline_lane,
+            project_root=self._config.project_root,
+            project_id=self._config.fused_memory.project_id,
+            head_sha=head,
+            observed_at=observation.started_at.isoformat(),
+            observing_task_id=None,
+            debt_eligible=eligible,
+            event_store=None,
+            escalation_queue=self._queue,
+        )
+
+    async def _cleared_debts(
+        self, before: CommandRecord, observation: PassObservation, covering: CoveringStatuses,
+    ) -> tuple[dict[str, DebtContext], tuple[str, ...]]:
+        """The contexts of the cleared tests that owe flake debt, and the cleared tests left undecided."""
+        outcome = observation.outcome
+        if not isinstance(outcome, Confirmed):
+            return {}, ()
+        eligible: dict[str, DebtContext] = {}
+        undecided: list[str] = []
+        for node in outcome.cleared:
+            episode = before.episodes.get(node)
+            match debt_decision(node, observation.command, episode, covering):
+                case DebtDecision.ELIGIBLE:
+                    eligible[node] = await self._debt_context(
+                        node, DebtTrigger.cleared, observation, episode, current=observation,
+                    )
+                case DebtDecision.COVERED:
+                    logger.info('offline-lane: %s: %s cleared under its open fix task; owes no flake debt',
+                                observation.command, node)
+                case DebtDecision.UNDECIDED:
+                    logger.error(
+                        'offline-lane: %s: cleared test %s not offered as flake debt: status of its covering '
+                        'task %s unreadable: %s',
+                        observation.command, node, episode.covering_task_id if episode else None, covering.error,
+                    )
+                    undecided.append(node)
+                case DebtDecision.NEVER:
+                    pass
+        return eligible, tuple(undecided)
+
+    async def _debt_context(
+        self,
+        node: str,
+        trigger: DebtTrigger,
+        observation: PassObservation,
+        episode: Episode | None,
+        *,
+        current: PassObservation | None,
+    ) -> DebtContext:
+        """*node*'s debt context: its occurrences in *episode*'s counted passes, then in *current* when given."""
+        earlier = await self._counted_records(observation.command, episode)
+        occurrences = recent_occurrences(node, earlier, current)
+        return debt_context(node, trigger, observation, episode, occurrences)
+
+    async def _counted_records(self, command: str, episode: Episode | None) -> list[PassRecord]:
+        """The run records of *episode*'s counted passes, oldest first, read off the loop; unreadable ones skipped."""
+        if episode is None:
+            return []
+        loaded = [await asyncio.to_thread(self._records.load_pass, command, pass_id) for pass_id in episode.counted_passes]
+        return [record for record in loaded if record is not None]
+
+    def _pressure(self) -> float | None:
+        """Host CPU pressure for the ledger's rows; a failed read is ``None`` and never changes an outcome."""
+        try:
+            return cpu_some10_or_none(self._read_psi())
+        except Exception:
+            logger.warning('offline-lane: host pressure read failed; recording psi_cpu_some10=None', exc_info=True)
+            return None
 
     async def _observed_outage(self, observation: PassObservation, probe: ProbeResult) -> PassEffect:
         """D5's outage row: held episodes are marked, the probe records kept, and nothing is filed."""
@@ -628,10 +787,9 @@ class LaneEngine:
         return after
 
     async def _pass_reads(
-        self, record: CommandRecord, observation: PassObservation,
+        self, record: CommandRecord, observation: PassObservation, covering: CoveringStatuses,
     ) -> tuple[PassReads, dict[str, str]]:
         """D10's reads for the red-again bound tests, the batched refresh read, and the previous pass's detect record."""
-        terminal = await self._terminal_task_ids(record)
         reproduced = reproduced_nodes(observation)
         bound = {
             node: episode for node in reproduced
@@ -647,28 +805,41 @@ class LaneEngine:
         statuses = {task_id: read.status or UNKNOWN_STATUS for task_id, read in task_reads.items()}
         starts = any(node not in record.episodes or not record.episodes[node].live for node in reproduced)
         previous = await self._previous_detect(record) if starts else None
-        return PassReads(verdicts, terminal, previous), statuses
+        return PassReads(verdicts, covering.terminal_task_ids, previous), statuses
 
-    async def _terminal_task_ids(self, record: CommandRecord) -> frozenset[str]:
+    async def _covering_statuses(self, record: CommandRecord) -> CoveringStatuses:
+        """The pass's one batched status read of every bound covering task.
+
+        A lane run with no task client reads nothing and logs nothing here: it was configured
+        that way, and each decision that rests on the read reports it.
+        """
         bound = sorted({e.covering_task_id for e in record.episodes.values() if e.covering_task_id is not None})
-        if not bound or self._tasks is None:
-            return frozenset()
-        try:
-            statuses, error = await self._tasks.get_statuses(bound)
-        except Exception as exc:
-            statuses, error = {}, exc
+        if not bound:
+            return CoveringStatuses({})
+        if self._tasks is None:
+            return CoveringStatuses({}, _NO_TASK_CLIENT)
+        statuses, error = await self._read_statuses(bound)
         if error is not None:
             logger.error(
                 'offline-lane: %s: covering task statuses unreadable, every binding refreshed: %s',
                 record.command, error,
             )
-            return frozenset()
-        closed = {OwnerLiveness.DONE, OwnerLiveness.CLOSED}
-        return frozenset(t for t in bound if t in statuses and owner_liveness(statuses[t]) in closed)
+            return CoveringStatuses({}, error)
+        return CoveringStatuses({task_id: statuses[task_id] for task_id in bound if task_id in statuses})
+
+    async def _read_statuses(self, task_ids: list[str]) -> tuple[Mapping[str, str], str | None]:
+        """One batched status read; the statuses, or why they could not be read."""
+        if self._tasks is None:
+            return {}, _NO_TASK_CLIENT
+        try:
+            statuses, error = await self._tasks.get_statuses(task_ids)
+        except Exception as exc:
+            statuses, error = {}, exc
+        return ({}, str(error)) if error is not None else (statuses, None)
 
     async def _read_task(self, task_id: str) -> _TaskRead:
         if self._tasks is None:
-            return _TaskRead(None, 'no task client')
+            return _TaskRead(None, _NO_TASK_CLIENT)
         try:
             task, error = await self._tasks.get_task(task_id)
         except Exception as exc:
@@ -831,7 +1002,7 @@ class LaneEngine:
     async def _open_lane_tasks(self) -> _OpenLaneTasks:
         """The project's open lane fix tasks, read live, in lookup order; or why they could not be read."""
         if self._tasks is None:
-            return {}, 'no task client'
+            return {}, _NO_TASK_CLIENT
         try:
             rows, error = await self._tasks.find_tasks_by_metadata(SPAWN_CONTEXT_KEY, SPAWN_CONTEXT, _OPEN_STATUSES)
         except Exception as exc:
@@ -900,7 +1071,30 @@ class LaneEngine:
         ]
         return build_lane_fix_task_arguments(
             command=record.command, leg=leg, priority=priority, tests=tests, reproduce=reproduce,
+            deflake_owners=await self._live_deflake_owners(nodes),
         )
+
+    async def _live_deflake_owners(self, nodes: Sequence[str]) -> dict[str, str]:
+        """Each of *nodes* owing open flake debt, mapped to its owner while that owner is open or deferred.
+
+        An unreadable owner status is named in the value.  No debt row with an owner, no task-client call.
+        """
+        rows = await asyncio.to_thread(read_debt_many, ledger_db_path(self._config.project_root), nodes)
+        owed = {
+            node: row.owner_task_id for node, row in rows.items()
+            if row.resolved_at is None and row.owner_task_id is not None
+        }
+        if not owed:
+            return {}
+        owners = sorted(set(owed.values()))
+        statuses, error = await self._read_statuses(owners)
+        if error is not None:
+            logger.error('offline-lane: de-flake owner statuses %s unreadable: %s', owners, error)
+            return {node: f'{owner} (status unreadable: {error})' for node, owner in owed.items()}
+        return {
+            node: owner for node, owner in owed.items()
+            if is_live_owner(statuses.get(owner))
+        }
 
     async def _counted_evidence(
         self, command: str, episode: Episode, modes: Mapping[str, str],

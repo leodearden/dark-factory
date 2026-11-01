@@ -28,6 +28,7 @@ from shared.merge_state import MergeReason
 from escalation import server as escalation_server
 from escalation.canonical import canonical_root_cause
 from escalation.dedupe import DedupeConfig, summary_dedupe_key
+from escalation.grant_delivery import GrantDelivery
 from escalation.merge_status_answer import hint_for
 from escalation.models import Escalation
 from escalation.queue import _MAX_AMENDMENTS, EscalationQueue
@@ -1579,6 +1580,164 @@ class TestResolveIssueGrantedFiles:
         record = queue.get(esc.id)
         assert record is not None
         assert record.granted_files == []
+
+
+_GRANT_TASK = 't-grant-delivery'
+_GRANTED = ['pkg/b.py']
+
+
+def _probe_harness(blocker: GrantDelivery | None) -> types.SimpleNamespace:
+    return types.SimpleNamespace(granted_files_delivery_blocker=lambda _task_id: blocker)
+
+
+def _raising_probe_harness() -> types.SimpleNamespace:
+    def _probe(_task_id: str) -> GrantDelivery | None:
+        raise RuntimeError('probe exploded')
+
+    return types.SimpleNamespace(granted_files_delivery_blocker=_probe)
+
+
+def _assert_shortfall(result: dict[str, Any], expected: GrantDelivery) -> None:
+    assert result['granted_files_delivery'] == expected
+    reason = result['granted_files_delivery_reason']
+    assert _GRANT_TASK in reason
+    for path in _GRANTED:
+        assert path in reason
+
+
+class TestResolveIssueGrantedFilesDelivery:
+    """Every success return of resolve_issue says what became of granted_files (task 5650).
+
+    ``granted_files_delivery`` is always present, mirroring
+    ``late_resolution_captured``: the returned record looks identically
+    healthy whether or not the grant will land.
+    """
+
+    def _seed(self, queue: EscalationQueue) -> Escalation:
+        return seed_escalation(queue, level=0, task_id=_GRANT_TASK)
+
+    @pytest.mark.asyncio
+    async def test_no_grant_is_none_granted(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='fixed', action='resume',
+        )
+
+        assert result['granted_files_delivery'] == GrantDelivery.NONE_GRANTED
+        assert 'granted_files_delivery_reason' not in result
+
+    @pytest.mark.asyncio
+    async def test_an_unblocked_resume_grant_is_scheduled(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        assert result['granted_files_delivery'] == GrantDelivery.SCHEDULED
+        assert 'granted_files_delivery_reason' not in result
+
+    @pytest.mark.asyncio
+    async def test_no_harness_is_no_orchestrator(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.NO_ORCHESTRATOR)
+
+    @pytest.mark.asyncio
+    async def test_a_probe_blocker_is_reported(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue, harness=_probe_harness(GrantDelivery.NO_PLAN_TO_WIDEN),
+        )
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.NO_PLAN_TO_WIDEN)
+
+    @pytest.mark.asyncio
+    async def test_a_close_only_grant_does_not_apply(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='closed', action='close_only',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.ACTION_DOES_NOT_APPLY_GRANTS)
+
+    @pytest.mark.asyncio
+    async def test_a_park_grant_is_reported_and_discarded(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='parked', action='park',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.ACTION_DOES_NOT_APPLY_GRANTS)
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.granted_files == [], 'park discards the grant outright'
+
+    @pytest.mark.asyncio
+    async def test_a_grant_on_an_already_closed_record_is_record_not_open(
+        self, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+        await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='closed', action='close_only',
+        )
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.RECORD_NOT_OPEN)
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.granted_files == []
+
+    @pytest.mark.asyncio
+    async def test_a_raising_probe_still_resolves_and_reports_scheduled(
+        self, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_raising_probe_harness())
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        assert result['granted_files_delivery'] == GrantDelivery.SCHEDULED
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'resolved'
 
 
 # ---------------------------------------------------------------------------
@@ -3459,6 +3618,8 @@ class TestPromoteToL2Cascade:
 
 _STREAK_SENTINEL_5469 = '__recovery_veto_streak__5469'
 _STREAK_SENTINEL_7000 = '__recovery_veto_streak__7000'
+_ZERO_PROGRESS_SENTINEL_5469 = '__zero_progress_requeue__5469'
+_ZERO_PROGRESS_SENTINEL_7000 = '__zero_progress_requeue__7000'
 
 
 def _seed_streak_alarm(queue: EscalationQueue, esc_id: str, sentinel: str) -> Escalation:
@@ -3470,6 +3631,21 @@ def _seed_streak_alarm(queue: EscalationQueue, esc_id: str, sentinel: str) -> Es
         severity='blocking',
         category='risk_identified',
         summary='recovery veto streak alarm',
+        level=1,
+    )
+    queue.submit(esc)
+    return esc
+
+
+def _seed_zero_progress_alarm(queue: EscalationQueue, esc_id: str, sentinel: str) -> Escalation:
+    """Seed a pending zero-progress-requeue alarm L1, filed the way the orchestrator files it."""
+    esc = Escalation(
+        id=esc_id,
+        task_id=sentinel,
+        agent_role='orchestrator-zero-progress-requeue',
+        severity='blocking',
+        category='risk_identified',
+        summary='zero-progress requeue alarm',
         level=1,
     )
     queue.submit(esc)
@@ -3699,6 +3875,70 @@ class TestPromoteToL2SentinelIdentity:
 
         assert 'error' in result, result
         assert result.get('code') != 'sentinel_task_id_required', result
+
+    @pytest.mark.asyncio
+    async def test_zero_progress_only_cluster_under_real_id_mints_nothing(self, tmp_path: Path):
+        """(h) The zero-progress requeue alarm is sentinel-bound too (task 5880)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_zero_progress_alarm(queue, 'esc-zp-5469-1', _ZERO_PROGRESS_SENTINEL_5469)
+        member_before = queue.get('esc-zp-5469-1')
+
+        result = await call_promote(
+            server,
+            **{**_L2_DEFAULTS, 'task_id': '5469', 'member_ids': ['esc-zp-5469-1']},
+        )
+
+        assert result.get('code') == 'sentinel_task_id_required', result
+        assert result['required_task_ids'] == [_ZERO_PROGRESS_SENTINEL_5469]
+        assert [e.id for e in queue.get_pending() if e.level == 2] == []
+        assert queue.get('esc-zp-5469-1') == member_before
+
+    @pytest.mark.asyncio
+    async def test_zero_progress_only_cluster_under_its_sentinel_id_is_created(
+        self, tmp_path: Path,
+    ):
+        """(h cont.) Minted under the alarm's own sentinel id, the promote goes through."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_zero_progress_alarm(queue, 'esc-zp-5469-1', _ZERO_PROGRESS_SENTINEL_5469)
+
+        result = await call_promote(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'task_id': _ZERO_PROGRESS_SENTINEL_5469,
+                'member_ids': ['esc-zp-5469-1'],
+            },
+        )
+
+        assert result.get('status') == 'created', result
+        minted = queue.get(result['id'])
+        assert minted is not None
+        assert minted.task_id == _ZERO_PROGRESS_SENTINEL_5469
+
+    @pytest.mark.asyncio
+    async def test_cross_class_sentinel_cluster_names_both_sentinels(self, tmp_path: Path):
+        """(h cont.) Alarms of two sentinel classes compose: the refusal names both sentinels."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
+        _seed_zero_progress_alarm(queue, 'esc-zp-7000-1', _ZERO_PROGRESS_SENTINEL_7000)
+
+        result = await call_promote(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'task_id': '5469',
+                'member_ids': ['esc-streak-5469-1', 'esc-zp-7000-1'],
+            },
+        )
+
+        assert result.get('code') == 'sentinel_task_id_required', result
+        assert result['required_task_ids'] == sorted(
+            [_STREAK_SENTINEL_5469, _ZERO_PROGRESS_SENTINEL_7000],
+        )
+        assert [e.id for e in queue.get_pending() if e.level == 2] == []
 
 
 # ---------------------------------------------------------------------------
@@ -4735,6 +4975,18 @@ async def _call_get_merge_queue(server) -> dict[str, Any]:
 class TestGetMergeQueue:
     """Tests for the get_merge_queue escalation MCP tool."""
 
+    @staticmethod
+    async def _finalize_through_gate(worker, entry) -> bool:
+        """``_finalize_inflight`` *entry*, resuming it while it parks on a gate
+        re-verify (task 6155), as
+        ``orchestrator/tests/_merge_queue_harness.py::finalize_through_gate``
+        does for the orchestrator suite.  Returns True iff main advanced.
+        """
+        while True:
+            advanced = await worker._finalize_inflight(entry)
+            if entry.gate is None:
+                return advanced
+
     def _make_finalize_fixture(
         self,
         tmp_path: Path,
@@ -5405,7 +5657,7 @@ class TestGetMergeQueue:
         original_reverify = mq_module._reverify_rebased_tree
         mq_module._reverify_rebased_tree = fake_reverify_rebased_tree  # type: ignore[attr-defined]
         try:
-            await worker._finalize_inflight(entry)
+            await self._finalize_through_gate(worker, entry)
         finally:
             mq_module._reverify_rebased_tree = original_reverify  # type: ignore[attr-defined]
 
@@ -5513,7 +5765,7 @@ class TestGetMergeQueue:
         original_reverify = mq_module._reverify_rebased_tree
         mq_module._reverify_rebased_tree = fake_reverify_rebased_tree  # type: ignore[attr-defined]
         try:
-            await worker._finalize_inflight(entry)
+            await self._finalize_through_gate(worker, entry)
         finally:
             mq_module._reverify_rebased_tree = original_reverify  # type: ignore[attr-defined]
 

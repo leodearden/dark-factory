@@ -317,14 +317,16 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
     ),
     'resolve_ticket': (
         'resolve_ticket(ticket, project_root) -> '
-        "{'status': 'created'|'combined'|'failed'|'refused'|'awaiting_curation', "
-        "'task_id'?: ..., 'reason'?: ...}  "
+        "{'status': 'created'|'combined'|'failed'|'refused'|'cancelled'"
+        "|'pending'|'awaiting_curation', "
+        "'task_id'?: ..., 'ticket'?: ..., 'reason'?: ...}  "
         '# refused = a deterministic guard rejected the candidate: NO task was '
         'created and NO task_id key is present. Terminal and intended; never '
         'retry it and never record a task id for it. '
-        '# awaiting_curation = NON-terminal: the ticket is durably parked for '
-        'curation and carries NO task_id. Do not count it, do not retry or '
-        're-submit it, and do not flag it as a discrepancy.'
+        '# cancelled = terminal, NO task_id. '
+        '# pending / awaiting_curation = OPEN: not decided yet; carries the '
+        'ticket, never a task_id. Do not count it or flag it as a discrepancy; '
+        're-poll the same ticket, never re-submit.'
     ),
     'add_finding': (
         'add_finding(severity, category, flag_type, actionable, description, '
@@ -812,8 +814,9 @@ def render_task_creation_accounting_section() -> str:
         'no new task id: count it under `tasks_combined`, never under '
         '`tasks_created`.\n\n'
         'Confirmation rule: see `## Verifying Task Operations` above for the '
-        'full rule, including its `get_task`-verified fallback for a status '
-        'other than `created`/`combined`/`failed`. Only the '
+        'full rule, including its `get_task`-verified fallback for an '
+        'unrecognised status, and its rule that an open status (`pending`, '
+        '`awaiting_curation`) counts toward neither tally. Only the '
         '`resolve_ticket`-confirmed subset of that rule — `status` `created` '
         'or `combined` WITH a `task_id` — is machine-countable via the '
         'action record below; never record on the `submit_task` call '
