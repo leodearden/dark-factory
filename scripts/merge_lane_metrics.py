@@ -124,6 +124,9 @@ class AppendOnlyViolation(RatchetError):
 # ---------------------------------------------------------------------------
 # The cluster spec -- SPOT for PRD Appendix A.
 
+#: Where the ``orchestrator.merge_lane`` package's modules live on disk.
+LANE_PACKAGE_GLOB = 'orchestrator/src/orchestrator/merge_lane/**/*.py'
+
 #: Repo-relative literal paths and glob patterns naming the merge-lane cluster.
 #: This tuple IS Appendix A; editing it forces a deliberate baseline
 #: regeneration, because ``check_against_baseline`` compares the baseline's
@@ -138,7 +141,7 @@ CLUSTER_PATHS: tuple[str, ...] = (
     'orchestrator/src/orchestrator/git_ops.py',
     # The package, holding the fourteen modules PRD task zeta2 moved into it. A
     # glob matching nothing is NOT a failure; a literal matching nothing is.
-    'orchestrator/src/orchestrator/merge_lane/**/*.py',
+    LANE_PACKAGE_GLOB,
     'orchestrator/tests/_merge_queue_harness.py',
     'orchestrator/tests/conftest.py',
 )
@@ -266,6 +269,28 @@ def resolve_cluster_paths(root: Path) -> Enumeration:
 #: name's leaf is its dotted path below this package: ``<attr>`` on the package
 #: itself, ``<sub>.<attr>`` on a submodule.
 LANE_PACKAGE = 'orchestrator.merge_lane'
+
+
+def lane_patch_modules(root: Path) -> frozenset[str]:
+    """``LANE_PACKAGE`` plus the dotted name of every module ``LANE_PACKAGE_GLOB``
+    finds under *root*, so a patch receiver bound to a submodule is resolved and
+    a class imported from the package is not."""
+    modules = {LANE_PACKAGE}
+    for match in root.glob(LANE_PACKAGE_GLOB):
+        relpath = match.relative_to(root).as_posix()
+        name = source_measures.src_module_name(relpath)
+        if name is None or not _is_in_lane_package(name):
+            raise RatchetError(
+                f'{relpath!r} matches LANE_PACKAGE_GLOB {LANE_PACKAGE_GLOB!r} but '
+                f'its module {name!r} is not LANE_PACKAGE {LANE_PACKAGE!r} or '
+                'under it; the two constants disagree, so update them together'
+            )
+        modules.add(name)
+    return frozenset(modules)
+
+
+def _is_in_lane_package(module: str) -> bool:
+    return module == LANE_PACKAGE or module.startswith(LANE_PACKAGE + '.')
 
 
 # ---------------------------------------------------------------------------
@@ -463,15 +488,14 @@ def sweep_repo(root: Path) -> RepoSweep:
     compare at all. That split is the INV-11 seam between "this cluster file is
     unmeasurable, which IS the finding" and "some unrelated file is mid-edit".
     """
+    lane_modules = lane_patch_modules(root)
     test_tree = _test_tree_files(root)
     tests: dict[str, object] = {}
     unreadable: list[str] = []
     for relpath in test_tree:
         try:
             source = (root / relpath).read_text(encoding='utf-8')
-            measures = test_file_measures(
-                source, path=relpath, lane_modules=(LANE_PACKAGE,)
-            )
+            measures = test_file_measures(source, path=relpath, lane_modules=lane_modules)
         except (OSError, UnicodeDecodeError, source_measures.MetricsError):
             unreadable.append(relpath)
             continue
