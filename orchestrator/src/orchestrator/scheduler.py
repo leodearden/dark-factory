@@ -1298,14 +1298,13 @@ class ModuleLockTable:
         self._limits: dict[str, int] = {}
         self._held: dict[str, set[str]] = {}  # task_id -> set of held modules
         # normalized_module -> LIFO stack of (owner_task_id, priority_rank).
-        # Top = last element = the ACTIVE reservation.  Preemption by a strictly-
-        # higher-priority owner PUSHES (shadows) the lower entry instead of
+        # Top = last element = the ACTIVE reservation.  Preemption by an entry
+        # with a smaller _ParkKey PUSHES (shadows) the top entry instead of
         # destroying it.  Restoration happens when the top entry is removed.
-        # INV-3: every stack is strictly rank-decreasing top-ward (top has the
-        # lowest rank / highest priority), so depth is bounded by the 5 priority
-        # tiers plus the bounded number of pin reservations (task 6040).  An
-        # owner holds at most one entry per stack in each band (tier, pin), and
-        # its pin entry sits above its own tier entry.
+        # INV-3: every stack is strictly ordered by _ParkKey, smallest key on
+        # top (task 7799), so its depth is bounded by one entry per owner per
+        # band (tier, pin, task 6040).  An owner's pin entry sits above its
+        # own tier entry.
         self._parked: dict[str, list[tuple[str, int]]] = {}
         # task_id -> ISO8601 timestamp of first install_parks call for that owner
         self._park_install_at: dict[str, str] = {}
@@ -1700,10 +1699,11 @@ class ModuleLockTable:
         entry per band per stack, never reports shadowing itself, and is
         never downgraded.
 
-        Cross-tier preemption (INV-1): if the active TOP of a conflicting stack
-        has ``existing_rank > new_rank`` (strictly lower priority), the new entry
-        is PUSHED on top of the stack (shadowing, not destroying, the lower entry).
-        Same-tier or higher-priority tops BLOCK installation for that module (INV-3).
+        Preemption (INV-1): if the active TOP of a conflicting stack has a
+        larger :class:`_ParkKey` than the new entry (a lower priority, or the
+        same rank and a later id), the new entry is PUSHED on top of the stack
+        (shadowing, not destroying, the top entry).  A top with a smaller key
+        BLOCKS installation for that module (INV-3, task 7799).
 
         Hierarchical (different-key) conflicts: victim parks are kept under
         their ORIGINAL keys (not re-keyed onto the preemptor's key).
@@ -1714,6 +1714,7 @@ class ModuleLockTable:
         """
         depth = self._config.lock_depth
         rank = park_rank(priority)
+        key = _ParkKey.of(task_id, rank)
         installed: list[str] = []
         # Accumulate shadows: victim_owner -> list of original module keys shadowed.
         shadow_acc: dict[str, list[str]] = {}
@@ -1736,11 +1737,11 @@ class ModuleLockTable:
                 if not self._conflicts(parked_m, normalized):
                     continue
                 # Hierarchical conflict with a different top owner.
-                if existing_rank > rank:
-                    # TOP is strictly lower priority → shadow (push), retain beneath.
+                if _ParkKey.of(owner, existing_rank) > key:
+                    # The new entry outranks TOP → shadow (push), retain beneath.
                     to_shadow.append((parked_m, owner))
                 else:
-                    # TOP is same or higher priority → block our install (INV-3).
+                    # TOP outranks the new entry → block our install (INV-3).
                     blocked = True
                     break
             if blocked:
@@ -2053,7 +2054,8 @@ class ModuleLockTable:
         - ``pin_order``: int (pin entries only) / ``tier``: str (fairness
           entries only) — the priority behind ``rank``
 
-        INV-3: ranks are strictly decreasing top-ward (``entry[i].rank > entry[i+1].rank``).
+        INV-3: ranks are non-increasing top-ward (``entry[i].rank >= entry[i+1].rank``),
+        and equal ranks are ordered by the id tie-break of :class:`_ParkKey`.
 
         Builds fresh dicts/lists from ``_parked`` and ``_park_install_at`` so
         callers cannot mutate internal state.
@@ -5831,8 +5833,8 @@ class Scheduler:
         dropped, and the task's own parks are
         consumed (``reservation_used``, plus ``reservation_restored`` for each
         shadow the clear exposes).  A running task's park would otherwise
-        block same-tier installs (INV-3) until release, which is where
-        partial installs came from.  ``Scheduler.release`` keeps its
+        block the installs of every owner it outranks (INV-3) until release,
+        which is where partial installs came from.  ``Scheduler.release`` keeps its
         defensive clear only for parks installed AFTER dispatch, e.g. a
         park rehydrated at startup for a task that is already running.
         """
@@ -5969,8 +5971,8 @@ class Scheduler:
         if attempts not in _GEOMETRIC_EMIT_COUNTS:
             return
         logger.info(
-            'Task %s could not reserve modules %s: a same-or-higher-priority '
-            'park holds them (attempt %d, skip_count=%d, priority=%s)',
+            'Task %s could not reserve modules %s: a park that outranks it '
+            'holds them (attempt %d, skip_count=%d, priority=%s)',
             task_id, blocked, attempts, skip_count, priority,
         )
         self._emit_reservation(
@@ -8174,8 +8176,9 @@ class Scheduler:
         pin ahead of it in the queue has already been tried this tick, so the
         cap keeps this tick's heads first, and a displaced pin is outranked by
         the head's pin rank on every key they share.  (Pins with no stored
-        pin_order tie at one rank, so there the shared key waits for the
-        head's next completion.)  Owners that fail the park-hold predicate
+        pin_order tie at one rank, and tied pins resolve by the id tie-break of
+        :class:`_ParkKey`, so only a head whose id follows the displaced pin's
+        waits for its next completion on the shared key.)  Owners that fail the park-hold predicate
         (:meth:`_park_hold_refusal`) lost every park, pin entries included, in
         park GC earlier in the tick; completion runs only for an owner that
         is still a dispatch candidate.
