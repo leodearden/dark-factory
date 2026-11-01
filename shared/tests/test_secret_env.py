@@ -8,7 +8,12 @@ from __future__ import annotations
 
 import pytest
 
-from shared.secret_env import agent_subprocess_env, is_secret_env_name, secret_env_values
+from shared.secret_env import (
+    agent_subprocess_env,
+    is_secret_env_name,
+    secret_env_values,
+    without_agent_endpoint_vars,
+)
 
 SECRET_NAMES = (
     'CLAUDE_OAUTH_TOKEN_A',
@@ -126,6 +131,24 @@ class TestAgentSubprocessEnv:
         assert child['PATH'] == '/usr/bin:/bin'
         assert child['CLAUDE_CODE_OAUTH_TOKEN'] == environ['CLAUDE_CODE_OAUTH_TOKEN']
         assert 'CLAUDE_OAUTH_TOKEN_A' not in child
+
+
+class TestWithoutAgentEndpointVars:
+    def test_drops_the_endpoint_and_python_env_selection_but_keeps_every_credential(self):
+        environ = {
+            **_environ_with_secrets(),
+            'ANTHROPIC_BASE_URL': 'http://127.0.0.1:8317',
+            'ANTHROPIC_AUTH_TOKEN': 'proxy-' + 'x' * 40,
+            'HF_DOWNLOAD_TOKEN': 'hf-' + 'h' * 40,
+            'VIRTUAL_ENV': '/srv/orch/.venv',
+        }
+        child = without_agent_endpoint_vars(environ)
+        assert 'ANTHROPIC_BASE_URL' not in child
+        assert 'ANTHROPIC_AUTH_TOKEN' not in child
+        assert 'VIRTUAL_ENV' not in child
+        assert child['HF_DOWNLOAD_TOKEN'] == environ['HF_DOWNLOAD_TOKEN']
+        for name, value in _environ_with_secrets().items():
+            assert child[name] == value
 
 
 class TestSecretEnvValues:
