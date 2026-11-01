@@ -2341,7 +2341,9 @@ def _write_server_owned_waiting_terminal(
     p.chmod(0o755)
 
 
-@pytest.mark.parametrize("lane", ["tmux", "konsole", "custom-term", "gnome-terminal"])
+@pytest.mark.parametrize(
+    "lane", ["tmux", "konsole", "custom-term", "gnome-terminal", "mac-terminal"]
+)
 def test_live_claude_without_transcript_is_not_flagged_when_payload_is_not_the_launchers_descendant(
     tmp_path: pathlib.Path, lane: str,
 ) -> None:
@@ -2352,6 +2354,8 @@ def test_live_claude_without_transcript_is_not_flagged_when_payload_is_not_the_l
     Task 7943 measured the defect: the process probe anchored on the
     launcher's own $$, so tmux, konsole and a custom launcher exited a false
     144, and gnome-terminal printed a false FAILED-TO-START line.
+    mac-terminal is the one lane that runs the payload from a tmpscript
+    rather than ``bash -c``.
     """
     bin_dir = _make_bin_dir(tmp_path)
     if lane == "tmux":
@@ -2359,6 +2363,9 @@ def test_live_claude_without_transcript_is_not_flagged_when_payload_is_not_the_l
         terminal_name = "xterm"
     elif lane == "gnome-terminal":
         _write_server_owned_waiting_terminal(bin_dir, lane, tmp_path / "payload.pid")
+        terminal_name = lane
+    elif lane == "mac-terminal":
+        _write_fake_open(bin_dir, tmp_path / "open_argv")
         terminal_name = lane
     else:
         _write_detaching_terminal(bin_dir, lane, tmp_path / "leader.pid")

@@ -873,21 +873,23 @@ _encode_cwd() {
 # That parent is the same on every lane, whoever owns the payload (tmux
 # server, gnome-terminal-server, an orphaning launcher), and it never matches
 # an unrelated claude elsewhere on the host. No pidfile yet, an empty or torn
-# read, or no ps all mean "no evidence this poll"; the watchdog re-polls.
+# read, no child yet, or no pgrep/ps all mean "no evidence this poll"; the
+# watchdog re-polls.
 _payload_claude_alive() {
-  local payload_pid pid ppid tok1 tok2 rest
+  local payload_pid children tok1 tok2 rest
   payload_pid=$(cat "$payload_pid_file" 2>/dev/null) || return 1
   case "$payload_pid" in ''|*[!0-9]*) return 1 ;; esac
+  command -v pgrep >/dev/null 2>&1 || return 1
   command -v ps >/dev/null 2>&1 || return 1
+  children=$(pgrep -d, -P "$payload_pid" 2>/dev/null) || return 1
   # A `claude` CLI is commonly a shebang wrapper, whose argv is
   # "<interpreter> /path/to/claude" (comm names the interpreter), so match
   # the basename of either the first (native binary) or second token.
-  while read -r pid ppid tok1 tok2 rest; do
-    [ "$ppid" = "$payload_pid" ] || continue
+  while read -r tok1 tok2 rest; do
     if [ "${tok1##*/}" = claude ] || [ "${tok2##*/}" = claude ]; then
       return 0
     fi
-  done < <(ps -eo pid=,ppid=,args= 2>/dev/null)
+  done < <(ps -o args= -p "$children" 2>/dev/null)
   return 1
 }
 
