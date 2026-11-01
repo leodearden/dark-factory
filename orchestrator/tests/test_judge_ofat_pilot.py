@@ -296,8 +296,8 @@ class TestFormatReport:
         return decide_judge_adoption(report, margin=0.05), report
 
     def test_adopt_report_has_verdict_deltas_table_and_flip_line(self):
+        from orchestrator.evals.composite_report import format_composite_table
         from orchestrator.evals.judge_pilot import format_judge_ofat_report
-        from orchestrator.evals.report import format_composite_table
 
         decision, report = self._adopt()
         text = format_judge_ofat_report(decision, report)
@@ -320,8 +320,8 @@ class TestFormatReport:
         assert 'models.judge: sonnet -> haiku' in text
 
     def test_reject_report_renders_keep_sonnet_and_no_flip(self):
+        from orchestrator.evals.composite_report import format_composite_table
         from orchestrator.evals.judge_pilot import format_judge_ofat_report
-        from orchestrator.evals.report import format_composite_table
 
         decision, report = self._reject()
         text = format_judge_ofat_report(decision, report)

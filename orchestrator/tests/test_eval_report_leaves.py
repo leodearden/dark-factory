@@ -1,3 +1,4 @@
+import importlib.util
 import subprocess
 import sys
 
@@ -5,7 +6,7 @@ import pytest
 
 _REPORT_LEAVES = ('stats', 'table_render', 'prices', 'cell_admission', 'elo_report')
 _REPORT_SIBLINGS = frozenset({'composite_report', 'plan_quality_report'})
-_REPORT_SURFACES = ('plan_quality_report',)
+_REPORT_SURFACES = ('plan_quality_report', 'composite_report')
 _EVERY_REPORT_SURFACE = frozenset(
     {'orchestrator.evals.report'}
     | {f'orchestrator.evals.{sibling}' for sibling in _REPORT_SIBLINGS}
@@ -48,3 +49,8 @@ class TestReportSurfacesAreSiblings:
             for sibling in _REPORT_SIBLINGS - {surface}
         }
         assert not _evals_modules_loaded_by(surface) & others
+
+
+def test_report_module_is_gone() -> None:
+    """PRD D9: report.py is deleted with no re-export shim (the `report-module-gone` delivered check)."""
+    assert importlib.util.find_spec('orchestrator.evals.report') is None

@@ -24,7 +24,7 @@ import orchestrator.evals.runner as runner_module
 from orchestrator.cli import main
 from orchestrator.config import OrchestratorConfig
 from orchestrator.evals import configs as configs_module
-from orchestrator.evals.report import build_composite_report
+from orchestrator.evals.composite_report import build_composite_report
 from orchestrator.evals.results import EvalResult
 
 
@@ -346,7 +346,7 @@ class TestEmitCompositeReportArchitectSurface:
     def test_non_architect_result_set_emits_exactly_todays_output(self, capsys):
         """The existing eval-matrix / eval-confirm end_to_end surfaces are
         unchanged — no extra section when no architect ran."""
-        from orchestrator.evals.report import format_composite_table
+        from orchestrator.evals.composite_report import format_composite_table
 
         results = [
             _mk_result('e2e-opus-opus', role='end_to_end', composite=0.85),
