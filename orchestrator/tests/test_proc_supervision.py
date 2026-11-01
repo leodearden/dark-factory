@@ -5,11 +5,12 @@ EscalationSpec, FreshPidVerify, RestartOutcome/RestartDisposition, and one
 async execute() honoring 5 invariants (RP-1..5, PRD Sec 5.1).
 
 Prerequisite-1: shared test scaffolding (no behaviour assertions here) —
-fake_inspector (configurable inspect-result async callable), tmp_queue_dir
-fixture, and read_escalations() helper; FakeRunner and the canonical detached
-RP-4 plan live in _proc_supervision_doubles, shared with the other
-proc_supervision test files. Mirrors the injected-inspector pattern in
-test_deterministic_runner.py (AsyncMock unit_inspector).
+make_fake_inspector (configurable inspect-result async callable), the
+tmp_queue_dir fixture and the read_escalations() helper live in
+_proc_supervision_doubles alongside FakeRunner and the canonical detached
+RP-4 plan, shared with the other proc_supervision test files. Mirrors the
+injected-inspector pattern in test_deterministic_runner.py (AsyncMock
+unit_inspector).
 """
 
 from __future__ import annotations
@@ -18,59 +19,14 @@ import shlex
 from pathlib import Path
 
 import pytest
-from _proc_supervision_doubles import FakeRunner, detached_rp4_plan
+from _proc_supervision_doubles import (
+    FakeRunner,
+    detached_rp4_plan,
+    make_fake_inspector,
+    read_escalations,
+    tmp_queue_dir,  # noqa: F401 — re-export: pytest fixture used by test methods
+)
 from escalation.queue import EscalationQueue
-
-
-def make_fake_inspector(state: dict):
-    """Build an async inspector callable: ``(unit, *, timeout_secs, reap_grace_secs=5.0) -> dict``.
-
-    Returns a shallow copy of *state* on every call regardless of args, and
-    records each call's kwargs on the returned callable's ``.calls`` list
-    (each entry: ``{'unit', 'timeout_secs', 'reap_grace_secs'}``) so tests can
-    assert the exact unit/timeout the RP-5 verify leg was invoked with.
-    """
-    calls: list[dict] = []
-
-    async def _inspector(unit: str, *, timeout_secs: float, reap_grace_secs: float = 5.0) -> dict:
-        calls.append({
-            'unit': unit,
-            'timeout_secs': timeout_secs,
-            'reap_grace_secs': reap_grace_secs,
-        })
-        return dict(state)
-
-    _inspector.calls = calls  # type: ignore[attr-defined]
-    return _inspector
-
-
-@pytest.fixture
-def tmp_queue_dir(tmp_path: Path) -> Path:
-    """A ``tmp_path`` subdirectory usable as an ``EscalationQueue`` queue_dir.
-
-    Not pre-created — ``EscalationQueue.__init__`` mkdir(parents=True,
-    exist_ok=True)'s it, matching production (the queue dir may not yet exist
-    when the first escalation is filed).
-    """
-    return tmp_path / 'escalations'
-
-
-def read_escalations(
-    queue_dir: str | Path,
-    task_id: str,
-    *,
-    status: str | None = None,
-    level: int | None = None,
-    agent_role: str | None = None,
-) -> list:
-    """Construct ``EscalationQueue(queue_dir)`` and return ``get_by_task(task_id, ...)``.
-
-    Product read path (PRD Sec 7): tests assert filed escalations through
-    this helper rather than inspecting on-disk JSON directly.
-    """
-    return EscalationQueue(Path(queue_dir)).get_by_task(
-        task_id, status=status, level=level, agent_role=agent_role,
-    )
 
 
 def _build_cross_unit_verify_plan(*, on_failure_escalation):
