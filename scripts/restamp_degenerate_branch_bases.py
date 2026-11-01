@@ -12,20 +12,25 @@ on every scheduler tick. The orchestrator now re-stamps on every move
 this script repairs the rows written before that.
 
 A PENDING task is eligible when its ``task/<id>`` branch exists, its tip
-differs from the recorded base, the tip is an ancestor of main (so
-``git rev-list --count main..<tip>`` is 0: no commit of its own), and main
-holds neither a merge marker for the branch nor a commit citing the task. The
-marker and citation lookups are the orchestrator's own
-(``GitOps.find_merge_marker``, ``GitOps.find_task_citation_commit`` with the
-project's ``git.commit_citation_pattern``), so this script and the gate cannot
-disagree about what counts as a landing. An eligible task gets
+differs from the recorded base, the tip is an ancestor of main
+(``git rev-list --count main..<tip>`` is 0, so every commit on the branch is
+also on main), and main holds neither a merge marker for the branch nor a
+commit citing the task. The last two rule out a branch whose commits on main
+ARE its own landed work. The marker and citation lookups are the
+orchestrator's own, in their checked form
+(``GitOps.find_merge_marker_checked``,
+``GitOps.find_task_citation_commit_checked`` with the project's
+``git.commit_citation_pattern``), so a git failure excludes the task as
+``git_error`` instead of reading as "no landing". An eligible task gets
 ``branch_base_sha = <tip>``.
 
 ``--check`` (the default) reports and never dials the MCP server. ``--apply``
-re-judges each eligible task immediately before writing, writes through the
-fused-memory MCP ``update_task`` tool ('merge' mode), classifies every reply
-with ``write_failure_reason`` and re-reads the task to confirm the stored
-value. Any failure makes the exit status non-zero.
+re-reads each eligible task through the MCP ``get_task`` tool immediately
+before writing, skips it unless it is still pending with the census's recorded
+base and still judges eligible at the same tip, writes through ``update_task``
+('merge' mode), classifies every reply with ``write_failure_reason`` and
+re-reads the task to confirm the stored value. Exit status: 0 success, 1 any
+write failure, 2 unreadable task store.
 
 Usage:
     uv run --frozen python scripts/restamp_degenerate_branch_bases.py --project-root ROOT [--check]
@@ -56,7 +61,7 @@ from migrate_metadata_modules_to_files import (
     write_failure_reason,
 )
 from orchestrator.config import load_config
-from orchestrator.git_ops import GitOps
+from orchestrator.git_ops import GitOps, GitQueryFailed
 
 CONFIG_FILENAME = 'dark-factory-orchestrator.yaml'
 
@@ -111,12 +116,15 @@ async def judge_branch(
         return verdict(Exclusion.GIT_ERROR)
     if not on_main:
         return verdict(Exclusion.COMMITS_BEYOND_MAIN)
-    if await git_ops.find_merge_marker(branch, gate_on_existing_ref=False):
-        return verdict(Exclusion.MERGE_MARKER)
-    if await git_ops.find_task_citation_commit(
-        str(task_id), pattern_template=git_ops.config.commit_citation_pattern,
-    ):
-        return verdict(Exclusion.CITATION)
+    try:
+        if await git_ops.find_merge_marker_checked(branch):
+            return verdict(Exclusion.MERGE_MARKER)
+        if await git_ops.find_task_citation_commit_checked(
+            str(task_id), pattern_template=git_ops.config.commit_citation_pattern,
+        ):
+            return verdict(Exclusion.CITATION)
+    except GitQueryFailed:
+        return verdict(Exclusion.GIT_ERROR)
     return verdict(None)
 
 
@@ -154,35 +162,55 @@ def render_report(project_root: Path, main_sha: str, verdicts: list[BranchVerdic
     return '\n'.join(lines)
 
 
-def _stored_base(reply: Any) -> str | None:
-    if not isinstance(reply, dict):
-        return None
-    raw = reply.get('metadata')
-    metadata = raw if isinstance(raw, dict) else decode_metadata(raw)
-    stored = metadata.get('branch_base_sha')
-    return stored if isinstance(stored, str) else None
+def _metadata_of(reply: Any) -> dict:
+    raw = reply.get('metadata') if isinstance(reply, dict) else None
+    return raw if isinstance(raw, dict) else decode_metadata(raw)
+
+
+async def _read_task(client: FusedMemoryClient, project_root: Path, task_id: int) -> dict | str:
+    """The task as the MCP server holds it now, or why it could not be read."""
+    reply = await call_tool_with_retry(
+        client, 'get_task', {'id': str(task_id), 'project_root': str(project_root)},
+    )
+    if (reason := write_failure_reason(reply)) is not None:
+        return reason
+    return reply
 
 
 async def restamp_one(
-    client: FusedMemoryClient, project_root: Path, verdict: BranchVerdict,
+    client: FusedMemoryClient, git_ops: GitOps, project_root: Path, prior: BranchVerdict,
 ) -> str | None:
-    """Write *verdict*'s tip as the task's base and confirm it; return why it failed, or None."""
-    task_id = str(verdict.task_id)
+    """Re-check *prior* against the live task, write its tip, confirm; return why not, or None.
+
+    A task that is no longer pending, whose recorded base moved, or that no
+    longer judges eligible at the census's tip is skipped (reported, not a
+    failure): something else has touched it since the census.
+    """
+    task = await _read_task(client, project_root, prior.task_id)
+    if isinstance(task, str):
+        return f'pre-write read failed: {task}'
+    metadata = _metadata_of(task)
+    if task.get('status') != 'pending' or metadata.get('branch_base_sha') != prior.recorded_base:
+        print(f'  skip {prior.task_id}: status or recorded base changed since the census')
+        return None
+    verdict = await judge_branch(git_ops, prior.task_id, metadata)
+    if verdict.tip != prior.tip or not verdict.eligible:
+        print(f'  skip {prior.task_id}: changed since the census ({verdict.exclusion})')
+        return None
     reply = await call_tool_with_retry(client, 'update_task', {
-        'id': task_id,
+        'id': str(prior.task_id),
         'project_root': str(project_root),
         'metadata': json.dumps({'branch_base_sha': verdict.tip}),
         'metadata_mode': 'merge',
     })
     if (reason := write_failure_reason(reply)) is not None:
         return reason
-    reread = await call_tool_with_retry(
-        client, 'get_task', {'id': task_id, 'project_root': str(project_root)},
-    )
-    if (reason := write_failure_reason(reread)) is not None:
-        return f're-read failed: {reason}'
-    if (stored := _stored_base(reread)) != verdict.tip:
+    reread = await _read_task(client, project_root, prior.task_id)
+    if isinstance(reread, str):
+        return f're-read failed: {reread}'
+    if (stored := _metadata_of(reread).get('branch_base_sha')) != verdict.tip:
         return f're-read shows branch_base_sha={stored!r}, expected {verdict.tip}'
+    print(f'  restamped {prior.task_id}: branch_base_sha={verdict.tip}')
     return None
 
 
@@ -190,22 +218,15 @@ async def apply_restamps(
     client: FusedMemoryClient,
     git_ops: GitOps,
     project_root: Path,
-    pending: Mapping[int, Mapping[str, Any]],
     eligible: Iterable[BranchVerdict],
 ) -> int:
-    """Re-judge and re-stamp each eligible task; return the number of failures."""
+    """Re-stamp each eligible task; return the number of failures."""
     failures = 0
     for prior in eligible:
-        verdict = await judge_branch(git_ops, prior.task_id, pending[prior.task_id])
-        if verdict.tip != prior.tip or not verdict.eligible:
-            print(f'  skip {prior.task_id}: changed since the census ({verdict.exclusion})')
-            continue
-        reason = await restamp_one(client, project_root, verdict)
-        if reason is None:
-            print(f'  restamped {verdict.task_id}: branch_base_sha={verdict.tip}')
-        else:
+        reason = await restamp_one(client, git_ops, project_root, prior)
+        if reason is not None:
             failures += 1
-            print(f'  FAILED {verdict.task_id}: {reason}', file=sys.stderr)
+            print(f'  FAILED {prior.task_id}: {reason}', file=sys.stderr)
     return failures
 
 
@@ -224,8 +245,7 @@ async def main_async(args: argparse.Namespace) -> int:
         return 0
     async with RestampClient(args.server_url) as client:
         failures = await apply_restamps(
-            client, git_ops, project_root, dict(pending),
-            [v for v in verdicts if v.eligible],
+            client, git_ops, project_root, [v for v in verdicts if v.eligible],
         )
     return 1 if failures else 0
 

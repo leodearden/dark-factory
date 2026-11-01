@@ -7,7 +7,9 @@ recorded base left at the creation point.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -16,7 +18,7 @@ import pytest
 import restamp_degenerate_branch_bases as restamp
 from committed_git_repo import committed_repo
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps
+from orchestrator.git_ops import GitOps, GitQueryFailed
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -137,23 +139,55 @@ def test_the_report_counts_every_reason_and_lists_the_eligible_ids(repo: Path, g
     assert 'eligible ids: 101' in report
 
 
-class FakeFusedMemory(restamp.RestampClient):
-    """Answers update_task with *update_reply* and get_task from what was written."""
+def test_an_uncompilable_citation_pattern_is_a_git_error_not_eligible(repo: Path):
+    creation_point = git(repo, 'rev-parse', 'HEAD')
+    git(repo, 'branch', 'task/101', commit_on(repo, 'other.txt', 'feat(900): unrelated'))
+    broken = GitOps(GitConfig(push_after_advance=False, commit_citation_pattern='('), repo)
 
-    def __init__(self, update_reply: dict | None = None):
+    verdict = judge(broken, 101, {'branch_base_sha': creation_point})
+
+    assert verdict.exclusion is restamp.Exclusion.GIT_ERROR
+
+
+def test_a_failed_marker_scan_is_a_git_error_not_eligible(
+    repo: Path, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+):
+    creation_point = git(repo, 'rev-parse', 'HEAD')
+    git(repo, 'branch', 'task/101', commit_on(repo, 'other.txt', 'feat(900): unrelated'))
+
+    async def unreadable(branch: str) -> str | None:
+        raise GitQueryFailed(f'scan for {branch} failed')
+
+    monkeypatch.setattr(git_ops, 'find_merge_marker_checked', unreadable)
+
+    verdict = judge(git_ops, 101, {'branch_base_sha': creation_point})
+
+    assert verdict.exclusion is restamp.Exclusion.GIT_ERROR
+
+
+class FakeFusedMemory(restamp.RestampClient):
+    """An in-memory task store behind the two tools the script calls."""
+
+    def __init__(self, tasks: dict[int, dict], *, update_reply: dict | None = None):
         super().__init__('http://unused')
+        self.tasks = tasks
         self.update_reply = update_reply
-        self.stored: dict[str, str] = {}
         self.calls: list[tuple[str, dict]] = []
+
+    async def __aenter__(self) -> FakeFusedMemory:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
 
     async def call_tool(self, name: str, arguments: dict, *, timeout: float | None = None) -> dict:
         self.calls.append((name, arguments))
+        task = self.tasks[int(arguments['id'])]
         if name == 'update_task':
             if self.update_reply is not None:
                 return self.update_reply
-            self.stored[arguments['id']] = arguments['metadata']
-            return {'id': int(arguments['id'])}
-        return {'id': int(arguments['id']), 'metadata': self.stored.get(arguments['id'], '{}')}
+            task['metadata'] = {**task['metadata'], **json.loads(arguments['metadata'])}
+        return {'id': int(arguments['id']), **task}
 
 
 def _moved_branch(repo: Path) -> tuple[str, str]:
@@ -163,29 +197,99 @@ def _moved_branch(repo: Path) -> tuple[str, str]:
     return creation_point, later_main
 
 
+def _apply(client: FakeFusedMemory, git_ops: GitOps, repo: Path, pending: dict) -> int:
+    verdicts = asyncio.run(restamp.census(git_ops, pending.items()))
+    eligible = [v for v in verdicts if v.eligible]
+    return asyncio.run(restamp.apply_restamps(client, git_ops, repo, eligible))
+
+
 def test_apply_writes_the_tip_in_merge_mode_and_confirms_it(repo: Path, git_ops: GitOps):
     creation_point, later_main = _moved_branch(repo)
-    pending = {101: {'branch_base_sha': creation_point}}
-    verdicts = asyncio.run(restamp.census(git_ops, pending.items()))
-    client = FakeFusedMemory()
+    client = FakeFusedMemory({101: {'status': 'pending', 'metadata': {'branch_base_sha': creation_point}}})
 
-    failures = asyncio.run(restamp.apply_restamps(client, git_ops, repo, pending, verdicts))
+    failures = _apply(client, git_ops, repo, {101: {'branch_base_sha': creation_point}})
 
     assert failures == 0
-    name, arguments = client.calls[0]
-    assert name == 'update_task'
-    assert arguments['id'] == '101' and arguments['metadata_mode'] == 'merge'
-    assert client.stored['101'] == f'{{"branch_base_sha": "{later_main}"}}'
-    assert client.calls[1][0] == 'get_task'
+    assert [name for name, _ in client.calls] == ['get_task', 'update_task', 'get_task']
+    update = client.calls[1][1]
+    assert update['id'] == '101' and update['metadata_mode'] == 'merge'
+    assert client.tasks[101]['metadata']['branch_base_sha'] == later_main
+
+
+@pytest.mark.parametrize(
+    'live',
+    [
+        {'status': 'in-progress', 'metadata': 'census'},
+        {'status': 'pending', 'metadata': 'moved'},
+    ],
+    ids=['no-longer-pending', 'base-changed'],
+)
+def test_apply_skips_a_task_touched_since_the_census(repo: Path, git_ops: GitOps, live: dict):
+    creation_point, _ = _moved_branch(repo)
+    live_base = creation_point if live['metadata'] == 'census' else 'f' * 40
+    client = FakeFusedMemory({101: {'status': live['status'], 'metadata': {'branch_base_sha': live_base}}})
+
+    failures = _apply(client, git_ops, repo, {101: {'branch_base_sha': creation_point}})
+
+    assert failures == 0
+    assert [name for name, _ in client.calls] == ['get_task']
 
 
 def test_apply_counts_an_empty_reply_as_a_failure(repo: Path, git_ops: GitOps):
     creation_point, _ = _moved_branch(repo)
-    pending = {101: {'branch_base_sha': creation_point}}
-    verdicts = asyncio.run(restamp.census(git_ops, pending.items()))
+    client = FakeFusedMemory(
+        {101: {'status': 'pending', 'metadata': {'branch_base_sha': creation_point}}},
+        update_reply={},
+    )
 
-    failures = asyncio.run(restamp.apply_restamps(
-        FakeFusedMemory(update_reply={}), git_ops, repo, pending, verdicts,
-    ))
+    assert _apply(client, git_ops, repo, {101: {'branch_base_sha': creation_point}}) == 1
 
-    assert failures == 1
+
+# ── main_async: the default never dials MCP; exit codes 0 / 1 / 2 ──────────
+
+
+@pytest.fixture
+def project(repo: Path, make_tasks_db) -> Path:
+    creation_point, _ = _moved_branch(repo)
+    (repo / '.taskmaster' / 'tasks').mkdir(parents=True)
+    make_tasks_db(
+        [{'id': 101, 'status': 'pending', 'metadata': {'branch_base_sha': creation_point}}],
+        directory=repo / '.taskmaster' / 'tasks',
+    )
+    (repo / restamp.CONFIG_FILENAME).write_text(f'project_root: {repo}\n')
+    return repo
+
+
+def _args(root: Path, *, apply: bool = False) -> argparse.Namespace:
+    return argparse.Namespace(
+        project_root=str(root), config=None, server_url='http://unused', check=not apply, apply=apply,
+    )
+
+
+def test_check_reports_without_dialling_mcp(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+):
+    def no_client(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail('--check must never construct an MCP client')
+
+    monkeypatch.setattr(restamp, 'RestampClient', no_client)
+
+    assert asyncio.run(restamp.main_async(_args(project))) == 0
+    assert 'eligible ids: 101' in capsys.readouterr().out
+
+
+def test_an_unreadable_task_store_exits_2(repo: Path):
+    (repo / restamp.CONFIG_FILENAME).write_text(f'project_root: {repo}\n')
+
+    assert asyncio.run(restamp.main_async(_args(repo))) == 2
+
+
+def test_a_failed_write_under_apply_exits_1(project: Path, monkeypatch: pytest.MonkeyPatch):
+    creation_point = git(project, 'rev-parse', 'HEAD~1')
+    refusing = FakeFusedMemory(
+        {101: {'status': 'pending', 'metadata': {'branch_base_sha': creation_point}}},
+        update_reply={'error': 'refused', 'error_type': 'Test'},
+    )
+    monkeypatch.setattr(restamp, 'RestampClient', lambda _url: refusing)
+
+    assert asyncio.run(restamp.main_async(_args(project, apply=True))) == 1
