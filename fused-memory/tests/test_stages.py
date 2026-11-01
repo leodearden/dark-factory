@@ -13,6 +13,7 @@ import pytest
 import pytest_asyncio
 from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_helpers import (
+    LoopFreedomProbe,
     as_async_run_git,
     assert_id_title_pairing,
     complete_paged_read,
@@ -18080,11 +18081,12 @@ class TestLiveWorkflowRenderIsNonBlocking:
     nothing else on the loop — health checks, heartbeats, MCP replies — could
     run at all.
 
-    The assertion is a TICKER: a coroutine incrementing a counter every 50 ms
-    runs concurrently with a render whose git probes each take real awaited
-    time. A non-blocking renderer lets the ticker keep ticking; a blocking one
-    pins it at ~0. This is what a `loop_lag`-style field could only report
-    after the fact.
+    The assertion is a loop-turn oracle: every stubbed git probe suspends on
+    fused-memory/tests/_fm_helpers.py::LoopFreedomProbe, which records whether
+    a marker queued on the test loop ran while that probe was suspended. A
+    renderer that ran its probes inline instead of awaiting them reads False.
+    It counts loop turns, never seconds, so host or GIL contention cannot red
+    it (task 5920 introduced the probe; task 5925 for this site).
     """
 
     _NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -18111,50 +18113,28 @@ class TestLiveWorkflowRenderIsNonBlocking:
 
     @pytest.mark.asyncio
     async def test_render_does_not_starve_the_event_loop(self, monkeypatch):
-        import asyncio
-
         from shared.git_async import GitResult
 
         import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services import live_workflow_detector as lwd
 
-        probe_delay = 0.02
+        probe = LoopFreedomProbe()
         n_tasks = 20
 
         async def slow_run_git(cmd, cwd=None, *, input_text=None, timeout=None):
-            await asyncio.sleep(probe_delay)
+            await probe.suspend()
             return GitResult(returncode=1, stdout='', stderr='')
 
         monkeypatch.setattr(lwd, 'run_git', slow_run_git)
         monkeypatch.setattr(lws_module, 'is_orchestrator_live_for', lambda _pr: False)
 
-        ticks = 0
-        stop = False
-
-        async def ticker():
-            nonlocal ticks
-            while not stop:
-                await asyncio.sleep(0.005)
-                ticks += 1
-
-        tick_task = asyncio.create_task(ticker())
-        try:
-            await lws_module.render_live_workflow_section(
-                tasks=[{'id': str(i), 'status': 'pending'} for i in range(n_tasks)],
-                project_root=ProjectRoot('/p'),
-                now=self._NOW,
-            )
-        finally:
-            stop = True
-            tick_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await tick_task
-
-        assert ticks > 5, (
-            f'the loop was starved during the render — only {ticks} ticks fired '
-            f'while {n_tasks} tasks were probed; a non-blocking renderer must '
-            f'let other coroutines run'
+        await lws_module.render_live_workflow_section(
+            tasks=[{'id': str(i), 'status': 'pending'} for i in range(n_tasks)],
+            project_root=ProjectRoot('/p'),
+            now=self._NOW,
         )
+
+        probe.assert_loop_stayed_free()
 
 
 # ---------------------------------------------------------------------------

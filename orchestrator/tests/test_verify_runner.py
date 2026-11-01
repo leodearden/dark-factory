@@ -5,6 +5,7 @@ import dataclasses
 import json
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, ClassVar
@@ -8846,7 +8847,7 @@ class TestRemoteRunnerPassSummaryArchival:
 # lower BEAT_INTERVAL_SECS, which is what re-creates the additive-delay cliff.
 # The discriminator survives any such widening, because the pre-4195 producer
 # delivers exactly ZERO beats for the whole hog.
-#: The three sizings below are all MULTIPLES of production's teardown bound,
+#: The four sizings below are all MULTIPLES of production's teardown bound,
 #: verify_runner.HEARTBEAT_STOP_JOIN_SECS, rather than independent literals:
 #: that constant is the single home of both the number and the argument for it
 #: (SPOT, docs/code-quality.md #11), and each relationship these comments claim
@@ -8859,25 +8860,50 @@ WEDGED_WRITER_PARK_SECS = 6 * HEARTBEAT_STOP_JOIN_SECS
 
 #: Budget for that test.  A regression to an unbounded join() must fail HERE as
 #: a timeout rather than wedging the suite; sized above the bound it is meant to
-#: observe and under WEDGED_WRITER_PARK_SECS, so it fires before the parked
-#: thread expires on its own.
+#: observe plus LOOP_ANSWER_CEILING_SECS, so a held loop fails as an assertion
+#: rather than as this timeout, and under WEDGED_WRITER_PARK_SECS, so it fires
+#: before the parked thread expires on its own.
 WEDGED_WRITER_TEST_TIMEOUT_SECS = 4 * HEARTBEAT_STOP_JOIN_SECS
 
 #: Join ceiling for the parked thread's own cleanup once released — a wedge
 #: detector, paid only if that thread is already stuck.
 HEARTBEAT_STOP_JOIN_CEILING_SECS = HEARTBEAT_STOP_JOIN_SECS
 
-#: Cadence of that test's loop-responsiveness ticker, and how many of its ticks
-#: must land inside the teardown join.  The discriminator is EXACT in the
-#: failing direction — a synchronous join lets precisely ZERO ticks run between
-#: stop() and the dispatch returning, since nothing else runs on a blocked loop
-#: — so any positive floor detects it and a low one cannot be flaky.  Two, in a
-#: window of HEARTBEAT_STOP_JOIN_SECS: even if every tick cost the ~0.85s worst
-#: single-gap scheduling delay measured at loadavg 113-178
-#: (the ROW_WATCHDOG banner of _verify_boundary_ceilings.py) rather than
-#: this cadence, that window still fits five.
-LOOP_TICK_SECS = 0.05
-LOOP_TICKS_REQUIRED_DURING_TEARDOWN = 2
+#: How long the wedged writer's join() waits for the event loop to answer a
+#: queued marker.  A CEILING, not a floor: a free loop answers within
+#: microseconds, so only a held loop ever reaches it.
+LOOP_ANSWER_CEILING_SECS = HEARTBEAT_STOP_JOIN_SECS
+
+
+class _WedgedHeartbeatWriter(threading.Thread):
+    """A heartbeat writer that ignores stop(); each join() samples once whether the loop answers."""
+
+    def __init__(self) -> None:
+        release = threading.Event()
+        super().__init__(target=release.wait, args=(WEDGED_WRITER_PARK_SECS,), daemon=True)
+        self._release_event = release
+        self._probe_loop = asyncio.get_running_loop()
+        self._probe_loop_thread = threading.get_ident()
+        self._loop_free_verdicts: list[bool] = []
+
+    @property
+    def loop_free_verdicts(self) -> tuple[bool, ...]:
+        return tuple(self._loop_free_verdicts)
+
+    def join(self, timeout: float | None = None) -> None:
+        self._loop_free_verdicts.append(self._loop_answers_while_joining())
+        super().join(timeout)
+
+    def release(self) -> None:
+        self._release_event.set()
+        super().join(HEARTBEAT_STOP_JOIN_CEILING_SECS)
+
+    def _loop_answers_while_joining(self) -> bool:
+        if threading.get_ident() == self._probe_loop_thread:
+            return False
+        loop_answered = threading.Event()
+        self._probe_loop.call_soon_threadsafe(loop_answered.set)
+        return loop_answered.wait(LOOP_ANSWER_CEILING_SECS)
 
 
 BEATS_REQUIRED = 5
@@ -9110,34 +9136,23 @@ class TestDefaultSshHeartbeatRun:
         freeze the orchestrator's shared loop — scheduler, agent dispatch, merge
         worker, uvicorn escalation server — for that whole bound, re-creating on
         the teardown side exactly the stall the beat was moved to a thread to
-        survive. The ticker counts loop iterations between ``stop()`` (the last
-        thing to run before the join) and the dispatch returning; a blocking
-        join admits exactly zero, because nothing else can run on a loop that is
-        blocked.
+        survive. The oracle rides the wedged writer's own join(): it records
+        whether the event loop answered a marker queued while that join was
+        pending, and False at once if the join runs on the loop's thread, which
+        cannot answer while it is the caller. That checks the loop ran during
+        the teardown, not a floor on work completed in a wall-clock window,
+        which reds under contention (the same fix as
+        orchestrator/tests/test_verify_ruff_config_boundary.py::TestProbeDoesNotBlockTheEventLoop,
+        task 4520 / esc-4520-6).
         """
         import os
         import sys
-        import threading
 
         from orchestrator.verify_cancel import HeartbeatHandle
         from orchestrator.verify_runner import _default_ssh_heartbeat_run
 
-        never_set = threading.Event()
-        parked = threading.Thread(
-            target=never_set.wait, args=(WEDGED_WRITER_PARK_SECS,), daemon=True
-        )
+        parked = _WedgedHeartbeatWriter()
         parked.start()
-
-        ticks = 0
-        ticks_at_stop: list[int] = []
-
-        async def ticker():
-            nonlocal ticks
-            while True:
-                await asyncio.sleep(LOOP_TICK_SECS)
-                ticks += 1
-
-        ticker_task = asyncio.create_task(ticker())
         write_fds: list[int] = []
 
         def wedged_start(write_fd, **kw):
@@ -9146,34 +9161,27 @@ class TestDefaultSshHeartbeatRun:
             # thread (verify_cancel.run_stdin_heartbeat) — saying so here is how
             # this test states the ownership contract it is standing in for.
             write_fds.append(write_fd)
-            return HeartbeatHandle(stop=lambda: ticks_at_stop.append(ticks), thread=parked)
+            return HeartbeatHandle(stop=lambda: None, thread=parked)
 
         try:
             rc, stdout, stderr = await _default_ssh_heartbeat_run(
                 [sys.executable, '-c', 'print("DONE")'],
-                heartbeat_interval=LOOP_TICK_SECS,
                 start_heartbeat=wedged_start,
             )
-            ticks_at_return = ticks
             still_parked = parked.is_alive()  # the call returned without waiting it out
         finally:
-            ticker_task.cancel()
-            await asyncio.gather(ticker_task, return_exceptions=True)
-            never_set.set()
-            parked.join(timeout=HEARTBEAT_STOP_JOIN_CEILING_SECS)
+            parked.release()
             for fd in write_fds:
                 os.close(fd)
 
         assert rc == 0
         assert 'DONE' in stdout
         assert still_parked
-
-        (stopped_at,) = ticks_at_stop
-        assert ticks_at_return - stopped_at >= LOOP_TICKS_REQUIRED_DURING_TEARDOWN, (
-            f'the loop ran {ticks_at_return - stopped_at} times while the dispatch waited out '
-            f'its {HEARTBEAT_STOP_JOIN_SECS}s join bound. Zero means the join is synchronous '
-            f'again and the shared event loop — scheduler, merge worker, escalation server — '
-            f'is frozen for that whole bound by every wedged writer.'
+        assert parked.loop_free_verdicts == (True,), (
+            f'teardown join verdicts {parked.loop_free_verdicts}: False means the join held '
+            f'the shared event loop — scheduler, merge worker, escalation server — for its '
+            f'{HEARTBEAT_STOP_JOIN_SECS}s bound on every wedged writer; a missing or extra '
+            f'verdict means the one-join-per-dispatch contract changed.'
         )
 
 
