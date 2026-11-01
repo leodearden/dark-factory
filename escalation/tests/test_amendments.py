@@ -14,6 +14,7 @@ of any cap leaves these tests meaningful.
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import sys
@@ -66,13 +67,14 @@ class TestAmendmentsModuleIsALeaf:
         """
         src_dir = Path(__file__).resolve().parent.parent / 'src'
         probe = (
+            'import json\n'
             'import sys\n'
             f'sys.path.insert(0, {str(src_dir)!r})\n'
             'import escalation\n'
             "before = {m for m in sys.modules if m.startswith('escalation')}\n"
             'import escalation.amendments\n'
             "after = {m for m in sys.modules if m.startswith('escalation')}\n"
-            "print(repr(sorted(after - before)))\n"
+            'print(json.dumps(sorted(after - before)))\n'
         )
         proc = subprocess.run(
             [sys.executable, '-c', probe],
@@ -86,7 +88,7 @@ class TestAmendmentsModuleIsALeaf:
             f'leaf-ness probe failed to run (rc={proc.returncode}).\n'
             f'stdout: {proc.stdout}\nstderr: {proc.stderr}'
         )
-        delta = eval(proc.stdout.strip())  # noqa: S307 — our own repr(sorted(...))
+        delta = json.loads(proc.stdout)
         expected = ['escalation.amendments', 'escalation.models']
         assert delta == expected, (
             'escalation.amendments must import nothing from the escalation package '
