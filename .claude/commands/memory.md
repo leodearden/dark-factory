@@ -193,14 +193,9 @@ To execute hints:
 
 ### Starting a session
 
-1. **Recall memory context:** run the queries in [Context Briefing](#context-briefing) below.
+1. **Recall memory context and the task tree:** run the queries in [Context Briefing](#context-briefing) below.
 
-2. **Check task tree:**
-   ```
-   get_tasks(project_root="/home/leo/src/dark-factory")
-   ```
-
-3. **If working on a specific task**, fetch it and execute its memory_hints:
+2. **If working on a specific task**, fetch it and execute its memory_hints:
    ```
    get_task(id="7", project_root="/home/leo/src/dark-factory")
    # Then execute any memory_hints queries and entity lookups
@@ -233,7 +228,7 @@ Reflect on the session and write separate memories for:
 
 ## Context Briefing
 
-To build a context briefing (at session start or before a complex task), run the queries below. They mirror the queries every dispatched agent's briefing fires; `shared/src/shared/briefing_queries.py` is the single home of their phrasing and of the measurements behind it, and where this section and that module disagree, the module wins.
+To build a context briefing (at session start or before a complex task), run the queries below. Items 1-2 mirror the queries every dispatched agent's briefing fires; `shared/src/shared/briefing_queries.py` is the single home of their phrasing and of the measurements behind it, and where this section and that module disagree, the module wins. Items 3-4 are extra reads for an interactive session that the dispatched briefing does not make.
 
 1. **Conventions for your working area**: Mem0-scoped, phrased from the prose words of the paths you work in. For example, `fused-memory/src/fused_memory/reconciliation/stages/` gives `fused memory reconciliation stages`:
    ```
