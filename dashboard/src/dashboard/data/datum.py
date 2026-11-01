@@ -19,11 +19,13 @@ the clock says when the validator happens to run.
 from __future__ import annotations
 
 import enum
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
 
 T = TypeVar('T')
+U = TypeVar('U')
 
 
 @runtime_checkable
@@ -249,6 +251,15 @@ def validate_datum(datum: Datum, served_at: datetime) -> None:
                 f'freshness_bound_seconds={datum.freshness_bound_seconds!r}, '
                 f'as_of={datum.as_of!r}, served_at={served_at!r}',
             )
+
+
+def map_datum(datum: Datum[T], project: Callable[[T], U]) -> Datum[U]:
+    """*datum*'s provenance over ``project(value)``; an unknown datum stays unknown.
+
+    Pure: *project* never runs on an unknown datum, and no clock is read.
+    """
+    value = None if datum.value is None else project(datum.value)
+    return Datum(value, datum.as_of, datum.state, datum.reason, datum.freshness_bound_seconds)
 
 
 def aged_at(datum: Datum[T], served_at: datetime) -> Datum[T]:
