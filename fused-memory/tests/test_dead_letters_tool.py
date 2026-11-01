@@ -198,7 +198,8 @@ class TestGetDeadLettersEventQueue:
     async def test_event_queue_items_filtered_by_project_id(self, tmp_path):
         """Items from event_queue filtered by project_id; each has required fields."""
         dl = tmp_path / 'dl.jsonl'
-        buf = _make_failing_buf()
+        released = asyncio.Event()
+        buf = parked_buffer(released)
         eq = EventQueue(
             buf,
             dead_letter_path=dl,
@@ -218,6 +219,7 @@ class TestGetDeadLettersEventQueue:
             await asyncio.wait_for(eq._queue.join(), timeout=2.0)
             assert eq.stats()['dead_letters'] == 5
         finally:
+            released.set()
             await eq.close()
 
         svc = AsyncMock()
@@ -245,7 +247,8 @@ class TestGetDeadLettersEventQueue:
     async def test_event_queue_merges_with_durable_queue_without_project_id(self, tmp_path):
         """Without project_id, items from both sources appear in the result."""
         dl = tmp_path / 'dl2.jsonl'
-        buf = _make_failing_buf()
+        released = asyncio.Event()
+        buf = parked_buffer(released)
         eq = EventQueue(
             buf,
             dead_letter_path=dl,
@@ -262,6 +265,7 @@ class TestGetDeadLettersEventQueue:
                 eq.enqueue(_make_recon_event('proj-b'))
             await asyncio.wait_for(eq._queue.join(), timeout=2.0)
         finally:
+            released.set()
             await eq.close()
 
         svc = _make_mock_service(get_dead_items_return=_FAKE_DEAD_ITEMS)
@@ -752,7 +756,8 @@ class TestGetStatusToolDeadLetters:
     async def test_get_status_includes_event_queue_dead_letter_count(self, tmp_path):
         """event_queue dead-letters for a project are counted in dead_letters."""
         dl_path = tmp_path / 'dl.jsonl'
-        buf = _make_failing_buf()
+        released = asyncio.Event()
+        buf = parked_buffer(released)
         eq = EventQueue(
             buf,
             dead_letter_path=dl_path,
@@ -770,6 +775,7 @@ class TestGetStatusToolDeadLetters:
             await asyncio.wait_for(eq._queue.join(), timeout=2.0)
             assert eq.stats()['dead_letters'] == 5
         finally:
+            released.set()
             await eq.close()
 
         svc = _make_status_mock_service(queue_counts={'dead': 0})
@@ -792,7 +798,8 @@ class TestGetStatusToolDeadLetters:
     async def test_get_status_dead_letters_total_matches_get_dead_letters(self, tmp_path):
         """get_status dead_letters.total equals len(get_dead_letters.items) for same project."""
         dl_path = tmp_path / 'dl.jsonl'
-        buf = _make_failing_buf()
+        released = asyncio.Event()
+        buf = parked_buffer(released)
         eq = EventQueue(
             buf,
             dead_letter_path=dl_path,
@@ -807,6 +814,7 @@ class TestGetStatusToolDeadLetters:
                 eq.enqueue(_make_recon_event('proj-a'))
             await asyncio.wait_for(eq._queue.join(), timeout=2.0)
         finally:
+            released.set()
             await eq.close()
 
         # Service reports 2 durable dead for proj-a; get_dead_letters returns 2 items
