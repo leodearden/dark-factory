@@ -6,7 +6,7 @@ schema_version: 1
 signal_leaves: ["ζ"]
 tasks:
   - label: "α"
-    task_id: null
+    task_id: 8142
     title: "Cancel-disposition contract module + vocabulary"
     capabilities:
       - name: "contract-module-exists"
@@ -41,7 +41,7 @@ tasks:
           paths: ["escalation/src/escalation/models.py"]
           expect: present
   - label: "β"
-    task_id: null
+    task_id: 8143
     title: "Interceptor gate (observe mode), executor, get_cancel_children, late path"
     capabilities:
       - name: "gate-module-exists"
@@ -90,7 +90,7 @@ tasks:
           kind: manual
           reason: "liveness and mode behaviour are test properties, not greppable"
   - label: "γ"
-    task_id: null
+    task_id: 8144
     title: "Backstop sweep rewrite"
     capabilities:
       - name: "backstop-module-exists"
@@ -109,7 +109,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/"]
           expect: absent
   - label: "δ"
-    task_id: null
+    task_id: 8145
     title: "Abandon path: pre-flight, persistence, pass-through, loud re-file"
     capabilities:
       - name: "typed-cancel-children-rejection"
@@ -137,7 +137,7 @@ tasks:
           paths: ["orchestrator/src/", "escalation/src/"]
           expect: present
   - label: "ε"
-    task_id: null
+    task_id: 8146
     title: "Skill + prose sites + Stage 2 render"
     capabilities:
       - name: "skill-exists"
@@ -164,7 +164,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/reconciliation/prompts/"]
           expect: present
   - label: "ζ"
-    task_id: null
+    task_id: 8147
     title: "Integration gate + enforce flip"
     capabilities:
       - name: "end-to-end-and-production-observation"
@@ -174,7 +174,7 @@ tasks:
           kind: manual
           reason: "end-to-end behaviour and a production observation are judged by the gate task, not a grep"
   - label: "η"
-    task_id: null
+    task_id: 8148
     title: "Production observation + retire the cancel_children.enforce flag"
     note: "delayed milestone, 7 days after ζ is done"
     capabilities:
