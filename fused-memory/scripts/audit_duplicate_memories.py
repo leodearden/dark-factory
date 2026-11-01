@@ -198,6 +198,7 @@ from typing import Any
 
 from shared.cli_boundary import LoudArgumentParser, run_cli
 
+from fused_memory.canonical_marker import is_canonical
 from fused_memory.reconciliation.task_filter import (
     LIVE_TASK_STATUS_RE,
     POINT_IN_TIME_CHECK_RE,
@@ -1293,8 +1294,9 @@ def pick_survivor(group: list[dict]) -> tuple[dict, list[dict]]:
     """Pick the survivor from a near-duplicate memory group.
 
     Survivor selection (in order):
-      1. A member explicitly flagged canonical (``metadata.get('canonical')``
-         truthy) wins, regardless of age.
+      1. A member whose metadata claims canonical per
+         ``canonical_marker.py::is_canonical`` (bool ``True`` only; ``'true'``
+         or ``1`` is not a claim) wins, regardless of age.
       2. Otherwise, the oldest member by ``created_at`` (ISO string) wins.
          Records with a missing/unparseable ``created_at`` sort last (see
          ``_created_at_sort_key``) so they are never chosen as "oldest"
@@ -1310,7 +1312,7 @@ def pick_survivor(group: list[dict]) -> tuple[dict, list[dict]]:
         raise ValueError(f'pick_survivor requires a group of >= 2 memories, got {len(group)}')
 
     def _sort_key(m: dict) -> tuple[bool, int, float, str]:
-        canonical = bool((m.get('metadata') or {}).get('canonical'))
+        canonical = is_canonical(m.get('metadata'))
         bucket, ts = _created_at_sort_key(m.get('created_at'))
         # `not canonical` so canonical=True sorts first (False < True);
         # bucket/ts ascending so the oldest parseable timestamp sorts first;
