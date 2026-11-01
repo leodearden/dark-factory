@@ -978,7 +978,7 @@ class TestReconcileStrandedInProgress:
         assert not lock_path.exists()
 
     async def test_stale_plan_lock_but_live_db_claimant_left_alone(
-        self, harness: Harness, monkeypatch, caplog
+        self, harness: Harness, caplog
     ):
         """Task-2588 regression pin.
 
@@ -995,11 +995,8 @@ class TestReconcileStrandedInProgress:
         """
         harness.scheduler.get_statuses.return_value = ({'62': 'in-progress'}, None)  # type: ignore[attr-defined]
         # Dead-PID staging: plan.lock/owner_pid forensics alone would read
-        # "stale".  Patched on the RESOLVER's copy (task_ground_truth), the
-        # only one still consulted — `orchestrator.harness._pid_alive` is no
-        # longer called on this path, so patching it there pinned nothing
-        # (task 4028).
-        monkeypatch.setattr('orchestrator.task_ground_truth._pid_alive', lambda pid: False)
+        # "stale".  The owner pid below is dead by construction (2**31 - 1,
+        # beyond any real pid_max).
         # Staged where the resolver READS it (task 4028): "the db claimant
         # PRECEDES the stale plan.lock" only means something if the lock is
         # actually visible to the resolver that is supposed to skip it.
@@ -1011,7 +1008,7 @@ class TestReconcileStrandedInProgress:
         lock_path.write_text(json.dumps({
             'session_id': '62-dead0001',
             'locked_at': datetime.now(UTC).isoformat(),
-            'owner_pid': 99999,
+            'owner_pid': 2**31 - 1,
         }))
 
         # But the DB row carries a fresh claimant — the live cross-process
@@ -1426,18 +1423,15 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.set_task_status.assert_called_once_with(str(tid), 'pending')  # type: ignore[attr-defined]
 
     async def test_stale_lock_worktree_cleaned_when_not_recovered(
-        self, harness: Harness, monkeypatch
+        self, harness: Harness
     ):
         """In-progress task with stale plan.lock (dead PID), not in _recovered_plans
         → cleanup_worktree called (removing entire worktree dir), task reverted."""
         tid = 32
         harness.scheduler.get_statuses.return_value = ({str(tid): 'in-progress'}, None)  # type: ignore[attr-defined]
-        # Patched on the RESOLVER's copy (task_ground_truth), the only one
-        # still consulted — `orchestrator.harness._pid_alive` is no longer
-        # called on this path, so patching it there pinned nothing (task
-        # 4028).  Belt-and-braces here: the expired locked_at below already
-        # decides staleness on its own.
-        monkeypatch.setattr('orchestrator.task_ground_truth._pid_alive', lambda pid: False)
+        # The owner pid below is dead by construction (2**31 - 1, beyond any
+        # real pid_max).  Belt-and-braces here: the expired locked_at below
+        # already decides staleness on its own.
 
         # Create the worktree, plus a plan.lock referencing a synthetic dead
         # PID where the RESOLVER reads it (task 4028) — the expired
@@ -1451,7 +1445,7 @@ class TestReconcileStrandedInProgress:
         lock_path.write_text(json.dumps({
             'session_id': f'{tid}-dead',
             'locked_at': '2026-01-01T00:00:00+00:00',
-            'owner_pid': 99999,
+            'owner_pid': 2**31 - 1,
         }))
         # _recovered_plans is empty (default)
 
