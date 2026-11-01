@@ -220,6 +220,63 @@ class TestEndpointAuthEnvContract:
         assert all(not c.env_overrides for c in incumbents)
 
 
+_MIMO_BUNDLE_NAMES = ('mimo-v2.6-pro-endpoint', 'mimo-v2.6-flash-endpoint')
+
+
+class TestMimoEndpointEnvContract:
+    """The MiMo base URL and key are both operator env vars (task 7992's contract).
+
+    A Token Plan key answers only on its region's cluster, so the base URL is
+    not a literal; with no base URL the key is withheld, which the shadow
+    credential gate reads as no_credentials rather than a run that 401s.
+    """
+
+    def _mimo_bundles(self):
+        from orchestrator.evals.configs import claude_endpoint_candidates
+
+        by_name = {c.name: c for c in claude_endpoint_candidates()}
+        return [by_name[name] for name in _MIMO_BUNDLE_NAMES]
+
+    def test_a_set_base_url_and_key_flow_through_verbatim(self, monkeypatch):
+        base_url = 'https://token-plan-sgp.xiaomimimo.com/anthropic'
+        monkeypatch.setenv('MIMO_ANTHROPIC_BASE_URL', base_url)
+        monkeypatch.setenv('MIMO_API_KEY', 'tp-test')
+
+        for bundle in self._mimo_bundles():
+            assert bundle.backend == 'claude'
+            assert bundle.env_overrides['ANTHROPIC_BASE_URL'] == base_url
+            assert bundle.env_overrides['ANTHROPIC_AUTH_TOKEN'] == 'tp-test'
+
+    @pytest.mark.parametrize('base_url', [None, '   '], ids=['unset', 'whitespace'])
+    def test_a_blank_base_url_withholds_the_key(self, monkeypatch, base_url):
+        if base_url is None:
+            monkeypatch.delenv('MIMO_ANTHROPIC_BASE_URL', raising=False)
+        else:
+            monkeypatch.setenv('MIMO_ANTHROPIC_BASE_URL', base_url)
+        monkeypatch.setenv('MIMO_API_KEY', 'tp-test')
+
+        for bundle in self._mimo_bundles():
+            assert bundle.env_overrides['ANTHROPIC_AUTH_TOKEN'] == ''
+
+    def test_a_blank_base_url_logs_a_warning_naming_the_candidate(
+        self, monkeypatch, caplog,
+    ):
+        import logging
+
+        monkeypatch.delenv('MIMO_ANTHROPIC_BASE_URL', raising=False)
+        monkeypatch.setenv('MIMO_API_KEY', 'tp-test')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.configs'):
+            self._mimo_bundles()
+
+        warnings = [
+            record.getMessage() for record in caplog.records
+            if record.levelno == logging.WARNING
+        ]
+        for name in _MIMO_BUNDLE_NAMES:
+            assert any(name in message for message in warnings), warnings
+
+
 class TestClaudeEndpointPriceTable:
     """claude_endpoint_price_table(): default seeds + candidate-model prices,
     proven to resolve via λ's resolve_cost_usd (cost_source='price_table')."""
