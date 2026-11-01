@@ -32,6 +32,7 @@ from pathlib import Path
 
 import pytest
 from config_reload_script_fakes import (
+    TOOL_RAISED,
     TRANSPORT_FAULTS,
     ClosedPort,
     FakeEscalationMcp,
@@ -611,6 +612,41 @@ def test_a_converged_reload_that_never_reached_the_tool_fails_closed(tmp_path, s
 
     _assert_failed_closed_on_the_transport(proc)
     assert _verdict(proc)["commit"] == "already-at-8"
+    _assert_left_nothing_behind(config.parent, scratch)
+
+
+def test_a_reload_that_raised_after_a_landing_fails_closed_as_reload_raised(tmp_path, scratch):
+    """reload_config was reached and raised once the flip had landed: the
+    tool may have applied the flip before failing, so the verdict names the
+    raise and the landed sha, never a transport that did not deliver it."""
+    config = _make_repo(tmp_path, "16")
+    repo = config.parent
+    queue = FakeMergeQueue(repo)
+
+    with _target(queue, reload_report(config_path=str(config), applied=FLIP_TO_8),
+                 faults_armed=queue.has_landed, **TOOL_RAISED) as server:
+        proc = _run(server, config, "8")
+
+    assert _failure(proc) == "reload_raised"
+    assert not _converged_verdict_lines(proc)
+    landed_as = head(repo)
+    assert _verdict(proc)["commit"] == queue.merge_sha == landed_as
+    assert landed_as in proc.stderr, f"stderr={proc.stderr}"
+    assert "never reached the tool" not in proc.stderr, f"stderr={proc.stderr}"
+    _assert_left_nothing_behind(repo, scratch)
+
+
+def test_a_converged_reload_that_raised_fails_closed_as_reload_raised(tmp_path, scratch):
+    """A raised reload must never read as already_converged, even when there
+    was nothing to land."""
+    config = _make_repo(tmp_path, "8", marker=True)
+
+    with FakeEscalationMcp(reload_report(config_path=str(config)), **TOOL_RAISED) as server:
+        proc = _run(server, config, "8")
+
+    assert _failure(proc) == "reload_raised"
+    assert _verdict(proc)["commit"] == "already-at-8"
+    assert not _converged_verdict_lines(proc)
     _assert_left_nothing_behind(config.parent, scratch)
 
 

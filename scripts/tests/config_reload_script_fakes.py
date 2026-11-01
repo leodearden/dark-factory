@@ -272,9 +272,11 @@ TRANSPORT_FAULTS = {
     "initialize_assigns_no_session": {"initialize_reply": INITIALIZE_WITHOUT_A_SESSION},
     # The request reached the server but never a tool.
     "envelope_level_error": {"tool_call_reply": ENVELOPE_LEVEL_ERROR},
-    # FastMCP's shape for a raised ToolError: the tool ran and failed.
-    "tool_is_error": {"tool_call_reply": TOOL_IS_ERROR},
 }
+
+# FastMCP's shape for a raised ToolError: the request reached the tool, which
+# ran and failed, so unlike every TRANSPORT_FAULTS entry it may have acted.
+TOOL_RAISED = {"tool_call_reply": TOOL_IS_ERROR}
 
 
 class ClosedPort:
