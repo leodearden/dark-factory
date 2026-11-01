@@ -21,15 +21,17 @@ from __future__ import annotations
 
 import pytest
 
-# The 2026-09 endpoint slate as LITERALS (task 5384), deliberately not read
-# from the ``*_MODEL`` constants: a pin that reads what it protects guards
-# nothing (INV-10).
+# The endpoint slate as LITERALS, pinned by task 5384 and extended by task
+# 7991, deliberately not read from the ``*_MODEL`` constants: a pin that reads
+# what it protects guards nothing (INV-10).
 _SLATE_MODELS_BY_NAME = {
     'minimax-m3-endpoint': 'MiniMax-M3',
     'glm-5.3-endpoint': 'glm-5.3',
     'glm-5.3-flash-endpoint': 'glm-5.3-flash',
     'deepseek-v4-endpoint': 'deepseek-v4',
     'kimi-endpoint': 'kimi-latest',
+    'mimo-v2.6-pro-endpoint': 'mimo-v2.6-pro',
+    'mimo-v2.6-flash-endpoint': 'mimo-v2.6-flash',
 }
 # (model, input_per_1m, output_per_1m) list prices, USD per 1M tokens.
 _SLATE_LIST_PRICES = [
@@ -38,6 +40,8 @@ _SLATE_LIST_PRICES = [
     ('glm-5.3-flash', 0.15, 0.50),
     ('deepseek-v4', 0.28, 0.42),
     ('kimi-latest', 0.60, 2.50),
+    ('mimo-v2.6-pro', 0.435, 0.87),
+    ('mimo-v2.6-flash', 0.14, 0.28),
 ]
 
 
@@ -348,6 +352,8 @@ class TestCandidatePriceCostBasis:
         ('MiniMax-M3', 'metered', False),
         ('deepseek-v4', 'metered', False),
         ('kimi-latest', 'metered', False),
+        ('mimo-v2.6-pro', 'subscription', True),
+        ('mimo-v2.6-flash', 'subscription', True),
     ])
     def test_per_model_cost_basis_is_pinned(self, model, basis, imputed):
         from orchestrator.evals.configs import CANDIDATE_ENDPOINT_PRICES
@@ -368,16 +374,16 @@ class TestCandidatePriceCostBasis:
 
 
 class TestEndpointSlatePin:
-    """The 2026-09 endpoint slate, pinned by LITERAL ids and list prices.
+    """The endpoint slate, pinned by LITERAL ids and list prices.
 
     Every other test in this module reads the ``*_MODEL`` constants, so it
     stays green whatever those constants hold — a guard that reads the thing
     it protects (INV-10). This class restates the slate as literals so a
     stale or placeholder id, an unnoticed addition or removal, or a drifted
-    price fails loudly (task 5384).
+    price fails loudly (task 5384; extended by task 7991).
     """
 
-    def test_roster_is_exactly_the_incumbents_plus_the_2026_09_slate(self):
+    def test_roster_is_exactly_the_incumbents_plus_the_pinned_slate(self):
         from orchestrator.evals.configs import claude_endpoint_candidates
 
         by_name = {c.name: c for c in claude_endpoint_candidates()}
@@ -421,7 +427,8 @@ class TestEndpointSlatePin:
     def test_get_config_by_name_resolves_the_refreshed_bundles(self):
         from orchestrator.evals.configs import get_config_by_name
 
-        for name in ('minimax-m3-endpoint', 'glm-5.3-endpoint', 'glm-5.3-flash-endpoint'):
+        for name, model in _SLATE_MODELS_BY_NAME.items():
             cfg = get_config_by_name(name)
             assert cfg is not None
-            assert cfg.model == _SLATE_MODELS_BY_NAME[name]
+            assert cfg.model == model
+            assert cfg.backend == 'claude'
