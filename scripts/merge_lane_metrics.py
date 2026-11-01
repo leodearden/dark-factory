@@ -257,14 +257,15 @@ def resolve_cluster_paths(root: Path) -> Enumeration:
 # ---------------------------------------------------------------------------
 # Test-suite patch targets into lane internals.
 #
-# The measure is ``source_measures.patch_targets_in_tree`` over
-# ``LANE_PATCH_MODULES``, keeping the distinct leaves. It subsumes the retired
-# reachback guard's allowlist as a COUNT, which is what lets PRD task delta
-# delete the guard once the count reaches zero.
+# The measure is ``source_measures.patch_targets_in_tree`` over the package
+# plus the lane modules the caller passes, keeping the distinct leaves. It
+# subsumes the retired reachback guard's allowlist as a COUNT, which is what
+# lets PRD task delta delete the guard once the count reaches zero.
 
-#: Dotted module paths whose attributes count as lane internals when patched:
-#: the package, and through it every submodule (a leaf reads ``<sub>.<attr>``).
-LANE_PATCH_MODULES: tuple[str, ...] = ('orchestrator.merge_lane',)
+#: The package whose names count as lane internals when patched. A patched
+#: name's leaf is its dotted path below this package: ``<attr>`` on the package
+#: itself, ``<sub>.<attr>`` on a submodule.
+LANE_PACKAGE = 'orchestrator.merge_lane'
 
 
 # ---------------------------------------------------------------------------
@@ -322,26 +323,42 @@ def imports_lane_module_in_tree(tree: ast.Module) -> bool:
     return False
 
 
-def test_file_measures(source: str, *, path: str) -> dict[str, object] | None:
+def test_file_measures(
+    source: str, *, path: str, lane_modules: Collection[str]
+) -> dict[str, object] | None:
     """The two test-suite measures for *source*, or None when it is not
     lane-importing.
 
     Returning None rather than a zeroed dict makes the exclusion a property of
     the MEASURE rather than of the caller, so a non-lane-importing file can
     never be summed into the report by accident.
+
+    *lane_modules* names the submodules a patch receiver may be bound to; with
+    the package alone, ``from orchestrator.merge_lane import gates`` would
+    patch ``gates`` unseen.
     """
-    return test_file_measures_in_tree(source_measures.parse_source(source, path=path))
+    return test_file_measures_in_tree(
+        source_measures.parse_source(source, path=path), lane_modules
+    )
 
 
-def test_file_measures_in_tree(tree: ast.Module) -> dict[str, object] | None:
+def test_file_measures_in_tree(
+    tree: ast.Module, lane_modules: Collection[str]
+) -> dict[str, object] | None:
     """``test_file_measures`` over an already-parsed tree."""
     if not imports_lane_module_in_tree(tree):
         return None
-    lane_targets = source_measures.patch_targets_in_tree(tree, LANE_PATCH_MODULES)
+    lane_targets = source_measures.patch_targets_in_tree(
+        tree, {LANE_PACKAGE, *lane_modules}
+    )
     return {
-        'patch_targets': sorted({target.leaf for target in lane_targets}),
+        'patch_targets': sorted({_lane_leaf(target) for target in lane_targets}),
         'private_reads': source_measures.private_reads_in_tree(tree),
     }
+
+
+def _lane_leaf(target: source_measures.PatchTarget) -> str:
+    return f'{target.module}.{target.leaf}'.removeprefix(LANE_PACKAGE + '.')
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +469,9 @@ def sweep_repo(root: Path) -> RepoSweep:
     for relpath in test_tree:
         try:
             source = (root / relpath).read_text(encoding='utf-8')
-            measures = test_file_measures(source, path=relpath)
+            measures = test_file_measures(
+                source, path=relpath, lane_modules=(LANE_PACKAGE,)
+            )
         except (OSError, UnicodeDecodeError, source_measures.MetricsError):
             unreadable.append(relpath)
             continue
