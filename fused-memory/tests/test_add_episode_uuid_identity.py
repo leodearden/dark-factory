@@ -827,16 +827,16 @@ async def _live_episodic_count(graph_name: str, episode_uuid: str) -> tuple[int,
 
 
 def _live_config(base: FusedMemoryConfig) -> FusedMemoryConfig:
+    """Point *base* at the live FalkorDB with the real OpenAI key, as production config does."""
     config = base.model_copy(deep=True)
-    # mock_config's api_keys are the literal string 'test-key'. Clearing them
-    # makes the OpenAI clients fall back to the real OPENAI_API_KEY env var —
-    # the idiom test_recon_dedup_premise.py:130-133 established for the two
-    # tests in this suite that need real embeddings.
+    # Keyless, Graphiti substitutes graphiti_core's default clients (deprecated small
+    # model gpt-4.1-nano); see test_the_live_config_runs_graphiti_on_the_configured_clients.
+    api_key = os.environ['OPENAI_API_KEY']
     llm_provider = config.llm.providers.openai
     embedder_provider = config.embedder.providers.openai
     assert llm_provider is not None and embedder_provider is not None
-    llm_provider.api_key = None
-    embedder_provider.api_key = None
+    llm_provider.api_key = api_key
+    embedder_provider.api_key = api_key
     config.graphiti.falkordb.uri = f'redis://{FALKOR_HOST}:{FALKOR_PORT}'
     return config
 
