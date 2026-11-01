@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock
 import aiosqlite
 import pytest
 import pytest_asyncio
-from _dead_letter_helpers import hold_fifo, seed_dead_letters
+from _dead_letter_helpers import hold_fifo, parked_buffer, seed_dead_letters
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -1702,8 +1702,9 @@ async def test_replay_dead_letters_reenqueues_and_clears(real_buffer, tmp_path):
     them), clears them from the file, and a second call finds nothing to replay.
     """
     dl = tmp_path / 'dl.jsonl'
+    released = asyncio.Event()
     q = EventQueue(
-        real_buffer,
+        parked_buffer(released),
         dead_letter_path=dl,
         journal_path=tmp_path / 'ej.db',
         maxsize=100,
@@ -1726,6 +1727,7 @@ async def test_replay_dead_letters_reenqueues_and_clears(real_buffer, tmp_path):
         # Second call → nothing to replay (no re-replay).
         assert q.replay_dead_letters() == {'replayed': 0, 'failed': 0}
     finally:
+        released.set()
         await q.close()
 
 
@@ -1734,8 +1736,9 @@ async def test_replay_dead_letters_filters_by_project_id(real_buffer, tmp_path):
     """With project_id set, only matching records are replayed; non-matching
     records remain in the dead-letter file."""
     dl = tmp_path / 'dl.jsonl'
+    released = asyncio.Event()
     q = EventQueue(
-        real_buffer,
+        parked_buffer(released),
         dead_letter_path=dl,
         journal_path=tmp_path / 'ej.db',
         maxsize=100,
@@ -1757,6 +1760,7 @@ async def test_replay_dead_letters_filters_by_project_id(real_buffer, tmp_path):
         assert len(remaining) == 3
         assert all(r['event']['project_id'] == 'proj-b' for r in remaining)
     finally:
+        released.set()
         await q.close()
 
 
@@ -1765,8 +1769,9 @@ async def test_replay_dead_letters_preserves_unparseable(real_buffer, tmp_path):
     """A malformed/unparseable dead-letter line counts toward `failed` and is
     preserved (loud-over-silent — never silently dropped)."""
     dl = tmp_path / 'dl.jsonl'
+    released = asyncio.Event()
     q = EventQueue(
-        real_buffer,
+        parked_buffer(released),
         dead_letter_path=dl,
         journal_path=tmp_path / 'ej.db',
         maxsize=100,
@@ -1787,6 +1792,7 @@ async def test_replay_dead_letters_preserves_unparseable(real_buffer, tmp_path):
         assert dl.exists()
         assert '{not valid json' in dl.read_text()
     finally:
+        released.set()
         await q.close()
 
 
