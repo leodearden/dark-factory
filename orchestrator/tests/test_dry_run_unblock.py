@@ -3376,9 +3376,10 @@ class TestInvestigationIsConfined:
         assert kwargs['sandbox_modules'] is None
 
     @pytest.mark.asyncio
-    async def test_a_non_claude_backend_keeps_its_own_confinement(self, tmp_path):
+    @pytest.mark.parametrize('backend', ['codex', 'gemini', 'pi'])
+    async def test_only_the_claude_backend_is_confined_by_the_os_sandbox(self, tmp_path, backend):
         kwargs = await _capture_investigation_call(
-            tmp_path, _TaskDocScheduler(), config=_make_config(sandbox_enabled=True, backend='codex'),
+            tmp_path, _TaskDocScheduler(), config=_make_config(sandbox_enabled=True, backend=backend),
         )
 
         assert kwargs['sandbox_modules'] is None
@@ -3408,6 +3409,36 @@ class TestInvestigationIsConfined:
         assert entry['status'] == 'investigation_failed'
         assert entry['risk_label'] == 'human-review-required'
         assert 'unconfined' in entry['proposal_text']
+
+    @pytest.mark.asyncio
+    async def test_the_callers_sandbox_guard_decides_the_refusal(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        guarded: list[str] = []
+
+        def refusing_guard(role_name: str) -> str:
+            guarded.append(role_name)
+            raise sandbox_dispatch.SandboxUnavailable(
+                'no sandbox here', should_escalate=True, backend_state='landlock',
+            )
+
+        scheduler = _TaskDocScheduler()
+        mock_invoke = AsyncMock(return_value=_make_agent_result())
+        with patch('orchestrator.dry_run_unblock.invoke_agent', new=mock_invoke):
+            await run_dry_run_unblock(
+                task_id='42',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='All 5 attempts timed out',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(sandbox_enabled=True),
+                sandbox_guard=refusing_guard,
+            )
+
+        assert guarded == ['unblock_auto']
+        mock_invoke.assert_not_called()
+        assert _persisted_entry(scheduler)['status'] == 'investigation_failed'
 
 
 _FENCE = re.compile(r'^```(\w*)\n(.*?)^```', re.MULTILINE | re.DOTALL)

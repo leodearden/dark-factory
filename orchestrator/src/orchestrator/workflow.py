@@ -18110,6 +18110,7 @@ class TaskWorkflow:
                     usage_gate=self.usage_gate,
                     cost_store=self.cost_store,
                     block_class=block_class,
+                    sandbox_guard=self._guard_sandbox,
                 ),
                 name=investigation_task_name(self.task_id),
             )

@@ -1,7 +1,9 @@
 """Autonomous dry-run unblock — fire-and-forget investigation at block time.
 
 Invoked by workflow._mark_blocked when a task transitions to blocked.
-Runs the unblock-auto skill confined to writing its own config dir, then persists a proposal entry to
+Runs the unblock-auto skill (with config.sandbox.enabled and a claude backend,
+under the OS sandbox: writable only <worktree>/.task, plan.json included, and
+/tmp), then persists a proposal entry to
 metadata.dry_run_proposals[] via scheduler.update_task(metadata_mode='additive')
 (list-union — preserves prior entries) and trims the list to keep_last entries
 via a separate update_task(default merge — overwrites dry_run_proposals wholesale
@@ -16,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -311,15 +314,22 @@ _DISALLOWED_TOOLS: list[str] = [
     'Skill',
 ]
 
-def _investigation_sandbox_modules(config: Any) -> list[str] | None:
+def _investigation_sandbox_modules(
+    config: Any, sandbox_guard: Callable[[str], str] | None,
+) -> list[str] | None:
     """``[]`` confines a claude investigation to writing ``<worktree>/.task``, where its config dir lives; ``None`` leaves it unconfined.
 
-    Raises ``SandboxUnavailable`` when confinement is required and no OS
-    sandbox resolves, so the run is refused rather than launched unconfined.
+    *sandbox_guard* raises ``SandboxUnavailable`` when no OS sandbox resolves,
+    so the run is refused rather than launched unconfined; without one, the
+    refusal files no escalation.
     """
+    # gemini and pi stay unconfined: their CLIs' config-dir write sets are not mapped.
     if not (config.sandbox.enabled and config.unblock_auto.backend == 'claude'):
         return None
-    resolve_backend_or_refuse()
+    if sandbox_guard is None:
+        resolve_backend_or_refuse()
+    else:
+        sandbox_guard('unblock_auto')
     return []
 
 
@@ -543,6 +553,7 @@ async def run_dry_run_unblock(
     usage_gate: Any = None,
     cost_store: Any = None,
     block_class: BlockClass | None = None,
+    sandbox_guard: Callable[[str], str] | None = None,
 ) -> None:
     """Investigate a blocked task and write a proposal to metadata.
 
@@ -554,6 +565,10 @@ async def run_dry_run_unblock(
     explicitly (e.g. workflow._spawn_dry_run_unblock classifies `reason`
     up front); when omitted (None), it is derived via
     ``classify_block_reason(reason)`` as a defensive fallback.
+
+    *sandbox_guard* is the workflow's fail-closed sandbox check
+    (``workflow.py::TaskWorkflow._guard_sandbox``), so a refusal here files
+    the host's sandbox-outage escalation when it holds the escalate-once token.
     """
     import time
 
@@ -637,7 +652,7 @@ async def run_dry_run_unblock(
             )
             return
 
-        sandbox_modules = _investigation_sandbox_modules(config)
+        sandbox_modules = _investigation_sandbox_modules(config, sandbox_guard)
 
         # Per-investigation isolated CLAUDE_CONFIG_DIR, named distinctly from
         # the main task's `claude-config-{task_id}` dir so this background

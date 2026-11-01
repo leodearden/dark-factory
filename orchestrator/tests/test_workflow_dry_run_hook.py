@@ -202,6 +202,7 @@ class TestMarkBlockedSpawnsFireAndForget:
         assert 'worktree' in kwargs
         assert 'scheduler' in kwargs
         assert 'config' in kwargs
+        assert kwargs['sandbox_guard'] == wf._guard_sandbox
 
         # FakeScheduler captured the 'blocked' status write
         assert 'blocked' in scheduler.statuses.get('42', [])

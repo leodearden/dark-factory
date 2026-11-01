@@ -133,7 +133,7 @@ class AgentRole:
                 )
 
 
-# --- Tools offered to analysis roles: advisory under their bypassPermissions, where only disallowed_tools binds; Bash(git:*) is not read-only ---
+# --- Tools offered to analysis roles (advisory under bypassPermissions; not read-only) ---
 _ANALYSIS_TOOLS = ['Read', 'Glob', 'Grep', 'Bash(git:*)']
 
 # --- jCodeMunch tools for structured code retrieval ---
