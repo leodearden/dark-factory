@@ -269,6 +269,8 @@ class MergeAttempts:
     row set, so the chart's total always equals ``with_duration +
     without_duration`` — a headline can never count a subset of what the
     donut beside it counts (PRD dashboard-one-datum-one-path, sketch #9).
+    It is served as ONE Datum for the same reason: the donut and the latency
+    can never disagree on whether the window was read.
 
     Attributes:
         outcomes: Every attempt counted by outcome; an unrecorded outcome
@@ -293,12 +295,16 @@ class MergeAttempts:
         }
 
     def latency(self) -> dict:
-        """Centiles and mean over the timed attempts, and the timed/untimed split."""
+        """Centiles and mean over the timed attempts, and the timed/untimed split.
+
+        An untimed window has no centiles: they are None, never a 0 computed
+        over zero samples.
+        """
         with_duration = len(self.durations)
         without_duration = sum(self.outcomes.values()) - with_duration
         if not self.durations:
             return {
-                'p50': 0, 'p95': 0, 'p99': 0, 'mean_ms': 0.0,
+                'p50': None, 'p95': None, 'p99': None, 'mean_ms': None,
                 'with_duration': 0, 'without_duration': without_duration,
             }
         return {
@@ -316,19 +322,25 @@ async def merge_attempts(
     *,
     hours: int = 24,
     now: datetime | None = None,
-) -> MergeAttempts:
+) -> Datum[MergeAttempts]:
     """Read every merge_attempt in the window with ONE query.
 
     Args:
-        db: aiosqlite connection, or None (returns an empty record).
+        db: aiosqlite connection, or None (no runs.db is open for the project).
         hours: Look-back window in hours (default 24).
         now: Reference timestamp for the cutoff. When None, ``datetime.now(UTC)``
             is used. Pass an explicit value to share a timestamp with sibling calls.
-    """
-    if db is None:
-        return MergeAttempts()
 
-    async def _query(conn: aiosqlite.Connection) -> MergeAttempts:
+    Returns:
+        One ``Datum[MergeAttempts]``, FRESH at *now* when the window was read —
+        a readable empty window is an empty record. With no runs.db, or when
+        the read fails, the Datum is UNKNOWN with a reason saying which.
+    """
+    bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
+    if db is None:
+        return unknown_datum('no runs.db is open for this project', bound)
+
+    async def _query(conn: aiosqlite.Connection) -> Datum[MergeAttempts]:
         rows = await conn.execute_fetchall(
             "SELECT json_extract(data, '$.outcome') AS outcome, duration_ms "
             "FROM events "
@@ -340,9 +352,13 @@ async def merge_attempts(
             float(row['duration_ms']) for row in rows
             if row['duration_ms'] is not None and row['duration_ms'] > 0
         )
-        return MergeAttempts(outcomes=dict(outcomes), durations=tuple(durations))
+        record = MergeAttempts(outcomes=dict(outcomes), durations=tuple(durations))
+        return Datum(record, resolve_now(now), DatumState.FRESH, None, bound)
 
-    return await with_db(db, _query, MergeAttempts())
+    return await with_db(
+        db, _query,
+        unknown_datum('the merge_attempt events could not be read from runs.db', bound),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -792,9 +808,9 @@ async def build_per_project_merge_queue(
     the same ``hours`` window every other leg uses, and ``recent_total`` is
     how many that window holds (see :func:`recent_merges`).
 
-    ``depth_timeseries``, ``speculative`` and ``recent_total`` are Datums: a
-    leg that raises, or a project whose whole build fails, serves them UNKNOWN
-    with a reason rather than zeros that read as measured.
+    ``depth_timeseries``, ``attempts``, ``speculative`` and ``recent_total``
+    are Datums: a leg that raises, or a project whose whole build fails,
+    serves them UNKNOWN with a reason rather than zeros that read as measured.
 
     Args:
         project_dbs: List of ``(project_root_str, connection_or_None)`` tuples
@@ -803,10 +819,11 @@ async def build_per_project_merge_queue(
         now: Shared reference timestamp captured once per request.
 
     Returns:
-        Dict ``{pid: {depth_timeseries, outcomes, latency, recent, recent_total, speculative, train_events, train_throughput}}``,
+        Dict ``{pid: {depth_timeseries, attempts, recent, recent_total, speculative, train_events, train_throughput}}``,
         where ``depth_timeseries`` is a ``Datum[DepthSeries]`` whose series
-        carries its ``bucket_minutes``, ``speculative`` a ``Datum[dict]`` and
-        ``recent_total`` a ``Datum[int]``.
+        carries its ``bucket_minutes``, ``attempts`` a ``Datum[MergeAttempts]``
+        (the shaper projects its outcome chart and latency), ``speculative`` a
+        ``Datum[dict]`` and ``recent_total`` a ``Datum[int]``.
     """
     bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
 
@@ -826,7 +843,11 @@ async def build_per_project_merge_queue(
                 lambda cause: unknown_datum(f'{pid} merge depth could not be read: {cause}', bound),
                 f'{pid}/depth',
             )
-            attempts = safe_gather_result(attempts_r, MergeAttempts(), f'{pid}/attempts')
+            attempts = _leg_or_unread(
+                attempts_r,
+                lambda cause: unknown_datum(f'{pid} merge attempts could not be read: {cause}', bound),
+                f'{pid}/attempts',
+            )
             recent = _leg_or_unread(
                 recent_r,
                 lambda cause: {
@@ -846,8 +867,7 @@ async def build_per_project_merge_queue(
             train_throughput = safe_gather_result(throughput_r, dict(_TRAIN_THROUGHPUT_DEFAULT), f'{pid}/train_throughput')
             return pid, {
                 'depth_timeseries': depth,
-                'outcomes': attempts.outcome_chart(),
-                'latency': attempts.latency(),
+                'attempts': attempts,
                 'recent': recent['rows'],
                 'recent_total': recent['total'],
                 'speculative': spec,
@@ -865,8 +885,7 @@ async def build_per_project_merge_queue(
             )
             return pid, {
                 'depth_timeseries': unread,
-                'outcomes': MergeAttempts().outcome_chart(),
-                'latency': MergeAttempts().latency(),
+                'attempts': unread,
                 'recent': [],
                 'recent_total': unread,
                 'speculative': unread,
