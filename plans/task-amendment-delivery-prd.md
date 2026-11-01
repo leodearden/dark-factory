@@ -244,7 +244,7 @@ which was chosen** rather than picking one. Performing reverts is out of scope (
 3. **γ — the disposition gate**, at merge *submission* time: a done step that β let
    drop with `disposition: orphan` or `revert` must not land on main. γ refuses a
    branch that still carries an `orphan` commit (by sha or by patch-equivalent), or
-   that carries a `revert` commit none of whose paths was restored. Commits
+   that carries a `revert` commit none of whose paths was ever restored after it. Commits
    that no plan step owns are not refused (D14).
 4. **δ — write-boundary advisory + event** in fused-memory, so an amendment to a
    planned task says so at the moment it is written.
@@ -422,7 +422,7 @@ splitting rather than by sequencing, removing the block instead of inheriting it
 |---|---|---|---|---|
 | **α** | Task-text fingerprint gates plan-revalidation skip | `shared/`, `orchestrator/` | Amend a planned task's `description`; redispatch; the dispatch takes the **architect revalidation** path (event `plan_revalidated`) instead of emitting `phase_skipped{reason:'revalidation_skipped_no_overlap'}`, and the resulting briefing contains the amended text | — |
 | **β** | Done-step integrity + sanctioned descope on the revalidation path | `orchestrator/` | A revalidation that drops a done step **without** a recorded disposition is refused with a structured reason; one that records `disposition` proceeds and the plan retains `_rescoped_at`/`_rescoped_by`/`_rescoped_note` + the dropped `(step_id, commit)`; a plan with duplicate done-step SHAs is refused | **3651**, α |
-| **γ** | Disposition gate at submission: no `orphan`/`revert`-descoped commit lands (D14) | `orchestrator/` | Submitting a merge for a branch that still carries a commit recorded `disposition: orphan`, or a `revert` commit none of whose paths was restored, is refused **at `_submit_to_merge_queue`** (before enqueue), with the sha, step and disposition in the reason. A branch whose only unexplained commits are unowned (`amend:`, gate fixes) submits normally | β |
+| **γ** | Disposition gate at submission: no `orphan`/`revert`-descoped commit lands (D14) | `orchestrator/` | Submitting a merge for a branch that still carries a commit recorded `disposition: orphan`, or a `revert` commit none of whose paths was ever restored after it, is refused **at `_submit_to_merge_queue`** (before enqueue), with the sha, step and disposition in the reason. A branch whose only unexplained commits are unowned (`amend:`, gate fixes) submits normally | β |
 | **δ** | Write-boundary amendment advisory + event | `fused-memory/`, `shared/` | `update_task` changing `description`/`details` on a task whose `metadata.plan_text_fp` disagrees returns `amendment_advisory` in its result, and emits a structured `task_text_amended` event carrying the writer source | α |
 | **ε** | Curator combine: execution-time predicate matches selection | `fused-memory/` | A combine whose live target is `in-progress` (or holds a claimant) is refused and the candidate is filed as its own task; `data/combine_audit.jsonl` records the refusal | — |
 | **ζ** | One-off plan-fingerprint migration sweep | `scripts/` | Every live plan under `.worktrees/.task-meta/*/plan.json` carries `_task_text_fp`; plans whose text has moved carry the forcing sentinel; the script reports counts per class — **re-derived at run time, not hard-coded at 27** (G6 relaxation at decompose: 27 is an authoring-time measurement, so asserting it as a signal would bake in a stale number; retained only as a sanity band — cf. open question 3 and INV-3) | α |
@@ -576,8 +576,9 @@ CHECKED  := { e ∈ plan['_descoped_steps'] : e.disposition ∈ {orphan, revert}
 MATCHES(e) := { s ∈ RANGE : commits_match(e.commit, s) ∨ pid(s) = pid(e.commit) }
 LANDS(e) := MATCHES(e) ≠ ∅
 m(e)     := the last of MATCHES(e) in RANGE's --topo-order
-RESTORED(e) := for at least one path p that m(e) changed,
-               blob(branch_head, p) = blob(m(e)^, p)   -- absent = absent;
+RESTORED(e) := for at least one path p that m(e) changed, some commit c in
+               `git rev-list --ancestry-path m(e)..branch_head -- p` has
+               blob(c, p) = blob(m(e)^, p)            -- absent = absent;
                paths from `git diff-tree -r --no-commit-id --name-only
                --no-renames m(e)`, so both sides of a rename count
 γ PASSES iff for every e ∈ CHECKED:
@@ -595,8 +596,10 @@ Each rule, and why it has that shape:
   (3225/3507, §2.8) restores part of `a7e3bee902` by hand, with no `This reverts
   commit` line, and is no inverse patch. Its census JSON is back to the pre-X blob
   byte for byte (`b13bce0b51`), while the script, the test and the `.md` are not. So
-  RESTORED asks only that at least one of X's paths is back to its pre-X content.
-  That passes the precedent. It refuses a `revert` recorded with no file actually
+  RESTORED asks only that, at some commit after X, at least one of X's paths was
+  back to its pre-X content. It need not still be that way at head, because the
+  replacement step often goes on to edit the restored file (the TDD shape of 2971).
+  That passes the precedent. It refuses a `revert` recorded with no file ever
   restored, even when later kept work edited X's files. Whether the *right* subset
   was restored is the reviewer's judgement, made from the full diff.
 - **`ride-along`** says the commit does land, so γ never checks it. A commit that no
@@ -630,7 +633,8 @@ repeated fail-open must escalate. A rejection returns the offending
 D13's γ arm. **INV-8:** every probe uses the async git runner
 (`orchestrator/src/orchestrator/git_ops.py::_run`), never a blocking `subprocess.run`.
 `RANGE`, `PIDS` and the per-commit path lists are computed once and hoisted out of the
-per-entry body. The fan-out is bounded by |CHECKED| plus the branch's commit count.
+per-entry body. The fan-out is bounded by |CHECKED| × |paths of m| × the branch's
+commit count, with the per-path `rev-list` and `ls-tree` results hoisted.
 
 ### C7 — The δ advisory + event
 
@@ -683,8 +687,8 @@ measured 20.2% rate an operator needs a counter, not just a log line.
 | 8 | Recorded descope proceeds (2971 replay) | dropped step recorded with `disposition: orphan` + authority | accepted; plan retains `_rescoped_*` and `_descoped_steps` |
 | 9 | Phantom-done wipe proceeds (3143 replay) | 19 done steps dropped, all recorded, SHAs unresolvable | accepted — unresolvable is expected, not a failure |
 | 10 | Duplicate done SHAs refused | two done steps share a commit | refused (closes the sha-duplication hole) |
-| 11 | A descope that is not honoured is refused | (a) plan records `(step-1, X)` with `disposition: orphan`, and the branch carries X or a rebased patch-equivalent of it; (b) X recorded `disposition: revert`, present, and none of X's paths restored; (c) as (b), but a later kept step edits one of X's files without restoring it | `_submit_to_merge_queue` refuses **before** enqueue in both cases; the reason names X, step-1 and the disposition |
-| 12 | Honoured dispositions and unowned commits proceed | (a) the same record with X absent from the branch; (b) X recorded `disposition: revert`, present, followed by a partial hand revert restoring one of X's paths to its pre-X blob (the 3225/3507 replay: `a7e3bee902` / `934ce79426`); (c) X present but recorded `ride-along`; (d) unowned `amend:` commits and no `_descoped_steps`; (e) a branch rebased onto a main that carries a patch-equivalent of an orphaned X, X itself absent from `merge-base..head` | submission proceeds in all five |
+| 11 | A descope that is not honoured is refused | (a) plan records `(step-1, X)` with `disposition: orphan`, and the branch carries X or a rebased patch-equivalent of it; (b) X recorded `disposition: revert`, present, and none of X's paths restored; (c) as (b), but a later kept step edits one of X's files without restoring it | `_submit_to_merge_queue` refuses **before** enqueue in all three cases; the reason names X, step-1 and the disposition |
+| 12 | Honoured dispositions and unowned commits proceed | (a) the same record with X absent from the branch; (b) X recorded `disposition: revert`, present, followed by a partial hand revert restoring one of X's paths to its pre-X blob (the 3225/3507 replay: `a7e3bee902` / `934ce79426`); (c) X present but recorded `ride-along`; (d) unowned `amend:` commits and no `_descoped_steps`; (e) a branch rebased onto a main that carries a patch-equivalent of an orphaned X, X itself absent from `merge-base..head`; (f) X recorded `revert`, a commit restores path p to its pre-X blob, then a later kept step edits p again | submission proceeds in all six |
 | 13 | fused-memory advisory returned | `update_task(description=…)` on a task whose `metadata.plan_text_fp` disagrees | result carries `amendment_advisory`; `task_text_amended` event emitted |
 | 14 | δ does no filesystem/git I/O | advisory path exercised under load | no filesystem or git call on the fused-memory loop thread (INV-8; D10) |
 | 15 | Combine into `in-progress` refused (2951 replay) | live target `in-progress` at execution; snapshot said `pending` | combine aborts; candidate filed as its own task; refusal recorded in the combine audit |
