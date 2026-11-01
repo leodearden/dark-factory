@@ -13,6 +13,7 @@ always loses to an existing ``config.prices`` entry).
 
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from orchestrator.config import default_price_table
@@ -470,9 +471,10 @@ def get_config_by_name(name: str) -> EvalConfig | None:
     """Look up an eval config by name (implementer, architect, OR ν/ξ candidates).
 
     ν's ``claude_endpoint_candidates()`` and ξ's ``codex_pi_candidates()``
-    bundles are searched LAST since they are function calls (built fresh per
-    call) rather than a static list — cheap at CLI/driver lookup frequency,
-    and keeps this the single by-name resolver for every eval config family
+    bundles are searched LAST, and built only when no static config matched:
+    they are built fresh per call, and building a ν bundle logs a WARNING for
+    each missing credential or base URL, which a static lookup must not emit.
+    This stays the single by-name resolver for every eval config family
     (avoids a second, per-selector lookup path).
 
     ``JUDGE_EVAL_CONFIGS`` (ο) is DELIBERATELY absent from the search list —
@@ -486,12 +488,15 @@ def get_config_by_name(name: str) -> EvalConfig | None:
     ("Unknown config") — a graceful, no-silent-misbehavior failure — rather
     than mis-running. See ``JUDGE_EVAL_CONFIGS`` below and design decision 4.
     """
-    for cfg in [
-        *EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS,
-        *claude_endpoint_candidates(), *codex_pi_candidates(),
-    ]:
-        if cfg.name == name:
-            return cfg
+    families: tuple[Callable[[], list[EvalConfig]], ...] = (
+        lambda: [*EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS],
+        claude_endpoint_candidates,
+        codex_pi_candidates,
+    )
+    for build_family in families:
+        for cfg in build_family():
+            if cfg.name == name:
+                return cfg
     return None
 
 
@@ -727,6 +732,7 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
     its provider's AUTH_TOKEN env var fresh rather than caching a stale/empty
     value from import time.
     """
+    mimo_base_url = _mimo_base_url()
     return [
         *_cloud_implementer_incumbents(),
         _claude_endpoint_config(
@@ -751,11 +757,11 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
         ),
         _claude_endpoint_config(
             'mimo-v2.6-pro-endpoint', MIMO_PRO_MODEL,
-            base_url=_mimo_base_url(), auth_token_env=MIMO_AUTH_TOKEN_ENV,
+            base_url=mimo_base_url, auth_token_env=MIMO_AUTH_TOKEN_ENV,
         ),
         _claude_endpoint_config(
             'mimo-v2.6-flash-endpoint', MIMO_FLASH_MODEL,
-            base_url=_mimo_base_url(), auth_token_env=MIMO_AUTH_TOKEN_ENV,
+            base_url=mimo_base_url, auth_token_env=MIMO_AUTH_TOKEN_ENV,
         ),
     ]
 

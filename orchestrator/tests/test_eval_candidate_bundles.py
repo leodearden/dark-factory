@@ -258,13 +258,17 @@ class TestMimoEndpointEnvContract:
         for bundle in self._mimo_bundles():
             assert bundle.env_overrides['ANTHROPIC_AUTH_TOKEN'] == ''
 
-    def test_a_blank_base_url_logs_a_warning_naming_the_candidate(
-        self, monkeypatch, caplog,
+    @pytest.mark.parametrize('api_key', ['tp-test', None], ids=['key-set', 'key-unset'])
+    def test_a_blank_base_url_warning_blames_the_base_url_not_the_key(
+        self, monkeypatch, caplog, api_key,
     ):
         import logging
 
         monkeypatch.delenv('MIMO_ANTHROPIC_BASE_URL', raising=False)
-        monkeypatch.setenv('MIMO_API_KEY', 'tp-test')
+        if api_key is None:
+            monkeypatch.delenv('MIMO_API_KEY', raising=False)
+        else:
+            monkeypatch.setenv('MIMO_API_KEY', api_key)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.evals.configs'):
             self._mimo_bundles()
@@ -274,7 +278,24 @@ class TestMimoEndpointEnvContract:
             if record.levelno == logging.WARNING
         ]
         for name in _MIMO_BUNDLE_NAMES:
-            assert any(name in message for message in warnings), warnings
+            naming_this_bundle = [message for message in warnings if repr(name) in message]
+            assert naming_this_bundle, warnings
+            for message in naming_this_bundle:
+                assert 'no base URL' in message, message
+                assert 'MIMO_API_KEY' not in message, message
+
+    def test_resolving_a_static_config_builds_no_endpoint_bundle(self, monkeypatch, caplog):
+        import logging
+
+        from orchestrator.evals.configs import get_config_by_name
+
+        monkeypatch.delenv('MIMO_ANTHROPIC_BASE_URL', raising=False)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.configs'):
+            config = get_config_by_name('claude-opus-high')
+
+        assert config is not None and config.name == 'claude-opus-high'
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], caplog.text
 
 
 class TestClaudeEndpointPriceTable:
