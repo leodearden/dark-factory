@@ -10625,21 +10625,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._retire_item(item.request.request_id)
 
     async def _bench_from_verify(
-        self, entry_slot: InflightEntrySlot | None, lease: HostLease, exc: RunnerUnavailable,
+        self, entry_slot: InflightEntrySlot | None, exc: RunnerUnavailable,
     ) -> None:
-        """Bench *lease*'s host for *exc* and free its slot (task 7266).
+        """Bench the host of the entry in *entry_slot* for *exc* and free its
+        slot (task 7266).
 
         The verify benches its own host as a dropping or requeuing verify
-        vacates its own entry (task 4582).  The entry keeps its ``_inflight``
-        place for its in-order finalize; ``lease = None`` is what tells
-        finalize, the cascade and ``stop()`` the bench and release are done.
-        Recorded before the slot is freed, so it is never FREE untracked.
+        vacates its own entry (task 4582), and reads the lease from the entry
+        just as :meth:`_vacate_inflight_entry` does.  The entry keeps its
+        ``_inflight`` place for its in-order finalize; ``lease = None`` is what
+        tells finalize, the cascade and ``stop()`` the bench and release are
+        done.  Recorded before the slot is freed, so it is never FREE untracked.
         """
-        if entry_slot is None or entry_slot.entry is None or self._host_allocator is None:
+        entry = entry_slot.entry if entry_slot is not None else None
+        if entry is None or entry.lease is None or self._host_allocator is None:
             return
-        self.bench_unavailable_runner(lease.name, exc)
-        await self._host_allocator.quarantine_and_release(lease)
-        entry_slot.entry.lease = None
+        self.bench_unavailable_runner(entry.lease.name, exc)
+        await self._host_allocator.quarantine_and_release(entry.lease)
+        entry.lease = None
 
     # ── task 3204 sweep: two neighbouring candidates, deliberately REJECTED ──
     # Recorded here because this is where a future author would be tempted.
@@ -19866,7 +19869,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # time; that guard exists only for the routes this handler never
             # sees (external cancellation of the outer task).
             _ru_owned_by_handler = True
-            await self._bench_from_verify(entry_slot, lease, exc)
+            await self._bench_from_verify(entry_slot, exc)
             # task 3185 (PRD γ): on the CHAIN arm, `merge_wt` is the chain's
             # pooled `_spec-` lane, which the `finally` below returns to the
             # pool.  Handing it out here would have _finalize_inflight's
