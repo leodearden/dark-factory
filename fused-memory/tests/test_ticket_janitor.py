@@ -37,7 +37,7 @@ from fused_memory.middleware.ticket_janitor import (
     TicketJanitor,
     curation_backlog_anchor,
 )
-from fused_memory.middleware.ticket_store import AWAITING_CURATION, TicketStore
+from fused_memory.middleware.ticket_store import TicketStatus, TicketStore
 
 
 @pytest_asyncio.fixture
@@ -1310,7 +1310,7 @@ class TestCurationDrain:
 
         assert requeue.calls == [(pid, oldest), (pid, middle)]
         assert [(await store.get(t))['status'] for t in (oldest, middle, newest)] == [
-            'pending', 'pending', AWAITING_CURATION,
+            'pending', 'pending', TicketStatus.AWAITING_CURATION,
         ]
 
     @pytest.mark.asyncio
@@ -1323,7 +1323,7 @@ class TestCurationDrain:
         await TicketJanitor(store, known_projects={}, requeue_ticket=requeue).tick()
 
         assert requeue.calls == [(pid, due)]
-        assert (await store.get(not_due))['status'] == AWAITING_CURATION
+        assert (await store.get(not_due))['status'] == TicketStatus.AWAITING_CURATION
 
     @pytest.mark.asyncio
     async def test_a_raising_requeue_leaves_the_row_parked_and_the_tick_running(
@@ -1349,7 +1349,7 @@ class TestCurationDrain:
         await janitor.tick()
 
         assert handed_back == [survivor]
-        assert (await store.get(doomed))['status'] == AWAITING_CURATION
+        assert (await store.get(doomed))['status'] == TicketStatus.AWAITING_CURATION
         assert probed == [pid]
 
     @pytest.mark.asyncio
@@ -1387,7 +1387,7 @@ class TestCurationDrain:
         assert sorted(signalled) == sorted([never_deferred, deferred_in_flight])
         failed, reparked = await store.get(never_deferred), await store.get(deferred_in_flight)
         assert (failed['status'], failed['reason']) == ('failed', 'worker_dead')
-        assert (reparked['status'], reparked['attempts']) == (AWAITING_CURATION, 1)
+        assert (reparked['status'], reparked['attempts']) == (TicketStatus.AWAITING_CURATION, 1)
 
 
 # scripts/sitting/inventory.py::ESC_ID_RE
@@ -1437,7 +1437,7 @@ class TestCurationBacklogEscalation:
             'max_attempts': 2,
         }
         assert {t['ticket_id'] for t in detail['tickets']} == {
-            r['ticket_id'] for r in await store.list_tickets(pid, status=AWAITING_CURATION)
+            r['ticket_id'] for r in await store.list_tickets(pid, status=TicketStatus.AWAITING_CURATION)
         }
 
     @pytest.mark.asyncio

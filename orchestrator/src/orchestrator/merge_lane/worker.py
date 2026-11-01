@@ -8976,6 +8976,26 @@ class SpeculativeMergeWorker:
         await self._vacate_inflight_entry(entry_slot, InflightStatus.DROPPED)
         self._retire_item(item.request.request_id)
 
+    async def _bench_from_verify(
+        self, entry_slot: InflightEntrySlot | None, exc: RunnerUnavailable,
+    ) -> None:
+        """Bench the host of the entry in *entry_slot* for *exc* and free its
+        slot (task 7266).
+
+        The verify benches its own host as a dropping or requeuing verify
+        vacates its own entry (task 4582), and reads the lease from the entry
+        just as :meth:`_vacate_inflight_entry` does.  The entry keeps its
+        ``_inflight`` place for its in-order finalize; ``lease = None`` is what
+        tells finalize, the cascade and ``stop()`` the bench and release are
+        done.  Recorded before the slot is freed, so it is never FREE untracked.
+        """
+        entry = entry_slot.entry if entry_slot is not None else None
+        if entry is None or entry.lease is None or self._host_allocator is None:
+            return
+        self.bench_unavailable_runner(entry.lease.name, exc)
+        await self._host_allocator.quarantine_and_release(entry.lease)
+        entry.lease = None
+
     # ── task 3204 sweep: two neighbouring candidates, deliberately REJECTED ──
     # Recorded here because this is where a future author would be tempted.
     # The bar an extraction had to clear: (a) 3+ genuinely identical
@@ -17244,7 +17264,8 @@ class SpeculativeMergeWorker:
             ``None`` (default) is every existing caller and is byte-identical
             to pre-γ dispatch.
         entry_slot: This dispatch's own InflightEntry, which every requeue or
-            drop exit vacates (:meth:`_vacate_inflight_entry`, task 4582).
+            drop exit vacates (:meth:`_vacate_inflight_entry`, task 4582), and
+            the RunnerUnavailable exit benches (:meth:`_bench_from_verify`).
             ``None`` (default) leaves the lease to finalize.
         """
         req = item.request
@@ -17815,9 +17836,10 @@ class SpeculativeMergeWorker:
             # dispose of it there (task 3251), adjacent to the _remerge that
             # allocates its replacement.  The re-dispatch does NOT reuse this
             # worktree: _remerge mints a fresh _merge-<uuid> for the retry.
-            # Disposal is deferred rather than done here so it cannot delay
-            # quarantine_and_release, which _finalize_inflight runs first to
-            # bench the dead remote before the re-dispatch.
+            # The dead remote is benched and its slot freed HERE, at bench
+            # time (_bench_from_verify, task 7266), not at the entry's
+            # in-order finalize, so a dead lease never holds a slot BUSY
+            # while the head verifies.
             logger.warning(
                 'Task %s: remote runner unavailable (merge=%s) on host %s — '
                 'will re-dispatch on another host: %s',
@@ -17837,13 +17859,14 @@ class SpeculativeMergeWorker:
             # vr.spec_warm False on every RU result regardless of how merge_wt
             # was acquired.
             #
-            # task 3043: this handler OWNS the failure — the RUNNER_UNAVAILABLE
-            # sentinel it returns is what drives _finalize_inflight's
-            # _quarantine_unreachable_host call.  Flag it so the orphan guard in
+            # task 3043: this handler OWNS the failure — it benches the host
+            # through _bench_from_verify below (finalize's RU branch is the
+            # fallback for a slot-less entry).  Flag it so the orphan guard in
             # the `finally` below does not record the SAME failure a second
             # time; that guard exists only for the routes this handler never
             # sees (external cancellation of the outer task).
             _ru_owned_by_handler = True
+            await self._bench_from_verify(entry_slot, exc)
             # task 3185 (PRD γ): on the CHAIN arm, `merge_wt` is the chain's
             # pooled `_spec-` lane, which the `finally` below returns to the
             # pool.  Handing it out here would have _finalize_inflight's
@@ -19515,6 +19538,9 @@ class SpeculativeMergeWorker:
             if vr is not None and vr.status == InflightStatus.RUNNER_UNAVAILABLE:
                 _skip_release = True   # quarantine_and_release handles the lease
                 _n_failed_val = False  # not a chain failure
+                # The verify normally benched and freed already
+                # (_bench_from_verify, task 7266), leaving entry.lease None, so
+                # the two lease-guarded calls below are the slot-less fallback.
                 if entry.lease is not None and self._host_allocator is not None:
                     await self._host_allocator.quarantine_and_release(entry.lease)
                 # ── Unavailability tracker + alarm (tasks 1795, 3043) ──────

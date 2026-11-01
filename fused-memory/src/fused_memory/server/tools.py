@@ -9297,7 +9297,9 @@ def create_mcp_server(
         Callers should follow up with ``resolve_ticket`` to obtain the final
         task_id once the curator has decided (create / drop / combine).
         When the curator cannot judge it yet, the ticket parks as
-        ``awaiting_curation`` and is curated later.
+        ``awaiting_curation`` and is curated later. An open ``resolve_ticket``
+        answer means not decided yet: resolve the same ticket again and never
+        re-submit.
 
         ``planning_mode=True`` switches to a synchronous, curator-bypassing
         path for batched human decomposition (e.g., breaking a PRD into ~50
@@ -9686,32 +9688,31 @@ def create_mcp_server(
         project_root: str,
         timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
-        """Phase-2 of two-phase task creation: block until the curator worker decides.
+        """Phase-2 of two-phase task creation: answer a ticket, waiting while it is pending.
 
-        Returns ``{status, task_id?, reason?}`` once the ticket is terminal.
-        If the ticket is already terminal, returns immediately.
+        OPEN statuses — not decided yet. The answer carries ``ticket`` and
+        ``reason``, never ``task_id``, and the ticket is still being curated:
+        call ``resolve_ticket`` again with the SAME ticket and never re-submit.
+        - ``pending`` — queued or in curation. ``reason`` is ``wait_timeout``
+          (the wait expired), ``wait_interrupted`` (woken while still open,
+          e.g. a shutdown) or ``store_unavailable`` (the ticket store was
+          closing).
+        - ``awaiting_curation`` — the curator could not judge it yet, so it is
+          durably parked and retried automatically; ``reason`` says why.
 
-        Status values:
-        - ``created``  — a new task was created; ``task_id`` is the numeric id.
-        - ``combined`` — candidate was folded into an existing task; ``task_id``
-          is the target task's id.
-        - ``failed``   — an error occurred; ``reason`` describes it. Common
-          reasons: ``timeout``, ``server_restart``, ``expired``.
-        - ``awaiting_curation`` — NON-terminal: the curator could not judge the
-          submission yet (``reason`` says why), so it is durably parked and
-          retried automatically until it gets a verdict. NO ``task_id`` is
-          returned. It is neither a failure nor a creation: do NOT re-submit
-          and do NOT count it as created; call ``resolve_ticket`` again later.
-        - ``refused``  — a deterministic guard (cancelled-premise blocklist /
-          recon premise registry) rejected the candidate. **NO TASK WAS
-          CREATED and NO ``task_id`` is returned** — the key is absent, not
-          null, so a refusal can never be read as a creation. ``reason``
-          carries the refusal justification. This is terminal and a SUCCESS,
-          not an error: do NOT retry it (a retry re-hits the same
-          deterministic guard) and do NOT record any task id for it.
+        TERMINAL statuses — decided; an already-terminal ticket answers at once.
+        - ``created`` — a new task was created; ``task_id`` is its id.
+        - ``combined`` — folded into an existing task; ``task_id`` is that task's id.
+        - ``refused`` — a deterministic guard (cancelled-premise blocklist /
+          recon premise registry) rejected the candidate. NO task was created
+          and NO ``task_id`` key is present. A success, not an error: never
+          retry it and never record a task id for it.
+        - ``cancelled`` — withdrawn by ``cancel_ticket``; no ``task_id`` key.
+        - ``failed`` — no task was created; no ``task_id`` key; ``reason`` says
+          why (e.g. ``server_restart``, ``worker_dead``). With no ticket row to
+          read it is ``unknown_ticket`` or ``ticket_store not configured``.
 
-        Callers that receive ``status=failed, reason=timeout`` should either
-        retry or report an error.
+        The caller rule is ``skills/_shared/ticket-failure-handling.md``.
 
         Args:
             ticket: Ticket id returned by ``submit_task`` (must start with ``tkt_``)
@@ -9773,8 +9774,10 @@ def create_mcp_server(
         Args:
             project_root: Absolute path to project root.
             status: Optional status filter ('pending', 'awaiting_curation',
-                'created', 'failed', 'combined', 'refused', 'cancelled'). 'refused' means a deterministic guard
-                rejected the candidate and no task was created.
+                'created', 'failed', 'combined', 'refused', 'cancelled').
+                'pending' and 'awaiting_curation' are the open statuses: the
+                ticket is not decided yet. 'refused' means a deterministic
+                guard rejected the candidate and no task was created.
                 When None, all statuses are returned.
             since: Optional ISO-8601 timestamp; only tickets with
                 ``created_at >= since`` are returned. Default: now − 7 days.
