@@ -113,8 +113,15 @@ async def test_error_reply_is_absence_not_a_task_row(
 
 
 @pytest.mark.asyncio
-async def test_task_row_is_returned_with_metadata_normalised(tmp_path: Path) -> None:
-    session = _GetTaskReplySession(_text_only(WELL_FORMED_ROW))
+@pytest.mark.parametrize(
+    'envelope',
+    [_text_only, _structured_and_text],
+    ids=['text-only', 'structured-content'],
+)
+async def test_task_row_is_returned_with_metadata_normalised(
+    tmp_path: Path, envelope,
+) -> None:
+    session = _GetTaskReplySession(envelope(dict(WELL_FORMED_ROW)))
     scheduler = _scheduler(tmp_path, session)
 
     task = await scheduler.get_task('42')
