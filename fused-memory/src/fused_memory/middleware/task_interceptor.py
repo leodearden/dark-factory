@@ -126,7 +126,7 @@ from fused_memory.middleware.task_creation_journal import (
     creation_operation_for,
 )
 from fused_memory.middleware.task_curator import TaskCurator, flatten_task_tree
-from fused_memory.middleware.ticket_store import AWAITING_CURATION
+from fused_memory.middleware.ticket_store import OPEN_TICKET_STATUSES, TicketStatus
 from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
@@ -452,7 +452,6 @@ class _TicketLifecycle:
     dispatched: bool = False
 
 
-_CANCELLABLE_STATUSES: tuple[str, ...] = ('pending', AWAITING_CURATION)
 
 
 def _format_ticket_result(row: dict) -> dict:
@@ -4248,7 +4247,7 @@ class TaskInterceptor:
                 existing_id = str(exc.existing_id) if exc.existing_id is not None else None
                 await self._journal_creation_outcome(
                     project_root=project_root,
-                    status='combined',
+                    status=TicketStatus.COMBINED,
                     task_id=existing_id,
                     attribution=attribution,
                     ticket_id=None,
@@ -4277,7 +4276,7 @@ class TaskInterceptor:
         await self._journal(event)
         await self._journal_creation_outcome(
             project_root=project_root,
-            status='created',
+            status=TicketStatus.CREATED,
             task_id=task_id_str,
             attribution=attribution,
             ticket_id=None,
@@ -4544,11 +4543,11 @@ class TaskInterceptor:
         row = await self._ticket_store.get(ticket_id)
         if row is None:
             return {'error': 'not_found', 'ticket_id': ticket_id}
-        if row['status'] not in _CANCELLABLE_STATUSES:
+        if row['status'] not in OPEN_TICKET_STATUSES:
             return {'status': row['status'], 'ticket_id': ticket_id, 'no_op': True}
         did_cancel = await self._ticket_store.mark_resolved(
-            ticket_id, status='cancelled', reason='user_cancelled',
-            from_statuses=_CANCELLABLE_STATUSES,
+            ticket_id, status=TicketStatus.CANCELLED, reason='user_cancelled',
+            from_statuses=tuple(OPEN_TICKET_STATUSES),
         )
         self._signal_ticket_event(ticket_id)
         if not did_cancel:
@@ -4565,7 +4564,7 @@ class TaskInterceptor:
             )
             return {'status': row['status'], 'ticket_id': ticket_id, 'no_op': True}
         logger.info('cancel_ticket: cancelled %s ticket %s', row['status'], ticket_id)
-        return {'status': 'cancelled', 'ticket_id': ticket_id}
+        return {'status': TicketStatus.CANCELLED, 'ticket_id': ticket_id}
 
     async def requeue_awaiting_curation_ticket(self, project_id: str, ticket_id: str) -> bool:
         """Hand a parked ticket back to *project_id*'s curator worker for another attempt.
@@ -4757,7 +4756,7 @@ class TaskInterceptor:
                             with contextlib.suppress(Exception):
                                 await self._ticket_store.mark_resolved(
                                     tid,
-                                    status='failed',
+                                    status=TicketStatus.FAILED,
                                     reason='curator_failed',
                                 )
                     # Signal so resolve_ticket callers are not blocked forever
@@ -4795,7 +4794,7 @@ class TaskInterceptor:
                 ticket_id,
             )
             return None
-        if row['status'] != 'pending':
+        if row['status'] != TicketStatus.PENDING:
             logger.warning(
                 '_prepare_ticket: ticket %s already terminal (%s), skipping',
                 ticket_id,
@@ -4812,7 +4811,7 @@ class TaskInterceptor:
             )
             await self._ticket_store.mark_resolved(
                 ticket_id,
-                status='failed',
+                status=TicketStatus.FAILED,
                 reason='bad_candidate_json',
             )
             self._signal_ticket_event(ticket_id)
@@ -4876,7 +4875,7 @@ class TaskInterceptor:
         """Execute the refuse/defer/drop/combine/create dispatch for one curator decision.
 
         Returns (status, task_id, reason, result_dict, curator_degrade_reason).
-        A ``defer`` returns status ``AWAITING_CURATION`` and creates nothing.
+        A ``defer`` returns ``TicketStatus.AWAITING_CURATION`` and creates nothing.
         Does NOT persist, signal, journal, or commit — the caller does, via
         :meth:`_persist_worker_outcome`.
 
@@ -4913,7 +4912,7 @@ class TaskInterceptor:
                 'justification': decision.justification,
             }
             return (
-                'refused',
+                TicketStatus.REFUSED,
                 None,
                 f'refused (no task created): {decision.justification}',
                 result_dict,
@@ -4922,7 +4921,7 @@ class TaskInterceptor:
 
         if decision is not None and decision.action == 'defer':
             logger.info('ticket %s: curation deferred, parking it: %s', ticket_id, decision.justification)
-            return (AWAITING_CURATION, None, decision.justification, None, None)
+            return (TicketStatus.AWAITING_CURATION, None, decision.justification, None, None)
 
         if decision is not None and decision.action == 'drop' and decision.target_id:
             # Drop: fold candidate into the existing target task (status='combined').
@@ -4935,7 +4934,7 @@ class TaskInterceptor:
                 'justification': decision.justification,
             }
             return (
-                'combined',
+                TicketStatus.COMBINED,
                 decision.target_id,
                 f'drop: {decision.justification}',
                 result_dict,
@@ -4978,7 +4977,7 @@ class TaskInterceptor:
                     'justification': decision.justification,
                 }
                 return (
-                    'combined',
+                    TicketStatus.COMBINED,
                     decision.target_id,
                     f'combine: {decision.justification}',
                     result_dict,
@@ -4993,7 +4992,7 @@ class TaskInterceptor:
             metadata = self._inject_deterministic_pure_gate(metadata)
 
         # ── Create task ───────────────────────────────────────────────
-        status: str = 'failed'
+        status: str = TicketStatus.FAILED
         task_id: str | None = None
         reason: str | None = None
         result_dict: dict | None = None
@@ -5047,7 +5046,7 @@ class TaskInterceptor:
                     'justification': 'candidate_key_collision',
                 }
                 return (
-                    'combined',
+                    TicketStatus.COMBINED,
                     existing_id,
                     'candidate_key_collision',
                     result_dict,
@@ -5063,7 +5062,7 @@ class TaskInterceptor:
             # task exists in tasks.json; marking the ticket 'failed' would
             # strand the task and cause duplicate-on-retry.
             task_id = task_id_str
-            status = 'created'
+            status = TicketStatus.CREATED
             reason = _create_reason(decision, curator_unavailable=curator_unavailable)
             result_dict = dict(result)
             if curator_degrade_reason is not None:
@@ -5233,7 +5232,7 @@ class TaskInterceptor:
         attribution: CreationAttribution,
     ) -> bool:
         """Persist what the dispatch decided: park a deferral, otherwise write the terminal."""
-        if status != AWAITING_CURATION:
+        if status != TicketStatus.AWAITING_CURATION:
             return await self._persist_worker_terminal(
                 ticket_id, status=status, task_id=task_id, reason=reason,
                 result_dict=result_dict, caller=caller, project_root=project_root,
@@ -5296,7 +5295,7 @@ class TaskInterceptor:
                 result_json=json.dumps(result_dict) if result_dict is not None else None,
             )
         )
-        if not resolved and status == 'created' and task_id is not None:
+        if not resolved and status == TicketStatus.CREATED and task_id is not None:
             logger.warning(
                 'orphan-race: ticket %s — '
                 'tm.add_task created task %s but ticket row was terminalized '
@@ -5389,7 +5388,7 @@ class TaskInterceptor:
                     existing_id = str(idempotency_hit.get('id', ''))
                     await self._persist_worker_terminal(
                         t.ticket_id,
-                        status='combined',
+                        status=TicketStatus.COMBINED,
                         task_id=existing_id or None,
                         reason='idempotency_hit',
                         result_dict=idempotency_hit,
@@ -5633,7 +5632,7 @@ class TaskInterceptor:
                             )
 
                     t = rec.ticket
-                    status = 'failed'
+                    status = TicketStatus.FAILED
                     task_id: str | None = None
                     reason: str | None = None
                     result_dict: dict | None = None
@@ -5663,7 +5662,7 @@ class TaskInterceptor:
                             '_process_add_tickets_batch_prepared: dispatch failed for ticket %s',
                             t.ticket_id,
                         )
-                        status = 'failed'
+                        status = TicketStatus.FAILED
                         reason = str(exc)
                         task_id = None
                         result_dict = None
@@ -5681,7 +5680,7 @@ class TaskInterceptor:
                     )
 
                     # Emit journal event and schedule commit (create path only).
-                    if status == 'created' and task_id:
+                    if status == TicketStatus.CREATED and task_id:
                         event = self._make_event(
                             EventType.task_created,
                             t.project_root,

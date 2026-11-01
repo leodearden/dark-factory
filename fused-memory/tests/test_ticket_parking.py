@@ -32,7 +32,7 @@ from fused_memory.middleware.curator_types import (
 )
 from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
-from fused_memory.middleware.ticket_store import AWAITING_CURATION, TicketStore
+from fused_memory.middleware.ticket_store import TicketStatus, TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
 PROJECT_ROOT = '/project'
@@ -321,7 +321,7 @@ class TestUncappedCurationUnchanged:
 CAPPED = CuratorDecision.deferred(DeferReason.ALL_ACCOUNTS_CAPPED)
 AUTH_FAILED = CuratorDecision.deferred(DeferReason.ACCOUNTS_AUTH_FAILED)
 PARKED_CAPPED_ANSWER = {
-    'status': AWAITING_CURATION, 'reason': 'curation-deferred: all-accounts-capped',
+    'status': TicketStatus.AWAITING_CURATION, 'reason': 'curation-deferred: all-accounts-capped',
 }
 
 
@@ -342,7 +342,7 @@ async def _parked_row(store: TicketStore, ticket_id: str) -> dict:
 
 def _parked(reason: DeferReason, *, attempts: int = 1) -> dict:
     return {
-        'status': AWAITING_CURATION, 'task_id': None, 'reason': f'curation-deferred: {reason}',
+        'status': TicketStatus.AWAITING_CURATION, 'task_id': None, 'reason': f'curation-deferred: {reason}',
         'result_json': None, 'resolved_at': None, 'attempts': attempts, 'defer_reason': reason.value,
     }
 
@@ -424,7 +424,7 @@ class TestParking:
         release.set()
         answers = [await _resolve(interceptor, ticket_id) for ticket_id in (sibling, duplicate)]
 
-        parked_answer = {'status': AWAITING_CURATION, 'reason': 'curation-deferred: accounts-auth-failed'}
+        parked_answer = {'status': TicketStatus.AWAITING_CURATION, 'reason': 'curation-deferred: accounts-auth-failed'}
         assert answers == [parked_answer, parked_answer]
         assert await _parked_row(store, duplicate) == _parked(DeferReason.ACCOUNTS_AUTH_FAILED)
         assert taskmaster.add_task_calls == []
@@ -515,7 +515,7 @@ class TestRequeue:
         assert (await _resolve(restarted, ticket_id))['status'] == 'combined'
 
 
-PARKED_LLM_FAILED_ANSWER = {'status': AWAITING_CURATION, 'reason': 'curation-deferred: llm-failed'}
+PARKED_LLM_FAILED_ANSWER = {'status': TicketStatus.AWAITING_CURATION, 'reason': 'curation-deferred: llm-failed'}
 
 
 class TestCuratorEscapeParks:
@@ -576,7 +576,7 @@ class TestCuratorEscapeParks:
         ticket_id = await _submit(interceptor, 'Work')
 
         assert await _resolve(interceptor, ticket_id) == {
-            'status': AWAITING_CURATION, 'reason': 'curation-deferred: curator-raised',
+            'status': TicketStatus.AWAITING_CURATION, 'reason': 'curation-deferred: curator-raised',
         }
         assert await _parked_row(store, ticket_id) == _parked(DeferReason.CURATOR_RAISED)
         assert taskmaster.add_task_calls == []

@@ -46,7 +46,7 @@ from fused_memory.middleware.curator_types import (
 from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_janitor import TicketJanitor, curation_backlog_anchor
-from fused_memory.middleware.ticket_store import AWAITING_CURATION, TicketStore
+from fused_memory.middleware.ticket_store import TicketStatus, TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.main import _build_ticket_janitor
 
@@ -240,7 +240,7 @@ async def _resolve(interceptor: TaskInterceptor, ticket_id: str) -> dict:
 
 
 def _parked_answer(reason: DeferReason = DeferReason.ALL_ACCOUNTS_CAPPED) -> dict:
-    return {'status': AWAITING_CURATION, 'reason': f'curation-deferred: {reason}'}
+    return {'status': TicketStatus.AWAITING_CURATION, 'reason': f'curation-deferred: {reason}'}
 
 
 async def _park(interceptor: TaskInterceptor, title: str, **kwargs: Any) -> str:
@@ -318,7 +318,7 @@ async def test_a_long_outage_never_creates(server):
     age = datetime.now(UTC) - datetime.fromisoformat(row['created_at'])
     assert age > 2 * OLD_TERMINAL_BOUND
     assert (row['status'], row['task_id'], row['resolved_at'], row['attempts']) == (
-        AWAITING_CURATION, None, None, ticks + 1,
+        TicketStatus.AWAITING_CURATION, None, None, ticks + 1,
     )
     assert curator.asked == ['Capped work'] * (ticks + 1)
     assert server.taskmaster.add_task_calls == []
@@ -330,7 +330,7 @@ async def test_parked_ticket_survives_restart_and_is_curated_after(server):
     first, first_janitor, first_store = await server.boot(config, _Curator(lambda title: CAPPED))
     ticket_id = await _park(first, 'Capped work')
     await _bounded(first_janitor.tick())
-    assert (await _row(first_store, ticket_id))['status'] == AWAITING_CURATION
+    assert (await _row(first_store, ticket_id))['status'] == TicketStatus.AWAITING_CURATION
     await _bounded(first.close())
 
     curator = _Curator(lambda title: CuratorDecision(action='create', justification='nothing like it'))
@@ -360,7 +360,7 @@ async def test_requeued_in_flight_ticket_is_reparked_on_restart_not_failed(serve
     curator = _Curator(lambda title: CuratorDecision(action='create', justification='nothing like it'))
     second, second_janitor, second_store = await server.boot(_config(), curator)
     row = await _row(second_store, ticket_id)
-    assert (row['status'], row['attempts'], row['next_attempt_at']) == (AWAITING_CURATION, 1, None)
+    assert (row['status'], row['attempts'], row['next_attempt_at']) == (TicketStatus.AWAITING_CURATION, 1, None)
     assert await _resolve(second, ticket_id) == _parked_answer()
 
     await _bounded(second_janitor.tick())
@@ -419,7 +419,7 @@ async def test_submitter_never_hangs_on_a_frozen_pool(server):
     assert answer == _parked_answer()
     row = await _row(store, ticket_id)
     assert (row['status'], row['attempts'], row['defer_reason']) == (
-        AWAITING_CURATION, 1, DeferReason.ALL_ACCOUNTS_CAPPED.value,
+        TicketStatus.AWAITING_CURATION, 1, DeferReason.ALL_ACCOUNTS_CAPPED.value,
     )
     assert server.taskmaster.add_task_calls == []
 

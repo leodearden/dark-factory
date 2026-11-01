@@ -31,10 +31,10 @@ class TestTicketStatusVocabulary:
         }
 
     def test_open_and_terminal_partition_the_statuses(self):
-        assert OPEN_TICKET_STATUSES == frozenset({TicketStatus.PENDING, TicketStatus.AWAITING_CURATION})
+        assert frozenset({TicketStatus.PENDING, TicketStatus.AWAITING_CURATION}) == OPEN_TICKET_STATUSES
         assert isinstance(OPEN_TICKET_STATUSES, frozenset)
         assert isinstance(TERMINAL_TICKET_STATUSES, frozenset)
-        assert TERMINAL_TICKET_STATUSES == frozenset(TicketStatus) - OPEN_TICKET_STATUSES
+        assert frozenset(TicketStatus) - OPEN_TICKET_STATUSES == TERMINAL_TICKET_STATUSES
         assert OPEN_TICKET_STATUSES.isdisjoint(TERMINAL_TICKET_STATUSES)
 
     def test_resolve_reason_values(self):
