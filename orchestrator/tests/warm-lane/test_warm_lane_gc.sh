@@ -20,7 +20,8 @@
 #       (wiring error) before argv is parsed (A9, task 5572 review); the same
 #       contract for the new sibling scripts/lib_lane_state.sh, with
 #       lib_live_refs.sh PRESENT so A9's guard cannot account for it
-#       (A10, task 3075); --max-record-age-days is validated and a
+#       (A10, task 3075), and for scripts/lib_lane_seed.sh with both earlier
+#       siblings present (A12, task 7859); --max-record-age-days is validated and a
 #       misconfiguration is FATAL, because EVERY wrong bound is invisible in
 #       the summary line: missing value, non-integer and negative all exit 2
 #       (A11a-A11d), and so do the two doors the `^[0-9]+$` first cut ACCEPTED
@@ -145,6 +146,12 @@
 #       on /proc/locks); T3 is a dangling base — bounded give-up, no seed, no
 #       lock-file litter, lane left cold; T4 is a gen whose lock cannot be
 #       opened, with an inherited FD 9 that must not stand in for it
+#   V — Pass 1 SKIPS a lane whose cache is unchanged since its last seed on the
+#       current base generation (task 7859): counted in the appended
+#       skipped_unchanged=, never in reset or preserved. Every doubt — a write
+#       since the seed, a moved generation, a missing or untrustworthy stamp,
+#       no target/ — resets as before; --disk-pressure and an assigned record
+#       both take precedence over the skip (README.md "Delta 14")
 #   X — the DEFAULT protect-glob is RENDERED from dark-factory's
 #       PROTECTED_PREFIXES via lib_lane_state.sh's lane_protect_glob, not
 #       hand-mirrored as a literal (task 3292). X-band pins the observable
@@ -653,6 +660,23 @@ assert "A10a: missing sibling lib_lane_state.sh exits 2 (wiring error, not runti
 # assertion data.
 assert "A10b: stderr names the missing library with the registered fragment" \
     bash -c 'printf "%s\n" "$1" | grep -qF "lib_lane_state.sh not found next to"' _ "$A10_ERR"
+
+# A12: the SAME contract for scripts/lib_lane_seed.sh (task 7859), A10's shape
+# one sibling further on: both earlier libs travel with the copy, so only the
+# new guard can account for an exit 2.
+A12_DIR="$(mktemp -d /tmp/test-gc-a12-XXXXXX)"
+_TMPDIRS+=("$A12_DIR")
+cp "$SCRIPT" "$A12_DIR/warm-lane-gc.sh"
+cp "$WARM_LANE_SCRIPTS_DIR/lib_live_refs.sh" "$A12_DIR/lib_live_refs.sh"
+cp "$WARM_LANE_SCRIPTS_DIR/lib_lane_state.sh" "$A12_DIR/lib_lane_state.sh"
+assert "A12: fixture — the copy HAS lib_live_refs.sh and lib_lane_state.sh and has NO lib_lane_seed.sh" \
+    bash -c '[ -f "$1/lib_live_refs.sh" ] && [ -f "$1/lib_lane_state.sh" ] && [ ! -e "$1/lib_lane_seed.sh" ]' _ "$A12_DIR"
+A12_RC=0
+A12_ERR="$(bash "$A12_DIR/warm-lane-gc.sh" --help 2>&1 >/dev/null)" || A12_RC=$?
+assert "A12a: missing sibling lib_lane_seed.sh exits 2 (wiring error, not runtime 1)" \
+    test "$A12_RC" -eq 2
+assert "A12b: stderr names the missing library with the registered fragment" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "lib_lane_seed.sh not found next to warm-lane-gc.sh"' _ "$A12_ERR"
 
 # A11: --max-record-age-days is validated, and a misconfiguration is FATAL
 # (task 5504). A bound is a safety valve, and both silent failure directions
@@ -3282,8 +3306,8 @@ assert "S-discard1: summary carries the appended reset_cold=1 sub-count" \
 # the substring greps above cannot see. reify puts reset_cold after
 # preserved_live_ref; here it is APPENDED after downgraded_assigned, so the prefix
 # every existing consumer matches is unchanged (README.md "Delta 13").
-assert "S-discard1: full summary line — prefix unchanged, reset_cold APPENDED after downgraded_assigned" \
-    bash -c 'printf "%s\n" "$1" | grep -qxE "reclaim: reset=1 removed=0 preserved=0 preserved_live_ref=0 preserved_assigned=0 downgraded_assigned=0 reset_cold=1"' _ "$OUT"
+assert "S-discard1: full summary line — prefix unchanged, reset_cold APPENDED after downgraded_assigned, skipped_unchanged after it" \
+    bash -c 'printf "%s\n" "$1" | grep -qxE "reclaim: reset=1 removed=0 preserved=0 preserved_live_ref=0 preserved_assigned=0 downgraded_assigned=0 reset_cold=1 skipped_unchanged=0"' _ "$OUT"
 
 # ── S-discard2: POSITIVE CONTROL — a CERTIFYING seed's clone is never discarded ─
 # Load-bearing, and specifically what pins the discard to the seed's EXIT STATUS
@@ -3754,6 +3778,259 @@ assert "T4c: a stderr line says gc cannot pin a base generation" \
     bash -c 'printf "%s\n" "$1" | grep -qF "cannot pin a base generation"' _ "$ERR_OUT"
 assert "T4d: the lane is reset cold (reset=1 removed=0 preserved=0, reset_cold=1)" \
     bash -c 'printf "%s\n" "$1" | grep -qE "reset=1 removed=0 preserved=0 .*reset_cold=1"' _ "$OUT"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Block V — skip a lane unchanged since its last seed on the current generation
+# (task 7859)
+#
+# Resetting a lane nothing has built in since its seed frees nothing and costs a
+# full α reseed. The project-owned seed stamp, <realpath lane>.seed-stamp.json
+# (reify scripts/verify-ledger.py::write_seed_stamp, plus reify task 9611's
+# base_gen), says when the lane was last seeded and from which gen; the mtimes of
+# a fixed set of directories under <lane>/target say whether anything was written
+# since. Only a lane for which every reading is trustworthy AND unchanged is
+# skipped; every doubt resets, which is today's behaviour. The probe set and its
+# blind spot: orchestrator/scripts/warm-lane/README.md "Delta 14".
+#
+# "Unchanged" is made deterministic with no sleep: every dir under target/ is aged
+# to V_AGED and the stamp says the seed exited at V_EXITED, 50s later, so anything
+# a case writes afterwards is newer than the seed's exit.
+# ──────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "--- Block V: skip a lane unchanged since its last seed on the current gen (task 7859) ---"
+
+V_ROOT="$(mktemp -d /tmp/test-gc-v-XXXXXX)"
+_TMPDIRS+=("$V_ROOT")
+V_NOW="$(date +%s)"
+V_AGED=$((V_NOW - 100))
+V_EXITED=$((V_NOW - 50))
+
+V_SEED_STUB="$V_ROOT/seed_stub.sh"
+_seed_stub_body > "$V_SEED_STUB"
+chmod +x "$V_SEED_STUB"
+
+# make_seed_stamp LANE BASE_GEN EXITED_AT — write LANE's stamp where reify's
+# seed_stamp_path puts it, in write_seed_stamp's one-line json.dumps shape plus
+# base_gen. A BASE_GEN of `-` omits the key. EXITED_AT is interpolated as a RAW
+# JSON value, so a case can pass `true` or a quoted string.
+make_seed_stamp() {
+    local lane="$1" base_gen="$2" exited_at="$3" real gen_field=''
+    real="$(readlink -f -- "$lane")"
+    if [ "$base_gen" != "-" ]; then
+        gen_field=", \"base_gen\": \"$base_gen\""
+    fi
+    printf '{"schema": "reify.lane-seed/1", "seed_id": "0123456789abcdef", "lane_dir": "%s", "mode": "fresh-checkout", "started_at": %s, "exited_at": %s%s}\n' \
+        "$real" "$((V_EXITED - 10))" "$exited_at" "$gen_field" > "$real.seed-stamp.json"
+}
+
+# make_seed_stamp_raw LANE TEXT — write arbitrary bytes as LANE's stamp.
+make_seed_stamp_raw() {
+    printf '%s' "$2" > "$(readlink -f -- "$1").seed-stamp.json"
+}
+
+# _make_v_lane ROOT — make_gc_fixture plus _lane-1, whose target/ carries the
+# probed cargo layout and a DIVERGENT_MARKER (the "target/ was left alone"
+# witness), with every directory under target/ aged to V_AGED.
+_make_v_lane() {
+    local root="$1" lane="$1/worktrees/_lane-1"
+    make_gc_fixture "$root"
+    git -C "$root/repo" worktree add -q "$lane"
+    mkdir -p "$lane/target/debug/deps" "$lane/target/debug/.fingerprint" \
+        "$lane/target/debug/build" "$lane/target/debug/incremental" "$lane/target/tmp"
+    touch "$lane/target/DIVERGENT_MARKER"
+    find "$lane/target" -type d -exec touch -d "@$V_AGED" {} +
+}
+
+# _current_gen ROOT — the exact string gc compares base_gen against.
+_current_gen() { readlink -f "$1/base/target"; }
+
+# _run_v ROOT [EXTRA-ARGS...] — reclaim ROOT's mount with the logging seed stub,
+# which logs to ROOT/seed_calls.log.
+_run_v() {
+    local root="$1"; shift
+    export SEED_LOG="$root/seed_calls.log"
+    run_helper reclaim \
+        --worktrees-dir "$root/worktrees" \
+        --base-target "$root/base/target" \
+        --seed-script "$V_SEED_STUB" "$@"
+}
+
+# _assert_v_reset LABEL ROOT — the outcome every case that must NOT skip shares.
+_assert_v_reset() {
+    local label="$1" root="$2"
+    assert "$label: exit 0" test "$RC" -eq 0
+    assert "$label: the seed WAS invoked for _lane-1" \
+        bash -c 'test -f "$1" && grep -q "_lane-1" "$1"' _ "$root/seed_calls.log"
+    assert "$label: summary counts the lane reset (reset=1 removed=0 preserved=0)" \
+        bash -c 'printf "%s\n" "$1" | grep -qE "reset=1 removed=0 preserved=0"' _ "$OUT"
+    assert "$label: summary shows skipped_unchanged=0" \
+        bash -c 'printf "%s\n" "$1" | grep -qE " skipped_unchanged=0( |$)"' _ "$OUT"
+}
+
+# ── V1: unchanged since a seed from the current gen ⇒ skipped, target/ intact ──
+V1_ROOT="$V_ROOT/v1"
+_make_v_lane "$V1_ROOT"
+make_seed_stamp "$V1_ROOT/worktrees/_lane-1" "$(_current_gen "$V1_ROOT")" "$V_EXITED"
+_run_v "$V1_ROOT"
+
+assert "V1a: exit 0" test "$RC" -eq 0
+assert "V1b: the seed was NOT invoked — an unchanged lane has nothing to reclaim" \
+    bash -c '[ ! -s "$1" ]' _ "$V1_ROOT/seed_calls.log"
+assert "V1c: target/ is untouched (divergent marker still present)" \
+    test -f "$V1_ROOT/worktrees/_lane-1/target/DIVERGENT_MARKER"
+assert "V1d: the lane is in neither reset nor preserved (reset=0 removed=0 preserved=0)" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "reset=0 removed=0 preserved=0"' _ "$OUT"
+assert "V1e: summary carries the appended skipped_unchanged=1" \
+    bash -c 'printf "%s\n" "$1" | grep -qE " skipped_unchanged=1( |$)"' _ "$OUT"
+assert "V1f: an [info] line names _lane-1 as skipped unchanged" \
+    bash -c 'printf "%s\n" "$1" | grep -F "[info]" | grep -F "skipping unchanged lane" | grep -qF "_lane-1"' _ "$ERR_OUT"
+
+# ── V2: anything written under a probed dir since the seed's exit ⇒ reset ─────
+# One arm per probed shape: a new artifact in deps/ (every compile — rustc
+# replaces its outputs), a new unit dir in .fingerprint/ (cargo check), a new file
+# directly under a profile-level dir (target/tmp, CARGO_TARGET_TMPDIR), and the
+# BOUNDARY: a mtime EXACTLY equal to exited_at resets, because only strictly older
+# proves the write preceded the seed's exit.
+for _v2_arm in deps-file fingerprint-dir tmp-file boundary; do
+    _v2_root="$V_ROOT/v2-$_v2_arm"
+    _v2_lane="$_v2_root/worktrees/_lane-1"
+    _make_v_lane "$_v2_root"
+    make_seed_stamp "$_v2_lane" "$(_current_gen "$_v2_root")" "$V_EXITED"
+    case "$_v2_arm" in
+        deps-file)       touch "$_v2_lane/target/debug/deps/libnew-0123.rlib" ;;
+        fingerprint-dir) mkdir "$_v2_lane/target/debug/.fingerprint/new-unit-0123" ;;
+        tmp-file)        touch "$_v2_lane/target/tmp/written-by-a-test" ;;
+        boundary)        touch -d "@$V_EXITED" "$_v2_lane/target/debug/deps" ;;
+    esac
+    _run_v "$_v2_root"
+    _assert_v_reset "V2 ($_v2_arm)" "$_v2_root"
+done
+
+# ── V3: the base generation moved since the seed ⇒ reset, from the NEW gen ────
+V3_ROOT="$V_ROOT/v3"
+_make_v_lane "$V3_ROOT"
+make_seed_stamp "$V3_ROOT/worktrees/_lane-1" "$(_current_gen "$V3_ROOT")" "$V_EXITED"
+mkdir "$V3_ROOT/base/target.gen.2"
+touch "$V3_ROOT/base/target.gen.2.lock"
+ln -sfn "$V3_ROOT/base/target.gen.2" "$V3_ROOT/base/target"
+_run_v "$V3_ROOT"
+
+_assert_v_reset "V3 (gen moved)" "$V3_ROOT"
+assert "V3: the seed received target.gen.2, the gen live now" \
+    bash -c 'grep -q "target\.gen\.2" "$1"' _ "$V3_ROOT/seed_calls.log"
+
+# ── V4: no stamp ⇒ exactly today's behaviour, and no skip-gate diagnostic ─────
+# The ordinary reading for every project that writes no stamp: the eight
+# non-reify units. (a) with a seed, the lane resets as in Block B. (b) their
+# production shape, `--mount` with no --seed-script and no sibling seed: the lane
+# is preserved by the seed-presence guard as in S-discard5c, neither skipped nor
+# failing the pass.
+V4A_ROOT="$V_ROOT/v4a"
+_make_v_lane "$V4A_ROOT"
+_run_v "$V4A_ROOT"
+
+_assert_v_reset "V4a (no stamp, seed present)" "$V4A_ROOT"
+assert "V4a: the seed thinned target/ (divergent marker removed), as in Block B" \
+    bash -c '[ ! -e "$1" ]' _ "$V4A_ROOT/worktrees/_lane-1/target/DIVERGENT_MARKER"
+assert "V4a: a missing stamp is quiet — no skip-gate line on stderr" \
+    bash -c '! printf "%s\n" "$1" | grep -qE "skipping unchanged lane|not skipped"' _ "$ERR_OUT"
+
+V4B_ROOT="$V_ROOT/v4b"
+_make_v_lane "$V4B_ROOT"
+assert "V4b: fixture — the sibling default seed-warm-lane.sh really is absent" \
+    bash -c '[ ! -e "$1" ]' _ "$WARM_LANE_SCRIPTS_DIR/seed-warm-lane.sh"
+REIFY_WARM_LANE_GC_SEED_SCRIPT='' run_helper reclaim --mount "$V4B_ROOT/worktrees"
+
+assert "V4b: exit 0" test "$RC" -eq 0
+assert "V4b: target/ is untouched (divergent marker still present)" \
+    test -f "$V4B_ROOT/worktrees/_lane-1/target/DIVERGENT_MARKER"
+assert "V4b: the lane is preserved with the 'seed-script error' warn" \
+    bash -c 'printf "%s\n" "$1" | grep -F "[warn]" | grep -qF "reset failed for _lane-1 (seed-script error)"' _ "$ERR_OUT"
+assert "V4b: summary line present, the lane preserved and not skipped (preserved=1, skipped_unchanged=0)" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "^reclaim: reset=0 removed=0 preserved=1 .* skipped_unchanged=0( |$)"' _ "$OUT"
+assert "V4b: a missing stamp is quiet — no skip-gate line on stderr" \
+    bash -c '! printf "%s\n" "$1" | grep -qE "skipping unchanged lane|not skipped"' _ "$ERR_OUT"
+
+# ── V5: an unreadable or untrustworthy stamp ⇒ reset ──────────────────────────
+# Each arm is otherwise a V1 skip, so the one named defect is the only thing that
+# can explain a reset. `symlink-spelled` matters most: a stamp naming base/target
+# rather than the concrete gen must NOT be normalised, or every such stamp would
+# read as current. It is spelled as realpath(base) + /target, so a realpath
+# normalisation would land exactly on the current gen and skip.
+for _v5_arm in truncated schema-v2 no-base-gen empty-base-gen symlink-spelled \
+               exited-at-string exited-at-bool exited-at-future; do
+    _v5_root="$V_ROOT/v5-$_v5_arm"
+    _v5_lane="$_v5_root/worktrees/_lane-1"
+    _make_v_lane "$_v5_root"
+    _v5_gen="$(_current_gen "$_v5_root")"
+    case "$_v5_arm" in
+        truncated)        make_seed_stamp_raw "$_v5_lane" '{"schema": "reify.lane-seed/1", "exited_at": 1' ;;
+        schema-v2)        make_seed_stamp_raw "$_v5_lane" "{\"schema\": \"reify.lane-seed/2\", \"exited_at\": $V_EXITED, \"base_gen\": \"$_v5_gen\"}" ;;
+        no-base-gen)      make_seed_stamp "$_v5_lane" - "$V_EXITED" ;;
+        empty-base-gen)   make_seed_stamp "$_v5_lane" "" "$V_EXITED" ;;
+        symlink-spelled)  make_seed_stamp "$_v5_lane" "$(readlink -f "$_v5_root/base")/target" "$V_EXITED" ;;
+        exited-at-string) make_seed_stamp "$_v5_lane" "$_v5_gen" "\"$V_EXITED\"" ;;
+        exited-at-bool)   make_seed_stamp "$_v5_lane" "$_v5_gen" true ;;
+        exited-at-future) make_seed_stamp "$_v5_lane" "$_v5_gen" "$((V_NOW + 3600))" ;;
+    esac
+    _run_v "$_v5_root"
+    _assert_v_reset "V5 ($_v5_arm)" "$_v5_root"
+done
+
+# ── V6: a valid stamp but no target/ ⇒ reset ──────────────────────────────────
+V6_ROOT="$V_ROOT/v6"
+_make_v_lane "$V6_ROOT"
+rm -rf "$V6_ROOT/worktrees/_lane-1/target"
+make_seed_stamp "$V6_ROOT/worktrees/_lane-1" "$(_current_gen "$V6_ROOT")" "$V_EXITED"
+_run_v "$V6_ROOT"
+
+_assert_v_reset "V6 (no target/)" "$V6_ROOT"
+
+# ── V7: --disk-pressure bypasses the skip — the emergency path is unchanged ───
+V7_ROOT="$V_ROOT/v7"
+_make_v_lane "$V7_ROOT"
+make_seed_stamp "$V7_ROOT/worktrees/_lane-1" "$(_current_gen "$V7_ROOT")" "$V_EXITED"
+_run_v "$V7_ROOT" --disk-pressure
+
+assert "V7: exit 0" test "$RC" -eq 0
+assert "V7: target/ is deleted outright — the emergency rm ran on an unchanged lane" \
+    bash -c '[ ! -e "$1" ]' _ "$V7_ROOT/worktrees/_lane-1/target"
+assert "V7: summary counts the lane reset, not skipped (reset=1, skipped_unchanged=0)" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "^reclaim: reset=1 removed=0 preserved=0 .* skipped_unchanged=0( |$)"' _ "$OUT"
+
+# ── V8: an assigned record is decided BEFORE the skip ─────────────────────────
+# The record gate keeps its authoritative preserved_assigned attribution; a lane
+# it preserves never reaches the skip.
+V8_ROOT="$V_ROOT/v8"
+_make_v_lane "$V8_ROOT"
+make_seed_stamp "$V8_ROOT/worktrees/_lane-1" "$(_current_gen "$V8_ROOT")" "$V_EXITED"
+make_lane_state "$V8_ROOT/worktrees" _lane-1 assigned 7859
+_run_v "$V8_ROOT"
+
+assert "V8: exit 0" test "$RC" -eq 0
+assert "V8: the record preserves the lane (preserved=1 preserved_live_ref=0 preserved_assigned=1)" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "reset=0 removed=0 preserved=1 preserved_live_ref=0 preserved_assigned=1"' _ "$OUT"
+assert "V8: ...and it is not also counted skipped (skipped_unchanged=0)" \
+    bash -c 'printf "%s\n" "$1" | grep -qE " skipped_unchanged=0( |$)"' _ "$OUT"
+
+# ── V9: a mount reached through a symlink still finds the realpath stamp ──────
+V9_ROOT="$V_ROOT/v9"
+_make_v_lane "$V9_ROOT"
+make_seed_stamp "$V9_ROOT/worktrees/_lane-1" "$(_current_gen "$V9_ROOT")" "$V_EXITED"
+ln -s "$V9_ROOT/worktrees" "$V9_ROOT/worktrees-link"
+export SEED_LOG="$V9_ROOT/seed_calls.log"
+run_helper reclaim \
+    --worktrees-dir "$V9_ROOT/worktrees-link" \
+    --base-target "$V9_ROOT/base/target" \
+    --seed-script "$V_SEED_STUB"
+
+assert "V9: exit 0" test "$RC" -eq 0
+assert "V9: the seed was NOT invoked" \
+    bash -c '[ ! -s "$1" ]' _ "$V9_ROOT/seed_calls.log"
+assert "V9: target/ is untouched (divergent marker still present)" \
+    test -f "$V9_ROOT/worktrees/_lane-1/target/DIVERGENT_MARKER"
+assert "V9: summary carries skipped_unchanged=1" \
+    bash -c 'printf "%s\n" "$1" | grep -qE " skipped_unchanged=1( |$)"' _ "$OUT"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Block X — the PROTECT_GLOB default is RENDERED from dark-factory's registry
