@@ -181,14 +181,15 @@ def by_design_reaper(metadata: Any) -> str | None:
 
     Read off the CITING record's metadata and never parsed from its content:
     the "CANONICAL (consolidates ...)" prose is LLM-authored. ``canonical`` is
-    tested with ``is True``, the vocabulary validator's own idiom, so a ``1``
-    or ``'true'`` never attributes. Status correction is checked first, so a
+    read through ``canonical_marker.py::is_canonical``, so a ``1`` or
+    ``'true'`` never attributes. Status correction is checked first, so a
     record carrying both signatures gets the more specific writer.
 
     One residual (PRD D11): a reaper-written edge whose target vanished for an
     unrelated reason is indistinguishable from a reaped one, and is treated as
     by-design because that target was going to be deleted anyway.
     """
+    from fused_memory.canonical_marker import is_canonical  # noqa: PLC0415
     from fused_memory.reconciliation.harness import (  # noqa: PLC0415
         PROJECT_STATUS_CORRECTION_KIND,
     )
@@ -197,7 +198,7 @@ def by_design_reaper(metadata: Any) -> str | None:
         return None
     if metadata.get('kind') == PROJECT_STATUS_CORRECTION_KIND:
         return REAPER_STATUS_CORRECTION
-    if metadata.get('canonical') is True or metadata.get('agent_id') == CONSOLIDATOR_AGENT_ID:
+    if is_canonical(metadata) or metadata.get('agent_id') == CONSOLIDATOR_AGENT_ID:
         return REAPER_CONSOLIDATION
     return None
 
