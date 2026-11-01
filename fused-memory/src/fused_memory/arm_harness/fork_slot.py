@@ -2,7 +2,7 @@
 
 from collections.abc import Awaitable, Mapping
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Protocol
 
 PERSISTENCE_SECTION = 'persistence'
 
@@ -18,23 +18,38 @@ class ForkHolder(StrEnum):
 class ServerInfo(Protocol):
     """The slice of redis.asyncio.Redis (falkordb.asyncio.FalkorDB.connection) that reads INFO."""
 
-    def info(self, section: str, /) -> Awaitable[Mapping[str, Any]]: ...
+    def info(self, section: str, /) -> Awaitable[Mapping[str, object]]: ...
 
 
 class ForkSlotUnreadable(RuntimeError):
-    """The INFO reply lacks a flag naming a fork holder, so whether the fork is free is unknown."""
+    """The INFO reply does not report every fork-holder flag as 0 or 1, so whether the fork is free is unknown."""
 
-    def __init__(self, missing: tuple[str, ...]) -> None:
+    def __init__(
+        self, missing: tuple[str, ...], malformed: tuple[tuple[str, object], ...]
+    ) -> None:
         self.missing = missing
+        self.malformed = malformed
+        unread = [f'{flag} (absent)' for flag in missing] + [
+            f'{flag}={value!r}' for flag, value in malformed
+        ]
         super().__init__(
-            f'INFO {PERSISTENCE_SECTION} reported none of {list(missing)}, so which child '
-            'holds the fork cannot be read'
+            f'INFO {PERSISTENCE_SECTION} did not report {", ".join(unread)} as 0 or 1, so which '
+            'child holds the fork cannot be read'
         )
 
 
 async def read_fork_holders(server: ServerInfo) -> frozenset[ForkHolder]:
     reply = await server.info(PERSISTENCE_SECTION)
     missing = tuple(holder.value for holder in ForkHolder if holder.value not in reply)
-    if missing:
-        raise ForkSlotUnreadable(missing)
-    return frozenset(holder for holder in ForkHolder if reply[holder.value])
+    malformed = tuple(
+        (holder.value, reply[holder.value])
+        for holder in ForkHolder
+        if holder.value in reply and not _is_flag(reply[holder.value])
+    )
+    if missing or malformed:
+        raise ForkSlotUnreadable(missing, malformed)
+    return frozenset(holder for holder in ForkHolder if reply[holder.value] == 1)
+
+
+def _is_flag(value: object) -> bool:
+    return isinstance(value, int) and value in (0, 1)

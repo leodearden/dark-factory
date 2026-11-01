@@ -20,9 +20,11 @@ async def test_the_live_server_reports_every_fork_holder_flag() -> None:
     client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
     try:
         raw = await client.connection.info('persistence')
-        holders = await read_fork_holders(client.connection)
+        await read_fork_holders(client.connection)
     finally:
         await client.aclose()
 
     assert {holder.value for holder in ForkHolder} <= set(raw)
-    assert all(isinstance(holder, ForkHolder) for holder in holders)
+    assert all(
+        isinstance(raw[holder.value], int) and raw[holder.value] in (0, 1) for holder in ForkHolder
+    )

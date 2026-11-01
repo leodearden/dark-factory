@@ -31,11 +31,11 @@ FLAG_HOLDERS = [
 
 
 class RecordingServer:
-    def __init__(self, reply: Mapping[str, int]) -> None:
+    def __init__(self, reply: Mapping[str, object]) -> None:
         self.reply = reply
         self.sections: list[str] = []
 
-    async def info(self, section: str, /) -> Mapping[str, int]:
+    async def info(self, section: str, /) -> Mapping[str, object]:
         self.sections.append(section)
         return self.reply
 
@@ -82,3 +82,20 @@ async def test_a_reply_missing_a_flag_is_unreadable_never_free(flag: str) -> Non
         await read_fork_holders(RecordingServer(reply))
 
     assert raised.value.missing == (flag,)
+    assert flag in str(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('flag', [flag for flag, _ in FLAG_HOLDERS])
+@pytest.mark.parametrize('value', ['0', '1', 2, -1, 1.0, None, {'a': 1}])
+async def test_a_flag_that_is_not_0_or_1_is_unreadable_never_free_or_held(
+    flag: str, value: object
+) -> None:
+    server = RecordingServer({**QUIET_PERSISTENCE, flag: value})
+
+    with pytest.raises(ForkSlotUnreadable) as raised:
+        await read_fork_holders(server)
+
+    assert raised.value.malformed == ((flag, value),)
+    assert raised.value.missing == ()
+    assert f'{flag}={value!r}' in str(raised.value)
