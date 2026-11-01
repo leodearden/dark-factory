@@ -3529,16 +3529,20 @@ supersedes `data/afk-digest.md`, which was last written 2026-08-19.
 
 1. **Prepare.** A headless `claude --print` run on Fable follows the
    prepare-sitting mode's nightly form and records its judgement (options,
-   ramifications, a recommendation or an explicit no-lean). Its one write
-   channel is a per-run inbox, `data/sitting/inbox/<run>/`: it writes JSON
-   batch files there and runs `prepare_sitting.py record --from <file>`.
-   It is read-only otherwise, by construction: it runs
-   under `--permission-mode dontAsk`, with an allowlist and an explicit
-   denylist of every apply verb, both in `nightly_prepare.py`, reading no
-   settings file (`--setting-sources ''`), and its
-   environment sets `SITTING_NIGHTLY_CONFINED` to the run's inbox. The CLI
-   allow rule plus the absence of settings files confine the agent's own
-   file writes to that inbox. `prepare_sitting.py` confines in code what
+   ramifications, a recommendation or an explicit no-lean). It writes JSON
+   batch files to a per-run inbox, `data/sitting/inbox/<run>/`, and runs
+   `prepare_sitting.py record --from <file>`. Three layers confine it, all
+   in `nightly_prepare.py`. The write boundary is the OS sandbox: the CLI
+   runs under Landlock (else bwrap), with the tree read-only except
+   `data/sitting/`, `.task/`, `~/.cache/uv` and `/tmp`, and with no OS
+   sandbox available the run is refused (`prepare=2`), never launched
+   unconfined. The CLI rules are the first gate, not the boundary: it runs
+   under `--permission-mode dontAsk` with an allowlist and an explicit
+   denylist of every apply verb, reading no settings file
+   (`--setting-sources ''`); the CLI matches those rules against raw
+   command text, so a shell-quoted spelling can pass a deny. Its
+   environment sets `SITTING_NIGHTLY_CONFINED` to the run's inbox, under
+   which `prepare_sitting.py` confines in code what
    `record` reads (a `.json` file directly in that inbox, never stdin or
    another path, so never an earlier night's batch) and where it writes
    (the default store in `data/sitting/`), and refuses everything but `brief`
@@ -3548,8 +3552,11 @@ supersedes `data/afk-digest.md`, which was last written 2026-08-19.
    on the project config being approved for a headless run, and playwright
    never starts. Its account comes from the shared pool, as a
    lease that is read and handed straight back, so the night's Fable spend
-   is invisible to the gate. With nothing leasable, it inherits the unit's
-   environment. It stops itself after 2700s.
+   is invisible to the gate. Its `CLAUDE_CONFIG_DIR` is a per-run directory
+   under `data/sitting/config/`, holding the leased token or, with nothing
+   leasable, a copy of the host's `~/.claude/.credentials.json`; the
+   credentials file is removed when the run ends. It stops itself after
+   2700s.
 2. **Render.** This step is deterministic and runs whatever prepare
    returned. Every figure on the page comes from its own fresh measurement
    and carries a stamp, and a store it cannot read is a stated shortfall in
@@ -3564,6 +3571,7 @@ is no commit seam, unlike the 05:00 census:
 | `data/sitting/ledger-nightly.json` | The night's item numbering, carried over from the night before so an item keeps its number; a watcher seeds its sitting from it |
 | `data/sitting/preparation.json` | The prepared judgement, per open item |
 | `data/sitting/inbox/<run>/` | The night's batch files, kept for forensics |
+| `data/sitting/config/claude-config-nightly-prepare-<run>/` | The night's CLI config dir and session transcript, kept for forensics |
 
 **The regen commands**, which are the two invocations the wrapper makes, run
 from the repo root:
@@ -3598,7 +3606,7 @@ systemctl --user list-timers return-brief.timer
   of <m>, undecodable=<u>, permission_denials=<d>)`; a high `undecodable`
   means the agent's entries failed validation even though some were recorded.
 - `prepare=2` is a configuration error, such as no `claude` on the unit's
-  PATH.
+  PATH, or no OS sandbox (`refusing to run unconfined`).
 - `brief=` other than 0 means the page was not written. That is the one
   worth acting on.
 

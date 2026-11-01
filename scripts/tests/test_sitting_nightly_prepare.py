@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 from legibility import account_pool
+from orchestrator.agents import landlock, sandbox_dispatch
 from shared.cli_invoke import build_claude_argv
 from shared.usage_gate import AccountLease
 from sitting import nightly_prepare as mod
@@ -25,7 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 OK_RESULT = json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'recorded 3'})
 BANNER = "You've hit your usage limit · resets 5am (Europe/London)"
-ENV_KEYS = ('CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'SITTING_TEST_MARKER', 'SITTING_NIGHTLY_CONFINED')
+ENV_KEYS = ('CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'SITTING_TEST_MARKER', 'SITTING_NIGHTLY_CONFINED', 'CLAUDE_CONFIG_DIR')
 TIMEOUT_SECS = '3'
 """Outlasts the fake's interpreter start under ``-n auto`` load (0.5s did not, 2 runs in 10), far short of its sleep."""
 
@@ -69,6 +70,10 @@ record = {{
     'env': {{key: os.environ.get(key) for key in spec['env_keys']}},
     'env_has': {{key: key in os.environ for key in spec['env_keys']}},
 }}
+credentials = Path(os.environ.get('CLAUDE_CONFIG_DIR', '/nonexistent'), '.credentials.json')
+if credentials.exists():
+    record['credentials'] = credentials.read_text()
+    record['credentials_mode'] = credentials.stat().st_mode & 0o777
 if '--system-prompt-file' in argv:
     path = argv[argv.index('--system-prompt-file') + 1]
     record['sysprompt_path'] = path
@@ -86,6 +91,26 @@ sys.stderr.flush()
 time.sleep(spec['sleep'])
 sys.exit(spec['exit_code'])
 '''
+
+
+@pytest.fixture(autouse=True)
+def _sandbox_backend():
+    """``none`` unless a test picks a backend, so most tests see the CLI argv unwrapped on any host."""
+    saved = sandbox_dispatch.get_backend()
+    sandbox_dispatch.reset_escalation_dedupe()
+    sandbox_dispatch.set_backend('none')
+    yield
+    sandbox_dispatch.set_backend(saved)
+    sandbox_dispatch.reset_escalation_dedupe()
+
+
+@pytest.fixture
+def host_home(tmp_path, monkeypatch):
+    """A HOME whose ``~/.claude`` login the no-lease path may copy, so no test reads the real one."""
+    home = tmp_path / 'home'
+    (home / '.claude').mkdir(parents=True)
+    monkeypatch.setenv('HOME', str(home))
+    return home
 
 
 @dataclass
@@ -445,6 +470,50 @@ def test_the_child_runs_the_prepare_script_confined_to_data_sitting(tmp_path):
     assert prepare_sitting.DEFAULT_PREPARATION.parent == REPO_ROOT / 'data' / 'sitting'
 
 
+def _landlock_grants(argv: list[str]) -> set[Path]:
+    head = argv[:argv.index('--')]
+    return {Path(head[i + 1]) for i, token in enumerate(head) if token == '--writable'}
+
+
+@pytest.mark.skipif(not landlock.is_landlock_available(), reason='needs a Landlock kernel to run the fake confined')
+def test_the_cli_runs_under_landlock_writing_only_the_run_grants(tmp_path, monkeypatch, host_home):
+    sandbox_dispatch.set_backend('landlock')
+    spawned: list[list[str]] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(args, *rest, **kwargs):
+        spawned.append(list(args))
+        return real_popen(args, *rest, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'Popen', recording_popen)
+    fake = _fake_claude(tmp_path)
+
+    assert _run(fake) == mod.EXIT_OK
+
+    [argv] = spawned
+    assert Path(argv[1]).name == 'landlock_exec.py'
+    assert argv[argv.index('--') + 1] == str(fake.bin)
+    root = tmp_path.resolve()
+    grants = _landlock_grants(argv)
+    assert grants == {root / '.task', root / 'data' / 'sitting', host_home / '.cache' / 'uv'}
+    config_dir = Path(fake.only_call()['env']['CLAUDE_CONFIG_DIR'])
+    assert config_dir.is_absolute()
+    assert any(config_dir.is_relative_to(grant) for grant in grants)
+
+
+def test_an_unavailable_sandbox_refuses_the_run_and_leases_nothing(tmp_path, monkeypatch, capsys):
+    sandbox_dispatch.set_backend('landlock')
+    monkeypatch.setattr(landlock, 'is_landlock_available', lambda: False)
+    fake = _fake_claude(tmp_path)
+    gate = _live_gate()
+
+    rc = _run(fake, gate=gate)
+
+    assert rc == mod.EXIT_CONFIG
+    assert (gate.leases, fake.calls()) == (0, [])
+    assert 'refusing to run unconfined' in capsys.readouterr().err
+
+
 # ---------------------------------------------------------------------------
 # 3. The account comes from the shared pool; the API key never rides along.
 # ---------------------------------------------------------------------------
@@ -484,7 +553,7 @@ def test_a_real_pool_lease_is_handed_back_before_the_run(tmp_path, monkeypatch, 
     )
 
 
-def test_no_lease_inherits_the_parent_env_and_still_runs(tmp_path, monkeypatch):
+def test_no_lease_inherits_the_parent_env_and_still_runs(tmp_path, monkeypatch, host_home):
     monkeypatch.setenv('ANTHROPIC_API_KEY', 'sk-ant-must-not-survive')
     monkeypatch.setenv('SITTING_TEST_MARKER', 'kept')
     monkeypatch.setenv('CLAUDE_CODE_OAUTH_TOKEN', 'ambient-login')
@@ -498,6 +567,30 @@ def test_no_lease_inherits_the_parent_env_and_still_runs(tmp_path, monkeypatch):
     assert call['env']['SITTING_TEST_MARKER'] == 'kept'
     assert not call['env_has']['ANTHROPIC_API_KEY']
     assert os.environ['ANTHROPIC_API_KEY'] == 'sk-ant-must-not-survive', 'the parent env is not mutated'
+
+
+def test_the_leased_token_is_the_config_dirs_login_for_the_run_only(tmp_path):
+    fake = _fake_claude(tmp_path)
+
+    assert _run(fake) == mod.EXIT_OK
+
+    call = fake.only_call()
+    assert json.loads(call['credentials']) == {'claudeAiOauth': {'accessToken': 'tok-max-h'}}
+    assert call['credentials_mode'] == 0o600
+    assert not (Path(call['env']['CLAUDE_CONFIG_DIR']) / '.credentials.json').exists()
+
+
+def test_no_lease_copies_the_host_login_into_the_config_dir_for_the_run_only(tmp_path, host_home):
+    (host_home / '.claude' / '.credentials.json').write_text('{"claudeAiOauth": {"accessToken": "host"}}')
+    fake = _fake_claude(tmp_path)
+
+    assert _run(fake, gate=FakeGate([('max-b', True)])) == mod.EXIT_OK
+
+    call = fake.only_call()
+    assert call['credentials'] == '{"claudeAiOauth": {"accessToken": "host"}}'
+    assert call['credentials_mode'] == 0o600
+    assert not (Path(call['env']['CLAUDE_CONFIG_DIR']) / '.credentials.json').exists()
+    assert (host_home / '.claude' / '.credentials.json').exists()
 
 
 # ---------------------------------------------------------------------------
