@@ -327,6 +327,14 @@ async def _bounded(coro: Awaitable[Any], *, label: str) -> _HalfRead[Any]:
     expiry means this process ran out of budget and the server may be perfectly
     healthy. Collapsing them is what made the 2026-07-30 event get misdiagnosed
     as an orchestrator outage.
+
+    The ``wait_for`` is deliberately bounded at ``PER_CALL_TIMEOUT`` itself, NOT
+    at ``memory.py::enclosing_deadline``. The equal bound keeps every
+    client-side timeout, a saturated pool included, in ``BUDGET``; a larger one
+    would let the fan-out fold it into an offline marker, reported as
+    ``UNREACHABLE``. ``PER_CALL_TIMEOUT`` is also the operation term in
+    ``test_tasks_budget.py``'s assertion (a). Pinned by
+    ``test_saturated_pool_is_diagnosable.py::test_task_snapshot_reports_a_saturated_pool_as_budget_not_offline``.
     """
     try:
         result = await asyncio.wait_for(coro, PER_CALL_TIMEOUT)

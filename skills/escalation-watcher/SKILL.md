@@ -2006,19 +2006,23 @@ Resolve with `action='resume'`, carrying the scope grant as `granted_files` — 
 mcp__escalation__resolve_issue(
   escalation_id="...",
   resolution="Scope expanded to include [<files>]; resuming.",
-  action='resume',   # re-pends the task AND folds the grant — see below
+  action='resume',   # folds the grant, and re-pends unless a live workflow owns the task — see below
   granted_files=["<project-relative file path>", ...],   # file-level paths, not module names
   resolved_by="escalation-watcher"
 )
 ```
 
-**`granted_files` is delivered on the re-pend path, not just to a live workflow.** It is persisted durably on the escalation record either way. On a `blocked` — or stranded `in-progress` — task with no live workflow, which is this queue's normal case, the resolve folds the union of every resolved escalation's `granted_files` into both `plan.json`'s `files` and `metadata.files` before the re-pend (`orchestrator/src/orchestrator/harness.py::Harness._fold_granted_files_on_repend`). A live workflow takes `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._collect_granted_files` instead.
+**`granted_files` is delivered on every `action='resume'`, whatever the task's state.** It is persisted durably on the escalation record either way. The resolve folds the union of every resolved escalation's `granted_files` into both `plan.json`'s `files` and `metadata.files` (`orchestrator/src/orchestrator/harness.py::Harness._fold_granted_files`, reached through `harness.py::Harness._deliver_resume_resolution`). On a `blocked` — or stranded `in-progress` — task with no live workflow, which is this queue's normal case, the fold lands before the re-pend. On a LIVE `in-progress` task it lands with no re-pend, because the running workflow owns that, and only within the module locks the running slot already holds. A grant on the live workflow's own level-0 record is left to that workflow: its resume branch widens the scope and acquires the locks.
 
-**Three caveats that survive, so state them accurately rather than promising more than the fold delivers:**
+**Read `granted_files_delivery` on the `resolve_issue` return.** It is always present. `scheduled` means the grant was routed to the fold; any other value means it will not land, and `granted_files_delivery_reason` says why and what to do instead (`park` discards a grant; a resolve against an already-closed record records nothing). After the fact, a note tagged `escalation/src/escalation/grant_delivery.py::GRANT_NOT_DELIVERED_MARKER` in the record's `resolution` means the asynchronous delivery fell short.
 
-- **The fold is best-effort.** A failed plan write or a failed `update_task` logs a WARNING and the task re-pends anyway, against the *unwidened* scope — deliberately, because withholding the re-pend would park the task with its escalation already closed and nothing left to advance it. Re-check `plan.files` after the redispatch rather than assuming the widening took.
-- **No plan, no widen.** A task that never reached the architect (no `plan.json` in either `.task-meta/<worktree>/` or the legacy `<worktree>/.task/`) has no scope to widen; the fold logs a DEBUG and skips, and the re-pend still happens.
-- **The re-block guard outranks the grant.** If the guard withholds the flip, nothing is re-pended, so nothing is widened.
+**Two caveats survive, so state them accurately rather than promising more than the fold delivers:**
+
+- **The fold is best-effort.** A failed plan write or a failed `update_task` logs a WARNING, appends that marker note to the record, and the task re-pends anyway, against a possibly *unwidened* scope — deliberately, because withholding the re-pend would park the task with its escalation already closed and nothing left to advance it. Re-check `plan.files` after the redispatch rather than assuming the widening took.
+- **No plan, no widen.** A task that never reached the architect (no `plan.json` in either `.task-meta/<worktree>/` or the legacy `<worktree>/.task/`) has no scope to widen. `resolve_issue` reports `no_plan_to_widen` when it can already see that; otherwise the fold logs a WARNING and appends the marker note. The re-pend still happens.
+- **A live slot is widened only within its locks.** A running implementer re-reads `plan.json` for its next prompt, so a grant that needs a module the live slot does not lock is not written into it. The fold logs a WARNING and appends the marker note with the `needs_unheld_lock` reason. The grant stays recorded and lands when that workflow next resumes from its own level-0 escalation; otherwise re-issue it on a resume once the task is no longer running.
+
+The re-block guard no longer outranks the grant: when it withholds the flip, only the re-pend is withheld, and the grant is still delivered.
 
 Module **locks** follow `plan.files`, but the fold does not touch them directly: `orchestrator/src/orchestrator/scheduler.py::Scheduler._get_modules` is cache-first, and the task's narrow `_module_cache` entry from its prior dispatch outlives the escalation, so the old lock can stand until the next plan boundary. There `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._reconcile_scope_locks` re-derives the locks and persists `metadata.files = plan_files`.
 
