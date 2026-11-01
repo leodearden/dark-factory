@@ -785,6 +785,11 @@ class TestPlanningEpisodeIsFilteredFromSearch:
 #
 # Deselected by default (pyproject.toml's `-m 'not integration'`), so it
 # burdens neither CI nor a routine local run with OPENAI credits.
+#
+# Its config helper `_live_config` lives here too, with a hermetic guard over
+# that helper. The guard is neither live nor deselected: it runs in every
+# default suite, and is the in-pipeline evidence that the live test builds
+# graphiti's clients from config.
 # ---------------------------------------------------------------------------
 
 _LIVE_CONTENT = 'Task 3561 fixed the self-referential add_episode NodeNotFoundError.'
@@ -834,7 +839,10 @@ def _live_config(base: FusedMemoryConfig) -> FusedMemoryConfig:
     api_key = os.environ['OPENAI_API_KEY']
     llm_provider = config.llm.providers.openai
     embedder_provider = config.embedder.providers.openai
-    assert llm_provider is not None and embedder_provider is not None
+    assert llm_provider is not None and embedder_provider is not None, (
+        'base config must carry openai provider blocks for both llm and embedder; '
+        '_live_config copies OPENAI_API_KEY into them'
+    )
     llm_provider.api_key = api_key
     embedder_provider.api_key = api_key
     config.graphiti.falkordb.uri = f'redis://{FALKOR_HOST}:{FALKOR_PORT}'
