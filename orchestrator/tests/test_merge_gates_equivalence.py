@@ -211,7 +211,7 @@ async def test_a_linear_landing_with_no_tip_on_record_ignores_a_drifted_worktree
     _git(repo, 'merge', '--squash', TASK_BRANCH)
     _git(repo, 'commit', '-m', f'Squash-land {TASK_BRANCH}')
     landed = _git(repo, 'rev-parse', 'HEAD')
-    assert len(_git(repo, 'rev-list', '--parents', '-n', '1', landed).split()) == 2
+    assert len(_git(repo, 'show', '-s', '--format=%P', landed).split()) == 1
     _commit(worktree, {'feature.txt': 'drifted after landing\n'}, 'drift')
 
     outcome = await _finalize(git_ops, _request(lane_config, worktree), landed=landed, base=base)
