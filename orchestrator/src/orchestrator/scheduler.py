@@ -16,7 +16,16 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, overload, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    NamedTuple,
+    Protocol,
+    TypeVar,
+    overload,
+    runtime_checkable,
+)
 
 from shared import safe_io
 from shared.capability_manifest import CHECK_SUBJECT_FIELD
@@ -1190,6 +1199,18 @@ def _numeric_id(task_id: str) -> float:
     return float(int(task_id)) if task_id.isdecimal() else math.inf
 
 
+class _ParkKey(NamedTuple):
+    """THE park order (task 7799): the smaller key outranks; see ``plans/scheduler-dispatch-scoring-and-lock-layer-prd.md`` §7, Amendment (task 7799)."""
+
+    rank: int
+    id_rank: float
+    owner: str
+
+    @classmethod
+    def of(cls, owner: str, rank: int) -> _ParkKey:
+        return cls(rank, _numeric_id(owner), owner)
+
+
 def _as_stamp(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
@@ -1340,33 +1361,23 @@ class ModuleLockTable:
         A buried (shadowed) reservation is never consulted — only the active
         top of each stack (INV-2).  Order is ``_parked`` iteration order.
 
-        Rank-aware (step-12): first compute task_id's OWN dominant rank — the
-        minimum rank over active-top entries that *task_id* itself owns on keys
-        conflicting with *module* (None if it has no such top).  A foreign
-        conflicting top then counts UNLESS task_id's own dominant rank is
-        strictly less (strictly higher priority) — in which case task_id
-        preempts that foreign top.  This lets a preemptor acquire its own
-        module even when hierarchical victim parks are kept under their
-        original keys (their active tops are no longer moved to the
-        preemptor's key by a re-key step).
+        INV-8, park precedence (task 7799): a foreign conflicting top blocks a
+        requester that owns parks only when that entry's :class:`_ParkKey`
+        precedes the requester's best key (:meth:`_best_park_key`, over every
+        entry it holds, at any level and on any key).  A requester that owns
+        no park is blocked by every conflicting foreign top.  So every park
+        wait points at an owner whose best key is strictly smaller than the
+        waiter's, and the wait-for graph between park owners is acyclic in
+        every reachable state; the owner with the smallest key waits only on
+        live holders.  Rationale: ``plans/scheduler-dispatch-scoring-and-lock-layer-prd.md``
+        §7, Amendment (task 7799).
 
         *ignore_owners* (task 3823 / PRD C7) names park owners whose parks are
         treated as absent for this request — the EASY-backfill admission
         bypass.  It is scoped to the park rule alone and has no bearing on the
         held-lock limit gate.
         """
-        # Step 1: compute task_id's own dominant rank among conflicting active tops.
-        own_dominant_rank: int | None = None
-        for parked_module, stack in self._parked.items():
-            if not stack:
-                continue
-            owner, rank = stack[-1]  # active TOP only
-            if owner != task_id:
-                continue
-            if self._conflicts(parked_module, module) and (own_dominant_rank is None or rank < own_dominant_rank):
-                own_dominant_rank = rank
-
-        # Step 2: check each foreign conflicting active top.
+        own = self._best_park_key(task_id)
         blocking: list[tuple[str, str]] = []
         for parked_module, stack in self._parked.items():
             if not stack:
@@ -1376,10 +1387,7 @@ class ModuleLockTable:
                 continue
             if not self._conflicts(parked_module, module):
                 continue
-            # Foreign conflicting top: counts unless task_id has a strictly
-            # higher-priority (strictly lower rank) own conflicting top.
-            if own_dominant_rank is not None and own_dominant_rank < rank:
-                # task_id preempts this foreign top.
+            if own is not None and own < _ParkKey.of(owner, rank):
                 continue
             blocking.append((owner, parked_module))
         return blocking
@@ -1393,10 +1401,11 @@ class ModuleLockTable:
     ) -> Iterator[str]:
         """EVERY owner of an ACTIVE park that blocks *task_id* on *module*.
 
-        THE single rank-aware park-blocking rule.  ``_blocking_park_owner`` is
-        the first-match view over it, ``_is_parked_blocks`` the bool view, and
+        THE single precedence-aware park-blocking rule (INV-8, over
+        :meth:`_rank_blocking_parks`).  ``_blocking_park_owner`` is the
+        first-match view over it, ``_is_parked_blocks`` the bool view, and
         ``park_owners_blocking`` the naming view — one rule, three views
-        (INV-5).  Forking the rank logic is what would let admission believe it
+        (INV-5).  Forking the precedence logic is what would let admission believe it
         can borrow through a park that ``try_acquire`` then refuses: churn with
         no dispatch.
 
@@ -1565,12 +1574,12 @@ class ModuleLockTable:
         ignore_owners: frozenset[str] = frozenset(),
     ) -> bool:
         """Return True iff any ACTIVE (top-of-stack) park conflicts with *module*,
-        is owned by a different task that task_id cannot preempt (INV-2), and
-        fires the two-term capacity rule of :meth:`_iter_blocking_park_owners`
-        (task 7313).
+        is owned by a different task that task_id does not precede (INV-2,
+        INV-8), and fires the two-term capacity rule of
+        :meth:`_iter_blocking_park_owners` (task 7313).
 
-        The bool view of :meth:`_blocking_park_owner`, which carries the rank
-        logic.  Kept as a delegate rather than inlined so ``try_acquire`` /
+        The bool view of :meth:`_blocking_park_owner`, which carries the
+        precedence logic.  Kept as a delegate rather than inlined so ``try_acquire`` /
         ``try_acquire_additional`` and every existing test keep their call
         shape, and so the naming view (``park_owners_blocking``) and this
         gating view can never disagree (INV-5).
@@ -1583,9 +1592,9 @@ class ModuleLockTable:
         """``{key: rank}`` for every stack holding *task_id* at ANY level, top or buried.
 
         THE single definition of "the owner already parks this key": the
-        install idempotency skip, the completion remainder and ``has_parks``
-        all read it, so they cannot disagree about a buried entry.  The rank
-        is the owner's best (lowest) one on that key.
+        install idempotency skip, the completion remainder, ``has_parks`` and
+        :meth:`_best_park_key` all read it, so they cannot disagree about a
+        buried entry.  The rank is the owner's best (lowest) one on that key.
         """
         owned: dict[str, int] = {}
         for module, stack in self._parked.items():
@@ -1593,6 +1602,11 @@ class ModuleLockTable:
             if ranks:
                 owned[module] = min(ranks)
         return owned
+
+    def _best_park_key(self, task_id: str) -> _ParkKey | None:
+        """*task_id*'s smallest :class:`_ParkKey` over every entry it holds, at any level; None without parks."""
+        owned = self._owned_ranks(task_id)
+        return _ParkKey.of(task_id, min(owned.values())) if owned else None
 
     @staticmethod
     def _covers(held_rank: int | None, rank: int | None) -> bool:
@@ -1692,9 +1706,9 @@ class ModuleLockTable:
         Same-tier or higher-priority tops BLOCK installation for that module (INV-3).
 
         Hierarchical (different-key) conflicts: victim parks are kept under
-        their ORIGINAL keys (not re-keyed onto the preemptor's key).  Rank-
-        aware blocking in ``_is_parked_blocks`` lets the preemptor acquire its
-        own module without needing to move victim entries.  This preserves each
+        their ORIGINAL keys (not re-keyed onto the preemptor's key).
+        Precedence-aware blocking in ``_is_parked_blocks`` (INV-8) lets the
+        preemptor acquire its own module without needing to move victim entries.  This preserves each
         victim's original module identity so that ALL victims are independently
         restorable after the preemptor clears (step-12 fix).
         """
@@ -1735,8 +1749,8 @@ class ModuleLockTable:
             # For exact-match conflicts (parked_m == normalized), the victim's
             # entry stays in its stack; the new entry will be pushed on top
             # in the install step below.  For hierarchical (different-key)
-            # conflicts, the victim park is also left untouched: rank-aware
-            # blocking in _is_parked_blocks lets the preemptor acquire its own
+            # conflicts, the victim park is also left untouched: precedence-
+            # aware blocking in _is_parked_blocks lets the preemptor acquire its own
             # module without moving victim entries (step-12 fix).
             for parked_m, victim_owner in to_shadow:
                 if victim_owner not in shadow_acc:
@@ -1797,7 +1811,7 @@ class ModuleLockTable:
         the hierarchical victim's own stack is NEVER touched during the
         preemptor's removal — the preemptor only appears in its own normalized
         key's stack, so ``was_top`` only fires for that key.  The victim becomes
-        acquirable the instant the preemptor is removed (rank-aware blocking in
+        acquirable the instant the preemptor is removed (precedence-aware blocking in
         ``_is_parked_blocks`` stops gating on the now-absent foreign top), but no
         ``reservation_restored`` pair is returned and no event is emitted.  This
         asymmetry is intentional (documented in the plan's design decisions):
