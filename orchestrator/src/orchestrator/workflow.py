@@ -98,6 +98,7 @@ from orchestrator.artifacts import (
     TaskArtifacts,
     iteration_entry_written_by_orchestrator,
 )
+from orchestrator.branch_base import own_work_base
 from orchestrator.branch_mergeability import Mergeability, read_branch_state
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.curator_submit import SubmitBatchResult, submit_task_batch
@@ -156,7 +157,7 @@ from orchestrator.plan_descope import (
 )
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.recut_ruling import ruling_to_enforce
-from orchestrator.review_inputs import gather_review_subject, review_fork_point
+from orchestrator.review_inputs import gather_review_subject
 from orchestrator.review_outcome import review_completed_payload
 from orchestrator.review_suggestions.curator_intake import (
     review_suggestion_submit_arguments,
@@ -9629,11 +9630,7 @@ class TaskWorkflow:
         """
         assert self.worktree is not None and self.artifacts is not None
 
-        base_commit = self.artifacts.read_base_commit()
-        if base_commit:
-            diff = await self.git_ops.get_diff_from_base(self.worktree, base_commit)
-        else:
-            diff = await self.git_ops.get_diff_from_main(self.worktree)
+        diff = await self.git_ops.get_diff_from_base(self.worktree, await self._own_work_base())
 
         if not diff or not diff.strip():
             logger.info(
@@ -11164,11 +11161,7 @@ class TaskWorkflow:
                 return self._review_inputs_unavailable(roster, exc)
             diff = subject.change.diff
         else:
-            base_commit = self.artifacts.read_base_commit()
-            if base_commit:
-                diff = await self.git_ops.get_diff_from_base(self.worktree, base_commit)
-            else:
-                diff = await self.git_ops.get_diff_from_main(self.worktree)
+            diff = await self.git_ops.get_diff_from_base(self.worktree, await self._own_work_base())
 
         amendment_suggestions = (
             amendment_ctx.amended_suggestions if amendment_ctx is not None else None
@@ -11234,22 +11227,18 @@ class TaskWorkflow:
 
         return self.artifacts.aggregate_reviews()
 
-    async def _context_complete_review_subject(self) -> ReviewSubject:
-        """The context-complete reviewer's inputs, from the worktree at a fresh fork point.
-
-        The fork point is re-derived now, because the stored base goes stale
-        once main is merged into the branch (task 5695); the stored base and
-        then the main branch name are the fallbacks.
-        """
+    async def _own_work_base(self) -> str:
+        """The base whose ``...HEAD`` range in the worktree is this task's own work."""
         assert self.worktree is not None and self.artifacts is not None
-        main_branch = self.config.git.main_branch
-        base = (
-            await review_fork_point(self.worktree, main_branch)
-            or self.artifacts.read_base_commit()
-            or main_branch
+        return await own_work_base(
+            self.worktree, self.config.git.main_branch, self.artifacts.read_base_commit(),
         )
+
+    async def _context_complete_review_subject(self) -> ReviewSubject:
+        """The context-complete reviewer's inputs, from the worktree at its own-work base."""
+        assert self.worktree is not None and self.artifacts is not None
         return await gather_review_subject(
-            self.worktree, base,
+            self.worktree, await self._own_work_base(),
             task=self.task,
             plan=self.artifacts.read_plan() or None,
             plan_absent_reason='this task has no plan.json (a simple-task run writes none)',
