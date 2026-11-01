@@ -1,37 +1,34 @@
-"""Remote verify-host construction and the task-path host pool.
+"""Remote verify-host construction and the task path's per-host admission gates.
 
-PRD ``plans/remote-task-leg-verify-prd.md`` §4.4-4.5, §5.4.  This module sits
-below both the merge lane and the task workflow: it must never import
-``orchestrator.merge_lane`` or ``orchestrator.workflow``.
+PRD ``plans/remote-task-leg-verify-prd.md`` decisions 14 and 16, §5.4.  This
+module sits below both the merge lane and the task workflow: it must never
+import ``orchestrator.merge_lane`` or ``orchestrator.workflow``.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import dataclasses
 import logging
-from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence, Set
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, get_args
+from typing import TYPE_CHECKING, ClassVar
 
 from orchestrator.deployed_sha import DeployedSha, resolve_code_checkout
-from orchestrator.verify_runner import (
-    HostAllocator,
-    HostLease,
-    RemoteRunner,
-    RunnerUnavailable,
-    RunnerUnavailableSink,
-)
+from orchestrator.verify import admission_policy
+from orchestrator.verify_admission_gate import AdmissionGate, AdmissionPolicy
+from orchestrator.verify_runner import RemoteRunner, RunnerUnavailable, RunnerUnavailableSink
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
 
 logger = logging.getLogger(__name__)
 
-MergeDemand = Callable[[], bool]
-RefusalReason = Literal['no_host', 'host_busy', 'host_quarantined', 'host_parked', 'merge_demand']
-_HOST_STATE_PRECEDENCE: tuple[RefusalReason, ...] = ('host_busy', 'host_quarantined', 'host_parked')
 Unwind = Callable[[], Awaitable[object]]
+
+_CANCEL_PROBE_ATTEMPTS = 10
+_CANCEL_PROBE_INTERVAL_SECS = 1.0
 
 
 def build_remote_runners(
@@ -79,159 +76,130 @@ def build_remote_runners(
     return runners
 
 
-@dataclass(frozen=True)
-class Refusal:
-    """Why :meth:`HostPool.acquire_for_task` handed out no remote host."""
-
-    reason: RefusalReason
-
-    def __post_init__(self) -> None:
-        if self.reason not in get_args(RefusalReason):
-            raise ValueError(
-                f'Refusal reason {self.reason!r} is not one of {get_args(RefusalReason)}'
-            )
-
-
-@dataclass(frozen=True)
-class _CancelThenUnwind:
-    """*runner* as the allocator sees it during one cancel: *unwind* follows the host-side cancel."""
-
-    runner: RemoteRunner
-    unwind: Unwind
-
-    async def cancel_verify(self) -> int:
-        try:
-            return await self.runner.cancel_verify()
-        except Exception:
-            logger.warning(
-                'cancel-verify on %s raised; treating it as a failed cancel',
-                self.runner.name, exc_info=True,
-            )
-            return 1
-        finally:
-            await self.unwind()
-
-    async def probe_clean(self) -> bool:
-        return await self.runner.probe_clean()
-
-
-def _blocker(allocator: HostAllocator, name: str) -> RefusalReason | None:
-    """Why remote *name* cannot be leased now, or None when it is free.
-
-    Parked is checked first because ``is_busy`` is also true for a PARKED slot.
-    """
-    if allocator.is_parked(name):
-        return 'host_parked'
-    if allocator.is_quarantined(name):
-        return 'host_quarantined'
-    if allocator.is_busy(name):
-        return 'host_busy'
-    return None
-
-
-def _run_once(unwind: Unwind | None) -> Callable[[], Awaitable[None]]:
-    remaining = [] if unwind is None else [unwind]
-
-    async def once() -> None:
-        if remaining:
-            await remaining.pop()()
-
-    return once
-
-
 class HostPool:
-    """The task path's leases on the worker-lifetime :class:`HostAllocator`.
+    """One admission gate per remote host, the same class the local verify queue uses.
 
-    Invariants: a hold is a lease this pool handed out and whose release or
-    cancel has not yet returned, so its slot is BUSY (or PARKED while a failed
-    cancel probes the host); the pool never writes the allocator's quarantine set (an
-    unavailable host is reported through *on_unavailable* and readmission stays
-    with the merge lane's tracker, PRD §4.5); :meth:`acquire_for_task` is
-    synchronous, so its check-then-acquire is atomic on the event loop, and it
-    refuses on host state before it reads merge demand.
+    Invariants: the pool holds no HostAllocator and reads no merge state; a hold
+    record exists iff a remote attempt holds that gate's turn; the pool never
+    writes the quarantine set, which it reads by reference.
     """
+
+    local_name: ClassVar[str] = 'local'
 
     def __init__(
         self,
-        allocator: HostAllocator,
+        hosts: Sequence[str],
         *,
-        merge_demand: MergeDemand,
+        runner_for: Callable[[str], RemoteRunner],
+        quarantine: Set[str],
         on_unavailable: RunnerUnavailableSink,
-        on_recovered: Callable[[str], None],
-        probe_sleep: Callable[[float], Awaitable[None]] | None = None,
+        probe_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        probe_attempts: int = _CANCEL_PROBE_ATTEMPTS,
     ) -> None:
-        self._allocator = allocator
-        self._merge_demand = merge_demand
+        self._hosts = _validated_hosts(hosts, local_name=self.local_name)
+        self._gates = {host: AdmissionGate() for host in self._hosts}
+        self._runner_for = runner_for
+        self._quarantine = quarantine
         self._on_unavailable = on_unavailable
-        self._on_recovered = on_recovered
         self._probe_sleep = probe_sleep
-        self._holds: dict[str, tuple[str, HostLease]] = {}
+        self._probe_attempts = probe_attempts
+        self._holds: dict[str, list[str]] = {}
 
     @property
-    def allocator(self) -> HostAllocator:
-        return self._allocator
+    def hosts(self) -> tuple[str, ...]:
+        """The remote hosts; empty means every eligible verify runs local."""
+        return self._hosts
 
-    def acquire_for_task(self, task_id: str) -> HostLease | Refusal:
-        """Lease a free remote for *task_id*, or say why none was handed out.
+    def gate(self, host: str) -> AdmissionGate:
+        self._known(host)
+        return self._gates[host]
 
-        No remote configured is ``no_host``; when no remote is free the refusal
-        names the most transient blocker present (busy, then quarantined, then
-        parked); only then is merge demand read.
-        """
-        allocator = self._allocator
-        remotes = [n for n in allocator.host_names if n != allocator.local_name]
-        if not remotes:
-            return Refusal('no_host')
-        blockers = {_blocker(allocator, name) for name in remotes}
-        if None not in blockers:
-            return Refusal(next(r for r in _HOST_STATE_PRECEDENCE if r in blockers))
-        if self._merge_demand():
-            return Refusal('merge_demand')
-        lease = allocator.acquire_remote()
-        if lease is None:
-            return Refusal('host_busy')
-        self._holds[lease.name] = (task_id, lease)
-        return lease
+    def policy(self, host: str, config: OrchestratorConfig) -> AdmissionPolicy:
+        """The local admission policy, with no slots while *host* is benched."""
+        self._known(host)
+        policy = admission_policy(config)
+        return dataclasses.replace(policy, slots=0) if host in self._quarantine else policy
 
-    async def release(self, lease: HostLease) -> None:
-        """Free *lease*'s slot; a lease this pool does not hold is a no-op."""
-        if not self._holds_lease(lease):
-            return
+    def runner_for_turn(self, host: str) -> RemoteRunner:
+        """A fresh runner for one turn, so a runner is in exclusive use at any slot count."""
+        self._known(host)
+        runner = self._runner_for(host)
+        if runner.name != host:
+            raise ValueError(f'the runner built for host {host!r} is named {runner.name!r}')
+        return runner
+
+    def note_readmitted(self, host: str, config: OrchestratorConfig) -> None:
+        self.gate(host).redispatch(self.policy(host, config))
+
+    def mark_unavailable(self, host: str, exc: RunnerUnavailable) -> None:
+        self._on_unavailable(host, exc)
+
+    @contextlib.contextmanager
+    def holding(self, host: str, task_id: str) -> Iterator[None]:
+        """The hold record of *task_id* on *host* for the life of the body."""
+        holds = self._holds.setdefault(host, [])
+        holds.append(task_id)
         try:
-            await self._allocator.release(lease)
+            yield
         finally:
-            self._holds.pop(lease.name, None)
-
-    async def cancel_and_release(self, lease: HostLease, *, unwind: Unwind | None = None) -> bool:
-        """Cancel the verify on *lease*'s host and release (or PARK) its slot.
-
-        *unwind*, the caller's teardown of the dispatch that was using the runner,
-        is awaited exactly once: after the host-side cancel and before the slot is
-        freed or PARKED, so no other lease can reach a runner whose dispatch is
-        still unwinding (PRD §4.3 exclusive use).
-        """
-        once = _run_once(unwind)
-        try:
-            if not self._holds_lease(lease):
-                return True
-            cancelling = dataclasses.replace(lease, runner=_CancelThenUnwind(lease.runner, once))
-            try:
-                return await self._allocator.cancel_and_release(cancelling, sleep=self._probe_sleep)
-            finally:
-                self._holds.pop(lease.name, None)
-        finally:
-            await once()
-
-    def mark_unavailable(self, lease: HostLease, exc: RunnerUnavailable) -> None:
-        self._on_unavailable(lease.name, exc)
-
-    def mark_recovered(self, lease: HostLease) -> None:
-        self._on_recovered(lease.name)
+            holds.remove(task_id)
+            if not holds:
+                del self._holds[host]
 
     def holders(self) -> Mapping[str, str]:
-        """A fresh ``{host: 'task:<id>'}`` map of the holds this pool owns."""
-        return {host: f'task:{task_id}' for host, (task_id, _) in self._holds.items()}
+        """A fresh ``{host: 'task:<id>[,task:<id>]'}`` map of the holds now recorded."""
+        return {
+            host: ','.join(f'task:{task_id}' for task_id in holds)
+            for host, holds in self._holds.items()
+        }
 
-    def _holds_lease(self, lease: HostLease) -> bool:
-        hold = self._holds.get(lease.name)
-        return hold is not None and hold[1] is lease
+    async def cancel_in_flight(self, host: str, runner: RemoteRunner, *, unwind: Unwind) -> bool:
+        """Cancel *runner*'s verify on *host*, then *unwind* the dispatch using it.
+
+        A failed cancel probes the cancelled request; a request never probed
+        clean benches the host (kind ``transport``) and returns False.  The
+        caller still holds its turn throughout, so a bench precedes the release.
+        """
+        try:
+            rc = await self._cancel(host, runner)
+        finally:
+            await unwind()
+        if rc == 0 or await self._probed_clean(runner):
+            return True
+        self.mark_unavailable(host, RunnerUnavailable(
+            f'cancel-verify on {host!r} exited rc={rc} and the cancelled request '
+            f'still runs or cannot be probed',
+            kind='transport',
+        ))
+        return False
+
+    async def _cancel(self, host: str, runner: RemoteRunner) -> int:
+        try:
+            return await runner.cancel_verify()
+        except Exception:
+            logger.warning(
+                'cancel-verify on %s raised; treating it as a failed cancel', host, exc_info=True,
+            )
+            return 1
+
+    async def _probed_clean(self, runner: RemoteRunner) -> bool:
+        for attempt in range(self._probe_attempts):
+            if await runner.probe_clean():
+                return True
+            if attempt < self._probe_attempts - 1:
+                await self._probe_sleep(_CANCEL_PROBE_INTERVAL_SECS)
+        return False
+
+    def _known(self, host: str) -> None:
+        if host not in self._gates:
+            raise ValueError(f'unknown verify host {host!r}; known hosts: {list(self._hosts)!r}')
+
+
+def _validated_hosts(hosts: Sequence[str], *, local_name: str) -> tuple[str, ...]:
+    hosts = tuple(hosts)
+    if local_name in hosts:
+        raise ValueError(f'{local_name!r} names the local host, not a remote verify host')
+    duplicates = sorted({host for host in hosts if hosts.count(host) > 1})
+    if duplicates:
+        raise ValueError(f'duplicate remote verify hosts: {duplicates!r}')
+    return hosts
