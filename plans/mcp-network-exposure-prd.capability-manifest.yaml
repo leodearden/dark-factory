@@ -168,7 +168,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: manual
-      reason: scripts/check_network_exposure.py is produced by α and absent on main, so a kind:script check would ERROR forever (shared/tests/test_capability_manifest.py::TestCheckedInScriptCheckTargets); the deploy runs the probe and the runner stamps the result
+      reason: scripts/check_network_exposure.py is produced by α and absent on main, so a delivered_check that execs it would ERROR forever (shared/tests/test_capability_manifest.py::TestCheckedInScriptCheckTargets); the deploy runs the probe and the runner stamps the result
   - name: fused-memory-restarted-on-new-socket-unit
     binding: capability→producer — DeterministicRunner verifies a fresh MainPID/ActiveEnterTimestamp on fused-memory.service (docs/task-authoring.md section 5) and stamps done_provenance.kind deterministic-deploy.
     verdict: PASS
