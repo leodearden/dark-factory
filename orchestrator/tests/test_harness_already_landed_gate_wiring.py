@@ -2745,13 +2745,17 @@ class TestAlreadyLandedGatePendingEscalationSnapshot:
         assert cast(
             MagicMock, from_snapshot._escalation_queue,
         ).get_by_task.call_count == expected_marks, 'one fresh re-read per flip, none to veto'
+        assert cast(
+            MagicMock, per_candidate._escalation_queue,
+        ).get_by_task.call_count == 1, 'without a snapshot the one read is the veto read'
         assert _disposition_trail(from_snapshot) == _disposition_trail(per_candidate)
 
     async def test_a_task_absent_from_the_snapshot_has_no_pending_rows(
         self, mock_orch_config, tmp_path,
     ) -> None:
         """Absent means ``[]``, never ``None``: the store WAS read, so the
-        unreadable-store veto must not fire, and nothing re-reads it."""
+        unreadable-store veto must not fire; the one read the store sees is
+        the clean pre-flip re-read."""
         h = _emitting_harness(mock_orch_config, tmp_path)
         _matrix_clean(h)
 
@@ -2761,6 +2765,9 @@ class TestAlreadyLandedGatePendingEscalationSnapshot:
 
         assert result is True
         cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+        cast(MagicMock, h._escalation_queue).get_by_task.assert_called_once_with(
+            '42', status='pending',
+        )
         assert _recovery_rows(h) == []
 
     @pytest.mark.parametrize('arm', _ARMS)
@@ -2780,10 +2787,58 @@ class TestAlreadyLandedGatePendingEscalationSnapshot:
         )
 
     @pytest.mark.parametrize('arm', _ARMS)
-    async def test_a_failed_re_read_before_the_flip_abstains(
-        self, mock_orch_config, arm, caplog,
+    async def test_a_severity_raised_in_place_after_the_snapshot_stops_every_flip_arm(
+        self, mock_orch_config, arm,
+    ) -> None:
+        """Same id, new severity: ``add_members_to_l2`` / ``attach_dedupe_child``
+        raise a pending record's severity in place, so an id diff would miss it."""
+        h, _meta = _arm_harness(mock_orch_config, arm, metadata={})
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-1', level=2, severity='blocking'),
+        )
+        snapshot = {'42': [_open_escalation('esc-42-1', level=2, severity='info')]}
+
+        with patch(_GATE_TARGET, AsyncMock(return_value=None)):
+            result = await h._already_landed_dispatch_gate('42', pending_escalations=snapshot)
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_an_info_record_filed_after_the_snapshot_does_not_stop_the_flip(
+        self, mock_orch_config, arm,
     ) -> None:
         h, _meta = _arm_harness(mock_orch_config, arm, metadata={})
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-5', level=0, severity='info'),
+        )
+
+        with patch(_GATE_TARGET, AsyncMock(return_value=None)):
+            result = await h._already_landed_dispatch_gate('42', pending_escalations={})
+
+        assert result is True
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+
+    async def test_an_arbitration_filed_after_the_snapshot_withholds_dispatch(
+        self, mock_orch_config,
+    ) -> None:
+        """The re-read decides as the first read does: a contested task is
+        withheld (``True``), never released to dispatch."""
+        h = _wired_ancestry_harness(mock_orch_config)
+        _matrix_arbitration(h)
+
+        result = await h._already_landed_dispatch_gate('42', pending_escalations={})
+
+        assert result is True
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_a_failed_re_read_before_the_flip_abstains_and_says_so(
+        self, mock_orch_config, tmp_path, arm, caplog,
+    ) -> None:
+        h, _meta = _arm_harness(mock_orch_config, arm, metadata={})
+        h.event_store = EventStore(tmp_path / 'runs.db', 'run-test')
+        h.config.recovery_emission = RecoveryEmissionConfig()
         _matrix_store_failure(h)
 
         with patch(_GATE_TARGET, AsyncMock(return_value=None)), \
@@ -2792,7 +2847,13 @@ class TestAlreadyLandedGatePendingEscalationSnapshot:
 
         assert result is False
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
-        assert any('could not re-read' in r.getMessage() for r in caplog.records)
+        assert any(
+            'could not READ the escalation store for task 42' in r.getMessage()
+            for r in caplog.records
+        )
+        rows = _recovery_rows(h)
+        assert [r['data']['reason'] for r in rows] == ['escalation_store_unavailable']
+        assert rows[0]['data']['store_unavailable'] is True
 
     async def test_a_record_resolved_after_the_snapshot_still_holds_the_flip_only_once(
         self, mock_orch_config,
