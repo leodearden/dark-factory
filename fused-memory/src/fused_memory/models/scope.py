@@ -362,6 +362,15 @@ def build_known_projects_map(
     return out
 
 
+def configured_known_projects_map(
+    taskmaster: TaskmasterConfig | None,
+) -> dict[str, str]:
+    """The registry every consumer derives from config plus ``KNOWN_PROJECT_ROOTS_ENV``."""
+    return build_known_projects_map(
+        configured_primary_root(taskmaster), known_project_roots_from_env(),
+    )
+
+
 ProjectId = NewType('ProjectId', str)
 ProjectRoot = NewType('ProjectRoot', str)
 
