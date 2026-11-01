@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -181,6 +182,52 @@ async def test_escalation_when_over_threshold_and_orchestrator_live(
     assert body['project_id'] == 'proj'
     assert body['workflow_state'] == 'infra'
     assert body['category'] == 'infra_issue'
+
+
+def _write_lock_file(project_root: Path, first_line: str) -> Path:
+    lock_dir = project_root / 'data' / 'orchestrator'
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / 'orchestrator.lock'
+    lock_path.write_text(f'{first_line}\n')
+    return lock_path
+
+
+@pytest.mark.asyncio
+async def test_default_detector_rejects_when_the_lock_names_a_live_pid_but_nothing_holds_it(
+    event_buffer, tmp_path,
+):
+    await _seed_buffered(event_buffer, 'proj', n=6)
+    project_root = tmp_path / 'proj_root'
+    _write_lock_file(project_root, f'PID {os.getpid()} started 2026-04-18T00:00:00Z')
+    policy = BacklogPolicy(event_buffer, _StubQueue(), hard_limit=5)
+
+    verdict = await policy.check('proj', project_root=str(project_root))
+
+    assert verdict.outcome == 'rejection'
+    esc_dir = escalation_queue_dir(project_root)
+    assert not esc_dir.exists() or not any(esc_dir.glob('esc-*.json'))
+
+
+@pytest.mark.asyncio
+async def test_default_detector_escalates_when_the_lock_is_held_whatever_pid_it_names(
+    event_buffer, tmp_path,
+):
+    await _seed_buffered(event_buffer, 'proj', n=6)
+    project_root = tmp_path / 'proj_root'
+    lock_path = _write_lock_file(project_root, 'PID 2147483646 started 2026-04-13T00:00:00Z')
+    policy = BacklogPolicy(event_buffer, _StubQueue(), hard_limit=5)
+
+    handle = lock_path.open('r+b')
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        verdict = await policy.check('proj', project_root=str(project_root))
+    finally:
+        handle.close()
+
+    assert verdict.outcome == 'escalated'
+    assert verdict.escalation_path is not None
+    record = json.loads(Path(verdict.escalation_path).read_text(encoding='utf-8'))
+    assert record['error_type'] == 'ReconciliationBacklogExceeded'
 
 
 @pytest.mark.asyncio
