@@ -239,13 +239,16 @@ async def _resolve(interceptor: TaskInterceptor, ticket_id: str) -> dict:
     )
 
 
-def _parked_answer(reason: DeferReason = DeferReason.ALL_ACCOUNTS_CAPPED) -> dict:
-    return {'status': TicketStatus.AWAITING_CURATION, 'reason': f'curation-deferred: {reason}'}
+def _parked_answer(ticket_id: str, reason: DeferReason = DeferReason.ALL_ACCOUNTS_CAPPED) -> dict:
+    return {
+        'status': TicketStatus.AWAITING_CURATION, 'ticket': ticket_id,
+        'reason': f'curation-deferred: {reason}',
+    }
 
 
 async def _park(interceptor: TaskInterceptor, title: str, **kwargs: Any) -> str:
     ticket_id = await _submit(interceptor, title, **kwargs)
-    assert await _resolve(interceptor, ticket_id) == _parked_answer()
+    assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id)
     return ticket_id
 
 
@@ -312,7 +315,7 @@ async def test_a_long_outage_never_creates(server):
         _age_ticket(server.db_path, ticket_id, submitted_at - tick * simulated_step)
         await _let_tiny_backoff_pass()
         await _bounded(janitor.tick())
-        assert await _resolve(interceptor, ticket_id) == _parked_answer()
+        assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id)
 
     row = await _row(store, ticket_id)
     age = datetime.now(UTC) - datetime.fromisoformat(row['created_at'])
@@ -335,7 +338,7 @@ async def test_parked_ticket_survives_restart_and_is_curated_after(server):
 
     curator = _Curator(lambda title: CuratorDecision(action='create', justification='nothing like it'))
     second, second_janitor, second_store = await server.boot(config, curator)
-    assert await _resolve(second, ticket_id) == _parked_answer()
+    assert await _resolve(second, ticket_id) == _parked_answer(ticket_id)
     assert curator.asked == []
 
     await _bounded(second_janitor.tick())
@@ -361,7 +364,7 @@ async def test_requeued_in_flight_ticket_is_reparked_on_restart_not_failed(serve
     second, second_janitor, second_store = await server.boot(_config(), curator)
     row = await _row(second_store, ticket_id)
     assert (row['status'], row['attempts'], row['next_attempt_at']) == (TicketStatus.AWAITING_CURATION, 1, None)
-    assert await _resolve(second, ticket_id) == _parked_answer()
+    assert await _resolve(second, ticket_id) == _parked_answer(ticket_id)
 
     await _bounded(second_janitor.tick())
 
@@ -416,7 +419,7 @@ async def test_submitter_never_hangs_on_a_frozen_pool(server):
     finally:
         await _bounded(gate.shutdown())
 
-    assert answer == _parked_answer()
+    assert answer == _parked_answer(ticket_id)
     row = await _row(store, ticket_id)
     assert (row['status'], row['attempts'], row['defer_reason']) == (
         TicketStatus.AWAITING_CURATION, 1, DeferReason.ALL_ACCOUNTS_CAPPED.value,
@@ -450,7 +453,7 @@ async def test_one_backlog_escalation_per_outage(server, tmp_path):
     titles = [f'capped-{n}' for n in range(8)] + [f'auth-{n}' for n in range(3)]
     tickets = {title: await _submit(interceptor, title) for title in titles}
     for title, ticket_id in tickets.items():
-        assert await _resolve(interceptor, ticket_id) == _parked_answer(_group_reason(title))
+        assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, _group_reason(title))
     for _ in range(2):
         await _bounded(janitor.tick())
     assert pending_per_group() == {reason: [] for reason in DeferReason}
@@ -461,7 +464,7 @@ async def test_one_backlog_escalation_per_outage(server, tmp_path):
         for _ in range(3):
             await _bounded(janitor.tick())
             for title, ticket_id in tickets.items():
-                assert await _resolve(interceptor, ticket_id) == _parked_answer(_group_reason(title))
+                assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, _group_reason(title))
 
     pending = pending_per_group()
     parked_reasons = {DeferReason.ALL_ACCOUNTS_CAPPED, DeferReason.ACCOUNTS_AUTH_FAILED}
@@ -545,11 +548,11 @@ async def test_llm_outage_queues_escalates_then_curates(server, tmp_path):
         )
         tickets = {title: await _submit(interceptor, title) for title in titles}
         for ticket_id in tickets.values():
-            assert await _resolve(interceptor, ticket_id) == _parked_answer(DeferReason.LLM_FAILED)
+            assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, DeferReason.LLM_FAILED)
         await asyncio.sleep(backoff_seconds * 1.2)
         await _bounded(janitor.tick())
         for ticket_id in tickets.values():
-            assert await _resolve(interceptor, ticket_id) == _parked_answer(DeferReason.LLM_FAILED)
+            assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, DeferReason.LLM_FAILED)
         await _bounded(janitor.tick())
 
         [backlog] = queue.get_by_task(curation_backlog_anchor(DeferReason.LLM_FAILED), status='pending')

@@ -320,14 +320,18 @@ class TestUncappedCurationUnchanged:
 
 CAPPED = CuratorDecision.deferred(DeferReason.ALL_ACCOUNTS_CAPPED)
 AUTH_FAILED = CuratorDecision.deferred(DeferReason.ACCOUNTS_AUTH_FAILED)
-PARKED_CAPPED_ANSWER = {
-    'status': TicketStatus.AWAITING_CURATION, 'reason': 'curation-deferred: all-accounts-capped',
-}
+
+
+def _parked_answer(ticket_id: str, reason: DeferReason) -> dict:
+    return {
+        'status': TicketStatus.AWAITING_CURATION, 'ticket': ticket_id,
+        'reason': f'curation-deferred: {reason}',
+    }
 
 
 async def _park(interceptor: TaskInterceptor, title: str) -> str:
     ticket_id = await _submit(interceptor, title)
-    assert await _resolve(interceptor, ticket_id) == PARKED_CAPPED_ANSWER
+    assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, DeferReason.ALL_ACCOUNTS_CAPPED)
     return ticket_id
 
 
@@ -373,7 +377,7 @@ class TestParking:
         assert not waiter.done()
         release.set()
 
-        assert await waiter == PARKED_CAPPED_ANSWER
+        assert await waiter == _parked_answer(ticket_id, DeferReason.ALL_ACCOUNTS_CAPPED)
 
     @pytest.mark.asyncio
     async def test_resolve_on_a_parked_ticket_returns_at_once(self, make_interceptor):
@@ -385,7 +389,7 @@ class TestParking:
             timeout=RESOLVE_DEADLINE_SECONDS,
         )
 
-        assert answer == PARKED_CAPPED_ANSWER
+        assert answer == _parked_answer(ticket_id, DeferReason.ALL_ACCOUNTS_CAPPED)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -424,8 +428,10 @@ class TestParking:
         release.set()
         answers = [await _resolve(interceptor, ticket_id) for ticket_id in (sibling, duplicate)]
 
-        parked_answer = {'status': TicketStatus.AWAITING_CURATION, 'reason': 'curation-deferred: accounts-auth-failed'}
-        assert answers == [parked_answer, parked_answer]
+        assert answers == [
+            _parked_answer(sibling, DeferReason.ACCOUNTS_AUTH_FAILED),
+            _parked_answer(duplicate, DeferReason.ACCOUNTS_AUTH_FAILED),
+        ]
         assert await _parked_row(store, duplicate) == _parked(DeferReason.ACCOUNTS_AUTH_FAILED)
         assert taskmaster.add_task_calls == []
 
@@ -515,9 +521,6 @@ class TestRequeue:
         assert (await _resolve(restarted, ticket_id))['status'] == 'combined'
 
 
-PARKED_LLM_FAILED_ANSWER = {'status': TicketStatus.AWAITING_CURATION, 'reason': 'curation-deferred: llm-failed'}
-
-
 class TestCuratorEscapeParks:
     """A curator failure that escapes curate() parks the ticket; only a zero-output hang creates."""
 
@@ -529,7 +532,7 @@ class TestCuratorEscapeParks:
 
         ticket_id = await _submit(interceptor, 'Work')
 
-        assert await _resolve(interceptor, ticket_id) == PARKED_LLM_FAILED_ANSWER
+        assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, DeferReason.LLM_FAILED)
         assert await _parked_row(store, ticket_id) == _parked(DeferReason.LLM_FAILED)
         assert taskmaster.add_task_calls == []
 
@@ -541,7 +544,7 @@ class TestCuratorEscapeParks:
 
         ticket_id = await _submit(interceptor, 'Work')
 
-        assert await _resolve(interceptor, ticket_id) == PARKED_LLM_FAILED_ANSWER
+        assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, DeferReason.LLM_FAILED)
         assert await _parked_row(store, ticket_id) == _parked(DeferReason.LLM_FAILED)
         assert taskmaster.add_task_calls == []
 
@@ -560,7 +563,7 @@ class TestCuratorEscapeParks:
 
         with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
             ticket_id = await _submit(interceptor, 'Work')
-            assert await _resolve(interceptor, ticket_id) == PARKED_LLM_FAILED_ANSWER
+            assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, DeferReason.LLM_FAILED)
 
         assert [
             r.levelno for r in caplog.records
@@ -575,9 +578,7 @@ class TestCuratorEscapeParks:
 
         ticket_id = await _submit(interceptor, 'Work')
 
-        assert await _resolve(interceptor, ticket_id) == {
-            'status': TicketStatus.AWAITING_CURATION, 'reason': 'curation-deferred: curator-raised',
-        }
+        assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, DeferReason.CURATOR_RAISED)
         assert await _parked_row(store, ticket_id) == _parked(DeferReason.CURATOR_RAISED)
         assert taskmaster.add_task_calls == []
 
@@ -604,7 +605,7 @@ class TestCuratorEscapeParks:
         curator.batch_raises.append(CuratorFailureError('batch down'))
         interceptor = make_interceptor(curator)
         ticket_id = await _submit(interceptor, 'Overlapping work')
-        assert await _resolve(interceptor, ticket_id) == PARKED_LLM_FAILED_ANSWER
+        assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, DeferReason.LLM_FAILED)
 
         assert await interceptor.requeue_awaiting_curation_ticket('project', ticket_id) is True
 
