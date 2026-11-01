@@ -29,6 +29,7 @@ from pydantic import BaseModel, field_validator
 from shared.project_id import normalize_project_id
 from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, known_project_roots
 
+from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.utils.validation import (
     InputValidationError,
     PathShapedProjectIdError,
@@ -280,6 +281,17 @@ def is_phantom_project_root(root: str | os.PathLike[str]) -> bool:
     unreadable or malformed path, so it is safe during process startup.
     """
     return not os.path.isdir(root)
+
+
+def configured_primary_root(taskmaster: TaskmasterConfig | None) -> str:
+    """The ONE normalisation of ``taskmaster.project_root``: expanded and
+    resolved, as every project-registry consumer must see it.
+
+    ``''`` means no primary root.  The literal default ``'.'`` denotes the
+    process CWD at call time and is registered like any other root.
+    """
+    raw = taskmaster.project_root if taskmaster is not None else ''
+    return str(Path(raw).expanduser().resolve()) if raw else ''
 
 
 def build_known_projects_map(
