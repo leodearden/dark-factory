@@ -2485,6 +2485,36 @@ class TestAlreadyLandedGateReleasesItsVetoStreak:
 _ABSENT_VIEW = AlreadyLandedTickView(local_branches=frozenset({'main'}))
 
 
+class _GateProbe:
+    """The already-landed gate as these tests drive it.
+
+    The one place they name the harness's private members, so each test
+    asserts on outcomes (docs/code-quality.md: tests reaching a module's
+    internals are an interface smell). The gate has no public caller cheaper
+    than a whole ``acquire_next`` tick.
+    """
+
+    def __init__(self, harness: Harness, *, stub_flips: bool = False) -> None:
+        self.harness = harness
+        if stub_flips:
+            harness._mark_in_progress_done = AsyncMock()
+        self.decide = harness._already_landed_dispatch_gate
+        self.consult = harness.scheduler._consult_already_landed
+        self.read_snapshot = harness._read_pending_escalations_by_task
+
+    @property
+    def flips(self) -> AsyncMock:
+        return cast(AsyncMock, self.harness._mark_in_progress_done)
+
+    @property
+    def queue(self) -> Any:
+        return self.harness._escalation_queue
+
+    @queue.setter
+    def queue(self, queue: Any) -> None:
+        self.harness._escalation_queue = queue
+
+
 @pytest.mark.asyncio
 class TestAlreadyLandedGateTickView:
     """Task 4900: the gate takes the scheduler's candidate dict as ``task=``
@@ -2502,20 +2532,22 @@ class TestAlreadyLandedGateTickView:
         )
         h.scheduler.get_task = AsyncMock(return_value={'id': '42', 'metadata': {}})
 
-        result = await h._already_landed_dispatch_gate(
+        gate = _GateProbe(h)
+        result = await gate.decide(
             '42', task={'id': '42', 'metadata': {'branch_base_sha': 'e' * 40}},
         )
 
         assert result is False, 'the supplied branch_base_sha drives the stale-marker veto'
         cast(AsyncMock, h.scheduler.get_task).assert_not_awaited()
-        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        gate.flips.assert_not_awaited()
 
     async def test_without_a_supplied_task_get_task_is_read_once(
         self, mock_orch_config,
     ) -> None:
         h = _wired_absent_branch_harness(mock_orch_config)
 
-        await h._already_landed_dispatch_gate('42')
+        gate = _GateProbe(h)
+        await gate.decide('42')
 
         cast(AsyncMock, h.scheduler.get_task).assert_awaited_once_with('42')
 
@@ -2524,13 +2556,14 @@ class TestAlreadyLandedGateTickView:
     ) -> None:
         h = _wired_absent_branch_harness(mock_orch_config)
 
-        result = await h._already_landed_dispatch_gate('42', tick_view=_ABSENT_VIEW)
+        gate = _GateProbe(h)
+        result = await gate.decide('42', tick_view=_ABSENT_VIEW)
 
         assert result is False
         cast(AsyncMock, h.git_ops.resolve_branch_sha).assert_not_awaited()
         cast(AsyncMock, h.git_ops.is_ancestor).assert_not_awaited()
         cast(AsyncMock, h.git_ops.branch_content_in_main).assert_not_awaited()
-        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        gate.flips.assert_not_awaited()
 
     async def test_absent_but_marked_rereads_and_follows_a_recreated_branch(
         self, mock_orch_config,
@@ -2542,12 +2575,13 @@ class TestAlreadyLandedGateTickView:
         h.git_ops.resolve_branch_sha = AsyncMock(return_value='f' * 40)
         h.git_ops.is_ancestor = AsyncMock(return_value=False)
 
-        result = await h._already_landed_dispatch_gate('42', tick_view=_ABSENT_VIEW)
+        gate = _GateProbe(h)
+        result = await gate.decide('42', tick_view=_ABSENT_VIEW)
 
         assert result is False
         cast(AsyncMock, h.git_ops.resolve_branch_sha).assert_awaited_once()
         cast(AsyncMock, h.git_ops.branch_content_in_main).assert_awaited_once()
-        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        gate.flips.assert_not_awaited()
 
     async def test_absent_but_marked_and_confirmed_absent_flips_on_the_marker(
         self, mock_orch_config,
@@ -2560,11 +2594,12 @@ class TestAlreadyLandedGateTickView:
             marker_is_ancestor_of_base=False,
         )
 
-        result = await h._already_landed_dispatch_gate('42', tick_view=_ABSENT_VIEW)
+        gate = _GateProbe(h)
+        result = await gate.decide('42', tick_view=_ABSENT_VIEW)
 
         assert result is True
         cast(AsyncMock, h.git_ops.resolve_branch_sha).assert_awaited_once()
-        call_args = cast(AsyncMock, h._mark_in_progress_done).await_args
+        call_args = gate.flips.await_args
         assert call_args is not None
         assert call_args.args[1] == marker_sha
         assert call_args.args[3] == 'dispatch-gate-marker-found'
@@ -2573,18 +2608,20 @@ class TestAlreadyLandedGateTickView:
         h = _wired_ancestry_harness(mock_orch_config)
         view = AlreadyLandedTickView(local_branches=frozenset({'main', 'task/42'}))
 
-        result = await h._already_landed_dispatch_gate('42', tick_view=view)
+        gate = _GateProbe(h)
+        result = await gate.decide('42', tick_view=view)
 
         assert result is True
         cast(AsyncMock, h.git_ops.resolve_branch_sha).assert_awaited_once()
-        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+        gate.flips.assert_awaited_once()
 
     async def test_an_unknown_enumeration_takes_todays_flow(
         self, mock_orch_config,
     ) -> None:
         h = _wired_absent_branch_harness(mock_orch_config)
 
-        result = await h._already_landed_dispatch_gate(
+        gate = _GateProbe(h)
+        result = await gate.decide(
             '42', tick_view=AlreadyLandedTickView(local_branches=None),
         )
 
@@ -2602,12 +2639,13 @@ class TestAlreadyLandedGateTickView:
         h = _wired_ancestry_harness(mock_orch_config)
         _let_mark_in_progress_done_run_for_real(h, tmp_path)
         h.git_ops.find_merge_marker = AsyncMock(return_value=None)
-        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        gate = _GateProbe(h)
+        gate.queue = EscalationQueue(tmp_path / 'esc')
         h.scheduler.get_task = AsyncMock(
             return_value={'id': '42', 'metadata': {'reopen_at': _STALE_REOPEN_AT}},
         )
         _wire_stale_evidence_mark_done(h, evidence_commit='a' * 40)
-        ProvenanceConflictSink(escalation_queue=h._escalation_queue).record(
+        ProvenanceConflictSink(escalation_queue=gate.queue).record(
             task_id='42',
             evidence_commit='a' * 40,
             evidence_committed_at='2026-07-10T00:00:00+00:00',
@@ -2616,10 +2654,10 @@ class TestAlreadyLandedGateTickView:
             gate_source='merge-queue',
         )
         h._provenance_conflict_sink = ProvenanceConflictSink(
-            escalation_queue=h._escalation_queue,
+            escalation_queue=gate.queue,
         )
 
-        result = await h._already_landed_dispatch_gate('42', tick_view=_ABSENT_VIEW)
+        result = await gate.decide('42', tick_view=_ABSENT_VIEW)
 
         assert result is True, 'a contested task stays withheld whatever the view says'
 
@@ -2628,11 +2666,12 @@ class TestAlreadyLandedGateTickView:
     ) -> None:
         h = _emitting_harness(mock_orch_config, tmp_path)
         h.git_ops.find_merge_marker = AsyncMock(return_value=None)
-        h._escalation_queue = _queue_with_open(
+        gate = _GateProbe(h)
+        gate.queue = _queue_with_open(
             _open_escalation('esc-42-9', level=2),
         )
 
-        result = await h._already_landed_dispatch_gate('42', tick_view=_ABSENT_VIEW)
+        result = await gate.decide('42', tick_view=_ABSENT_VIEW)
 
         assert result is False
         rows = _recovery_rows(h)
@@ -2650,7 +2689,8 @@ class TestAlreadyLandedGateTickView:
         git_ops_double.find_merge_marker = AsyncMock(return_value=None)
         h.git_ops = git_ops_double
 
-        gated = await h.scheduler._consult_already_landed([{'id': '9', 'metadata': {}}])
+        gate = _GateProbe(h)
+        gated = await gate.consult([{'id': '9', 'metadata': {}}])
 
         assert gated == set()
         git_ops_double.list_local_branches.assert_awaited_once_with()
@@ -2660,9 +2700,9 @@ class TestAlreadyLandedGateTickView:
         git_ops_double.resolve_branch_sha.assert_not_awaited()
 
 
-def _pending_snapshot_for(h: Harness) -> dict[str, list[Escalation]]:
+def _pending_snapshot_for(gate: _GateProbe) -> dict[str, list[Escalation]]:
     """What a consult's snapshot holds for task 42, read from the wired stub."""
-    queue = cast(MagicMock, h._escalation_queue)
+    queue = cast(MagicMock, gate.queue)
     rows = queue.get_by_task('42', status='pending')
     queue.get_by_task.reset_mock()
     return {'42': list(rows)} if rows else {}
@@ -2699,7 +2739,7 @@ class _CountingQueue:
         return self.queue.get_pending_by_task()
 
 
-def _consulting_harness(tmp_path: Path, queue: _CountingQueue) -> Harness:
+def _consulting_gate(tmp_path: Path, queue: _CountingQueue) -> _GateProbe:
     """A real Harness whose consult runs end to end; every branch is absent."""
     h = Harness(OrchestratorConfig(project_root=tmp_path))
     git_ops_double = MagicMock(spec=GitOps)
@@ -2707,9 +2747,9 @@ def _consulting_harness(tmp_path: Path, queue: _CountingQueue) -> Harness:
     git_ops_double.list_local_branches = AsyncMock(return_value=frozenset({'main'}))
     git_ops_double.find_merge_marker = AsyncMock(return_value=None)
     h.git_ops = git_ops_double
-    h._mark_in_progress_done = AsyncMock()
-    h._escalation_queue = cast(Any, queue)
-    return h
+    gate = _GateProbe(h, stub_flips=True)
+    gate.queue = queue
+    return gate
 
 
 _SNAPSHOT_SCENARIOS = [
@@ -2730,23 +2770,23 @@ class TestAlreadyLandedGatePendingEscalationSnapshot:
         wire, expected_result, expected_marks = _GATE_MATRIX[scenario]
         per_candidate = _emitting_harness(mock_orch_config, tmp_path / 'a')
         wire(per_candidate)
+        per_candidate_gate = _GateProbe(per_candidate)
         from_snapshot = _emitting_harness(mock_orch_config, tmp_path / 'b')
         wire(from_snapshot)
-        snapshot = _pending_snapshot_for(from_snapshot)
+        snapshot_gate = _GateProbe(from_snapshot)
+        snapshot = _pending_snapshot_for(snapshot_gate)
 
-        expected = await per_candidate._already_landed_dispatch_gate('42')
-        result = await from_snapshot._already_landed_dispatch_gate(
-            '42', pending_escalations=snapshot,
-        )
+        expected = await per_candidate_gate.decide('42')
+        result = await snapshot_gate.decide('42', pending_escalations=snapshot)
 
         assert expected is expected_result
         assert result is expected_result
-        assert cast(AsyncMock, from_snapshot._mark_in_progress_done).await_count == expected_marks
+        assert snapshot_gate.flips.await_count == expected_marks
         assert cast(
-            MagicMock, from_snapshot._escalation_queue,
+            MagicMock, snapshot_gate.queue,
         ).get_by_task.call_count == expected_marks, 'one fresh re-read per flip, none to veto'
         assert cast(
-            MagicMock, per_candidate._escalation_queue,
+            MagicMock, per_candidate_gate.queue,
         ).get_by_task.call_count == 1, 'without a snapshot the one read is the veto read'
         assert _disposition_trail(from_snapshot) == _disposition_trail(per_candidate)
 
@@ -2758,14 +2798,15 @@ class TestAlreadyLandedGatePendingEscalationSnapshot:
         the clean pre-flip re-read."""
         h = _emitting_harness(mock_orch_config, tmp_path)
         _matrix_clean(h)
+        gate = _GateProbe(h)
 
-        result = await h._already_landed_dispatch_gate(
+        result = await gate.decide(
             '42', pending_escalations={'7': [_open_escalation('esc-7-1', level=2)]},
         )
 
         assert result is True
-        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
-        cast(MagicMock, h._escalation_queue).get_by_task.assert_called_once_with(
+        gate.flips.assert_awaited_once()
+        cast(MagicMock, gate.queue).get_by_task.assert_called_once_with(
             '42', status='pending',
         )
         assert _recovery_rows(h) == []
@@ -2775,14 +2816,15 @@ class TestAlreadyLandedGatePendingEscalationSnapshot:
         self, mock_orch_config, arm,
     ) -> None:
         h, _meta = _arm_harness(mock_orch_config, arm, metadata={})
-        h._escalation_queue = _queue_with_open(_open_escalation('esc-42-9', level=2))
+        gate = _GateProbe(h)
+        gate.queue = _queue_with_open(_open_escalation('esc-42-9', level=2))
 
         with patch(_GATE_TARGET, AsyncMock(return_value=None)):
-            result = await h._already_landed_dispatch_gate('42', pending_escalations={})
+            result = await gate.decide('42', pending_escalations={})
 
         assert result is False
-        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
-        cast(MagicMock, h._escalation_queue).get_by_task.assert_called_once_with(
+        gate.flips.assert_not_awaited()
+        cast(MagicMock, gate.queue).get_by_task.assert_called_once_with(
             '42', status='pending',
         )
 
@@ -2793,31 +2835,33 @@ class TestAlreadyLandedGatePendingEscalationSnapshot:
         """Same id, new severity: ``add_members_to_l2`` / ``attach_dedupe_child``
         raise a pending record's severity in place, so an id diff would miss it."""
         h, _meta = _arm_harness(mock_orch_config, arm, metadata={})
-        h._escalation_queue = _queue_with_open(
+        gate = _GateProbe(h)
+        gate.queue = _queue_with_open(
             _open_escalation('esc-42-1', level=2, severity='blocking'),
         )
         snapshot = {'42': [_open_escalation('esc-42-1', level=2, severity='info')]}
 
         with patch(_GATE_TARGET, AsyncMock(return_value=None)):
-            result = await h._already_landed_dispatch_gate('42', pending_escalations=snapshot)
+            result = await gate.decide('42', pending_escalations=snapshot)
 
         assert result is False
-        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        gate.flips.assert_not_awaited()
 
     @pytest.mark.parametrize('arm', _ARMS)
     async def test_an_info_record_filed_after_the_snapshot_does_not_stop_the_flip(
         self, mock_orch_config, arm,
     ) -> None:
         h, _meta = _arm_harness(mock_orch_config, arm, metadata={})
-        h._escalation_queue = _queue_with_open(
+        gate = _GateProbe(h)
+        gate.queue = _queue_with_open(
             _open_escalation('esc-42-5', level=0, severity='info'),
         )
 
         with patch(_GATE_TARGET, AsyncMock(return_value=None)):
-            result = await h._already_landed_dispatch_gate('42', pending_escalations={})
+            result = await gate.decide('42', pending_escalations={})
 
         assert result is True
-        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+        gate.flips.assert_awaited_once()
 
     async def test_an_arbitration_filed_after_the_snapshot_withholds_dispatch(
         self, mock_orch_config,
@@ -2826,27 +2870,29 @@ class TestAlreadyLandedGatePendingEscalationSnapshot:
         withheld (``True``), never released to dispatch."""
         h = _wired_ancestry_harness(mock_orch_config)
         _matrix_arbitration(h)
+        gate = _GateProbe(h)
 
-        result = await h._already_landed_dispatch_gate('42', pending_escalations={})
+        result = await gate.decide('42', pending_escalations={})
 
         assert result is True
-        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        gate.flips.assert_not_awaited()
 
     @pytest.mark.parametrize('arm', _ARMS)
     async def test_a_failed_re_read_before_the_flip_abstains_and_says_so(
         self, mock_orch_config, tmp_path, arm, caplog,
     ) -> None:
         h, _meta = _arm_harness(mock_orch_config, arm, metadata={})
+        gate = _GateProbe(h)
         h.event_store = EventStore(tmp_path / 'runs.db', 'run-test')
         h.config.recovery_emission = RecoveryEmissionConfig()
         _matrix_store_failure(h)
 
         with patch(_GATE_TARGET, AsyncMock(return_value=None)), \
                 caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
-            result = await h._already_landed_dispatch_gate('42', pending_escalations={})
+            result = await gate.decide('42', pending_escalations={})
 
         assert result is False
-        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        gate.flips.assert_not_awaited()
         assert any(
             'could not READ the escalation store for task 42' in r.getMessage()
             for r in caplog.records
@@ -2862,28 +2908,29 @@ class TestAlreadyLandedGatePendingEscalationSnapshot:
         consult, and the next consult's fresh snapshot lets the task flip."""
         h = _wired_ancestry_harness(mock_orch_config)
         _matrix_clean(h)
+        gate = _GateProbe(h)
         pinned = _open_escalation('esc-42-9', level=2)
 
-        held = await h._already_landed_dispatch_gate(
+        held = await gate.decide(
             '42', pending_escalations={'42': [pinned]},
         )
-        flipped = await h._already_landed_dispatch_gate('42', pending_escalations={})
+        flipped = await gate.decide('42', pending_escalations={})
 
         assert (held, flipped) == (False, True)
-        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+        gate.flips.assert_awaited_once()
 
     async def test_the_harness_reader_groups_the_live_store_and_skips_an_unwired_one(
         self, tmp_path,
     ) -> None:
-        h = Harness(OrchestratorConfig(project_root=tmp_path))
-        h._escalation_queue = None
-        assert await h._read_pending_escalations_by_task() is None
+        gate = _GateProbe(Harness(OrchestratorConfig(project_root=tmp_path)))
+        gate.queue = None
+        assert await gate.read_snapshot() is None
 
         queue = _CountingQueue(tmp_path / 'esc')
         queue.queue.submit(_open_escalation('esc-42-9', level=2))
-        h._escalation_queue = cast(Any, queue)
+        gate.queue = queue
 
-        snapshot = await h._read_pending_escalations_by_task()
+        snapshot = await gate.read_snapshot()
 
         assert snapshot is not None
         assert [e.id for e in snapshot['42']] == ['esc-42-9']
@@ -2893,10 +2940,10 @@ class TestAlreadyLandedGatePendingEscalationSnapshot:
     ) -> None:
         queue = _CountingQueue(tmp_path / 'esc')
         queue.queue.submit(_open_escalation('esc-42-9', level=2))
-        h = _consulting_harness(tmp_path, queue)
+        gate = _consulting_gate(tmp_path, queue)
         candidates = [{'id': tid, 'metadata': {}} for tid in ('9', '42', '77', '78')]
 
-        gated = await h.scheduler._consult_already_landed(candidates)
+        gated = await gate.consult(candidates)
 
         assert gated == set()
         assert (queue.snapshot_reads, queue.per_task_reads) == (1, 0)
@@ -2905,15 +2952,15 @@ class TestAlreadyLandedGatePendingEscalationSnapshot:
         self, tmp_path, caplog,
     ) -> None:
         queue = _CountingQueue(tmp_path / 'esc', unreadable=True)
-        h = _consulting_harness(tmp_path, queue)
+        gate = _consulting_gate(tmp_path, queue)
         candidates = [{'id': tid, 'metadata': {}} for tid in ('9', '42')]
 
         with caplog.at_level(logging.WARNING):
-            gated = await h.scheduler._consult_already_landed(candidates)
+            gated = await gate.consult(candidates)
 
         assert gated == set()
         assert (queue.snapshot_reads, queue.per_task_reads) == (1, 2)
-        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        gate.flips.assert_not_awaited()
         messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
         assert any('pending escalation snapshot' in m for m in messages), messages
         for tid in ('9', '42'):
@@ -2930,14 +2977,14 @@ class TestAlreadyLandedGatePendingEscalationSnapshot:
         on store_unavailable exactly as before task 8073."""
         queue = _CountingQueue(tmp_path / 'esc')
         (queue.queue.queue_dir / 'esc-9-1.json').write_bytes(b'\xff\xfe not utf-8')
-        h = _consulting_harness(tmp_path, queue)
+        gate = _consulting_gate(tmp_path, queue)
 
         with caplog.at_level(logging.WARNING):
-            gated = await h.scheduler._consult_already_landed([{'id': '9', 'metadata': {}}])
+            gated = await gate.consult([{'id': '9', 'metadata': {}}])
 
         assert gated == set()
         assert (queue.snapshot_reads, queue.per_task_reads) == (1, 1)
-        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        gate.flips.assert_not_awaited()
         messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
         assert any('pending escalation snapshot' in m for m in messages), messages
         assert any(
