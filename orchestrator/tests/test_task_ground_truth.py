@@ -828,9 +828,9 @@ class TestDeriveTruthLiveClaimant:
         assert report.live_claimant is None
 
     async def test_plan_lock_dead_owner_pid_returns_none(self, tmp_path: Path) -> None:
-        # _pid_alive(2**31 - 1) is deterministically False — not a valid
+        # pid_alive(2**31 - 1) is deterministically False — not a valid
         # live PID on any standard Linux (mirrors
-        # test_pid_alive_contract.py's identical convention) — so a
+        # shared/tests/test_proc_liveness.py's identical convention) — so a
         # plan.lock whose owner process has died must NOT be treated as a
         # live claimant (review finding #3).
         artifacts = _plan_lock_artifacts(tmp_path)
