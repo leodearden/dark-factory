@@ -1249,9 +1249,12 @@ class TestTestTreeSweep:
             },
         )
         sweep = metrics.sweep_repo(root)
-        assert sweep.tests['orchestrator/tests/test_g.py']['patch_targets'] == [
-            'gates.POST_ADVANCE_GATES'
-        ]
+        assert sweep.tests == {
+            'orchestrator/tests/test_g.py': {
+                'patch_targets': ['gates.POST_ADVANCE_GATES'],
+                'private_reads': 0,
+            }
+        }
 
     def test_an_unreadable_cluster_path_is_not_masked_by_a_clean_sweep(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
