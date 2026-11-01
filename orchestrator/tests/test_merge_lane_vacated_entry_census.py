@@ -40,6 +40,8 @@ _GIT = GitConfig(
 _SEED = RepoSeed(files=(('README.md', '# Test\n'),), message='Initial commit')
 _HEAD_HOST = 'head-host'
 _REQUEUE_TRIGGERS = ('lane_contended', 'no_progress')
+_POLL_SECS = 0.005
+_SETTLE_POLLS = 200
 
 
 @dataclasses.dataclass(frozen=True)
@@ -76,7 +78,26 @@ async def _request(scene: _Scene, name: str) -> MergeRequest:
 
 async def _until(predicate: Callable[[], bool]) -> None:
     while not predicate():
-        await asyncio.sleep(0.005)
+        await asyncio.sleep(_POLL_SECS)
+
+
+async def _settle(predicate: Callable[[], bool]) -> None:
+    """Give the lane up to ``_SETTLE_POLLS`` short turns to make *predicate*
+    hold, and return either way: the caller's assertion, not a timeout,
+    then reports what is still there.
+    """
+    for _ in range(_SETTLE_POLLS):
+        if predicate():
+            return
+        await asyncio.sleep(_POLL_SECS)
+
+
+def _rendered_ids(snap: dict[str, Any]) -> list[str]:
+    return [entry['request_id'] for entry in snap['entries']]
+
+
+def _slot_states(snap: dict[str, Any]) -> dict[str, str]:
+    return {host['name']: host['slot_state'] for host in snap['hosts']}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -103,6 +124,12 @@ async def _vacated_scene(scene: _Scene, trigger: str) -> AsyncIterator[_VacatedS
     'lane_contended' and 'no_progress' requeue R, and ``halt_admission()``
     (taken before R's verify exits) holds it in its lane buffer; 'abandon'
     cancels R's outcome, and the lane drops it.
+
+    After an abandon the scene waits for R's 'local' lease to come back, read
+    from the hosts census rather than from the filter under test, and only
+    then lets the retire that follows settle. A vacated entry that still
+    renders therefore fails the test's own assertion, which names it, rather
+    than timing out this wait.
     """
     head = await _request(scene, 'head')
     req = await _request(scene, 'req')
@@ -124,12 +151,14 @@ async def _vacated_scene(scene: _Scene, trigger: str) -> AsyncIterator[_VacatedS
         await wait_responsive(head_entered.wait(), label='head verify under way on the remote')
         await queue.put(req)
         await wait_responsive(r_entered.wait(), label='R verify under way on local')
+        assert _slot_states(lane.snapshot()).get('local') == 'busy', lane.snapshot()['hosts']
         if trigger == 'abandon':
             req.result.cancel()
             await wait_responsive(
-                _until(lambda: lane_state(lane, req.request_id) is None),
-                label='abandoned R dropped',
+                _until(lambda: _slot_states(lane.snapshot()).get('local') == 'free'),
+                label="abandoned R's verify handed its local lease back",
             )
+            await _settle(lambda: lane_state(lane, req.request_id) is None)
         else:
             lane.halt_admission('test: hold the requeued request')
             if trigger == 'lane_contended':
@@ -143,14 +172,6 @@ async def _vacated_scene(scene: _Scene, trigger: str) -> AsyncIterator[_VacatedS
         yield _VacatedScene(lane=lane, head=head, req=req, main_sha=main_sha)
 
 
-def _rendered_ids(snap: dict[str, Any]) -> list[str]:
-    return [entry['request_id'] for entry in snap['entries']]
-
-
-def _slot_states(snap: dict[str, Any]) -> dict[str, str]:
-    return {host['name']: host['slot_state'] for host in snap['hosts']}
-
-
 class TestVacatedInflightEntryRendersAtMostOnce:
     """R's vacated entry is invisible to every in-flight reader: a requeued R
     renders exactly once, as queued, and never in the frozen prefix; a
@@ -160,6 +181,12 @@ class TestVacatedInflightEntryRendersAtMostOnce:
     speculatively behind it (``speculation_depth=2``), verifies on 'local',
     so R's entry sits behind H in the pipeline and cannot reach head of line
     while H verifies. R's verify then exits, leaving its vacated entry there.
+
+    ``snapshot()`` keeps one row per request_id, the head-of-line copy
+    (worker.py::_first_copy_per_request), so a leaked vacated entry never
+    shows as a second row. It shows as R's one row carrying the corpse's
+    in-flight state instead of 'queued', which is what the requeue test's
+    state assertion catches.
 
     Read through the public seams only: ``snapshot()`` (entries, depth,
     occupancy, verify_in_progress, frozen_prefix, the hosts census),
@@ -176,15 +203,11 @@ class TestVacatedInflightEntryRendersAtMostOnce:
             rid = vacated.req.request_id
             head = vacated.head
             snap = lane.snapshot()
-            rendered = _rendered_ids(snap)
             entries = snap['entries']
 
-            assert rendered.count(rid) == 1, (
-                f'the requeued request must render exactly once, not also as '
-                f'its vacated in-flight entry: {entries!r}'
-            )
             assert [e['state'] for e in entries if e['request_id'] == rid] == ['queued'], (
-                f'{entries!r}'
+                f'the requeued request must render once, as its lane-buffer copy, '
+                f'not as its vacated in-flight entry: {entries!r}'
             )
             assert rid not in lane.frozen_prefix(), (
                 f'a vacated entry is not frozen: {lane.frozen_prefix()!r} {entries!r}'
@@ -193,7 +216,7 @@ class TestVacatedInflightEntryRendersAtMostOnce:
             assert lane.check_frozen_prefix_invariant(vacated.main_sha) == [], (
                 f'{lane.check_frozen_prefix_invariant(vacated.main_sha)!r} {entries!r}'
             )
-            assert snap['depth'] == 2 == len(set(rendered)), (
+            assert snap['depth'] == 2 == len(entries), (
                 f'depth must count the two live requests: depth={snap["depth"]} {entries!r}'
             )
             assert snap['occupancy']['inflight_by_host'] == {_HEAD_HOST: [head.task_id]}, (
@@ -225,6 +248,13 @@ class TestVacatedInflightEntryRendersAtMostOnce:
             assert snap['depth'] == 1, f'{entries!r}'
             assert snap['occupancy']['inflight_by_host'] == {_HEAD_HOST: [vacated.head.task_id]}, (
                 f'{snap["occupancy"]!r} {entries!r}'
+            )
+            assert snap['verify_in_progress'] is not None, f'{entries!r}'
+            assert snap['verify_in_progress']['task_id'] == vacated.head.task_id, (
+                f'{snap["verify_in_progress"]!r} {entries!r}'
+            )
+            assert _slot_states(snap).get('local') == 'free', (
+                f'the drop must hand R\'s local lease back: {snap["hosts"]!r} {entries!r}'
             )
             assert lane.check_frozen_prefix_invariant(vacated.main_sha) == [], (
                 f'{lane.check_frozen_prefix_invariant(vacated.main_sha)!r} {entries!r}'
