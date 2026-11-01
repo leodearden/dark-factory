@@ -1,6 +1,7 @@
 # PRD: Task-amendment delivery — make a post-plan amendment reach the work, and make descoping legible
 
 **Status:** active · authored 2026-08-12 · approach **B + H** (contract + two-way boundary tests)
+· γ rescoped 2026-11-01 to a disposition check (D14; Leo's ruling on esc-4033-2)
 **Author session:** sweep-df-3334614 (investigation report:
 `/home/leo/.claude/spawn-briefs/df-amendment-drop-sweep-RESULT.md`)
 
@@ -240,8 +241,10 @@ which was chosen** rather than picking one. Performing reverts is out of scope (
    the revalidation path before trusting any done step; promote 2971's `_rescoped_*`
    fields plus a per-step `disposition` to schema; key the invariant on
    `(step_id, commit)` + disposition, not on count.
-3. **γ — the converse merge gate**, at *submission* time: every commit on the task
-   branch is owned by a plan step or named in a disposition.
+3. **γ — the disposition gate**, at merge *submission* time: a done step that β let
+   drop with `disposition: orphan` or `revert` must not land on main. γ refuses a
+   branch on which that commit is still present, by sha or by patch-equivalent, and
+   not reverted. Commits that no plan step owns are not refused (D14).
 4. **δ — write-boundary advisory + event** in fused-memory, so an amendment to a
    planned task says so at the moment it is written.
 5. **ε — close the curator combine race**: make the execution-time predicate match the
@@ -336,6 +339,30 @@ re-pending. That is a pre-existing owned-and-bounded hold with a storm escape, s
 and γ reuse it rather than adding a second failure path (INV-4, INV-5, INV-7 all
 satisfied by reuse).
 
+**D14 — γ checks that descope dispositions are true; it does not check commit
+ownership** (Leo, 2026-11-01, ruling on esc-4033-2, option D3). The original C6
+predicate — every branch commit is owned by a plan step or named in a disposition —
+had a false premise. Measured at the point where γ would run (per task, before
+coalesce trains), over 35 recent task branches (esc-4033-2 investigation,
+2026-10-31): 368 commits, of which 258 (70%) are
+owned, 75 are `amend:` commits, 33 are other commits and 2 are merges. 15 of the 35
+branches (43%) carry a non-amend commit that no step owns, and every one is a
+legitimate fix to its own task: late gate fixes, data commits, debugger commits,
+WIP commits made before a rebase. `amend:` commits have no owner by construction
+(`orchestrator/src/orchestrator/agents/briefing.py::build_amender_prompt`), and
+ownership is recorded only partially (one pre-rebase sha per step). γ as first
+written would therefore have refused at least 43% of real submissions, while
+catching nothing that the reviewer — who already sees the full branch diff — misses.
+The hole the original γ was meant to close is closed on the plan side by β, which
+refuses a dropped done step unless it carries a disposition. β does not check that
+the disposition is true: a step recorded `orphan` or `revert` whose commit still
+lands on main. That check is now γ's whole scope.
+
+Rejected alternatives. Recording every role's commits, or marking ownership with
+commit trailers, would build bookkeeping whose only consumer is γ, just so that γ
+passes legitimate commits. Parking γ behind a measurement would observe nothing:
+descopes are rare (the corpus holds six hand-worked precedents, §2.8).
+
 ---
 
 ## 5. Pre-conditions for activating
@@ -385,7 +412,7 @@ splitting rather than by sequencing, removing the block instead of inheriting it
 |---|---|---|---|---|
 | **α** | Task-text fingerprint gates plan-revalidation skip | `shared/`, `orchestrator/` | Amend a planned task's `description`; redispatch; the dispatch takes the **architect revalidation** path (event `plan_revalidated`) instead of emitting `phase_skipped{reason:'revalidation_skipped_no_overlap'}`, and the resulting briefing contains the amended text | — |
 | **β** | Done-step integrity + sanctioned descope on the revalidation path | `orchestrator/` | A revalidation that drops a done step **without** a recorded disposition is refused with a structured reason; one that records `disposition` proceeds and the plan retains `_rescoped_at`/`_rescoped_by`/`_rescoped_note` + the dropped `(step_id, commit)`; a plan with duplicate done-step SHAs is refused | **3651**, α |
-| **γ** | Converse merge gate at submission: branch commits ⊆ owned ∪ descoped | `orchestrator/` | Submitting a merge for a branch carrying a commit owned by no plan step and named in no disposition is refused **at `_submit_to_merge_queue`** (before enqueue), with the offending sha in the reason | β |
+| **γ** | Disposition gate at submission: no `orphan`/`revert`-descoped commit lands (D14) | `orchestrator/` | Submitting a merge for a branch on which a commit recorded `disposition: orphan` (or `revert`, unreverted) still lands is refused **at `_submit_to_merge_queue`** (before enqueue), with the sha, step and disposition in the reason. A branch whose only unexplained commits are unowned (`amend:`, gate fixes) submits normally | β |
 | **δ** | Write-boundary amendment advisory + event | `fused-memory/`, `shared/` | `update_task` changing `description`/`details` on a task whose `metadata.plan_text_fp` disagrees returns `amendment_advisory` in its result, and emits a structured `task_text_amended` event carrying the writer source | α |
 | **ε** | Curator combine: execution-time predicate matches selection | `fused-memory/` | A combine whose live target is `in-progress` (or holds a claimant) is refused and the candidate is filed as its own task; `data/combine_audit.jsonl` records the refusal | — |
 | **ζ** | One-off plan-fingerprint migration sweep | `scripts/` | Every live plan under `.worktrees/.task-meta/*/plan.json` carries `_task_text_fp`; plans whose text has moved carry the forcing sentinel; the script reports counts per class — **re-derived at run time, not hard-coded at 27** (G6 relaxation at decompose: 27 is an authoring-time measurement, so asserting it as a signal would bake in a stale number; retained only as a sanity band — cf. open question 3 and INV-3) | α |
@@ -520,28 +547,46 @@ recorded with `disposition: orphan`), and **3143 passes** (all 19 dropped, each
 recorded, disposition `orphan`, authority `esc-3143-4`) — while a silent
 `create_plan()` wipe **fails**, because nothing recorded the drops.
 
-### C6 — The γ merge gate (submission-time)
+### C6 — The γ merge gate (submission-time; the disposition check, D14)
 
 At `TaskWorkflow._submit_to_merge_queue`, alongside the existing
 `_check_plan_files_touched_in_branch` call and **before**
 `register_and_enqueue_merge_request`:
 
 ```
-OWNED    := { commit of every plan step (any status) }
-DESCOPED := { commit of every _descoped_steps entry }
-γ PASSES iff  every commit in (base..branch_head)  ∈ OWNED ∪ DESCOPED
-              OR is classified equivalent by find_equivalent_commit
+CHECKED     := { e ∈ plan['_descoped_steps'] : e.disposition ∈ {orphan, revert} }
+LANDS(e)    := e.commit ∈ (base..branch_head)
+               OR find_equivalent_commit(base, e.commit, patch_id_only=True) ≠ None
+REVERTED(e) := some commit in (base..branch_head) either
+                 carries git revert's `This reverts commit <sha>` line naming e.commit
+                 or the equivalent LANDS found,
+                 OR has the patch-id of e.commit's inverse diff
+γ PASSES iff  for every e ∈ CHECKED:  ¬LANDS(e)  ∨  REVERTED(e)
 ```
+
+γ does not check `ride-along` entries, because that disposition says the commit does
+land. A commit that no plan step owns and no disposition names is **not** refused
+(D14). The equivalence lookup is `patch_id_only` because a subject-only match does
+not prove that the content landed (the task-4862 precedent). An `e.commit` that does
+not resolve (50.2% of recorded done-step SHAs are gc-pruned, §2.7) cannot be on the
+branch by sha and yields no equivalent, so it passes: unresolvable is expected, never
+a failure. A plan with no `CHECKED` entry, which is almost every plan, costs γ no git
+work at all. A partial hand-authored revert matches neither revert test, so these
+two tests refuse it, naming the sha. The remedy is a full revert or a truthful
+re-recording of the disposition, unless γ also adopts the net-diff test that §11
+question 4 leaves open.
 
 Fail-open on git error — but **with a streak counter, not bare** (G7 redesign at
 decompose, INV-4 `storm-escape-required`; see task 4033). The sibling gates' documented
 fail-open convention turns out on reading to be loud-log-only with no counter, so
 inheriting it verbatim would let γ degrade silently under a persistent git fault. A
-repeated fail-open must escalate. Rejection
-returns the offending sha; the workflow may remedy in place and re-check, as
-`_try_narrow_plan` already does at the same site. **INV-8:** the commit walk uses the
-async git runner (`git_ops._run`), never a blocking `subprocess.run`, and its fan-out
-is bounded by the branch's commit count with the loop-invariant probes hoisted.
+repeated fail-open must escalate. Rejection returns the offending
+`(step_id, commit, disposition)` as structured fields. The workflow may remedy in
+place and re-check, as `_try_narrow_plan` already does at the same site. **INV-8:** the
+probes use the async git runner (`git_ops._run`), never a blocking `subprocess.run`.
+Their fan-out is bounded by |CHECKED| and the branch's commit count, and the
+loop-invariant probes (the `base..head` commit list, the revert lines) are hoisted out
+of the per-entry body.
 
 ### C7 — The δ advisory + event
 
@@ -594,8 +639,8 @@ measured 20.2% rate an operator needs a counter, not just a log line.
 | 8 | Recorded descope proceeds (2971 replay) | dropped step recorded with `disposition: orphan` + authority | accepted; plan retains `_rescoped_*` and `_descoped_steps` |
 | 9 | Phantom-done wipe proceeds (3143 replay) | 19 done steps dropped, all recorded, SHAs unresolvable | accepted — unresolvable is expected, not a failure |
 | 10 | Duplicate done SHAs refused | two done steps share a commit | refused (closes the sha-duplication hole) |
-| 11 | Ride-along commit blocked at submission | branch carries a commit owned by no step and named in no disposition | `_submit_to_merge_queue` refuses **before** enqueue; reason names the sha |
-| 12 | Descoped ride-along permitted | same commit named with `disposition: ride-along` | submission proceeds |
+| 11 | Orphaned commit that still lands is refused | plan records `(step-1, X)` with `disposition: orphan`; the branch carries X, or a rebased patch-equivalent of it, unreverted | `_submit_to_merge_queue` refuses **before** enqueue; the reason names X, step-1 and the disposition |
+| 12 | Honoured dispositions and unowned commits proceed | the same record with X absent from the branch or reverted on it; the same X present but recorded `disposition: ride-along`; and a branch carrying unowned `amend:` commits and no `_descoped_steps` | submission proceeds in all three |
 | 13 | fused-memory advisory returned | `update_task(description=…)` on a task whose `metadata.plan_text_fp` disagrees | result carries `amendment_advisory`; `task_text_amended` event emitted |
 | 14 | δ does no filesystem/git I/O | advisory path exercised under load | no filesystem or git call on the fused-memory loop thread (INV-8; D10) |
 | 15 | Combine into `in-progress` refused (2951 replay) | live target `in-progress` at execution; snapshot said `pending` | combine aborts; candidate filed as its own task; refusal recorded in the combine audit |
@@ -615,9 +660,11 @@ measured 20.2% rate an operator needs a counter, not just a log line.
    re-derive rather than hard-code. Whether it re-derives from transcripts or simply
    fingerprints current text against the plan's authoring-time briefing is an
    implementation choice for ζ.
-4. **γ's treatment of merge-commits and rebase churn** on long-lived branches — the
-   equivalence escape hatch is specified (C6) but its exact ordering versus the
-   ownership check is tactical.
+4. **γ's revert detection** — C6 accepts git revert's message line or an exact
+   inverse patch-id. Whether γ should also accept a net-diff test (the commit's hunks
+   absent from `base..head`), so that partial hand-authored reverts pass, is tactical.
+   The questions this item used to raise about merge commits and rebase churn went
+   with the ownership predicate (D14).
 5. **Whether ε should also emit an advisory** to the curator's audit record beyond the
    existing refusal log line.
 
@@ -634,7 +681,7 @@ measured 20.2% rate an operator needs a counter, not just a log line.
 | `no-lockstep-duplication` | Two live copies of a description normalizer already exist. D2 puts ours in `shared/` with an explicit non-unification note; D6 forbids a second reachability mechanism. | **Satisfied — both are INV-5-driven** |
 | `status-matches-liveness` | β/γ refusals must not leave a task in a status implying a live owner. | Satisfied via D13 — refusals route to `_handle_no_plan_failure`, an existing choke point that writes the successor status |
 | `holds-owned-and-bounded` | A β refusal is a hold: who exits it, and what bounds it? | **Satisfied via D13** — exit owner is the architect in-loop; bound is the pre-existing `consecutive_no_plan_failures` streak, escalating to a human at ≥2 |
-| `loop-thread-occupancy-bounded` | γ walks branch commits (git I/O); δ runs inside fused-memory's loop — the exact process of the task-3778 incident. | Addressed by C6 (async runner, hoisted invariants, bounded fan-out) and D10 (δ reads `task.metadata`, never the filesystem) |
+| `loop-thread-occupancy-bounded` | γ probes the branch for each orphan/revert-descoped commit (git I/O); δ runs inside fused-memory's loop — the exact process of the task-3778 incident. | Addressed by C6 (async runner, hoisted invariants, bounded fan-out) and D10 (δ reads `task.metadata`, never the filesystem) |
 
 No waivers proposed. D13 closed the `holds-owned-and-bounded` and
 `status-matches-liveness` rows by **reusing** an existing bounded path rather than
