@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol, overload, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, overload, runtime_checkable
 
 from shared import safe_io
 from shared.capability_manifest import CHECK_SUBJECT_FIELD
@@ -43,7 +43,11 @@ from shared.task_statuses import TaskStatus
 from shared.task_submit import SubmitFailed, SubmitOutcome, parse_submit_task_result
 
 from orchestrator import git_ops
-from orchestrator.already_landed_tick_view import AlreadyLandedGate, AlreadyLandedTickView
+from orchestrator.already_landed_tick_view import (
+    AlreadyLandedGate,
+    AlreadyLandedTickView,
+    PendingEscalationsByTask,
+)
 from orchestrator.anchor_coverage_gate import AnchorCoverageGate
 from orchestrator.config import (
     DEFAULT_TIER,
@@ -726,6 +730,34 @@ class SchedulerCallbacks:
     on_warm_base_resolve: Callable[..., Any] | None = None
     suppress_blocked_write: Callable[[str], bool] | None = None
     read_already_landed_tick_view: Callable[[], Awaitable[AlreadyLandedTickView]] | None = None
+    read_pending_escalations_by_task: (
+        Callable[[], Awaitable[PendingEscalationsByTask | None]] | None
+    ) = None
+
+
+_ConsultSnapshotT = TypeVar('_ConsultSnapshotT')
+
+
+async def _read_consult_snapshot(
+    reader: Callable[[], Awaitable[_ConsultSnapshotT]] | None, *, what: str,
+) -> _ConsultSnapshotT | None:
+    """One per-consult read for the already-landed gate; ``None`` when absent or failed.
+
+    ``None`` sends the gate back to that read per candidate, so a failure here
+    costs latency, never a verdict, and can NEVER abort the tick (PROPERTY 1).
+    """
+    if reader is None:
+        return None
+    try:
+        return await reader()
+    except Exception:
+        logger.warning(
+            'Already-landed consult: reading the %s raised — failing open (the '
+            'gate does its own per-candidate reads this tick, PROPERTY 1)',
+            what,
+            exc_info=True,
+        )
+        return None
 
 
 def _render_retry_cap_report(
@@ -2897,8 +2929,7 @@ class Scheduler:
         # / merge-marker / content-equivalence) rather than this
         # orchestrator's own merge queue, so it also catches OUT-OF-BAND
         # landings (sibling direct-merge, prior run, squash/rebase/manual).
-        # Signature: (task_id: str, *, task=None, tick_view=None) -> bool
-        # (async; AlreadyLandedGate). True means the task is
+        # Signature: AlreadyLandedGate (async). True means the task is
         # already fully landed on main and has been driven to done inline by
         # the hook's own routine, so acquire_next() must NOT dispatch it this
         # tick. Default None so bare-Scheduler unit tests are unaffected.
@@ -6527,14 +6558,23 @@ class Scheduler:
         tick nor stop the remaining candidates from being consulted
         (PROPERTY 1).
 
-        The per-tick view is read once per consult and may be ``None``, in
-        which case the gate does its own per-candidate reads.
+        The branch view and the pending-escalation snapshot (task 8073) are
+        each read once per consult, before the first candidate, and either may
+        be ``None``, in which case the gate does that read per candidate. The
+        snapshot's staleness bound is stated in
+        ``orchestrator/src/orchestrator/already_landed_tick_view.py``.
         """
         if self._already_landed_gate is None:
             return set()
         if not candidates:
             return set()
-        tick_view = await self._read_already_landed_tick_view()
+        tick_view = await _read_consult_snapshot(
+            self._callbacks.read_already_landed_tick_view, what='branch view',
+        )
+        pending_escalations = await _read_consult_snapshot(
+            self._callbacks.read_pending_escalations_by_task,
+            what='pending escalation snapshot',
+        )
         gated: set[str] = set()
         for t in candidates:
             if self.is_deterministic(t):
@@ -6545,7 +6585,10 @@ class Scheduler:
             tid = str(t.get('id', ''))
             try:
                 gated_now = await self._already_landed_gate(
-                    tid, task=t, tick_view=tick_view,
+                    tid,
+                    task=t,
+                    tick_view=tick_view,
+                    pending_escalations=pending_escalations,
                 )
             except Exception:
                 logger.warning(
@@ -6560,21 +6603,6 @@ class Scheduler:
             if gated_now:
                 gated.add(tid)
         return gated
-
-    async def _read_already_landed_tick_view(self) -> AlreadyLandedTickView | None:
-        reader = self._callbacks.read_already_landed_tick_view
-        if reader is None:
-            return None
-        try:
-            return await reader()
-        except Exception:
-            logger.warning(
-                'Already-landed tick view read raised — failing open (the '
-                'gate does its own per-candidate reads this tick) so a git '
-                'hiccup can NEVER abort the tick (PROPERTY 1)',
-                exc_info=True,
-            )
-            return None
 
     # ---- acquire_next tick phases (W10-β) ----
     #

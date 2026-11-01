@@ -1,4 +1,6 @@
-"""One bulk read of local branches per dispatch tick, for the already-landed gate.
+"""Per-consult bulk reads for the already-landed gate, and its call contract.
+
+``AlreadyLandedTickView`` is one bulk read of local branches per consult.
 
 The view may only make the gate ABSTAIN. It concludes nothing on its own except
 "this branch had no ref when the view was read and main carries no merge marker
@@ -11,18 +13,37 @@ main, can only cost a missed auto-done, never cause a false one (task 4900; see
 ``orchestrator/src/orchestrator/git_ops.py::GitOps.find_merge_marker``'s
 branch-existence gate).
 
+``PendingEscalationsByTask`` is one read of the pending escalation store per
+consult, grouped by task id (task 8073). For a task id it lists exactly the rows
+``escalation/src/escalation/queue.py::EscalationQueue.get_by_task`` returns with
+``status='pending'``, and a task id it lacks has no pending rows. It is as old as
+the consult when the gate reaches a late candidate, so the any-level
+escalation veto (task 3534) and the arbitration hold see the store as it was
+when the consult began, not when the candidate is judged. That window is at
+most one consult phase: minutes before task 7332, tens of seconds after it.
+A record filed inside the window can no longer veto that candidate's auto-done
+in this consult; a record resolved inside it holds the candidate one consult
+longer.
+
 ``AlreadyLandedGate`` is the gate's call contract, the signature the
-scheduler calls and the harness implements. It lives here, beside the view it
-carries, so the scheduler can type the gate without importing the harness.
+scheduler calls and the harness implements. It lives here, beside the
+snapshots it carries, so the scheduler can type the gate without importing
+the harness. Every keyword defaults to ``None``, meaning the gate does that
+read itself.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, TypeAlias
+
+from escalation.models import Escalation
 
 if TYPE_CHECKING:
     from orchestrator.git_ops import GitOps
+
+PendingEscalationsByTask: TypeAlias = Mapping[str, Sequence[Escalation]]
 
 
 @dataclass(frozen=True)
@@ -54,4 +75,5 @@ class AlreadyLandedGate(Protocol):
         *,
         task: dict | None = None,
         tick_view: AlreadyLandedTickView | None = None,
+        pending_escalations: PendingEscalationsByTask | None = None,
     ) -> bool: ...

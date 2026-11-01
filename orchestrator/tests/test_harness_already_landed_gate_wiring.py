@@ -2658,3 +2658,155 @@ class TestAlreadyLandedGateTickView:
             branch, gate_on_existing_ref=False,
         )
         git_ops_double.resolve_branch_sha.assert_not_awaited()
+
+
+def _pending_snapshot_for(h: Harness) -> dict[str, list[Escalation]]:
+    """What a consult's snapshot holds for task 42, read from the wired stub."""
+    queue = cast(MagicMock, h._escalation_queue)
+    rows = queue.get_by_task('42', status='pending')
+    queue.get_by_task.reset_mock()
+    return {'42': list(rows)} if rows else {}
+
+
+def _disposition_trail(h: Harness) -> list[tuple[str, str, Any]]:
+    return [
+        (r['event_type'], r['data']['reason'], r['data']['escalation_ids'])
+        for r in _recovery_rows(h)
+    ]
+
+
+class _CountingQueue:
+    """A REAL queue that counts the two pending reads the gate can make."""
+
+    def __init__(self, queue_dir: Path, *, unreadable: bool = False) -> None:
+        from escalation.queue import EscalationQueue
+
+        self.queue = EscalationQueue(queue_dir)
+        self.unreadable = unreadable
+        self.per_task_reads = 0
+        self.snapshot_reads = 0
+
+    def get_by_task(self, task_id: str, **kwargs: Any) -> list[Escalation]:
+        self.per_task_reads += 1
+        if self.unreadable:
+            raise OSError('escalation queue dir unreadable')
+        return self.queue.get_by_task(task_id, **kwargs)
+
+    def get_pending_by_task(self) -> dict[str, list[Escalation]]:
+        self.snapshot_reads += 1
+        if self.unreadable:
+            raise OSError('escalation queue dir unreadable')
+        return self.queue.get_pending_by_task()
+
+
+def _consulting_harness(tmp_path: Path, queue: _CountingQueue) -> Harness:
+    """A real Harness whose consult runs end to end; every branch is absent."""
+    h = Harness(OrchestratorConfig(project_root=tmp_path))
+    git_ops_double = MagicMock(spec=GitOps)
+    git_ops_double.config = h.git_ops.config
+    git_ops_double.list_local_branches = AsyncMock(return_value=frozenset({'main'}))
+    git_ops_double.find_merge_marker = AsyncMock(return_value=None)
+    h.git_ops = git_ops_double
+    h._mark_in_progress_done = AsyncMock()
+    h._escalation_queue = cast(Any, queue)
+    return h
+
+
+_SNAPSHOT_SCENARIOS = [
+    'l2_pin_abstains', 'info_only_still_flips', 'clean_read_flips', 'arbitration_withholds',
+]
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedGatePendingEscalationSnapshot:
+    """Task 8073: the consult reads the pending store once and hands every
+    candidate its rows as ``pending_escalations=``. The gate must decide
+    exactly as its own ``get_by_task(task_id, status='pending')`` read would."""
+
+    @pytest.mark.parametrize('scenario', _SNAPSHOT_SCENARIOS)
+    async def test_a_snapshot_decides_exactly_as_the_per_candidate_read(
+        self, mock_orch_config, tmp_path, scenario,
+    ) -> None:
+        wire, expected_result, expected_marks = _GATE_MATRIX[scenario]
+        per_candidate = _emitting_harness(mock_orch_config, tmp_path / 'a')
+        wire(per_candidate)
+        from_snapshot = _emitting_harness(mock_orch_config, tmp_path / 'b')
+        wire(from_snapshot)
+        snapshot = _pending_snapshot_for(from_snapshot)
+
+        expected = await per_candidate._already_landed_dispatch_gate('42')
+        result = await from_snapshot._already_landed_dispatch_gate(
+            '42', pending_escalations=snapshot,
+        )
+
+        assert expected is expected_result
+        assert result is expected_result
+        assert cast(AsyncMock, from_snapshot._mark_in_progress_done).await_count == expected_marks
+        cast(MagicMock, from_snapshot._escalation_queue).get_by_task.assert_not_called()
+        assert _disposition_trail(from_snapshot) == _disposition_trail(per_candidate)
+
+    async def test_a_task_absent_from_the_snapshot_has_no_pending_rows(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """Absent means ``[]``, never ``None``: the store WAS read, so the
+        unreadable-store veto must not fire, and nothing re-reads it."""
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        _matrix_store_failure(h)
+
+        result = await h._already_landed_dispatch_gate(
+            '42', pending_escalations={'7': [_open_escalation('esc-7-1', level=2)]},
+        )
+
+        assert result is True
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+        cast(MagicMock, h._escalation_queue).get_by_task.assert_not_called()
+        assert _recovery_rows(h) == []
+
+    async def test_the_harness_reader_groups_the_live_store_and_skips_an_unwired_one(
+        self, tmp_path,
+    ) -> None:
+        h = Harness(OrchestratorConfig(project_root=tmp_path))
+        h._escalation_queue = None
+        assert await h._read_pending_escalations_by_task() is None
+
+        queue = _CountingQueue(tmp_path / 'esc')
+        queue.queue.submit(_open_escalation('esc-42-9', level=2))
+        h._escalation_queue = cast(Any, queue)
+
+        snapshot = await h._read_pending_escalations_by_task()
+
+        assert snapshot is not None
+        assert [e.id for e in snapshot['42']] == ['esc-42-9']
+
+    async def test_one_store_read_per_consult_whatever_the_candidate_count(
+        self, tmp_path,
+    ) -> None:
+        queue = _CountingQueue(tmp_path / 'esc')
+        queue.queue.submit(_open_escalation('esc-42-9', level=2))
+        h = _consulting_harness(tmp_path, queue)
+        candidates = [{'id': tid, 'metadata': {}} for tid in ('9', '42', '77', '78')]
+
+        gated = await h.scheduler._consult_already_landed(candidates)
+
+        assert gated == set()
+        assert (queue.snapshot_reads, queue.per_task_reads) == (1, 0)
+
+    async def test_an_unreadable_snapshot_degrades_to_per_candidate_store_unavailable(
+        self, tmp_path, caplog,
+    ) -> None:
+        queue = _CountingQueue(tmp_path / 'esc', unreadable=True)
+        h = _consulting_harness(tmp_path, queue)
+        candidates = [{'id': tid, 'metadata': {}} for tid in ('9', '42')]
+
+        with caplog.at_level(logging.WARNING):
+            gated = await h.scheduler._consult_already_landed(candidates)
+
+        assert gated == set()
+        assert (queue.snapshot_reads, queue.per_task_reads) == (1, 2)
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('pending escalation snapshot' in m for m in messages), messages
+        for tid in ('9', '42'):
+            assert any(
+                f'could not READ the escalation store for task {tid}' in m for m in messages
+            ), messages

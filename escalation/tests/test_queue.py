@@ -9104,3 +9104,73 @@ class TestTripFactsPersistence:
         stored = queue.get(esc_id)
         assert stored is not None
         assert stored.ewa_rate_trip == esc.ewa_rate_trip
+
+
+class TestGetPendingByTask:
+    """``get_pending_by_task`` groups ONE root listing by task id (task 8073).
+
+    For every task id it must yield exactly what
+    ``get_by_task(task_id, status='pending')`` yields over the same files.
+    """
+
+    def _seed(self, queue: EscalationQueue) -> None:
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+        queue.submit(_make_escalation('esc-1-2', task_id='1', level=2))
+        queue.submit(_make_escalation('esc-2-1', task_id='2'))
+        queue.submit(_make_escalation('esc-2-2', task_id='2'))
+        queue.resolve('esc-2-2', 'archived, no longer pending')
+        resolved_in_root = _make_escalation('esc-3-1', task_id='3', status='resolved')
+        (queue.queue_dir / 'esc-3-1.json').write_text(resolved_in_root.to_json())
+        (queue.queue_dir / 'esc-4-1.json').write_text('{not json')
+        (queue.queue_dir / 'esc-5-1.json.lock').write_text('')
+        (queue.queue_dir / 'esc-5.seq').write_text('7')
+
+    def test_each_group_matches_the_per_task_pending_read(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._seed(queue)
+
+        grouped = queue.get_pending_by_task()
+
+        for task_id in ('1', '2', '3', '4', '5', 'absent'):
+            expected = queue.get_by_task(task_id, status='pending')
+            assert [e.to_json() for e in grouped.get(task_id, [])] == [
+                e.to_json() for e in expected
+            ], task_id
+        assert set(grouped) == {'1', '2'}
+
+    def test_a_duplicated_id_dedups_within_a_task_but_not_across_tasks(
+        self, tmp_path: Path,
+    ):
+        """``get_by_task``'s ``seen`` set lives for one task's call, so a
+        second file carrying the same id counts once for its own task and
+        still counts for a different task."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+        (queue.queue_dir / 'esc-1-1-copy.json').write_text(
+            _make_escalation('esc-1-1', task_id='1').to_json(),
+        )
+        (queue.queue_dir / 'esc-1-1-elsewhere.json').write_text(
+            _make_escalation('esc-1-1', task_id='2').to_json(),
+        )
+
+        grouped = queue.get_pending_by_task()
+
+        for task_id in ('1', '2'):
+            assert [e.id for e in grouped[task_id]] == [
+                e.id for e in queue.get_by_task(task_id, status='pending')
+            ] == ['esc-1-1']
+
+    def test_one_root_listing_serves_every_task(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._seed(queue)
+        real_glob = Path.glob
+        globbed: list[Path] = []
+
+        def counting_glob(self: Path, pattern: str, *args: Any, **kwargs: Any):
+            globbed.append(self)
+            return real_glob(self, pattern, *args, **kwargs)
+
+        with patch.object(Path, 'glob', counting_glob):
+            queue.get_pending_by_task()
+
+        assert globbed == [queue.queue_dir]

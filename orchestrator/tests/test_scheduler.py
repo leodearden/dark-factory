@@ -12993,6 +12993,83 @@ class TestConsultAlreadyLanded:
         assert all(call.kwargs['tick_view'] is None for call in gate.await_args_list)
         assert any(record.levelname == 'WARNING' for record in caplog.records)
 
+    async def test_the_pending_escalations_are_read_once_after_the_view_and_threaded(self):
+        """Task 8073: one store read per consult, whatever the candidate count."""
+        reads: list[str] = []
+        snapshot = {'B': []}
+
+        async def read_view() -> AlreadyLandedTickView:
+            reads.append('view')
+            return AlreadyLandedTickView(local_branches=frozenset())
+
+        async def read_escalations() -> dict:
+            reads.append('escalations')
+            return snapshot
+
+        async def gate(task_id: str, **kwargs) -> bool:
+            reads.append(f'gate:{task_id}')
+            return False
+
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(
+                read_already_landed_tick_view=read_view,
+                read_pending_escalations_by_task=read_escalations,
+            ),
+        )
+        scheduler.finish_startup()
+        spy = AsyncMock(side_effect=gate)
+        scheduler._already_landed_gate = spy
+        candidates = [_pending_task(tid) for tid in ('A', 'B', 'C')]
+
+        await scheduler._consult_already_landed(candidates)
+
+        assert reads == ['view', 'escalations', 'gate:A', 'gate:B', 'gate:C']
+        assert all(
+            call.kwargs['pending_escalations'] is snapshot for call in spy.await_args_list
+        )
+
+    async def test_without_an_escalation_reader_the_gate_reads_per_candidate(self):
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        gate = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = gate
+
+        await scheduler._consult_already_landed([_pending_task('Z')])
+
+        (call,) = gate.await_args_list
+        assert call.kwargs['pending_escalations'] is None
+
+    async def test_a_raising_escalation_reader_fails_open_to_per_candidate_reads(
+        self, caplog,
+    ):
+        caplog.set_level('WARNING')
+        view = AlreadyLandedTickView(local_branches=frozenset())
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(
+                read_already_landed_tick_view=AsyncMock(return_value=view),
+                read_pending_escalations_by_task=AsyncMock(
+                    side_effect=OSError('escalation queue dir unreadable'),
+                ),
+            ),
+        )
+        scheduler.finish_startup()
+        gate = AsyncMock(side_effect=lambda task_id, **_: task_id == 'Z')
+        scheduler._already_landed_gate = gate
+
+        result = await scheduler._consult_already_landed(
+            [_pending_task('Z'), _pending_task('Y')]
+        )
+
+        assert result == {'Z'}
+        assert all(call.kwargs['pending_escalations'] is None for call in gate.await_args_list)
+        assert all(call.kwargs['tick_view'] is view for call in gate.await_args_list)
+        assert any(
+            record.levelname == 'WARNING' and 'pending escalation snapshot' in record.getMessage()
+            for record in caplog.records
+        )
+
     async def test_without_a_gate_the_tick_view_is_not_read(self):
         reader = AsyncMock(return_value=AlreadyLandedTickView(local_branches=frozenset()))
         scheduler = Scheduler(

@@ -71,6 +71,7 @@ from orchestrator.agents.skill_prompt import load_skill_system_prompt
 from orchestrator.agents.watcher_rearm_outcome_guidance import WATCHER_REARM_OUTCOME_GUIDANCE
 from orchestrator.already_landed_tick_view import (
     AlreadyLandedTickView,
+    PendingEscalationsByTask,
     branch_absent_and_unmarked,
     read_already_landed_tick_view,
 )
@@ -1783,6 +1784,9 @@ class Harness:
         #   - read_already_landed_tick_view (task 4900): one local-branch
         #     snapshot per already-landed consult, read through the bound
         #     method so a test-replaced self.git_ops is honoured.
+        #   - read_pending_escalations_by_task (task 8073): one pending
+        #     escalation-store read per consult, through the bound method so
+        #     the late-wired self._escalation_queue is honoured.
         self.scheduler = Scheduler(
             config,
             callbacks=SchedulerCallbacks(
@@ -1797,6 +1801,7 @@ class Harness:
                 on_warm_base_resolve=self._resolve_warm_base_hard_down,
                 suppress_blocked_write=self._is_action_teardown_task,
                 read_already_landed_tick_view=self._read_already_landed_tick_view,
+                read_pending_escalations_by_task=self._read_pending_escalations_by_task,
             ),
             override_store=OverrideStore.from_config(config),
             park_eviction_store=ParkEvictionRequestStore.from_config(config),
@@ -13712,12 +13717,18 @@ class Harness:
     async def _read_already_landed_tick_view(self) -> AlreadyLandedTickView:
         return await read_already_landed_tick_view(self.git_ops)
 
+    async def _read_pending_escalations_by_task(self) -> PendingEscalationsByTask | None:
+        if self._escalation_queue is None:
+            return None
+        return await asyncio.to_thread(self._escalation_queue.get_pending_by_task)
+
     async def _already_landed_dispatch_gate(
         self,
         task_id: str,
         *,
         task: dict | None = None,
         tick_view: AlreadyLandedTickView | None = None,
+        pending_escalations: PendingEscalationsByTask | None = None,
     ) -> bool:
         """Pre-dispatch gate for OUT-OF-BAND already-landed tasks (task 2313).
 
@@ -13913,6 +13924,12 @@ class Harness:
         is consulted only after every veto above, and only to abstain early —
         the safety argument lives in
         ``orchestrator/src/orchestrator/already_landed_tick_view.py``.
+        ``pending_escalations`` (task 8073) is the consult's shared
+        pending-store snapshot, standing in for the per-candidate
+        ``get_by_task(task_id, status='pending')`` read: a task id it lacks
+        has no pending rows, and ``None`` means this gate reads the store
+        itself, so ``rows is None`` still arises exactly when a read failed.
+        Its staleness bound is stated in the same module.
         """
         branch = f'{self.git_ops.config.branch_prefix}{task_id}'
         if task is None:
@@ -13944,8 +13961,10 @@ class Harness:
             from escalation.pins import classify_pins  # noqa: PLC0415
 
             try:
-                rows = self._escalation_queue.get_by_task(
-                    task_id, status='pending',
+                rows = (
+                    self._escalation_queue.get_by_task(task_id, status='pending')
+                    if pending_escalations is None
+                    else list(pending_escalations.get(task_id, ()))
                 )
             except Exception:
                 # `classify_pins`'s store-correctness contract, obligation 2:
