@@ -1767,13 +1767,17 @@ def _proj_raw(*roots: str) -> dict:
     from datetime import UTC
 
     from dashboard.data.datum import Datum, DatumState
+    from dashboard.data.merge_queue import MergeAttempts
 
     read_at = datetime.now(UTC)
     return {
         root: {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
+            'depth_timeseries': Datum(
+                {'labels': [], 'values': [], 'bucket_minutes': 15},
+                read_at, DatumState.FRESH, None, 30,
+            ),
+            'attempts': Datum(MergeAttempts(), read_at, DatumState.FRESH, None, 30),
+            'train_throughput': Datum({}, read_at, DatumState.FRESH, None, 30),
             'recent': [],
             'recent_total': Datum(0, read_at, DatumState.FRESH, None, 30),
             'speculative': Datum(
