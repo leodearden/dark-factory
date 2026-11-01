@@ -1314,7 +1314,7 @@ def build_canonical_by_topic(records: list[ArmRecord]) -> dict[str, ArmRecord]:
     depend on scroll order — non-deterministic between runs, and invisible in
     the report.
     """
-    from fused_memory.canonical_marker import is_canonical  # noqa: PLC0415
+    from fused_memory.canonical_marker import is_canonical
 
     index: dict[str, ArmRecord] = {}
     for record in records:

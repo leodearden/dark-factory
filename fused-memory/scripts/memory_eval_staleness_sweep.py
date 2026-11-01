@@ -189,7 +189,7 @@ def by_design_reaper(metadata: Any) -> str | None:
     unrelated reason is indistinguishable from a reaped one, and is treated as
     by-design because that target was going to be deleted anyway.
     """
-    from fused_memory.canonical_marker import is_canonical  # noqa: PLC0415
+    from fused_memory.canonical_marker import is_canonical
     from fused_memory.reconciliation.harness import (  # noqa: PLC0415
         PROJECT_STATUS_CORRECTION_KIND,
     )
