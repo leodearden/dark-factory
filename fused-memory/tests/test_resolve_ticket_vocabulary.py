@@ -126,6 +126,7 @@ class _Stack:
     interceptor: TaskInterceptor
     store: TicketStore
     backend: SqliteTaskBackend
+    event_buffer: EventBuffer
     root: str
 
     async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -168,7 +169,7 @@ async def make_stack(tmp_path):
         )
         built.append(interceptor)
         server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
-        return _Stack(server, interceptor, store, backend, str(root))
+        return _Stack(server, interceptor, store, backend, event_buffer, str(root))
 
     yield _make
     for interceptor in built:
@@ -272,11 +273,14 @@ class TestResolveTicketReportsTheRow:
         assert answer == {'status': 'failed', 'reason': 'unknown_ticket'}
 
     @pytest.mark.asyncio
-    async def test_no_ticket_store_fails_without_a_task_id_key(self, make_stack, tmp_path):
+    async def test_no_ticket_store_fails_without_a_task_id_key(self, make_stack):
         stack = await make_stack(None)
-        bare = TaskInterceptor(stack.backend, None, EventBuffer(db_path=tmp_path / 'bare.db'))
+        bare = TaskInterceptor(stack.backend, None, stack.event_buffer)
 
-        answer = await bare.resolve_ticket('tkt_' + '0' * 26, stack.root, timeout_seconds=1)
+        try:
+            answer = await bare.resolve_ticket('tkt_' + '0' * 26, stack.root, timeout_seconds=1)
+        finally:
+            await bare.close()
 
         assert answer == {'status': 'failed', 'reason': 'ticket_store not configured'}
 
