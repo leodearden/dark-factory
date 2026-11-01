@@ -670,7 +670,7 @@ def _claude_endpoint_config(
     """Build one non-incumbent Claude-format-endpoint candidate bundle.
 
     Mirrors ``_vllm_config``'s env-dict builder pattern: ``ANTHROPIC_BASE_URL``
-    is the public literal *base_url*; ``ANTHROPIC_AUTH_TOKEN`` is read from
+    is *base_url*; ``ANTHROPIC_AUTH_TOKEN`` is read from
     *auth_token_env* via ``os.environ.get`` at CALL time (never baked into
     source as a secret), so an operator supplies it via the environment and a
     test can monkeypatch it and observe the value flow through.
@@ -680,9 +680,20 @@ def _claude_endpoint_config(
     it), a missing token HERE means the run cannot authenticate against the
     provider at all, so a WARNING is logged at build time rather than only
     surfacing later as an opaque 401/auth error mid-run.
+
+    A blank *base_url* means the endpoint is unknown, so the bundle carries no
+    credential: the key is never read, let alone sent to an unknown endpoint.
     """
-    auth_token = os.environ.get(auth_token_env, '')
-    if not auth_token:
+    auth_token = os.environ.get(auth_token_env, '') if base_url else ''
+    if not base_url:
+        logger.warning(
+            "ν candidate %r has no base URL — ANTHROPIC_AUTH_TOKEN is left "
+            "blank, so the shadow credential gate "
+            "(shadow_eval.py::candidate_has_credentials) skips it as "
+            "no_credentials and no key goes to an unknown endpoint.",
+            name,
+        )
+    elif not auth_token:
         logger.warning(
             "ν candidate %r: %s is not set in the environment — "
             "ANTHROPIC_AUTH_TOKEN will be empty and the %s endpoint will "
