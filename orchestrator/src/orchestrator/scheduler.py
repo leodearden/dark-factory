@@ -3746,8 +3746,8 @@ class Scheduler:
                 task_id, type(e).__name__, e,
             )
             return None
-        task, _ = parse_tool_result(result, None, dict)
-        if task is None:
+        task, parse_err = parse_tool_result(result, None, dict)
+        if parse_err is not None or task is None:
             return None
         if 'error' in task:
             logger.warning(
