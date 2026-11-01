@@ -116,7 +116,7 @@ are the test half of
 [`orchestrator/scripts/warm-lane/README.md`](../../scripts/warm-lane/README.md)
 "Delta 14":
 
-- **Block V** in `test_warm_lane_gc.sh` (85 asserts) pins the Pass-1
+- **Block V** in `test_warm_lane_gc.sh` (102 asserts) pins the Pass-1
   skip-unchanged gate (V1-V9), with **A12** (3 asserts) for its sibling lib
   `lib_lane_seed.sh`. It builds an "unchanged" lane deterministically, with no
   sleep: every dir under `target/` is aged 100s back and the stamp's

@@ -150,7 +150,7 @@
 #       current base generation (task 7859): counted in the appended
 #       skipped_unchanged=, never in reset or preserved. Every doubt — a write
 #       since the seed, a moved generation, a missing or untrustworthy stamp,
-#       no target/ — resets as before; --disk-pressure and an assigned record
+#       no target/, no python3 — resets as before; --disk-pressure and an assigned record
 #       both take precedence over the skip (README.md "Delta 14")
 #   X — the DEFAULT protect-glob is RENDERED from dark-factory's
 #       PROTECTED_PREFIXES via lib_lane_state.sh's lane_protect_glob, not
@@ -3957,14 +3957,34 @@ assert "V4b: a missing stamp is quiet — no skip-gate line on stderr" \
 # rather than the concrete gen must NOT be normalised, or every such stamp would
 # read as current. It is spelled as realpath(base) + /target, so a realpath
 # normalisation would land exactly on the current gen and skip.
-for _v5_arm in truncated schema-v2 no-base-gen empty-base-gen symlink-spelled \
-               exited-at-string exited-at-bool exited-at-future; do
+#
+# `exited-at-nan` is the one arm the finiteness check alone stands behind: json
+# accepts a bare NaN, it is not in the future, and every `mtime >= NaN` is
+# False, so without that check a NaN stamp reads as unchanged and SKIPS.
+# `exited-at-inf` is also refused as a future exit. `python3-absent` puts a
+# PATH stub first that answers as bash does for a missing command (rc 127), so
+# the probe cannot run at all; its log is the witness that the stub was reached.
+V5_NO_PY_DIR="$V_ROOT/v5-no-python3-bin"
+mkdir -p "$V5_NO_PY_DIR"
+cat > "$V5_NO_PY_DIR/python3" << 'STUB_EOF'
+#!/usr/bin/env bash
+echo "$*" >> "${0%/*}/calls.log"
+echo "python3: command not found (test stub)" >&2
+exit 127
+STUB_EOF
+chmod +x "$V5_NO_PY_DIR/python3"
+
+for _v5_arm in truncated not-an-object schema-v2 no-base-gen empty-base-gen \
+               symlink-spelled exited-at-string exited-at-bool exited-at-future \
+               exited-at-nan exited-at-inf python3-absent; do
     _v5_root="$V_ROOT/v5-$_v5_arm"
     _v5_lane="$_v5_root/worktrees/_lane-1"
+    _v5_path="$PATH"
     _make_v_lane "$_v5_root"
     _v5_gen="$(_current_gen "$_v5_root")"
     case "$_v5_arm" in
         truncated)        make_seed_stamp_raw "$_v5_lane" '{"schema": "reify.lane-seed/1", "exited_at": 1' ;;
+        not-an-object)    make_seed_stamp_raw "$_v5_lane" '[]' ;;
         schema-v2)        make_seed_stamp_raw "$_v5_lane" "{\"schema\": \"reify.lane-seed/2\", \"exited_at\": $V_EXITED, \"base_gen\": \"$_v5_gen\"}" ;;
         no-base-gen)      make_seed_stamp "$_v5_lane" - "$V_EXITED" ;;
         empty-base-gen)   make_seed_stamp "$_v5_lane" "" "$V_EXITED" ;;
@@ -3972,10 +3992,16 @@ for _v5_arm in truncated schema-v2 no-base-gen empty-base-gen symlink-spelled \
         exited-at-string) make_seed_stamp "$_v5_lane" "$_v5_gen" "\"$V_EXITED\"" ;;
         exited-at-bool)   make_seed_stamp "$_v5_lane" "$_v5_gen" true ;;
         exited-at-future) make_seed_stamp "$_v5_lane" "$_v5_gen" "$((V_NOW + 3600))" ;;
+        exited-at-nan)    make_seed_stamp "$_v5_lane" "$_v5_gen" NaN ;;
+        exited-at-inf)    make_seed_stamp "$_v5_lane" "$_v5_gen" Infinity ;;
+        python3-absent)   make_seed_stamp "$_v5_lane" "$_v5_gen" "$V_EXITED"
+                          _v5_path="$V5_NO_PY_DIR:$PATH" ;;
     esac
-    _run_v "$_v5_root"
+    PATH="$_v5_path" _run_v "$_v5_root"
     _assert_v_reset "V5 ($_v5_arm)" "$_v5_root"
 done
+assert "V5 (python3-absent): the stamp probe reached the PATH stub, not a real python3" \
+    bash -c 'grep -qF "_lane-1.seed-stamp.json" "$1"' _ "$V5_NO_PY_DIR/calls.log"
 
 # ── V6: a valid stamp but no target/ ⇒ reset ──────────────────────────────────
 V6_ROOT="$V_ROOT/v6"

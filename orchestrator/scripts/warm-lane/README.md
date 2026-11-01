@@ -65,7 +65,8 @@ Copied at reify HEAD `638d97d8aba4de09a603494bfb5f239426fa73ef`
 | `lib_lane_state.sh` | — **dark-factory-native** | 2026-07-30 |
 | `lib_lane_seed.sh` | — **dark-factory-native** | 2026-11-01 |
 
-**The last two rows are a PARTIAL re-sync, not a new anchor.** The
+**The `warm-lane-degenerate-ref-check.sh` and `lib_task_citation.sh` rows
+are a PARTIAL re-sync, not a new anchor.** The
 `638d97d8aba4de09a603494bfb5f239426fa73ef` HEAD above still governs every
 other row. `warm-lane-degenerate-ref-check.sh` and `lib_task_citation.sh` were
 re-synced by **task 5566** at reify HEAD
@@ -1366,7 +1367,9 @@ A lane is skipped only when ALL of these hold:
 - every probed directory is strictly older than `exited_at`.
 
 Anything else resets, as before. That includes a `NaN` `exited_at`, which
-`json.load` accepts and which would otherwise compare as "older" than nothing.
+`json.load` accepts and which would otherwise compare as "older" than nothing
+(pinned by V5 `exited-at-nan`), and a host with no `python3` (V5
+`python3-absent`).
 
 - **Position.** It is gate 3 of 4 in Pass 1:
   - after the record gate, so an assigned lane keeps its `preserved_assigned`

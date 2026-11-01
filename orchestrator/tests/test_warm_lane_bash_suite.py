@@ -162,23 +162,24 @@ SCRIPT_COVERAGE = {
 #: NON-VACUOUS by construction: against the pre-port script the two blocks
 #: reported ``20`` and ``10`` failures respectively.
 #:
-#: Dark-factory task 7859 then added gc's skip-unchanged gate (Block V, 85
+#: Dark-factory task 7859 then added gc's skip-unchanged gate (Block V, 102
 #: asserts, plus A12's 3 for its new sibling lib) and the sweep's
-#: trash-and-emergency mode (Block Z, 28), so the floors moved 336 → 424 and
-#: 102 → 130.  RE-MEASURED against the suites (``Results: 432 passed, 0
+#: trash-and-emergency mode (Block Z, 28), so the floors moved 336 → 441 and
+#: 102 → 130.  RE-MEASURED against the suites (``Results: 449 passed, 0
 #: failed`` less S-discard3's 8 root-guarded asserts, and ``Results: 130
 #: passed, 0 failed``), not raised to absorb a red.  Neither block adds a skip
 #: guard.  NON-VACUOUS by construction: against the pre-change scripts they
-#: reported ``29`` and ``9`` failures respectively.
+#: reported ``29`` and ``9`` failures respectively, and the four V5 arms added
+#: on review (NaN, Infinity, a non-object stamp, no python3; 17 asserts) 5 more.
 ASSERT_FLOORS = {
     'test_warm_lane_disk_guard.sh': 89,  # 79 + 10 (A10, task 5940)
     'test_warm_lane_degenerate_ref.sh': 84,  # 70 + 11 (K1-K6: the conventional-commit citation arm)
                                              # + 3 (U8, task 5940)
     'test_thin_warm_lane.sh': 45,
-    'test_warm_lane_gc.sh': 424,  # 214 + 64 (S-pressure 17 + S-age 16 + S-age-degrade 14
+    'test_warm_lane_gc.sh': 441,  # 214 + 64 (S-pressure 17 + S-age 16 + S-age-degrade 14
                                  #           + A11 12 + A11-boundary 5) + 2 (A11m/A11n, task 5940)
                                  # + 43 (S-discard) + 21 (T) − 8 (S-discard3, root-guarded; task 7862)
-                                 # + 88 (V/A12, task 7859)
+                                 # + 105 (V/A12, task 7859)
     'test_warm_lane_gc_sweep.sh': 130,  # 99 + 3 (G6g, task 5940) + 28 (Z, task 7859)
     'test_warm_lane_audit.sh': 229,  # 232 measured − 3 (L9, root-guarded)
     'test_warm_lane_sizing_lifecycle.sh': 65,
