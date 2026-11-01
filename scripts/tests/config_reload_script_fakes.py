@@ -21,7 +21,7 @@ import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
 
 
 def sse_frame(payload):
@@ -262,8 +262,18 @@ TOOL_IS_ERROR = (
     }}),
 )
 
-# id -> FakeEscalationMcp keyword arguments.
-TRANSPORT_FAULTS = {
+
+class McpFault(TypedDict, total=False):
+    """The FakeEscalationMcp keyword arguments that inject one fault, each
+    overriding one step of the exchange with a literal (status, headers, body)
+    reply."""
+
+    initialize_reply: tuple[int, dict[str, str], str]
+    tool_call_reply: tuple[int, dict[str, str], str]
+
+
+# id -> fault.
+TRANSPORT_FAULTS: dict[str, McpFault] = {
     # The shape a raw single-shot POST hits against the live server today --
     # the direct regression test for the defect.
     "always_400": {"initialize_reply": FakeEscalationMcp.MISSING_SESSION_REPLY},
@@ -277,7 +287,7 @@ TRANSPORT_FAULTS = {
 
 # FastMCP's shape for a raised ToolError: the request reached the tool, which
 # ran and failed, so unlike every TRANSPORT_FAULTS entry it may have acted.
-TOOL_RAISED: dict[str, Any] = {"tool_call_reply": TOOL_IS_ERROR}
+TOOL_RAISED: McpFault = {"tool_call_reply": TOOL_IS_ERROR}
 
 
 class ClosedPort:
