@@ -214,6 +214,8 @@ mutations, overstating one is still drift.
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import json
 import shutil
 import sys
@@ -2117,6 +2119,35 @@ def audit_recall_over_labeled_fixture(
     }
 
 
+_AUDIT_RECALL_BY_CONTENT: dict[tuple[str, float, object], dict[str, Any]] = {}
+
+
+def memoized_audit_recall(
+    records: list[dict[str, Any]],
+    threshold: float | None = None,
+) -> dict[str, Any]:
+    """:func:`audit_recall_over_labeled_fixture`, computed once per process per content.
+
+    The audit is an O(n^2) sweep over the WHOLE alpha fixture that
+    ``cluster_limit`` does not shrink.  Keyed on the records actually audited,
+    the resolved threshold and the detector function itself, so a swapped-in
+    detector neither reads another detector's result nor leaves its own for
+    the next caller.  Every caller gets its own deep copy.
+    """
+    if threshold is None:
+        threshold = resolve_audit_threshold()
+    content = hashlib.sha256(
+        json.dumps(records, sort_keys=True, ensure_ascii=False).encode(),
+    ).hexdigest()
+    detector = load_audit_script().find_near_duplicate_memory_groups
+    key = (content, threshold, detector)
+    if key not in _AUDIT_RECALL_BY_CONTENT:
+        _AUDIT_RECALL_BY_CONTENT[key] = audit_recall_over_labeled_fixture(
+            records, threshold,
+        )
+    return copy.deepcopy(_AUDIT_RECALL_BY_CONTENT[key])
+
+
 # ---------------------------------------------------------------------------
 # The report — the artifact gate η reads
 # ---------------------------------------------------------------------------
@@ -2384,6 +2415,26 @@ def _git_stdout(args: list[str], cwd: Path) -> str | None:
     return completed.stdout.strip() or None
 
 
+_LAST_TOUCHING_COMMIT: dict[tuple[str | None, str, str], str] = {}
+
+
+def _last_touching_commit(head: str | None, path: Path, repo_root: Path) -> str | None:
+    """``git log -1`` for *path*, walked once per process per HEAD.
+
+    A path's last-touching commit is a pure function of the history reachable
+    from HEAD, so a moved HEAD re-walks.  Only git's answers are remembered:
+    with no HEAD, or after a walk that failed (a timeout under load, a
+    transient OSError), the next call asks git again.
+    """
+    key = (head, str(path), str(repo_root))
+    if key in _LAST_TOUCHING_COMMIT:
+        return _LAST_TOUCHING_COMMIT[key]
+    commit = _git_stdout(['log', '-1', '--format=%H', '--', str(path)], repo_root)
+    if head is not None and commit is not None:
+        _LAST_TOUCHING_COMMIT[key] = commit
+    return commit
+
+
 def fixture_provenance(paths: list[str | Path]) -> list[dict[str, Any]]:
     """Repo-relative path, content blob and last-touching commit per fixture.
 
@@ -2411,13 +2462,13 @@ def fixture_provenance(paths: list[str | Path]) -> list[dict[str, Any]]:
     audit trail is worse than an absent one, because it looks checkable.
     """
     repo_root = _PACKAGE_ROOT.parent
+    head = _git_stdout(['rev-parse', 'HEAD'], repo_root)
     provenance: list[dict[str, Any]] = []
     for raw in paths:
         path = Path(raw).resolve()
         provenance.append({
             'path': _repo_relative(path),
-            'commit': _git_stdout(
-                ['log', '-1', '--format=%H', '--', str(path)], repo_root),
+            'commit': _last_touching_commit(head, path, repo_root),
             'blob': _git_stdout(['hash-object', '--', str(path)], repo_root),
         })
     return provenance
@@ -4160,8 +4211,6 @@ def corpus_fingerprint(records: list[ArmRecord]) -> str:
     ``json.dumps(sort_keys=True)`` rather than ``str(dict)`` so the digest
     does not depend on metadata insertion order either.
     """
-    import hashlib  # noqa: PLC0415
-
     digest = hashlib.sha256()
     for record_id, content, metadata in sorted(
         (
@@ -4196,8 +4245,6 @@ def fixture_digests(paths: list[str | Path]) -> list[dict[str, Any]]:
     absolute home-directory checkout is neither reproducible nor readable by
     anyone else.
     """
-    import hashlib  # noqa: PLC0415
-
     rows: list[dict[str, Any]] = []
     for raw in paths:
         path = Path(raw).resolve()
@@ -5810,9 +5857,7 @@ async def run_bake_off(
 
     return build_report(
         arms=arms,
-        audit_recall=audit_recall_over_labeled_fixture(
-            load_labeled_fixture(alpha_fixture),
-        ),
+        audit_recall=memoized_audit_recall(load_labeled_fixture(alpha_fixture)),
         regrowth=regrowth_block,
         protocol={
             'blind_authoring': BLIND_AUTHORING_PROTOCOL,
@@ -6008,9 +6053,7 @@ async def _replay_bake_off(
 
     return build_report(
         arms=arms,
-        audit_recall=audit_recall_over_labeled_fixture(
-            load_labeled_fixture(alpha_fixture),
-        ),
+        audit_recall=memoized_audit_recall(load_labeled_fixture(alpha_fixture)),
         regrowth=regrowth_block,
         protocol={
             'blind_authoring': BLIND_AUTHORING_PROTOCOL,
