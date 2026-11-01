@@ -17,6 +17,8 @@ from fused_memory.server.grouped_read import (
     group_memory_document,
     group_search_results,
 )
+from fused_memory.server.tools import create_mcp_server
+from fused_memory.services.memory_service import SearchResults
 from fused_memory.utils.clip_disclosure import elision_marker
 
 PROJECT_ID = 'dark_factory'
@@ -189,4 +191,51 @@ class TestTheGroupedEntryPointsForwardTheCap:
 
         assert grouped is not None
         entry = _entry_for(block_of(grouped)['amendments'], CONTESTING_ID)
+        assert entry['content'] == _cut_at(50)
+
+
+def _tool_service(judge_field_chars: int) -> AsyncMock:
+    """A parent-only search corpus whose live config names *judge_field_chars*."""
+    service = _service([_PLAIN_ROW, _contesting_row()], {P: _PARENT_RECORD})
+    service.search = AsyncMock(return_value=SearchResults([_parent_hit()]))
+    service.config.write_triage.judge_field_chars = judge_field_chars
+    return service
+
+
+async def _searched_contested_content(server: Any) -> str:
+    reply = await server._tool_manager.call_tool(
+        'search', {'query': 'merge-lane verify timeout', 'project_id': PROJECT_ID},
+    )
+    return _entry_for(reply['results'][0]['grouped']['amendments'], CONTESTING_ID)['content']
+
+
+class TestToolsCapAtTheLiveJudgeFieldCap:
+    @pytest.mark.asyncio
+    async def test_search_caps_contested_text_at_the_live_judge_field_chars(self) -> None:
+        server = create_mcp_server(_tool_service(50))
+
+        assert await _searched_contested_content(server) == _cut_at(50)
+
+    @pytest.mark.asyncio
+    async def test_the_cap_is_read_per_call(self) -> None:
+        service = _tool_service(50)
+        server = create_mcp_server(service)
+
+        first = await _searched_contested_content(server)
+        service.config.write_triage.judge_field_chars = 80
+        second = await _searched_contested_content(server)
+
+        assert (first, second) == (_cut_at(50), _cut_at(80))
+
+    @pytest.mark.asyncio
+    async def test_get_memory_by_id_caps_contested_text_at_the_live_judge_field_chars(
+        self,
+    ) -> None:
+        server = create_mcp_server(_tool_service(50))
+
+        reply = await server._tool_manager.call_tool(
+            'get_memory_by_id', {'project_id': PROJECT_ID, 'memory_id': P},
+        )
+
+        entry = _entry_for(reply['grouped']['amendments'], CONTESTING_ID)
         assert entry['content'] == _cut_at(50)
