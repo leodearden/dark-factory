@@ -887,10 +887,11 @@ class UsageGate:
     def _init_accounts(self) -> list[AccountState]:
         """Resolve account tokens from env vars.
 
-        If no accounts are configured, falls back to reading the default
-        credential from ``~/.claude/.credentials.json`` — unless the config
-        disables that fallback (``fallback_to_default_credential=False``), in
-        which case the pool stays empty.
+        If no configured account resolves a token the pool stays empty, unless
+        the config opts in with ``fallback_to_default_credential=True``: then
+        the default credential from ``~/.claude/.credentials.json`` is adopted
+        as a single account (interactive tooling only; ruling 2026-11-01,
+        task 8161).
         """
         accounts: list[AccountState] = []
         for acct_cfg in self._config.accounts:
