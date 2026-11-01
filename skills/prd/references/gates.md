@@ -216,6 +216,8 @@ This trigger-shape list and the family row above have now drifted out of sync tw
    - `grep:<path>::<dotted.name>` — the Python module at `<path>` defines that dotted name: a module-level `def`, `class` or assignment, or `Class.method`.
 
    `<path>` is repo-root-relative: no leading `/`, no `..`, no spaces or colons.
+
+   For a wiring claim, `::<dotted.name>` names the enclosing **consumer** function or method that calls the capability, never the capability's own definition. A pointer at the definition resolves, but it proves only that the thing is declared.
 2. It is never:
    - bare, unbackticked text — grep:pkg/store.py::Store.get typed into the cell without backticks, which no resolver reads;
    - a package-relative path — `grep:api/routers/config.py` where the file is `src/<pkg>/api/routers/config.py`;
@@ -223,10 +225,10 @@ This trigger-shape list and the family row above have now drifted out of sync tw
    - prose inside the span — `grep:pkg/store.py::Store.get WIRED`;
    - a pathless annotation — "(grep: on main)".
 3. A name the grammar cannot check — a TypeScript symbol, an SQL object, a YAML/TOML key, a Markdown section — stays in prose beside a path-only pointer: `grep:pyproject.toml` (`[project.scripts]`). `::<dotted.name>` is for Python modules only.
-4. A file or symbol the leaf itself creates is bound `capability→producer (built here)`, never as `grep:`. A `grep:` pointer asserts the thing is on main today.
+4. A file or symbol the leaf itself creates is bound `capability→producer (built here)`, never as `grep:`. A `grep:` pointer asserts the thing is on main today. A built-here row's sidecar `verdict` is `PASS`, because its producer is this leaf. `OPEN` stays reserved for a binding the leaf must decide (`shared/src/shared/capability_manifest.py::ManifestCapability`).
 5. Placeholders in a vocabulary or grammar line keep `<…>`, e.g. `grep:<path>::<symbol>`, so a resolver skips them.
-6. Before the manifest is committed, every pointer must resolve on main **as written**. If the **[overlay]** names the project's manifest-pointer resolver, run it over the manifest; a failure blocks the commit. Otherwise check by hand that the path exists (`git ls-files -- <path>`) and that the module defines the name. A pointer that does not resolve is fixed, or the binding is re-verdicted (`declared-only`, `producer-absent`, …); it is not a new FAIL value.
-7. The YAML sidecar's `binding` repeats the `.md` cell's pointer span verbatim, so the twins never disagree about where the evidence lives.
+6. Before the manifest is committed, every pointer must resolve on main **as written**. If the **[overlay]** names the project's manifest-pointer resolver, run it over the manifest; a failure blocks the commit. Otherwise check by hand that the path exists (`git ls-files -- <path>`) and that the module defines the name. Where a project's resolver accepts more than rule 1 does (a name the module only imports, say), that resolver is authoritative for its project; rule 1 is the subset every resolver accepts. A pointer that does not resolve is fixed, or the binding is re-verdicted (`declared-only`, `producer-absent`, …); it is not a new FAIL value.
+7. The YAML sidecar's `binding` starts with the `.md` cell's pointer span exactly as written there, backticks included, so the twins never disagree about where the evidence lives. Any prose claim (`wired`, a key per rule 3) follows the span. A built-here row's `binding` starts with `built here`. Quote the YAML string, because a plain YAML scalar cannot start with a backtick: `` binding: "`grep:pkg/cli.py::main` wired" ``.
 8. Scope: this governs manifests a session writes or edits. Legacy manifests are not swept — the same scoping as `author-mode.md` → *Code anchors in PRD prose*.
 
 Any capability resolving to a FAIL value **blocks** queueing until resolved by one of the G3/G6 resolutions: rewrite to an existing capability, queue the prerequisite **upstream** + wire the dep, move the signal to the producing leaf, or relax the bound.
