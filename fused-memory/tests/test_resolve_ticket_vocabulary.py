@@ -6,6 +6,7 @@ import asyncio
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock
 
@@ -319,3 +320,34 @@ class TestVocabularyParityRuntimeSites:
     def test_site_names_the_vocabulary(self, site):
         text_of, required = RUNTIME_SITES[site]
         assert _unnamed(text_of(), required) == [], f'{site} does not name these values'
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CANONICAL_CALLER_DOC = 'skills/_shared/ticket-failure-handling.md'
+CALLER_SNIPPETS = (
+    'skills/escalation-watcher/SKILL.md',
+    'skills/recon-escalation-watcher/SKILL.md',
+    'skills/review/references/phase3-triage.md',
+    'skills/unblock/SKILL.md',
+    'skills/orchestrate/SKILL.md',
+    'skills/escalation-watcher-auto/SKILL.md',
+)
+
+
+class TestVocabularyParityCallerDocs:
+    """The caller rule is stated once; every caller snippet branches on every open status (B5)."""
+
+    def test_the_canonical_doc_names_the_whole_vocabulary(self):
+        text = (REPO_ROOT / CANONICAL_CALLER_DOC).read_text()
+        assert _unnamed(text, ALL_STATUSES | ALL_RESOLVE_REASONS) == [], (
+            f'{CANONICAL_CALLER_DOC} does not name these values'
+        )
+
+    @pytest.mark.parametrize('snippet', CALLER_SNIPPETS)
+    def test_a_caller_snippet_has_one_open_branch_and_points_at_the_rule(self, snippet):
+        text = (REPO_ROOT / snippet).read_text()
+        open_branches = [
+            line for line in text.splitlines() if not _unnamed(line, OPEN_TICKET_STATUSES)
+        ]
+        assert open_branches, f'{snippet} has no line naming every open status'
+        assert 'ticket-failure-handling.md' in text, f'{snippet} does not point at the caller rule'
