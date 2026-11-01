@@ -844,8 +844,9 @@ def _compact_escalation(d: dict[str, Any], fields: tuple[str, ...]) -> dict[str,
 
 
 # INV-4 storm escape for L2 amendment truncation (task 3997).  Sizing: with
-# ``queue._MAX_AMENDMENTS`` = 20, ONE L2 has to fold 21+ times inside the window
-# to truncate even ONCE, so three truncations in an hour is not routine churn.
+# ``escalation/src/escalation/amendments.py::MAX_AMENDMENTS`` = 20, ONE L2 has to fold
+# 21+ times inside the window to truncate even ONCE, so three truncations in an
+# hour is not routine churn.
 # It says either the cap is systematically wrong for the live fold rate, or
 # root-cause matching is over-folding unrelated clusters into a single L2 — and
 # task 3998 canonicalises that matching, which RAISES the fold rate BY DESIGN.
@@ -1633,9 +1634,9 @@ def create_server(
 
         Called by both amendment writers' tools — a ``promote_to_l2`` fold and
         an explicit ``amend_escalation`` — whenever their write shed entries.
-        ``queue._append_amendment_capped`` already counts every dropped
-        amendment on the record itself (``amendments_truncated``) and logs a
-        WARNING.  The
+        ``escalation/src/escalation/amendments.py::append_amendment_capped`` already
+        counts every dropped amendment on the record itself
+        (``amendments_truncated``) and logs a WARNING.  The
         counter stays the PRIMARY structured fact — the contract is assertable
         from the record, never by log-scrape (INV-8) — but a WARNING has no
         audience.  This is the rate-thresholded NOTIFICATION layered on top,
@@ -1722,7 +1723,8 @@ def create_server(
                     f"OBSERVED: {storm['count']} amendment truncations within "
                     f"{storm['window_seconds']}s across L2 escalation(s): {labels}.\n"
                     f"Each truncation drops the OLDEST entry of that L2's "
-                    f"`amendments` list at the queue._MAX_AMENDMENTS cap; the "
+                    f"`amendments` list at the "
+                    f"escalation/src/escalation/amendments.py::MAX_AMENDMENTS cap; the "
                     f"record's own `amendments_truncated` field holds the durable "
                     f"per-L2 total, and its own root_cause/detail/options/summary "
                     f"are never touched.\n"
@@ -1733,7 +1735,8 @@ def create_server(
                 suggested_action=(
                     'Read the named L2s and compare each record\'s own framing '
                     'against its amendments to judge whether those folds belong '
-                    'together; then either raise queue._MAX_AMENDMENTS or tighten '
+                    'together; then either raise '
+                    'escalation/src/escalation/amendments.py::MAX_AMENDMENTS or tighten '
                     'root-cause matching.'
                 ),
             ))
@@ -3472,10 +3475,10 @@ def create_server(
         existing L2's ``amendments`` list rather than discarding them (task
         3997): the record's OWN framing stays immutable, but the framing a fold
         carried in is no longer lost.  That list is bounded — oldest-shed at
-        ``queue._MAX_AMENDMENTS``, with every drop counted in the record's
-        ``amendments_truncated``.  The info-only refusal (see *severity*) is
-        judged BEFORE this fold, so an all-info cluster is never folded into an
-        already-pending L2 either.
+        ``escalation/src/escalation/amendments.py::MAX_AMENDMENTS``, with every
+        drop counted in the record's ``amendments_truncated``.  The info-only
+        refusal (see *severity*) is judged BEFORE this fold, so an all-info
+        cluster is never folded into an already-pending L2 either.
 
         **Members stay at L1**: the member L1 escalations are referenced but
         NOT promoted; they remain pending at L1 until the L2 is resolved.
@@ -3631,7 +3634,8 @@ def create_server(
         parse per fold and raced concurrent folds in either direction.  A
         framing-free or framing-identical re-promote appends nothing and
         correctly reports False.  ``amendments`` is the resulting list length,
-        which saturates at ``queue._MAX_AMENDMENTS``.
+        which saturates at
+        ``escalation/src/escalation/amendments.py::MAX_AMENDMENTS``.
 
         ``severity`` reports what was ACTUALLY filed, which for a caller that
         omitted the argument is how the inherited value becomes visible — and

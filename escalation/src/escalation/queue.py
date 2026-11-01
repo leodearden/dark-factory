@@ -157,7 +157,8 @@ SEQ_COUNTER_SUFFIX = '.seq'
 # substantive resolutions that arrived after an automated sweep had already
 # closed the record (task 4495; see `_is_late_resolution_worth_capturing` for
 # why that is rare).  Same sole-writer/sole-trimmer, oldest-shed,
-# count-every-drop policy as `_MAX_AMENDMENTS` above: `resolve()`'s
+# count-every-drop policy as
+# `escalation/src/escalation/amendments.py::MAX_AMENDMENTS`: `resolve()`'s
 # already-terminal branch owns both, and each shed entry increments the
 # record's `late_resolutions_truncated` so the TRUE total
 # (`len(list) + truncated`) never plateaus.
@@ -167,8 +168,9 @@ SEQ_COUNTER_SUFFIX = '.seq'
 # status/resolution/resolved_by, so nothing anchoring is stored only in this
 # list, and a reader triaging NOW wants the most recent finding.
 #
-# SIZED SMALLER THAN `_MAX_AMENDMENTS` (20) on purpose: an L2 folds repeatedly
-# by design, but a SECOND late resolution on one already-swept record means the
+# SIZED SMALLER THAN `escalation/src/escalation/amendments.py::MAX_AMENDMENTS`
+# (20) on purpose: an L2 folds repeatedly by design, but a SECOND late
+# resolution on one already-swept record means the
 # race recurred on the same escalation — a shape that should be exceptional, so
 # a low cap costs nothing real and keeps the envelope tight.
 #   whole list <= 8 * (1200 kept + ~70 marker + ~180 timestamp/keys) ~= 11 KB
@@ -178,7 +180,7 @@ _MAX_LATE_RESOLUTIONS = 8
 # Per-ENTRY character cap on a captured `resolution`.  An entry count alone is
 # NOT a size bound: `resolution` is unbounded caller free text (an agent's full
 # finding), so 8 uncapped entries could add hundreds of KB to a record every
-# reader of a full record then parses.  Shares `_MAX_AMENDMENT_DETAIL_CHARS`'s
+# reader of a full record then parses.  Shares `MAX_AMENDMENT_DETAIL_CHARS`'s
 # sizing — both are the "prose" field of their entry — and the same in-band
 # marked elision, with the dropped characters counted on the record in
 # `late_resolutions_chars_elided` exactly as shed ENTRIES are counted in
@@ -189,9 +191,9 @@ _MAX_LATE_RESOLUTION_CHARS = MAX_AMENDMENT_DETAIL_CHARS
 # Hard cap on the NUMBER of Escalation.root_cause_variants entries — the DISTINCT
 # pre-canonical root_cause spellings one L2 has been addressed by (task 3998).
 # Same sole-writer/sole-trimmer, oldest-shed, count-every-drop policy as
-# `_MAX_AMENDMENTS` above, and sized against the same post-canonicalisation fold
-# rate; each entry is one elided LINE (a dedup key), so the whole list is bounded
-# by 20 * ~370 chars ~= 7 KB.
+# `escalation/src/escalation/amendments.py::MAX_AMENDMENTS`, and sized against
+# the same post-canonicalisation fold rate; each entry is one elided LINE (a
+# dedup key), so the whole list is bounded by 20 * ~370 chars ~= 7 KB.
 # DELIBERATELY WELL ABOVE the server's over-fold alarm threshold
 # (`_ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD = 5`): the cap must never be what
 # decides whether the signal fires, or a tighter cap would silently mute the
@@ -260,7 +262,8 @@ class AmendmentOutcome(TypedDict):
     """
 
     recorded: bool  # THIS call appended an amendment
-    dropped: int    # entries THIS call shed at the _MAX_AMENDMENTS cap
+    dropped: int    # entries THIS call shed at the amendment-count cap,
+                    # escalation/src/escalation/amendments.py::MAX_AMENDMENTS
     # THIS call added a previously-unseen PRE-canonical root_cause spelling
     # (task 3998).  Same TOCTOU argument as `recorded`: "is this spelling new to
     # the record" is only answerable against the record as it is INSIDE the lock.
@@ -279,7 +282,8 @@ class AmendWithRecord(TypedDict):
     status: Literal['amended', 'repeat_framing', 'not_pending']
     escalation: Escalation  # as amended, or as found when nothing was recorded
     recorded: bool          # THIS call appended an amendment
-    dropped: int            # entries THIS call shed at the _MAX_AMENDMENTS cap
+    dropped: int            # entries THIS call shed at the amendment-count cap,
+                            # escalation/src/escalation/amendments.py::MAX_AMENDMENTS
 
 
 class AmendWithoutRecord(TypedDict):
@@ -427,8 +431,9 @@ def _build_late_resolution(
 ) -> tuple[LateResolution, int]:
     """Build one :class:`~escalation.models.LateResolution`, size-bounded.
 
-    Modelled on :func:`_build_amendment`: the single site that maps a
-    ``resolve()`` argument set onto the entry's key names, and the single site
+    Modelled on ``escalation/src/escalation/amendments.py::_build_amendment``:
+    the single site that maps a ``resolve()`` argument set onto the entry's key
+    names, and the single site
     that applies the per-entry character cap (``_MAX_LATE_RESOLUTION_CHARS``)
     that turns ``_MAX_LATE_RESOLUTIONS`` from an entry count into an actual size
     bound.  Elision is marked in-band and the dropped total is returned so the
@@ -2023,8 +2028,9 @@ class EscalationQueue:
         framing appends no amendment, so every existing two-positional-arg
         caller is byte-unchanged.  Framing byte-identical to what the record
         ALREADY says is likewise not re-recorded (see
-        :func:`_is_repeat_framing`): a re-promote with unchanged text has
-        contributed nothing, so it stays a true no-op and does NOT bump
+        ``escalation/src/escalation/amendments.py::_is_repeat_framing``): a
+        re-promote with unchanged text has contributed nothing, so it stays a
+        true no-op and does NOT bump
         ``updated_at``.  "What the record already says" is the LAST amendment
         when there is one and **the record's OWN framing when there is not** —
         so the FIRST re-promote of a freshly-created L2, the one most likely to
@@ -2032,16 +2038,19 @@ class EscalationQueue:
         copy of the record's own fields.
 
         **Each entry is size-bounded too.**  Every free-text field is elided to
-        its named per-field cap (``_MAX_AMENDMENT_LINE_CHARS`` /
-        ``_MAX_AMENDMENT_DETAIL_CHARS``) with an in-band marker, and the options
-        list is capped at ``_MAX_AMENDMENT_OPTIONS`` — without that, the entry
-        count alone would bound nothing, since *evidence* is unbounded free
+        its named per-field cap (``MAX_AMENDMENT_LINE_CHARS`` /
+        ``MAX_AMENDMENT_DETAIL_CHARS``) with an in-band marker, and the options
+        list is capped at
+        ``escalation/src/escalation/amendments.py::MAX_AMENDMENT_OPTIONS`` —
+        without that, the entry count alone would bound nothing, since
+        *evidence* is unbounded free
         text.  Characters dropped are added to ``amendments_chars_elided``,
         the byte-side counterpart of ``amendments_truncated``.
 
-        **The list is capped at** :data:`_MAX_AMENDMENTS`.  The trim happens at
-        write time (:func:`_append_amendment_capped`), in the same critical
-        section and the same single ``_rewrite`` as the append — so cap
+        **The list is capped at**
+        ``escalation/src/escalation/amendments.py::MAX_AMENDMENTS``.  The trim
+        happens at write time (:func:`append_amendment_capped`), in the same
+        critical section and the same single ``_rewrite`` as the append — so cap
         enforcement is atomic with it and no over-cap list is ever durable.  It
         sheds the OLDEST entries, which is
         safe because the ORIGINAL framing is never in this list at all: it lives
@@ -2142,9 +2151,11 @@ class EscalationQueue:
             # union-preservation is inherited from the lock rather than
             # re-established.
             variant_added = False
-            # STRIPPED, exactly as `_framing_view` compares root_cause and as the
-            # create path stores it: a key differing only in surrounding
-            # whitespace was folded by the lookup even BEFORE canonicalisation,
+            # STRIPPED, exactly as
+            # `escalation/src/escalation/amendments.py::_framing_view` compares
+            # root_cause and as the create path stores it: a key differing only
+            # in surrounding whitespace was folded by the lookup even BEFORE
+            # canonicalisation,
             # so it is not a distinct SPELLING and carries no over-fold
             # information.  Recording it would also contradict the pinned
             # contract that such a fold is a no-op (no spurious `updated_at`
@@ -2160,7 +2171,8 @@ class EscalationQueue:
                 # Elide through the SAME helper as amendment fields, so an
                 # over-long spelling is capped with the in-band marker rather
                 # than silently truncated — and so the comparison below is
-                # against the STORED form, exactly as _is_repeat_framing does.
+                # against the STORED form, exactly as
+                # `escalation/src/escalation/amendments.py::_is_repeat_framing` does.
                 incoming, _ = elide(incoming_variant, MAX_AMENDMENT_LINE_CHARS)
                 if incoming not in esc.root_cause_variants:
                     esc.root_cause_variants.append(incoming)
@@ -2298,9 +2310,11 @@ class EscalationQueue:
         The explicit counterpart of the framing a ``promote_to_l2`` fold carries
         in: a ruling made elsewhere can be written onto the record it rules on
         WITHOUT a fold's side effects.  APPEND-ONLY through
-        :func:`_append_amendment_capped`, so the per-field elision, repeat
-        suppression and ``_MAX_AMENDMENTS`` oldest-shed policy are exactly the
-        fold's.  *detail* lands under the amendment's ``detail`` key.
+        :func:`append_amendment_capped`, so the per-field elision, repeat
+        suppression and
+        ``escalation/src/escalation/amendments.py::MAX_AMENDMENTS`` oldest-shed
+        policy are exactly the fold's.  *detail* lands under the amendment's
+        ``detail`` key.
 
         It NEVER writes ``status``, ``severity``, ``level``, ``members``,
         ``resolution`` / ``resolved_at`` / ``resolved_by`` /
@@ -2341,7 +2355,7 @@ class EscalationQueue:
                 esc, root_cause=root_cause, summary=summary, evidence=detail,
                 options=options, agent_role=agent_role, caller='amend',
             )
-            # Framing already passed _has_framing above, so nothing recorded
+            # Framing already passed has_framing above, so nothing recorded
             # can only mean the record already says it.
             if not recorded:
                 return {
