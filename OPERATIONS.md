@@ -3532,11 +3532,13 @@ supersedes `data/afk-digest.md`, which was last written 2026-08-19.
    ramifications, a recommendation or an explicit no-lean). It writes JSON
    batch files to a per-run inbox, `data/sitting/inbox/<run>/`, and runs
    `prepare_sitting.py record --from <file>`. Three layers confine it, all
-   in `nightly_prepare.py`. The write boundary is the OS sandbox: the CLI
-   runs under Landlock (else bwrap), with the tree read-only except
-   `data/sitting/`, `.task/`, `~/.cache/uv` and `/tmp`, and with no OS
-   sandbox available the run is refused (`prepare=2`), never launched
-   unconfined. The CLI rules are the first gate, not the boundary: it runs
+   in `nightly_prepare.py`. The write boundary is Landlock: the CLI runs
+   under it with the tree read-only except `data/sitting/`, `~/.cache/uv`,
+   `/tmp` and `.task/` (Landlock always grants its cwd's `.task/`, and the
+   run's cwd is the repo root because its prepare command is
+   repo-relative). Without Landlock the run is refused (`prepare=2`), never
+   launched unconfined; bwrap is not a fallback, since its mount order
+   leaves the host `/tmp` read-only. The CLI rules are the first gate, not the boundary: it runs
    under `--permission-mode dontAsk` with an allowlist and an explicit
    denylist of every apply verb, reading no settings file
    (`--setting-sources ''`); the CLI matches those rules against raw
@@ -3555,8 +3557,8 @@ supersedes `data/afk-digest.md`, which was last written 2026-08-19.
    is invisible to the gate. Its `CLAUDE_CONFIG_DIR` is a per-run directory
    under `data/sitting/config/`, holding the leased token or, with nothing
    leasable, a copy of the host's `~/.claude/.credentials.json`; the
-   credentials file is removed when the run ends. It stops itself after
-   2700s.
+   credentials file is removed on every exit short of a SIGKILL. It stops
+   itself after 2700s.
 2. **Render.** This step is deterministic and runs whatever prepare
    returned. Every figure on the page comes from its own fresh measurement
    and carries a stamp, and a store it cannot read is a stated shortfall in
@@ -3606,7 +3608,7 @@ systemctl --user list-timers return-brief.timer
   of <m>, undecodable=<u>, permission_denials=<d>)`; a high `undecodable`
   means the agent's entries failed validation even though some were recorded.
 - `prepare=2` is a configuration error, such as no `claude` on the unit's
-  PATH, or no OS sandbox (`refusing to run unconfined`).
+  PATH, or no Landlock (`refusing to run unconfined`).
 - `brief=` other than 0 means the page was not written. That is the one
   worth acting on.
 

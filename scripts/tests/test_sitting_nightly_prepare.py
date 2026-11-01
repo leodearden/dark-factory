@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 from legibility import account_pool
-from orchestrator.agents import landlock, sandbox_dispatch
+from orchestrator.agents import landlock, sandbox, sandbox_dispatch
 from shared.cli_invoke import build_claude_argv
 from shared.usage_gate import AccountLease
 from sitting import nightly_prepare as mod
@@ -94,11 +94,10 @@ sys.exit(spec['exit_code'])
 
 
 @pytest.fixture(autouse=True)
-def _sandbox_backend():
-    """``none`` unless a test picks a backend, so most tests see the CLI argv unwrapped on any host."""
+def _restore_sandbox_backend():
+    """The run sets the process-global backend; put it back after each test."""
     saved = sandbox_dispatch.get_backend()
     sandbox_dispatch.reset_escalation_dedupe()
-    sandbox_dispatch.set_backend('none')
     yield
     sandbox_dispatch.set_backend(saved)
     sandbox_dispatch.reset_escalation_dedupe()
@@ -208,7 +207,7 @@ def _run(fake: FakeClaude, *, gate=None, **overrides) -> int:
     settings = mod.Settings(**{
         'claude_bin': str(fake.bin), 'model': mod.DEFAULT_MODEL, 'budget_usd': mod.DEFAULT_BUDGET_USD,
         'timeout_secs': mod.DEFAULT_TIMEOUT_SECS, 'max_turns': mod.DEFAULT_MAX_TURNS,
-        'mcp_json': mod.DEFAULT_MCP_JSON, 'root': fake.root, **overrides,
+        'mcp_json': mod.DEFAULT_MCP_JSON, 'root': fake.root, 'sandbox_backend': 'none', **overrides,
     })
     return mod.run(settings, gate=gate if gate is not None else _live_gate())
 
@@ -292,7 +291,8 @@ def test_the_child_runs_in_the_root_it_was_given(tmp_path):
 def test_main_works_in_the_root_it_is_given_and_forwards_the_cli_flags(tmp_path):
     fake = _fake_claude(tmp_path)
 
-    rc = mod.main(['--claude-bin', str(fake.bin), '--model', 'opus', '--max-turns', '17'], gate=_live_gate(), root=tmp_path)
+    rc = mod.main(['--claude-bin', str(fake.bin), '--model', 'opus', '--max-turns', '17'], gate=_live_gate(), root=tmp_path,
+                  sandbox_backend='none')
 
     call = fake.only_call()
     assert rc == mod.EXIT_OK
@@ -477,7 +477,6 @@ def _landlock_grants(argv: list[str]) -> set[Path]:
 
 @pytest.mark.skipif(not landlock.is_landlock_available(), reason='needs a Landlock kernel to run the fake confined')
 def test_the_cli_runs_under_landlock_writing_only_the_run_grants(tmp_path, monkeypatch, host_home):
-    sandbox_dispatch.set_backend('landlock')
     spawned: list[list[str]] = []
     real_popen = subprocess.Popen
 
@@ -488,7 +487,7 @@ def test_the_cli_runs_under_landlock_writing_only_the_run_grants(tmp_path, monke
     monkeypatch.setattr(subprocess, 'Popen', recording_popen)
     fake = _fake_claude(tmp_path)
 
-    assert _run(fake) == mod.EXIT_OK
+    assert _run(fake, sandbox_backend='landlock') == mod.EXIT_OK
 
     [argv] = spawned
     assert Path(argv[1]).name == 'landlock_exec.py'
@@ -501,13 +500,13 @@ def test_the_cli_runs_under_landlock_writing_only_the_run_grants(tmp_path, monke
     assert any(config_dir.is_relative_to(grant) for grant in grants)
 
 
-def test_an_unavailable_sandbox_refuses_the_run_and_leases_nothing(tmp_path, monkeypatch, capsys):
-    sandbox_dispatch.set_backend('landlock')
+def test_without_landlock_the_run_is_refused_even_where_bwrap_is_available(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(landlock, 'is_landlock_available', lambda: False)
+    monkeypatch.setattr(sandbox, 'is_bwrap_available', lambda: True)
     fake = _fake_claude(tmp_path)
     gate = _live_gate()
 
-    rc = _run(fake, gate=gate)
+    rc = _run(fake, gate=gate, sandbox_backend='landlock')
 
     assert rc == mod.EXIT_CONFIG
     assert (gate.leases, fake.calls()) == (0, [])
@@ -567,6 +566,19 @@ def test_no_lease_inherits_the_parent_env_and_still_runs(tmp_path, monkeypatch, 
     assert call['env']['SITTING_TEST_MARKER'] == 'kept'
     assert not call['env_has']['ANTHROPIC_API_KEY']
     assert os.environ['ANTHROPIC_API_KEY'] == 'sk-ant-must-not-survive', 'the parent env is not mutated'
+
+
+def test_the_entry_point_pins_landlock(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(landlock, 'is_landlock_available', lambda: False)
+    monkeypatch.setattr(sandbox, 'is_bwrap_available', lambda: True)
+    fake = _fake_claude(tmp_path)
+    gate = _live_gate()
+
+    rc = mod.main(['--claude-bin', str(fake.bin)], gate=gate, root=tmp_path)
+
+    assert rc == mod.EXIT_CONFIG
+    assert (gate.leases, fake.calls()) == (0, [])
+    assert "backend='landlock'" in capsys.readouterr().err
 
 
 def test_the_leased_token_is_the_config_dirs_login_for_the_run_only(tmp_path):
@@ -676,7 +688,7 @@ def test_the_entry_point_runs_standalone_without_the_test_sys_path(tmp_path):
 def test_main_never_raises(tmp_path, capsys):
     fake = _fake_claude(tmp_path)
 
-    rc = mod.main(['--claude-bin', str(fake.bin)], gate=ExplodingGate(), root=tmp_path)
+    rc = mod.main(['--claude-bin', str(fake.bin)], gate=ExplodingGate(), root=tmp_path, sandbox_backend='none')
 
     assert rc == mod.EXIT_FAILED
     assert 'roster unreadable: simulated' in capsys.readouterr().err

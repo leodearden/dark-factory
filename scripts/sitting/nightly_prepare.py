@@ -9,12 +9,14 @@ itself, so a failed night costs thinner recommendations, never a wrong page.
 
 Recommend-only regardless of flags. Three layers confine the run:
 
-- The OS sandbox is the write boundary. The CLI runs under
+- Landlock is the write boundary. The CLI runs under
   ``orchestrator/src/orchestrator/agents/sandbox_dispatch.py::wrap_command``
-  (Landlock, else bwrap), so the whole tree is read-only except
-  ``data/sitting/`` (the inbox, the store and the run's ``CLAUDE_CONFIG_DIR``),
-  ``<root>/.task/``, ``~/.cache/uv`` and ``/tmp``. With no OS sandbox the run
-  is refused, never launched unconfined.
+  pinned to Landlock, so the whole tree is read-only except ``data/sitting/``
+  (the inbox, the store and the run's ``CLAUDE_CONFIG_DIR``), ``~/.cache/uv``,
+  ``/tmp`` and ``<root>/.task/``, which Landlock always grants in its cwd (the
+  run's cwd is the root, since ``PREPARE_COMMAND`` is repo-relative). Without
+  Landlock the run is refused, never launched unconfined; bwrap is not a
+  fallback, since its mount order leaves the host ``/tmp`` read-only.
 - The CLI rules are the first gate. It runs under ``--permission-mode dontAsk``
   with ``nightly_allowed_tools`` as the only tools it may use, reading no
   settings file (``setting_sources=[]``), and ``NIGHTLY_DENIED_TOOLS`` naming
@@ -43,7 +45,8 @@ lease, read and handed straight back before the run, because nothing in the
 child can settle a slot. The known cost is that this run's spend is invisible
 to the gate. The leased token is written into the run's config dir; with no
 lease, ``_adopt_host_login`` supplies the host's own login instead. Either
-credentials file is removed when the run ends.
+credentials file is removed on every exit that reaches ``run``'s ``finally``;
+a SIGKILL leaves it in place.
 ``ANTHROPIC_API_KEY`` is stripped on both paths (OPERATIONS.md §12,
 "Legibility trickle accounts (03:00)").
 
@@ -79,8 +82,10 @@ if str(_REPO_ROOT / 'scripts' / 'legibility') not in sys.path:
 
 from legibility import account_pool  # noqa: E402
 from orchestrator.agents.sandbox_dispatch import (  # noqa: E402  # debt: task 6760
+    Backend,
     SandboxUnavailable,
     resolve_backend_or_refuse,
+    set_backend,
     wrap_command,
 )
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
@@ -126,7 +131,6 @@ NIGHTLY_READ_TOOLS: tuple[str, ...] = (
 TIMESTAMP_FORMAT = '%Y%m%dT%H%M%SZ'
 
 SITTING_DATA_PATH = preparation.DEFAULT_PREPARATION_PATH.parent
-CONFIG_DIRS_PATH = SITTING_DATA_PATH / 'config'
 CREDENTIALS_FILE = '.credentials.json'
 
 
@@ -191,6 +195,7 @@ class Settings:
     max_turns: int
     mcp_json: Path
     root: Path
+    sandbox_backend: Backend = 'landlock'
 
 
 class McpConfigUnusable(Exception):
@@ -226,6 +231,7 @@ def run(settings: Settings, *, gate: Any = None) -> int:
     except McpConfigUnusable as exc:
         _log(f'no usable MCP config: {exc}')
         return EXIT_CONFIG
+    set_backend(settings.sandbox_backend)
     try:
         resolve_backend_or_refuse()
     except SandboxUnavailable as exc:
@@ -233,31 +239,26 @@ def run(settings: Settings, *, gate: Any = None) -> int:
         return EXIT_CONFIG
     root = settings.root.resolve()
     inbox = _new_inbox(root)
-    config_dir = TaskConfigDir(f'nightly-prepare-{inbox.name}', base_dir=root / CONFIG_DIRS_PATH)
-    grants = _writable_grants(root)
-    if not _is_granted(config_dir.path, grants):
-        _log(f'refusing to run: CLAUDE_CONFIG_DIR {config_dir.path} is not inside a writable grant {grants}')
-        return EXIT_CONFIG
+    sitting_data = root / SITTING_DATA_PATH
+    config_dir = TaskConfigDir(f'nightly-prepare-{inbox.name}', base_dir=sitting_data / 'config')
     try:
         env = _child_env(gate if gate is not None else account_pool.build_pool(), inbox, config_dir)
-        return _run_confined(claude, settings, mcp_config, env, root, inbox, grants)
+        return _run_confined(
+            claude=claude, settings=settings, mcp_config=mcp_config, env=env, root=root, inbox=inbox,
+            grants=(sitting_data, _ensure_uv_cache()),
+        )
     finally:
         (config_dir.path / CREDENTIALS_FILE).unlink(missing_ok=True)
 
 
-def _writable_grants(root: Path) -> tuple[Path, ...]:
-    """What the sandbox lets the run write besides ``<root>/.task`` and ``/tmp``, which it always grants."""
+def _ensure_uv_cache() -> Path:
+    """``~/.cache/uv``, created if absent: Landlock can grant only a directory that exists."""
     uv_cache = Path.home() / '.cache' / 'uv'
     uv_cache.mkdir(parents=True, exist_ok=True)
-    return (root / SITTING_DATA_PATH, uv_cache)
+    return uv_cache
 
 
-def _is_granted(path: Path, grants: Sequence[Path]) -> bool:
-    """Both properties matter: the child resolves a relative path against its own cwd, and an ungranted config dir silently loses every session write."""
-    return path.is_absolute() and any(path.is_relative_to(grant) for grant in grants)
-
-
-def _run_confined(claude: str, settings: Settings, mcp_config: dict[str, Any], env: dict[str, str],
+def _run_confined(*, claude: str, settings: Settings, mcp_config: dict[str, Any], env: dict[str, str],
                   root: Path, inbox: Path, grants: Sequence[Path]) -> int:
     argv, temp_files = build_claude_argv(
         model=settings.model,
@@ -290,9 +291,11 @@ def _run_confined(claude: str, settings: Settings, mcp_config: dict[str, Any], e
     return _judge(completed, settings, _measure(inbox, store_path, held_before))
 
 
-def main(argv: Sequence[str] | None = None, *, gate: Any = None, root: Path = _REPO_ROOT) -> int:
+def main(argv: Sequence[str] | None = None, *, gate: Any = None, root: Path = _REPO_ROOT,
+         sandbox_backend: Backend = 'landlock') -> int:
     args = _parser().parse_args(argv)
-    settings = Settings(args.claude_bin, args.model, args.budget_usd, args.timeout_secs, args.max_turns, args.mcp_json, root)
+    settings = Settings(args.claude_bin, args.model, args.budget_usd, args.timeout_secs, args.max_turns, args.mcp_json,
+                        root, sandbox_backend)
     try:
         return run(settings, gate=gate)
     except Exception as exc:
