@@ -29,7 +29,8 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
 # nothing in it imports orchestrator.  escalation.pins (is_queue_handoff, the
 # severity semantics _needs_human consumes) is pure and imports only
 # escalation.models, so it is cycle-safe too; harness.py already imports it at
-# module top.
+# module top.  escalation.classify is likewise pure over escalation.models.
+from escalation.classify import closed_by_non_sweep_resolver
 from escalation.dedupe import submit_or_dedupe
 from escalation.models import BORN_AT_L2_SEVERITIES
 from escalation.pins import is_queue_handoff
@@ -18504,6 +18505,27 @@ class TaskWorkflow:
             )
         return in_scope
 
+    def _awaited_record_outcome(
+        self, escalation_id: str | None,
+    ) -> StewardResolved | None:
+        """The outcome a wait scoped to *escalation_id* settles on when that
+        record is found closed by a non-sweep resolver, else ``None``.
+
+        One read of one record by id.  The text mirrors the steward's own
+        lost-race publish (``steward.py::TaskSteward._give_up_with_wip``).
+        """
+        if escalation_id is None or self.escalation_queue is None:
+            return None
+        record = self.escalation_queue.get(escalation_id)
+        if record is None or not closed_by_non_sweep_resolver(record):
+            return None
+        logger.info(
+            'Task %s: awaited escalation %s found %s by %s with no outcome '
+            'published for it — settling the steward wait on the record',
+            self.task_id, escalation_id, record.status, record.resolved_by,
+        )
+        return StewardResolved(resolution_text=record.resolution or record.summary)
+
     async def _receive_steward_outcome(
         self,
         channel: asyncio.Queue[PublishedStewardOutcome],
@@ -18511,12 +18533,17 @@ class TaskWorkflow:
         escalation_id: str | None,
         timeout: float,
     ) -> StewardOutcome | None:
-        """Race the channel against the soft-cancel event until an in-scope
-        outcome arrives, returning the most severe of its burst, or ``None`` on
-        cancel or once *timeout* has elapsed since the call.
+        """Race the channel against the soft-cancel event until the wait
+        settles, or return ``None`` on cancel or once *timeout* has elapsed
+        since the call.
 
-        Out-of-scope publications do not move the deadline.  A publication
-        still wins a tie with the cancel event.
+        The wait settles on an in-scope outcome (the most severe of its burst),
+        or on the awaited record found closed by a non-sweep resolver
+        (:meth:`_awaited_record_outcome`).  The record is read after each burst
+        with nothing in scope and once at the deadline, never on cancel.
+
+        Out-of-scope publications do not move the deadline.  An in-scope
+        publication still wins a tie with the cancel event.
         """
         if self._cancel_event.is_set():
             return None
@@ -18537,20 +18564,26 @@ class TaskWorkflow:
                         t.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await t
-            if get_wait in done:
-                in_scope = self._in_scope_burst(
+            in_scope = (
+                self._in_scope_burst(
                     channel, get_wait.result(), escalation_id=escalation_id,
                 )
-                if in_scope:
-                    return max(in_scope, key=self._outcome_severity)
-                continue
+                if get_wait in done else []
+            )
+            if in_scope:
+                return max(in_scope, key=self._outcome_severity)
             if cancel_wait in done:
                 logger.info(
                     f'Task {self.task_id}: cancel-event fired during steward grace — '
                     f'exiting completion wait'
                 )
                 return None
-            break
+            if get_wait not in done:
+                break
+            if (settled := self._awaited_record_outcome(escalation_id)) is not None:
+                return settled
+        if (settled := self._awaited_record_outcome(escalation_id)) is not None:
+            return settled
         logger.warning(
             f'Task {self.task_id}: steward completion timed out after '
             f'{timeout:.0f}s with no outcome published for {escalation_id or "any escalation"}'
@@ -18567,10 +18600,15 @@ class TaskWorkflow:
         steward published about that escalation ends it.  One published about
         any other escalation — typically an older L0 the steward was still
         working when this one was filed — is logged and discarded, and the
-        wait runs on to its original deadline.  ``None`` is the explicit
-        unscoped mode, where any publication ends the wait.  The argument is
-        required rather than defaulted so every caller chooses its scope; the
-        rule itself lives in :meth:`_in_wait_scope`.
+        wait runs on to its original deadline.  The wait also settles when
+        the awaited record itself is found closed by a non-sweep resolver,
+        read after each out-of-scope burst and once at the deadline, never on
+        cancel: the steward can close it while handling another L0, and humans
+        can close it from outside, and neither publishes an envelope for it.
+        ``None`` is the explicit unscoped mode, where any publication ends the
+        wait.  The argument is required rather than defaulted so every caller
+        chooses its scope; the rule's homes are :meth:`_in_wait_scope` and
+        ``escalation/classify.py::closed_by_non_sweep_resolver``.
 
         *skip_if_idle* (task 3170) is passed by the post-merge success tail,
         whose contract is "give queued steward work a chance to finish" rather
