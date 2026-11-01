@@ -558,6 +558,13 @@ def iter_config_path_blanking_sites(
     ``qualname`` joins the enclosing class and function names with dots, or
     is ``'<module>'`` at module level."""
     tree = ast.parse(Path(path).read_text(), filename=str(path))
+    yield from config_path_blanking_sites_in(tree)
+
+
+def config_path_blanking_sites_in(
+    tree: ast.Module,
+) -> Iterator[tuple[str, int, ConfigPathWrite]]:
+    """:func:`iter_config_path_blanking_sites` over an already-parsed module."""
     yield from _blanking_sites(tree, ())
 
 
@@ -678,7 +685,13 @@ def iter_default_asserting_tests(
     default assertions appears several times.
     """
     source = Path(path).read_text()
-    tree = ast.parse(source, filename=str(path))
+    yield from default_asserting_tests_in(ast.parse(source, filename=str(path)))
+
+
+def default_asserting_tests_in(
+    tree: ast.Module,
+) -> Iterator[tuple[str | None, str, int, str, Any]]:
+    """:func:`iter_default_asserting_tests` over an already-parsed module."""
     if _scope_isolates(tree):
         return
 

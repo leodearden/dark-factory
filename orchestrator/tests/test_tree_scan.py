@@ -6,6 +6,7 @@ the real repository, so this module is not a consumer of the shared pass.
 from __future__ import annotations
 
 import ast
+import enum
 import gc
 import re
 import weakref
@@ -222,6 +223,10 @@ class _Point(NamedTuple):
     text: str
 
 
+class _Shade(enum.Enum):
+    DARK = 'dark'
+
+
 @dataclass(frozen=True)
 class _FrozenFact:
     path: Path
@@ -274,6 +279,7 @@ class TestFactInvariant:
             pytest.param(lambda m: True, id='bool'),
             pytest.param(lambda m: None, id='none'),
             pytest.param(lambda m: m.path, id='path'),
+            pytest.param(lambda m: _Shade.DARK, id='enum-member'),
             pytest.param(lambda m: (_Point(1, 'x'),), id='namedtuple'),
             pytest.param(lambda m: _FrozenFact(m.path, (1, 2), frozenset({'f'})),
                          id='frozen-dataclass'),

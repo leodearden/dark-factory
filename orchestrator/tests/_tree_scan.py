@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import enum
 import functools
 import subprocess
 import unicodedata
@@ -53,6 +54,11 @@ def python_files(*roots: Path, exclude_parts: frozenset[str] = frozenset()) -> t
 
 ORCHESTRATOR_TESTS = functools.partial(python_files, TESTS_DIR)
 ORCHESTRATOR_SRC = functools.partial(python_files, ORCHESTRATOR_SRC_DIR)
+
+
+def orchestrator_test_modules() -> tuple[Path, ...]:
+    """Every ``test_*.py`` directly in the orchestrator tests directory, sorted: the modules pytest collects there."""
+    return tuple(sorted(TESTS_DIR.glob('test_*.py')))
 
 CHECKOUT_SKIP_PARTS = frozenset({'.worktrees', '.venv', 'node_modules', '__pycache__'})
 
@@ -190,7 +196,7 @@ class ListingFailure:
 AnalysisFailure = ExtractionFailure | ListingFailure
 
 
-_PLAIN_SCALARS = (str, bytes, int, float, bool, type(None), PurePath)
+_PLAIN_SCALARS = (str, bytes, int, float, bool, type(None), PurePath, enum.Enum)
 
 
 def _require_plain_fact(fact: object, analysis_name: str) -> None:
@@ -207,7 +213,7 @@ def _require_plain_fact(fact: object, analysis_name: str) -> None:
     raise TypeError(
         f'analysis {analysis_name!r} returned a fact holding a {type(fact).__name__}; '
         'facts are shared across tests and must be immutable and AST-free: '
-        'str, bytes, int, float, bool, None or Path, or a tuple, frozenset, '
+        'str, bytes, int, float, bool, None, Path or an Enum member, or a tuple, frozenset, '
         'NamedTuple or frozen dataclass of those'
     )
 
