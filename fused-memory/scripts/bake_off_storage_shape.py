@@ -1314,13 +1314,12 @@ def build_canonical_by_topic(records: list[ArmRecord]) -> dict[str, ArmRecord]:
     depend on scroll order — non-deterministic between runs, and invisible in
     the report.
     """
+    from fused_memory.canonical_marker import is_canonical  # noqa: PLC0415
+
     index: dict[str, ArmRecord] = {}
     for record in records:
         topic = record.metadata.get('topic')
-        # Bool identity, matching β's `invalid_canonical_type` rule: a truthy
-        # 1 is a FATAL violation at the write boundary, so it must not be
-        # treated as canonical here either.
-        if topic is None or record.metadata.get('canonical') is not True:
+        if topic is None or not is_canonical(record.metadata):
             continue
         existing = index.get(topic)
         if existing is not None:
