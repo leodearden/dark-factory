@@ -1,6 +1,6 @@
 """Escalation classification helpers.
 
-Single site (INV-5) for three related but distinct classification concerns.
+Single site (INV-5) for four related but distinct classification concerns.
 The first two are described in plans/escalation-lifecycle-dashboard-prd.md
 Contract Seam 1; the third in plans/info-l0-disposition-router-prd.md D8:
 
@@ -15,6 +15,9 @@ Contract Seam 1; the third in plans/info-l0-disposition-router-prd.md D8:
 - ``info_l0_mechanical_class`` — which mechanical info-L0 class a record
   belongs to, if any: a registered filer role (``INFO_L0_MECHANICAL_ROLES``)
   or the discriminated done-step-commit orphan (``is_done_step_commit_orphan``).
+- ``closed_by_non_sweep_resolver`` — whether a record was closed by something
+  that carries a finding (an agent, a human, a cascade) rather than by an
+  automated sweep.
 
 All helpers are pure functions with no I/O — callers (queue.py, server.py,
 and future dashboard aggregators) import them rather than re-deriving the
@@ -101,6 +104,19 @@ def effective_benign(record: Escalation) -> tuple[str | None, str]:
         f'effective_benign: unrecognized status {record.status!r} on escalation '
         f'{record.id!r}; expected one of (pending, resolved, dismissed)'
     )
+
+
+def closed_by_non_sweep_resolver(record: Escalation) -> bool:
+    """Is *record* terminal, and closed by a resolver outside the reaper-sweep tier?
+
+    Such a close carries a finding: an agent, a human, a cascade or another
+    non-sweep actor decided it. Both terminal states count, because
+    ``resolve_issue``'s ``close_only`` and ``abandon`` actions dismiss rather
+    than resolve.
+    """
+    if record.status not in ('resolved', 'dismissed'):
+        return False
+    return classify_resolver_tier(record.resolved_by) != 'reaper-sweep'
 
 
 def default_resolution_class_for_resolver(resolved_by: str | None) -> str | None:

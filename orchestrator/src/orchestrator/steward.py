@@ -50,7 +50,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from escalation.classify import classify_resolver_tier
+from escalation.classify import closed_by_non_sweep_resolver
 from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
@@ -1442,18 +1442,14 @@ def _dismissal_was_overtaken(stored: Escalation) -> bool:
 
     ANOTHER automated sweep winning (``harness-orphan-reaper`` et al.) is
     deliberately NOT a lost race: it closed the record the same way this
-    steward was about to, carrying no agent finding to publish.  The tier test
-    goes through ``escalation.classify`` rather than an inline
-    ``'auto-dismissed'`` literal so that membership stays single-sited (INV-5).
+    steward was about to, carrying no agent finding to publish.
 
-    MagicMock-safe by construction, which is load-bearing for the ~150
-    ``test_steward.py`` cases whose mock queue returns a bare ``MagicMock``
-    from ``resolve()``: the status test is a membership check that a MagicMock
-    fails, and it short-circuits before the tier lookup ever sees one.
+    The rule lives in ``escalation/classify.py::closed_by_non_sweep_resolver``,
+    which keeps the sweep-tier membership single-sited (INV-5) and is
+    MagicMock-safe for the ``test_steward.py`` cases whose mock queue returns
+    a bare ``MagicMock`` from ``resolve()``.
     """
-    if stored.status not in ('resolved', 'dismissed'):
-        return False
-    return classify_resolver_tier(stored.resolved_by) != 'reaper-sweep'
+    return closed_by_non_sweep_resolver(stored)
 
 
 def _strip_hash_prefix(detail: str) -> str:
