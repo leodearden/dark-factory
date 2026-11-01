@@ -17,6 +17,7 @@ SECRET_NAMES = (
     'CLAUDE_CODE_OAUTH_TOKEN',
     'ANTHROPIC_API_KEY',
     'ANTHROPIC_OAUTH_TOKEN',
+    'ANTHROPIC_AUTH_TOKEN',
     'OPENAI_API_KEY',
     'GEMINI_API_KEY',
     'PERPLEXITY_API_KEY',
@@ -98,6 +99,17 @@ class TestAgentSubprocessEnv:
     def test_the_only_secret_bearing_key_is_the_session_credential(self):
         child = agent_subprocess_env(_environ_with_secrets())
         assert {k for k in child if is_secret_env_name(k)} == {'CLAUDE_CODE_OAUTH_TOKEN'}
+
+    def test_drops_a_proxied_shells_endpoint_selection_and_keeps_the_session_credential(self):
+        environ = {
+            **_environ_with_secrets(),
+            'ANTHROPIC_BASE_URL': 'http://127.0.0.1:8317',
+            'ANTHROPIC_AUTH_TOKEN': 'proxy-' + 'x' * 40,
+        }
+        child = agent_subprocess_env(environ)
+        assert 'ANTHROPIC_BASE_URL' not in child
+        assert 'ANTHROPIC_AUTH_TOKEN' not in child
+        assert child['CLAUDE_CODE_OAUTH_TOKEN'] == environ['CLAUDE_CODE_OAUTH_TOKEN']
 
     def test_drops_python_env_selection(self):
         environ = {

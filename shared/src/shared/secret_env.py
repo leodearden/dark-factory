@@ -4,8 +4,9 @@ A variable is secret-bearing when its name starts with the OAuth pool prefix or
 ends in ``_API_KEY`` or ``_TOKEN``; the rule reads names only, never values. An
 agent child inherits no secret-bearing variable except its own session
 credential, ``CLAUDE_CODE_OAUTH_TOKEN``. An agent child also inherits no
-Python-environment selection (``shared.python_env``). Operator view:
-``OPERATIONS.md``.
+endpoint-selection variable (``AGENT_ENDPOINT_VARS``) and no Python-environment
+selection (``shared.python_env``); an endpoint reaches a child only through its
+caller's overrides. Operator view: ``OPERATIONS.md``.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from shared.python_env import without_python_env_selection
 
 __all__ = [
     'AGENT_CREDENTIAL_VAR',
+    'AGENT_ENDPOINT_VARS',
     'POOL_TOKEN_PREFIX',
     'agent_subprocess_env',
     'is_secret_env_name',
@@ -24,6 +26,7 @@ __all__ = [
 
 POOL_TOKEN_PREFIX = 'CLAUDE_OAUTH_TOKEN_'
 AGENT_CREDENTIAL_VAR = 'CLAUDE_CODE_OAUTH_TOKEN'
+AGENT_ENDPOINT_VARS = frozenset({'ANTHROPIC_BASE_URL'})
 
 _SECRET_SUFFIXES = ('_API_KEY', '_TOKEN')
 
@@ -36,7 +39,8 @@ def agent_subprocess_env(environ: Mapping[str, str]) -> dict[str, str]:
     return {
         name: value
         for name, value in without_python_env_selection(environ).items()
-        if name == AGENT_CREDENTIAL_VAR or not is_secret_env_name(name)
+        if name not in AGENT_ENDPOINT_VARS
+        and (name == AGENT_CREDENTIAL_VAR or not is_secret_env_name(name))
     }
 
 
