@@ -3,7 +3,8 @@
 Injected in place of the production adapters through
 ``MergeLane(..., verifier=FakeVerifier(...), clock=FakeClock(...))``.
 ``FakeVerifier`` scripts the verify outcome per task id or in call order,
-and records each scoped verify as a ``ScopedVerifyCall``; ``FakeClock`` is a
+or hands a call to a delegate that does real work at verify time, and
+records each scoped verify as a ``ScopedVerifyCall``; ``FakeClock`` is a
 hand-advanced clock whose ``sleep`` advances it and waits at most
 ``sleep_cap`` of real time, and ``healthy_verify_clock`` one on which an
 in-flight verify keeps writing;
@@ -33,7 +34,15 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
-from collections.abc import AsyncIterator, Collection, Coroutine, Iterable, Mapping
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Coroutine,
+    Iterable,
+    Mapping,
+)
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +53,9 @@ from orchestrator.merge_lane.ports import ClockPort
 from orchestrator.merge_lane.types import DiskGuardOutcome, MergeOutcome
 from orchestrator.merge_lane.worker import MAIN_HEALTH_PROBE_PENDING_NOTE
 from orchestrator.verify import VerifyResult
+
+#: A scoped verify a script hands its call to, called with ``run_scoped``'s own arguments.
+ScopedVerify = Callable[..., Awaitable[VerifyResult]]
 
 
 def lane_entry(lane: MergeLane, request_id: str) -> dict[str, Any] | None:
@@ -117,7 +129,8 @@ class VerifyScript:
     """What one ``FakeVerifier.run_scoped`` call does.
 
     Exactly one of the shapes below applies: return ``result``, raise
-    ``error``, or wait for ``release`` first and then return ``result``.
+    ``error``, wait for ``release`` first and then return ``result``, or
+    hand the call to ``delegate`` and return what it returns.
     *entered*, when given, is set the moment a call reaches this script,
     before any release wait; it is the arrival half of a release gate.
     """
@@ -126,6 +139,7 @@ class VerifyScript:
     error: BaseException | None = None
     release: asyncio.Event | None = None
     entered: asyncio.Event | None = None
+    delegate: ScopedVerify | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -154,6 +168,10 @@ def raises(error: BaseException) -> VerifyScript:
     return VerifyScript(result=passes().result, error=error)
 
 
+def delegates_to(delegate: ScopedVerify) -> VerifyScript:
+    return VerifyScript(result=passes().result, delegate=delegate)
+
+
 def hangs_until(
     release: asyncio.Event, *, entered: asyncio.Event | None = None,
 ) -> VerifyScript:
@@ -172,6 +190,9 @@ class FakeVerifier:
 
     Each ``run_scoped`` call follows the next of the ordered ``sequence``
     scripts while any remain, then ``scripts[task_id]``, then ``default``.
+    A call whose behaviour is more than a verdict (a side effect at verify
+    time, a span recorder, production's own ``run_scoped_verification``) is
+    scripted with ``delegates_to(fn)``, and is recorded like any other call.
     It records every task id it was asked about in ``verified`` and what each
     call was handed in ``verify_calls``, one ``ScopedVerifyCall`` per entry
     into the BASE ``run_scoped`` (an override that does not delegate records
@@ -258,6 +279,10 @@ class FakeVerifier:
             await script.release.wait()
         if script.error is not None:
             raise script.error
+        if script.delegate is not None:
+            return await script.delegate(
+                worktree, config, module_configs, task_files, **options,
+            )
         return script.result
 
     async def run_unscoped_typechecks(
