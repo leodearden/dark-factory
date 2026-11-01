@@ -96,7 +96,7 @@ class TestSelectCarriedResolutions:
 
         assert isinstance(carried, tuple)
         with pytest.raises(dataclasses.FrozenInstanceError):
-            carried[0].resolution = 'rewritten'  # type: ignore[misc]
+            setattr(carried[0], dataclasses.fields(carried[0])[0].name, 'rewritten')
 
     def test_falls_back_to_filing_time_then_id_never_input_order(self):
         filed_last = _esc('esc-9-1', timestamp='2026-08-05T00:00:00+00:00')

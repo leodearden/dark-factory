@@ -321,6 +321,7 @@ def _time_the_wait(workflow: TaskWorkflow) -> dict[str, float]:
 
 def _file_gating_l0_after_the_wait(
     workflow: TaskWorkflow, queue: EscalationQueue, task_id: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """File a plain blocking L0 the moment ``_wait_for_resolution`` returns.
 
@@ -341,7 +342,7 @@ def _file_gating_l0_after_the_wait(
         _submit_gating_l0(queue, task_id)
         return carried
 
-    workflow._wait_for_resolution = _then_file  # type: ignore[method-assign]
+    monkeypatch.setattr(workflow, '_wait_for_resolution', _then_file)
 
 
 def _steward_wait_timeouts(store: _RecordingEventStore) -> list[dict]:
@@ -1529,9 +1530,9 @@ class TestGateReFireIsBounded:
             events.append(f'status:{status}')
             return await record_status(task_id_, status, *args, **kwargs)
 
-        scheduler.set_task_status = _journalled_set_task_status  # type: ignore[method-assign]
+        monkeypatch.setattr(scheduler, 'set_task_status', _journalled_set_task_status)
 
-        _file_gating_l0_after_the_wait(wf, queue, task_id)
+        _file_gating_l0_after_the_wait(wf, queue, task_id, monkeypatch)
         timing = _time_the_wait(wf)
 
         _submit_gating_l0(queue, task_id)

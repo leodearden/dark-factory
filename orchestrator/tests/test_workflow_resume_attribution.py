@@ -78,7 +78,7 @@ def _make_follow_on_filing_steward(
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self.chain_task: asyncio.Task | None = None
 
         def set_outcome_channel(self, channel) -> None:
@@ -270,17 +270,18 @@ async def _resume_once(
     task_assignment: TaskAssignment,
     queue: EscalationQueue,
     invoke: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[_ResumeRecordingBriefing, Escalation]:
     """Drive ``run()`` through one ESCALATED wait and one implementer resume."""
     worktree = await _make_advanced_worktree(git_ops, TASK_ID)
     workflow, _ = _build_workflow(config, git_ops, task_assignment, queue, worktree)
     briefing = _ResumeRecordingBriefing()
-    workflow.briefing = briefing  # type: ignore[assignment]
+    monkeypatch.setattr(workflow, 'briefing', briefing)
     _wire_resolve_callback(queue, workflow)
     workflow._steward_factory = _make_resolving_steward(queue, TASK_ID)
     evrl, _ = _make_evrl_returner([WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE])
-    workflow._execute_verify_review_loop = evrl  # type: ignore[method-assign]
-    workflow._invoke = invoke  # type: ignore[method-assign]
+    monkeypatch.setattr(workflow, '_execute_verify_review_loop', evrl)
+    monkeypatch.setattr(workflow, '_invoke', invoke)
     answered = _submit(queue, 'verify red at step 19')
 
     await asyncio.wait_for(workflow.run(), 30)
@@ -296,6 +297,7 @@ class TestResumeBriefingNamesItsEscalations:
         git_ops: GitOps,
         task_assignment: TaskAssignment,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ):
         queue = EscalationQueue(tmp_path / 'queue')
         late: list[Escalation] = []
@@ -303,7 +305,9 @@ class TestResumeBriefingNamesItsEscalations:
             lambda: late.append(_submit(queue, 'verify still red at step 20')),
         )
 
-        briefing, answered = await _resume_once(config, git_ops, task_assignment, queue, invoke)
+        briefing, answered = await _resume_once(
+            config, git_ops, task_assignment, queue, invoke, monkeypatch,
+        )
 
         ((issue, resolution),) = briefing.resume_calls
         assert resolution.index(answered.id) < resolution.index('Resolved by FakeSteward')
@@ -317,10 +321,11 @@ class TestResumeBriefingNamesItsEscalations:
         git_ops: GitOps,
         task_assignment: TaskAssignment,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ):
         briefing, answered = await _resume_once(
             config, git_ops, task_assignment, EscalationQueue(tmp_path / 'queue'),
-            _make_prompt_building_invoke(),
+            _make_prompt_building_invoke(), monkeypatch,
         )
 
         ((issue, _resolution),) = briefing.resume_calls
