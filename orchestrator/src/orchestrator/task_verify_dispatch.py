@@ -15,7 +15,7 @@ import functools
 import json
 import logging
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -369,7 +369,7 @@ class _Race:
 
 
 async def _reap_race(race: _Race) -> None:
-    reaps: list[Any] = [_reap(task) for task in race.attempts]
+    reaps: list[Awaitable[None]] = [_reap(task) for task in race.attempts]
     reaping = race.withdraw_local()
     if reaping is not None:
         reaps.append(reaping)
