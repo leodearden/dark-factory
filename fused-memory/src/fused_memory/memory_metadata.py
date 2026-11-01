@@ -1231,8 +1231,7 @@ def check_canonical_routing(
       never supplied by any caller, so attributes are always ``{}``.
 
     So the marker is never stored — hence never readable by any reader,
-    every one of which reads Mem0 payloads through
-    ``canonical_marker.py::is_canonical`` — and
+    all of which read Mem0 payloads — and
     never countable by the <=1-per-``(project, topic)`` probe, whose two
     round-trips are Qdrant payload filters.  Admitting such a write would
     silently destroy a caller's assertion, which is the fail-soft the house
