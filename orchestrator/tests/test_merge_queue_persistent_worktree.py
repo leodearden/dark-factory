@@ -5,7 +5,7 @@ All tests in this file relate to PRD κ Phase 1 of reify warmer-builds-merge-ver
 The routing tests are real-git and observe the lane through an injected
 ``VerifyPort`` (``FakeVerifier``).  What that does and does NOT stub of
 the post-merge gate chain is stated once, with the measurement behind it, in
-``_merge_lane_verifier_doubles.py``'s module docstring.
+``orchestrator/tests/_merge_lane_fakes.py::FakeVerifier``'s docstring.
 """
 
 from __future__ import annotations

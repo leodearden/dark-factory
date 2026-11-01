@@ -201,14 +201,40 @@ class FakeVerifier:
     is how a test waits for a scripted hang to be genuinely under way before
     it probes the lane -- per CALL, so a test that drives two verifies can
     wait for the SECOND one instead of being let through early by the first.
-    The gates a merge passes through after a green scoped verify all report
-    clean, the disk guard reports *disk_reason* (``None``, the default, being
-    "proceed"), and dry-run investigations are recorded in ``investigations``
-    rather than run.
+    Its post-verify methods report clean, the disk guard reports
+    *disk_reason* (``None``, the default, being "proceed"), and dry-run
+    investigations are recorded in ``investigations`` rather than run.
 
     Script a per-CALL sequence with ``sequence=``; a subclass that must vary
     the selection further overrides ``next_script``. A legacy subclass that
     overrides ``run_scoped`` itself must still call ``_note_entry``.
+
+    WHAT INJECTING IT DOES AND DOES NOT STUB of the post-merge gate chain.
+    Measured by counting ``verifier.<method>`` call sites under
+    ``orchestrator/src/orchestrator/``, because the answer is narrower than
+    the port's method list suggests:
+
+    * ``check_post_merge_pyright`` and ``check_post_merge_equivalence`` have
+      ZERO lane call sites.
+      ``orchestrator/src/orchestrator/merge_lane/gates.py::_run_pyright_gate``
+      and ``::_run_equivalence_gate`` call ``::_check_post_merge_pyright`` and
+      ``::_check_post_merge_equivalence`` directly, so both gates run
+      PRODUCTION code under an injected verifier.
+    * ``run_unscoped_typechecks`` IS injected
+      (``run_unscoped=verifier.run_unscoped_typechecks`` in the lane's
+      ``worker.py``, ``drift.py`` and ``shadow.py``). Production
+      ``orchestrator/src/orchestrator/merge_lane/gates.py::_run_unscoped_typechecks``
+      returns a clean ``PostMergePyrightResult()`` when no module config
+      carries a ``type_check_command``, which is what this fake returns for a
+      request built with ``module_configs=[]``.
+    * ``ensure_disk_space`` IS injected, and is the one real narrowing.
+      Production
+      ``orchestrator/src/orchestrator/merge_lane/worker.py::_ensure_verify_disk_space``
+      proceeds whenever free bytes are at or above the threshold; its other
+      branch prunes stale ``_merge-*`` worktrees and is unit-covered by
+      ``orchestrator/tests/test_merge_queue.py::TestEnsureVerifyDiskSpace``.
+      Injecting the port also makes a test independent of the host's free
+      disk.
     """
 
     def __init__(

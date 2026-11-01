@@ -15,10 +15,10 @@ Fakes/fixtures are reused from the sibling γ harness
 churn to the landed γ test file.
 
 These are real-git cases that observe the lane through an injected
-``VerifyPort`` (``FakeVerifier``/``ScriptedVerifier``) rather than a patch of
+``VerifyPort`` (``FakeVerifier``) rather than a patch of
 ``run_scoped_verification``.  What that does and does NOT stub of the
 post-merge gate chain is stated once, with the measurement behind it, in
-``_merge_lane_verifier_doubles.py``'s module docstring.
+``orchestrator/tests/_merge_lane_fakes.py::FakeVerifier``'s docstring.
 """
 
 from __future__ import annotations
