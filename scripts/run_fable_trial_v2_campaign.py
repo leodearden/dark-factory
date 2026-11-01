@@ -409,7 +409,7 @@ def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
     Rows are sorted by ``config_name`` so a committed report artifact diffs
     cleanly.
     """
-    from orchestrator.evals.report import build_plan_quality_report
+    from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
     report = build_plan_quality_report(results)
     rows = []

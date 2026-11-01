@@ -1579,7 +1579,7 @@ def _run_single_eval(
     from orchestrator.evals.eval_gate import campaign_usage_gate
     from orchestrator.evals.measurement import format_invocation_errors
     from orchestrator.evals.metrics import RoleUnderTest
-    from orchestrator.evals.report import (
+    from orchestrator.evals.plan_quality_report import (
         build_plan_quality_report,
         format_plan_quality_table,
     )
@@ -1756,12 +1756,11 @@ def _emit_composite_report(results, price_table) -> None:
     ``eval-matrix`` / ``eval-confirm`` end-to-end surfaces are unchanged.
     """
     from orchestrator.evals.metrics import RoleUnderTest
-    from orchestrator.evals.report import (
-        build_composite_report,
+    from orchestrator.evals.plan_quality_report import (
         build_plan_quality_report,
-        format_composite_table,
         format_plan_quality_table,
     )
+    from orchestrator.evals.report import build_composite_report, format_composite_table
 
     report = build_composite_report(results, price_table=price_table)
     click.echo(format_composite_table(report))
