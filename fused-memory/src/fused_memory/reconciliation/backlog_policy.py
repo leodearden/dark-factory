@@ -4,7 +4,10 @@ Bounds the backlog of unprocessed reconciliation events per project. When the
 count of buffered events plus the in-flight queue exceeds a hard limit, the
 policy routes to one of two outcomes:
 
-* **Orchestrator live for project** → file an L1 escalation under
+* **Orchestrator holds its project flock** (some process holds
+  ``<project_root>/data/orchestrator/orchestrator.lock``; see
+  ``fused_memory/services/orchestrator_detector.py``'s module docstring for
+  why the flock, not the PID probe, gates filing) → file an L1 escalation under
   ``<project_root>/data/escalations/`` through
   ``escalation.dedupe.submit_or_dedupe``. A tick that finds the condition
   still live FOLDS into the pending record for the same
@@ -33,6 +36,8 @@ from urllib.parse import quote
 
 from shared.project_layout import escalation_queue_dir
 from shared.safe_io import atomic_write_text
+
+from fused_memory.services.orchestrator_detector import is_orchestrator_lock_held
 
 if TYPE_CHECKING:
     from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -239,7 +244,7 @@ class BacklogPolicy:
         self,
         event_buffer: EventBuffer,
         event_queue: EventQueueLike | None,
-        orchestrator_detector: OrchestratorDetector,
+        orchestrator_detector: OrchestratorDetector = is_orchestrator_lock_held,
         *,
         hard_limit: int = 500,
         hard_limit_overrides: dict[str, int] | None = None,

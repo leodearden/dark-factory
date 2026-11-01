@@ -764,9 +764,6 @@ async def run_server():
         from fused_memory.reconciliation.journal import ReconciliationJournal
         from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
         from fused_memory.reconciliation.targeted import TargetedReconciler
-        from fused_memory.services.orchestrator_detector import (
-            is_orchestrator_live_for,
-        )
 
         recon_journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
         await recon_journal.initialize()
@@ -826,7 +823,6 @@ async def run_server():
         backlog_policy = BacklogPolicy(
             event_buffer,
             event_queue,
-            is_orchestrator_live_for,
             hard_limit=config.reconciliation.backlog_hard_limit,
             hard_limit_overrides=config.reconciliation.backlog_hard_limit_overrides,
             rate_limit_seconds=(
