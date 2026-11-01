@@ -1350,9 +1350,9 @@ def test_uniform_corpora_are_unchanged():
 # recipe re-runs cap-tainted fixtures, so a post-σ re-run writes keyed cells
 # beside older keyless ones. Two operator-facing surfaces, built inside one
 # function from one input, contradicting each other about one quantity is exactly
-# what ``report.py``:334-340 and ``metrics.py`` assert three times over must not
-# happen — "two consumers of one field must not answer the same question
-# differently".
+# what ``cell_admission.py::judged_without_reference`` and ``metrics.py`` assert
+# three times over must not happen — "two consumers of one field must not answer
+# the same question differently".
 
 
 def _report_entries(results):

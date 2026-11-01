@@ -1,9 +1,12 @@
-"""Tests for evals/report.py — the C4 composite report surface (task 2477 λ).
+"""Tests for evals/composite_report.py — the C4 composite report surface (task 2477 λ).
 
 Covers _ratio_score, the composite report over the UNION of configs (retiring
-the all-tasks-intersection collapse) and its deterministic renderer. The leaves
-report.py builds on are tested beside them: test_eval_stats, test_eval_prices,
-test_eval_table_render, test_eval_cell_admission and test_eval_elo_report.
+the all-tasks-intersection collapse) and its deterministic renderer. The tests
+that the composite row and evals/plan_quality_report.py agree on every shared
+figure live here too, with the plan-quality table's judged-without-reference
+and decline-split rendering. The leaves composite_report.py builds on are
+tested beside them: test_eval_stats, test_eval_prices, test_eval_table_render,
+test_eval_cell_admission and test_eval_elo_report.
 """
 
 from __future__ import annotations

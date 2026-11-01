@@ -3,7 +3,7 @@
 Pure-function tests over λ's ``build_composite_report``-shaped dict — the same
 hermetic ``_row``/``_report`` style as ``test_eval_driver_report.py``. The pilot
 module is a CONSUME-ONLY analysis surface over the ο judge-OFAT seam (task 2825):
-it imports ``report.build_composite_report`` / ``format_composite_table`` and
+it imports ``composite_report.py::build_composite_report`` / ``format_composite_table`` and
 ``ResultStore.load_all`` / ``run_ofat_stage`` and edits none of them (decision 11).
 
 Every ``decide_judge_adoption`` / ``format_judge_ofat_report`` test is hermetic:
@@ -270,7 +270,7 @@ class TestDecideNonAdopt:
 
 # ---------------------------------------------------------------------------
 # step-5/6 — format_judge_ofat_report: a deterministic markdown report that
-# carries the verdict + deltas, EMBEDS report.format_composite_table verbatim
+# carries the verdict + deltas, EMBEDS composite_report.py::format_composite_table verbatim
 # (so the committed trial report stays consistent with every other eval surface
 # and byte-stable), and renders the decide-and-act footer (the models.judge flip
 # on adopt; keep-sonnet + escalate otherwise).

@@ -1,4 +1,4 @@
-"""μ methodology report layer in evals/report.py (task 2478).
+"""μ methodology report layer in evals/composite_report.py (task 2478).
 
 Pure-function tests over λ's ``build_composite_report``-shaped dict:
   step-13/14  select_survivors (top-K config names per role_under_test)

@@ -2135,7 +2135,7 @@ class TestArchitectCellStampsTokenUsageAndProxySignal:
     price-table path is unreachable on the architect side no matter what the
     resolver is asked, so they are pinned BEFORE the resolution itself
     (step-5). Every assertion checks the PERSISTED cell as well as the returned
-    result — the persisted JSON is what ``report.py`` and an operator read.
+    result — the persisted JSON is what the report surfaces and an operator read.
     """
 
     def _cfg(self, **kw):
@@ -3567,13 +3567,13 @@ class TestLegacyAndProducedUnmeasuredCellsReportAlike:
 
     @pytest.mark.asyncio
     async def test_both_cells_bucket_and_render_as_cap_exhausted(self, tmp_path):
+        from shared.cli_invoke import AllAccountsCappedException
+
+        from orchestrator.evals.configs import EvalConfig
         from orchestrator.evals.plan_quality_report import (
             build_plan_quality_report,
             format_plan_quality_table,
         )
-        from shared.cli_invoke import AllAccountsCappedException
-
-        from orchestrator.evals.configs import EvalConfig
 
         store = ResultStore(tmp_path)
         legacy = {

@@ -976,7 +976,7 @@ Code: `orchestrator/src/orchestrator/evals/measurement.py` (`UnmeasuredCause`,
 `classify_unmeasured`, `measured_call`), persisted on
 `metrics.py::EvalMetrics.invocation_errors`, mapped from legacy cells by
 `results.py::_invocation_errors_from_marker`, rendered by
-`report.py::format_invocation_errors`.
+`measurement.py::format_invocation_errors`.
 
 An LLM invocation behind an eval cell either produced a measurement (`Scored`)
 or did not (`Unmeasured`, naming its stage, cause, reason and spend). The cell
@@ -1263,7 +1263,7 @@ population exactly.
 `is_scorable_plan` / `score_plan_structure` / `cap_tainted` are untouched — so
 every campaign artifact already committed stays comparable. The split is
 reported ALONGSIDE it, by
-`report.py::build_plan_quality_report` (`declined`, `declined_by_kind`,
+`plan_quality_report.py::build_plan_quality_report` (`declined`, `declined_by_kind`,
 `no_plan_declined`, `terminal_kind_unmeasured`, over the SAME admitted pool `n`)
 and surfaced verbatim by `scripts/run_fable_trial_v2_campaign.py`. **The number
 to read beside `plan_rate` is `no_plan_declined`**: when it equals `no_plan`,
