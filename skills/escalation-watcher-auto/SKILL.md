@@ -603,12 +603,10 @@ result = mcp__fused-memory__resolve_ticket(ticket=ticket["ticket"], project_root
 # "created" | "combined" → cite result["task_id"]; combined = folded into an existing task, not lost.
 # "refused"  → terminal and a SUCCESS: NO task exists and there is NO "task_id" key.
 #              Never retry, never cite an id → step 4, carrying result["reason"].
-# "failed" with reason "timeout" → call resolve_ticket ONCE more on the SAME ticket
-#              (a wait, not a re-file); still not created/combined → step 4.
-# "awaiting_curation" → NOT terminal: the ticket is parked durably and has no task_id yet.
-#              Never re-submit; call resolve_ticket ONCE more as for a timeout,
-#              then step 4, carrying the ticket id.
-# "failed" with any other reason → step 4, carrying result["reason"] and the ticket id.
+# "pending" | "awaiting_curation" → open, no task_id yet (skills/_shared/ticket-failure-handling.md):
+#              call resolve_ticket ONCE more on the SAME ticket (a wait, not a re-file),
+#              never re-submit; still open → step 4, carrying the ticket id.
+# "failed" → step 4, carrying result["reason"] and the ticket id.
 ```
 
 Never call `submit_task` twice for one record in a rotation.

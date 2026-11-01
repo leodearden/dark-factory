@@ -1467,72 +1467,6 @@ architect.\
 """
 
 
-def submit_resolve_instructions(
-    metadata_template: str,
-    *,
-    outcome_target: str,
-    project_root_expr: str = '...',
-    step_prefix: tuple[str, str] = ('a', 'b'),
-    extra_submit_guidance: str = '',
-    caller_indent: str = '',
-) -> str:
-    """Return the shared submit_task → resolve_ticket two-step instruction block.
-
-    Returns the block indented by ``caller_indent`` (default ``''`` for no
-    extra indentation).  Pass the same prefix you would have given to
-    ``textwrap.indent`` — the helper applies it internally so callers don't
-    need a separate wrap step and the sub-continuation alignment is always
-    correct regardless of indent width.
-
-    Args:
-        metadata_template: The metadata dict literal to show in the submit_task call.
-        outcome_target: Role-specific outcome target string (e.g. 'resolve_issue summary',
-            'review output', 'finding description').
-        project_root_expr: Expression for project_root arg (default '...' placeholder;
-            use e.g. '"/actual/path"' for interpolated contexts).
-        step_prefix: Tuple of (first_label, second_label) for the step bullets,
-            e.g. ('a', 'b') or ('1', '2').
-        extra_submit_guidance: Optional per-site extra guidance paragraph inserted
-            after the error-shape description.
-        caller_indent: Prefix string applied to every line of the returned block via
-            ``textwrap.indent``.  Defaults to ``''`` (unindented).
-
-    Returns:
-        Multi-line string with the shared skeleton, indented by caller_indent.
-    """
-    a, b = step_prefix
-    # Normalize multi-line metadata_template: add 3-space continuation indent so
-    # lines after the first align at the 'metadata=' column in the raw block.
-    metadata_normalized = metadata_template.replace('\n', '\n   ')
-    # extra_submit_guidance sits after the error-shape sentence; indent its lines
-    # 3 spaces so they read as a sub-continuation under step a./1. in the raw block.
-    extra = (
-        '\n' + textwrap.indent(extra_submit_guidance.rstrip(), '   ') + '\n'
-    ) if extra_submit_guidance.strip() else '\n'
-    # Build the raw (unindented) block, then apply caller_indent in one shot.
-    raw = (
-        f'{a}. Call `submit_task`(title=..., description=..., priority=...,\n'
-        f'   metadata={metadata_normalized},\n'
-        f'   project_root={project_root_expr}) — returns `{{"ticket": "tkt_..."}}` on success, or\n'
-        '   `{"error": ..., "error_type": ...}` (no `ticket` key) if the call was\n'
-        '   rejected at submit time (e.g. backlog full, closed interceptor). On the\n'
-        '   error shape, treat the candidate as skipped and record the error in your\n'
-        f'   {outcome_target}.'
-        + extra
-        + f'{b}. Call `resolve_ticket`(ticket=..., project_root={project_root_expr}, timeout_seconds=60) —\n'
-        '   (60 s is intentionally conservative; server default is 115 s — raise if\n'
-        '   curator is consistently slow) returns {status, task_id?, reason?}. Branch on `status`:\n'
-        '   - `created` — the curator accepted the candidate; record `task_id`.\n'
-        '   - `combined` — the curator deduped into an existing task; `task_id` points\n'
-        '     at that task. Record it the same way as `created` (the candidate was\n'
-        '     absorbed, not lost).\n'
-        f'   - `failed` — report the `reason` in your {outcome_target}.'
-        + '\n\n'
-        + _COMPLEXITY_RUBRIC
-    )
-    return textwrap.indent(raw, caller_indent)
-
-
 def submit_only_instructions(
     metadata_template: str,
     *,
@@ -1544,8 +1478,8 @@ def submit_only_instructions(
 ) -> str:
     """Return a one-step ``submit_task``-only instruction block.
 
-    Sibling of :func:`submit_resolve_instructions` for callers (steward,
-    deep_reviewer) that should not block on the curator. The R4 idempotency
+    For callers (steward, deep_reviewer, and the follow-up filing fragment)
+    that should not block on the curator. The R4 idempotency
     cache (``task_interceptor`` / ``(escalation_id, suggestion_hash)``) and
     the server-side ticket janitor together replace the per-call
     ``resolve_ticket`` wait: failed tickets resurface as a follow-up

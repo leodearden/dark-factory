@@ -162,19 +162,25 @@ _UNKNOWN_TICKET_REASON = 'unknown_ticket'
 
 _UNPERSISTED_FAILURES: Mapping[str, TicketState | None] = MappingProxyType(
     {
-        'timeout': TicketState.PENDING,
         _UNKNOWN_TICKET_REASON: TicketState.DEAD,
-        'server_closed': None,
         'ticket_store not configured': None,
+        'timeout': TicketState.PENDING,
+        'server_closed': None,
     }
 )
 """The server's ``failed`` answers that no ticket row carries, by reason.
 
 Their home is
-``fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._resolve_ticket_raw``.
-``timeout`` is a ticket still being curated; ``unknown_ticket`` names no
-ticket at all.  None marks a server that could not look: the answer is
-unreadable, not a verdict."""
+``fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor.resolve_ticket``.
+``unknown_ticket`` names no ticket at all.  None marks a server that could
+not look: the answer is unreadable, not a verdict.  ``timeout`` (a ticket
+still being curated) and ``server_closed`` (a closing store) are only a
+pre-6705 server's answers, tolerated until task 8004 retires them."""
+
+_OPEN_STATUSES = frozenset({'pending', 'awaiting_curation'})
+
+_STORE_UNAVAILABLE_REASON = 'store_unavailable'
+"""The open answer of a server whose ticket store was closing: it could not look."""
 
 _RESOLVED_STATUSES = frozenset({'created', 'combined'})
 
@@ -189,8 +195,8 @@ _TICKET_DEATH_CAUSES: Mapping[str, DeathCause] = MappingProxyType(
 
 
 def _ticket_state(status: str, reason: str | None, task_id: int | None) -> TicketState | None:
-    if status == 'pending':
-        return TicketState.PENDING
+    if status in _OPEN_STATUSES:
+        return None if reason == _STORE_UNAVAILABLE_REASON else TicketState.PENDING
     if status in _RESOLVED_STATUSES:
         return TicketState.RESOLVED_TO_TASK if task_id is not None else None
     if status == 'failed' and reason is not None and reason in _UNPERSISTED_FAILURES:
