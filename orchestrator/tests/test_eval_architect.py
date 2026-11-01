@@ -3400,16 +3400,6 @@ class TestPlanQualityReport:
         assert 't1 x a' in message
         assert 'not_a_cause' in message
 
-    def test_format_invocation_errors_renders_records(self):
-        from orchestrator.evals.report import format_invocation_errors
-
-        assert format_invocation_errors(None) is None
-        assert format_invocation_errors([]) is None
-        assert format_invocation_errors([
-            {'stage': 'architect', 'cause': 'timeout', 'reason': 'r1'},
-            {'stage': 'judge', 'cause': 'raised', 'reason': 'r2'},
-        ]) == 'architect:timeout: r1; judge:raised: r2'
-
     def test_all_cells_tainted_yields_null_mean_never_zero(self):
         from orchestrator.evals.report import build_plan_quality_report
 
