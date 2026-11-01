@@ -23,10 +23,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'shared' / 'src'))
-
-from shared.cli_invoke import build_claude_argv  # noqa: E402
-from shared.git_read_rules import git_read_rules  # noqa: E402
+import _checkout as _checkout
+from shared.cli_invoke import build_claude_argv
+from shared.git_read_rules import git_read_rules
 
 BATTERY: tuple[tuple[str, str], ...] = (
     ('plain', 'git log -1 --output={out}'),

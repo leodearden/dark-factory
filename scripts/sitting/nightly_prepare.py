@@ -78,15 +78,15 @@ if str(_REPO_ROOT / 'scripts' / 'legibility') not in sys.path:
     sys.path.append(str(_REPO_ROOT / 'scripts' / 'legibility'))
 
 from legibility import account_pool  # noqa: E402
-from orchestrator.agents.sandbox_dispatch import (  # noqa: E402
+from orchestrator.agents.sandbox_dispatch import (  # noqa: E402  # debt: task 6760
     SandboxUnavailable,
     resolve_backend_or_refuse,
     wrap_command,
 )
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
 from shared.cli_invoke import build_claude_argv  # noqa: E402
-from shared.config_dir import TaskConfigDir  # noqa: E402
-from shared.git_read_rules import git_read_rules  # noqa: E402
+from shared.config_dir import TaskConfigDir  # noqa: E402  # debt: task 6760
+from shared.git_read_rules import git_read_rules  # noqa: E402  # debt: task 6760
 from sitting import inventory, preparation  # noqa: E402  # debt: task 6760
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG = 0, 1, 2
