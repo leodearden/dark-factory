@@ -2012,8 +2012,9 @@ def _consolidation_events(
 ) -> list[dict[str, Any]]:
     """Per-consolidation net delta: what accreted after it minus what it absorbed.
 
-    A consolidation event is a record carrying ``canonical: true`` and/or a
-    non-empty ``supersedes``. Its peer set — the population that can accrete
+    A consolidation event is a record whose metadata claims canonical
+    (``canonical_marker.py::is_canonical``) and/or carries a non-empty
+    ``supersedes``. Its peer set — the population that can accrete
     "after" it — is its shared ``metadata.topic`` when it has one, else the
     near-duplicate cluster it belongs to. An event with neither has no
     identifiable peers, so nothing is attributed to it (0), rather than
@@ -2048,7 +2049,7 @@ def _consolidation_events(
     events: list[dict[str, Any]] = []
     for index, record in enumerate(records):
         metadata = record.get('metadata') or {}
-        if not (metadata.get('canonical') or metadata.get('supersedes')):
+        if not (is_canonical(metadata) or metadata.get('supersedes')):
             continue
         topic = topic_by_index[index]
         event_ts = ts_by_index[index]
