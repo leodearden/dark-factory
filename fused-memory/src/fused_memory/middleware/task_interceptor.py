@@ -471,12 +471,14 @@ def _open_ticket_answer(status: TicketStatus, ticket: str, reason: str) -> dict:
     return {'status': status, 'ticket': ticket, 'reason': reason}
 
 
-def _resolve_answer(row: dict, *, ticket: str, wait_reason: ResolveReason) -> dict:
-    """resolve_ticket's answer for *row*: an open row with its ticket, any other as stored."""
+def _resolve_answer(row: dict, *, ticket: str) -> dict:
+    """resolve_ticket's answer for a row that is not ``pending``.
+
+    A parked row is open, with its ticket and the reason it was parked for;
+    any other row is answered as stored.
+    """
     if row['status'] == TicketStatus.AWAITING_CURATION:
-        return _open_ticket_answer(TicketStatus.AWAITING_CURATION, ticket, row['reason'] or wait_reason)
-    if row['status'] == TicketStatus.PENDING:
-        return _open_ticket_answer(TicketStatus.PENDING, ticket, wait_reason)
+        return _open_ticket_answer(TicketStatus.AWAITING_CURATION, ticket, row['reason'])
     return _format_ticket_result(row)
 
 
@@ -4340,12 +4342,13 @@ class TaskInterceptor:
             return {'status': TicketStatus.FAILED, 'reason': ResolveReason.STORE_NOT_CONFIGURED}
         event = asyncio.Event()
         self._ticket_events.setdefault(ticket, []).append(event)
-        wait_reason = ResolveReason.WAIT_TIMEOUT
         try:
             row = await self._ticket_store.get(ticket)
             if row is not None and row['status'] == TicketStatus.PENDING:
                 wait_reason = await _wait_for_ticket_signal(event, timeout_seconds)
                 row = await self._ticket_store.get(ticket)
+                if row is not None and row['status'] == TicketStatus.PENDING:
+                    return _open_ticket_answer(TicketStatus.PENDING, ticket, wait_reason)
         except RuntimeError as exc:
             logger.debug('resolve_ticket: ticket_store closed while reading %s: %s', ticket, exc)
             return _open_ticket_answer(TicketStatus.PENDING, ticket, ResolveReason.STORE_UNAVAILABLE)
@@ -4353,7 +4356,7 @@ class TaskInterceptor:
             self._discard_ticket_event(ticket, event)
         if row is None:
             return {'status': TicketStatus.FAILED, 'reason': ResolveReason.UNKNOWN_TICKET}
-        return _resolve_answer(row, ticket=ticket, wait_reason=wait_reason)
+        return _resolve_answer(row, ticket=ticket)
 
     def _discard_ticket_event(self, ticket: str, event: asyncio.Event) -> None:
         """Drop one waiter's event, leaving other waiters' events registered."""

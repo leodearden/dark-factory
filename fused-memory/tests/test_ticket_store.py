@@ -1270,6 +1270,7 @@ async def test_flush_reparks_a_requeued_pending_row(store):
     assert row['next_attempt_at'] is None
     assert row['resolved_at'] is None
     assert row['defer_reason'] == 'accounts-auth-failed'
+    assert row['reason'] == 'curation-deferred: accounts-auth-failed'
     fresh = await store.get(never_deferred)
     assert (fresh['status'], fresh['reason']) == ('failed', 'server_restart')
 
@@ -1291,7 +1292,8 @@ async def test_recover_for_dead_worker_reparks_requeued_and_fails_the_rest(store
     reparked = await store.get(requeued)
     assert (
         reparked['status'], reparked['attempts'], reparked['next_attempt_at'], reparked['defer_reason'],
-    ) == (TicketStatus.AWAITING_CURATION, 1, None, 'accounts-auth-failed')
+        reparked['reason'],
+    ) == (TicketStatus.AWAITING_CURATION, 1, None, 'accounts-auth-failed', 'curation-deferred: accounts-auth-failed')
     failed = await store.get(never_deferred)
     assert (failed['status'], failed['reason']) == ('failed', 'worker_dead')
     assert await store.get(parked) == parked_before
