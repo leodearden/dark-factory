@@ -646,10 +646,11 @@ class TestQueueDepthTimeseries:
 ATTEMPTS_NOW = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
 """The injected instant every ``merge_attempts`` case reads its window against."""
 
-ZERO_LATENCY = {
-    'p50': 0, 'p95': 0, 'p99': 0, 'mean_ms': 0.0,
+UNTIMED_LATENCY = {
+    'p50': None, 'p95': None, 'p99': None, 'mean_ms': None,
     'with_duration': 0, 'without_duration': 0,
 }
+"""A window with no timed attempt: no centile is invented over zero samples."""
 
 
 def _attempt(minutes_ago, outcome, duration_ms=None):
@@ -683,18 +684,23 @@ async def _merge_attempts_over(tmp_path, events, *, hours=24):
         return await merge_attempts(conn, hours=hours, now=ATTEMPTS_NOW)
 
 
+async def _attempts_read_over(tmp_path, events, *, hours=24):
+    """The record of a readable window, once checked FRESH at :data:`ATTEMPTS_NOW`."""
+    return fresh_read(await _merge_attempts_over(tmp_path, events, hours=hours), ATTEMPTS_NOW)
+
+
 class TestMergeAttempts:
     """``merge_attempts`` reads the window once; the chart and latency agree."""
 
     async def test_the_chart_counts_every_attempt(self, tmp_path):
-        result = await _merge_attempts_over(tmp_path, FIVE_ATTEMPTS)
+        result = await _attempts_read_over(tmp_path, FIVE_ATTEMPTS)
 
         assert result.outcome_chart() == {
             'labels': ['conflict', 'done', 'blocked'], 'values': [2, 2, 1],
         }
 
     async def test_latency_reads_only_the_attempts_with_a_duration(self, tmp_path):
-        result = await _merge_attempts_over(tmp_path, FIVE_ATTEMPTS)
+        result = await _attempts_read_over(tmp_path, FIVE_ATTEMPTS)
 
         latency = result.latency()
         assert latency['with_duration'] == 3
@@ -706,7 +712,7 @@ class TestMergeAttempts:
 
     async def test_every_attempt_is_counted_once_in_the_latency_split(self, tmp_path):
         """Sketch #9: the donut total IS the latency block's attempt total."""
-        result = await _merge_attempts_over(tmp_path, FIVE_ATTEMPTS)
+        result = await _attempts_read_over(tmp_path, FIVE_ATTEMPTS)
 
         latency = result.latency()
         assert sum(result.outcome_chart()['values']) == (
@@ -720,13 +726,13 @@ class TestMergeAttempts:
             _attempt(3, 'done', 300), _attempt(4, 'done', 200),
             _attempt(5, 'done', 100),
         ]
-        result = await _merge_attempts_over(tmp_path, events)
+        result = await _attempts_read_over(tmp_path, events)
 
         assert result.durations == (100.0, 200.0, 300.0, 400.0, 500.0)
 
     async def test_populated_outcomes(self, tmp_path):
         outcomes = ['done'] * 3 + ['conflict'] * 2 + ['blocked', 'already_merged']
-        result = await _merge_attempts_over(
+        result = await _attempts_read_over(
             tmp_path, [_attempt(10, outcome) for outcome in outcomes],
         )
 
@@ -740,7 +746,7 @@ class TestMergeAttempts:
         outcomes = (
             ['conflict'] * 3 + ['blocked'] * 2 + ['done'] * 2 + ['zzz', 'aaa']
         )
-        result = await _merge_attempts_over(
+        result = await _attempts_read_over(
             tmp_path, [_attempt(5, outcome) for outcome in outcomes],
         )
 
@@ -751,7 +757,7 @@ class TestMergeAttempts:
 
     async def test_equal_counts_sorted_alphabetically(self, tmp_path):
         outcomes = ['already_merged', 'done', 'conflict', 'blocked']
-        result = await _merge_attempts_over(
+        result = await _attempts_read_over(
             tmp_path, [_attempt(5, outcome) for outcome in outcomes],
         )
 
@@ -761,7 +767,7 @@ class TestMergeAttempts:
 
     async def test_non_canonical_outcomes_are_counted(self, tmp_path):
         outcomes = ['done', 'done', 'wip_halted', 'done_wip_recovery']
-        result = await _merge_attempts_over(
+        result = await _attempts_read_over(
             tmp_path, [_attempt(5, outcome) for outcome in outcomes],
         )
 
@@ -771,7 +777,7 @@ class TestMergeAttempts:
         }
 
     async def test_an_unrecorded_outcome_counts_as_unknown(self, tmp_path):
-        result = await _merge_attempts_over(
+        result = await _attempts_read_over(
             tmp_path, [_attempt(5, None, 100), _attempt(6, 'done', 200)],
         )
 
@@ -783,9 +789,9 @@ class TestMergeAttempts:
         events = [
             _attempt(10 + i, 'done', ms) for i, ms in enumerate(range(100, 1100, 100))
         ]
-        latency = (await _merge_attempts_over(tmp_path, events)).latency()
+        latency = (await _attempts_read_over(tmp_path, events)).latency()
 
-        assert set(latency) == set(ZERO_LATENCY)
+        assert set(latency) == set(UNTIMED_LATENCY)
         assert latency['with_duration'] == 10
         assert latency['without_duration'] == 0
         assert latency['mean_ms'] == pytest.approx(550.0, abs=1e-6)
@@ -793,26 +799,36 @@ class TestMergeAttempts:
         assert latency['p95'] > latency['p50']
         assert latency['p99'] >= latency['p95']
 
-    async def test_all_null_durations_give_zero_latency_over_every_attempt(self, tmp_path):
+    async def test_all_null_durations_give_no_centile_over_every_attempt(self, tmp_path):
+        """Three untimed attempts are counted, and no centile is invented over zero samples."""
         events = [_attempt(i + 1, 'done', None) for i in range(3)]
-        result = await _merge_attempts_over(tmp_path, events)
+        result = await _attempts_read_over(tmp_path, events)
 
-        assert result.latency() == {**ZERO_LATENCY, 'without_duration': 3}
+        assert result.latency() == {**UNTIMED_LATENCY, 'without_duration': 3}
         assert sum(result.outcome_chart()['values']) == 3
 
-    async def test_no_db_is_an_empty_record(self):
-        result = await merge_attempts(None, hours=24, now=ATTEMPTS_NOW)
+    async def test_no_db_is_unknown(self):
+        """A project with no runs.db open has no attempts to count, not zero attempts."""
+        assert_unread(
+            await merge_attempts(None, hours=24, now=ATTEMPTS_NOW), ATTEMPTS_NOW,
+            'no runs.db is open',
+        )
 
-        assert result.outcome_chart() == {'labels': [], 'values': []}
-        assert result.latency() == ZERO_LATENCY
+    async def test_a_failed_read_is_unknown(self, tableless_runs_conn):
+        """with_db swallows the OperationalError; its default must still say the read failed."""
+        assert_unread(
+            await merge_attempts(tableless_runs_conn, hours=24, now=ATTEMPTS_NOW), ATTEMPTS_NOW,
+        )
 
     async def test_an_empty_db_is_an_empty_record(self, empty_merge_events_conn):
-        result = await merge_attempts(
-            empty_merge_events_conn, hours=24, now=ATTEMPTS_NOW,
+        """A readable empty window is measured: no outcomes, and no centiles."""
+        result = fresh_read(
+            await merge_attempts(empty_merge_events_conn, hours=24, now=ATTEMPTS_NOW),
+            ATTEMPTS_NOW,
         )
 
         assert result.outcome_chart() == {'labels': [], 'values': []}
-        assert result.latency() == ZERO_LATENCY
+        assert result.latency() == UNTIMED_LATENCY
 
     async def test_attempts_older_than_the_window_are_excluded(self, tmp_path):
         events = [
@@ -820,7 +836,7 @@ class TestMergeAttempts:
             _attempt(90, 'conflict', 200),
             _attempt(95, 'conflict', None),
         ]
-        result = await _merge_attempts_over(tmp_path, events, hours=1)
+        result = await _attempts_read_over(tmp_path, events, hours=1)
 
         assert result.outcome_chart() == {'labels': ['done'], 'values': [1]}
         assert result.latency()['with_duration'] == 1
@@ -1394,9 +1410,10 @@ class TestBuildPerProjectMergeQueue:
         assert isinstance(result, dict)
         assert set(result.keys()) == {'/tmp/A', '/tmp/B'}
 
-        # (b) each value has the expected keys
+        # (b) each value has the expected keys; one attempts Datum, no split outcomes/latency
         for pid_data in result.values():
-            assert set(pid_data.keys()) >= {'depth_timeseries', 'outcomes', 'latency', 'recent', 'speculative'}
+            assert set(pid_data.keys()) >= {'depth_timeseries', 'attempts', 'recent', 'speculative'}
+            assert not {'outcomes', 'latency'} & set(pid_data.keys())
 
     async def test_per_project_isolation(self, tmp_path):
         """Each project's stats reflect only its own DB rows."""
@@ -1473,10 +1490,10 @@ class TestBuildPerProjectMergeQueue:
 
         assert '/tmp/nofile' in result
         data = result['/tmp/nofile']
-        assert set(data.keys()) >= {'depth_timeseries', 'outcomes', 'latency', 'recent', 'speculative'}
+        assert set(data.keys()) >= {'depth_timeseries', 'attempts', 'recent', 'speculative'}
+        assert not {'outcomes', 'latency'} & set(data.keys())
         assert_unread(data['depth_timeseries'], now, 'no runs.db is open')
-        assert data['outcomes'] == {'labels': [], 'values': []}
-        assert data['latency'] == ZERO_LATENCY
+        assert_unread(data['attempts'], now, 'no runs.db is open')
         assert data['recent'] == []
         for field in ('speculative', 'recent_total'):
             assert data[field].state is DatumState.UNKNOWN, field
@@ -1511,14 +1528,16 @@ class TestBuildPerProjectMergeQueue:
 
         # None-db entry produces defaults without crashing
         none_data = result['/tmp/none']
-        assert none_data['latency']['with_duration'] == 0
+        assert_unread(none_data['attempts'], now)
         assert none_data['recent'] == []
         for field in ('speculative', 'recent_total'):
             assert none_data[field].state is DatumState.UNKNOWN, field
 
         # Real-but-empty entry: its zeros were measured
         real_data = result['/tmp/real']
-        assert set(real_data.keys()) >= {'depth_timeseries', 'outcomes', 'latency', 'recent', 'speculative'}
+        assert set(real_data.keys()) >= {'depth_timeseries', 'attempts', 'recent', 'speculative'}
+        assert not {'outcomes', 'latency'} & set(real_data.keys())
+        assert fresh_read(real_data['attempts'], now).outcome_chart() == {'labels': [], 'values': []}
         assert real_data['speculative'].state is DatumState.FRESH
         assert real_data['speculative'].value['total'] == 0
         assert real_data['recent_total'].state is DatumState.FRESH
@@ -1559,10 +1578,10 @@ class TestBuildPerProjectMergeQueue:
             conn.row_factory = aiosqlite.Row
             result = await build_per_project_merge_queue([('/tmp/A', conn)], hours=24, now=now)
 
-        project = result['/tmp/A']
-        latency = project['latency']
+        attempts = fresh_read(result['/tmp/A']['attempts'], now)
+        latency = attempts.latency()
         assert (latency['with_duration'], latency['without_duration']) == (1, 1)
-        assert sum(project['outcomes']['values']) == (
+        assert sum(attempts.outcome_chart()['values']) == (
             latency['with_duration'] + latency['without_duration']
         )
 
@@ -1706,6 +1725,7 @@ class TestBuildPerProjectMergeQueue:
         ('speculative_stats', 'speculative', 'recent_total'),
         ('recent_merges', 'recent_total', 'speculative'),
         ('queue_depth_timeseries', 'depth_timeseries', 'speculative'),
+        ('merge_attempts', 'attempts', 'speculative'),
     ])
     async def test_a_raising_leg_serves_unknown_not_zeros(self, tmp_path, leg, field, sibling):
         """A leg that raises is a hole in its own field; its siblings stay measured."""
@@ -1748,7 +1768,7 @@ class TestBuildPerProjectMergeQueue:
 
         project = result['/tmp/P']
         assert project['recent'] == []
-        for field in ('speculative', 'recent_total', 'depth_timeseries'):
+        for field in ('speculative', 'recent_total', 'depth_timeseries', 'attempts'):
             assert project[field].state is DatumState.UNKNOWN, field
             assert 'RuntimeError: boom' in (project[field].reason or ''), field
             validate_datum(project[field], now)
