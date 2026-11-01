@@ -242,6 +242,7 @@ def run(settings: Settings, *, gate: Any = None) -> int:
     try:
         env = _child_env(gate if gate is not None else account_pool.build_pool(), inbox, config_dir)
         if env is None:
+            config_dir.cleanup()
             return EXIT_FAILED
         return _run_confined(
             claude=claude, settings=settings, mcp_config=mcp_config, env=env, root=root, inbox=inbox,

@@ -561,7 +561,7 @@ def test_no_lease_skips_the_night_without_launching_the_cli(tmp_path, capsys, ho
 
     assert fake.calls() == []
     assert 'skipping: the nightly never uses the host login' in capsys.readouterr().err
-    assert not list((tmp_path / 'data' / 'sitting' / 'config').rglob('.credentials.json'))
+    assert not list((tmp_path / 'data' / 'sitting' / 'config').iterdir())
 
 
 def test_the_entry_point_pins_landlock(tmp_path, monkeypatch, capsys):
