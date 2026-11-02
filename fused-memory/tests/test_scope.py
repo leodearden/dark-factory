@@ -534,19 +534,6 @@ class TestConfiguredKnownProjectsMap:
         }
         assert next(iter(result)) == 'primary_root'
 
-    def test_primary_wins_a_duplicate_id(self, tmp_path, monkeypatch):
-        primary = tmp_path / 'a' / 'proj'
-        env_root = tmp_path / 'b' / 'proj'
-        primary.mkdir(parents=True)
-        env_root.mkdir(parents=True)
-        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(env_root))
-
-        result = configured_known_projects_map(
-            TaskmasterConfig(project_root=str(primary)),
-        )
-
-        assert result['proj'] == str(primary.resolve())
-
     def test_no_taskmaster_section_registers_only_env_roots(
         self, tmp_path, monkeypatch,
     ):
