@@ -711,7 +711,8 @@ def _oauth_post(
         return PairFailed(PairFailure.UNREACHABLE, reply.detail)
     if reply.status == 400:
         refusal = reply.body or {}
-        return PairFailed(PairFailure.PAIRING_REJECTED, f'{path}: {refusal.get("error_description") or refusal.get("message")}')
+        message = refusal.get('error_description') or refusal.get('message') or 'HTTP 400'
+        return PairFailed(PairFailure.PAIRING_REJECTED, f'{path}: {message}')
     if reply.status != expected_status or reply.body is None:
         return PairFailed(PairFailure.INCOMPATIBLE, f'{path}: HTTP {reply.status}')
     return reply.body
@@ -752,7 +753,7 @@ def _approve(origin: str, client_id: str, code: str, *, challenge: str, state: s
         return PairFailed(PairFailure.INCOMPATIBLE, f'{_DECISION_PATH}: no redirectTo')
     query = parse_qs(urlsplit(redirect_to).query)
     if query.get('state') != [state] or len(query.get('code', [])) != 1:
-        [reason] = query.get('error_description', ['no code for this state'])[:1]
+        reason = query.get('error_description', ['no code for this state'])[0]
         return PairFailed(PairFailure.PAIRING_REJECTED, f'{_DECISION_PATH}: {reason}')
     return query['code'][0]
 
