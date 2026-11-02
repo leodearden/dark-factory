@@ -339,7 +339,6 @@ async def test_worker_processes_drop_decision(
     """
     mock_curator = MagicMock()
     _drop_decision = CuratorDecision(action='drop', target_id='5', justification='dup')
-    mock_curator.curate = AsyncMock(return_value=_drop_decision)
     mock_curator.curate_prepared = AsyncMock(return_value=[_drop_decision])
     _stub_prepare_candidate(mock_curator)
     mock_curator.note_created = MagicMock()
@@ -410,7 +409,6 @@ async def test_worker_processes_combine_decision(
         rewritten_task=rewritten,
         justification='similar scope',
     )
-    mock_curator.curate = AsyncMock(return_value=_combine_decision)
     mock_curator.curate_prepared = AsyncMock(return_value=[_combine_decision])
     _stub_prepare_candidate(mock_curator)
     mock_curator.note_created = MagicMock()
@@ -923,16 +921,11 @@ async def test_resolve_ticket_timeout_answers_pending_without_mutating_row(
     # Strategy: pause the curator so it never responds during our test window.
     paused = asyncio.Event()  # never set during the test
 
-    async def blocking_curate(*args, **kwargs):
-        await paused.wait()  # blocks indefinitely during this test
-        return CuratorDecision(action='create')
-
     async def blocking_curate_prepared(candidates, *args, **kwargs):
         await paused.wait()
         return [CuratorDecision(action='create')] * len(candidates)
 
     mock_curator = MagicMock()
-    mock_curator.curate = blocking_curate
     mock_curator.curate_prepared = blocking_curate_prepared
     _stub_prepare_candidate(mock_curator)
     mock_curator.note_created = MagicMock()
@@ -1945,10 +1938,10 @@ _ADD_TASK_RESULT = {'id': '42', 'title': 'New Task'}
 
 
 def _curator_returning(decision: CuratorDecision) -> MagicMock:
-    """A curator mock whose single-item ``curate`` returns *decision*.
+    """A curator mock whose ``curate_prepared`` answers every bundle with *decision*.
 
-    ``prepare_candidate`` returns None, so the worker's batch path takes the
-    unprepared-record backfill and asks ``curate`` for the verdict.
+    ``prepare_candidate`` returns a bundle over an empty pool, as the worker
+    needs; the verdict comes from the ``curate`` mock, so a test can count it.
     """
     mock_curator = MagicMock()
     mock_curator.curate = AsyncMock(return_value=decision)
@@ -2204,7 +2197,7 @@ class TestCuratorUnavailableReasonPersisted:
     async def test_present_curator_without_decision_is_not_called_unavailable(
         self, interceptor_with_store, taskmaster,
     ):
-        """The batch path's catch-all arm hands a live curator a None decision."""
+        """A live curator's ticket dispatched with no decision is not called unavailable."""
         from fused_memory.middleware.curator_types import CandidateTask
 
         curator = MagicMock()
@@ -2252,6 +2245,25 @@ class TestCuratorUnavailableReasonPersisted:
         assert row['status'] == 'created'
         assert row['reason'] == 'create: novel'
 
+    @pytest.mark.asyncio
+    async def test_a_ticket_prepared_before_the_curator_recovered_is_still_curated(
+        self, configured_interceptor, ticket_store,
+    ):
+        recovered = _curator_returning(
+            CuratorDecision(action='create', justification='novel'),
+        )
+        with patch(
+            'fused_memory.middleware.task_interceptor.TaskCurator',
+            side_effect=[RuntimeError('qdrant down'), recovered],
+        ):
+            row = await _submit_and_resolve(
+                configured_interceptor, ticket_store, 'Prepared While Broken',
+            )
+
+        assert row['status'] == 'created'
+        assert row['reason'] == 'create: novel'
+        assert recovered.curate_prepared.await_count == 1
+
 
 # ---------------------------------------------------------------------------
 # TestCuratorWorkerBatchDrain — step-39 / step-41 / step-43 / step-45
@@ -2276,9 +2288,6 @@ class TestCuratorWorkerBatchDrain:
         project_id = 'project'
 
         mock_curator = MagicMock()
-        mock_curator.curate = AsyncMock(
-            return_value=CuratorDecision(action='create', justification='single')
-        )
         mock_curator.curate_prepared = AsyncMock(return_value=[
             CuratorDecision(action='create', justification='a'),
             CuratorDecision(action='create', justification='b'),
@@ -2356,9 +2365,6 @@ class TestCuratorWorkerBatchDrain:
         project_id = 'project'
 
         mock_curator = MagicMock()
-        mock_curator.curate = AsyncMock(
-            return_value=CuratorDecision(action='create', justification='single')
-        )
         mock_curator.curate_prepared = AsyncMock(return_value=[
             CuratorDecision(action='create', justification='single'),
         ])
@@ -2592,7 +2598,7 @@ class TestCuratorWorkerBatchDrain:
         """End-to-end: 3 tickets pre-queued, one curate_prepared call, all resolve.
 
         Decisions: [create, drop-to-existing, create].
-        Expected: curate_prepared called once, curate called zero times,
+        Expected: curate_prepared called once,
         taskmaster.add_task called twice (for the two 'create' items),
         all 3 tickets resolve to their expected status + task_id.
 
@@ -2605,7 +2611,6 @@ class TestCuratorWorkerBatchDrain:
 
         # Three decisions: create, drop (to existing task), create
         mock_curator = MagicMock()
-        mock_curator.curate = AsyncMock()  # should NOT be called
         mock_curator.curate_prepared = AsyncMock(return_value=[
             CuratorDecision(action='create', justification='new task A'),
             CuratorDecision(action='drop', target_id=existing_task_id,
@@ -2668,12 +2673,9 @@ class TestCuratorWorkerBatchDrain:
         assert r3['status'] == 'created', f'ticket3 expected created, got {r3}'
         assert r3.get('task_id') == 'task-c', f'ticket3 expected task-c, got {r3}'
 
-        # One batched call, no single-item calls
+        # One batched call
         assert mock_curator.curate_prepared.await_count == 1, (
             f'Expected 1 curate_prepared call, got {mock_curator.curate_prepared.await_count}'
-        )
-        assert mock_curator.curate.await_count == 0, (
-            f'Expected 0 curate calls (no fallback), got {mock_curator.curate.await_count}'
         )
 
         # Only the 2 creates trigger add_task

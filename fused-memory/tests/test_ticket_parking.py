@@ -401,11 +401,23 @@ class TestParking:
         ],
         ids=['pool-frozen', 'all-accounts-capped'],
     )
-    async def test_a_curator_raising_pool_unavailable_parks_never_creates(
+    async def test_a_pool_error_from_the_llm_call_parks_never_creates(
         self, make_interceptor, store, taskmaster, pool_error,
     ):
+        interceptor = make_interceptor(_real_curator(invoke=AsyncMock(side_effect=pool_error)))
+
+        ticket_id = await _park(interceptor, 'Capped work')
+
+        assert await _parked_row(store, ticket_id) == _parked(DeferReason.ALL_ACCOUNTS_CAPPED)
+        assert taskmaster.add_task_calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_pool_error_raised_out_of_the_pipeline_parks_never_creates(
+        self, make_interceptor, store, taskmaster,
+    ):
+        """The worker's pool arm: ``curate_prepared`` may raise a pool error, and it parks."""
         curator = _ScriptedCurator({'Capped work': []})
-        curator.batch_raises.append(pool_error)
+        curator.batch_raises.append(_frozen_pool())
         interceptor = make_interceptor(curator)
 
         ticket_id = await _park(interceptor, 'Capped work')
@@ -542,10 +554,10 @@ def _real_curator(*, invoke: Any, escalator: Any = None) -> TaskCurator:
     async def bundle_for(candidate: CandidateTask, *_args: Any) -> PreparedCandidate:
         return prepared(candidate.title, candidate=candidate)
 
-    cast(Any, curator).prepare_candidate = AsyncMock(side_effect=bundle_for)
-    cast(Any, curator).record_task = AsyncMock()
-    cast(Any, curator).reembed_task = AsyncMock()
-    cast(Any, curator).search_corpus = AsyncMock(return_value=[])
+    curator.prepare_candidate = AsyncMock(side_effect=bundle_for)
+    curator.record_task = AsyncMock()
+    curator.reembed_task = AsyncMock()
+    curator.search_corpus = AsyncMock(return_value=[])
     return curator
 
 
@@ -563,7 +575,7 @@ class TestCuratorFailuresDecidedByThePipeline:
         self, make_interceptor, store, taskmaster,
     ):
         curator = _real_curator(invoke=must_not_invoke())
-        cast(Any, curator).prepare_candidate = AsyncMock(side_effect=RuntimeError('qdrant gone'))
+        curator.prepare_candidate = AsyncMock(side_effect=RuntimeError('qdrant gone'))
         interceptor = make_interceptor(curator)
 
         ticket_id = await _submit(interceptor, 'Work')
@@ -652,7 +664,7 @@ class TestCuratorFailuresDecidedByThePipeline:
         async def bundle_over_task_7(candidate: CandidateTask, *_args: Any) -> PreparedCandidate:
             return prepared(candidate.title, candidate=candidate, pool=pool_with_ids(('7', 'pending')))
 
-        cast(Any, curator).prepare_candidate = AsyncMock(side_effect=bundle_over_task_7)
+        curator.prepare_candidate = AsyncMock(side_effect=bundle_over_task_7)
         interceptor = make_interceptor(curator)
         ticket_id = await _submit(interceptor, 'Overlapping work')
         assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, DeferReason.LLM_FAILED)

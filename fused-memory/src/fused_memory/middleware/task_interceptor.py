@@ -392,9 +392,10 @@ class _PreparedTicket:
     the next ticket from the queue.
 
     ``prepared`` is None only when ``candidate`` is None (no title — the
-    curator cannot judge it) or there is no curator; the dispatch path then
-    skips the curator decision and goes straight to ``tm.add_task``. A
-    ``prepare_candidate`` that raised yields
+    curator cannot judge it) or there was no curator at prepare time; with no
+    candidate the dispatch path skips the curator decision and goes straight to
+    ``tm.add_task``, and a missing bundle is prepared at batch time once a
+    curator exists. A ``prepare_candidate`` that raised yields
     :meth:`PreparedCandidate.corpus_failed`, which the pipeline defers.
     """
 
@@ -411,10 +412,33 @@ class _PreparedTicket:
     def prompt_tokens(self) -> int:
         """Estimated user-prompt token cost for this ticket's batch section.
 
-        Returns 0 when there is no prepared bundle (the ticket bypasses the
-        curator and contributes nothing to the LLM prompt).
+        Returns 0 when there is no prepared bundle: nothing is counted for a
+        bundle the batch has yet to prepare.
         """
         return self.prepared.prompt_tokens if self.prepared is not None else 0
+
+
+async def _prepare_bundle(
+    curator: TaskCurator,
+    candidate: CandidateTask,
+    *,
+    ticket_id: str,
+    project_id: str,
+    project_root: str,
+) -> PreparedCandidate:
+    """``curator.prepare_candidate``, with any raise turned into a bundle that defers.
+
+    ``prepare_candidate`` already turns a corpus-build failure into
+    :meth:`PreparedCandidate.corpus_failed`. An exception here is unexpected,
+    and gets the same bundle, so the pipeline defers it ``CORPUS_FAILED``.
+    """
+    try:
+        return await curator.prepare_candidate(candidate, project_id, project_root)
+    except Exception as exc:
+        logger.exception('curator.prepare_candidate failed for ticket %s', ticket_id)
+        return PreparedCandidate.corpus_failed(
+            candidate, f'prepare_candidate raised: {exception_summary(exc)}',
+        )
 
 
 @dataclasses.dataclass
@@ -4680,7 +4704,7 @@ class TaskInterceptor:
 
         Returns a populated :class:`_PreparedTicket` for valid tickets.
         ``prepared`` is ``None`` only when the ticket has no title (the
-        curator cannot judge it) or there is no curator. A
+        curator cannot judge it) or there is no curator yet. A
         ``prepare_candidate`` that raises yields
         :meth:`PreparedCandidate.corpus_failed`, which the pipeline defers.
         """
@@ -4730,23 +4754,10 @@ class TaskInterceptor:
         if candidate is not None:
             curator = await self._get_curator()
             if curator is not None:
-                try:
-                    prepared = await curator.prepare_candidate(
-                        candidate,
-                        project_id,
-                        project_root,
-                    )
-                except Exception as exc:
-                    # prepare_candidate already turns a corpus-build failure
-                    # into a corpus-failed bundle; an exception here is
-                    # unexpected, and gets the same bundle so it defers.
-                    logger.exception(
-                        '_prepare_ticket: curator.prepare_candidate failed for ticket %s',
-                        ticket_id,
-                    )
-                    prepared = PreparedCandidate.corpus_failed(
-                        candidate, f'prepare_candidate raised: {exception_summary(exc)}',
-                    )
+                prepared = await _prepare_bundle(
+                    curator, candidate,
+                    ticket_id=ticket_id, project_id=project_id, project_root=project_root,
+                )
 
         return _PreparedTicket(
             ticket_id=ticket_id,
@@ -5232,11 +5243,13 @@ class TaskInterceptor:
 
         ``curate_prepared`` returns one decision per bundle and raises only a
         pool error (``POOL_UNAVAILABLE_ERRORS``) or ``CancelledError``: every
-        other curator failure is decided inside it. A submission the curator
-        could not judge parks ``awaiting_curation``, and a within-batch drop
-        onto a parked sibling parks with it; nothing is created for them.
-        That covers a ``defer`` decision and the pool error, which defers
-        every curatable ticket here.
+        other curator failure is decided inside it. A pool error from the
+        curator's LLM call is decided there too, one defer per bundle, so the
+        pool arm here serves only a pool error raised elsewhere in the
+        pipeline, deferring every curatable ticket under the pool's reason. A
+        submission the curator could not judge parks ``awaiting_curation``,
+        and a within-batch drop onto a parked sibling parks with it; nothing
+        is created for them.
         """
         if self._ticket_store is None:
             return
@@ -5308,17 +5321,27 @@ class TaskInterceptor:
                 _TicketLifecycle(ticket=t) for t in ticket_data
             ]
 
-            # Curatable slice: records whose ticket has both a candidate and
-            # a prepared bundle.  Built as one fused loop so curatable_records
-            # and curatable_bundles stay index-aligned — the invariant
-            # curate_prepared's positional response relies on — and so the
-            # bundle's None-check narrows for the type checker.
+            # Curatable slice: every record whose ticket has a candidate, while
+            # a curator exists. A ticket prepared before the curator could be
+            # built gets its bundle now. Built as one fused loop so
+            # curatable_records and curatable_bundles stay index-aligned — the
+            # invariant curate_prepared's positional response relies on.
             curatable_records: list[_TicketLifecycle] = []
             curatable_bundles: list[PreparedCandidate] = []
-            for r in records:
-                if r.ticket.candidate is not None and r.ticket.prepared is not None:
+            if curator is not None:
+                for r in records:
+                    candidate = r.ticket.candidate
+                    if candidate is None:
+                        continue
+                    bundle = r.ticket.prepared
+                    if bundle is None:
+                        bundle = await _prepare_bundle(
+                            curator, candidate,
+                            ticket_id=r.ticket.ticket_id, project_id=project_id,
+                            project_root=project_root,
+                        )
                     curatable_records.append(r)
-                    curatable_bundles.append(r.ticket.prepared)
+                    curatable_bundles.append(bundle)
 
             # One pipeline for the whole slice. curate_prepared returns one
             # decision per bundle and raises only a pool error or
