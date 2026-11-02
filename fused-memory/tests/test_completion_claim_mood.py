@@ -263,10 +263,6 @@ class TestNonAssertiveScopes:
                 id='esc-unverified-claim-536-1',
             ),
             pytest.param(
-                _ESC_536_1_MEMORY, 'solar_challenge_platform',
-                id='esc-unverified-claim-536-1-record',
-            ),
-            pytest.param(
                 'On branch task/1053 (holds once merged), the warning reads X.',
                 'solar_challenge',
                 id='esc-unverified-claim-1053-1',
@@ -282,10 +278,6 @@ class TestNonAssertiveScopes:
                 id='until-merged',
             ),
             pytest.param(
-                _ESC_1053_1_MEMORY, 'solar_challenge',
-                id='esc-unverified-claim-1053-1-record',
-            ),
-            pytest.param(
                 'Task 758 adds tests/_schema_state.py::index_shapes for this '
                 '(holds once merged)',
                 'solar_challenge_platform',
@@ -298,6 +290,11 @@ class TestNonAssertiveScopes:
                 id='esc-unverified-claim-1378-2',
             ),
             pytest.param('task 5422 stays on its branch till merged', 'reify', id='till'),
+            pytest.param(
+                'task 5422 stays on its branch as soon as merged', 'reify', id='as-soon-as',
+            ),
+            pytest.param('task 5422 is rebased before merged', 'reify', id='before'),
+            pytest.param('task 5422 reopens the day merged', 'reify', id='the-day'),
             pytest.param(
                 'the guard on branch task/5422 applies whenever landed', 'reify',
                 id='whenever',
@@ -312,6 +309,25 @@ class TestNonAssertiveScopes:
     )
     def test_a_verbless_temporal_clause_is_not_a_claim(self, text, project):
         assert _triples(text, project) == []
+
+    @pytest.mark.parametrize(
+        ('text', 'project', 'task'),
+        [
+            pytest.param(
+                _ESC_536_1_MEMORY, 'solar_challenge_platform', '536',
+                id='esc-unverified-claim-536-1-record',
+            ),
+            pytest.param(
+                _ESC_1053_1_MEMORY, 'solar_challenge', '1053',
+                id='esc-unverified-claim-1053-1-record',
+            ),
+        ],
+    )
+    def test_a_verbless_temporal_clause_does_not_claim_its_branch_task(
+        self, text, project, task,
+    ):
+        claimed = {(subject, ref) for _, subject, ref in _triples(text, project)}
+        assert ('task', task) not in claimed
 
     @pytest.mark.parametrize(
         ('text', 'ref'),
@@ -338,9 +354,18 @@ class TestNonAssertiveScopes:
             pytest.param('Task 536 merged in abc1234.', '536', id='declarative-merged-in'),
             pytest.param('#5422 landed in abc123', '5422', id='declarative-hash-landed-in'),
             pytest.param(
-                'task 5422 was merged; it holds once merged', '5422',
-                id='verbless-clause-elsewhere',
+                'task 5422 was merged and holds once merged', '5422',
+                id='verbless-clause-in-the-same-clause',
             ),
+            pytest.param(
+                'Task 5 was once merged into main but reverted', '5',
+                id='adverbial-once-after-was',
+            ),
+            pytest.param(
+                'task 5422 had once landed before the revert', '5422',
+                id='adverbial-once-after-had',
+            ),
+            pytest.param('task 5422 has once been merged', '5422', id='adverbial-once-after-has'),
         ],
     )
     def test_an_asserted_landing_outside_any_scope_is_still_a_claim(self, text, ref):

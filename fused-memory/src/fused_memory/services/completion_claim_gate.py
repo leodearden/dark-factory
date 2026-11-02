@@ -382,6 +382,8 @@ _IMPERATIVE_HEAD_RE: re.Pattern[str] = re.compile(
 # present tense in a temporal clause is future reference ('once #N has
 # landed') while simple past is narrative and presupposes the event ('after
 # task 5 landed'). Each row is (cue, tense gate); None means always blank.
+# A verbless temporal clause ('holds once merged') has no tense to read; binding
+# handles it instead (_FORWARD_ONLY_LEAD_RE).
 # Pinned by tests/test_completion_claim_mood.py::TestNonAssertiveScopes.
 _MOOD_SCOPES: tuple[tuple[re.Pattern[str], re.Pattern[str] | None], ...] = (
     (_NON_VERIDICAL_CUE_RE, None),
@@ -675,12 +677,20 @@ _BINDING_BARRIER_RE: re.Pattern[str] = re.compile(
 # fit, so they do not bind forward.
 _TASK_COMPLEMENT_LEAD_RE: re.Pattern[str] = re.compile(r'\s+(?:as\s+)?', re.IGNORECASE)
 
+# An auxiliary right before 'once' makes it the adverb 'formerly' ('was once merged'),
+# so the cue is not a temporal lead. Python lookbehind is fixed-width, hence one per width.
+_NOT_AFTER_AN_AUXILIARY: str = (
+    r'(?<!\bis\s)(?<!\b(?:was|are|has|had)\s)(?<!\b(?:were|have|been)\s)'
+)
+
 # A marker with no subject of its own binds forward only. After a determiner it is
 # attributive ('the shipped examples'); after a temporal cue it heads a verbless clause
 # ('holds once merged') with no auxiliary for the _MOOD_SCOPES tense gate to read.
-# Pinned by tests/test_completion_claim_mood.py::TestNonAssertiveScopes.
+# Pinned by tests/test_completion_claim_mood.py::TestNonAssertiveScopes (temporal
+# cue) and ::TestAttributiveMarkersBindForwardOnly (determiner).
 _FORWARD_ONLY_LEAD_RE: re.Pattern[str] = re.compile(
-    r'(?:\b(?:the|a|an|its|their|our|your|his|her|my)|' + _TEMPORAL_CUE + r')'
+    r'(?:\b(?:the|a|an|its|their|our|your|his|her|my)|'
+    + _NOT_AFTER_AN_AUXILIARY + _TEMPORAL_CUE + r')'
     r'\s+(?:(?:\w+ly|already|just|now)\s+)?$',
     re.IGNORECASE,
 )
