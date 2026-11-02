@@ -195,6 +195,7 @@ class FakeT3Server(ThreadingHTTPServer):
         self._auth_codes: dict[str, _AuthCode] = {}
         self._tokens: set[str] = set()
         self._sessions: set[str] = set()
+        self._issued_sessions: list[str] = []
 
     @classmethod
     @contextlib.contextmanager
@@ -228,6 +229,11 @@ class FakeT3Server(ThreadingHTTPServer):
     def forget_sessions(self) -> None:
         with self._lock:
             self._sessions.clear()
+
+    def issued_sessions(self) -> list[str]:
+        """Every Mcp-Session-Id an ``initialize`` was answered with, oldest first."""
+        with self._lock:
+            return list(self._issued_sessions)
 
     def mcp_requests(self) -> list[RecordedRequest]:
         return [request for request in self.requests if request.path == MCP_PATH]
@@ -357,6 +363,7 @@ class FakeT3Server(ThreadingHTTPServer):
             session_id = str(uuid.uuid4())
             with self._lock:
                 self._sessions.add(session_id)
+                self._issued_sessions.append(session_id)
             result = {
                 'protocolVersion': PROTOCOL_VERSION,
                 'capabilities': {'tools': {}},

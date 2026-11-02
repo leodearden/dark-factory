@@ -8,13 +8,15 @@ the wire it uses in production.
 from __future__ import annotations
 
 import json
+import socket
 import stat
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
-from _fake_t3_server import ENVIRONMENT_ID
+from _fake_t3_server import ENVIRONMENT_ID, FakeT3Server, ToolFailure
 
 from orchestrator import t3_mcp_client as client
 
@@ -53,6 +55,54 @@ def make_credential(**overrides: Any) -> client.Credential:
 @pytest.fixture
 def fleet(tmp_path: Path) -> Path:
     return tmp_path / 'fleet'
+
+
+@pytest.fixture
+def t3_server() -> Iterator[FakeT3Server]:
+    with FakeT3Server.running() as server:
+        yield server
+
+
+@pytest.fixture(params=['json', 'sse'])
+def framed_server(request: pytest.FixtureRequest) -> Iterator[FakeT3Server]:
+    with FakeT3Server.running(framing=request.param) as server:
+        yield server
+
+
+def seed_credential(
+    server: FakeT3Server, root: Path, *, expires_at: datetime | None = None, access_token: str | None = None
+) -> client.Credential:
+    paired_at = datetime.now(UTC).replace(microsecond=0)
+    credential = make_credential(
+        origin=server.origin,
+        environment_id=server.environment_id,
+        access_token=access_token if access_token is not None else server.issue_token(),
+        paired_at=paired_at,
+        expires_at=expires_at if expires_at is not None else paired_at + timedelta(days=30),
+    )
+    client.write_credential(credential, root=root)
+    return credential
+
+
+def closed_origin() -> str:
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
+    return f'http://127.0.0.1:{port}'
+
+
+def connected(server: FakeT3Server, root: Path, **options: Any) -> client.T3McpClient:
+    result = client.connect(server.origin, root=root, **options)
+    assert isinstance(result, client.T3McpClient), result
+    return result
+
+
+def mcp_methods(server: FakeT3Server) -> list[str]:
+    return [request.body['method'] for request in server.mcp_requests()]
+
+
+def touched_mcp_or_oauth(server: FakeT3Server) -> list[str]:
+    return [request.path for request in server.requests if request.path == '/mcp' or request.path.startswith('/oauth/')]
 
 
 class TestCredentialFile:
@@ -154,3 +204,104 @@ class TestCheckedOrigin:
     def test_refuses_plain_http_off_loopback_and_other_schemes(self, url: str):
         with pytest.raises(ValueError):
             client.checked_origin(url)
+
+
+class TestCall:
+    def test_connect_then_call_runs_the_mcp_handshake_once_and_reads_the_tool(
+        self, framed_server: FakeT3Server, fleet: Path
+    ):
+        token = seed_credential(framed_server, fleet).access_token
+
+        mcp = connected(framed_server, fleet)
+        result = mcp.call('t3_environment_read', {})
+
+        assert mcp.environment_id == framed_server.environment_id
+        assert isinstance(result, client.ToolOk)
+        assert result.value['environmentId'] == framed_server.environment_id
+        requests = framed_server.mcp_requests()
+        assert mcp_methods(framed_server) == ['initialize', 'notifications/initialized', 'tools/call']
+        assert requests[0].body['params']['protocolVersion'] == '2025-06-18'
+        assert requests[2].body['params'] == {'name': 't3_environment_read', 'arguments': {}}
+        for request in requests:
+            assert request.headers['authorization'] == f'Bearer {token}'
+            assert 'application/json' in request.headers['accept']
+            assert 'text/event-stream' in request.headers['accept']
+        [session_id] = framed_server.issued_sessions()
+        for request in requests[1:]:
+            assert request.headers['mcp-protocol-version'] == '2025-06-18'
+            assert request.headers['mcp-session-id'] == session_id
+
+    def test_a_second_call_reuses_the_session(self, framed_server: FakeT3Server, fleet: Path):
+        seed_credential(framed_server, fleet)
+        mcp = connected(framed_server, fleet)
+
+        first = mcp.call('t3_environment_read', {})
+        second = mcp.call('t3_environment_read', {})
+
+        assert isinstance(first, client.ToolOk)
+        assert isinstance(second, client.ToolOk)
+        assert mcp_methods(framed_server) == ['initialize', 'notifications/initialized', 'tools/call', 'tools/call']
+
+    def test_a_declared_tool_failure_is_tool_failed(self, framed_server: FakeT3Server, fleet: Path):
+        seed_credential(framed_server, fleet)
+        framed_server.tool_replies['t3_thread_read'] = ToolFailure('thread_not_found', 'm')
+
+        result = connected(framed_server, fleet).call('t3_thread_read', {'threadId': 't'})
+
+        assert result == client.ToolFailed('thread_not_found', 'm')
+
+    def test_a_json_rpc_error_is_a_protocol_fault(self, framed_server: FakeT3Server, fleet: Path):
+        seed_credential(framed_server, fleet)
+
+        result = connected(framed_server, fleet).call('t3_no_such_tool', {})
+
+        assert isinstance(result, client.TransportFailed)
+        assert result.fault is client.TransportFault.PROTOCOL
+
+    def test_a_server_gone_after_connect_is_unreachable(self, fleet: Path):
+        with FakeT3Server.running() as server:
+            seed_credential(server, fleet)
+            mcp = connected(server, fleet)
+            assert isinstance(mcp.call('t3_environment_read', {}), client.ToolOk)
+
+        result = mcp.call('t3_environment_read', {})
+
+        assert isinstance(result, client.TransportFailed)
+        assert result.fault is client.TransportFault.UNREACHABLE
+
+    def test_connect_to_a_closed_port_fails_on_the_descriptor(self, fleet: Path):
+        result = client.connect(closed_origin(), root=fleet)
+
+        assert isinstance(result, client.ConnectFailed)
+        assert result.reason is client.ConnectFailure.DESCRIPTOR_UNREACHABLE
+
+    def test_connect_with_no_credential_file_is_unpaired_and_sends_nothing(self, t3_server: FakeT3Server, fleet: Path):
+        result = client.connect(t3_server.origin, root=fleet)
+
+        assert isinstance(result, client.ConnectFailed)
+        assert result.reason is client.ConnectFailure.UNPAIRED
+        assert touched_mcp_or_oauth(t3_server) == []
+
+    def test_connect_with_an_expired_file_and_no_repair_sends_nothing(self, t3_server: FakeT3Server, fleet: Path):
+        seed_credential(t3_server, fleet, expires_at=datetime.now(UTC) + timedelta(minutes=30))
+
+        result = client.connect(t3_server.origin, root=fleet)
+
+        assert isinstance(result, client.ConnectFailed)
+        assert result.reason is client.ConnectFailure.CREDENTIAL_EXPIRED
+        assert touched_mcp_or_oauth(t3_server) == []
+
+    def test_credential_status_at_selects_the_file_the_descriptor_names(self, t3_server: FakeT3Server, fleet: Path):
+        seed_credential(t3_server, fleet)
+
+        status = client.credential_status_at(t3_server.origin, root=fleet, now=NOW)
+
+        assert status == client.read_credential_status(t3_server.environment_id, root=fleet, now=NOW)
+        assert isinstance(status, client.CredentialStatus)
+        assert status.state is client.CredentialState.PAIRED
+
+    def test_credential_status_at_a_closed_port_is_unreachable(self, fleet: Path):
+        status = client.credential_status_at(closed_origin(), root=fleet)
+
+        assert isinstance(status, client.TransportFailed)
+        assert status.fault is client.TransportFault.UNREACHABLE
