@@ -751,6 +751,7 @@ function TasksTab({ projectFilter, search }) {
     partial: 'tasks-partial-banner',
     degraded: 'tasks-degraded-banner',
     'count-unknown': 'tasks-count-unknown-banner',
+    'count-stale': 'tasks-count-stale-banner',
   };
 
   // Runtime-probe health, derived frontend-side from the snapshot rows
