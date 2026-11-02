@@ -92,21 +92,21 @@ async def _prepare_and_curate(
 
 
 def _answering_with(
-    decide: Callable[..., Awaitable[list[CuratorDecision]]],
+    decide: Callable[[list[CandidateTask]], Awaitable[list[CuratorDecision]]],
     prepared: list[PreparedCandidate],
 ) -> Callable[..., Awaitable[AgentResult]]:
     """An injected invoker's side effect that answers each LLM call with *decide*'s decisions.
 
-    *decide* receives the candidates the call carries, in prompt order, as the
-    first positional argument, and its decisions are rendered back into the
-    verdict the curator parses, at either spec. The candidates are looked up by
-    title among *prepared*'s, so a test may assert on their identity.
+    *decide* receives the candidates the call carries, in prompt order, and
+    its decisions are rendered back into the verdict the curator parses, at
+    either spec. The candidates are looked up by title among *prepared*'s, so
+    a test may assert on their identity.
     """
     by_title = {bundle.candidate.title: bundle.candidate for bundle in reversed(prepared)}
 
     async def invoke(**kwargs: Any) -> AgentResult:
         candidates = [by_title[title] for title in candidate_titles(kwargs['prompt'])]
-        decisions = await decide(candidates, None, None, None, None, None)
+        decisions = await decide(candidates)
         verdicts = [
             {
                 'candidate_index': i,
@@ -4794,9 +4794,9 @@ class TestPrepareCandidate:
         assert prepared.prompt_tokens > 0  # candidate has real text
 
     @pytest.mark.asyncio
-    async def test_corpus_failure_degrades_to_empty_pool(self):
-        """Per the curate_prepared contract, corpus errors degrade to
-        an empty pool so the curator can still call the LLM."""
+    async def test_corpus_failure_yields_a_corpus_failed_bundle(self):
+        """A corpus failure yields a ``corpus_failed`` bundle over an empty pool,
+        which the pipeline defers ``CORPUS_FAILED`` without calling the LLM."""
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
         async def boom(*a, **k):
@@ -4805,6 +4805,7 @@ class TestPrepareCandidate:
             prepared = await curator.prepare_candidate(
                 CandidateTask(title='X'), 'p', '/x',
             )
+        assert prepared.corpus_error is not None
         assert prepared.pool == []
         assert prepared.pool_sizes == {
             'anchor': 0, 'sibling': 0, 'module': 0, 'embedding': 0, 'dependency': 0,
@@ -5085,7 +5086,7 @@ class TestWithheldReachesTheLlmPrompt:
 
 
 class TestSizeOneBatchReusesThePreparedCorpus:
-    """`curate_prepared` short-circuits N=1 to `curate` — with the bundle.
+    """A size-1 `curate_prepared` judges over the bundle it was handed, never rebuilding it.
 
     Bigger per-candidate sections (the raised `entry_description_chars`) mean
     the worker's token accumulator admits fewer tickets per batch, so batches
@@ -6143,11 +6144,11 @@ class TestCuratorBatchBlocklistShortCircuit:
         ]
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
+        async def decide(cands):
             llm_candidates_received.extend(cands)
             return llm_decisions_returned
 
-        llm.side_effect = _answering_with(fake_llm_batch, prepared)
+        llm.side_effect = _answering_with(decide, prepared)
         decisions = await curator.curate_prepared(
             prepared, project_id="p", project_root="/x"
         )
@@ -7721,11 +7722,11 @@ class TestCuratorBatchPremiseRefutedDrop:
         ]
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
+        async def decide(cands):
             llm_candidates_received.extend(cands)
             return llm_decisions_returned
 
-        llm.side_effect = _answering_with(fake_llm_batch, prepared)
+        llm.side_effect = _answering_with(decide, prepared)
         decisions = await curator.curate_prepared(
             prepared, project_id="p", project_root="/x"
         )
@@ -7787,11 +7788,11 @@ class TestCuratorBatchPremiseRefutedDrop:
         ]
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
+        async def decide(cands):
             llm_candidates_received.extend(cands)
             return llm_decisions_returned
 
-        llm.side_effect = _answering_with(fake_llm_batch, prepared)
+        llm.side_effect = _answering_with(decide, prepared)
         decisions = await curator.curate_prepared(
             prepared, project_id="p", project_root="/x"
         )
@@ -7830,9 +7831,7 @@ class TestCuratorBatchPremiseRefutedDrop:
         llm = AsyncMock()
         curator = TaskCurator(config=config, taskmaster=None, cwd=source_root, invoke=llm)
 
-        # A second, ordinary candidate keeps this a genuine 2-item batch so
-        # curate_prepared exercises the real bisecting-LLM path instead
-        # of its len(prepared) == 1 shortcut straight to curate().
+        # A second, ordinary candidate keeps this a genuine 2-item batch.
         c0 = CandidateTask(
             title="Fix entity-summary rebuild missing invalid_at filter",
             description="Rebuild does not check missing invalid_at filter before writing.",
@@ -7847,7 +7846,7 @@ class TestCuratorBatchPremiseRefutedDrop:
 
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
+        async def decide(cands):
             llm_candidates_received.extend(cands)
             return [
                 CuratorDecision(action="create", justification=f"genuinely new {i}",
@@ -7855,7 +7854,7 @@ class TestCuratorBatchPremiseRefutedDrop:
                 for i in range(len(cands))
             ]
 
-        llm.side_effect = _answering_with(fake_llm_batch, prepared)
+        llm.side_effect = _answering_with(decide, prepared)
         decisions1 = await curator.curate_prepared(
             prepared, project_id="p", project_root="/x"
         )
@@ -8028,13 +8027,13 @@ class TestBatchDuplicateInheritsRefusal:
             PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
         ]
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
+        async def decide(cands):
             return [
                 CuratorDecision(action="create", justification="new-1",
                                 pool_sizes=empty_sizes, latency_ms=0),
             ]
 
-        llm.side_effect = _answering_with(fake_llm_batch, prepared)
+        llm.side_effect = _answering_with(decide, prepared)
         decisions = await curator.curate_prepared(
             prepared, project_id="p", project_root="/x"
         )
@@ -8590,7 +8589,7 @@ class TestCuratorBatchRouteDeterministic:
 
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
+        async def decide(cands):
             # Mirrors the real batch LLM: one decision per candidate it
             # actually receives. Its output schema has no 'route_deterministic'
             # action, so anything reaching it can only ever come back 'create'.
@@ -8601,7 +8600,7 @@ class TestCuratorBatchRouteDeterministic:
                 for i in range(len(cands))
             ]
 
-        llm.side_effect = _answering_with(fake_llm_batch, prepared)
+        llm.side_effect = _answering_with(decide, prepared)
         decisions = await curator.curate_prepared(
             prepared, project_id="p", project_root="/x"
         )
@@ -8666,11 +8665,11 @@ class TestCuratorBatchRouteDeterministic:
         ]
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
+        async def decide(cands):
             llm_candidates_received.extend(cands)
             return llm_decisions_returned
 
-        llm.side_effect = _answering_with(fake_llm_batch, prepared)
+        llm.side_effect = _answering_with(decide, prepared)
         decisions = await curator.curate_prepared(
             prepared, project_id="p", project_root="/x"
         )
@@ -8714,7 +8713,7 @@ class TestCuratorBatchRouteDeterministic:
 
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
+        async def decide(cands):
             # Mirrors the real batch LLM: one decision per candidate it
             # actually receives. If c0 reaches it, it can only come back
             # 'create' — its output schema has no 'route_deterministic'.
@@ -8725,7 +8724,7 @@ class TestCuratorBatchRouteDeterministic:
                 for i in range(len(cands))
             ]
 
-        llm.side_effect = _answering_with(fake_llm_batch, prepared)
+        llm.side_effect = _answering_with(decide, prepared)
         decisions = await curator.curate_prepared(
             prepared, project_id="p", project_root="/x"
         )

@@ -15262,11 +15262,6 @@ async def test_dispatch_refuse_precedes_drop_even_with_stray_target(
 # ── task 3126 step-5 RED: the user-observable signal — a refusal creates no task ──
 
 
-def _refusal_curator(decision: CuratorDecision) -> MagicMock:
-    """A curator mock whose prepared batch answers *decision* for every candidate."""
-    return _mock_curator(decision)
-
-
 def _blocklisted_refusal() -> CuratorDecision:
     """The decision `_maybe_blocklist_drop` emits for a blocklisted candidate."""
     return CuratorDecision(
@@ -15305,7 +15300,7 @@ async def test_refused_ticket_creates_no_task_end_to_end(
     guard's refusal was INERT, so the candidate it named was filed anyway.
     """
     decision = decision_factory()
-    curator_interceptor._curator = _refusal_curator(decision)
+    curator_interceptor._curator = _mock_curator(decision)
 
     submit_result = await curator_interceptor.submit_task(
         '/project',
@@ -15338,7 +15333,7 @@ async def test_batch_sibling_pointing_at_refused_candidate_degrades_to_create(
     at a refused candidate sees task_id=None and must fail OPEN to create —
     refusing one candidate cannot silently discard an unrelated one."""
     refusal = _blocklisted_refusal()
-    mock_curator = _refusal_curator(refusal)
+    mock_curator = _mock_curator(refusal)
     mock_curator.curate_prepared = AsyncMock(return_value=[
         refusal,
         CuratorDecision(
