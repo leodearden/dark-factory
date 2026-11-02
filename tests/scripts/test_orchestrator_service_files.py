@@ -148,7 +148,7 @@ def test_dark_factory_orchestrator_service_structure() -> None:
     # VALUE; the relational cap-implies-steps invariant is enforced fleet-wide
     # in tests/scripts/test_systemd_restart_backoff.py.
     assert "RestartSteps=4" in content
-    assert "StartLimitIntervalSec=600" in content
+    assert "StartLimitIntervalSec=1800" in content
     assert "StartLimitBurst=10" in content
     assert "TimeoutStopSec=90" in content
     # TimeoutStartSec must exceed the ExecStartPre poll budget (280s) so a slow
@@ -227,7 +227,7 @@ def test_reify_orchestrator_service_structure() -> None:
     # VALUE; the relational cap-implies-steps invariant is enforced fleet-wide
     # in tests/scripts/test_systemd_restart_backoff.py.
     assert "RestartSteps=4" in content
-    assert "StartLimitIntervalSec=600" in content
+    assert "StartLimitIntervalSec=1800" in content
     assert "StartLimitBurst=10" in content
     assert "TimeoutStopSec=90" in content
     assert "TimeoutStartSec=300" in content
@@ -403,7 +403,7 @@ def test_autopilot_video_service_exists_and_structure() -> None:
         in content
     ), "ExecStart must invoke the orchestrator with the autopilot-video config, no-sync"
     assert "Restart=on-failure" in content
-    assert "StartLimitIntervalSec=600" in content
+    assert "StartLimitIntervalSec=1800" in content
     assert "StartLimitBurst=10" in content
     assert "TimeoutStopSec=90" in content
     assert "TimeoutStartSec=300" in content
@@ -419,7 +419,7 @@ def test_autopilot_video_start_limit_directives_under_unit_section() -> None:
     sections = parse_sections(AUTOPILOT_SERVICE.read_text(encoding="utf-8"))
     unit_text = "\n".join(sections.get("Unit", []))
     service_text = "\n".join(sections.get("Service", []))
-    assert "StartLimitIntervalSec=600" in unit_text
+    assert "StartLimitIntervalSec=1800" in unit_text
     assert "StartLimitBurst=10" in unit_text
     assert "StartLimitIntervalSec" not in service_text
     assert "StartLimitBurst" not in service_text
@@ -541,8 +541,8 @@ def test_start_limit_directives_under_unit_section(
     service_text = "\n".join(sections.get("Service", []))
 
     # Must be present in [Unit]
-    assert "StartLimitIntervalSec=600" in unit_text, (
-        f"StartLimitIntervalSec=600 must be under [Unit] in {service_path.name}"
+    assert "StartLimitIntervalSec=1800" in unit_text, (
+        f"StartLimitIntervalSec=1800 must be under [Unit] in {service_path.name}"
     )
     assert "StartLimitBurst=10" in unit_text, (
         f"StartLimitBurst=10 must be under [Unit] in {service_path.name}"
