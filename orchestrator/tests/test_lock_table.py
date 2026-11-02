@@ -14,11 +14,14 @@ test_scheduler.py alongside TestModuleLockTable / TestHierarchicalLocking.
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from orchestrator.config import PRIORITY_RANK, OrchestratorConfig
+from orchestrator.lock_table import ModuleLockTable
 from orchestrator.pin_reservation import (
     Blocker,
     BlockerKind,
@@ -26,7 +29,6 @@ from orchestrator.pin_reservation import (
     ReservationSource,
     park_rank,
 )
-from orchestrator.scheduler import ModuleLockTable
 
 #: Fixed park-install instant for the park-age tests (task 3823 / PRD task η).
 PARK_T0 = datetime(2026, 8, 1, 0, 0, 0, tzinfo=UTC)
@@ -1273,3 +1275,18 @@ class TestRelease:
 
     def test_release_of_a_task_holding_nothing_returns_empty(self):
         assert _lt().release('nobody') == []
+
+
+class TestModuleBoundary:
+    """The lock table is its own module: it loads no scheduler, and the
+    scheduler does not re-export it."""
+
+    def test_importing_the_lock_table_loads_no_scheduler(self):
+        probe = 'import sys, orchestrator.lock_table; print("orchestrator.scheduler" in sys.modules)'
+        out = subprocess.run([sys.executable, '-c', probe], capture_output=True, text=True, check=True)
+        assert out.stdout.strip() == 'False'
+
+    def test_scheduler_does_not_re_export_the_lock_table(self):
+        import orchestrator.scheduler
+
+        assert 'ModuleLockTable' not in orchestrator.scheduler.__all__
