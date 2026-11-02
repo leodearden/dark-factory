@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import make_gate_yielding as _make_gate_yielding  # centralized (task 1458)
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
-from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
+from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult, parse_claude_cli_output
 from shared.invocation_outcome import CapHit
 from shared.process_cost import ProcessCostBasis
 from shared.testing_fake_claude import install_fake_claude_cli
@@ -251,7 +251,7 @@ class TestCapHitResume:
         assert not any(isinstance(arg, CapHit) for arg in reported)
 
     async def test_resume_failure_falls_back_to_fresh(self):
-        """Resume returns success=False → retry with original prompt."""
+        """The CLI rejects the resume (measured payload) → retry with original prompt."""
         gate = _make_gate_yielding([
             _make_slot(token='token-a', account_name='acct-a', cap_hit=True),
             _make_slot(token='token-b', account_name='acct-b', cap_hit=False),
@@ -259,9 +259,9 @@ class TestCapHitResume:
         ])
 
         capped_result = _make_result(success=False, session_id='sess-abc')
-        failed_resume = _make_result(success=False)
-        failed_resume.duration_ms = 6000
-        failed_resume.turns = 2
+        failed_resume = parse_claude_cli_output(
+            stdout='', stderr='No conversation found with session ID: sess-abc', returncode=1,
+        )
         ok_result = _make_result(success=True, cost_usd=0.5)
         ok_result.duration_ms = 6000
         ok_result.turns = 2

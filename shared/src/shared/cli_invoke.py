@@ -288,7 +288,6 @@ __all__ = [
     'invoke_claude_agent',
     'invoke_with_cap_retry',
     'is_cli_invocation_rejected',
-    'is_resume_rejected',
     'is_server_error_status',
     'is_timed_out_with_progress',
     'is_zero_output_timeout',
@@ -503,20 +502,21 @@ class AgentResult:
       ``.task/zero_output_evidence-iter{N}.json`` by the workflow's
       ``_capture_zero_output_evidence`` helper (task 1739).
     - ``resume_fallbacks``: how many times THIS invocation armed ``--resume``
-      and had to fall back to a fresh session because the resume itself failed
-      (task 3578).  Stamped by ``invoke_with_cap_retry`` at its single return
-      point from a loop-local counter — the retry loop rebinds ``result`` on
-      every pass, so a count stamped onto a discarded attempt would be lost by
-      construction.  ``shared`` has no event store, so this field is the
-      carrier the orchestrator reads to emit ``session_resume_failed``
-      (``stage='cli'``) for a resume the CLI rejected: previously that loss was
-      invisible in runs.db, because the loop retried fresh and returned a
-      SUCCESS.  Counts fallbacks TAKEN, not resumes armed — a resume that
-      succeeded leaves it 0.
+      and fell back to a fresh session because the CLI REJECTED the resume
+      before any model turn (``is_resume_rejected``; tasks 3578, 5579).
+      Stamped by ``invoke_with_cap_retry`` at its single return point from a
+      loop-local counter — the retry loop rebinds ``result`` on every pass, so
+      a count stamped onto a discarded attempt would be lost by construction.
+      ``shared`` has no event store, so this field is the carrier the
+      orchestrator reads to emit ``session_resume_failed`` (``stage='cli'``)
+      for a resume the CLI rejected.  Counts fallbacks TAKEN, not resumes
+      armed — a resume that survived leaves it 0, and so does a resumed run
+      that did work and then ended non-success: that run is returned, not
+      retried.
 
-      READ THE PREDICATE EXACTLY: it counts every resumed attempt this loop
-      made that then failed non-cap, which includes a resume **the loop itself
-      re-armed** after a cap hit (the cap branch sets
+      READ THE PREDICATE EXACTLY: it counts every rejected resume this loop
+      made, which includes a resume **the loop itself re-armed** after a cap
+      hit (the cap branch sets
       ``invoke_kwargs['resume_session_id'] = result.session_id``).  A caller
       that never passed ``resume_session_id`` can therefore still come back
       with a non-zero count, so a consumer asking "did the resume *I* adopted
@@ -1636,15 +1636,15 @@ def _stderr_has_cli_input_required(stderr: str) -> bool:
     return _stderr_carries_any(stderr, CLI_INPUT_REQUIRED_MARKERS)
 
 
-def _cli_input_rejection_cause(stderr: str) -> str:
+def _stderr_cause_line(stderr: str, markers: Sequence[str]) -> str:
     """Extract the operator-facing CAUSE line for a pre-turn CLI rejection.
 
     The CLI's own stderr is the ONLY evidence of what actually happened, so
     this returns REAL OBSERVED TEXT or an explicit absence marker — never an
     invented explanation.  Preference order:
 
-    1. the first stderr line carrying one of ``CLI_INPUT_REQUIRED_MARKERS``
-       (the CLI's verbatim argument-validation error);
+    1. the first stderr line carrying one of the lower-case *markers* (the
+       CLI's verbatim error);
     2. the LAST non-empty stderr line (defensive: a caller stamped the subtype
        by hand, or the CLI's wording drifted off the marker table — either way
        the tail is the closest thing to a real cause we observed);
@@ -1653,18 +1653,30 @@ def _cli_input_rejection_cause(stderr: str) -> str:
        a plausible-sounding cause here would be exactly the laundering this
        task exists to remove.
     """
-    # Lazy (function-local) import — see _stderr_has_cli_input_required.
-    from shared.invocation_outcome import CLI_INPUT_REQUIRED_MARKERS
-
     lines = [line.strip() for line in (stderr or '').splitlines()]
     non_empty = [line for line in lines if line]
     for line in non_empty:
-        line_lower = line.lower()
-        if any(marker in line_lower for marker in CLI_INPUT_REQUIRED_MARKERS):
+        if _stderr_carries_any(line, markers):
             return line
     if non_empty:
         return non_empty[-1]
     return '<no stderr captured>'
+
+
+def _cli_input_rejection_cause(stderr: str) -> str:
+    """The cause line of an input-required rejection (``CLI_INPUT_REQUIRED_MARKERS``)."""
+    # Lazy (function-local) import — see _stderr_has_cli_input_required.
+    from shared.invocation_outcome import CLI_INPUT_REQUIRED_MARKERS
+
+    return _stderr_cause_line(stderr, CLI_INPUT_REQUIRED_MARKERS)
+
+
+def _resume_rejection_cause(stderr: str) -> str:
+    """The cause line of a rejected ``--resume`` (``RESUME_REJECTED_MARKERS``)."""
+    # Lazy (function-local) import — see _stderr_has_cli_input_required.
+    from shared.invocation_outcome import RESUME_REJECTED_MARKERS
+
+    return _stderr_cause_line(stderr, RESUME_REJECTED_MARKERS)
 
 
 def is_cli_invocation_rejected(result: AgentResult) -> bool:
@@ -2525,8 +2537,10 @@ async def invoke_with_cap_retry(
     retry resumes that session via ``--resume`` instead of starting fresh,
     unless the caller passes ``resume_on_cap_hit=False``.
     This preserves all agent progress (tool calls, reasoning) across
-    account switches.  If resume itself fails (non-cap-hit error), falls
-    back to a fresh invocation with the original (or rebuilt) prompt.
+    account switches.  Only a resume the CLI rejected before any model turn
+    (``is_resume_rejected``) falls back to a fresh invocation with the
+    original (or rebuilt) prompt; any other resumed non-success is returned
+    like a fresh invocation's result (task 5579).
 
     Resume eligibility is a TWO-PART rule, and both parts require a
     *config_dir* (without one there is no correct place to glob for the
@@ -2649,8 +2663,8 @@ async def invoke_with_cap_retry(
     # so that `original_prompt` captures it for fresh-fallback restoration.  We
     # immediately overwrite `invoke_kwargs['prompt']` with CRASH_RECOVERY_RESUME_PROMPT
     # so the first subprocess invocation uses the short continuation string.  The
-    # existing non-cap-hit resume-failure branch (below) then correctly restores
-    # `original_prompt` (the real task prompt) for any subsequent fresh invocation.
+    # resume-rejection branch (below) then correctly restores `original_prompt`
+    # (the real task prompt) for any subsequent fresh invocation.
     # `resume_delivers_prompt` opts a live-continuation caller (the steward) out of
     # this swap: its resumed session must receive the real prompt, not the short
     # crash-recovery continuation prompt.
@@ -2788,10 +2802,10 @@ async def invoke_with_cap_retry(
     #
     # NOTE: if `resume_session_id` was set by the caller (crash-recovery path),
     # this fast path will attempt the resume but cannot fall back to a fresh
-    # invocation on a general failure — the non-cap-hit resume→fresh-fallback
-    # branch in the while-loop below only runs when usage_gate is provided.  In
-    # practice the orchestrator always supplies a gate, but callers without one
-    # should be aware that a failed resume returns the failure result directly.
+    # invocation on a rejected resume — the resume-rejection branch in the
+    # while-loop below only runs when usage_gate is provided.  In practice the
+    # orchestrator always supplies a gate, but callers without one should be
+    # aware that a rejected resume returns the failure result directly.
     # A pre-turn REJECTION is the one exception, and it is not really an
     # exception to that rule: the CLI exited before contacting the API, so
     # there is no session to preserve and _reset_for_fresh_retry's switch to a
@@ -3450,34 +3464,42 @@ async def invoke_with_cap_retry(
                     slot.confirm(result.cost_usd)
                     break
 
-                # Non-cap-hit failure while resuming → fall back to fresh invocation.
-                if not result.success and invoke_kwargs.get('resume_session_id'):
-                    # This branch — and ONLY this branch — is the population
-                    # task 3578 measured: 28 occurrences where a resume was
-                    # armed, the CLI rejected it, and the loop retried fresh
-                    # and returned a SUCCESS, leaving no runs.db event at all.
-                    # Deliberately NOT folded in with the cap-hit
-                    # 'fresh (transcript unreachable)' path above: that one is
-                    # already visible as a cap_hit event, and counting both
-                    # here would conflate two populations with different causes.
-                    #
-                    # NOTE the armed id here is not necessarily the CALLER's:
-                    # after a cap hit this loop re-arms a resume of its own
-                    # (result.session_id), and that re-armed resume can land in
-                    # this branch too.  Record WHICH session each fallback lost
-                    # so the consumer can name it instead of guessing from a
-                    # pre-allocated id the fresh retry has already replaced.
+                # The resume-rejection branch: the CLI refused the armed
+                # session before any model turn (is_resume_rejected), so
+                # there is nothing to keep and the loop retries fresh.  Any
+                # other resumed non-success did work and is returned below
+                # like a fresh invocation's result (task 5579): treating it
+                # as a rejection discarded completed runs.  Deliberately NOT
+                # folded in with the cap-hit 'fresh (transcript unreachable)'
+                # path above: that one is already visible as a cap_hit event.
+                #
+                # NOTE the armed id here is not necessarily the CALLER's:
+                # after a cap hit this loop re-arms a resume of its own
+                # (result.session_id), and that re-armed resume can land in
+                # this branch too.  Record WHICH session each fallback lost
+                # so the consumer can name it instead of guessing from a
+                # pre-allocated id the fresh retry has already replaced.
+                if invoke_kwargs.get('resume_session_id') and is_resume_rejected(result):
                     resume_fallbacks += 1
                     resume_fallback_session_ids.append(
                         str(invoke_kwargs['resume_session_id']),
                     )
                     logger.warning(
-                        f'{label}: resume failed (session_id={invoke_kwargs["resume_session_id"]}), '
-                        f'retrying fresh',
+                        f'{label}: resume rejected by the CLI before any model turn '
+                        f'(session_id={invoke_kwargs["resume_session_id"]}) — retrying fresh. '
+                        f'Cause: {_resume_rejection_cause(result.stderr)}',
                     )
                     _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                     continue  # __aexit__ releases probe slot
 
+                if invoke_kwargs.get('resume_session_id') and not result.success:
+                    logger.warning(
+                        f'{label}: resumed session {invoke_kwargs["resume_session_id"]} ended '
+                        f'non-success without a resume rejection (turns={result.turns}, '
+                        f'cost_usd={result.cost_usd}, subtype={result.subtype!r}, '
+                        f'ended_awaiting_background={result.ended_awaiting_background}) '
+                        f'— returned to the caller; no fresh retry',
+                    )
                 slot.confirm(result.cost_usd)
                 break
 

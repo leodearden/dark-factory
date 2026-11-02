@@ -17,6 +17,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _measured_cli_results import measured_resume_rejection
 
 from shared.cli_invoke import AgentResult, invoke_claude_agent, invoke_with_cap_retry
 from shared.process_cost import ProcessCostBasis
@@ -218,12 +219,7 @@ class TestCapRetryCarriesSessionPrior:
         assert _PRIOR_KWARG not in _second_call_kwargs(invoke_fn)
 
     @pytest.mark.parametrize(('first', 'cap_hits', 'extra'), [
-        (
-            AgentResult(success=False, output='resume broke', turns=3,
-                        duration_ms=60_000, cost_usd=1.0),
-            [False, False],
-            {},
-        ),
+        (measured_resume_rejection('S'), [False, False], {}),
         (
             AgentResult(success=False, output='Unauthorized', api_error_status=401),
             [False, False],

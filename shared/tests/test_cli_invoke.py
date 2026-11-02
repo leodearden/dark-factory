@@ -19,6 +19,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _measured_cli_results import measured_resume_rejection
 
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 from shared.cli_invoke import (
@@ -534,7 +535,7 @@ class TestCapHitResume:
             assert second_call.kwargs.get('prompt') == 'do stuff'
 
     async def test_resume_failure_falls_back_to_fresh(self):
-        """Resume returns success=False (not cap hit) → retry with original prompt."""
+        """The CLI rejects the re-armed resume → retry with original prompt."""
         gate = make_gate_mock(
             account_count=2,
             before_invoke=AsyncMock(side_effect=['token-a', 'token-b', 'token-a']),
@@ -543,7 +544,7 @@ class TestCapHitResume:
         )
 
         capped_result = _make_cap_result(session_id='sess-123')
-        failed_resume = _make_result(success=False, output='resume error')
+        failed_resume = measured_resume_rejection('sess-123')
         ok_result = _make_result()
 
         with (
@@ -603,7 +604,7 @@ class TestCapHitResume:
             assert mock_invoke.call_args_list[2].kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
 
     async def test_fresh_fallback_regenerates_session_id(self):
-        """Failed resume → fresh fallback hands the CLI a NEW pre-allocated UUID.
+        """Rejected resume → fresh fallback hands the CLI a NEW pre-allocated UUID.
 
         Regression for reify-3604: the resume attempt may already have committed
         the caller's pre-allocated UUID to disk, so reusing it on the fresh
@@ -618,9 +619,7 @@ class TestCapHitResume:
             active_account_name='acct',
         )
 
-        # cost_usd defaults to 0.5 in _make_result, so the failure does not trip
-        # the zero-cost heuristic — it routes through the resume-fallback branch.
-        failed_resume = _make_result(success=False, output='resume error')
+        failed_resume = measured_resume_rejection('sess-orig')
         ok_result = _make_result()
 
         with (
@@ -652,19 +651,18 @@ class TestCapHitResume:
 
 @pytest.mark.asyncio
 class TestResumeFallbackCounter:
-    """``AgentResult.resume_fallbacks`` counts armed-then-lost resumes.
+    """``AgentResult.resume_fallbacks`` counts armed-then-rejected resumes.
 
     The population this makes visible: ``invoke_with_cap_retry`` armed
-    ``--resume``, the CLI rejected the session, the loop silently retried fresh
-    and returned a SUCCESS.  Today nothing anywhere records that a resume — and
-    with it the whole prior transcript — was lost; the 28 measured occurrences
-    left no runs.db event at all.  ``shared`` has no event store, so the count
+    ``--resume``, the CLI rejected the session before any model turn, and the
+    loop retried fresh.  Without the count nothing records that a resume — and
+    with it the whole prior transcript — was lost.  ``shared`` has no event store, so the count
     rides out on the result as the carrier the orchestrator reads (step-22)
     without ``shared`` acquiring an event-store dependency.
 
-    THE PREDICATE, EXACTLY: every resumed attempt this loop made that then
-    failed non-cap — the caller's ``resume_session_id`` AND any resume the loop
-    re-armed itself off a capped attempt.  It is therefore not the answer to
+    THE PREDICATE, EXACTLY: every resumed attempt this loop made that the CLI
+    then rejected (``is_resume_rejected``) — the caller's ``resume_session_id``
+    AND any resume the loop re-armed itself off a capped attempt.  It is therefore not the answer to
     "did the resume the ORCHESTRATOR adopted survive?"; the orchestrator gates
     its ``session_resume_failed(stage='cli')`` emit on its own armed session id
     for that.  ``resume_fallback_session_ids`` names which sessions were lost,
@@ -678,11 +676,11 @@ class TestResumeFallbackCounter:
     """
 
     async def test_single_resume_fallback_counted(self):
-        """One armed-then-failed resume → the RETURNED result carries 1.
+        """One armed-then-rejected resume → the RETURNED result carries 1.
 
-        Caller-initiated resume (the pooled-warm-lane shape this task fixes):
-        the first invocation carries the caller's ``resume_session_id``, fails
-        non-cap, and the loop retries fresh and succeeds.
+        Caller-initiated resume (the pooled-warm-lane shape): the first
+        invocation carries the caller's ``resume_session_id``, the CLI rejects
+        it, and the loop retries fresh and succeeds.
         """
         gate = make_gate_mock(
             account_count=1,
@@ -690,9 +688,7 @@ class TestResumeFallbackCounter:
             detect_cap_hit=MagicMock(return_value=False),
             active_account_name='acct',
         )
-        # cost_usd defaults to 0.5, so the failure does not trip the zero-cost
-        # heuristic — it routes through the resume-fallback branch under test.
-        failed_resume = _make_result(success=False, output='resume error')
+        failed_resume = measured_resume_rejection('sess-lost')
         ok_result = _make_result()
 
         with (
@@ -718,12 +714,12 @@ class TestResumeFallbackCounter:
         assert got.resume_fallback_session_ids == ('sess-lost',)
 
     async def test_two_resume_fallbacks_counted(self):
-        """Two armed-then-failed resumes across a cap re-arm → the count reaches 2.
+        """Two armed-then-rejected resumes across a cap re-arm → the count reaches 2.
 
-        Realistic FOUR-call shape: caller resume fails (fallback 1) → fresh
+        Realistic FOUR-call shape: caller resume rejected (fallback 1) → fresh
         retry hits a cap that carries a session id → the loop re-arms
-        ``--resume`` itself → that resume fails too (fallback 2) → fresh retry
-        succeeds.  Proves the counter accumulates rather than latching at one.
+        ``--resume`` itself → that resume is rejected too (fallback 2) → fresh
+        retry succeeds.  Proves the counter accumulates rather than latching at one.
 
         Also the row that pins the counter's REAL predicate: increment 2 comes
         from a resume the LOOP re-armed, not one the caller asked for — which
@@ -736,9 +732,9 @@ class TestResumeFallbackCounter:
             detect_cap_hit=MagicMock(side_effect=[False, True, False, False]),
             active_account_name='acct-b',
         )
-        failed_resume_1 = _make_result(success=False, output='resume error')
+        failed_resume_1 = measured_resume_rejection('sess-lost')
         capped = _make_cap_result(session_id='sess-capped')
-        failed_resume_2 = _make_result(success=False, output='resume error')
+        failed_resume_2 = measured_resume_rejection('sess-capped')
         ok_result = _make_result()
 
         with (
@@ -929,7 +925,7 @@ class TestCallerInitiatedResume:
     When the orchestrator resumes a crashed agent, it now passes the real task
     prompt + resume_session_id to invoke_with_cap_retry.  cli_invoke must
     substitute CRASH_RECOVERY_RESUME_PROMPT for the first subprocess call and
-    restore the real task prompt on any non-cap resume failure fallback.
+    restore the real task prompt on the fresh fallback after a rejected resume.
     """
 
     async def test_caller_resume_substitutes_continuation_prompt_and_restores_real_prompt_on_fresh_fallback(self):
@@ -943,7 +939,7 @@ class TestCallerInitiatedResume:
             active_account_name='acct',
         )
 
-        failed_resume = _make_result(success=False, output='resume error')
+        failed_resume = measured_resume_rejection('sess-xyz')
         ok_result = _make_result()
 
         with patch(
@@ -2568,40 +2564,36 @@ class TestHeuristicCapGating:
         mock_asyncio.sleep.assert_not_called()
         assert got.success is False
 
-    async def test_heuristic_cap_false_falls_through_to_resume_fallback(self):
-        """cap_marked=False + resume_session_id → resume-fallback retries fresh, no sleep.
+    async def test_unattributed_heuristic_cap_on_a_resume_is_returned(self):
+        """cap_marked=False + resume_session_id → the attempt is returned, no retry, no sleep.
 
-        This exercises the secondary path: heuristic fires but _handle_cap_detected
-        returns False (token unresolvable), so the code falls through to the
-        resume-session fallback (line ~372) which pops resume_session_id and
-        retries from scratch — exactly one fresh retry, zero sleeps.
+        The heuristic fires but _handle_cap_detected returns False (token
+        unresolvable), so the attempt is treated as a normal failure.  It took
+        a turn and carries no rejection marker, so it is not a resume rejection
+        (task 5579): it is the terminal attempt, exactly as for a fresh call.
         """
         gate = _make_gate(before_invoke_tokens=['token-a', 'token-b'])
 
-        # First call: heuristic-triggering failure with a prior resume_session_id
         heuristic_result = _make_result(success=False, cost_usd=0, turns=1, duration_ms=100)
-        ok_result = _make_result(success=True, cost_usd=0.5)
 
         with (
             patch(
                 'shared.cli_invoke.invoke_claude_agent',
                 new_callable=AsyncMock,
-                side_effect=[heuristic_result, ok_result],
+                return_value=heuristic_result,
             ) as mock_invoke,
             patch('shared.cli_invoke.asyncio') as mock_asyncio,
         ):
             mock_asyncio.sleep = AsyncMock()
-            # Simulate a prior pattern-match cap hit that left resume_session_id set
             got = await invoke_with_cap_retry(
                 gate, 'test-label',
                 prompt='hi', resume_session_id='sess-123',
             )
 
-        assert got.success is True
-        # Two calls: first (heuristic+resume-fallback triggers retry), second succeeds
-        assert mock_invoke.call_count == 2
-        # No cap-hit cooldown sleep — resume-fallback retries immediately
+        mock_invoke.assert_called_once()
         mock_asyncio.sleep.assert_not_called()
+        assert got.success is False
+        assert got.resume_fallbacks == 0
 
     async def test_heuristic_cap_exponential_backoff_on_consecutive_hits(self):
         """Two consecutive heuristic-True hits produce exponentially increasing cooldowns.
