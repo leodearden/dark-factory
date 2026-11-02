@@ -25,11 +25,9 @@ from shared.phantom_verdict import UNPARSEABLE_VERDICT_CODE, is_phantom_verdict_
 from shared.sqlite_column_migration import add_column_if_missing
 
 from fused_memory.models.reconciliation import (
-    JournalEntry,
     JudgeVerdict,
     ReconciliationRun,
     RunStatus,
-    StageId,
     StageReport,
     Watermark,
 )
@@ -110,20 +108,6 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
-
-CREATE TABLE IF NOT EXISTS journal_entries (
-    id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL,
-    stage TEXT,
-    timestamp TEXT NOT NULL,
-    operation TEXT NOT NULL,
-    target_system TEXT NOT NULL,
-    before_state TEXT,
-    after_state TEXT,
-    reasoning TEXT DEFAULT '',
-    evidence TEXT DEFAULT '[]'
-);
-CREATE INDEX IF NOT EXISTS idx_journal_run ON journal_entries(run_id);
 
 CREATE TABLE IF NOT EXISTS judge_verdicts (
     run_id TEXT PRIMARY KEY,
@@ -312,6 +296,10 @@ class ReconciliationJournal:
             await add_column_if_missing(db, 'runs', 'session_id', 'TEXT')
             await add_column_if_missing(db, 'runs', 'stage_cursor', 'TEXT')
             await add_column_if_missing(db, 'runs', 'attempt', 'INTEGER DEFAULT 0')
+
+            # Retired mutation-audit ledger (task 5890), dropped from DBs created
+            # before its DDL was removed; its idx_journal_run index goes with it.
+            await db.execute('DROP TABLE IF EXISTS journal_entries')
 
         logger.info(f'Reconciliation journal initialized at {db_path}')
 
@@ -773,56 +761,6 @@ class ReconciliationJournal:
             (project_id,),
         )
         return row is not None
-
-    # ── Journal entries ────────────────────────────────────────────────
-
-    async def add_entry(self, entry: JournalEntry) -> None:
-        async with self._require_access().write() as db:
-            await db.execute(
-                """INSERT INTO journal_entries
-                   (id, run_id, stage, timestamp, operation, target_system,
-                    before_state, after_state, reasoning, evidence)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    entry.id,
-                    entry.run_id,
-                    entry.stage.value if entry.stage else None,
-                    entry.timestamp.isoformat(),
-                    entry.operation,
-                    entry.target_system,
-                    json.dumps(entry.before_state) if entry.before_state is not None else None,
-                    json.dumps(entry.after_state) if entry.after_state is not None else None,
-                    entry.reasoning,
-                    json.dumps(entry.evidence),
-                ),
-            )
-
-    async def get_entries(self, run_id: str) -> list[JournalEntry]:
-        rows = await self._require_access().read_all(
-            'SELECT * FROM journal_entries WHERE run_id = ? ORDER BY timestamp',
-            (run_id,),
-        )
-        entries = []
-        for row in rows:
-            entries.append(
-                JournalEntry(
-                    id=row['id'],
-                    run_id=row['run_id'],
-                    stage=StageId(row['stage']) if row['stage'] else None,
-                    timestamp=datetime.fromisoformat(row['timestamp']),
-                    operation=row['operation'],
-                    target_system=row['target_system'],
-                    before_state=json.loads(row['before_state'])
-                    if row['before_state']
-                    else None,
-                    after_state=json.loads(row['after_state'])
-                    if row['after_state']
-                    else None,
-                    reasoning=row['reasoning'],
-                    evidence=json.loads(row['evidence']),
-                )
-            )
-        return entries
 
     # ── Judge verdicts ─────────────────────────────────────────────────
 

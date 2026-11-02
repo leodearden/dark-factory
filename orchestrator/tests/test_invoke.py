@@ -1361,6 +1361,14 @@ class TestInvokePiFlags:
         assert env.get('ANTHROPIC_API_KEY') == 'sk-direct-key'
         assert 'ANTHROPIC_OAUTH_TOKEN' not in env
 
+    async def test_ambient_proxy_endpoint_and_client_key_do_not_reach_pi(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('ANTHROPIC_BASE_URL', 'http://127.0.0.1:8317')
+        monkeypatch.setenv('ANTHROPIC_AUTH_TOKEN', 'proxy-key')
+        mock_run = await self._invoke(tmp_path, oauth_token='tok')
+        env = mock_run.call_args.args[2]
+        assert 'ANTHROPIC_BASE_URL' not in env
+        assert 'ANTHROPIC_AUTH_TOKEN' not in env
+
     async def test_resume_session_id_uses_session_flag(self, tmp_path):
         mock_run = await self._invoke(tmp_path, resume_session_id='r1')
         cmd = mock_run.call_args.args[0]

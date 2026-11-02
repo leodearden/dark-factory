@@ -12,17 +12,20 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import json
 import logging
 import os
 import sys
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any, TypeVar
 
 from shared.cli_invoke import invoke_with_cap_retry
+from shared.safe_io import atomic_write_text
 from shared.usage_gate import UsageGate
 
 from orchestrator.agents.briefing import DIFF_ONLY_DIFF_CAP_CHARS, BriefingAssembler
@@ -42,6 +45,7 @@ from orchestrator.evals.reviewer_trial.corpus import (
     CorpusDiff,
     CorpusManifest,
 )
+from orchestrator.evals.reviewer_trial.scorer import ScoringResult, score_panel_run
 from orchestrator.evals.reviewer_trial.variants import (
     ReviewerSpec,
     VariantConfig,
@@ -96,6 +100,40 @@ DIFF_CAP_CHARS = DIFF_ONLY_DIFF_CAP_CHARS
 _NO_PLAN_REASON = 'the fixture records neither a plan nor why it has none'
 
 
+@dataclass(frozen=True)
+class PanelRunKey:
+    """What, besides the variant and the fixture, decides a panel run's result."""
+
+    prices_sha256: str | None
+    gated: bool
+    diff_cap_chars: int
+
+    @classmethod
+    def of(
+        cls,
+        *,
+        prices: dict | None,
+        usage_gate: UsageGate | None,
+        diff_cap_chars: int,
+    ) -> PanelRunKey:
+        prices_sha256 = None if prices is None else hashlib.sha256(
+            json.dumps(prices, sort_keys=True, default=str).encode(),
+        ).hexdigest()
+        return cls(
+            prices_sha256=prices_sha256,
+            gated=usage_gate is not None,
+            diff_cap_chars=diff_cap_chars,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PanelRunKey:
+        return cls(
+            prices_sha256=data['prices_sha256'],
+            gated=data['gated'],
+            diff_cap_chars=data['diff_cap_chars'],
+        )
+
+
 @dataclass
 class PanelRunResult:
     """Result of running one panel variant against one corpus diff."""
@@ -106,6 +144,20 @@ class PanelRunResult:
     total_cost_usd: float = 0.0
     wall_clock_ms: int = 0
     errors: list[str] = field(default_factory=list)
+    run_key: PanelRunKey | None = None
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PanelRunResult:
+        run_key = data.get('run_key')
+        return cls(
+            variant_name=data['variant_name'],
+            diff_id=data['diff_id'],
+            reviews=dict(data.get('reviews', {})),
+            total_cost_usd=data.get('total_cost_usd', 0.0),
+            wall_clock_ms=data.get('wall_clock_ms', 0),
+            errors=list(data.get('errors', [])),
+            run_key=None if run_key is None else PanelRunKey.from_dict(run_key),
+        )
 
 
 @functools.cache
@@ -433,7 +485,86 @@ async def run_panel(
         total_cost_usd=total_cost,
         wall_clock_ms=elapsed_ms,
         errors=errors,
+        run_key=PanelRunKey.of(prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars),
     )
+
+
+def _slot_filename(variant_name: str, diff_id: str, run_key: PanelRunKey | None) -> str:
+    """The file holding the panel run under *run_key*, and its score; a keyless legacy panel has the bare name."""
+    if run_key is None:
+        return f'{variant_name}__{diff_id}.json'
+    key_digest = hashlib.sha256(json.dumps(asdict(run_key), sort_keys=True).encode()).hexdigest()[:12]
+    return f'{variant_name}__{diff_id}__{key_digest}.json'
+
+
+_Entry = TypeVar('_Entry', PanelRunResult, ScoringResult)
+
+
+def _load_entry(
+    path: Path, from_dict: Callable[[Mapping[str, Any]], _Entry], variant_name: str, diff_id: str,
+) -> _Entry | None:
+    """The entry stored at *path* for this (variant, diff), or None when absent, corrupt or foreign."""
+    try:
+        entry = from_dict(json.loads(path.read_text()))
+    except FileNotFoundError:
+        return None
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        logger.info('Not reusing %s: it is unreadable (%s)', path, exc)
+        return None
+    if (entry.variant_name, entry.diff_id) != (variant_name, diff_id):
+        logger.info('Not reusing %s: it records %s__%s', path, entry.variant_name, entry.diff_id)
+        return None
+    return entry
+
+
+async def run_panel_cached(
+    variant: VariantConfig,
+    diff: CorpusDiff,
+    *,
+    results_dir: Path | None = None,
+    stagger_secs: float = 2.0,
+    prices: dict | None = None,
+    usage_gate: UsageGate | None = None,
+    diff_cap_chars: int = DIFF_CAP_CHARS,
+) -> PanelRunResult:
+    """*variant*'s panel on *diff*, reused from *results_dir* only when stored under an equal PanelRunKey.
+
+    Each key has its own file. A keyless entry written before the key existed
+    is reused when the key's own file is absent. Why, and how to re-measure
+    one: docs/plan-scoring-and-judge.md, "Reviewer-trial panel cache and
+    score loop (task 6741)".
+
+    Raises FixtureNotMaterialisable when the panel has to run and its clone cannot be built.
+    """
+    out_dir = results_dir or _RESULTS_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    wanted = PanelRunKey.of(prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars)
+    path = out_dir / _slot_filename(variant.name, diff.diff_id, wanted)
+
+    cached = _load_entry(path, PanelRunResult.from_dict, variant.name, diff.diff_id)
+    if cached is not None and cached.run_key == wanted:
+        logger.info('Reusing %s', path)
+        return cached
+    legacy_path = out_dir / _slot_filename(variant.name, diff.diff_id, None)
+    legacy = _load_entry(legacy_path, PanelRunResult.from_dict, variant.name, diff.diff_id)
+    if legacy is not None and legacy.run_key is None:
+        logger.info('Reusing %s, a legacy panel that records no run key', legacy_path)
+        return legacy
+    if cached is not None:
+        logger.info('Re-running %s: stored under %s, wanted %s', path, cached.run_key, wanted)
+
+    logger.info('Running %s against %s', variant.name, diff.diff_id)
+    result = await run_panel(
+        variant, diff, stagger_secs=stagger_secs, prices=prices, usage_gate=usage_gate,
+        diff_cap_chars=diff_cap_chars,
+    )
+    atomic_write_text(path, json.dumps(asdict(result), indent=2))
+    logger.info(
+        'Completed %s__%s: cost=$%.2f, wall=%dms, errors=%d',
+        variant.name, diff.diff_id,
+        result.total_cost_usd, result.wall_clock_ms, len(result.errors),
+    )
+    return result
 
 
 async def run_trial(
@@ -444,13 +575,13 @@ async def run_trial(
     results_dir: Path | None = None,
     usage_gate: UsageGate | None = None,
     diff_cap_chars: int = DIFF_CAP_CHARS,
+    stagger_secs: float = 2.0,
 ) -> list[PanelRunResult]:
-    """Run all (variant x diff) pairs with bounded concurrency.
-
-    Persists results incrementally to the results/ directory.
+    """Run all (variant x diff) pairs with bounded concurrency, each through run_panel_cached.
 
     *prices* (default-off) is threaded through to each ``run_panel`` call so
     cross-family (codex/gemini) reviewers get a non-sentinel cost column.
+    Reused legacy panels are counted in one warning.
 
     Raises FixtureEnrichmentMissing, before any reviewer runs, when a
     context-complete variant meets a fixture with no ``context``. A pair whose
@@ -461,36 +592,15 @@ async def run_trial(
         if unenriched:
             raise FixtureEnrichmentMissing(unenriched)
 
-    out_dir = results_dir or _RESULTS_DIR
-    out_dir.mkdir(parents=True, exist_ok=True)
     semaphore = asyncio.Semaphore(max_parallel_panels)
     all_results: list[PanelRunResult] = []
 
     async def _run_and_save(variant: VariantConfig, diff: CorpusDiff) -> PanelRunResult | None:
         async with semaphore:
-            result_path = out_dir / f'{variant.name}__{diff.diff_id}.json'
-
-            # Skip if already completed
-            if result_path.exists():
-                try:
-                    existing = json.loads(result_path.read_text())
-                    logger.info('Skipping %s__%s (already exists)', variant.name, diff.diff_id)
-                    return PanelRunResult(
-                        variant_name=existing['variant_name'],
-                        diff_id=existing['diff_id'],
-                        reviews=existing.get('reviews', {}),
-                        total_cost_usd=existing.get('total_cost_usd', 0.0),
-                        wall_clock_ms=existing.get('wall_clock_ms', 0),
-                        errors=existing.get('errors', []),
-                    )
-                except (json.JSONDecodeError, KeyError):
-                    pass  # Re-run if result file is corrupt
-
-            logger.info('Running %s against %s', variant.name, diff.diff_id)
             try:
-                result = await run_panel(
-                    variant, diff, prices=prices, usage_gate=usage_gate,
-                    diff_cap_chars=diff_cap_chars,
+                return await run_panel_cached(
+                    variant, diff, results_dir=results_dir, stagger_secs=stagger_secs,
+                    prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars,
                 )
             except FixtureNotMaterialisable as exc:
                 logger.warning(
@@ -498,15 +608,6 @@ async def run_trial(
                     variant.name, diff.diff_id, exc.reason,
                 )
                 return None
-
-            # Persist incrementally
-            result_path.write_text(json.dumps(asdict(result), indent=2))
-            logger.info(
-                'Completed %s__%s: cost=$%.2f, wall=%dms, errors=%d',
-                variant.name, diff.diff_id,
-                result.total_cost_usd, result.wall_clock_ms, len(result.errors),
-            )
-            return result
 
     # Build all (variant, diff) pairs
     tasks = [
@@ -522,4 +623,69 @@ async def run_trial(
         elif r is not None:
             all_results.append(r)
 
+    legacy = sum(1 for r in all_results if r.run_key is None)
+    if legacy:
+        logger.warning(
+            'Reused %d legacy panel(s) from %s that record no run key; see docs/plan-scoring-and-judge.md, '
+            '"Reviewer-trial panel cache and score loop (task 6741)"',
+            legacy, results_dir or _RESULTS_DIR,
+        )
     return all_results
+
+
+async def run_and_score(
+    variants: Sequence[VariantConfig],
+    corpus: CorpusManifest,
+    *,
+    results_dir: Path | None = None,
+    score_dir: Path | None = None,
+    max_parallel_panels: int = 3,
+    stagger_secs: float = 2.0,
+    prices: dict | None = None,
+    usage_gate: UsageGate | None = None,
+    diff_cap_chars: int = DIFF_CAP_CHARS,
+    on_scored: Callable[[ScoringResult], None] | None = None,
+) -> list[ScoringResult]:
+    """Every reviewer-trial subcommand's score loop: run_trial's panels, each scored through *usage_gate*.
+
+    With *score_dir*, a score is stored beside the key of the panel it scored:
+    a stored score is reused, and only a measured one is stored. *on_scored*
+    sees each score as it lands. See
+    docs/plan-scoring-and-judge.md, "Reviewer-trial panel cache and score loop (task 6741)".
+    """
+    panels = await run_trial(
+        list(variants), corpus, max_parallel_panels=max_parallel_panels, prices=prices,
+        results_dir=results_dir, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars,
+        stagger_secs=stagger_secs,
+    )
+    scores: list[ScoringResult] = []
+    for panel in panels:
+        diff = corpus.get_diff(panel.diff_id)
+        if diff is None:
+            logger.warning('Not scoring %s__%s: its diff is not in the corpus', panel.variant_name, panel.diff_id)
+            continue
+        score = await _score_cached(panel, diff, score_dir=score_dir, usage_gate=usage_gate)
+        if on_scored is not None:
+            on_scored(score)
+        scores.append(score)
+    return scores
+
+
+async def _score_cached(
+    panel: PanelRunResult,
+    diff: CorpusDiff,
+    *,
+    score_dir: Path | None,
+    usage_gate: UsageGate | None,
+) -> ScoringResult:
+    if score_dir is None:
+        return await score_panel_run(panel, diff, usage_gate=usage_gate)
+    score_dir.mkdir(parents=True, exist_ok=True)
+    path = score_dir / _slot_filename(panel.variant_name, panel.diff_id, panel.run_key)
+    cached = _load_entry(path, ScoringResult.from_dict, panel.variant_name, panel.diff_id)
+    if cached is not None:
+        return cached
+    score = await score_panel_run(panel, diff, usage_gate=usage_gate)
+    if score.unmeasured is None:
+        atomic_write_text(path, json.dumps(asdict(score), indent=2))
+    return score

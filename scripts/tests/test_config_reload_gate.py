@@ -37,6 +37,9 @@ def test_a_healthy_reload_returns_the_unwrapped_report():
         )
 
     assert fetched == report
+    assert server.rpc_methods()[0] == "initialize", server.rpc_methods()
+    assert server.called_tools() == ["reload_config"]
+    assert server.delete_count() == 1
 
 
 @pytest.mark.parametrize(

@@ -49,6 +49,7 @@ from escalation.categories import UnregisteredEscalationCategory, require_regist
 from escalation.declared_pins import blocking_pin_declarations, format_refusal
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe_off_loop as _dedupe_submit_or_dedupe_off_loop
+from escalation.grant_delivery import GrantDelivery, grant_delivery_for, shortfall_reason
 from escalation.merge_lane_resolution import (
     InvalidMergeLane,
     resolve_merge_lane,
@@ -472,6 +473,65 @@ def _get_terminal_retention(harness: Any | None) -> Any | None:
     return getattr(harness, '_terminal_retention', None)
 
 
+def _granted_files_blocker(harness: Any | None, task_id: str) -> GrantDelivery | None:
+    """Ask *harness* why a scope grant for *task_id* could not land; never raises.
+
+    Centralises the ``granted_files_delivery_blocker`` probe
+    (``orchestrator/src/orchestrator/harness.py::Harness.granted_files_delivery_blocker``)
+    so its name lives in exactly one place.  When *harness* is None nothing
+    routes the grant, so the answer is ``NO_ORCHESTRATOR``.  An absent or
+    failing probe answers None: routing in ``Harness._on_escalation_resolved``
+    does not depend on it, so the grant is still scheduled, and a diagnostic
+    must never fail a resolution — the same best-effort contract as the
+    ``escalate_model`` routing-tier bump.
+    """
+    if harness is None:
+        return GrantDelivery.NO_ORCHESTRATOR
+    probe = getattr(harness, 'granted_files_delivery_blocker', None)
+    if not callable(probe):
+        return None
+    try:
+        blocker = probe(task_id)
+    except Exception:
+        logger.warning(
+            'granted_files delivery probe failed for task %s (non-fatal)',
+            task_id, exc_info=True,
+        )
+        return None
+    if blocker is None or isinstance(blocker, GrantDelivery):
+        return blocker
+    logger.warning(
+        'granted_files delivery probe for task %s answered %r, not a '
+        'GrantDelivery (ignored)', task_id, blocker,
+    )
+    return None
+
+
+def _stamp_grant_delivery(
+    payload: dict[str, Any],
+    *,
+    harness: Any | None,
+    task_id: str,
+    granted_files: list[str] | None,
+    workflow_disposition: str,
+    applied: bool,
+) -> dict[str, Any]:
+    """Add ``granted_files_delivery`` (always) and its reason (on a shortfall) to *payload*."""
+    delivery = grant_delivery_for(
+        granted_files=granted_files,
+        workflow_disposition=workflow_disposition,
+        applied=applied,
+        probe_blocker=lambda: _granted_files_blocker(harness, task_id),
+    )
+    payload['granted_files_delivery'] = delivery.value
+    reason = shortfall_reason(
+        delivery, task_id=task_id, granted_files=granted_files or [],
+    )
+    if reason is not None:
+        payload['granted_files_delivery_reason'] = reason
+    return payload
+
+
 def _get_merge_journal(harness: Any | None) -> MergeQueueStore | None:
     """Return the harness-mounted durable merge journal, or None.
 
@@ -725,6 +785,30 @@ _COMPACT_ESCALATION_FIELDS = (
     # and giving absence a second, different meaning on a neighbouring key would
     # be exactly the legibility trap that contract exists to prevent.
     'pin_declared_by',
+    # project_id (task 4951) is DELIBERATELY NOT PROJECTED — decided in task 5776
+    # (won't-fix), so do not re-file it as an oversight.
+    #
+    # THE GAP IS REAL BUT NARROW: the reconciliation queue is shared across
+    # projects, so a compact row there cannot name its subject project.  An
+    # orchestrator queue is per-project (each endpoint serves one project), so
+    # for those the answer is already the endpoint itself.
+    #
+    # WHY IT IS NOT WORTH A KEY ON EVERY ROW: (1) the in-repo consumers
+    # (orphaned_recon_escalation_sweep.py::escalation_project_id and
+    # derive_orphaned_recon_escalations.py) read FULL records, so nothing needs
+    # it; (2) `None` means UNSTAMPED, and `attach_dedupe_child` never backfills a
+    # folded parent, so a parent filed before 4951 never gains it — a compact
+    # reader would see `null`, could not tell "legacy" from "no project", and
+    # would STILL need a get_escalation round-trip for exactly the records it
+    # cares about; (3) it costs ~20 bytes (`"project_id":null`) on
+    # EVERY compact row, including the dashboard's fetch_pins_recovery poll that
+    # reads nothing but `pins_recovery`, for a value that is null on the
+    # overwhelming majority.
+    #
+    # IF A PROJECT-SCOPED COMPACT DRAIN EVER EXISTS: add a server-side
+    # `project_id` filter to get_pending_escalations (one filtered value per
+    # call, no per-row cost) rather than widening this tuple — and note that no
+    # such filter exists today.
 )
 
 # get_pending_escalations(compact=True) additionally keeps its computed
@@ -760,8 +844,9 @@ def _compact_escalation(d: dict[str, Any], fields: tuple[str, ...]) -> dict[str,
 
 
 # INV-4 storm escape for L2 amendment truncation (task 3997).  Sizing: with
-# ``queue._MAX_AMENDMENTS`` = 20, ONE L2 has to fold 21+ times inside the window
-# to truncate even ONCE, so three truncations in an hour is not routine churn.
+# ``escalation/src/escalation/amendments.py::MAX_AMENDMENTS`` = 20, ONE L2 has to fold
+# 21+ times inside the window to truncate even ONCE, so three truncations in an
+# hour is not routine churn.
 # It says either the cap is systematically wrong for the live fold rate, or
 # root-cause matching is over-folding unrelated clusters into a single L2 — and
 # task 3998 canonicalises that matching, which RAISES the fold rate BY DESIGN.
@@ -1549,9 +1634,9 @@ def create_server(
 
         Called by both amendment writers' tools — a ``promote_to_l2`` fold and
         an explicit ``amend_escalation`` — whenever their write shed entries.
-        ``queue._append_amendment_capped`` already counts every dropped
-        amendment on the record itself (``amendments_truncated``) and logs a
-        WARNING.  The
+        ``escalation/src/escalation/amendments.py::append_amendment_capped`` already
+        counts every dropped amendment on the record itself
+        (``amendments_truncated``) and logs a WARNING.  The
         counter stays the PRIMARY structured fact — the contract is assertable
         from the record, never by log-scrape (INV-8) — but a WARNING has no
         audience.  This is the rate-thresholded NOTIFICATION layered on top,
@@ -1638,7 +1723,8 @@ def create_server(
                     f"OBSERVED: {storm['count']} amendment truncations within "
                     f"{storm['window_seconds']}s across L2 escalation(s): {labels}.\n"
                     f"Each truncation drops the OLDEST entry of that L2's "
-                    f"`amendments` list at the queue._MAX_AMENDMENTS cap; the "
+                    f"`amendments` list at the "
+                    f"escalation/src/escalation/amendments.py::MAX_AMENDMENTS cap; the "
                     f"record's own `amendments_truncated` field holds the durable "
                     f"per-L2 total, and its own root_cause/detail/options/summary "
                     f"are never touched.\n"
@@ -1649,7 +1735,8 @@ def create_server(
                 suggested_action=(
                     'Read the named L2s and compare each record\'s own framing '
                     'against its amendments to judge whether those folds belong '
-                    'together; then either raise queue._MAX_AMENDMENTS or tighten '
+                    'together; then either raise '
+                    'escalation/src/escalation/amendments.py::MAX_AMENDMENTS or tighten '
                     'root-cause matching.'
                 ),
             ))
@@ -2313,10 +2400,21 @@ def create_server(
         ``granted_files`` (task 2505): an optional structured scope-expansion
         grant — a list of file-level, project-relative paths — consumed only
         on the ``action='resume'`` orchestrator path (it widens
-        ``plan.files``/``metadata.files``/locks there). Distinct from
-        ``resolution``, which stays free-text human-readable rationale. Not
-        forwarded to the ``park`` action; omit to leave the record's
-        ``granted_files`` at its existing value (``[]`` for a fresh record).
+        ``plan.files``/``metadata.files`` there). Distinct from
+        ``resolution``, which stays free-text human-readable rationale. Omit
+        it to leave the record's ``granted_files`` at its existing value
+        (``[]`` for a fresh record).
+
+        Every success return carries ``granted_files_delivery``, one of
+        ``escalation.grant_delivery.GrantDelivery``, plus a
+        ``granted_files_delivery_reason`` only when there is a shortfall to
+        explain (task 5650).  Like ``late_resolution_captured`` the key is
+        always present, so index it.  ``scheduled`` means ROUTED, not landed:
+        delivery is asynchronous, and a shortfall found there is appended to
+        the record's ``resolution`` under
+        ``escalation.grant_delivery.GRANT_NOT_DELIVERED_MARKER``.  ``park``
+        returns before the record is resolved, so it DISCARDS a grant and says
+        so; a resolve against an already-closed record records nothing.
 
         ``resolution_class`` optionally stamps an explicit
         ``'benign'``/``'actionable'`` classification
@@ -2640,7 +2738,12 @@ def create_server(
             )
             if esc is None:
                 return {'error': f'Escalation {escalation_id} not found'}
-            return _attach_related_pending(esc.to_dict(), esc)
+            payload = _stamp_grant_delivery(
+                esc.to_dict(), harness=harness, task_id=rec.task_id,
+                granted_files=granted_files,
+                workflow_disposition=effect.workflow_disposition, applied=True,
+            )
+            return _attach_related_pending(payload, esc)
 
         # DECLARED-PIN GATE (task 4377) — see the "Declared-pin gate" section of
         # this docstring.  Its POSITION is load-bearing in two ways.  It sits
@@ -2759,6 +2862,12 @@ def create_server(
                     if corrected else '.'
                 )
             )
+        _stamp_grant_delivery(
+            payload, harness=harness, task_id=rec.task_id,
+            granted_files=granted_files,
+            workflow_disposition=effect.workflow_disposition,
+            applied=resolve_outcome['applied'],
+        )
         return _attach_related_pending(payload, esc)
 
     @mcp.tool()
@@ -3366,10 +3475,10 @@ def create_server(
         existing L2's ``amendments`` list rather than discarding them (task
         3997): the record's OWN framing stays immutable, but the framing a fold
         carried in is no longer lost.  That list is bounded — oldest-shed at
-        ``queue._MAX_AMENDMENTS``, with every drop counted in the record's
-        ``amendments_truncated``.  The info-only refusal (see *severity*) is
-        judged BEFORE this fold, so an all-info cluster is never folded into an
-        already-pending L2 either.
+        ``escalation/src/escalation/amendments.py::MAX_AMENDMENTS``, with every
+        drop counted in the record's ``amendments_truncated``.  The info-only
+        refusal (see *severity*) is judged BEFORE this fold, so an all-info
+        cluster is never folded into an already-pending L2 either.
 
         **Members stay at L1**: the member L1 escalations are referenced but
         NOT promoted; they remain pending at L1 until the L2 is resolved.
@@ -3401,9 +3510,10 @@ def create_server(
 
         **Sentinel-bound members** (task 4541): when at least one member
         resolves and EVERY resolved member was filed under a role in
-        ``escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES`` (today the
-        recovery-veto-streak alarm and the offline lane's escalations), a new
-        L2 must be minted under one of those members' own task ids.  Any other *task_id* is refused with
+        ``escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES`` (the
+        sentinel-filed orchestrator alarms; that frozenset is the list), a new
+        L2 must be minted under one of those members' own task ids.  Any other
+        *task_id* is refused with
         ``code: 'sentinel_task_id_required'`` and ``required_task_ids`` —
         re-issue with one of them — and nothing is minted, for header-less
         callers too.  Why: see
@@ -3524,7 +3634,8 @@ def create_server(
         parse per fold and raced concurrent folds in either direction.  A
         framing-free or framing-identical re-promote appends nothing and
         correctly reports False.  ``amendments`` is the resulting list length,
-        which saturates at ``queue._MAX_AMENDMENTS``.
+        which saturates at
+        ``escalation/src/escalation/amendments.py::MAX_AMENDMENTS``.
 
         ``severity`` reports what was ACTUALLY filed, which for a caller that
         omitted the argument is how the inherited value becomes visible — and
@@ -3892,7 +4003,7 @@ def create_server(
 
         Named ``lane``, not ``merge_lane``, because that is the word the whole
         merge-queue boundary already uses: ``MergeRequest.lane``,
-        ``orchestrator/src/orchestrator/merge_queue.py::MERGE_LANES``, and the
+        ``orchestrator/src/orchestrator/merge_lane/intake.py::MERGE_LANES``, and the
         ``lane`` field ``get_merge_queue`` emits per queue item.  The TASK
         METADATA key stays ``merge_lane`` because task metadata is one flat
         global namespace in which a bare ``lane`` would collide with the warm,

@@ -604,11 +604,11 @@ class TestDfChartsDestructure:
     """The shared `window.DF_CHARTS` destructure/export parser.
 
     The primitive returns (canonical, local) PAIRS rather than one side,
-    because the three consumers it replaces project OPPOSITE halves of the
-    same line: test_charts_consumer_bindings wants the LOCAL/alias name (what
-    the file must actually reference), test_charts_axis_labels wants the
-    CANONICAL/source name (what must exist on the namespace object), and
-    test_tab_burndown wants both at once.  On `HistBar: HB` those are `'HB'`
+    because its two DF_CHARTS consumers project OPPOSITE halves of the same
+    line: test_charts_consumer_bindings wants the LOCAL/alias name (what the
+    file must actually reference), and test_tab_burndown wants both at once,
+    including the CANONICAL/source names of the export literal (what must
+    exist on the namespace object).  On `HistBar: HB` those are `'HB'`
     and `'HistBar'` — disjoint — so a primitive that picked a side would
     silently invert one suite.
     """
@@ -640,8 +640,8 @@ class TestDfChartsDestructure:
         """The LIST shape is load-bearing — each caller does its own projection.
 
         consumer_bindings' `_unused_bindings` must report a repeated binding
-        twice; burndown's dict collapses last-wins; axis_labels' set dedupes.
-        Collapsing here would take that choice away from all three.
+        twice; burndown's alias map collapses last-wins and its export set
+        dedupes.  Collapsing here would take that choice away from both.
         """
         assert destructure_bindings('A, B, A') == [
             ('A', 'A'), ('B', 'B'), ('A', 'A'),
@@ -679,8 +679,8 @@ class TestDfChartsDestructure:
     def test_a_nested_brace_yields_no_match(self) -> None:
         """The `[^{}]*` class is brace-HOSTILE by design; do not widen it.
 
-        Three call sites turn this miss into a loud, self-naming failure that
-        points at the nested brace.  Widening it would instead let the parser
+        A miss hands the consumer no binding list at all, so its downstream
+        assertion goes red.  Widening it would instead let the parser
         return a half-read binding list, and a sweep built on that list would
         go quietly wrong rather than loudly red.
         """

@@ -297,6 +297,7 @@ class ReviewAggregation:
     suggestions: list[dict]
     reviews: dict[str, dict]
     reviewer_errors: list[str] = field(default_factory=list)
+    errored_reviews: dict[str, dict] = field(default_factory=dict)
 
     @property
     def all_reviewers_errored(self) -> bool:
@@ -1102,16 +1103,21 @@ class TaskArtifacts:
         return reviews
 
     def aggregate_reviews(self) -> ReviewAggregation:
-        """Aggregate every review as ``orchestrator/review_payload.py::normalize_review`` reads it."""
+        """Aggregate every review as ``orchestrator/review_payload.py::normalize_review`` reads it.
+
+        ERROR reviews are kept out of ``reviews`` and returned verbatim in
+        ``errored_reviews`` (``reviewer_errors`` is its names), so the review
+        arm can read each errored reviewer's failure record.
+        """
         reviews = self.read_reviews()
         blocking = []
         suggestions = []
-        errors = []
+        errored_reviews = {}
 
         for reviewer_name, review in reviews.items():
             payload = normalize_review(review)
             if payload.verdict is Verdict.ERROR:
-                errors.append(reviewer_name)
+                errored_reviews[reviewer_name] = review
             blocking.extend(
                 {**issue, 'reviewer': reviewer_name} for issue in payload.blocking_issues
             )
@@ -1119,13 +1125,14 @@ class TaskArtifacts:
                 {**issue, 'reviewer': reviewer_name} for issue in payload.suggestions
             )
 
-        clean = {k: v for k, v in reviews.items() if k not in errors}
+        clean = {k: v for k, v in reviews.items() if k not in errored_reviews}
         return ReviewAggregation(
             has_blocking_issues=len(blocking) > 0,
             blocking_issues=blocking,
             suggestions=suggestions,
             reviews=clean,
-            reviewer_errors=errors,
+            reviewer_errors=list(errored_reviews),
+            errored_reviews=errored_reviews,
         )
 
     def validate_plan_prerequisites(self) -> None:
@@ -1368,6 +1375,9 @@ class TaskArtifacts:
     # files at most genuinely-new pairs.
     # ──────────────────────────────────────────────────────────────────
 
+    _RECONCILE_STATE_NAME = 'reconcile_state.json'
+    _EMITTED_STEP_ESCALATIONS_KEY = 'emitted_done_step_escalations'
+
     def read_emitted_step_escalations(self) -> set[tuple[str, str]]:
         """Return the set of ``(step_id, stale_commit)`` orphaned-done-step
         escalation keys already filed for this task, persisted across restarts.
@@ -1375,26 +1385,39 @@ class TaskArtifacts:
         Stored at ``self.root/reconcile_state.json`` (beside plan.json in the
         meta-root).  JSON has no set/tuple types, so the on-disk shape is
         ``{"emitted_done_step_escalations": [[step_id, commit], ...]}``; each
-        2-element list is re-tupled here and malformed entries are skipped.
+        2-element list of strings is re-tupled here; any other entry is
+        skipped, with one warning counting the skipped entries.
 
-        Fail-safe: a missing file, corrupt/unreadable or non-UTF-8 JSON, or a
-        non-object payload all return an empty ``set``, so a corrupt sidecar
-        re-files rather than silently suppressing.
+        Fail-safe: a missing file, corrupt/unreadable or non-UTF-8 JSON, a
+        non-object payload, or a non-list ``emitted_done_step_escalations``
+        field all return an empty ``set``, so a corrupt sidecar re-files
+        rather than silently suppressing.
         """
-        data = self._read_json_object('reconcile_state.json')
+        name = self._RECONCILE_STATE_NAME
+        key = self._EMITTED_STEP_ESCALATIONS_KEY
+        data = self._read_json_object(name)
         if data is None:
             return set()
-        result: set[tuple[str, str]] = set()
-        for entry in data.get('emitted_done_step_escalations', []):
-            # Each entry must be a 2-element [step_id, commit] list of strings;
-            # skip anything malformed rather than raising (fail-safe read).
-            if (
-                isinstance(entry, list)
-                and len(entry) == 2
-                and all(isinstance(x, str) for x in entry)
-            ):
-                result.add((entry[0], entry[1]))
-        return result
+        entries = data.get(key, [])
+        if not isinstance(entries, list):
+            logger.warning(
+                'Malformed %s at %s: %s is not a list',
+                name, self._read_path(name), key,
+            )
+            return set()
+        pairs = [
+            (entry[0], entry[1])
+            for entry in entries
+            if isinstance(entry, list)
+            and len(entry) == 2
+            and all(isinstance(x, str) for x in entry)
+        ]
+        if len(pairs) < len(entries):
+            logger.warning(
+                'Malformed %s at %s: skipped %d malformed %s entries',
+                name, self._read_path(name), len(entries) - len(pairs), key,
+            )
+        return set(pairs)
 
     def append_emitted_step_escalation(
         self, step_id: str, stale_commit: str
@@ -1420,9 +1443,9 @@ class TaskArtifacts:
             return
         keys.add((step_id, stale_commit))
         self._write_json(
-            self.root / 'reconcile_state.json',
+            self.root / self._RECONCILE_STATE_NAME,
             {
-                'emitted_done_step_escalations': sorted(
+                self._EMITTED_STEP_ESCALATIONS_KEY: sorted(
                     [k[0], k[1]] for k in keys
                 )
             },

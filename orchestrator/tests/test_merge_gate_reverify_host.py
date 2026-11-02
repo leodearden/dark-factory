@@ -549,8 +549,8 @@ async def _abort_a_gate_verifying_on(scene: _Scene, *, cancel_rc: int = 0) -> tu
 async def test_cancelling_the_lane_mid_remote_gate_aborts_the_remote_verify_while_live(
     remote_scene: _Scene,
 ) -> None:
-    """The merger awaits the gate inline, so cancelling the lane must abort the
-    remote verify through the worker's teardown chokepoint while it is still
+    """The cancelled verifier loop pre-empts the parked gate, so it must abort
+    the remote verify through the worker's teardown chokepoint while it is still
     live; otherwise the verify-merge is orphaned on the host (task 1757)."""
     host, unwound = await _abort_a_gate_verifying_on(remote_scene)
 

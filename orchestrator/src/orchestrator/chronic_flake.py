@@ -583,9 +583,8 @@ def _unwrap_dispatch_envelope(result: object) -> dict:
 
     Tolerates a bare payload dict, ``{'structuredContent': {...}}`` /
     ``{'result': {...}}`` nested, or a ``content`` list of text blocks
-    carrying JSON, so the parsers here — :func:`_extract_results_list`,
-    :func:`_extract_task`, and
-    :func:`_extract_statuses_map` for bare shapes — share one seam. Returns
+    carrying JSON, so the parsers here — :func:`_extract_results_list` and
+    :func:`_extract_task` — share one seam. Returns
     ``{}`` for a non-dict *result* or when no known shape unwraps.
 
     UNWRAPS ITERATIVELY, and that is the whole correctness of it.  The
@@ -596,9 +595,10 @@ def _unwrap_dispatch_envelope(result: object) -> dict:
     — so a single step lands on the INNER RESULT, whose keys are
     ``content``/``structuredContent``/``isError`` and never the payload's own.
     A one-step unwrapper therefore returns a dict in which every payload key is
-    absent, which each parser above reads as a well-formed envelope that simply
-    does not carry its key: ``_extract_statuses_map`` returned an error on
-    EVERY successful production call.  Corroborated by
+    absent, which each parser over this seam reads as a well-formed envelope
+    that simply does not carry its key: :func:`_extract_task` would report no
+    task, and :func:`_extract_results_list` no results, for EVERY successful
+    production call, as ``_extract_statuses_map`` once did.  Corroborated by
     ``orchestrator/src/orchestrator/scheduler.py::SchedulerFacade.get_statuses``, which
     parses the very same ``dispatch_tool`` result with
     ``shared.mcp_envelope.parse_tool_result(result, 'statuses', dict)`` — a
@@ -609,8 +609,9 @@ def _unwrap_dispatch_envelope(result: object) -> dict:
     are returned untouched.  ``shared.mcp_envelope.parse_tool_result`` cannot
     stand in for this generic unwrap, because it accepts ONLY the strict
     ``result.content[].text`` spelling and rejects every bare shape; where one
-    tool's reader must match the scheduler's, as :func:`_extract_statuses_map`
-    does, it is used for JSON-RPC bodies and this unwrap only for bare ones.
+    tool's reader must match the scheduler's, as ``get_statuses``' must,
+    :func:`_extract_statuses_map` reads the response with it and this unwrap
+    only describes a failed read.
     """
     if not isinstance(result, dict):
         return {}
@@ -672,11 +673,11 @@ def _extract_statuses_map(result: object) -> tuple[dict[str, str], Exception | N
     """Extract a ``get_statuses`` response's ``statuses`` mapping from a
     ``dispatch_tool`` result, as a ``(statuses, error)`` pair.
 
-    A JSON-RPC response is parsed by ``shared.mcp_envelope.parse_tool_result(result,
-    'statuses', dict)``, the exact call ``scheduler.py::Scheduler.get_statuses`` makes,
-    so the two readers of this tool cannot disagree; its error becomes the reported
-    error's ``__cause__``.  Only an already-unwrapped bare shape, which test fakes alone
-    produce, goes through :func:`_unwrap_dispatch_envelope`.
+    Every response, a non-JSON-RPC one included, is read by one call to
+    ``shared.mcp_envelope.parse_tool_result(result, 'statuses', dict)``, the exact call
+    ``scheduler.py::Scheduler.get_statuses`` makes, so the two readers of this tool
+    cannot disagree; its error becomes the reported error's ``__cause__``.
+    :func:`_unwrap_dispatch_envelope` only describes a failed read.
 
     The PAIR is what keeps two things that both look like an empty mapping apart.  A
     PRESENT ``statuses`` dict, even an empty one, is a CORROBORATED ABSENCE: the tool
@@ -694,25 +695,14 @@ def _extract_statuses_map(result: object) -> tuple[dict[str, str], Exception | N
     Keys and values are coerced to ``str``: the tool returns JSON, but a caller may
     hand ints and the consumer (``flake_ledger``) looks the id up as a ``str``.
     """
-    if _is_jsonrpc_response(result):
-        statuses, parse_error = parse_tool_result(result, 'statuses', dict)
-        if parse_error is not None:
-            return {}, _response_error(
-                f'get_statuses response unreadable ({parse_error})',
-                _unwrap_dispatch_envelope(result),
-                cause=parse_error,
-            )
-        assert statuses is not None
-    else:
-        envelope = _unwrap_dispatch_envelope(result)
-        if 'statuses' not in envelope:
-            return {}, _response_error('get_statuses response carries no "statuses" key', envelope)
-        statuses = envelope['statuses']
-        if not isinstance(statuses, dict):
-            return {}, _response_error(
-                f'get_statuses response "statuses" is {type(statuses).__name__}, not a dict',
-                envelope,
-            )
+    statuses, parse_error = parse_tool_result(result, 'statuses', dict)
+    if parse_error is not None:
+        return {}, _response_error(
+            f'get_statuses response unreadable ({parse_error})',
+            _unwrap_dispatch_envelope(result),
+            cause=parse_error,
+        )
+    assert statuses is not None
     return {str(key): str(value) for key, value in statuses.items()}, None
 
 
@@ -727,8 +717,7 @@ def _extract_task(result: object) -> tuple[dict | None, Exception | None]:
     """Extract a ``get_task`` response's task from a ``dispatch_tool`` envelope (see
     :func:`_unwrap_dispatch_envelope`), as a ``(task, error)`` pair.
 
-    Beside :func:`_extract_statuses_map` and over the same seam, for the same reason:
-    one envelope policy for every parser.  Three readings, which
+    Three readings, which
     ``orchestrator/src/orchestrator/flake_ledger.py::resolve_debt`` must tell apart:
 
     - ``(task, None)`` — a dict carrying ``status``, after descending one ``data``
@@ -761,8 +750,8 @@ def _extract_metadata_matches(result: object) -> tuple[list[dict], bool, Excepti
     """One ``find_tasks_by_metadata`` page from a ``dispatch_tool`` result, as ``(rows,
     has_more, error)``.
 
-    Two branches, as in :func:`_extract_statuses_map`: a JSON-RPC body is parsed whole by
-    ``shared.mcp_envelope.parse_tool_result``, a bare shape by
+    Two branches: a JSON-RPC body is parsed whole by
+    ``shared.mcp_envelope.parse_tool_result``, an already-unwrapped bare shape by
     :func:`_unwrap_dispatch_envelope`.  Rows are returned as the tool sent them, so an
     int ``task_id`` stays an int.  Construct-don't-raise.
     """

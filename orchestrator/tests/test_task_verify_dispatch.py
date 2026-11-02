@@ -39,6 +39,7 @@ from orchestrator.task_verify_dispatch import (
 )
 from orchestrator.task_verify_spec import TaskVerifySpec, task_spec_from_json
 from orchestrator.verify import VerifyInfraError, VerifyResult
+from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
 from orchestrator.verify_hosts import HostPool
 from orchestrator.verify_runner import HostAllocator, RunnerUnavailable, result_to_json
 
@@ -147,7 +148,7 @@ class TestEligible:
 
 
 class TestDispatchDecision:
-    @pytest.mark.parametrize('reason', ['local', 'REMOTE', 'busy'])
+    @pytest.mark.parametrize('reason', ['local', 'REMOTE', 'busy', 'pressure_hold'])
     def test_reason_outside_the_vocabulary_is_refused(self, reason) -> None:
         with pytest.raises(ValueError, match=f"'{reason}'"):
             _decision(reason)
@@ -156,6 +157,8 @@ class TestDispatchDecision:
         ('remote', 'remote'),
         ('not_eligible', 'local'),
         ('merge_demand', 'local'),
+        ('host_busy', 'local'),
+        ('host_quarantined', 'local'),
         ('cross_check', 'local'),
         ('red_confirm', 'local'),
         ('dispatcher_error', 'local'),
@@ -430,6 +433,16 @@ def _harness(
 _ORCH_ONLY = TaskVerifyPolicy(host_policy='remote_modules', remote_modules=('orchestrator',))
 
 
+async def _held_by_a_merge_lease(allocator: HostAllocator) -> None:
+    assert allocator.acquire_remote() is not None
+
+
+async def _benched(allocator: HostAllocator) -> None:
+    lease = allocator.acquire_remote()
+    assert lease is not None
+    await allocator.quarantine_and_release(lease)
+
+
 # ---------------------------------------------------------------------------
 # Routing that never reaches a remote
 # ---------------------------------------------------------------------------
@@ -551,6 +564,25 @@ class TestLocalRoutes:
         assert h.only_sidecar()['reason'] == 'merge_demand'
         assert h.local.observed == [False]
         assert h.allocator.is_busy('laptop') is False
+        assert h.transport.log == []
+
+    @pytest.mark.parametrize(('enter_state', 'reason'), [
+        pytest.param(_held_by_a_merge_lease, 'host_busy', id='held-by-a-merge-lease'),
+        pytest.param(_benched, 'host_quarantined', id='benched'),
+    ])
+    async def test_an_unleasable_host_runs_locally_naming_its_state(
+        self, tmp_path: Path, enter_state: Callable[[HostAllocator], Awaitable[None]],
+        reason: str,
+    ) -> None:
+        h = _harness(tmp_path, _ORCH_ONLY, demand=True)
+        await enter_state(h.allocator)
+
+        result = await h.call()
+
+        assert result is h.local.result
+        assert h.local.calls == [h.expected_call()]
+        assert h.only_sidecar()['reason'] == reason
+        assert h.hooks.demand_calls == 0
         assert h.transport.log == []
 
     async def test_no_remote_host_runs_locally(self, tmp_path: Path) -> None:
@@ -731,17 +763,42 @@ class TestRemoteLeg:
         assert h.hooks.recovered == []
         _assert_slot_free(h)
 
-    async def test_an_infra_transient_remote_red_reruns_locally_in_the_same_call(
-        self, tmp_path: Path,
+    @pytest.mark.parametrize('category', sorted(INFRA_TRANSIENT_CATEGORIES))
+    async def test_an_infra_transient_remote_red_is_reported_unavailable_and_reruns_locally(
+        self, tmp_path: Path, category: str,
     ) -> None:
-        remote_red = _result(False, category='env_transient', summary='uv cache locked')
+        remote_red = _result(False, category=category, summary=f'{category} on the host')
         h = _harness(tmp_path, _ORCH_ONLY, transport=_Transport(verify=_answers(remote_red)))
 
         result = await h.call()
 
         assert result is h.local.result
         assert h.local.calls == [h.expected_call()]
-        assert h.only_sidecar()['reason'] == 'infra_transient'
+        sidecar = h.only_sidecar()
+        assert (sidecar['reason'], sidecar['decision'], sidecar['runner']) == (
+            'infra_transient', 'local', 'local',
+        )
+        assert h.hooks.recovered == []
+        [(name, exc)] = h.hooks.unavailable
+        assert (name, exc.kind) == ('laptop', 'no_verdict')
+        assert str(category) in str(exc)
+        assert h.allocator.is_quarantined('laptop') is False
+        _assert_slot_free(h)
+
+    async def test_a_non_infra_remote_red_is_a_verdict_and_counts_as_recovery(
+        self, tmp_path: Path,
+    ) -> None:
+        remote_red = _result(False, category='test_failure')
+        h = _harness(tmp_path, _ORCH_ONLY, transport=_Transport(verify=_answers(remote_red)))
+
+        result = await h.call()
+
+        assert result.passed is False
+        assert h.local.calls == []
+        sidecar = h.only_sidecar()
+        assert (sidecar['reason'], sidecar['runner']) == ('remote', 'laptop')
+        assert h.hooks.recovered == ['laptop']
+        assert h.hooks.unavailable == []
         _assert_slot_free(h)
 
     async def test_an_unexpected_transport_error_is_a_dispatcher_error(self, tmp_path: Path) -> None:

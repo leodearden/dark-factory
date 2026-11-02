@@ -1,5 +1,7 @@
-"""The Stop hook's opt-in self-exit: decide from the record dir, then SIGINT the owning ``claude``.
+"""The Stop hook's self-exit: decide from the record dir, then SIGINT the owning ``claude``.
 
+Whether a spawn has self-exit on is ``record.self_exit``, resolved per lane by
+``skills/spawn/spawn-claude.sh`` (rule: ``skills/spawn/SKILL.md``).
 A spawned session that has finished touches ``exit-requested`` in its record
 dir. On a proven-owner Stop, ``SelfExit.evaluate`` checks every precondition
 and returns the ``ExitRequest`` the hook stamps in its one write;

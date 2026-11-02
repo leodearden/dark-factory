@@ -333,8 +333,14 @@ _LIVE_CHAINED_LINT_COMMANDS = [
     ('root', ROOT_LINT_COMMAND),
     ('fused-memory', FM_LINT_COMMAND),
     ('dashboard', DASHBOARD_LINT_COMMAND),
+    ('scripts', SCRIPTS_LINT_COMMAND),
     *sorted(MODULE_LINT_COMMANDS.items()),
 ]
+
+# A single-segment lint command. No live config is chainless since task 6230
+# chained the envelope-literal guard onto every module's lint_command, so the
+# chainless gate behaviour is pinned on this synthetic literal instead.
+_CHAINLESS_LINT_COMMAND = 'uv run --project shared ruff check scripts/'
 
 
 class TestParseChainRecoversLintTypeIdentity:
@@ -368,8 +374,8 @@ class TestParseChainRecoversLintTypeIdentity:
             'identity recovery must not change rendering'
         )
 
-    def test_chainless_scripts_lint_command_stays_structured(self):
-        cmd = parse_config_command(SCRIPTS_LINT_COMMAND)
+    def test_chainless_lint_command_stays_structured(self):
+        cmd = parse_config_command(_CHAINLESS_LINT_COMMAND)
         assert cmd.tool is ToolKind.RUFF
         assert cmd.raw is None, 'a single-segment command keeps its structured parse'
 
@@ -2536,11 +2542,11 @@ class TestSplitChainTail:
         prefix, tail = split_chain_tail(raw, keyword)
         assert prefix + tail == raw
 
-    def test_accepts_fused_memory_lint_chain_and_preserves_both_checkers(self):
+    def test_accepts_fused_memory_lint_chain_and_preserves_every_checker(self):
         """The task's headline case: fused-memory/orchestrator.yaml::lint_command.
 
-        The ruff clause is segment 0 (the caller will scope it); both
-        `python3 .../check_*.py` sibling clauses live in the preserved tail,
+        The ruff clause is segment 0 (the caller will scope it); every
+        `python3 <checker>.py` sibling clause lives in the preserved tail,
         byte-identical to their slice of the config string.
 
         Labelled by yaml KEY, not line number — the old `:11` label is the
@@ -2553,8 +2559,16 @@ class TestSplitChainTail:
         assert tail == (
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
             ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
+            ' && python3 tests/scripts/raw_envelope_literal_guard.py fused-memory'
         )
         assert tail == FM_LINT_COMMAND[len(prefix):]
+
+    def test_accepts_scripts_lint_chain(self):
+        """scripts/orchestrator.yaml::lint_command — the envelope-literal guard is its tail."""
+        prefix, tail = split_chain_tail(SCRIPTS_LINT_COMMAND, 'ruff check')
+        assert prefix == 'uv run --project shared ruff check scripts/ '
+        assert tail == '&& python3 tests/scripts/raw_envelope_literal_guard.py scripts'
+        assert prefix + tail == SCRIPTS_LINT_COMMAND
 
     def test_accepts_root_lint_chain(self):
         """dark-factory-orchestrator.yaml::lint_command — one sibling checker clause."""
@@ -2570,17 +2584,18 @@ class TestSplitChainTail:
         )
         assert prefix + tail == ROOT_LINT_COMMAND
 
-    def test_scripts_lint_command_has_no_chain_to_split(self):
-        """scripts/orchestrator.yaml::lint_command — CHAINLESS, so the gate is inert.
+    def test_chainless_lint_command_has_no_chain_to_split(self):
+        """A CHAINLESS lint command leaves the gate inert.
 
-        The corpus' third shape: a single segment with no `&&` at all. There is
-        no tail to preserve or drop, so ``split_chain_tail`` must fall out at
-        its ``len(segments) < 2`` guard and echo the command back untouched —
+        A single segment with no `&&` at all, on a synthetic literal because no
+        live config is chainless since task 6230. There is no tail to preserve
+        or drop, so ``split_chain_tail`` must fall out at its
+        ``len(segments) < 2`` guard and echo the command back untouched —
         neither an ACCEPT (nothing to carry) nor a lossy REJECT.
         """
-        assert split_top_level_and(SCRIPTS_LINT_COMMAND) == [SCRIPTS_LINT_COMMAND]
-        assert split_chain_tail(SCRIPTS_LINT_COMMAND, 'ruff check') == (
-            SCRIPTS_LINT_COMMAND,
+        assert split_top_level_and(_CHAINLESS_LINT_COMMAND) == [_CHAINLESS_LINT_COMMAND]
+        assert split_chain_tail(_CHAINLESS_LINT_COMMAND, 'ruff check') == (
+            _CHAINLESS_LINT_COMMAND,
             '',
         )
 
@@ -2782,7 +2797,8 @@ class TestTailPreservationAllowlist:
                 '&& python3 fused-memory/scripts/check_bare_magicmock_config.py'
                 ' fused-memory/tests'
                 ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py'
-                ' fused-memory/tests',
+                ' fused-memory/tests'
+                ' && python3 tests/scripts/raw_envelope_literal_guard.py fused-memory',
             ),
             ('npx pyright && python3 y.py', 'pyright', '&& python3 y.py'),
             (
@@ -2791,7 +2807,8 @@ class TestTailPreservationAllowlist:
                 '&& python3 fused-memory/scripts/check_bare_magicmock_config.py'
                 ' fused-memory/tests'
                 ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py'
-                ' fused-memory/tests',
+                ' fused-memory/tests'
+                ' && python3 tests/scripts/raw_envelope_literal_guard.py fused-memory',
             ),
         ],
         ids=['ruff-check', 'pyright', 'uv-run'],

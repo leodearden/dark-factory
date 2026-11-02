@@ -3,14 +3,12 @@ from a freshly built one, to porcelain AND plumbing, and costs one git spawn.
 """
 from __future__ import annotations
 
-import asyncio
 import os
 import shlex
 import shutil
 import subprocess
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 import pytest
 from _git_fixtures import README_SEED, RepoSeed, RepoTemplates, build_repo, seed_repo
@@ -217,7 +215,7 @@ def test_session_templates_live_under_this_runs_basetemp(
     assert pristine_repo_templates.root.resolve().is_relative_to(basetemp)
 
 
-Seeder = Callable[[Path], Coroutine[Any, Any, None]]
+Seeder = Callable[[Path], None]
 
 
 @pytest.mark.parametrize(('seeder', 'files', 'subject'), [
@@ -248,7 +246,7 @@ class TestSharedWorkflowSeeders:
         repo = tmp_path / 'repo'
         repo.mkdir()
 
-        asyncio.run(seeder(repo))
+        seeder(repo)
 
         assert _tracked_paths(repo) == set(files)
         assert _worktree_files(repo) == files
@@ -264,10 +262,10 @@ class TestSharedWorkflowSeeders:
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         (tmp_path / 'warm').mkdir()
-        asyncio.run(seeder(tmp_path / 'warm'))
+        seeder(tmp_path / 'warm')
         log = _install_git_spawn_counter(monkeypatch, tmp_path / 'shim')
         (tmp_path / 'measured').mkdir()
 
-        asyncio.run(seeder(tmp_path / 'measured'))
+        seeder(tmp_path / 'measured')
 
         assert _spawns(log) == 1

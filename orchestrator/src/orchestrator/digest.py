@@ -19,7 +19,9 @@ Design decisions (see plan.json):
   0 and the EWA decays, so draining a backlog heals the breaker instead of
   re-tripping it.  The gate is deliberately left on all lifecycle events: a
   submissions-only gate would fire no digest at all during a drain, freezing a
-  tripped EWA forever.
+  tripped EWA forever.  Task 3821: ``counts_toward_ewa_numerator`` keeps the
+  starvation watchdog's alarms out of the numerator; they are observations of
+  the queue, not faults (they still advance the gate).
 - EWA state is process-local EXCEPT across an ewa_trip_ pause (task 4559): the
   tripping value is persisted on the scheduler_state row and restored on
   startup, where the trip predicate is RE-TESTED before the halt is
@@ -49,6 +51,7 @@ from escalation.queue import iter_all_escalation_paths
 
 from orchestrator.chain_telemetry import ChainTelemetry, summarize_chain_telemetry
 from orchestrator.event_store import EventType
+from orchestrator.starvation_watchdog import STARVATION_WATCHDOG_ROLE
 from orchestrator.workflow import WorkflowOutcome
 
 logger = logging.getLogger(__name__)
@@ -62,6 +65,11 @@ _BLOCKED_OUTCOME: str = WorkflowOutcome.BLOCKED.value
 # ---------------------------------------------------------------------------
 # EWA math
 # ---------------------------------------------------------------------------
+
+
+def counts_toward_ewa_numerator(escalation: Escalation) -> bool:
+    """Whether a submitted *escalation* is a fault the EWA breaker should weigh."""
+    return escalation.agent_role != STARVATION_WATCHDOG_ROLE
 
 
 def update_ewa(

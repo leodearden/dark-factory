@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from fused_memory.models.enums import MEM0_PRIMARY, MemoryCategory, SourceStore
-from fused_memory.models.memory import MemoryResult
+from fused_memory.models.memory import AddMemoryResponse, MemoryResult
 from fused_memory.server import write_triage
 from fused_memory.server.grouped_read import (
     CHILD_KINDS,
@@ -49,6 +49,7 @@ from fused_memory.server.write_triage import (
     TriageFailOpenCounter,
     TriageJudgeVerdict,
     _stub_judge,
+    attach_write_durable,
     attach_write_landed,
     canonical_id_of,
     decide_band,
@@ -1743,6 +1744,31 @@ class TestEmitTriageFailOpenStormEscalation:
             f'must route the burst at the owning PRD leaf: {payload!r}'
         )
 
+    def test_states_the_mem0_intent_counts_for_the_window(self, tmp_path) -> None:
+        """The journal, not triage, knows whether each write's Mem0 leg landed."""
+        pytest.importorskip('escalation')
+        storm = {
+            **_STORM,
+            'mem0_intents_in_window': {'completed': 7, 'failed': 2, 'retrying': 3},
+        }
+
+        emit_triage_fail_open_storm_escalation(str(tmp_path), storm)
+
+        detail = _only_escalation(tmp_path)['detail']
+        assert (
+            "mem0_intents_in_window={'completed': 7, 'failed': 2, 'retrying': 3}"
+            in detail
+        ), detail
+
+    def test_without_counts_it_records_none(self, tmp_path) -> None:
+        """A fail-open storm is often the same outage that fails the Mem0 write itself."""
+        pytest.importorskip('escalation')
+
+        emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
+
+        payload = _only_escalation(tmp_path)
+        assert 'mem0_intents_in_window=None' in payload['detail']
+
     def test_the_escalation_id_is_greppable_via_the_stable_anchor(
         self, tmp_path,
     ) -> None:
@@ -1809,6 +1835,28 @@ class TestEmitTriageFailOpenStormEscalation:
         assert payload['category'] == 'write_triage_fail_open_storm'
         assert payload['task_id'] == write_triage._ANCHOR_TASK_ID
         assert payload['level'] == 1
+
+
+def _only_escalation(project_root) -> dict:
+    (path,) = (project_root / 'data' / 'escalations').glob('esc-*.json')
+    return json.loads(path.read_text())
+
+
+class TestAttachWriteDurable:
+    """An attach whose Mem0 leg is queued for server-side retry still stands."""
+
+    def test_a_response_with_ids_is_durable(self) -> None:
+        assert attach_write_durable(AddMemoryResponse(memory_ids=['m1'])) is True
+
+    def test_a_mem0_leg_pending_retry_is_durable(self) -> None:
+        result = AddMemoryResponse(memory_ids=[], stores_pending_retry=[SourceStore.mem0])
+        assert attach_write_durable(result) is True
+
+    def test_nothing_landed_and_nothing_pending_is_not_durable(self) -> None:
+        assert attach_write_durable(AddMemoryResponse(memory_ids=[])) is False
+
+    def test_an_unspecced_test_double_reads_as_durable(self) -> None:
+        assert attach_write_durable(Mock()) is True
 
 
 class TestAttachWriteLanded:

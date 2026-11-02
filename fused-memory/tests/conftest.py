@@ -21,13 +21,18 @@ import re
 import sys
 import warnings
 import weakref
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from graphiti_core.cross_encoder.client import CrossEncoderClient
+from graphiti_core.embedder import EmbedderClient
+from graphiti_core.llm_client import LLMClient
 
 # Make this file's directory importable by test modules so
 # `from _fm_helpers import ...` resolves regardless of whether pytest
@@ -85,6 +90,7 @@ from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
+    arm_leaked_drain_process_guard,
     reject_unsafe_basetemp,
 )
 
@@ -103,7 +109,7 @@ from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV  # noqa: E402
 
 
 def pytest_configure(config):
-    """Session-start hooks: basetemp safety, and async-httpx leak tracking.
+    """Session-start hooks: basetemp safety, the drain-leak guard, async-httpx leak tracking.
 
     ``track_async_httpx_clients()`` runs HERE — at session start, before
     collection — rather than lazily from a fixture, so clients constructed at
@@ -111,6 +117,7 @@ def pytest_configure(config):
     (task 4412).
     """
     reject_unsafe_basetemp(config)
+    arm_leaked_drain_process_guard(config)
     track_async_httpx_clients()
 
 
@@ -548,12 +555,81 @@ def make_backend():
 
     For a client that enforces graphiti_core's uuid= contract, use
     make_backend_over_fake_graphiti.
+
+    ``driver=`` replaces the default MagicMock driver; make_graph_driver builds one.
+    For a real driver and spec'd sub-clients, use make_wired_backend.
     """
-    def _factory(config, *, registered_graph_ids=()) -> GraphitiBackend:
-        backend = GraphitiBackend(config, registered_graph_ids=registered_graph_ids)
+    def _factory(config, *, registered_graph_ids=(), driver=None) -> GraphitiBackend:
+        backend = GraphitiBackend.with_driver(
+            config,
+            MagicMock() if driver is None else driver,
+            registered_graph_ids=registered_graph_ids,
+        )
         backend.client = MagicMock()
-        backend._driver = MagicMock()
         return backend
+
+    return _factory
+
+
+@pytest.fixture
+def make_graph_driver():
+    """Factory fixture: returns a callable(graphs) -> a real _MultiTenantFalkorDriver over *graphs*.
+
+    The driver runs over a FalkorDB double whose ``select_graph(name)`` answers
+    ``graphs[name]``; names are the canonical group ids the backend selects.  Pass
+    it as ``make_backend(config, driver=...)`` instead of assigning
+    ``backend._driver._get_graph``.
+    """
+    from fused_memory.backends.graphiti_client import _MultiTenantFalkorDriver
+
+    def _factory(graphs: Mapping[str, Any]) -> _MultiTenantFalkorDriver:
+        def _select(name: str) -> Any:
+            if name not in graphs:
+                raise KeyError(f'no graph wired for {name!r}; wired: {sorted(graphs)}')
+            return graphs[name]
+
+        falkor = MagicMock()
+        falkor.select_graph.side_effect = _select
+        return _MultiTenantFalkorDriver(falkor_db=falkor)
+
+    return _factory
+
+
+class SubClients(NamedTuple):
+    """Spec'd sub-client doubles, named as GraphitiBackend.with_driver's keywords."""
+
+    llm_client: LLMClient
+    embedder: EmbedderClient
+    cross_encoder: CrossEncoderClient
+
+
+class WiredBackend(NamedTuple):
+    backend: GraphitiBackend
+    sub_clients: SubClients
+
+
+@pytest.fixture
+def make_wired_backend(make_graph_driver):
+    """Factory fixture: returns a callable(config, driver=None) -> WiredBackend.
+
+    The backend is GraphitiBackend.with_driver over *driver* and fresh spec'd
+    sub-client doubles, returned beside it so a test can assert identity.  The
+    default driver is ``make_graph_driver({})``, which wires no graph.  Unlike
+    make_backend, it assigns no base ``client``.  The registry is empty.
+    """
+    def _factory(config, driver=None) -> WiredBackend:
+        sub_clients = SubClients(
+            llm_client=MagicMock(spec=LLMClient),
+            embedder=MagicMock(spec=EmbedderClient),
+            cross_encoder=MagicMock(spec=CrossEncoderClient),
+        )
+        backend = GraphitiBackend.with_driver(
+            config,
+            make_graph_driver({}) if driver is None else driver,
+            registered_graph_ids=(),
+            **sub_clients._asdict(),
+        )
+        return WiredBackend(backend, sub_clients)
 
     return _factory
 
@@ -631,9 +707,7 @@ def make_graph_mock():
     carries the stateful query log the truncation tests need — because two
     doubles that both claim to stand in for the same server drift, and the
     drift shows up as a test that passes against a fake nothing else agrees
-    with.  A test that needs the cap should use that one (or, for episode
-    reads through graphiti-core, its API-level counterpart
-    ``FakeCappedEpisodeStore`` in the same module).
+    with.  A test that needs the cap should use that one.
     """
     skip_limit_re = re.compile(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', re.IGNORECASE)
     # Deliberately NARROW: only a query whose entire projection is a bare row

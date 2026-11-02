@@ -16,6 +16,7 @@ from orchestrator.shadow_types import (
     ReferenceKind,
     ShadowCellState,
     ShadowShape,
+    ShadowStormCause,
 )
 
 
@@ -70,6 +71,13 @@ def test_cost_basis_values():
     assert [b.value for b in CostBasis] == ['metered', 'subscription']
 
 
+@pytest.mark.parametrize(
+    ('basis', 'imputes'), [(CostBasis.METERED, False), (CostBasis.SUBSCRIPTION, True)],
+)
+def test_only_a_subscription_arm_imputes_its_dollars(basis, imputes):
+    assert basis.imputes_dollars is imputes
+
+
 class TestShadowCellState:
     """C1's cell lifecycle and the two predicates its invariants hang on."""
 
@@ -101,6 +109,76 @@ class TestShadowCellState:
         }
 
 
+_S = ShadowCellState
+
+_LEGAL_SUCCESSORS: dict[ShadowCellState, set[ShadowCellState]] = {
+    _S.SAMPLED: {_S.OPENED, _S.FAILED},
+    _S.OPENED: {_S.RUNNING, _S.FAILED},
+    _S.RUNNING: {_S.AWAITING_REFERENCE, _S.CAP_EXCLUDED, _S.FAILED},
+    _S.AWAITING_REFERENCE: {_S.SETTLED, _S.EXPIRED},
+    _S.SETTLED: set(),
+    _S.CAP_EXCLUDED: set(),
+    _S.EXPIRED: set(),
+    _S.FAILED: set(),
+}
+
+
+class TestShadowCellLifecycleRules:
+    """The successor table and the two state groups the store and coordinator key on."""
+
+    @pytest.mark.parametrize(
+        'source,target',
+        [(a, b) for a in ShadowCellState for b in ShadowCellState],
+        ids=lambda s: s.value,
+    )
+    def test_may_become_is_exactly_the_successor_table(self, source, target):
+        assert source.may_become(target) is (target in _LEGAL_SUCCESSORS[source])
+
+    def test_table_is_monotone_in_declaration_order(self):
+        order = list(ShadowCellState)
+        allowed = [(a, b) for a in order for b in order if a.may_become(b)]
+        assert allowed
+        assert all(order.index(b) > order.index(a) for a, b in allowed)
+
+    def test_no_state_may_become_itself(self):
+        assert not any(s.may_become(s) for s in ShadowCellState)
+
+    def test_terminal_states_have_no_successor(self):
+        for state in ShadowCellState:
+            if state.is_terminal:
+                assert not any(state.may_become(t) for t in ShadowCellState)
+
+    def test_held_by_run_is_the_three_pre_run_end_states(self):
+        assert {s for s in ShadowCellState if s.held_by_run} == {
+            _S.SAMPLED,
+            _S.OPENED,
+            _S.RUNNING,
+        }
+
+    def test_stamps_settled_at_is_settled_and_expired(self):
+        assert {s for s in ShadowCellState if s.stamps_settled_at} == {
+            _S.SETTLED,
+            _S.EXPIRED,
+        }
+
+    def test_stamps_run_ended_at_is_every_state_a_held_state_leaves_into(self):
+        assert {s for s in ShadowCellState if s.stamps_run_ended_at} == {
+            _S.AWAITING_REFERENCE,
+            _S.CAP_EXCLUDED,
+            _S.FAILED,
+        }
+
+
+def test_storm_cause_values():
+    assert issubclass(ShadowStormCause, StrEnum)
+    assert {c.value for c in ShadowStormCause} == {
+        'daily_budget',
+        'failure_streak',
+        'cost_ratio',
+        'cost_unreadable',
+    }
+
+
 def test_reference_kind_values():
     assert [k.value for k in ReferenceKind] == ['landed', 'none']
 
@@ -111,7 +189,14 @@ def test_plan_source_values():
 
 _ALL_MEMBERS: list[StrEnum] = [
     member
-    for enum_cls in (ShadowShape, CostBasis, ShadowCellState, ReferenceKind, PlanSource)
+    for enum_cls in (
+        ShadowShape,
+        CostBasis,
+        ShadowCellState,
+        ReferenceKind,
+        PlanSource,
+        ShadowStormCause,
+    )
     for member in enum_cls
 ]
 
@@ -126,8 +211,16 @@ def test_every_member_is_a_bare_str_that_round_trips(member: StrEnum):
 class TestSingleCopy:
     """The sibling modules consume these exact enums, never a second copy."""
 
-    def test_candidate_prices_use_the_shadow_types_cost_basis(self):
-        assert CANDIDATE_ENDPOINT_PRICES['glm-5.3'].cost_basis is CostBasis.SUBSCRIPTION
+    @pytest.mark.parametrize(
+        'model', ['glm-5.3', 'glm-5.3-flash', 'mimo-v2.6-pro', 'mimo-v2.6-flash'],
+    )
+    def test_candidate_prices_use_the_shadow_types_cost_basis(self, model):
+        assert CANDIDATE_ENDPOINT_PRICES[model].cost_basis is CostBasis.SUBSCRIPTION
+
+    @pytest.mark.parametrize('model', sorted(CANDIDATE_ENDPOINT_PRICES))
+    def test_a_price_entry_and_its_basis_agree_on_imputed_dollars(self, model):
+        price = CANDIDATE_ENDPOINT_PRICES[model]
+        assert price.imputed is price.cost_basis.imputes_dollars
 
     def test_build_live_fixture_accepts_a_shadow_types_shape(self, tmp_path):
         fixture = build_live_fixture(

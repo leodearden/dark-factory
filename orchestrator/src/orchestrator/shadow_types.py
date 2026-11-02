@@ -15,6 +15,7 @@ __all__ = [
     'ReferenceKind',
     'ShadowCellState',
     'ShadowShape',
+    'ShadowStormCause',
 ]
 
 
@@ -59,6 +60,11 @@ class CostBasis(StrEnum):
     METERED = 'metered'
     SUBSCRIPTION = 'subscription'
 
+    @property
+    def imputes_dollars(self) -> bool:
+        """Whether cost_usd is a list price modelled onto credits, not measured (PRD decision 16)."""
+        return self is CostBasis.SUBSCRIPTION
+
 
 class ShadowCellState(StrEnum):
     """C1's cell lifecycle, in order (``shadow_cells.state``)."""
@@ -81,6 +87,29 @@ class ShadowCellState(StrEnum):
         """A cell that ended without settling must say why (C1)."""
         return self.is_terminal and self is not ShadowCellState.SETTLED
 
+    def may_become(self, target: ShadowCellState) -> bool:
+        """Whether a cell in this state may transition to *target*.
+
+        The table only moves forward through the declaration order, so a cell
+        can never revisit a state, and a terminal state has no successor.
+        """
+        return target in _SUCCESSORS[self]
+
+    @property
+    def held_by_run(self) -> bool:
+        """The states a live coordinator run owns, so its exit writes the successor."""
+        return self in _HELD_BY_RUN_STATES
+
+    @property
+    def stamps_settled_at(self) -> bool:
+        """The states whose entry writes ``settled_at``: the cell is closed for scoring."""
+        return self in _SETTLED_AT_STATES
+
+    @property
+    def stamps_run_ended_at(self) -> bool:
+        """The states whose entry writes ``run_ended_at``: a held state leaves into them."""
+        return self in _RUN_ENDED_AT_STATES
+
 
 _TERMINAL_STATES = frozenset({
     ShadowCellState.SETTLED,
@@ -88,6 +117,36 @@ _TERMINAL_STATES = frozenset({
     ShadowCellState.EXPIRED,
     ShadowCellState.FAILED,
 })
+
+_SUCCESSORS: dict[ShadowCellState, frozenset[ShadowCellState]] = {
+    ShadowCellState.SAMPLED: frozenset({ShadowCellState.OPENED, ShadowCellState.FAILED}),
+    ShadowCellState.OPENED: frozenset({ShadowCellState.RUNNING, ShadowCellState.FAILED}),
+    ShadowCellState.RUNNING: frozenset({
+        ShadowCellState.AWAITING_REFERENCE,
+        ShadowCellState.CAP_EXCLUDED,
+        ShadowCellState.FAILED,
+    }),
+    ShadowCellState.AWAITING_REFERENCE: frozenset({
+        ShadowCellState.SETTLED,
+        ShadowCellState.EXPIRED,
+    }),
+    **{state: frozenset() for state in _TERMINAL_STATES},
+}
+
+_HELD_BY_RUN_STATES = frozenset({
+    ShadowCellState.SAMPLED,
+    ShadowCellState.OPENED,
+    ShadowCellState.RUNNING,
+})
+
+_SETTLED_AT_STATES = frozenset({ShadowCellState.SETTLED, ShadowCellState.EXPIRED})
+
+_RUN_ENDED_AT_STATES = frozenset(
+    target
+    for held in _HELD_BY_RUN_STATES
+    for target in _SUCCESSORS[held]
+    if target not in _HELD_BY_RUN_STATES
+)
 
 
 class ReferenceKind(StrEnum):
@@ -102,3 +161,12 @@ class PlanSource(StrEnum):
 
     PRODUCTION = 'production'
     CANDIDATE = 'candidate'
+
+
+class ShadowStormCause(StrEnum):
+    """Which storm guard paused shadow evaluation (C2 storm escape, ``shadow_storm.cause``)."""
+
+    DAILY_BUDGET = 'daily_budget'
+    FAILURE_STREAK = 'failure_streak'
+    COST_RATIO = 'cost_ratio'
+    COST_UNREADABLE = 'cost_unreadable'

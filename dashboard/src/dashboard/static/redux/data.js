@@ -20,12 +20,13 @@ const {
   unknownDatum: unknownDatumPlaceholder,
 } = window.DF_DATUM;
 
-// The surface -> endpoint maps that decide what is polled (pollSetFor). Module
-// scope, no fallback, RENAMED, for the same reason as the destructure above.
+// poll_scope.js's surface -> endpoint maps, which decide what is polled
+// (pollSetFor). Module scope, no fallback, RENAMED, for the same reason as the
+// destructure above: poll_scope.js owns the bare names.
 const {
   TAB_ENDPOINTS: POLL_TAB_ENDPOINTS,
   CHROME_ENDPOINTS: POLL_CHROME_ENDPOINTS,
-} = window.DF_ENDPOINT_STALENESS;
+} = window.DF_POLL_SCOPE;
 
 // How the wire delivers a key: 'plain' is a bare value, 'datum' is the
 // five-key envelope data/datum.py::Datum.to_wire() emits. Two shared frozen
@@ -757,9 +758,10 @@ let currentWin = '24h';
 
 // Module-scope tab — announced by app.jsx through scopePollingToTab(tab).
 //
-// THE POLL SET IS CHROME_ENDPOINTS ∪ TAB_ENDPOINTS[tab] (pollSetFor): the open
-// tab's own endpoints in full, plus the always-on chrome, with /tasks narrowed
-// to ?projection=census whenever the tab itself does not list it.
+// THE POLL SET IS CHROME_ENDPOINTS ∪ TAB_ENDPOINTS[tab] (pollSetFor), both
+// declared in poll_scope.js: the open tab's own endpoints in full, plus the
+// always-on chrome, with /tasks narrowed to ?projection=census whenever the
+// tab itself does not list it.
 //
 // UNTIL A TAB IS NAMED, OR FOR A TAB ID WITH NO TAB_ENDPOINTS ENTRY, EVERY
 // ENDPOINT IS POLLED. The script-load first poll runs before the text/babel

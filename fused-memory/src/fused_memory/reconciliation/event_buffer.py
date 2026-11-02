@@ -4,8 +4,9 @@ import json
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import uuid4
 
 import aiosqlite
@@ -21,6 +22,11 @@ from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
+)
+from fused_memory.reconciliation.coalescing import (
+    coalesce_key,
+    coalesced_count,
+    merge_coalesced_payload,
 )
 from fused_memory.reconciliation.throughput import utc_hour_bucket
 from fused_memory.utils.sqlite_connector import Connector
@@ -38,7 +44,8 @@ CREATE TABLE IF NOT EXISTS event_buffer (
     timestamp TEXT NOT NULL,
     payload TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL DEFAULT 'buffered',
-    drained_by_run_id TEXT
+    drained_by_run_id TEXT,
+    coalesce_key TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_eb_project_status ON event_buffer(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_eb_agent_timestamp ON event_buffer(agent_id, timestamp)
@@ -69,7 +76,6 @@ CREATE TABLE IF NOT EXISTS deferred_writes (
     claimed_at TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_dw_project_claimed ON deferred_writes(project_id, claimed_at);
 
 -- Task 3049: durable hourly inflow record.  event_buffer rows are DELETEd by
 -- cleanup_drained once they are drained and older than max_age_seconds
@@ -86,6 +92,19 @@ CREATE TABLE IF NOT EXISTS event_arrival_hourly (
     event_count INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (project_id, hour_bucket, event_type)
 );
+
+-- Task 4278 (recon lever 3): events push() folded into an older buffered row.
+-- Counted in the same write unit as the fold, so every pushed event is a live
+-- event_buffer row, OR in event_arrival_hourly, OR in event_coalesced_hourly.
+-- One bound: a redelivered event that folded in as an older or middle
+-- constituent is not recognised as a redelivery, so it is counted here again.
+CREATE TABLE IF NOT EXISTS event_coalesced_hourly (
+    project_id TEXT NOT NULL,
+    hour_bucket TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    coalesced_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (project_id, hour_bucket, event_type)
+);
 """
 
 # Maximum number of replay attempts before a deferred write is treated as a poison-pill
@@ -96,6 +115,53 @@ _MAX_DEFERRED_WRITE_ATTEMPTS: int = 5
 # DELETE ... RETURNING cursor.  Bounds peak memory at O(chunk) instead of
 # O(rows deleted) — see cleanup_drained's docstring for the measurement.
 _CLEANUP_FETCH_CHUNK: int = 10_000
+
+# A folded row announces itself at WARNING each time its fold count reaches a
+# multiple of this.  A looping task no longer builds backlog once its events
+# fold, so the reconciliation_backlog alarm cannot see it; this line can.
+_COALESCE_HOT_TASK_WARNING_INTERVAL: int = 100
+
+
+class _PushOutcome(StrEnum):
+    """What one push did to the buffer."""
+
+    buffered = 'buffered'  # a new row
+    coalesced = 'coalesced'  # folded into an older buffered row
+    redelivered = 'redelivered'  # already stored, so nothing changed
+
+
+class _PushResult(NamedTuple):
+    outcome: _PushOutcome
+    fold_count: int = 1
+
+
+_UNFOLDED_PUSH_LOG_LINE = {
+    _PushOutcome.buffered: 'reconciliation.event_buffered',
+    _PushOutcome.redelivered: 'reconciliation.event_redelivered',
+}
+
+
+def _log_push(event: ReconciliationEvent, key: str | None, result: _PushResult) -> None:
+    """One structured line per push; a WARNING when a folded row turns hot."""
+    if result.outcome is not _PushOutcome.coalesced:
+        logger.info(
+            _UNFOLDED_PUSH_LOG_LINE[result.outcome],
+            extra={
+                'project_id': event.project_id,
+                'event_type': event.type.value,
+                'agent_id': event.agent_id,
+            },
+        )
+        return
+    fold_extra = {
+        'project_id': event.project_id,
+        'event_type': event.type.value,
+        'coalesce_key': key,
+        'coalesced_count': result.fold_count,
+    }
+    logger.info('reconciliation.event_coalesced', extra=fold_extra)
+    if result.fold_count % _COALESCE_HOT_TASK_WARNING_INTERVAL == 0:
+        logger.warning('reconciliation.coalesce_hot_task', extra=fold_extra)
 
 
 class EventBuffer:
@@ -121,10 +187,12 @@ class EventBuffer:
         instance_id: str | None = None,
         *,
         connect: Connector = connect_daemon,
+        coalesce_task_events: bool = True,
     ):
         """*connect* is how ``initialize`` opens the buffer's one connection.
 
         It is given the database path and defaults to ``connect_daemon``.
+        *coalesce_task_events* switches push-time folding (see ``push``).
         """
         # _in_memory is derived from the caller's intent (db_path is None),
         # not from the resolved string ':memory:'.  This means explicitly
@@ -142,6 +210,7 @@ class EventBuffer:
         self._queue_stats_fn = queue_stats_fn
         self.instance_id = instance_id or str(uuid4())
         self._connect = connect
+        self.coalesce_task_events = coalesce_task_events
         self._access: AtomicConnection | None = None
         self._manual_triggers: set[str] = set()
 
@@ -175,18 +244,31 @@ class EventBuffer:
             if await add_column_if_missing(db, 'event_buffer', 'drained_by_run_id', 'TEXT'):
                 logger.info('EventBuffer: migrated event_buffer — added drained_by_run_id column')
 
+            # Add coalesce_key if missing (task 4278).  Rows written before it
+            # keep NULL and are never fold targets.  The index lives here, not
+            # in _BUFFER_SCHEMA_SQL, because that script runs first and would
+            # name a column a pre-existing table does not have yet.
+            if await add_column_if_missing(db, 'event_buffer', 'coalesce_key', 'TEXT'):
+                logger.info('EventBuffer: migrated event_buffer — added coalesce_key column')
+            await db.execute(
+                'CREATE INDEX IF NOT EXISTS idx_eb_coalesce'
+                ' ON event_buffer(project_id, coalesce_key, status)'
+                ' WHERE coalesce_key IS NOT NULL'
+            )
+
             # Drop the now-redundant single-column project index.  idx_dw_project_claimed
             # (project_id, claimed_at) is a strict superset; keeping both wastes write
             # IOPS and disk.  IF EXISTS makes this a no-op for fresh DBs that never
             # had idx_dw_project.
             await db.execute('DROP INDEX IF EXISTS idx_dw_project')
 
+            # Same placement as idx_eb_coalesce above, for the same reason.
             if await add_column_if_missing(db, 'deferred_writes', 'claimed_at', 'TEXT'):
-                await db.execute(
-                    'CREATE INDEX IF NOT EXISTS idx_dw_project_claimed'
-                    ' ON deferred_writes(project_id, claimed_at)'
-                )
                 logger.info('EventBuffer: migrated deferred_writes — added claimed_at column')
+            await db.execute(
+                'CREATE INDEX IF NOT EXISTS idx_dw_project_claimed'
+                ' ON deferred_writes(project_id, claimed_at)'
+            )
 
             # Add attempt_count if missing — tracks poison-pill detection across restarts.
             if await add_column_if_missing(
@@ -202,29 +284,37 @@ class EventBuffer:
     # ── Push ───────────────────────────────────────────────────────────
 
     async def push(self, event: ReconciliationEvent) -> None:
-        """Insert event into the shared buffer.
+        """Insert event into the shared buffer, folding a repeat task event.
 
-        Idempotent on the event id (UUID primary key): the conflict clause is
-        scoped to the primary key with ``ON CONFLICT(id) DO NOTHING`` so
-        re-pushing an already-committed event is a harmless no-op rather than an
-        IntegrityError. A duplicate only ever occurs on EventJournal-driven
-        startup recovery, which redelivers in-flight events at-least-once — the
-        drainer can be killed after this push commits but before it marks the
-        journal row processed, so recover() re-enqueues and re-pushes it (task
-        2709). Without the conflict clause the drainer would treat the duplicate
-        as a non-retriable error and dead-letter a perfectly good event.
+        Idempotent on the event id: ``ON CONFLICT(id) DO NOTHING`` makes the
+        at-least-once redelivery of EventJournal startup recovery a no-op
+        (task 2709), while any other constraint violation still raises.
 
-        Scoping to ``(id)`` rather than a bare ``INSERT OR IGNORE`` is
-        deliberate (loud-over-silent): only the intended duplicate-id case is
-        swallowed; any *other* constraint violation on this row — e.g. a
-        NOT NULL breach on project_id/event_type/event_source/timestamp — still
-        raises loudly instead of silently dropping the event.
+        An event with a ``coalescing.coalesce_key`` folds into the OLDEST
+        buffered row with the same key (task 4278).  That row keeps its id, so
+        an id ``peek_buffered`` handed out still drains via ``drain_by_ids``,
+        and its timestamp, which only ever moves earlier, so ``ORDER BY
+        timestamp`` positions and the ``MIN(timestamp)`` staleness trigger
+        hold.  A folded event leaves no row of its own for ``ON CONFLICT`` to
+        hit, so its redelivery is recognised only when it is the row's newest
+        constituent (``coalescing.merge_coalesced_payload``); an older or
+        middle constituent folds again and over-counts by one.
+        The INSERT runs first: a unit whose first statement writes is
+        serialised against other connections, which a unit that SELECTs first
+        is not (``AtomicConnection.write``).  A transition into done never
+        folds (``coalescing.coalesce_key``), so ``select_done_transitions`` sees
+        each with its own ``done_provenance``; every other drained task-event
+        reader uses task_id or the live task.  That also makes a fold landing
+        between ``peek_buffered`` and ``drain_by_ids`` benign: the stage gets
+        the pre-fold payload, and no done event can have folded into it.
         """
+        key = coalesce_key(event)
         async with self._require_access().write() as db:
-            await db.execute(
+            cursor = await db.execute(
                 """INSERT INTO event_buffer
-                   (id, project_id, event_type, event_source, agent_id, timestamp, payload, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'buffered')
+                   (id, project_id, event_type, event_source, agent_id, timestamp, payload,
+                    status, coalesce_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'buffered', ?)
                    ON CONFLICT(id) DO NOTHING""",
                 (
                     event.id,
@@ -234,20 +324,71 @@ class EventBuffer:
                     event.agent_id,
                     event.timestamp.isoformat(),
                     json.dumps(event.payload),
+                    key,
                 ),
             )
+            if cursor.rowcount == 0:
+                result = _PushResult(_PushOutcome.redelivered)
+            elif self.coalesce_task_events and key is not None:
+                result = await self._fold_into_oldest(db, event, key)
+            else:
+                result = _PushResult(_PushOutcome.buffered)
 
         if event.agent_id is not None:
             await self._update_burst_state(event.agent_id, event.timestamp)
 
-        logger.info(
-            'reconciliation.event_buffered',
-            extra={
-                'project_id': event.project_id,
-                'event_type': event.type.value,
-                'agent_id': event.agent_id,
-            },
+        _log_push(event, key, result)
+
+    async def _fold_into_oldest(
+        self, db: aiosqlite.Connection, event: ReconciliationEvent, key: str,
+    ) -> _PushResult:
+        """Fold the row ``push`` just inserted into the oldest buffered row sharing ``key``.
+
+        Runs on the open write unit's connection.  The just-inserted row is
+        uncommitted, so deleting it leaves no trace any reader could see.
+        """
+        # Oldest buffered row: stable id, MIN(timestamp) and ORDER BY position (see push).
+        async with db.execute(
+            """SELECT id, payload, timestamp FROM event_buffer
+               WHERE project_id = ? AND coalesce_key = ? AND status = 'buffered'
+                 AND id != ?
+               ORDER BY timestamp ASC
+               LIMIT 1""",
+            (event.project_id, key, event.id),
+        ) as cursor:
+            target = await cursor.fetchone()
+        if target is None:
+            return _PushResult(_PushOutcome.buffered)
+
+        await db.execute('DELETE FROM event_buffer WHERE id = ?', (event.id,))
+        fold = merge_coalesced_payload(
+            json.loads(target['payload']),
+            event.payload,
+            event_type=event.type,
+            incoming_id=event.id,
+            incoming_ts=event.timestamp,
+            row_ts=datetime.fromisoformat(target['timestamp']),
         )
+        if fold is None:
+            return _PushResult(_PushOutcome.redelivered)
+
+        await db.execute(
+            'UPDATE event_buffer SET payload = ?, timestamp = ? WHERE id = ?',
+            (json.dumps(fold.payload), fold.row_timestamp.isoformat(), target['id']),
+        )
+        await db.execute(
+            """INSERT INTO event_coalesced_hourly
+                   (project_id, hour_bucket, event_type, coalesced_count)
+               VALUES (?, ?, ?, 1)
+               ON CONFLICT(project_id, hour_bucket, event_type)
+               DO UPDATE SET coalesced_count = coalesced_count + excluded.coalesced_count""",
+            (
+                event.project_id,
+                utc_hour_bucket(fold.folded_timestamp.isoformat()),
+                event.type.value,
+            ),
+        )
+        return _PushResult(_PushOutcome.coalesced, coalesced_count(fold.payload))
 
     # ── Burst detection ────────────────────────────────────────────────
 
@@ -1043,10 +1184,13 @@ class EventBuffer:
 
         Task 3049: before deleting, roll the very same rows up into
         ``event_arrival_hourly`` so the project's arrival history survives the
-        DELETE.  This is the only ``DELETE FROM event_buffer`` in the codebase
-        — the single chokepoint where inflow history is destroyed — so rolling
-        up here captures 100% of events regardless of which drain path
-        (``drain`` / ``drain_oldest_chunk`` / ``drain_by_ids``) marked them.
+        DELETE.  This is the only DELETE of a COMMITTED ``event_buffer`` row in
+        the codebase — the single chokepoint where inflow history is destroyed
+        — so rolling up here captures 100% of events regardless of which drain
+        path (``drain`` / ``drain_oldest_chunk`` / ``drain_by_ids``) marked
+        them.  ``push``'s fold deletes only the row it inserted earlier in the
+        same uncommitted unit, and counts that event in
+        ``event_coalesced_hourly``.
 
         The rollup runs inside the SAME write unit as the DELETE, and takes its
         rows FROM that delete via ``DELETE ... RETURNING`` (SQLite >= 3.35,
