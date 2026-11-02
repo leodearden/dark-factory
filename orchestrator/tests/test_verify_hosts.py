@@ -190,7 +190,7 @@ class TestRunnerForTurn:
             _pool().runner_for_turn('nope')
 
 
-async def _until(predicate: Any, *, timeout: float = 5.0) -> None:
+async def _until(predicate: Callable[[], bool], *, timeout: float = 5.0) -> None:
     async with asyncio.timeout(timeout):
         while not predicate():
             await asyncio.sleep(0.005)
