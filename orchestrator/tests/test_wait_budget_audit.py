@@ -7,6 +7,7 @@ case is non-vacuous and does not shift when another file is edited.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import dataclasses
 import math
@@ -19,6 +20,7 @@ from _wait_budget_audit import (
     LimitSource,
     audit_module,
     is_module_level_item,
+    is_responsive_wait_call,
     item_wait_budgets,
 )
 
@@ -749,6 +751,91 @@ async def settle():
         assert budgets == {'test_x': 90.0}, (
             f'Expected the module-level test_x billed at 90.0 under its bare '
             f'name and the non-test helper ignored, got {budgets!r}.'
+        )
+
+    @pytest.mark.parametrize(
+        ('context', 'expected'),
+        [
+            pytest.param('asyncio.timeout(30.0)', 30.0, id='literal-delay'),
+            pytest.param('asyncio.timeout(MERGE_RESULT_TIMEOUT)', 45.0, id='named-delay'),
+            pytest.param('asyncio.timeout(delay=12.0)', 12.0, id='keyword-delay'),
+            pytest.param('asyncio.timeout(some_var)', math.inf, id='unreadable-delay'),
+            pytest.param('asyncio.timeout(None)', math.inf, id='no-deadline'),
+            pytest.param('gate.timeout(999.0)', 0.0, id='not-asyncio'),
+        ],
+    )
+    def test_an_asyncio_timeout_block_bills_its_delay(
+        self, context: str, expected: float
+    ) -> None:
+        """An `asyncio.timeout(X)` block is wait_for's deadline spelled as a
+        context, so it bills X exactly as `asyncio.wait_for(..., timeout=X)`
+        does -- an unreadable or None delay fails closed at `math.inf` -- and
+        a non-`asyncio` `.timeout(...)` contributes 0.0.
+        """
+        source = f'''
+class TestTimeoutBlock:
+    async def test_it(self):
+        async with {context}:
+            while not ready():
+                await asyncio.sleep(0.01)
+'''
+        budgets = item_wait_budgets(source)
+
+        assert budgets == {'TestTimeoutBlock::test_it': expected}, (
+            f'Expected `async with {context}:` around a poll to bill '
+            f'{expected}, got {budgets!r}.'
+        )
+
+    @pytest.mark.parametrize(
+        ('call', 'expected'),
+        [
+            pytest.param("poll_responsive(pred, label='x')", 90.0, id='bare-default'),
+            pytest.param(
+                "poll_responsive(pred, timeout=MERGE_GATE_BARRIER_TIMEOUT, label='x')",
+                30.0,
+                id='gate-barrier-nominal',
+            ),
+            pytest.param(
+                "poll_responsive(pred, timeout=1.0, max_wall_s=1000.0, label='x')",
+                1000.0,
+                id='explicit-wall-cap',
+            ),
+        ],
+    )
+    def test_poll_responsive_bills_exactly_as_wait_responsive(
+        self, call: str, expected: float
+    ) -> None:
+        """`poll_responsive` delegates its accounting to `wait_responsive`,
+        so it bills the same stretched-and-clamped nominal, or an explicit
+        `max_wall_s` verbatim.
+        """
+        source = f'''
+class TestPollResponsive:
+    async def test_it(self):
+        await {call}
+'''
+        budgets = item_wait_budgets(source)
+
+        assert budgets == {'TestPollResponsive::test_it': expected}, (
+            f'Expected `{call}` to bill {expected}, got {budgets!r}.'
+        )
+
+    @pytest.mark.parametrize(
+        ('call', 'is_responsive'),
+        [
+            ("wait_responsive(req.result, label='x')", True),
+            ("poll_responsive(pred, label='x')", True),
+            ("wait_until(pred, label='x')", False),
+            ("x.wait_responsive(req.result, label='x')", False),
+        ],
+    )
+    def test_is_responsive_wait_call_names_exactly_the_responsive_helpers(
+        self, call: str, is_responsive: bool
+    ) -> None:
+        node = ast.parse(call, mode='eval').body
+
+        assert is_responsive_wait_call(node) is is_responsive, (
+            f'is_responsive_wait_call({call!r}) should be {is_responsive}'
         )
 
 
