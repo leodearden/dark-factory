@@ -1983,51 +1983,99 @@ class TestExemptionSeparatorVariants:
         )
 
 
-# The Rule C census, re-measured by task 5269 after it widened detection: 650
-# violations across 47 files in four packages (task 4246 shipped 618 across 20,
-# every one under orchestrator/tests/).  Counted as VIOLATIONS, not sites — one call
-# can produce two.  test_merge_speculation.py measures ZERO (task 3980 migrated it)
-# and is deliberately ABSENT.
+# The Rule C census, re-measured ONCE per widening of its detection, each time a
+# sanctioned rise where every added violation was newly SEEN, not new debt:
+#   * task 5269: 650 violations across 47 files in four packages (task 4246 shipped
+#     618 across 20, every one under orchestrator/tests/);
+#   * task 7800: 294 across 82 files after Rule C learned asyncio.timeout blocks and
+#     clock-deadline polls — every added violation newly SEEN, not new debt (220
+#     across 39 before it).
+# Counted as VIOLATIONS, not sites — one call can produce two.
+# test_merge_speculation.py measures ZERO (tasks 3980 and 7800 migrated it) and is
+# deliberately ABSENT.
 _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_merge_queue_concurrent_verify.py',
     'orchestrator/tests/test_merge_queue_request_liveness.py',
     'orchestrator/tests/test_offline_lane.py',
     'orchestrator/tests/test_live_merge_worker.py',
+    'orchestrator/tests/test_merge_queue.py',
+    'orchestrator/tests/test_verify_admission_integration_gate.py',
     'orchestrator/tests/test_background_service.py',
+    'orchestrator/tests/test_harness_lifecycle_registry.py',
     'orchestrator/tests/test_merge_queue_deep_dispatch.py',
-    'orchestrator/tests/test_merge_queue_deep_landing.py',
     'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py',
-    'orchestrator/tests/test_harness.py',
+    'orchestrator/tests/test_git_ops.py',
     'orchestrator/tests/test_invoke.py',
-    'orchestrator/tests/test_merge_queue_deep_integration_gate.py',
+    'orchestrator/tests/test_merge_queue_bounce.py',
+    'orchestrator/tests/test_merge_queue_deep_landing.py',
     'orchestrator/tests/test_merge_queue_invariant_integration_gate.py',
+    'orchestrator/tests/test_merge_queue_supervisor.py',
+    'orchestrator/tests/test_workflow_cancellation.py',
+    'orchestrator/tests/test_harness.py',
+    'orchestrator/tests/test_merge_queue_coalesce.py',
+    'orchestrator/tests/test_merge_queue_deep_integration_gate.py',
+    'orchestrator/tests/test_merge_queue_rebased_landing_dead_base.py',
     'orchestrator/tests/test_merge_skew_tripwire.py',
     'orchestrator/tests/test_merge_worktree_lifecycle_integration_gate.py',
     'orchestrator/tests/test_offline_lane_infra_integration.py',
     'orchestrator/tests/test_offline_lane_integration.py',
-    'orchestrator/tests/test_workflow_cancellation.py',
+    'orchestrator/tests/test_verify_ruff_config_boundary.py',
+    'orchestrator/tests/test_cancel_scope_bounded_cleanup.py',
+    'orchestrator/tests/test_cascade_unblock.py',
+    'orchestrator/tests/test_coalesce_integration_gate.py',
+    'orchestrator/tests/test_delivered_check_gate.py',
+    'orchestrator/tests/test_deterministic_runner.py',
+    'orchestrator/tests/test_done_phase_wedge.py',
+    'orchestrator/tests/test_harness_force_release_wedged_slot.py',
+    'orchestrator/tests/test_harness_offline_lane.py',
+    'orchestrator/tests/test_harness_resume_scheduler.py',
+    'orchestrator/tests/test_lane_lock_leak_guard.py',
+    'orchestrator/tests/test_merge_lane_parked_custody.py',
+    'orchestrator/tests/test_merge_queue_lifecycle_registry.py',
+    'orchestrator/tests/test_merge_queue_orphan_reaper.py',
+    'orchestrator/tests/test_merge_queue_restart_hook.py',
+    'orchestrator/tests/test_offline_lane_records.py',
+    'orchestrator/tests/test_remote_gate.py',
     'orchestrator/tests/test_verify.py',
+    'orchestrator/tests/test_verify_admission_cancel_release.py',
+    'orchestrator/tests/test_verify_admission_executor_bypass.py',
+    'orchestrator/tests/test_verify_admission_gate.py',
+    'orchestrator/tests/test_verify_admission_order_integration.py',
+    'orchestrator/tests/test_verify_admission_watch.py',
+    'orchestrator/tests/test_verify_run_cmd_reap.py',
+    'orchestrator/tests/test_workflow_halt_owner.py',
     'dashboard/tests/test_db.py',
     'dashboard/tests/test_mcp_fanout.py',
     'dashboard/tests/test_durability.py',
     'dashboard/tests/test_metrics_curator.py',
     'dashboard/tests/_dashboard_helpers.py',
     'dashboard/tests/test_api_curator.py',
+    'dashboard/tests/test_memory_exchange_isolation.py',
     'dashboard/tests/test_merge_queue_data.py',
-    'fused-memory/tests/test_drain_signal_handler.py',
     'fused-memory/tests/test_harness.py',
+    'fused-memory/tests/test_drain_signal_handler.py',
     'fused-memory/tests/test_memory_service.py',
     'fused-memory/tests/test_operator_signal_handler.py',
     'fused-memory/tests/test_periodic_rebuild_summaries.py',
     'fused-memory/tests/test_task_interceptor.py',
+    'fused-memory/tests/_fm_helpers.py',
     'fused-memory/tests/server/test_grouped_read.py',
     'fused-memory/tests/test_dependency_direction_check.py',
     'fused-memory/tests/test_e2e_durable_queue.py',
     'fused-memory/tests/test_journaling_integration.py',
     'fused-memory/tests/test_recon_claim_verification_wiring.py',
+    'fused-memory/tests/test_event_loop_lag.py',
+    'fused-memory/tests/test_event_queue.py',
+    'fused-memory/tests/test_main_curator_usage_gate.py',
     'shared/tests/test_uuid_prefix_guard.py',
     'shared/tests/test_async_sqlite_base.py',
+    'shared/tests/test_auth_failed.py',
+    'shared/tests/test_auth_reprobe_opt_out.py',
     'shared/tests/test_cli_invoke.py',
+    'shared/tests/test_cli_invoke_transcript_offloop.py',
+    'shared/tests/test_failover_integration.py',
+    'shared/tests/test_git_async.py',
+    'shared/tests/test_usage_gate_park_visibility.py',
 })
 
 # Exactly ONE Rule C violation (bare wait_for; the bound is derived, not written),
@@ -2062,8 +2110,10 @@ class TestWallClockDeadlineDebtBaseline:
     """The shrink-only per-file debt baseline that lets Rule C ship default-ON.
 
     Pre-existing violations — 618 across 20 files when task 4246 shipped the rule,
-    650 across 47 files in four packages once task 5269 widened its detection —
-    mean a hot default-on rule would turn those packages' lint_commands red
+    650 across 47 files in four packages once task 5269 widened its detection, and
+    294 across 82 files once task 7800 taught it asyncio.timeout blocks and
+    clock-deadline polls (220 across 39 before; every added one newly SEEN, not new
+    debt) — mean a hot default-on rule would turn those packages' lint_commands red
     immediately and stall the merge lane repo-wide — the identical situation Rule B
     faced at 95 sites/11 files, solved the identical way and since retired, its debt
     fully migrated (task 4354).
