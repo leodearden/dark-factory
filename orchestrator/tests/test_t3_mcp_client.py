@@ -492,3 +492,99 @@ class TestSelfPair:
         assert cli_calls(t3_cli) == [['--version'], PAIRING_CREATE]
         assert touched_oauth(t3_server) == []
         assert no_credential_written(fleet)
+
+
+class TestCredentialRecovery:
+    @pytest.mark.parametrize('framing', ['json', 'sse'])
+    def test_a_revoked_token_is_repaired_once_per_client(
+        self, t3_server: FakeT3Server, t3_cli: Path, fleet: Path, framing: str
+    ):
+        t3_server.framing = framing
+        seeded = seed_credential(t3_server, fleet)
+        mcp = connected(t3_server, fleet, repair=client.CliCodeSource())
+        assert isinstance(mcp.call('t3_environment_read', {}), client.ToolOk)
+        t3_server.revoke_tokens()
+
+        repaired = mcp.call('t3_environment_read', {})
+
+        assert isinstance(repaired, client.ToolOk)
+        assert cli_calls(t3_cli).count(PAIRING_CREATE) == 1
+        stored = client.read_credential_status(t3_server.environment_id, root=fleet).credential
+        assert stored is not None
+        assert stored.access_token != seeded.access_token
+        assert stored.paired_by is client.PairedBy.SELF_PAIR
+
+        t3_server.revoke_tokens()
+        refused = mcp.call('t3_environment_read', {})
+
+        assert isinstance(refused, client.TransportFailed)
+        assert refused.fault is client.TransportFault.CREDENTIAL_EXPIRED
+        assert refused.fault.value == 'credential-expired'
+        assert cli_calls(t3_cli).count(PAIRING_CREATE) == 1
+
+    def test_a_revoked_token_without_a_repair_source_is_credential_expired(
+        self, t3_server: FakeT3Server, t3_cli: Path, fleet: Path
+    ):
+        seed_credential(t3_server, fleet)
+        mcp = connected(t3_server, fleet)
+        assert isinstance(mcp.call('t3_environment_read', {}), client.ToolOk)
+        t3_server.revoke_tokens()
+
+        result = mcp.call('t3_environment_read', {})
+
+        assert isinstance(result, client.TransportFailed)
+        assert result.fault is client.TransportFault.CREDENTIAL_EXPIRED
+        assert cli_calls(t3_cli) == []
+
+    def test_a_token_refused_at_initialize_is_repaired(self, t3_server: FakeT3Server, t3_cli: Path, fleet: Path):
+        seed_credential(t3_server, fleet, access_token='never-issued')
+        mcp = connected(t3_server, fleet, repair=client.CliCodeSource())
+
+        result = mcp.call('t3_environment_read', {})
+
+        assert isinstance(result, client.ToolOk)
+        assert cli_calls(t3_cli).count(PAIRING_CREATE) == 1
+
+    @pytest.mark.parametrize('stored', ['expired', 'unpaired'])
+    def test_connect_with_a_repair_source_self_pairs_an_unusable_credential(
+        self, t3_server: FakeT3Server, t3_cli: Path, fleet: Path, stored: str
+    ):
+        if stored == 'expired':
+            seed_credential(t3_server, fleet, expires_at=datetime.now(UTC) + timedelta(minutes=30))
+
+        result = client.connect(t3_server.origin, root=fleet, repair=client.CliCodeSource())
+
+        assert isinstance(result, client.T3McpClient)
+        status = client.read_credential_status(t3_server.environment_id, root=fleet)
+        assert status.state is client.CredentialState.PAIRED
+        assert status.credential is not None
+        assert status.credential.paired_by is client.PairedBy.SELF_PAIR
+        assert isinstance(result.call('t3_environment_read', {}), client.ToolOk)
+
+    def test_connect_whose_self_pair_is_refused_leaves_the_old_file(
+        self, t3_server: FakeT3Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fleet: Path
+    ):
+        install_cli(t3_server, tmp_path, monkeypatch, 't3 v0.1.4')
+        seed_credential(t3_server, fleet, expires_at=datetime.now(UTC) + timedelta(minutes=30))
+        path = client.credential_path(t3_server.environment_id, root=fleet)
+        before = path.read_bytes()
+
+        result = client.connect(t3_server.origin, root=fleet, repair=client.CliCodeSource())
+
+        assert isinstance(result, client.ConnectFailed)
+        assert result.reason is client.ConnectFailure.PAIR_FAILED
+        assert result.detail is not None and 'cli-version-mismatch' in result.detail
+        assert path.read_bytes() == before
+
+    def test_a_lost_session_reinitializes_without_repairing(self, t3_server: FakeT3Server, t3_cli: Path, fleet: Path):
+        seed_credential(t3_server, fleet)
+        mcp = connected(t3_server, fleet, repair=client.CliCodeSource())
+        assert isinstance(mcp.call('t3_environment_read', {}), client.ToolOk)
+        t3_server.forget_sessions()
+
+        result = mcp.call('t3_environment_read', {})
+
+        assert isinstance(result, client.ToolOk)
+        assert mcp_methods(t3_server).count('initialize') == 2
+        assert len(t3_server.issued_sessions()) == 2
+        assert cli_calls(t3_cli) == []
