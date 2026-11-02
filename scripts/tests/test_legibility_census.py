@@ -2512,13 +2512,6 @@ def test_build_method_records_a_copy_of_every_verify_normalisation_count():
     assert method["extra"]["verify_normalisations"] == recorded
 
 
-def _method_block_yaml(markdown: str) -> dict:
-    """The mapping in the fenced yaml block of *markdown*'s ## Method section."""
-    return yaml.safe_load(
-        markdown.split("## Method", 1)[1].split("```yaml\n", 1)[1].split("```", 1)[0]
-    )
-
-
 def test_build_method_records_the_runs_slug_rejections():
     expected = {"count": 3, "values": ["a", "b"], "values_omitted": 0}
 
@@ -2529,7 +2522,9 @@ def test_build_method_records_the_runs_slug_rejections():
     assert check_census_report.check_record_method(record, _ORACLE_REPORT) == []
     assert check_census_report.check_rendered_method(mod.render_report(record), _ORACLE_REPORT) == []
     method_section = _section_text(mod.census_report_sections(record), mod.SECTION_METHOD)
-    assert _method_block_yaml(method_section)["extra"]["slug_rejections"] == expected
+    block = check_census_report.method_block(method_section)
+    assert isinstance(block, dict), block
+    assert block["extra"]["slug_rejections"] == expected
 
 
 def test_build_method_without_slug_rejections_records_zero():
@@ -3331,8 +3326,9 @@ def test_run_census_records_its_slug_rejections_in_the_method_block(tmp_path):
 
     assert outcome.status == "done"
     assert _run_record(kwargs)["method"]["extra"]["slug_rejections"] == expected
-    report_text = kwargs["report_path"].read_text(encoding="utf-8")
-    assert _method_block_yaml(report_text)["extra"]["slug_rejections"] == expected
+    block = check_census_report.method_block(kwargs["report_path"].read_text(encoding="utf-8"))
+    assert isinstance(block, dict), block
+    assert block["extra"]["slug_rejections"] == expected
 
 
 def test_run_census_rejects_a_report_path_outside_project_root_before_any_spend(tmp_path):
@@ -4998,9 +4994,9 @@ def test_run_census_normalises_and_counts_a_malformed_verdict_from_the_real_veri
         anchor_from_remediation=1, tag_dropped=1, severity_substituted=1, route_defaulted=1,
     )
     assert _recorded_normalisations(kwargs) == expected
-    report_text = kwargs["report_path"].read_text(encoding="utf-8")
-    method_yaml = report_text.split("## Method", 1)[1].split("```yaml\n", 1)[1].split("```", 1)[0]
-    assert yaml.safe_load(method_yaml)["extra"]["verify_normalisations"] == expected
+    block = check_census_report.method_block(kwargs["report_path"].read_text(encoding="utf-8"))
+    assert isinstance(block, dict), block
+    assert block["extra"]["verify_normalisations"] == expected
 
 
 def test_run_census_storm_batch_is_logged_and_noted_in_report(tmp_path, caplog):
