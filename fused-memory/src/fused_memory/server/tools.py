@@ -5133,8 +5133,10 @@ def create_mcp_server(
         distinction semantic search's silent low-similarity drop could not make.
 
         A miss now carries an optional ``tombstone`` key (task 3041) when the
-        record was DELIBERATELY reaped by a named reconciliation sweep. Its
-        presence proves the record is gone on purpose — naming the sweep
+        record was DELIBERATELY deleted by a tombstone-writing delete path —
+        one of the deleter tags listed at
+        ``reconciliation/recon_self_model.py::MEM0_TOMBSTONE_DELETERS``. Its
+        presence proves the record is gone on purpose — naming the deleter
         (``deleter``), the run that performed the deletion
         (``deleting_run_id``, distinct from the victim's own ``run_id``), when,
         and the victim's identifying metadata — rather than lost. This closes
@@ -5145,9 +5147,13 @@ def create_mcp_server(
 
         The key is OMITTED (not ``None``) when no tombstone exists, so its
         presence is itself the signal and the ordinary never-existed miss keeps
-        its original shape. Absence is NOT proof of the converse: tombstones
-        are TTL-bounded, so one older than
-        ``mem0_tombstone.MEM0_TOMBSTONE_TTL_DAYS`` has itself expired. The
+        its original shape. Absence is NOT proof of the converse: a miss with
+        no ``tombstone`` key is not evidence that the record was not
+        deliberately deleted, for two independent reasons. (1) Several Mem0
+        delete paths write no tombstone at all;
+        ``reconciliation/recon_self_model.py::render_cycle_summary_section``
+        is the maintained enumeration of them. (2) Even a written tombstone
+        expires after ``mem0_tombstone.MEM0_TOMBSTONE_TTL_DAYS``. The
         lookup is guarded and never runs on the hit branch, so it can only add
         information to an already-correct answer — a tombstone failure can
         never convert a correct ``found: False`` into an error, and a backend
