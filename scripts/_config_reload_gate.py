@@ -38,7 +38,10 @@ import os
 import sys
 from enum import Enum
 from pathlib import Path
-from typing import NoReturn
+from typing import TYPE_CHECKING, NoReturn
+
+if TYPE_CHECKING:
+    from shared.mcp_session import McpCallError
 
 RELOAD_REPLY_TIMEOUT_SECS = 30.0
 
@@ -150,30 +153,35 @@ def _call_reload_config(port: str, *, committed_as: str, timeout: float) -> dict
         ) as session:
             return session.call_tool("reload_config", {})
     except mcp_session.McpCallError as exc:
+        # Only a READ timeout follows a completely sent request. A connect,
+        # write or pool timeout leaves the server no complete request to run,
+        # so those are a reload that never reached the tool.
         raise _not_confirmed_by(
-            exc, mcp_session=mcp_session, httpx=httpx, base_url=base_url,
-            timeout=timeout, committed_as=committed_as,
+            exc,
+            tool_raised=exc.kind is mcp_session.McpFailureKind.TOOL_ERROR,
+            read_timed_out=isinstance(exc.__cause__, httpx.ReadTimeout),
+            base_url=base_url, timeout=timeout, committed_as=committed_as,
         ) from exc
 
 
 def _not_confirmed_by(
-    exc, *, mcp_session, httpx, base_url: str, timeout: float, committed_as: str,
+    exc: McpCallError, *, tool_raised: bool, read_timed_out: bool,
+    base_url: str, timeout: float, committed_as: str,
 ) -> ReloadNotConfirmed:
     """The refusal for a reload_config call that raised *exc*: the tool ran
-    and failed, its reply was lost after a full send, or the request never
-    reached the tool."""
-    if exc.kind is mcp_session.McpFailureKind.TOOL_ERROR:
+    and failed (*tool_raised*), its reply did not arrive in time after a full
+    send (*read_timed_out*), or else the request never reached the tool.
+
+    Whenever the tool may have run, the live config is UNKNOWN, and a deploy
+    gate must not pass on that."""
+    if tool_raised:
         return ReloadNotConfirmed(
             ReloadFailure.RELOAD_RAISED,
             f"reload_config ran and failed at {base_url}: {exc} (it may have applied the change "
             f"before failing, so the live config is unknown; committed as {committed_as}; "
             f"re-run to converge, or the value lands at the next restart)",
         )
-    # Only a READ timeout follows a completely sent request. A connect, write
-    # or pool timeout leaves the server no complete request to run, so those
-    # are a reload that never reached the tool. Whenever the tool may have
-    # run, the live config is UNKNOWN, and a deploy gate must not pass on that.
-    if isinstance(exc.__cause__, httpx.ReadTimeout):
+    if read_timed_out:
         return ReloadNotConfirmed(
             ReloadFailure.REPLY_TIMED_OUT,
             f"no reply from {base_url} within {timeout}s to a request already sent; the transport "
