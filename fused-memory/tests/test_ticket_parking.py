@@ -8,16 +8,26 @@ curator injected through the interceptor's ``curator=`` constructor argument.
 
 import asyncio
 import json
-import logging
 from collections import deque
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any, cast
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
-from shared.cli_invoke import AllAccountsCappedException
+from _curator_helpers import (
+    agent_result,
+    escalator_double,
+    invoke_by_role,
+    make_config,
+    must_not_invoke,
+    pool_with_ids,
+    prepared,
+    submit_as_one_batch,
+    zot_agent_result,
+)
+from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.usage_gate import PoolFrozen
 
 from fused_memory.config.schema import FusedMemoryConfig
@@ -72,14 +82,12 @@ class _ScriptedCurator:
     """A curator double answering each candidate, by title, with its next scripted verdict.
 
     A batch-level script entry (``batch_raises``) makes the next
-    ``curate_prepared`` call raise instead of answering; a title in
-    ``prepare_raises`` makes ``prepare_candidate`` raise for it.
+    ``curate_prepared`` call raise instead of answering.
     """
 
     def __init__(self, script: Mapping[str, Sequence[Verdict]]) -> None:
         self._script = {title: deque(verdicts) for title, verdicts in script.items()}
         self.batch_raises: deque[BaseException] = deque()
-        self.prepare_raises: set[str] = set()
         self.hold_prepare: dict[str, asyncio.Event] = {}
         self.created: list[tuple[str, str]] = []
 
@@ -95,8 +103,6 @@ class _ScriptedCurator:
         hold = self.hold_prepare.get(candidate.title)
         if hold is not None:
             await hold.wait()
-        if candidate.title in self.prepare_raises:
-            raise RuntimeError(f'prepare exploded for {candidate.title}')
         return PreparedCandidate(candidate=candidate, pool=[], pool_sizes={}, prompt_tokens=0)
 
     async def curate_prepared(
@@ -516,59 +522,105 @@ class TestRequeue:
         assert (await _resolve(restarted, ticket_id))['status'] == 'combined'
 
 
-class TestCuratorEscapeParks:
-    """A curator failure that escapes curate() parks the ticket; only a zero-output hang creates."""
+def _max_turns_failure() -> AgentResult:
+    """A failed LLM call that is not a zero-output hang."""
+    return AgentResult(success=False, output='', subtype='error_max_turns', turns=12)
+
+
+def _real_curator(*, invoke: Any, escalator: Any = None) -> TaskCurator:
+    """A real TaskCurator whose LLM is *invoke* and whose corpus is never touched.
+
+    ``prepare_candidate`` hands back a bundle over an empty pool, and the
+    corpus writes and reads the worker makes after a create are stubbed, so
+    nothing reaches Qdrant or an embedder.
+    """
+    curator = TaskCurator(
+        config=make_config(), taskmaster=None,
+        escalator=escalator if escalator is not None else escalator_double(), invoke=invoke,
+    )
+
+    async def bundle_for(candidate: CandidateTask, *_args: Any) -> PreparedCandidate:
+        return prepared(candidate.title, candidate=candidate)
+
+    cast(Any, curator).prepare_candidate = AsyncMock(side_effect=bundle_for)
+    cast(Any, curator).record_task = AsyncMock()
+    cast(Any, curator).reembed_task = AsyncMock()
+    cast(Any, curator).search_corpus = AsyncMock(return_value=[])
+    return curator
+
+
+def _escalator_raising(error: BaseException) -> AsyncMock:
+    escalator = escalator_double()
+    escalator.report_failure = AsyncMock(side_effect=error)
+    return escalator
+
+
+class TestCuratorFailuresDecidedByThePipeline:
+    """Every curator failure is decided inside curate_prepared; the worker only dispatches."""
 
     @pytest.mark.asyncio
-    async def test_a_failure_escaping_the_per_item_fallback_parks(self, make_interceptor, store, taskmaster):
-        curator = _ScriptedCurator({'Work': [CuratorFailureError('llm down')]})
-        curator.batch_raises.append(CuratorFailureError('batch down'))
-        interceptor = make_interceptor(curator)
-
-        ticket_id = await _submit(interceptor, 'Work')
-
-        assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, DeferReason.LLM_FAILED)
-        assert await _parked_row(store, ticket_id) == _parked(DeferReason.LLM_FAILED)
-        assert taskmaster.add_task_calls == []
-
-    @pytest.mark.asyncio
-    async def test_a_failure_escaping_the_unprepared_backfill_parks(self, make_interceptor, store, taskmaster):
-        curator = _ScriptedCurator({'Work': [CuratorFailureError('llm down')]})
-        curator.prepare_raises.add('Work')
-        interceptor = make_interceptor(curator)
-
-        ticket_id = await _submit(interceptor, 'Work')
-
-        assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, DeferReason.LLM_FAILED)
-        assert await _parked_row(store, ticket_id) == _parked(DeferReason.LLM_FAILED)
-        assert taskmaster.add_task_calls == []
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize('escape', ['per-item-fallback', 'unprepared-backfill'])
-    async def test_a_parked_escape_logs_its_failure_against_the_ticket(
-        self, make_interceptor, caplog, escape,
+    async def test_a_prepare_candidate_exception_parks_corpus_failed_and_never_reaches_the_llm(
+        self, make_interceptor, store, taskmaster,
     ):
-        """The parked row records only the defer reason, so the failure itself is logged."""
-        curator = _ScriptedCurator({'Work': [CuratorFailureError('claude not on PATH')]})
-        if escape == 'per-item-fallback':
-            curator.batch_raises.append(CuratorFailureError('batch down'))
-        else:
-            curator.prepare_raises.add('Work')
+        curator = _real_curator(invoke=must_not_invoke())
+        cast(Any, curator).prepare_candidate = AsyncMock(side_effect=RuntimeError('qdrant gone'))
         interceptor = make_interceptor(curator)
 
-        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
-            ticket_id = await _submit(interceptor, 'Work')
-            assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, DeferReason.LLM_FAILED)
+        ticket_id = await _submit(interceptor, 'Work')
 
-        assert [
-            r.levelno for r in caplog.records
-            if ticket_id in r.getMessage() and 'claude not on PATH' in r.getMessage()
-        ] == [logging.WARNING]
+        assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, DeferReason.CORPUS_FAILED)
+        assert await _parked_row(store, ticket_id) == _parked(DeferReason.CORPUS_FAILED)
+        assert taskmaster.add_task_calls == []
 
     @pytest.mark.asyncio
-    async def test_a_curator_that_raises_instead_of_deciding_parks(self, make_interceptor, store, taskmaster):
-        curator = _ScriptedCurator({'Work': []})
-        curator.batch_raises.append(RuntimeError('curator exploded'))
+    async def test_a_failed_batch_bisects_and_both_tickets_park_llm_failed(
+        self, make_interceptor, store, taskmaster,
+    ):
+        invoke = invoke_by_role(single=_max_turns_failure(), batch=_max_turns_failure())
+        curator = _real_curator(invoke=invoke)
+        interceptor = make_interceptor(curator)
+
+        ticket_ids = await submit_as_one_batch(interceptor, curator, [
+            {'title': 'First work', 'description': 'first'},
+            {'title': 'Second work', 'description': 'second'},
+        ], project_root=PROJECT_ROOT)
+
+        for ticket_id in ticket_ids:
+            assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, DeferReason.LLM_FAILED)
+            assert await _parked_row(store, ticket_id) == _parked(DeferReason.LLM_FAILED)
+        assert [call.kwargs['role'] for call in invoke.await_args_list] == [
+            'task_curator_batch', 'task_curator', 'task_curator',
+        ]
+        assert taskmaster.add_task_calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_zero_output_hang_with_no_orchestrator_creates_marked(self, make_interceptor, taskmaster):
+        no_orchestrator = CuratorFailureError('no orchestrator is running', zero_output_timeout=True)
+        curator = _real_curator(
+            invoke=invoke_by_role(
+                single=zot_agent_result(), batch=AssertionError('one ticket is a batch of one'),
+            ),
+            escalator=_escalator_raising(no_orchestrator),
+        )
+        interceptor = make_interceptor(curator)
+
+        ticket_id = await _submit(interceptor, 'Work', metadata=_CALLER_METADATA)
+
+        answer = await _resolve(interceptor, ticket_id)
+        assert (answer['status'], answer['task_id']) == ('created', '101')
+        reason = answer['reason'].removeprefix('create: ')
+        assert reason.startswith('curator-failed: CuratorFailureError')
+        [metadata] = taskmaster.added_metadata()
+        assert _marker_of(metadata) == {'reason': reason, 'at': metadata[DEDUPE_SKIPPED_KEY]['at']}
+
+    @pytest.mark.asyncio
+    async def test_a_curator_that_raises_instead_of_deciding_parks_curator_raised(
+        self, make_interceptor, store, taskmaster,
+    ):
+        curator = _real_curator(
+            invoke=invoke_by_role(single=_max_turns_failure(), batch=_max_turns_failure()),
+            escalator=_escalator_raising(RuntimeError('escalation queue corrupt')),
+        )
         interceptor = make_interceptor(curator)
 
         ticket_id = await _submit(interceptor, 'Work')
@@ -578,30 +630,34 @@ class TestCuratorEscapeParks:
         assert taskmaster.add_task_calls == []
 
     @pytest.mark.asyncio
-    async def test_a_zero_output_hang_escaping_curate_still_creates(self, make_interceptor, taskmaster):
-        curator = _ScriptedCurator({'Work': [CuratorFailureError('llm hung', zero_output_timeout=True)]})
-        curator.batch_raises.append(CuratorFailureError('batch down'))
-        interceptor = make_interceptor(curator)
-
-        ticket_id = await _submit(interceptor, 'Work', metadata=_CALLER_METADATA)
-
-        reason = 'curator-failed: CuratorFailureError: llm hung'
-        assert await _resolve(interceptor, ticket_id) == {
-            'status': 'created', 'task_id': '101', 'reason': f'create: {reason}',
-        }
-        [metadata] = taskmaster.added_metadata()
-        assert _marker_of(metadata) == {'reason': reason, 'at': metadata[DEDUPE_SKIPPED_KEY]['at']}
-
-    @pytest.mark.asyncio
     async def test_a_parked_llm_failure_resolves_on_a_later_combine(self, make_interceptor, store, taskmaster):
-        curator = _ScriptedCurator({
-            'Overlapping work': [CuratorFailureError('llm down'), _combine_into_existing(taskmaster)],
-        })
-        curator.batch_raises.append(CuratorFailureError('batch down'))
+        taskmaster.tasks['7'] = {'id': '7', 'title': 'Existing task', 'status': 'pending', 'metadata': {}}
+        llm_down = True
+
+        def single(_kwargs: dict[str, Any]) -> AgentResult:
+            if llm_down:
+                return _max_turns_failure()
+            return agent_result({
+                'action': 'combine', 'target_id': '7', 'target_fingerprint': 'Existing task',
+                'justification': 'overlaps 7',
+                'rewritten_task': {
+                    'title': 'Existing task, widened', 'description': 'both asks', 'details': 'merged',
+                },
+            })
+
+        curator = _real_curator(invoke=invoke_by_role(
+            single=single, batch=AssertionError('one ticket is a batch of one'),
+        ))
+
+        async def bundle_over_task_7(candidate: CandidateTask, *_args: Any) -> PreparedCandidate:
+            return prepared(candidate.title, candidate=candidate, pool=pool_with_ids(('7', 'pending')))
+
+        cast(Any, curator).prepare_candidate = AsyncMock(side_effect=bundle_over_task_7)
         interceptor = make_interceptor(curator)
         ticket_id = await _submit(interceptor, 'Overlapping work')
         assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, DeferReason.LLM_FAILED)
 
+        llm_down = False
         assert await interceptor.requeue_awaiting_curation_ticket('project', ticket_id) is True
 
         assert await _resolve(interceptor, ticket_id) == {
@@ -645,40 +701,34 @@ async def _batch_created_metadata(
 class TestDedupeSkippedMarker:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ('script', 'batch_error', 'reason'),
+        ('script', 'reason'),
         [
             (
                 [CuratorDecision(action='create', degraded=True, justification='llm-failed: boom')],
-                None, 'llm-failed: boom',
-            ),
-            (
-                [CuratorFailureError('llm hung', zero_output_timeout=True)],
-                CuratorFailureError('batch down'), 'curator-failed: CuratorFailureError: llm hung',
+                'llm-failed: boom',
             ),
             (
                 [CuratorDecision(action='drop', batch_target_index=5, justification='dup')],
-                None, 'batch-target-out-of-range: local=5',
+                'batch-target-out-of-range: local=5',
             ),
             (
                 [CuratorDecision(action='combine', target_id='404', justification='overlaps 404')],
-                None, 'combine-failed: overlaps 404',
+                'combine-failed: overlaps 404',
             ),
             (
                 [CuratorDecision(action='drop', justification='dup of nothing')],
-                None, 'drop-failed: dup of nothing',
+                'drop-failed: dup of nothing',
             ),
         ],
         ids=[
-            'curator-degraded-create', 'curator-failed-zot',
+            'curator-degraded-create',
             'batch-target-out-of-range', 'combine-fell-through', 'drop-fell-through',
         ],
     )
     async def test_a_create_no_verdict_judged_is_marked(
-        self, make_interceptor, taskmaster, script, batch_error, reason,
+        self, make_interceptor, taskmaster, script, reason,
     ):
         curator = _ScriptedCurator({'Work': script})
-        if batch_error is not None:
-            curator.batch_raises.append(batch_error)
 
         [metadata] = await _created_metadata(make_interceptor(curator), taskmaster, 'Work')
 

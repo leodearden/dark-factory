@@ -540,7 +540,7 @@ async def test_worker_r4_escalation_idempotency_returns_existing_task(
 
 
 # ---------------------------------------------------------------------------
-# step-29: worker parks the ticket on a CuratorFailureError
+# step-29: worker parks the ticket on the pipeline's LLM_FAILED defer
 # ---------------------------------------------------------------------------
 
 
@@ -2020,53 +2020,6 @@ class TestCreatePathReasonPersisted:
         assert row['status'] == 'created'
         assert row['reason'] == 'create: ' + prose
         assert json.loads(row['result_json']) == _ADD_TASK_RESULT
-
-    @pytest.mark.asyncio
-    async def test_zot_curator_failure_records_curator_failed_reason(
-        self, interceptor_with_store, ticket_store, taskmaster,
-    ):
-        from fused_memory.middleware.curator_types import CuratorFailureError
-
-        exc = CuratorFailureError(
-            'llm down', timed_out=True, duration_ms=100, zero_output_timeout=True,
-        )
-        curator = MagicMock()
-        curator.curate = AsyncMock(side_effect=exc)
-        curator.curate_prepared = AsyncMock(side_effect=exc)
-        _stub_prepare_candidate(curator)
-        curator.note_created = MagicMock()
-        curator.record_task = AsyncMock()
-
-        row = await _drive_ticket_through_worker(
-            interceptor_with_store, ticket_store, curator,
-        )
-
-        assert row['status'] == 'created'
-        assert row['reason'] == 'create: curator-failed: CuratorFailureError: llm down'
-        assert json.loads(row['result_json'])['curator_degrade_reason'] == 'llm down'
-
-    @pytest.mark.asyncio
-    async def test_unprepared_ticket_zot_curator_failure_records_reason(
-        self, interceptor_with_store, ticket_store, taskmaster,
-    ):
-        """A ticket with no prepared bundle is curated alone; its zero-output hang degrades to create."""
-        from fused_memory.middleware.curator_types import CuratorFailureError
-
-        curator = MagicMock()
-        curator.prepare_candidate = AsyncMock(return_value=None)
-        curator.curate = AsyncMock(
-            side_effect=CuratorFailureError('llm down', zero_output_timeout=True),
-        )
-        curator.note_created = MagicMock()
-        curator.record_task = AsyncMock()
-
-        row = await _drive_ticket_through_worker(
-            interceptor_with_store, ticket_store, curator,
-        )
-
-        assert row['status'] == 'created'
-        assert row['reason'] == 'create: curator-failed: CuratorFailureError: llm down'
-        assert json.loads(row['result_json'])['curator_degrade_reason'] == 'llm down'
 
     @pytest.mark.asyncio
     async def test_prepared_ticket_create_records_reason(
