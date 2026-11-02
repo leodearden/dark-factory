@@ -693,9 +693,18 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     the producer's files and never imports the producer.
   - (f) `tests/scripts/test_client_feed_escalation_queue_boundary.py` checks the reader against the
     real producer. It drives the escalation server's own tools (`escalate_blocker`, `promote_to_l2`,
-    `resolve_issue`, including a park) on a tmp root and asserts `leo`, then `factory`. The records that
-    `client-feed/tests/_stores.py::EscalationQueueDir` writes by hand cannot catch producer drift, any
-    more than the copied DDL can (2026-10-21 (g)). For this seam the boundary test does.
+    `resolve_issue`) on a tmp root and checks:
+    - `level`, in every test;
+    - own-task attribution, and member attribution across tasks: an L1 on one task promoted under
+      another task's L2 makes the member task wait on `leo` until the cascade;
+    - the `status` filter: a resolution whose archival fails, forced by a regular file at
+      `data/escalations/archive`, leaves the closed records at the root
+      (`escalation/src/escalation/queue.py::EscalationQueue._archive_resolved`), and they are not open;
+    - archival, the L2 cascade and park.
+
+    The records that `client-feed/tests/_stores.py::EscalationQueueDir` writes by hand cannot catch
+    producer drift, any more than the copied DDL can (2026-10-21 (g)). For this seam the boundary test
+    does.
 
 
 ## 13. Open questions (tactical)
