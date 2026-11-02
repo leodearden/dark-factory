@@ -11,35 +11,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from shared.project_layout import runs_db, tasks_db
-
-# fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_SCHEMA_SQL
-TASKS_DDL: Final = """
-CREATE TABLE IF NOT EXISTS tasks (
-    tag             TEXT NOT NULL DEFAULT 'master',
-    id              INTEGER NOT NULL,
-    title           TEXT NOT NULL,
-    description     TEXT,
-    details         TEXT,
-    test_strategy   TEXT,
-    status          TEXT NOT NULL,
-    priority        TEXT,
-    metadata        TEXT,
-    updated_at      TEXT NOT NULL,
-    claimant_run_id TEXT,
-    heartbeat_at    TEXT,
-    candidate_key   TEXT,
-    PRIMARY KEY (tag, id)
-);
-
-CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
-
-CREATE TABLE IF NOT EXISTS dependencies (
-    tag        TEXT NOT NULL DEFAULT 'master',
-    task_id    INTEGER NOT NULL,
-    depends_on INTEGER NOT NULL,
-    PRIMARY KEY (tag, task_id, depends_on)
-);
-"""
+from shared.task_store_schema import TASK_STORE_DDL
 
 # orchestrator/src/orchestrator/event_store.py::_SCHEMA
 EVENTS_DDL: Final = """\
@@ -196,7 +168,7 @@ class TasksDb:
     @classmethod
     def create(cls, root: Path) -> TasksDb:
         path = tasks_db(root)
-        _create(path, TASKS_DDL)
+        _create(path, TASK_STORE_DDL)
         return cls(path)
 
     def add(

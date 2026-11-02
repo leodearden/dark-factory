@@ -1,9 +1,9 @@
 """Role-prompt guidance: a command given several paths can fail on one and print the rest.
 
-`orchestrator/src/orchestrator/agents/roles.py::_BASH_CAPABLE_ROLE_PREAMBLE`
+`orchestrator/src/orchestrator/agents/harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE`
 splices `MULTI_PATH_PARTIAL_FAILURE_GUIDANCE` into every role holding
-unqualified `Bash`. It is a leaf module, imported downward by roles.py, only so
-that already oversized file does not grow further.
+unqualified `Bash`. It is a leaf module, imported downward by
+harness_guidance.py.
 
 `wc`, `cat`, `head`, `grep` and `ls` print genuine output for every readable
 path beside one error line per missing one, so the failure reads as noise.

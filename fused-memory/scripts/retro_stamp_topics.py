@@ -96,7 +96,7 @@ import types
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fused_memory.memory_metadata import normalize_supersedes
+from fused_memory.memory_metadata import is_canonical, normalize_supersedes
 from fused_memory.topic_slug import (
     TOPIC_SLUG_MAX_LEN,
     derive_topic_slug,
@@ -328,12 +328,12 @@ def compute_patch(
     # deletion. A cluster whose canonical is disputed or plural leaves the
     # sweep with a topic on every member and an opinion about none.
     if make_canonical:
-        if existing_metadata.get('canonical') is True:
+        if is_canonical(existing_metadata):
             dispositions.append('canonical_already_present')
         else:
             patch['canonical'] = True
             dispositions.append('canonical_stamped')
-    elif existing_metadata.get('canonical') is True:
+    elif is_canonical(existing_metadata):
         # A member that is ALREADY canonical, in a cluster whose canonical is
         # someone else (or is plural/undecided). Silence here would defeat the
         # <=1-canonical-per-(project_id, topic) guarantee `merge_plans` claims
@@ -1267,7 +1267,7 @@ async def stamp_one(memory_service, target: StampTarget, *, apply: bool) -> dict
     if not decision.patch:
         return {**result, 'outcome': 'already_stamped'}
 
-    if decision.patch.get('canonical') is True:
+    if is_canonical(decision.patch):
         filters = {'topic': target.topic, 'canonical': True}
         try:
             count = await memory_service.count_memories_by_metadata(

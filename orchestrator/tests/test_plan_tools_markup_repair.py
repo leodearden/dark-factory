@@ -474,8 +474,12 @@ def _alternate_writer_changed_the_cell(
             kwargs[name] = sorted(DEVIATION_KINDS)[0]
         elif name == 'prose_only':
             kwargs[name] = False
-        elif name in ('sha', 'commit_sha'):
+        elif name in ('sha', 'commit_sha', 'commit'):
             kwargs[name] = 'a' * 40
+        elif name == 'disposition':
+            kwargs[name] = 'orphan'
+        elif name == 'authority':
+            kwargs[name] = f'Probe marker for {tool_name}.{name}.'
         elif name == 'files':
             kwargs[name] = ['a.py']
         elif name == 'task_id':
@@ -2609,6 +2613,13 @@ def _deviation_recorded(plan: dict) -> None:
     assert plan['steps'][0]['status'] == 'pending'
 
 
+def _descope_recorded(plan: dict) -> None:
+    assert [(d['step_id'], d['commit']) for d in plan['_descoped_steps']] == [
+        ('step-1', _NEW_SHA),
+    ]
+    assert plan['_rescoped_note'] == 'Descoped.'
+
+
 #: ``(id, call, expected-response-subset, on-disk-mutation-check)`` for every
 #: plan-tools entry point that OPENS an existing plan. ``_create_plan`` is
 #: absent on purpose: it overwrites the document wholesale, so it has no read to
@@ -2665,6 +2676,14 @@ READ_PATH_CASES = [
         ),
         {'status': 'ok', 'step_id': 'step-1', 'deviations': 1},
         _deviation_recorded,
+    ),
+    (
+        'record_descoped_step',
+        lambda a: plan_tools._record_descoped_step(
+            a, 'step-1', _NEW_SHA, 'orphan', 'esc-probe', 'Descoped.'
+        ),
+        {'status': 'ok', 'step_id': 'step-1', 'commit': _NEW_SHA, 'descoped_steps': 1},
+        _descope_recorded,
     ),
     (
         # Contract A1's DELIBERATELY divergent envelope — ``ok`` plus ``status``

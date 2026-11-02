@@ -22,6 +22,7 @@ from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+from orchestrator.evals import snapshots
 from orchestrator.evals.metrics import EvalMetrics, compute_composite
 from orchestrator.review_payload import ReviewPayload, normalize_review
 
@@ -191,7 +192,7 @@ def compute_recovery_score(
     Raises ``ValueError`` on an empty/missing ``criteria`` list, an unknown
     detector kind, or a non-positive total weight — the rubric is a code-owned
     adversarial fixture, so a typo must fail loudly (structured-facts-at-failure
-    / loud-over-silent). The boundary caller (``metrics.collect_metrics``)
+    / loud-over-silent). The boundary caller (``runner.collect_metrics``)
     wraps this so a real-run failure degrades to a null column, not a nuked run.
     """
     criteria = rubric.get('criteria') or []
@@ -243,9 +244,7 @@ async def recovery_score_for_run(
     scores them against ``task['adversarial']['recovery_rubric']``.
 
     ``base_commit`` is the task's ``pre_task_commit`` (the same base
-    ``metrics._git_diff_stats`` uses). ``snapshots`` is imported lazily to keep
-    this module import-light and mirror the local-import idiom the eval scoring
-    path already uses.
+    ``runner._git_diff_stats`` uses).
     """
     adversarial = task.get('adversarial')
     if not adversarial:
@@ -254,7 +253,6 @@ async def recovery_score_for_run(
     plan = artifacts.read_plan() if artifacts else {}
     reviews = artifacts.aggregate_reviews() if artifacts else None
     blocking_issues = list(reviews.blocking_issues) if reviews else []
-    from orchestrator.evals import snapshots
     diff = await snapshots.get_diff(worktree, base_commit)
     return compute_recovery_score(
         rubric, plan=plan, blocking_issues=blocking_issues, diff=diff,

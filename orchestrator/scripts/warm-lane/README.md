@@ -37,7 +37,9 @@ hermeticity seam only** — production never sets it. See the autouse
 `test_warm_lane_script_resolution.py` pin the *shipped* and *resolution* halves
 of the contract above. `test_lane_state_lib.py` pins `lib_lane_state.sh` —
 including the INV-5 drift gate that fails the build if `PROTECTED_PREFIXES`
-gains a band the library's static fallback does not cover. The **behaviour** of
+gains a band the library's static fallback does not cover.
+`test_live_refs_lib.py` pins `lib_live_refs.sh`'s reference detection and its
+scan footprint, at the merge gate. The **behaviour** of
 every invocable script here is
 covered by the ported bash tests in `orchestrator/tests/warm-lane/` — see
 [that directory's README](../../tests/warm-lane/README.md) for provenance, the
@@ -63,8 +65,10 @@ Copied at reify HEAD `638d97d8aba4de09a603494bfb5f239426fa73ef`
 | `lib_portable.sh` | `473217c346` | 2026-06-10 |
 | `lib_task_citation.sh` | `d1fea3e2c0` | 2026-09-17 |
 | `lib_lane_state.sh` | — **dark-factory-native** | 2026-07-30 |
+| `lib_lane_seed.sh` | — **dark-factory-native** | 2026-11-01 |
 
-**The last two rows are a PARTIAL re-sync, not a new anchor.** The
+**The `warm-lane-degenerate-ref-check.sh` and `lib_task_citation.sh` rows
+are a PARTIAL re-sync, not a new anchor.** The
 `638d97d8aba4de09a603494bfb5f239426fa73ef` HEAD above still governs every
 other row. `warm-lane-degenerate-ref-check.sh` and `lib_task_citation.sh` were
 re-synced by **task 5566** at reify HEAD
@@ -72,6 +76,17 @@ re-synced by **task 5566** at reify HEAD
 reify's task 7244 landed; nothing else was re-copied at that HEAD, so do not
 read the pair's dates as moving the anchor for the rest of the table. See
 Delta 11.
+
+**`warm-lane-gc.sh` carries a second, behaviour-only partial re-sync.** Its
+row stays at `973fde7955`, and that anchor still governs the rest of the
+file. **Task 7862** ported the behaviour of reify tasks 5635 (seed-failure
+discard, `reset_cold`) and 7366 (per-lane base-generation pin), plus the
+comments that describe it, as they stood at reify `9bd66abbbf` (2026-10-08),
+the file's last reify commit. Four reify commits in that range were
+deliberately NOT ported: `888c7a5fae`, `028779089e`, `84f1b33853` and
+`2c24e35c25`. All four are comment-only, and the 7227 pair cites files that
+exist only in reify. Diffing this file against reify therefore shows Delta 13
+plus those four commits' comment drift. See Delta 13.
 
 The copy includes reify task 5572's per-lane live-consumer `/proc` check
 (merged as reify `a4bddeaa51`), which is why `lib_live_refs.sh` travels here.
@@ -97,7 +112,9 @@ them, at `warm-lane-gc.sh:231` and `lib_live_refs.sh:137`, and the new lib adds
 none. No code path branches on anything reify-specific. (The eleventh,
 `lib_lane_state.sh`, is dark-factory-native and deliberately reify-free; the
 coupling it carries runs the other way, to
-`orchestrator/src/orchestrator/`.)
+`orchestrator/src/orchestrator/`. A twelfth, `lib_lane_seed.sh`, is also
+dark-factory-native: task 7859's skip-unchanged predicate, sourced by
+`warm-lane-gc.sh` — see Delta 14.)
 
 Four of the eleven source a sibling lib, and none of those libs is among the
 seven scripts the task named — copying only seven would ship four scripts that
@@ -132,7 +149,8 @@ rather than implements them.
 ## Documented deltas from the reify sources
 
 Every file here that HAS a reify source is **byte-identical** to it except as
-recorded below. (`lib_lane_state.sh` has none — see Provenance.) Keeping them
+recorded below. (`lib_lane_state.sh` and `lib_lane_seed.sh` have none — see
+Provenance.) Keeping them
 diffable against reify is the cheap drift check available for the whole α→κ
 duplication window, so deltas are enumerated rather than absorbed. Policy is
 untouched: `REIFY_*` env-var names, default image/mount paths and exit-code
@@ -205,10 +223,13 @@ changing it, and it is pinned by the `.worktrees` case in
 
 ### Delta 3 — `warm-lane-gc.sh` / `thin-warm-lane.sh` sibling-seed defaults
 
-A **documented behavioural caveat, deliberately NOT patched** — no file
-content diverges *for this reason*. (Delta 7 later diverged both files for an
-unrelated one, and its `--reseed` measurement sharpens the warning this delta
-already carried.) Both scripts default `--seed-script` to a sibling
+A **documented behavioural caveat**. The default itself is **not patched**.
+One file-content divergence exists for this reason: Delta 13's seed-presence
+guard in `warm-lane-gc.sh`. It keeps an unresolvable default from reaching
+the seed-failure discard, and it still guesses at no project-owned path.
+(Delta 7 diverged both files for an unrelated reason, and its `--reseed`
+measurement sharpens the warning this delta already carried.) Both scripts
+default `--seed-script` to a sibling
 `seed-warm-lane.sh` that PRD §5 keeps project-owned, so at the new location
 that default cannot resolve. Rather than patch the scripts to guess at a
 project-owned path (PRD invariant C-1), the caller resolves it: see
@@ -1236,6 +1257,241 @@ pipelines.
 and by `tests/scripts/test_quiet_grep_sweep.py::test_never_pipes_a_producer_into_grep_q`,
 which sweeps all seven invocable scripts in this directory.
 
+### Delta 13 — `warm-lane-gc.sh`: seed-failure discard and per-lane gen pin, behind a seed-presence guard
+
+Added by **task 7862**, as the behaviour-only partial re-sync recorded under
+Provenance. Two reify behaviours were ported into Pass 1's α branch:
+
+- **Seed-failure discard** — reify task 5635: `b4ba65a803`, `d7357ad617`,
+  `5082fd67d1`, `2bb3eccbea`. A seed that exits non-zero did not certify the
+  lane, and its fail-closed abort lands on the CoW clone it refused. gc now
+  discards `<lane>/target` (reify PRD `docs/prds/warm-lane-pool-cow-seeding.md`
+  §9.5 inv.13, the caller obligation) instead of counting the lane
+  *preserved*. It probes before the `rm`, so a refusal that left nothing is
+  reported as "nothing to discard". The lane is counted `reset` plus a new
+  `reset_cold` sub-count. If the discard itself fails, the lane is counted
+  *preserved*, with two loud warns.
+- **Per-lane base-generation pin** — reify task 7366: `9e46c6531d`,
+  `7f951d74b5`, `9bd66abbbf`. A pass runs 25-40 minutes and the base can
+  rotate inside it, so the gen is no longer resolved once up front.
+  `_reseed_lane_pinned` resolves it for each lane, takes `flock -s` on it, and
+  re-checks that the gen still exists once the lock is held. It retries up to
+  `_BASE_GEN_PIN_ATTEMPTS` (3) and then gives up. A lane that cannot be pinned
+  runs no seed and falls into the discard arm (`reset_cold`). The up-front
+  block is now an argument check only. Its `Cannot resolve base-target
+  symlink: <path>` message and exit 1 are unchanged.
+
+Divergences from reify's copy, all dark-factory-only:
+
+1. **The seed-presence guard.** `_seed_script_invocable` (`[ -f ] && [ -x ]`
+   on `SEED_SCRIPT`) is checked first in the α branch. A missing or
+   non-executable seed is never invoked, and nothing is discarded: the lane is
+   preserved with `target/` untouched.
+   - **Why it is needed:** the discard keys on a non-zero reseed status.
+     `GitOps._run_warm_lane_gc_reclaim` passes no `--seed-script` for a
+     project that ships none, and the sibling default does not exist here
+     (PRD §5; Delta 3). A verbatim port would therefore turn bash's 126/127
+     into an `rm -rf` of every lane's `target/` on every pass, each reported
+     as `reset`/`reset_cold`, for a certification no seed was asked to make.
+   - **Why it comes before the pin:** a missing seed then takes no gen reader
+     lock and creates no lock file.
+   - **Why the warn keeps its prefix:** it starts with the pre-port
+     `reset failed for <lane> (seed-script error); continuing` and then adds
+     the seed path and the reason. `_run_warm_lane_gc_reclaim`'s WARNING
+     quotes that text, and stays true, for exactly this case.
+   - **Why it does not key on 126/127:** a seed that really ran can exit 127
+     after staging a clone, when a command inside it is missing under
+     `set -e`.
+2. **Field order.** `reset_cold=N` is APPENDED after `downgraded_assigned`.
+   reify puts it straight after `preserved_live_ref`, because reify has
+   neither record-gate field (Delta 6, Delta 10), and here those two predate
+   it. The prefix every existing consumer matches is unchanged. A consumer
+   reading both copies must key on field names, not on positions (task 7857).
+3. **Two neutralised comments.** The PRD is named as reify's, since it does
+   not exist here. reify's "RUSTFLAGS mismatch" became "a build-flag
+   mismatch", which keeps the token-grep claim under "Why these eleven" true.
+
+**Deliberately not ported:** the task-5635 counterpart in `thin-warm-lane.sh`.
+Its discard is reachable only under `--reseed`, which dark-factory never
+passes (PRD D3).
+
+**Census at port time** (2026-10-31T00:42Z, task 7862). Each unit's
+`project_root` was read from its systemd unit's `--config`. All eight units
+use `worktree_dir` `.worktrees`:
+
+- autopilot-video
+- dark-factory
+- know-live
+- my-solar-challenge (`/home/leo/src/solar-challenge`)
+- pump-web-ui
+- scoping-intake
+- solar-challenge-platform
+- stream-touch
+
+In every one of them, `<project_root>/.worktrees` held **zero** `_lane-*` or
+`_spec-*` entries, and none had a `scripts/seed-warm-lane.sh` or a
+`scripts/warm-lane-gc.sh` override. So on merge Pass 1 had nothing to act on
+anywhere. The guard is what keeps that harmless if a lane appears in a
+project with no seed script.
+
+**Pinned by** `orchestrator/tests/warm-lane/test_warm_lane_gc.sh`:
+
+- Block S-discard (reify S1-S4)
+  - S-discard1's full-line assert pins the field order.
+  - S-discard5's three arms pin the guard: a missing seed, a non-executable
+    seed, and the production `--mount` shape with no sibling.
+- Block T (reify T1-T4)
+
+### Delta 14 — `warm-lane-gc.sh` skips a lane unchanged since its last seed; `warm-lane-gc-sweep.sh` gains `REIFY_WARM_LANE_GC_SWEEP_MODE`
+
+Added by **task 7859**, on Leo's ruling of 2026-10-30. The evidence is in
+`plans/3190-deep-canary-few-verifies-2026-10-29.md` Rounds 4 and 7: 92% of the
+timer arm's resets freed nothing. Both changes are dark-factory-only for now.
+reify task 9611 adds the stamp's `base_gen` field, and reuses this env spelling
+and this summary field.
+
+**B — the skip-unchanged gate (`lib_lane_seed.sh`, dark-factory-native).** It
+reads two things:
+
+- the project-owned stamp `<realpath lane>.seed-stamp.json`, which reify writes
+  in `scripts/verify-ledger.py::write_seed_stamp`;
+- the mtimes of a fixed set of directories: `target`, `target/*/`,
+  `target/*/{deps,.fingerprint,build,incremental}` and
+  `target/*/*/{deps,.fingerprint}`.
+
+A lane is skipped only when ALL of these hold:
+
+- the schema is `reify.lane-seed/1`;
+- `base_gen` exactly equals `readlink -f` of the base symlink, re-resolved for
+  each lane;
+- `exited_at` is a finite number, not a bool, and not in the future;
+- `target/` exists;
+- every probed directory is strictly older than `exited_at`.
+
+Anything else resets, as before. That includes a `NaN` `exited_at`, which
+`json.load` accepts and which would otherwise compare as "older" than nothing
+(pinned by V5 `exited-at-nan`), and a host with no `python3` (V5
+`python3-absent`).
+
+- **Position.** It is gate 3 of 4 in Pass 1:
+  - after the record gate, so an assigned lane keeps its `preserved_assigned`
+    attribution (V8);
+  - before the ~1.9 s `live_ref_present` walk, cheapest-decisive-first. A skip
+    is non-destructive, so a lane that goes live mid-pass is never harmed by
+    one;
+  - off under `--disk-pressure`, because the ENOSPC valve must not wait on a
+    heuristic (V7).
+- **`skipped_unchanged=N`** is APPENDED after `reset_cold`. It is disjoint from
+  both `reset` and `preserved`:
+  - `preserved` means "a reclaim candidate held back". An unchanged lane has
+    nothing to reclaim, so folding it in would hide a growing shield inside
+    ordinary idleness.
+  - No Python consumer parses the line: `GitOps._run_warm_lane_gc_reclaim`
+    discards stdout on rc=0. S-discard1 pins the full line.
+- **`base_gen` is compared exactly, never normalised.** Taking the realpath of a
+  stamp that recorded the `base/target` symlink would resolve it to whatever gen
+  is current now. That reads as a silent "always the same gen", the unsafe
+  direction (V5 `symlink-spelled`). reify 9611 defines the field as the concrete
+  `target.gen.N`, which is what `_reseed_lane_pinned` hands the seed.
+- **Why a lib.** `warm-lane-gc.sh` is near the size ceiling, and one file is
+  the auditable single home of PRD C-1's exception. The lib parses the stamp
+  with `python3 -I` and `json`, not `sed`, because the stamp is a typed boundary
+  input; `test_lane_state_lib.py`'s one-definition-site guard also forbids a
+  second copy of the sed idiom. A bash existence check runs first, so a project
+  with no stamp never starts a python3.
+
+**Measurements** (taken while planning, 2026-10-31). The first set used a
+scratch cargo crate. Every directory in `target` was touched to 2020-01-01,
+then one operation was run, then `find -maxdepth 3 -newermt` listed what moved:
+
+- a no-op `cargo build` moves no directory mtime;
+- a source edit bumps `target/debug` and `target/debug/deps`, and the rlib gets
+  a NEW inode (24144473 → 24911747). rustc replaces its outputs rather than
+  overwriting them;
+- `cargo check` bumps `deps`, `.fingerprint`, `.fingerprint/<unit>` and
+  `incremental`;
+- a test writing to `CARGO_TARGET_TMPDIR` bumps `target/tmp`;
+- an IN-PLACE overwrite of an existing file (`dd conv=notrunc`) bumps nothing;
+- `target/debug/.cargo-lock` keeps its creation mtime across rebuilds, so it is
+  unsound as a signal. Lanes clone it from base anyway.
+
+The second set was on reify's live `_lane-0` at load average 88:
+
+- one probe costs 46 ms per lane. A full `find -newermt` takes 27.6 s, and one
+  `live_ref_present` walk takes ~1.9 s;
+- one probed directory there carried a mtime inside the seed window (between
+  `started_at` and `exited_at`). So the comparison is against `exited_at`, and
+  equality resets.
+
+**Blind spot, stated.** Some writes move no probed mtime:
+
+- an in-place overwrite of an existing file;
+- a write deep inside an already-existing subdirectory, e.g. under
+  `target/tmp/<x>/`.
+
+A compile, which is where the ~19.6 GiB-per-reset accretion comes from, replaces
+its outputs, so it always bumps `<profile>/deps`.
+
+**F — `REIFY_WARM_LANE_GC_SWEEP_MODE`.** The values are `full` (the default;
+also empty or unset) and `trash-and-emergency`. Anything else exits 2 before
+the reaper runs. An enum rather than a truthy flag, so a typo fails the unit
+visibly.
+
+In `trash-and-emergency` mode:
+
+- the reaper and the df floor run unchanged;
+- gc.sh is exec'd only when the floor appended `--disk-pressure`. Otherwise the
+  sweep logs and exits 0;
+- a df failure means no reclaim at all, because emergency engages only on a
+  positive low-water measurement.
+
+The switch is Environment= only. reify's `install-warm-lane-units.sh` rewrites
+ExecStart with `s|^(ExecStart=.*/warm-lane-gc-sweep\.sh).*|\1 --mount …|`,
+which strips any flag on the next install. Environment= lines survive it, so the
+unit file stays the single switch.
+
+gc.sh has no Pass-2-only mode. Pass 2 removed 0 entries in the Round 4 window,
+so none was added. The mode never passes `--seed-script`, and under
+`--disk-pressure` gc.sh never invokes a seed (Z6).
+
+**Go-live for the eight non-reify units** (Delta 13's census). None writes a
+seed stamp, so every lane reads as "no stamp": no python3 start, no log line,
+and today's outcome (V4b pins their production shape). On the live host 171
+reify stamps exist and none carries `base_gen` yet. Until reify 9611 lands,
+every reify lane therefore also resets as today, visible as
+`skipped_unchanged=0`.
+
+**Pinned by:**
+
+- `orchestrator/tests/warm-lane/test_warm_lane_gc.sh` Block V (V1-V9) and A12;
+- `test_warm_lane_gc_sweep.sh` Block Z (Z1-Z6).
+
+### Delta 15 — `lib_live_refs.sh`: the fd/cwd pass enumerates only `/proc/<pid>/cwd` and `/proc/<pid>/fd`
+
+Added by **task 8089**. Offline pass `20261101T113026-1bafdf` killed
+`test_warm_lane_gc.sh` at its 900 s budget with `Results: 449 passed, 0 failed`
+already printed: nothing failed, the suite was slow. An instrumented 307 s run
+spent 164 s in 86 fd/cwd scans and 65 s in 79 maps scans.
+
+- **Equivalence.** On a real `/proc` the old `find /proc -maxdepth 3 …`
+  expression can match only `/proc/<pid>/cwd` and `/proc/<pid>/fd/*`. The rest
+  of its depth-3 walk (`attr/`, `net/`, `ns/`, `map_files/`, `fdinfo/`,
+  `/proc/sys/…`) matched nothing and was pure cost. The new producer hands
+  `find` exactly those links as starting points. The awk matcher is unchanged.
+- **`xargs` + `sh -c 'exec find "$@" …'`**, not a bare glob as `find`'s argv,
+  which would `E2BIG` at very large process counts and fail OPEN.
+- **Not `find -files0-from`**: findutils ≥ 4.9 only, and an older `find`
+  prints nothing, which fails open the same way.
+- **`warm-lane-gc.sh`** carries a comment-only pointer at the end of its
+  header's COST REVERSAL bullet, to the figures in `lib_live_refs.sh`; no code
+  change.
+
+reify's original still carries the depth-3 walk. Current per-call figures live
+in `lib_live_refs.sh`'s MEASURED COST block.
+
+**Pinned by:** `orchestrator/tests/test_live_refs_lib.py` — `TestScanFootprint`
+for what a negative verdict may list, `TestReferenceDetection` for the verdicts.
+
 ## Sibling-seed defaults, and who resolves them
 
 Two of the relocated scripts default their `--seed-script` to a **sibling**
@@ -1244,11 +1500,11 @@ project. At the new location that sibling does not exist, so anything relying
 on the default would fail. They are handled differently because their reach
 differs, and neither is a policy change:
 
-- **`warm-lane-gc.sh`** invokes `$SEED_SCRIPT` *unconditionally* on the Pass-1
-  lane-reset path, so its default is on the hot path. dark-factory's caller
+- **`warm-lane-gc.sh`** reaches `$SEED_SCRIPT` on every non-disk-pressure
+  Pass-1 lane reset, so its default is on the hot path. dark-factory's caller
   (`GitOps._run_warm_lane_gc_reclaim`) therefore passes `--seed-script
   <project_root>/scripts/seed-warm-lane.sh` explicitly whenever that file
-  exists. The script itself is left **verbatim**: the caller resolves the
+  exists. The script's default is left **verbatim**: the caller resolves the
   project-owned primitive, rather than dark-factory patching a default to
   guess at a project-owned path (PRD invariant C-1). Strictly no-op today —
   for reify the passed path is byte-identical to what the sibling default
@@ -1257,8 +1513,10 @@ differs, and neither is a policy change:
   **A project with no seed script gets a WARNING instead of a flag.** That is
   the fallback's own target case: a project carrying no warm-lane tooling is
   why these copies exist, and there is nothing to name. The sibling default
-  then cannot resolve, so every non-disk-pressure Pass-1 lane reset fails
-  inside the script and counts as *preserved* while reclaiming nothing.
+  then cannot resolve, so every non-disk-pressure Pass-1 lane reset is skipped
+  by the seed-presence guard (Delta 13). The skip is logged with the same
+  `reset failed for <lane> (seed-script error)` prefix and counted *preserved*.
+  target/ is left untouched and never discarded, so the pass reclaims nothing.
   `_run_warm_lane_gc_reclaim` therefore logs, once per invocation and only
   when the resolved origin is `dark-factory`, a WARNING naming the missing
   `<project_root>/scripts/seed-warm-lane.sh` and stating that lane resets will

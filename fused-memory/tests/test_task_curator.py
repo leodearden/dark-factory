@@ -229,7 +229,8 @@ class TestFlattenTaskTree:
         assert flatten_task_tree({}) == []
 
 class TestClipForPrompt:
-    """`clip_for_prompt` is the single owner of truncate-and-mark (INV-5).
+    """`clip_for_prompt` is the curator prompt's single route to
+    `utils/clip_disclosure.py::elide_text`, which owns truncate-and-mark.
 
     Both the pool side (`PoolEntry.render`) and the candidate side (the
     candidate section of the single and batch prompts) route through it, so
@@ -268,6 +269,14 @@ class TestClipForPrompt:
     def test_marker_keeps_the_ellipsis_prefix(self):
         clipped = clip_for_prompt('z' * 50, 10)
         assert clipped[10] == '\u2026'
+
+    @pytest.mark.parametrize('cap', [0, -1])
+    def test_a_non_positive_cap_is_rejected_not_rendered(self, cap):
+        with pytest.raises(ValueError, match='cap'):
+            clip_for_prompt('abc', cap)
+
+    def test_empty_text_fits_a_zero_cap_unchanged(self):
+        assert clip_for_prompt('', 0) == ''
 
 
 class TestEmbeddingText:
@@ -3368,6 +3377,7 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
         )
 
         assert withheld.caps == {
+            'sibling': config.curator.pool_sibling_cap,
             'module': config.curator.pool_module_cap,
             'embedding': config.curator.pool_embedding_cap,
             'dependency': config.curator.pool_dependency_cap,
@@ -3464,9 +3474,10 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
             curator, CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
         )
 
-        assert set(sizes) == {'anchor', 'module', 'embedding', 'dependency'}
+        assert set(sizes) == {'anchor', 'sibling', 'module', 'embedding', 'dependency'}
         assert sizes == {
             'anchor': 0,
+            'sibling': 0,
             'module': config.curator.pool_module_cap,
             'embedding': 0,
             'dependency': 0,
@@ -4758,7 +4769,7 @@ class TestPrepareCandidate:
             )
         assert prepared.pool == []
         assert prepared.pool_sizes == {
-            'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0,
+            'anchor': 0, 'sibling': 0, 'module': 0, 'embedding': 0, 'dependency': 0,
         }
 
 

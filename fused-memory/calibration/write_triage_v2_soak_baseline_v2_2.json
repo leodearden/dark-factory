@@ -1,0 +1,460 @@
+{
+  "rubric": "v2.2",
+  "cell_rules": {
+    "hidden_detail": "A restated write adds something a reader acting on its record would need (HOME, LOSS, no CONFLICT), and a sighting is only counted, never shown.",
+    "hidden_conflict": "A restated write disputes its record (CONFLICT), and the dispute sits in a sighting a reader of the record never sees.",
+    "digest_conflict": "An amended write disputes its record (CONFLICT), and a reader of the record meets the dispute only as an untagged 240-character digest.",
+    "wrong_home": "An attached write is not about its record's claim (HOME=NO); a contest whose dispute is true is never a wrong home (ruling 5b).",
+    "false_conflict": "A contested write does not dispute its record (CONFLICT=NO), so a reader is told a sound record is in doubt.",
+    "duplicate_clutter": "A standalone write restates an earlier record and adds nothing a reader needs (HOME, no LOSS, no CONFLICT).",
+    "orphaned_conflict": "A standalone write disputes an earlier record (CONFLICT) that carries no superseded-by mark for it, so a reader of that record never learns of it.",
+    "attached_supersession": "A write declaring that it supersedes its record was attached under it; a supersession is a new standalone record plus a mark, never an attach (ruling 5c)."
+  },
+  "harm_weights": {
+    "hidden_conflict": 3,
+    "digest_conflict": 2,
+    "false_conflict": 2,
+    "orphaned_conflict": 1.5,
+    "hidden_detail": 1,
+    "wrong_home": 1,
+    "attached_supersession": 1,
+    "duplicate_clutter": 0.5
+  },
+  "harm_weights_status": "provisional",
+  "bootstrap": {
+    "resamples": 10000,
+    "seed": 7157
+  },
+  "population": {
+    "n_items": 673,
+    "by_outcome": {
+      "amended": 100,
+      "contested": 473,
+      "restated": 100,
+      "stored": 0
+    },
+    "by_stratum": {
+      "amended-sample": 100,
+      "contested-census": 473,
+      "restated-sample": 100
+    },
+    "strata": {
+      "amended-sample": 1224,
+      "contested-census": 473,
+      "restated-sample": 125
+    },
+    "decided": 671,
+    "unclear": 2,
+    "unclear_entry_ids": [
+      "756c582f-ba18-4d51-88e3-5615cfa6c8cf",
+      "adf43f4e-0405-4c5c-aec4-199fcd617d2e"
+    ]
+  },
+  "kappa": {
+    "floor": 0.7,
+    "min_pairs": 60,
+    "floor_binaries": [
+      "home",
+      "conflict",
+      "loss"
+    ],
+    "by_binary": {
+      "home": {
+        "n_consumed": 223,
+        "kappa": 0.9371,
+        "floor_met": true
+      },
+      "loss": {
+        "n_consumed": 81,
+        "kappa": 0.8652,
+        "floor_met": true
+      },
+      "conflict": {
+        "n_consumed": 423,
+        "kappa": 0.8372,
+        "floor_met": true
+      },
+      "scope": {
+        "n_consumed": 286,
+        "kappa": 0.844,
+        "floor_met": true
+      },
+      "action_changing": {
+        "n_consumed": 286,
+        "kappa": 0.7744,
+        "floor_met": true
+      },
+      "digest": {
+        "n_consumed": 4,
+        "kappa": null,
+        "floor_met": false
+      }
+    }
+  },
+  "cells": {
+    "triage": {
+      "hidden_detail": 7,
+      "hidden_conflict": 25,
+      "digest_conflict": 14,
+      "wrong_home": 234,
+      "false_conflict": 140,
+      "duplicate_clutter": 0,
+      "orphaned_conflict": 0,
+      "attached_supersession": 12
+    },
+    "status_quo": {
+      "hidden_detail": 0,
+      "hidden_conflict": 0,
+      "digest_conflict": 0,
+      "wrong_home": 0,
+      "false_conflict": 0,
+      "duplicate_clutter": 51,
+      "orphaned_conflict": 371,
+      "attached_supersession": 0
+    }
+  },
+  "metrics": {
+    "m1": {
+      "n": 91,
+      "hits": 28,
+      "rate": 0.3077,
+      "wilson95": [
+        0.2223,
+        0.4087
+      ],
+      "unclear": 1,
+      "population_rate": 0.3084,
+      "population_interval95": [
+        0.2149,
+        0.4054
+      ],
+      "band_unknown": 4
+    },
+    "m1_as_amended": {
+      "n": 91,
+      "hits": 29,
+      "rate": 0.3187,
+      "wilson95": [
+        0.232,
+        0.4201
+      ],
+      "unclear": 1,
+      "population_rate": 0.3172,
+      "population_interval95": [
+        0.2225,
+        0.4157
+      ]
+    },
+    "m2": {
+      "amended": {
+        "n": 100,
+        "hits": 31,
+        "rate": 0.31,
+        "wilson95": [
+          0.2278,
+          0.4063
+        ],
+        "unclear": 0,
+        "population_rate": 0.31,
+        "population_interval95": [
+          0.22,
+          0.4
+        ],
+        "by_project": {
+          "dark_factory": {
+            "n": 27,
+            "hits": 4
+          },
+          "reify": {
+            "n": 28,
+            "hits": 12
+          },
+          "scoping_intake": {
+            "n": 1,
+            "hits": 0
+          },
+          "solar_challenge": {
+            "n": 30,
+            "hits": 10
+          },
+          "solar_challenge_platform": {
+            "n": 14,
+            "hits": 5
+          }
+        }
+      },
+      "contested": {
+        "n": 472,
+        "hits": 322,
+        "rate": 0.6822,
+        "wilson95": [
+          0.6389,
+          0.7226
+        ],
+        "unclear": 1,
+        "population_rate": 0.6822,
+        "population_interval95": [
+          0.6385,
+          0.7246
+        ],
+        "by_project": {
+          "dark_factory": {
+            "n": 125,
+            "hits": 90
+          },
+          "reify": {
+            "n": 115,
+            "hits": 92
+          },
+          "scoping_intake": {
+            "n": 2,
+            "hits": 2
+          },
+          "solar_challenge": {
+            "n": 132,
+            "hits": 70
+          },
+          "solar_challenge_platform": {
+            "n": 98,
+            "hits": 68
+          }
+        }
+      },
+      "restated": {
+        "n": 99,
+        "hits": 29,
+        "rate": 0.2929,
+        "wilson95": [
+          0.2124,
+          0.389
+        ],
+        "unclear": 1,
+        "population_rate": 0.2929,
+        "population_interval95": [
+          0.202,
+          0.3878
+        ],
+        "by_project": {
+          "dark_factory": {
+            "n": 14,
+            "hits": 4
+          },
+          "reify": {
+            "n": 19,
+            "hits": 8
+          },
+          "solar_challenge": {
+            "n": 53,
+            "hits": 15
+          },
+          "solar_challenge_platform": {
+            "n": 13,
+            "hits": 2
+          }
+        }
+      },
+      "stored": {
+        "n": 0,
+        "hits": 0,
+        "rate": null,
+        "wilson95": null,
+        "unclear": 0,
+        "population_rate": null,
+        "population_interval95": null,
+        "by_project": {}
+      }
+    },
+    "m3": {
+      "n": 371,
+      "hits": 39,
+      "rate": 0.1051,
+      "wilson95": [
+        0.0779,
+        0.1405
+      ],
+      "unclear": 2,
+      "population_rate": 0.379,
+      "population_interval95": [
+        0.2686,
+        0.4673
+      ],
+      "by_ending": {
+        "restated": 25,
+        "amended": 14,
+        "stored_unlinked": 0,
+        "contested": 332,
+        "stored_linked": 0
+      }
+    },
+    "m4": {
+      "n": 671,
+      "hits": 234,
+      "rate": 0.3487,
+      "wilson95": [
+        0.3136,
+        0.3856
+      ],
+      "unclear": 2,
+      "population_rate": 0.5422,
+      "population_interval95": [
+        0.4767,
+        0.6048
+      ],
+      "by_route": {
+        "direct": {
+          "n": 503,
+          "hits": 127,
+          "rate": 0.2525,
+          "wilson95": [
+            0.2165,
+            0.2922
+          ],
+          "unclear": 1,
+          "population_rate": 0.4658,
+          "population_interval95": [
+            0.3882,
+            0.5418
+          ]
+        },
+        "via_sibling": {
+          "n": 164,
+          "hits": 105,
+          "rate": 0.6402,
+          "wilson95": [
+            0.5644,
+            0.7097
+          ],
+          "unclear": 1,
+          "population_rate": 0.7772,
+          "population_interval95": [
+            0.6712,
+            0.8629
+          ]
+        },
+        "unknown": {
+          "n": 4,
+          "hits": 2,
+          "rate": 0.5,
+          "wilson95": [
+            0.15,
+            0.85
+          ],
+          "unclear": 0,
+          "population_rate": 0.5294,
+          "population_interval95": [
+            0.0,
+            1.0
+          ]
+        }
+      },
+      "by_category": {
+        "same": {
+          "n": 445,
+          "hits": 157,
+          "rate": 0.3528,
+          "wilson95": [
+            0.3098,
+            0.3983
+          ],
+          "unclear": 1,
+          "population_rate": 0.5474,
+          "population_interval95": [
+            0.4663,
+            0.6216
+          ]
+        },
+        "cross": {
+          "n": 226,
+          "hits": 77,
+          "rate": 0.3407,
+          "wilson95": [
+            0.282,
+            0.4047
+          ],
+          "unclear": 1,
+          "population_rate": 0.5314,
+          "population_interval95": [
+            0.4125,
+            0.6395
+          ]
+        },
+        "unknown": {
+          "n": 0,
+          "hits": 0,
+          "rate": null,
+          "wilson95": null,
+          "unclear": 0,
+          "population_rate": null,
+          "population_interval95": null
+        }
+      }
+    },
+    "m5": {
+      "n": 472,
+      "hits": 332,
+      "rate": 0.7034,
+      "wilson95": [
+        0.6607,
+        0.7428
+      ],
+      "unclear": 1,
+      "population_rate": 0.7034,
+      "population_interval95": [
+        0.661,
+        0.7442
+      ],
+      "by_scope": {
+        "central": 158,
+        "secondary": 140,
+        "unknown": 34
+      },
+      "by_action_changing": {
+        "yes": 273,
+        "no": 32,
+        "unknown": 27
+      }
+    },
+    "m6": {
+      "parent_edited": 20,
+      "attach_time_rated": 20,
+      "drifted": 11,
+      "drifted_entry_ids": [
+        "0944c8af-4c77-46f0-802f-fef0d93b4e7f",
+        "28bd2462-f06f-4194-9cac-a13c461cf4ec",
+        "3c88f869-8247-419b-a985-30c966d68afd",
+        "434bbd68-0ad2-4b69-9b8d-37e0955e303e",
+        "51f55850-df72-4eda-8f03-77c24dc7a75b",
+        "56c08b07-48f9-487d-8b87-27e74f597415",
+        "5b5850ac-5732-4523-80a2-8304aeb3b594",
+        "6d648544-f6a7-4a5c-a68c-ec785825466a",
+        "777f6cb1-8a75-4761-8717-7465e6dfb875",
+        "8f46293e-67ad-41d1-a0a0-da9186f05b72",
+        "fa50625d-8f99-4041-85eb-3a00a559fc59"
+      ],
+      "attach_time_undecided": 0,
+      "attach_time_unrated": 0
+    }
+  },
+  "harm": {
+    "n": 671,
+    "unclear": 2,
+    "per_write": {
+      "triage": 0.9478,
+      "status_quo": 0.8674
+    },
+    "delta_per_write": 0.0805,
+    "delta_interval95": [
+      -0.0507,
+      0.2146
+    ],
+    "population_per_write": {
+      "triage": 0.9476,
+      "status_quo": 0.5061
+    },
+    "population_delta_per_write": 0.4415,
+    "population_delta_interval95": [
+      0.3421,
+      0.5397
+    ]
+  }
+}

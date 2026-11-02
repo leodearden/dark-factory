@@ -19,6 +19,8 @@ from typing import Any
 
 _WORKER = 'orchestrator.merge_lane.worker'
 _GATES = 'orchestrator.merge_lane.gates'
+_INTAKE = 'orchestrator.merge_lane.intake'
+_INTAKE_BUFFERS = 'orchestrator.merge_lane.intake_buffers'
 _LANDING_EVIDENCE = 'orchestrator.merge_lane.landing_evidence'
 _MEMBER_REDRIVE = 'orchestrator.merge_lane.member_redrive'
 _PORTS = 'orchestrator.merge_lane.ports'
@@ -39,8 +41,8 @@ class _ExportTable(dict[str, tuple[str, str]]):
 
 _EXPORTS = _ExportTable({
     'MergeLane': (_WORKER, 'SpeculativeMergeWorker'),
-    'coalesce_or_enqueue_merge_request': (_WORKER, 'coalesce_or_enqueue_merge_request'),
-    'enqueue_merge_request': (_WORKER, 'enqueue_merge_request'),
+    'coalesce_or_enqueue_merge_request': (_INTAKE, 'coalesce_or_enqueue_merge_request'),
+    'enqueue_merge_request': (_INTAKE, 'enqueue_merge_request'),
     'retire_cancelled_merge_request': (_WORKER, 'retire_cancelled_merge_request'),
     'resolve_dispatch_time_merge_base': (_WORKER, 'resolve_dispatch_time_merge_base'),
     'patch_content_contained': (_LANDING_EVIDENCE, 'patch_content_contained'),
@@ -59,7 +61,7 @@ _EXPORTS = _ExportTable({
     'CROSS_REPO_DELIVERABLE_REASON_PREFIX': (_GATES, 'CROSS_REPO_DELIVERABLE_REASON_PREFIX'),
     'DROPPED_PLAN_TARGETS_REASON_PREFIX': (_GATES, 'DROPPED_PLAN_TARGETS_REASON_PREFIX'),
     'MAIN_HEALTH_RED_REASON_PREFIX': (_WORKER, 'MAIN_HEALTH_RED_REASON_PREFIX'),
-    'MERGE_WORKER_SHUTDOWN_REASON': (_WORKER, 'MERGE_WORKER_SHUTDOWN_REASON'),
+    'MERGE_WORKER_SHUTDOWN_REASON': (_INTAKE_BUFFERS, 'MERGE_WORKER_SHUTDOWN_REASON'),
     'NEEDS_REBASE_REASON_PREFIX': (_WORKER, 'NEEDS_REBASE_REASON_PREFIX'),
     'PLAN_FILES_NOT_TOUCHED_REASON_PREFIX': (_GATES, 'PLAN_FILES_NOT_TOUCHED_REASON_PREFIX'),
     'POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX': (

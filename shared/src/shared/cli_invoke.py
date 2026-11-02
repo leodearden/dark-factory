@@ -22,6 +22,7 @@ from typing import IO, TYPE_CHECKING, Any, TypeGuard, TypeVar
 from shared.cost_store import CapReason
 from shared.proc_group import snapshot_process_group, terminate_process_group
 from shared.process_cost import ProcessCostBasis, derive_process_cost, next_resume_prior
+from shared.secret_env import agent_subprocess_env
 
 # VllmBridge depends on aiohttp, which is not installed in every consumer
 # environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
@@ -809,8 +810,9 @@ def note_unreadable_transcript(
 # input references the background task's id or output-file path (task 3639),
 # or a delivered task-notification naming it (task 5986).  The tool_use
 # clause is tool-agnostic, so it catches the ``Read``-the-output-file shape the
-# role wait-guidance now prescribes (roles.py WAIT_PATTERN_GUIDANCE) — which is
-# why correcting those prompts needed no change to this detector.  If the first
+# role wait-guidance now prescribes
+# (orchestrator/src/orchestrator/agents/harness_guidance.py::WAIT_PATTERN_GUIDANCE)
+# — which is why correcting those prompts needed no change to this detector.  If the first
 # clause were the whole mechanism, only ``TaskStop`` would still fire it.
 #
 # That is an executable claim, not a comment's promise: the exact prescribed
@@ -1196,7 +1198,7 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     reading the bg-log directly — ``Bash tail/cat/grep <log>``, or ``Read`` /
     ``Grep`` on that path, which the CLI's own launch message recommends ("To
     check interim output, use Read on that file path") and which
-    ``agents/roles.py``'s wait-guidance explicitly sanctions — counted as no
+    ``agents/harness_guidance.py``'s wait-guidance explicitly sanctions — counted as no
     engagement at all.  On the ``_lane-31`` specimen (four backgrounded
     ``cargo test`` runs, each tailed, zero ``BashOutput``) the detector fired
     and falsified ``success`` on a completed run; the measured false-positive
@@ -3811,8 +3813,8 @@ async def _invoke_claude(
     # (task 3147 — see _materialize_stdin).
     stdin_data = prompt.encode()
 
-    # Strip ANTHROPIC_API_KEY so `claude` falls back to OAuth
-    env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+    # Which inherited variables the child may see: shared.secret_env.
+    env = agent_subprocess_env(os.environ)
     # Merge caller-supplied overrides (e.g. ANTHROPIC_BASE_URL for vLLM)
     if env_overrides:
         env.update(env_overrides)
@@ -3884,6 +3886,32 @@ async def _invoke_claude(
             await bridge.stop()
 
 
+def _content_block_text(block: object) -> str | None:
+    if isinstance(block, str):
+        return block
+    if isinstance(block, dict) and block.get('type') == 'text':
+        text = block.get('text')
+        return text if isinstance(text, str) else None
+    return None
+
+
+def _assistant_message_text(messages: object) -> str:
+    """Join the text blocks of a CLI result's assistant *messages* with newlines.
+
+    Skips any message, content or block that is not of the expected shape.
+    """
+    if not isinstance(messages, list):
+        return ''
+    parts: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get('type') != 'assistant':
+            continue
+        content = msg.get('content')
+        if isinstance(content, list):
+            parts.extend(text for text in map(_content_block_text, content) if text is not None)
+    return '\n'.join(parts)
+
+
 def _parse_claude_output(
     result: _SubprocessResult,
     *,
@@ -3941,6 +3969,8 @@ def _parse_claude_output(
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError:
+        data = None
+    if not isinstance(data, dict):
         return AgentResult(
             success=result.returncode == 0,
             output=result.stdout,
@@ -3964,27 +3994,24 @@ def _parse_claude_output(
     session_id = data.get('session_id', '')
     subtype = data.get('subtype', '')
     structured = data.get('structured_output')
-    api_error_status = data.get('api_error_status')
+    raw_status = data.get('api_error_status')
+    api_error_status = (
+        raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) else None
+    )
     raw_stop_reason = data.get('stop_reason')
     stop_reason = raw_stop_reason if isinstance(raw_stop_reason, str) else None
 
-    usage = data.get('usage') or {}
+    raw_usage = data.get('usage')
+    usage = raw_usage if isinstance(raw_usage, dict) else {}
     input_tokens = _to_token_count(usage.get('input_tokens'))
     output_tokens = _to_token_count(usage.get('output_tokens'))
     cache_read_tokens = _to_token_count(usage.get('cache_read_input_tokens'))
     cache_create_tokens = _to_token_count(usage.get('cache_creation_input_tokens'))
 
-    output_text = data.get('result', '')
-    if not output_text and isinstance(data.get('messages'), list):
-        parts = []
-        for msg in data['messages']:
-            if msg.get('type') == 'assistant':
-                for block in msg.get('content', []):
-                    if isinstance(block, dict) and block.get('type') == 'text':
-                        parts.append(block['text'])
-                    elif isinstance(block, str):
-                        parts.append(block)
-        output_text = '\n'.join(parts)
+    raw_result = data.get('result')
+    output_text = raw_result if isinstance(raw_result, str) else ''
+    if not output_text:
+        output_text = _assistant_message_text(data.get('messages'))
 
     # The CLI may report subtype='success' even when is_error is true (e.g.
     # usage cap hit).  Trust is_error as an authoritative override.
@@ -4052,6 +4079,18 @@ def _parse_claude_output(
         cost_basis=process_cost.basis,
         reported_total_cost_usd=process_cost.reported_total_usd,
         cost_delta_clamped=process_cost.delta_clamped,
+    )
+
+
+def parse_claude_cli_output(*, stdout: str, stderr: str, returncode: int) -> AgentResult:
+    """Parse one finished, non-resumed ``claude --print --output-format json`` run.
+
+    The one reader of the CLI result for callers outside this module that ran
+    the CLI themselves (``shared.usage_gate.UsageGate._run_probe``). Never
+    raises, whatever *stdout* holds.
+    """
+    return _parse_claude_output(
+        _SubprocessResult(stdout=stdout, stderr=stderr, returncode=returncode, duration_ms=0)
     )
 
 

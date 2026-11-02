@@ -8,36 +8,29 @@ Stage 1, which holds ``repair_memory_citation``:
 - (a) in the same cycle's remediation pass, as ``remediation_findings``;
 - (b) in the next full cycle, as ``prior_s3_findings``.
 
-Only public seams are used: a constructor-built harness, and stage ``run``
-methods stubbed at class level. The harness scaffolding is copied from
-``test_overreach_flags_section.py::cycle_harness``, not imported, because
-``fused-memory/tests`` is not an importable package.
+Only public seams are used: a constructor-built harness from
+``reconciliation.harness_fixtures``, and stage ``run`` methods stubbed at class
+level.
 """
 from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
 
-from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.models.reconciliation import StageReport
 from fused_memory.reconciliation.dangling_citation import (
     DanglingCitation,
     build_dangling_citation_finding,
     dangling_citation_from_finding,
 )
-from fused_memory.reconciliation.event_buffer import EventBuffer
-from fused_memory.reconciliation.harness import ReconciliationHarness
-from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
-from fused_memory.reconciliation.stages.task_knowledge_sync import (
-    IntegrityCheck,
-    TaskKnowledgeSync,
-)
+from fused_memory.reconciliation.stages.task_knowledge_sync import IntegrityCheck
+from reconciliation.harness_fixtures import make_harness_config, open_harness, stub_stage_runs
 
 PROJECT = 'proj'
 HARNESS_LOGGER = 'fused_memory.reconciliation.harness'
@@ -53,37 +46,19 @@ RECORD = DanglingCitation(
 
 @pytest_asyncio.fixture
 async def cycle_harness(tmp_path):
-    journal = ReconciliationJournal(tmp_path / 'journal')
-    await journal.initialize()
-    buffer = EventBuffer(
-        db_path=tmp_path / 'events.db', buffer_size_threshold=2, max_staleness_seconds=3600,
-    )
-    await buffer.initialize()
-    memory = AsyncMock()
-    memory.search = AsyncMock(return_value=[])
-    memory.get_episodes = AsyncMock(return_value=[])
-    memory.get_status = AsyncMock(return_value={
-        'graphiti': {'connected': True}, 'mem0': {'connected': True}, 'projects': {},
-    })
-    memory.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
-    memory.get_memories_by_metadata = AsyncMock(return_value=[])
-    memory.mem0.get_all = AsyncMock(return_value={'results': []})
-    config = FusedMemoryConfig(reconciliation=ReconciliationConfig(
-        enabled=True, explore_codebase_root='/tmp/test', agent_llm_provider='anthropic',
-        agent_llm_model='claude-sonnet-4-20250514', judge_enabled=False,
-    ))
     taskmaster = AsyncMock()
     taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
-    yield ReconciliationHarness(
-        memory_service=memory, taskmaster=taskmaster, journal=journal, event_buffer=buffer,
-        config=config, known_projects={PROJECT: '/tmp/test-project'},
-    )
-    await buffer.close()
-    await journal.close()
+    async with open_harness(
+        tmp_path,
+        taskmaster=taskmaster,
+        config=make_harness_config(judge_enabled=False),
+        known_projects={PROJECT: '/tmp/test-project'},
+    ) as harness:
+        yield harness
 
 
 @pytest.fixture
-def stage_1_calls():
+def stage_1_calls(monkeypatch):
     """Stub every stage's run; Stage 3 files the dangling finding on its FIRST run only.
 
     Records ``(remediation_findings, prior_s3_findings)`` for every Stage-1 run.
@@ -105,12 +80,8 @@ def stage_1_calls():
             stage=self.stage_id, started_at=now, completed_at=now, items_flagged=items,
         )
 
-    with (
-        patch.object(MemoryConsolidator, 'run', fake_run),
-        patch.object(TaskKnowledgeSync, 'run', fake_run),
-        patch.object(IntegrityCheck, 'run', fake_run),
-    ):
-        yield calls
+    stub_stage_runs(monkeypatch, fake_run)
+    return calls
 
 
 def _parses_to_record(findings: list[dict] | None) -> list[DanglingCitation | None]:

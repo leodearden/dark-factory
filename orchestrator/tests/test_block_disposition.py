@@ -334,6 +334,32 @@ class TestClassifyFailureKnownRows:
         assert disp.category is FailureCategory.NONE
         assert disp.reason_prefix == 'Re-cut ruling refused provisioning'
 
+    def test_branch_checked_out_elsewhere_has_own_block_and_escalate_row(self):
+        from orchestrator.lane_branch_holder import (
+            BranchCheckedOutElsewhere,
+            BranchHolderAction,
+        )
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import (
+            RequeueKind,
+            _disposition_table,
+            _lookup_disposition,
+            classify_failure,
+        )
+        exc = BranchCheckedOutElsewhere(
+            'task/88', Path('/x/side'), BranchHolderAction.REFUSE_FOREIGN_WORKTREE,
+        )
+        disp = classify_failure(exc)
+        assert _lookup_disposition(BranchCheckedOutElsewhere) is _disposition_table()[
+            BranchCheckedOutElsewhere
+        ]
+        assert disp is _disposition_table()[BranchCheckedOutElsewhere]
+        assert disp.requeue_kind is RequeueKind.BLOCK
+        assert disp.escalate_to_human is True
+        assert disp.counts_against_requeue_cap is True
+        assert disp.category is FailureCategory.NONE
+        assert 'checked out' in disp.reason_prefix
+
     def test_unreadable_recut_ruling_blocks_and_escalates_to_human(self):
         from orchestrator.recut_ruling import RecutRulingUnreadable
         from orchestrator.unblock_types import BlockClass
@@ -624,7 +650,7 @@ def git_repo(tmp_path: Path) -> Path:
     """A bare-minimum git repo with an initial commit (mirrors test_workflow_e2e.py)."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return repo
 
 

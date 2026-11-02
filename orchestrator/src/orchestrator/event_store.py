@@ -200,6 +200,9 @@ class EventType(StrEnum):
     #                Measured by _deep_chain_placement, not by build_chain, so
     #                it covers the FULL stall: lane acquisition, the sequential
     #                merges, and the asyncio.timeout wrapper's overhead.
+    # PLUS three always-present, nullable keys (task 5651): plan_hash,
+    # cache_mode and units, defined by
+    # orchestrator/src/orchestrator/verify_evidence.py::verify_event_fields.
     merge_verify = 'merge_verify'
     # A merge-role scoped-verify red that the isolated-rerun-confirm gate
     # (verify.apply_merge_flake_suppression, PRD task α) demonstrated was a
@@ -224,8 +227,17 @@ class EventType(StrEnum):
     # The branch's OWN pre-merge verify verdict, recorded by the orchestrator
     # workflow VERIFY phase (branch-vs-its-merge-base) — distinct from
     # merge_verify, which is the merge worker's POST-rebase verify (branch
-    # already merged onto CURRENT main).  task_id-keyed; data carries at least
-    # {passed: bool, base_sha: str, branch: str}.  Consumed by the merge-skew
+    # already merged onto CURRENT main).  task_id-keyed; the workflow's rows
+    # (TaskWorkflow._emit_workflow_verify, task 5651) carry {passed, tip_sha,
+    # base_sha, branch, site, duration_ms, slot_wait_secs, plan_hash,
+    # cache_mode, units}, site per verify_evidence.py::VerifySite and the
+    # last three per verify_evidence.py::verify_event_fields.  duration_ms is
+    # the verify run's own wall
+    # (VerifyResult.duration_secs), excluding the admission queueing that
+    # slot_wait_secs records.  Escalation-side vouch rows carry only
+    # {passed, base_sha, branch} until task 5409.  A 2752 checkpoint hit emits
+    # phase_skipped(verify, reason='durable_verified_green') INSTEAD of this
+    # row.  Consumed by the merge-skew
     # attribution classifier's I5 branch-green fact (merge_disposition.
     # _branch_pre_merge_verify_green).  Task 2381 α adds this member + the
     # reader; task 2383 β emits it at the workflow VERIFY-pass site.  Its
@@ -652,6 +664,13 @@ class EventType(StrEnum):
     # when the pin becomes blocked, then at most once per
     # pin_blocked_emit_interval_secs while it stays blocked.
     pin_blocked = 'pin_blocked'
+    # The starvation watchdog fired on a task (task 3821).  Producer, and the
+    # one statement of the payload: scheduler.py::Scheduler._deliver_starvation_finding,
+    # whose pin fields come from starvation_watchdog.py::PinOutcome.as_payload;
+    # predicate in starvation_watchdog.py::classify.  Emitted once per firing
+    # (deduped by the watchdog's escalated set, which survives restarts), and
+    # once more when a firing the auto-pin cap turned away gets a slot.
+    starvation_detected = 'starvation_detected'
     # Emitted once per acquire_next tick when the fused-memory task read
     # FAILED (distinct from a genuinely empty project) and the park-eviction
     # drain was therefore SKIPPED (fail-safe, survey finding C3).
@@ -741,6 +760,11 @@ class EventType(StrEnum):
     #   task's current text; the Lever-B skip is declined and the architect told.
     #   data: {drift, plan_text_fp, task_text_fp, plan_session_id}
     plan_text_drift = 'plan_text_drift'
+    # Task 4032 — a revalidated plan dropped a done step without a descope record or newly
+    #   shared a done commit, and one remedy architect pass did not fix it; the prior plan is
+    #   restored and the task takes the no-plan hold.
+    #   data: DoneStepIntegrityVerdict.to_dict()
+    done_step_integrity_refused = 'done_step_integrity_refused'
 
     # Config hot-reload (plans/config-hot-reload-prd.md, task beta) — emitted
     # by Harness.reload_config() on every call, success or failure. Data
@@ -1076,13 +1100,23 @@ class EventType(StrEnum):
     #   (INV-4). Age surfacing only; nothing times out. Payload:
     #   {waiter: {task_id, module, role, plan_id, wait_secs}, aged_count, alarm_secs}
     verify_admission_wait_aged = 'verify_admission_wait_aged'
+    # predicate_rearmed / predicate_recheck_stalled — from DeterministicRunner
+    #   when a declared predicate exits 75 ("not yet") and re-arms, or reaches
+    #   deterministic.predicate_recheck_stall_cap and files milestone_check_stalled
+    #   (plans/completion-driven-triggers-prd.md C1). Payload:
+    #   {rc, consecutive, stall_cap, recheck_secs, next_check_at, verdict}
+    predicate_rearmed = 'predicate_rearmed'
+    predicate_recheck_stalled = 'predicate_recheck_stalled'
 
     # Shadow eval (plans/live-shadow-eval-prd.md C2). task_id is the PRODUCTION
     # task the cell shadows; shadow_cell_skipped's data.reason is a
     # ShadowSkipReason value. The payloads are owned by the coordinator (ε1).
+    # shadow_cell_settled marks a cell whose settled_at was written (settled |
+    # expired); shadow_cell_ended marks one that ended without it (failed | cap_excluded).
     shadow_cell_opened = 'shadow_cell_opened'
     shadow_cell_skipped = 'shadow_cell_skipped'
     shadow_cell_settled = 'shadow_cell_settled'
+    shadow_cell_ended = 'shadow_cell_ended'
 
 
 @unique
@@ -1103,6 +1137,8 @@ class ShadowSkipReason(StrEnum):
     SHAPE_DISABLED = 'shape_disabled'
     ALREADY_OPEN = 'already_open'
     PAUSED = 'paused'
+    UNKNOWN_CANDIDATE = 'unknown_candidate'
+    NO_BASE_SHA = 'no_base_sha'
 
 
 _MERGE_FINALIZED_ROWS = f"event_type = '{EventType.merge_finalized.value}'"

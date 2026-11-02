@@ -368,6 +368,33 @@ class MetadataNotAnObjectError(TaskmasterError):
         return metadata_not_an_object_error(self.task_id, self.received)
 
 
+class MetadataTooDeepError(TaskmasterError):
+    """Raised when an additive metadata merge is nested too deeply to recurse.
+
+    The write is refused and nothing is written: the stored metadata,
+    ``done_provenance`` included, is left unchanged. Keeps the
+    ``TASKMASTER_TOOL_ERROR`` code. Like :class:`AppendUnsupportedFieldError`
+    it has no ``to_error_dict()`` and reaches callers raw through
+    ``server/tool_errors.py::mcp_tool_errors``.
+
+    Attributes:
+        task_id: The task the rejected write targeted (``None`` if not supplied).
+    """
+
+    def __init__(self, task_id: str | None) -> None:
+        self.task_id = task_id
+        super().__init__(
+            'TASKMASTER_TOOL_ERROR',
+            f'Refusing an additive metadata merge for task {task_id!r}: the '
+            'payload and the stored metadata share a key path nested too deeply '
+            'to merge recursively (beyond the interpreter recursion limit). '
+            'Nothing was written; the stored metadata, done_provenance included, '
+            'is unchanged. Flatten the payload, or pass metadata_mode=\'merge\' '
+            '(without append=True) to overwrite each supplied top-level key '
+            'wholesale.',
+        )
+
+
 class AppendUnsupportedFieldError(TaskmasterError):
     """Raised when ``update_task`` combines ``append=True`` with a REPLACE-ONLY column.
 
@@ -434,6 +461,7 @@ __all__ = [
     'DefectRecordsWriteAuthorityError',
     'DeferralWriteAuthorityError',
     'MetadataNotAnObjectError',
+    'MetadataTooDeepError',
     'AppendUnsupportedFieldError',
     'status_via_update_task_error',
     'done_provenance_via_update_task_error',

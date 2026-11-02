@@ -68,15 +68,15 @@ contract](#doneprovenance-contract) for what a stamp must carry.
 
 ```bash
 S="Merge task/<TASK_ID> into main"
-git log main --fixed-strings --grep="$S" --format='%H%x09%s' \
+git log main --fixed-strings --grep="task/<TASK_ID>" --format='%H%x09%s' \
   | awk -F'\t' -v s="$S" '$2==s && !seen {print $1; seen=1}'
 ```
 
 It prints the newest commit on main whose **subject** is exactly the marker, or nothing. The
-`--grep` half is a whole-message prefilter that git evaluates *during* the revision walk — there is
-no commit-message index, so it reads commit objects as it goes; the `awk` half is the subject
-selection, and **[it is not optional](#step-1-subject-check)** — the two paragraphs below are
-why, and why there is no `--max-count=1` here.
+`--grep` half is only a coarse pre-filter on the bare branch name, which git evaluates *during* the
+revision walk — there is no commit-message index, so it reads commit objects as it goes; the `awk`
+half is the subject selection, and **[it is not optional](#step-1-subject-check)** — the two
+paragraphs below are why, and why there is no `--max-count=1` here.
 
 **The `awk` has no `exit`, and putting one back breaks the pipeline.** A `{print $1; exit}` closes
 the pipe while `git log` is still walking, so git dies of `SIGPIPE` and the pipeline reports **141
@@ -90,33 +90,36 @@ silences genuine git failures such as `main` not resolving; the sticky flag keep
 without ever closing the pipe early.
 
 This mirrors the in-repo authority, `orchestrator/src/orchestrator/git_ops.py::GitOps.find_merge_marker`
-— the same function `merge_status`'s git-authority tier calls on the deleted-branch path.
-`--fixed-strings` against the exact subject from
+— the same function `merge_status`'s git-authority tier calls on the deleted-branch path — and its
+scan, `orchestrator/src/orchestrator/git_ops.py::GitOps._scan_merge_marker`, pre-filters on the
+same bare branch name. The pre-filter is the branch, not the subject, because git applies `--grep`
+to each line of the message separately while `%s` joins a wrapped first paragraph into one subject:
+a full-subject pattern misses a marker whose subject wraps, and a branch name, which has no
+whitespace, survives. `--fixed-strings` keeps the branch name literal, and the search is
+**substring-safe** because of the `awk` equality against the exact subject from
 `orchestrator/src/orchestrator/git_ops.py::_merge_subject` (canonical form
-`Merge <full-branch> into <main-branch>`) is what makes it **substring-safe**: `Merge task/1
-into main` cannot match inside `Merge task/10 into main`, because the `0` falls where the
-pattern has a space. Do **not** substitute a bare `--grep="task/<TASK_ID>"` — that is BRE, not
-restricted to merge commits, matches any commit merely *mentioning* the task, and re-opens the
-`task/1`/`task/10` collision. If a project overrides `git.branch_prefix` (default `task/`) or
-`git.main_branch`, build the subject from `_merge_subject` rather than hardcoding it.
+`Merge <full-branch> into <main-branch>`): the `task/1` pre-filter does match inside `task/10`, but
+`Merge task/10 into main` is not equal to `Merge task/1 into main`. Do **not** put the full subject
+back into `--grep`. If a project overrides `git.branch_prefix` (default `task/`) or
+`git.main_branch`, build the branch and the subject from config, the subject from
+`_merge_subject`, rather than hardcoding them.
 
-**Substring-safety is not subject-scoping, and the search alone does not give you the latter.**
-`git log --grep` matches the **whole commit message**, not the subject, so this command also
-returns any ordinary commit whose *body* happens to quote the marker string — a documentation
+**Substring-safety is not subject-scoping, and the `--grep` half gives you neither.**
+`git log --grep` matches the **whole commit message**, not the subject, so the `--grep` half alone
+also returns any ordinary commit whose message merely *mentions* the branch — a documentation
 commit describing this very mechanism, a revert, a commit message citing another task's merge.
 That is a live hazard in this repo, not a hypothetical: measured 2026-09-22,
 `git log main --fixed-strings --grep="Merge task/4181 into main" --max-count=1 --format=%H` <!-- marker-search-guard: counterexample -->
 returns `d0d67f0c53`, a **non-merge** docs commit from task 4612 whose body quotes the subject,
-rather than the true train merge `d25b24468c` — which the command above does return. The
-substring-safety argument covers only the `task/1`-inside-`task/10` collision; it says nothing
-about a body match.
+rather than the true train merge `d25b24468c` — which the command above does return. Only the
+subject equality rules out the `task/1`-inside-`task/10` collision and a body match alike.
 
 <a id="step-1-subject-check"></a>
 **So a hit is not a marker until its SUBJECT matches.** A message match whose subject is something
 else is **not** a marker and may never be treated as one on either of [step 2](#step-2)'s arms —
 [step 2](#step-2)'s *branch GONE* arm otherwise treats the marker as authoritative on its own with
 no further check, so this selection is the only thing standing between a body match and a stamped
-`done_provenance`. Equality is against the `_merge_subject` string you searched for; nothing weaker
+`done_provenance`. Equality is against the `_merge_subject` string bound to `S`; nothing weaker
 (prefix, substring, case-folded) counts.
 
 **Select the newest subject-matching hit — do not take the newest hit and then test it.** These
@@ -137,11 +140,12 @@ everything — so benchmarking a missing marker will wrongly suggest the flag is
 Roughly two seconds, once, at the moment a task is stamped, is the price of not recording a
 documentation commit as a merge. `tests/scripts/test_merge_marker_search_snippets.py` enforces
 this: it runs every marker search in `skills/` — any `git log` or `git rev-list` that greps for
-`$S` or a merge subject, with or without `--fixed-strings` — against a history where a newer body
-match shadows the genuine marker, so putting the flag back — or any other take-the-newest-hit
-shortcut — turns it red. A snippet that quotes a bare form on purpose, like the measured one above,
-carries `<!-- marker-search-guard: counterexample -->` right after its closing backtick and is not
-run.
+`$S`, a merge subject or the bare `task/…` branch name, with or without `--fixed-strings` — against
+a history where a newer body match shadows the genuine marker, once with a one-line marker subject
+and once with one wrapped onto two lines, so putting the flag back — or any other
+take-the-newest-hit shortcut, or a full-subject pre-filter — turns it red. A snippet that quotes a
+bare form on purpose, like the measured one above, carries
+`<!-- marker-search-guard: counterexample -->` right after its closing backtick and is not run.
 
 The shadowing is common and it is *growing*, because this repo's own commits about this mechanism
 quote the subject they document. Measured 2026-09-22 over all 68,279 commits on main: 12 branches
@@ -168,10 +172,10 @@ of the selecting form: paired with `--max-count=1` subject equality *was* lossy,
 cases above.)
 
 The shell selection above and the server's lookup now apply the same rule: the newest commit whose
-subject equals the merge subject. The `awk` selection is the agent re-supplying in the shell what
-the server already does — the same relationship [step 2](#step-2)'s containment check has to
-`find_merge_marker`'s branch-existence gate. It is not optional: the bare `--grep` still matches
-bodies.
+subject equals the merge subject; the server's direct scan shares the bare-branch pre-filter too.
+The `awk` selection is the agent re-supplying in the shell what the server already does — the same
+relationship [step 2](#step-2)'s containment check has to `find_merge_marker`'s branch-existence
+gate. It is not optional: the bare `--grep` still matches bodies.
 
 - **Printed a sha** → its subject already matched, by construction. Go to [step 2](#step-2); whether it is authoritative depends on the branch ref.
 - **Printed nothing** (no hits at all, or every hit was a body match) → go to [step 3](#step-3). An empty result is **not** a not-landed verdict.

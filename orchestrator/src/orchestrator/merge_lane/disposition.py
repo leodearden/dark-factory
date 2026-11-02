@@ -105,6 +105,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import _run
+from orchestrator.verify_evidence import counts_as_branch_verdict
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -495,13 +496,19 @@ def _branch_pre_merge_verify_green(
     means the merge already succeeded; a first-attempt skew has no prior
     passing merge_verify row at all, so sourcing I5 from it would make
     INTEGRATION_SKEW never fire on the exact case it targets).
+
+    Pre-merge reds never count: they are integration evidence taken on main's
+    tip after the rebase. Reader effects are listed at verify_evidence.py::VerifySite.
     """
     if event_store is None or task_id is None:
         return None
     try:
-        rows = event_store.fetch_events_by_type_all_runs(
-            EventType.workflow_verify, task_id=task_id,
-        )
+        rows = [
+            row for row in event_store.fetch_events_by_type_all_runs(
+                EventType.workflow_verify, task_id=task_id,
+            )
+            if counts_as_branch_verdict(row.get('data') or {})
+        ]
         if not rows:
             return None
         return any(bool((row.get('data') or {}).get('passed')) for row in rows)

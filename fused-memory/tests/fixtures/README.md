@@ -893,6 +893,18 @@ this one result list" — no pointer-shape knowledge at runtime at all.
   not gauge them.
 - **3 `hand`** — single-entry dark_factory topics.
 
+### Also read by E2
+
+The E2 storage-shape bake-off (`fused-memory/scripts/bake_off_storage_shape.py`)
+reads only each `curator_gate` entry's `provenance.cluster_id` → `topic`,
+which lands in its arm records' metadata. Its committed fetch cache
+(`e2_fetch_cache.json`) therefore pins this file through the per-shape corpus
+fingerprint, not through the file's bytes; the merge lane asserts that in
+`fused-memory/tests/test_bake_off_fetch_cache.py::TestMeasurementAnchor::test_the_committed_fixtures_still_materialize_the_cached_corpus`.
+An E1-only edit or a canonical re-key needs no E2 re-pin. An edit that moves a
+fingerprint, such as renaming a `curator_gate` topic, needs a live
+`--dump-fetches` re-seed.
+
 ### What the registry does **not** cover (`_disclosures`)
 
 The committed topics are a *selection*. `scripts/memory_eval_retrieval_probe.py
@@ -989,14 +1001,9 @@ Re-keying a topic:
    `content_prefix` (whitespace-normalised content, first 160 characters) and
    `last_known_id`, and re-point every `supersedes_pairs[].successor_hash` at
    the new hash. Never change `provenance.cluster_id`.
-5. Check that every
-   `fused-memory/scripts/bake_off_storage_shape.py::ARM_SHAPES`
-   `corpus_fingerprint` still equals `e2_fetch_cache.json`
-   `provenance.corpus_fingerprints`. If one moved, the cache needs a live
-   `--dump-fetches` instead.
-6. In the same commit, re-pin the registry's sha256 in
-   `fused-memory/tests/test_bake_off_fetch_cache.py::ANCHOR_FIXTURE_SHA256`
-   and in `e2_fetch_cache.json` `provenance.fixtures`.
+5. Nothing in E2 needs re-pinning (see "Also read by E2" above). If its
+   corpus-fingerprint anchor test fails anyway, the edit moved a `topic`, and
+   the cache needs a live `--dump-fetches`.
 
 ---
 

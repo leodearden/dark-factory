@@ -159,12 +159,13 @@ def _isolate_legibility_trickle_state(tmp_path_factory, monkeypatch):
 # Shared tasks.db fixtures (task 3336).
 #
 # _TASKS_SCHEMA is a deliberate SUBSET (of tables and columns) of
-# `fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_SCHEMA_SQL`,
-# keeping only what the sweep scripts read, with the real shapes and NOT NULL
-# constraints of what it keeps rather than invented ones. For the full shape,
-# run `python scripts/tasks_db_schema.py`. It stays private to `make_tasks_db`,
-# which executes it on every use — that is the executable check, so no test
-# asserts on the literal.
+# `shared/src/shared/task_store_schema.py::TASK_STORE_DDL`, keeping only what
+# the sweep scripts read, with the real shapes and NOT NULL constraints of what
+# it keeps rather than invented ones. For the full shape, run
+# `python scripts/tasks_db_schema.py`. It stays private to `make_tasks_db`:
+# scripts/tests/test_make_tasks_db_schema.py builds a store through
+# `make_tasks_db` and checks it with `tasks_db_schema.columns_outside`, so no
+# test asserts on the literal.
 #
 # The schema is the SUPERSET of what the three sweep-script test files used
 # privately: audit_wiped_metadata_files' copy carries `priority TEXT`, the two
@@ -299,9 +300,8 @@ def install_fake_httpx(monkeypatch):
     httpx IS installed here — a direct dependency of ``shared``
     (``shared/pyproject.toml``, ``httpx>=0.27``, added for task 2965) — so the
     lazy, function-local ``import httpx`` in the modules under test resolves to
-    the real library and its POST genuinely goes out to
-    ``$FUSED_MEMORY_MCP_URL`` (default ``localhost:8002``).  On any box running
-    the fused-memory stack that POST SUCCEEDS, so a test leaning on ambient
+    the real library and its request genuinely goes out.  On any box where the
+    target is listening that request SUCCEEDS, so a test leaning on ambient
     unreachability flaps with the host's listener state — the exact defect
     tasks 3237/3291 fixed by injecting a fake.  Injecting makes both the
     request shape assertable and the failure path deterministic regardless of
@@ -312,19 +312,17 @@ def install_fake_httpx(monkeypatch):
 
     The stub exposes ``post``, and ``get``/``delete`` when a caller supplies
     one (task 3713: readiness polling hits GET ``/health`` and GET
-    ``/v1/models``, which a POST-only stub cannot express; task 3644:
-    ``census_trigger.post_mcp_envelope`` DELETEs the ``/mcp`` endpoint to
-    terminate the MCP session it opened, so the server does not leak one
-    session dict entry + one live anyio task per legibility escalation).
+    ``/v1/models``, which a POST-only stub cannot express).
     Both stay OPT-IN rather than no-arg defaults, so a module that starts
     issuing a verb without its test saying so still lands in the loud-miss
     path below instead of silently receiving a stub response nobody wrote.
 
     Any OTHER attribute is a loud ``pytest.fail`` rather than an
-    ``AttributeError``, because ``default_status_fetcher`` funnels every
-    ``Exception`` into ``StatusFetchUnavailable``: a future production change
-    reaching for e.g. ``httpx.Timeout`` or ``except httpx.HTTPError`` would
-    otherwise keep its test green off the stub's own miss.  ``pytest.fail``
+    ``AttributeError``, because a module under test whose error boundary is
+    ``except Exception`` would turn the miss into its own failure: a future
+    production change reaching for e.g. ``httpx.Timeout`` or
+    ``except httpx.HTTPError`` would otherwise keep its test green off the
+    stub's own miss.  ``pytest.fail``
     raises a ``BaseException``, which such a handler cannot swallow.  Dunders
     stay ordinary ``AttributeError``s so import machinery and introspection can
     still probe the module.

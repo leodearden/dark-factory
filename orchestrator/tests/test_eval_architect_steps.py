@@ -61,7 +61,7 @@ from orchestrator.evals.measurement import (
     Unmeasured,
     UnmeasuredCause,
 )
-from orchestrator.evals.metrics import DECLINE_KINDS, DECLINE_READERS
+from orchestrator.evals.metrics import DECLINE_KINDS, DECLINE_READERS, RoleUnderTest
 from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
 from orchestrator.evals.results import CellName, ResultStore
 
@@ -481,7 +481,7 @@ class TestArchitectEvalDeps:
 _REAL_SLEEP = asyncio.sleep
 _DECLINE_READS = frozenset(DECLINE_READERS.values())
 _CAP_TEXT = "You've hit your session limit · resets 8pm"
-_CFG = EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect')
+_CFG = EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT)
 
 
 def _answered(**over) -> AgentResult:

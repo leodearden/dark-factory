@@ -129,9 +129,9 @@ def _isolate_caches():
     """The unit cache may not cross a test."""
     import dashboard.data.task_snapshot as snapshot_mod
 
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
     yield
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
 
 
 class TestAcquireSnapshotHappyPath:
@@ -253,7 +253,7 @@ class TestAcquireSnapshotHappyPath:
 
         canned.fail_when = lambda call: call['tool'] == 'get_statuses'
         import dashboard.data.task_snapshot as snapshot_mod
-        snapshot_mod._snapshot_cache_clear()
+        snapshot_mod.clear_snapshot_cache()
         degraded = await self._acquire(canned, dummy_client, dashboard_config, project_root,
                                        now=NOW)
 
@@ -660,7 +660,7 @@ class TestSnapshotDegradation:
         assert unreachable.failure is SnapshotFailure.UNREACHABLE
         assert unreachable.rows.state is not DatumState.FRESH
 
-        snapshot_mod._snapshot_cache_clear()
+        snapshot_mod.clear_snapshot_cache()
         monkeypatch.setattr(snapshot_mod, 'PER_CALL_TIMEOUT', 0.01)
         slow = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
 

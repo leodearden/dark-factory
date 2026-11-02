@@ -870,3 +870,111 @@ async def test_set_task_status_done_does_not_clear_override_row(
         assert row[1] == 1
     finally:
         conn.close()
+
+
+# ===========================================================================
+# overrides.source — who owns a row (task 3821)
+# ===========================================================================
+
+
+_LEGACY_OVERRIDES_SCHEMA = """\
+CREATE TABLE overrides (
+    project_root  TEXT NOT NULL,
+    task_id       TEXT NOT NULL,
+    boost_tier    TEXT,
+    pinned        INTEGER NOT NULL DEFAULT 0,
+    pin_order     INTEGER,
+    reserve_now   INTEGER NOT NULL DEFAULT 0,
+    ttl_until     TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (project_root, task_id)
+);
+"""
+
+
+async def _pin_queue(mcp_server, project_root) -> list[dict]:
+    result = await mcp_server._tool_manager.call_tool(
+        'get_pin_queue', {'project_root': str(project_root)},
+    )
+    return result['pin_queue']
+
+
+@pytest.mark.asyncio
+async def test_get_pin_queue_reports_operator_source(tmp_path, mcp_server):
+    await mcp_server._tool_manager.call_tool(
+        'set_task_priority_override',
+        {'project_root': str(tmp_path), 'task_id': '5', 'pinned': True},
+    )
+
+    [entry] = await _pin_queue(mcp_server, tmp_path)
+
+    assert entry['task_id'] == '5'
+    assert entry['source'] == 'operator'
+
+
+@pytest.mark.asyncio
+async def test_get_pin_queue_shows_watchdog_pin_after_operator_pin(
+    tmp_path, mcp_server,
+):
+    from orchestrator.overrides import OverrideStore
+
+    await mcp_server._tool_manager.call_tool(
+        'set_task_priority_override',
+        {'project_root': str(tmp_path), 'task_id': 'op', 'pinned': True},
+    )
+    OverrideStore(_db_path(tmp_path)).create_watchdog_pin(
+        str(tmp_path), 'wd', ttl_until=datetime.now(UTC) + timedelta(days=1),
+    )
+
+    queue = await _pin_queue(mcp_server, tmp_path)
+
+    assert [(e['task_id'], e['source']) for e in queue] == [
+        ('op', 'operator'), ('wd', 'starvation_watchdog'),
+    ]
+    assert queue[1]['ttl_until'] is not None
+
+
+@pytest.mark.asyncio
+async def test_legacy_overrides_db_reads_as_operator_owned(tmp_path, mcp_server):
+    db_p = _db_path(tmp_path)
+    db_p.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_p))
+    try:
+        conn.executescript(_LEGACY_OVERRIDES_SCHEMA)
+        conn.execute(
+            'INSERT INTO overrides (project_root, task_id, boost_tier, pinned, '
+            'pin_order, reserve_now, ttl_until, created_at, updated_at) '
+            "VALUES (?, 'L', NULL, 1, 4, 0, NULL, 'then', 'then')",
+            (str(tmp_path),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    [entry] = await _pin_queue(mcp_server, tmp_path)
+
+    assert entry['task_id'] == 'L'
+    assert entry['pin_order'] == 4
+    assert entry['source'] == 'operator'
+
+
+@pytest.mark.asyncio
+async def test_operator_override_takes_ownership_of_watchdog_pin(
+    tmp_path, mcp_server,
+):
+    from orchestrator.overrides import OverrideStore
+
+    store = OverrideStore(_db_path(tmp_path))
+    store.create_watchdog_pin(
+        str(tmp_path), 'wd', ttl_until=datetime.now(UTC) + timedelta(days=1),
+    )
+
+    await mcp_server._tool_manager.call_tool(
+        'set_task_priority_override',
+        {'project_root': str(tmp_path), 'task_id': 'wd', 'boost_tier': 'high'},
+    )
+
+    [entry] = await _pin_queue(mcp_server, tmp_path)
+    assert entry['source'] == 'operator'
+    assert store.release_watchdog_pin(str(tmp_path), 'wd') is False

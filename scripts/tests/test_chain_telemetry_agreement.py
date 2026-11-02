@@ -16,7 +16,7 @@ from pathlib import Path
 
 import analyze_speculation_depth
 import merge_lane_throughput
-from canary_predicate_summary import metric, n_deep_verifies
+from canary_predicate_summary import metric, n_deep_verifies, population
 from cli_subprocess_timeout import cli_timeout_from_env
 from orchestrator.chain_telemetry import ChainBucket, summarize_chain_telemetry
 from orchestrator.event_store import EventStore
@@ -28,8 +28,8 @@ _PREDICATE_TIMEOUT = cli_timeout_from_env('CHAIN_TELEMETRY_AGREEMENT_CLI_TIMEOUT
 # four items then landed, a halved 2-item round that failed, an ordinary
 # adjacent speculative verify (its depth is frontier height) and a probe-era row.
 MERGE_VERIFY = [
-    {'chain_items': 4, 'passed': True, 'depth': 1},
-    {'chain_items': 2, 'passed': False, 'depth': 1},
+    {'chain_items': 4, 'passed': True, 'depth': 1, 'merge_sha': 'tip-4', 'attempt': 0},
+    {'chain_items': 2, 'passed': False, 'depth': 1, 'merge_sha': 'tip-2', 'attempt': 0},
     {'chain_items': 1, 'passed': True, 'depth': 2},
     {'depth': 3, 'passed': True},
 ]
@@ -44,6 +44,7 @@ TRUE_DEEP_FAILURES = 1
 TRUE_DEEP_FAIL_RATE = 0.5
 TRUE_ITEMS_LANDED = 4
 TRUE_ITEMS_LANDED_PER_DEEP_VERIFY = 2.0
+TRUE_ITEMS_LANDED_PER_PASSED_DEEP_ROUND = 4.0
 TRUE_LEGACY_ROWS = 1
 
 
@@ -102,7 +103,7 @@ class TestReaderAgreement:
             conn.close()
 
         result = subprocess.run(
-            ['bash', str(_PREDICATE), '--runs-db', str(db)],
+            ['bash', str(_PREDICATE), '--runs-db', str(db), '--min-deep-verifies', '1'],
             capture_output=True, text=True, timeout=_PREDICATE_TIMEOUT,
         )
 
@@ -110,7 +111,10 @@ class TestReaderAgreement:
         # no duration; 2 is an infra fault.
         assert result.returncode in (0, 1), f'{result.returncode=} {result.stdout=} {result.stderr=}'
         assert n_deep_verifies(result.stdout) == TRUE_DEEP_VERIFIES, result.stdout
-        assert metric(result.stdout, 'deep_fail_rate') == round(TRUE_DEEP_FAIL_RATE, 4), result.stdout
+        # The digest's deep_fail_rate is the RAW rate; the predicate's gated leg excludes item-attributed tips.
+        assert population(result.stdout, 'deep_fail_rate_raw') == round(TRUE_DEEP_FAIL_RATE, 4), result.stdout
+        # Its items_per_verify divides by passed deep ROUNDS, not deep verifies, so it is
+        # deliberately a different quantity from the digest's per-deep-verify 2.0 (task 7722).
         assert metric(result.stdout, 'items_per_verify') == round(
-            TRUE_ITEMS_LANDED_PER_DEEP_VERIFY, 4
+            TRUE_ITEMS_LANDED_PER_PASSED_DEEP_ROUND, 4
         ), result.stdout

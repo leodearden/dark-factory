@@ -484,7 +484,8 @@ async def test_routing_intent_enforce_mode_rejects_a_stamped_submission(
 # (the probe is not monkeypatched) with the interceptor mocked. The declared
 # path is .taskmaster/tasks/tasks.json rather than tasks.db: '.db' is not on
 # the lock-charter extension allowlist, so lock-charter guard γ refuses
-# tasks.db as a "directory" before this guard is reached.
+# tasks.db as a "directory" before this guard is reached. That γ rejection is
+# pinned by the task-6199 tests at the end of this file.
 # ------------------------------------------------------------------
 
 _IGNORED_DELIVERABLE = '.taskmaster/tasks/tasks.json'
@@ -642,3 +643,54 @@ async def test_gitignored_deliverable_operational_class_is_exempt(
     )
     assert 'gitignored_deliverable_warning' not in result
     task_interceptor.submit_task.assert_called_once()
+
+
+# ------------------------------------------------------------------
+# lock-charter guard γ — unrecognised-extension rejection names the
+# deterministic routing (task 6199)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'filing',
+    [
+        {'task_kind': 'normal', 'metadata': {'files': ['tasks.db']}},
+        {'task_kind': 'deterministic', 'metadata': {'files': ['tasks.db'], 'always_escalates': True}},
+    ],
+    ids=['normal', 'deterministic'],
+)
+async def test_lock_charter_rejection_of_unrecognised_extension_path_names_deterministic_routing(
+    mcp_server, task_interceptor, ignored_project, filing,
+):
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': str(ignored_project),
+            'title': 'Edit the task store',
+            **filing,
+        },
+    )
+    assert result.get('error_type') == 'LockCharterViolation', f'Expected LockCharterViolation, got: {result!r}'
+    assert result['unrecognised_extension_paths'] == ['tasks.db']
+    assert "task_kind='deterministic'" in result['error']
+    assert "task_kind='deterministic'" in result['hint']
+    task_interceptor.submit_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_lock_charter_rejection_of_genuine_directory_keeps_directory_message(
+    mcp_server, task_interceptor, ignored_project,
+):
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': str(ignored_project),
+            'title': 'Edit the source tree',
+            'metadata': {'files': ['src']},
+        },
+    )
+    assert result.get('error_type') == 'LockCharterViolation', f'Expected LockCharterViolation, got: {result!r}'
+    assert result['unrecognised_extension_paths'] == []
+    assert 'deterministic' not in result['error'] + result['hint']
+    task_interceptor.submit_task.assert_not_called()

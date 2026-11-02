@@ -260,10 +260,7 @@ def load_scope(path: Path) -> set[str]:
 
 def recompute_composite_from_metrics(metrics_dict: dict) -> float:
     """Rebuild an EvalMetrics from the patched dict and call compute_composite."""
-    known = set(EvalMetrics.__dataclass_fields__)
-    filtered = {k: v for k, v in metrics_dict.items() if k in known}
-    m = EvalMetrics(**filtered)
-    return compute_composite(m)
+    return compute_composite(EvalMetrics.from_dict(metrics_dict))
 
 
 def _with_rereview(result: dict, blocking: int, suggestions: int) -> dict:

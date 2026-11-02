@@ -623,13 +623,43 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     caller's work between reads never counts against it. A read that outlasts it kills the session
     and fails as `timed out` (`client-feed/src/client_feed/sources/git.py::blob_reader`).
 
+- 2026-10-29, from η (task 6974). These bind σ2 and the portal's deploy/ README:
+  - (a) The publisher unit is `client-feed@<name>.service`, rendered from
+    `scripts/client-feed.service.template`. Its ExecStart is `uv run --no-sync --project client-feed
+    client-feed publish --config %h/.config/client-feed/%i.yaml`, so an instance's config is
+    `~/.config/client-feed/<name>.yaml`. Operating it: `OPERATIONS.md` §"Client feed".
+  - (b) It is rendered through `scripts/render_systemd_unit.py::UNITS` entry `client-feed`, whose
+    family is None: it has no Environment= policy and preserves nothing. `scripts/setup-host.sh`
+    section 7a renders it, runs `daemon-reload` on success, and never enables or starts an
+    instance.
+  - (c) setup-host section 3 now runs one `uv sync --all-packages` from the repo root, in place of
+    its per-member `uv sync` loop. A member-scoped sync is exact and prunes the other members from
+    the one shared `.venv`, so the loop left only the last member's closure installed (measured
+    2026-10-29, uv 0.11.6, in a throwaway two-member workspace: after `uv sync --all-packages`,
+    `cd b && uv sync` left only `b`). Appending `client-feed` to the loop, as the task text read,
+    would have pruned the dashboard.
+  - (d) The worked policy for this repository is `client-feed/examples/dark-factory.yaml`,
+    validated by `client-feed/tests/test_policy_example.py`.
+  - (e) A clean stop exits 0 through `uv run`, so the unit carries no `SuccessExitStatus=`. The
+    publisher's handler only sets its stop Event, and the process exits once the pass in progress
+    completes (`client-feed/src/client_feed/cli.py::_publish_until_signalled`). A `uv run` child of
+    that shape gave uv rc 0 in 6 of 6 trials, whether SIGTERM reached uv alone or the whole process
+    group, as systemd's control-group kill sends it (measured 2026-10-29, uv 0.11.6). The shape
+    matters: in one trial, a child that called `sys.exit(0)` inside its handler gave 143 when the
+    whole group was signalled. A likely cause, not verified: uv forwards the SIGTERM it receives,
+    and that duplicate lands after the interpreter has dropped the handler. Re-measure before
+    changing the handler.
+  - (f) For σ2: the filer's template is another `UNITS` entry with its own explicit `--unit` call
+    site in setup-host. `tests/scripts/test_render_systemd_unit.py::test_setup_host_renders_each_unit_from_the_template_its_spec_names`
+    pairs each registry key with that call site.
+
 ## 13. Open questions (tactical)
 
 1. **Tree-snapshot cost on large repos.** Suggested: snapshot only on head change; blob line counts
    cached by sha in `cursor.json`; last-change dates from the commits walked since the previous
    snapshot. Decide in β2/γ.
-2. **One unit per project or one unit with a list.** Suggested: `client-feed@<name>.service` instance
-   per project, `--config ~/.config/client-feed/<name>.yaml`. Decide in η.
+2. **One unit per project or one unit with a list.** **Decided by η (6974):** one instance per
+   project, `client-feed@<name>.service`, `--config %h/.config/client-feed/<name>.yaml`.
 3. **Default globs** for visible, test, docs and generated sets. Suggested as in §7.2 and §7.6, with
    `visible_globs` having no default (a policy must name it). Decide in β2.
 4. **`excerpt` rule for PRDs** whose first paragraph is a status line. **Decided by β1 (6968):** the

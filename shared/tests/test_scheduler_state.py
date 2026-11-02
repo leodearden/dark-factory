@@ -35,6 +35,7 @@ _SNAPSHOT_KEYS = {
     'lock_depth',
     'is_paused',
     'pause_reason',
+    'pause_class',
     'requeue_cooldowns',
     'snapshot_at',
 }
@@ -79,6 +80,7 @@ def _populated() -> SchedulerStateSnapshot:
         lock_depth=3,
         is_paused=True,
         pause_reason='operator halt',
+        pause_class='operator',
         requeue_cooldowns={
             'T1': RequeueCooldown(
                 armed_secs=31.25,
@@ -113,6 +115,7 @@ class TestEmpty:
             'lock_depth': None,
             'is_paused': False,
             'pause_reason': None,
+            'pause_class': None,
             'requeue_cooldowns': {},
             'snapshot_at': None,
         }
@@ -186,6 +189,7 @@ class TestWireShape:
         assert wire['lock_depth'] == 3
         assert wire['is_paused'] is True
         assert wire['pause_reason'] == 'operator halt'
+        assert wire['pause_class'] == 'operator'
 
 
 class TestRollingRestart:
@@ -200,6 +204,13 @@ class TestRollingRestart:
         assert parsed == SchedulerStateSnapshot.from_json(wire)
         assert 'added_by_a_newer_producer' not in parsed.to_json()
         assert 'added_nested' not in parsed.to_json()['parks']['P']
+
+    def test_older_producer_without_pause_class_reads_none(self) -> None:
+        wire = _populated().to_json()
+        del wire['pause_class']
+        parsed = SchedulerStateSnapshot.from_json(wire)
+        assert parsed.is_paused is True
+        assert parsed.pause_class is None
 
     def test_older_producer_missing_keys_fill_with_defaults(self) -> None:
         parsed = SchedulerStateSnapshot.from_json({'current_holders': {'m': '7'}})

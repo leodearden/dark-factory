@@ -5082,10 +5082,9 @@ class TestVerificationFailureAudit:
 
         with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
             agent = AsyncMock()
-            agent.run = AsyncMock(return_value=(
-                {'warning': 'no_tool_calls', 'warning_origin': 'cli_output_unparseable', 'text': ''},
-                [],
-            ))
+            agent.run = AsyncMock(return_value={
+                'warning': 'no_tool_calls', 'warning_origin': 'cli_output_unparseable', 'text': '',
+            })
             MockAgentLoop.return_value = agent
 
             await _run_done_transition(reconciler, project_root=str(real_root))
