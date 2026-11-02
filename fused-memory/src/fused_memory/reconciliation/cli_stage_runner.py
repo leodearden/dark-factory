@@ -684,9 +684,9 @@ def run_config_dir_path(data_dir: Path, run_id: str) -> Path:
 
     Names exactly ``TaskConfigDir(task_id=run_id, base_dir=recon_config_base_dir(data_dir)).path``
     without constructing one. That is the point: ``TaskConfigDir.__init__``
-    mkdirs the dir and symlinks settings into it, so a read-only caller — the
-    resume-eligibility probe asking whether a transcript survives — would
-    resurrect the very directory it is probing for.
+    mkdirs the dir and symlinks settings into it, so a caller that only needs
+    the path — ``gc_run_config_dir``, removing a dir that may never have been
+    created — would resurrect the very directory it is acting on.
     """
     return recon_config_base_dir(data_dir) / f'{CONFIG_DIR_PREFIX}{run_id}'
 
@@ -821,8 +821,6 @@ async def run_stage_via_cli(
     output_schema: dict | None = None,
     session_id: str | None = None,
     config_dir: TaskConfigDir | None = None,
-    resume_session_id: str | None = None,
-    resume_delivers_prompt: bool = False,
 ) -> StageResult:
     """Invoke a reconciliation stage via Claude CLI with MCP tools.
 
@@ -841,15 +839,6 @@ async def run_stage_via_cli(
     extras so the CLI can actually write the transcript inside it. Setting
     ``config_dir`` without that grant is the 2026-07-18 defect — the CLI is told
     where to write and then denied the write, silently.
-
-    ``resume_session_id`` / ``resume_delivers_prompt`` (task 2717 σ) are likewise
-    forwarded straight to ``invoke_with_cap_retry`` for the startup
-    adopt-and-resume path: when set, the stage subprocess ``--resume``s an
-    in-flight session and (with ``resume_delivers_prompt=True``) receives the
-    caller's real ``payload`` as its continuation prompt instead of the generic
-    CRASH_RECOVERY placeholder. Both default to None/False so non-resume call
-    sites are byte-identical. BaseStage.run validates the transcript exists and
-    builds the recovery prompt before setting these; this runner stays generic.
     """
     effective_model = model or config.agent_llm_model
     # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT switched to
@@ -957,8 +946,6 @@ async def run_stage_via_cli(
             sandbox_wrap=sandbox_wrap,
             session_id=session_id,
             config_dir=config_dir,
-            resume_session_id=resume_session_id,
-            resume_delivers_prompt=resume_delivers_prompt,
         )
     except AllAccountsCappedException:
         logger.warning(
