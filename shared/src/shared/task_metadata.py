@@ -767,14 +767,30 @@ class TriggerChain(BaseModel):
         return value
 
     @model_validator(mode='after')
-    def _run_id_names_the_skill(self) -> TriggerChain:
-        prefix = f'{self.skill}-'
-        if not self.run_id.startswith(prefix):
-            raise ValueError(
-                f'trigger_chain.run_id={self.run_id!r} must start with {prefix!r}, '
-                f'the skill it was run by'
-            )
+    def _run_ids_name_the_skill(self) -> TriggerChain:
+        _require_run_of(self.skill, 'run_id', self.run_id)
+        if self.superseded_by is not None:
+            _require_run_of(self.skill, 'superseded_by', self.superseded_by)
         return self
+
+
+def _require_run_of(skill: str, field: str, run_id: str) -> None:
+    """Refuse a *run_id* that is not a run of *skill* (``<skill>-…``).
+
+    A run of a longer skill that *skill* prefixes (``review-all-…`` against
+    ``review``) is refused too: its ``review-`` prefix is not a ``review`` run.
+    """
+    prefix = f'{skill}-'
+    if not run_id.startswith(prefix):
+        raise ValueError(
+            f'trigger_chain.{field}={run_id!r} must start with {prefix!r}, '
+            f'the skill it was run by'
+        )
+    for longer in get_args(TriggerChainSkill):
+        if longer.startswith(prefix) and run_id.startswith(f'{longer}-'):
+            raise ValueError(
+                f'trigger_chain.{field}={run_id!r} is a run of {longer!r}, not of {skill!r}'
+            )
 
 
 class RoutingDecisionMirror(BaseModel):

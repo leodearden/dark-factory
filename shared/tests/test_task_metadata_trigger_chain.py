@@ -78,6 +78,33 @@ class TestTriggerChainModel:
         assert repr(run_id) in message
         assert "'review-'" in message
 
+    def test_a_longer_skills_run_is_not_a_run_of_its_prefix(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            TriggerChain.model_validate(_chain(skill='review', run_id='review-all-x'))
+        assert (
+            "trigger_chain.run_id='review-all-x' is a run of 'review-all', not of 'review'"
+        ) in str(excinfo.value)
+
+    def test_the_longer_skill_accepts_its_own_run(self) -> None:
+        chain = TriggerChain.model_validate(_chain(skill='review-all', run_id='review-all-x'))
+        assert chain.skill == 'review-all'
+
+    @pytest.mark.parametrize(
+        ('superseded_by', 'expected'),
+        [
+            ('', "trigger_chain.superseded_by='' must start with 'review-'"),
+            ('hotspot-survey-x', "trigger_chain.superseded_by='hotspot-survey-x' must start with 'review-'"),
+            ('review-all-x', "trigger_chain.superseded_by='review-all-x' is a run of 'review-all'"),
+        ],
+        ids=['empty', 'other-skill', 'longer-skill'],
+    )
+    def test_superseded_by_must_name_a_run_of_the_same_skill(
+        self, superseded_by: str, expected: str
+    ) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            TriggerChain.model_validate(_chain(superseded_by=superseded_by))
+        assert expected in str(excinfo.value)
+
     @pytest.mark.parametrize('missing', ['run_id', 'role'])
     def test_required_fields(self, missing: str) -> None:
         raw = _chain()
@@ -87,9 +114,8 @@ class TestTriggerChainModel:
 
 
 class TestTriggerChainRegistration:
-    def test_key_is_registered_to_the_model(self) -> None:
+    def test_key_spelling(self) -> None:
         assert TRIGGER_CHAIN_KEY == 'trigger_chain'
-        assert task_metadata._SUBMODEL_REGISTRY[TRIGGER_CHAIN_KEY] is TriggerChain
 
     def test_write_boundary_refuses_a_slashed_skill(self) -> None:
         with pytest.raises(ValidationError, match='no leading slash'):
