@@ -1259,3 +1259,17 @@ class TestPinReservationRank:
 
         assert lt.blockers('P', ['w.py', 'x.py']) == []
         assert lt.try_acquire('P', ['w.py', 'x.py']) is True
+
+
+class TestRelease:
+    """``release`` returns the modules it freed, as ``release_subset`` does."""
+
+    def test_release_returns_the_freed_modules_sorted(self):
+        lt = _lt()
+        assert lt.try_acquire('T', ['b', 'a'])
+
+        assert lt.release('T') == ['a', 'b']
+        assert not lt.is_held('T')
+
+    def test_release_of_a_task_holding_nothing_returns_empty(self):
+        assert _lt().release('nobody') == []
