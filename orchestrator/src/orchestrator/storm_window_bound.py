@@ -49,7 +49,9 @@ in-workflow progress-timeout re-arms — against 8 ``session_resume`` rows, all
 from the harness eligibility predicate and none from the arm seam. The arm-seam
 SUCCESS population emits no event at all, so its size is not merely unmeasured
 but unmeasurable from runs.db, and the interleaved series cannot be
-reconstructed after the fact.
+reconstructed after the fact. Those 12 stage='cli' rows predate task 5579,
+under which the branch counted every resumed non-success, and 0 of the 25 such
+rows measured on dark_factory+reify were rejections.
 
 So the inequality bounds the window from below and nothing more: clearing it
 does not prove the escape will fire, only that a window below it could not.
@@ -322,11 +324,14 @@ def observed_storm_window_inputs(db_path: Path | str) -> StormWindowSample | Non
     arrives — and within them only the rows that actually FEED the streak:
     ``harness._BY_DESIGN_RESTORE_OUTCOMES`` is carved out at the classifier, so
     a row carrying one of those outcomes never increments a streak and must not
-    shorten a measured gap either. The carve-out set is imported rather than
-    re-typed (SPOT); see the module docstring for why sampling the superset
-    would be conservative on one side of the bound and ANTI-conservative on the
-    other. The import is function-local so a 300-line derivation module does
-    not drag the orchestrator's largest module into its import graph.
+    shorten a measured gap either. Steward rows (task 5579) are dropped for the
+    same reason: a steward resume is a live continuation that never reaches
+    ``Harness.note_resume_failed``. The carve-out set and the steward role name
+    are imported rather than re-typed (SPOT); see the module docstring for why
+    sampling the superset would be conservative on one side of the bound and
+    ANTI-conservative on the other. The imports are function-local so a
+    300-line derivation module does not drag the orchestrator's largest modules
+    into its import graph.
 
     Timestamps are parsed in Python rather than compared as strings: the SQL
     bound is only a prefilter, and a row whose timestamp does not parse is
@@ -346,6 +351,7 @@ def observed_storm_window_inputs(db_path: Path | str) -> StormWindowSample | Non
                      exc_info=True)
         return None
 
+    from orchestrator.agents.roles import STEWARD  # noqa: PLC0415
     from orchestrator.harness import _BY_DESIGN_RESTORE_OUTCOMES  # noqa: PLC0415
 
     carved = sorted(_BY_DESIGN_RESTORE_OUTCOMES)
@@ -361,8 +367,9 @@ def observed_storm_window_inputs(db_path: Path | str) -> StormWindowSample | Non
             # interpolated, so the carve-out set stays data.
             "AND coalesce(json_extract(data, '$.restore'), '') NOT IN "
             f'({", ".join("?" * len(carved))}) '
+            "AND coalesce(json_extract(data, '$.role'), '') != ? "
             'ORDER BY timestamp',
-            (threshold.isoformat(), *carved),
+            (threshold.isoformat(), *carved, STEWARD.name),
         ):
             parsed = parsed_utc(value)
             if parsed is not None and parsed >= threshold:
