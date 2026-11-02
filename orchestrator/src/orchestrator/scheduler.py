@@ -4893,7 +4893,8 @@ class Scheduler:
 
         - ``reservation_installed`` only when something was NEWLY parked,
           carrying just that increment (plus ``reservation_shadowed`` per
-          outranked owner, one with a larger :class:`_ParkKey`, pushed
+          outranked owner, one with a larger park key
+          (``orchestrator/src/orchestrator/lock_table.py::_ParkKey``), pushed
           beneath it);
         - ``reservation_install_blocked`` whenever fewer modules were parked
           than requested — empty and partial installs are one signal.
@@ -4932,7 +4933,7 @@ class Scheduler:
                 source=source,
             )
             # Emit reservation_shadowed (non-destructive shadow) for each
-            # outranked owner (larger _ParkKey: lower priority, or the same
+            # outranked owner (larger park key: lower priority, or the same
             # rank and a later id) whose park was pushed beneath task_id.
             # reservation_evicted is RETAINED as an enum member for historical
             # event-log back-compat but is no longer emitted on preemption.
@@ -7160,8 +7161,8 @@ class Scheduler:
         pin ahead of it in the queue has already been tried this tick, so the
         cap keeps this tick's heads first, and a displaced pin is outranked by
         the head's pin rank on every key they share.  (Pins with no stored
-        pin_order tie at one rank, and tied pins resolve by the id tie-break of
-        :class:`_ParkKey`, so only a head whose id follows the displaced pin's
+        pin_order tie at one rank, and tied pins resolve by the park key's id
+        tie-break, so only a head whose id follows the displaced pin's
         waits for its next completion on the shared key.)  Owners that fail the park-hold predicate
         (:meth:`_park_hold_refusal`) lost every park, pin entries included, in
         park GC earlier in the tick; completion runs only for an owner that
