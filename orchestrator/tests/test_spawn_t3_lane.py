@@ -11,21 +11,24 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sqlite3
 import subprocess
 import sys
 import textwrap
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _fake_t3_server import ENVIRONMENT_ID, FakeT3Server, install_fake_t3_cli
 
 from orchestrator import session_registry as sr
 from orchestrator import spawn_t3_lane as lane
+from orchestrator import t3_mcp_client
 from orchestrator.session_ownership_probes import ProcessTree
 
 _PKG_SRC = Path(lane.__file__).resolve().parents[1]
@@ -1098,3 +1101,153 @@ def test_the_module_runs_by_path_with_only_pythonpath(tmp_path: Path) -> None:
     )
 
     assert (completed.returncode, completed.stdout) == (0, 'not-t3\n'), completed.stderr
+
+
+@pytest.fixture
+def t3_server() -> Iterator[FakeT3Server]:
+    with FakeT3Server.running() as server:
+        yield server
+
+
+def point_runtime_at(env: Env, server: FakeT3Server) -> None:
+    """Make server-runtime.json name the fake server, never the host's real :3773."""
+    runtime = {**SERVER_RUNTIME_JSON, 'origin': server.origin, 'serverVersion': server.server_version}
+    (env.t3_home / 'userdata' / 'server-runtime.json').write_text(json.dumps(runtime))
+
+
+def remove_runtime(env: Env) -> None:
+    (env.t3_home / 'userdata' / 'server-runtime.json').unlink()
+
+
+def install_mcp_cli(
+    server: FakeT3Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version_line: str
+) -> None:
+    """The pairing fake ``t3`` from ``_fake_t3_server``, not this module's ``fake_t3``."""
+    bin_dir = tmp_path / 'pairing-t3-bin'
+    install_fake_t3_cli(bin_dir, origin=server.origin, version_line=version_line, log_path=tmp_path / 'pairing-t3.log')
+    monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
+
+
+def stored_credential(env: Env) -> t3_mcp_client.Credential:
+    credential = t3_mcp_client.read_credential_status(ENVIRONMENT_ID, root=env.fleet).credential
+    assert credential is not None
+    return credential
+
+
+def closed_origin() -> str:
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
+    return f'http://127.0.0.1:{port}'
+
+
+class TestPairAndStatus:
+    def test_pair_self_pairs_with_the_runtime_origin(
+        self,
+        env: Env,
+        t3_server: FakeT3Server,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        point_runtime_at(env, t3_server)
+        install_mcp_cli(t3_server, tmp_path, monkeypatch, 't3 v0.1.6')
+
+        line = run_verb(capsys, 'pair')
+
+        credential = stored_credential(env)
+        assert line == (
+            f'paired environment_id={ENVIRONMENT_ID} expires_at={credential.expires_at.isoformat()} access=full-access'
+        )
+        path = env.fleet / 't3-mcp' / f'{ENVIRONMENT_ID}.json'
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert json.loads(path.read_text())['paired_by'] == 'self-pair'
+
+    def test_pair_with_a_cli_of_another_version_refuses_and_writes_nothing(
+        self,
+        env: Env,
+        t3_server: FakeT3Server,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        point_runtime_at(env, t3_server)
+        install_mcp_cli(t3_server, tmp_path, monkeypatch, 't3 v0.1.4')
+
+        line = run_verb(capsys, 'pair')
+
+        assert line == 'pair-failed reason=cli-version-mismatch cli=0.1.4 server=0.1.6'
+        assert not (env.fleet / 't3-mcp').exists()
+
+    def test_pair_with_an_operator_code_needs_neither_runtime_nor_cli(
+        self,
+        env: Env,
+        t3_server: FakeT3Server,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        remove_runtime(env)
+        empty = tmp_path / 'empty-bin'
+        empty.mkdir()
+        monkeypatch.setenv('PATH', str(empty))
+
+        paired = run_verb(capsys, 'pair', '--code', t3_server.add_pairing_code(), '--origin', t3_server.origin)
+        rejected = run_verb(capsys, 'pair', '--code', 'wrong', '--origin', t3_server.origin)
+
+        assert paired.startswith(f'paired environment_id={ENVIRONMENT_ID} ')
+        assert stored_credential(env).paired_by is t3_mcp_client.PairedBy.OPERATOR
+        assert rejected.startswith('pair-failed reason=pairing_rejected')
+
+    def test_pair_with_no_origin_anywhere_says_so(self, env: Env, capsys: pytest.CaptureFixture[str]) -> None:
+        remove_runtime(env)
+
+        assert run_verb(capsys, 'pair') == 'pair-failed reason=server-runtime-missing'
+
+    def test_pair_refuses_plain_http_off_loopback_at_the_argument(
+        self, env: Env, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with pytest.raises(SystemExit) as exited:
+            lane.main(['pair', '--origin', 'http://192.168.1.105:3773'])
+
+        assert exited.value.code == 2
+        assert capsys.readouterr().out == ''
+
+    def test_status_reports_paired_unpaired_and_expired(
+        self,
+        env: Env,
+        t3_server: FakeT3Server,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        point_runtime_at(env, t3_server)
+        install_mcp_cli(t3_server, tmp_path, monkeypatch, 't3 v0.1.6')
+        run_verb(capsys, 'pair')
+        path = env.fleet / 't3-mcp' / f'{ENVIRONMENT_ID}.json'
+        expires_at = stored_credential(env).expires_at.isoformat()
+
+        paired = run_verb(capsys, 'status')
+        stored = json.loads(path.read_text())
+        path.unlink()
+        unpaired = run_verb(capsys, 'status')
+        past = (datetime.now(UTC) - timedelta(days=1)).replace(microsecond=0).isoformat()
+        path.write_text(json.dumps({**stored, 'expires_at': past}))
+        expired = run_verb(capsys, 'status')
+
+        origin = t3_server.origin
+        assert paired == f'paired environment_id={ENVIRONMENT_ID} expires_at={expires_at} origin={origin}'
+        assert unpaired == f'unpaired environment_id={ENVIRONMENT_ID} expires_at=none origin={origin}'
+        assert expired == f'expired environment_id={ENVIRONMENT_ID} expires_at={past} origin={origin}'
+
+    def test_status_without_a_descriptor_cannot_select_a_file(
+        self, env: Env, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        origin = closed_origin()
+
+        unreachable = run_verb(capsys, 'status', '--origin', origin)
+        remove_runtime(env)
+        no_runtime = run_verb(capsys, 'status')
+
+        assert unreachable == f'status-failed reason=descriptor-unreachable origin={origin}'
+        assert no_runtime == 'status-failed reason=server-runtime-missing origin=none'
