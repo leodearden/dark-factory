@@ -1326,11 +1326,11 @@ class TestHarnessCostCeiling:
         # override these code defaults (task 2719: the orchestrator/config.yaml
         # symlink whose cwd-relative fallback this test used to rely on was retired).
         config = OrchestratorConfig(project_root=tmp_path)
-        assert config.watcher_daily_cost_ceiling_usd == 50.0, (
-            f'Expected 50.0; got {config.watcher_daily_cost_ceiling_usd!r}'
+        assert config.watcher_daily_cost_ceiling_usd == 150.0, (
+            f'Expected 150.0; got {config.watcher_daily_cost_ceiling_usd!r}'
         )
-        assert config.orch_daily_cost_ceiling_usd == 200.0, (
-            f'Expected 200.0; got {config.orch_daily_cost_ceiling_usd!r}'
+        assert config.orch_daily_cost_ceiling_usd == 10000.0, (
+            f'Expected 10000.0; got {config.orch_daily_cost_ceiling_usd!r}'
         )
 
     def test_config_overridable(self, monkeypatch, tmp_path: Path) -> None:
