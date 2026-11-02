@@ -1194,9 +1194,13 @@ class _BackfillScanCache:
     delays: dict[str, float] = field(default_factory=dict)
 
 
-def _numeric_id(task_id: str) -> float:
-    """The dispatch tie-break rank of *task_id*: older numeric ids first, any non-numeric id last (PRD I-4)."""
-    return float(int(task_id)) if task_id.isdecimal() else math.inf
+def _tie_break(task_id: str) -> tuple[float, str]:
+    """THE id tie-break (PRD I-4): older numeric ids first, then non-numeric ids in string order.
+
+    Both dispatch order (``Scheduler._score_candidates``) and park order
+    (:class:`_ParkKey`) end in it, so the two cannot diverge.
+    """
+    return (float(int(task_id)) if task_id.isdecimal() else math.inf, task_id)
 
 
 class _ParkKey(NamedTuple):
@@ -1208,7 +1212,7 @@ class _ParkKey(NamedTuple):
 
     @classmethod
     def of(cls, owner: str, rank: int) -> _ParkKey:
-        return cls(rank, _numeric_id(owner), owner)
+        return cls(rank, *_tie_break(owner))
 
 
 def _as_stamp(value: object) -> str | None:
@@ -1348,7 +1352,7 @@ class ModuleLockTable:
 
     # --- Park (reservation) helpers ---
 
-    def _rank_blocking_parks(
+    def _precedence_blocking_parks(
         self,
         module: str,
         task_id: str,
@@ -1401,7 +1405,7 @@ class ModuleLockTable:
         """EVERY owner of an ACTIVE park that blocks *task_id* on *module*.
 
         THE single precedence-aware park-blocking rule (INV-8, over
-        :meth:`_rank_blocking_parks`).  ``_blocking_park_owner`` is the
+        :meth:`_precedence_blocking_parks`).  ``_blocking_park_owner`` is the
         first-match view over it, ``_is_parked_blocks`` the bool view, and
         ``park_owners_blocking`` the naming view — one rule, three views
         (INV-5).  Forking the precedence logic is what would let admission believe it
@@ -1416,7 +1420,7 @@ class ModuleLockTable:
 
         Capacity (task 7313): a park takes one of its key's slots instead of
         reserving the key exclusively.  A park on key K that
-        :meth:`_rank_blocking_parks` names blocks when either term fires:
+        :meth:`_precedence_blocking_parks` names blocks when either term fires:
 
         (a) the hold term — a park counts as its owner's hold, so the request
             is refused once *module* is at ``_limit_for(module)`` counting the
@@ -1439,7 +1443,7 @@ class ModuleLockTable:
         The hold term needs the full count, so nothing is yielded before every
         park has been scanned; a generator keeps every view's call shape.
         """
-        parks = self._rank_blocking_parks(module, task_id, ignore_owners=ignore_owners)
+        parks = self._precedence_blocking_parks(module, task_id, ignore_owners=ignore_owners)
         if not parks:
             return
         park_owners = {owner for owner, _key in parks}
@@ -1679,8 +1683,9 @@ class ModuleLockTable:
         Returns ``(installed, shadowed)`` where *installed* is the list of
         normalized modules NEWLY parked, or re-ranked upward, as the active
         top by this call and *shadowed* is a list of
-        ``(owner_id, modules_shadowed)`` for any lower-priority parks that
-        were PUSHED beneath the new reservation (retained, not destroyed).
+        ``(owner_id, modules_shadowed)`` for any parks with a larger
+        :class:`_ParkKey` (a lower priority, or the same rank and a later id)
+        that were PUSHED beneath the new reservation (retained, not destroyed).
 
         *priority* is a tier name or a :class:`PinOrder`; :func:`park_rank`
         resolves either to the stack rank (task 6040).
@@ -5911,7 +5916,8 @@ class Scheduler:
 
         - ``reservation_installed`` only when something was NEWLY parked,
           carrying just that increment (plus ``reservation_shadowed`` per
-          lower-priority owner pushed beneath it);
+          outranked owner, one with a larger :class:`_ParkKey`, pushed
+          beneath it);
         - ``reservation_install_blocked`` whenever fewer modules were parked
           than requested — empty and partial installs are one signal.
 
@@ -5949,7 +5955,8 @@ class Scheduler:
                 source=source,
             )
             # Emit reservation_shadowed (non-destructive shadow) for each
-            # lower-priority owner whose park was pushed beneath task_id.
+            # outranked owner (larger _ParkKey: lower priority, or the same
+            # rank and a later id) whose park was pushed beneath task_id.
             # reservation_evicted is RETAINED as an enum member for historical
             # event-log back-compat but is no longer emitted on preemption.
             for victim, victim_modules in shadowed_pairs:
@@ -8395,7 +8402,7 @@ class Scheduler:
                 score = self._compute_score_legacy(pri, self._compute_age(tid, ctx.max_id), transitive)
             scored.append((score, tid, t, pri))
 
-        scored.sort(key=lambda entry: (-entry[0], _numeric_id(entry[1]), entry[1]))
+        scored.sort(key=lambda entry: (-entry[0], *_tie_break(entry[1])))
         return scored
 
     async def _phase_select_scored(self, ctx: TickContext) -> object:

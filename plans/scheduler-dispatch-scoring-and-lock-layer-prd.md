@@ -553,7 +553,7 @@ tie-break (older numeric id, then id; non-numeric ids last, I-4). One comparator
 enforced at two points. At INSTALL (INV-3), a new entry shadows a conflicting top with
 a larger key and is blocked by one with a smaller key, so same-tier installs resolve by
 id instead of colliding. At the GATE (INV-8,
-`orchestrator/src/orchestrator/scheduler.py::ModuleLockTable._rank_blocking_parks`), a
+`orchestrator/src/orchestrator/scheduler.py::ModuleLockTable._precedence_blocking_parks`), a
 foreign top blocks a requester that owns parks only when its key precedes the
 requester's best key, the minimum over every entry it holds. A requester that owns no
 park is blocked by every park, as before. A park owner therefore passes a lower-key park
