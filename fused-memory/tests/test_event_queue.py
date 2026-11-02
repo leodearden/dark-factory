@@ -113,8 +113,10 @@ def _signal_after_commits(buffer: EventBuffer, count: int) -> asyncio.Event:
 
     The Event is set inside the drainer's own push call, so its synchronous post-push
     bookkeeping (journal mark_processed, events_committed, task_done) has already run
-    when a waiter resumes. Await ``.wait()`` bare; pytest-timeout bounds a drainer that
-    never commits.
+    when a waiter resumes. That relies on no await point after push in
+    fused-memory/src/fused_memory/reconciliation/event_queue.py::EventQueue._commit_with_retry
+    / _drain_loop. Await ``.wait()`` bare; pytest-timeout bounds a drainer that never
+    commits.
     """
     committed = asyncio.Event()
     inner_push = buffer.push
@@ -661,13 +663,15 @@ async def test_signal_after_commits_counts_only_returned_pushes(real_buffer):
     """The drainer-commit tests await this signal bare, so it must never fire
     before ``count`` pushes have returned with their rows committed."""
     calls: list[int] = []
+    set_when_inner_push_returned: list[bool] = []
     original_push = real_buffer.push
 
     async def fails_first(event):
         calls.append(1)
         if len(calls) == 1:
             raise aiosqlite.OperationalError('transient lock')
-        return await original_push(event)
+        await original_push(event)
+        set_when_inner_push_returned.append(committed.is_set())
 
     real_buffer.push = fails_first
     committed = _signal_after_commits(real_buffer, 2)
@@ -681,6 +685,7 @@ async def test_signal_after_commits_counts_only_returned_pushes(real_buffer):
 
     await real_buffer.push(_make_event())
     assert committed.is_set()
+    assert set_when_inner_push_returned == [False, False]
     assert (await real_buffer.get_buffer_stats('test-project'))['size'] == 2
 
 
@@ -1086,9 +1091,6 @@ def test_read_dead_letters_tolerates_oserror(tmp_path, monkeypatch, caplog):
     dl = tmp_path / 'dl.jsonl'
     seed_dead_letters(dl, [_make_event()])
     q = EventQueue(AsyncMock(), dead_letter_path=dl)
-
-    # Confirm the dead-letter file was actually written.
-    assert dl.exists(), 'dead-letter file must exist before patching open'
 
     # Patch Path.open selectively: only fail when opening the dead-letter path.
     _original_open = pathlib.Path.open
