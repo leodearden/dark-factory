@@ -113,7 +113,7 @@ from orchestrator.dry_run_unblock import (
     run_dry_run_unblock,
 )
 from orchestrator.escalation_router import InfoL0Sweep, RouterPorts, exit_kind_for, router_owns
-from orchestrator.event_store import EventStore, EventType
+from orchestrator.event_store import EventStore, EventType, cli_resume_failed_data
 from orchestrator.exit_contract import (
     ExitStatusWriteFailure,
     judge_exit,
@@ -15004,41 +15004,32 @@ class TaskWorkflow:
         # resumes we DECIDED to make, how many did not survive?") and could
         # push it above 1. resume_session_id is non-None iff the arm site above
         # corroborated and adopted, which is that predicate exactly.
+        #
+        # The payload names the session actually LOST, which session_id_val
+        # often is not: cli_invoke's _reset_for_fresh_retry regenerates the
+        # pre-allocated id, and a cap re-arm replaces the armed id with
+        # result.session_id. The steward builds the same row through the same
+        # builder (event_store.py::cli_resume_failed_data).
         resume_fallbacks = getattr(result, 'resume_fallbacks', 0)
-        if resume_fallbacks and resume_session_id:
-            # …and name the session actually LOST, which session_id_val often
-            # is not: cli_invoke's _reset_for_fresh_retry regenerates the
-            # pre-allocated id, and a cap re-arm replaces the armed id with
-            # result.session_id. The carrier keeps every dropped id in order;
-            # the first is the resume we adopted, so it is the scalar
-            # data.session_id, with the full list alongside for the
-            # multi-fallback invocations. Falls back to our own armed id if an
-            # older shared/ (or a suite stand-in) carries no list.
-            lost_session_ids = [
-                str(s) for s in
-                (getattr(result, 'resume_fallback_session_ids', ()) or ())
-            ]
-            lost_session_id = (
-                lost_session_ids[0] if lost_session_ids else resume_session_id
-            )
+        cli_failure = cli_resume_failed_data(
+            armed_session_id=resume_session_id,
+            role=role.name,
+            fallbacks=resume_fallbacks,
+            dropped_session_ids=getattr(result, 'resume_fallback_session_ids', ()) or (),
+        )
+        if cli_failure is not None:
             if self.event_store:
                 self.event_store.emit(
                     EventType.session_resume_failed,
                     task_id=self.task_id,
-                    data={
-                        'stage': 'cli',
-                        'session_id': lost_session_id,
-                        'session_ids': lost_session_ids,
-                        'role': role.name,
-                        'fallbacks': resume_fallbacks,
-                    },
+                    data=cli_failure,
                 )
             # Genuine by construction (task ε/3733): the restore ran a phase
             # earlier and is not what failed here, so the report carries no
             # restore outcome and the harness cannot carve it out.
             self._report_resume_failed(
                 stage='cli',
-                session_id=lost_session_id,
+                session_id=cli_failure['session_id'],
                 role_name=role.name,
                 restore=None,
                 archive_root=archive_root,

@@ -60,7 +60,7 @@ from shared.process_cost import next_resume_prior
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import STEWARD
-from orchestrator.event_store import EventStore, EventType
+from orchestrator.event_store import EventStore, EventType, cli_resume_failed_data
 from orchestrator.guard_state import PersistentMap, PersistentSet, guard_path
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
@@ -820,7 +820,10 @@ class TaskSteward:
         auth routing) to the shared ``invoke_with_cap_retry``.  This method
         does only session-id bookkeeping: it forwards ``self._session_id``
         as ``resume_session_id`` when a prior session exists, and captures
-        the result's ``session_id`` for the next call.
+        the result's ``session_id`` for the next call.  A fresh session
+        replaces ``_session_id`` only after the CLI provably rejected the
+        armed resume, and that replacement is reported
+        (``_note_rejected_resume``).
 
         The steward is always a LIVE continuation, never a crash-recovery
         resume: ``prompt`` (built by ``_handle_escalation``) carries the new
@@ -898,6 +901,7 @@ class TaskSteward:
             kwargs['resume_session_id'] = self._session_id
             if self._session_reported_total_usd is not None:
                 kwargs['resume_prior_total_cost_usd'] = self._session_reported_total_usd
+        armed = kwargs.get('resume_session_id')
 
         # `backend` below reaches invoke_agent: invoke_with_cap_retry forwards
         # it into invoke_kwargs only when a custom invoke_fn is supplied, and
@@ -931,9 +935,35 @@ class TaskSteward:
             **kwargs,
         )
 
+        self._note_rejected_resume(armed, result)
         self._adopt_session(result)
 
         return result
+
+    def _note_rejected_resume(self, armed: str | None, result) -> None:
+        """Report that the CLI rejected the steward's own armed resume.
+
+        No resume-outcome-sink call: a steward resume is a live continuation,
+        never an adopted crash-recovery resume, so it must not feed the INV-4
+        storm streak.
+        """
+        data = cli_resume_failed_data(
+            armed_session_id=armed,
+            role=STEWARD.name,
+            fallbacks=result.resume_fallbacks,
+            dropped_session_ids=result.resume_fallback_session_ids,
+        )
+        if data is None:
+            return
+        logger.warning(
+            'Steward for task %s: the CLI rejected resume of session %s before '
+            'any model turn — adopting fresh session %s',
+            self.task_id, data['session_id'], result.session_id,
+        )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.session_resume_failed, task_id=self.task_id, data=data,
+            )
 
     def _adopt_session(self, result) -> None:
         """Resume *result*'s session next time, carrying its reported total as the prior."""

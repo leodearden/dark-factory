@@ -12,10 +12,12 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum, unique
 from pathlib import Path
+from typing import Any
 
 from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
 
@@ -1117,6 +1119,28 @@ class EventType(StrEnum):
     shadow_cell_skipped = 'shadow_cell_skipped'
     shadow_cell_settled = 'shadow_cell_settled'
     shadow_cell_ended = 'shadow_cell_ended'
+
+
+def cli_resume_failed_data(
+    *,
+    armed_session_id: str | None,
+    role: str,
+    fallbacks: int,
+    dropped_session_ids: Sequence[str],
+) -> dict[str, Any] | None:
+    """The ``session_resume_failed`` stage='cli' payload, or None unless the
+    caller's own armed resume was rejected (see the
+    ``EventType.session_resume_failed`` taxonomy note)."""
+    if not (fallbacks and armed_session_id):
+        return None
+    ids = [str(s) for s in dropped_session_ids]
+    return {
+        'stage': 'cli',
+        'session_id': ids[0] if ids else armed_session_id,
+        'session_ids': ids,
+        'role': role,
+        'fallbacks': fallbacks,
+    }
 
 
 @unique
