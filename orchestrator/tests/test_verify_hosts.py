@@ -260,6 +260,14 @@ class TestMarkUnavailable:
 
 
 class TestHolding:
+    def test_an_unknown_host_takes_no_hold(self):
+        pool = _pool()
+
+        with pytest.raises(ValueError, match='nope'), pool.holding('nope', '7'):
+            pass
+
+        assert pool.holders() == {}
+
     def test_a_hold_shows_while_its_context_runs(self):
         pool = _pool()
 

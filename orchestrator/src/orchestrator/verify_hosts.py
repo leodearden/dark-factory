@@ -147,6 +147,7 @@ class HostPool:
     @contextlib.contextmanager
     def holding(self, host: str, task_id: str) -> Iterator[None]:
         """The hold record of *task_id* on *host* for the life of the body."""
+        self._known(host)
         holds = self._holds.setdefault(host, [])
         holds.append(task_id)
         try:

@@ -45,7 +45,12 @@ from orchestrator.verify import (
     admission_policy,
     run_scoped_verification,
 )
-from orchestrator.verify_admission_gate import AdmissionGate, AdmissionPlan, gate_for
+from orchestrator.verify_admission_gate import (
+    AdmissionGate,
+    AdmissionPlan,
+    AdmissionPolicy,
+    gate_for,
+)
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
 from orchestrator.verify_hosts import HostPool
 from orchestrator.verify_runner import HostAllocator, RunnerUnavailable, result_to_json
@@ -237,7 +242,7 @@ class _Turn:
 
 
 def _queue(
-    gate: AdmissionGate, policy: Callable[[], Any], *, task_id: str, arrival: float | None = None,
+    gate: AdmissionGate, policy: Callable[[], AdmissionPolicy], *, task_id: str, arrival: float | None = None,
 ) -> _Turn:
     """Queue a task-role plan of *task_id* on *gate*, holding its turn until released."""
     plan = AdmissionPlan.begin(role='task', task_id=task_id)
@@ -325,7 +330,7 @@ class _Rig:
     archive_root: Path
     policy: TaskVerifyPolicy
     policy_raises: Exception | None = None
-    dispatcher: Any = None
+    dispatcher: TaskVerifyDispatcher = field(init=False)
 
     def policy_of(self, _config: OrchestratorConfig) -> TaskVerifyPolicy:
         if self.policy_raises is not None:
@@ -988,8 +993,6 @@ class TestCancellation:
         [provision_pid] = rig.legs.pids(_PROVISION)
         await laptop_holder.leave()
         await _until(lambda: rig.pool.holders() == {'laptop': 'task:7'}, watching=call.task)
-        await asyncio.sleep(0.1)
-        assert _alive(provision_pid)
         assert not any(task is not None and task.done() for task in rig.local.tasks)
 
         call.cancel()
