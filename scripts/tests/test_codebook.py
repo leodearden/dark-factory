@@ -1545,6 +1545,42 @@ def test_the_unknown_slug_warning_stays_one_bounded_line(caplog):
     assert len(message) < 2000
 
 
+def test_a_slug_tallys_rejections_record_counts_every_value_and_lists_each_distinct_one_once():
+    record = mod.SlugTally(
+        valid=2, rejected=("unknown-y", "unknown-x", "unknown-y")
+    ).rejections_record()
+
+    assert record == {"count": 3, "values": ["unknown-x", "unknown-y"], "values_omitted": 0}
+    assert json.loads(json.dumps(record)) == record
+
+
+def test_a_tally_without_rejections_records_zero_not_absent():
+    assert mod.SlugTally(valid=2).rejections_record() == {
+        "count": 0, "values": [], "values_omitted": 0,
+    }
+
+
+def test_the_rejections_record_is_bounded_as_the_warning_is(caplog):
+    caplog.set_level(logging.DEBUG, logger="legibility.codebook")
+    tally = mod.SlugTally(
+        rejected=tuple(f"free-text-{n:03d}-" + "z" * 1000 for n in range(50))
+    )
+
+    record = tally.rejections_record()
+
+    assert record["count"] == 50
+    assert len(record["values"]) == 10
+    assert record["values_omitted"] == 40
+    assert record["values"][0].startswith("free-text-000-")
+    assert not any(value.startswith("free-text-049-") for value in record["values"])
+    assert all(len(value) <= 83 and value.endswith("...") for value in record["values"])
+
+    mod.warn_unknown_invariant_slugs(tally, ("a",), run="run-1")
+
+    [warning] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert str(record["values"]) in warning.getMessage()
+
+
 def test_no_unknown_slugs_means_no_warning(caplog):
     caplog.set_level(logging.DEBUG, logger="legibility.codebook")
 
