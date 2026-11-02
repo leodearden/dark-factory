@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
 
 # ---------------------------------------------------------------------------
 # Shared helpers (adapted from test_dry_run_unblock.py)
@@ -1143,6 +1144,72 @@ class TestReaderFailureWarning:
             f'in this amendment pass (scope discipline — see docstring); got: '
             f'{[r.message for r in warn_records]}'
         )
+
+    def _seed_stub_tasks_db(self, tmp_path):
+        """The 0-byte decoy shape: a tasks.db that exists and holds nothing."""
+        db = tmp_path / '.taskmaster' / 'tasks' / 'tasks.db'
+        db.parent.mkdir(parents=True, exist_ok=True)
+        db.write_bytes(b'')
+        return db
+
+    def test_stub_tasks_db_warning_names_the_refusal(self, tmp_path, caplog):
+        import logging as _logging
+
+        from orchestrator.b3_gate import _read_task_description
+        db = self._seed_stub_tasks_db(tmp_path)
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
+            result = _read_task_description(42, tmp_path)
+
+        assert result is None
+        refusal = str(TaskDbUnreadable(db.resolve(), TaskDbProblem.EMPTY_STUB))
+        assert any(
+            r.levelno == _logging.WARNING and refusal in r.getMessage()
+            for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+    def test_stub_tasks_db_latest_proposal_stays_silent_none(self, tmp_path, caplog):
+        """A non-ABSENT refusal reaches _read_latest_proposal's existing outer
+        handler, which stays deliberately un-instrumented (see above)."""
+        import logging as _logging
+
+        from orchestrator.b3_gate import _read_latest_proposal
+        self._seed_stub_tasks_db(tmp_path)
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
+            result = _read_latest_proposal(42, tmp_path)
+
+        assert result is None
+        assert not [r for r in caplog.records if r.levelno >= _logging.WARNING]
+
+    def test_run_check_on_a_stub_store_still_prints_a_verdict(self, tmp_path, capsys, caplog):
+        import argparse
+        import logging as _logging
+
+        from orchestrator.b3_gate import run_check
+        db = self._seed_stub_tasks_db(tmp_path)
+        args = argparse.Namespace(
+            task_id='42',
+            worktree=str(tmp_path),
+            project_root=str(tmp_path),
+            config=None,
+            now='2026-06-04T12:00:00+00:00',
+            tag='master',
+            category=None,
+            verb='check',
+        )
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
+            run_check(args)
+
+        result = json.loads(capsys.readouterr().out)
+        assert 'verdict' in result
+        refusal = str(TaskDbUnreadable(db.resolve(), TaskDbProblem.EMPTY_STUB))
+        naming = [
+            r for r in caplog.records
+            if r.levelno == _logging.WARNING and refusal in r.getMessage()
+        ]
+        assert len(naming) == 1, [r.getMessage() for r in caplog.records]
 
 
 # ---------------------------------------------------------------------------
