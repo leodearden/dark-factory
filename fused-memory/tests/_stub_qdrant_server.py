@@ -119,7 +119,7 @@ def _make_handler(state: StubQdrantServer) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
 
-        def log_message(self, *args: Any) -> None:  # noqa: A002 - stdlib signature
+        def log_message(self, *args: Any) -> None:
             """Silence the default stderr access log."""
 
         def _serve(self) -> None:
@@ -134,7 +134,7 @@ def _make_handler(state: StubQdrantServer) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(payload)
 
-        do_GET = do_PUT = do_POST = _serve  # noqa: N815 - stdlib naming
+        do_GET = do_PUT = do_POST = _serve
 
     return Handler
 

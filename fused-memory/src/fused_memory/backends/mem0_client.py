@@ -392,8 +392,8 @@ class Mem0Backend:
 
     async def _ensure_collection(self, collection_name: str) -> None:
         """Create the collection if absent, under this backend's own budgets (tests/test_mem0_collection_provisioning.py)."""
-        from qdrant_client.http import models as qmodels  # noqa: PLC0415
-        from qdrant_client.http.exceptions import UnexpectedResponse  # noqa: PLC0415
+        from qdrant_client.http import models as qmodels
+        from qdrant_client.http.exceptions import UnexpectedResponse
 
         client = await self._get_async_qdrant()
         if await self._timed_read(client.collection_exists(collection_name), 'collection_exists'):
