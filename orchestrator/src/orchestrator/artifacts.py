@@ -27,12 +27,19 @@ logger = logging.getLogger(__name__)
 
 PLAN_SCHEMA_VERSION = 1
 PLAN_TASK_TEXT_FP_KEY = '_task_text_fp'
+PLAN_BASE_COMMIT_KEY = '_base_commit'
 
 # Must exceed the longest legitimate critical section: plan_tools._mark_step_done's two timeout=10 git probes.
 PLAN_MUTEX_TIMEOUT_SECS = 60.0
 
 ORCHESTRATOR_ITERATION_SOURCES: frozenset[str] = frozenset({'orchestrator', 'amendment'})
 """The only ``source`` values :meth:`TaskArtifacts.append_iteration_log` writes."""
+
+
+def plan_base_commit(plan: Mapping[str, object]) -> str | None:
+    """The main SHA *plan* was last validated against (plans/task-meta-task-keying-prd.md §M2); None when unstamped or malformed."""
+    stamped = plan.get(PLAN_BASE_COMMIT_KEY)
+    return stamped if isinstance(stamped, str) and stamped else None
 
 
 def iteration_entry_written_by_orchestrator(entry: object) -> bool:
@@ -1304,20 +1311,21 @@ class TaskArtifacts:
     def bump_revalidation_stamp(
         self, session_id: str, base_commit: str | None = None,
     ) -> None:
-        """Stamp ``_revalidated_at`` on plan.json and update metadata.json's
-        ``base_commit`` to *base_commit*. Mirrors the write semantics of the
+        """Stamp ``_revalidated_at`` on plan.json and advance the plan's own
+        ``_base_commit`` to *base_commit*. Mirrors the write semantics of the
         ``confirm_plan`` plan-tools MCP call but is invoked by orchestrator
         code (Lever B — overlap=0 revalidation skip) rather than by an
-        architect tool call.
+        architect tool call. metadata.json is never written here: its
+        ``base_commit`` is this dispatch's worktree fork point, owned by
+        ``init``/``update_base_commit`` alone (PRD task-meta-task-keying §M2).
 
         Args:
             session_id: Current orchestrator session id, written into
                 ``_revalidated_by_session`` for telemetry / audit. The
                 plan.json's existing ``_session_id`` (the original planner)
                 is preserved.
-            base_commit: New main SHA the plan is now tracked against. When
-                ``None``, metadata.json is left untouched (typical for tests
-                that exercise only the plan.json side-effect).
+            base_commit: The main SHA the plan has now been validated
+                against. A falsy value leaves an existing stamp untouched.
 
         Raises:
             ValueError: if plan.json is missing or has no ``steps`` —
@@ -1332,18 +1340,20 @@ class TaskArtifacts:
                 )
             plan['_revalidated_at'] = datetime.now(UTC).isoformat()
             plan['_revalidated_by_session'] = session_id
+            if base_commit:
+                plan[PLAN_BASE_COMMIT_KEY] = base_commit
             self._write_held_plan(plan)
-        if base_commit is not None:
-            self.update_base_commit(base_commit)
 
     def stamp_plan_provenance(
         self, session_id: str, *, task_text_fp: str | None = None,
+        base_commit: str | None = None,
     ) -> None:
         """Stamp _session_id and _created_at into plan.json.
 
         Reads current plan.json, adds provenance fields, writes back.
         ``task_text_fp=None`` leaves an existing fingerprint untouched (the
-        per-iteration and recovered-plan stamps rely on this).
+        per-iteration and recovered-plan stamps rely on this); a falsy
+        ``base_commit`` likewise leaves an existing ``_base_commit`` untouched.
 
         Raises:
             ValueError: if plan.json is missing or does not contain a 'steps' list.
@@ -1368,6 +1378,8 @@ class TaskArtifacts:
             plan.setdefault('_finalized_at', plan['_created_at'])
             if task_text_fp is not None:
                 plan[PLAN_TASK_TEXT_FP_KEY] = task_text_fp
+            if base_commit:
+                plan[PLAN_BASE_COMMIT_KEY] = base_commit
             self._write_held_plan(plan)
 
     def validate_plan_owner(self, session_id: str) -> bool:
