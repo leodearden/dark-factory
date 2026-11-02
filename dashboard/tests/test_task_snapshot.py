@@ -325,7 +325,7 @@ class TestAcquireSnapshotHappyPath:
             assert f'{FRESHNESS_BOUND_SECONDS}s freshness bound' in (half.reason or '')
         assert served.census.value == snapshot.census.value
         assert served.rows.value == snapshot.rows.value
-        assert classify(served) is SnapshotHealth.COUNT_UNKNOWN
+        assert classify(served) is SnapshotHealth.COUNT_STALE
 
     async def test_to_wire_emits_the_contract_keys_and_not_the_raw_map(
         self, project_root, dashboard_config, dummy_client
@@ -524,6 +524,49 @@ class TestSnapshotDegradation:
         assert degraded.rows.state is DatumState.FRESH
         assert degraded.rows.as_of == later
         assert degraded.skew_seconds == 20, 'the real gap, now that there is one'
+
+    async def test_a_failed_map_routes_on_whether_a_last_good_census_exists(
+        self, project_root, dashboard_config, dummy_client, monkeypatch
+    ):
+        """A census with no value is unknown; one with a last good value is stale.
+
+        Both are rows-current roots, but their census surfaces disagree: an
+        unknown census renders no value, a stale one renders its last measured
+        value with an age badge. The banner each root lands in must say what
+        its surfaces show, so the two are routed apart.
+        """
+        import dashboard.data.task_snapshot as snapshot_mod
+        from dashboard.data.datum import DatumState
+        from dashboard.data.task_snapshot import SnapshotHealth, classify
+
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        canned.fail_when = lambda call: call['tool'] == 'get_statuses'
+        cold = await self._acquire(canned, dummy_client, dashboard_config,
+                                   project_root, now=NOW)
+
+        assert cold.rows.state is DatumState.FRESH
+        assert cold.census.state is DatumState.UNKNOWN
+        assert classify(cold) is SnapshotHealth.COUNT_UNKNOWN
+
+        snapshot_mod.clear_snapshot_cache()
+        canned.fail_when = lambda call: False
+        await self._acquire(canned, dummy_client, dashboard_config,
+                            project_root, now=NOW)
+        self._expire_unit(monkeypatch)
+        canned.fail_when = lambda call: call['tool'] == 'get_statuses'
+        stale = await self._acquire(canned, dummy_client, dashboard_config,
+                                    project_root, now=NOW + timedelta(seconds=20))
+
+        assert stale.rows.state is DatumState.FRESH
+        assert stale.census.state is DatumState.STALE
+        assert classify(stale) is SnapshotHealth.COUNT_STALE
+
+        canned.fail_when = lambda call: False
+        healed = await self._acquire(canned, dummy_client, dashboard_config,
+                                     project_root, now=NOW + timedelta(seconds=40))
+
+        assert classify(healed) is SnapshotHealth.OK
 
     async def test_recovery_returns_the_census_to_fresh(
         self, project_root, dashboard_config, dummy_client, monkeypatch
