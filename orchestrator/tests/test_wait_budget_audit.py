@@ -787,6 +787,39 @@ class TestTimeoutBlock:
         )
 
     @pytest.mark.parametrize(
+        ('context', 'expected'),
+        [
+            pytest.param('asyncio.timeout_at(deadline)', math.inf, id='named-deadline'),
+            pytest.param(
+                'asyncio.timeout_at(loop.time() + 5.0)', math.inf, id='clock-arithmetic'
+            ),
+            pytest.param('asyncio.timeout_at(when=deadline)', math.inf, id='keyword'),
+            pytest.param('gate.timeout_at(deadline)', 0.0, id='not-asyncio'),
+        ],
+    )
+    def test_an_asyncio_timeout_at_block_fails_closed(
+        self, context: str, expected: float
+    ) -> None:
+        """`asyncio.timeout_at(when)` takes an absolute deadline, which the
+        per-call model cannot read as a duration, so it bills `math.inf` like
+        any unreadable bound rather than slipping through at 0.0; a
+        non-`asyncio` `.timeout_at(...)` contributes 0.0.
+        """
+        source = f'''
+class TestTimeoutAtBlock:
+    async def test_it(self):
+        async with {context}:
+            while not ready():
+                await asyncio.sleep(0.01)
+'''
+        budgets = item_wait_budgets(source)
+
+        assert budgets == {'TestTimeoutAtBlock::test_it': expected}, (
+            f'Expected `async with {context}:` around a poll to bill '
+            f'{expected}, got {budgets!r}.'
+        )
+
+    @pytest.mark.parametrize(
         ('call', 'expected'),
         [
             pytest.param("poll_responsive(pred, label='x')", 90.0, id='bare-default'),

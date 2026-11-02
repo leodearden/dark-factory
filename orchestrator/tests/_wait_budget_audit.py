@@ -194,29 +194,26 @@ def _wait_responsive_budget(call: ast.Call, visible: Mapping[str, float]) -> flo
     )
 
 
-def is_asyncio_wait_for_call(node: ast.AST) -> bool:
-    """Whether *node* is an ``asyncio.wait_for(...)`` call spelled through
-    the ``asyncio`` name: ``gate.wait_for(...)`` and ``self.wait_for(...)``
-    are not."""
+def _is_asyncio_call(node: ast.AST, attr: str) -> bool:
+    """Whether *node* is an ``asyncio.<attr>(...)`` call spelled through the
+    ``asyncio`` name: ``gate.<attr>(...)`` and ``self.<attr>(...)`` are not."""
     return (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr == 'wait_for'
+        and node.func.attr == attr
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == 'asyncio'
     )
+
+
+def is_asyncio_wait_for_call(node: ast.AST) -> bool:
+    """Whether *node* is an ``asyncio.wait_for(...)`` call (``_is_asyncio_call``)."""
+    return _is_asyncio_call(node, 'wait_for')
 
 
 def is_asyncio_timeout_call(node: ast.AST) -> bool:
-    """Whether *node* is an ``asyncio.timeout(...)`` call spelled through
-    the ``asyncio`` name: ``gate.timeout(...)`` is not."""
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == 'timeout'
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == 'asyncio'
-    )
+    """Whether *node* is an ``asyncio.timeout(...)`` call (``_is_asyncio_call``)."""
+    return _is_asyncio_call(node, 'timeout')
 
 
 # The helpers that charge their deadline in loop-responsive time, by the name a
@@ -240,9 +237,11 @@ def is_responsive_wait_call(node: ast.AST) -> bool:
 def _call_wait_budget(call: ast.Call, visible: Mapping[str, float]) -> float:
     """Return the wait-budget contribution of a single ``ast.Call`` node.
 
-    Recognises exactly six call shapes -- ``asyncio.wait_for(..., timeout=N)``
+    Recognises exactly seven call shapes -- ``asyncio.wait_for(..., timeout=N)``
     (``is_asyncio_wait_for_call``), ``asyncio.timeout(N)`` (``is_asyncio_timeout_call``),
-    billed its ``delay`` exactly as wait_for's timeout, ``_await_outcome(...)`` (whose hidden default is ``MERGE_RESULT_TIMEOUT``
+    billed its ``delay`` exactly as wait_for's timeout, ``asyncio.timeout_at(when)``,
+    billed ``math.inf`` because its absolute deadline cannot be read as a
+    duration, ``_await_outcome(...)`` (whose hidden default is ``MERGE_RESULT_TIMEOUT``
     when no ``timeout=`` kwarg is given), ``wait_responsive(...)``
     (task 3980) and ``poll_responsive(...)`` (``is_responsive_wait_call``), both
     billed by ``_wait_responsive_budget`` as an unconditional
@@ -285,6 +284,8 @@ def _call_wait_budget(call: ast.Call, visible: Mapping[str, float]) -> float:
         if delay is None and call.args:
             delay = call.args[0]
         return _resolve_wait_value(delay, visible)
+    if _is_asyncio_call(call, 'timeout_at'):
+        return math.inf
     if is_responsive_wait_call(call):
         return _wait_responsive_budget(call, visible)
     if isinstance(func, ast.Name) and func.id == 'stop_merge_worker':
