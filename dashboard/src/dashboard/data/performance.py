@@ -17,6 +17,7 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, TypeVar
 
 import aiosqlite
@@ -77,9 +78,38 @@ def _cutoff(days: int, *, now: datetime | None = None) -> str:
     return (resolve_now(now) - timedelta(days=days)).isoformat()
 
 
-# A cancel ends an attempt from outside (shutdown drain, operator cancel, takeover); the resumed attempt
-# records its own row, so no reading counts one. Values of orchestrator/src/orchestrator/workflow_types.py::WorkflowOutcome.
-_NOT_A_CANCEL = "outcome NOT IN ('cancelled', 'soft-cancelled')"
+class _Reading(enum.Enum):
+    """How a task_results row's outcome reads on the completion-path card."""
+
+    PASSED = enum.auto()  # sliced by how it passed
+    REQUEUED = enum.auto()  # the 'requeued' slice
+    BLOCKED = enum.auto()  # the 'blocked' slice
+    UNCOUNTED = enum.auto()  # counted by no reading
+
+
+# Keyed by shared/src/shared/task_transitions.py::WORKFLOW_OUTCOMES. Why each outcome reads as it does:
+# dashboard/tests/test_performance.py::_SLICE_OF_A_CLEAN_ATTEMPT.
+_READING_BY_OUTCOME: Mapping[str, _Reading] = MappingProxyType(
+    {
+        'done': _Reading.PASSED,
+        'merge-deferred': _Reading.PASSED,
+        'requeued': _Reading.REQUEUED,
+        'planned': _Reading.REQUEUED,
+        'blocked': _Reading.BLOCKED,
+        'escalated': _Reading.BLOCKED,
+        'cancelled': _Reading.UNCOUNTED,
+        'soft-cancelled': _Reading.UNCOUNTED,
+    }
+)
+
+_NOT_A_CANCEL = (
+    'outcome NOT IN ('
+    + ', '.join(
+        f"'{outcome}'"
+        for outcome in sorted(o for o, reading in _READING_BY_OUTCOME.items() if reading is _Reading.UNCOUNTED)
+    )
+    + ')'
+)
 
 
 async def _latest_completions(db: aiosqlite.Connection) -> dict[str, str]:
@@ -135,8 +165,9 @@ async def get_completion_paths(
 
     Returns {project_id: [{path: str, count: int, pct: float}, ...]} for each
     of *projects* (default: every project with a recorded completion).
-    Paths: one-pass, multi-pass, via-steward, via-interactive, blocked; a
-    cancel outcome is no path and is not counted (see ``_NOT_A_CANCEL``).
+    Paths: one-pass, multi-pass, via-steward, via-interactive, requeued,
+    blocked. Each row's outcome reads through ``_READING_BY_OUTCOME``: a
+    merge-deferred attempt is sliced as a pass, and a cancel is not counted.
     """
     escalations = _load_escalations(escalations_dir)
 
@@ -166,13 +197,17 @@ async def get_completion_paths(
                 'multi-pass': 0,
                 'via-steward': 0,
                 'via-interactive': 0,
+                'requeued': 0,
                 'blocked': 0,
             }
             for row in rows:
                 task_id, outcome, review_cycles, steward_inv = row
                 task_id = str(task_id)
+                reading = _READING_BY_OUTCOME.get(outcome, _Reading.BLOCKED)
 
-                if outcome != 'done':
+                if reading is _Reading.REQUEUED:
+                    counts['requeued'] += 1
+                elif reading is not _Reading.PASSED:
                     counts['blocked'] += 1
                 elif task_id in interactive_task_ids:
                     counts['via-interactive'] += 1
