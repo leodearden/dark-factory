@@ -13,12 +13,14 @@ cover the new entry grammar, the violation taxonomy, and citation liveness.
 """
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
 
 from orchestrator.config_census_ignore import (
     CensusIgnoreFinding,
@@ -29,6 +31,8 @@ from orchestrator.config_census_ignore import (
     parse_census_ignore_entries,
     read_task_statuses,
 )
+
+_CENSUS_IGNORE_LOGGER = 'orchestrator.config_census_ignore'
 
 
 def _spec(reason: str | None, pattern: str = 'a.b') -> CensusIgnoreSpec:
@@ -367,6 +371,29 @@ def test_read_task_statuses_returns_none_and_never_raises(tmp_path, broken):
         db.parent.mkdir(parents=True)
         db.write_bytes(b'this is definitely not a sqlite file' * 20)
     assert read_task_statuses(tmp_path) is None
+
+
+def test_read_task_statuses_warns_with_the_refusal_for_a_stub_store(tmp_path, caplog):
+    db = tmp_path / '.taskmaster' / 'tasks' / 'tasks.db'
+    db.parent.mkdir(parents=True)
+    db.write_bytes(b'')
+    with caplog.at_level(logging.DEBUG, logger=_CENSUS_IGNORE_LOGGER):
+        assert read_task_statuses(tmp_path) is None
+    refusal = str(TaskDbUnreadable(db.resolve(), TaskDbProblem.EMPTY_STUB))
+    assert any(
+        r.levelno == logging.WARNING and refusal in r.getMessage() for r in caplog.records
+    )
+
+
+@pytest.mark.parametrize('absent', ['missing_dir', 'missing_db'])
+def test_read_task_statuses_absent_store_stays_below_warning(tmp_path, caplog, absent):
+    """Absence is ROUTINE: check-config is pointed at configs whose project
+    store is not on this machine, so it must not WARN."""
+    if absent == 'missing_db':
+        (tmp_path / '.taskmaster' / 'tasks').mkdir(parents=True)
+    with caplog.at_level(logging.DEBUG, logger=_CENSUS_IGNORE_LOGGER):
+        assert read_task_statuses(tmp_path) is None
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 def test_read_task_statuses_does_not_mutate_the_store(tmp_path):
