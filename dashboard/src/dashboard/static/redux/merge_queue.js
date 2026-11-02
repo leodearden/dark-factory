@@ -131,12 +131,7 @@ function recentTotal(data, project) {
 // The speculative counts summed over `projects` (null: every payload project).
 // A window with no attempts has no rate, so the total is a hole rather than 0%.
 function speculativeOver(data, projects) {
-  if (!queueReceipts(data)[MERGE_QUEUE_ENDPOINT]) return unknownQueueDatum(QUEUE_NOT_YET_FETCHED);
-  const total = combineQueueDatums(
-    runsDbScope(data, projects).map(project => [project, projectSpeculative(data, project)]),
-    sumSpeculativeCounts,
-    'no project is in scope',
-  );
+  const total = runsDbOver(data, projects, projectSpeculative, sumSpeculativeCounts);
   if (total.state !== 'unknown' && total.value.total === 0) {
     return unknownQueueDatum('no speculative attempts in this window');
   }
@@ -147,6 +142,17 @@ function speculativeOver(data, projects) {
 // to the probed projects.
 function runsDbScope(data, projects) {
   return projects === null ? Object.keys(queueEntries(data)) : projects;
+}
+
+// Each in-scope project's `reader` Datum, combined: a hole before the
+// endpoint's first receipt, and a hole anywhere in scope is a hole in it.
+function runsDbOver(data, projects, reader, combine) {
+  if (!queueReceipts(data)[MERGE_QUEUE_ENDPOINT]) return unknownQueueDatum(QUEUE_NOT_YET_FETCHED);
+  return combineQueueDatums(
+    runsDbScope(data, projects).map(project => [project, reader(data, project)]),
+    combine,
+    'no project is in scope',
+  );
 }
 
 function sumSpeculativeCounts(parts) {
@@ -179,11 +185,8 @@ function attemptCount(attempts) {
 // The attempts summed over `projects` (null: every payload project). A
 // measured window with no attempts is a measured 0.
 function attemptsOver(data, projects) {
-  if (!queueReceipts(data)[MERGE_QUEUE_ENDPOINT]) return unknownQueueDatum(QUEUE_NOT_YET_FETCHED);
-  return combineQueueDatums(
-    runsDbScope(data, projects).map(project => [project, projectAttempts(data, project)]),
-    parts => parts.reduce((sum, part) => sum + attemptCount(part), 0),
-    'no project is in scope',
+  return runsDbOver(
+    data, projects, projectAttempts, parts => parts.reduce((sum, part) => sum + attemptCount(part), 0),
   );
 }
 
@@ -207,12 +210,7 @@ function attemptsHistory(data, projects) {
 // The worst p95 over the in-scope projects whose window holds a timed attempt,
 // and how many did. No timed project has no worst centile: a hole, not 0.
 function worstP95Over(data, projects) {
-  if (!queueReceipts(data)[MERGE_QUEUE_ENDPOINT]) return unknownQueueDatum(QUEUE_NOT_YET_FETCHED);
-  const worst = combineQueueDatums(
-    runsDbScope(data, projects).map(project => [project, projectAttempts(data, project)]),
-    worstTimedP95,
-    'no project is in scope',
-  );
+  const worst = runsDbOver(data, projects, projectAttempts, worstTimedP95);
   if (worst.state !== 'unknown' && worst.value.timed_projects === 0) {
     return unknownQueueDatum('no timed merges in this window');
   }

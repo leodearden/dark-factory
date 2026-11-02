@@ -439,7 +439,23 @@ test('tabs.jsx::MergeTab counts a measured window\'s attempts with attemptCount'
   const count = harness.window.DF_MERGE_QUEUE.attemptCount(block.attempts.value);
   assert.equal(count, 5);
   assert.equal(statTile(container, 'Merges (window)').querySelector('.val').textContent, String(count));
+  for (const prefix of ['Outcomes', 'Merge attempts']) {
+    assert.notEqual(panelTitled(container, prefix).querySelector('svg'), null, `${prefix} draws no chart over a measured window`);
+  }
 });
+
+// The depth panel reads what its series counted, not how many buckets the
+// server's leading-zero trim left: a trimmed series counts the same attempts.
+for (const buckets of [1, 3]) {
+  test(`tabs.jsx::MergeTab reads the depth panel as the series' summed attempts over ${buckets} bucket(s)`, t => {
+    const block = mergeQueueBlock({ bucketMinutes: 60, buckets });
+    const { container } = mountMergeTab(t, block);
+
+    const summed = block.depth.value.values.reduce((sum, n) => sum + n, 0);
+    const meta = panelTitled(container, 'Merge attempts').querySelector('.panel-head > .meta').textContent;
+    assert.ok(meta.startsWith(`${summed} attempts`), meta);
+  });
+}
 
 // ── Decision 6: a render throw is contained, and its notice is render_failure.js's ──
 // React's development build reports every throw a boundary catches on

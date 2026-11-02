@@ -924,7 +924,7 @@ function MergeTab({ projectFilter }) {
               <div className="grid cols-12" style={{ gap: 12 }}>
                 <div className="col-span-7 panel">
                   <DatumPanelHead title={`Merge attempts · ${depthBucketCaption(depthSeries)}`} datum={depth}
-                      reading={series => `${series.labels.length} buckets`} />
+                      reading={series => `${sumOf(series.values)} attempts`} />
                   {depthSeries && <div className="panel-body"><LC labels={depthSeries.labels.map(String)} series={[{ values: depthSeries.values, color: CP.accent }]} height={180} countAxis formatX={window.DF_SHELL.fmtDateTime} /></div>}
                 </div>
 
