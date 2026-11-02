@@ -632,6 +632,34 @@ async def test_drain_for_test_drains_enqueued_events(real_buffer, tmp_path):
         await q.close()
 
 
+@pytest.mark.asyncio
+async def test_signal_after_commits_counts_only_returned_pushes(real_buffer):
+    """The drainer-commit tests await this signal bare, so it must never fire
+    before ``count`` pushes have returned with their rows committed."""
+    calls: list[int] = []
+    original_push = real_buffer.push
+
+    async def fails_first(event):
+        calls.append(1)
+        if len(calls) == 1:
+            raise aiosqlite.OperationalError('transient lock')
+        return await original_push(event)
+
+    real_buffer.push = fails_first
+    committed = _signal_after_commits(real_buffer, 2)
+
+    with pytest.raises(aiosqlite.OperationalError):
+        await real_buffer.push(_make_event())
+    assert not committed.is_set()
+
+    await real_buffer.push(_make_event())
+    assert not committed.is_set()
+
+    await real_buffer.push(_make_event())
+    assert committed.is_set()
+    assert (await real_buffer.get_buffer_stats('test-project'))['size'] == 2
+
+
 # ── Rotation ────────────────────────────────────────────────────────────
 
 
