@@ -17,8 +17,14 @@ from test_plan_revalidation_skip import (
     _untouching_architect,
     _wipe_to,
 )
+from test_plan_text_fp_preserving_stamps import _wiping_replan
+from test_workflow_metadata_files_reconcile import (
+    _blocking_then_pass_reviews,
+    _make_replan_workflow,
+)
 
 from orchestrator.artifacts import PLAN_BASE_COMMIT_KEY, TaskArtifacts, plan_base_commit
+from orchestrator.scheduler import files_to_modules
 from orchestrator.workflow import WorkflowOutcome
 
 
@@ -152,3 +158,26 @@ async def test_unconfirmed_revalidation_keeps_the_prior_stamp(
 
     assert outcome == WorkflowOutcome.PLANNED
     assert plan_base_commit(f.artifacts.read_plan()) == 'planbase789'
+
+
+@pytest.mark.parametrize('stamped_base', ['planbase789', None], ids=['stamped', 'unstamped'])
+@pytest.mark.asyncio
+async def test_post_review_replan_restores_the_prior_plan_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stamped_base: str | None,
+):
+    files = ['a/b/c/d/e.py']
+    wf, _ = _make_replan_workflow(
+        tmp_path=tmp_path, initial_files=files, modules=files_to_modules(files, 2),
+    )
+    assert wf.artifacts is not None
+    wf.artifacts.stamp_plan_provenance(wf.session_id, base_commit=stamped_base)
+    replan = _wiping_replan(wf)
+    monkeypatch.setattr(wf, '_execute_iterations', AsyncMock(return_value=WorkflowOutcome.DONE))
+    monkeypatch.setattr(wf, '_review', _blocking_then_pass_reviews())
+    monkeypatch.setattr(wf, '_replan', replan)
+
+    outcome = await wf._execute_verify_review_loop()
+
+    assert outcome == WorkflowOutcome.DONE
+    replan.assert_awaited_once()
+    assert plan_base_commit(wf.artifacts.read_plan()) == stamped_base
