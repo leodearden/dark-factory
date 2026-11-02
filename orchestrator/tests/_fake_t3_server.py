@@ -170,9 +170,12 @@ class FakeT3Server(ThreadingHTTPServer):
         expires_in: int = DEFAULT_EXPIRES_IN,
         environment_id: str = ENVIRONMENT_ID,
         server_version: str = SERVER_VERSION,
+        serves_descriptor: bool = True,
     ) -> None:
         super().__init__(('127.0.0.1', 0), _Handler)
         self.origin = f'http://127.0.0.1:{self.server_port}'
+        self.serves_descriptor = serves_descriptor
+        """False answers the descriptor path 404, as a pre-0.1.6 T3 or a non-T3 service on the port would."""
         self.environment_id = environment_id
         self.server_version = server_version
         self.framing = framing
@@ -275,7 +278,7 @@ class FakeT3Server(ThreadingHTTPServer):
             self.requests.append(request)
 
     def answer_get(self, path: str) -> _Reply:
-        if path != DESCRIPTOR_PATH:
+        if path != DESCRIPTOR_PATH or not self.serves_descriptor:
             return _json_reply(404, {'error': 'not_found'})
         return _json_reply(
             200,

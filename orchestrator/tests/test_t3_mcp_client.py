@@ -311,7 +311,7 @@ class TestCall:
         result = client.connect(closed_origin(), root=fleet)
 
         assert isinstance(result, client.ConnectFailed)
-        assert result.reason is client.ConnectFailure.DESCRIPTOR_UNREACHABLE
+        assert result.reason is client.DescriptorFailure.UNREACHABLE
 
     def test_connect_with_no_credential_file_is_unpaired_and_sends_nothing(self, t3_server: FakeT3Server, fleet: Path):
         result = client.connect(t3_server.origin, root=fleet)
@@ -341,8 +341,55 @@ class TestCall:
     def test_credential_status_at_a_closed_port_is_unreachable(self, fleet: Path):
         status = client.credential_status_at(closed_origin(), root=fleet)
 
-        assert isinstance(status, client.TransportFailed)
-        assert status.fault is client.TransportFault.UNREACHABLE
+        assert isinstance(status, client.DescriptorFailed)
+        assert status.reason is client.DescriptorFailure.UNREACHABLE
+
+
+@pytest.fixture(params=['descriptor-404', 'unusable-environment-id'])
+def incompatible_server(request: pytest.FixtureRequest) -> Iterator[FakeT3Server]:
+    """A server that answers, but not with a descriptor this client can use."""
+    options: dict[str, Any] = (
+        {'serves_descriptor': False} if request.param == 'descriptor-404' else {'environment_id': '../elsewhere'}
+    )
+    with FakeT3Server.running(**options) as server:
+        yield server
+
+
+class TestDescriptor:
+    def test_a_server_answering_an_unusable_descriptor_is_incompatible(self, incompatible_server: FakeT3Server):
+        result = client.fetch_descriptor(incompatible_server.origin)
+
+        assert isinstance(result, client.DescriptorFailed)
+        assert result.reason is client.DescriptorFailure.INCOMPATIBLE
+        assert result.reason.value == 'descriptor-incompatible'
+        assert result.detail
+
+    def test_a_closed_port_is_unreachable(self):
+        result = client.fetch_descriptor(closed_origin())
+
+        assert isinstance(result, client.DescriptorFailed)
+        assert result.reason is client.DescriptorFailure.UNREACHABLE
+        assert result.reason.value == 'descriptor-unreachable'
+
+    def test_connect_to_an_incompatible_server_neither_calls_nor_pairs(
+        self, incompatible_server: FakeT3Server, fleet: Path
+    ):
+        result = client.connect(incompatible_server.origin, root=fleet, repair=client.OperatorCode('any'))
+
+        assert isinstance(result, client.ConnectFailed)
+        assert result.reason is client.DescriptorFailure.INCOMPATIBLE
+        assert touched_mcp_or_oauth(incompatible_server) == []
+        assert no_credential_written(fleet)
+
+    def test_pair_with_an_incompatible_server_sends_no_oauth_request(
+        self, incompatible_server: FakeT3Server, fleet: Path
+    ):
+        result = client.pair(incompatible_server.origin, client.OperatorCode('any'), root=fleet)
+
+        assert isinstance(result, client.PairFailed)
+        assert result.reason is client.DescriptorFailure.INCOMPATIBLE
+        assert touched_oauth(incompatible_server) == []
+        assert no_credential_written(fleet)
 
 
 class TestPairWithOperatorCode:
@@ -405,7 +452,7 @@ class TestPairWithOperatorCode:
         result = client.pair(closed_origin(), client.OperatorCode('any'), root=fleet)
 
         assert isinstance(result, client.PairFailed)
-        assert result.reason is client.PairFailure.DESCRIPTOR_UNREACHABLE
+        assert result.reason is client.DescriptorFailure.UNREACHABLE
         assert no_credential_written(fleet)
 
     def test_a_token_answering_for_another_environment_is_not_stored(self, t3_server: FakeT3Server, fleet: Path):

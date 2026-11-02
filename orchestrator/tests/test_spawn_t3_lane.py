@@ -1249,5 +1249,23 @@ class TestPairAndStatus:
         remove_runtime(env)
         no_runtime = run_verb(capsys, 'status')
 
-        assert unreachable == f'status-failed reason=descriptor-unreachable origin={origin}'
+        assert unreachable.startswith(f'status-failed reason=descriptor-unreachable origin={origin} detail=')
+        assert not unreachable.endswith('detail=none')
         assert no_runtime == 'status-failed reason=server-runtime-missing origin=none'
+
+    def test_status_of_a_server_answering_an_unusable_descriptor(
+        self, env: Env, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with FakeT3Server.running(serves_descriptor=False) as server:
+            line = run_verb(capsys, 'status', '--origin', server.origin)
+
+        assert line.startswith(f'status-failed reason=descriptor-incompatible origin={server.origin} detail=')
+
+    def test_pair_against_an_unusable_descriptor_writes_nothing(
+        self, env: Env, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with FakeT3Server.running(serves_descriptor=False) as server:
+            line = run_verb(capsys, 'pair', '--code', 'any', '--origin', server.origin)
+
+        assert line.startswith('pair-failed reason=descriptor-incompatible detail=')
+        assert not (env.fleet / 't3-mcp').exists()
