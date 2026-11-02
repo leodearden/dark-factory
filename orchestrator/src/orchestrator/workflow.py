@@ -5730,10 +5730,12 @@ class TaskWorkflow:
         return fp if isinstance(fp, str) else None
 
     async def _stamp_authored_plan(self) -> None:
-        """Provenance-stamp a plan just authored against ``self.task`` and mirror its text fingerprint."""
+        """Provenance-stamp a plan just authored against ``self.task`` and the dispatch base, and mirror its text fingerprint."""
         assert self.artifacts is not None
         fp = self._current_task_text_fp()
-        self.artifacts.stamp_plan_provenance(self.session_id, task_text_fp=fp)
+        self.artifacts.stamp_plan_provenance(
+            self.session_id, task_text_fp=fp, base_commit=self.artifacts.read_base_commit(),
+        )
         await self._mirror_plan_text_fp(fp, self.artifacts.read_plan().get('_created_at'))
 
     async def _mirror_plan_text_fp(self, fp: str, authored_at: object) -> None:
