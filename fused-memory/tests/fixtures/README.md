@@ -901,9 +901,14 @@ which lands in its arm records' metadata. Its committed fetch cache
 (`e2_fetch_cache.json`) therefore pins this file through the per-shape corpus
 fingerprint, not through the file's bytes; the merge lane asserts that in
 `fused-memory/tests/test_bake_off_fetch_cache.py::TestMeasurementAnchor::test_the_committed_fixtures_still_materialize_the_cached_corpus`.
-An E1-only edit or a canonical re-key needs no E2 re-pin. An edit that moves a
-fingerprint, such as renaming a `curator_gate` topic, needs a live
-`--dump-fetches` re-seed.
+An E1-only edit or a canonical re-key needs no fetch-cache re-pin. An edit
+that moves a fingerprint, such as renaming a `curator_gate` topic, needs a
+live `--dump-fetches` re-seed. Any content edit to this file, an E1-only one
+included, still moves its git-blob stamp in the read-transform selection
+report (`fused-memory/scripts/read_transform_selection.py::main` stamps it),
+so the report must be regenerated: see step 5 of "Re-keying a topic" below,
+and the coupling rule in the module docstring of
+`fused-memory/tests/test_read_transform_selection_regeneration.py`.
 
 ### What the registry does **not** cover (`_disclosures`)
 
@@ -1001,9 +1006,16 @@ Re-keying a topic:
    `content_prefix` (whitespace-normalised content, first 160 characters) and
    `last_known_id`, and re-point every `supersedes_pairs[].successor_hash` at
    the new hash. Never change `provenance.cluster_id`.
-5. Nothing in E2 needs re-pinning (see "Also read by E2" above). If its
-   corpus-fingerprint anchor test fails anyway, the edit moved a `topic`, and
-   the cache needs a live `--dump-fetches`.
+5. No E2 fetch-cache re-pin is needed: the cache anchors on the corpus
+   fingerprint (see "Also read by E2" above). If that anchor test fails
+   anyway, the edit moved a `topic`, and the cache needs a live
+   `--dump-fetches`. The registry is also a stamped fixture of the
+   read-transform selection report, so AFTER the registry edit is committed,
+   regenerate `plans/read-transform-selection-report.{json,md}` with
+   `uv run --project fused-memory python fused-memory/scripts/read_transform_selection.py`
+   and commit both files in the same change. Never hand-edit a blob;
+   `fused-memory/tests/test_read_transform_selection_regeneration.py::TestEveryCommittedFixtureBlobIsWhatHeadHolds`
+   enforces it.
 
 ---
 
