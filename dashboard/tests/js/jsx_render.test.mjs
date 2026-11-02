@@ -444,18 +444,39 @@ test('tabs.jsx::MergeTab counts a measured window\'s attempts with attemptCount'
   }
 });
 
-// The depth panel reads what its series counted, not how many buckets the
-// server's leading-zero trim left: a trimmed series counts the same attempts.
-for (const buckets of [1, 3]) {
-  test(`tabs.jsx::MergeTab reads the depth panel as the series' summed attempts over ${buckets} bucket(s)`, t => {
-    const block = mergeQueueBlock({ bucketMinutes: 60, buckets });
+function withDepthValues(block, values) {
+  return { ...block, depth: { ...block.depth, value: { ...block.depth.value, values } } };
+}
+
+function panelMeta(container, prefix) {
+  return panelTitled(container, prefix).querySelector('.panel-head > .meta').textContent;
+}
+
+// The depth series' first bucket is counted whole (test_merge_queue_data.py::test_first_bucket_includes_events_before_cutoff), so its sum is not the window's attempt count; attemptCount is the only one.
+for (const values of [[1], [2, 0, 3]]) {
+  test(`tabs.jsx::MergeTab reads the depth panel as the series' per-bucket peak over ${JSON.stringify(values)}`, t => {
+    const block = withDepthValues(mergeQueueBlock({ bucketMinutes: 60, buckets: values.length }), values);
     const { container } = mountMergeTab(t, block);
 
-    const summed = block.depth.value.values.reduce((sum, n) => sum + n, 0);
-    const meta = panelTitled(container, 'Merge attempts').querySelector('.panel-head > .meta').textContent;
-    assert.ok(meta.startsWith(`${summed} attempts`), meta);
+    const meta = panelMeta(container, 'Merge attempts');
+    assert.ok(meta.startsWith(`peak ${Math.max(0, ...values)}/bucket`), meta);
   });
 }
+
+test('tabs.jsx::MergeTab gives a window one attempt count, whatever the depth series sums to', t => {
+  const block = withDepthValues(mergeQueueBlock({ bucketMinutes: 60, buckets: 3, outcomes: { done: 1 } }), [1, 0, 1]);
+  const { harness, container } = mountMergeTab(t, block);
+  const count = harness.window.DF_MERGE_QUEUE.attemptCount(block.attempts.value);
+
+  const pips = [...container.querySelectorAll('.pip')].map(pip => pip.textContent);
+  assert.ok(pips.includes(`${count} attempts`), JSON.stringify(pips));
+  const outcomes = panelMeta(container, 'Outcomes');
+  assert.ok(outcomes.startsWith(`${count} merges`), outcomes);
+  assert.equal(statTile(container, 'Merges (window)').querySelector('.val').textContent, String(count));
+  const depth = panelMeta(container, 'Merge attempts');
+  assert.doesNotMatch(depth, /\battempts\b/);
+  assert.doesNotMatch(depth, /\bmerges\b/);
+});
 
 // ── Decision 6: a render throw is contained, and its notice is render_failure.js's ──
 // React's development build reports every throw a boundary catches on
