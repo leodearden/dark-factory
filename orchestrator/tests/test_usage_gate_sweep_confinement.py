@@ -1,4 +1,4 @@
-"""Pins this root's arming of the suite-wide UsageGate probe-dir sweep confinement (task 6275).
+"""Pins orchestrator/tests' arming of the UsageGate probe-dir sweep confinement (task 6275).
 
 It is armed by ``df_pytest_isolation.py::arm_usage_gate_sweep_confinement``; the
 full contract (the opt-out, the still-reclaiming re-base) is
