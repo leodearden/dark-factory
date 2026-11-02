@@ -262,6 +262,7 @@ async def test_drainer_recovers_after_transient_failure(tmp_path, real_buffer):
         return await original_push(event)
 
     real_buffer.push = flaky_push
+    committed = _signal_after_commits(real_buffer, 5)
 
     q = EventQueue(
         real_buffer,
@@ -275,7 +276,7 @@ async def test_drainer_recovers_after_transient_failure(tmp_path, real_buffer):
     try:
         for _ in range(5):
             q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        await committed.wait()
         stats = await real_buffer.get_buffer_stats('test-project')
         # All 5 eventually landed; push() was called >= 5 + 3 retries = 8 times.
         assert stats['size'] == 5
@@ -1648,6 +1649,7 @@ async def test_drainer_marks_processed_on_commit(real_buffer, tmp_path):
     removed — the in-memory queue is a pure dispatch cache over the durable row.
     """
     ej_path = tmp_path / 'ej.db'
+    committed = _signal_after_commits(real_buffer, 1)
     q = EventQueue(
         real_buffer,
         dead_letter_path=tmp_path / 'dl.jsonl',
@@ -1661,16 +1663,12 @@ async def test_drainer_marks_processed_on_commit(real_buffer, tmp_path):
     try:
         event = _make_event()
         assert q.enqueue(event) is True
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        await committed.wait()
         # Committed to the buffer.
         stats = await real_buffer.get_buffer_stats('test-project')
         assert stats['size'] == 1
         # Journal row removed (drainer marked it processed after the push).
-        journal = EventJournal(ej_path)
-        try:
-            assert journal.load_unprocessed() == []
-        finally:
-            journal.close()
+        assert journaled_events(ej_path) == {}
     finally:
         await q.close()
 
@@ -1741,6 +1739,7 @@ async def test_startup_recovery_after_kill9(real_buffer, tmp_path):
 
     # queue2: fresh EventQueue over the SAME buffer + journal_path. start()
     # must recover() the unprocessed row and re-enqueue it for the drainer.
+    committed = _signal_after_commits(real_buffer, 1)
     queue2 = EventQueue(
         real_buffer,
         dead_letter_path=tmp_path / 'dl.jsonl',
@@ -1752,15 +1751,11 @@ async def test_startup_recovery_after_kill9(real_buffer, tmp_path):
     )
     await queue2.start()
     try:
-        await asyncio.wait_for(queue2._queue.join(), timeout=2.0)
+        await committed.wait()
         # (1) present after restart.
         assert (await real_buffer.get_buffer_stats('test-project'))['size'] == 1
         # (2) processed after restart — journal drained.
-        journal = EventJournal(ej_path)
-        try:
-            assert journal.load_unprocessed() == []
-        finally:
-            journal.close()
+        assert journaled_events(ej_path) == {}
     finally:
         await queue2.close()
 
