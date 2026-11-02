@@ -7096,6 +7096,23 @@ def _log_event_channel(label: str, channel: VerifyEventChannel) -> None:
         )
 
 
+_Gathered = TypeVar('_Gathered')
+
+
+async def _gather_unwound(*aws: Awaitable[_Gathered]) -> list[_Gathered]:
+    """``asyncio.gather``, except that a cancel returns only once every child has unwound.
+
+    A cancelled plain gather finishes at its first cancelled child, so a sibling
+    still killing its subprocess would outlive the verify that spawned it.
+    """
+    children = [asyncio.ensure_future(aw) for aw in aws]
+    try:
+        return await asyncio.gather(*children)
+    except asyncio.CancelledError:
+        await asyncio.wait(children)
+        raise
+
+
 async def run_verification(
     worktree: Path,
     config: OrchestratorConfig,
@@ -7763,7 +7780,7 @@ async def run_verification(
         # `break` below, so it is always bound whenever the loop exits — no
         # pre-loop sentinel scaffolding needed.
         if concurrent:
-            attempt = VerifyAttempt(list(await asyncio.gather(
+            attempt = VerifyAttempt(list(await _gather_unwound(
                 _run_or_skip_timed(test_cmd, label=LegSlot.TEST, current_attempt=current_attempt_id),
                 _run_or_skip_timed(lint_cmd, label=LegSlot.LINT, current_attempt=current_attempt_id),
                 _run_or_skip_timed(type_cmd, label=LegSlot.TYPE, current_attempt=current_attempt_id),
@@ -9084,7 +9101,7 @@ async def _run_scoped_verification_body(
                             plan_dict, worktree, attempt_id=attempt_id,
                             task_id=task_id, archive_root=archive_root,
                         )
-                        results = await asyncio.gather(*(
+                        results = await _gather_unwound(*(
                             _verify_module(mc, _test_scope_kind(plan, mc.prefix)) for mc in scoped
                         ))
                         aggregated = _aggregate_results(list(results))
@@ -9270,7 +9287,7 @@ async def _run_scoped_verification_body(
                         'Verification mode: per-subproject fan-out (%d subprojects)',
                         len(module_configs),
                     )
-                    results = await asyncio.gather(*(
+                    results = await _gather_unwound(*(
                         _verify_module(mc) for mc in module_configs
                     ))
                     return _aggregate_results(list(results))
@@ -9365,7 +9382,7 @@ async def _run_scoped_verification_body(
                 plan = None
                 plan_dict = None
                 logger.info('Verification mode: subproject-scoped (%d subprojects)', len(module_configs))
-            results = await asyncio.gather(
+            results = await _gather_unwound(
                 *(_verify_module(mc, _test_scope_kind(plan, mc.prefix)) for mc in scoped)
             )
             aggregated = _aggregate_results(list(results))

@@ -495,10 +495,9 @@ def _rig(
 
 
 async def _assert_cancelled_call_unwound(rig: _Rig, before: set[asyncio.Task[Any]]) -> None:
-    """The local task is done when the call raises, cancelled once.  The local run's
-    own leg tasks may still be reaping then (``run_verification`` gathers its legs
-    with ``asyncio.gather``, which raises at the first cancelled leg), so those are
-    awaited only until they end."""
+    """The local task is done when the call raises, cancelled once.  A cancel landing
+    while the call awaits its shielded reap raises before that reap has ended, so the
+    tasks the reap still runs are awaited only until they end."""
     assert rig.local.tasks
     assert all(task is not None and task.done() for task in rig.local.tasks)
     assert rig.local.cancels == [1]
@@ -820,13 +819,16 @@ class TestTheRace:
     ) -> None:
         rig = _rig(tmp_path, concurrent=True, modules=modules, lints_ignoring_term=(VERIFY_MODULE,))
         lints = [f'lint-{prefix}' for prefix in modules]
+        types = [f'type-{prefix}' for prefix in modules]
         rig.legs.block(*lints)
         laptop_holder, local_holder = await rig.hold_both()
         call = rig.start()
         await _until(
-            lambda: all(rig.legs.spawned(lint) for lint in lints) and _waiting(rig.local_gate, '7'),
+            lambda: all(rig.legs.spawned(leg) for leg in (*lints, *types))
+            and _waiting(rig.local_gate, '7'),
             watching=call,
         )
+        await _until(lambda: not any(_alive(pid) for leg in types for pid in rig.legs.pids(leg)))
         [stubborn_lint] = rig.legs.pids(_LINT)
         alive_at_return: list[bool] = []
         call.add_done_callback(lambda _call: alive_at_return.append(_alive(stubborn_lint)))
