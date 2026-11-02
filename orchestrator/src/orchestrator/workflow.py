@@ -157,6 +157,12 @@ from orchestrator.plan_descope import (
 )
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.recut_ruling import ruling_to_enforce
+from orchestrator.resume_resolution import (
+    CarriedResolution,
+    render_carried_resolutions,
+    render_issue_context,
+    select_carried_resolutions,
+)
 from orchestrator.review_inputs import gather_review_subject
 from orchestrator.review_outcome import review_completed_payload
 from orchestrator.review_suggestions.curator_intake import (
@@ -399,8 +405,8 @@ def _needs_human(e: Escalation) -> bool:
       never hand-roll ``severity != 'info'`` here.
 
     The single home of that rule for both consumers: disjuncts 2 and 3 of
-    :func:`_is_gating_escalation`, and the stop-the-line short-circuit in
-    ``TaskWorkflow._wait_for_resolution``.
+    :func:`_is_gating_escalation`, and the stop-the-line checks at the entry
+    and the tail of ``TaskWorkflow._wait_for_resolution``.
     """
     return e.severity in BORN_AT_L2_SEVERITIES or (
         e.level >= 2 and is_queue_handoff(e)
@@ -488,9 +494,10 @@ class _HumanHandoff(Exception):
 
 
 class _StewardReescalated(_HumanHandoff):
-    """The steward filed a hand-off L1 during this wait — through its own
+    """The steward filed a hand-off during this wait — an L1 through its own
     give-up path or its agent's ``escalate_blocker(level=1)`` (consumed by the
-    auto-watcher, which may promote to L2 for a human)."""
+    auto-watcher, which may promote to L2 for a human), or a record
+    :func:`_needs_human` selects."""
 
     def __init__(self, escalations: list[Escalation]):
         super().__init__(escalations, 'Steward re-escalated to human')
@@ -498,14 +505,18 @@ class _StewardReescalated(_HumanHandoff):
 
 class _NoStewardApplicable(_HumanHandoff):
     """Open records end the wait that no steward acted on: the stop-the-line
-    ``'L2'`` records :func:`_needs_human` selects, raised before the wait ever
-    awaits, or ``'L1'`` hand-offs left open by anyone but this wait's steward."""
+    records :func:`_needs_human` selects, raised before the wait ever awaits or
+    at its tail, or L1 hand-offs left open by anyone but this wait's steward.
+    The block reason names each record under its own tier: ``L2`` for a record
+    that needs a human, else ``L1``."""
 
-    def __init__(self, escalations: list[Escalation], tier: Literal['L1', 'L2']):
-        ids = ', '.join(e.id for e in escalations)
-        super().__init__(
-            escalations, f'Gated by open {tier} {ids}; no steward applicable',
+    def __init__(self, escalations: list[Escalation]):
+        tiers = (
+            ('L2', [e.id for e in escalations if _needs_human(e)]),
+            ('L1', [e.id for e in escalations if not _needs_human(e)]),
         )
+        gated_by = ' and '.join(f'{tier} {", ".join(ids)}' for tier, ids in tiers if ids)
+        super().__init__(escalations, f'Gated by open {gated_by}; no steward applicable')
 
 if TYPE_CHECKING:
     from escalation.disposition import ExitKind
@@ -3009,7 +3020,7 @@ class TaskWorkflow:
                     await self._ensure_steward_started()
                     logger.info(f'Task {self.task_id}: waiting for escalation resolution')
                     try:
-                        resolution = await self._wait_for_resolution()
+                        carried = await self._wait_for_resolution()
                     except _HumanHandoff as handoff:
                         return await self._mark_blocked(
                             handoff.block_reason,
@@ -3084,7 +3095,7 @@ class TaskWorkflow:
                     # free-text resolution prose and the resumed
                     # implementer's briefing/_task_files never reflect the
                     # expanded scope. granted_files is read from resolved
-                    # escalation records, not the joined `resolution` string.
+                    # escalation records, not from the prose in `carried`.
                     granted = self._collect_granted_files()
                     if granted:
                         current_files = self.plan.get('files', [])
@@ -3130,13 +3141,16 @@ class TaskWorkflow:
                     # Resume with resolution context
                     logger.info(f'Task {self.task_id}: resuming after escalation resolution')
                     async def build_resume_prompt(
-                        resolution: str = resolution,
+                        carried: tuple[CarriedResolution, ...] = carried,
                     ) -> str:
                         assert self.worktree is not None
                         return await self.briefing.build_resume_prompt(
                             self.task, self._live_plan(),
-                            '\n'.join(e.summary for e in self._check_escalations()),
-                            resolution, self.worktree,
+                            render_issue_context(
+                                [e for e in self._check_escalations() if is_queue_handoff(e)],
+                                carried,
+                            ),
+                            render_carried_resolutions(carried), self.worktree,
                         )
 
                     await self._invoke(IMPLEMENTER, build_resume_prompt, self.worktree)
@@ -4369,7 +4383,10 @@ class TaskWorkflow:
         try:
             await self._wait_for_resolution()
         except _HumanHandoff as handoff:
-            # Byte-for-byte the shape at :2643-2647.  merge_phase stays at its
+            # run()'s hand-off arm, plus the stop every merge-entry park exit
+            # makes before parking: a hand-off can end the wait with the
+            # steward still live, and _mark_blocked spawns the dry-run
+            # investigator in its worktree.  merge_phase stays at its
             # default False so the row lands `blocked` at _mark_blocked's ENTRY
             # gate (spec S1).  Post-3537 a merge_phase=True call would also
             # write it — the suppression now covers only the ENTRY transition,
@@ -4378,6 +4395,7 @@ class TaskWorkflow:
             # here: this path exits the slot outright, it does not retry a
             # queue submission in-place, which is the ONLY thing merge_phase
             # is for.
+            await self._stop_and_clear_steward()
             return await self._mark_blocked(
                 handoff.block_reason,
                 detail=_format_reescalation_detail(handoff.escalations),
@@ -4447,14 +4465,16 @@ class TaskWorkflow:
                 ),
                 escalate_to_human=True,
             )
-        # SINGLE-SHOT re-check.  The wait can return having cleared what it was
-        # waiting on while a DIFFERENT gating record is open — most sharply a
-        # born-at-L2 filed mid-resolution, which the wait cannot see at all
-        # (its loop polls level-0, its stop-the-line check ran at entry before
-        # the record existed, and its tail reads level-1 queue handoffs).
-        # Without this, such a record is merged straight past.  Re-uses the
-        # SAME _is_gating_escalation predicate rather than an equivalent
-        # inline condition, so there is exactly one gate policy in this file.
+        # SINGLE-SHOT re-check, deliberately redundant with the wait's tail.
+        # That tail applies _needs_human to the full pending set, so a
+        # born-at-L2 filed mid-resolution already raises inside the wait.  It
+        # cannot see a gating record filed AFTER its read — including a plain
+        # blocking L0, which it deliberately does not gate — and at merge entry
+        # there is no later gate, so without this such a record is merged
+        # straight past.  Re-uses the SAME _is_gating_escalation predicate
+        # rather than an equivalent inline condition, so there is exactly one
+        # gate policy in this file.  Pinned by
+        # orchestrator/tests/test_workflow_merge_gating_strand.py::TestGateReFireIsBounded::test_gating_record_filed_after_the_wait_parks_with_l1
         #
         # Deliberately NOT a loop back into the machinery.  Boundedness (spec
         # S5): the whole merge-entry gate path must cost at most ONE steward
@@ -4473,31 +4493,19 @@ class TaskWorkflow:
             e for e in self._check_escalations() if _is_gating_escalation(e)
         ]
         if still_gating:
-            # STOP-THEN-CLEAR before parking, the same idiom the gate-cleared
-            # exit below and _wait_for_resolution's give-up branch (:12620-
-            # 12623) use.  Unlike the sibling exits, this one reaches
-            # _mark_blocked with the steward STILL LIVE — the expiry branch's
-            # steward was already stopped by the wait itself, and the
-            # _NoStewardApplicable branch's records are out of its reach —
-            # and _mark_blocked(escalate_to_human=True) fires
-            # _spawn_dry_run_unblock, which runs run_dry_run_unblock against
-            # self.worktree: the SAME worktree TaskSteward invokes its agent in
-            # (steward.py:542, 590).  Leaving the poll loop live is therefore
-            # the two-agents-one-worktree hazard here too, just with the
-            # dry-run investigator in place of the merge tail (review
-            # amendment).  Stopping first also closes the narrower race the
-            # single-shot re-check opens: a live steward can resolve the record
-            # microseconds after the re-check read it, making the freshly-filed
-            # L1 and the `blocked` park spurious.  Suppressed for the same
-            # reason as every other stop() on a degraded path — a failing stop
-            # must not convert a park into a workflow crash.  Safe with respect
-            # to _mark_blocked: its escalate_to_human branch returns before any
+            # Stop the steward before parking, as the hand-off arm above does:
+            # this arm too reaches _mark_blocked with the steward still live,
+            # and _mark_blocked(escalate_to_human=True) spawns the dry-run
+            # investigator in its worktree.  (The expiry branch needs no stop:
+            # the wait already stopped its steward.)  Stopping first also
+            # closes the narrower race the single-shot re-check opens: a live
+            # steward can resolve the record microseconds after the re-check
+            # read it, making the freshly-filed L1 and the `blocked` park
+            # spurious.  Safe with respect to _mark_blocked: its
+            # escalate_to_human branch returns before any
             # _ensure_steward_started, so clearing the reference here cannot
             # cause a fresh steward to be built behind our back.
-            if self._steward is not None:
-                with contextlib.suppress(Exception):
-                    await self._steward.stop()
-                self._steward = None
+            await self._stop_and_clear_steward()
             return await self._mark_blocked(
                 f'Merge-entry gate: {len(still_gating)} gating escalation(s) '
                 f'still open after the steward wait',
@@ -4535,26 +4543,11 @@ class TaskWorkflow:
         # steward, so nothing was ever live in the worktree during a merge; and
         # unlike run()'s ESCALATED branch — which resumes only the implementer
         # and re-gates afterwards — there is no later gate here to catch a bad
-        # merge, and no re-dispatch can un-merge a branch.  The sibling exits
-        # above do not need it: they never reach the merge tail, and run()'s
-        # `finally` stops the steward on the way out of the slot.
-        #
-        # stop() cancels the loop task (steward.py:209-217) and on the stock
-        # `steward: "claude"` backend the resulting CancelledError propagates
-        # into cli_invoke.py:_run_subprocess, whose handler (:2240-2252)
-        # terminates the agent's whole process group — so an in-flight agent
-        # genuinely stops writing rather than merely being detached from.
-        # Clearing the reference is the existing stop-then-clear idiom
-        # (cf. :6807-6809 / :6851-6853 / :12579-12582): a later _mark_blocked
-        # on the merge tail then builds a FRESH steward through
-        # _ensure_steward_started rather than awaiting a cancelled loop that
-        # can never publish.  Suppressed because a failing stop() must not
-        # convert a cleared gate into a workflow crash — the merge is still
-        # safe to attempt if the loop was already dead.
-        if self._steward is not None:
-            with contextlib.suppress(Exception):
-                await self._steward.stop()
-            self._steward = None
+        # merge, and no re-dispatch can un-merge a branch.  The park exits
+        # above stop the steward too, for the dry-run investigator their
+        # _mark_blocked spawns in this worktree.  A later _mark_blocked on the
+        # merge tail builds a FRESH steward, because the reference is cleared.
+        await self._stop_and_clear_steward()
         # BLOCKED → IN_PROGRESS is likewise legal for ActorClass.ORCHESTRATOR.
         self._enter_phase(WorkflowState.MERGE)
         return None
@@ -15234,7 +15227,7 @@ class TaskWorkflow:
             return []
         return self.escalation_queue.get_by_task(self.task_id, status='pending')
 
-    async def _wait_for_resolution(self) -> str:
+    async def _wait_for_resolution(self) -> tuple[CarriedResolution, ...]:
         """Wait until no pending level-0 record holds the wait: every L0 while a
         steward is live, else only the steward-owned ones.
 
@@ -15247,18 +15240,23 @@ class TaskWorkflow:
         that ``run()`` calls ``_mark_blocked`` and halts.
 
         Raises a ``_HumanHandoff``:
-        - ``_NoStewardApplicable('L2')`` if any pending escalation needs a
-          human — immediate terminal, stop the line, before any await; OR,
-          once the level-0 wait ends with level-1 queue handoffs open (never
-          an info record, PRD D3):
-        - ``_StewardReescalated`` if this wait's steward re-escalated, else
-        - ``_NoStewardApplicable('L1')`` — the L1s predate the wait or came
-          from elsewhere, so no steward acted on them (PRD D13).
+        - ``_NoStewardApplicable`` if any pending escalation needs a human —
+          immediate terminal, stop the line, before any await; OR,
+          once the level-0 wait ends with open records that the same
+          :func:`_needs_human` rule selects over the FULL pending set (so a
+          record filed during the wait is caught), or with level-1 queue
+          handoffs open (never an info record, PRD D3):
+        - ``_StewardReescalated`` if this wait's steward filed one of them, else
+        - ``_NoStewardApplicable`` — they predate the wait or came from
+          elsewhere, so no steward acted on them (PRD D13).
 
-        When no escalation queue is available (e.g. eval mode), returns
-        an empty string immediately — the caller treats this as "no
-        resolution" and the workflow proceeds to ESCALATED/BLOCKED
-        via its normal path.
+        Otherwise returns the task's resolved escalations as attributed
+        :class:`CarriedResolution` items in resolution order, each marked as
+        answering this round when it was not yet resolved as the wait began
+        (see ``orchestrator/src/orchestrator/resume_resolution.py``).  When no
+        escalation queue is available (e.g. eval mode), returns an empty
+        tuple immediately — the caller treats this as "no resolution" and
+        the workflow proceeds to ESCALATED/BLOCKED via its normal path.
 
         **Bounded (task 3170, fix C + review fixes D1/D2/D3).** The level-0
         wait is bounded by an IDLE window
@@ -15328,8 +15326,9 @@ class TaskWorkflow:
         resumed implementer edits and commits in, so dismissing or resuming
         beside a live steward agent means two agents committing in one git
         worktree.  The tail then yields exactly two dispositions: a
-        ``_HumanHandoff`` (blocking, with the open level-1 queue handoffs) when
-        one is open, or the collected resolutions (resuming) when none is.  It
+        ``_HumanHandoff`` (blocking, with the open hand-off records the Raises
+        list names) when one is open, or the collected resolutions (resuming)
+        when none is.  It
         deliberately does NOT call :meth:`_mark_blocked`, which would file a
         fresh L0 and could add a SECOND full grace window for what is a pure
         wait-timeout.
@@ -15345,7 +15344,7 @@ class TaskWorkflow:
                 '(eval mode?) — returning immediately',
                 self.task_id,
             )
-            return ''
+            return ()
 
         # Reset once per wait, AFTER the no-queue early return, so each wait
         # reports its OWN outcome and a stale True from an earlier wait can
@@ -15358,15 +15357,18 @@ class TaskWorkflow:
         # Records that need a human are stop-the-line: no auto-watcher or
         # steward can resolve them, so waiting for the
         # L0 loop to clear makes no sense and risks a busy resume-spin (gate
-        # fires → _wait_for_resolution returns '' → resume → gate fires again).
+        # fires → _wait_for_resolution returns nothing → resume → gate fires again).
         # Raised as a _HumanHandoff so run() calls _mark_blocked and halts for
         # human intervention rather than looping; the reason says no steward
         # was applicable (D13).
         open_at_entry = self.escalation_queue.get_by_task(self.task_id, status='pending')
         pending_l2 = [e for e in open_at_entry if _needs_human(e)]
         if pending_l2:
-            raise _NoStewardApplicable(pending_l2, 'L2')
+            raise _NoStewardApplicable(pending_l2)
         open_ids_at_entry = {e.id for e in open_at_entry}
+        resolved_before_round = frozenset(
+            e.id for e in self.escalation_queue.get_by_task(self.task_id, status='resolved')
+        )
 
         # Wait for level-0 pending escalations to clear, BOUNDED by a derived
         # window (task 3170, fix C + review fix D1).  See the method docstring
@@ -15453,24 +15455,13 @@ class TaskWorkflow:
                 # (steward.py:542, 590), the SAME worktree the resumed
                 # implementer edits and commits in, so stopping first closes
                 # the two-agents-one-worktree window entirely rather than
-                # narrowing it.  stop() cancels the loop task (steward.py:
-                # 209-217) and on the stock `steward: "claude"` backend the
-                # resulting CancelledError propagates into
-                # cli_invoke.py:_run_subprocess, whose handler (:2240-2252)
-                # terminates the agent's whole process group — so the in-flight
-                # agent genuinely stops writing rather than merely being
-                # detached from.  Clearing the reference (the existing
-                # stop-then-clear idiom, cf. :5319-5320 / :5363-5364) makes a
-                # later _mark_blocked build a FRESH steward through
-                # _ensure_steward_started instead of awaiting a cancelled loop
-                # that can never publish.  Suppressed because this is cleanup on
-                # an already-degraded path: a failing stop() must not convert a
-                # wait-timeout into a workflow crash.
+                # narrowing it (how, and why the reference is cleared:
+                # _stop_and_clear_steward).
                 #
                 # Task 3536: record the give-up for callers that must tell it
                 # apart from a genuine resolution.  They cannot do so from this
                 # method's return value — the tail below dismisses the orphans
-                # and, with no open L1, returns the collected resolutions
+                # and, with no open hand-off, returns the collected resolutions
                 # exactly as a successful wait does.  run()'s ESCALATED branch
                 # deliberately ignores the flag (resuming the implementer on
                 # expiry is safe there: it does more work and the pipeline
@@ -15480,10 +15471,7 @@ class TaskWorkflow:
                 # repend-PRD D4 stop-the-line.  The flag is set only when the
                 # give-up dismissed something: a router-owned info note left
                 # pending for the exit finalizer (D10) was not auto-dismissed.
-                if self._steward is not None:
-                    with contextlib.suppress(Exception):
-                        await self._steward.stop()
-                    self._steward = None
+                await self._stop_and_clear_steward()
                 orphans = self._pending_steward_l0s()
                 self._steward_wait_expired = bool(orphans)
                 orphan_ids = [e.id for e in orphans]
@@ -15538,28 +15526,26 @@ class TaskWorkflow:
         # outcome out of _await_steward_completion.
         self._drain_steward_outcomes()
 
-        handoff_l1 = [
-            e for e in self.escalation_queue.get_by_task(
-                self.task_id, status='pending', level=1,
-            )
-            if is_queue_handoff(e)
+        # The entry gate's stop-the-line rule again, over the FULL pending set:
+        # a record that needs a human may have been filed while this waited.
+        open_at_tail = self.escalation_queue.get_by_task(self.task_id, status='pending')
+        handoffs = [
+            e for e in open_at_tail
+            if _needs_human(e) or (e.level == 1 and is_queue_handoff(e))
         ]
-        if handoff_l1:
+        if handoffs:
             steward_filed_one = any(
                 e.agent_role == STEWARD.name and e.id not in open_ids_at_entry
-                for e in handoff_l1
+                for e in handoffs
             )
             if steward_filed_one:
-                raise _StewardReescalated(handoff_l1)
-            raise _NoStewardApplicable(handoff_l1, 'L1')
+                raise _StewardReescalated(handoffs)
+            raise _NoStewardApplicable(handoffs)
 
-        # Collect resolutions (filter ensures resolution is non-None str for join)
-        resolutions = [
-            e.resolution
-            for e in self.escalation_queue.get_by_task(self.task_id)
-            if e.status == 'resolved' and e.resolution is not None
-        ]
-        return '\n'.join(resolutions)
+        return select_carried_resolutions(
+            self.escalation_queue.get_by_task(self.task_id),
+            resolved_before_round=resolved_before_round,
+        )
 
     async def _get_head_commit(self) -> str:
         """Return the worktree's HEAD sha, or ``''`` when git exits non-zero.
@@ -18518,6 +18504,25 @@ class TaskWorkflow:
         steward.set_outcome_channel(self._steward_outcome_channel)
         steward.set_wip_probe(self._worktree_has_wip_commits)
         await steward.start()
+
+    async def _stop_and_clear_steward(self) -> None:
+        """Stop the steward before anything else writes in its worktree.
+
+        ``TaskSteward._run_loop`` keeps invoking its agent with ``cwd =
+        self.worktree``, so a park (whose dry-run investigator runs there) or
+        the merge tail beside a live loop is two agents in one worktree.
+        ``stop()`` cancels the loop, and on the stock ``claude`` backend that
+        terminates the agent's process group.  Clearing the reference makes a
+        later :meth:`_ensure_steward_started` build a fresh steward rather than
+        await a cancelled loop that can never publish; it also drops this
+        steward's cost from the report ``harness.py::_run_slot`` reads off
+        ``workflow._steward``.  A failing ``stop()`` is suppressed: it must not
+        turn a park or a cleared gate into a workflow crash.
+        """
+        if self._steward is not None:
+            with contextlib.suppress(Exception):
+                await self._steward.stop()
+            self._steward = None
 
     async def _await_cancellable(self, awaitable, *, on_soft_cancel=None):
         """Race ``awaitable`` against ``self._cancel_event``.
