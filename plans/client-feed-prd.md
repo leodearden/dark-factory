@@ -678,8 +678,11 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     unrecorded any more, because the producer defaults it to 0.
   - (b) A missing or unlistable queue degrades `events`, and the reason names `data/escalations`. A
     malformed or unreadable record is skipped and counted under `events`
-    (`skipped N rows: malformed_record=N`). A record that is gone between listing and reading was
-    archived in between, so it is not open.
+    (`skipped N records in data/escalations: malformed_record=N`). A `status` outside the producer's
+    `pending`, `resolved` and `dismissed` makes the record malformed, so it is counted rather than
+    read as closed. `client-feed dump-sources` prints the open escalations and names each skipped
+    record by file. A record that is gone between listing and reading was archived in between, so
+    it is not open.
   - (c) The publisher reads the queue as its own unit
     (`client-feed/src/client_feed/publisher.py::_escalations_unit`), apart from runs.db. An unreadable
     runs.db therefore no longer blinds `waiting_on`, and an unreadable queue does not hold the stream.

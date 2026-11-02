@@ -451,7 +451,10 @@ def test_a_malformed_escalation_record_is_counted_and_the_escalated_task_still_w
     report = run_pass(project.policy, project.open(), now=NOW)
 
     assert report.degraded == (
-        Degradation(source=Source.EVENTS, reason='skipped 1 rows: malformed_record=1'),
+        Degradation(
+            source=Source.EVENTS,
+            reason='skipped 1 records in data/escalations: malformed_record=1',
+        ),
     )
     assert upserted_task(feed(project), 9).waiting_on is WaitingOn.LEO
     assert_valid(project)

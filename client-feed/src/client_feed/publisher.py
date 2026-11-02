@@ -15,6 +15,7 @@ from types import MappingProxyType
 from typing import Final, TypeVar
 
 from pydantic import BaseModel, ConfigDict
+from shared.project_layout import ESCALATION_QUEUE_RELPATH
 
 from client_feed.budget import counted_set
 from client_feed.contract import (
@@ -114,14 +115,16 @@ def _guarded(unit: Callable[[], _T], degraded: list[Degradation]) -> _T | None:
         return None
 
 
-def _skipped(source: Source, rows: Iterable[tuple[int | str, StrEnum]]) -> tuple[Degradation, ...]:
-    """Rows of `source` that could not be projected, counted by reason; none is no degradation."""
+def _skipped(
+    source: Source, rows: Iterable[tuple[int | str, StrEnum]], *, unit: str = 'rows'
+) -> tuple[Degradation, ...]:
+    """Rows of `source` that could not be projected, counted by reason and named by `unit`; none is no degradation."""
     rows = tuple(rows)
     if not rows:
         return ()
     tally = Counter(reason for _, reason in rows)
     counts = ', '.join(f'{reason}={count}' for reason, count in sorted(tally.items()))
-    reason = f'skipped {len(rows)} rows: {counts}'
+    reason = f'skipped {len(rows)} {unit}: {counts}'
     _log.warning('source %s %s (ids %s)', source, reason, ', '.join(str(key) for key, _ in rows))
     return (Degradation(source=source, reason=reason),)
 
@@ -177,8 +180,9 @@ def _escalations_unit(root: Path, degraded: list[Degradation]) -> OpenEscalation
     """The escalation queue's open escalations, read apart from runs.db so that either fails alone."""
     escalations = _guarded(lambda: read_open_escalations(root), degraded)
     if escalations is not None:
+        skipped = ((record.name, record.reason) for record in escalations.skipped)
         degraded.extend(
-            _skipped(Source.EVENTS, ((record.name, record.reason) for record in escalations.skipped))
+            _skipped(Source.EVENTS, skipped, unit=f'records in {ESCALATION_QUEUE_RELPATH}')
         )
     return escalations
 

@@ -100,6 +100,10 @@ def test_the_dump_carries_every_source_and_no_secret(
     assert document['factory']['idle_seconds'] >= 10800
     tasks = {row['task_id']: row for row in document['tasks']['rows']}
     assert tasks[9]['waiting_on'] == 'leo'
+    assert document['escalations'] == {
+        'by_task': {'9': [{'escalation_id': 'esc-9-1', 'level': 2}]},
+        'skipped': [],
+    }
     assert tasks[9]['title'] == 'Unblock [path]'
     assert document['prds']['found'] == [
         {'prd_path': 'plans/x-prd.md', 'title': 'X plan [path]', 'excerpt': 'The goal paragraph.'}
@@ -130,6 +134,20 @@ def test_the_cursor_skips_events_already_read(
     _, second, _ = dump(capsys, '--config', str(config), '--after-id', str(cursor))
 
     assert [event['event_id'] for event in json.loads(second)['events']['events']] == [2]
+
+
+def test_a_malformed_escalation_record_is_named_and_the_rest_still_dump(
+    root: Path, config: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    EscalationQueueDir.create(root).write_raw('esc-9-2.json', '{"summary": "SECRET')
+
+    code, out, _ = dump(capsys, '--config', str(config))
+
+    escalations = json.loads(out)['escalations']
+    assert code == 0
+    assert 'SECRET' not in out
+    assert escalations['skipped'] == [{'name': 'esc-9-2.json', 'reason': 'malformed_record'}]
+    assert escalations['by_task'] == {'9': [{'escalation_id': 'esc-9-1', 'level': 2}]}
 
 
 def test_a_refused_policy_exits_1_with_nothing_on_stdout(
