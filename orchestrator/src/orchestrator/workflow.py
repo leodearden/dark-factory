@@ -8827,9 +8827,12 @@ class TaskWorkflow:
                 f'{len(reviews.blocking_issues)} blocking issues'
             )
             stamped_fp = self._stamped_task_text_fp()
-            await self._replan(reviews)
-            # Re-stamp provenance — architect may have overwritten plan.json
             assert self.artifacts is not None
+            stamped_base = plan_base_commit(self.artifacts.read_plan())
+            await self._replan(reviews)
+            # Re-stamp provenance — architect may have overwritten plan.json.
+            # A review replan is not a validation against main: restore the
+            # prior _base_commit rather than stamping the dispatch base.
             self.plan = self.artifacts.read_plan()
             if not self.plan or not self.plan.get('steps'):
                 plan_dump = json.dumps(self.plan, indent=2) if self.plan else 'None'
@@ -8844,7 +8847,7 @@ class TaskWorkflow:
             if outcome := await self._validate_prerequisites_or_block('replan'):
                 return outcome
             self.artifacts.stamp_plan_provenance(
-                self.session_id, task_text_fp=stamped_fp,
+                self.session_id, task_text_fp=stamped_fp, base_commit=stamped_base,
             )
             # Task 2874: the architect may have WIDENED plan.files while
             # addressing review feedback ("you may add new steps"), so route
