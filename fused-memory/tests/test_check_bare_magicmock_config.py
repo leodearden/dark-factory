@@ -1420,7 +1420,7 @@ class TestAllScannedTestDirsClean:
             'Remedy depends on the rule:\n'
             '  bare-magicmock        → mock_orch_config / MagicMock(spec_set=pydantic_spec(...))\n'
             '  bare-dataclass-double → fake_verify_result(...) / MagicMock(spec=VerifyResult)\n'
-            '  wall-clock-deadline   → wait_responsive(...) with a label= / bound derived from MERGE_RESULT_TIMEOUT,\n'
+            '  wall-clock-deadline   → wait_responsive(...) or poll_responsive(...) with a label= / bound derived from MERGE_RESULT_TIMEOUT,\n'
             '                          or, for a debt-baseline slack report, lower the named budget\n'
             f'Scanned: {present}\n'
             'Violations:\n'

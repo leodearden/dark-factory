@@ -672,11 +672,13 @@ def _dataclass_double_violation(
 # after WIDENING DETECTION — the barrier leg became a structural zero-argument
 # ``.wait()`` on any receiver, the raw-literal leg learned ``max_wall_s=`` and
 # wait_for's positional timeout, and directory discovery gained ``_*.py`` helper
-# modules — and recorded 650 violations across 47 files in four packages.  That is
-# the one sanctioned rise: every added violation was already in the tree, newly
-# SEEN, not new debt.  The non-orchestrator entries can shrink only by a per-site
-# ``# noqa: wall-clock-deadline`` until follow-up ticket
-# tkt_0RVCE77JGW0CZGWPSFFZ00REB5 makes ``wait_responsive`` importable outside
+# modules — and recorded 650 violations across 47 files in four packages.  Task 7800
+# re-measured once more after Rule C learned asyncio.timeout/timeout_at blocks and
+# clock-deadline polls, and recorded 294 violations across 82 files (220 across 39
+# before it).  Those are the two sanctioned rises: each time every added violation
+# was already in the tree, newly SEEN, not new debt.  The non-orchestrator entries
+# can shrink only by a per-site ``# noqa: wall-clock-deadline`` until follow-up
+# ticket tkt_0RVCE77JGW0CZGWPSFFZ00REB5 makes ``wait_responsive`` importable outside
 # orchestrator/tests.
 #
 # The number counts VIOLATIONS, not SITES.
@@ -701,7 +703,8 @@ def _dataclass_double_violation(
 # another package's suite (task 6202).
 #
 # DO NOT ADD ENTRIES, AND DO NOT RAISE A NUMBER.  Both may only shrink, as files are
-# migrated onto wait_responsive(...) with bounds derived from MERGE_RESULT_TIMEOUT.
+# migrated onto wait_responsive(...) or poll_responsive(...) with bounds derived from
+# MERGE_RESULT_TIMEOUT.
 # A NEW file with a load-bearing wall-clock wait must FAIL the gate — that is the
 # entire reason the baseline is opt-OUT rather than opt-in.  An opt-in list would
 # exempt precisely the brand-new file this rule exists to catch, and would make
@@ -709,7 +712,8 @@ def _dataclass_double_violation(
 # 3980's amendment pass deleted a five-class frozenset to escape.
 #
 # orchestrator/tests/test_merge_speculation.py is deliberately NOT here.  It measures
-# ZERO because task 3980 already migrated it, and even a budgeted entry of zero would
+# ZERO because task 3980 already migrated it (and task 7800 its one clock-deadline
+# poll), and even a budgeted entry of zero would
 # be a blanket suppression letting a regression land there silently — which is what
 # 3980 spent a task removing, and what makes it safe for task 4246 to delete that
 # module's file-local copy of this guard.
@@ -718,24 +722,56 @@ def _dataclass_double_violation(
 # on trailing path COMPONENTS, so the package directory keeps them distinct.
 _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     # orchestrator/tests
-    'orchestrator/tests/test_merge_queue_concurrent_verify.py': 64,
+    'orchestrator/tests/test_merge_queue_concurrent_verify.py': 65,
     'orchestrator/tests/test_merge_queue_request_liveness.py': 10,
     'orchestrator/tests/test_offline_lane.py': 10,
     'orchestrator/tests/test_live_merge_worker.py': 6,
+    'orchestrator/tests/test_merge_queue.py': 6,
+    'orchestrator/tests/test_verify_admission_integration_gate.py': 5,
     'orchestrator/tests/test_background_service.py': 4,
+    'orchestrator/tests/test_harness_lifecycle_registry.py': 4,
     'orchestrator/tests/test_merge_queue_deep_dispatch.py': 4,
+    'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py': 4,
+    'orchestrator/tests/test_git_ops.py': 3,
+    'orchestrator/tests/test_invoke.py': 3,
+    'orchestrator/tests/test_merge_queue_bounce.py': 3,
     'orchestrator/tests/test_merge_queue_deep_landing.py': 3,
-    'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py': 3,
+    'orchestrator/tests/test_merge_queue_invariant_integration_gate.py': 3,
+    'orchestrator/tests/test_merge_queue_supervisor.py': 3,
+    'orchestrator/tests/test_workflow_cancellation.py': 3,
     'orchestrator/tests/test_harness.py': 2,
-    'orchestrator/tests/test_invoke.py': 2,
+    'orchestrator/tests/test_merge_queue_coalesce.py': 2,
     'orchestrator/tests/test_merge_queue_deep_integration_gate.py': 2,
-    'orchestrator/tests/test_merge_queue_invariant_integration_gate.py': 2,
+    'orchestrator/tests/test_merge_queue_rebased_landing_dead_base.py': 2,
     'orchestrator/tests/test_merge_skew_tripwire.py': 2,
     'orchestrator/tests/test_merge_worktree_lifecycle_integration_gate.py': 2,
     'orchestrator/tests/test_offline_lane_infra_integration.py': 2,
     'orchestrator/tests/test_offline_lane_integration.py': 2,
-    'orchestrator/tests/test_workflow_cancellation.py': 2,
+    'orchestrator/tests/test_verify_ruff_config_boundary.py': 2,
+    'orchestrator/tests/test_cancel_scope_bounded_cleanup.py': 1,
+    'orchestrator/tests/test_cascade_unblock.py': 1,
+    'orchestrator/tests/test_coalesce_integration_gate.py': 1,
+    'orchestrator/tests/test_delivered_check_gate.py': 1,
+    'orchestrator/tests/test_deterministic_runner.py': 1,
+    'orchestrator/tests/test_done_phase_wedge.py': 1,
+    'orchestrator/tests/test_harness_force_release_wedged_slot.py': 1,
+    'orchestrator/tests/test_harness_offline_lane.py': 1,
+    'orchestrator/tests/test_harness_resume_scheduler.py': 1,
+    'orchestrator/tests/test_lane_lock_leak_guard.py': 1,
+    'orchestrator/tests/test_merge_lane_parked_custody.py': 1,
+    'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 1,
+    'orchestrator/tests/test_merge_queue_orphan_reaper.py': 1,
+    'orchestrator/tests/test_merge_queue_restart_hook.py': 1,
+    'orchestrator/tests/test_offline_lane_records.py': 1,
+    'orchestrator/tests/test_remote_gate.py': 1,
     'orchestrator/tests/test_verify.py': 1,
+    'orchestrator/tests/test_verify_admission_cancel_release.py': 1,
+    'orchestrator/tests/test_verify_admission_executor_bypass.py': 1,
+    'orchestrator/tests/test_verify_admission_gate.py': 1,
+    'orchestrator/tests/test_verify_admission_order_integration.py': 1,
+    'orchestrator/tests/test_verify_admission_watch.py': 1,
+    'orchestrator/tests/test_verify_run_cmd_reap.py': 1,
+    'orchestrator/tests/test_workflow_halt_owner.py': 1,
     # dashboard/tests
     'dashboard/tests/test_db.py': 26,
     'dashboard/tests/test_mcp_fanout.py': 18,
@@ -743,23 +779,34 @@ _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     'dashboard/tests/test_metrics_curator.py': 4,
     'dashboard/tests/_dashboard_helpers.py': 3,
     'dashboard/tests/test_api_curator.py': 2,
+    'dashboard/tests/test_memory_exchange_isolation.py': 2,
     'dashboard/tests/test_merge_queue_data.py': 2,
     # fused-memory/tests
+    'fused-memory/tests/test_harness.py': 7,
     'fused-memory/tests/test_drain_signal_handler.py': 4,
-    'fused-memory/tests/test_harness.py': 4,
     'fused-memory/tests/test_memory_service.py': 4,
     'fused-memory/tests/test_operator_signal_handler.py': 4,
     'fused-memory/tests/test_periodic_rebuild_summaries.py': 4,
     'fused-memory/tests/test_task_interceptor.py': 4,
+    'fused-memory/tests/_fm_helpers.py': 2,
     'fused-memory/tests/server/test_grouped_read.py': 2,
     'fused-memory/tests/test_dependency_direction_check.py': 2,
     'fused-memory/tests/test_e2e_durable_queue.py': 2,
     'fused-memory/tests/test_journaling_integration.py': 2,
     'fused-memory/tests/test_recon_claim_verification_wiring.py': 2,
+    'fused-memory/tests/test_event_loop_lag.py': 1,
+    'fused-memory/tests/test_event_queue.py': 1,
+    'fused-memory/tests/test_main_curator_usage_gate.py': 1,
     # shared/tests
     'shared/tests/test_uuid_prefix_guard.py': 2,
     'shared/tests/test_async_sqlite_base.py': 1,
+    'shared/tests/test_auth_failed.py': 1,
+    'shared/tests/test_auth_reprobe_opt_out.py': 1,
     'shared/tests/test_cli_invoke.py': 1,
+    'shared/tests/test_cli_invoke_transcript_offloop.py': 1,
+    'shared/tests/test_failover_integration.py': 1,
+    'shared/tests/test_git_async.py': 1,
+    'shared/tests/test_usage_gate_park_visibility.py': 1,
 }
 
 
