@@ -48,7 +48,10 @@ def queue(tmp_path: Path) -> EscalationQueue:
 
 
 @pytest.fixture
-def harness(mock_orch_config, store: TaskStoreDouble, queue: EscalationQueue) -> Harness:
+def harness(
+    mock_orch_config, store: TaskStoreDouble, queue: EscalationQueue,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Harness:
     with (
         patch('orchestrator.harness.McpLifecycle'),
         patch('orchestrator.harness.OverrideStore'),
@@ -59,7 +62,7 @@ def harness(mock_orch_config, store: TaskStoreDouble, queue: EscalationQueue) ->
     h.scheduler = MagicMock()
     wire_scheduler_liveness_mock(h.scheduler)
     store.wire_into(h.scheduler)
-    h.is_workflow_active = lambda task_id: False  # type: ignore[method-assign]
+    monkeypatch.setattr(h, 'is_workflow_active', lambda task_id: False)
     h._escalation_queue = queue
     queue.set_resolve_callback(h._on_escalation_resolved)
     return h
@@ -180,26 +183,28 @@ class TestRestartRecutIssuesARuling:
 
 
 def _kill_lands_a_stale_replace_write(
-    harness: Harness, store: TaskStoreDouble, task_id: str, *,
+    monkeypatch: pytest.MonkeyPatch, harness: Harness, store: TaskStoreDouble, task_id: str, *,
     then_refuse: frozenset[str] = frozenset(),
 ) -> None:
     """A live workflow whose dying metadata write replaces the record it read before the ruling."""
     stale = copy.deepcopy(store.metadata(task_id))
     active = {task_id}
-    harness.is_workflow_active = lambda tid: tid in active  # type: ignore[method-assign]
+    monkeypatch.setattr(harness, 'is_workflow_active', lambda tid: tid in active)
 
     def _cancel(tid: str) -> None:
         store.tasks[tid]['metadata'] = copy.deepcopy(stale)
         store.refused_metadata_keys |= then_refuse
         active.discard(tid)
 
-    harness.cancel_workflow = _cancel  # type: ignore[method-assign]
+    monkeypatch.setattr(harness, 'cancel_workflow', _cancel)
 
 
 class TestRulingDroppedDuringTheKillWindow:
-    async def test_the_same_ruling_is_re_asserted(self, server, harness, store, queue):
+    async def test_the_same_ruling_is_re_asserted(
+        self, monkeypatch, server, harness, store, queue,
+    ):
         store.add('42', status='in-progress', metadata={'files': ['a.py']})
-        _kill_lands_a_stale_replace_write(harness, store, '42')
+        _kill_lands_a_stale_replace_write(monkeypatch, harness, store, '42')
         l1 = _file_l1(queue, '42')
 
         await _resolve(server, harness, escalation_id=l1.id, action='restart', recut=True)
@@ -211,10 +216,12 @@ class TestRulingDroppedDuringTheKillWindow:
         assert ruling is not None and ruling.ruling_id == l1.id
         assert store.status('42') == 'pending'
 
-    async def test_a_failed_re_assert_files_an_l1(self, server, harness, store, queue):
+    async def test_a_failed_re_assert_files_an_l1(
+        self, monkeypatch, server, harness, store, queue,
+    ):
         store.add('42', status='in-progress')
         _kill_lands_a_stale_replace_write(
-            harness, store, '42', then_refuse=frozenset({RECUT_RULING_KEY}),
+            monkeypatch, harness, store, '42', then_refuse=frozenset({RECUT_RULING_KEY}),
         )
         l1 = _file_l1(queue, '42')
 
