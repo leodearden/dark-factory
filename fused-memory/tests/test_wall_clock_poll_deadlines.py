@@ -183,3 +183,105 @@ class TestClockDeadlinePollLeg:
             assert phrase in message, f'{phrase!r} missing from: {message}'
         for foreign in ('mock_orch_config', 'fake_verify_result', 'bare asyncio.wait_for'):
             assert foreign not in message, f'{foreign!r} must not appear in: {message}'
+
+
+_PARKED_VERIFY_POLL = """
+    async def _await_parked_verify(verifier, task_id, timeout):
+        async with asyncio.timeout(timeout):
+            while task_id not in verifier.verified:
+                await asyncio.sleep(0.01)
+"""
+
+_RULE_A_AND_B_VOCABULARY = (
+    'mock_orch_config',
+    'pydantic_spec',
+    'fake_verify_result',
+    'spec=VerifyResult',
+    'bare-magicmock',
+    'bare-dataclass-double',
+)
+
+
+def _timeout_block(context: str, body: str) -> str:
+    """An async test whose *body* lines run inside ``async with <context>:``."""
+    inner = ''.join(f'        {line}\n' for line in body.splitlines())
+    return f'async def test_x():\n    async with {context}:\n{inner}'
+
+
+_POLL_BODY = 'while not ready():\n    await asyncio.sleep(0.01)'
+
+
+class TestTimeoutBlockLeg:
+    def test_a_named_delay_around_a_poll_flags_routing_only_at_the_block(self):
+        violations = _rule_c(_PARKED_VERIFY_POLL)
+
+        assert len(violations) == 1, violations
+        assert violations[0].lineno == _line_of(_PARKED_VERIFY_POLL, 'async with')
+
+    def test_a_literal_delay_adds_the_raw_literal_kind(self):
+        violations = _rule_c(_timeout_block('asyncio.timeout(5)', _POLL_BODY))
+
+        assert len(violations) == 2, violations
+        literal = [v.message for v in violations if 'RAW wall-clock literal' in v.message]
+        assert len(literal) == 1, violations
+        assert 'delay' in literal[0], literal[0]
+        assert 'Derive the bound from MERGE_RESULT_TIMEOUT' in literal[0], literal[0]
+
+    def test_the_keyword_delay_spelling_flags_identically(self):
+        assert len(_rule_c(_timeout_block('asyncio.timeout(delay=5)', _POLL_BODY))) == 2
+
+    def test_a_load_bearing_await_with_no_poll_flags(self):
+        barrier = _rule_c(_timeout_block('asyncio.timeout(5)', 'await done.wait()'))
+        future = _rule_c(_timeout_block('asyncio.timeout(t)', 'await req.result'))
+
+        assert len(barrier) == 2, barrier
+        assert len(future) == 1, future
+        for v in barrier:
+            assert 'done.wait() (.wait() barrier)' in v.message, v.message
+
+    @pytest.mark.parametrize(
+        ('context', 'body'),
+        [
+            pytest.param('asyncio.timeout(5)', 'await task', id='bare-name-join'),
+            pytest.param(
+                'asyncio.timeout(30)', 'result = await run_verification(x)', id='plain-call'
+            ),
+            pytest.param('asyncio.timeout(5)', 'await asyncio.gather(a, b)', id='gather'),
+            pytest.param('asyncio.timeout(None)', _POLL_BODY, id='no-deadline'),
+            pytest.param('other.timeout(5)', _POLL_BODY, id='not-asyncio'),
+        ],
+    )
+    def test_blocks_that_bound_no_load_bearing_wait_stay_silent(self, context, body):
+        assert _rule_c(_timeout_block(context, body)) == []
+
+    def test_a_multi_item_block_flags_its_deadline_item(self):
+        assert len(_rule_c(_timeout_block('asyncio.timeout(5), slot()', _POLL_BODY))) == 2
+
+    def test_an_absolute_deadline_flags_routing_only(self):
+        violations = _rule_c(_timeout_block('asyncio.timeout_at(when)', _POLL_BODY))
+
+        assert len(violations) == 1, violations
+        assert 'RAW wall-clock literal' not in violations[0].message
+
+    def test_one_noqa_above_the_block_suppresses_both_kinds(self):
+        source = f'async def test_x():\n    {_NOQA}\n' + _timeout_block(
+            'asyncio.timeout(5)', _POLL_BODY
+        ).removeprefix('async def test_x():\n')
+
+        assert _rule_c(source) == []
+
+    def test_the_routing_message_names_both_remedies_and_no_other_rule(self):
+        [violation] = _rule_c(_PARKED_VERIFY_POLL)
+        message = violation.message
+
+        for phrase in (
+            'asyncio.timeout',
+            'WALL CLOCK',
+            'wait_responsive',
+            'poll_responsive',
+            'importable only under orchestrator/tests',
+            '# noqa: wall-clock-deadline',
+        ):
+            assert phrase in message, f'{phrase!r} missing from: {message}'
+        for foreign in (*_RULE_A_AND_B_VOCABULARY, 'bare asyncio.wait_for'):
+            assert foreign not in message, f'{foreign!r} must not appear in: {message}'
