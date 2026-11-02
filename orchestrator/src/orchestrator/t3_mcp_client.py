@@ -26,6 +26,8 @@ import itertools
 import json
 import os
 import re
+import shutil
+import subprocess
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
@@ -60,6 +62,7 @@ _REGISTER_PATH = '/oauth/mcp/register'
 _DECISION_PATH = '/oauth/mcp/decision'
 _TOKEN_PATH = '/oauth/mcp/token'
 _ENVIRONMENT_ID = re.compile(r'[0-9A-Za-z][0-9A-Za-z_-]*')
+_CLI_VERSION_LINE = re.compile(r'\S+ v(\S+)')
 _T = TypeVar('_T')
 
 
@@ -548,6 +551,75 @@ class OperatorCode:
 
     def mint(self, descriptor: Descriptor) -> str | PairFailed:
         return self.code
+
+
+def parse_cli_version(stdout: str) -> str | None:
+    """The bare version in ``t3 --version``'s ``t3 v0.1.6``.
+
+    The CLI prints Effect's ``<name> v<semver>`` (``apps/server/src/binCli.ts``)
+    while the descriptor's serverVersion is the bare ``0.1.6``, so the two are
+    compared after this parse; any other line is None, never a guess.
+    """
+    match = _CLI_VERSION_LINE.fullmatch(stdout.strip())
+    return match.group(1) if match else None
+
+
+def _run_t3(executable: str, *args: str) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            [executable, *args], capture_output=True, text=True, timeout=CLI_TIMEOUT_SECS, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _cli_version_refusal(executable: str, descriptor: Descriptor) -> PairFailed | None:
+    """None when this host's ``t3`` is the server's own version."""
+    ran = _run_t3(executable, '--version')
+    if ran is None or ran.returncode != 0:
+        return PairFailed(PairFailure.CLI_VERSION_UNREADABLE, 't3 --version did not run cleanly')
+    cli_version = parse_cli_version(ran.stdout)
+    if cli_version is None:
+        return PairFailed(PairFailure.CLI_VERSION_UNREADABLE, f't3 --version printed {ran.stdout.strip()!r}')
+    if cli_version != descriptor.server_version:
+        return PairFailed(
+            PairFailure.CLI_VERSION_MISMATCH, cli_version=cli_version, server_version=descriptor.server_version
+        )
+    return None
+
+
+def _created_pairing_code(created: subprocess.CompletedProcess[str] | None) -> str | PairFailed:
+    """The ``credential`` of ``t3 auth pairing create --json`` (``cliAuthFormat.ts::formatIssuedPairingCredential``)."""
+    if created is None:
+        return PairFailed(PairFailure.PAIRING_CREATE_FAILED, 't3 auth pairing create did not run')
+    if created.returncode != 0:
+        return PairFailed(PairFailure.PAIRING_CREATE_FAILED, created.stderr.strip() or f'exit {created.returncode}')
+    try:
+        issued = json.loads(created.stdout)
+    except ValueError:
+        return PairFailed(PairFailure.PAIRING_CREATE_FAILED, 'output is not JSON')
+    code = issued.get('credential') if isinstance(issued, dict) else None
+    if not isinstance(code, str) or not code:
+        return PairFailed(PairFailure.PAIRING_CREATE_FAILED, 'output has no credential')
+    return code
+
+
+@dataclass(frozen=True)
+class CliCodeSource:
+    """Mint a code with this host's own ``t3``, refusing one of another version before minting."""
+
+    @property
+    def paired_by(self) -> PairedBy:
+        return PairedBy.SELF_PAIR
+
+    def mint(self, descriptor: Descriptor) -> str | PairFailed:
+        executable = shutil.which('t3')
+        if executable is None:
+            return PairFailed(PairFailure.T3_MISSING, 'no t3 on PATH')
+        refusal = _cli_version_refusal(executable, descriptor)
+        if refusal is not None:
+            return refusal
+        return _created_pairing_code(_run_t3(executable, 'auth', 'pairing', 'create', '--json'))
 
 
 @dataclass(frozen=True)
