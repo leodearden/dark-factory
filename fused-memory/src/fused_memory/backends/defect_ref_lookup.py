@@ -25,6 +25,7 @@ from shared.defects import (
 
 from fused_memory.backends.defect_records import DefectRefNotLive, refs_required_live
 from fused_memory.backends.metadata_lookup_pages import (
+    LOOKUP_PAGE_SIZE,
     MetadataLookupSource,
     metadata_lookup_pages,
 )
@@ -36,8 +37,6 @@ __all__ = [
     'lookup_defect_ref',
     'require_refs_live',
 ]
-
-_PAGE_SIZE = 100
 
 
 @dataclass(frozen=True)
@@ -94,7 +93,7 @@ async def lookup_defect_ref(
     ref: str,
     *,
     tag: str | None = None,
-    page_size: int = _PAGE_SIZE,
+    page_size: int = LOOKUP_PAGE_SIZE,
 ) -> DefectRefLookup:
     """Every task, of any status, whose ``metadata.defects`` declares *ref*.
 

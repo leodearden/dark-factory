@@ -36,8 +36,6 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-_PAGE_SIZE = 100
-
 
 @dataclass(frozen=True)
 class OpenChainTask:
@@ -167,7 +165,6 @@ async def _read_chain_rows(
         statuses=sorted(ACTIVE),
         include_value=True,
         tag=tag,
-        page_size=_PAGE_SIZE,
     ):
         if page['malformed_metadata_ids']:
             logger.warning(

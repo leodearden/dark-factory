@@ -14,7 +14,9 @@ from typing import Protocol
 from fused_memory.backends.metadata_lookup import DEFAULT_LOOKUP_LIMIT
 from fused_memory.backends.task_backend_types import MetadataLookupResult
 
-__all__ = ['MetadataLookupSource', 'metadata_lookup_pages']
+__all__ = ['LOOKUP_PAGE_SIZE', 'MetadataLookupSource', 'metadata_lookup_pages']
+
+LOOKUP_PAGE_SIZE = 100
 
 
 class MetadataLookupSource(Protocol):
@@ -40,7 +42,7 @@ async def metadata_lookup_pages(
     statuses: list[str] | None = None,
     include_value: bool = False,
     tag: str | None = None,
-    page_size: int = 100,
+    page_size: int = LOOKUP_PAGE_SIZE,
 ) -> AsyncIterator[MetadataLookupResult]:
     """Every page of the tasks carrying *key*, from offset 0 to the last match."""
     offset = 0
