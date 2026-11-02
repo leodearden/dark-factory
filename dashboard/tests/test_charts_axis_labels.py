@@ -890,7 +890,7 @@ def test_rounding_default_control_shows_the_ratio_guard_actually_fires() -> None
 
 _COUNT_AXIS_SITES = [
     pytest.param('tabs_jsx_body', 'MemoryTab', _LINE_CHART_TAG_RE, 'MEMORY_OPS.reads', id='MemoryTab-reads-writes'),
-    pytest.param('tabs_jsx_body', 'MergeTab', _LINE_CHART_TAG_RE, 'd.depth.values', id='MergeTab-attempt-depth'),
+    pytest.param('tabs_jsx_body', 'MergeTab', _LINE_CHART_TAG_RE, 'depthSeries.values', id='MergeTab-attempt-depth'),
     pytest.param('tab_analytics_jsx_body', 'WorkflowPanel', _LINE_CHART_TAG_RE, 'churnDaily', id='WorkflowPanel-churn'),
     pytest.param('tab_overview_jsx_body', 'OverviewTab', _LINE_CHART_TAG_RE, 'D.MEMORY_OPS.reads', id='OverviewTab-memory-ops'),
     pytest.param('tab_analytics_jsx_body', 'OriginPanel', _STACKED_AREA_TAG_RE, 'stacks={stacks}', id='OriginPanel-filings-by-source'),
