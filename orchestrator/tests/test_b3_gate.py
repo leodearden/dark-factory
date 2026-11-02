@@ -1152,42 +1152,17 @@ class TestReaderFailureWarning:
         db.write_bytes(b'')
         return db
 
-    def test_stub_tasks_db_warning_names_the_refusal(self, tmp_path, caplog):
-        import logging as _logging
+    def _run_check_warnings(self, tmp_path, capsys, caplog):
+        """Run the public 'check' verb; return its verdict and EVERY warning.
 
-        from orchestrator.b3_gate import _read_task_description
-        db = self._seed_stub_tasks_db(tmp_path)
-
-        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
-            result = _read_task_description(42, tmp_path)
-
-        assert result is None
-        refusal = str(TaskDbUnreadable(db.resolve(), TaskDbProblem.EMPTY_STUB))
-        assert any(
-            r.levelno == _logging.WARNING and refusal in r.getMessage()
-            for r in caplog.records
-        ), [r.getMessage() for r in caplog.records]
-
-    def test_stub_tasks_db_latest_proposal_stays_silent_none(self, tmp_path, caplog):
-        """A non-ABSENT refusal reaches _read_latest_proposal's existing outer
-        handler, which stays deliberately un-instrumented (see above)."""
-        import logging as _logging
-
-        from orchestrator.b3_gate import _read_latest_proposal
-        self._seed_stub_tasks_db(tmp_path)
-
-        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
-            result = _read_latest_proposal(42, tmp_path)
-
-        assert result is None
-        assert not [r for r in caplog.records if r.levelno >= _logging.WARNING]
-
-    def test_run_check_on_a_stub_store_still_prints_a_verdict(self, tmp_path, capsys, caplog):
+        Every warning, not only those naming the store: run_check reads tasks.db
+        through both readers, and _read_latest_proposal must stay silent while
+        _read_task_description warns once, so a second warning is a regression.
+        """
         import argparse
         import logging as _logging
 
         from orchestrator.b3_gate import run_check
-        db = self._seed_stub_tasks_db(tmp_path)
         args = argparse.Namespace(
             task_id='42',
             worktree=str(tmp_path),
@@ -1203,13 +1178,39 @@ class TestReaderFailureWarning:
             run_check(args)
 
         result = json.loads(capsys.readouterr().out)
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= _logging.WARNING]
+        return result, warnings
+
+    def test_run_check_on_a_stub_store_warns_once_naming_the_refusal(
+        self, tmp_path, capsys, caplog,
+    ):
+        db = self._seed_stub_tasks_db(tmp_path)
+
+        result, warnings = self._run_check_warnings(tmp_path, capsys, caplog)
+
         assert 'verdict' in result
         refusal = str(TaskDbUnreadable(db.resolve(), TaskDbProblem.EMPTY_STUB))
-        naming = [
-            r for r in caplog.records
-            if r.levelno == _logging.WARNING and refusal in r.getMessage()
-        ]
-        assert len(naming) == 1, [r.getMessage() for r in caplog.records]
+        assert len(warnings) == 1, warnings
+        assert refusal in warnings[0]
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='mode 000 does not deny root')
+    def test_run_check_on_an_unopenable_store_warns_once(self, tmp_path, capsys, caplog):
+        """A store connect_ro cannot OPEN raises sqlite3.Error, not a refusal.
+
+        It propagates out of _open_tasks_db like a non-ABSENT refusal, so the
+        description reader warns instead of answering a silent None.
+        """
+        _seed_tasks_db(tmp_path, 42, [])
+        db = tmp_path / '.taskmaster' / 'tasks' / 'tasks.db'
+        db.chmod(0o000)
+        try:
+            result, warnings = self._run_check_warnings(tmp_path, capsys, caplog)
+        finally:
+            db.chmod(0o600)
+
+        assert 'verdict' in result
+        assert len(warnings) == 1, warnings
+        assert sqlite3.OperationalError.__name__ in warnings[0]
 
 
 # ---------------------------------------------------------------------------

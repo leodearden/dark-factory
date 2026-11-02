@@ -604,7 +604,8 @@ def _open_tasks_db(project_root: str | Path) -> sqlite3.Connection | None:
 
     An absent store is the benign first-run case, so it answers None. Every
     other ``TaskDbUnreadable`` refusal propagates, carrying its remedy into
-    the caller's own handler.
+    the caller's own handler, and so does the ``sqlite3.Error`` of a store
+    that exists but cannot be opened (permissions, a lock).
     """
     try:
         return connect_ro(tasks_db(project_root))
