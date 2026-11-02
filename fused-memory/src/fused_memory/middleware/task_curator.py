@@ -1833,19 +1833,29 @@ class TaskCurator:
             return _corpus_failed_deferral(candidate, bundle.corpus_error, start)
 
         # 10. Only the LLM call is the cost the breaker exists to avoid.
-        if self._zero_output_breaker.is_open(time.monotonic()):
-            logger.warning(
-                'task_curator: zero-output-breaker open — deferring curation '
-                'for candidate %r (consecutive ZOTs=%d)',
-                candidate.title,
-                self._zero_output_breaker.consecutive_timeouts,
-            )
-            return CuratorDecision.deferred(
+        deferred = self._defer_while_breaker_open([bundle], start)
+        return deferred[0] if deferred is not None else None
+
+    def _defer_while_breaker_open(
+        self, bundles: Sequence[PreparedCandidate], start: float,
+    ) -> list[CuratorDecision] | None:
+        """One breaker deferral per bundle while the zero-output breaker is open, else ``None``."""
+        if not self._zero_output_breaker.is_open(time.monotonic()):
+            return None
+        logger.warning(
+            'task_curator: zero-output-breaker open — deferring curation '
+            'for candidates %r (consecutive ZOTs=%d)',
+            [bundle.candidate.title for bundle in bundles],
+            self._zero_output_breaker.consecutive_timeouts,
+        )
+        return [
+            CuratorDecision.deferred(
                 DeferReason.ZERO_OUTPUT_BREAKER_OPEN,
                 pool_sizes=empty_pool_sizes(),
                 latency_ms=_elapsed_ms(start),
             )
-        return None
+            for _ in bundles
+        ]
 
     async def curate(
         self,
@@ -2839,16 +2849,21 @@ class TaskCurator:
     ) -> list[CuratorDecision]:
         """Judge *bundles* in one LLM call: the single spec for one, the batch spec for more.
 
-        The only caller of :meth:`_invoke_curator`. A failed call over two or
-        more bundles bisects, each half dispatched again over its own prepared
-        pools and never back through the guard chain, so the bottom of a
-        bisection is a single-spec invocation. A pool error is not bisected:
-        a smaller batch cannot cure an account pool that cannot serve, and
-        each half would repeat the cap-retry wait. Every failure that is not
-        bisected is decided by :meth:`_failure_decision`.
+        The only caller of :meth:`_invoke_curator`. An open zero-output
+        breaker defers the call's bundles before any invocation, at every
+        level: the top-level call, each bisected half and each leaf. A failed
+        call over two or more bundles bisects, each half dispatched again over
+        its own prepared pools and never back through the guard chain, so the
+        bottom of a bisection is a single-spec invocation. A pool error is not
+        bisected: a smaller batch cannot cure an account pool that cannot
+        serve, and each half would repeat the cap-retry wait. Every failure
+        that is not bisected is decided by :meth:`_failure_decision`.
 
         Decisions come back in *bundles*-local index space.
         """
+        deferred = self._defer_while_breaker_open(bundles, start)
+        if deferred is not None:
+            return deferred
         cfg = self._config.curator
         if len(bundles) == 1:
             [only] = bundles

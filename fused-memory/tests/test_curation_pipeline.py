@@ -320,6 +320,8 @@ def _breaker_scene(
 ) -> tuple[TaskCurator, AsyncMock, AsyncMock]:
     """A curator whose breaker opens on its first hang, and its invoker and escalator.
 
+    Each call yields once before it answers, as a call in flight would, so
+    halves dispatched together are all invoked before either answers.
     ``report_failure`` signals a hang synchronously, and the failure mapper
     records the hang on the breaker before it next yields, so a call scripted
     to wait resumes only once the breaker is open.
@@ -341,6 +343,7 @@ def _breaker_scene(
         if titles not in script:
             raise AssertionError(f'unscripted curator call over {titles!r}')
         scripted = script[titles]
+        await asyncio.sleep(0)
         if isinstance(scripted, tuple):
             _wait, scripted = scripted
             await zot_reported.wait()
