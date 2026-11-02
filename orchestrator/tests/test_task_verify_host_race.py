@@ -394,6 +394,7 @@ Provision = Literal['none', 'waits', 'ignores_term']
 
 def _module(
     legs: _Legs, prefix: str, *, test_leg: TestLeg, timeout: float | None,
+    lint_ignores_term: bool,
 ) -> ModuleConfig:
     test_label = f'test-{prefix}'
     test_command = {
@@ -404,7 +405,7 @@ def _module(
     return ModuleConfig(
         prefix,
         test_command=test_command,
-        lint_command=legs.command(f'lint-{prefix}'),
+        lint_command=legs.command(f'lint-{prefix}', ignore_term=lint_ignores_term),
         type_check_command=legs.command(f'type-{prefix}'),
         verify_command_timeout_secs=timeout,
     )
@@ -436,9 +437,11 @@ def _rig(
     test_leg: TestLeg = 'waits',
     module_timeout: float | None = None,
     provision: Provision = 'none',
+    lints_ignoring_term: tuple[str, ...] = (),
 ) -> _Rig:
     """*provision* other than ``'none'`` makes the worktree cold (it gains ``.task/``)
-    and runs the :data:`_PROVISION` leg as its cold pre-provision."""
+    and runs the :data:`_PROVISION` leg as its cold pre-provision.  The lint leg of
+    each module in *lints_ignoring_term* traps SIGTERM, so only a SIGKILL ends it."""
     repo, _base, tip = seed_task_branch_repo(tmp_path, modules=modules)
     legs = _Legs(tmp_path / 'legs')
     config_overrides: dict[str, Any] = {}
@@ -448,7 +451,10 @@ def _rig(
             _PROVISION, ignore_term=provision == 'ignores_term',
         )
     module_configs = [
-        _module(legs, prefix, test_leg=test_leg, timeout=module_timeout)
+        _module(
+            legs, prefix, test_leg=test_leg, timeout=module_timeout,
+            lint_ignores_term=prefix in lints_ignoring_term,
+        )
         for prefix in modules
     ]
     remotes = {host: _Remote() for host in hosts}
@@ -804,6 +810,33 @@ class TestTheRace:
         assert not rig.legs.spawned(_TEST)
         assert [pid for pid in rig.legs.all_pids() if _alive(pid)] == []
         assert _git(rig.repo, 'status', '--porcelain') == ''
+        await local_holder.leave()
+
+    @pytest.mark.parametrize(
+        'modules', [(VERIFY_MODULE,), (VERIFY_MODULE, _SECOND_MODULE)], ids=['one', 'two'],
+    )
+    async def test_row35_the_verdict_waits_for_a_leg_that_only_sigkill_ends(
+        self, tmp_path: Path, modules: tuple[str, ...],
+    ) -> None:
+        rig = _rig(tmp_path, concurrent=True, modules=modules, lints_ignoring_term=(VERIFY_MODULE,))
+        lints = [f'lint-{prefix}' for prefix in modules]
+        rig.legs.block(*lints)
+        laptop_holder, local_holder = await rig.hold_both()
+        call = rig.start()
+        await _until(
+            lambda: all(rig.legs.spawned(lint) for lint in lints) and _waiting(rig.local_gate, '7'),
+            watching=call,
+        )
+        [stubborn_lint] = rig.legs.pids(_LINT)
+        alive_at_return: list[bool] = []
+        call.add_done_callback(lambda _call: alive_at_return.append(_alive(stubborn_lint)))
+
+        await laptop_holder.leave()
+        result = await _bounded(call)
+
+        assert result.summary == 'remote verdict'
+        assert alive_at_return == [False]
+        assert [pid for pid in rig.legs.all_pids() if _alive(pid)] == []
         await local_holder.leave()
 
     async def test_row36_a_reentry_reruns_the_cold_provision_and_keeps_its_arrival(
