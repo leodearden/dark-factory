@@ -59,6 +59,10 @@ dict) when any of these invariants is violated:
    advances) to ``recheck_secs_milestone_conflict``. Unlike recurrence's
    carrier clauses, the milestone half also holds at ``update_task``, because
    ``TaskMetadata`` applies the same rule at the write boundary.
+9. ``metadata.trigger_chain``, when present, must match the shared
+   ``TriggerChain`` model on a carrier its role allows (PRD
+   ``plans/completion-driven-triggers-prd.md`` C2). Like recurrence's, the
+   carrier rules apply at submit only (task 3093; see ``_validate_recurrence``).
 
 ``inject_task_kind`` normalises the metadata dict and sets
 ``metadata.task_kind`` so it is persisted alongside ``before_done`` /
@@ -78,9 +82,11 @@ from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
 from shared.task_metadata import (
     RECHECK_SECS_MIN,
     TASK_METADATA_CAPABILITIES,
+    TRIGGER_CHAIN_KEY,
     BeforeDone,
     Milestone,
     Recurrence,
+    TriggerChain,
     recheck_secs_milestone_conflict,
 )
 
@@ -338,6 +344,94 @@ def _validate_recurrence(
     return None
 
 
+_TRIGGER_CHAIN_SHAPE_HINT = (
+    "A trigger_chain must be {'role': 'completion_gate'|'human_gate', "
+    "'skill': 'review'|'hotspot-survey'|'review-all' (the bare skill name, no leading "
+    "slash), 'run_id': '<skill>-…', 'superseded_by': <run_id>|None}."
+)
+
+
+def _validate_trigger_chain(
+    trigger_chain: Any,
+    *,
+    task_kind: str,
+    before_done: Any,
+    always_escalates: Any,
+    metadata: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Validate metadata.trigger_chain — shape + carrier rules (PRD C2).
+
+    The shape is delegated to :class:`shared.task_metadata.TriggerChain`; the
+    carrier clauses read the rest of the metadata, as
+    :func:`_validate_recurrence`'s do, and share its submit-time-only residual.
+    """
+    try:
+        chain = TriggerChain(**trigger_chain)
+    except (ValidationError, TypeError) as exc:
+        return _validation_error(
+            f'metadata.trigger_chain is invalid: {exc}', hint=_TRIGGER_CHAIN_SHAPE_HINT
+        )
+    role = chain.role
+    if task_kind != 'deterministic':
+        return _validation_error(
+            f"metadata.trigger_chain role {role!r} requires task_kind='deterministic' "
+            f'(got task_kind={task_kind!r}).',
+            hint="Set task_kind='deterministic', or remove 'trigger_chain' from metadata.",
+        )
+    if 'x_finding_run' in metadata:
+        return _validation_error(
+            f'metadata.trigger_chain role {role!r} must not carry x_finding_run: a '
+            "chain task must never count toward its own run's measure.",
+            hint="Remove 'x_finding_run' from the chain task's metadata.",
+        )
+    if role == 'completion_gate':
+        return _completion_gate_carrier_error(before_done)
+    return _human_gate_carrier_error(before_done, always_escalates)
+
+
+def _completion_gate_carrier_error(before_done: Any) -> dict[str, Any] | None:
+    # The dated-milestone clause is invariant 8's, through recheck_secs_milestone_conflict.
+    if not isinstance(before_done, dict):
+        return _validation_error(
+            "metadata.trigger_chain role 'completion_gate' requires a before_done "
+            "predicate, but this task has no before_done.",
+            hint=(
+                "Add 'before_done': {'kind': 'predicate', 'script': '<path>', "
+                "'timeout_secs': <n>, 'recheck_secs': <n>} on a dated milestone."
+            ),
+        )
+    effective_kind = before_done.get('kind') or 'deploy'
+    if effective_kind != 'predicate':
+        return _validation_error(
+            "metadata.trigger_chain role 'completion_gate' requires "
+            f"before_done.kind='predicate' (got {effective_kind!r}).",
+            hint="A completion gate checks the run's measure: set kind='predicate'.",
+        )
+    if before_done.get('recheck_secs') is None:
+        return _validation_error(
+            "metadata.trigger_chain role 'completion_gate' requires before_done.recheck_secs.",
+            hint=(
+                'A completion gate answers "not yet" until the run completes: declare '
+                "'recheck_secs' (e.g. 86400) on its predicate."
+            ),
+        )
+    return None
+
+
+def _human_gate_carrier_error(before_done: Any, always_escalates: Any) -> dict[str, Any] | None:
+    if always_escalates is True and before_done is None:
+        return None
+    return _validation_error(
+        "metadata.trigger_chain role 'human_gate' requires always_escalates=True and no "
+        f'before_done (got always_escalates={always_escalates!r}, before_done '
+        f'{"absent" if before_done is None else "present"}).',
+        hint=(
+            "A human gate is a pure escalation gate: set 'always_escalates': True and "
+            "remove 'before_done'. Its milestone is optional."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public guard functions
 # ---------------------------------------------------------------------------
@@ -454,6 +548,20 @@ def deterministic_task_error(
             task_kind=task_kind,
             before_done=before_done,
             milestone=milestone,
+        )
+        if err is not None:
+            return err
+
+    # Invariant 9 (PRD completion-driven-triggers C2): last, for the reason
+    # given for recurrence above.
+    trigger_chain = meta.get(TRIGGER_CHAIN_KEY)
+    if trigger_chain is not None:
+        err = _validate_trigger_chain(
+            trigger_chain,
+            task_kind=task_kind,
+            before_done=before_done,
+            always_escalates=always_escalates,
+            metadata=meta,
         )
         if err is not None:
             return err
