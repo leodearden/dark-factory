@@ -1480,8 +1480,14 @@ async def test_drainer_marks_processed_on_dead_letter(tmp_path):
     """When the drainer dead-letters a non-retriable event, its journal row is
     removed too — durability is handed off to the dead-letter JSONL file.
     """
+    push_failed = asyncio.Event()
+
+    def fail(event):
+        push_failed.set()
+        raise ValueError('schema mismatch')
+
     buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('schema mismatch'))
+    buf.push = AsyncMock(side_effect=fail)
     ej_path = tmp_path / 'ej.db'
     dl = tmp_path / 'dl.jsonl'
     q = EventQueue(
@@ -1497,18 +1503,15 @@ async def test_drainer_marks_processed_on_dead_letter(tmp_path):
     try:
         event = _make_event()
         assert q.enqueue(event) is True
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        await push_failed.wait()
+        await q.flush_dead_letters()
         # Dead-lettered (non-retriable push error).
         assert q.stats()['dead_letters'] == 1
         lines = dl.read_text().strip().splitlines()
         assert len(lines) == 1
         assert json.loads(lines[0])['reason'] == 'non_retriable'
         # Journal row removed — durability handed off to the dead-letter file.
-        journal = EventJournal(ej_path)
-        try:
-            assert journal.load_unprocessed() == []
-        finally:
-            journal.close()
+        assert journaled_events(ej_path) == {}
     finally:
         await q.close()
 
