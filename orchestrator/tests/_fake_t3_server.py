@@ -7,7 +7,8 @@ unauthenticated environment descriptor, the pairing-code OAuth exchange
 streamable-HTTP ``/mcp`` endpoint, framed as a JSON body or as SSE frames.
 :func:`install_fake_t3_cli` writes an executable ``t3`` that answers
 ``--version`` and mints pairing codes on that server, the way the real CLI
-writes the real server's state.
+writes the real server's state; :func:`put_fake_t3_cli_on_path` installs it
+first on a test's PATH. :data:`DEAD_ORIGIN` is an origin nothing answers.
 
 WHERE THE SHAPES COME FROM.  Every canned payload and refusal is copied from
 T3 Code v0.1.6 (``~/src/t3code-v0.1.6``):
@@ -34,6 +35,7 @@ import base64
 import contextlib
 import hashlib
 import json
+import os
 import secrets
 import sys
 import threading
@@ -44,14 +46,20 @@ from email.message import Message
 from enum import StrEnum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlencode, urlsplit
+
+if TYPE_CHECKING:
+    import pytest
 
 ENVIRONMENT_ID = '3f9a1c2e-5b7d-4e8f-9a0b-1c2d3e4f5a6b'
 SERVER_VERSION = '0.1.6'
 PROTOCOL_VERSION = '2025-06-18'
 DEFAULT_EXPIRES_IN = 2_592_000
 FULL_ACCESS_SCOPES = ('orchestration:read', 'orchestration:operate', 'settings:write', 'source-control:write')
+DEAD_ORIGIN = 'http://127.0.0.1:1'
+"""Nothing answers here: binding port 1 needs root, so unlike a freed ephemeral
+port no concurrently running fake can be handed it."""
 
 DESCRIPTOR_PATH = '/.well-known/t3/environment'
 REGISTER_PATH = '/oauth/mcp/register'
@@ -150,6 +158,18 @@ def _parse_body(content_type: str, raw: bytes) -> Any:
         return text
 
 
+def _environment_read(environment_id: str, server_version: str) -> ToolSuccess:
+    return ToolSuccess(
+        {
+            'environmentId': environment_id,
+            'label': 'fake-t3',
+            'serverVersion': server_version,
+            'platform': {'os': 'linux', 'arch': 'x64'},
+            'preferences': {},
+        }
+    )
+
+
 def _call_tool_result(reply: ToolReply) -> dict[str, Any]:
     if isinstance(reply, ToolSuccess):
         value = dict(reply.value)
@@ -180,17 +200,15 @@ class FakeT3Server(ThreadingHTTPServer):
         self.server_version = server_version
         self.framing = framing
         self.expires_in = expires_in
-        self.tool_replies: dict[str, ToolReply] = {
-            't3_environment_read': ToolSuccess(
-                {
-                    'environmentId': environment_id,
-                    'label': 'fake-t3',
-                    'serverVersion': server_version,
-                    'platform': {'os': 'linux', 'arch': 'x64'},
-                    'preferences': {},
-                }
-            )
-        }
+        self.token_reply_overrides: dict[str, Any] = {}
+        """Merged over the well-formed token reply, to answer a malformed one."""
+        self.decision_state_override: str | None = None
+        """When set, the decision's redirect carries this ``state`` instead of echoing the client's."""
+        self.pings_with_the_request_id = False
+        """True puts a server-to-client ``ping`` bearing the client's own request id before each SSE reply."""
+        self.hangs_up = False
+        """True closes every connection without a reply, as a server dying mid-request does."""
+        self.tool_replies: dict[str, ToolReply] = {'t3_environment_read': _environment_read(environment_id, server_version)}
         self.requests: list[RecordedRequest] = []
         self._lock = threading.Lock()
         self._pairing_codes: set[str] = set()
@@ -215,6 +233,11 @@ class FakeT3Server(ThreadingHTTPServer):
             server.shutdown()
             server.server_close()
             thread.join()
+
+    def answer_as(self, environment_id: str) -> None:
+        """Answer the descriptor and ``t3_environment_read`` as ``environment_id``, as a T3 reinstalled on this port would."""
+        self.environment_id = environment_id
+        self.tool_replies['t3_environment_read'] = _environment_read(environment_id, self.server_version)
 
     def add_pairing_code(self) -> str:
         code = secrets.token_urlsafe(12)
@@ -347,7 +370,8 @@ class FakeT3Server(ThreadingHTTPServer):
             self._pairing_codes.discard(decision['code'])
             auth_code = secrets.token_urlsafe(16)
             self._auth_codes[auth_code] = _AuthCode(client_id, redirect_uri, authorization['code_challenge'])
-        query = urlencode({'code': auth_code, 'state': authorization.get('state', ''), 'iss': self.origin})
+        state = self.decision_state_override if self.decision_state_override is not None else authorization.get('state', '')
+        query = urlencode({'code': auth_code, 'state': state, 'iss': self.origin})
         return _json_reply(200, {'redirectTo': f'{redirect_uri}?{query}'})
 
     def _token(self, form: dict[str, Any]) -> _Reply:
@@ -361,15 +385,13 @@ class FakeT3Server(ThreadingHTTPServer):
             or _s256(form.get('code_verifier', '')) != grant.code_challenge
         ):
             return _invalid_grant('The authorization code is invalid or expired.')
-        return _json_reply(
-            200,
-            {
-                'access_token': self.issue_token(),
-                'token_type': 'Bearer',
-                'expires_in': self.expires_in,
-                'scope': ' '.join(FULL_ACCESS_SCOPES),
-            },
-        )
+        issued = {
+            'access_token': self.issue_token(),
+            'token_type': 'Bearer',
+            'expires_in': self.expires_in,
+            'scope': ' '.join(FULL_ACCESS_SCOPES),
+        }
+        return _json_reply(200, issued | self.token_reply_overrides)
 
     def _mcp(self, headers: Message, body: Any) -> _Reply:
         with self._lock:
@@ -420,7 +442,10 @@ class FakeT3Server(ThreadingHTTPServer):
     def _framed(self, message: dict[str, Any], headers: Mapping[str, str] | None = None) -> _Reply:
         if self.framing != 'sse':
             return _json_reply(200, message, headers)
-        frames = ''.join(f'event: message\ndata: {json.dumps(frame)}\n\n' for frame in (_UNRELATED_FRAME, message))
+        prelude = [_UNRELATED_FRAME]
+        if self.pings_with_the_request_id:
+            prelude.append({'jsonrpc': '2.0', 'id': message.get('id'), 'method': 'ping'})
+        frames = ''.join(f'event: message\ndata: {json.dumps(frame)}\n\n' for frame in (*prelude, message))
         return _Reply(200, frames.encode(), 'text/event-stream', headers or {})
 
 
@@ -433,6 +458,8 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         self.server.record(RecordedRequest('GET', path, self._header_map(), None))
+        if self.server.hangs_up:
+            return
         self._send(self.server.answer_get(path))
 
     def do_POST(self) -> None:
@@ -440,6 +467,8 @@ class _Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(int(self.headers.get('Content-Length') or 0))
         body = _parse_body(self.headers.get('Content-Type', ''), raw)
         self.server.record(RecordedRequest('POST', path, self._header_map(), body))
+        if self.server.hangs_up:
+            return
         self._send(self.server.answer_post(path, self.headers, body))
 
     def _header_map(self) -> dict[str, str]:
@@ -511,6 +540,16 @@ def install_fake_t3_cli(bin_dir: Path, *, origin: str, version_line: str, log_pa
     executable.write_text(header + _FAKE_T3_CLI_BODY)
     executable.chmod(0o755)
     return executable
+
+
+def put_fake_t3_cli_on_path(
+    server: FakeT3Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, version_line: str
+) -> Path:
+    """Install the fake ``t3`` minting on ``server`` first on PATH; returns its argv log."""
+    bin_dir, log_path = tmp_path / 'fake-t3-mcp-bin', tmp_path / 'fake-t3-mcp-cli.log'
+    install_fake_t3_cli(bin_dir, origin=server.origin, version_line=version_line, log_path=log_path)
+    monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
+    return log_path
 
 
 def cli_calls(log_path: Path) -> list[list[str]]:

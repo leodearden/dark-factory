@@ -8,9 +8,10 @@ the wire it uses in production.
 from __future__ import annotations
 
 import json
-import os
+import math
 import socket
 import stat
+import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,6 +19,7 @@ from typing import Any
 
 import pytest
 from _fake_t3_server import (
+    DEAD_ORIGIN,
     DECISION_PATH,
     ENVIRONMENT_ID,
     PAIRING_CREATE_MODE_ENV,
@@ -28,12 +30,13 @@ from _fake_t3_server import (
     ToolFailure,
     ToolSuccess,
     cli_calls,
-    install_fake_t3_cli,
+    put_fake_t3_cli_on_path,
 )
 
 from orchestrator import t3_mcp_client as client
 
 NOW = datetime(2026, 11, 2, 12, 0, 0, tzinfo=UTC)
+OTHER_ENVIRONMENT_ID = '7c1e0d9b-2a3f-4b5c-8d6e-0f1a2b3c4d5e'
 
 CREDENTIAL_KEYS = {
     'schema_version',
@@ -83,11 +86,16 @@ def framed_server(request: pytest.FixtureRequest) -> Iterator[FakeT3Server]:
 
 
 def seed_credential(
-    server: FakeT3Server, root: Path, *, expires_at: datetime | None = None, access_token: str | None = None
+    server: FakeT3Server,
+    root: Path,
+    *,
+    expires_at: datetime | None = None,
+    access_token: str | None = None,
+    origin: str | None = None,
 ) -> client.Credential:
     paired_at = datetime.now(UTC).replace(microsecond=0)
     credential = make_credential(
-        origin=server.origin,
+        origin=origin if origin is not None else server.origin,
         environment_id=server.environment_id,
         access_token=access_token if access_token is not None else server.issue_token(),
         paired_at=paired_at,
@@ -97,28 +105,13 @@ def seed_credential(
     return credential
 
 
-def install_cli(server: FakeT3Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version_line: str) -> Path:
-    """Put a fake ``t3`` minting on ``server`` first on PATH; returns its argv log."""
-    bin_dir, log_path = tmp_path / 'bin', tmp_path / 't3-cli.log'
-    install_fake_t3_cli(bin_dir, origin=server.origin, version_line=version_line, log_path=log_path)
-    monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
-    return log_path
-
-
 @pytest.fixture
 def t3_cli(t3_server: FakeT3Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """The real CLI's version line for the fake server's version."""
-    return install_cli(t3_server, tmp_path, monkeypatch, 't3 v0.1.6')
+    return put_fake_t3_cli_on_path(t3_server, tmp_path, monkeypatch, version_line='t3 v0.1.6')
 
 
 PAIRING_CREATE = ['auth', 'pairing', 'create', '--json']
-
-
-def closed_origin() -> str:
-    with socket.socket() as sock:
-        sock.bind(('127.0.0.1', 0))
-        port = sock.getsockname()[1]
-    return f'http://127.0.0.1:{port}'
 
 
 def connected(server: FakeT3Server, root: Path, **options: Any) -> client.T3McpClient:
@@ -296,19 +289,55 @@ class TestCall:
         assert isinstance(result, client.TransportFailed)
         assert result.fault is client.TransportFault.PROTOCOL
 
-    def test_a_server_gone_after_connect_is_unreachable(self, fleet: Path):
-        with FakeT3Server.running() as server:
-            seed_credential(server, fleet)
-            mcp = connected(server, fleet)
-            assert isinstance(mcp.call('t3_environment_read', {}), client.ToolOk)
+    def test_a_server_hanging_up_after_connect_is_unreachable(self, t3_server: FakeT3Server, fleet: Path):
+        seed_credential(t3_server, fleet)
+        mcp = connected(t3_server, fleet)
+        assert isinstance(mcp.call('t3_environment_read', {}), client.ToolOk)
+        t3_server.hangs_up = True
 
         result = mcp.call('t3_environment_read', {})
 
         assert isinstance(result, client.TransportFailed)
         assert result.fault is client.TransportFault.UNREACHABLE
 
+    def test_a_client_of_a_dead_origin_is_unreachable(self):
+        result = client.T3McpClient(DEAD_ORIGIN, make_credential(origin=DEAD_ORIGIN)).call('t3_environment_read', {})
+
+        assert isinstance(result, client.TransportFailed)
+        assert result.fault is client.TransportFault.UNREACHABLE
+
+    def test_a_server_request_bearing_the_request_id_is_not_taken_for_the_reply(
+        self, t3_server: FakeT3Server, fleet: Path
+    ):
+        t3_server.framing = 'sse'
+        t3_server.pings_with_the_request_id = True
+        seed_credential(t3_server, fleet)
+
+        result = connected(t3_server, fleet).call('t3_environment_read', {})
+
+        assert isinstance(result, client.ToolOk)
+
+    def test_the_handshake_on_a_silent_server_gives_up_after_the_http_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(client, 'HTTP_TIMEOUT_SECS', 0.2)
+        with socket.create_server(('127.0.0.1', 0)) as silent:
+            origin = f'http://127.0.0.1:{silent.getsockname()[1]}'
+            mcp = client.T3McpClient(origin, make_credential(origin=origin))
+            outcome: list[client.CallResult] = []
+            caller = threading.Thread(target=lambda: outcome.append(mcp.call('t3_environment_read', {})), daemon=True)
+            caller.start()
+            caller.join(timeout=10)
+            gave_up_in_time = not caller.is_alive()
+        caller.join(timeout=10)
+
+        assert gave_up_in_time
+        [result] = outcome
+        assert isinstance(result, client.TransportFailed)
+        assert result.fault is client.TransportFault.UNREACHABLE
+
     def test_connect_to_a_closed_port_fails_on_the_descriptor(self, fleet: Path):
-        result = client.connect(closed_origin(), root=fleet)
+        result = client.connect(DEAD_ORIGIN, root=fleet)
 
         assert isinstance(result, client.ConnectFailed)
         assert result.reason is client.DescriptorFailure.UNREACHABLE
@@ -329,6 +358,18 @@ class TestCall:
         assert result.reason is client.ConnectFailure.CREDENTIAL_EXPIRED
         assert touched_mcp_or_oauth(t3_server) == []
 
+    def test_connect_never_sends_a_bearer_issued_for_another_origin(self, t3_server: FakeT3Server, fleet: Path):
+        seed_credential(t3_server, fleet, origin='https://elsewhere.example')
+
+        result = client.connect(t3_server.origin, root=fleet)
+        status = client.credential_status_at(t3_server.origin, root=fleet)
+
+        assert isinstance(result, client.ConnectFailed)
+        assert result.reason is client.ConnectFailure.UNPAIRED
+        assert touched_mcp_or_oauth(t3_server) == []
+        assert isinstance(status, client.CredentialStatus)
+        assert status.state is client.CredentialState.UNPAIRED
+
     def test_credential_status_at_selects_the_file_the_descriptor_names(self, t3_server: FakeT3Server, fleet: Path):
         seed_credential(t3_server, fleet)
 
@@ -339,7 +380,7 @@ class TestCall:
         assert status.state is client.CredentialState.PAIRED
 
     def test_credential_status_at_a_closed_port_is_unreachable(self, fleet: Path):
-        status = client.credential_status_at(closed_origin(), root=fleet)
+        status = client.credential_status_at(DEAD_ORIGIN, root=fleet)
 
         assert isinstance(status, client.DescriptorFailed)
         assert status.reason is client.DescriptorFailure.UNREACHABLE
@@ -365,7 +406,7 @@ class TestDescriptor:
         assert result.detail
 
     def test_a_closed_port_is_unreachable(self):
-        result = client.fetch_descriptor(closed_origin())
+        result = client.fetch_descriptor(DEAD_ORIGIN)
 
         assert isinstance(result, client.DescriptorFailed)
         assert result.reason is client.DescriptorFailure.UNREACHABLE
@@ -448,17 +489,62 @@ class TestPairWithOperatorCode:
         assert t3_server.oauth_calls(TOKEN_PATH) == []
         assert no_credential_written(fleet)
 
+    def test_a_redirect_for_another_state_is_rejected_before_any_token_request(
+        self, t3_server: FakeT3Server, fleet: Path
+    ):
+        t3_server.decision_state_override = 'forged-state'
+
+        result = client.pair(t3_server.origin, client.OperatorCode(t3_server.add_pairing_code()), root=fleet)
+
+        assert isinstance(result, client.PairFailed)
+        assert result.reason is client.PairFailure.PAIRING_REJECTED
+        assert t3_server.oauth_calls(TOKEN_PATH) == []
+        assert no_credential_written(fleet)
+
+    @pytest.mark.parametrize(
+        'override',
+        [
+            {'token_type': 'mac'},
+            {'expires_in': math.inf},
+            {'expires_in': math.nan},
+            {'expires_in': 1e12},
+            {'expires_in': 0},
+            {'expires_in': '3600'},
+            {'expires_in': True},
+        ],
+        ids=['not-bearer', 'infinite', 'nan', 'beyond-datetime', 'zero', 'string', 'bool'],
+    )
+    def test_an_unusable_token_reply_is_incompatible_and_not_stored(
+        self, t3_server: FakeT3Server, fleet: Path, override: dict[str, Any]
+    ):
+        t3_server.token_reply_overrides = override
+
+        result = client.pair(t3_server.origin, client.OperatorCode(t3_server.add_pairing_code()), root=fleet)
+
+        assert isinstance(result, client.PairFailed)
+        assert result.reason is client.PairFailure.INCOMPATIBLE
+        assert t3_server.mcp_requests() == []
+        assert no_credential_written(fleet)
+
+    def test_a_token_whose_validation_call_is_refused_is_not_stored(self, t3_server: FakeT3Server, fleet: Path):
+        t3_server.tool_replies['t3_environment_read'] = ToolFailure('forbidden', 'This credential cannot read.')
+
+        result = client.pair(t3_server.origin, client.OperatorCode(t3_server.add_pairing_code()), root=fleet)
+
+        assert isinstance(result, client.PairFailed)
+        assert result.reason is client.PairFailure.PAIRING_REJECTED
+        assert result.detail is not None and 'forbidden' in result.detail
+        assert no_credential_written(fleet)
+
     def test_an_unreachable_descriptor_fails_before_any_exchange(self, fleet: Path):
-        result = client.pair(closed_origin(), client.OperatorCode('any'), root=fleet)
+        result = client.pair(DEAD_ORIGIN, client.OperatorCode('any'), root=fleet)
 
         assert isinstance(result, client.PairFailed)
         assert result.reason is client.DescriptorFailure.UNREACHABLE
         assert no_credential_written(fleet)
 
     def test_a_token_answering_for_another_environment_is_not_stored(self, t3_server: FakeT3Server, fleet: Path):
-        t3_server.tool_replies['t3_environment_read'] = ToolSuccess(
-            {'environmentId': 'another-environment', 'label': 'x', 'serverVersion': '0.1.6', 'platform': {}, 'preferences': {}}
-        )
+        t3_server.tool_replies['t3_environment_read'] = ToolSuccess({'environmentId': OTHER_ENVIRONMENT_ID})
 
         result = client.pair(t3_server.origin, client.OperatorCode(t3_server.add_pairing_code()), root=fleet)
 
@@ -483,7 +569,7 @@ class TestSelfPair:
     def test_a_cli_of_another_version_mints_nothing(
         self, t3_server: FakeT3Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fleet: Path
     ):
-        log = install_cli(t3_server, tmp_path, monkeypatch, 't3 v0.1.4')
+        log = put_fake_t3_cli_on_path(t3_server, tmp_path, monkeypatch, version_line='t3 v0.1.4')
 
         result = client.pair(t3_server.origin, client.CliCodeSource(), root=fleet)
 
@@ -500,7 +586,7 @@ class TestSelfPair:
     def test_an_unparsable_version_line_mints_nothing(
         self, t3_server: FakeT3Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fleet: Path
     ):
-        log = install_cli(t3_server, tmp_path, monkeypatch, 'garbage')
+        log = put_fake_t3_cli_on_path(t3_server, tmp_path, monkeypatch, version_line='garbage')
 
         result = client.pair(t3_server.origin, client.CliCodeSource(), root=fleet)
 
@@ -592,12 +678,30 @@ class TestCredentialRecovery:
         assert isinstance(result, client.ToolOk)
         assert cli_calls(t3_cli).count(PAIRING_CREATE) == 1
 
-    @pytest.mark.parametrize('stored', ['expired', 'unpaired'])
+    def test_a_repair_answering_as_another_environment_does_not_switch_the_client(
+        self, t3_server: FakeT3Server, t3_cli: Path, fleet: Path
+    ):
+        seed_credential(t3_server, fleet)
+        mcp = connected(t3_server, fleet, repair=client.CliCodeSource())
+        assert isinstance(mcp.call('t3_environment_read', {}), client.ToolOk)
+        t3_server.answer_as(OTHER_ENVIRONMENT_ID)
+        t3_server.revoke_tokens()
+
+        result = mcp.call('t3_environment_read', {})
+
+        assert isinstance(result, client.TransportFailed)
+        assert result.fault is client.TransportFault.CREDENTIAL_EXPIRED
+        assert ENVIRONMENT_ID in result.detail and OTHER_ENVIRONMENT_ID in result.detail
+        assert mcp.environment_id == ENVIRONMENT_ID
+
+    @pytest.mark.parametrize('stored', ['expired', 'unpaired', 'another-origin'])
     def test_connect_with_a_repair_source_self_pairs_an_unusable_credential(
         self, t3_server: FakeT3Server, t3_cli: Path, fleet: Path, stored: str
     ):
         if stored == 'expired':
             seed_credential(t3_server, fleet, expires_at=datetime.now(UTC) + timedelta(minutes=30))
+        if stored == 'another-origin':
+            seed_credential(t3_server, fleet, origin='https://elsewhere.example')
 
         result = client.connect(t3_server.origin, root=fleet, repair=client.CliCodeSource())
 
@@ -606,12 +710,13 @@ class TestCredentialRecovery:
         assert status.state is client.CredentialState.PAIRED
         assert status.credential is not None
         assert status.credential.paired_by is client.PairedBy.SELF_PAIR
+        assert status.credential.origin == t3_server.origin
         assert isinstance(result.call('t3_environment_read', {}), client.ToolOk)
 
     def test_connect_whose_self_pair_is_refused_leaves_the_old_file(
         self, t3_server: FakeT3Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fleet: Path
     ):
-        install_cli(t3_server, tmp_path, monkeypatch, 't3 v0.1.4')
+        put_fake_t3_cli_on_path(t3_server, tmp_path, monkeypatch, version_line='t3 v0.1.4')
         seed_credential(t3_server, fleet, expires_at=datetime.now(UTC) + timedelta(minutes=30))
         path = client.credential_path(t3_server.environment_id, root=fleet)
         before = path.read_bytes()

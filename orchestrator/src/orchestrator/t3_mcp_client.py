@@ -24,6 +24,7 @@ import http.client
 import ipaddress
 import itertools
 import json
+import math
 import os
 import re
 import shutil
@@ -53,7 +54,11 @@ EXPIRY_MARGIN = timedelta(hours=1)
 T3_MAX_WAIT_SLICE_SECS = 3600
 """T3's ``OrchestratorMcpService.ts`` ``MAX_WAIT_TIMEOUT_MS``: the longest wait a tool call may hold."""
 MCP_READ_TIMEOUT_SECS = T3_MAX_WAIT_SLICE_SECS + 60
+"""How long a tool call may wait for its reply by default: long enough for a full wait slice."""
 HTTP_TIMEOUT_SECS = 30
+"""How long every other request waits: the descriptor, OAuth, and the MCP handshake."""
+MAX_TOKEN_LIFETIME_SECS = 10 * 365 * 24 * 3600
+"""The longest ``expires_in`` accepted, far past T3's 30 days and well inside datetime's range."""
 CLI_TIMEOUT_SECS = 60
 
 _DESCRIPTOR_PATH = '/.well-known/t3/environment'
@@ -348,11 +353,19 @@ def fetch_descriptor(origin: str) -> Descriptor | DescriptorFailed:
 def credential_status_at(
     origin: str, *, root: Path | str | None = None, now: datetime | None = None
 ) -> CredentialStatus | DescriptorFailed:
-    """The credential state for whichever environment ``origin`` answers as."""
-    descriptor = fetch_descriptor(origin)
+    """The credential state for whichever environment ``origin`` answers as.
+
+    A credential issued for another origin is UNPAIRED here: its bearer was
+    issued for that origin's ``/mcp``, so it is never sent to this one.
+    """
+    checked = checked_origin(origin)
+    descriptor = fetch_descriptor(checked)
     if isinstance(descriptor, DescriptorFailed):
         return descriptor
-    return read_credential_status(descriptor.environment_id, root=root, now=now)
+    status = read_credential_status(descriptor.environment_id, root=root, now=now)
+    if status.credential is not None and status.credential.origin != checked:
+        return CredentialStatus(CredentialState.UNPAIRED, descriptor.environment_id, None)
+    return status
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +392,13 @@ def _sse_event_data(stream: http.client.HTTPResponse) -> Iterator[str]:
 
 
 def _is_reply_to(message: object, request_id: int) -> bool:
-    return isinstance(message, dict) and message.get('id') == request_id
+    """A response to ``request_id``; a server-to-client request such as ``ping`` carries an id of its own."""
+    return (
+        isinstance(message, dict)
+        and 'method' not in message
+        and ('result' in message or 'error' in message)
+        and message.get('id') == request_id
+    )
 
 
 def _read_message(response: _Response, request_id: int) -> dict[str, Any] | TransportFailed:
@@ -397,7 +416,7 @@ def _read_message(response: _Response, request_id: int) -> dict[str, Any] | Tran
     except ValueError as error:
         return TransportFailed(TransportFault.PROTOCOL, f'request {request_id}: undecodable reply: {error}')
     if not _is_reply_to(message, request_id):
-        return TransportFailed(TransportFault.PROTOCOL, f'request {request_id}: the reply names another request')
+        return TransportFailed(TransportFault.PROTOCOL, f'request {request_id}: the body is not a reply to it')
     return message
 
 
@@ -478,18 +497,21 @@ class T3McpClient:
     def environment_id(self) -> str:
         return self._credential.environment_id
 
-    def call(self, tool: str, arguments: Mapping[str, Any]) -> CallResult:
-        outcome = self._attempt(tool, arguments)
+    def call(
+        self, tool: str, arguments: Mapping[str, Any], *, read_timeout: float = MCP_READ_TIMEOUT_SECS
+    ) -> CallResult:
+        """One ``tools/call``, waiting up to ``read_timeout`` for its reply; the handshake waits :data:`HTTP_TIMEOUT_SECS`."""
+        outcome = self._attempt(tool, arguments, read_timeout)
         if outcome is _Refusal.SESSION_LOST:
             self._session = None
-            outcome = self._attempt(tool, arguments)
+            outcome = self._attempt(tool, arguments, read_timeout)
         if outcome is _Refusal.UNAUTHORIZED:
-            outcome = self._repaired_attempt(tool, arguments)
+            outcome = self._repaired_attempt(tool, arguments, read_timeout)
         if isinstance(outcome, _Refusal):
             return TransportFailed(_UNRECOVERED_FAULT[outcome], f'{tool}: {outcome.value} again after recovery')
         return outcome
 
-    def _repaired_attempt(self, tool: str, arguments: Mapping[str, Any]) -> CallResult | _Refusal:
+    def _repaired_attempt(self, tool: str, arguments: Mapping[str, Any], read_timeout: float) -> CallResult | _Refusal:
         if self._repair is None or self._repaired:
             spent = 'no repair source' if self._repair is None else 'already re-paired once'
             return TransportFailed(TransportFault.CREDENTIAL_EXPIRED, f'{tool}: T3 refused the bearer ({spent})')
@@ -499,23 +521,29 @@ class T3McpClient:
             return TransportFailed(
                 TransportFault.CREDENTIAL_EXPIRED, f'{tool}: T3 refused the bearer; re-pair {paired.summary()}'
             )
+        if paired.credential.environment_id != self.environment_id:
+            detail = (
+                f'{tool}: T3 refused the bearer; {self._origin} now answers as environment '
+                f'{paired.credential.environment_id}, not {self.environment_id}'
+            )
+            return TransportFailed(TransportFault.CREDENTIAL_EXPIRED, detail)
         self._credential = paired.credential
         self._session = None
-        return self._attempt(tool, arguments)
+        return self._attempt(tool, arguments, read_timeout)
 
-    def _attempt(self, tool: str, arguments: Mapping[str, Any]) -> CallResult | _Refusal:
+    def _attempt(self, tool: str, arguments: Mapping[str, Any], read_timeout: float) -> CallResult | _Refusal:
         if self._session is None:
             refused = self._initialize()
             if refused is not None:
                 return refused
-        reply = self._rpc('tools/call', {'name': tool, 'arguments': dict(arguments)})
+        reply = self._rpc('tools/call', {'name': tool, 'arguments': dict(arguments)}, timeout=read_timeout)
         if isinstance(reply, _RpcResult):
             return _tool_result(reply.result)
         return reply
 
     def _initialize(self) -> TransportFailed | _Refusal | None:
         params = {'protocolVersion': PROTOCOL_VERSION, 'capabilities': {}, 'clientInfo': {'name': SOFTWARE_ID, 'version': '1'}}
-        reply = self._rpc('initialize', params)
+        reply = self._rpc('initialize', params, timeout=HTTP_TIMEOUT_SECS)
         if not isinstance(reply, _RpcResult):
             return reply
         self._session = {'Mcp-Session-Id': reply.session_id} if reply.session_id else {}
@@ -525,7 +553,7 @@ class T3McpClient:
         return refused
 
     def _notify_initialized(self) -> TransportFailed | _Refusal | None:
-        response = self._post({'jsonrpc': '2.0', 'method': 'notifications/initialized'})
+        response = self._post({'jsonrpc': '2.0', 'method': 'notifications/initialized'}, timeout=HTTP_TIMEOUT_SECS)
         if isinstance(response, TransportFailed):
             return response
         with contextlib.closing(response):
@@ -541,9 +569,11 @@ class T3McpClient:
             return _Refusal.SESSION_LOST
         return TransportFailed(TransportFault.PROTOCOL, f'{method}: HTTP {status}')
 
-    def _rpc(self, method: str, params: Mapping[str, Any]) -> _RpcResult | TransportFailed | _Refusal:
+    def _rpc(
+        self, method: str, params: Mapping[str, Any], *, timeout: float
+    ) -> _RpcResult | TransportFailed | _Refusal:
         request_id = next(self._request_ids)
-        response = self._post({'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params})
+        response = self._post({'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params}, timeout=timeout)
         if isinstance(response, TransportFailed):
             return response
         with contextlib.closing(response):
@@ -561,7 +591,7 @@ class T3McpClient:
             return TransportFailed(TransportFault.PROTOCOL, f'{method}: a reply without a result object')
         return _RpcResult(result, response.header('Mcp-Session-Id'))
 
-    def _post(self, message: Mapping[str, Any]) -> _Response | TransportFailed:
+    def _post(self, message: Mapping[str, Any], *, timeout: float) -> _Response | TransportFailed:
         headers = {
             'Content-Type': 'application/json',
             'Accept': 'application/json, text/event-stream',
@@ -570,7 +600,7 @@ class T3McpClient:
             **(self._session or {}),
         }
         body = json.dumps(message).encode()
-        return _open(self._origin, 'POST', _MCP_PATH, body=body, headers=headers, timeout=MCP_READ_TIMEOUT_SECS)
+        return _open(self._origin, 'POST', _MCP_PATH, body=body, headers=headers, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -791,9 +821,19 @@ def _redeem(origin: str, client_id: str, authorization_code: str, *, verifier: s
     access_token, expires_in = token.get('access_token'), token.get('expires_in')
     if token.get('token_type') != 'Bearer' or not isinstance(access_token, str) or not access_token:
         return PairFailed(PairFailure.INCOMPATIBLE, f'{_TOKEN_PATH}: no Bearer access_token')
-    if isinstance(expires_in, bool) or not isinstance(expires_in, int | float) or expires_in <= 0:
+    lifetime_secs = _lifetime_secs(expires_in)
+    if lifetime_secs is None:
         return PairFailed(PairFailure.INCOMPATIBLE, f'{_TOKEN_PATH}: unusable expires_in {expires_in!r}')
-    return _Issued(client_id, access_token, int(expires_in))
+    return _Issued(client_id, access_token, lifetime_secs)
+
+
+def _lifetime_secs(expires_in: object) -> int | None:
+    """Whole seconds when ``expires_in`` is finite and in (0, :data:`MAX_TOKEN_LIFETIME_SECS`]; JSON admits ``Infinity`` and ``NaN``."""
+    if isinstance(expires_in, bool) or not isinstance(expires_in, int | float):
+        return None
+    if not math.isfinite(expires_in) or not 0 < expires_in <= MAX_TOKEN_LIFETIME_SECS:
+        return None
+    return int(expires_in)
 
 
 def _exchange(origin: str, code: str) -> _Issued | PairFailed:
@@ -818,7 +858,8 @@ _VALIDATION_FAILURE = {
 
 def _validation_refusal(credential: Credential, *, root: Path | str | None) -> PairFailed | None:
     """None when one ``t3_environment_read`` on the new token answers for the descriptor's environment."""
-    result = T3McpClient(credential.origin, credential, root=root).call('t3_environment_read', {})
+    validator = T3McpClient(credential.origin, credential, root=root)
+    result = validator.call('t3_environment_read', {}, read_timeout=HTTP_TIMEOUT_SECS)
     if isinstance(result, TransportFailed):
         return PairFailed(_VALIDATION_FAILURE[result.fault], f't3_environment_read: {result.detail}')
     if isinstance(result, ToolFailed):
