@@ -162,20 +162,25 @@ class TestRepairDuplicateEdgeUuids:
             return result
 
         graph = make_graph_mock([])
-        graph.query = AsyncMock(side_effect=router)
+        graph.ro_query = AsyncMock(side_effect=router)
         backend._driver._get_graph = MagicMock(return_value=graph)
 
         result = await backend._repair_duplicate_edge_uuids(group_id='g1')
 
         assert result == 2
 
-        all_calls = graph.query.call_args_list
-        detection_calls = [c for c in all_calls if 'collect(ID(e))' in extract_cypher(c)]
-        repair_calls = [c for c in all_calls if 'WHERE ID(e) = $eid' in extract_cypher(c)]
+        detection_calls = [
+            c for c in graph.ro_query.call_args_list if 'collect(ID(e))' in extract_cypher(c)
+        ]
+        write_calls = graph.query.call_args_list
+        repair_calls = [c for c in write_calls if 'WHERE ID(e) = $eid' in extract_cypher(c)]
 
         assert len(detection_calls) == 1
         assert 'group_id' not in extract_cypher(detection_calls[0])
         assert 'group_id' not in extract_params(detection_calls[0])
+        assert not any('collect(ID(e))' in extract_cypher(c) for c in write_calls), (
+            'dup-uuid detection must be read over GRAPH.RO_QUERY, never GRAPH.QUERY'
+        )
 
         assert len(repair_calls) == 2, (
             f'expected one per-edge repair call per re-minted edge, got '
@@ -213,8 +218,8 @@ class TestRepairDuplicateEdgeUuids:
     async def test_clean_graph_no_dup_uuids_is_noop(
         self, mock_config, make_backend, make_graph_mock,
     ):
-        """No dup-uuid groups -> return 0 and zero repair queries (only the
-        detection query ran)."""
+        """No dup-uuid groups -> return 0 and zero GRAPH.QUERY write commands
+        (only the read-only detection ran)."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
@@ -222,7 +227,8 @@ class TestRepairDuplicateEdgeUuids:
         result = await backend._repair_duplicate_edge_uuids(group_id='g1')
 
         assert result == 0
-        graph.query.assert_awaited_once()
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
