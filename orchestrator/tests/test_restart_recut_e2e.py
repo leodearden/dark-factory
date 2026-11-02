@@ -38,7 +38,7 @@ from _workflow_helpers import (
     AgentStub,
     _build_harness,
     _build_workflow_with_escalation,
-    _derive_meta_root_like_production,  # noqa: F401 — autouse fixture, imported to activate
+    _derive_meta_root_like_production,
     _init_repo,
 )
 from escalation.models import Escalation
@@ -63,7 +63,11 @@ from orchestrator.recut_ruling import (
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
 
-pytestmark = pytest.mark.asyncio
+# Autouse; named here so the agent-side doubles resolve the meta_root production does.
+pytestmark = [
+    pytest.mark.asyncio,
+    pytest.mark.usefixtures(_derive_meta_root_like_production.__name__),
+]
 
 TASK_ID = '42'
 TITLE = 'Add farewell function'
@@ -137,10 +141,11 @@ def queue(tmp_path: Path) -> EscalationQueue:
 @pytest.fixture
 def harness(
     config: OrchestratorConfig, store: TaskStoreDouble, queue: EscalationQueue,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> Harness:
     h = _build_harness(config)
     store.wire_into(h.scheduler)
-    h.is_workflow_active = lambda task_id: False  # type: ignore[method-assign]
+    monkeypatch.setattr(h, 'is_workflow_active', lambda task_id: False)
     h._escalation_queue = queue
     queue.set_resolve_callback(h._on_escalation_resolved)
     return h
@@ -214,7 +219,7 @@ async def _resolve_plan_touch_block(
 
 async def _dispatch(
     config: OrchestratorConfig, git_ops: GitOps, store: TaskStoreDouble,
-    agents: AgentStub, tmp_path: Path,
+    agents: AgentStub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[RecutGateResult, _EventRecorder]:
     """The next dispatch: the re-cut gate on the stored task, then the workflow."""
     gate = await enforce_recut_ruling(
@@ -230,20 +235,20 @@ async def _dispatch(
         config, git_ops, assignment, agents, tmp_path,
     )
     events = _EventRecorder()
-    workflow.event_store = events  # type: ignore[assignment]
+    monkeypatch.setattr(workflow, 'event_store', events)
     await workflow.run()
     return gate, events
 
 
 async def test_plain_restart_reuses_the_prior_plan_without_the_architect(
-    config, git_ops, store, queue, harness, agents, tmp_path,
+    config, git_ops, store, queue, harness, agents, tmp_path, monkeypatch,
 ):
     await _seed_prior_incarnation(git_ops)
     await _resolve_plan_touch_block(harness, queue, action='restart')
     assert store.status(TASK_ID) == 'pending'
     assert RECUT_RULING_KEY not in store.metadata(TASK_ID)
 
-    gate, events = await _dispatch(config, git_ops, store, agents, tmp_path)
+    gate, events = await _dispatch(config, git_ops, store, agents, tmp_path, monkeypatch)
 
     assert gate.verdict is GateVerdict.PROCEED
     assert events.lever_b_skips(), 'the seed must be Lever-B eligible'
@@ -254,14 +259,14 @@ async def test_plain_restart_reuses_the_prior_plan_without_the_architect(
 
 
 async def test_recut_restart_parks_the_prior_incarnation_and_runs_the_architect(
-    config, git_ops, store, queue, harness, agents, tmp_path,
+    config, git_ops, store, queue, harness, agents, tmp_path, monkeypatch,
 ):
     prior_tip = await _seed_prior_incarnation(git_ops)
     esc = await _resolve_plan_touch_block(harness, queue, action='restart', recut=True)
     assert store.status(TASK_ID) == 'pending'
     assert store.metadata(TASK_ID)[RECUT_RULING_KEY]['ruling_id'] == esc.id
 
-    gate, events = await _dispatch(config, git_ops, store, agents, tmp_path)
+    gate, events = await _dispatch(config, git_ops, store, agents, tmp_path, monkeypatch)
 
     assert gate.verdict is GateVerdict.EXECUTED, gate.reason
     assert agents.calls[0] == 'architect'
