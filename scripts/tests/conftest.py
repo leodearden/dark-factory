@@ -42,7 +42,6 @@ drive the shared session runner end to end.
 """
 import json
 import os
-import shutil
 import sqlite3
 import sys
 from datetime import UTC, datetime, timedelta
@@ -84,6 +83,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from df_pytest_isolation import (  # noqa: E402
+    _df_claude_binary_unset,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_fleet_deploy_clock_redirect,  # noqa: F401  — the binding IS the wiring
     _df_fleet_dir_redirect,  # noqa: F401  — the binding IS the wiring
@@ -641,9 +641,10 @@ def runs_db(runs_db_path):
 #
 # The legibility trickle and census spawn `claude` through the shared runner
 # (shared.cli_invoke.invoke_with_cap_retry -> invoke_claude_agent), which
-# resolves the BARE name against PATH. These fixtures put a fake first on PATH
-# and give it a per-token script, so a suite can drive a real UsageGate through
-# failover, auth rejection and caps without any real CLI being reachable.
+# resolves CLAUDE_BINARY, else the bare name, against PATH. These fixtures put a
+# fake first on PATH and give it a per-token script, so a suite can drive a real
+# UsageGate through failover, auth rejection and caps without any real CLI
+# being reachable.
 # ---------------------------------------------------------------------------
 
 _FAKE_CLAUDE_PLAN_ENV = 'FAKE_CLAUDE_PLAN'
@@ -762,12 +763,15 @@ class FakeClaudeCli:
 def fake_claude_cli(tmp_path, monkeypatch):
     """Install a :class:`FakeClaudeCli` as the only `claude` on PATH.
 
-    Prepended to PATH and then PROVEN to win: ``shutil.which('claude')`` must
-    resolve to the fake, so no test using this fixture can ever reach the real
-    CLI (real LLM spend, and a test passing for the wrong reason). The shebang
-    is ``sys.executable``, so the fake needs nothing else on PATH to start.
-    Starts with the default plan; call ``.plan(...)`` to script it.
+    Prepended to PATH and then PROVEN to win: ``resolve_claude_binary()``, the
+    resolution the spawn itself performs, must return the fake, so no test
+    using this fixture can ever reach the real CLI (real LLM spend, and a test
+    passing for the wrong reason). The shebang is ``sys.executable``, so the
+    fake needs nothing else on PATH to start. Starts with the default plan;
+    call ``.plan(...)`` to script it.
     """
+    from shared.cli_invoke import resolve_claude_binary
+
     bin_dir = tmp_path / 'fake-claude-bin'
     bin_dir.mkdir()
     state_dir = tmp_path / 'fake-claude-state'
@@ -781,9 +785,9 @@ def fake_claude_cli(tmp_path, monkeypatch):
     monkeypatch.setenv(_FAKE_CLAUDE_PLAN_ENV, str(fake._plan_path))
     monkeypatch.setenv(_FAKE_CLAUDE_CALLS_ENV, str(fake._calls_path))
     monkeypatch.setenv('PATH', f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
-    assert shutil.which('claude') == str(fake.path), (
-        f"the fake claude at {fake.path} must be the one PATH resolves; "
-        f"got {shutil.which('claude')!r}"
+    assert resolve_claude_binary() == str(fake.path), (
+        f"the fake claude at {fake.path} must be the one the spawn resolves; "
+        f"got {resolve_claude_binary()!r}"
     )
     return fake
 

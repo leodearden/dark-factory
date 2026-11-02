@@ -270,6 +270,16 @@ scoped, unlike all four siblings, because its hazard is introduced MID-session
 by another test rather than present at session start — task 4966 measured
 exactly that as a 1-in-3 flake, green standalone and green in its own file.
 
+SIXTH DEFENCE — an ambient ``CLAUDE_BINARY`` can never reroute a faked ``claude``.
+
+Since task 4448 every shared claude spawn takes ``CLAUDE_BINARY`` ahead of PATH,
+so a test that hides or fakes ``claude`` by editing PATH, and proves it with
+``shutil.which``, passes for the wrong reason under an operator's override: the
+spawn runs the real CLI.  ``_df_claude_binary_unset`` is function scoped, for
+the same mid-session reason as the fifth.  The literal name is pinned to
+shared's resolver behaviourally by
+``tests/scripts/test_claude_binary_isolation.py``.
+
 Import constraint: STDLIB + PYTEST ONLY.  Every subproject conftest imports this
 module, so it must import cleanly inside every member venv — escalation's lacks
 aiosqlite and stubs ``shared`` in ``sys.modules``, so nothing under ``shared/src``
@@ -2836,3 +2846,24 @@ def _df_git_env_hermetic():
         for key in git_redirect_env(os.environ):
             del os.environ[key]
         os.environ.update(saved)
+
+
+# ---------------------------------------------------------------------------
+# Ambient claude-binary override
+# ---------------------------------------------------------------------------
+
+CLAUDE_BINARY_ENV = 'CLAUDE_BINARY'
+
+
+@pytest.fixture(autouse=True)
+def _df_claude_binary_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SIXTH DEFENCE — an ambient ``CLAUDE_BINARY`` never reaches a test body.
+
+    ``shared.cli_invoke::claude_binary_spec`` reads it ahead of PATH, so a test
+    that hides or fakes ``claude`` by editing PATH can still be routed to the
+    real CLI, and verify inherits the orchestrator's environment. FUNCTION
+    scoped like :func:`_df_git_env_hermetic`, because a leak can arrive
+    mid-session. ``monkeypatch`` restores the pre-test value, and a test may
+    still set the variable deliberately.
+    """
+    monkeypatch.delenv(CLAUDE_BINARY_ENV, raising=False)

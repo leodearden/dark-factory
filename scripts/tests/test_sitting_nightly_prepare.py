@@ -1,7 +1,8 @@
 """Tests for scripts/sitting/nightly_prepare.py — the 05:30 headless Fable prepare run (task 5376).
 
 The real ``claude`` is never reached: every test hands ``--claude-bin`` a
-recording fake and ``main`` a hand-rolled gate, so no account is leased from
+recording fake, or sets ``CLAUDE_BINARY`` to one on a PATH stripped of
+``claude``, and hands ``main`` a hand-rolled gate, so no account is leased from
 the live pool and no model is billed.
 """
 from __future__ import annotations
@@ -16,7 +17,7 @@ from pathlib import Path
 
 import pytest
 from legibility import account_pool
-from shared.cli_invoke import build_claude_argv
+from shared.cli_invoke import build_claude_argv, resolve_claude_binary
 from shared.usage_gate import AccountLease
 from sitting import nightly_prepare as mod
 from sitting import prepare_sitting
@@ -195,6 +196,14 @@ def _flag_values(argv: list[str], flag: str) -> list[str]:
 
 def _sysprompt_path(call: dict) -> Path:
     return Path(call['sysprompt_path'])
+
+
+def _strip_claude_from_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Leave no `claude` on PATH, so a bare default can never reach the real CLI."""
+    empty_bin = tmp_path / 'empty-bin'
+    empty_bin.mkdir()
+    monkeypatch.setenv('PATH', f'{empty_bin}{os.pathsep}/usr/bin')
+    assert resolve_claude_binary() is None, 'the premise: no claude is reachable'
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +572,39 @@ def test_a_missing_binary_is_a_configuration_error_and_leases_nothing(tmp_path, 
     assert rc == mod.EXIT_CONFIG
     assert gate.leases == 0
     assert 'no-such-claude' in capsys.readouterr().err
+
+
+def test_with_no_flag_the_run_spawns_claude_binary(tmp_path, monkeypatch):
+    _strip_claude_from_path(tmp_path, monkeypatch)
+    fake = _fake_claude(tmp_path)
+    monkeypatch.setenv('CLAUDE_BINARY', str(fake.bin))
+
+    rc = mod.main([], gate=_live_gate(), root=fake.root)
+
+    assert rc == mod.EXIT_OK
+    assert fake.only_call()['argv'][0] == str(fake.bin)
+
+
+def test_the_flag_outranks_claude_binary(tmp_path, monkeypatch):
+    fake = _fake_claude(tmp_path)
+    monkeypatch.setenv('CLAUDE_BINARY', str(tmp_path / 'no-such-claude'))
+
+    rc = mod.main(['--claude-bin', str(fake.bin)], gate=_live_gate(), root=fake.root)
+
+    assert rc == mod.EXIT_OK
+    assert fake.only_call()['argv'][0] == str(fake.bin)
+
+
+def test_an_unresolvable_claude_binary_without_the_flag_is_a_configuration_error(tmp_path, monkeypatch, capsys):
+    _strip_claude_from_path(tmp_path, monkeypatch)
+    monkeypatch.setenv('CLAUDE_BINARY', str(tmp_path / 'no-such-claude'))
+    gate = _live_gate()
+
+    rc = mod.main([], gate=gate, root=tmp_path)
+
+    assert rc == mod.EXIT_CONFIG
+    assert gate.leases == 0
+    assert str(tmp_path / 'no-such-claude') in capsys.readouterr().err
 
 
 def test_the_entry_point_runs_standalone_without_the_test_sys_path(tmp_path):
