@@ -1581,6 +1581,13 @@ def test_the_rejections_record_is_bounded_as_the_warning_is(caplog):
     assert str(record["values"]) in warning.getMessage()
 
 
+def test_values_that_truncate_alike_are_listed_once_and_the_rest_counted_omitted():
+    prefix = "p" * 80
+    record = mod.SlugTally(rejected=(prefix + "-one", prefix + "-two", "short")).rejections_record()
+
+    assert record == {"count": 3, "values": [prefix + "...", "short"], "values_omitted": 1}
+
+
 def test_no_unknown_slugs_means_no_warning(caplog):
     caplog.set_level(logging.DEBUG, logger="legibility.codebook")
 

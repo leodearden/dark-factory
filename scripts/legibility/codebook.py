@@ -652,16 +652,18 @@ _MAX_REPORTED_REJECTED_SLUGS = 10
 _MAX_REPORTED_SLUG_CHARS = 80
 
 
+def _bounded_slug(value: str) -> str:
+    if len(value) <= _MAX_REPORTED_SLUG_CHARS:
+        return value
+    return value[:_MAX_REPORTED_SLUG_CHARS] + "..."
+
+
 def _bounded_distinct(values: Collection[str]) -> tuple[list[str], int]:
-    """The distinct *values*, sorted and bounded, and how many distinct values
-    the bound left out: they are LLM free text, so both their number and their
-    length are capped."""
-    distinct = sorted(set(values))
-    shown = [
-        value if len(value) <= _MAX_REPORTED_SLUG_CHARS
-        else value[:_MAX_REPORTED_SLUG_CHARS] + "..."
-        for value in distinct[:_MAX_REPORTED_REJECTED_SLUGS]
-    ]
+    """The distinct bounded renderings of *values*, sorted and capped, and how
+    many distinct values none of them shows on its own: they are LLM free text,
+    so both their number and their length are capped."""
+    distinct = set(values)
+    shown = sorted({_bounded_slug(value) for value in distinct})[:_MAX_REPORTED_REJECTED_SLUGS]
     return shown, len(distinct) - len(shown)
 
 
