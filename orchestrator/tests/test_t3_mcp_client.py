@@ -16,7 +16,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _fake_t3_server import ENVIRONMENT_ID, FakeT3Server, ToolFailure
+from _fake_t3_server import (
+    DECISION_PATH,
+    ENVIRONMENT_ID,
+    REGISTER_PATH,
+    TOKEN_PATH,
+    FakeT3Server,
+    ToolFailure,
+    ToolSuccess,
+)
 
 from orchestrator import t3_mcp_client as client
 
@@ -99,6 +107,14 @@ def connected(server: FakeT3Server, root: Path, **options: Any) -> client.T3McpC
 
 def mcp_methods(server: FakeT3Server) -> list[str]:
     return [request.body['method'] for request in server.mcp_requests()]
+
+
+def no_credential_written(root: Path) -> bool:
+    return not (root / 't3-mcp').exists()
+
+
+def touched_oauth(server: FakeT3Server) -> list[str]:
+    return [request.path for request in server.requests if request.path.startswith('/oauth/')]
 
 
 def touched_mcp_or_oauth(server: FakeT3Server) -> list[str]:
@@ -305,3 +321,78 @@ class TestCall:
 
         assert isinstance(status, client.TransportFailed)
         assert status.fault is client.TransportFault.UNREACHABLE
+
+
+class TestPairWithOperatorCode:
+    @pytest.mark.parametrize('expires_in', [2_592_000, 3 * 3600])
+    def test_an_operator_code_pairs_and_writes_the_validated_credential(
+        self, t3_server: FakeT3Server, fleet: Path, expires_in: int
+    ):
+        t3_server.expires_in = expires_in
+        code = t3_server.add_pairing_code()
+
+        result = client.pair(t3_server.origin, client.OperatorCode(code), root=fleet)
+
+        assert isinstance(result, client.Paired)
+        credential = result.credential
+        assert credential.origin == t3_server.origin
+        assert credential.environment_id == t3_server.environment_id
+        assert credential.server_version == '0.1.6'
+        assert credential.access == 'full-access'
+        assert [credential.client_id] == t3_server.issued_client_ids()
+        assert [credential.access_token] == t3_server.issued_tokens()
+        assert credential.paired_by is client.PairedBy.OPERATOR
+        assert credential.expires_at - credential.paired_at == timedelta(seconds=expires_in)
+        status = client.read_credential_status(t3_server.environment_id, root=fleet)
+        assert status.state is client.CredentialState.PAIRED
+        assert status.credential == credential
+        path = client.credential_path(t3_server.environment_id, root=fleet)
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    def test_the_exchange_registers_decides_and_redeems_once_then_validates_once(
+        self, t3_server: FakeT3Server, fleet: Path
+    ):
+        code = t3_server.add_pairing_code()
+
+        client.pair(t3_server.origin, client.OperatorCode(code), root=fleet)
+
+        [register] = t3_server.oauth_calls(REGISTER_PATH)
+        assert register['software_id'] == client.SOFTWARE_ID
+        assert register['redirect_uris'] == [client.REDIRECT_URI]
+        [decision] = t3_server.oauth_calls(DECISION_PATH)
+        assert decision['decision'] == {'_tag': 'pairing-code', 'access': 'full-access', 'code': code}
+        assert decision['authorization']['code_challenge_method'] == 'S256'
+        assert decision['authorization']['resource'] == t3_server.origin + '/mcp'
+        [token] = t3_server.oauth_calls(TOKEN_PATH)
+        assert token['grant_type'] == 'authorization_code'
+        assert token['client_id'] == t3_server.issued_client_ids()[0]
+        assert token['redirect_uri'] == client.REDIRECT_URI
+        assert t3_server.tool_calls('t3_environment_read') == [{}]
+
+    def test_a_wrong_code_is_rejected_before_any_token_request(self, t3_server: FakeT3Server, fleet: Path):
+        result = client.pair(t3_server.origin, client.OperatorCode('not-a-code'), root=fleet)
+
+        assert isinstance(result, client.PairFailed)
+        assert result.reason is client.PairFailure.PAIRING_REJECTED
+        assert result.reason.value == 'pairing_rejected'
+        assert result.detail is not None and 'The pairing code is invalid or expired.' in result.detail
+        assert t3_server.oauth_calls(TOKEN_PATH) == []
+        assert no_credential_written(fleet)
+
+    def test_an_unreachable_descriptor_fails_before_any_exchange(self, fleet: Path):
+        result = client.pair(closed_origin(), client.OperatorCode('any'), root=fleet)
+
+        assert isinstance(result, client.PairFailed)
+        assert result.reason is client.PairFailure.DESCRIPTOR_UNREACHABLE
+        assert no_credential_written(fleet)
+
+    def test_a_token_answering_for_another_environment_is_not_stored(self, t3_server: FakeT3Server, fleet: Path):
+        t3_server.tool_replies['t3_environment_read'] = ToolSuccess(
+            {'environmentId': 'another-environment', 'label': 'x', 'serverVersion': '0.1.6', 'platform': {}, 'preferences': {}}
+        )
+
+        result = client.pair(t3_server.origin, client.OperatorCode(t3_server.add_pairing_code()), root=fleet)
+
+        assert isinstance(result, client.PairFailed)
+        assert result.reason is client.PairFailure.ENVIRONMENT_MISMATCH
+        assert no_credential_written(fleet)

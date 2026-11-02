@@ -194,6 +194,8 @@ class FakeT3Server(ThreadingHTTPServer):
         self._clients: dict[str, list[str]] = {}
         self._auth_codes: dict[str, _AuthCode] = {}
         self._tokens: set[str] = set()
+        self._issued_tokens: list[str] = []
+        self._issued_client_ids: list[str] = []
         self._sessions: set[str] = set()
         self._issued_sessions: list[str] = []
 
@@ -220,6 +222,7 @@ class FakeT3Server(ThreadingHTTPServer):
         token = secrets.token_urlsafe(24)
         with self._lock:
             self._tokens.add(token)
+            self._issued_tokens.append(token)
         return token
 
     def revoke_tokens(self) -> None:
@@ -229,6 +232,16 @@ class FakeT3Server(ThreadingHTTPServer):
     def forget_sessions(self) -> None:
         with self._lock:
             self._sessions.clear()
+
+    def issued_tokens(self) -> list[str]:
+        """Every bearer issued, by the token endpoint or :meth:`issue_token`, oldest first."""
+        with self._lock:
+            return list(self._issued_tokens)
+
+    def issued_client_ids(self) -> list[str]:
+        """Every client_id the register endpoint answered with, oldest first."""
+        with self._lock:
+            return list(self._issued_client_ids)
 
     def issued_sessions(self) -> list[str]:
         """Every Mcp-Session-Id an ``initialize`` was answered with, oldest first."""
@@ -292,6 +305,7 @@ class FakeT3Server(ThreadingHTTPServer):
         client_id = f'mcp-client-{secrets.token_hex(8)}'
         with self._lock:
             self._clients[client_id] = list(redirect_uris)
+            self._issued_client_ids.append(client_id)
         return _json_reply(
             201,
             {
