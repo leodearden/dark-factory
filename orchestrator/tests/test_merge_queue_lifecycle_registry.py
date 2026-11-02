@@ -249,7 +249,7 @@ class TestNoteTransitionBestEffort:
 # ---------------------------------------------------------------------------
 # step-3 RED / step-4 GREEN: merger-drain wiring — register QUEUED at the
 # `_queue` drain chokepoint, transition to LANE_BUFFERED there, then to
-# MERGING at the `_pop_next_pickable` pop feeding `_inflight_req`.
+# MERGING at the `pop_next_pickable` pop feeding `_inflight_req`.
 # ---------------------------------------------------------------------------
 
 
@@ -261,8 +261,8 @@ class TestMergerDrainRegistersAndTransitions:
     step with the still-present transient fields (task 2169 step-3).
 
     RED until step-4 GREEN wires ``_register_item``/``_note_transition``
-    into ``_buffer_owned_request`` (QUEUED -> LANE_BUFFERED at the drain)
-    and ``_pop_next_pickable`` (-> MERGING at the pop).
+    into ``buffer_owned_request`` (QUEUED -> LANE_BUFFERED at the drain)
+    and ``pop_next_pickable`` (-> MERGING at the pop).
     """
 
     async def test_item_in_external_queue_before_drain_is_pre_registry(
@@ -553,7 +553,7 @@ class TestRequeueToQueuedSites:
     ``_run_inflight_verify``, and the head-failure cascade's downstream
     self-requeue) must transition a TRACKED item's registry entry back to
     QUEUED, and the SAME request_id must be able to re-arm/re-drain through
-    the normal ``_buffer_owned_request`` chokepoint afterwards WITHOUT a
+    the normal ``buffer_owned_request`` chokepoint afterwards WITHOUT a
     duplicate-register ``ValueError`` or a spurious escalation (task 2169
     step-5).
 
@@ -566,7 +566,7 @@ class TestRequeueToQueuedSites:
     the registry-side re-arm/re-drain contract.
 
     RED until step-6 GREEN wires ``_note_requeue`` at the 3 sites and
-    teaches ``_buffer_owned_request`` to skip re-``register()``-ing an
+    teaches ``buffer_owned_request`` to skip re-``register()``-ing an
     already-tracked (requeued) request_id.
     """
 
@@ -619,7 +619,7 @@ class TestRequeueToQueuedSites:
 
         # Re-arm and re-drain: the SAME request_id flows back through the
         # normal drain chokepoint without a duplicate-register ValueError.
-        worker._buffer_owned_request(drained)
+        worker._intake.buffer_owned_request(drained)
 
         assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.LANE_BUFFERED
         assert worker._live_items[req.request_id] is drained
@@ -1275,7 +1275,7 @@ class TestVerifierDispatchFillRegistersDispatching:
 
     RED until step-8 GREEN wires ``_note_transition`` at both
     ``_dispatch_item`` call sites in ``_verifier_loop``, at
-    ``_inflight_append``, at the two no-host ``_redispatch.appendleft``
+    ``_inflight_append``, at the two no-host ``request_redispatch(item, front=True)``
     sites, and around the dispatch-time remerge inside ``_dispatch_item``.
     """
 
@@ -1397,7 +1397,7 @@ class TestVerifierDispatchFillRegistersDispatching:
         entered is fetched by DISPATCH-FILL's ``get_nowait()`` branch (the
         FIRST ``_dispatch_item`` call site). With zero free hosts forced,
         ``_dispatch_item`` returns None and the item bounces onto
-        ``_redispatch`` — this must transition
+        the redispatch park — this must transition
         AWAITING_VERIFY -> DISPATCHING -> REDISPATCH_PARKED, not just set
         the legacy ``_dispatching_item`` field.
         """
@@ -1441,12 +1441,12 @@ class TestVerifierDispatchFillRegistersDispatching:
             (ItemLifecycleState.AWAITING_VERIFY, ItemLifecycleState.DISPATCHING),
             (ItemLifecycleState.DISPATCHING, ItemLifecycleState.REDISPATCH_PARKED),
         ], f'unexpected transition sequence: {observed!r}'
-        assert len(worker._redispatch) == 1
+        assert len(worker._intake.pending_redispatch()) == 1
         # _live_items must track whatever object actually ended up in
-        # _redispatch (may be a dataclasses.replace()'d copy of `item` with
+        # the redispatch park (may be a dataclasses.replace()'d copy of `item` with
         # cap_permit cleared, not `item` itself) — the lockstep invariant is
         # membership-consistency, not object identity with the original.
-        assert worker._live_items[req.request_id] is worker._redispatch[0]
+        assert worker._live_items[req.request_id] is worker._intake.pending_redispatch()[0]
 
     async def test_blocking_get_call_site_no_host_bounces_to_redispatch_parked(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
@@ -1494,7 +1494,7 @@ class TestVerifierDispatchFillRegistersDispatching:
 
         loop_task = asyncio.create_task(worker._verifier_loop())
         try:
-            # Let the loop find _redispatch/_verifier_queue empty and fall
+            # Let the loop find the redispatch park/_verifier_queue empty and fall
             # through to the blocking get() BEFORE the item is put — proving
             # this is genuinely the blocking-get call site, not DISPATCH-FILL's.
             for _ in range(5):
@@ -1514,7 +1514,7 @@ class TestVerifierDispatchFillRegistersDispatching:
             (ItemLifecycleState.AWAITING_VERIFY, ItemLifecycleState.DISPATCHING),
             (ItemLifecycleState.DISPATCHING, ItemLifecycleState.REDISPATCH_PARKED),
         ], f'unexpected transition sequence: {observed!r}'
-        assert worker._live_items[req.request_id] is worker._redispatch[0]
+        assert worker._live_items[req.request_id] is worker._intake.pending_redispatch()[0]
 
     async def test_dispatch_time_staleness_remerge_observed_at_merging(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -1811,9 +1811,9 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
         """RUNNER_UNAVAILABLE re-merges the entry and front-queues it on
-        ``_redispatch`` — the registry must observe
+        the redispatch park — the registry must observe
         FINALIZING -> MERGING (for the duration of the ``_remerge()`` call)
-        -> REDISPATCH_PARKED (once landed on ``_redispatch``), mirroring the
+        -> REDISPATCH_PARKED (once landed on the redispatch park), mirroring the
         dispatch-time staleness remerge window's "then back" shape.
         """
         from orchestrator.merge_lane.worker import (
@@ -1886,7 +1886,7 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
             (ItemLifecycleState.MERGING, ItemLifecycleState.REDISPATCH_PARKED),
         ], f'unexpected transition sequence: {observed!r}'
         assert worker._live_items[req.request_id] is remerged
-        assert worker._redispatch[0] is remerged
+        assert worker._intake.pending_redispatch()[0] is remerged
 
     async def test_gate_reverify_sub_transitions_finalizing_gate_reverify_finalizing(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -2254,7 +2254,7 @@ class TestSentinelExitLeavesNoLiveItemsResidue:
         )
         current = worker._lifecycle.current(rid)
         assert current == ItemLifecycleState.QUEUED, (
-            f'a requeued request must be left at QUEUED so _buffer_owned_request '
+            f'a requeued request must be left at QUEUED so buffer_owned_request '
             f'buffers it normally; registry reads {current!r}'
         )
         assert _accretion_warnings(caplog) == [], (
@@ -2277,7 +2277,7 @@ class TestSentinelExitLeavesNoLiveItemsResidue:
         ``_finalize_inflight`` was suspended at ``await entry.verify_task``.
 
         ``_merger_loop``'s speculative look-ahead calls
-        ``_buffer_owned_request`` + ``_drain_queue_into_lanes`` while a
+        ``buffer_owned_request`` + ``_drain_queue_into_lanes`` while a
         predecessor verify is in flight, so the requeued request can already
         read LANE_BUFFERED by the time finalize resumes.  A merely-not-QUEUED
         guard would then attempt LANE_BUFFERED -> QUEUED — not a legal edge —
@@ -2354,7 +2354,7 @@ class TestStopMidFlightRetiresEveryContainer:
     Seeds one item into each of: the lane buffer, the raw external queue (a
     previously-requeued, still-tracked item), the persistent verifier
     getter's already-harvested Future, the verifier queue, ``_inflight``,
-    and ``_redispatch`` — then calls ``stop()`` directly on a bare (never
+    and the redispatch park — then calls ``stop()`` directly on a bare (never
     ``run()``) worker, which exercises the drain logic deterministically
     without needing the merger/verifier loops actually running.
 
@@ -2376,8 +2376,7 @@ class TestStopMidFlightRetiresEveryContainer:
 
         # 1. Lane-buffered request.
         req_lb = _make_request('kappa-stop-lb', 'kappa-stop-lb', tmp_path, config)
-        worker._register_item(req_lb, initial=ItemLifecycleState.LANE_BUFFERED)
-        worker._lane_buffers['normal'].append(req_lb)
+        worker._intake.buffer_owned_request(req_lb)
 
         # 2. Raw-queue request — simulates a previously-requeued, still-
         # tracked item sitting in the external queue at shutdown time (NOT
@@ -2431,7 +2430,7 @@ class TestStopMidFlightRetiresEveryContainer:
             base_sha='deadbeef', speculative=False,
         )
         worker._register_item(item_rd, initial=ItemLifecycleState.REDISPATCH_PARKED)
-        worker._redispatch.append(item_rd)
+        worker._intake.request_redispatch(item_rd)
 
         all_reqs = [req_lb, req_q, req_pvg, req_vq, req_infl, req_rd]
 
@@ -2744,12 +2743,12 @@ class TestCoalesceSupersededRetiresRegistry:
         req3 = _make_request('kc3', 'kc3', wt3, coalesce_cfg, awaited_by_workflow=True)
         for req in (req1, req2, req3):
             worker._register_item(req, initial=ItemLifecycleState.LANE_BUFFERED)
-        worker._lane_buffers['normal'].extend([req1, req2, req3])
+        worker._intake.replace_lane('normal', [req1, req2, req3])
 
         result = await worker._maybe_coalesce_waiting_singles()
 
         assert result is True, 'expected the 3 disjoint singles to coalesce into one train'
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         assert len(buf) == 1 and isinstance(buf[0], GroupMergeRequest)
         group_req = buf[0]
 
@@ -3471,7 +3470,7 @@ class TestVacatedCorpseFinalizeLeavesReincarnationAlone:
             # Walk the request back to VERIFYING through the production
             # chokepoints and legal edges, as a fresh incarnation N.
             worker._drain_queue_into_lanes()
-            assert worker._pop_next_pickable() is scene.req
+            assert worker._intake.pop_next_pickable() is scene.req
             n_item = dataclasses.replace(scene.item)
             worker._note_transition(
                 rid, ItemLifecycleState.MERGING, ItemLifecycleState.AWAITING_VERIFY,

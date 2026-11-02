@@ -1266,8 +1266,9 @@ _STEAL_RETRYABLE = frozenset({
 class WorktreeInfo:
     """Return value from create_worktree - captures worktree path and base commit.
 
-    The base_commit is the SHA of main at worktree creation time, pinned to
-    ensure stable diffs even if main advances during task execution.
+    The base_commit is the SHA of main at worktree creation time. A review
+    or judge diff re-derives its base at use time instead, with
+    ``orchestrator/src/orchestrator/branch_base.py::own_work_base``.
 
     reify_debug_port: per-worktree reify-debug port allocated during provisioning
     by running scripts/setup-worktree-debug-port.sh in the worktree.  None when
@@ -9487,19 +9488,11 @@ class GitOps:
         _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
         return sha
 
-    async def get_diff_from_main(self, worktree: Path) -> str:
-        """Get diff of worktree branch vs main (dynamic — may be empty if main moved)."""
-        _, diff, _ = await _run(
-            ['git', 'diff', f'{self.config.main_branch}...HEAD'],
-            cwd=worktree,
-        )
-        return diff
-
     async def get_diff_from_base(self, worktree: Path, base_commit: str) -> str:
-        """Get diff of worktree HEAD vs a fixed base commit.
+        """The diff ``<base_commit>...HEAD`` in *worktree*.
 
-        Use this instead of get_diff_from_main when main may have advanced
-        since the worktree was created (e.g. during review stage).
+        Review and judge callers resolve *base_commit* with
+        ``orchestrator/src/orchestrator/branch_base.py::own_work_base``.
         """
         _, diff, _ = await _run(
             ['git', 'diff', f'{base_commit}...HEAD'],

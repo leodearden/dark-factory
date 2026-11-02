@@ -953,26 +953,12 @@ class TestReviewLoop:
 @pytest.mark.asyncio
 @pytest.mark.mocks_dry_run_unblock
 class TestBaseCommitDiff:
-    """Verify review uses base_commit diff, not moving main ref."""
+    """The creation-time base_commit is stored, and the diff primitive honours a given base."""
 
     async def test_worktree_base_commit_written_to_artifacts(
         self, config, git_ops, task_assignment, monkeypatch
     ):
-        """Verify that create_worktree's base_commit flows to artifacts.init().
-
-        This test verifies the fix for: "Reviewers receive empty diff, rubber-stamp PASS"
-
-        The bug occurred when:
-        1. Worktree A is created based on main at SHA M1
-        2. While A runs, another task B merges to main (advancing main to M2)
-        3. In review, workflow called get_diff_from_main() using `git diff main...HEAD`
-        4. Since main now points to M2, the diff would be empty
-        5. Reviewers would see no changes and rubber-stamp PASS
-
-        The fix: workflow captures base_commit=main's SHA at worktree creation,
-        passes it to artifacts.init() to persist, then reads it during review
-        and uses get_diff_from_base(worktree, base_commit) instead.
-        """
+        """create_worktree's base_commit flows to artifacts.init() and is stored as a full SHA."""
 
         class MinimalStub(AgentStub):
             async def _architect(self, cwd: Path) -> AgentResult:
@@ -1004,8 +990,6 @@ class TestBaseCommitDiff:
             )),
         )
 
-        # Verify pre-condition: main advancing would normally cause empty diff
-        # But we verify base_commit is captured and stored
         await workflow.run()
 
         # Either way the workflow completes, we can verify base_commit was stored
@@ -1014,17 +998,10 @@ class TestBaseCommitDiff:
             assert stored is not None, "base_commit should have been stored"
             assert len(stored) == 40, f"base_commit should be 40-char SHA, got {stored!r}"
 
-    async def test_review_uses_base_commit_diff(
+    async def test_diff_from_base_keeps_branch_changes_when_main_advances(
         self, config, git_ops, task_assignment, monkeypatch
     ):
-        """Verify get_diff_from_base returns branch changes when main advances.
-
-        This is the critical test for the fix - simulates the scenario where:
-        1. Worktree is created based on main at SHA M1
-        2. Branch makes changes
-        3. Another task advances main to M2
-        4. get_diff_from_base must still return branch changes (not empty)
-        """
+        """get_diff_from_base from the creation base still shows the branch's changes after main advances."""
         # Create worktree and capture the base_commit
         worktree_info = await git_ops.create_worktree('df-review-test')
         base_commit = worktree_info.base_commit
@@ -1042,9 +1019,6 @@ class TestBaseCommitDiff:
         diff_from_base = await git_ops.get_diff_from_base(worktree_info.path, base_commit)
         assert 'branch_change.py' in diff_from_base, \
             f"get_diff_from_base should return branch changes after main advances, got: {diff_from_base[:200]}"
-
-        # Verify the old method might return empty/different (proves base_commit needed)
-        # Note: we don't assert on this as behavior varies by git merge topology
 
 
 # ---------------------------------------------------------------------------
@@ -3236,7 +3210,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -3305,7 +3279,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -3373,7 +3347,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,

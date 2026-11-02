@@ -557,7 +557,7 @@ and are not restated here.
     `_file_stop_instruction_and_block`,
     `_file_curator_adjudication_missing_and_block`,
     `_file_milestone_gate_and_block`,
-    `_file_milestone_check_failed_and_block`). Each wraps the status write in
+    `_file_predicate_escalation_and_block`). Each wraps the status write in
     `try`/`except` and *log-and-swallows* a failure (the escalation is already
     durable), so it can file the record and still not write `blocked`. These
     are also the `pending → blocked` edge §3.8 depends on — no workflow, and

@@ -48,13 +48,19 @@ Rules the engine and its pure rules keep beyond the PRD's text:
 - R14 a command record that has observed no pass takes its last pass and last green
   head from the command's run records before the pass, so a cutover or a lost store
   keeps a green pass on record.
+- R15 a command whose tick raises is logged and skipped: it adds nothing to the tick's
+  result, and the other commands' ticks go on.  ``TICK_FAILURES_BEFORE_ESCALATION``
+  failures in a row keep one level-1 record on the command's sentinel, which the lane
+  resolves at the command's first clean tick, or at the first tick after its record has
+  left the store (a failing tick may save nothing, so the record can expire); the run of
+  failures is kept in memory only.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -104,17 +110,21 @@ from orchestrator.offline_lane_escalations import (
     PENDING_ESCALATION,
     ProbeReport,
     StuckFiling,
+    TickFailure,
     UnlandedRed,
     amend_outage,
     amend_probe_broken,
     amend_stuck_filing,
+    amend_tick_failure,
     escalation_state,
     file_outage,
     file_probe_broken,
     file_stuck_filing,
+    file_tick_failure,
     file_unlanded_red,
     release_lane_record,
     resolve_stuck_filing,
+    resolve_tick_failure,
 )
 from orchestrator.offline_lane_filing import (
     SPAWN_CONTEXT,
@@ -158,6 +168,7 @@ CLOSED_ESCALATION_STATES = frozenset({'resolved', 'dismissed'})
 DEFERRED_STATUS = 'deferred'
 _NO_TASK_CLIENT = 'no task client'
 _OPEN_STATUSES = tuple(sorted(s.value for s in TaskStatus if owner_liveness(s) is OwnerLiveness.OPEN))
+TICK_FAILURES_BEFORE_ESCALATION = 3
 
 
 def _utc_now() -> datetime:
@@ -214,6 +225,70 @@ class _OpenLaneTaskLookup:
         if self._answer is None:
             self._answer = await self._read()
         return self._answer
+
+
+@dataclass(frozen=True)
+class _FailedTicks:
+    since: datetime
+    count: int
+    escalation_id: str | None = None
+
+
+class _TickFailures:
+    """R15's run of consecutive failed ticks per command, kept in memory for the engine's life."""
+
+    def __init__(self, queue: EscalationQueue | None, now: Callable[[], datetime]) -> None:
+        self._queue = queue
+        self._now = now
+        self._runs: dict[str, _FailedTicks] = {}
+
+    async def failed(self, command: str, exc: Exception) -> None:
+        run = self._next(self._runs.get(command))
+        self._runs[command] = run
+        logger.error(
+            'offline-lane: %s: tick failed (%d in a row); the other commands go on: %s: %s',
+            command, run.count, type(exc).__name__, exc, exc_info=exc if run.count == 1 else None,
+        )
+        if run.count >= TICK_FAILURES_BEFORE_ESCALATION and self._queue is not None:
+            failure = TickFailure(command, run.since, f'{type(exc).__name__}: {exc}')
+            self._runs[command] = await self._escalated(self._queue, run, failure)
+
+    def _next(self, run: _FailedTicks | None) -> _FailedTicks:
+        """*run* one failure longer; a new run starts now and keeps the record a failed resolve left."""
+        if run is None or run.count == 0:
+            return _FailedTicks(since=self._now(), count=1, escalation_id=None if run is None else run.escalation_id)
+        return replace(run, count=run.count + 1)
+
+    async def _escalated(self, queue: EscalationQueue, run: _FailedTicks, failure: TickFailure) -> _FailedTicks:
+        """*run* with its record amended while pending, else filed; unchanged when the queue fails."""
+        try:
+            current = run.escalation_id
+            if current is not None and await asyncio.to_thread(escalation_state, queue, current) == PENDING_ESCALATION:
+                await asyncio.to_thread(amend_tick_failure, queue, current, failure)
+                return run
+            escalation_id = await asyncio.to_thread(file_tick_failure, queue, failure)
+        except Exception:
+            logger.exception('offline-lane: %s: tick-failure escalation not maintained; retried next tick',
+                             failure.command)
+            return run
+        return replace(run, escalation_id=escalation_id)
+
+    async def cleared(self, command: str) -> None:
+        run = self._runs.pop(command, None)
+        if run is None or run.escalation_id is None or self._queue is None:
+            return
+        try:
+            if await asyncio.to_thread(escalation_state, self._queue, run.escalation_id) == PENDING_ESCALATION:
+                await asyncio.to_thread(resolve_tick_failure, self._queue, run.escalation_id)
+        except Exception:
+            logger.exception('offline-lane: %s: tick-failure record %s not resolved; retried next clean tick',
+                             command, run.escalation_id)
+            self._runs[command] = replace(run, count=0)
+
+    async def cleared_unless_in(self, commands: Collection[str]) -> None:
+        """Clear the run of every command not in *commands*: a command with no record in the store has no tick to fail."""
+        for command in [command for command in self._runs if command not in commands]:
+            await self.cleared(command)
 
 
 @dataclass(frozen=True)
@@ -457,6 +532,7 @@ class LaneEngine:
         self._read_psi = read_psi
         self._store = EpisodeStore(config.project_root, clock=self._now)
         self._records = RunRecordStore(config.project_root, clock=self._now)
+        self._tick_failures = _TickFailures(escalation_queue, self._now)
 
     async def observe(self, observation: PassObservation) -> PassEffect:
         if isinstance(observation.outcome, Outage):
@@ -640,21 +716,35 @@ class LaneEngine:
         due: list[str] = []
         filed: list[str] = []
         open_tasks = _OpenLaneTaskLookup(self._open_lane_tasks)
-        for command in await asyncio.to_thread(self._store.commands):
-            record = await asyncio.to_thread(self._store.load, command)
-            record, tasks = await self._retry_due_filings(record, open_tasks)
+        commands = await asyncio.to_thread(self._store.commands)
+        for command in commands:
+            try:
+                due_now, tasks = await self._command_ticked(command, head, policy, open_tasks)
+            except Exception as exc:
+                await self._tick_failures.failed(command, exc)
+                continue
+            await self._tick_failures.cleared(command)
             filed.extend(tasks)
-            saved = record
-            record = await self._maintained_stuck_record(record, policy)
-            record, probe_due = await self._probe_loop(record, self._lane_command(command), policy)
-            rechecked = None if probe_due else recheck_due(record, head, policy, self._now())
-            if rechecked is not None:
-                record = rechecked
-            if probe_due or rechecked is not None:
+            if due_now:
                 due.append(command)
-            if record != saved:
-                await self._save(record)
+        await self._tick_failures.cleared_unless_in(commands)
         return TickResult(tuple(due), tuple(filed))
+
+    async def _command_ticked(
+        self, command: str, head: str, policy: LanePolicy, open_tasks: _OpenLaneTaskLookup,
+    ) -> tuple[bool, list[str]]:
+        """One command's tick: whether it is due a pass, and the tasks its due filings filed."""
+        record = await asyncio.to_thread(self._store.load, command)
+        record, tasks = await self._retry_due_filings(record, open_tasks)
+        saved = record
+        record = await self._maintained_stuck_record(record, policy)
+        record, probe_due = await self._probe_loop(record, self._lane_command(command), policy)
+        rechecked = None if probe_due else recheck_due(record, head, policy, self._now())
+        if rechecked is not None:
+            record = rechecked
+        if record != saved:
+            await self._save(record)
+        return probe_due or rechecked is not None, tasks
 
     def _lane_command(self, command: str) -> LaneCommand | None:
         """*command*'s configuration as of now, read on every tick so a reload takes effect."""

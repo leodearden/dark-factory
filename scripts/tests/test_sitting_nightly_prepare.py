@@ -25,7 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 OK_RESULT = json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'recorded 3'})
 BANNER = "You've hit your usage limit · resets 5am (Europe/London)"
-ENV_KEYS = ('CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'SITTING_TEST_MARKER', 'SITTING_NIGHTLY_CONFINED')
+ENV_KEYS = ('CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'SITTING_TEST_MARKER', 'SITTING_NIGHTLY_CONFINED')
 TIMEOUT_SECS = '3'
 """Outlasts the fake's interpreter start under ``-n auto`` load (0.5s did not, 2 runs in 10), far short of its sleep."""
 
@@ -450,6 +450,19 @@ def test_a_leased_account_supplies_the_child_env(tmp_path, monkeypatch):
     assert call['env']['SITTING_NIGHTLY_CONFINED']
     assert not call['env_has']['ANTHROPIC_API_KEY']
     assert gate.released == ['tok-max-h'], 'the lease is handed straight back'
+
+
+@pytest.mark.parametrize('gate', [_live_gate, lambda: FakeGate([('max-b', True), ('max-h', True)])], ids=['leased', 'no-lease'])
+def test_a_proxied_shells_endpoint_selection_does_not_reach_the_child(tmp_path, monkeypatch, gate):
+    monkeypatch.setenv('ANTHROPIC_BASE_URL', 'http://127.0.0.1:8317')
+    monkeypatch.setenv('ANTHROPIC_AUTH_TOKEN', 'proxy-key')
+    fake = _fake_claude(tmp_path)
+
+    assert _run(fake, gate=gate()) == mod.EXIT_OK
+
+    env_has = fake.only_call()['env_has']
+    assert not env_has['ANTHROPIC_BASE_URL']
+    assert not env_has['ANTHROPIC_AUTH_TOKEN']
 
 
 def test_a_real_pool_lease_is_handed_back_before_the_run(tmp_path, monkeypatch, pool_roster):

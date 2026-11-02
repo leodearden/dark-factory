@@ -1577,7 +1577,7 @@ class TestLateArrivalAttaches:
             # DONE-WHEN 2 (mechanism): assert the late-arrival ATTACH code path
             # fired — not just the outcome.  The ATTACH branch emits a DEBUG log
             # 'late arrival attaches to in-flight predecessor …'.  If a future
-            # edit introduces an await inside _pop_next_pickable/_drain_queue so B
+            # edit introduces an await inside pop_next_pickable/_drain_queue so B
             # is prefetched normally by the look-ahead, the outcome assertions above
             # remain green but this log assertion will fail, revealing the test has
             # stopped guarding the late-arrival path.
@@ -1820,7 +1820,7 @@ class TestLateArrivalFailCascade:
 
     GREEN after step-2: B is a speculative descendant of A; the existing
     cascade in _verifier_loop (7608-7721) finds B in _inflight, cancels its
-    verify, re-merges against actual main, re-dispatches with _redispatch,
+    verify, re-merges against actual main, re-dispatches through the redispatch park,
     and emits speculative_discard reason=previous_failed via _dispatch_item.
     """
 
@@ -1976,7 +1976,7 @@ class TestLateArrivalFailCascade:
         #    speculatively against A's commit — only present after step-2).
         #
         #    NOTE: speculative_discard is emitted in _dispatch_item only when a
-        #    speculative item is re-dispatched from _redispatch with _n_failed=True
+        #    speculative item is re-dispatched from the redispatch park with _n_failed=True
         #    (single-host path). In the two-host cascade path, the remerged item
         #    has speculative=False (_remerge sets speculative=False), so
         #    speculative_discard is NOT emitted at re-dispatch.  The meaningful

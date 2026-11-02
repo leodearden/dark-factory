@@ -399,8 +399,8 @@ class TestTrackerBounceWithoutWorker:
     items that conflict with the frozen tip — no SpeculativeMergeWorker
     involved.
 
-    RED until step-6 GREEN moves the _bounce_conflicting_suffix_items() body
-    (verbatim) into SuffixConflictTracker.bounce_conflicting_suffix_items().
+    RED until step-6 GREEN moves the worker's bounce body (verbatim) into
+    SuffixConflictTracker.bounce_conflicting_suffix_items().
     """
 
     async def test_clean_rebase_requeues_item(self, git_ops, config, git_repo):

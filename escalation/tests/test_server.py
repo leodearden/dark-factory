@@ -26,12 +26,13 @@ from _resolve_issue_call import call_resolve_issue
 from shared.merge_state import MergeReason
 
 from escalation import server as escalation_server
+from escalation.amendments import MAX_AMENDMENTS
 from escalation.canonical import canonical_root_cause
 from escalation.dedupe import DedupeConfig, summary_dedupe_key
 from escalation.grant_delivery import GrantDelivery
 from escalation.merge_status_answer import hint_for
 from escalation.models import Escalation
-from escalation.queue import _MAX_AMENDMENTS, EscalationQueue
+from escalation.queue import EscalationQueue
 from escalation.server import (
     _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID,
     _AMENDMENT_TRUNCATION_STORM_THRESHOLD,
@@ -50,13 +51,13 @@ from escalation.server import (
 try:
     from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
     from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.types import TerminalOutcomeRecord
     from orchestrator.merge_lane.worker import (
         MergeRequest,
         QueuedBranch,
         RealMergeItem,
         SpeculativeItem,
         SpeculativeMergeWorker,
-        TerminalOutcomeRecord,
         TerminalOutcomeRetention,
     )
     _ORCHESTRATOR_AVAILABLE = True
@@ -3122,7 +3123,7 @@ class TestAmendmentTruncationStorm:
 
         # Fill the amendment list exactly to the cap — no truncation yet, so
         # nothing may be filed.  Bound derived from the NAME, never the value.
-        for i in range(_MAX_AMENDMENTS):
+        for i in range(MAX_AMENDMENTS):
             filled = await self._fold(server, f'fill-{i}')
             assert filled['status'] == 'updated', f'Expected a fold, got {filled}'
         at_cap = queue.get(l2_id)
@@ -3202,7 +3203,7 @@ class TestAmendmentTruncationStorm:
         assert crossed['status'] == 'updated', f'Expected a fold, got {crossed}'
         assert crossed['id'] == l2_id
         assert crossed['amendment_recorded'] is True, f'framing must still land: {crossed}'
-        assert crossed['amendments'] == _MAX_AMENDMENTS, (
+        assert crossed['amendments'] == MAX_AMENDMENTS, (
             f'the list stays capped while truncating: {crossed}'
         )
         assert crossed['severity'] == 'blocking', f'severity must still report: {crossed}'
@@ -3246,7 +3247,7 @@ class TestAmendmentTruncationStorm:
         assert created['status'] == 'created', f'Unexpected first result: {created}'
 
         # Fill to the cap, then burst past the threshold on server #1.
-        for i in range(_MAX_AMENDMENTS + _AMENDMENT_TRUNCATION_STORM_THRESHOLD):
+        for i in range(MAX_AMENDMENTS + _AMENDMENT_TRUNCATION_STORM_THRESHOLD):
             await self._fold(server, f'first-{i}')
         known = pending_ids()
         assert len(known) == 2, (
@@ -4028,10 +4029,8 @@ class TestMergeRequestDedup:
         """
         import asyncio
 
-        from orchestrator.merge_lane import worker as _mq_mod
-        from orchestrator.merge_lane.worker import (
-            MergeDispatchResult,
-        )
+        from orchestrator.merge_lane import intake
+        from orchestrator.merge_lane.types import MergeDispatchResult
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -4047,7 +4046,7 @@ class TestMergeRequestDedup:
             )
 
         monkeypatch.setattr(
-            _mq_mod, 'coalesce_or_enqueue_merge_request', _fake_coalesce,
+            intake, 'coalesce_or_enqueue_merge_request', _fake_coalesce,
         )
 
         server = create_server(
@@ -4388,10 +4387,8 @@ class TestMergeRequestDedup:
         import asyncio
         from pathlib import Path as _Path
 
-        from orchestrator.merge_lane.worker import (
-            MergeRequest,
-            register_and_enqueue_merge_request,
-        )
+        from orchestrator.merge_lane.intake import register_and_enqueue_merge_request
+        from orchestrator.merge_lane.worker import MergeRequest
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -4525,13 +4522,14 @@ def _stub_patch_content_contained(monkeypatch: pytest.MonkeyPatch, stub: object)
     """Install *stub* where both readers of ``patch_content_contained`` look it up.
 
     The server reads it through the façade, whose home for it is
-    ``orchestrator.merge_lane.landing_evidence``; the worker's
-    ``coalesce_or_enqueue_merge_request`` reads the worker's own binding.
+    ``orchestrator.merge_lane.landing_evidence``; the C3 gate of
+    ``coalesce_or_enqueue_merge_request`` reads it through
+    ``orchestrator.merge_lane.tip_relation.resolve_divergent``.
     """
     import orchestrator.merge_lane.landing_evidence as landing_evidence
-    import orchestrator.merge_lane.worker as worker
+    import orchestrator.merge_lane.tip_relation as tip_relation
 
-    for module in (worker, landing_evidence):
+    for module in (tip_relation, landing_evidence):
         monkeypatch.setattr(module, 'patch_content_contained', stub)
 
 
@@ -5893,12 +5891,12 @@ class TestGetMergeQueue:
             f'wip_overlap, got: {bad_states}'
         )
 
-        # (5) The halt reverses cleanly — retirement did not corrupt
-        # _lane_halt.
+        # (5) The halt reverses cleanly — retirement did not corrupt the
+        # lane halt state.
         worker.unhalt_wip()
         assert not worker.is_wip_halted, (
             'Expected is_wip_halted False after unhalt_wip() — retirement '
-            'must not have corrupted _lane_halt'
+            'must not have corrupted the lane halt state'
         )
 
 
@@ -7457,9 +7455,11 @@ class TestPromoteToL2CanonicalFold:
     ):
         """The over-fold evidence trail: the incoming spelling lands in `amendments`.
 
-        This is also what proves ``_framing_view`` was NOT canonicalised — if it
-        had been, a spelling-only difference would read as a REPEAT and be
-        suppressed, emptying the slot task 3997 built for exactly this.
+        This is also what proves
+        ``escalation/src/escalation/amendments.py::_framing_view`` was NOT
+        canonicalised — if it had been, a spelling-only difference would read
+        as a REPEAT and be suppressed, emptying the slot task 3997 built for
+        exactly this.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)

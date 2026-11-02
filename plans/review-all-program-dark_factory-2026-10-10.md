@@ -321,18 +321,78 @@ designed behaviour, not a regression; `merge_gate_unmeasured` events (S7) replac
 should be read as the gate reporting, not failing; the lane timing-budget validator (S6) refuses a yaml
 that raises a verify timeout above the budget at config load, which is the intended loud failure.
 
+## Program status (2026-11-01)
+
+Read by the next `/review-all`'s Phase 0 (contract §9). Swept from the task store on 2026-11-01
+(`find_tasks_by_metadata(key="x_finding_run", value="review-all-dark_factory-20261008")`: 118 tasks,
+confirmed with `get_task`; the live tooling under `skills/review-all/scripts/program/` was not usable
+against this server until task 7178 lands).
+
+**What ran.** Deliberation (R1–R24, 2026-10-10) and wave 1 of R24: the six agent-mode streams S11, S14,
+S18, S21, S23 and S25 were authored, critiqued and decomposed on 2026-10-10/11 (PRDs and stamped sidecars
+in `plans/review-all-s{11,14,18,21,23,25}-*-prd.md`, commits `4cfbb33757`, `ae3047ec3a`, `81731dc052`).
+Those six streams filed 60 tasks (59 leaves plus 6709, an acceptance record); as of 2026-11-01: 31 done,
+26 pending, 2 held `deferred` (6764, 6770), 1 cancelled-as-accepted (6709). One foreign leaf, 6861
+(`plans/offline-lane-red-path-prd.md` δ2, done), also carries the run id because it absorbed mechanical
+6639's key. S23 is complete. Phase 5 filed 55 mechanical
+tasks 6587–6646: 16 done, 36 pending, 1 in-progress (6615), 2 cancelled (6639, 6644). Two skill defects
+found during the run carry the run id without a finding key (6785 done, 6786 pending).
+
+**What did not run.** The 20 spawn-mode streams — wave 2 (S4, S5, S6, S8, S9, S10, S26) and wave 3 (S1, S2,
+S3, S7, S12, S13, S15, S16, S17, S19, S20, S24), plus S22, which the Streams table marks agent-mode wave 1
+but R21/R24 left out of the wave-1 `/team` — were never authored: R24's "later sittings" were never held, and
+no session from the first invocation is still live. Their 334 finding keys (the Streams table's per-stream counts summed) have no task; in the record
+`plans/review-all-dark_factory-20261008.json` they stand as the run's `open` findings or as `re-observed`
+`prior_rows`. R22's eight promoted invariants are owned by S1, S2, S19, S10, S16, S7, S23 and S6: only S23's
+(INV `sampler-vocabulary-one-table`, task 6773, done) exists. R23's eight weakened mechanical keys
+(fk-f12106b3adaf, fk-04c4612589ea, fk-5564cc32de5c, fk-6b0dec845d9e, fk-c0932f0b7df1, fk-0165547376d8,
+fk-b49ccd852736, fk-c9935b02f118) belong to no stream in the Streams table, so "routed to their owning
+streams" routed them nowhere; they are still unfiled and open. The `## Triage briefing` describes behaviour of
+S6, S7 and S10, none of which exists. The two S25 held leaves wait on S20 (C3) and S2 (C5), neither authored;
+task 7724 (pending) depends on held 6764. The S25 sidecar still carries `task_id: null` for ι and ξ, as
+designed for a held leaf.
+
+**Gate.** Human gate 6698 depends on every `high`/`critical` leaf of the six authored streams (6707, 6721,
+6736, 6740, 6747, 6750; no leaf of an un-authored stream exists to add) and was released from its planning
+hold to `pending` on 2026-11-01 on Leo's instruction, with the FILED table below complete for what ran. Its
+delayed milestone (259200 s) runs from that release; 6736, 6740 and 6747 are done, 6707 (deps all done),
+6721 (waits on 6720) and 6750 (waits on 6749) are pending. When it fires, the next run re-derives streams
+from the open findings per contract §9; what to do with the 20 un-authored streams before then is an open
+decision for Leo (recorded in the cleanup session's result, 2026-11-01).
+
 ## FILED — program status
 
-Appended by each `/prd` session as it files. Columns: stream · PRD path · task anchors (ids) · gate
-dependencies added · notes. The trigger-chain gate id, the superseded chain (none: first run) and the
+Appended by each `/prd` session as it files; completed by the 2026-11-01 cleanup sitting with one row per
+stream. Columns: stream · PRD path · task anchors (ids) · gate dependencies added · notes. Leaf status is
+as of the 2026-11-01 store sweep. The trigger-chain gate id, the superseded chain (none: first run) and the
 `review_due` escalation resolved (none: hand launch) are recorded here by the lead.
 
 | Stream | PRD | Tasks | Gate deps added | Notes |
 |---|---|---|---|---|
-| (trigger chain) | — | human gate **6698** (deferred, planning mode; deps after wave 1: 6707, 6721, 6736, 6740, 6747, 6750; `metadata.trigger_chain.skill=review-all`, `run_id=review-all-dark_factory-20261008`, milestone delayed 259200 s) | — | interim form (`scripts/check_run_completion.py` absent at as_of); no prior chain to supersede; launched_from none; `commit_planning` on 6698 when this table is complete |
-| S11 curator-pipeline-and-candidate-types | plans/review-all-s11-curator-pipeline-prd.md | α 6703 (low), β 6704, γ 6705, δ 6706, ε 6707 (high), ζ 6708; ω acceptance 6709 (cancelled, fk-85234d9d39c4) | 6698 → 6707 | ext deps 4513 (α), 4503 (ε; looks subsumed by 4513's branch), 6385 (ζ); 6176 cancelled (→β); 6332 depends on 6708; RISK: whole chain gates on 4513, whose finished branch waits on esc-4513-9 ack; priority inversion α low → ε high recorded, no override (contract §4) |
-| S14 shared-leaves-for-cross-package-facts | plans/review-all-s14-shared-leaves-prd.md | α 6710, ζ 6711, λ 6712, ε 6713, β 6714, γ 6715, δ 6716, η 6717, θ 6718, ξ 6719 (low), ν 6720, μ 6721 (high), κ 6722, ι 6723, ο 6724, π 6725, ρ 6726 (integration gate) | 6698 → 6721 | fk-06de98fa328b dropped (cost gone, task 4618); 4709 depends on 6718; 6333 cancelled (→6720); ζ 6711 widened to SyncMcpSession per S21's extent; OPEN: 6713 → depends on S25's bootstrap leaf (wired by S25 at its phase B); 6726 allow-list references S21's transport leaf id |
-| S18 evals-measurement-integrity | plans/review-all-s18-evals-measurement-prd.md | α 6733, β 6734, γ 6736 (high), δ 6737 (medium per critic correction of fk-3505aba0481d), ε 6738, ζ 6739, η 6741 (low), θ 6743 (low), ι 6746 (low), κ 6748 (low), λ 6752 (low) | 6698 → 6736 | 6324 cancelled (→6737/6738); λ depends on 6597 and 6710 (adds a narrow tickets_db locator inside S14's project_layout seam); leaves β/ε/θ/ι/κ declare orchestrator/cli.py — S16/S20 sessions wire that same-file edge; S25 wires the scripts/ same-file edges |
-| S21 legibility-pipeline | plans/review-all-s21-legibility-pipeline-prd.md | α 6740 (high), β 6742, γ 6744, δ 6745, ε 6747 (high), ζ 6749, η 6750 (high), θ 6751, ι 6753 | 6698 → 6740, 6747, 6750 | cancelled (→leaf): 5960→6740, 6357→6742, 6466→6747, 5927→6749, 6009→6750, 4241→6750; 5693 KEPT as a dependency of 6740 (finished branch), PRD §8 "cancel" line superseded by this row; 5785 depends on 6740, 5513 on 6744; ext deps 5678/6548/5783 (γ), 6549/6358/5754 (δ), 6619/6711 (ε), 6408 (ζ); 6747 is the transport leaf S14's 6726 allow-list references; census-incremental §4.7 C7 cross-reference line to be added by the lead |
-| S25 scripts-instruments-shared-locators-and-parity-checkers | plans/review-all-s25-scripts-instruments-prd.md | α 6756, β 6757, γ 6758 (bootstrap; binds every member's src incl. sampler), δ 6759, ε 6760, ζ 6761, η 6762, θ 6763 (low), ι 6764 (HELD deferred, x_seam_wait S20/C3), κ 6765 (low), λ 6766 (shared.route_rejection, S25-owned, S16 consumes), μ 6767 (low), ν 6769, ξ 6770 (HELD deferred, x_seam_wait S2/C5; esc-3169-2 declare_pin migration is its step 1) | none (no high leaves) | 6713 (S14 ε) now depends on 6758; 6723 → 6758 edge added by the lead (shared trial_module_tagger_haiku.py); 6037 amended + 6764 depends on it; 6447 cancelled (→6756); 6381 depends on 6756; 6422 depends on 6769; PRD text lags rulings 3/6/7 in four places (task descriptions + sidecar are authoritative); S20 session: add_dependency(6764 → its C3 leaf) + commit_planning 6764 + re-stamp sidecar; S2 session: same for 6770 with its C5 leaf |
-| S23 sampler-collection-groups-and-schema | plans/review-all-s23-sampler-metric-groups-prd.md | α 6772, β 6773 (mints INV `sampler-vocabulary-one-table`, next free number at implementation) | none (no high leaves) | 6644 cancelled (→6773); 6643 depends on 6772; β depends on 6758 (S25 bootstrap); S22 leaves touching dashboard data/load.py or tests/test_load_data.py must depend on 6772/6773 |
+| (trigger chain) | — | human gate **6698**: `metadata.trigger_chain.skill=review-all`, `run_id=review-all-dark_factory-20261008`, `task_kind=deterministic`, `always_escalates`, milestone delayed 259200 s; deps 6707, 6721, 6736, 6740, 6747, 6750 | — | interim form (`scripts/check_run_completion.py` still absent 2026-11-01); no prior chain to supersede; launched_from none; `commit_planning(task_ids="6698", target_status="pending")` run 2026-11-01 by the cleanup sitting on Leo's instruction — echo `deferred → pending`, `deferral_cleared: null`; the delayed milestone runs from that release |
+| S11 curator-pipeline-and-candidate-types (agent, wave 1) | plans/review-all-s11-curator-pipeline-prd.md | α 6703 (low) done, β 6704 done, γ 6705 done, δ 6706 done, ε 6707 (high) pending, ζ 6708 pending; ω acceptance 6709 cancelled (fk-85234d9d39c4, `x_acceptance_reason` present) | 6698 → 6707 | 4/6 leaves done; ε's deps (6705, 6706, 4503) are all done, so it is dispatchable; ext deps 4513 (α, landed), 6385 (ζ); 6176 cancelled (→β, reason stamped); 6332 depends on 6708; priority inversion α low → ε high recorded, no override (contract §4) |
+| S14 shared-leaves-for-cross-package-facts (agent, wave 1) | plans/review-all-s14-shared-leaves-prd.md | done: α 6710, ζ 6711, λ 6712, ε 6713, β 6714, γ 6715, η 6717, π 6725; pending: δ 6716, θ 6718, ξ 6719 (low), ν 6720, μ 6721 (high), κ 6722, ι 6723, ο 6724, ρ 6726 (integration gate) | 6698 → 6721 | 8/17 done; μ waits on ν 6720; fk-06de98fa328b dropped (cost gone, task 4618) — the stream's only key with no task; 4709 depends on 6718; 6333 cancelled (→6720, reason stamped); ζ 6711 widened to SyncMcpSession per S21's extent; the 10-11 OPEN item is closed: 6713 depends on 6758 (S25 γ) and both are done — the sidecar's ε `scripts-checkout-bootstrap` verdict still reads OPEN (stale, not re-stamped); 6726 allow-list references S21's transport leaf 6747 (done) |
+| S18 evals-measurement-integrity (agent, wave 1) | plans/review-all-s18-evals-measurement-prd.md | done: α 6733, β 6734, γ 6736 (high), δ 6737, ε 6738, ζ 6739, η 6741 (low), θ 6743 (low); pending: ι 6746 (low), κ 6748 (low), λ 6752 (low) | 6698 → 6736 | 8/11 done, every remaining leaf low; 6324 cancelled (→6737/6738, reason stamped); λ depends on 6597 (done) and 6710 (done); the S16/S20 same-file edges on orchestrator/cli.py were never wired because S16/S20 were never authored (no harm observed: β/ε/θ/ι/κ landed or wait on nothing from them) |
+| S21 legibility-pipeline (agent, wave 1) | plans/review-all-s21-legibility-pipeline-prd.md | done: α 6740 (high), β 6742, γ 6744, δ 6745, ε 6747 (high); pending: ζ 6749, η 6750 (high), θ 6751, ι 6753 | 6698 → 6740, 6747, 6750 | 5/9 done; η waits on ζ 6749; cancelled (→leaf, reasons stamped): 5960→6740, 6357→6742, 6466→6747, 5927→6749, 6009→6750, 4241→6750; 5693 (done) kept as a dependency of 6740; 5785 depends on 6740, 5513 on 6744; 6747 is the transport leaf S14's 6726 allow-list references; census-incremental §4.7 cross-reference to D8/6749 is in `plans/census-incremental-prd.md` (landed) |
+| S23 sampler-collection-groups-and-schema (agent, wave 1) | plans/review-all-s23-sampler-metric-groups-prd.md | α 6772 done, β 6773 done (INV `sampler-vocabulary-one-table` minted) | none (no high leaves) | STREAM COMPLETE; 6644 cancelled (→6773, reason stamped); 6643 (pending, mechanical) depends on 6772; β depended on 6758 (done) |
+| S25 scripts-instruments-shared-locators-and-parity-checkers (agent, wave 1) | plans/review-all-s25-scripts-instruments-prd.md | done: α 6756, β 6757, γ 6758 (bootstrap), ν 6769; pending: δ 6759, ε 6760, ζ 6761, η 6762, θ 6763 (low), κ 6765 (low), λ 6766, μ 6767 (low); HELD deferred, never released: ι 6764 (`x_seam_wait` S20/C3; sidecar `task_id: null`), ξ 6770 (`x_seam_wait` S2/C5; sidecar `task_id: null`; esc-3169-2 declare_pin migration is its step 1) | none (no high leaves) | 4/14 done; the two holds wait on streams S20 and S2 that were never authored — release needs a ruling (see Program status); 7724 (pending) depends on held 6764; 6713 (S14 ε) and 6723 → 6758 edges present; 6037 amended, 6764 depends on it (and on θ 6763); 6770 depends on ε 6760; 6447 cancelled (→6756) WITHOUT `x_acceptance_reason`; 6381 depends on 6756; 6422 depends on 6769; PRD text lags rulings 3/6/7 in four places (task descriptions + sidecar authoritative) |
+| S1 one-escalation-filing-entry-point (spawn, wave 3) | — | — | — | not authored — R24 later sitting never held; 11 keys open; owns R22 invariant 1 (R8) |
+| S2 typed-escalation-record-facts (spawn, wave 3; upstream S1) | — | — | — | not authored — R24 later sitting never held; 14 keys open; owns R22 invariant 2 (R9); S25 ξ 6770 is held on its C5 leaf |
+| S3 escalation-server-and-queue-boundary (spawn, wave 3; upstream S6, S2) | — | — | — | not authored — R24 later sitting never held; 15 keys open (R10) |
+| S4 verify-run-context-and-runner-contract (spawn, wave 2, high-risk) | — | — | — | not authored — R24 later sitting never held; 24 keys open (R4) |
+| S5 gitops-ports-query-contract-and-the-git-runner (spawn, wave 2, high-risk) | — | — | — | not authored — R24 later sitting never held; 24 keys open (R5) |
+| S6 merge-lane-lifecycle-outcome-types-and-provenance (spawn, wave 2, high-risk; upstream S5, S7) | — | — | — | not authored — R24 later sitting never held; 25 keys open; owns the R1 timing-budget validator (R22 item 8); `## Triage briefing` describes its behaviour, which does not exist |
+| S7 merge-lane-gates-placement-mechanisms-and-target-adapters (spawn, wave 3) | — | — | — | not authored — R24 later sitting never held; 5 keys open; owns R22 invariant 6 (R11); `## Triage briefing`'s `merge_gate_unmeasured` does not exist |
+| S8 harness-composition-root-and-slot-registry (spawn, wave 2, high-risk; upstream S5, S9, S3) | — | — | — | not authored — R24 later sitting never held; 19 keys open (R6) |
+| S9 workflow-phase-spine-and-recovery-ledger (spawn, wave 2, high-risk; upstream S10, S4) | — | — | — | not authored — R24 later sitting never held; 20 keys open (R2) |
+| S10 task-write-contract-metadata-modes-success-signal-and-registry (spawn, wave 2, high-risk) | — | — | — | not authored — R24 later sitting never held; 20 keys open; owns R22 invariant 4 (R3); `## Triage briefing`'s `MetadataWriteFailed` does not exist |
+| S12 reconciliation-run-lifecycle-and-stage-interface (spawn, wave 3; upstream S14) | — | — | — | not authored — R24 later sitting never held; 21 keys open (R12); its S14 upstream leaves are largely landed |
+| S13 recon-sweeps-flag-identity-and-recon-report-state (spawn, wave 3; upstream S14, S12) | — | — | — | not authored — R24 later sitting never held; 20 keys open (R13) |
+| S15 fused-memory-mcp-server-boundary (spawn, wave 3) | — | — | — | not authored — R24 later sitting never held; 12 keys open (R14); S22 consumes its read model |
+| S16 orchestrator-config-shape-defaults-and-routing (spawn, wave 3) | — | — | — | not authored — R24 later sitting never held; 11 keys open; owns R22 invariant 5 (R15); S25 λ 6766 (shared.route_rejection) was filed for it to consume |
+| S17 scheduler-seams-and-tick-state (spawn, wave 3; upstream S14, S8) | — | — | — | not authored — R24 later sitting never held; 13 keys open (R16) |
+| S19 package-layering-and-private-seams (spawn, wave 3; upstream S14) | — | — | — | not authored — R24 later sitting never held; 12 keys open; owns R22 invariant 3 (R17) |
+| S20 cli-invocation-and-usage-gate (spawn, wave 3; upstream S16) | — | — | — | not authored — R24 later sitting never held; 19 keys open (R18); S25 ι 6764 is held on its C3 leaf (`shared.capability_manifest` sidecar_for / tracked_sidecar_paths) and 7724 waits behind it |
+| S22 dashboard-readers-and-aggregation (agent, wave 1 in the Streams table; not in R21/R24's wave-1 six; upstream S15, S14) | — | — | — | not authored — omitted from the wave-1 `/team` and no later sitting held; 22 keys open (R19); its S15 upstream was never authored either |
+| S24 fleet-watchdog-and-redeploy-coordination (spawn, wave 3; upstream S14) | — | — | — | not authored — R24 later sitting never held; 9 keys open (R20) |
+| S26 memory-service-write-path-and-graph-client (spawn, wave 2, high-risk) | — | — | — | not authored — R24 later sitting never held; 18 keys open (R7) |

@@ -221,9 +221,7 @@ def _setup_judge_workflow(
 
     ``get_diff_from_base`` is mocked to return a non-empty diff (mirrors
     ``test_judge_completion_verdict.py``'s ``_setup``) so the judge is
-    actually invoked rather than empty-diff-skipped — ``base_commit='oldbase'``
-    is stamped at ``artifacts.init()`` time (via ``_seed_workflow_artifacts``),
-    so ``_run_completion_judge`` takes the ``get_diff_from_base`` branch.
+    actually invoked rather than empty-diff-skipped.
     """
     workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, AgentStub())
     _seed_workflow_artifacts(workflow, tmp_path=tmp_path)

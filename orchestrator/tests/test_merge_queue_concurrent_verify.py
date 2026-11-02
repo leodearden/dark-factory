@@ -5,7 +5,7 @@ Tests are grouped per plan step:
 
   pre-1  SCAFFOLD — shared fixtures/helpers (git repo, gated runner, fake remote)
   step-1 RED      — _run_post_merge_verify(runner=<fake>) + runner=None byte-identical
-  step-3 RED      — _inflight/_redispatch/_n_failed/_remerge_occurred attrs + InflightEntry
+  step-3 RED      — _inflight/redispatch-park/_n_failed/_remerge_occurred attrs + InflightEntry
   step-5 RED      — _run_inflight_verify happy paths (LOCAL + REMOTE lease)
   step-7 RED      — _run_inflight_verify abort-poll (abandon + halt)
   step-9 RED      — _run_inflight_verify RUNNER_UNAVAILABLE sentinel
@@ -498,7 +498,7 @@ class TestRunPostMergeVerifyRunnerParam:
 
 
 class TestInflightStateAttrs:
-    """SpeculativeMergeWorker exposes _inflight/_redispatch/_n_failed/_remerge_occurred.
+    """SpeculativeMergeWorker exposes _inflight/redispatch-park/_n_failed/_remerge_occurred.
     InflightEntry dataclass is importable from merge_queue.
 
     RED until step-4 GREEN adds the dataclass and initialises the attrs.
@@ -515,12 +515,10 @@ class TestInflightStateAttrs:
         assert isinstance(worker._inflight, collections.deque)
         assert len(worker._inflight) == 0
 
-    def test_redispatch_is_empty_deque(self, git_ops: GitOps) -> None:
-        """_redispatch starts as an empty collections.deque."""
-        import collections
+    def test_redispatch_park_starts_empty(self, git_ops: GitOps) -> None:
+        """The redispatch park starts empty."""
         worker = self._make_worker(git_ops)
-        assert isinstance(worker._redispatch, collections.deque)
-        assert len(worker._redispatch) == 0
+        assert worker._intake.pending_redispatch() == ()
 
     def test_n_failed_is_false(self, git_ops: GitOps) -> None:
         """_n_failed starts False."""
@@ -2213,7 +2211,7 @@ class TestChainInvalidationUnderOverlap:
       · cancel_and_release(N+1's lease) → remote cancel_verify called
       · cleans N+1's stale merge worktree
       · _remerge(N+1's req) → fresh SpeculativeItem on actual main
-      · appends to _redispatch → re-dispatched on next fill iteration
+      · appends to the redispatch park → re-dispatched on next fill iteration
     N+1 resolves 'done' and main has ci_b.py; N (ci_a.py) never landed.
     """
 
@@ -2322,7 +2320,7 @@ class TestChainInvalidationUnderOverlap:
             'RED: fill-ahead blocking-get deadlocks after N fails — '
             '_inflight still has N+1 but loop waits for queue items. '
             'GREEN (step-20): head-failure cascade clears _inflight, '
-            're-dispatches N+1 via _redispatch → "done".'
+            're-dispatches N+1 via the redispatch park → "done".'
         )
 
         # ── RED: fails here (cancel_verify not called) ───────────────────────
@@ -2360,12 +2358,12 @@ class TestChainInvalidationUnderOverlap:
     ) -> None:
         """The head-failure cascade's remerge-and-park of a downstream entry
         must reconcile the ItemLifecycle registry (VERIFYING -> MERGING ->
-        REDISPATCH_PARKED), not just move the item onto ``_redispatch``.
+        REDISPATCH_PARKED), not just move the item onto the redispatch park.
 
         task 2441: merge_queue.py:9456-9460 re-merges N+1 and appends it to
-        ``_redispatch`` with NO ``_note_transition`` calls, so the registry
+        the redispatch park with NO ``_note_transition`` calls, so the registry
         stays at VERIFYING while the item is physically parked on
-        ``_redispatch``. The later DISPATCH-FILL drain's
+        the redispatch park. The later DISPATCH-FILL drain's
         REDISPATCH_PARKED -> DISPATCHING ``_note_transition`` (9204-9209)
         then fails its from_state cross-check against the diverged VERIFYING
         registry state, firing a dedup'd L1
@@ -2573,13 +2571,13 @@ class TestHaltAndUnavailable:
     ) -> None:
         """OPERATOR-HALT aborts both in-flight verifies and requeues both requests.
 
-        After halt each _run_inflight_verify abort-poll detects _operator_halt
+        After halt each _run_inflight_verify abort-poll detects the operator halt
         and returns REQUEUED (req already back on _queue).  The head-failure
         cascade MUST NOT re-merge REQUEUED items — they are already handled.
 
         RED: cascade fires for N+1 (because N's finalize returns False for
         REQUEUED), calls _remerge(req_b) and puts the re-merged item in
-        _redispatch.  We detect this by spying on _remerge.
+        the redispatch park.  We detect this by spying on _remerge.
         GREEN (step-22): cascade skips REQUEUED entries; _remerge is never
         called; both reqs land on _queue exactly once and are resolved cleanly.
         """
@@ -2645,8 +2643,8 @@ class TestHaltAndUnavailable:
                 label='halt-b: remote verify entered',
             )
 
-            # Set operator halt — both abort-polls fire within 0.01s
-            worker._operator_halt.set()
+            # Operator halt — both abort-polls fire within 0.01s
+            worker.operator_halt('test: concurrent abort')
 
             # Give abort-polls time to fire and requeue
             await asyncio.sleep(0.15)
@@ -2937,10 +2935,10 @@ class TestStopDrainsInflight:
         git_ops: GitOps,
         config: OrchestratorConfig,
     ) -> None:
-        """stop() also drains _redispatch (pending re-dispatch items).
+        """stop() also drains the redispatch park (pending re-dispatch items).
 
-        RED: _redispatch items are not drained; their futures stay pending.
-        GREEN (step-24): _redispatch drained + futures resolved.
+        RED: redispatch-park items are not drained; their futures stay pending.
+        GREEN (step-24): the redispatch park drained + futures resolved.
         """
         from orchestrator.merge_lane.worker import DecidedItem
 
@@ -2954,14 +2952,14 @@ class TestStopDrainsInflight:
             base_sha='ddd',
             speculative=False,
         )
-        worker._redispatch.append(item)
+        worker._intake.request_redispatch(item)
 
         await worker.stop()
 
         assert req.result.done(), (
-            'req.result not resolved after stop() with item in _redispatch. '
-            'RED: stop() does not drain _redispatch. '
-            'GREEN (step-24): _redispatch drained; future resolved with shutdown.'
+            'req.result not resolved after stop() with item in the redispatch park. '
+            'RED: stop() does not drain the redispatch park. '
+            'GREEN (step-24): the redispatch park drained; future resolved with shutdown.'
         )
 
 
@@ -3419,7 +3417,7 @@ class TestRunnerUnavailableHeadCascade:
         # _finalize_inflight(N) returns False → head-failure cascade fires:
         #   · N+1's verify task is cancelled (cascade calls cancel_and_release)
         #   · N+1 is re-merged onto actual main
-        #   · both N and N+1 are re-dispatched via _redispatch
+        #   · both N and N+1 are re-dispatched via the redispatch park
         gate_a_release.set()
 
         # Release N+1's gate so the (possibly still-running) gated task
@@ -5178,7 +5176,7 @@ class TestStopDrainSurvivesARaisingRemoteAbort:
 
 
 # ---------------------------------------------------------------------------
-# task 2063: _redispatch-parked speculative permit accounting (signal test)
+# task 2063: speculative permit accounting on the redispatch park (signal test)
 # ---------------------------------------------------------------------------
 
 
@@ -5224,13 +5222,13 @@ class _DriftCheckTakesRemoteAllocator(HostAllocator):
 @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: a deliberate over-mark -- a loop.time()-deadline poll loop here is invisible to _wait_budget_audit.py::item_wait_budgets
 class TestRedispatchSpeculativeConservation:
     """Signal/e2e regression lock (task 2063): a genuinely speculative item
-    parked on ``_redispatch`` must stay counted by
+    parked on the redispatch park must stay counted by
     ``_inflight_speculative_count()`` throughout the REAL merger/verifier
     pipeline — not just in the hand-constructed unit tests in
     test_merge_queue_resource_audit.py.
 
     MECHANISM — the production route to a speculative item on
-    ``_redispatch``: ``_dispatch_item`` passes its ``free_host_count()``
+    the redispatch park: ``_dispatch_item`` passes its ``free_host_count()``
     guard, then a concurrent non-loop acquirer takes the free slot before its
     ``acquire()``.  That acquirer is
     ``orchestrator/src/orchestrator/merge_drift.py::_run_drift_check``, which
@@ -5243,7 +5241,7 @@ class TestRedispatchSpeculativeConservation:
     SCENARIO: A's local verify is gated then FAILS. While gated, the merger
     speculatively merges B against A's tentative commit and hands it to the
     verifier; dispatching B loses the remote to the modelled drift check and
-    B parks on ``_redispatch``. When A's gate releases (A fails), the
+    B parks on the redispatch park. When A's gate releases (A fails), the
     existing 'previous_failed' chain-invalidation path re-merges B against
     actual main (speculative -> False) and re-dispatches it; B's second
     local verify passes -> 'done'.
@@ -5257,7 +5255,7 @@ class TestRedispatchSpeculativeConservation:
     ) -> None:
         """The I4 speculation-slot identity holds at every heartbeat-observable
         point while a genuinely speculative item sits parked on
-        ``_redispatch``, and no ``merge_resource_leak`` escalation ever fires.
+        the redispatch park, and no ``merge_resource_leak`` escalation ever fires.
 
         Also (task 3477): the disposition classifier must not silently
         degrade to its fail-open path while processing this test's failing
@@ -5319,14 +5317,14 @@ class TestRedispatchSpeculativeConservation:
 
             # Bounded poll (not a flat sleep): the merger's real git worktree
             # + commit calls have variable latency, so wait until B has
-            # actually landed on _redispatch rather than guessing a delay.
+            # actually landed on the redispatch park rather than guessing a delay.
             deadline = asyncio.get_running_loop().time() + 15.0
-            while not worker._redispatch and asyncio.get_running_loop().time() < deadline:
+            while not worker._intake.pending_redispatch() and asyncio.get_running_loop().time() < deadline:
                 await asyncio.sleep(0.05)
 
-            parked = list(worker._redispatch)
+            parked = list(worker._intake.pending_redispatch())
             assert len(parked) == 1 and parked[0].speculative, (
-                f'Expected exactly one speculative item parked on _redispatch '
+                f'Expected exactly one speculative item parked on the redispatch park '
                 f'while A is gated (proves the fix is actually exercised); '
                 f'got {parked!r}.'
             )
@@ -5384,12 +5382,12 @@ class TestRedispatchSpeculativeConservation:
             assert all(v == [] for v in heartbeat_samples), (
                 f'speculation-slot identity must hold on every '
                 f'heartbeat-triggered audit call while the speculative item '
-                f'is parked on _redispatch; got {heartbeat_samples!r}'
+                f'is parked on the redispatch park; got {heartbeat_samples!r}'
             )
 
             assert worker.speculation_accounting_violations() == [], (
                 'speculation-slot identity must hold while the speculative '
-                'item is parked on _redispatch'
+                'item is parked on the redispatch park'
             )
 
             # A fails -> the existing 'previous_failed' chain-invalidation
@@ -5430,7 +5428,7 @@ class TestRedispatchSpeculativeConservation:
         assert all(v == [] for v in recorded_violations), (
             f'speculation-slot identity must hold at every heartbeat-observable '
             f'point (identity broken pre-fix while B sat uncounted on '
-            f'_redispatch); got samples: {recorded_violations!r}'
+            f'redispatch park); got samples: {recorded_violations!r}'
         )
 
         leak_escalations = [

@@ -721,7 +721,6 @@ class TestReviewMirrorCarriesSalvagedVerdict:
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
         f.wf.briefing.build_reviewer_prompt = AsyncMock(return_value='prompt')
         f.wf.git_ops.get_diff_from_base = AsyncMock(return_value='diff')
-        f.wf.git_ops.get_diff_from_main = AsyncMock(return_value='diff')
         f.wf.config.reviewer_stagger_secs = 0
         f.wf.config.max_reviewer_retries = retries
         return f

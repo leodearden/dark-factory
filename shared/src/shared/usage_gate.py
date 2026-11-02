@@ -88,6 +88,11 @@ __all__ = [
 # this module now consumes them indirectly via classify_invocation.
 CREDENTIALS_PATH = Path.home() / '.claude' / '.credentials.json'
 
+_EMPTY_POOL_FIX_HINT = (
+    '— export the oauth_token_env vars named in usage_cap.accounts_file, or '
+    '(interactive tooling only) set usage_cap.fallback_to_default_credential: true'
+)
+
 # Robustness bound for the scoped no-freeze wait (task 2857 amendment). The
 # per-scope waiter Event is set() ONLY by the scope-uncap sweep
 # (_refresh_scope_capped), so it never wakes on an ACCOUNT-level transition —
@@ -887,10 +892,11 @@ class UsageGate:
     def _init_accounts(self) -> list[AccountState]:
         """Resolve account tokens from env vars.
 
-        If no accounts are configured, falls back to reading the default
-        credential from ``~/.claude/.credentials.json`` — unless the config
-        disables that fallback (``fallback_to_default_credential=False``), in
-        which case the pool stays empty.
+        If no configured account resolves a token the pool stays empty, unless
+        the config opts in with ``fallback_to_default_credential=True``: then
+        the default credential from ``~/.claude/.credentials.json`` is adopted
+        as a single account (interactive tooling only; ruling 2026-11-01,
+        task 8161).
         """
         accounts: list[AccountState] = []
         for acct_cfg in self._config.accounts:
@@ -906,7 +912,7 @@ class UsageGate:
         if not accounts and not self._config.fallback_to_default_credential:
             logger.warning(
                 'No configured account resolved a token, and the ~/.claude '
-                'default-credential fallback is disabled — the pool is empty'
+                f'default-credential fallback is disabled, so the pool is empty {_EMPTY_POOL_FIX_HINT}'
             )
         elif not accounts:
             token = _read_oauth_token()
@@ -1281,8 +1287,8 @@ class UsageGate:
         Returns an :class:`AccountLease` snapshotting the selected account's
         name/token/generation (task W4-δ, PRD §7.4) — built IN-LOCK, after
         any PROBING -> PROBE_IN_FLIGHT claim, so the returned lease always
-        names the SAME account as its token. Returns ``None`` if no accounts
-        are configured (no token override).
+        names the SAME account as its token. Raises :class:`RuntimeError` if
+        the pool is empty (no account resolved a token).
 
         *scope* (PRD task γ, task 2857): when non-None (a scoped-cap model, e.g.
         ``claude-fable-5``), selection additionally skips accounts whose
@@ -1308,9 +1314,7 @@ class UsageGate:
             raise SessionBudgetExhausted(self._cumulative_cost)
 
         if not self._accounts:
-            raise RuntimeError(
-                'No OAuth accounts available — configure accounts or provide credentials'
-            )
+            raise RuntimeError(f'No OAuth accounts available {_EMPTY_POOL_FIX_HINT}')
 
         park_deadline = _park_deadline(park, max_wait_secs)
         # Find first non-capped account (works with 1 or N)

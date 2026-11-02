@@ -16,7 +16,16 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol, overload, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    NamedTuple,
+    Protocol,
+    TypeVar,
+    overload,
+    runtime_checkable,
+)
 
 from shared import safe_io
 from shared.capability_manifest import CHECK_SUBJECT_FIELD
@@ -43,7 +52,11 @@ from shared.task_statuses import TaskStatus
 from shared.task_submit import SubmitFailed, SubmitOutcome, parse_submit_task_result
 
 from orchestrator import git_ops
-from orchestrator.already_landed_tick_view import AlreadyLandedGate, AlreadyLandedTickView
+from orchestrator.already_landed_tick_view import (
+    AlreadyLandedGate,
+    AlreadyLandedTickView,
+    PendingEscalationsByTask,
+)
 from orchestrator.anchor_coverage_gate import AnchorCoverageGate
 from orchestrator.config import (
     DEFAULT_TIER,
@@ -726,6 +739,34 @@ class SchedulerCallbacks:
     on_warm_base_resolve: Callable[..., Any] | None = None
     suppress_blocked_write: Callable[[str], bool] | None = None
     read_already_landed_tick_view: Callable[[], Awaitable[AlreadyLandedTickView]] | None = None
+    read_pending_escalations_by_task: (
+        Callable[[], Awaitable[PendingEscalationsByTask | None]] | None
+    ) = None
+
+
+_ConsultSnapshotT = TypeVar('_ConsultSnapshotT')
+
+
+async def _read_consult_snapshot(
+    reader: Callable[[], Awaitable[_ConsultSnapshotT]] | None, *, what: str,
+) -> _ConsultSnapshotT | None:
+    """One per-consult read for the already-landed gate; ``None`` when absent or failed.
+
+    ``None`` sends the gate back to that read per candidate, so a failure here
+    costs latency, never a verdict, and can NEVER abort the tick (PROPERTY 1).
+    """
+    if reader is None:
+        return None
+    try:
+        return await reader()
+    except Exception:
+        logger.warning(
+            'Already-landed consult: reading the %s raised — failing open (the '
+            'gate does its own per-candidate reads this tick, PROPERTY 1)',
+            what,
+            exc_info=True,
+        )
+        return None
 
 
 def _render_retry_cap_report(
@@ -1153,9 +1194,25 @@ class _BackfillScanCache:
     delays: dict[str, float] = field(default_factory=dict)
 
 
-def _numeric_id(task_id: str) -> float:
-    """The dispatch tie-break rank of *task_id*: older numeric ids first, any non-numeric id last (PRD I-4)."""
-    return float(int(task_id)) if task_id.isdecimal() else math.inf
+def _tie_break(task_id: str) -> tuple[float, str]:
+    """THE id tie-break (PRD I-4): older numeric ids first, then non-numeric ids in string order.
+
+    Both dispatch order (``Scheduler._score_candidates``) and park order
+    (:class:`_ParkKey`) end in it, so the two cannot diverge.
+    """
+    return (float(int(task_id)) if task_id.isdecimal() else math.inf, task_id)
+
+
+class _ParkKey(NamedTuple):
+    """THE park order (task 7799): the smaller key outranks; see ``plans/scheduler-dispatch-scoring-and-lock-layer-prd.md`` §7, Amendment (task 7799)."""
+
+    rank: int
+    id_rank: float
+    owner: str
+
+    @classmethod
+    def of(cls, owner: str, rank: int) -> _ParkKey:
+        return cls(rank, *_tie_break(owner))
 
 
 def _as_stamp(value: object) -> str | None:
@@ -1245,14 +1302,13 @@ class ModuleLockTable:
         self._limits: dict[str, int] = {}
         self._held: dict[str, set[str]] = {}  # task_id -> set of held modules
         # normalized_module -> LIFO stack of (owner_task_id, priority_rank).
-        # Top = last element = the ACTIVE reservation.  Preemption by a strictly-
-        # higher-priority owner PUSHES (shadows) the lower entry instead of
+        # Top = last element = the ACTIVE reservation.  Preemption by an entry
+        # with a smaller _ParkKey PUSHES (shadows) the top entry instead of
         # destroying it.  Restoration happens when the top entry is removed.
-        # INV-3: every stack is strictly rank-decreasing top-ward (top has the
-        # lowest rank / highest priority), so depth is bounded by the 5 priority
-        # tiers plus the bounded number of pin reservations (task 6040).  An
-        # owner holds at most one entry per stack in each band (tier, pin), and
-        # its pin entry sits above its own tier entry.
+        # INV-3: every stack is strictly ordered by _ParkKey, smallest key on
+        # top (task 7799), so its depth is bounded by one entry per owner per
+        # band (tier, pin, task 6040).  An owner's pin entry sits above its
+        # own tier entry.
         self._parked: dict[str, list[tuple[str, int]]] = {}
         # task_id -> ISO8601 timestamp of first install_parks call for that owner
         self._park_install_at: dict[str, str] = {}
@@ -1296,7 +1352,7 @@ class ModuleLockTable:
 
     # --- Park (reservation) helpers ---
 
-    def _rank_blocking_parks(
+    def _precedence_blocking_parks(
         self,
         module: str,
         task_id: str,
@@ -1308,33 +1364,23 @@ class ModuleLockTable:
         A buried (shadowed) reservation is never consulted — only the active
         top of each stack (INV-2).  Order is ``_parked`` iteration order.
 
-        Rank-aware (step-12): first compute task_id's OWN dominant rank — the
-        minimum rank over active-top entries that *task_id* itself owns on keys
-        conflicting with *module* (None if it has no such top).  A foreign
-        conflicting top then counts UNLESS task_id's own dominant rank is
-        strictly less (strictly higher priority) — in which case task_id
-        preempts that foreign top.  This lets a preemptor acquire its own
-        module even when hierarchical victim parks are kept under their
-        original keys (their active tops are no longer moved to the
-        preemptor's key by a re-key step).
+        INV-8, park precedence (task 7799): a foreign conflicting top blocks a
+        requester that owns parks only when that entry's :class:`_ParkKey`
+        precedes the requester's best key (:meth:`_best_park_key`, over every
+        entry it holds, at any level and on any key).  A requester that owns
+        no park is blocked by every conflicting foreign top.  So every park
+        wait points at an owner whose best key is strictly smaller than the
+        waiter's, and the wait-for graph between park owners is acyclic in
+        every reachable state; the owner with the smallest key waits only on
+        live holders.  Rationale: ``plans/scheduler-dispatch-scoring-and-lock-layer-prd.md``
+        §7, Amendment (task 7799).
 
         *ignore_owners* (task 3823 / PRD C7) names park owners whose parks are
         treated as absent for this request — the EASY-backfill admission
         bypass.  It is scoped to the park rule alone and has no bearing on the
         held-lock limit gate.
         """
-        # Step 1: compute task_id's own dominant rank among conflicting active tops.
-        own_dominant_rank: int | None = None
-        for parked_module, stack in self._parked.items():
-            if not stack:
-                continue
-            owner, rank = stack[-1]  # active TOP only
-            if owner != task_id:
-                continue
-            if self._conflicts(parked_module, module) and (own_dominant_rank is None or rank < own_dominant_rank):
-                own_dominant_rank = rank
-
-        # Step 2: check each foreign conflicting active top.
+        own = self._best_park_key(task_id)
         blocking: list[tuple[str, str]] = []
         for parked_module, stack in self._parked.items():
             if not stack:
@@ -1344,10 +1390,7 @@ class ModuleLockTable:
                 continue
             if not self._conflicts(parked_module, module):
                 continue
-            # Foreign conflicting top: counts unless task_id has a strictly
-            # higher-priority (strictly lower rank) own conflicting top.
-            if own_dominant_rank is not None and own_dominant_rank < rank:
-                # task_id preempts this foreign top.
+            if own is not None and own < _ParkKey.of(owner, rank):
                 continue
             blocking.append((owner, parked_module))
         return blocking
@@ -1361,10 +1404,11 @@ class ModuleLockTable:
     ) -> Iterator[str]:
         """EVERY owner of an ACTIVE park that blocks *task_id* on *module*.
 
-        THE single rank-aware park-blocking rule.  ``_blocking_park_owner`` is
-        the first-match view over it, ``_is_parked_blocks`` the bool view, and
+        THE single precedence-aware park-blocking rule (INV-8, over
+        :meth:`_precedence_blocking_parks`).  ``_blocking_park_owner`` is the
+        first-match view over it, ``_is_parked_blocks`` the bool view, and
         ``park_owners_blocking`` the naming view — one rule, three views
-        (INV-5).  Forking the rank logic is what would let admission believe it
+        (INV-5).  Forking the precedence logic is what would let admission believe it
         can borrow through a park that ``try_acquire`` then refuses: churn with
         no dispatch.
 
@@ -1376,7 +1420,7 @@ class ModuleLockTable:
 
         Capacity (task 7313): a park takes one of its key's slots instead of
         reserving the key exclusively.  A park on key K that
-        :meth:`_rank_blocking_parks` names blocks when either term fires:
+        :meth:`_precedence_blocking_parks` names blocks when either term fires:
 
         (a) the hold term — a park counts as its owner's hold, so the request
             is refused once *module* is at ``_limit_for(module)`` counting the
@@ -1399,7 +1443,7 @@ class ModuleLockTable:
         The hold term needs the full count, so nothing is yielded before every
         park has been scanned; a generator keeps every view's call shape.
         """
-        parks = self._rank_blocking_parks(module, task_id, ignore_owners=ignore_owners)
+        parks = self._precedence_blocking_parks(module, task_id, ignore_owners=ignore_owners)
         if not parks:
             return
         park_owners = {owner for owner, _key in parks}
@@ -1533,12 +1577,12 @@ class ModuleLockTable:
         ignore_owners: frozenset[str] = frozenset(),
     ) -> bool:
         """Return True iff any ACTIVE (top-of-stack) park conflicts with *module*,
-        is owned by a different task that task_id cannot preempt (INV-2), and
-        fires the two-term capacity rule of :meth:`_iter_blocking_park_owners`
-        (task 7313).
+        is owned by a different task that task_id does not precede (INV-2,
+        INV-8), and fires the two-term capacity rule of
+        :meth:`_iter_blocking_park_owners` (task 7313).
 
-        The bool view of :meth:`_blocking_park_owner`, which carries the rank
-        logic.  Kept as a delegate rather than inlined so ``try_acquire`` /
+        The bool view of :meth:`_blocking_park_owner`, which carries the
+        precedence logic.  Kept as a delegate rather than inlined so ``try_acquire`` /
         ``try_acquire_additional`` and every existing test keep their call
         shape, and so the naming view (``park_owners_blocking``) and this
         gating view can never disagree (INV-5).
@@ -1551,9 +1595,9 @@ class ModuleLockTable:
         """``{key: rank}`` for every stack holding *task_id* at ANY level, top or buried.
 
         THE single definition of "the owner already parks this key": the
-        install idempotency skip, the completion remainder and ``has_parks``
-        all read it, so they cannot disagree about a buried entry.  The rank
-        is the owner's best (lowest) one on that key.
+        install idempotency skip, the completion remainder, ``has_parks`` and
+        :meth:`_best_park_key` all read it, so they cannot disagree about a
+        buried entry.  The rank is the owner's best (lowest) one on that key.
         """
         owned: dict[str, int] = {}
         for module, stack in self._parked.items():
@@ -1561,6 +1605,11 @@ class ModuleLockTable:
             if ranks:
                 owned[module] = min(ranks)
         return owned
+
+    def _best_park_key(self, task_id: str) -> _ParkKey | None:
+        """*task_id*'s smallest :class:`_ParkKey` over every entry it holds, at any level; None without parks."""
+        owned = self._owned_ranks(task_id)
+        return _ParkKey.of(task_id, min(owned.values())) if owned else None
 
     @staticmethod
     def _covers(held_rank: int | None, rank: int | None) -> bool:
@@ -1634,8 +1683,9 @@ class ModuleLockTable:
         Returns ``(installed, shadowed)`` where *installed* is the list of
         normalized modules NEWLY parked, or re-ranked upward, as the active
         top by this call and *shadowed* is a list of
-        ``(owner_id, modules_shadowed)`` for any lower-priority parks that
-        were PUSHED beneath the new reservation (retained, not destroyed).
+        ``(owner_id, modules_shadowed)`` for any parks with a larger
+        :class:`_ParkKey` (a lower priority, or the same rank and a later id)
+        that were PUSHED beneath the new reservation (retained, not destroyed).
 
         *priority* is a tier name or a :class:`PinOrder`; :func:`park_rank`
         resolves either to the stack rank (task 6040).
@@ -1654,20 +1704,22 @@ class ModuleLockTable:
         entry per band per stack, never reports shadowing itself, and is
         never downgraded.
 
-        Cross-tier preemption (INV-1): if the active TOP of a conflicting stack
-        has ``existing_rank > new_rank`` (strictly lower priority), the new entry
-        is PUSHED on top of the stack (shadowing, not destroying, the lower entry).
-        Same-tier or higher-priority tops BLOCK installation for that module (INV-3).
+        Preemption (INV-1): if the active TOP of a conflicting stack has a
+        larger :class:`_ParkKey` than the new entry (a lower priority, or the
+        same rank and a later id), the new entry is PUSHED on top of the stack
+        (shadowing, not destroying, the top entry).  A top with a smaller key
+        BLOCKS installation for that module (INV-3, task 7799).
 
         Hierarchical (different-key) conflicts: victim parks are kept under
-        their ORIGINAL keys (not re-keyed onto the preemptor's key).  Rank-
-        aware blocking in ``_is_parked_blocks`` lets the preemptor acquire its
-        own module without needing to move victim entries.  This preserves each
+        their ORIGINAL keys (not re-keyed onto the preemptor's key).
+        Precedence-aware blocking in ``_is_parked_blocks`` (INV-8) lets the
+        preemptor acquire its own module without needing to move victim entries.  This preserves each
         victim's original module identity so that ALL victims are independently
         restorable after the preemptor clears (step-12 fix).
         """
         depth = self._config.lock_depth
         rank = park_rank(priority)
+        key = _ParkKey.of(task_id, rank)
         installed: list[str] = []
         # Accumulate shadows: victim_owner -> list of original module keys shadowed.
         shadow_acc: dict[str, list[str]] = {}
@@ -1690,11 +1742,11 @@ class ModuleLockTable:
                 if not self._conflicts(parked_m, normalized):
                     continue
                 # Hierarchical conflict with a different top owner.
-                if existing_rank > rank:
-                    # TOP is strictly lower priority → shadow (push), retain beneath.
+                if _ParkKey.of(owner, existing_rank) > key:
+                    # The new entry outranks TOP → shadow (push), retain beneath.
                     to_shadow.append((parked_m, owner))
                 else:
-                    # TOP is same or higher priority → block our install (INV-3).
+                    # TOP outranks the new entry → block our install (INV-3).
                     blocked = True
                     break
             if blocked:
@@ -1703,8 +1755,8 @@ class ModuleLockTable:
             # For exact-match conflicts (parked_m == normalized), the victim's
             # entry stays in its stack; the new entry will be pushed on top
             # in the install step below.  For hierarchical (different-key)
-            # conflicts, the victim park is also left untouched: rank-aware
-            # blocking in _is_parked_blocks lets the preemptor acquire its own
+            # conflicts, the victim park is also left untouched: precedence-
+            # aware blocking in _is_parked_blocks lets the preemptor acquire its own
             # module without moving victim entries (step-12 fix).
             for parked_m, victim_owner in to_shadow:
                 if victim_owner not in shadow_acc:
@@ -1765,7 +1817,7 @@ class ModuleLockTable:
         the hierarchical victim's own stack is NEVER touched during the
         preemptor's removal — the preemptor only appears in its own normalized
         key's stack, so ``was_top`` only fires for that key.  The victim becomes
-        acquirable the instant the preemptor is removed (rank-aware blocking in
+        acquirable the instant the preemptor is removed (precedence-aware blocking in
         ``_is_parked_blocks`` stops gating on the now-absent foreign top), but no
         ``reservation_restored`` pair is returned and no event is emitted.  This
         asymmetry is intentional (documented in the plan's design decisions):
@@ -2007,7 +2059,8 @@ class ModuleLockTable:
         - ``pin_order``: int (pin entries only) / ``tier``: str (fairness
           entries only) — the priority behind ``rank``
 
-        INV-3: ranks are strictly decreasing top-ward (``entry[i].rank > entry[i+1].rank``).
+        INV-3: ranks are non-increasing top-ward (``entry[i].rank >= entry[i+1].rank``),
+        and equal ranks are ordered by the id tie-break of :class:`_ParkKey`.
 
         Builds fresh dicts/lists from ``_parked`` and ``_park_install_at`` so
         callers cannot mutate internal state.
@@ -2897,8 +2950,7 @@ class Scheduler:
         # / merge-marker / content-equivalence) rather than this
         # orchestrator's own merge queue, so it also catches OUT-OF-BAND
         # landings (sibling direct-merge, prior run, squash/rebase/manual).
-        # Signature: (task_id: str, *, task=None, tick_view=None) -> bool
-        # (async; AlreadyLandedGate). True means the task is
+        # Signature: AlreadyLandedGate (async). True means the task is
         # already fully landed on main and has been driven to done inline by
         # the hook's own routine, so acquire_next() must NOT dispatch it this
         # tick. Default None so bare-Scheduler unit tests are unaffected.
@@ -5786,8 +5838,8 @@ class Scheduler:
         dropped, and the task's own parks are
         consumed (``reservation_used``, plus ``reservation_restored`` for each
         shadow the clear exposes).  A running task's park would otherwise
-        block same-tier installs (INV-3) until release, which is where
-        partial installs came from.  ``Scheduler.release`` keeps its
+        block the installs of every owner it outranks (INV-3) until release,
+        which is where partial installs came from.  ``Scheduler.release`` keeps its
         defensive clear only for parks installed AFTER dispatch, e.g. a
         park rehydrated at startup for a task that is already running.
         """
@@ -5864,7 +5916,8 @@ class Scheduler:
 
         - ``reservation_installed`` only when something was NEWLY parked,
           carrying just that increment (plus ``reservation_shadowed`` per
-          lower-priority owner pushed beneath it);
+          outranked owner, one with a larger :class:`_ParkKey`, pushed
+          beneath it);
         - ``reservation_install_blocked`` whenever fewer modules were parked
           than requested — empty and partial installs are one signal.
 
@@ -5902,7 +5955,8 @@ class Scheduler:
                 source=source,
             )
             # Emit reservation_shadowed (non-destructive shadow) for each
-            # lower-priority owner whose park was pushed beneath task_id.
+            # outranked owner (larger _ParkKey: lower priority, or the same
+            # rank and a later id) whose park was pushed beneath task_id.
             # reservation_evicted is RETAINED as an enum member for historical
             # event-log back-compat but is no longer emitted on preemption.
             for victim, victim_modules in shadowed_pairs:
@@ -5924,8 +5978,8 @@ class Scheduler:
         if attempts not in _GEOMETRIC_EMIT_COUNTS:
             return
         logger.info(
-            'Task %s could not reserve modules %s: a same-or-higher-priority '
-            'park holds them (attempt %d, skip_count=%d, priority=%s)',
+            'Task %s could not reserve modules %s: a park that outranks it '
+            'holds them (attempt %d, skip_count=%d, priority=%s)',
             task_id, blocked, attempts, skip_count, priority,
         )
         self._emit_reservation(
@@ -6527,14 +6581,23 @@ class Scheduler:
         tick nor stop the remaining candidates from being consulted
         (PROPERTY 1).
 
-        The per-tick view is read once per consult and may be ``None``, in
-        which case the gate does its own per-candidate reads.
+        The branch view and the pending-escalation snapshot (task 8073) are
+        each read once per consult, before the first candidate, and either may
+        be ``None``, in which case the gate does that read per candidate. The
+        snapshot's staleness bound is stated in
+        ``orchestrator/src/orchestrator/already_landed_tick_view.py``.
         """
         if self._already_landed_gate is None:
             return set()
         if not candidates:
             return set()
-        tick_view = await self._read_already_landed_tick_view()
+        tick_view = await _read_consult_snapshot(
+            self._callbacks.read_already_landed_tick_view, what='branch view',
+        )
+        pending_escalations = await _read_consult_snapshot(
+            self._callbacks.read_pending_escalations_by_task,
+            what='pending escalation snapshot',
+        )
         gated: set[str] = set()
         for t in candidates:
             if self.is_deterministic(t):
@@ -6545,7 +6608,10 @@ class Scheduler:
             tid = str(t.get('id', ''))
             try:
                 gated_now = await self._already_landed_gate(
-                    tid, task=t, tick_view=tick_view,
+                    tid,
+                    task=t,
+                    tick_view=tick_view,
+                    pending_escalations=pending_escalations,
                 )
             except Exception:
                 logger.warning(
@@ -6560,21 +6626,6 @@ class Scheduler:
             if gated_now:
                 gated.add(tid)
         return gated
-
-    async def _read_already_landed_tick_view(self) -> AlreadyLandedTickView | None:
-        reader = self._callbacks.read_already_landed_tick_view
-        if reader is None:
-            return None
-        try:
-            return await reader()
-        except Exception:
-            logger.warning(
-                'Already-landed tick view read raised — failing open (the '
-                'gate does its own per-candidate reads this tick) so a git '
-                'hiccup can NEVER abort the tick (PROPERTY 1)',
-                exc_info=True,
-            )
-            return None
 
     # ---- acquire_next tick phases (W10-β) ----
     #
@@ -8132,8 +8183,9 @@ class Scheduler:
         pin ahead of it in the queue has already been tried this tick, so the
         cap keeps this tick's heads first, and a displaced pin is outranked by
         the head's pin rank on every key they share.  (Pins with no stored
-        pin_order tie at one rank, so there the shared key waits for the
-        head's next completion.)  Owners that fail the park-hold predicate
+        pin_order tie at one rank, and tied pins resolve by the id tie-break of
+        :class:`_ParkKey`, so only a head whose id follows the displaced pin's
+        waits for its next completion on the shared key.)  Owners that fail the park-hold predicate
         (:meth:`_park_hold_refusal`) lost every park, pin entries included, in
         park GC earlier in the tick; completion runs only for an owner that
         is still a dispatch candidate.
@@ -8350,7 +8402,7 @@ class Scheduler:
                 score = self._compute_score_legacy(pri, self._compute_age(tid, ctx.max_id), transitive)
             scored.append((score, tid, t, pri))
 
-        scored.sort(key=lambda entry: (-entry[0], _numeric_id(entry[1]), entry[1]))
+        scored.sort(key=lambda entry: (-entry[0], *_tie_break(entry[1])))
         return scored
 
     async def _phase_select_scored(self, ctx: TickContext) -> object:

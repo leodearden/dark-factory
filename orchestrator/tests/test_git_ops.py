@@ -903,14 +903,6 @@ class TestWorktreeLifecycle:
             'unresolved conflicts'
         )
 
-    async def test_diff_from_main(self, git_ops: GitOps):
-        worktree_info = await git_ops.create_worktree('feature-4')
-        (worktree_info.path / 'change.py').write_text('x = 1\n')
-        await git_ops.commit(worktree_info.path, 'Add change')
-        diff = await git_ops.get_diff_from_main(worktree_info.path)
-        assert 'change.py' in diff
-        assert 'x = 1' in diff
-
     async def test_diff_from_base(self, git_ops: GitOps):
         worktree_info = await git_ops.create_worktree('feature-4b')
         (worktree_info.path / 'base_change.py').write_text('y = 2\n')
@@ -920,12 +912,7 @@ class TestWorktreeLifecycle:
         assert 'y = 2' in diff
 
     async def test_diff_from_base_stable_when_main_advances(self, git_ops: GitOps):
-        """get_diff_from_base returns branch changes even after main advances.
-
-        This is the key test for the fix: when main advances during task execution,
-        get_diff_from_base must still return the branch's changes by using the
-        pinned base_commit instead of the moving main ref.
-        """
+        """get_diff_from_base diffs from the base it is given, whatever main does since."""
         # Create worktree and capture base_commit
         worktree_info = await git_ops.create_worktree('feature-adv')
         base_commit = worktree_info.base_commit
@@ -943,9 +930,6 @@ class TestWorktreeLifecycle:
         diff = await git_ops.get_diff_from_base(worktree_info.path, base_commit)
         assert 'branch_change.py' in diff
         assert 'z = 3' in diff
-
-        # Contrast: get_diff_from_main might return empty/different (main absorbed branch)
-        # This demonstrates that base_commit is needed for stable diffs
 
     async def test_cleanup_worktree(self, git_ops: GitOps):
         worktree_info = await git_ops.create_worktree('feature-5')

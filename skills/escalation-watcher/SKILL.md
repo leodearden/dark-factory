@@ -722,19 +722,9 @@ carries the brief. Check "Always ask — keyed on record content" below first: i
     on main means the task is a gate: add the dependency on the code task and `resume`, so it fires
     again later (Leo, 2026-10-31, solar_challenge_platform esc-1538-2; precedents 1490, 1503, 1498,
     1545 and 1567).
-15. Breaking a fairness-park deadlock: two or more pending tasks, each parking a module another
-    of them needs (`park_stacks` in `data/orchestrator/scheduler_state.json` against each owner's
-    latest `task_skipped` modules in `runs.db`). Add a dependency from the owner with the least
-    branch progress (`git rev-list --count main..task/<id>`) onto each owner it is cycled with,
-    and leave it `pending`. `_park_hold_refusal` then reads `deps_unsatisfied`, so park GC expires
-    its parks on the next tick and it cannot re-park until the others are done. Check first that
-    no new edge closes a dependency cycle, and afterwards that a `reservation_expired` and a
-    `task_started` follow. Never `request_park_eviction` a pending owner (it is refused
-    `live_owner`), and never defer one as the break. This item lapses when dark_factory task 7799
-    lands (Leo, 2026-11-01, solar_challenge; method ruled 2026-10-30 on 787/894/919).
 
-Lines 11, 12 and 14 are exceptions to the scope-change class below, and line 15 to the
-dependency-sequencing class. Cancelling a task WITH dependents still goes to Leo.
+Lines 11, 12 and 14 are exceptions to the scope-change class below. Cancelling a task WITH
+dependents still goes to Leo.
 
 #### Always ask — keyed on record content
 
