@@ -849,15 +849,38 @@ def self_record(tree: ProcessTree) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _runtime_origin(env: Mapping[str, str]) -> str | None:
+class RuntimeOriginFailure(StrEnum):
+    MISSING = 'server-runtime-missing'
+    UNUSABLE = 'server-runtime-origin-unusable'
+
+
+@dataclass(frozen=True)
+class RuntimeOriginFailed:
+    """server-runtime.json names no origin a credential may be sent to."""
+
+    reason: RuntimeOriginFailure
+    origin: str | None = None
+    """The ``origin`` string as found, for an UNUSABLE one."""
+    detail: str | None = None
+
+    def fields(self) -> dict[str, object]:
+        """The verdict tokens: the reason, then for an UNUSABLE origin what was found and why."""
+        if self.reason is RuntimeOriginFailure.MISSING:
+            return {'reason': self.reason.value}
+        return {'reason': self.reason.value, 'origin': self.origin, 'detail': self.detail}
+
+
+def _runtime_origin(env: Mapping[str, str]) -> str | RuntimeOriginFailed:
     runtime = read_server_runtime(env)
-    origin = runtime.get('origin') if runtime else None
+    if runtime is None:
+        return RuntimeOriginFailed(RuntimeOriginFailure.MISSING)
+    origin = runtime.get('origin')
     if not isinstance(origin, str):
-        return None
+        return RuntimeOriginFailed(RuntimeOriginFailure.UNUSABLE, detail='server-runtime.json has no origin string')
     try:
         return t3_mcp_client.checked_origin(origin)
-    except ValueError:
-        return None
+    except ValueError as error:
+        return RuntimeOriginFailed(RuntimeOriginFailure.UNUSABLE, origin, str(error))
 
 
 def _pair_failure_fields(failed: t3_mcp_client.PairFailed) -> dict[str, object]:
@@ -871,8 +894,8 @@ def _pair_failure_fields(failed: t3_mcp_client.PairFailed) -> dict[str, object]:
 
 def pair_verb(env: Mapping[str, str], code: str | None, origin: str | None) -> str:
     resolved = origin or _runtime_origin(env)
-    if resolved is None:
-        return _verdict('pair-failed', reason='server-runtime-missing')
+    if isinstance(resolved, RuntimeOriginFailed):
+        return _verdict('pair-failed', **resolved.fields())
     source = t3_mcp_client.OperatorCode(code) if code else t3_mcp_client.CliCodeSource()
     result = t3_mcp_client.pair(resolved, source)
     if isinstance(result, t3_mcp_client.PairFailed):
@@ -888,8 +911,8 @@ def pair_verb(env: Mapping[str, str], code: str | None, origin: str | None) -> s
 
 def status_verb(env: Mapping[str, str], origin: str | None) -> str:
     resolved = origin or _runtime_origin(env)
-    if resolved is None:
-        return _verdict('status-failed', reason='server-runtime-missing', origin=None)
+    if isinstance(resolved, RuntimeOriginFailed):
+        return _verdict('status-failed', **({'reason': resolved.reason.value, 'origin': None} | resolved.fields()))
     status = t3_mcp_client.credential_status_at(resolved)
     if isinstance(status, t3_mcp_client.DescriptorFailed):
         return _verdict('status-failed', reason=status.reason.value, origin=resolved, detail=status.detail)
@@ -900,6 +923,14 @@ def status_verb(env: Mapping[str, str], origin: str | None) -> str:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
+def _origin_argument(url: str) -> str:
+    """``checked_origin`` for argparse, which prints an ArgumentTypeError's message and drops a ValueError's."""
+    try:
+        return t3_mcp_client.checked_origin(url)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -933,10 +964,10 @@ def _build_parser() -> argparse.ArgumentParser:
         'pair', help="pair this host with the T3 server's /mcp (self-pair, or --code from an operator)"
     )
     pair_p.add_argument('--code', default=None)
-    pair_p.add_argument('--origin', type=t3_mcp_client.checked_origin, default=None)
+    pair_p.add_argument('--origin', type=_origin_argument, default=None)
 
     status_p = verbs.add_parser('status', help="print the lane's MCP credential state")
-    status_p.add_argument('--origin', type=t3_mcp_client.checked_origin, default=None)
+    status_p.add_argument('--origin', type=_origin_argument, default=None)
     return parser
 
 
