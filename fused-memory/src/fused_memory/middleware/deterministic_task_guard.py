@@ -25,7 +25,11 @@ dict) when any of these invariants is violated:
    ``script_root`` (when present) must be one of ``{'project', 'factory'}``,
    and ``'factory'`` requires ``kind='predicate'``. An unresolvable
    dark-factory root is a rejection.
-5. ``metadata.milestone``, when present, must match the shared ``Milestone``
+4b. ``before_done``'s key set is closed to ``BeforeDone``'s declared fields.
+   An unknown key is refused with ``error_type='UnsupportedTaskMetadata'``,
+   naming the running capabilities, so a client meeting an older server
+   learns of the skew (PRD ``plans/completion-driven-triggers-prd.md`` C2).
+5.``metadata.milestone``, when present, must match the shared ``Milestone``
    model (``mode='dated'`` with a parseable ``at``, or ``mode='delayed'``
    with a positive int ``after_secs``). Checked by presence alone — this
    invariant is orthogonal to ``task_kind`` and applies on both
@@ -73,6 +77,7 @@ from shared.before_done_paths import ScriptRootRefused, resolve_script_base
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
 from shared.task_metadata import (
     RECHECK_SECS_MIN,
+    TASK_METADATA_CAPABILITIES,
     BeforeDone,
     Milestone,
     Recurrence,
@@ -126,6 +131,28 @@ def _validation_error(message: str, *, hint: str | None = None) -> dict[str, Any
     if hint is not None:
         err['hint'] = hint
     return err
+
+
+def _unsupported_before_done_keys_error(before_done: dict[str, Any]) -> dict[str, Any] | None:
+    """Refuse a before_done key this server's ``BeforeDone`` does not declare."""
+    unknown = sorted(set(before_done) - set(BeforeDone.model_fields))
+    if not unknown:
+        return None
+    capabilities = sorted(TASK_METADATA_CAPABILITIES)
+    return {
+        'error': (
+            f'before_done carries keys this server does not support: {unknown}. '
+            f'Supported before_done keys: {sorted(BeforeDone.model_fields)}. '
+            f'Running task-metadata capabilities: {capabilities}.'
+        ),
+        'error_type': 'UnsupportedTaskMetadata',
+        'unsupported_keys': unknown,
+        'task_metadata_capabilities': capabilities,
+        'hint': (
+            'Drop the key, or use the form your recipe names for a server without it '
+            '(skills/_shared/filing-the-trigger-chain.md §2 falls back to the interim form).'
+        ),
+    }
 
 
 def _validate_milestone(milestone: Any) -> dict[str, Any] | None:
@@ -460,6 +487,10 @@ def _validate_before_done(
             f"before_done must be an object (dict), got {type(before_done).__name__!r}.",
             hint="Supply before_done as a JSON object: {'script': '<path>', 'timeout_secs': <n>}.",
         )
+
+    err = _unsupported_before_done_keys_error(before_done)
+    if err is not None:
+        return err
 
     # kind: optional enum (absent -> 'deploy', mirroring the shared BeforeDone
     # model's default). Checked early, like the task_kind enum check above,
