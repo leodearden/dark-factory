@@ -2844,6 +2844,10 @@ class TestCompletionPathTaxonomy:
     merge-deferred attempt passed, a requeue is its own slice, an escalation
     is a block, and a cancel is not counted."""
 
+    @pytest.fixture(autouse=True)
+    def _clear_history_cache(self):
+        _HISTORY_CACHE.clear()
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize('outcome', sorted(WORKFLOW_OUTCOMES))
     async def test_a_clean_attempt_lands_in_its_outcomes_slice(
@@ -2903,4 +2907,25 @@ class TestCompletionPathTaxonomy:
             )
         assert {p['path']: p['pct'] for p in result['proj']} == {
             'one-pass': 50.0, 'requeued': 25.0, 'blocked': 25.0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_one_pass_history_reads_a_merge_deferred_pass_as_a_pass(self, tmp_path):
+        """The sparkline agrees with the card on what a pass is, while time to
+        complete stays done-only: a merge-deferred row's duration stops at the park."""
+        rows = [
+            _task_row('d1', 'proj', CARDS_NOW - timedelta(minutes=30), duration_ms=1000),
+            _task_row(
+                'm1', 'proj', CARDS_NOW - timedelta(minutes=40),
+                outcome='merge-deferred', duration_ms=9000,
+            ),
+            _task_row('r1', 'proj', CARDS_NOW - timedelta(minutes=50), outcome='requeued'),
+        ]
+        async with _runs_conn_of(tmp_path, rows) as conn:
+            history = await aggregate_performance_history([conn], days=CARDS_DAYS, now=CARDS_NOW)
+        assert history['proj']['one_pass_history'] == {
+            'labels': ['2026-09-30T11:00'], 'values': [66.7],
+        }
+        assert history['proj']['time_centiles_history'] == {
+            'labels': ['2026-09-30T11:00'], 'p50': [1000], 'p95': [1000],
         }
