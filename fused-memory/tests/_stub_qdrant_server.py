@@ -17,6 +17,7 @@ Binds 127.0.0.1 on port 0, so ``-n auto`` xdist workers cannot collide.
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping
@@ -34,9 +35,13 @@ def _ok(result: Any) -> dict[str, Any]:
     return {'result': result, 'status': 'ok', 'time': 0}
 
 
+def _error(message: str) -> dict[str, Any]:
+    return {'status': {'error': message}, 'time': 0}
+
+
 def _already_exists(name: str) -> dict[str, Any]:
     """Qdrant's 409 body for a create of a live collection (measured 2026-11-02)."""
-    return {'status': {'error': f'Wrong input: Collection `{name}` already exists!'}, 'time': 0}
+    return _error(f'Wrong input: Collection `{name}` already exists!')
 
 
 class StubQdrantServer:
@@ -48,15 +53,18 @@ class StubQdrantServer:
         create_delay_s: Mapping[str, float],
         preexisting: Iterable[str],
         conflict_on_create: Iterable[str],
+        create_status: Mapping[str, int],
     ) -> None:
         self.url = ''
         self.release_event = threading.Event()
         """Set it to finish every pending and future create without its delay."""
         self._create_delay_s = dict(create_delay_s)
         self._conflict_on_create = frozenset(conflict_on_create)
+        self._create_status = dict(create_status)
         self._state_lock = threading.Lock()
         self._meta_op_lock = threading.Lock()
         self._create_requests: Counter[str] = Counter()
+        self._exists_requests: Counter[str] = Counter()
         self._created: dict[str, threading.Event] = {}
         for name in preexisting:
             self._created_event(name).set()
@@ -65,6 +73,11 @@ class StubQdrantServer:
         """How many ``PUT /collections/{name}`` requests the server has received."""
         with self._state_lock:
             return self._create_requests[name]
+
+    def exists_checks(self, name: str) -> int:
+        """How many ``GET /collections/{name}/exists`` requests the server has received."""
+        with self._state_lock:
+            return self._exists_requests[name]
 
     def wait_created(self, name: str, timeout: float) -> bool:
         """Block until collection *name* exists server-side; False on timeout."""
@@ -79,6 +92,11 @@ class StubQdrantServer:
             event = self._created.get(name)
         return event is not None and event.is_set()
 
+    def _check_exists(self, name: str) -> tuple[int, dict[str, Any]]:
+        with self._state_lock:
+            self._exists_requests[name] += 1
+        return 200, _ok({'exists': self._exists(name)})
+
     def _collection_names(self) -> list[str]:
         with self._state_lock:
             return [name for name, event in self._created.items() if event.is_set()]
@@ -92,6 +110,8 @@ class StubQdrantServer:
             if name in self._conflict_on_create:
                 self._created_event(name).set()
                 return 409, _already_exists(name)
+            if name in self._create_status:
+                return self._create_status[name], _error(f'stub rejected the create of `{name}`')
             self.release_event.wait(self._create_delay_s.get(name, 0.0))
             self._created_event(name).set()
             return 200, _ok(True)
@@ -105,14 +125,14 @@ class StubQdrantServer:
             case 'GET', ['collections']:
                 return 200, _ok({'collections': [{'name': name} for name in self._collection_names()]})
             case 'GET', ['collections', name, 'exists']:
-                return 200, _ok({'exists': self._exists(name)})
+                return self._check_exists(name)
             case 'PUT', ['collections', name]:
                 return self._create(name)
             case 'PUT', ['collections', _, 'index']:
                 return 200, _ok({'operation_id': 0, 'status': 'completed'})
             case 'POST', ['collections', _, 'points']:
                 return 200, _ok([])
-        return 404, {'status': {'error': f'stub has no route for {method} {path}'}, 'time': 0}
+        return 404, _error(f'stub has no route for {method} {path}')
 
 
 def _make_handler(state: StubQdrantServer) -> type[BaseHTTPRequestHandler]:
@@ -143,7 +163,10 @@ class _QuietServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def handle_error(self, request: Any, client_address: Any) -> None:
-        """A client that hung up mid-delay is expected here, not an error."""
+        """Stay quiet for a client that hung up mid-delay; report any other handler fault."""
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
 
 
 @contextmanager
@@ -152,18 +175,22 @@ def stub_qdrant_server(
     create_delay_s: Mapping[str, float] | None = None,
     preexisting: Iterable[str] = (),
     conflict_on_create: Iterable[str] = (),
+    create_status: Mapping[str, int] | None = None,
 ) -> Iterator[StubQdrantServer]:
     """Serve the stub on an ephemeral local port.
 
     *create_delay_s* is how long a create of each named collection takes.
     *preexisting* collections exist from the start.  A create of a collection
     in *conflict_on_create* answers 409 AND leaves it created, as when another
-    creator wins between an exists check and the create.
+    creator wins between an exists check and the create.  A create of a
+    collection in *create_status* answers that error status and leaves it
+    absent.
     """
     state = StubQdrantServer(
         create_delay_s=create_delay_s or {},
         preexisting=preexisting,
         conflict_on_create=conflict_on_create,
+        create_status=create_status or {},
     )
     httpd = _QuietServer(('127.0.0.1', 0), _make_handler(state))
     host, port = httpd.server_address[:2]

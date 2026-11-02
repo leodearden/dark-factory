@@ -17,6 +17,8 @@ from contextlib import asynccontextmanager
 import httpx
 import pytest
 from _stub_qdrant_server import stub_qdrant_server
+from mem0.memory.storage import SQLiteManager
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from fused_memory.backends.mem0_client import Mem0Backend
 from fused_memory.config.schema import FusedMemoryConfig
@@ -28,7 +30,10 @@ MEMORY_ID = '00000000-0000-4000-8000-000000000001'
 
 @pytest.fixture
 def config(mock_config, monkeypatch) -> FusedMemoryConfig:
+    """mem0's history store defaults to the LIVE ~/.mem0/history.db; keep these tests off it."""
     monkeypatch.setattr('mem0.memory.main.capture_event', lambda *a, **kw: None)
+    monkeypatch.setattr('mem0.memory.main.MEM0_TELEMETRY', False)
+    monkeypatch.setattr('mem0.memory.main.SQLiteManager', lambda *_a, **_kw: SQLiteManager(':memory:'))
     return mock_config.model_copy(deep=True)
 
 
@@ -78,6 +83,20 @@ async def test_a_collection_another_creator_made_first_is_adopted_not_failed(con
     with stub_qdrant_server(conflict_on_create={target}) as stub:
         async with backend_against(stub.url, config) as backend:
             assert await backend.get(MEMORY_ID, SCOPE) is None
+            assert await backend.get(MEMORY_ID, SCOPE) is None
+        assert stub.creates(target) == 1
+        assert stub.exists_checks(target) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_create_the_server_rejects_propagates_and_leaves_nothing_cached(config, target):
+    with stub_qdrant_server(create_status={target: 500}) as stub:
+        async with backend_against(stub.url, config) as backend:
+            for attempt in (1, 2):
+                with pytest.raises(UnexpectedResponse) as excinfo:
+                    await backend.get(MEMORY_ID, SCOPE)
+                assert excinfo.value.status_code == 500
+                assert stub.creates(target) == attempt
 
 
 @pytest.mark.asyncio
