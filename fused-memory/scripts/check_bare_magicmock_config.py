@@ -24,15 +24,16 @@ separate message vocabularies and separate ``# noqa`` codes.  Every statement in
       Hot for every scanned file: the transitional per-file debt baseline was
       retired once its 95 grandfathered sites were migrated (task 4354).
 
-  Rule C — ``wall-clock-deadline`` (task 4246)
+  Rule C — ``wall-clock-deadline`` (tasks 4246, 7800)
       NOT a mock-spec rule.  Position-blind over any ``ast.Call``: a load-bearing
       synchronisation point (a ``MergeRequest.result`` future or a zero-argument
       ``.wait()`` barrier) awaited through a bare ``asyncio.wait_for`` instead of
       ``wait_responsive``, or carrying a raw numeric literal bound (``timeout=``,
-      ``max_wall_s=`` or wait_for's positional timeout).  Remedies are wait-specific
-      (``wait_responsive(...)`` with a ``label=``, bound derived from
-      ``MERGE_RESULT_TIMEOUT``).  Carries its own shrink-only per-file debt BUDGET
-      (``_WALL_CLOCK_DEADLINE_DEBT``).
+      ``max_wall_s=`` or wait_for's positional timeout).  Also any async ``while``
+      poll that gives up against a wall-clock read.  Remedies are wait-specific
+      (``wait_responsive(...)`` or ``poll_responsive(...)`` with a ``label=``,
+      bound derived from ``MERGE_RESULT_TIMEOUT``).  Carries its own shrink-only
+      per-file debt BUDGET (``_WALL_CLOCK_DEADLINE_DEBT``).
 
 WIDEN-NOT-SIBLING RULING (task 4016): Rule B was added here rather than as a sibling
 script.  A sibling would have cost nine wiring edits (seven package ``orchestrator.yaml``
@@ -160,6 +161,19 @@ TWO violations:
      migrated site can have moved the accounting while keeping a hand-written
      number.  Several literal bounds on one call are still ONE violation.
 
+The same defect is also written as a POLL, so a further leg covers it:
+
+  3. CLOCK-DEADLINE POLL (task 7800): an async ``while`` loop that gives up against a
+     wall-clock read — a ``Compare`` in its test or its own body with a DIRECT
+     operand that is a zero-argument ``.time()``, ``.monotonic()`` or
+     ``.perf_counter()`` call, on any receiver.  One violation, at the ``while``.
+     Its bound is arithmetic in another statement, so it has no raw-literal kind.
+     Two structural discriminators keep it to polls.  DIRECT-OPERAND-ONLY excludes
+     elapsed-duration arithmetic (``loop.time() - t0 < duration``), which simulates
+     work rather than waiting for it.  AWAIT-REQUIRED excludes a sync ``time.sleep``
+     loop, which a loop-responsive budget cannot help.  The search does not descend
+     into a nested loop or scope, so a comparison belongs to the loop that owns it.
+
 Suppressed by ``# noqa: wall-clock-deadline — <reason>`` on the preceding non-blank
 line, or by the file's ``_WALL_CLOCK_DEADLINE_DEBT`` budget.
 
@@ -189,8 +203,10 @@ points, so flagging them is correct; ``# noqa: wall-clock-deadline — <reason>`
 escape for a ``Process.wait()``.
 
 Remedy reachability: ``wait_responsive`` and ``MERGE_RESULT_TIMEOUT`` are defined in
-``orchestrator/tests/_orch_helpers.py`` and importable only under orchestrator/tests,
-so every Rule C message says that elsewhere the per-site ``# noqa`` is the remedy.
+``orchestrator/tests/_orch_helpers.py``, and ``poll_responsive`` in
+``orchestrator/tests/_poll_responsive.py``; all three are importable only under
+orchestrator/tests, so every Rule C message says that elsewhere the per-site
+``# noqa`` is the remedy.
 Scoping the rule to orchestrator/tests instead would reintroduce exactly the
 a-list-decides-coverage failure mode the paragraph above rejects.
 
@@ -208,10 +224,13 @@ Scope paths are NOT carried in the message (the file-local guard printed
 Preferred alternatives named in the rejection message:
   • ``wait_responsive(aw, *, timeout=MERGE_RESULT_TIMEOUT, label, ...)``
     (orchestrator/tests/_orch_helpers.py::wait_responsive)
+  • ``poll_responsive(predicate, *, timeout=MERGE_RESULT_TIMEOUT, label, ...)`` for a
+    poll (orchestrator/tests/_poll_responsive.py::poll_responsive)
   • a bound derived from ``MERGE_RESULT_TIMEOUT``, never a written number
 
 Origin: task 2376 (the sweep whose threshold left the gap), task 3980 (migrated the
-sites and added a file-local guard), task 4246 (this shared, repo-wide guard).
+sites and added a file-local guard), task 4246 (this shared, repo-wide guard), task
+7800 (the poll leg).
 
 ---------------------------------------------------------------------------
 
@@ -232,9 +251,9 @@ from __future__ import annotations
 
 import ast
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path, PurePosixPath
-from typing import NamedTuple
+from typing import NamedTuple, TypeGuard
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -823,26 +842,20 @@ def _load_bearing_wait_target(node: ast.expr) -> str | None:
         return f'{ast.unparse(node)} (.wait() barrier)'
     return None
 
-# Rule C's two offence kinds.  They are INDEPENDENT — one call can trip both
-# (a bare asyncio.wait_for that also writes a number) or exactly one (a migrated
-# wait_responsive that kept its literal; a bare wait_for whose bound is derived).
-_WALL_CLOCK_BARE_WAIT_FOR = 'bare-wait_for'
-_WALL_CLOCK_RAW_LITERAL = 'raw-literal'
-
-# Shared by both kinds: WHY a wall-clock deadline on a load-bearing sync point is a
-# defect rather than a style preference.  Task 3980's three measured failures were
-# all genuine deadline expiries on tests that had already passed.
+# Shared by every offence kind: WHY a wall-clock deadline on a load-bearing sync
+# point is a defect rather than a style preference.  Task 3980's three measured
+# failures were all genuine deadline expiries on tests that had already passed.
 _WALL_CLOCK_CONSEQUENCE = (
     ' A deadline expiry on a load-bearing synchronisation point fails a test whose'
     ' awaited event did happen, only because the loop was descheduled.'
 )
 
-# Shared by both kinds and the debt overrun: every Rule C remedy names
-# wait_responsive or MERGE_RESULT_TIMEOUT, and both live in
-# orchestrator/tests/_orch_helpers.py while the rule scans every package.
+# Shared by every offence kind and the debt overrun: every Rule C remedy names
+# wait_responsive, poll_responsive or MERGE_RESULT_TIMEOUT, and all three live under
+# orchestrator/tests while the rule scans every package.
 _WALL_CLOCK_REMEDY_REACH = (
-    ' wait_responsive and MERGE_RESULT_TIMEOUT are importable only under'
-    ' orchestrator/tests, so in another package the # noqa escape is the remedy.'
+    ' wait_responsive, poll_responsive and MERGE_RESULT_TIMEOUT are importable only'
+    ' under orchestrator/tests, so in another package the # noqa escape is the remedy.'
 )
 
 _WALL_CLOCK_SUPPRESS = (
@@ -851,32 +864,62 @@ _WALL_CLOCK_SUPPRESS = (
 )
 
 
-def _wall_clock_violation_msg(kind: str, target: str, *, parameter: str | None = None) -> str:
-    """Build Rule C's rejection message for one offence *kind* on *target*.
+class _DeadlineRouting(NamedTuple):
+    """One SPELLING of a wall-clock deadline, and the remedy that re-routes it.
 
-    *parameter* names the bound that carries the raw literal (``timeout`` or
-    ``max_wall_s``); it is consulted only for the raw-literal kind.
+    Rule C's routing offence is the same defect however the deadline is spelled;
+    only the clause naming the spelling and the helper that replaces it differ.
+    """
+
+    spelled: str
+    remedy: str
+
+
+_BARE_WAIT_FOR = _DeadlineRouting(
+    spelled='is routed through a bare asyncio.wait_for',
+    remedy=(
+        ' Route it through wait_responsive(...) with a descriptive label='
+        ' (orchestrator/tests/_orch_helpers.py::wait_responsive), which charges its'
+        ' budget in loop-responsive time and still reports a genuine hang red.'
+    ),
+)
+
+_CLOCK_DEADLINE = _DeadlineRouting(
+    spelled='gives up against a wall-clock read',
+    remedy=(
+        ' Replace the loop with poll_responsive(predicate, ...) with a descriptive'
+        ' label= (orchestrator/tests/_poll_responsive.py::poll_responsive), which'
+        ' polls under a loop-responsive budget and still reports a genuine hang red.'
+    ),
+)
+
+
+def _wall_clock_routing_msg(routing: _DeadlineRouting, target: str) -> str:
+    """Build Rule C's routing message: *target*'s deadline, spelled as *routing*, is wall clock.
 
     Deliberately shares NO vocabulary with ``_VIOLATION_MSG`` or
     ``_dataclass_violation_msg``: Rule A's remedies read pydantic ``model_fields``
     and Rule B's spec a stdlib dataclass — neither has anything to say about a
     wall-clock deadline on a future, so offering either here would send the reader
-    down a dead end.  The two KINDS also keep separate remedies from each other for
-    the same reason: routing through ``wait_responsive`` and deriving the bound from
-    ``MERGE_RESULT_TIMEOUT`` are independent fixes, and a site can need one, the
-    other, or both.
+    down a dead end.
     """
-    if kind == _WALL_CLOCK_BARE_WAIT_FOR:
-        return (
-            f'load-bearing wait on {target} is routed through a bare asyncio.wait_for,'
-            ' so its deadline is charged in WALL CLOCK.'
-            + _WALL_CLOCK_CONSEQUENCE
-            + ' Route it through wait_responsive(...) with a descriptive label='
-            ' (orchestrator/tests/_orch_helpers.py::wait_responsive), which charges its'
-            ' budget in loop-responsive time and still reports a genuine hang red.'
-            + _WALL_CLOCK_REMEDY_REACH
-            + _WALL_CLOCK_SUPPRESS
-        )
+    return (
+        f'load-bearing wait on {target} {routing.spelled},'
+        ' so its deadline is charged in WALL CLOCK.'
+        + _WALL_CLOCK_CONSEQUENCE
+        + routing.remedy
+        + _WALL_CLOCK_REMEDY_REACH
+        + _WALL_CLOCK_SUPPRESS
+    )
+
+
+def _wall_clock_raw_literal_msg(target: str, parameter: str) -> str:
+    """Build Rule C's raw-literal message: *target*'s *parameter* bound is a written number.
+
+    Kept apart from the routing message because the two are independent fixes:
+    re-routing the wait and deriving its bound from ``MERGE_RESULT_TIMEOUT``, and a
+    site can need one, the other, or both.
+    """
     return (
         f'load-bearing wait on {target} carries a RAW wall-clock literal as its'
         f' {parameter} bound.'
@@ -925,9 +968,34 @@ def _raw_wall_clock_literal(call: ast.Call, *, is_bare_wait_for: bool) -> str | 
 
 
 def _wall_clock_deadline_violations(
-    call: ast.Call, lines: list[str], filename: str
+    node: ast.AST, lines: list[str], filename: str
 ) -> list[Violation]:
-    """Rule C, evaluated for ONE ``ast.Call``: return 0, 1 or 2 Violations.
+    """Rule C, evaluated for ONE node of any type: return 0, 1 or 2 Violations.
+
+    Dispatches on the node type, one leg per spelling of a wall-clock deadline:
+    an ``ast.Call`` to the wait-call leg (``_wait_call_violations``) and an
+    ``ast.While`` to the clock-deadline poll leg (``_clock_deadline_poll_violations``).
+    Every other node yields nothing.
+
+    Per-NODE rather than per-tree so ``find_violations`` can evaluate all three rules
+    in a SINGLE ``ast.walk``; a second full walk was measured at ~43% of total checker
+    runtime (20.8s -> 30.7s over the seven scanned dirs), paid on every merge-queue
+    verify across all nine call sites.  Position-blind by construction: the caller
+    hands this every node, so there is no class list and no scope filter — see the
+    Rule C section of the module docstring for why a list, or a threshold, is not a
+    sound key.
+
+    Must never raise: a crash would fail every caller's lint over an unrelated edit.
+    """
+    if isinstance(node, ast.Call):
+        return _wait_call_violations(node, lines, filename)
+    if isinstance(node, ast.While):
+        return _clock_deadline_poll_violations(node, lines, filename)
+    return []
+
+
+def _wait_call_violations(call: ast.Call, lines: list[str], filename: str) -> list[Violation]:
+    """Rule C's wait-call leg, for ONE ``ast.Call``: return 0, 1 or 2 Violations.
 
     Returns a LIST, not an Optional, because the two offence kinds are independent
     and a single call can trip both — ``asyncio.wait_for(req.result, timeout=25.0)``
@@ -940,26 +1008,13 @@ def _wall_clock_deadline_violations(
          otherwise — and a bare ``asyncio.wait_for()`` must be skipped, not crash);
       2. the func is ``asyncio.wait_for`` or ``wait_responsive``;
       3. ``_load_bearing_wait_target`` recognises ``args[0]``.
-    Only then is the exemption line-walk run (see ``_wall_clock_deadline_violations``'s
-    call to ``is_exempted``), so the upward walk keeps Rule B's cost profile rather
-    than running on every ``ast.Call`` in the tree.
-
-    Position-blind by construction: the caller hands this every ``ast.Call``, so a
-    wait in a ``return``, an argument, a comprehension body or at module level is
-    covered identically.  There is no class list and no scope filter — see the Rule C
-    section of the module docstring for why a list, or a threshold, is not a sound key.
-
-    Per-NODE rather than per-tree so ``find_violations`` can evaluate all three rules
-    in a SINGLE ``ast.walk``; a second full walk was measured at ~43% of total checker
-    runtime (20.8s -> 30.7s over the seven scanned dirs), paid on every merge-queue
-    verify across all nine call sites.
+    Only then is the exemption line-walk run, so the upward walk keeps Rule B's cost
+    profile rather than running on every ``ast.Call`` in the tree.
 
     Violations carry ``call.col_offset``, so a node tripping several rules yields
     deterministically-ordered entries under ``find_violations``' final sort.  Both
     kinds from one call share a position; Python's stable sort keeps them in the
     fixed order they are appended here.
-
-    Must never raise: a crash would fail every caller's lint over an unrelated edit.
     """
     if not call.args:
         return []
@@ -988,7 +1043,7 @@ def _wall_clock_deadline_violations(
 
     messages: list[str] = []
     if is_bare_wait_for:
-        messages.append(_wall_clock_violation_msg(_WALL_CLOCK_BARE_WAIT_FOR, target))
+        messages.append(_wall_clock_routing_msg(_BARE_WAIT_FOR, target))
 
     # A raw numeric literal is an offence on EITHER call shape: wait_responsive
     # also takes ``timeout`` and ``max_wall_s`` keywords, so a migrated site can
@@ -997,9 +1052,7 @@ def _wall_clock_deadline_violations(
     # many bounds carry a number: it is one offence with one remedy.
     parameter = _raw_wall_clock_literal(call, is_bare_wait_for=is_bare_wait_for)
     if parameter is not None:
-        messages.append(
-            _wall_clock_violation_msg(_WALL_CLOCK_RAW_LITERAL, target, parameter=parameter)
-        )
+        messages.append(_wall_clock_raw_literal_msg(target, parameter))
 
     return [
         Violation(
@@ -1009,6 +1062,102 @@ def _wall_clock_deadline_violations(
             message=message,
         )
         for message in messages
+    ]
+
+
+# The nodes that open a new scope: an await, or a comparison, inside one belongs to
+# that scope's own code, not to the loop or block that merely contains its definition.
+_SCOPE_NODES: tuple[type[ast.AST], ...] = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.Lambda,
+    ast.ClassDef,
+)
+
+
+def _walk_own_scope(
+    nodes: Iterable[ast.AST], *, stop_at: tuple[type[ast.AST], ...] = _SCOPE_NODES
+) -> Iterator[ast.AST]:
+    """Yield *nodes* and their descendants in source order, not descending into a *stop_at* node.
+
+    A *stop_at* node is itself yielded; only its children are skipped.
+    """
+    pending = list(reversed(list(nodes)))
+    while pending:
+        node = pending.pop()
+        yield node
+        if not isinstance(node, stop_at):
+            pending.extend(reversed(list(ast.iter_child_nodes(node))))
+
+
+def _awaits(stmts: Iterable[ast.AST]) -> bool:
+    """Return True if *stmts* await anything in their own scope."""
+    return any(isinstance(node, ast.Await) for node in _walk_own_scope(stmts))
+
+
+# The zero-argument methods that read a wall clock: ``loop.time()``, ``time.time()``,
+# ``time.monotonic()``, ``time.perf_counter()``.  Matched by attribute name only.
+_WALL_CLOCK_READS: frozenset[str] = frozenset({'time', 'monotonic', 'perf_counter'})
+
+
+def _is_wall_clock_read(node: ast.AST) -> TypeGuard[ast.Call]:
+    """Return True if *node* is a zero-argument call of a ``_WALL_CLOCK_READS`` method.
+
+    The receiver is never consulted, like the barrier leg's ``.wait()``: no name
+    list decides what is a clock.
+    """
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in _WALL_CLOCK_READS
+        and not node.args
+        and not node.keywords
+    )
+
+
+def _clock_deadline_read(loop: ast.While) -> ast.Call | None:
+    """Return the wall-clock read *loop* compares against to give up, else None.
+
+    That is the first ``Compare`` in the loop's test or own body with a DIRECT
+    operand that is a wall-clock read.  A nested loop or scope is not searched: its
+    comparison is its own.
+    """
+    own_code = _walk_own_scope(
+        [loop.test, *loop.body], stop_at=(*_SCOPE_NODES, ast.While)
+    )
+    for node in own_code:
+        if not isinstance(node, ast.Compare):
+            continue
+        for operand in (node.left, *node.comparators):
+            if _is_wall_clock_read(operand):
+                return operand
+    return None
+
+
+def _clock_deadline_poll_violations(
+    loop: ast.While, lines: list[str], filename: str
+) -> list[Violation]:
+    """Rule C's clock-deadline poll leg, for ONE ``ast.While``: return 0 or 1 Violations.
+
+    Flags an awaiting loop that gives up against a wall-clock read.  Only the
+    routing kind applies: the loop's bound is arithmetic in another statement, so
+    there is no literal on the inspected node to report.
+    """
+    if not _awaits(loop.body):
+        return []
+    read = _clock_deadline_read(loop)
+    if read is None:
+        return []
+    if is_exempted(lines, loop.lineno, _RULE_C_CODE):
+        return []
+    target = f'poll loop `while {ast.unparse(loop.test)}` ({ast.unparse(read)} deadline)'
+    return [
+        Violation(
+            filename=filename,
+            lineno=loop.lineno,
+            col_offset=loop.col_offset,
+            message=_wall_clock_routing_msg(_CLOCK_DEADLINE, target),
+        )
     ]
 
 
@@ -1044,7 +1193,8 @@ def find_violations_in_tree(tree: ast.Module, source: str, filename: str) -> lis
     ``MergeRequest.result`` future or a zero-argument ``.wait()`` barrier) routed through a
     bare ``asyncio.wait_for``, and/or carrying a raw numeric literal bound
     (``timeout=``, ``max_wall_s=`` or wait_for's positional timeout).  One call can
-    produce TWO violations — the kinds are independent.
+    produce TWO violations — the kinds are independent.  Also each async ``while``
+    poll that gives up against a wall-clock read (one violation, at the ``while``).
 
     Rule C additionally honours its own SHRINK-ONLY per-file debt budget
     (``_WALL_CLOCK_DEADLINE_DEBT``), compared with the collected COUNT after the
@@ -1068,10 +1218,15 @@ def find_violations_in_tree(tree: ast.Module, source: str, filename: str) -> lis
     # same tree, which cost ~43% of total checker runtime (20.8s → 30.7s over the seven
     # scanned tests/ dirs) — a cost paid on every merge-queue verify across all nine
     # call sites.  Rule A's walk already visits every node and simply skips non-Assign
-    # ones, so folding Rule B's and Rule C's per-Call handling in here makes them nearly
+    # ones, so folding Rule B's and Rule C's per-node handling in here makes them nearly
     # free.  Output is unchanged: the final sort by (lineno, col_offset) still
     # normalises ordering.
     for node in ast.walk(tree):
+        # ---- Rule C: wall-clock-deadline, every node, dispatched on its type ----
+        # Runs FIRST and unconditionally: its legs read ast.Call AND ast.While nodes,
+        # so neither Rule B's `continue` nor Rule A's type filter below may skip it.
+        wall_clock.extend(_wall_clock_deadline_violations(node, lines, filename))
+
         # ---- Rule B: bare-dataclass-double, position-blind over every ast.Call ----
         # An ast.Call is never an ast.Assign/ast.AnnAssign, so this branch and Rule A's
         # below are mutually exclusive and the `continue` cannot skip Rule A work.
@@ -1079,10 +1234,6 @@ def find_violations_in_tree(tree: ast.Module, source: str, filename: str) -> lis
             double = _dataclass_double_violation(node, lines, filename)
             if double is not None:
                 violations.append(double)
-            # Rule C shares this branch rather than adding its own `continue`:
-            # a second early exit here would shadow Rule B for any node Rule C
-            # matched first.  Both run, then the single existing continue fires.
-            wall_clock.extend(_wall_clock_deadline_violations(node, lines, filename))
             continue
 
         # ---- Rule A: bare-magicmock, ast.Assign/ast.AnnAssign only ----
