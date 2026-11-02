@@ -250,6 +250,7 @@ class Mem0Backend:
     def __init__(self, config: FusedMemoryConfig):
         self.config = config
         self._instances: dict[str, AsyncMemory] = {}
+        self._instance_locks: dict[str, asyncio.Lock] = {}
         self._read_timeout: float = config.queue.backend_read_timeout_seconds
         self._write_timeout: float = config.queue.backend_write_timeout_seconds
         self._async_qdrant_client = None  # Lazy async client for count/list ops
@@ -367,14 +368,27 @@ class Mem0Backend:
     async def _get_instance(self, scope: Scope) -> AsyncMemory:
         """Lazily create and cache an AsyncMemory instance for a project."""
         project_id = scope.project_id
-        if project_id not in self._instances:
-            collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
-            config_dict = self._build_config_dict(collection_name)
-            await self._ensure_collection(collection_name)
-            instance = AsyncMemory.from_config(config_dict)
-            self._instances[project_id] = instance
-            logger.info(f'Mem0 instance created for project {project_id} (collection: {collection_name})')
-        return self._instances[project_id]
+        instance = self._instances.get(project_id)
+        if instance is not None:
+            return instance
+        async with self._instance_lock_for(project_id):
+            instance = self._instances.get(project_id)
+            if instance is None:
+                collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+                config_dict = self._build_config_dict(collection_name)
+                await self._ensure_collection(collection_name)
+                instance = AsyncMemory.from_config(config_dict)
+                self._instances[project_id] = instance
+                logger.info(f'Mem0 instance created for project {project_id} (collection: {collection_name})')
+            return instance
+
+    def _instance_lock_for(self, project_id: str) -> asyncio.Lock:
+        """Return the per-project lock that single-flights first instance creation."""
+        lock = self._instance_locks.get(project_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._instance_locks[project_id] = lock
+        return lock
 
     async def _ensure_collection(self, collection_name: str) -> None:
         """Create the collection if absent, under this backend's own budgets (tests/test_mem0_collection_provisioning.py)."""
