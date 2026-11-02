@@ -2473,6 +2473,7 @@ def _method(**overrides):
         inputs_consumed_note=_NO_INSTRUMENT_RECORDS_NOTE,
         embedding_calls=0,
         adjudication={"attached": 0, "adjudicated": 0},
+        slug_tally=codebook.SlugTally(),
     )
     kwargs.update(overrides)
     return mod.build_method(**kwargs)
@@ -2509,6 +2510,32 @@ def test_build_method_records_a_copy_of_every_verify_normalisation_count():
     counts["tag_dropped"] = 99
 
     assert method["extra"]["verify_normalisations"] == recorded
+
+
+def _method_block_yaml(markdown: str) -> dict:
+    """The mapping in the fenced yaml block of *markdown*'s ## Method section."""
+    return yaml.safe_load(
+        markdown.split("## Method", 1)[1].split("```yaml\n", 1)[1].split("```", 1)[0]
+    )
+
+
+def test_build_method_records_the_runs_slug_rejections():
+    expected = {"count": 3, "values": ["a", "b"], "values_omitted": 0}
+
+    method = _method(slug_tally=codebook.SlugTally(valid=1, rejected=("b", "a", "b")))
+
+    assert method["extra"]["slug_rejections"] == expected
+    record = json.loads(json.dumps(_census_record(method=method)))
+    assert check_census_report.check_record_method(record, _ORACLE_REPORT) == []
+    assert check_census_report.check_rendered_method(mod.render_report(record), _ORACLE_REPORT) == []
+    method_section = _section_text(mod.census_report_sections(record), mod.SECTION_METHOD)
+    assert _method_block_yaml(method_section)["extra"]["slug_rejections"] == expected
+
+
+def test_build_method_without_slug_rejections_records_zero():
+    assert _method()["extra"]["slug_rejections"] == {
+        "count": 0, "values": [], "values_omitted": 0,
+    }
 
 
 def test_build_method_since_is_none_text_without_a_prior_census():
@@ -3248,8 +3275,9 @@ def _invariant_slugs_block(prompt):
     return prompt.split("=== INVARIANT SLUGS ===\n", 1)[1].split("\n=== ", 1)[0]
 
 
-def test_run_census_screens_mined_slugs_and_warns_once(tmp_path, caplog):
-    """plans/census-incremental-prd.md §4.8 row 15 on the census path."""
+def _slug_screening_census(tmp_path):
+    """A run whose project declares `known-slug` and whose two mined sessions
+    name it (`digest-alpha`) and the free text `free-text-one` (`digest-beta`)."""
     doc = tmp_path / invariants.DOC_RELPATH
     doc.parent.mkdir(parents=True)
     doc.write_text("## INV-1 `known-slug`\n", encoding="utf-8")
@@ -3266,6 +3294,12 @@ def test_run_census_screens_mined_slugs_and_warns_once(tmp_path, caplog):
         status_fetcher=_make_fake_status_fetcher(5),
         commit=_make_fake_commit(),
     )
+    return kwargs, fake_invoke
+
+
+def test_run_census_screens_mined_slugs_and_warns_once(tmp_path, caplog):
+    """plans/census-incremental-prd.md §4.8 row 15 on the census path."""
+    kwargs, fake_invoke = _slug_screening_census(tmp_path)
 
     with caplog.at_level(logging.WARNING):
         outcome = mod.run_census(**kwargs)
@@ -3287,6 +3321,18 @@ def test_run_census_screens_mined_slugs_and_warns_once(tmp_path, caplog):
         if r.levelno == logging.WARNING and "free-text-one" in r.getMessage()
     ]
     assert len(naming_it) == 1, naming_it
+
+
+def test_run_census_records_its_slug_rejections_in_the_method_block(tmp_path):
+    expected = {"count": 1, "values": ["free-text-one"], "values_omitted": 0}
+    kwargs, _ = _slug_screening_census(tmp_path)
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert _run_record(kwargs)["method"]["extra"]["slug_rejections"] == expected
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    assert _method_block_yaml(report_text)["extra"]["slug_rejections"] == expected
 
 
 def test_run_census_rejects_a_report_path_outside_project_root_before_any_spend(tmp_path):
