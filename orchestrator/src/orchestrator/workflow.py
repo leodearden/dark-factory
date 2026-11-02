@@ -97,6 +97,7 @@ from orchestrator.artifacts import (
     ReviewAggregation,
     TaskArtifacts,
     iteration_entry_written_by_orchestrator,
+    plan_base_commit,
 )
 from orchestrator.branch_base import own_work_base
 from orchestrator.branch_mergeability import Mergeability, read_branch_state
@@ -1368,7 +1369,9 @@ class TaskWorkflow:
         # that _mark_blocked used to perform.
         self._steward_outcome_channel: asyncio.Queue | None = None
         self._config_dir: TaskConfigDir | None = None
-        self._old_plan_base: str | None = None  # base commit from prior session (for revalidation diff)
+        # The prior dispatch's metadata.json fork point: Layer-B's discriminator,
+        # and _plan()'s revalidation fallback for a plan with no trusted _base_commit.
+        self._old_plan_base: str | None = None
         # Base commit for the current run's worktree (set in run() right after
         # create_worktree).  Captured here so _reconcile_metadata_files_for_done
         # can diff base..merge_sha and write the actually-changed paths instead
@@ -2747,8 +2750,9 @@ class TaskWorkflow:
             await self._sync_worktree_venvs()
 
         self.artifacts = TaskArtifacts(self.worktree, *self._artifact_roots(self.worktree))
-        # Capture old base_commit before init() overwrites metadata.json
-        # — _plan() uses it for revalidation diff.
+        # Capture the prior dispatch's fork point before init() overwrites
+        # metadata.json — Layer-B's discriminator below, and _plan()'s
+        # revalidation fallback for a plan with no trusted _base_commit.
         self._old_plan_base = self.artifacts.read_base_commit()
         self.artifacts.init(
             self.task_id,
@@ -5197,7 +5201,7 @@ class TaskWorkflow:
             existing_plan
             and existing_plan.get('steps')
             and existing_plan.get('_session_id')
-            and self._old_plan_base
+            and (revalidation_base := await self._revalidation_base(existing_plan))
         ):
             # Done-step commits a rebase orphaned are remapped before either
             # the skip or the architect trusts them (task 4032).
@@ -5205,22 +5209,23 @@ class TaskWorkflow:
             before_plan = existing_plan
             current_main = await self.git_ops.get_main_sha()
             revalidation_changed_files = await self.git_ops.get_changed_files(
-                self._old_plan_base, current_main,
+                revalidation_base, current_main,
             )
             plan_file_set = set(existing_plan.get('files', []))
             overlap = [f for f in revalidation_changed_files if f in plan_file_set]
             logger.info(
-                'Task %s: revalidating existing plan '
+                'Task %s: revalidating existing plan from %s '
                 '(%d changed files, %d overlap with plan)',
-                self.task_id, len(revalidation_changed_files), len(overlap),
+                self.task_id, revalidation_base[:12],
+                len(revalidation_changed_files), len(overlap),
             )
             text_drift = self._check_plan_text_drift(existing_plan)
 
             # ── Lever B: revalidation skip ────────────────────────────
             # When main has gained no changes that touch the plan's files,
             # the architect's revalidation pass is a near-certain no-op.
-            # Short-circuit by stamping _revalidated_at and bumping
-            # base_commit ourselves, then return PLANNED. Falls through to
+            # Short-circuit by stamping _revalidated_at and advancing the
+            # plan's _base_commit ourselves, then return PLANNED. Falls through to
             # the existing architect path on any pre-flight failure.
             if (
                 self.config.revalidation_skip_enabled
@@ -5741,6 +5746,21 @@ class TaskWorkflow:
         except Exception as exc:
             logger.warning('Task %s: plan_text_fp mirror write failed: %s', self.task_id, exc)
         self._mutable_task_metadata().update(mirror)
+
+    async def _revalidation_base(self, plan: dict) -> str | None:
+        """The main SHA *plan* was last validated against, corroborated on main's history, else the prior dispatch's fork point (PRD task-meta-task-keying §M2)."""
+        stamped = plan_base_commit(plan)
+        if stamped is None:
+            return self._old_plan_base
+        on_main = await self.git_ops.is_ancestor_checked(stamped, self.config.git.main_branch)
+        if on_main is True:
+            return stamped
+        logger.info(
+            'Task %s: plan _base_commit %s not corroborated on main (is_ancestor=%r); '
+            'revalidating from the prior dispatch base',
+            self.task_id, stamped[:12], on_main,
+        )
+        return self._old_plan_base
 
     async def _can_skip_revalidation(self, plan: dict) -> bool:
         """Lever B pre-flight checks for the revalidation skip.

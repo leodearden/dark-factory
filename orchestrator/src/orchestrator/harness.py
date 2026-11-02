@@ -4816,7 +4816,9 @@ class Harness:
                 # 17-20 wasted Opus calls per 14d.  Keep the worktree, unlink
                 # plan.lock, and add to _preserved_worktrees so the next
                 # acquisition reuses it; _plan() will then take the
-                # revalidation branch via _old_plan_base.  We deliberately
+                # revalidation branch via the plan's own _base_commit
+                # (falling back to the lane's prior base for unstamped
+                # plans).  We deliberately
                 # do NOT pre-load into _recovered_plans because that bypasses
                 # _plan() entirely.
                 if plan.get('_session_id'):
