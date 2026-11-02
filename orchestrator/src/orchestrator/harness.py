@@ -3564,22 +3564,42 @@ class Harness:
             logger.info(f'Module cache sample: {sample}')
 
     def _resolve_recovery_artifact(self, entry: Path, name: str) -> Path:
-        """Resolve a `.task` artifact path new-then-old (W11 delta relocation).
+        """Resolve a LANE-keyed artifact (``agent_session.json``) new-then-old.
 
         Prefers ``TaskArtifacts.meta_root_for(worktree_base, entry.name) /
-        name`` (the new ``.task-meta`` sibling location, W11 beta), falling
-        back to the legacy ``entry / '.task' / name`` when the new path is
-        absent.  Mirrors ``TaskArtifacts._read_path``'s new-then-old
-        contract, for the ``_recover_crashed_tasks`` reads that don't go
-        through a ``TaskArtifacts`` instance.
+        name`` (the ``.task-meta`` lane root, W11 beta), falling back to the
+        legacy ``entry / '.task' / name`` when that path is absent.
+        Task-scoped artifacts go through :meth:`_task_recovery_artifact`.
         """
         new_path = TaskArtifacts.meta_root_for(self.git_ops.worktree_base, entry.name) / name
         if new_path.exists():
             return new_path
         return entry / '.task' / name
 
+    def _task_recovery_artifact(self, entry: Path, task_id: str | None, name: str) -> Path | None:
+        """Where task-scoped *name* (plan.json, plan.lock) of *task_id* survives
+        for *entry*: the task root (``TaskArtifacts.for_task``), else the legacy
+        ``entry / '.task' / name`` (W11 compat).
+
+        ``None`` when *task_id* is None or ``task_root_for`` rejects it: there
+        is no task to read for, so the caller takes its no-plan branch.
+        """
+        if task_id is None:
+            return None
+        try:
+            task_path = TaskArtifacts.for_task(entry, task_id).artifact_path(name)
+        except ValueError as exc:
+            logger.warning(
+                'Recovery: %s names an unaddressable task id (%s) — no %s to read',
+                entry.name, exc, name,
+            )
+            return None
+        if task_path.exists():
+            return task_path
+        return entry / '.task' / name
+
     def _clear_recovery_artifact(self, entry: Path, name: str) -> None:
-        """Remove a `.task` artifact from BOTH the new and legacy roots.
+        """Remove a LANE-keyed artifact from BOTH the lane and legacy roots.
 
         The write-side mirror of :meth:`_resolve_recovery_artifact` — mirrors
         ``TaskArtifacts._clear_path``: clearing only the resolved path risks
@@ -3606,11 +3626,11 @@ class Harness:
         ``AgentSession`` through.
 
         Keying: when *task_id* is given (the plan-present sites, keyed by
-        the plan-derived recovery id) it is used directly — this covers both
+        the entry's recovery id) it is used directly — this covers both
         a v2 sidecar (whose own ``task_id`` should equal it) and a v1
         sidecar (which has no ``task_id`` of its own, B11 fallback). When
         *task_id* is ``None`` (the no-plan lane site, which has no
-        plan-derived id) falls back to the sidecar's own v2 ``task_id``. If
+        recovered plan) falls back to the sidecar's own v2 ``task_id``. If
         neither yields a usable key (a v1 sidecar on a no-plan lane) — or the
         sidecar is missing, unreadable, or parsed to something that is not a
         JSON OBJECT — nothing is adopted and ``None`` is returned. Never
@@ -3673,8 +3693,8 @@ class Harness:
         # ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow`` as
         # ``TaskConfigDir(self.task_id, base_dir=self.worktree / '.task')``.
         # And ``key`` above IS the real task id at every call arity (the
-        # plan-derived recovery id, the v2 sidecar's own ``task_id``, or the
-        # cold worktree's dir name — all the same identity).
+        # lane metadata's recovery id, the v2 sidecar's own ``task_id``, or
+        # the cold worktree's dir name — all the same identity).
         #
         # Nothing else is EVER stashed: the one other creator,
         # ``orchestrator/src/orchestrator/dry_run_unblock.py::dry_run_unblock``,
@@ -4506,10 +4526,10 @@ class Harness:
                                 continue
 
                         pool.restore_assignment(rec.task_id, entry)
-                        rec_plan_path = self._resolve_recovery_artifact(
-                            entry, 'plan.json',
+                        rec_plan_path = self._task_recovery_artifact(
+                            entry, rec.task_id, 'plan.json',
                         )
-                        if rec_plan_path.exists():
+                        if rec_plan_path is not None and rec_plan_path.exists():
                             try:
                                 rec_plan = json.loads(rec_plan_path.read_text())
                             except (json.JSONDecodeError, OSError) as e:
@@ -4552,10 +4572,10 @@ class Harness:
                                         entry.name, rec.task_id,
                                     )
                                     self._preserved_worktrees.add(rec.task_id)
-                        rec_lock_path = self._resolve_recovery_artifact(
-                            entry, 'plan.lock',
+                        rec_lock_path = self._task_recovery_artifact(
+                            entry, rec.task_id, 'plan.lock',
                         )
-                        if rec_lock_path.exists():
+                        if rec_lock_path is not None and rec_lock_path.exists():
                             rec_lock_path.unlink()
                             logger.info(
                                 'Recovery: cleared stale plan.lock for '
@@ -4607,16 +4627,27 @@ class Harness:
                         cleaned += 1
                         continue
 
-            plan_path = self._resolve_recovery_artifact(entry, 'plan.json')
+            # The task this entry was dispatched for. A cold worktree is named
+            # for it; a lane is named for its pool slot, so its id comes from
+            # the lane root's metadata.json — never from a plan.json, which is
+            # task-scoped and lives in the task root that id names.
+            recovery_id = (
+                TaskArtifacts.read_lane_task_id(
+                    TaskArtifacts.meta_root_for(worktree_base, entry.name),
+                )
+                if is_lane else task_id
+            )
+            plan_path = self._task_recovery_artifact(entry, recovery_id, 'plan.json')
 
-            if not plan_path.exists():
+            if recovery_id is None or plan_path is None or not plan_path.exists():
                 # Mid-invocation crash: an agent subprocess was in flight when
                 # the prior orchestrator died (no plan was written yet).  The
                 # sidecar pins the Claude session UUID so the next workflow
                 # can --resume it with a "continue" prompt instead of spawning
                 # a fresh agent.
                 #
-                # For lanes: a v1 sidecar carries session_id/role/owner_pid
+                # For lanes this also covers a lane whose metadata names no
+                # task.  A v1 sidecar carries session_id/role/owner_pid
                 # but NO task_id, and the in-memory assignment map is empty
                 # after a restart, so a v1-only lane still can't be mapped
                 # back to its real task -- nothing is adopted for it.  A v2
@@ -4672,31 +4703,6 @@ class Harness:
                 cleaned += 1
                 continue
 
-            # For lanes, derive the real task id from plan.json.  A lane dir
-            # name (e.g. '_lane-0') never equals the real task_id by design —
-            # the lane dir is named after the pool slot, not the task.
-            # Cold path: recovery_id == task_id (entry.name) — byte-identical.
-            # Normalize to str: plan.json could store task_id as int; dispatch
-            # and restore_assignment key off str (mirroring the str() coercion
-            # in the orphan-reaper live_ids set).
-            recovery_id = (
-                str(plan.get('task_id'))
-                if (is_lane and plan.get('task_id') is not None)
-                else task_id
-            )
-
-            # For lanes: if plan.json has no task_id there is no recoverable
-            # identity — release the lane back to the pool.
-            if is_lane and not recovery_id:
-                logger.warning(
-                    'Recovery: lane %s plan.json has no task_id — '
-                    'releasing back to pool',
-                    task_id,
-                )
-                await self.git_ops.cleanup_worktree(entry, task_id)
-                cleaned += 1
-                continue
-
             # Validate plan belongs to this task (cold path only).
             # Lanes skip this check: lane name != task_id is expected by
             # design, so the cold numeric-mismatch cleanup must not fire.
@@ -4719,7 +4725,7 @@ class Harness:
             # task).  Compare the worktree's stored title to the LIVE DB
             # task's title and quarantine on a provable mismatch — this is the
             # exact line that would have caught 3770.
-            # For lanes, recovery_id is the real task id read from plan.json.
+            # For lanes, recovery_id is the real task id from lane metadata.
             if self.config.worktree_identity_guard_enabled:
                 live = await self.scheduler.get_task(recovery_id)
                 if live is None:
@@ -4818,8 +4824,8 @@ class Harness:
                         f'Recovery: worktree {recovery_id} has stamped plan with '
                         f'no completed steps — preserving for revalidation'
                     )
-                    lock_path = self._resolve_recovery_artifact(entry, 'plan.lock')
-                    if lock_path.exists():
+                    lock_path = self._task_recovery_artifact(entry, recovery_id, 'plan.lock')
+                    if lock_path is not None and lock_path.exists():
                         lock_path.unlink()
                         logger.info(
                             f'Recovery: cleared stale plan.lock for '
@@ -4855,8 +4861,8 @@ class Harness:
             self._recovered_plans[recovery_id] = plan
             self._adopt_recovered_session(entry, recovery_id)
             # Clear stale plan.lock so the new session doesn't immediately requeue
-            lock_path = self._resolve_recovery_artifact(entry, 'plan.lock')
-            if lock_path.exists():
+            lock_path = self._task_recovery_artifact(entry, recovery_id, 'plan.lock')
+            if lock_path is not None and lock_path.exists():
                 lock_path.unlink()
                 logger.info(f'Recovery: cleared stale plan.lock for task {recovery_id}')
             recovered += 1
@@ -17649,16 +17655,26 @@ class Harness:
     def _locate_plan_artifacts(self, task_id: str) -> TaskArtifacts | None:
         """Return *task_id*'s plan artifacts resolved new-then-old, or None.
 
-        The W11 ``.task-meta`` SIBLING first, the legacy ``<worktree>/.task``
-        second. Without the fallback arm every pre-relocation task would take
-        the "no plan" exit of :meth:`_fold_granted_files`.
-        :meth:`_resolve_recovery_artifact` is the read-only sibling of the same
-        contract, for single artifact paths.
+        The task's own ``.task-meta/task-<id>`` root first, the legacy
+        ``<worktree>/.task`` second. Without the fallback arm every
+        pre-relocation task would take the "no plan" exit of
+        :meth:`_fold_granted_files`. :meth:`_task_recovery_artifact` is the
+        read-only sibling of the same contract, for single artifact paths.
+
+        ``None`` also when ``task_root_for`` rejects *task_id*: there is no
+        addressable task root to read, so the caller takes its no-plan branch.
         """
         wt = self._resolve_task_worktree(task_id)
-        new_root = TaskArtifacts.meta_root_for(self.git_ops.worktree_base, wt.name)
-        if (new_root / 'plan.json').exists():
-            return TaskArtifacts(wt, meta_root=new_root)
+        try:
+            task_view = TaskArtifacts.for_task(wt, task_id)
+        except ValueError as exc:
+            logger.warning(
+                'granted-files fold: task %s names an unaddressable task id (%s) '
+                '— no plan to widen', task_id, exc,
+            )
+            return None
+        if task_view.artifact_path('plan.json').exists():
+            return task_view
         if (wt / '.task' / 'plan.json').exists():
             return TaskArtifacts(wt)
         return None
@@ -17883,11 +17899,9 @@ class Harness:
                 # an operator-visible line.
                 wt = self._resolve_task_worktree(task_id)
                 logger.warning(
-                    'granted-files fold: task %s has no plan.json at %s or %s '
-                    '— the grant %s was not delivered',
-                    task_id,
-                    TaskArtifacts.meta_root_for(self.git_ops.worktree_base, wt.name),
-                    wt / '.task', granted,
+                    'granted-files fold: task %s has no plan.json in its task '
+                    'root or at %s — the grant %s was not delivered',
+                    task_id, wt / '.task', granted,
                 )
                 return GrantDelivery.NO_PLAN_TO_WIDEN
 

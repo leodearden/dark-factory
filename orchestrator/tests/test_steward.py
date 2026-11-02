@@ -18,6 +18,7 @@ from escalation.queue import EscalationQueue
 from shared.cli_invoke import AllAccountsCappedException
 from shared.usage_gate import AccountLease, InvokeSlot
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.steward import (
     StewardMetrics,
     TaskSteward,
@@ -2234,7 +2235,7 @@ class TestPreTriageUsageGateCleanup:
 
         TRIAGE is the REAL AgentRole (imported before the module is replaced)
         so role.name/system_prompt/allowed_tools stay genuine — steward.py's
-        _inject_verdict_tools_mcp(None, self.worktree, TRIAGE) call reads
+        _inject_verdict_tools_mcp(..., self.worktree, TRIAGE, task_root=...) call reads
         role.name for real, and a MagicMock stand-in would smuggle a Mock
         object into the --verdict-role subprocess arg. extract_triage_verdict
         is stubbed to always succeed, standing in for parse_triage_result's
@@ -2476,7 +2477,7 @@ class TestPreTriageSuggestionsPath:
 
         TRIAGE is the REAL AgentRole (imported before the module is replaced)
         so role.name/system_prompt/allowed_tools stay genuine — steward.py's
-        _inject_verdict_tools_mcp(None, self.worktree, TRIAGE) call reads
+        _inject_verdict_tools_mcp(..., self.worktree, TRIAGE, task_root=...) call reads
         role.name for real, and a MagicMock stand-in would smuggle a Mock
         object into the --verdict-role subprocess arg. extract_triage_verdict
         is stubbed to always succeed, standing in for parse_triage_result's
@@ -2645,6 +2646,31 @@ class TestPreTriageSuggestionsPath:
         call_kwargs = mock_invoke.call_args.kwargs
         assert 'verdict-tools' in call_kwargs['mcp_config']['mcpServers']
         assert 'output_schema' not in call_kwargs
+
+    async def test_pre_triage_verdict_round_trips_through_the_task_root(
+        self, steward, _mock_triage,
+    ):
+        """Task 3155: verdict-tools is launched on the task root, and the
+        triage verdict consumed is the one there, never a lane-root decoy."""
+        artifacts = TaskArtifacts.for_task(steward.worktree, steward.task_id)
+
+        def _submit_triage(**_kwargs):
+            for root, accepted in ((artifacts.lane_root, 'decoy'), (artifacts.task_root, 'real')):
+                (root / 'verdicts').mkdir(parents=True, exist_ok=True)
+                (root / 'verdicts' / 'triage.json').write_text(
+                    json.dumps({'verdict': {'accepted': accepted}}),
+                )
+            return _make_result()
+
+        with patch('orchestrator.steward.invoke_agent',
+                   new_callable=AsyncMock, side_effect=_submit_triage) as mock_invoke:
+            await steward._pre_triage_suggestions(self._esc_with_suggestions(12))
+
+        args = mock_invoke.call_args.kwargs['mcp_config']['mcpServers']['verdict-tools']['args']
+        assert args[args.index('--task-root') + 1] == str(artifacts.task_root)
+        _mock_triage.extract_triage_verdict.assert_called_once_with(
+            {'verdict': {'accepted': 'real'}},
+        )
 
     async def test_pre_triage_uses_worktree_as_cwd(self, steward):
         """_pre_triage_suggestions runs in the task worktree, never the main checkout."""

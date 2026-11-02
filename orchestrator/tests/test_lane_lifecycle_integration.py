@@ -229,9 +229,9 @@ class TestB1WriterReaderRoundTrip:
         lane = await _acquire_lane(harness.git_ops, '42', head, expected_title='B1 task')
         assert lane.name.startswith('_lane-')
 
-        # Write crashed progress under the sibling .task-meta root.
-        meta = TaskArtifacts.meta_root_for(harness.git_ops.worktree_base, lane.name)
-        ta = TaskArtifacts(lane, meta)
+        # Write crashed progress under the sibling .task-meta roots, as a
+        # dispatch of '42' into this lane leaves them.
+        ta = TaskArtifacts.for_task(lane, '42')
         ta.init('42', 'B1 task', 'd')
         ta.write_plan(_make_plan(3, 5, '42'))
 
@@ -376,8 +376,7 @@ class TestB2CrashQuarantine:
 
         head = await _get_head(repo)
         lane = await _acquire_lane(harness.git_ops, '42', head, expected_title='B2 identity')
-        meta = TaskArtifacts.meta_root_for(harness.git_ops.worktree_base, lane.name)
-        ta = TaskArtifacts(lane, meta)
+        ta = TaskArtifacts.for_task(lane, '42')
         ta.init('42', 'B2 identity', 'd')
         ta.write_plan(_make_plan(1, 2, '42'))
 
@@ -496,18 +495,17 @@ class TestB4Contamination:
         _wire_recovery_scheduler(harness)
 
         lane = await _acquire_lane(harness.git_ops, '42', await _get_head(repo))
-        meta = TaskArtifacts.meta_root_for(harness.git_ops.worktree_base, lane.name)
-        ta = TaskArtifacts(lane, meta)
+        ta = TaskArtifacts.for_task(lane, '42')
         ta.init('42', 'B4', 'd')
         ta.write_plan(_make_plan(1, 2, '42'))
         ta.append_iteration_log({'k': 1})
 
         # Metadata lives OUTSIDE the worktree: TaskArtifacts was pointed at
-        # the sibling `meta` root, never at `<lane>/.task`.  Nothing writes
-        # `<lane>/.task` any more, either — acquire's _ensure_task_gitignore
-        # defense-in-depth guard, the last thing that unconditionally
-        # created it, is gone.
-        assert (meta / 'plan.json').exists()
+        # the sibling `.task-meta` roots, never at `<lane>/.task`.  Nothing
+        # writes `<lane>/.task` any more, either — acquire's
+        # _ensure_task_gitignore defense-in-depth guard, the last thing that
+        # unconditionally created it, is gone.
+        assert ta.artifact_path('plan.json').exists()
         assert not (lane / '.task' / 'plan.json').exists()
         assert not (lane / '.task-meta').exists()
 
@@ -524,7 +522,7 @@ class TestB4Contamination:
             assert forbidden not in out, f'{forbidden!r} leaked into the hostile commit tree'
 
         # The sidecar is untouched by the commit.
-        assert (meta / 'plan.json').exists()
+        assert ta.artifact_path('plan.json').exists()
 
 
 # ── B5 — survives cleaning ──────────────────────────────────────────────
@@ -547,8 +545,7 @@ class TestB5SurvivesCleaning:
 
         base = harness.git_ops.worktree_base
         lane = await _acquire_lane(harness.git_ops, '42', await _get_head(repo))
-        meta = TaskArtifacts.meta_root_for(base, lane.name)
-        ta = TaskArtifacts(lane, meta)
+        ta = TaskArtifacts.for_task(lane, '42')
         ta.init('42', 'B5', 'd')
         ta.write_plan(_make_plan(1, 2, '42'))
 
@@ -566,7 +563,7 @@ class TestB5SurvivesCleaning:
         assert rec.state == DurableLaneState.ASSIGNED
         assert rec.task_id == '42'
 
-        assert (meta / 'plan.json').exists()
+        assert ta.artifact_path('plan.json').exists()
 
 
 # ── B7 — REUSE dispatch refreshes the record's age (task 7863) ─────────
@@ -592,8 +589,7 @@ class TestB7ReuseDispatchRefreshesRecordAge:
 
         head = await _get_head(repo)
         lane = await _acquire_lane(harness.git_ops, '42', head, expected_title='B7 task')
-        meta = TaskArtifacts.meta_root_for(harness.git_ops.worktree_base, lane.name)
-        ta = TaskArtifacts(lane, meta)
+        ta = TaskArtifacts.for_task(lane, '42')
         ta.init('42', 'B7 task', 'd')
         ta.write_plan(_make_plan(1, 3, '42'))
 

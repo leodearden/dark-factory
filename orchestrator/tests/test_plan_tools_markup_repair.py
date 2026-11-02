@@ -180,7 +180,7 @@ _COLLECTION_SCHEMA_TOOL_NAME = {
 #: The ``TaskArtifacts`` plan-mutating methods that plan-tools impls call:
 #: ``artifacts.py::TaskArtifacts.write_plan``, ``::update_step_status``,
 #: ``::mark_step_committed`` and ``::append_step_deviation`` each write
-#: ``self.root / 'plan.json'``, the last two via a call to ``self.write_plan``.
+#: ``artifact_path('plan.json')``, the last two via a call to ``self.write_plan``.
 #: ``_plan_writing_tool_names()`` below keys its live-module walk on this set
 #: to derive the candidate set for "could this plan-tools entry point write a
 #: ``_REPAIRABLE_PLAN_FIELDS`` cell?".
@@ -2061,14 +2061,14 @@ class TestRepairWriteBackByteFormat:
         """
         _seed_corrupt(plan_artifacts)
         repaired, _ = plan_tools._read_plan_repaired(plan_artifacts)
-        via_write_back = plan_artifacts.root / 'plan.json'
+        via_write_back = plan_artifacts.artifact_path('plan.json')
 
         reference_worktree = tmp_path / 'reference'
         reference_worktree.mkdir()
         reference = TaskArtifacts(reference_worktree)
         reference.init('test-1', 'Test task', 'A test')
         reference.write_plan(copy.deepcopy(repaired))
-        via_write_plan = reference.root / 'plan.json'
+        via_write_plan = reference.artifact_path('plan.json')
 
         assert via_write_back.read_bytes() == via_write_plan.read_bytes()
         # ...and the same PERMISSIONS, a difference the content comparison
@@ -2147,7 +2147,7 @@ class TestReadPlanRepaired:
 
         plan_tools._read_plan_repaired(plan_artifacts)
 
-        on_disk = json.loads((plan_artifacts.root / 'plan.json').read_text())
+        on_disk = json.loads(plan_artifacts.artifact_path('plan.json').read_text())
         assert on_disk['design_decisions'][0]['rationale'] == _RATIONALE_PROSE
         # ...and the refusing field is BYTE-IDENTICAL on disk, not sanitized.
         assert on_disk['design_decisions'][1]['decision'] == PROSE_QUOTED
@@ -2157,7 +2157,7 @@ class TestReadPlanRepaired:
 
         plan_tools._read_plan_repaired(plan_artifacts)
 
-        on_disk = json.loads((plan_artifacts.root / 'plan.json').read_text())
+        on_disk = json.loads(plan_artifacts.artifact_path('plan.json').read_text())
         assert on_disk['_schema_version'] == PLAN_SCHEMA_VERSION
         for key in ('task_id', 'title', 'analysis', 'files', 'prerequisites',
                     'steps', 'reuse'):
@@ -2176,7 +2176,7 @@ class TestReadPlanRepaired:
         turn a read into a write for the overwhelmingly common clean path.
         """
         _seed_mixed_plan(plan_artifacts)
-        plan_path = plan_artifacts.root / 'plan.json'
+        plan_path = plan_artifacts.artifact_path('plan.json')
 
         first, _ = plan_tools._read_plan_repaired(plan_artifacts)
         before_bytes = plan_path.read_bytes()
@@ -2201,7 +2201,7 @@ class TestReadPlanRepaired:
 
     def test_a_wholly_clean_plan_is_never_written(self, plan_artifacts, monkeypatch):
         plan_artifacts.write_plan(corrupt_plan())
-        plan_path = plan_artifacts.root / 'plan.json'
+        plan_path = plan_artifacts.artifact_path('plan.json')
         before_mtime = plan_path.stat().st_mtime_ns
         writes: list = []
         monkeypatch.setattr(
@@ -2221,7 +2221,7 @@ class TestReadPlanRepaired:
         plan = corrupt_plan()
         plan['design_decisions'][0]['decision'] = PROSE_QUOTED
         plan_artifacts.write_plan(plan)
-        plan_path = plan_artifacts.root / 'plan.json'
+        plan_path = plan_artifacts.artifact_path('plan.json')
         before_bytes = plan_path.read_bytes()
         writes: list = []
         monkeypatch.setattr(
@@ -2318,7 +2318,7 @@ class TestReadPlanRepaired:
         assert sorted(f['outcome'] for f in first) == ['repaired', 'unrepairable']
 
         # Re-corrupt the same field and read again: reported afresh.
-        on_disk = json.loads((plan_artifacts.root / 'plan.json').read_text())
+        on_disk = json.loads(plan_artifacts.artifact_path('plan.json').read_text())
         on_disk['design_decisions'][0]['rationale'] = TRAILING_RATIONALE
         plan_artifacts.write_plan(on_disk)
 
@@ -2342,7 +2342,7 @@ class TestReadPlanRepaired:
             assert payload['event'] == MARKUP_FACT_EVENT
             assert set(payload) >= FACT_LOG_KEYS
             assert payload['outcome'] in {'repaired', 'unrepairable'}
-            assert payload['path'] == str(plan_artifacts.root / 'plan.json')
+            assert payload['path'] == str(plan_artifacts.artifact_path('plan.json'))
         assert sorted(p['outcome'] for p in payloads) == ['repaired', 'unrepairable']
 
     def test_the_logged_payload_carries_the_full_locator(self, plan_artifacts, caplog):
@@ -2383,7 +2383,7 @@ class TestReadPlanRepaired:
         self, plan_artifacts, monkeypatch
     ):
         """No plan.json -> ``{}``, no facts, no write. No NEW failure mode."""
-        plan_path = plan_artifacts.root / 'plan.json'
+        plan_path = plan_artifacts.artifact_path('plan.json')
         plan_path.unlink(missing_ok=True)
         assert plan_artifacts.read_plan() == {}
         writes: list = []
@@ -2401,7 +2401,7 @@ class TestReadPlanRepaired:
     def test_unparseable_plan_raises_exactly_what_read_plan_raises(
         self, plan_artifacts, monkeypatch
     ):
-        plan_path = plan_artifacts.root / 'plan.json'
+        plan_path = plan_artifacts.artifact_path('plan.json')
         plan_path.write_text('{not json at all')
         before_bytes = plan_path.read_bytes()
         with pytest.raises(json.JSONDecodeError):
@@ -2930,11 +2930,11 @@ class TestRepairWriteBackDelegatesToTaskArtifacts:
         plan = corrupt_plan()
         plan['design_decisions'][0]['decision'] = PROSE_QUOTED
         plan_artifacts.write_plan(plan)
-        before_bytes = (plan_artifacts.root / 'plan.json').read_bytes()
+        before_bytes = plan_artifacts.artifact_path('plan.json').read_bytes()
         calls = self._spy_on_write_plan(monkeypatch)
 
         _, facts = plan_tools._read_plan_repaired(plan_artifacts)
 
         assert [f['outcome'] for f in facts] == ['unrepairable']
         assert calls == []
-        assert (plan_artifacts.root / 'plan.json').read_bytes() == before_bytes
+        assert plan_artifacts.artifact_path('plan.json').read_bytes() == before_bytes

@@ -32,7 +32,6 @@ from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import (
     TaskWorkflow,
     WorkflowOutcome,
-    _meta_root_for_worktree,
     build_workflow,
 )
 
@@ -45,6 +44,7 @@ from .architect_eval import (
     invoke_architect,
     judge_plan,
     log_architect_cell,
+    open_eval_artifacts,
     read_reference_diff,
 )
 from .configs import (
@@ -1097,14 +1097,14 @@ async def run_confirm_stage(
 def _resume_plan_from_worktree(worktree: Path, task: dict) -> dict | None:
     """Load the initial plan for a --worktree resume run.
 
-    Reads the RELOCATED plan.json at ``_meta_root_for_worktree(worktree)/plan.json``.
+    Reads the RELOCATED plan.json through ``open_eval_artifacts(worktree)``.
     Production TaskWorkflow moved plan.json out of the legacy ``<worktree>/.task/``
     to the sibling ``.task-meta/<name>/`` root (W11 / task 2258); reading the
     stale legacy path silently missed and discarded completed-step progress on
     resume (D1 drift, task 2812). Falls back to the frozen ``task['plan']`` only
     when the relocated file is absent.
     """
-    existing_plan_path = _meta_root_for_worktree(worktree) / 'plan.json'
+    existing_plan_path = open_eval_artifacts(worktree).artifact_path('plan.json')
     if existing_plan_path.exists():
         initial_plan = json.loads(existing_plan_path.read_text())
         steps = initial_plan.get('steps', [])

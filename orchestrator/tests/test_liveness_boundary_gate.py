@@ -588,7 +588,7 @@ class TestB5EvidenceCarriesTranscript:
         assert wf.artifacts is not None
 
         # Build a real TaskConfigDir so _capture_zero_output_evidence can locate the transcript
-        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
+        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.lane_root)
         wf._config_dir = config_dir  # type: ignore[attr-defined]
 
         sid = 'sid-b5-evidence'
@@ -609,7 +609,7 @@ class TestB5EvidenceCarriesTranscript:
 
         wf._capture_zero_output_evidence(result, iteration=3)  # type: ignore[attr-defined]
 
-        evidence_path = wf.artifacts.root / 'zero_output_evidence-iter3.json'
+        evidence_path = wf.artifacts.zero_output_evidence_path(3)
         assert evidence_path.exists(), f'Expected evidence file at {evidence_path}'
 
         data = json.loads(evidence_path.read_text())

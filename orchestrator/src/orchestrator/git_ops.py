@@ -16293,15 +16293,23 @@ class GitOps:
             )
 
     def _meta_roots_naming(self, task_id: str) -> list[Path]:
-        """Every ``.task-meta`` root named *task_id* or whose metadata.json names it."""
+        """Every ``.task-meta`` root of *task_id*: a lane root named for it or
+        whose metadata.json names it, and its task root
+        (``TaskArtifacts.task_root_for``)."""
         meta_dir = self.worktree_base / TASK_META_DIRNAME
         try:
             roots = sorted(entry for entry in meta_dir.iterdir() if entry.is_dir())
         except FileNotFoundError:
             return []
+        try:
+            task_root = TaskArtifacts.task_root_for(self.worktree_base, task_id)
+        except ValueError:
+            task_root = None
         return [
             root for root in roots
-            if root.name == task_id or TaskArtifacts.read_lane_task_id(root) == task_id
+            if root == task_root
+            or root.name == task_id
+            or TaskArtifacts.read_lane_task_id(root) == task_id
         ]
 
     def _park_meta_roots(self, task_id: str, parked_name: str) -> list[str]:

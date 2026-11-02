@@ -727,7 +727,7 @@ class TestReviewMirrorCarriesSalvagedVerdict:
 
     def _mirror(self, f) -> dict:
         return json.loads(
-            (f.artifacts.root / 'reviews' / 'reviewer_comprehensive.json').read_text(),
+            (f.artifacts.artifact_path('reviews') / 'reviewer_comprehensive.json').read_text(),
         )
 
     async def test_mirror_carries_verdict_salvaged_from_exception(

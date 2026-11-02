@@ -1985,7 +1985,9 @@ class TestRunArchitectEval:
         # the RELOCATED .task-meta/<name>/ root (matching production
         # _inject_plan_tools_mcp), so the plan-tools server writes plan.json where
         # the TaskArtifacts(worktree, meta_root=_meta_root_for_worktree(worktree))
-        # readback reads it.
+        # readback reads it. That meta root is also its task root (task 3155):
+        # the eval stays single-root, since parallel trials of one task id would
+        # otherwise share one .task-meta/task-<id>.
         import sys
 
         from orchestrator.workflow import _meta_root_for_worktree
@@ -2005,6 +2007,7 @@ class TestRunArchitectEval:
             '-m', 'orchestrator.mcp.plan_tools',
             '--worktree', str(Path('/fake/wt')),
             '--meta-root', str(expected_meta_root),
+            '--task-root', str(expected_meta_root),
         ]
 
 

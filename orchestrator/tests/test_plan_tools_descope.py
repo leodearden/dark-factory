@@ -61,7 +61,7 @@ def _record(artifacts: TaskArtifacts, **overrides) -> dict:
 
 
 def _plan_bytes(artifacts: TaskArtifacts) -> bytes:
-    return (artifacts.root / 'plan.json').read_bytes()
+    return (artifacts.artifact_path('plan.json')).read_bytes()
 
 
 class TestRecordDescopedStep:

@@ -853,18 +853,17 @@ class TestResumeLevelGateRemoved:
 def _plan_root(harness: Harness, task_id: str, *, legacy: bool = False) -> Path:
     """The directory the fold must resolve for *task_id*'s plan.json.
 
-    Mirrors the harness's own new-then-old artifact resolution
-    (``Harness._resolve_recovery_artifact``): the W11 ``.task-meta`` SIBLING of
-    the worktree first, the legacy ``<worktree>/.task`` second.  Derived
-    through ``TaskArtifacts.meta_root_for`` / ``Harness._resolve_task_worktree``
-    rather than by joining the path shape by hand, so a relocation moves the
-    fixture with the production resolver instead of silently pointing the test
-    at a directory nothing writes.
+    plan.json is task-scoped, so the fold reads *task_id*'s
+    ``.task-meta/task-<id>`` root first and the legacy ``<worktree>/.task``
+    second.  Derived through ``TaskArtifacts.task_root_for`` /
+    ``Harness._resolve_task_worktree`` rather than by joining the path shape
+    by hand, so a relocation moves the fixture with the production resolver
+    instead of silently pointing the test at a directory nothing writes.
     """
     wt = harness._resolve_task_worktree(task_id)
     if legacy:
         return wt / '.task'
-    return TaskArtifacts.meta_root_for(harness.git_ops.worktree_base, wt.name)
+    return TaskArtifacts.task_root_for(wt.parent, task_id)
 
 
 def _seed_plan(
