@@ -10,6 +10,7 @@ server went on to complete.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -85,3 +86,12 @@ async def test_an_existing_collection_is_adopted_and_never_recreated(config, tar
         async with backend_against(stub.url, config) as backend:
             assert await backend.get(MEMORY_ID, SCOPE) is None
         assert stub.creates(target) == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_calls_for_one_project_provision_once(config, target):
+    with stub_qdrant_server(create_delay_s={target: 0.3}) as stub:
+        async with backend_against(stub.url, config) as backend:
+            results = await asyncio.gather(backend.get(MEMORY_ID, SCOPE), backend.get(MEMORY_ID, SCOPE))
+            assert results == [None, None]
+        assert stub.creates(target) == 1
