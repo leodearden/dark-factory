@@ -1070,3 +1070,25 @@ for (const chart of COUNT_AXIS_CHARTS) {
     assert.deepEqual(axis.labels, tickValues(max, axis.ticks).map(v => `${v} ops`));
   });
 }
+
+// ── Decision 10: the Tasks tab's banner notices (tasks_offline_banner.js::tasksBannerNoticesFor) ──
+// Every notice kind the helper returns renders under its own test id.
+
+test('tab_tasks.jsx::TasksTab renders the count-stale notice tasksBannerNoticesFor describes under its own test id', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  seedOneTask(window, inProgressTask(false));
+  seedDashboardData(window, {
+    TASKS_COUNT_STALE_PROJECTS: [PROJECT],
+    TASKS_PROJECT_COUNT: 1,
+    __receipt: receiptsFor(window.DF_DATA_LOADER, ['TASKS_COUNT_STALE_PROJECTS', 'TASKS_PROJECT_COUNT']),
+  });
+  const { container } = harness.mount(window.DF_TASKS.TasksTab, TAB_PROPS);
+
+  const [notice] = window.DF_TASKS_OFFLINE_BANNER.tasksBannerNoticesFor(window.DF_DATA);
+  assert.equal(notice.kind, 'count-stale');
+  const rendered = [...container.querySelectorAll('[data-testid="tasks-count-stale-banner"]')];
+  assert.equal(rendered.length, 1, 'the count-stale notice must render exactly once under its own test id');
+  assert.equal(rendered[0].textContent, notice.text);
+  assert.deepEqual([...container.querySelectorAll('[data-testid="tasks-count-unknown-banner"]')], []);
+});
