@@ -127,9 +127,9 @@ class TestBlessing:
 
 class TestCapabilities:
     def test_the_capability_set(self) -> None:
-        assert TASK_METADATA_CAPABILITIES == frozenset(
-            {'before_done.recheck_secs', 'before_done.script_root', 'trigger_chain'}
-        )
+        expected = {'before_done.recheck_secs', 'before_done.script_root', 'trigger_chain'}
+        assert set(TASK_METADATA_CAPABILITIES) == expected
+        assert isinstance(TASK_METADATA_CAPABILITIES, frozenset)
 
     def test_every_capability_names_something_this_schema_declares(self) -> None:
         for capability in TASK_METADATA_CAPABILITIES:

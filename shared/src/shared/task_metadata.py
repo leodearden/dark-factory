@@ -42,6 +42,8 @@ __all__ = [
     'HUMAN_CURATOR_GATE_KEY',
     'KNOWN_ROLE_NAMES',
     'RECHECK_SECS_MIN',
+    'TASK_METADATA_CAPABILITIES',
+    'TRIGGER_CHAIN_KEY',
     'BeforeDone',
     'DoneProvenance',
     'ExternalDep',
@@ -55,6 +57,8 @@ __all__ = [
     'SchemaWarning',
     'SubmodelCardinality',
     'TaskMetadata',
+    'TriggerChain',
+    'TriggerChainSkill',
     'apply_migrations',
     'is_known_metadata_key',
     'parse_metadata',
@@ -731,6 +735,48 @@ class Recurrence(BaseModel):
     minted_from: str | None = None
 
 
+TRIGGER_CHAIN_KEY: str = 'trigger_chain'
+
+TriggerChainSkill = Literal['review', 'hotspot-survey', 'review-all']
+
+
+class TriggerChain(BaseModel):
+    """``metadata.trigger_chain`` — a task's place in an attended run's trigger chain.
+
+    A chain is the completion gate and human gate a run files so the next run
+    of the same skill is scheduled by completion (plans/completion-driven-triggers-prd.md
+    C2). This model owns the shape; the carrier rules live in the fused-memory
+    submit guard.
+    """
+
+    model_config = ConfigDict(extra='allow')
+
+    role: Literal['completion_gate', 'human_gate']
+    skill: TriggerChainSkill
+    run_id: str
+    superseded_by: str | None = None
+
+    @field_validator('skill', mode='before')
+    @classmethod
+    def _skill_is_bare(cls, value: object) -> object:
+        if isinstance(value, str) and value.startswith('/'):
+            raise ValueError(
+                f'trigger_chain.skill={value!r} must be the bare skill name '
+                f'{value.lstrip("/")!r} (no leading slash)'
+            )
+        return value
+
+    @model_validator(mode='after')
+    def _run_id_names_the_skill(self) -> TriggerChain:
+        prefix = f'{self.skill}-'
+        if not self.run_id.startswith(prefix):
+            raise ValueError(
+                f'trigger_chain.run_id={self.run_id!r} must start with {prefix!r}, '
+                f'the skill it was run by'
+            )
+        return self
+
+
 class RoutingDecisionMirror(BaseModel):
     """One resolved routing decision for a single LLM invocation (PRD γ).
 
@@ -1074,6 +1120,15 @@ register_metadata_submodel('deferral', DeferralRecord, cardinality='dict')
 # strand_converted: shared/src/shared/strand_conversion.py.
 register_metadata_submodel(STRAND_CONVERTED_METADATA_KEY, StrandConverted, cardinality='dict')
 
+# trigger_chain: plans/completion-driven-triggers-prd.md C2.
+register_metadata_submodel(TRIGGER_CHAIN_KEY, TriggerChain, cardinality='dict')
+
+# The metadata capabilities this schema's submit guard enforces; the running
+# fused-memory reports it through get_status (PRD C2 "Capability report").
+TASK_METADATA_CAPABILITIES: frozenset[str] = frozenset(
+    {'before_done.recheck_secs', 'before_done.script_root', TRIGGER_CHAIN_KEY}
+)
+
 
 def _normalize_legacy_memory_hints(value: object) -> object:
     """Coerce a legacy list-of-dicts ``memory_hints`` value to canonical dict shape.
@@ -1223,9 +1278,10 @@ _WHOLE_METADATA_FIELD = '<metadata>'
 # still preserves each value byte-for-value (I1). Blessed keys are NORMALLY
 # disjoint from TaskMetadata.model_fields and _SUBMODEL_REGISTRY — a typed
 # field or a registered submodel already suppresses unknown_key via
-# known_fields, so blessing it too would be redundant. 'recurrence' is the
-# one deliberate overlap: task 4676 / PRD
-# docs/prds/recurring-deterministic-tasks.md R-D4 specifies both, so the key
+# known_fields, so blessing it too would be redundant. 'recurrence' and
+# 'trigger_chain' are the two deliberate overlaps: task 4676 / PRD
+# docs/prds/recurring-deterministic-tasks.md R-D4 and
+# plans/completion-driven-triggers-prd.md C2 specify both, so the key
 # stays suppressed if its registration is ever moved or made lazy, and so
 # migrate_task_metadata_to_x_namespace.py refuses to x_-namespace it, which
 # for a submodel-backed key with live readers is the correct refusal.
@@ -1462,9 +1518,17 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # vocabulary and be re-added on the next block.
         'last_blocked_at',
         # recurrence (task 4676, PRD docs/prds/recurring-deterministic-tasks.md
-        # R-D4) is the ONE blessed key that is also a registered submodel — see
-        # the header note above on why the overlap is deliberate.
+        # R-D4) and trigger_chain (below) are the blessed keys that are also
+        # registered submodels — see the header note above on why the overlap
+        # is deliberate.
         'recurrence',
+        # plans/completion-driven-triggers-prd.md C2: the chain record, and the
+        # runner stamps of C1 written by
+        # orchestrator/src/orchestrator/predicate_recheck.py::PREDICATE_RECHECK_KEY
+        # and ::PREDICATE_VERDICT_KEY.
+        TRIGGER_CHAIN_KEY,
+        'predicate_recheck',
+        'predicate_verdict',
         # Recon-stage execution-class discriminator (task 3780): machine-read
         # by live guards at the fused-memory submit boundary, with real
         # dispatch consequences rather than decorative ones. Readers, named
