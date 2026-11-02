@@ -36,7 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -98,11 +98,12 @@ def _all_dashboard_get_paths() -> list[str]:
 
 @pytest.fixture()
 def hung_mcp(monkeypatch, tmp_path, client):
-    """Hang every task-read binding; shrink every budget; clear every cache.
+    """Hang every task-read binding; bound every budget; warm each lookup root.
 
-    Yields :class:`HungSeams`, so a caller can assert each lookup endpoint
-    genuinely exercised the hang for its own root. Requests ``client`` so the
-    configured root it seeds is the one the running app reads.
+    Yields :class:`HungSeams` once each lookup root's snapshot unit is cached,
+    so a lookup's deadline encloses no snapshot read and a caller can assert
+    each lookup endpoint reached the hang for its own root. Requests
+    ``client`` so the configured root it seeds is the one the running app reads.
     """
     import dashboard.api.escalations as _esc
     from dashboard.data import (
@@ -198,6 +199,14 @@ def hung_mcp(monkeypatch, tmp_path, client):
         '/api/v2/dashboard/merge-queue': str(client.app.state.config.project_root),
         '/api/v2/dashboard/escalations': str(proj),
     }
+    monkeypatch.setattr(task_snapshot, 'SNAPSHOT_TTL_SECONDS', 3600.0)
+    assert client.portal is not None, 'the warm-up runs inside a live TestClient'
+    client.portal.call(
+        _warm_snapshot_units,
+        client.app.state.http_client,
+        client.app.state.config,
+        set(lookup_roots.values()),
+    )
 
     yield HungSeams(reached=reached, lookup_roots=lookup_roots)
 
@@ -205,6 +214,17 @@ def hung_mcp(monkeypatch, tmp_path, client):
 
     # Leave no hang-stubbed entry behind for the next test in the session.
     _clear_caches()
+
+
+async def _warm_snapshot_units(http_client, config, roots: Iterable[str]) -> None:
+    """Cache each root's snapshot unit, bounded only by the snapshot's own budget."""
+    from dashboard.data.task_snapshot import acquire_snapshot
+    from dashboard.data.utils import resolve_now
+
+    now = resolve_now(None)
+    await asyncio.gather(
+        *(acquire_snapshot(http_client, config, root, now=now) for root in roots),
+    )
 
 
 def _seed_merge_attempt(project_root):
