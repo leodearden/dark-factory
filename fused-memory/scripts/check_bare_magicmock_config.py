@@ -157,10 +157,13 @@ TWO violations:
   1. the target is awaited through a bare ``asyncio.wait_for(...)`` rather than
      ``wait_responsive(...)``, so its deadline is charged in WALL CLOCK; and
   2. the call carries a RAW numeric literal bound — a ``timeout=`` or
-     ``max_wall_s=`` keyword on EITHER call shape, or ``asyncio.wait_for``'s
-     positional timeout.  ``wait_responsive`` takes both keywords too, so a
-     migrated site can have moved the accounting while keeping a hand-written
-     number.  Several literal bounds on one call are still ONE violation.
+     ``max_wall_s=`` keyword on ANY wait call shape, or ``asyncio.wait_for``'s
+     positional timeout.  ``wait_responsive`` and ``poll_responsive`` take both
+     keywords too, so a migrated site can have moved the accounting while keeping a
+     hand-written number.  Only this kind applies to them, and every
+     ``poll_responsive`` predicate is load-bearing: it IS the poll's
+     synchronisation point.  Several literal bounds on one call are still ONE
+     violation.
 
 The same defect is also written as a POLL, so a further leg covers it:
 
@@ -953,8 +956,8 @@ def _wall_clock_raw_literal_msg(target: str, parameter: str) -> str:
     )
 
 
-# The keywords that carry a wall-clock bound on a wait call: ``timeout`` on both call
-# shapes, and ``max_wall_s``, wait_responsive's wall-clock cap
+# The keywords that carry a wall-clock bound on a wait call: ``timeout`` on every call
+# shape, and ``max_wall_s``, the responsive helpers' wall-clock cap
 # (orchestrator/tests/_orch_helpers.py::wait_responsive).
 _WALL_CLOCK_BOUND_KEYWORDS: tuple[str, ...] = ('timeout', 'max_wall_s')
 
@@ -975,9 +978,9 @@ def _is_numeric_literal(node: ast.expr) -> bool:
 def _raw_wall_clock_literal(call: ast.Call, *, is_bare_wait_for: bool) -> str | None:
     """Return the name of the first wall-clock bound on *call* written as a number.
 
-    Checks the ``_WALL_CLOCK_BOUND_KEYWORDS`` keywords on either call shape, and
+    Checks the ``_WALL_CLOCK_BOUND_KEYWORDS`` keywords on any wait call shape, and
     ``asyncio.wait_for``'s positional timeout (``args[1]``) only when
-    *is_bare_wait_for*: wait_responsive's ``timeout`` is keyword-only, so a
+    *is_bare_wait_for*: a responsive helper's ``timeout`` is keyword-only, so a
     positional second argument there is a TypeError, not a lintable site.
     """
     for kw in call.keywords:
@@ -986,6 +989,23 @@ def _raw_wall_clock_literal(call: ast.Call, *, is_bare_wait_for: bool) -> str | 
     if is_bare_wait_for and len(call.args) >= 2 and _is_numeric_literal(call.args[1]):
         return 'timeout'
     return None
+
+
+def _polled_predicate_target(node: ast.expr) -> str:
+    """Describe *node* as a polled predicate: a poll's predicate IS its synchronisation point."""
+    return f'{ast.unparse(node)} (polled predicate)'
+
+
+# The responsive wait helpers by name, each with how it describes its first argument
+# as a load-bearing target.  A stdlib-only literal copy of the helper names
+# (orchestrator/tests/_orch_helpers.py::wait_responsive,
+# orchestrator/tests/_poll_responsive.py::poll_responsive), which this checker
+# cannot import — the same precedent as ``_DATACLASS_SHAPES``.  A responsive helper
+# is itself the remedy, so only its raw-literal kind ever applies.
+_RESPONSIVE_WAIT_TARGETS: dict[str, Callable[[ast.expr], str | None]] = {
+    'wait_responsive': _load_bearing_wait_target,
+    'poll_responsive': _polled_predicate_target,
+}
 
 
 def _wall_clock_deadline_violations(
@@ -1031,8 +1051,9 @@ def _wait_call_violations(call: ast.Call, lines: list[str], filename: str) -> li
     Gating order is cheapest-first, and deliberately so:
       1. the call has at least one positional argument (no ``args[0]`` to inspect
          otherwise — and a bare ``asyncio.wait_for()`` must be skipped, not crash);
-      2. the func is ``asyncio.wait_for`` or ``wait_responsive``;
-      3. ``_load_bearing_wait_target`` recognises ``args[0]``.
+      2. the func is ``asyncio.wait_for`` or a ``_RESPONSIVE_WAIT_TARGETS`` helper;
+      3. that shape's describer recognises ``args[0]`` (``_load_bearing_wait_target``,
+         except a ``poll_responsive`` predicate, which is always load-bearing).
     Only then is the exemption line-walk run, so the upward walk keeps Rule B's cost
     profile rather than running on every ``ast.Call`` in the tree.
 
@@ -1051,11 +1072,14 @@ def _wait_call_violations(call: ast.Call, lines: list[str], filename: str) -> li
         and isinstance(func.value, ast.Name)
         and func.value.id == 'asyncio'
     )
-    is_responsive = isinstance(func, ast.Name) and func.id == 'wait_responsive'
-    if not (is_bare_wait_for or is_responsive):
+    if is_bare_wait_for:
+        describe = _load_bearing_wait_target
+    elif isinstance(func, ast.Name) and func.id in _RESPONSIVE_WAIT_TARGETS:
+        describe = _RESPONSIVE_WAIT_TARGETS[func.id]
+    else:
         return []
 
-    target = _load_bearing_wait_target(call.args[0])
+    target = describe(call.args[0])
     if target is None:
         return []
 
@@ -1070,8 +1094,8 @@ def _wait_call_violations(call: ast.Call, lines: list[str], filename: str) -> li
     if is_bare_wait_for:
         messages.append(_wall_clock_routing_msg(_BARE_WAIT_FOR, target))
 
-    # A raw numeric literal is an offence on EITHER call shape: wait_responsive
-    # also takes ``timeout`` and ``max_wall_s`` keywords, so a migrated site can
+    # A raw numeric literal is an offence on ANY wait call shape: the responsive
+    # helpers also take ``timeout`` and ``max_wall_s`` keywords, so a migrated site can
     # have moved the accounting into loop-responsive time while keeping a
     # hand-written number.  At most ONE raw-literal violation per call, however
     # many bounds carry a number: it is one offence with one remedy.
