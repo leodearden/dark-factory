@@ -23,12 +23,14 @@ import select
 import signal
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from pathlib import Path
 
 import pytest
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
+from shared.config_dir import CONFIG_DIR_PREFIX
 
 # Every test in this module spawns a python child.
 pytestmark = pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
@@ -97,6 +99,25 @@ SIGHUP_SCRIPT = textwrap.dedent('''
 # inside VERIFY_CLI_PER_TEST_TIMEOUT, so a hang fails as an assertion.
 READY_WITHIN_SECS = 60.0
 EXIT_WITHIN_SECS = 60.0
+
+# Above Linux's PID_MAX_LIMIT (2**22): no live process can own this dir.
+_PROBE_GHOST = f'{CONFIG_DIR_PREFIX}usage-gate-probe-ghost-4194305'
+
+
+def _plant_aged_probe_ghost(base: Path) -> Path:
+    ghost = base / _PROBE_GHOST
+    ghost.mkdir()
+    (ghost / '.credentials.json').write_text('')
+    old = time.time() - 3600
+    os.utime(ghost, (old, old))
+    return ghost
+
+
+def _child_tempdir(tmp_path: Path) -> Path:
+    """The private tempdir the spawned child's gate sweeps and writes its probe dirs under."""
+    child_tmp = tmp_path / 'child-tmp'
+    child_tmp.mkdir(exist_ok=True)
+    return child_tmp
 
 
 def _await_ready(proc: subprocess.Popen[bytes], *, within_secs: float) -> bytes:
@@ -231,4 +252,31 @@ def test_without_in_loop_registration_sighup_kills_the_process(tmp_path: Path):
     assert result.returncode == -signal.SIGHUP, (
         f'expected death by SIGHUP without in-loop registration, '
         f'got rc={result.returncode}; stderr={result.stderr!r}'
+    )
+
+
+def test_the_child_gate_sweeps_only_the_tempdir_its_spawner_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    inherited = tmp_path / 'inherited-tmp'
+    inherited.mkdir()
+    # Pin this process's tempdir cache first, so only the spawned child sees
+    # the stand-in TMPDIR and no later test can cache it.
+    monkeypatch.setattr(tempfile, 'tempdir', tempfile.gettempdir())
+    monkeypatch.setenv('TMPDIR', str(inherited))
+    inherited_ghost = _plant_aged_probe_ghost(inherited)
+    child_ghost = _plant_aged_probe_ghost(_child_tempdir(tmp_path))
+
+    result = _exit_after_hup_then_term(tmp_path, register_in_loop=True)
+
+    assert inherited_ghost.exists(), (
+        f"the child's UsageGate swept the tempdir it inherited and reclaimed "
+        f'{inherited_ghost.name}; outside this test that is the real /tmp. The '
+        f'spawner must pass a private TMPDIR, because the in-process '
+        f'confinement plugin cannot reach a child'
+    )
+    assert not child_ghost.exists(), (
+        f"{child_ghost.name} survived in the TMPDIR the spawner passed; the child's "
+        f'sweep must land there (re-base, not suppress). '
+        f'rc={result.returncode}; stderr={result.stderr!r}'
     )
