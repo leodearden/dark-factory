@@ -285,6 +285,9 @@ def test_every_transport_fault_at_submit_is_transport_failed(repo, scratch, faul
 
 
 def test_a_merge_request_tool_error_at_submit_fails_closed(repo, scratch):
+    """Keeps the tool-error shape covered now that TRANSPORT_FAULTS no longer
+    carries it. TRANSPORT_FAILED is today's tag, not the contract: task 8025
+    owns this case's tag and prose."""
     before = _main(repo)
 
     with FakeEscalationMcp(**TOOL_RAISED) as server:

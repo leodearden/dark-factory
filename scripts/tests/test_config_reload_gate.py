@@ -60,10 +60,10 @@ def test_a_tool_that_raised_is_reload_raised():
     tool."""
     with FakeEscalationMcp(reload_report(config_path=CONFIG_PATH), **TOOL_RAISED) as server:
         refusal = _refusal(server.port)
-        tools = server.called_tools()
+        dispatched = [name for name, _ in server.tool_calls()]
 
     assert refusal.failure is ReloadFailure.RELOAD_RAISED
-    assert "reload_config" in tools, tools
+    assert dispatched == ["reload_config"], dispatched
     assert COMMITTED_AS in refusal.detail, refusal.detail
     assert "ToolError: reload_config failed" in refusal.detail, refusal.detail
     assert "never reached the tool" not in refusal.detail, refusal.detail
@@ -177,10 +177,10 @@ def test_a_reply_slower_than_the_timeout_is_reply_timed_out():
         reload_report(config_path="/x"), tool_call_delay=5.0,
     ) as server:
         refusal = _refusal(server.port, timeout=0.5)
-        tools = server.called_tools()
+        dispatched = [name for name, _ in server.tool_calls()]
 
     assert refusal.failure is ReloadFailure.REPLY_TIMED_OUT
-    assert "reload_config" in tools, tools
+    assert dispatched == ["reload_config"], dispatched
     assert COMMITTED_AS in refusal.detail, refusal.detail
 
 
