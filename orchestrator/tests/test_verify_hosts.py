@@ -1,25 +1,26 @@
 """HostPool: one admission gate per remote host, and the task path's hold records.
 
 PRD ``plans/remote-task-leg-verify-prd.md`` decisions 14 and 16, §5.4.  Driven
-through the pool's public API with REAL AdmissionGates and small duck-typed
-runners that expose only what the cancel path calls (``name``,
-``cancel_verify()``, ``probe_clean()``).
+through the pool's public API with REAL AdmissionGates; the cancel path is
+fed small runners that implement only ``CancellableRunner``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytest
+from _gate_fixtures import gated_remote_runner
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import admission_policy
 from orchestrator.verify_admission_gate import AdmissionPlan, AdmissionPolicy
 from orchestrator.verify_hosts import HostPool
-from orchestrator.verify_runner import RunnerUnavailable
+from orchestrator.verify_runner import RemoteRunner, RunnerUnavailable
 
 
 class _Runner:
@@ -59,17 +60,21 @@ async def _no_sleep(_seconds: float) -> None:
     return None
 
 
+def _remote_runner(name: str) -> RemoteRunner:
+    return gated_remote_runner(name, name, f'ssh://{name}/repo.git', Path('/nonexistent'))
+
+
 def _pool(
     hosts: tuple[str, ...] = ('laptop',),
     *,
     quarantine: set[str] | None = None,
     hooks: _Hooks | None = None,
-    runner_for: Any = None,
+    runner_for: Callable[[str], RemoteRunner] = _remote_runner,
     probe_attempts: int = 3,
 ) -> HostPool:
     return HostPool(
         hosts,
-        runner_for=runner_for or (lambda host: cast(Any, _Runner(host, []))),
+        runner_for=runner_for,
         quarantine=quarantine if quarantine is not None else set(),
         on_unavailable=(hooks or _Hooks()).on_unavailable,
         probe_sleep=_no_sleep,
@@ -106,6 +111,11 @@ class TestHosts:
     def test_the_local_name(self):
         assert HostPool.local_name == 'local'
         assert _pool().local_name == 'local'
+
+    @pytest.mark.parametrize('attempts', [0, -1])
+    def test_a_cancel_must_be_probed_at_least_once(self, attempts: int):
+        with pytest.raises(ValueError, match=f'probe_attempts.*{attempts}'):
+            _pool(probe_attempts=attempts)
 
 
 class TestGates:
@@ -158,9 +168,9 @@ class TestRunnerForTurn:
     def test_each_turn_gets_a_fresh_runner(self):
         built: list[str] = []
 
-        def runner_for(host: str) -> Any:
+        def runner_for(host: str) -> RemoteRunner:
             built.append(host)
-            return _Runner(host, [])
+            return _remote_runner(host)
 
         pool = _pool(runner_for=runner_for)
 
@@ -170,7 +180,7 @@ class TestRunnerForTurn:
         assert built == ['laptop', 'laptop']
 
     def test_a_runner_named_otherwise_is_refused(self):
-        pool = _pool(runner_for=lambda host: _Runner('desk', []))
+        pool = _pool(runner_for=lambda host: _remote_runner('desk'))
 
         with pytest.raises(ValueError, match=r"'desk'.*'laptop'|'laptop'.*'desk'"):
             pool.runner_for_turn('laptop')
@@ -274,7 +284,7 @@ class TestHolding:
 
         with pool.holding('laptop', '7'):
             first = pool.holders()
-            cast(dict, first)['laptop'] = 'task:forged'
+            first['laptop'] = 'task:forged'
 
             assert pool.holders() == {'laptop': 'task:7'}
             assert pool.holders() is not pool.holders()
@@ -296,7 +306,7 @@ class TestCancelInFlight:
         async def unwind() -> None:
             log.append('unwind')
 
-        clean = await pool.cancel_in_flight('laptop', cast(Any, runner), unwind=unwind)
+        clean = await pool.cancel_in_flight('laptop', runner, unwind=unwind)
         return clean, log, hooks, [name for name, _ in hooks.unavailable]
 
     async def test_a_clean_cancel_unwinds_and_probes_nothing(self):

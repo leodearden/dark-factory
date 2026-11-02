@@ -11,9 +11,9 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
-from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence, Set
+from collections.abc import Awaitable, Callable, Iterator, Sequence, Set
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 from orchestrator.deployed_sha import DeployedSha, resolve_code_checkout
 from orchestrator.verify import admission_policy
@@ -29,6 +29,14 @@ Unwind = Callable[[], Awaitable[object]]
 
 _CANCEL_PROBE_ATTEMPTS = 10
 _CANCEL_PROBE_INTERVAL_SECS = 1.0
+
+
+class CancellableRunner(Protocol):
+    """What the cancel path calls on a runner whose verify is still in flight."""
+
+    async def cancel_verify(self) -> int: ...
+
+    async def probe_clean(self) -> bool: ...
 
 
 def build_remote_runners(
@@ -96,6 +104,8 @@ class HostPool:
         probe_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         probe_attempts: int = _CANCEL_PROBE_ATTEMPTS,
     ) -> None:
+        if probe_attempts < 1:
+            raise ValueError(f'probe_attempts must be >= 1, got {probe_attempts!r}')
         self._hosts = _validated_hosts(hosts, local_name=self.local_name)
         self._gates = {host: AdmissionGate() for host in self._hosts}
         self._runner_for = runner_for
@@ -146,14 +156,16 @@ class HostPool:
             if not holds:
                 del self._holds[host]
 
-    def holders(self) -> Mapping[str, str]:
+    def holders(self) -> dict[str, str]:
         """A fresh ``{host: 'task:<id>[,task:<id>]'}`` map of the holds now recorded."""
         return {
             host: ','.join(f'task:{task_id}' for task_id in holds)
             for host, holds in self._holds.items()
         }
 
-    async def cancel_in_flight(self, host: str, runner: RemoteRunner, *, unwind: Unwind) -> bool:
+    async def cancel_in_flight(
+        self, host: str, runner: CancellableRunner, *, unwind: Unwind,
+    ) -> bool:
         """Cancel *runner*'s verify on *host*, then *unwind* the dispatch using it.
 
         A failed cancel probes the cancelled request; a request never probed
@@ -173,7 +185,7 @@ class HostPool:
         ))
         return False
 
-    async def _cancel(self, host: str, runner: RemoteRunner) -> int:
+    async def _cancel(self, host: str, runner: CancellableRunner) -> int:
         try:
             return await runner.cancel_verify()
         except Exception:
@@ -182,7 +194,7 @@ class HostPool:
             )
             return 1
 
-    async def _probed_clean(self, runner: RemoteRunner) -> bool:
+    async def _probed_clean(self, runner: CancellableRunner) -> bool:
         for attempt in range(self._probe_attempts):
             if await runner.probe_clean():
                 return True

@@ -564,7 +564,7 @@ class TaskVerifyDispatcher:
     async def _run_local_because(
         self, call: _VerifyCall, draft: _DecisionDraft, reason: DispatchReason,
     ) -> VerifyResult:
-        """Run local with a plan of its own; a verify that never queued remotely has none to keep."""
+        """Run local under a fresh plan: before any remote queueing, and for parity re-runs (row 39)."""
         draft.reason = reason
         return await call.run(self._run_local)
 
