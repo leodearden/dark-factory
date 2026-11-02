@@ -108,6 +108,29 @@ async def _wait_for_drained(queue, expected: int, *, timeout: float = 10.0) -> d
     )
 
 
+def _signal_after_commits(buffer: EventBuffer, count: int) -> asyncio.Event:
+    """Wrap ``buffer.push`` so the returned Event is set once ``count`` pushes have returned.
+
+    The Event is set inside the drainer's own push call, so its synchronous post-push
+    bookkeeping (journal mark_processed, events_committed, task_done) has already run
+    when a waiter resumes. Await ``.wait()`` bare; pytest-timeout bounds a drainer that
+    never commits.
+    """
+    committed = asyncio.Event()
+    inner_push = buffer.push
+    commits = 0
+
+    async def push(event: ReconciliationEvent) -> None:
+        nonlocal commits
+        await inner_push(event)
+        commits += 1
+        if commits == count:
+            committed.set()
+
+    buffer.push = push
+    return committed
+
+
 def _make_event(
     project_id: str = 'test-project',
     event_type: EventType = EventType.task_created,
