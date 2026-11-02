@@ -996,39 +996,17 @@ def test_read_dead_letters_project_id_filter(tmp_path):
     assert all(r['event']['project_id'] == 'proj-b' for r in proj_b_records)
 
 
-@pytest.mark.asyncio
-async def test_read_dead_letters_after_rotation(tmp_path):
+def test_read_dead_letters_after_rotation(tmp_path):
     """After rotation, read_dead_letters merges current + rotated files newest-first."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
+    seed_dead_letters(tmp_path / 'dl.jsonl.1', [_make_event() for _ in range(2)])
+    seed_dead_letters(dl, [_make_event()])
+    q = EventQueue(AsyncMock(), dead_letter_path=dl, keep_rotations=2)
 
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
-        max_bytes=500,
-        keep_rotations=2,
+    all_records = q.read_dead_letters()
+    assert len(all_records) == 3, (
+        f'Must return records from current + rotated file; got {len(all_records)}'
     )
-    await q.start()
-    try:
-        # 3 events: events 1+2 fill the pre-rotation file, event 3 goes to fresh file.
-        for _ in range(3):
-            q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-
-        # Rotation should have happened; .jsonl has event3, .jsonl.1 has events1+2.
-        assert (tmp_path / 'dl.jsonl.1').exists(), 'Rotation must have occurred'
-
-        all_records = q.read_dead_letters()
-        assert len(all_records) == 3, (
-            f'Must return records from current + rotated file; got {len(all_records)}'
-        )
-    finally:
-        await q.close()
 
 
 def test_read_dead_letters_tolerates_malformed_line(tmp_path):
@@ -1046,37 +1024,14 @@ def test_read_dead_letters_tolerates_malformed_line(tmp_path):
     assert len(records) == 1
 
 
-@pytest.mark.asyncio
-async def test_read_dead_letters_streams_without_loading_whole_files(tmp_path, monkeypatch):
+def test_read_dead_letters_streams_without_loading_whole_files(tmp_path, monkeypatch):
     """Streaming implementation never calls read_text; older rotation files not opened when limit satisfied."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
-
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=1000,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
-        max_bytes=500,
-        keep_rotations=2,
-    )
-    await q.start()
-    try:
-        for _ in range(10):
-            q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=5.0)
-    finally:
-        await q.close()
-
-    # Precondition: both dl.jsonl and dl.jsonl.1 must exist so the test
-    # exercises the short-circuit optimization across rotation files.
-    assert dl.exists(), 'dl.jsonl must exist (precondition)'
-    assert (tmp_path / 'dl.jsonl.1').exists(), (
-        'dl.jsonl.1 must exist after rotation (precondition)'
-    )
+    # Both dl.jsonl and dl.jsonl.1 hold records, so the test exercises the
+    # short-circuit optimization across rotation files.
+    seed_dead_letters(tmp_path / 'dl.jsonl.1', [_make_event() for _ in range(3)])
+    seed_dead_letters(dl, [_make_event() for _ in range(3)])
+    q = EventQueue(AsyncMock(), dead_letter_path=dl, keep_rotations=2)
 
     # Track every path opened by read_dead_letters.
     opened_paths: list[str] = []
@@ -1288,34 +1243,12 @@ def test_count_dead_letters_matches_read_dead_letters_project_id_filter(tmp_path
     assert q.count_dead_letters(project_id='proj-b') == len(proj_b_records) == 2
 
 
-@pytest.mark.asyncio
-async def test_count_dead_letters_spans_rotated_files(tmp_path):
+def test_count_dead_letters_spans_rotated_files(tmp_path):
     """count_dead_letters spans current + rotated files; equals len(read_dead_letters())."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
-
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
-        max_bytes=500,
-        keep_rotations=2,
-    )
-    await q.start()
-    try:
-        # 3 events trigger rotation: events 1+2 fill the pre-rotation file,
-        # event 3 lands in the fresh file (mirrors test_read_dead_letters_after_rotation).
-        for _ in range(3):
-            q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-    finally:
-        await q.close()
-
-    assert (tmp_path / 'dl.jsonl.1').exists(), 'Rotation must have occurred'
+    seed_dead_letters(tmp_path / 'dl.jsonl.1', [_make_event() for _ in range(2)])
+    seed_dead_letters(dl, [_make_event()])
+    q = EventQueue(AsyncMock(), dead_letter_path=dl, keep_rotations=2)
 
     all_records = q.read_dead_letters()
     assert len(all_records) == 3, (
