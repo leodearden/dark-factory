@@ -129,7 +129,7 @@ def test_the_cursor_skips_events_already_read(
 
     _, second, _ = dump(capsys, '--config', str(config), '--after-id', str(cursor))
 
-    assert [event['event_id'] for event in json.loads(second)['events']['events']] == [3]
+    assert [event['event_id'] for event in json.loads(second)['events']['events']] == [2]
 
 
 def test_a_refused_policy_exits_1_with_nothing_on_stdout(
@@ -148,9 +148,23 @@ def test_a_missing_store_exits_1_naming_it(
     tmp_path: Path, root: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     TasksDb.create(root)
+    EscalationQueueDir.create(root)
 
     code, out, err = dump(capsys, '--config', str(write_policy(tmp_path, root)))
 
     assert (code, out) == (1, '')
     assert 'events' in err
     assert 'data/orchestrator/runs.db' in err
+
+
+def test_a_missing_escalation_queue_exits_1_naming_it(
+    tmp_path: Path, root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    TasksDb.create(root)
+    RunsDb.create(root)
+
+    code, out, err = dump(capsys, '--config', str(write_policy(tmp_path, root)))
+
+    assert (code, out) == (1, '')
+    assert 'events' in err
+    assert 'data/escalations' in err

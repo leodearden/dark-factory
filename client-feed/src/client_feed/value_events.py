@@ -22,7 +22,8 @@ from client_feed.contract import (
     TreeSnapshot,
 )
 from client_feed.envelope import Stamp, payload
-from client_feed.sources.events import FactoryStatus, OpenEscalations
+from client_feed.sources.escalations import OpenEscalations
+from client_feed.sources.events import FactoryStatus
 from client_feed.sources.prds import PrdText, summarize_prd
 from client_feed.sources.tasks import TaskRow, waiting_on
 from client_feed.sources.tree import VisibleTree
@@ -78,7 +79,7 @@ def task_events(
     """Each read row the state does not already say; then, given the open escalations, each unread task whose waiting_on they change.
 
     With the escalations unknown (None), a read row whose status the state already records keeps the
-    recorded waiting_on, so an unreadable runs.db holds who a task waits on rather than clearing it.
+    recorded waiting_on, so an unreadable escalation queue holds who a task waits on rather than clearing it.
     """
     rows = tuple(rows)
     events = _read_task_events(rows, state, stamp, escalations_known=escalations is not None)

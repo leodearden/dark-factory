@@ -15,13 +15,13 @@ from pydantic import TypeAdapter
 
 from client_feed.contract import NotRecorded, ReviewCounts
 from client_feed.policy import Policy
+from client_feed.sources.escalations import read_open_escalations
 from client_feed.sources.events import (
     EventBatch,
     FactoryStatus,
     LandedCommit,
     read_events,
     read_factory_status,
-    read_open_escalations,
     read_review_counts,
 )
 from client_feed.sources.git import main_head

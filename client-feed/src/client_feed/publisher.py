@@ -41,14 +41,13 @@ from client_feed.policy import Policy
 from client_feed.redact import redact_paths
 from client_feed.reveals import Answer, RevealOutput, answered_in, reveal_events
 from client_feed.sources.archive import ArchiveReadError
+from client_feed.sources.escalations import OpenEscalations, read_open_escalations
 from client_feed.sources.events import (
     FactoryStatus,
-    OpenEscalations,
     SkippedRow,
     StreamEvent,
     read_events,
     read_factory_status,
-    read_open_escalations,
 )
 from client_feed.sources.git import GitError, main_head, task_branches
 from client_feed.sources.prds import PrdText, read_prds
@@ -115,7 +114,7 @@ def _guarded(unit: Callable[[], _T], degraded: list[Degradation]) -> _T | None:
         return None
 
 
-def _skipped(source: Source, rows: Iterable[tuple[int, StrEnum]]) -> tuple[Degradation, ...]:
+def _skipped(source: Source, rows: Iterable[tuple[int | str, StrEnum]]) -> tuple[Degradation, ...]:
     """Rows of `source` that could not be projected, counted by reason; none is no degradation."""
     rows = tuple(rows)
     if not rows:
@@ -137,9 +136,8 @@ def _engagement_unit(policy: Policy, degraded: list[Degradation]) -> EngagementP
 
 @dataclass(frozen=True)
 class _EventsStore:
-    """runs.db as one pass reads it: the open escalations, every stream row past the cursor, the factory status."""
+    """runs.db as one pass reads it: every stream row past the cursor, and the factory status."""
 
-    escalations: OpenEscalations
     stream: tuple[StreamEvent, ...]
     skipped: tuple[SkippedRow, ...]
     cursor: int
@@ -148,7 +146,6 @@ class _EventsStore:
 
 def _read_events_store(root: Path, *, after_id: int, now: datetime) -> _EventsStore:
     """Every stream row past `after_id`, batch after batch until none is left, with the store's other facts."""
-    escalations = read_open_escalations(root)
     stream: list[StreamEvent] = []
     skipped: list[SkippedRow] = []
     cursor = after_id
@@ -160,7 +157,6 @@ def _read_events_store(root: Path, *, after_id: int, now: datetime) -> _EventsSt
         if not batch.has_more:
             break
     return _EventsStore(
-        escalations=escalations,
         stream=tuple(stream),
         skipped=tuple(skipped),
         cursor=cursor,
@@ -177,12 +173,22 @@ def _events_store_unit(
     return store
 
 
+def _escalations_unit(root: Path, degraded: list[Degradation]) -> OpenEscalations | None:
+    """The escalation queue's open escalations, read apart from runs.db so that either fails alone."""
+    escalations = _guarded(lambda: read_open_escalations(root), degraded)
+    if escalations is not None:
+        degraded.extend(
+            _skipped(Source.EVENTS, ((record.name, record.reason) for record in escalations.skipped))
+        )
+    return escalations
+
+
 def _tasks_unit(
-    root: Path, since: str | None, store: _EventsStore | None, degraded: list[Degradation]
+    root: Path, since: str | None, escalations: OpenEscalations | None, degraded: list[Degradation]
 ) -> TasksRead | None:
-    """The task rows; while runs.db is unreadable no escalation is known, so each row's waiting_on follows its status alone."""
-    escalations = _NO_ESCALATIONS if store is None else store.escalations
-    tasks = _guarded(lambda: read_tasks(root, since=since, escalations=escalations), degraded)
+    """The task rows; while the escalation queue is unreadable no escalation is known, so each row's waiting_on follows its status alone."""
+    known = _NO_ESCALATIONS if escalations is None else escalations
+    tasks = _guarded(lambda: read_tasks(root, since=since, escalations=known), degraded)
     if tasks is not None:
         degraded.extend(_skipped(Source.TASKS, ((task.task_id, task.reason) for task in tasks.skipped)))
     return tasks
@@ -429,11 +435,12 @@ def run_pass(
     degraded: list[Degradation] = []
     engagement = _engagement_unit(policy, degraded)
     store = _events_store_unit(root, cursor, now, degraded)
-    tasks = _tasks_unit(root, None if rescan_tasks else cursor.tasks_updated_at, store, degraded)
+    escalations = _escalations_unit(root, degraded)
+    tasks = _tasks_unit(root, None if rescan_tasks else cursor.tasks_updated_at, escalations, degraded)
     upserts = task_events(
         () if tasks is None else tasks.rows,
         state=out.state,
-        escalations=None if store is None else store.escalations,
+        escalations=escalations,
         stamp=stamp,
         now=now,
     )
