@@ -803,8 +803,9 @@ async def _hour_bucketed_history(
     """Return per-hour rows for *project_id* over the trailing *days* window.
 
     Each row carries: bucket label, p50/p95 of duration_ms (done tasks),
-    count of done tasks, count of one-pass (review_cycles=0 done) tasks,
-    count of escalated (steward_invocations>0) tasks, and total tasks.
+    count of done tasks, count of one-pass tasks (review_cycles=0 passes, a
+    pass as ``_READING_BY_OUTCOME`` reads one), count of escalated
+    (steward_invocations>0) tasks, and total tasks.
     Caller derives ratios.
 
     Args:
@@ -852,11 +853,10 @@ async def _hour_bucketed_history(
             {'durations': [], 'total': 0, 'one_pass_done': 0, 'escalated': 0},
         )
         b['total'] += 1
-        if outcome == 'done':
-            if duration is not None and duration > 0:
-                b['durations'].append(duration)
-            if review_cycles == 0:
-                b['one_pass_done'] += 1
+        if outcome == 'done' and duration is not None and duration > 0:
+            b['durations'].append(duration)
+        if _READING_BY_OUTCOME.get(outcome) is _Reading.PASSED and review_cycles == 0:
+            b['one_pass_done'] += 1
         if steward > 0:
             b['escalated'] += 1
 
