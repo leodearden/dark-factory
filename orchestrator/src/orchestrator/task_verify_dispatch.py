@@ -330,6 +330,17 @@ class _Left(enum.Enum):
 _AttemptOutcome = VerifyResult | FallbackReason | Literal[_Left.LEFT]
 
 
+def _warn_if_failed(host: str, attempt: asyncio.Task[_AttemptOutcome]) -> None:
+    if not attempt.cancelled() and (exc := attempt.exception()) is not None:
+        logger.warning('Task verify attempt on %s failed', host, exc_info=exc)
+
+
+async def _reap_attempt(host: str, attempt: asyncio.Task[_AttemptOutcome]) -> None:
+    attempt.cancel()
+    await asyncio.wait({attempt})
+    _warn_if_failed(host, attempt)
+
+
 @dataclass(frozen=True)
 class _LocalWon:
     """The local call finished while no remote attempt had claimed the verify."""
@@ -345,20 +356,22 @@ class _Race:
     """One eligible call's race between the local queue and every remote host's gate."""
 
     plan: AdmissionPlan
+    policy: TaskVerifyPolicy
+    """Read at arrival, then re-read at the claiming grant, whose turn it checks and settles."""
     local: asyncio.Task[VerifyResult] | None = None
     attempts: dict[asyncio.Task[_AttemptOutcome], str] = field(default_factory=dict)
     claimed_by: str | None = None
     reaping: asyncio.Future[None] | None = None
     remote_wait_secs: float | None = None
 
-    def try_claim(self, host: str, *, still_remote: bool) -> bool:
+    def try_claim(self, host: str, policy: TaskVerifyPolicy) -> bool:
         """Claim the verify for *host*'s turn, unless it is no longer the remote's to run."""
         local_done = self.local is not None and self.local.done()
         if self.claimed_by is not None or self.plan.has_been_granted() or local_done:
             return False
-        if not still_remote:
+        if policy.host_policy == 'local':
             return False
-        self.claimed_by = host
+        self.claimed_by, self.policy = host, policy
         return True
 
     def withdraw_local(self) -> asyncio.Future[None] | None:
@@ -369,7 +382,9 @@ class _Race:
 
 
 async def _reap_race(race: _Race) -> None:
-    reaps: list[Awaitable[None]] = [_reap(task) for task in race.attempts]
+    reaps: list[Awaitable[None]] = [
+        _reap_attempt(host, attempt) for attempt, host in race.attempts.items()
+    ]
     reaping = race.withdraw_local()
     if reaping is not None:
         reaps.append(reaping)
@@ -445,13 +460,12 @@ class TaskVerifyDispatcher:
             return await self._run_local_because(call, draft, 'not_eligible')
         if not self._pool.hosts:
             return await self._run_local_because(call, draft, 'no_host')
-        race = _Race(plan=AdmissionPlan.begin(role='task', task_id=call.task_id))
+        race = _Race(plan=AdmissionPlan.begin(role='task', task_id=call.task_id), policy=policy)
         outcome = await self._race(race, call, draft)
-        return await self._after_race(call, policy, race, outcome, draft)
+        return await self._after_race(call, race, outcome, draft)
 
     async def _after_race(
-        self, call: _VerifyCall, policy: TaskVerifyPolicy, race: _Race,
-        outcome: _RaceOutcome, draft: _DecisionDraft,
+        self, call: _VerifyCall, race: _Race, outcome: _RaceOutcome, draft: _DecisionDraft,
     ) -> VerifyResult:
         """Settle *outcome* once the race has unwound, so no local run holds a remote turn."""
         if isinstance(outcome, _LocalWon):
@@ -460,7 +474,7 @@ class TaskVerifyDispatcher:
         if isinstance(outcome, VerifyResult):
             draft.reason = 'remote'
             draft.remote_wait_secs = race.remote_wait_secs
-            return await self._settle_remote(call, policy, outcome, draft)
+            return await self._settle_remote(call, race.policy, outcome, draft)
         draft.reason = outcome
         return await call.run(self._run_local, admission_plan=race.plan)
 
@@ -472,18 +486,15 @@ class TaskVerifyDispatcher:
                 race.attempts[attempt] = host
             await asyncio.sleep(0)
             if race.claimed_by is None:
-                race.local = self._start_local(race, call)
-            return await self._await_race(race, call)
+                race.local = asyncio.ensure_future(
+                    call.run(self._run_local, admission_plan=race.plan),
+                )
+            return await self._await_race(race)
         finally:
             await asyncio.shield(_reap_race(race))
 
-    def _start_local(self, race: _Race, call: _VerifyCall) -> asyncio.Task[VerifyResult]:
-        return asyncio.ensure_future(call.run(self._run_local, admission_plan=race.plan))
-
-    async def _await_race(self, race: _Race, call: _VerifyCall) -> _RaceOutcome:
+    async def _await_race(self, race: _Race) -> _RaceOutcome:
         while True:
-            if race.local is None and race.claimed_by is None and not race.attempts:
-                race.local = self._start_local(race, call)
             local = {race.local} if race.local is not None and race.claimed_by is None else set()
             done, _ = await asyncio.wait(
                 {*race.attempts, *local}, return_when=asyncio.FIRST_COMPLETED,
@@ -501,10 +512,7 @@ class TaskVerifyDispatcher:
         """The claiming attempt's outcome (its exception re-raised); any other attempt left."""
         if race.claimed_by == host:
             return attempt.result()
-        if not attempt.cancelled() and (exc := attempt.exception()) is not None:
-            logger.warning(
-                'Task verify attempt on %s failed before it claimed a turn', host, exc_info=exc,
-            )
+        _warn_if_failed(host, attempt)
         return _Left.LEFT
 
     async def _attempt(
@@ -516,16 +524,13 @@ class TaskVerifyDispatcher:
         return leaves the hold and the turn before the parent sees its value.
         """
         request = race.plan.request(module=None, scope_kind=None)
-        policy = functools.partial(self._pool.policy, host, call.config)
-        async with self._pool.gate(host).admit(request, policy) as grant:
-            if not race.try_claim(host, still_remote=self._still_remote(call.config)):
+        gate_policy = functools.partial(self._pool.policy, host, call.config)
+        async with self._pool.gate(host).admit(request, gate_policy) as grant:
+            if not race.try_claim(host, self._policy_of(call.config)):
                 return _Left.LEFT
             race.remote_wait_secs = grant.granted - race.plan.arrival
             with self._pool.holding(host, call.task_id):
                 return await self._claimed_turn(race, host, call, draft)
-
-    def _still_remote(self, config: OrchestratorConfig) -> bool:
-        return self._policy_of(config).host_policy != 'local'
 
     async def _claimed_turn(
         self, race: _Race, host: str, call: _VerifyCall, draft: _DecisionDraft,
@@ -538,7 +543,7 @@ class TaskVerifyDispatcher:
         if scope is None:
             return 'dispatcher_error'
         draft.tip_sha, draft.base_sha = scope.tip_sha, scope.base_sha
-        if not self._eligible(call, self._policy_of(call.config), scope):
+        if not self._eligible(call, race.policy, scope):
             return 'not_eligible'
         return await self._run_remote(call, scope, host, draft)
 

@@ -329,6 +329,7 @@ class _Rig:
     events: EventStore
     archive_root: Path
     policy: TaskVerifyPolicy
+    bench_hooks: list[Callable[[str], object]]
     policy_raises: Exception | None = None
     dispatcher: TaskVerifyDispatcher = field(init=False)
 
@@ -466,6 +467,7 @@ def _rig(
     request_ids = itertools.count(1)
     quarantine: set[str] = set()
     unavailable: list[tuple[str, RunnerUnavailable]] = []
+    bench_hooks: list[Callable[[str], object]] = []
 
     def runner_for(host: str):
         remote = remotes[host]
@@ -477,6 +479,8 @@ def _rig(
     def on_unavailable(host: str, exc: RunnerUnavailable) -> None:
         unavailable.append((host, exc))
         quarantine.add(host)
+        for hook in bench_hooks:
+            hook(host)
 
     pool = HostPool(
         hosts, runner_for=runner_for, quarantine=quarantine,
@@ -491,7 +495,7 @@ def _rig(
         quarantine=quarantine, unavailable=unavailable, pool=pool, remotes=remotes,
         local=_RealLocal(), git_ops=git_ops,
         events=EventStore(tmp_path / 'runs.db', run_id='race'),
-        archive_root=tmp_path / 'verify-logs', policy=policy,
+        archive_root=tmp_path / 'verify-logs', policy=policy, bench_hooks=bench_hooks,
     )
     rig.dispatcher = TaskVerifyDispatcher(
         pool, git_ops, policy_of=rig.policy_of, run_local=rig.local,
@@ -1149,18 +1153,16 @@ class TestAGrantedPlanStaysLocal:
         assert rig.remotes['laptop'].log == []
 
     async def test_row44_admission_off_at_the_test_leg_and_on_at_the_turn_keeps_the_leg(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self, tmp_path: Path,
     ) -> None:
         rig = _rig(tmp_path)
         rig.legs.block(_TEST)
-        with monkeypatch.context() as admission_off:
-            admission_off.setattr(
-                'orchestrator.verify._verify_admission_active', lambda _config: False,
-            )
-            laptop_holder = rig.hold()
-            await _bounded(laptop_holder.granted.wait())
-            call = rig.start()
-            await _until(lambda: rig.legs.spawned(_TEST), watching=call)
+        rig.config.verify_admission_enabled = False
+        laptop_holder = rig.hold()
+        await _bounded(laptop_holder.granted.wait())
+        call = rig.start()
+        await _until(lambda: rig.legs.spawned(_TEST), watching=call)
+        rig.config.verify_admission_enabled = True
         assert admission_active(rig.config) is True
         [plan] = rig.local.plans
         assert plan is not None and plan.has_been_granted()
@@ -1282,6 +1284,63 @@ class TestAroundTheClaim:
         assert rig.sidecar()['reason'] == 'local_granted_first'
         assert rig.local.cancels == []
         await next_waiter.leave()
+
+    async def test_row40_an_attempt_failing_beside_the_claimers_return_is_a_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The desk's grant lands in the same step that ends the laptop's claimed
+        turn, so both attempts are done when the race next looks at them."""
+        caplog.set_level(logging.DEBUG, logger=_DISPATCH_LOGGER)
+        rig = _rig(tmp_path, hosts=('laptop', 'desk'))
+        rig.quarantine.add('desk')
+        rig.remotes['laptop'].verdict = _result(
+            False, category=sorted(INFRA_TRANSIENT_CATEGORIES)[0], summary='host out of space',
+        )
+
+        def readmit_the_desk_to_an_unreadable_policy(benched: str) -> None:
+            assert benched == 'laptop'
+            rig.quarantine.discard('desk')
+            rig.policy_raises = RuntimeError('policy unreadable')
+            rig.pool.note_readmitted('desk', rig.config)
+
+        rig.bench_hooks.append(readmit_the_desk_to_an_unreadable_policy)
+        result = await _bounded(rig.call())
+
+        assert result.passed
+        assert rig.sidecar()['reason'] == 'infra_transient'
+        [record] = [
+            r for r in caplog.records
+            if r.name == _DISPATCH_LOGGER and r.exc_info is not None
+            and 'policy unreadable' in str(r.exc_info[1])
+        ]
+        assert (record.levelno, record.args) == (logging.WARNING, ('desk',))
+        assert rig.remotes['desk'].log == []
+        _assert_unwound(rig, laptop_holders=[], local_holders=[])
+
+    @pytest.mark.parametrize(('arrival_knobs', 'grant_knobs', 'reason'), [
+        pytest.param({'cross_check_every_n': 1}, {}, 'remote', id='reloaded_off'),
+        pytest.param({}, {'cross_check_every_n': 1}, 'cross_check', id='reloaded_on'),
+    ])
+    async def test_row39_the_claiming_grant_reads_the_parity_knobs_that_settle_the_verdict(
+        self, tmp_path: Path, arrival_knobs: dict[str, Any], grant_knobs: dict[str, Any],
+        reason: str,
+    ) -> None:
+        rig = _rig(tmp_path, policy=dataclasses.replace(_REMOTE_ALL, **arrival_knobs))
+        laptop_holder, local_holder = await rig.hold_both()
+        call = rig.start()
+        await rig.queued_on_both(call)
+
+        rig.policy = dataclasses.replace(_REMOTE_ALL, **grant_knobs)
+        await laptop_holder.leave()
+        await _until(lambda: rig.pool.holders() == {'laptop': 'task:7'}, watching=call)
+        await local_holder.leave()
+        result = await _bounded(call)
+
+        assert result.passed
+        sidecar = rig.sidecar()
+        assert sidecar['reason'] == reason
+        assert (sidecar['cross_check'] is not None) == (reason == 'cross_check')
+        assert rig.remotes['laptop'].log.count('verify_task') == 1
 
     @pytest.mark.parametrize(('fallback', 'kinds', 'verifies'), [
         pytest.param('dirty_tree', [], 0, id='dirty_tree'),
