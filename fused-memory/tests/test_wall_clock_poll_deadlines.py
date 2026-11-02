@@ -10,12 +10,14 @@ that gives up against a wall-clock read, an ``asyncio.timeout`` block, and
 
 from __future__ import annotations
 
+import ast
 import textwrap
 from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
 
+_REPO_ROOT = Path(__file__).parent.parent.parent
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'check_bare_magicmock_config.py'
 _checker = load_script_module(SCRIPT_PATH, mod_name='check_bare_magicmock_config')
 
@@ -121,6 +123,29 @@ class TestClockDeadlinePollLeg:
             ),
             pytest.param(
                 """
+                async def fake_worker():
+                    t0 = loop.time()
+                    while True:
+                        if loop.time() - t0 >= duration:
+                            break
+                        await asyncio.sleep(tick)
+                """,
+                id='elapsed-duration-whose-only-break-is-the-clock',
+            ),
+            pytest.param(
+                """
+                async def fake_worker():
+                    t0 = loop.time()
+                    while loop.time() - t0 < duration:
+                        for item in items:
+                            if item.done:
+                                break
+                        await asyncio.sleep(tick)
+                """,
+                id='elapsed-duration-break-ends-only-a-nested-loop',
+            ),
+            pytest.param(
+                """
                 async def test_x():
                     while not ready():
                         await asyncio.sleep(0.01)
@@ -140,6 +165,91 @@ class TestClockDeadlinePollLeg:
         ],
     )
     def test_shapes_that_are_not_a_clock_deadline_poll_stay_silent(self, source):
+        assert _rule_c(source) == []
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            pytest.param(
+                """
+                async def test_x():
+                    t0 = loop.time()
+                    while not ready() and loop.time() - t0 < timeout:
+                        await asyncio.sleep(0.01)
+                """,
+                id='a-predicate-conjunct',
+            ),
+            pytest.param(
+                """
+                async def test_x():
+                    t0 = loop.time()
+                    while True:
+                        if loop.time() - t0 > timeout:
+                            pytest.fail('x')
+                        if ready():
+                            break
+                        await asyncio.sleep(0.01)
+                """,
+                id='a-break-outside-the-clock-check',
+            ),
+            pytest.param(
+                """
+                async def test_x():
+                    t0 = loop.time()
+                    while True:
+                        if loop.time() - t0 > timeout:
+                            pytest.fail('x')
+                        elif ready():
+                            return
+                        await asyncio.sleep(0.01)
+                """,
+                id='a-return-in-the-clock-checks-else-arm',
+            ),
+        ],
+    )
+    def test_an_elapsed_time_poll_with_another_exit_flags_once(self, source):
+        """`loop.time() - t0 < timeout` is the one-line rewrite of `loop.time() < deadline`.
+
+        It counts as a poll's give-up when the loop can also end some other way,
+        so it cannot evade the leg the direct spelling trips.
+        """
+        violations = _rule_c(source)
+
+        assert len(violations) == 1, violations
+        assert violations[0].lineno == _line_of(source, 'while ')
+
+    def test_a_clock_check_in_a_for_loop_belongs_to_the_enclosing_while(self):
+        source = """
+            async def test_x():
+                while True:
+                    for probe in probes:
+                        if loop.time() > deadline:
+                            pytest.fail('x')
+                    await asyncio.sleep(0.01)
+        """
+
+        violations = _rule_c(source)
+
+        assert len(violations) == 1, violations
+        assert violations[0].lineno == _line_of(source, 'while True')
+
+    def test_a_for_loop_is_not_a_leg_of_its_own(self):
+        """Deliberate negative space: a top-level `for` clock poll is silent.
+
+        A `for` loop is searched as part of its enclosing `while` (above), so making
+        it a leg too would count one poll twice.  Zero clock-deadline `for` polls
+        were measured in the scanned tree on 2026-11-02 (task 7800).  Widening the
+        leg to `for` loops must be a deliberate change to this pin.
+        """
+        source = """
+            async def test_x():
+                deadline = loop.time() + 5
+                for _ in range(1000):
+                    if loop.time() > deadline:
+                        break
+                    await asyncio.sleep(0.01)
+        """
+
         assert _rule_c(source) == []
 
     def test_a_nested_poll_flags_once_at_the_inner_while(self):
@@ -257,11 +367,21 @@ class TestTimeoutBlockLeg:
     def test_a_multi_item_block_flags_its_deadline_item(self):
         assert len(_rule_c(_timeout_block('asyncio.timeout(5), slot()', _POLL_BODY))) == 2
 
-    def test_an_absolute_deadline_flags_routing_only(self):
-        violations = _rule_c(_timeout_block('asyncio.timeout_at(when)', _POLL_BODY))
+    @pytest.mark.parametrize(
+        'context', ['asyncio.timeout_at(when)', 'asyncio.timeout_at(when=deadline)']
+    )
+    def test_an_absolute_deadline_flags_routing_only(self, context):
+        violations = _rule_c(_timeout_block(context, _POLL_BODY))
 
         assert len(violations) == 1, violations
         assert 'RAW wall-clock literal' not in violations[0].message
+
+    @pytest.mark.parametrize(
+        'context', ['asyncio.timeout(when=5)', 'asyncio.timeout_at(delay=5)']
+    )
+    def test_the_other_contexts_keyword_is_not_a_deadline(self, context):
+        """Each context's argument is read by its own keyword: the other is a TypeError."""
+        assert _rule_c(_timeout_block(context, _POLL_BODY)) == []
 
     def test_one_noqa_above_the_block_suppresses_both_kinds(self):
         source = f'async def test_x():\n    {_NOQA}\n' + _timeout_block(
@@ -285,6 +405,122 @@ class TestTimeoutBlockLeg:
             assert phrase in message, f'{phrase!r} missing from: {message}'
         for foreign in (*_RULE_A_AND_B_VOCABULARY, 'bare asyncio.wait_for'):
             assert foreign not in message, f'{foreign!r} must not appear in: {message}'
+
+
+class TestNestedDeadlineSpellings:
+    """The innermost deadline spelling owns the waits inside it: one wait counts once."""
+
+    def test_nested_timeout_blocks_count_the_wait_once_at_the_inner_block(self):
+        source = """
+            async def test_x():
+                async with asyncio.timeout(5):
+                    async with asyncio.timeout(3):
+                        await ev.wait()
+        """
+
+        violations = _rule_c(source)
+
+        assert len(violations) == 2, violations
+        assert {v.lineno for v in violations} == {_line_of(source, 'asyncio.timeout(3)')}
+
+    def test_a_clock_poll_inside_a_timeout_block_counts_once_at_the_while(self):
+        source = """
+            async def test_x():
+                async with asyncio.timeout(t):
+                    while loop.time() < deadline:
+                        await asyncio.sleep(0.01)
+        """
+
+        violations = _rule_c(source)
+
+        assert len(violations) == 1, violations
+        assert violations[0].lineno == _line_of(source, 'while loop.time()')
+
+    def test_a_timeout_block_inside_a_clock_poll_counts_once_at_the_block(self):
+        source = """
+            async def test_x():
+                while loop.time() < deadline:
+                    async with asyncio.timeout(t):
+                        await ev.wait()
+        """
+
+        violations = _rule_c(source)
+
+        assert len(violations) == 1, violations
+        assert violations[0].lineno == _line_of(source, 'asyncio.timeout(t)')
+
+    def test_the_outer_block_still_owns_a_wait_outside_the_inner_one(self):
+        source = """
+            async def test_x():
+                async with asyncio.timeout(t):
+                    async with asyncio.timeout(u):
+                        await a.wait()
+                    await b.wait()
+        """
+
+        violations = _rule_c(source)
+
+        assert sorted(v.lineno for v in violations) == [
+            _line_of(source, 'asyncio.timeout(t)'),
+            _line_of(source, 'asyncio.timeout(u)'),
+        ], violations
+
+    def test_an_inner_block_with_no_deadline_owns_nothing(self):
+        source = """
+            async def test_x():
+                async with asyncio.timeout(t):
+                    async with asyncio.timeout(None):
+                        await ev.wait()
+        """
+
+        violations = _rule_c(source)
+
+        assert len(violations) == 1, violations
+        assert violations[0].lineno == _line_of(source, 'asyncio.timeout(t)')
+
+
+class TestResponsiveHelperRegistry:
+    """The responsive helpers Rule C recognises and cites exist where it says they do."""
+
+    def test_each_helper_is_a_top_level_async_def_at_its_registered_home(self):
+        """Parsed, never imported: the homes are orchestrator test helpers.
+
+        `_RESPONSIVE_WAIT_HELPERS` is a stdlib-only literal copy, so a rename or a
+        move would otherwise silently blind the call leg to that helper and leave
+        every message citing a path that no longer resolves.
+        """
+        for name, helper in _checker._RESPONSIVE_WAIT_HELPERS.items():
+            home = _REPO_ROOT / helper.home
+            assert home.is_file(), (
+                f'{name}: home {helper.home!r} is not a file; update '
+                '`_RESPONSIVE_WAIT_HELPERS` in fused-memory/scripts/check_bare_magicmock_config.py'
+            )
+            module = ast.parse(home.read_text(encoding='utf-8'))
+            async_defs = {
+                node.name for node in module.body if isinstance(node, ast.AsyncFunctionDef)
+            }
+            assert name in async_defs, (
+                f'{name} is not a top-level async def of {helper.home!r}; update '
+                '`_RESPONSIVE_WAIT_HELPERS` in fused-memory/scripts/check_bare_magicmock_config.py'
+            )
+
+    @pytest.mark.parametrize(
+        ('source', 'helper'),
+        [
+            pytest.param(
+                'async def t():\n    await asyncio.wait_for(done.wait(), timeout=t)\n',
+                'wait_responsive',
+                id='bare-wait-for',
+            ),
+            pytest.param(_LOOP_TIME_POLL, 'poll_responsive', id='clock-deadline-poll'),
+            pytest.param(_PARKED_VERIFY_POLL, 'poll_responsive', id='timeout-block'),
+        ],
+    )
+    def test_each_routing_remedy_cites_its_helper_at_its_registered_home(self, source, helper):
+        [violation] = _rule_c(source)
+        citation = f'{_checker._RESPONSIVE_WAIT_HELPERS[helper].home}::{helper}'
+
+        assert citation in violation.message, violation.message
 
 
 class TestPollResponsiveCallShape:

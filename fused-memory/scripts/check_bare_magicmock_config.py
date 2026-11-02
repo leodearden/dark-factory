@@ -172,11 +172,18 @@ The same defect is also written as a POLL, so a further leg covers it:
      operand that is a zero-argument ``.time()``, ``.monotonic()`` or
      ``.perf_counter()`` call, on any receiver.  One violation, at the ``while``.
      Its bound is arithmetic in another statement, so it has no raw-literal kind.
-     Two structural discriminators keep it to polls.  DIRECT-OPERAND-ONLY excludes
-     elapsed-duration arithmetic (``loop.time() - t0 < duration``), which simulates
-     work rather than waiting for it.  AWAIT-REQUIRED excludes a sync ``time.sleep``
-     loop, which a loop-responsive budget cannot help.  The search does not descend
-     into a nested loop or scope, so a comparison belongs to the loop that owns it.
+     Two structural discriminators keep it to polls.  ANOTHER-EXIT admits an
+     elapsed-time operand (``loop.time() - t0 < timeout``) only when the loop can
+     also end some other way: a test conjunct that reads no clock, or a ``break`` or
+     ``return`` outside every clock-reading ``if``.  So a fake worker's
+     ``while loop.time() - t0 < duration`` tick loop, which runs FOR a duration
+     rather than waiting for an event, stays silent, while the one-line elapsed
+     rewrite of a flagged poll does not.  AWAIT-REQUIRED excludes a sync
+     ``time.sleep`` loop, which a loop-responsive budget cannot help.  The search
+     does not descend into a nested ``while`` or scope, so a comparison belongs to
+     the loop that owns it.  A ``for`` loop is not a leg of its own: its comparison
+     belongs to the enclosing ``while``, so a top-level ``for`` clock poll is silent
+     (none in the scanned tree, measured 2026-11-02).
   4. TIMEOUT BLOCK (task 7800): an ``async with asyncio.timeout(...)`` or
      ``asyncio.timeout_at(...)`` block whose own scope awaits a load-bearing target
      or runs an awaiting ``while`` poll.  It is ``asyncio.wait_for``'s deadline
@@ -187,6 +194,9 @@ The same defect is also written as a POLL, so a further leg covers it:
      around ``await task`` or ``await asyncio.gather(...)`` is as silent as
      ``asyncio.wait_for(task, ...)``, so neither spelling is stricter than the other,
      and ``asyncio.wait_for(ev.wait(), 5)`` cannot escape by becoming a block.
+
+When deadline spellings nest — a block in a block, a clock poll in a block, a block
+in a clock poll — the INNERMOST owns the waits inside it, so one wait is counted once.
 
 Suppressed by ``# noqa: wall-clock-deadline — <reason>`` on the preceding non-blank
 line, or by the file's ``_WALL_CLOCK_DEADLINE_DEBT`` budget.
@@ -903,6 +913,46 @@ def _load_bearing_wait_target(node: ast.expr) -> str | None:
         return f'{ast.unparse(node)} (.wait() barrier)'
     return None
 
+
+def _polled_predicate_target(node: ast.expr) -> str:
+    """Describe *node* as a polled predicate: a poll's predicate IS its synchronisation point."""
+    return f'{ast.unparse(node)} (polled predicate)'
+
+
+class _ResponsiveHelper(NamedTuple):
+    """A responsive wait helper: a Rule C call shape, and a remedy its messages cite.
+
+    ``home`` is the repo-relative path of the module that defines it, and
+    ``describe`` how it describes its first argument as a load-bearing target.
+    """
+
+    home: str
+    describe: Callable[[ast.expr], str | None]
+
+
+# The responsive wait helpers by the name a call site spells.  A stdlib-only literal
+# copy of where they live, which this checker cannot import — the same precedent as
+# ``_DATACLASS_SHAPES``, guarded the same way: each ``home`` is parsed for its helper by
+# fused-memory/tests/test_wall_clock_poll_deadlines.py::TestResponsiveHelperRegistry.
+# A responsive helper is itself the remedy, so only its raw-literal kind ever applies.
+_RESPONSIVE_WAIT_HELPERS: dict[str, _ResponsiveHelper] = {
+    'wait_responsive': _ResponsiveHelper(
+        home='orchestrator/tests/_orch_helpers.py', describe=_load_bearing_wait_target
+    ),
+    'poll_responsive': _ResponsiveHelper(
+        home='orchestrator/tests/_poll_responsive.py', describe=_polled_predicate_target
+    ),
+}
+
+
+def _helper_ref(name: str) -> str:
+    """Cite responsive helper *name* as ``<home>::<name>``."""
+    return f'{_RESPONSIVE_WAIT_HELPERS[name].home}::{name}'
+
+
+_WAIT_RESPONSIVE_REF = _helper_ref('wait_responsive')
+_POLL_RESPONSIVE_REF = _helper_ref('poll_responsive')
+
 # Shared by every offence kind: WHY a wall-clock deadline on a load-bearing sync
 # point is a defect rather than a style preference.  Task 3980's three measured
 # failures were all genuine deadline expiries on tests that had already passed.
@@ -940,7 +990,7 @@ _BARE_WAIT_FOR = _DeadlineRouting(
     spelled='is routed through a bare asyncio.wait_for',
     remedy=(
         ' Route it through wait_responsive(...) with a descriptive label='
-        ' (orchestrator/tests/_orch_helpers.py::wait_responsive), which charges its'
+        f' ({_WAIT_RESPONSIVE_REF}), which charges its'
         ' budget in loop-responsive time and still reports a genuine hang red.'
     ),
 )
@@ -949,7 +999,7 @@ _CLOCK_DEADLINE = _DeadlineRouting(
     spelled='gives up against a wall-clock read',
     remedy=(
         ' Replace the loop with poll_responsive(predicate, ...) with a descriptive'
-        ' label= (orchestrator/tests/_poll_responsive.py::poll_responsive), which'
+        f' label= ({_POLL_RESPONSIVE_REF}), which'
         ' polls under a loop-responsive budget and still reports a genuine hang red.'
     ),
 )
@@ -959,7 +1009,7 @@ _TIMEOUT_BLOCK = _DeadlineRouting(
     remedy=(
         ' Route a load-bearing await through wait_responsive(...) and a poll through'
         ' poll_responsive(predicate, ...)'
-        ' (orchestrator/tests/_poll_responsive.py::poll_responsive), each with a'
+        f' ({_POLL_RESPONSIVE_REF}), each with a'
         ' descriptive label=.'
     ),
 )
@@ -1038,23 +1088,6 @@ def _raw_wall_clock_literal(call: ast.Call, *, is_bare_wait_for: bool) -> str | 
     return None
 
 
-def _polled_predicate_target(node: ast.expr) -> str:
-    """Describe *node* as a polled predicate: a poll's predicate IS its synchronisation point."""
-    return f'{ast.unparse(node)} (polled predicate)'
-
-
-# The responsive wait helpers by name, each with how it describes its first argument
-# as a load-bearing target.  A stdlib-only literal copy of the helper names
-# (orchestrator/tests/_orch_helpers.py::wait_responsive,
-# orchestrator/tests/_poll_responsive.py::poll_responsive), which this checker
-# cannot import — the same precedent as ``_DATACLASS_SHAPES``.  A responsive helper
-# is itself the remedy, so only its raw-literal kind ever applies.
-_RESPONSIVE_WAIT_TARGETS: dict[str, Callable[[ast.expr], str | None]] = {
-    'wait_responsive': _load_bearing_wait_target,
-    'poll_responsive': _polled_predicate_target,
-}
-
-
 def _wall_clock_deadline_violations(
     node: ast.AST, lines: list[str], filename: str
 ) -> list[Violation]:
@@ -1098,7 +1131,7 @@ def _wait_call_violations(call: ast.Call, lines: list[str], filename: str) -> li
     Gating order is cheapest-first, and deliberately so:
       1. the call has at least one positional argument (no ``args[0]`` to inspect
          otherwise — and a bare ``asyncio.wait_for()`` must be skipped, not crash);
-      2. the func is ``asyncio.wait_for`` or a ``_RESPONSIVE_WAIT_TARGETS`` helper;
+      2. the func is ``asyncio.wait_for`` or a ``_RESPONSIVE_WAIT_HELPERS`` helper;
       3. that shape's describer recognises ``args[0]`` (``_load_bearing_wait_target``,
          except a ``poll_responsive`` predicate, which is always load-bearing).
     Only then is the exemption line-walk run, so the upward walk keeps Rule B's cost
@@ -1121,8 +1154,8 @@ def _wait_call_violations(call: ast.Call, lines: list[str], filename: str) -> li
     )
     if is_bare_wait_for:
         describe = _load_bearing_wait_target
-    elif isinstance(func, ast.Name) and func.id in _RESPONSIVE_WAIT_TARGETS:
-        describe = _RESPONSIVE_WAIT_TARGETS[func.id]
+    elif isinstance(func, ast.Name) and func.id in _RESPONSIVE_WAIT_HELPERS:
+        describe = _RESPONSIVE_WAIT_HELPERS[func.id].describe
     else:
         return []
 
@@ -1170,25 +1203,36 @@ _SCOPE_NODES: tuple[type[ast.AST], ...] = (
     ast.ClassDef,
 )
 
+# The loops: a ``break`` inside one ends that loop, not an enclosing one.
+_LOOP_NODES: tuple[type[ast.AST], ...] = (ast.While, ast.For, ast.AsyncFor)
+
+
+def _opens_scope(node: ast.AST) -> bool:
+    """Return True if *node* opens a new scope (``_SCOPE_NODES``)."""
+    return isinstance(node, _SCOPE_NODES)
+
 
 def _walk_own_scope(
-    nodes: Iterable[ast.AST], *, stop_at: tuple[type[ast.AST], ...] = _SCOPE_NODES
+    nodes: Iterable[ast.AST], *, prune: Callable[[ast.AST], bool] = _opens_scope
 ) -> Iterator[ast.AST]:
-    """Yield *nodes* and their descendants in source order, not descending into a *stop_at* node.
+    """Yield *nodes* and their descendants in source order, skipping every node *prune* accepts.
 
-    A *stop_at* node is itself yielded; only its children are skipped.
+    A pruned node is skipped whole: neither it nor any of its descendants is yielded.
     """
     pending = list(reversed(list(nodes)))
     while pending:
         node = pending.pop()
+        if prune(node):
+            continue
         yield node
-        if not isinstance(node, stop_at):
-            pending.extend(reversed(list(ast.iter_child_nodes(node))))
+        pending.extend(reversed(list(ast.iter_child_nodes(node))))
 
 
-def _awaits(stmts: Iterable[ast.AST]) -> bool:
-    """Return True if *stmts* await anything in their own scope."""
-    return any(isinstance(node, ast.Await) for node in _walk_own_scope(stmts))
+def _awaits(
+    stmts: Iterable[ast.AST], *, prune: Callable[[ast.AST], bool] = _opens_scope
+) -> bool:
+    """Return True if *stmts* await anything outside every node *prune* accepts."""
+    return any(isinstance(node, ast.Await) for node in _walk_own_scope(stmts, prune=prune))
 
 
 # The zero-argument methods that read a wall clock: ``loop.time()``, ``time.time()``,
@@ -1211,23 +1255,151 @@ def _is_wall_clock_read(node: ast.AST) -> TypeGuard[ast.Call]:
     )
 
 
+def _reads_clock(node: ast.AST) -> bool:
+    """Return True if a wall-clock read appears anywhere in *node*."""
+    return any(_is_wall_clock_read(inner) for inner in ast.walk(node))
+
+
+def _elapsed_clock_read(node: ast.expr) -> ast.Call | None:
+    """Return the clock read in *node* if it is an elapsed time, ``<clock read> - <start>``."""
+    if (
+        isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Sub)
+        and _is_wall_clock_read(node.left)
+    ):
+        return node.left
+    return None
+
+
+def _ends_other_than_by_its_clock(loop: ast.While) -> bool:
+    """Return True if *loop* has an exit that no clock governs.
+
+    That is a conjunct of its test that reads no clock and is not a constant, or a
+    ``break`` or ``return`` in its own code outside the body of every ``if`` whose test
+    reads a clock.  A nested loop is not searched: its ``break`` ends that loop.  A loop
+    with neither runs FOR a duration — a fake worker's tick loop — rather than polling.
+    """
+    test = loop.test
+    conjuncts = (
+        test.values
+        if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And)
+        else [test]
+    )
+    if any(not isinstance(c, ast.Constant) and not _reads_clock(c) for c in conjuncts):
+        return True
+    own_body = list(
+        _walk_own_scope(
+            loop.body, prune=lambda node: isinstance(node, (*_SCOPE_NODES, *_LOOP_NODES))
+        )
+    )
+    clock_governed = {
+        id(node)
+        for clock_check in own_body
+        if isinstance(clock_check, ast.If) and _reads_clock(clock_check.test)
+        for node in _walk_own_scope(clock_check.body)
+    }
+    return any(
+        isinstance(node, (ast.Break, ast.Return)) and id(node) not in clock_governed
+        for node in own_body
+    )
+
+
 def _clock_deadline_read(loop: ast.While) -> ast.Call | None:
     """Return the wall-clock read *loop* compares against to give up, else None.
 
-    That is the first ``Compare`` in the loop's test or own body with a DIRECT
-    operand that is a wall-clock read.  A nested loop or scope is not searched: its
-    comparison is its own.
+    That is a DIRECT operand of a ``Compare`` in the loop's test or own body that is a
+    wall-clock read.  Failing one, it is the read inside an elapsed-time operand
+    (``_elapsed_clock_read``), but only for a loop that ``_ends_other_than_by_its_clock``.
+    A nested ``while`` or scope is not searched: its comparison is its own.  A nested
+    ``for`` IS searched: a ``for`` loop is not a leg of its own, so its comparison
+    belongs to the enclosing ``while``.
     """
     own_code = _walk_own_scope(
-        [loop.test, *loop.body], stop_at=(*_SCOPE_NODES, ast.While)
+        [loop.test, *loop.body],
+        prune=lambda node: isinstance(node, (*_SCOPE_NODES, ast.While)),
     )
+    elapsed_reads: list[ast.Call] = []
     for node in own_code:
         if not isinstance(node, ast.Compare):
             continue
         for operand in (node.left, *node.comparators):
             if _is_wall_clock_read(operand):
                 return operand
+            elapsed = _elapsed_clock_read(operand)
+            if elapsed is not None:
+                elapsed_reads.append(elapsed)
+    if elapsed_reads and _ends_other_than_by_its_clock(loop):
+        return elapsed_reads[0]
     return None
+
+
+class _DeadlineContext(NamedTuple):
+    """An ``asyncio.<attr>(...)`` deadline context's one argument.
+
+    ``keyword`` is that argument's keyword spelling, and ``is_duration`` whether it
+    is a duration, so a written number there is a raw literal, rather than an
+    absolute time.
+    """
+
+    keyword: str
+    is_duration: bool
+
+
+_DEADLINE_CONTEXTS: dict[str, _DeadlineContext] = {
+    'timeout': _DeadlineContext(keyword='delay', is_duration=True),
+    'timeout_at': _DeadlineContext(keyword='when', is_duration=False),
+}
+
+
+def _deadline_context(item: ast.withitem) -> tuple[ast.expr, _DeadlineContext] | None:
+    """Return *item*'s deadline argument and context if it is an asyncio deadline.
+
+    None unless the item is an ``asyncio.<attr>(...)`` call with *attr* in
+    ``_DEADLINE_CONTEXTS`` whose argument, positional or by that context's own
+    keyword, is present and not the literal None: a missing or None deadline bounds
+    nothing, and another context's keyword is a TypeError, not a deadline.
+    """
+    call = item.context_expr
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == 'asyncio'
+        and call.func.attr in _DEADLINE_CONTEXTS
+    ):
+        return None
+    context = _DEADLINE_CONTEXTS[call.func.attr]
+    keyword_bounds = [kw.value for kw in call.keywords if kw.arg == context.keyword]
+    bounds = keyword_bounds or call.args[:1]
+    if not bounds:
+        return None
+    bound = bounds[0]
+    if isinstance(bound, ast.Constant) and bound.value is None:
+        return None
+    return bound, context
+
+
+def _block_deadline(block: ast.AsyncWith) -> tuple[ast.expr, _DeadlineContext] | None:
+    """Return the first asyncio deadline among *block*'s items (``_deadline_context``)."""
+    return next(
+        (found for item in block.items if (found := _deadline_context(item)) is not None),
+        None,
+    )
+
+
+def _owns_its_waits(node: ast.AST) -> bool:
+    """Return True if *node* opens a scope or is a deadline spelling of its own.
+
+    Either owns the waits inside it.  A scope's code is its own, and a nested
+    ``asyncio`` deadline block or clock-deadline ``while`` is the innermost deadline
+    on what it contains, so Rule C attributes those waits to it alone and counts one
+    wait once.
+    """
+    if isinstance(node, ast.AsyncWith):
+        return _block_deadline(node) is not None
+    if isinstance(node, ast.While):
+        return _clock_deadline_read(node) is not None
+    return _opens_scope(node)
 
 
 def _clock_deadline_poll_violations(
@@ -1235,14 +1407,13 @@ def _clock_deadline_poll_violations(
 ) -> list[Violation]:
     """Rule C's clock-deadline poll leg, for ONE ``ast.While``: return 0 or 1 Violations.
 
-    Flags an awaiting loop that gives up against a wall-clock read.  Only the
+    Flags a loop that gives up against a wall-clock read and awaits outside every
+    nested deadline spelling, which owns its own waits (``_owns_its_waits``).  Only the
     routing kind applies: the loop's bound is arithmetic in another statement, so
     there is no literal on the inspected node to report.
     """
-    if not _awaits(loop.body):
-        return []
     read = _clock_deadline_read(loop)
-    if read is None:
+    if read is None or not _awaits(loop.body, prune=_owns_its_waits):
         return []
     if is_exempted(lines, loop.lineno, _RULE_C_CODE):
         return []
@@ -1257,55 +1428,22 @@ def _clock_deadline_poll_violations(
     ]
 
 
-# ``asyncio.<attr>(...)`` deadline contexts, mapped to the parameter that carries a
-# DURATION.  None: the context takes an absolute time, so it has no raw-literal kind.
-_DEADLINE_CONTEXTS: dict[str, str | None] = {'timeout': 'delay', 'timeout_at': None}
-
-# The keyword spellings of a deadline context's one argument: timeout's and timeout_at's.
-_DEADLINE_CONTEXT_KEYWORDS: tuple[str, ...] = ('delay', 'when')
-
-
-def _deadline_context(item: ast.withitem) -> tuple[ast.expr, str | None] | None:
-    """Return *item*'s deadline argument and duration parameter if it is an asyncio deadline.
-
-    None unless the item is an ``asyncio.<attr>(...)`` call with *attr* in
-    ``_DEADLINE_CONTEXTS`` whose argument is present and not the literal None: a
-    missing or None deadline bounds nothing.
-    """
-    call = item.context_expr
-    if not (
-        isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and isinstance(call.func.value, ast.Name)
-        and call.func.value.id == 'asyncio'
-        and call.func.attr in _DEADLINE_CONTEXTS
-    ):
-        return None
-    keyword_bounds = [kw.value for kw in call.keywords if kw.arg in _DEADLINE_CONTEXT_KEYWORDS]
-    bounds = keyword_bounds or call.args[:1]
-    if not bounds:
-        return None
-    bound = bounds[0]
-    if isinstance(bound, ast.Constant) and bound.value is None:
-        return None
-    return bound, _DEADLINE_CONTEXTS[call.func.attr]
-
-
 def _timeout_block_target(block: ast.AsyncWith) -> str | None:
     """Describe what *block*'s deadline bounds, if it is a load-bearing wait, else None.
 
-    A load-bearing await in the block's own scope wins; otherwise an awaiting
+    A load-bearing await in the block's own code wins; otherwise an awaiting
     ``while`` loop in it, which is a poll.  Anything else — ``await task``,
-    ``await asyncio.gather(...)``, a plain call — is not load-bearing.
+    ``await asyncio.gather(...)``, a plain call — is not load-bearing.  A nested
+    deadline spelling is not searched: it owns the waits inside it (``_owns_its_waits``).
     """
-    own_code = list(_walk_own_scope(block.body))
+    own_code = list(_walk_own_scope(block.body, prune=_owns_its_waits))
     for node in own_code:
         if isinstance(node, ast.Await):
             target = _load_bearing_wait_target(node.value)
             if target is not None:
                 return target
     for node in own_code:
-        if isinstance(node, ast.While) and _awaits(node.body):
+        if isinstance(node, ast.While) and _awaits(node.body, prune=_owns_its_waits):
             return f'poll loop `while {ast.unparse(node.test)}`'
     return None
 
@@ -1317,16 +1455,13 @@ def _timeout_block_violations(
 
     The first asyncio deadline context among the block's items decides.  The routing
     kind applies whenever the block bounds a load-bearing wait; the raw-literal kind
-    as well when that context's duration is a written number, exactly as for
-    ``asyncio.wait_for(x, 25.0)``.
+    as well when that context's argument is a duration written as a number, exactly
+    as for ``asyncio.wait_for(x, 25.0)``.
     """
-    context = next(
-        (found for item in block.items if (found := _deadline_context(item)) is not None),
-        None,
-    )
-    if context is None:
+    deadline = _block_deadline(block)
+    if deadline is None:
         return []
-    bound, duration_parameter = context
+    bound, context = deadline
     target = _timeout_block_target(block)
     if target is None:
         return []
@@ -1334,8 +1469,8 @@ def _timeout_block_violations(
         return []
 
     messages = [_wall_clock_routing_msg(_TIMEOUT_BLOCK, target)]
-    if duration_parameter is not None and _is_numeric_literal(bound):
-        messages.append(_wall_clock_raw_literal_msg(target, duration_parameter))
+    if context.is_duration and _is_numeric_literal(bound):
+        messages.append(_wall_clock_raw_literal_msg(target, context.keyword))
     return [
         Violation(
             filename=filename,
