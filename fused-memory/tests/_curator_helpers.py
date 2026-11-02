@@ -6,7 +6,7 @@ A plain module rather than conftest.py, for the reason ``_fm_helpers.py`` gives.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -171,11 +171,39 @@ def escalator_double() -> AsyncMock:
     return escalator
 
 
+def answer_each_with(
+    curator: Any, verdict: Callable[[CandidateTask], Awaitable[CuratorDecision]],
+) -> None:
+    """Make *curator* judge each candidate the ticket worker sends it with *verdict*.
+
+    ``prepare_candidate`` returns a bundle over an empty pool, and
+    ``curate_prepared`` answers each bundle, in order, with
+    ``await verdict(candidate)`` — the surface the worker drives.
+    """
+    async def prepare(candidate: CandidateTask, *_args: Any) -> PreparedCandidate:
+        return prepared(candidate.title, candidate=candidate)
+
+    async def curate_prepared(
+        bundles: Sequence[PreparedCandidate], *_args: Any,
+    ) -> list[CuratorDecision]:
+        return [await verdict(bundle.candidate) for bundle in bundles]
+
+    curator.prepare_candidate = AsyncMock(side_effect=prepare)
+    curator.curate_prepared = AsyncMock(side_effect=curate_prepared)
+
+
 def curator_returning(*decisions: CuratorDecision) -> MagicMock:
-    """A curator double for ``TaskInterceptor(curator=...)``; ``curate`` returns *decisions*."""
+    """A curator double for ``TaskInterceptor(curator=...)``.
+
+    Its ``curate_prepared`` hands out *decisions* in order, one per bundle.
+    """
     curator = MagicMock()
-    curator.prepare_candidate = AsyncMock(return_value=None)
-    curator.curate = AsyncMock(side_effect=list(decisions))
+    answers = iter(decisions)
+
+    async def next_decision(_candidate: CandidateTask) -> CuratorDecision:
+        return next(answers)
+
+    answer_each_with(curator, next_decision)
     curator.note_created = MagicMock()
     curator.record_task = AsyncMock()
     curator.reembed_task = AsyncMock(return_value=None)

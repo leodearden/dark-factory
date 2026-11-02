@@ -47,7 +47,7 @@ class _DeferThenHoldCurator:
     ) -> PreparedCandidate:
         return PreparedCandidate(candidate=candidate, pool=[], pool_sizes={}, prompt_tokens=0)
 
-    async def curate_batch_prepared(
+    async def curate_prepared(
         self, prepared: list[PreparedCandidate], project_id: str, project_root: str,
     ) -> list[CuratorDecision]:
         if self._defer_next:

@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from _curator_helpers import agent_result, submit_as_one_batch, zot_agent_result
+from _curator_helpers import agent_result, answer_each_with, submit_as_one_batch, zot_agent_result
 from _fm_helpers import _init_git_repo, make_8df8_scenario, poll_until
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
 from shared.async_sqlite_base import CheckpointResult
@@ -31,7 +31,6 @@ from fused_memory.middleware.curator_escalator import CuratorEscalator
 from fused_memory.middleware.curator_types import (
     CandidateTask,
     CuratorDecision,
-    CuratorFailureError,
     PreparedCandidate,
     RewrittenTask,
     is_combine_eligible_status,
@@ -643,16 +642,10 @@ def curator_interceptor(make_curator_interceptor):
 def _mock_curator(decision: CuratorDecision) -> MagicMock:
     """Mock TaskCurator returning a fixed decision."""
     curator = MagicMock()
+    # The per-candidate verdict, so assertions on curator.curate (e.g.
+    # assert_called_once) count the candidates the worker curated.
     curator.curate = AsyncMock(return_value=decision)
-
-    # curate_batch delegates to curate() per candidate so that assertions on
-    # curator.curate (e.g. assert_called_once) continue to pass for tests that
-    # use the batch worker path.  The inner curate call uses the same AsyncMock,
-    # so call counts accumulate correctly.
-    async def _curate_batch(candidates, *a, **kw):
-        return [await curator.curate(c, *a, **kw) for c in candidates]
-
-    curator.curate_batch = AsyncMock(side_effect=_curate_batch)
+    answer_each_with(curator, curator.curate)
     curator.record_task = AsyncMock()
     curator.reembed_task = AsyncMock()
     # note_created is a plain sync method on the real TaskCurator.
@@ -7422,7 +7415,7 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
     # headroom against scheduling jitter under host CPU oversubscription.
     CURATOR_LATENCY_S = 4.0
 
-    async def slow_curate(candidate, project_id, project_root):
+    async def slow_curate(candidate, *_args):
         await asyncio.sleep(CURATOR_LATENCY_S)
         # action='create' so the flow falls through to tm.add_task
         return CuratorDecision(
@@ -7431,14 +7424,10 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
         )
 
     curator = MagicMock()
+    # The per-candidate verdict, so slow_curate is invoked and the
+    # latency-based assertion holds.
     curator.curate = AsyncMock(side_effect=slow_curate)
-
-    # curate_batch delegates to curate() so slow_curate is still invoked
-    # and the latency-based assertion holds.
-    async def _slow_curate_batch(candidates, pid, project_root):
-        return [await curator.curate(c, pid, project_root) for c in candidates]
-
-    curator.curate_batch = AsyncMock(side_effect=_slow_curate_batch)
+    answer_each_with(curator, curator.curate)
     curator.record_task = AsyncMock()
     curator.reembed_task = AsyncMock()
     curator.note_created = MagicMock()
@@ -15276,27 +15265,8 @@ async def test_dispatch_refuse_precedes_drop_even_with_stray_target(
 
 
 def _refusal_curator(decision: CuratorDecision) -> MagicMock:
-    """A curator mock whose prepared batch answers *decision* for every candidate.
-
-    Extends :func:`_mock_curator` with the entry points the worker's batch path
-    uses (``prepare_candidate`` / ``curate_batch_prepared``).
-    """
-    from fused_memory.middleware.curator_types import PreparedCandidate
-
-    curator = _mock_curator(decision)
-
-    async def _prepare(candidate, project_id, project_root):
-        return PreparedCandidate(
-            candidate=candidate, pool=[], pool_sizes={}, prompt_tokens=0,
-        )
-
-    curator.prepare_candidate = AsyncMock(side_effect=_prepare)
-
-    async def _batch_prepared(prepared, project_id, project_root):
-        return [await curator.curate(p.candidate, project_id, project_root) for p in prepared]
-
-    curator.curate_batch_prepared = AsyncMock(side_effect=_batch_prepared)
-    return curator
+    """A curator mock whose prepared batch answers *decision* for every candidate."""
+    return _mock_curator(decision)
 
 
 def _blocklisted_refusal() -> CuratorDecision:
@@ -15371,7 +15341,7 @@ async def test_batch_sibling_pointing_at_refused_candidate_degrades_to_create(
     refusing one candidate cannot silently discard an unrelated one."""
     refusal = _blocklisted_refusal()
     mock_curator = _refusal_curator(refusal)
-    mock_curator.curate_batch_prepared = AsyncMock(return_value=[
+    mock_curator.curate_prepared = AsyncMock(return_value=[
         refusal,
         CuratorDecision(
             action='drop',
@@ -15408,7 +15378,7 @@ async def test_batch_sibling_pointing_at_refused_candidate_degrades_to_create(
 def _real_blocklist_curator(tmp_path):
     """A REAL TaskCurator wired to a tmp_path blocklist YAML.
 
-    A mock curator would bypass ``curate_batch_prepared``'s pre-batch
+    A mock curator would bypass ``curate_prepared``'s pre-batch
     payload_hash dedup — the very code under test — so this test needs the real
     thing. Only ``prepare_candidate`` (corpus assembly, not under test) is
     stubbed, to keep the test hermetic and off the network.
@@ -16487,9 +16457,8 @@ class TestZotDuplicateSweepWiring:
             pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
             prompt_tokens=0,
         )
-        return await curator.curate(
-            candidate, project_id, _ZOT_PROJECT_ROOT, prepared=prepared,
-        )
+        [decision] = await curator.curate_prepared([prepared], project_id, _ZOT_PROJECT_ROOT)
+        return decision
 
     async def _dispatch(self, interceptor, curator, candidate, decision, project_id):
         return await interceptor._dispatch_ticket_decision(
@@ -16727,12 +16696,12 @@ class TestZotDuplicateSweepWiring:
         assert held == {'search': False, 'stamp': True, 'escalation': False}
 
 
-class _ZotRaisingCurator(_ScoredCorpusCurator):
-    """Corpus fake whose curate re-raises a ZOT, as it does with no orchestrator."""
+class _UnescalatedZotCurator(_ScoredCorpusCurator):
+    """Corpus fake answering as the pipeline decides a ZOT with no orchestrator.
 
-    def __init__(self, scores: dict[str, float], *, prepares: bool) -> None:
-        super().__init__(scores)
-        self._prepares = prepares
+    With nothing to escalate to, the curator's failure mapper still creates,
+    marked ``degraded_by_zot``, and carries no escalation id.
+    """
 
     def note_created(self, project_id: str, candidate: CandidateTask, task_id: str) -> None:
         pass
@@ -16740,26 +16709,29 @@ class _ZotRaisingCurator(_ScoredCorpusCurator):
     async def prepare_candidate(
         self, candidate: CandidateTask, project_id: str, project_root: str,
     ) -> PreparedCandidate:
-        if not self._prepares:
-            raise RuntimeError('prepare unavailable')
         return PreparedCandidate(
             candidate=candidate, pool=[],
             pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
             prompt_tokens=0,
         )
 
-    async def curate_batch_prepared(self, prepared, project_id: str, project_root: str):
-        raise CuratorFailureError('batch call escaped its bisect')
-
-    async def curate(self, candidate, project_id: str, project_root: str, *, prepared=None):
-        raise CuratorFailureError('no orchestrator is running', zero_output_timeout=True)
+    async def curate_prepared(self, prepared, project_id: str, project_root: str):
+        return [
+            CuratorDecision(
+                action='create',
+                justification='curator-failed: CuratorFailureError: no orchestrator is running',
+                degraded=True,
+                degraded_by_zot=True,
+            )
+            for _ in prepared
+        ]
 
     async def close(self) -> None:
         return None
 
 
 class TestZotDuplicateSweepWithoutOrchestrator:
-    """With no orchestrator the ZOT re-raises, yet the create is still swept and stamped."""
+    """With no orchestrator the curator decides the ZOT as a marked create, still swept and stamped."""
 
     @pytest_asyncio.fixture
     async def setup(self, taskmaster, reconciler, event_buffer, ticket_store, tmp_path):
@@ -16775,8 +16747,8 @@ class TestZotDuplicateSweepWithoutOrchestrator:
         await interceptor.close()
 
     @staticmethod
-    async def _install_curator(interceptor, project_id: str, *, prepares: bool):
-        curator = _ZotRaisingCurator({_DUP_TASK_ID: 0.80}, prepares=prepares)
+    async def _install_curator(interceptor, project_id: str):
+        curator = _UnescalatedZotCurator({_DUP_TASK_ID: 0.80})
         await curator.record_task(_DUP_TASK_ID, CandidateTask(title='Existing gate fix'), project_id)
         interceptor._curator = curator
 
@@ -16791,10 +16763,9 @@ class TestZotDuplicateSweepWithoutOrchestrator:
         assert not list((Path(project_root) / 'data' / 'escalations').glob('esc-*.json'))
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('prepares', [False, True], ids=['backfill', 'batch-fallback'])
-    async def test_batch_paths(self, setup, taskmaster, ticket_store, prepares):
+    async def test_the_worker_path(self, setup, taskmaster, ticket_store):
         interceptor, project_root, project_id = setup
-        await self._install_curator(interceptor, project_id, prepares=prepares)
+        await self._install_curator(interceptor, project_id)
 
         submitted = await interceptor.submit_task(
             project_root, title='Re-filed gate fix', description='same fix again',

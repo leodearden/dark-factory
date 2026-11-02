@@ -72,7 +72,7 @@ class _ScriptedCurator:
     """A curator double answering each candidate, by title, with its next scripted verdict.
 
     A batch-level script entry (``batch_raises``) makes the next
-    ``curate_batch_prepared`` call raise instead of answering; a title in
+    ``curate_prepared`` call raise instead of answering; a title in
     ``prepare_raises`` makes ``prepare_candidate`` raise for it.
     """
 
@@ -99,17 +99,12 @@ class _ScriptedCurator:
             raise RuntimeError(f'prepare exploded for {candidate.title}')
         return PreparedCandidate(candidate=candidate, pool=[], pool_sizes={}, prompt_tokens=0)
 
-    async def curate_batch_prepared(
+    async def curate_prepared(
         self, prepared: list[PreparedCandidate], project_id: str, project_root: str,
     ) -> list[CuratorDecision]:
         if self.batch_raises:
             raise self.batch_raises.popleft()
         return [self._next(p.candidate.title) for p in prepared]
-
-    async def curate(
-        self, candidate: CandidateTask, project_id: str, project_root: str,
-    ) -> CuratorDecision:
-        return self._next(candidate.title)
 
     def note_created(self, project_id: str, candidate: CandidateTask, task_id: str) -> None:
         self.created.append((candidate.title, task_id))
