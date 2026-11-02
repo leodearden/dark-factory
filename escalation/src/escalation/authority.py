@@ -37,8 +37,9 @@ that the watcher QUOTED the proof, trusting the read-only watcher to have
 done the check. The denylist (``L2_AUTO_CLOSE_DENY_CATEGORIES`` /
 ``L2_AUTO_CLOSE_DENY_ROLES``) is applied BEFORE the allowlist, guaranteeing
 the born-at-L2 human gates (the design_concern / milestone_gate /
-milestone_check_failed / curator_adjudication_missing categories, and the
-``orchestrator-deterministic`` sentinel role) are never auto-closable even
+milestone_check_failed / milestone_check_stalled / curator_adjudication_missing
+categories, and the ``orchestrator-deterministic`` sentinel role) are never
+auto-closable even
 when a class predicate would otherwise match. That guarantee belongs to the
 MCP ``resolve_issue`` path. Direct-queue paths also auto-close L2s, gated by
 MEMBERSHIP rather than by class, so the category denylist does not bind them:
@@ -115,12 +116,13 @@ PROMOTE_SENTINEL_BOUND_ROLES: frozenset[str] = frozenset({
 L2_AUTO_CLOSE_ACTION: str = 'close_only'
 
 # Categories that are NEVER auto-closable regardless of class match — the
-# born-at-L2 human-judgment categories (design decisions, and BOTH milestone
+# born-at-L2 human-judgment categories (design decisions, and the THREE milestone
 # categories the deterministic runner files: 'milestone_gate' — the gate
-# itself — and 'milestone_check_failed' — a failed predicate check. The
-# latter is also covered by L2_AUTO_CLOSE_DENY_ROLES below (both file under
-# agent_role='orchestrator-deterministic'), but is listed here too for
-# defense-in-depth so a future filing under a different role stays blocked.
+# itself — 'milestone_check_failed' — a failed predicate check — and
+# 'milestone_check_stalled' — a re-arming predicate still "not yet" at its stall
+# cap. The latter two are also covered by L2_AUTO_CLOSE_DENY_ROLES below (all
+# file under agent_role='orchestrator-deterministic'), but are listed here too
+# for defense-in-depth so a future filing under a different role stays blocked.
 # 'curator_adjudication_missing' (filed by ``orchestrator.deterministic_runner``)
 # is the re-ask raised when a 'human_curator_gate' task resumes with no
 # 'human_curator_adjudicated_at' stamp; auto-closing it re-opens the task-3181
@@ -131,7 +133,7 @@ L2_AUTO_CLOSE_ACTION: str = 'close_only'
 # for that same defense-in-depth reason.
 #
 # Every member is spelled through the registry, so a misspelling fails at
-# import instead of silently ending the denial. The three RUNNER-FILED members
+# import instead of silently ending the denial. The four RUNNER-FILED members
 # are additionally held in lockstep with their named constants in
 # ``orchestrator.deterministic_runner`` by the function-local orchestrator
 # imports in ``tests/test_authority.py``, per the layer-direction rule in this
@@ -141,6 +143,8 @@ L2_AUTO_CLOSE_DENY_CATEGORIES: frozenset[str] = frozenset({
     EscalationCategory.DESIGN_CONCERN,
     EscalationCategory.MILESTONE_GATE,
     EscalationCategory.MILESTONE_CHECK_FAILED,
+    # The stall escalation of a re-arming predicate (PRD completion-driven-triggers C1).
+    EscalationCategory.MILESTONE_CHECK_STALLED,
     EscalationCategory.CURATOR_ADJUDICATION_MISSING,
 })
 

@@ -1392,6 +1392,13 @@ takes no arguments: it always re-reads that process's own
   `orchestrator/src/orchestrator/config.py::ScoringConfig` and
   `plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §C2. The legacy
   formula's `age_alpha` / `cpm_beta` stay restart-only.
+- `deterministic.predicate_recheck_stall_cap` (default 30, `>= 1`): how many
+  consecutive exit-75 "not yet" verdicts a re-arming predicate may return
+  before the runner files `milestone_check_stalled`. Read whenever a
+  deterministic slot builds its runner, so a reload applies from the next
+  dispatch. Calibrate it from `predicate_recheck_stalled` events. Normative
+  homes: `orchestrator/src/orchestrator/config.py::DeterministicConfig` and
+  `plans/completion-driven-triggers-prd.md` C1.
 - `verify_env`
 - `verify_cgroup_cpu_weight_merge` / `_task` / `_background` (the per-role
   cgroup `CPUWeight` a verify scope is spawned with when

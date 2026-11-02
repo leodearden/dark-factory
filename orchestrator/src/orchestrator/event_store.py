@@ -1100,6 +1100,13 @@ class EventType(StrEnum):
     #   (INV-4). Age surfacing only; nothing times out. Payload:
     #   {waiter: {task_id, module, role, plan_id, wait_secs}, aged_count, alarm_secs}
     verify_admission_wait_aged = 'verify_admission_wait_aged'
+    # predicate_rearmed / predicate_recheck_stalled — from DeterministicRunner
+    #   when a declared predicate exits 75 ("not yet") and re-arms, or reaches
+    #   deterministic.predicate_recheck_stall_cap and files milestone_check_stalled
+    #   (plans/completion-driven-triggers-prd.md C1). Payload:
+    #   {rc, consecutive, stall_cap, recheck_secs, next_check_at, verdict}
+    predicate_rearmed = 'predicate_rearmed'
+    predicate_recheck_stalled = 'predicate_recheck_stalled'
 
     # Shadow eval (plans/live-shadow-eval-prd.md C2). task_id is the PRODUCTION
     # task the cell shadows; shadow_cell_skipped's data.reason is a
