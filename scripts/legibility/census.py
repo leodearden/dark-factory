@@ -1181,6 +1181,7 @@ def build_method(
     inputs_consumed_note: str | None,
     embedding_calls: int,
     adjudication: Mapping[str, int],
+    slug_tally: codebook.SlugTally,
 ) -> dict[str, Any]:
     """The JSON-safe ``## Method`` block: the seven keys of the
     quality-findings contract §5, then ``extra``
@@ -1189,7 +1190,9 @@ def build_method(
     *reverify* counts of the outcome feedback (L5, D8), whose offered
     re-verifies *verify_calls* includes, and the pre-screen's per-rule
     *screened* counts (L6), and the similarity stage's *adjudication*
-    counts (L7), whose embedding requests are *embedding_calls*.
+    counts (L7), whose embedding requests are *embedding_calls*, and
+    *slug_tally*, the merge's ``invariant_violated`` screen
+    (codebook.SlugTally), recorded as ``slug_rejections`` (§4.3 C3).
     *inputs_consumed* are the run ids of the other
     instruments' records the pre-screen read, and *inputs_consumed_note*
     says why any gave it none. *selection* is ``None`` for a
@@ -1221,6 +1224,7 @@ def build_method(
             **_ledger_extra(selection),
             "verify_normalisations": dict(verify_normalisations),
             "reverify": dict(reverify),
+            "slug_rejections": slug_tally.rejections_record(),
         },
     }
 
@@ -3511,6 +3515,7 @@ def run_census(
         inputs_consumed_note=screen_report.inputs.note,
         embedding_calls=view.requests,
         adjudication=adjudication_report.counts(),
+        slug_tally=merge.invariant_slugs,
     )
     record = build_census_record(
         method=method,
