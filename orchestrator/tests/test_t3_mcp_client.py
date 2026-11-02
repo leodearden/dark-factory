@@ -8,6 +8,7 @@ the wire it uses in production.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import stat
 from collections.abc import Iterator
@@ -19,11 +20,15 @@ import pytest
 from _fake_t3_server import (
     DECISION_PATH,
     ENVIRONMENT_ID,
+    PAIRING_CREATE_MODE_ENV,
     REGISTER_PATH,
     TOKEN_PATH,
     FakeT3Server,
+    PairingCreateMode,
     ToolFailure,
     ToolSuccess,
+    cli_calls,
+    install_fake_t3_cli,
 )
 
 from orchestrator import t3_mcp_client as client
@@ -90,6 +95,23 @@ def seed_credential(
     )
     client.write_credential(credential, root=root)
     return credential
+
+
+def install_cli(server: FakeT3Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version_line: str) -> Path:
+    """Put a fake ``t3`` minting on ``server`` first on PATH; returns its argv log."""
+    bin_dir, log_path = tmp_path / 'bin', tmp_path / 't3-cli.log'
+    install_fake_t3_cli(bin_dir, origin=server.origin, version_line=version_line, log_path=log_path)
+    monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
+    return log_path
+
+
+@pytest.fixture
+def t3_cli(t3_server: FakeT3Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The real CLI's version line for the fake server's version."""
+    return install_cli(t3_server, tmp_path, monkeypatch, 't3 v0.1.6')
+
+
+PAIRING_CREATE = ['auth', 'pairing', 'create', '--json']
 
 
 def closed_origin() -> str:
@@ -395,4 +417,78 @@ class TestPairWithOperatorCode:
 
         assert isinstance(result, client.PairFailed)
         assert result.reason is client.PairFailure.ENVIRONMENT_MISMATCH
+        assert no_credential_written(fleet)
+
+
+class TestSelfPair:
+    def test_a_matching_cli_mints_the_code_and_pairs(self, t3_server: FakeT3Server, t3_cli: Path, fleet: Path):
+        result = client.pair(t3_server.origin, client.CliCodeSource(), root=fleet)
+
+        assert isinstance(result, client.Paired)
+        assert result.credential.paired_by is client.PairedBy.SELF_PAIR
+        assert cli_calls(t3_cli) == [['--version'], PAIRING_CREATE]
+        [minted] = t3_server.issued_pairing_codes()
+        [decision] = t3_server.oauth_calls(DECISION_PATH)
+        assert decision['decision']['code'] == minted
+        path = client.credential_path(t3_server.environment_id, root=fleet)
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    def test_a_cli_of_another_version_mints_nothing(
+        self, t3_server: FakeT3Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fleet: Path
+    ):
+        log = install_cli(t3_server, tmp_path, monkeypatch, 't3 v0.1.4')
+
+        result = client.pair(t3_server.origin, client.CliCodeSource(), root=fleet)
+
+        assert result == client.PairFailed(
+            client.PairFailure.CLI_VERSION_MISMATCH, cli_version='0.1.4', server_version='0.1.6'
+        )
+        assert isinstance(result, client.PairFailed)
+        assert result.reason.value == 'cli-version-mismatch'
+        assert cli_calls(log) == [['--version']]
+        assert t3_server.issued_pairing_codes() == []
+        assert touched_oauth(t3_server) == []
+        assert no_credential_written(fleet)
+
+    def test_an_unparsable_version_line_mints_nothing(
+        self, t3_server: FakeT3Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fleet: Path
+    ):
+        log = install_cli(t3_server, tmp_path, monkeypatch, 'garbage')
+
+        result = client.pair(t3_server.origin, client.CliCodeSource(), root=fleet)
+
+        assert isinstance(result, client.PairFailed)
+        assert result.reason is client.PairFailure.CLI_VERSION_UNREADABLE
+        assert cli_calls(log) == [['--version']]
+
+    def test_no_t3_on_path_is_t3_missing(
+        self, t3_server: FakeT3Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fleet: Path
+    ):
+        empty = tmp_path / 'empty-bin'
+        empty.mkdir()
+        monkeypatch.setenv('PATH', str(empty))
+
+        result = client.pair(t3_server.origin, client.CliCodeSource(), root=fleet)
+
+        assert isinstance(result, client.PairFailed)
+        assert result.reason is client.PairFailure.T3_MISSING
+        assert no_credential_written(fleet)
+
+    @pytest.mark.parametrize('mode', [PairingCreateMode.FAILS, PairingCreateMode.OMITS_CREDENTIAL])
+    def test_a_failed_pairing_create_sends_no_oauth_request(
+        self,
+        t3_server: FakeT3Server,
+        t3_cli: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        fleet: Path,
+        mode: PairingCreateMode,
+    ):
+        monkeypatch.setenv(PAIRING_CREATE_MODE_ENV, mode.value)
+
+        result = client.pair(t3_server.origin, client.CliCodeSource(), root=fleet)
+
+        assert isinstance(result, client.PairFailed)
+        assert result.reason is client.PairFailure.PAIRING_CREATE_FAILED
+        assert cli_calls(t3_cli) == [['--version'], PAIRING_CREATE]
+        assert touched_oauth(t3_server) == []
         assert no_credential_written(fleet)

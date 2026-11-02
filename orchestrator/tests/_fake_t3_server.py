@@ -191,6 +191,7 @@ class FakeT3Server(ThreadingHTTPServer):
         self.requests: list[RecordedRequest] = []
         self._lock = threading.Lock()
         self._pairing_codes: set[str] = set()
+        self._issued_pairing_codes: list[str] = []
         self._clients: dict[str, list[str]] = {}
         self._auth_codes: dict[str, _AuthCode] = {}
         self._tokens: set[str] = set()
@@ -216,7 +217,13 @@ class FakeT3Server(ThreadingHTTPServer):
         code = secrets.token_urlsafe(12)
         with self._lock:
             self._pairing_codes.add(code)
+            self._issued_pairing_codes.append(code)
         return code
+
+    def issued_pairing_codes(self) -> list[str]:
+        """Every pairing code minted, by the fake CLI or :meth:`add_pairing_code`, oldest first."""
+        with self._lock:
+            return list(self._issued_pairing_codes)
 
     def issue_token(self) -> str:
         token = secrets.token_urlsafe(24)
