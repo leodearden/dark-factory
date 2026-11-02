@@ -19,6 +19,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
+    CANCEL_PROBE_INTERVAL_SECS,
     HEARTBEAT_STOP_JOIN_SECS,
     LocalRunner,
     MergeVerifySpec,
@@ -26,6 +27,7 @@ from orchestrator.verify_runner import (
     VerifyCommand,
     VerifyRunner,
     VerifyRunnerPool,
+    poll_until_clean,
     result_from_dict,
     result_from_json,
     result_to_dict,
@@ -7240,7 +7242,7 @@ class TestRemoteRunnerMainBranchPush:
 
 @pytest.mark.asyncio
 class TestRemoteRunnerRequestId:
-    """run_merge_verify passes --request-id <id> appended to the ssh argv."""
+    """run_merge_verify passes --request-id <id> in the ssh argv, ahead of --spec."""
 
     def _make_runner_and_calls(self, *, config_path=None):
         """Return (runner, calls) where calls tracks (argv, cwd) pairs."""
@@ -7265,7 +7267,7 @@ class TestRemoteRunnerRequestId:
         return runner, calls
 
     async def test_request_id_in_remote_cmd(self):
-        """ssh remote command contains --request-id fixed-id (appended)."""
+        """ssh remote command contains --request-id fixed-id."""
 
         runner, calls = self._make_runner_and_calls()
         await runner.run_merge_verify('abc123', _make_spec())
@@ -7307,31 +7309,18 @@ class TestRemoteRunnerRequestId:
         parsed = gate_argv(ssh_call[0][-1])
         assert parsed[:3] == ['verify-merge', '--sha', 'abc123']
 
-    async def test_request_id_appended_after_spec(self):
-        """--request-id appears after --spec (appended at end)."""
+    @pytest.mark.parametrize('config_path', [None, '/etc/orch.yaml'])
+    async def test_request_id_precedes_the_spec_and_the_config(self, config_path):
+        """--request-id follows --sha, ahead of the unbounded --spec JSON, so the
+        cancel probe's pgrep finds it inside a 4096-byte command-line read."""
 
-        runner, calls = self._make_runner_and_calls()
+        runner, calls = self._make_runner_and_calls(config_path=config_path)
         await runner.run_merge_verify('abc123', _make_spec())
 
         ssh_call = next(c for c in calls if c[0][0] == 'ssh')
         parsed = gate_argv(ssh_call[0][-1])
 
-        spec_idx = parsed.index('--spec')
-        rid_idx = parsed.index('--request-id')
-        assert rid_idx > spec_idx, '--request-id must be appended after --spec'
-
-    async def test_request_id_with_config_path(self):
-        """--request-id is still appended after --config when config_path is set."""
-
-        runner, calls = self._make_runner_and_calls(config_path='/etc/orch.yaml')
-        await runner.run_merge_verify('abc123', _make_spec())
-
-        ssh_call = next(c for c in calls if c[0][0] == 'ssh')
-        parsed = gate_argv(ssh_call[0][-1])
-
-        cfg_idx = parsed.index('--config')
-        rid_idx = parsed.index('--request-id')
-        assert rid_idx > cfg_idx, '--request-id must come after --config'
+        assert parsed[:6] == ['verify-merge', '--sha', 'abc123', '--request-id', 'fixed-id', '--spec']
 
     async def test_dispatch_not_in_flight_after_exception(self):
         """The dispatch is no longer in flight after RunnerUnavailable (cleared in the finally)."""
@@ -9406,3 +9395,39 @@ class TestRemoteRunnerMainPushMirror:
         result = await runner.run_merge_verify('abc123', _make_spec(), event_store=None)
         assert result == expected
         assert '+main:refs/heads/main' in _push_refspecs(calls)
+
+
+@pytest.mark.asyncio
+class TestPollUntilClean:
+    """The one cancel-probe loop the merge allocator and the task host pool share."""
+
+    @staticmethod
+    def _probe(*answers: bool):
+        reads = iter(answers)
+        probes: list[int] = []
+
+        async def probe() -> bool:
+            probes.append(1)
+            return next(reads)
+
+        return probe, probes
+
+    async def test_polls_interval_apart_with_no_sleep_after_the_last(self):
+        probe, probes = self._probe(False, False, False)
+        slept: list[float] = []
+
+        async def sleep(secs: float) -> None:
+            slept.append(secs)
+
+        assert await poll_until_clean(probe, attempts=3, sleep=sleep) is False
+        assert (len(probes), slept) == (3, [CANCEL_PROBE_INTERVAL_SECS] * 2)
+
+    async def test_stops_at_the_first_clean_read(self):
+        probe, probes = self._probe(False, True, False)
+        slept: list[float] = []
+
+        async def sleep(secs: float) -> None:
+            slept.append(secs)
+
+        assert await poll_until_clean(probe, attempts=3, sleep=sleep) is True
+        assert (len(probes), len(slept)) == (2, 1)

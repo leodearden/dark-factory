@@ -123,6 +123,9 @@ __all__ = [
     "RemoteVerifySubcommand",
     "REMOTE_VERIFY_PROCESS_PATTERN",
     "remote_verify_process_pattern",
+    "CANCEL_PROBE_ATTEMPTS",
+    "CANCEL_PROBE_INTERVAL_SECS",
+    "poll_until_clean",
     "RunnerUnavailable",
     "RunnerUnavailableKind",
     "ConcurrentDispatchError",
@@ -1252,9 +1255,37 @@ def remote_verify_process_pattern(request_id: str) -> str:
     """The pgrep pattern of request *request_id*'s remote verify, of either subcommand.
 
     The subcommand alternation keeps a ``cancel-verify --request-id <id>`` from
-    matching, and the ``)`` after it keeps the probing command line from matching itself.
+    matching, and the ``)`` after it keeps the probing command line from matching
+    itself.  The id must end at a space or the line's end, so no id matches a
+    longer one it prefixes.  A dispatch puts ``--request-id`` ahead of the
+    unbounded ``--spec`` JSON, so the id lies inside the first 4096 bytes of the
+    command line that procps 3.3's ``pgrep -f`` reads.
     """
-    return f'({REMOTE_VERIFY_PROCESS_PATTERN}) .*--request-id {request_id}'
+    return f'({REMOTE_VERIFY_PROCESS_PATTERN}) .*--request-id {request_id}( |$)'
+
+
+CANCEL_PROBE_ATTEMPTS = 10
+CANCEL_PROBE_INTERVAL_SECS = 1.0
+
+
+async def poll_until_clean(
+    probe: Callable[[], Awaitable[bool]],
+    *,
+    attempts: int = CANCEL_PROBE_ATTEMPTS,
+    interval: float = CANCEL_PROBE_INTERVAL_SECS,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
+) -> bool:
+    """Await *probe* up to *attempts* times, *interval* apart, until it reads clean.
+
+    The one cancel-probe policy, for a failed cancel's merge PARK and its task
+    bench alike.  No sleep follows the last probe.
+    """
+    for attempt in range(attempts):
+        if await probe():
+            return True
+        if attempt < attempts - 1:
+            await sleep(interval)
+    return False
 
 
 @dataclass(frozen=True)
@@ -1906,10 +1937,9 @@ class RemoteRunner:
     async def _run_gate_verify(
         self, sha: str, subcommand: RemoteVerifySubcommand, spec_json: str, request_id: str,
     ) -> _DispatchOutcome:
-        # --request-id is APPENDED, after the optional --config.
         remote_cmd = self._gate_command([
-            subcommand, '--sha', sha, '--spec', spec_json, *self._config_args(),
-            '--request-id', request_id,
+            subcommand, '--sha', sha, '--request-id', request_id,
+            '--spec', spec_json, *self._config_args(),
         ])
         if request_id == self._cancelled_request_id:
             raise RunnerUnavailable(
@@ -4531,7 +4561,7 @@ class HostAllocator:
         lease: HostLease | None,
         *,
         sleep: Any | None = None,
-        max_attempts: int = 10,
+        max_attempts: int = CANCEL_PROBE_ATTEMPTS,
     ) -> bool:
         """Cancel an in-flight verify and release the slot.
 
@@ -4613,16 +4643,12 @@ class HostAllocator:
         # Cancel failed: PARK the slot and poll until the host is clean,
         # for as long as this park episode is still the current one.
         episode = self._park(lease.name, rc)
-        for attempt in range(max_attempts):
-            if self.park_epoch(lease.name) != episode:
-                return False
-            if await lease.runner.probe_clean():
-                self._unpark(lease.name, expect_epoch=episode, source='inline_probe')
-                return False
-            if attempt < max_attempts - 1:
-                await sleep(1.0)
 
-        # max_attempts exhausted — slot remains PARKED (non-acquirable)
+        async def clean_or_superseded() -> bool:
+            return self.park_epoch(lease.name) != episode or await lease.runner.probe_clean()
+
+        if await poll_until_clean(clean_or_superseded, attempts=max_attempts, sleep=sleep):
+            self._unpark(lease.name, expect_epoch=episode, source='inline_probe')
         return False
 
     async def reprobe_parked_slots(

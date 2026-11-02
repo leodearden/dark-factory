@@ -670,6 +670,11 @@ def _raises(exc: Exception) -> VerifyAnswer:
     return answer
 
 
+def _request_id_of(remote_cmd: str) -> str:
+    words = shlex.split(remote_cmd)
+    return words[words.index('--request-id') + 1]
+
+
 def _sent_spec(transport: _Transport) -> TaskVerifySpec:
     remote_cmd = transport.argvs[transport.log.index('verify_task')][-1]
     words = shlex.split(remote_cmd)
@@ -893,7 +898,7 @@ class TestHostSymmetry:
         assert task_runner is not merge_runner
         assert task_runner.dispatch_in_flight and merge_runner.dispatch_in_flight
         verifies = [argv[-1] for argv, label in zip(transport.argvs, transport.log, strict=True) if label == 'verify_task']
-        assert {shlex.split(cmd)[-1] for cmd in verifies} == {'merge1', 'req1'}
+        assert {_request_id_of(cmd) for cmd in verifies} == {'merge1', 'req1'}
 
         assert await merge_runner.cancel_verify() == 0
         merge_release.set()

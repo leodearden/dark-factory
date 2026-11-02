@@ -398,11 +398,11 @@ class TestRunTaskVerifyTransport:
         parsed = gate_argv(ssh_argv[-1])
         assert parsed == [
             'verify-task', '--sha', _TIP,
+            '--request-id', 'fixed-id',
             '--spec', task_spec_to_json(spec),
             '--config', '/etc/orch.yaml',
-            '--request-id', 'fixed-id',
         ]
-        assert task_spec_from_json(parsed[4]) == spec
+        assert task_spec_from_json(parsed[6]) == spec
         assert transport.deleted_refs() == ['refs/merge-verify/fixed-id']
 
     @pytest.mark.asyncio
@@ -709,7 +709,11 @@ def _sleeper(*argv: str) -> subprocess.Popen:
 
 
 def _verify_sleeper(subcommand: str, request_id: str) -> subprocess.Popen:
-    return _sleeper('orchestrator', subcommand, '--sha', 's', '--request-id', request_id)
+    """A process whose command line has a dispatch's shape, its spec past 4096 bytes."""
+    return _sleeper(
+        'orchestrator', subcommand, '--sha', 's', '--request-id', request_id,
+        '--spec', 'x' * 9000,
+    )
 
 
 def _stop(*children: subprocess.Popen) -> None:
@@ -750,22 +754,25 @@ class TestRemoteVerifyProcessPattern:
         request_id, other_id = uuid.uuid4().hex, uuid.uuid4().hex
         task = _verify_sleeper('verify-task', request_id)
         merge = _verify_sleeper('verify-merge', request_id)
+        at_the_end = _sleeper('orchestrator', 'verify-merge', '--request-id', request_id)
         others = [
             _verify_sleeper('verify-task', other_id),
+            _verify_sleeper('verify-task', f'{request_id}0'),
             _verify_sleeper('verify-other', request_id),
             _sleeper('orchestrator', 'cancel-verify', '--request-id', request_id),
         ]
         try:
             listed = _pgrep(remote_verify_process_pattern(request_id))
 
-            assert str(task.pid) in listed
-            assert str(merge.pid) in listed
+            assert {str(task.pid), str(merge.pid), str(at_the_end.pid)} <= set(listed)
             assert not {str(child.pid) for child in others} & set(listed)
         finally:
-            _stop(task, merge, *others)
+            _stop(task, merge, at_the_end, *others)
 
     def test_the_pattern_keeps_the_subcommand_alternation(self):
-        assert remote_verify_process_pattern('r1') == f'({REMOTE_VERIFY_PROCESS_PATTERN}) .*--request-id r1'
+        assert remote_verify_process_pattern('r1') == (
+            f'({REMOTE_VERIFY_PROCESS_PATTERN}) .*--request-id r1( |$)'
+        )
 
     @pytest.mark.asyncio
     async def test_a_runner_that_cancelled_nothing_is_clean_without_any_call(self):

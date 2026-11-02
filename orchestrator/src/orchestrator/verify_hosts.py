@@ -18,7 +18,13 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 from orchestrator.deployed_sha import DeployedSha, resolve_code_checkout
 from orchestrator.verify import admission_policy
 from orchestrator.verify_admission_gate import AdmissionGate, AdmissionPolicy
-from orchestrator.verify_runner import RemoteRunner, RunnerUnavailable, RunnerUnavailableSink
+from orchestrator.verify_runner import (
+    CANCEL_PROBE_ATTEMPTS,
+    RemoteRunner,
+    RunnerUnavailable,
+    RunnerUnavailableSink,
+    poll_until_clean,
+)
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
@@ -26,9 +32,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 Unwind = Callable[[], Awaitable[object]]
-
-_CANCEL_PROBE_ATTEMPTS = 10
-_CANCEL_PROBE_INTERVAL_SECS = 1.0
 
 
 class CancellableRunner(Protocol):
@@ -102,7 +105,7 @@ class HostPool:
         quarantine: Set[str],
         on_unavailable: RunnerUnavailableSink,
         probe_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-        probe_attempts: int = _CANCEL_PROBE_ATTEMPTS,
+        probe_attempts: int = CANCEL_PROBE_ATTEMPTS,
     ) -> None:
         if probe_attempts < 1:
             raise ValueError(f'probe_attempts must be >= 1, got {probe_attempts!r}')
@@ -177,7 +180,9 @@ class HostPool:
             rc = await self._cancel(host, runner)
         finally:
             await unwind()
-        if rc == 0 or await self._probed_clean(runner):
+        if rc == 0 or await poll_until_clean(
+            runner.probe_clean, attempts=self._probe_attempts, sleep=self._probe_sleep,
+        ):
             return True
         self.mark_unavailable(host, RunnerUnavailable(
             f'cancel-verify on {host!r} exited rc={rc} and the cancelled request '
@@ -194,14 +199,6 @@ class HostPool:
                 'cancel-verify on %s raised; treating it as a failed cancel', host, exc_info=True,
             )
             return 1
-
-    async def _probed_clean(self, runner: CancellableRunner) -> bool:
-        for attempt in range(self._probe_attempts):
-            if await runner.probe_clean():
-                return True
-            if attempt < self._probe_attempts - 1:
-                await self._probe_sleep(_CANCEL_PROBE_INTERVAL_SECS)
-        return False
 
     def _known(self, host: str) -> None:
         if host not in self._gates:
