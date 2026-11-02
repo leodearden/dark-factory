@@ -3603,7 +3603,10 @@ class GraphitiBackend:
         is the minimal write set that restores per-uuid count(*) <= 1 while
         preserving the full edge set (no edge created or deleted), and it
         makes the repair idempotent: a re-run's detection query finds no
-        group with count(*) > 1 and performs zero writes.
+        group with count(*) > 1 and performs zero writes. Detection is read
+        over GRAPH.RO_QUERY, so a graph deleted after the startup scan listed
+        it is refused rather than recreated empty (pinned by
+        test_repair_on_a_graph_deleted_after_listing_leaves_it_deleted).
 
         GRAPH-KEY-scoped (NO group_id filter) — deliberately broader than the
         dup-node alarm's `n.group_id = $group_id` scoping. ζ's forthcoming
@@ -3651,7 +3654,7 @@ class GraphitiBackend:
             'RETURN u, eids'
         )
         start = time.monotonic()
-        detect_result = await graph.query(detect_cypher)
+        detect_result = await graph.ro_query(detect_cypher)
         dup_groups = detect_result.result_set or []
         repaired = 0
         for old_uuid, eids in dup_groups:
