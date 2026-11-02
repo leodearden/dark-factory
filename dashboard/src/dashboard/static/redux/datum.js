@@ -268,6 +268,20 @@ function plainBoundSecondsFor(receipt) {
   return paced ? PLAIN_DATUM_BOUND_SECONDS + holdMs / 1000 : PLAIN_DATUM_BOUND_SECONDS;
 }
 
+// ── Has this endpoint delivered yet? ──
+// The one answer, for a caller that needs the hole rather than a value: the
+// 'not yet fetched' hole before endpointKey's first receipt, null once it has
+// one. It builds nothing but unknownDatum's hole, so the count of client-built
+// envelopes stated at the head of this file is unchanged.
+//
+// Module-unique, per the CANONICAL note: other classic scripts already declare
+// their own *_NOT_YET_FETCHED in the shared scope.
+const DATUM_NOT_YET_FETCHED = 'not yet fetched';
+
+function undeliveredDatum(endpointKey, receipts) {
+  return endpointReceipt(endpointKey, receipts) ? null : unknownDatum(DATUM_NOT_YET_FETCHED);
+}
+
 // ── Provenance for a value the server does not yet serve as a Datum ──
 // Every polled payload is still a bare number: PRD leaf beta has not landed.
 // Rather than leave 43 tiles unprovenanced until it does, this wraps a plain
@@ -305,7 +319,7 @@ function plainBoundSecondsFor(receipt) {
 // way a missing payload field reaches a tile.
 function plainDatum(value, endpointKey, receipts) {
   const receipt = endpointReceipt(endpointKey, receipts);
-  if (!receipt) return unknownDatum('not yet fetched');
+  if (!receipt) return unknownDatum(DATUM_NOT_YET_FETCHED);
   if (value === null || value === undefined) {
     return unknownDatum('no value in the payload');
   }
@@ -339,16 +353,14 @@ function plainDatum(value, endpointKey, receipts) {
 // payload resolves, a value derived from DF_DATA's seeds is null for a reason
 // that is not the domain's — an empty seed array has no last bucket — so
 // 'no ops in the last 24h' there would be a confident lie about data this
-// browser has never seen. That question stays plainDatum's and is ASKED rather
-// than re-implemented: a probe value it cannot call absent comes back unknown
-// only when there is no receipt. The probe is never rendered.
+// browser has never seen. That question is undeliveredDatum's, and is asked of
+// it rather than re-implemented here.
 //
 // `absentReason` is REQUIRED. A caller with nothing better to say than 'no
 // value in the payload' is describing the payload and should call plainDatum.
 function derivedDatum(value, endpointKey, absentReason, receipts) {
   if (value !== null && value !== undefined) return plainDatum(value, endpointKey, receipts);
-  const probe = plainDatum(0, endpointKey, receipts);
-  return probe.state === 'unknown' ? probe : unknownDatum(absentReason);
+  return undeliveredDatum(endpointKey, receipts) || unknownDatum(absentReason);
 }
 
 // ── A Datum the server DID serve, nested inside a PLAIN-registered payload ──
@@ -364,7 +376,7 @@ function derivedDatum(value, endpointKey, absentReason, receipts) {
 // and names what the delivered payload lacks where the caller looked.
 function servedDatum(served, endpointKey, absentReason, receipts) {
   const receipt = endpointReceipt(endpointKey, receipts);
-  if (!receipt) return unknownDatum('not yet fetched');
+  if (!receipt) return unknownDatum(DATUM_NOT_YET_FETCHED);
   if (!isDatum(served)) return unknownDatum(absentReason);
   return withReceipt(served, receipt);
 }
@@ -471,6 +483,7 @@ const DATUM_API = {
   plainDatum,
   derivedDatum,
   servedDatum,
+  undeliveredDatum,
   combinedDatum,
   PLAIN_DATUM_BOUND_SECONDS,
 };
