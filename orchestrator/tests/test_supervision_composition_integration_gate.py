@@ -65,8 +65,8 @@ from _proc_supervision_doubles import (
     FakeRunner,
     make_fake_inspector,
     read_escalations,
-    tmp_queue_dir,  # noqa: F401 — re-export: pytest fixture used by test methods
 )
+from _proc_supervision_doubles import tmp_queue_dir as tmp_queue_dir
 
 from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.task_ground_truth import TaskGroundTruth

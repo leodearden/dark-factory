@@ -7,8 +7,10 @@ One copy each of the subprocess-runner and unit-inspector doubles, the
 canonical detached RP-4 restart plan, the ``tmp_queue_dir`` escalation
 queue_dir fixture and the ``read_escalations`` EscalationQueue read helper,
 so every proc_supervision test file pins the same shapes. A module using the
-fixture imports it with ``# noqa: F401``: the import binding is what
-registers it with pytest.
+fixture re-exports it by redundant alias
+(``from _proc_supervision_doubles import tmp_queue_dir as tmp_queue_dir``):
+the import binding is what registers it with pytest, and the alias form
+needs no lint suppression.
 """
 
 from __future__ import annotations
