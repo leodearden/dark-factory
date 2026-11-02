@@ -34,6 +34,7 @@ from _fm_helpers import (
     unique_graph_name,
 )
 from falkordb.asyncio import FalkorDB
+from redis.exceptions import ResponseError
 
 from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
 
@@ -610,3 +611,27 @@ class TestRepairDuplicateEdgeUuidsLiveFalkorDB:
             assert dup_check2.result_set[0][0] == 0
         finally:
             await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_repair_on_a_graph_deleted_after_listing_leaves_it_deleted(
+        self, mock_config, startup_scan_live_graph,
+    ):
+        """The startup scan lists a graph, then a teardown deletes it before
+        the repair visits it. The repair's detection must not recreate it."""
+        graph_name, graph = startup_scan_live_graph
+        await graph.query("CREATE (:Entity {uuid: 'v1', name: 'V'})")
+        await graph.delete()
+
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            with contextlib.suppress(ResponseError):
+                await backend._repair_duplicate_edge_uuids(graph_name)
+            assert graph_name not in await client.list_graphs(), (
+                f'the identity scan detection materialized {graph_name!r}, '
+                f'a graph that had been deleted'
+            )
+        finally:
+            await backend.close()
+            await client.aclose()
