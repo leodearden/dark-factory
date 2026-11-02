@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
-from test_plan_revalidation_skip import _make
+from test_plan_revalidation_skip import (
+    _confirm,
+    _confirm_plan_architect,
+    _finalize_fixture_plan,
+    _Fixture,
+    _make,
+    _scripted_architect,
+    _untouching_architect,
+    _wipe_to,
+)
 
 from orchestrator.artifacts import PLAN_BASE_COMMIT_KEY, TaskArtifacts, plan_base_commit
 from orchestrator.workflow import WorkflowOutcome
@@ -103,3 +113,42 @@ async def test_plan_stamp_off_main_history_is_not_trusted(tmp_path: Path, answer
     f.get_changed_files.assert_awaited_once_with('oldmain123', 'newmain456')
     f.git_ops.is_ancestor_checked.assert_awaited()
     assert f.git_ops.is_ancestor_checked.await_args.args[0] == 'rewritten999'
+
+
+@pytest.mark.parametrize('architect', [
+    lambda f, mp: _confirm_plan_architect(f, mp),
+    lambda f, mp: _scripted_architect(f, mp, [[_wipe_to('step-1', 'step-2'), _confirm]]),
+], ids=['confirm-only', 'create-plan-wipe'])
+@pytest.mark.asyncio
+async def test_confirmed_revalidation_stamps_the_dispatch_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    architect: Callable[[_Fixture, pytest.MonkeyPatch], object],
+):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        changed_files=['mod_a/file.py'], plan_base_commit='planbase789',
+    )
+    architect(f, monkeypatch)
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert plan_base_commit(f.artifacts.read_plan()) == f.artifacts.read_base_commit() == 'oldmain123'
+
+
+@pytest.mark.parametrize('success', [False, True], ids=['capped', 'no_confirm'])
+@pytest.mark.asyncio
+async def test_unconfirmed_revalidation_keeps_the_prior_stamp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, success: bool,
+):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        changed_files=['mod_a/file.py'], plan_base_commit='planbase789',
+    )
+    _finalize_fixture_plan(f)
+    _untouching_architect(f, monkeypatch, success=success)
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert plan_base_commit(f.artifacts.read_plan()) == 'planbase789'
