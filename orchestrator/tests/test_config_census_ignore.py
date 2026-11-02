@@ -398,7 +398,7 @@ def test_read_task_statuses_absent_store_stays_below_warning(tmp_path, caplog, a
 
 def test_read_task_statuses_does_not_mutate_the_store(tmp_path):
     """Opened strictly read-only (mode=ro) — a lint must never mutate the store
-    it measures.  Mirrors sandbox_soak._connect_ro / b3_gate."""
+    it measures.  Opens through shared.tasks_db_readonly.connect_ro."""
     db = _seed_tasks_db(tmp_path)
     before = db.stat().st_mtime_ns
     read_task_statuses(tmp_path)
