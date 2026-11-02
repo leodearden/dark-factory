@@ -70,3 +70,18 @@ async def test_a_create_overrunning_the_write_budget_raises_a_timeout_naming_it_
             assert stub.wait_created(target, timeout=10)
             assert await backend.get(MEMORY_ID, SCOPE) is None
         assert stub.creates(target) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_collection_another_creator_made_first_is_adopted_not_failed(config, target):
+    with stub_qdrant_server(conflict_on_create={target}) as stub:
+        async with backend_against(stub.url, config) as backend:
+            assert await backend.get(MEMORY_ID, SCOPE) is None
+
+
+@pytest.mark.asyncio
+async def test_an_existing_collection_is_adopted_and_never_recreated(config, target):
+    with stub_qdrant_server(preexisting={target}) as stub:
+        async with backend_against(stub.url, config) as backend:
+            assert await backend.get(MEMORY_ID, SCOPE) is None
+        assert stub.creates(target) == 0
