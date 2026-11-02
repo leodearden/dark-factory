@@ -17,6 +17,7 @@ from _review_fixtures import review_aggregation, review_issue
 from shared import safe_io
 
 from orchestrator.artifacts import (
+    PLAN_BASE_COMMIT_KEY,
     PLAN_SCHEMA_VERSION,
     PLAN_TASK_TEXT_FP_KEY,
     ArtifactWriteError,
@@ -644,18 +645,24 @@ class TestBumpRevalidationStamp:
         assert '_revalidated_at' in updated
         assert updated['_revalidated_by_session'] == 'sess-1'
 
-    def test_updates_base_commit_when_provided(self, artifacts: TaskArtifacts):
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
-        artifacts.bump_revalidation_stamp('sess-1', base_commit='newsha456')
-        assert artifacts.read_base_commit() == 'newsha456'
+    def test_advances_the_plan_base_not_the_dispatch_base(self, worktree: Path):
+        worktree.mkdir(parents=True, exist_ok=True)
+        ta = TaskArtifacts(worktree)
+        ta.init('task-1', 'T', 'd', base_commit='originalsha')
+        ta.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        ta.bump_revalidation_stamp('sess-1', base_commit='newsha456')
+        assert ta.read_plan()[PLAN_BASE_COMMIT_KEY] == 'newsha456'
+        assert ta.read_base_commit() == 'originalsha'
 
     def test_leaves_base_commit_when_none(self, worktree: Path):
         worktree.mkdir(parents=True, exist_ok=True)
         ta = TaskArtifacts(worktree)
         ta.init('task-1', 'T', 'd', base_commit='originalsha')
         ta.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        ta.stamp_plan_provenance('s0', base_commit='planbase')
         ta.bump_revalidation_stamp('sess-1')  # base_commit=None default
         assert ta.read_base_commit() == 'originalsha'
+        assert ta.read_plan()[PLAN_BASE_COMMIT_KEY] == 'planbase'
 
     def test_raises_on_missing_plan(self, artifacts: TaskArtifacts):
         with pytest.raises(ValueError, match='valid plan'):

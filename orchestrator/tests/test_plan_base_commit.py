@@ -1,0 +1,69 @@
+"""plan.json carries its own ``_base_commit`` (plans/task-meta-task-keying-prd.md §M2, task 3157)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from orchestrator.artifacts import PLAN_BASE_COMMIT_KEY, TaskArtifacts, plan_base_commit
+
+
+def _one_step_plan() -> dict:
+    return {
+        'task_id': '101', 'title': 'T', 'analysis': 'a', 'files': ['lib.py'],
+        'prerequisites': [],
+        'steps': [{'id': 'step-1', 'type': 'impl', 'description': 'x',
+                   'status': 'pending', 'commit': None}],
+    }
+
+
+def _dual_root_artifacts(tmp_path: Path) -> TaskArtifacts:
+    worktree = tmp_path / 'worktrees' / 'lane-a'
+    worktree.mkdir(parents=True)
+    artifacts = TaskArtifacts.for_task(worktree, '101')
+    artifacts.init('101', 'T', 'd', base_commit='fork111')
+    artifacts.write_plan(_one_step_plan())
+    return artifacts
+
+
+def test_plan_base_commit_reads_a_stamped_sha():
+    assert plan_base_commit({PLAN_BASE_COMMIT_KEY: 'abc123'}) == 'abc123'
+
+
+@pytest.mark.parametrize('plan', [
+    {},
+    {PLAN_BASE_COMMIT_KEY: ''},
+    {PLAN_BASE_COMMIT_KEY: None},
+    {PLAN_BASE_COMMIT_KEY: 123},
+    {PLAN_BASE_COMMIT_KEY: ['abc']},
+], ids=['absent', 'empty', 'none', 'int', 'list'])
+def test_plan_base_commit_is_none_for_an_absent_or_malformed_stamp(plan: dict):
+    assert plan_base_commit(plan) is None
+
+
+def test_stamp_with_base_writes_the_plan_not_the_dispatch_base(tmp_path: Path):
+    artifacts = _dual_root_artifacts(tmp_path)
+
+    artifacts.stamp_plan_provenance('s1', base_commit='plan222')
+
+    assert artifacts.read_plan()[PLAN_BASE_COMMIT_KEY] == 'plan222'
+    assert artifacts.read_base_commit() == 'fork111'
+
+
+def test_stamp_without_base_keeps_the_existing_stamp(tmp_path: Path):
+    artifacts = _dual_root_artifacts(tmp_path)
+    artifacts.stamp_plan_provenance('s1', base_commit='plan222')
+
+    artifacts.stamp_plan_provenance('s2')
+    artifacts.stamp_plan_provenance('s3', task_text_fp='tfp:x')
+
+    assert artifacts.read_plan()[PLAN_BASE_COMMIT_KEY] == 'plan222'
+
+
+def test_unstamped_plan_stays_unstamped(tmp_path: Path):
+    artifacts = _dual_root_artifacts(tmp_path)
+
+    artifacts.stamp_plan_provenance('s1')
+
+    assert PLAN_BASE_COMMIT_KEY not in artifacts.read_plan()

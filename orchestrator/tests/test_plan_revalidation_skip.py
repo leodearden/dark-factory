@@ -3,7 +3,7 @@
 When the prior plan has provenance and the diff main has gained since the
 plan was stamped does not overlap any plan files, the architect's
 revalidation pass is short-circuited. The orchestrator stamps
-``_revalidated_at`` and bumps ``base_commit`` directly (mirroring
+``_revalidated_at`` and advances the plan's own ``_base_commit`` (mirroring
 ``confirm_plan``), then returns PLANNED without invoking the architect.
 
 Task 4031 adds a fifth precondition: the plan's ``_task_text_fp`` must equal
@@ -27,7 +27,7 @@ from _workflow_helpers import FakeMetadataBackend, wire_metadata_backend
 from shared.cli_invoke import AgentResult
 from shared.task_text_fingerprint import TaskTextDrift, task_text_fingerprint
 
-from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
+from orchestrator.artifacts import PLAN_BASE_COMMIT_KEY, PLAN_SCHEMA_VERSION, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.mcp.plan_tools import (
@@ -252,8 +252,9 @@ async def test_overlap_zero_short_circuits(tmp_path: Path):
     assert '_revalidated_at' in plan
     assert plan['_revalidated_by_session'] == f.wf.session_id
 
-    # base_commit advanced to current main SHA
-    assert f.artifacts.read_base_commit() == 'newmain456'
+    # The skip advances the plan's own base; the dispatch base is untouched.
+    assert plan[PLAN_BASE_COMMIT_KEY] == 'newmain456'
+    assert f.artifacts.read_base_commit() == 'oldmain123'
 
     # phase_skipped event emitted with the right reason
     skip_calls = [c for c in f.event_emit.call_args_list
