@@ -108,6 +108,11 @@ _ZOT_CATEGORY = 'curator_zero_output_hang'
 _ZOT_ROOT_CAUSE = 'curator-empty-output-pre-turn-hang'
 _ZOT_DUPLICATE_CATEGORY = 'curator_zot_duplicate'
 
+# The curator-bucket SUBJECT pseudo-task id, shared deliberately with ticket_janitor
+# so every curator-subsystem escalation lands in one task history; pinned equal by
+# tests/test_folded_escalation.py::_DELIBERATE_ALIASES.
+_ANCHOR_TASK_ID: str = 'task-curator'
+
 
 def _transcript_evidence_lines(
     transcript_turns: int | None, tools_used: tuple[str, ...] | None,
@@ -128,7 +133,7 @@ def _curator_escalation(
     """Build a level-1 record in the fixed envelope every curator escalation shares."""
     return Escalation(
         id=queue.make_id('curator'),
-        task_id='task-curator',
+        task_id=_ANCHOR_TASK_ID,
         agent_role='fused-memory/task-curator',
         severity='blocking',
         category=category,
@@ -714,7 +719,7 @@ class CuratorEscalator:
         queue = self._queue_for(project_root)
         escalation = Escalation(
             id=queue.make_id('curator'),
-            task_id='task-curator',
+            task_id=_ANCHOR_TASK_ID,
             agent_role='fused-memory/task-curator',
             severity='blocking',
             category='curator_consecutive_degraded',
@@ -812,7 +817,7 @@ class CuratorEscalator:
         queue = self._queue_for(project_root)
         escalation = Escalation(
             id=queue.make_id('curator'),
-            task_id='task-curator',
+            task_id=_ANCHOR_TASK_ID,
             agent_role='fused-memory/task-curator',
             severity='blocking',
             category='curator_backend_binary_unresolvable',

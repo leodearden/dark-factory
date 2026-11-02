@@ -377,23 +377,43 @@ def mcp_notify_response() -> httpx.Response:
     return httpx.Response(202, headers={'mcp-session-id': MCP_SESSION_ID})
 
 
-def mcp_tool_response(inner: dict, request_id: int = 1) -> httpx.Response:
-    """A ``tools/call`` result carrying *inner* as JSON text content.
+def _tool_result_envelope(inner: dict, request_id: int) -> dict:
+    """The JSON-RPC ``tools/call`` result carrying *inner* as JSON text content.
 
     MCP nests the tool's own payload as a JSON *string* inside
     ``result.content[0].text``, so *inner* is serialized, not embedded — which
     is exactly the double-encoding the dashboard readers have to undo.
     """
+    return {
+        'jsonrpc': '2.0',
+        'id': request_id,
+        'result': {
+            'content': [{'type': 'text', 'text': json.dumps(inner)}],
+        },
+    }
+
+
+def mcp_tool_response(inner: dict, request_id: int = 1) -> httpx.Response:
+    """A ``tools/call`` result carrying *inner*, framed as a JSON body."""
     return httpx.Response(
         200,
-        json={
-            'jsonrpc': '2.0',
-            'id': request_id,
-            'result': {
-                'content': [{'type': 'text', 'text': json.dumps(inner)}],
-            },
-        },
+        json=_tool_result_envelope(inner, request_id),
         headers={'mcp-session-id': MCP_SESSION_ID},
+    )
+
+
+def mcp_sse_tool_response(inner: dict, request_id: int = 1) -> httpx.Response:
+    """The same ``tools/call`` result, framed as a Streamable-HTTP SSE body.
+
+    FastMCP may answer ``text/event-stream`` instead of ``application/json``;
+    the envelope inside the ``data:`` frame is identical to
+    :func:`mcp_tool_response`'s.
+    """
+    envelope = json.dumps(_tool_result_envelope(inner, request_id))
+    return httpx.Response(
+        200,
+        text=f'event: message\ndata: {envelope}\n\n',
+        headers={'content-type': 'text/event-stream', 'mcp-session-id': MCP_SESSION_ID},
     )
 
 
@@ -756,20 +776,6 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
-
-CREATE TABLE IF NOT EXISTS journal_entries (
-    id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL,
-    stage TEXT,
-    timestamp TEXT NOT NULL,
-    operation TEXT NOT NULL,
-    target_system TEXT NOT NULL,
-    before_state TEXT,
-    after_state TEXT,
-    reasoning TEXT DEFAULT '',
-    evidence TEXT DEFAULT '[]'
-);
-CREATE INDEX IF NOT EXISTS idx_journal_run ON journal_entries(run_id);
 
 CREATE TABLE IF NOT EXISTS judge_verdicts (
     run_id TEXT PRIMARY KEY,
@@ -1257,13 +1263,13 @@ def strip_js_comments(source: str) -> str:
 # list they check against can never drift from what the files actually say.
 #
 # `destructure_bindings` returns (canonical, local) PAIRS, and each caller
-# projects the half it needs.  This is not fussiness — the three consumers it
-# replaces answer OPPOSITE questions over the identical line:
+# projects the half it needs.  This is not fussiness — its two DF_CHARTS
+# consumers answer OPPOSITE questions over the identical line:
 #   test_charts_consumer_bindings wants the LOCAL/alias name  — what the file
 #       must actually reference, since the alias is what it renders by;
-#   test_charts_axis_labels wants the CANONICAL/source name   — what must
-#       actually exist on the namespace object;
-#   test_tab_burndown wants BOTH, as an alias -> canonical map.
+#   test_tab_burndown wants BOTH, as an alias -> canonical map, plus the
+#       CANONICAL/source names of the export literal — what must actually
+#       exist on the namespace object.
 # On tabs.jsx's real `HistBar: HB` those are 'HB' and 'HistBar'.  A primitive
 # that picked one side would silently INVERT one of the two suites, which is
 # precisely the canonical-vs-alias slip test_charts_consumer_bindings.py
@@ -1283,10 +1289,11 @@ def strip_js_comments(source: str) -> str:
 #     object are not statically enumerable the way a destructure list is.  The
 #     defect these suites exist to catch can only exist in the destructure
 #     shape anyway.
-#   - A NESTED brace must fail loudly at the call site that names the coupling,
-#     rather than yield a half-read binding list that turns a downstream
-#     assertion red with an unrelated-looking message.  Three call sites turn
-#     the miss into a self-naming assertion for exactly that reason.
+#   - A NESTED brace must yield NO match rather than a half-read binding list:
+#     an empty result turns a downstream assertion red, where a half-read list
+#     would let a sweep go quietly wrong.  No call site names the coupling on
+#     that miss (test_tab_burndown.py's readers return an empty result), so the
+#     property is pinned in the contract below.
 #
 # Contract: test_jsx_source_helpers.py::TestDfChartsDestructure.
 # ---------------------------------------------------------------------------

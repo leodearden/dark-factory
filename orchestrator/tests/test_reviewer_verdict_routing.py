@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -45,6 +46,7 @@ from shared.usage_gate import SessionBudgetExhausted
 
 from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE
 from orchestrator.mcp.verdict_tools import _envelope
+from orchestrator.reviewer_failure import ReviewerFailure, ReviewerFailureKind
 
 
 class TestReviewerGrantSurface:
@@ -330,6 +332,39 @@ class TestRunReviewerVerdictRouting:
 
         assert result['verdict'] == 'ERROR'
         assert result['reviewer'] == 'reviewer_comprehensive'
+
+    async def test_turn_cap_error_records_its_cause(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        f = self._setup(tmp_path)
+        invoke = AsyncMock(
+            return_value=AgentResult(
+                success=False, output='', subtype='error_max_turns', turns=31,
+            ),
+        )
+        monkeypatch.setattr(f.wf, '_invoke', invoke)
+
+        result = await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
+
+        assert result['verdict'] == 'ERROR'
+        assert ReviewerFailure.from_review(result).kind is ReviewerFailureKind.TURN_CAP
+
+    async def test_timed_out_error_records_its_cause(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        f = self._setup(tmp_path)
+        invoke = AsyncMock(
+            side_effect=_invoke_writes_review_verdict(
+                f, verdict='PASS', summary='Looks good.', output='ok',
+                success=False, timed_out=True,
+            ),
+        )
+        monkeypatch.setattr(f.wf, '_invoke', invoke)
+
+        result = await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
+
+        assert result['verdict'] == 'ERROR'
+        assert ReviewerFailure.from_review(result).kind is ReviewerFailureKind.TIMED_OUT
 
 
 def _invoke_writes_raw_verdict(
@@ -763,6 +798,79 @@ class TestReviewMirrorCarriesSalvagedVerdict:
         assert mirror['summary'].startswith('Reviewer exception:')
         assert f.wf._invoke.call_count == 3  # initial + 2 retries
         assert aggregation.reviewer_errors == ['reviewer_comprehensive']
+
+    async def test_server_error_skips_the_retry_burn(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        f = self._setup(tmp_path, retries=2)
+        invoke = AsyncMock(
+            return_value=AgentResult(
+                success=False, output='API Error: 529', api_error_status=529,
+            ),
+        )
+        monkeypatch.setattr(f.wf, '_invoke', invoke)
+
+        aggregation = await f.wf._review()
+
+        mirror = self._mirror(f)
+        assert invoke.call_count == 1
+        assert mirror['verdict'] == 'ERROR'
+        assert mirror['failure']['kind'] == 'server_error'
+        assert mirror['failure']['api_error_status'] == 529
+        assert aggregation.errored_reviews == {'reviewer_comprehensive': mirror}
+
+    async def test_skipped_retry_log_names_the_decoded_cause(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        f = self._setup(tmp_path, retries=2)
+        invoke = AsyncMock(
+            return_value=AgentResult(
+                success=False, output='API Error: 529', api_error_status=529,
+            ),
+        )
+        monkeypatch.setattr(f.wf, '_invoke', invoke)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.workflow'):
+            await f.wf._review()
+
+        label = ReviewerFailure.from_review(self._mirror(f)).label
+        assert f'reviewer_comprehensive ({label})' in caplog.text
+
+    async def test_zero_work_keeps_its_free_in_phase_retries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        f = self._setup(tmp_path, retries=2)
+        invoke = AsyncMock(
+            return_value=AgentResult(
+                success=False,
+                output='Agent produced no output',
+                subtype='error_empty_output',
+                transcript_turns=0,
+            ),
+        )
+        monkeypatch.setattr(f.wf, '_invoke', invoke)
+
+        await f.wf._review()
+
+        assert invoke.call_count == 3  # initial + 2 retries
+        assert self._mirror(f)['failure']['kind'] == 'zero_work'
+
+    async def test_persistent_exception_records_its_cause(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        f = self._setup(tmp_path, retries=2)
+        invoke = AsyncMock(
+            side_effect=_invoke_writes_then_raises(
+                f, RuntimeError('died before deciding'), verdict=None,
+            ),
+        )
+        monkeypatch.setattr(f.wf, '_invoke', invoke)
+
+        await f.wf._review()
+
+        assert invoke.call_count == 3  # initial + 2 retries
+        assert self._mirror(f)['failure']['kind'] == 'exception'
 
     @pytest.mark.parametrize('path', ['exception', 'failed_invocation'])
     async def test_salvaged_blocking_issues_reach_the_gate(

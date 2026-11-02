@@ -878,6 +878,7 @@ class _Pin:
     level: int
     severity: str = 'blocking'
     filing_claimant_run_id: str | None = None
+    members: tuple[str, ...] = ()
 
 
 class TestStreakAlarmIsPinClassAware:
@@ -1334,14 +1335,15 @@ def _ref(esc_id: str):
     )
 
 
-def _row(esc_id: str):
+def _row(esc_id: str, *, level: int = 1, members: tuple[str, ...] = ()):
     """A real queue ``Escalation`` — the shape the scheduler / deterministic
     recon sites pass, since they hold raw queue rows rather than refs."""
     from escalation.models import Escalation
 
     return Escalation(
         id=esc_id, task_id='3535', agent_role='implementer', severity='blocking',
-        category='risk_identified', summary='held', level=1,
+        category='risk_identified', summary='held', level=level,
+        members=list(members),
     )
 
 
@@ -1610,3 +1612,15 @@ class TestPinBuckets:
         pins = pin_buckets('3535', [_Pin('esc-1', 2)], store_unavailable=True)
 
         assert pins.human_parked is False
+
+    def test_a_hold_pinned_by_an_l2_and_its_member_l1_is_human_parked(self):
+        """Task 7709: the promoted hold, on the raw queue rows the scheduler and
+        the deterministic-recon streak-charging site pass.  Only the gate moves:
+        the held L1 still sits in the bucket the veto and its signature read."""
+        from orchestrator.recovery_emission import pin_buckets
+
+        rows = [_row('esc-1'), _row('esc-2', level=2, members=('esc-1',))]
+        pins = pin_buckets('3535', rows, store_unavailable=False)
+
+        assert pins.human_parked is True
+        assert sorted(pins.buckets['queue_handoff']) == ['esc-1', 'esc-2']

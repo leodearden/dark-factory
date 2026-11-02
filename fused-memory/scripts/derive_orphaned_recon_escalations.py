@@ -131,7 +131,7 @@ from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     classify_pending_escalations,
 )
 from fused_memory.utils.target_store_preflight import (
-    TargetStoreMissing,
+    TargetStoreUnpopulated,
     assert_queue_dir_populated,
 )
 
@@ -157,7 +157,7 @@ DEFAULT_QUEUE_DIR: str = './data/reconciliation/escalations'
 # (--project-root).  2 is skipped: argparse exits with it on a usage error, so
 # reusing it would make a bad flag indistinguishable from a degraded scan.
 EXIT_OK: int = 0
-EXIT_QUEUE_DIR_MISSING: int = 1
+EXIT_QUEUE_DIR_UNPOPULATED: int = 1
 EXIT_CENSUS_ERRORS: int = 3
 EXIT_UNRESOLVABLE: int = 4
 
@@ -220,7 +220,7 @@ async def run(
         ``.get()``.  ``reaped`` is simply 0 on a dry run.
 
     Raises:
-        TargetStoreMissing: When *queue_dir* is missing or empty — see the module
+        TargetStoreUnpopulated: When *queue_dir* is missing or empty — see the module
             docstring.  The check lives here rather than in ``main()`` so
             programmatic callers inherit it, and ahead of the backend build so
             a refusal costs nothing and leaves nothing behind.
@@ -334,13 +334,13 @@ def main() -> int:
                 resolved_by=args.resolved_by,
             ),
         )
-    except TargetStoreMissing as exc:
+    except TargetStoreUnpopulated as exc:
         # The refusal is an OPERATOR-facing message about a mis-targeted
         # --queue-dir (or a cwd the relative default does not fit), not a bug:
         # one line on stderr says more than a traceback, and the exit code is
         # what a caller actually branches on.
         print(f'error: {exc}', file=sys.stderr)
-        return EXIT_QUEUE_DIR_MISSING
+        return EXIT_QUEUE_DIR_UNPOPULATED
 
     print(json.dumps(report, indent=2, default=str))
     # The report is printed either way — a degraded run is still the operator's

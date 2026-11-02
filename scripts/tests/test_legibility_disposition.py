@@ -473,6 +473,19 @@ def test_resolve_tickets_resolves_every_unresolved_row_by_its_outcome() -> None:
     assert [arguments["ticket"] for arguments in again.arguments_of("resolve_ticket")] == ["tkt_t"]
 
 
+def test_resolve_tickets_holds_an_open_ticket_pending() -> None:
+    cb = _codebook(_entry("entry-a", filed_tickets=[_row("tkt_o")]))
+    store = FakeTaskStore(resolve_outcomes={
+        "tkt_o": _outcome(task_store.TicketStatus.PENDING, reason="wait_timeout"),
+    })
+
+    result, resolutions = disposition.resolve_tickets(cb, store=store, run_id=_RUN, clock=_Clock())
+
+    assert resolutions.pending == ("tkt_o",)
+    assert resolutions.resolved == ()
+    assert _rows(result, "entry-a")[0]["resolution"] is None
+
+
 def test_resolve_tickets_stops_when_its_budget_is_spent() -> None:
     assert disposition.RESOLVE_BUDGET_SECS == 300
     assert disposition.RESOLVE_CALL_CAP_SECS == 115

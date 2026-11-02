@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 from _briefing_helpers import (
+    SUPERSEDED_CHILD_FIXTURES,
     _edge,
     _grouped_block,
     _grouped_parent,
@@ -25,6 +26,8 @@ from _briefing_helpers import (
     _result,
     recorded_search_text,
 )
+from shared.elision import elision_marker
+from shared.memory_supersession import SUPERSEDED_BY_METADATA_KEY
 
 from orchestrator.agents.memory_recall import (
     ENTITY_BLOCK_MAX_EDGES,
@@ -682,6 +685,65 @@ class TestRenderMemoryResults:
         assert render_memory_results(('stray', silent)) == ''
 
 
+_NEW_ID = '0f6c2a4e-8b1d-4c3e-9a7f-5d2e1b0c9a8f'
+
+
+def _dated(entry: dict) -> dict:
+    entry['category'] = 'preferences_and_norms'
+    entry['created_at'] = '2026-08-15T22:22:49+00:00'
+    return entry
+
+
+class TestSupersededRender:
+    """A superseded entry is tagged in place: never dropped, never reordered."""
+
+    def test_a_superseded_result_names_what_superseded_it(self):
+        entry = _dated(_result(
+            '1', 'Old text.', metadata={SUPERSEDED_BY_METADATA_KEY: _NEW_ID}, source_store='mem0',
+        ))
+
+        assert render_memory_results((entry,)) == (
+            f'- [superseded by {_NEW_ID} · preferences_and_norms · 2026-08-15 · mem0] Old text.'
+        )
+
+    def test_a_superseded_result_keeps_its_place_beside_the_current_one(self):
+        superseded = _dated(_result(
+            '1', 'Old text.', metadata={SUPERSEDED_BY_METADATA_KEY: _NEW_ID}, source_store='mem0',
+        ))
+        current = _dated(_result(_NEW_ID, 'New text.', source_store='mem0'))
+
+        lines = render_memory_results((superseded, current)).splitlines()
+
+        assert [line.rsplit('] ', 1)[1] for line in lines] == ['Old text.', 'New text.']
+        assert 'superseded by' in lines[0]
+        assert 'superseded by' not in lines[1]
+
+    def test_superseded_grouped_children_are_tagged_in_their_nested_bullets(self):
+        """Read from a reply the real ``search`` tool produced; see that fixture's PROVENANCE.md."""
+        reply = parse_search_reply(
+            recorded_search_text('superseded-children', fixtures=SUPERSEDED_CHILD_FIXTURES),
+        )
+        assert isinstance(reply, SearchReply), reply
+
+        lines = render_memory_results(reply.results).splitlines()
+
+        assert len(lines) == 3, lines
+        parent, amendment, sighting = lines
+        assert parent.startswith('- [') and 'superseded by' not in parent, lines
+        assert amendment.startswith(f'  - [superseded by {_NEW_ID} · amendment · '), lines
+        assert sighting.startswith(f'  - [superseded by {_NEW_ID} · sighting · '), lines
+
+    @pytest.mark.parametrize('mark', ['', 123], ids=['empty', 'not-a-str'])
+    def test_an_unreadable_mark_renders_the_plain_tag(self, mark):
+        entry = _dated(_result(
+            '1', 'Old text.', metadata={SUPERSEDED_BY_METADATA_KEY: mark}, source_store='mem0',
+        ))
+
+        assert render_memory_results((entry,)) == (
+            '- [preferences_and_norms · 2026-08-15 · mem0] Old text.'
+        )
+
+
 def _recorded_results(name: str) -> tuple:
     reply = parse_search_reply(recorded_search_text(name))
     assert isinstance(reply, SearchReply), reply
@@ -758,18 +820,45 @@ class TestContestingChildRender:
 
         assert render_memory_results(results).count(full_body) == 1
 
-    def test_a_digest_only_contesting_child_is_still_marked_and_first(self):
+    def test_a_parent_only_contesting_child_renders_in_full_and_first(self):
         results = _recorded_results('only-parent-matched')
         parent = _grouped_parent_of(results)
         contesting = _amendment(parent, contested=True)
         plain = _amendment(parent, contested=False)
+        full_body = _top_level(_recorded_results('child-also-matched'), contesting['id'])['content']
 
-        lines = render_memory_results(results).splitlines()
+        rendered = render_memory_results(results)
 
+        lines = rendered.splitlines()
         contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
         plain_at = _line_index(lines, lambda line: line.endswith(f'] {plain["digest"]}'))
         assert contests_at < plain_at, lines
-        assert lines[contests_at].endswith(f'] {contesting["digest"]}')
+        assert lines[contests_at].endswith(f'] {full_body}'), lines
+        assert contesting['digest'] not in rendered
+
+    def test_the_childs_own_hit_outranks_the_capped_grouped_text(self):
+        results = _recorded_results('child-also-matched')
+        parent = _grouped_parent_of(results)
+        contesting = _amendment(parent, contested=True)
+        full_body = _top_level(results, contesting['id'])['content']
+        capped = {**contesting, 'content': full_body[:50] + elision_marker(len(full_body) - 50)}
+        grouped = {
+            **parent['grouped'],
+            'amendments': [
+                capped if child is contesting else child
+                for child in parent['grouped']['amendments']
+            ],
+        }
+        recapped = tuple(
+            {**entry, 'grouped': grouped} if entry is parent else entry for entry in results
+        )
+
+        rendered = render_memory_results(recapped)
+
+        lines = rendered.splitlines()
+        contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
+        assert lines[contests_at].endswith(f'] {full_body}'), lines
+        assert 'chars elided]' not in rendered
 
     @pytest.mark.parametrize('name', ['child-also-matched', 'only-parent-matched'])
     def test_an_uncontested_digest_renders_unchanged(self, name):
@@ -816,7 +905,7 @@ class TestContestingChildRender:
         contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
         assert ' · graphiti] ' in lines[contests_at], lines
 
-    def test_a_digest_only_contesting_child_renders_under_its_parents_store(self):
+    def test_a_parent_only_contesting_child_renders_under_its_parents_store(self):
         results = _recorded_results('only-parent-matched')
         parent = _grouped_parent_of(results)
         moved = tuple(

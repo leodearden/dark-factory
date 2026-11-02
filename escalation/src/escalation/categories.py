@@ -59,6 +59,7 @@ class EscalationCategory(StrEnum):
     MERGE_FF_FAILED = 'merge_ff_failed'
     MERGE_FLAKE_SUPPRESSION_STORM = 'merge_flake_suppression_storm'
     MERGE_LIFECYCLE_TRANSITION_REJECTED = 'merge_lifecycle_transition_rejected'
+    MERGE_NEEDS_REBASE = 'merge_needs_rebase'
     MERGE_REQUEST_STUCK = 'merge_request_stuck'
     MERGE_RESOURCE_LEAK = 'merge_resource_leak'
     MERGE_SCOPE_MISMATCH = 'merge_scope_mismatch'

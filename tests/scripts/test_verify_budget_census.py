@@ -2235,10 +2235,36 @@ class TestTheCensusAndTheGuardShareOneDerivation:
         assert report['budget_check']['derived_floor'] == census_budget_floor(worst)
 
     def test_the_section_names_the_constant_it_feeds(self, tmp_path, capsys):
-        """So the operator running it knows where the number lands."""
+        """So the operator running it knows where the number lands.
+
+        The pointer must RESOLVE to the record's live home, not merely mention
+        its name: a moved record would leave a name-only check passing on a
+        stale path (task 6172).
+        """
+        import verify_budget_census_records
+
         report = self._report(tmp_path, capsys, _leg(duration_secs=4626.0))
 
-        assert 'ORCHESTRATOR_BUDGET_CENSUS' in report['budget_check']['feeds']
+        path, sep, name = report['budget_check']['feeds'].partition('::')
+        assert sep == '::', (
+            f'feeds={report["budget_check"]["feeds"]!r} is not a path::symbol '
+            'citation; repoint scripts/verify_budget_census.py::FEEDS_CONSTANT'
+        )
+        assert (Path(__file__).resolve().parents[2] / path).resolve() == Path(
+            verify_budget_census_records.__file__,
+        ).resolve(), (
+            f'feeds names {path!r}, not the census record home '
+            f'{verify_budget_census_records.__file__}; repoint '
+            'scripts/verify_budget_census.py::FEEDS_CONSTANT'
+        )
+        assert isinstance(
+            getattr(verify_budget_census_records, name, None),
+            verify_budget_census_records.BudgetCensus,
+        ), (
+            f'feeds names {name!r}, which is not a BudgetCensus record in '
+            'verify_budget_census_records; repoint '
+            'scripts/verify_budget_census.py::FEEDS_CONSTANT'
+        )
 
     def test_the_section_names_the_refusal_ceiling_and_its_meaning(
         self, tmp_path, capsys,

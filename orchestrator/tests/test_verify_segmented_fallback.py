@@ -304,7 +304,7 @@ class TestRunSegmentedSharedDeadline:
     The figures are deliberately NOT copied into this docstring. They live once,
     in MEASURED_FLEET_SEGMENT_SECS / UNMEASURED_FLEET_SEGMENTS in
     tests/scripts/test_fallback_verify_config.py and ORCHESTRATOR_BUDGET_CENSUS
-    in tests/scripts/test_module_verify_budgets.py; a number restated here
+    in tests/scripts/verify_budget_census_records.py; a number restated here
     would be one more copy to raise in lockstep.
 
     A segment the deadline never reached is `not_run` with ``rc=None``: the

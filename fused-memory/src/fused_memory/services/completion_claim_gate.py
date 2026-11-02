@@ -49,14 +49,17 @@ imports IT, and a cycle would be fatal.
 
 from __future__ import annotations
 
+import functools
 import logging
 import re
 import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal
 
+from shared.project_id import fold_project_token
 from shared.task_statuses import TERMINAL as TERMINAL_TASK_STATUSES
 
 from fused_memory.middleware._folded_escalation import file_folded_escalation
@@ -208,9 +211,10 @@ COMMIT_REF_RE: re.Pattern[str] = re.compile(
 )
 
 # A project qualifier sitting immediately before a ref — "dark_factory task
-# 3142", "dark_factory's task 3142". Case-sensitive and anchored to the end of
-# the preceding text, and (crucially) only HONOURED when the captured word is a
-# member of the server's project registry: without that membership test "the
+# 3142", "dark-factory's task 3142". Anchored to the end of the preceding text,
+# and (crucially) only HONOURED when the captured word names a registered
+# project through _registered_project's shared fold, so case, '-' vs '_' and
+# the 'df' alias do not matter but registry membership does: without it "the
 # merge task 3142" would read 'merge' as a project name, and every unqualified
 # ref in ordinary prose would acquire a bogus owner.
 _PROJECT_QUALIFIER_RE: re.Pattern[str] = re.compile(
@@ -461,9 +465,10 @@ def extract_completion_claims(
         text: The episode content being ingested.
         default_project_id: The WRITING agent's project — the fallback owner of
             an unqualified task ref.
-        known_project_ids: The server's project registry. A project qualifier
-            adjacent to a ref is honoured only when it is a member here, which
-            is what stops an arbitrary preceding word from being mistaken for a
+        known_project_ids: The server's project registry. A project word
+            written next to a ref is honoured only when it names a member here
+            through the shared fold (:func:`_registered_project`), which is
+            what stops an arbitrary preceding word from being mistaken for a
             project name.
 
     Pure: no I/O, no side effects. Never raises on empty/odd input.
@@ -474,19 +479,20 @@ def extract_completion_claims(
     claims: list[CompletionClaim] = []
     seen: set[tuple[str, str, str, str | None]] = set()
     assertive = _blank_quotations(text)
+    registry = _fold_index(frozenset(known_project_ids))
 
     for clause, offset in _iter_clauses(text):
         mentions = _ref_mentions(
             clause,
             default_project_id=default_project_id,
-            known_project_ids=known_project_ids,
+            registry=registry,
         )
         if not mentions:
             continue
         span = (offset, offset + len(clause))
         assertive_clause = assertive[span[0]:span[1]]
         for marker in _marker_spans(_strip_exemptions(assertive_clause)):
-            bound = _bind_marker(clause, marker, mentions, known_project_ids)
+            bound = _bind_marker(clause, marker, mentions)
             if bound is None:
                 continue
             key = (marker.kind, bound.subject, bound.ref, bound.project_id)
@@ -506,20 +512,65 @@ def extract_completion_claims(
     return claims
 
 
-def _qualifying_project(
-    clause: str, start: int, known_project_ids: frozenset[str] | set[str]
-) -> str | None:
-    """Return the registered project qualifying the ref at *start*, else None."""
+@functools.lru_cache(maxsize=8)
+def _fold_index(known_project_ids: frozenset[str]) -> Mapping[str, str]:
+    """Each registered id's :func:`fold_project_token`, mapped to the id itself.
+
+    Two registered ids that share a fold (say 'df' beside 'dark_factory') make
+    that token ambiguous. The alphabetically first id keeps it, so the choice
+    never depends on set order, and a WARNING names both ids. The cache makes
+    that warning once per registry rather than once per write.
+    """
+    index: dict[str, str] = {}
+    for pid in sorted(known_project_ids):
+        token = fold_project_token(pid)
+        kept = index.setdefault(token, pid)
+        if kept != pid:
+            logger.warning(
+                'completion_claim_gate: registered projects %r and %r both fold to %r; '
+                'a ref qualified by that word is adjudicated in %r',
+                kept, pid, token, kept,
+            )
+    return MappingProxyType(index)
+
+
+def _registered_project(word: str, registry: Mapping[str, str]) -> str | None:
+    """The registry's own key for the project *word* names, else None.
+
+    The ONLY place a written project word becomes a project id. *registry* is
+    a :func:`_fold_index`.
+    """
+    return registry.get(fold_project_token(word))
+
+
+# The word that opens a TASK_REF_RE match ('task', 'df'); a '#'-anchored match
+# has none.
+_TASK_REF_ANCHOR_RE: re.Pattern[str] = re.compile(r'[A-Za-z]+')
+
+
+def _anchor_project(match: re.Match[str], registry: Mapping[str, str]) -> str | None:
+    """The registered project a task ref's own anchor word names ('df 94'), else None."""
+    anchor = _TASK_REF_ANCHOR_RE.match(match.group(0))
+    return None if anchor is None else _registered_project(anchor.group(0), registry)
+
+
+def _qualifier(
+    clause: str, start: int, registry: Mapping[str, str]
+) -> tuple[int, str] | None:
+    """``(phrase_start, project)`` of the registered qualifier before *start*, else None."""
     match = _PROJECT_QUALIFIER_RE.search(clause[:start])
     if match is None:
         return None
-    candidate = match.group(1)
-    return candidate if candidate in known_project_ids else None
+    project = _registered_project(match.group(1), registry)
+    return None if project is None else (match.start(), project)
 
 
 @dataclass(frozen=True, slots=True)
 class _RefMention:
     """One named ref in a clause, with the project whose authority answers it.
+
+    ``phrase_start`` is where the ref's written phrase begins: the start of
+    its recognised project qualifier, else ``start``.
 
     ``project_id`` is ``None`` for a ticket, which resolves by globally unique
     primary key in one shared tickets.db — that is what let esc-3085-1
@@ -527,6 +578,7 @@ class _RefMention:
     adjudicated correctly.
     """
 
+    phrase_start: int
     start: int
     end: int
     subject: ClaimSubject
@@ -538,29 +590,43 @@ def _ref_mentions(
     clause: str,
     *,
     default_project_id: str,
-    known_project_ids: frozenset[str] | set[str],
+    registry: Mapping[str, str],
 ) -> list[_RefMention]:
     """Every ticket, commit and task ref named in *clause*, in text order."""
 
-    def owner(start: int) -> str:
-        return _qualifying_project(clause, start, known_project_ids) or default_project_id
+    def owned(
+        match: re.Match[str], subject: ClaimSubject, named: str | None
+    ) -> _RefMention:
+        """Owned by the project the ref *named* itself, else its qualifier's, else the writer's."""
+        if named is not None:
+            phrase_start, project = match.start(), named
+        else:
+            phrase_start, project = _qualifier(clause, match.start(), registry) or (
+                match.start(), default_project_id,
+            )
+        return _RefMention(
+            phrase_start=phrase_start, start=match.start(), end=match.end(),
+            subject=subject, ref=match.group(1), project_id=project,
+        )
 
     mentions = [
-        _RefMention(m.start(), m.end(), 'ticket', m.group(1), None)
+        _RefMention(
+            phrase_start=m.start(), start=m.start(), end=m.end(),
+            subject='ticket', ref=m.group(1), project_id=None,
+        )
         for m in TICKET_REF_RE.finditer(clause)
     ]
+    mentions += [owned(m, 'commit', None) for m in COMMIT_REF_RE.finditer(clause)]
     mentions += [
-        _RefMention(m.start(), m.end(), 'commit', m.group(1), owner(m.start()))
-        for m in COMMIT_REF_RE.finditer(clause)
+        owned(m, 'task', _anchor_project(m, registry)) for m in TASK_REF_RE.finditer(clause)
     ]
     mentions += [
-        _RefMention(m.start(), m.end(), 'task', m.group(1), owner(m.start()))
-        for m in TASK_REF_RE.finditer(clause)
-    ]
-    mentions += [
-        _RefMention(m.start(), m.end(), 'task', m.group(2), m.group(1))
+        _RefMention(
+            phrase_start=m.start(), start=m.start(), end=m.end(),
+            subject='task', ref=m.group(2), project_id=project,
+        )
         for m in _EXTERNAL_TASK_REF_RE.finditer(clause)
-        if m.group(1) in known_project_ids
+        if (project := _registered_project(m.group(1), registry)) is not None
     ]
     return sorted(mentions, key=lambda mention: mention.start)
 
@@ -601,15 +667,13 @@ _BINDING_BARRIER_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
-# The only gap through which a marker reaches FORWARD to a task ref: the task
+# The only lead through which a marker reaches FORWARD to a task ref: the task
 # is its direct object ("filed task 4746") or its 'as'-complement ("refiled as
-# task 4263"), optionally through one project word ("filed as dark_factory
-# task 4213") that must be registered. 'filed by task N' and 'had landed (task
-# N)' do not fit, so they do not bind forward.
-_TASK_COMPLEMENT_GAP_RE: re.Pattern[str] = re.compile(
-    r"\s+(?:as\s+)?(?:([A-Za-z][\w-]*)(?:'s)?\s+)?",
-    re.IGNORECASE,
-)
+# task 4263"). The lead runs up to the ref's written phrase, so a registered
+# qualifier is part of the ref ("filed as dark-factory task 4213"), while an
+# unregistered word is not. 'filed by task N' and 'had landed (task N)' do not
+# fit, so they do not bind forward.
+_TASK_COMPLEMENT_LEAD_RE: re.Pattern[str] = re.compile(r'\s+(?:as\s+)?', re.IGNORECASE)
 
 # A determiner (plus at most one adverb) directly before a marker makes it an
 # attributive participle modifying the noun after it ('the shipped examples').
@@ -623,7 +687,6 @@ def _bind_marker(
     clause: str,
     marker: _Marker,
     mentions: list[_RefMention],
-    known_project_ids: frozenset[str] | set[str],
 ) -> _RefMention | None:
     """The ONE ref *marker* asserts something about, or None.
 
@@ -634,9 +697,7 @@ def _bind_marker(
     An attributive marker ('the merged commit X') binds forward only.
     """
     following = next((m for m in mentions if m.start >= marker.end), None)
-    if following is not None and _binds_forward(
-        clause[marker.end:following.start], following, known_project_ids
-    ):
+    if following is not None and _binds_forward(clause, marker, following):
         return following
     if _ATTRIBUTIVE_LEAD_RE.search(clause, 0, marker.start):
         return None
@@ -648,23 +709,17 @@ def _bind_marker(
     return None
 
 
-def _binds_forward(
-    gap: str, mention: _RefMention, known_project_ids: frozenset[str] | set[str]
-) -> bool:
-    """Whether a marker reaches across *gap* to the *mention* after it.
+def _binds_forward(clause: str, marker: _Marker, mention: _RefMention) -> bool:
+    """Whether *marker* reaches forward to the *mention* after it.
 
     A ticket or commit binds across any barrier-free gap; a task only as the
-    marker's direct object or 'as'-complement (:data:`_TASK_COMPLEMENT_GAP_RE`).
+    marker's direct object or 'as'-complement (:data:`_TASK_COMPLEMENT_LEAD_RE`).
     """
-    if _BINDING_BARRIER_RE.search(gap):
+    if _BINDING_BARRIER_RE.search(clause[marker.end:mention.start]):
         return False
     if mention.subject != 'task':
         return True
-    complement = _TASK_COMPLEMENT_GAP_RE.fullmatch(gap)
-    if complement is None:
-        return False
-    qualifier = complement.group(1)
-    return qualifier is None or qualifier in known_project_ids
+    return _TASK_COMPLEMENT_LEAD_RE.fullmatch(clause[marker.end:mention.phrase_start]) is not None
 
 
 # --------------------------------------------------------------------------- #

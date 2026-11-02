@@ -20,16 +20,17 @@ import httpx
 import openai
 import pytest
 from _fm_helpers import load_script_module
+from _sdk_client_stubs import sdk_client_double
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server import write_triage_judge
 from fused_memory.server.write_triage_judge import (
-    _ELIDED_MARKER,
     resolve_judge_field_chars,
     resolve_judge_timeout,
 )
+from fused_memory.utils.clip_disclosure import elision_marker
 
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
 
@@ -118,10 +119,8 @@ def _response(
 
 
 def _client(respond: Callable[..., Any]) -> MagicMock:
-    """A fake ``AsyncOpenAI`` that is its own async context manager, as the SDK is."""
-    client = MagicMock()
-    client.__aenter__ = AsyncMock(return_value=client)
-    client.__aexit__ = AsyncMock(return_value=False)
+    """A fake ``AsyncOpenAI`` whose Responses calls *respond* answers."""
+    client = sdk_client_double()
     client.responses.create = AsyncMock(side_effect=respond)
     client.chat.completions.create = AsyncMock()
     return client
@@ -228,7 +227,7 @@ class TestTheWire:
         _judge(client, _arm('gpt-4o-mini@5'))
         rendered = client.responses.create.call_args.kwargs['input']
         for field in ('y' * 5_000, 'x' * 5_000):
-            assert field[:cap] + _ELIDED_MARKER in rendered
+            assert field[:cap] + elision_marker(len(field) - cap) in rendered
             assert field[:cap + 1] not in rendered
 
     def test_only_the_openai_provider_is_judged(self) -> None:

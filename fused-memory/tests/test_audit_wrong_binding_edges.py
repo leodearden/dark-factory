@@ -24,6 +24,12 @@ from typing import Any
 import pytest
 from _fm_helpers import load_script_module
 
+from fused_memory.backends.falkor_read_only import (
+    RO_COMMAND,
+    NonReadOnlyCommandError,
+    PagedQuery,
+    ReadOnlyGraphProxy,
+)
 from fused_memory.backends.graphiti_client import PagedRead
 from fused_memory.utils.canonical_labels import Referent
 
@@ -41,16 +47,11 @@ vars_of = _mod.vars_of
 id_proximity = _mod.id_proximity
 correct_node_present = _mod.correct_node_present
 EdgeReader = _mod.EdgeReader
-RO_COMMAND = _mod.RO_COMMAND
-EDGE_PAGE_CYPHER = _mod.EDGE_PAGE_CYPHER
-EDGE_CENSUS_CYPHER = _mod.EDGE_CENSUS_CYPHER
-NODE_PAGE_CYPHER = _mod.NODE_PAGE_CYPHER
-NODE_CENSUS_CYPHER = _mod.NODE_CENSUS_CYPHER
+EDGE_READ = _mod.EDGE_READ
+NODE_READ = _mod.NODE_READ
 build_report = _mod.build_report
 PROXIMITY_BUCKETS = _mod.PROXIMITY_BUCKETS
 NOT_COMPUTED = _mod.NOT_COMPUTED
-COMMAND_BY_PRIMITIVE = _mod.COMMAND_BY_PRIMITIVE
-_ReadOnlyGraphProxy = _mod._ReadOnlyGraphProxy
 EdgeParse = _mod.EdgeParse
 parse_edge = _mod.parse_edge
 _sweep_graph = _mod._sweep_graph
@@ -1035,7 +1036,7 @@ class TestCorrectNodePresent:
 
 
 _SKIP_LIMIT_RE = re.compile(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', re.IGNORECASE)
-_CENSUS_RE = re.compile(r'RETURN\s+count\(\*\)\s*$', re.IGNORECASE)
+_CENSUS_RE = re.compile(r'RETURN\s+count\(([*\w]+)\)\s*$', re.IGNORECASE)
 
 
 class _FakeResult:
@@ -1048,13 +1049,17 @@ class _FakeResult:
 class _FakeGraph:
     """A graph double reproducing FalkorDB's SILENT server-side row cap.
 
-    Modelled on ``tests/test_graph_read_pagination.py::FakeCappedGraph`` and
-    sharing its census pattern character for character, so the two doubles in
-    this repo cannot disagree about what a census probe IS.
+    Modelled on ``tests/test_graph_read_pagination.py::FakeCappedGraph``. Its
+    census pattern also accepts ``count(<var>)``, which is the only census
+    ``fused_memory/backends/falkor_read_only.py::PagedQuery`` builds, and it
+    answers a census as FalkorDB does: ``count(*)`` over a ``RELATES_TO``
+    pattern counts distinct (source, target) pairs, so a multi-edge collapses;
+    any other count is the row count.
 
     The cap is applied with no error and no marker, exactly as the real server
     does — which is what makes "we now get all the rows" a real before/after
-    rather than a tautology. The writable ``query`` RAISES, so the read-only
+    rather than a tautology. ``truncate_at`` serves only that many rows, as a
+    short read would. The writable ``query`` RAISES, so the read-only
     guarantee is behavioural here and not only structural.
     """
 
@@ -1064,32 +1069,37 @@ class _FakeGraph:
         *,
         resultset_cap: int = 10,
         census_override: int | None = None,
+        truncate_at: int | None = None,
     ):
         self.corpus = corpus
         self.resultset_cap = resultset_cap
         self.census_override = census_override
+        self.truncate_at = truncate_at
         self.queries: list[str] = []
 
     @property
     def page_queries(self) -> list[str]:
         return [q for q in self.queries if _SKIP_LIMIT_RE.search(q)]
 
+    def _census(self, cypher: str, counted: str) -> int:
+        if self.census_override is not None:
+            return self.census_override
+        if counted == '*' and 'RELATES_TO' in cypher:
+            return len({(row[0], row[1]) for row in self.corpus})
+        return len(self.corpus)
+
     async def ro_query(self, cypher: str, params: dict | None = None) -> _FakeResult:
         self.queries.append(cypher)
-        if _CENSUS_RE.search(cypher.strip()):
-            count = (
-                self.census_override
-                if self.census_override is not None
-                else len(self.corpus)
-            )
+        if census := _CENSUS_RE.search(cypher.strip()):
             # A single-row aggregate can never be truncated by the row cap it
             # is being used to detect — that is what makes it a proof.
-            return _FakeResult([[count]])
+            return _FakeResult([[self._census(cypher, census.group(1))]])
+        served = self.corpus[: self.truncate_at]
         match = _SKIP_LIMIT_RE.search(cypher)
         if match:
             skip, limit = int(match.group(1)), int(match.group(2))
-            return _FakeResult(self.corpus[skip: skip + limit][: self.resultset_cap])
-        return _FakeResult(self.corpus[: self.resultset_cap])
+            return _FakeResult(served[skip: skip + limit][: self.resultset_cap])
+        return _FakeResult(served[: self.resultset_cap])
 
     async def query(self, cypher: str, params: dict | None = None):
         raise AssertionError('this sweep is read-only: it may never issue query()')
@@ -1272,9 +1282,28 @@ class TestEdgeReader:
         assert read.reason is not None
         assert read.expected_rows == 99
 
+    @pytest.mark.asyncio
+    async def test_a_read_short_by_the_multi_edge_excess_is_incomplete(self) -> None:
+        """THE EDGE-CENSUS GOTCHA: the census must count edges, not node pairs.
+
+        With ``r`` unreferenced, FalkorDB's ``count(*)`` over an edge pattern
+        counts (source, target) pairs, so a read short by exactly the
+        multi-edge excess would match it and pass as complete.
+        """
+        corpus = _edge_rows(7)
+        corpus[1][0], corpus[1][1] = corpus[0][0], corpus[0][1]
+        pairs = len({(row[0], row[1]) for row in corpus})
+        assert pairs < len(corpus)
+        graph = _FakeGraph(corpus, resultset_cap=10, truncate_at=pairs)
+        reader = EdgeReader(graph=graph, graph_name=GRAPH, page_size=5, resultset_size=10)
+        rows, read = await reader.fetch_edges()
+        assert len(rows) == pairs
+        assert read.complete is False
+        assert read.expected_rows == len(corpus)
+
     @pytest.mark.parametrize(
         'template,sort_key',
-        [(EDGE_PAGE_CYPHER, 'r.uuid'), (NODE_PAGE_CYPHER, 'n.uuid')],
+        [(EDGE_READ.page_template, 'r.uuid'), (NODE_READ.page_template, 'n.uuid')],
         ids=['edges', 'nodes'],
     )
     def test_page_templates_sort_on_a_projected_unique_key(
@@ -1324,7 +1353,12 @@ class TestEdgeReader:
 
     @pytest.mark.parametrize(
         'query',
-        [EDGE_PAGE_CYPHER, EDGE_CENSUS_CYPHER, NODE_PAGE_CYPHER, NODE_CENSUS_CYPHER],
+        [
+            EDGE_READ.page_template,
+            EDGE_READ.census_cypher,
+            NODE_READ.page_template,
+            NODE_READ.census_cypher,
+        ],
     )
     def test_no_query_projects_the_fact_embedding(self, query: str) -> None:
         """~1500 floats per edge, over 15256 edges, for nothing."""
@@ -1334,13 +1368,10 @@ class TestEdgeReader:
     async def test_only_the_read_only_command_is_ever_issued(self) -> None:
         """Behavioural, not just structural: the double's query() raises.
 
-        The direct ``assert_read_only_command`` call below proves the helper
-        RAISES; what proves anything ROUTES through it is
-        ``TestReadOnlyByConstruction::test_the_command_guard_is_reachable_on_a_real_read``,
-        which exercises the ``_ReadOnlyGraphProxy`` seam ``_read`` actually
-        hands to the shared paged primitive. Before that seam existed this
-        pair was the whole guard, and the reachable half of it was a module
-        constant compared against itself.
+        The ``ReadOnlyGraphProxy`` refusal below proves the shared guard
+        RAISES over this double; that every read ROUTES through it is pinned in
+        ``tests/test_falkor_read_only.py``, against the guarded handle the
+        shared reader hands to the paged primitive.
         """
         graph = _FakeGraph(_edge_rows(3), resultset_cap=10)
         reader = EdgeReader(graph=graph, graph_name=GRAPH, page_size=5, resultset_size=10)
@@ -1348,15 +1379,15 @@ class TestEdgeReader:
         await reader.read_task_node_ids()
         assert graph.queries  # something was actually issued
         assert RO_COMMAND == 'GRAPH.RO_QUERY'
-        with pytest.raises(RuntimeError, match='read-only'):
-            EdgeReader.assert_read_only_command('GRAPH.QUERY')
+        with pytest.raises(NonReadOnlyCommandError, match='read-only'):
+            _ = ReadOnlyGraphProxy(graph).query
 
 
 class TestReadTaskNodeIds:
     """The Entity-name enumeration feeding ``correct_node_present``.
 
-    Rows are ``(n.uuid, n.name)`` because NODE_PAGE_CYPHER projects its sort
-    key — see that template for why it pages on ``n.uuid`` and not ``n.name``.
+    Rows are ``(n.uuid, n.name)`` because NODE_READ projects its sort
+    key — see that query for why it pages on ``n.uuid`` and not ``n.name``.
 
     Paged the SAME way as the edge read: dark_factory measured 16083 Entity
     nodes and reify 23616 on 2026-08-17, both far above the 10000 cap, so an
@@ -1728,7 +1759,7 @@ def _args(**over) -> Any:
 
 
 #: One row per shape the sweep loop must classify, in the tuple order
-#: EDGE_PAGE_CYPHER projects: (a.name, b.name, r.uuid, r.fact, r.episodes).
+#: EDGE_READ projects: (a.name, b.name, r.uuid, r.fact, r.episodes).
 ROW_FINDING = [
     'Task 6165', 'ElasticResult.rotation', 'e-finding',
     'Task 6164 described landing the same artefact.', ['779b7b7d'],
@@ -2197,8 +2228,11 @@ class TestReadOnlyByConstruction:
         constants = [
             v for n, v in vars(_mod).items()
             if n.endswith('_CYPHER') and isinstance(v, str)
+        ] + [
+            text for v in vars(_mod).values() if isinstance(v, PagedQuery)
+            for text in (v.page_template, v.census_cypher)
         ]
-        assert constants, 'expected at least one *_CYPHER constant'
+        assert constants, 'expected at least one query constant'
         for query in constants:
             hit = write_keyword_re.search(query)
             assert hit is None, f'write keyword {hit and hit.group()!r} in {query!r}'
@@ -2228,44 +2262,6 @@ class TestReadOnlyByConstruction:
         await reader.fetch_edges()
         await reader.read_task_node_ids()
         assert graph.queries
-
-    def test_the_command_guard_is_reachable_on_a_real_read(self) -> None:
-        """THE GUARD IS LOAD-BEARING, not a constant compared with itself.
-
-        ``_read`` used to call ``assert_read_only_command(RO_COMMAND)`` —
-        both sides the same module constant, so the branch was unreachable by
-        construction and the guard could never fire on a real run. It now
-        asserts on the command resolved from the primitive the read is about
-        to reach for, via ``_ReadOnlyGraphProxy``. Asserted here as the
-        wiring: the handle the shared paged primitive is handed is the
-        guarded one, not the raw graph.
-        """
-        graph = _FakeGraph(_edge_rows(1), resultset_cap=10)
-        proxy = _ReadOnlyGraphProxy(graph, EdgeReader.assert_read_only_command)
-        # The read primitive resolves and forwards...
-        assert proxy.ro_query.__self__ is graph
-        # ...and the WRITE primitive is refused before any byte reaches the
-        # store, naming the command rather than the method.
-        with pytest.raises(RuntimeError, match='GRAPH.QUERY'):
-            _ = proxy.query
-
-    def test_every_falkordb_primitive_the_proxy_knows_is_mapped(self) -> None:
-        """A primitive absent from the map is forwarded UNGUARDED.
-
-        So the map, not the guard, is the thing that can go quietly wrong —
-        pinned here rather than left to inspection.
-        """
-        assert COMMAND_BY_PRIMITIVE['ro_query'] == RO_COMMAND
-        assert COMMAND_BY_PRIMITIVE['query'] == 'GRAPH.QUERY'
-
-    def test_unmapped_attributes_are_forwarded_untouched(self) -> None:
-        """A handle legitimately carries bookkeeping; guarding it would only
-        make the proxy brittle without making it safer."""
-        graph = _FakeGraph(_edge_rows(1), resultset_cap=10)
-        proxy = _ReadOnlyGraphProxy(graph, EdgeReader.assert_read_only_command)
-        assert proxy.queries is graph.queries
-        assert proxy.resultset_cap == 10
-
 
     def test_graph_is_repeatable_and_the_gate_flag_exists(self) -> None:
         args = _build_parser().parse_args(

@@ -117,7 +117,7 @@ Type=simple
 Environment=MEM0_TELEMETRY=false
 Environment=PATH=%h/.local/bin:%h/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 WatchdogSec=120
-ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStartPre=/usr/bin/python3 /repo/scripts/falkordb_aof_gate.py --compose-file /repo/fused-memory/docker/docker-compose.yml
 ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 Restart=on-failure
 RestartSec=5
@@ -194,7 +194,7 @@ Description=Drifted Service Missing Restart Directives
 Type=notify
 Environment=MEM0_TELEMETRY=false
 WatchdogSec=120
-ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStartPre=/usr/bin/python3 /repo/scripts/falkordb_aof_gate.py --compose-file /repo/fused-memory/docker/docker-compose.yml
 ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 
 [Install]
@@ -213,7 +213,7 @@ Description=Installed Fused Memory (cap declared, no steps)
 Type=notify
 Environment=MEM0_TELEMETRY=false
 WatchdogSec=120
-ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStartPre=/usr/bin/python3 /repo/scripts/falkordb_aof_gate.py --compose-file /repo/fused-memory/docker/docker-compose.yml
 ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 Restart=on-failure
 RestartSec=5
@@ -237,7 +237,7 @@ Description=Installed Fused Memory (divergent TimeoutStopSec)
 Type=notify
 Environment=MEM0_TELEMETRY=false
 WatchdogSec=120
-ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStartPre=/usr/bin/python3 /repo/scripts/falkordb_aof_gate.py --compose-file /repo/fused-memory/docker/docker-compose.yml
 ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 Restart=on-failure
 RestartSec=5
@@ -347,7 +347,7 @@ Description=Installed Fused Memory
 [Service]
 Type=notify
 WatchdogSec=120
-ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+ExecStartPre=/usr/bin/python3 /repo/scripts/falkordb_aof_gate.py --compose-file /repo/fused-memory/docker/docker-compose.yml
 ExecStopPost=-/repo/scripts/stop-socket-unless-restarting.sh %n
 Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/dark-factory,/home/leo/src/other
 
@@ -444,6 +444,54 @@ def test_fix_unit_text_never_synthesizes_bare_execstartpre():
     assert not any(line.startswith("ExecStartPre=") for line in sections["Service"]), (
         "fix_unit_text must never synthesize an ExecStartPre= line (host-specific value)"
     )
+
+
+# ---------------------------------------------------------------------------
+# find_drift tests: the backing stores come up only through the AOF gate (task 6330)
+# ---------------------------------------------------------------------------
+
+_BARE_COMPOSE_UP_LINE = (
+    "ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml "
+    "up -d falkordb qdrant"
+)
+_GATE_LINE = (
+    "ExecStartPre=/usr/bin/python3 /repo/scripts/falkordb_aof_gate.py "
+    "--compose-file /repo/fused-memory/docker/docker-compose.yml"
+)
+_BARE_COMPOSE_UP_UNIT = _CLEAN_UNIT.replace(_GATE_LINE, _BARE_COMPOSE_UP_LINE)
+_GATE_PLUS_BARE_COMPOSE_UP_UNIT = _CLEAN_UNIT.replace(_GATE_LINE, f"{_GATE_LINE}\n{_BARE_COMPOSE_UP_LINE}")
+
+
+def test_find_drift_flags_a_unit_that_brings_the_stores_up_without_the_aof_gate():
+    mod = _load_checker()
+    assert _GATE_LINE in _CLEAN_UNIT
+
+    drift = mod.find_drift(_BARE_COMPOSE_UP_UNIT)
+
+    assert drift == [mod.AOF_GATE_DRIFT, mod.BARE_COMPOSE_UP_DRIFT]
+
+
+def test_find_drift_flags_a_bare_compose_up_beside_the_gate():
+    mod = _load_checker()
+
+    assert mod.find_drift(_GATE_PLUS_BARE_COMPOSE_UP_UNIT) == [mod.BARE_COMPOSE_UP_DRIFT]
+
+
+def test_fix_never_synthesizes_the_aof_gate_and_reports_it_as_residual_drift(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mod = _load_checker()
+    monkeypatch.setattr(mod, "daemon_reload", lambda: None)
+    installed = _write_unit(tmp_path, _BARE_COMPOSE_UP_UNIT)
+
+    rc = mod.main(["--installed", str(installed), "--fix"])
+
+    assert rc == 1
+    assert installed.read_text(encoding="utf-8") == _BARE_COMPOSE_UP_UNIT
+    combined = "".join(capsys.readouterr())
+    assert mod.AOF_GATE_DRIFT in combined and mod.BARE_COMPOSE_UP_DRIFT in combined
 
 
 # ---------------------------------------------------------------------------

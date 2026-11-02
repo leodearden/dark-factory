@@ -1,0 +1,20 @@
+import json,time,collections
+d=json.load(open('/tmp/3190s/phases.json'));S=d['seeds']
+def pct(xs,q):
+    xs=sorted(xs);k=q*(len(xs)-1);f=int(k);c=min(f+1,len(xs)-1);return xs[f]+(xs[c]-xs[f])*(k-f)
+ph=[('pre','start','clone0'),('clone','clone0','clone1'),('stamp','stamp0','stamp1'),('delta','stamp1','stale'),('inval','stale','inval'),('reloc','inval','reloc'),('relink','reloc','relink'),('oldest','relink','oldest'),('rerere','trash','rerere'),('hooks','rerere','hooks'),('stampjson','hooks','seeded'),('total','start','seeded')]
+def row(xs):
+    out=[]
+    for n,a,b in ph:
+        v=[s[b]-s[a] for s in xs if a in s and b in s]
+        out.append(f"{n}={pct(v,.5):.1f}/{pct(v,.9):.0f}" if v else f"{n}=-")
+    return ' '.join(out)
+for label,fmt in (('WEEK','%G-W%V'),('DAY','%m-%d')):
+    b=collections.defaultdict(list)
+    for s in S:
+        b[time.strftime(fmt,time.gmtime(s.get('start') or s.get('pin') or s.get('clone0') or s['seeded']))].append(s)
+    print(label,'(p50/p90 s)')
+    for k in sorted(b):
+        xs=b[k]
+        nc=[s['ncand'] for s in xs if 'ncand' in s]; nr=[s['nrelink'] for s in xs if 'nrelink' in s]; nd=[s['ndelta'] for s in xs if 'ndelta' in s]; gens=sorted({s.get('gen') for s in xs if s.get('gen')})
+        print(k,'n=%d'%len(xs),row(xs),'cand=%s relinked=%s delta_p50=%s gens=%s'%(sorted(set(nc))[-1:] ,sorted(set(nr))[-1:],pct(nd,.5) if nd else None,gens[:1]+gens[-1:]))

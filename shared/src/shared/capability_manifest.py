@@ -49,7 +49,7 @@ _SIDECAR_SUFFIX = '.capability-manifest.yaml'
 
 
 def sidecar_path(prd_key: str) -> str:
-    """The one PRD key → sidecar path rule, for the commit_planning stamper and the dashboard.
+    """The one PRD key → sidecar path rule, for the commit_planning stamper and the delivered-check owner lookup.
 
     ``plans/x-prd.md`` → ``plans/x-prd.capability-manifest.yaml``.
     """

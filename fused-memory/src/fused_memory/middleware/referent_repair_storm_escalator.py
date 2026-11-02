@@ -2,8 +2,8 @@
 
 The INV-4 storm escape for the write-time referent REPAIR sub-pass (task 3672,
 PRD leaf eta of ``plans/memory-referent-fidelity-prd.md``).  This is the FIRE
-half of the alarm; the counter half is
-``MemoryService._referent_repair_streaks``, which counts CONSECUTIVE episodes
+half of the alarm; the counter half is the streak reported by
+``MemoryService.referent_repair_counts``, which counts CONSECUTIVE episodes
 whose repair pass moved at least one edge endpoint and resets on any pass that
 looked and found nothing to move.
 

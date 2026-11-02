@@ -50,6 +50,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_lane.gates import DropGuardResult
+from orchestrator.merge_lane.intake_buffers import MergeIntake
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import (
     DROPPED_PLAN_TARGETS_REASON_PREFIX,
@@ -1036,7 +1037,7 @@ class TestPathEquivalence:
         worker1 = SpeculativeMergeWorker(git_ops, queue, event_store=es_merger)
         # Neutralise the eta/1892 suffix-conflict-graph pre-dequeue bounce
         # (_acquire_next_request -> recompute_suffix_conflict_graph ->
-        # _bounce_conflicting_suffix_items): it dry-run-detects a conflict
+        # bounce_conflicting_suffix_items): it dry-run-detects a conflict
         # against main BEFORE the item is even dequeued and reroutes it to a
         # rebase/escalate outcome, which is an orthogonal, already-shipped
         # feature (task 1892) — not part of classify_and_merge's equivalence
@@ -1044,11 +1045,11 @@ class TestPathEquivalence:
         # merger-path outcome is decided by that pre-flight bounce instead of
         # classify_and_merge's own conflict branch.
         monkeypatch.setattr(
-            worker1, 'recompute_suffix_conflict_graph',
+            MergeIntake, 'recompute_suffix_conflict_graph',
             AsyncMock(return_value=None),
         )
         monkeypatch.setattr(
-            worker1, '_bounce_conflicting_suffix_items',
+            MergeIntake, 'bounce_conflicting_suffix_items',
             AsyncMock(return_value=None),
         )
         async with running_merge_worker(worker1):

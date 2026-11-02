@@ -10,6 +10,7 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch  # noqa: F401
 
 import pytest
+from _mcp_transport_harness import tool_reply_envelope
 from _orch_helpers import pydantic_spec
 from _review_fixtures import review_aggregation, review_issue
 from shared.cli_invoke import AllAccountsCappedException
@@ -17,6 +18,10 @@ from shared.cli_invoke import AllAccountsCappedException
 from orchestrator.agents.triage import suggestion_hash
 from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
+from orchestrator.curator_submit import SubmitBatchResult, SubmitOutcome
+from orchestrator.review_suggestions.curator_intake import (
+    review_suggestion_submit_arguments,
+)
 from orchestrator.review_suggestions.disposition import SuggestionDisposition
 from orchestrator.workflow import StewardInterrupted, WorkflowOutcome
 
@@ -67,6 +72,23 @@ def _fake_reviews(suggestions=None, blocking_issues=None):
     reviews.has_blocking_issues = bool(blocking_issues)
     reviews.format_for_replan.return_value = 'formatted review feedback'
     return reviews
+
+
+def _ticket_response(ticket: str = 'tkt-1') -> MagicMock:
+    """A delivered ``submit_task`` POST: FastMCP's envelope around a curator ticket."""
+    envelope = tool_reply_envelope({'ticket': ticket})
+    return MagicMock(status_code=200, json=lambda: envelope)
+
+
+def _batch_result(*, delivered: int = 1, failed: int = 0) -> SubmitBatchResult:
+    """What ``_post_submit_tasks`` reports for *delivered* tickets and *failed* refusals."""
+    return SubmitBatchResult(outcomes=(
+        *(SubmitOutcome(title=f'delivered-{i}', ticket=f'tkt-{i}') for i in range(delivered)),
+        *(
+            SubmitOutcome(title=f'refused-{i}', failure='server returned an error: BacklogFull')
+            for i in range(failed)
+        ),
+    ))
 
 
 def _make_escalation(**overrides):
@@ -268,10 +290,6 @@ class TestRouteReviewSuggestionsToCurator:
 
         with patch('httpx.AsyncClient.post', side_effect=capture_post):
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
-            # Drain background tasks
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
         assert len(posted_bodies) == len(suggestions)
 
@@ -289,9 +307,6 @@ class TestRouteReviewSuggestionsToCurator:
 
         with patch('httpx.AsyncClient.post', side_effect=capture_post):
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
         assert len(posted_bodies) == len(suggestions)
         task_id = wf.task_id
@@ -319,8 +334,9 @@ class TestRouteReviewSuggestionsToCurator:
             expected_title = f'[{cat}] {loc}: {desc[:60]}'
             assert args['title'] == expected_title
 
-            # details: json.dumps(suggestion)
-            assert args['details'] == json.dumps(suggestion)
+            assert args == review_suggestion_submit_arguments(
+                suggestion, task_id=task_id, project_root=str(wf.config.project_root),
+            )
 
             # project_root is passed
             assert 'project_root' in args
@@ -356,9 +372,7 @@ class TestRouteReviewSuggestionsToCurator:
 
         with patch('httpx.AsyncClient.post', side_effect=capture_post):
             await wf._route_review_suggestions_to_curator(_fake_reviews([a, b]))
-            await asyncio.gather(*wf._background_tasks, return_exceptions=True)
             await wf._route_review_suggestions_to_curator(_fake_reviews([b_copy, c]))
-            await asyncio.gather(*wf._background_tasks, return_exceptions=True)
 
         def r4_key(body):
             meta = body['params']['arguments']['metadata']
@@ -382,9 +396,6 @@ class TestRouteReviewSuggestionsToCurator:
                 json=lambda: {'result': {'ticket': 'tkt-1'}},
             )
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
         queue.submit.assert_not_called()
 
@@ -400,9 +411,6 @@ class TestRouteReviewSuggestionsToCurator:
                 json=lambda: {'result': {'ticket': 'tkt-1'}},
             )
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
         for call in mock_post.call_args_list:
             body = call.kwargs.get('json') or (call.args[1] if len(call.args) > 1 else {})
@@ -439,15 +447,9 @@ class TestRouteReviewSuggestionsToCurator:
         with patch('httpx.AsyncClient.post', side_effect=capture_post):
             # First call with suggestions A
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_a))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
             # Second call with DIFFERENT suggestions B
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_b))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
         # Both batches must go through
         expected = len(suggestions_a) + len(suggestions_b)
@@ -541,20 +543,14 @@ class TestRouteReviewSuggestionsToCurator:
 
         async def capture_post(url, *, json=None, **kwargs):
             posted_bodies.append(json)
-            return MagicMock(status_code=200, json=lambda: {'result': {'ticket': 'tkt-1'}})
+            return _ticket_response()
 
         with patch('httpx.AsyncClient.post', side_effect=capture_post):
             # First call — should submit
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
             # Second call with identical suggestions — should be short-circuited
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
         # Exactly N posts (one batch), not 2*N
         assert len(posted_bodies) == len(suggestions), (
@@ -640,27 +636,18 @@ class TestRouteReviewSuggestionsToCurator:
 
         async def capture_post(url, *, json=None, **kwargs):
             posted_bodies.append(json)
-            return MagicMock(status_code=200, json=lambda: {'result': {'ticket': 'tkt-1'}})
+            return _ticket_response()
 
         with patch('httpx.AsyncClient.post', side_effect=capture_post):
             # Call 1: A — submitted, cache = hash(A)
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_a))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
             # Call 2: B — submitted (different hash), cache = hash(B)
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_b))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
             # Call 3: A again — hash(A) != hash(B) so NOT short-circuited;
             # re-submitted, cache = hash(A) again.
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_a))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
         expected = len(suggestions_a) + len(suggestions_b) + len(suggestions_a)
         assert len(posted_bodies) == expected, (
@@ -723,31 +710,29 @@ class TestRouteReviewSuggestionsDisposition:
     @pytest.mark.asyncio
     async def test_empty_suggestions_returns_none(self):
         wf = _make_workflow()
-        with patch.object(wf, '_post_submit_tasks', AsyncMock()):
+        with patch.object(wf, '_post_submit_tasks', AsyncMock(return_value=_batch_result())):
             disposition = await wf._route_review_suggestions_to_curator(_fake_reviews([]))
         assert disposition == SuggestionDisposition.NONE
 
     @pytest.mark.asyncio
     async def test_curator_path_returns_curator(self):
         wf = _make_workflow()
-        with patch.object(wf, '_post_submit_tasks', AsyncMock()):
+        with patch.object(wf, '_post_submit_tasks', AsyncMock(return_value=_batch_result())):
             disposition = await wf._route_review_suggestions_to_curator(
                 _fake_reviews(self._suggestions())
             )
-            await asyncio.gather(*wf._background_tasks, return_exceptions=True)
         assert disposition == SuggestionDisposition.CURATOR
 
     @pytest.mark.asyncio
     async def test_identical_second_call_returns_deduped(self):
         wf = _make_workflow()
-        with patch.object(wf, '_post_submit_tasks', AsyncMock()):
+        with patch.object(wf, '_post_submit_tasks', AsyncMock(return_value=_batch_result())):
             first = await wf._route_review_suggestions_to_curator(
                 _fake_reviews(self._suggestions())
             )
             second = await wf._route_review_suggestions_to_curator(
                 _fake_reviews(self._suggestions())
             )
-            await asyncio.gather(*wf._background_tasks, return_exceptions=True)
         assert (first, second) == (SuggestionDisposition.CURATOR, SuggestionDisposition.DEDUPED)
 
     @pytest.mark.asyncio
@@ -757,7 +742,7 @@ class TestRouteReviewSuggestionsDisposition:
         queue.get_by_task.return_value = []
         wf = _make_workflow(escalation_queue=queue)
         wf.mcp = None
-        with patch.object(wf, '_post_submit_tasks', AsyncMock()):
+        with patch.object(wf, '_post_submit_tasks', AsyncMock(return_value=_batch_result())):
             disposition = await wf._route_review_suggestions_to_curator(
                 _fake_reviews(self._suggestions())
             )
@@ -768,68 +753,68 @@ class TestRouteReviewSuggestionsDisposition:
     async def test_mcp_none_without_queue_returns_dropped(self):
         wf = _make_workflow(escalation_queue=None)
         wf.mcp = None
-        with patch.object(wf, '_post_submit_tasks', AsyncMock()):
+        with patch.object(wf, '_post_submit_tasks', AsyncMock(return_value=_batch_result())):
             disposition = await wf._route_review_suggestions_to_curator(
                 _fake_reviews(self._suggestions())
             )
         assert disposition == SuggestionDisposition.DROPPED
 
     @pytest.mark.asyncio
-    async def test_scheduling_failure_returns_error_without_a_scheduled_log(self, caplog):
+    async def test_a_suggestion_without_a_ticket_returns_undelivered(self, caplog):
         wf = _make_workflow()
-        # A synchronous MagicMock, not an AsyncMock: it must raise while the
-        # submit coroutine is being built, before anything is scheduled.
-        wf._post_submit_tasks = MagicMock(  # type: ignore[method-assign]
-            side_effect=RuntimeError('cannot schedule submits'),
-        )
+        post = AsyncMock(return_value=_batch_result(delivered=0, failed=1))
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.workflow'):
+        with (
+            patch.object(wf, '_post_submit_tasks', post),
+            caplog.at_level(logging.WARNING, logger='orchestrator.workflow'),
+        ):
             disposition = await wf._route_review_suggestions_to_curator(
                 _fake_reviews(self._suggestions())
             )
 
-        assert disposition == SuggestionDisposition.ERROR
-        scheduled_logs = [
-            r for r in caplog.records
-            if r.name == 'orchestrator.workflow'
-            and r.levelno == logging.INFO
-            and 'scheduled' in r.getMessage()
-        ]
-        assert scheduled_logs == []
+        assert disposition == SuggestionDisposition.UNDELIVERED
+        assert any(
+            r.levelno == logging.WARNING
+            and r.name == 'orchestrator.workflow'
+            and isinstance(r.args, tuple)
+            and wf.task_id in r.args
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_identical_reentry_after_undelivered_is_resubmitted(self):
+        wf = _make_workflow()
+        post = AsyncMock(side_effect=[_batch_result(delivered=0, failed=1), _batch_result()])
+
+        with patch.object(wf, '_post_submit_tasks', post):
+            first = await wf._route_review_suggestions_to_curator(
+                _fake_reviews(self._suggestions())
+            )
+            second = await wf._route_review_suggestions_to_curator(
+                _fake_reviews(self._suggestions())
+            )
+
+        assert (first, second) == (
+            SuggestionDisposition.UNDELIVERED, SuggestionDisposition.CURATOR,
+        )
+        assert post.await_count == 2
 
 
 # ---------------------------------------------------------------------------
-# Integration: stall guard + call-site routing
+# Integration: awaited delivery + call-site routing
 # ---------------------------------------------------------------------------
 
 
 class TestRouteReviewSuggestionsIntegration:
-    """Integration test: stall guard for `_route_review_suggestions_to_curator` fire-and-forget POST."""
+    """The route awaits its curator POSTs, so its disposition reports delivery."""
 
     @pytest.mark.asyncio
-    async def test_stall_guard_post_not_completed_when_route_returns(self):
-        """STALL GUARD: the curator POST must not complete before the route call returns.
+    async def test_route_returns_only_after_the_posts_complete(self):
+        """A route that returned while its POSTs were in flight could not know they landed.
 
-        Contract: `_route_review_suggestions_to_curator` schedules the curator POST
-        as a fire-and-forget background task via `asyncio.create_task`.  It must
-        NOT synchronously await the POST.
-
-        PRIMARY assertion: verifies that exactly one background task was scheduled and
-        is still unfinished when the route call returns.  This check tolerates
-        intermediate `await` points on the hot path (e.g. an MCP probe before
-        `create_task`) — what matters is that the task was scheduled *and* has not
-        finished by the time the call returns.
-
-        SECONDARY (strict no-sync-await sentinel): `post_completed` is an
-        `asyncio.Event` that the slow_post stub sets AFTER its 2s sleep finishes.
-        This secondary check only holds when no `await` occurs between the route
-        entry and the return — if the impl were changed to
-        `await self._post_submit_tasks(…)`, the route call would block for 2s while
-        slow_post's sleep completes, setting `post_completed`, and the assertion
-        would fail with a clear message — independent of system load.  Kept as
-        defense-in-depth alongside the PRIMARY check.
+        The curate_batch stall the old fire-and-forget shape guarded against
+        stays covered by ``TestRouteReviewSuggestionsToCurator.test_no_curate_batch_call``.
         """
-
         suggestions = [
             {
                 'reviewer': 'a',
@@ -841,52 +826,20 @@ class TestRouteReviewSuggestionsIntegration:
             }
         ]
         wf = _make_workflow()
-
         post_completed = asyncio.Event()
 
         async def slow_post(url, *, json=None, **kwargs):
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.05)
             post_completed.set()
-            return MagicMock(status_code=200, json=lambda: {'result': {'ticket': 'tkt-slow'}})
+            return _ticket_response('tkt-slow')
 
         with patch('httpx.AsyncClient.post', side_effect=slow_post):
-            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+            disposition = await wf._route_review_suggestions_to_curator(
+                _fake_reviews(suggestions)
+            )
 
-        # PRIMARY: structural contract — exactly one background task was scheduled and
-        # has not yet finished.  This directly verifies the fire-and-forget shape:
-        # `create_task` adds to _background_tasks; a synchronous `await` would exhaust
-        # the task before returning, making `.done()` True (or raising before we get
-        # here).  A future refactor that adds a *legitimate* await before create_task
-        # (e.g. an MCP probe) would still satisfy this check if the task is added and
-        # not yet done — unlike the event check, which relies on no yield occurring.
-        assert len(wf._background_tasks) == 1, (
-            f'_route_review_suggestions_to_curator must schedule exactly one background '
-            f'task via create_task — got {len(wf._background_tasks)}'
-        )
-        bg_task = next(iter(wf._background_tasks))
-        assert not bg_task.done(), (
-            'background task must not be done yet — fire-and-forget means it runs '
-            'after the route call returns, not before'
-        )
-
-        # SECONDARY safety-net: the slow_post sentinel must not have been set, which
-        # would only happen if the impl synchronously awaited the 2s sleep.
-        # The POST must not have completed — it should still be running (or not yet
-        # started) as a background task.  If post_completed is set it means the route
-        # call synchronously awaited slow_post's 2s sleep before returning, which
-        # violates the fire-and-forget contract.
-        assert not post_completed.is_set(), (
-            '_route_review_suggestions_to_curator must not synchronously await the '
-            'curator POST — post_completed was set, indicating the slow_post sleep '
-            'completed before the route call returned'
-        )
-
-        # Cancel the background task and await its completion to drain it
-        # deterministically, preventing 'Task was destroyed but it is pending'
-        # warnings at pytest-asyncio fixture teardown.  Reuse the same handle
-        # captured above to avoid re-iterating the set.
-        bg_task.cancel()
-        await asyncio.gather(bg_task, return_exceptions=True)
+        assert post_completed.is_set()
+        assert disposition == SuggestionDisposition.CURATOR
 
 
 # ---------------------------------------------------------------------------
@@ -1607,11 +1560,8 @@ class TestCuratorSubmitTransport:
             },
         ]
 
-    async def _route_and_drain(self, wf, suggestions):
+    async def _route(self, wf, suggestions):
         await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
-        tasks = list(wf._background_tasks)
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_submit_task_call_lands_at_the_mcp_path(self):
@@ -1627,7 +1577,7 @@ class TestCuratorSubmitTransport:
         factory = RecordingClientFactory(server)
 
         with patch('httpx.AsyncClient', factory):
-            await self._route_and_drain(wf, self._suggestions())
+            await self._route(wf, self._suggestions())
 
         calls = server.tool_calls('submit_task')
         assert len(calls) == 1, (
@@ -1646,7 +1596,7 @@ class TestCuratorSubmitTransport:
         factory = RecordingClientFactory(RecordingMcpServer())
 
         with patch('httpx.AsyncClient', factory):
-            await self._route_and_drain(wf, self._suggestions())
+            await self._route(wf, self._suggestions())
 
         factory.assert_follows_redirects()
 
@@ -1661,7 +1611,7 @@ class TestCuratorSubmitTransport:
 
         wf = _make_workflow()
         with patch('httpx.AsyncClient.post', side_effect=capture_post):
-            await self._route_and_drain(wf, self._suggestions())
+            await self._route(wf, self._suggestions())
 
         assert urls, 'no POST was made at all'
         for url in urls:
@@ -1696,7 +1646,7 @@ class TestCuratorSubmitTransport:
             caplog.at_level(logging.WARNING),
             patch('httpx.AsyncClient.post', side_effect=redirect_post),
         ):
-            await self._route_and_drain(wf, self._suggestions())
+            await self._route(wf, self._suggestions())
 
         warnings = [
             r for r in caplog.records

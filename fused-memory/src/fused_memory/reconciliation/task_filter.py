@@ -399,10 +399,6 @@ NEGATED_TERMINAL_RE: re.Pattern[str] = re.compile(
 #   (iii) A missing-space sentence boundary ('done.Task') no longer splits;
 #         rare in LLM prose, and the direction is the same over-firing as (i).
 WIDE_CLAUSE_BOUNDARY_RE: re.Pattern[str] = re.compile(r'\.(?!\w)|[;\n!?]')
-# The old private spelling, kept only for scripts/audit_duplicate_memories.py,
-# which task 4853 could not edit; tkt_0RVBV2PMGFWETFNDCRYB4TRFW1 migrates it
-# and deletes this alias. The allowlist test scans both names.
-_CLAUSE_SPLIT_RE = WIDE_CLAUSE_BOUNDARY_RE
 
 # The ORIGINAL, pre-task-3403 clause alphabet: the fail-safe-STRICT variant,
 # for the consumers that must NOT track WIDE_CLAUSE_BOUNDARY_RE's widening.
@@ -1076,9 +1072,9 @@ def select_done_since_boundary(
 
     Enumerates the FULL set of done tasks whose ``updatedAt`` is at or after
     *boundary* (the prior successful reconciliation cycle boundary — typically
-    ``Watermark.last_full_run_completed``), so the Stage-2 completion-memory
-    audit covers every task that reached ``done`` since the last cycle instead
-    of a small fixed sample.  Intended to consume the uncapped
+    ``Watermark.last_task_change_timestamp``, the previous full run's start), so
+    the Stage-2 completion-memory audit covers every task that reached ``done``
+    since the last cycle instead of a small fixed sample.  Intended to consume the uncapped
     ``FilteredTaskTree.all_done_tasks`` (not the 30-capped ``done_tasks``) so
     the coverage does not silently shrink as task throughput grows.
 

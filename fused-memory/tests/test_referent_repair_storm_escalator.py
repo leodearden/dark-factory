@@ -1,7 +1,7 @@
 """The INV-4 repair-storm alarm (task 3672, PRD leaf eta).
 
-The FIRE half of the storm escape whose counter half is
-`MemoryService._referent_repair_streaks`.  When a project's repair pass has
+The FIRE half of the storm escape whose counter half is reported by the
+`MemoryService.referent_repair_counts()['streaks']` gauge.  When a project's repair pass has
 moved at least one edge endpoint in ten CONSECUTIVE episodes, the scanner or
 the resolver has regressed — the measured base rate is ~0.22% of live
 task-mentioning edges, so a sustained streak is anomalous by construction —

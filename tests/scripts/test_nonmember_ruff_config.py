@@ -56,8 +56,9 @@ checkouts (``.eval-worktrees`` 218, ``.worktrees-orphaned`` 104, ``.claude``
 ``[tool.ruff]`` and so failing parity against the baseline, and each ``ruff``
 subprocess costing ~0.164 s inside a directory whose ``test_command`` is a merge
 gate under ``merge_verify_breadth: "full"``. Under the git derivation both
-checkouts yield the SAME 6 probe paths and zero shadows. See ``_git_ls_files``
-for why each flag is load-bearing. Because that contamination is invisible from
+checkouts yield the SAME 6 probe paths and zero shadows. See
+``tests/scripts/git_listing.py::listed_files`` for why each flag is
+load-bearing. Because that contamination is invisible from
 inside a worktree, the containment of ``_nonmember_probe_paths`` and
 ``_shadowing_configs`` is additionally pinned against a SYNTHETIC repo built
 per-test rather than against the ambient checkout — an ambient bound would have
@@ -94,11 +95,12 @@ on merge full-verify.
 from __future__ import annotations
 
 import json
-import os
 import pathlib
 import subprocess
 import sys
 import tomllib
+
+from git_listing import git, listed_files
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -168,75 +170,12 @@ def _member_roots(root: pathlib.Path = REPO_ROOT) -> set[pathlib.Path]:
     return roots
 
 
-def _git(cwd: pathlib.Path, *args: str) -> str:
-    """Run git in *cwd* with a scrubbed environment, FAILING loudly on non-zero.
-
-    ``GIT_*`` is stripped from the environment because pytest can run under a
-    hook or wrapper that exports ``GIT_DIR`` / ``GIT_INDEX_FILE`` — this repo's
-    own pre-commit hook does — and either would silently redirect these calls at
-    a different index than the tree being asked about. Identity and signing are
-    pinned inline so nothing depends on the ambient user's git config (they are
-    inert for the read-only ``ls-files`` call and load-bearing for the synthetic
-    fixture's commits).
-
-    A missing git, or a non-zero exit, raises ``AssertionError`` — it never
-    skips. Same stance, and the same reason, as the module docstring gives for
-    ruff: a guard that skips itself away is a green check that never ran.
-    """
-    env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
-    command = [
-        'git',
-        '-c', 'user.email=ruff-config-guard@example.invalid',
-        '-c', 'user.name=ruff config guard',
-        '-c', 'commit.gpgsign=false',
-        '-c', 'init.defaultBranch=main',
-        *args,
-    ]
-    try:
-        proc = subprocess.run(
-            command, cwd=cwd, capture_output=True, text=True, env=env, check=False,
-        )
-    except OSError as exc:  # pragma: no cover - only on a broken env
-        raise AssertionError(
-            f'Could not execute `git {" ".join(args)}` in {cwd}: {exc!r}. This guard derives '
-            'the swept set from git rather than from a filesystem walk, and deliberately FAILS '
-            'rather than skipping when git is unavailable.'
-        ) from exc
-    assert proc.returncode == 0, (
-        f'`git {" ".join(args)}` failed in {cwd} with rc={proc.returncode}.\n'
-        f'stdout: {proc.stdout!r}\nstderr: {proc.stderr!r}'
-    )
-    return proc.stdout
-
-
-def _git_ls_files(root: pathlib.Path, *pathspecs: str) -> list[str]:
-    """Repo-relative paths git considers part of the repository at *root*.
-
-    ``--cached --others --exclude-standard`` is the whole containment argument,
-    and each half is load-bearing:
-
-    * ``--cached`` alone would miss a NEWLY CREATED, not-yet-committed
-      ``scripts/legibility/ruff.toml`` — the live-shadow case the sweep exists
-      for — so ``--others`` is added to catch it.
-    * ``--exclude-standard`` then drops everything gitignored, which is how the
-      foreign checkouts vanish: ``.worktrees/``, ``.worktrees-orphaned/``,
-      ``.eval-worktrees/`` and ``.claude/worktrees/`` are all ignored at the repo
-      root. Verified to add nothing spurious — with and without ``--others`` the
-      tracked ``.py`` count and the shadow list are identical in both checkouts.
-    * Submodules need no handling at all: ``graphiti`` and ``mem0`` are single
-      mode-160000 gitlink entries, so a ``'*.py'`` pathspec matches nothing
-      inside them and no ``.gitmodules`` parsing is required.
-    * A nested checkout likewise needs none: git reports a directory holding a
-      VALID ``.git`` as one untracked directory entry and never descends into it.
-
-    ``-z`` rather than git's default output, so a path containing a space or a
-    quote is not silently mangled by C-style quoting.
-    """
+def _nonmember_files(root: pathlib.Path, *pathspecs: str) -> list[pathlib.Path]:
+    """Files git lists under *root* for *pathspecs*, minus those inside a workspace member."""
+    members = _member_roots(root)
     return [
-        entry
-        for entry in _git(root, 'ls-files', '--cached', '--others', '--exclude-standard',
-                          '-z', '--', *pathspecs).split('\0')
-        if entry
+        path for path in listed_files(root, *pathspecs)
+        if not any(path.is_relative_to(member) for member in members)
     ]
 
 
@@ -249,13 +188,7 @@ def _nonmember_directories(root: pathlib.Path = REPO_ROOT) -> set[str]:
     this helper used to carry, silently over-collects instead (2356 probe paths
     in the canonical clone against 6 here; see the module docstring).
     """
-    members = sorted(path.relative_to(root).as_posix() for path in _member_roots(root))
-    directories = set()
-    for entry in _git_ls_files(root, '*.py'):
-        if any(entry == member or entry.startswith(f'{member}/') for member in members):
-            continue
-        directories.add(pathlib.PurePosixPath(entry).parent.as_posix())
-    return directories
+    return {path.parent.relative_to(root).as_posix() for path in _nonmember_files(root, '*.py')}
 
 
 def _nonmember_probe_paths(root: pathlib.Path = REPO_ROOT) -> list[str]:
@@ -276,21 +209,14 @@ def _shadowing_configs(root: pathlib.Path = REPO_ROOT) -> list[str]:
     prefers those over a ``pyproject.toml`` in the SAME directory and one there
     would replace the very table this file pins.
     """
-    members = sorted(path.relative_to(root).as_posix() for path in _member_roots(root))
-    entries = _git_ls_files(root, *(f'*{filename}' for filename in _SHADOWING_FILENAMES))
-    found = []
-    for entry in entries:
-        # git pathspec `*` spans directory separators, which is what makes the
-        # sweep depth-independent — but it also makes `*ruff.toml` match e.g.
-        # `myruff.toml`, so the basename is re-checked against the real list.
-        if pathlib.PurePosixPath(entry).name not in _SHADOWING_FILENAMES:
-            continue
-        if any(entry == member or entry.startswith(f'{member}/') for member in members):
-            continue
-        if entry == 'pyproject.toml':
-            continue
-        found.append(entry)
-    return sorted(found)
+    candidates = _nonmember_files(root, *(f'*{filename}' for filename in _SHADOWING_FILENAMES))
+    # git pathspec `*` spans directory separators, which is what makes the
+    # sweep depth-independent — but it also makes `*ruff.toml` match e.g.
+    # `myruff.toml`, so the basename is re-checked against the real list.
+    return sorted(
+        path.relative_to(root).as_posix() for path in candidates
+        if path.name in _SHADOWING_FILENAMES and path != root / 'pyproject.toml'
+    )
 
 
 def _resolved_rule_codes(probe_path: str) -> set[str]:
@@ -407,6 +333,12 @@ _FIXTURE_EXPECTED_PROBES = frozenset({PROBE_BASENAME, f'tooling/{PROBE_BASENAME}
 # Prefixes that must contribute NOTHING, each asserted separately below.
 _FIXTURE_FOREIGN_PREFIXES = ('vendored/', 'nested/', '.eval-worktrees/')
 
+_FIXTURE_GIT_IDENTITY = (
+    '-c', 'user.email=ruff-config-guard@example.invalid',
+    '-c', 'user.name=ruff config guard',
+    '-c', 'commit.gpgsign=false',
+)
+
 
 def _write(root: pathlib.Path, relative: str, text: str) -> None:
     path = root / relative
@@ -418,7 +350,7 @@ def _hostile_fixture_repo(tmp_path: pathlib.Path) -> pathlib.Path:
     """Build a throwaway repo holding one directory per measured hostile class."""
     root = tmp_path / 'fixture_repo'
     root.mkdir()
-    _git(root, 'init', '-q')
+    git(root, 'init', '-q')
 
     # In-repo content the derivation MUST see.
     _write(root, 'pyproject.toml', _FIXTURE_ROOT_PYPROJECT)
@@ -436,24 +368,24 @@ def _hostile_fixture_repo(tmp_path: pathlib.Path) -> pathlib.Path:
     # configuration-dependent.
     _write(root, 'vendored/pyproject.toml', _FIXTURE_FOREIGN_PYPROJECT)
     _write(root, 'vendored/vend.py', 'x = 1\n')
-    _git(root / 'vendored', 'init', '-q')
-    _git(root / 'vendored', 'add', '-A')
-    _git(root / 'vendored', 'commit', '--no-verify', '-q', '-m', 'vendored')
-    gitlink_sha = _git(root / 'vendored', 'rev-parse', 'HEAD').strip()
+    git(root / 'vendored', 'init', '-q')
+    git(root / 'vendored', 'add', '-A')
+    git(root / 'vendored', *_FIXTURE_GIT_IDENTITY, 'commit', '--no-verify', '-q', '-m', 'vendored')
+    gitlink_sha = git(root / 'vendored', 'rev-parse', 'HEAD').strip()
 
-    _git(
+    git(
         root, 'add', 'pyproject.toml', '.gitignore', 'root_mod.py',
         'tooling/tool.py', 'memberpkg/pyproject.toml', 'memberpkg/mod.py',
     )
-    _git(root, 'update-index', '--add', '--cacheinfo', f'160000,{gitlink_sha},vendored')
-    _git(root, 'commit', '--no-verify', '-q', '-m', 'fixture')
+    git(root, 'update-index', '--add', '--cacheinfo', f'160000,{gitlink_sha},vendored')
+    git(root, *_FIXTURE_GIT_IDENTITY, 'commit', '--no-verify', '-q', '-m', 'fixture')
 
     # CLASS 2 — a NESTED CHECKOUT: a real `git worktree add`, which is precisely
     # what .worktrees/, .claude/worktrees/ and .worktrees-orphaned/ are. It must
     # be a VALID gitfile: measured, git recurses into a directory whose .git file
     # DANGLES and lists its contents, so a hand-written stub .git file would make
     # this fixture assert something git never does in practice.
-    _git(root, 'worktree', 'add', '--detach', '-q', 'nested', 'HEAD')
+    git(root, 'worktree', 'add', '--detach', '-q', 'nested', 'HEAD')
 
     # CLASS 3 — a GITIGNORED foreign root, the .eval-worktrees/ shape: the single
     # largest contributor in the canonical clone (218 shadows) and one no
@@ -598,6 +530,25 @@ def test_the_sweep_actually_finds_a_shadow_it_should_report(
         'are not files of this repository. Over-reporting fails the guard in the canonical clone '
         'for a reason no operator can act on.'
     )
+
+
+def test_a_deleted_tracked_file_yields_no_probe_path_and_no_shadow(
+    tmp_path: pathlib.Path,
+) -> None:
+    root = _hostile_fixture_repo(tmp_path)
+    _write(root, 'gone/old.py', 'x = 1\n')
+    _write(root, 'tooling/ruff.toml', 'line-length = 120\n')
+    git(root, 'add', 'gone/old.py', 'tooling/ruff.toml')
+    (root / 'gone/old.py').unlink()
+    (root / 'tooling/ruff.toml').unlink()
+
+    reason = (
+        'ruff resolves config from DISK, so a path git still tracks but that is gone '
+        'from the working tree shadows nothing and leaves no Python to lint; reporting '
+        'it fails the guard for a reason no operator can act on.'
+    )
+    assert f'gone/{PROBE_BASENAME}' not in _nonmember_probe_paths(root=root), reason
+    assert 'tooling/ruff.toml' not in _shadowing_configs(root=root), reason
 
 
 def test_root_ruff_config_matches_every_workspace_member() -> None:

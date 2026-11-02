@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -17,6 +18,7 @@ from _dashboard_helpers import (
     mcp_notify_response,
     mcp_tool_response,
 )
+from shared.testing_virtual_clock import virtual_clock_test
 
 # ---------------------------------------------------------------------------
 # Schema — events table from orchestrator/src/orchestrator/event_store.py
@@ -2061,6 +2063,11 @@ class _PerPortHandler:
     ``snapshot_responses`` maps port → snapshot dict (the inner result of get_merge_queue).
     ``fail_ports`` raise httpx.ConnectError.
     ``slow_ports`` sleep before responding (drives the timeout path).
+    ``stall_ports`` BLOCK the loop thread (``time.sleep``) once per cold
+    probe, on its ``initialize`` leg — a starved xdist worker: host wall
+    clock moves while the loop cannot run.
+    Unlike ``slow_ports`` (an in-loop await), a stall cannot move a
+    shared/src/shared/testing_virtual_clock.py::virtual_clock_test loop clock.
     """
 
     def __init__(
@@ -2069,21 +2076,25 @@ class _PerPortHandler:
         *,
         fail_ports: set[int] | None = None,
         slow_ports: dict[int, float] | None = None,
+        stall_ports: dict[int, float] | None = None,
     ):
         self.snapshot_responses = snapshot_responses or {}
         self.fail_ports = fail_ports or set()
         self.slow_ports = slow_ports or {}
+        self.stall_ports = stall_ports or {}
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         port = request.url.port
         assert port is not None
+        body = json.loads(request.content)
+        method = body.get('method', '')
+        request_id = body.get('id', 1)
+        if port in self.stall_ports and method == 'initialize':
+            time.sleep(self.stall_ports[port])
         if port in self.fail_ports:
             raise httpx.ConnectError('refused')
         if port in self.slow_ports:
             await asyncio.sleep(self.slow_ports[port])
-        body = json.loads(request.content)
-        method = body.get('method', '')
-        request_id = body.get('id', 1)
         if method == 'initialize':
             return mcp_init_response(request_id)
         if method.startswith('notifications/'):
@@ -2245,19 +2256,27 @@ class TestFetchLiveMergeQueuesFailure:
         assert result['proj8301']['entries'] == []
         assert 'error' in result['proj8301']
 
-    @pytest.mark.asyncio
+    @virtual_clock_test
     async def test_timeout_yields_unreachable(self, _clean_live_sessions):
-        """(b) Slow port with small per_call_timeout → {reachable: False}."""
+        """(b) Slow port with small per_call_timeout → {reachable: False}.
+
+        The answering project must beat the same deadline the slow one
+        misses, so this is a
+        shared/src/shared/testing_virtual_clock.py::virtual_clock_test and
+        host stalls cannot expire the deadline.
+        """
         from dashboard.data.merge_queue import fetch_live_merge_queues
 
+        probe_deadline = 0.05
         handler = _PerPortHandler(
             {8300: _snapshot([])},
             slow_ports={8302: 0.5},
+            stall_ports={8300: 2 * probe_deadline},
         )
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             result = await fetch_live_merge_queues(
-                client, _live_urls(8300, 8302), per_call_timeout=0.05,
+                client, _live_urls(8300, 8302), per_call_timeout=probe_deadline,
             )
 
         assert result['proj8300']['reachable'] is True

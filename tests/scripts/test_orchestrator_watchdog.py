@@ -4393,6 +4393,7 @@ _BOUNDARY_FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
 import json
 import os
 import sys
+import tempfile
 import time
 
 STATE_PATH = os.environ["FAKE_SYSTEMCTL_STATE"]
@@ -4404,8 +4405,17 @@ def _load():
 
 
 def _save(state):
-    with open(STATE_PATH, "w") as f:
-        json.dump(state, f)
+    fd, tmp_name = tempfile.mkstemp(dir=os.path.dirname(STATE_PATH) or ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp_name, STATE_PATH)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _observe_lease(args):
