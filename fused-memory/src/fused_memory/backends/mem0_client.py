@@ -391,7 +391,12 @@ class Mem0Backend:
         return lock
 
     async def _ensure_collection(self, collection_name: str) -> None:
-        """Create the collection if absent, under this backend's own budgets (tests/test_mem0_collection_provisioning.py)."""
+        """Create the collection if absent, under this backend's own budgets (tests/test_mem0_collection_provisioning.py).
+
+        Gap, owned by task 8196: the shared client's socket timeout is
+        ``int(read budget)``, so a create slower than that fails as an
+        unattributed ``ResponseHandlingException`` before the write budget.
+        """
         from qdrant_client.http import models as qmodels
         from qdrant_client.http.exceptions import UnexpectedResponse
 
