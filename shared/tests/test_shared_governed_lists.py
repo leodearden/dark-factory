@@ -158,6 +158,11 @@ BLESSED_TASK_METADATA_KEYS = governed_exceptions(
     sorted(_BLESSED_METADATA_KEYS),
     default=Policy('inv12-task-metadata-blessed-keys'),
     default_covers=56,
+    dispositions={
+        'predicate_recheck': Policy('inv12-task-metadata-blessed-keys'),
+        'predicate_verdict': Policy('inv12-task-metadata-blessed-keys'),
+        'trigger_chain': Policy('inv12-task-metadata-blessed-keys'),
+    },
 )
 
 LEGACY_RETRY_LEDGER_COUNTER_KEYS = governed_exceptions(
