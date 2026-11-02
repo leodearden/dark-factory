@@ -7100,16 +7100,24 @@ _Gathered = TypeVar('_Gathered')
 
 
 async def _gather_unwound(*aws: Awaitable[_Gathered]) -> list[_Gathered]:
-    """``asyncio.gather``, except that a cancel returns only once every child has unwound.
+    """``asyncio.gather``, except that it raises only once every child has ended.
 
-    A cancelled plain gather finishes at its first cancelled child, so a sibling
+    A plain gather raises at its first cancelled or failed child, so a sibling
     still killing its subprocess would outlive the verify that spawned it.
+    Here, as in a ``TaskGroup``, the other children are cancelled and awaited
+    first; the exception raised is the one the gather raised.  A child already
+    asked to cancel (a cancelled gather asks every child) is not asked again,
+    which would interrupt the kill it is awaiting.
     """
     children = [asyncio.ensure_future(aw) for aw in aws]
     try:
         return await asyncio.gather(*children)
-    except asyncio.CancelledError:
-        await asyncio.wait(children)
+    except BaseException:
+        for child in children:
+            if not (isinstance(child, asyncio.Task) and child.cancelling()):
+                child.cancel()
+        if children:
+            await asyncio.wait(children)
         raise
 
 
@@ -8377,7 +8385,7 @@ async def run_full_verification(
             'Full verification: running %d subprojects in parallel',
             len(module_configs),
         )
-        results = await asyncio.gather(
+        results = await _gather_unwound(
             *(
                 run_verification(
                     project_root, config, mc, role=role, max_retries=max_retries,
