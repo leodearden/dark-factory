@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+
 from fused_memory.maintenance.verdict_majority import VERDICT_WORDS, Resolution, resolve_verdicts
 
 
