@@ -1,9 +1,9 @@
 """`/api/v2/dashboard/tasks` — the per-project task snapshot (census and rows).
 
-The default render fans out over every known project root, reporting four
-distinct failure facts separately (offline / degraded / count-unknown / no
-root measured) rather than collapsing them into one "empty" — see the
-handler docstring for why each is its own signal. A ``?terminal=<project>``
+The default render fans out over every known project root, reporting five
+distinct failure facts separately (offline / degraded / count-unknown /
+count-stale / no root measured) rather than collapsing them into one "empty"
+— see the handler docstring for why each is its own signal. A ``?terminal=<project>``
 request reads that one root instead.
 """
 
@@ -248,7 +248,7 @@ async def api_tasks(
     debugging and tooling. No frontend UI reads it directly — lock display
     routes through D.SCHEDULER.
 
-    **Four distinct failure facts (plus a denominator), deliberately not
+    **Five distinct failure facts (plus a denominator), deliberately not
     collapsed:**
 
     - ``TASKS_OFFLINE`` — NO root was measured this render and at least one
@@ -276,9 +276,15 @@ async def api_tasks(
     - ``TASKS_OFFLINE_PROJECTS`` — the roots whose fetch DEMONSTRABLY failed.
       Non-empty with ``TASKS_OFFLINE`` false is the normal partial case.
     - ``TASKS_COUNT_UNKNOWN_PROJECTS`` — roots whose ACTIVE rows loaded fine
-      but whose compact status map did not, so the census is UNKNOWN. Neither
+      but whose census has NO value to show: the compact status map did not
+      load and there is no last good one, so the census is UNKNOWN. Neither
       offline nor degraded: without a list of their own they would render as a
       healthy project with a confident "0 done".
+    - ``TASKS_COUNT_STALE_PROJECTS`` — roots whose ACTIVE rows loaded fine but
+      whose census is served from its last good value at its own ``as_of``,
+      which every census surface renders with an age badge. Named apart from
+      an unknown count because calling that count unknown would contradict the
+      value those surfaces show.
     - ``TASKS_DEGRADED_PROJECTS`` — roots the handler ran out of budget for
       (see ``collect_tasks_with_counts``). Their state is UNKNOWN, not bad:
       nothing was proven unreachable, so degradation ALONE never raises the
@@ -296,9 +302,9 @@ async def api_tasks(
     ``TASKS_OFFLINE`` used to be ``bool(offline_projects)``. That is what made
     the banner claim a total outage over eight healthy projects' rows carried
     in the very same payload — one unreachable root out of nine was enough.
-    Collapsing any of these four into the others reintroduces that lie.
+    Collapsing any of these five into the others reintroduces that lie.
 
-    **All three lists are DERIVED, in one pass, from the per-root units.** The
+    **All four lists are DERIVED, in one pass, from the per-root units.** The
     collector returns a ``TaskSnapshot`` per root and ``task_snapshot.classify``
     routes each to exactly one banner from its STRUCTURED failure kind and its
     census's state — never from ``Datum.reason``, which is by contract the
@@ -389,11 +395,13 @@ async def api_tasks(
     offline_projects: list[str] = []
     degraded_projects: list[str] = []
     count_unknown_projects: list[str] = []
+    count_stale_projects: list[str] = []
     wire_snapshots: dict[str, dict] = {}
     banners = {
         SnapshotHealth.OFFLINE: offline_projects,
         SnapshotHealth.DEGRADED: degraded_projects,
         SnapshotHealth.COUNT_UNKNOWN: count_unknown_projects,
+        SnapshotHealth.COUNT_STALE: count_stale_projects,
     }
     for label, acquired in snapshots.items():
         snapshot = _validated(label, as_served(acquired, served_at), served_at)
@@ -427,6 +435,7 @@ async def api_tasks(
             'TASKS_OFFLINE_PROJECTS': offline_projects,
             'TASKS_DEGRADED_PROJECTS': degraded_projects,
             'TASKS_COUNT_UNKNOWN_PROJECTS': count_unknown_projects,
+            'TASKS_COUNT_STALE_PROJECTS': count_stale_projects,
             'TASKS_PROJECT_COUNT': total_roots,
             'served_at': served_at.isoformat(),
         }
