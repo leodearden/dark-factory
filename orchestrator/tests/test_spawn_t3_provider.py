@@ -93,7 +93,9 @@ def test_no_enabled_claude_instance_falls_back_to_a_disabled_claude_agent(tmp_pa
     assert choice == ProviderChoice('claudeAgent', ProviderSource.FALLBACK, False)
 
 
-@pytest.mark.parametrize('content', [None, 'not json', '[1]'])
+@pytest.mark.parametrize(
+    'content', [None, 'not json', '[1]', json.dumps({'providers': {'claudeAgent': {'enabled': False}}})]
+)
 def test_unreadable_settings_verify_nothing(tmp_path: Path, content: str | None) -> None:
     if content is not None:
         (tmp_path / 'settings.json').write_text(content)

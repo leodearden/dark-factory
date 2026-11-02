@@ -15,8 +15,10 @@ Enablement and the default selection are read from the server's settings,
 ``packages/contracts/src/settings.ts::resolveProjectProviderInstanceEnabled``
 and ``packages/shared/src/projectSettings.ts::resolveProjectOverrides`` (folded
 project settings: per-project overrides live under ``projectSettingsOverrides``).
-Unreadable settings verify nothing: the choice is then ``fallback`` with
-``enabled`` None, and ``t3`` itself remains the last word.
+Unreadable settings verify nothing, and neither do settings still carrying the
+pre-instance ``providers`` blob, which T3 migrates at load
+(``apps/server/src/serverSettings.ts::migrateLegacyProviderSettings``): the
+choice is then ``enabled`` None, and ``t3`` itself remains the last word.
 """
 
 from __future__ import annotations
@@ -62,7 +64,7 @@ class ProviderSettings:
             settings = json.loads((userdata / 'settings.json').read_text())
         except (OSError, ValueError):
             return None
-        if not isinstance(settings, dict):
+        if not isinstance(settings, dict) or 'providers' in settings:
             return None
         return cls(
             instances=_mapping_of_mappings(settings.get('providerInstances')),

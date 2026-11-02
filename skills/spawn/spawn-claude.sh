@@ -210,6 +210,21 @@ t3_lane_unexpected() {
   exit 127
 }
 
+# $t3_verdict is a `refused reason=provider-disabled` line naming the instance
+# and how it was chosen (spawn_t3_provider.ProviderSource).
+refuse_disabled_t3_provider() {
+  local instance source why
+  instance=$(verdict_field "$t3_verdict" instance_id)
+  source=$(verdict_field "$t3_verdict" source)
+  case "$source" in
+    explicit) why="CLAUDE_SPAWN_T3_PROVIDER names it, and it is disabled for this T3 project" ;;
+    fallback) why="this T3 project has no default and no single enabled Claude instance, and the fallback is disabled" ;;
+    *) why="it is disabled for this T3 project ($source)" ;;
+  esac
+  t3_lane_refuse "provider instance '$instance'" \
+    "$why; name an enabled instance in CLAUDE_SPAWN_T3_PROVIDER, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
+}
+
 # Sets t3_provider, the instance a model-pinned thread runs on, resolved by
 # spawn_t3_lane.py `provider` (order: $CLAUDE_SPAWN_T3_PROVIDER, the project's
 # live Claude instance, claudeAgent). Runs before the `launching` write, so a
@@ -229,10 +244,7 @@ resolve_t3_provider() {
       t3_provider=$(verdict_field "$t3_verdict" instance_id)
       [ -n "$t3_provider" ] || t3_lane_unexpected provider
       ;;
-    refused)
-      t3_lane_refuse "provider instance '$(verdict_field "$t3_verdict" detail)'" \
-        "it is disabled for this T3 project; name an enabled one in CLAUDE_SPAWN_T3_PROVIDER, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
-      ;;
+    refused) refuse_disabled_t3_provider ;;
     *) t3_lane_unexpected provider ;;
   esac
 }
@@ -1194,9 +1206,7 @@ launch_t3_thread() {
       exit 126
       ;;
     refused)
-      [ "$(verdict_field "$t3_verdict" reason)" = "provider-disabled" ] &&
-        t3_lane_refuse "provider instance '$(verdict_field "$t3_verdict" detail)'" \
-          "it was disabled for this T3 project during the launch; name an enabled one in CLAUDE_SPAWN_T3_PROVIDER"
+      [ "$(verdict_field "$t3_verdict" reason)" = "provider-disabled" ] && refuse_disabled_t3_provider
       t3_lane_refuse "cwd=$cwd ($(verdict_field "$t3_verdict" reason); project root $(verdict_field "$t3_verdict" detail))" \
         "a T3 thread always runs in its project's root; pass that root as cwd, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
       ;;

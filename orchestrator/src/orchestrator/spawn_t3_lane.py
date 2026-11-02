@@ -403,14 +403,21 @@ def provider_instance(
     except ProjectStoreUnreadable as exc:
         logger.warning(f'provider enablement is checked environment-wide: {exc}')
         project = None
+    return _provider_for(project, explicit, env)
+
+
+def _provider_for(
+    project: T3Project | None, explicit: str | None, env: Mapping[str, str]
+) -> spawn_t3_provider.ProviderChoice:
     project_id = project.project_id if project else None
     return spawn_t3_provider.resolve_instance(t3_userdata_dir(env), project_id, explicit)
 
 
 def _provider_verdict(choice: spawn_t3_provider.ProviderChoice) -> str:
+    named = {'instance_id': choice.instance_id, 'source': choice.source.value}
     if choice.enabled is False:
-        return _verdict('refused', reason='provider-disabled', detail=choice.instance_id)
-    return _verdict('instance', instance_id=choice.instance_id, source=choice.source.value)
+        return _verdict('refused', reason='provider-disabled', **named)
+    return _verdict('instance', **named)
 
 
 def launch(
@@ -437,7 +444,7 @@ def launch(
         detail = os.path.realpath(project.workspace_root) if project else None
         return _verdict('refused', reason='cwd-not-project-root', detail=detail)
 
-    choice = spawn_t3_provider.resolve_instance(t3_userdata_dir(env), project.project_id, provider)
+    choice = _provider_for(project, provider, env)
     if model and choice.enabled is False:
         return _provider_verdict(choice)
 

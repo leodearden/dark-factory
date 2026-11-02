@@ -284,7 +284,7 @@ class TestProvider:
             capsys, 'provider', '--cwd', str(env.project), '--provider', 'claudeAgent'
         )
 
-        assert line == 'refused reason=provider-disabled detail=claudeAgent'
+        assert line == 'refused reason=provider-disabled instance_id=claudeAgent source=explicit'
 
     def test_a_project_disable_is_read_through_the_project_store(
         self, env: Env, capsys: pytest.CaptureFixture[str]
@@ -294,7 +294,7 @@ class TestProvider:
 
         line = run_verb(capsys, 'provider', '--cwd', str(env.project))
 
-        assert line == 'refused reason=provider-disabled detail=claudeAgent'
+        assert line == 'refused reason=provider-disabled instance_id=claudeAgent source=fallback'
 
     def test_no_settings_falls_back_to_claude_agent_unverified(
         self, env: Env, capsys: pytest.CaptureFixture[str]
@@ -495,9 +495,9 @@ class TestLaunch:
             '--model', 'fable', '--provider', 'claudeAgent',
         )
 
-        assert line == 'refused reason=provider-disabled detail=claudeAgent'
+        assert line == 'refused reason=provider-disabled instance_id=claudeAgent source=explicit'
         assert fake_t3.calls('start') == [] and fake_t3.calls('list') == []
-        assert sr.read_record(Path(record_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
+        assert sr.read_record(Path(record_dir).name, root=env.fleet).display is None
 
     def test_no_t3_on_path_is_no_launcher(
         self, env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

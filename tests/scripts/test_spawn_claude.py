@@ -5398,20 +5398,28 @@ def test_t3_lane_runs_a_pinned_model_on_the_projects_enabled_instance(tmp_path: 
     assert record.display is not None and record.display.t3_thread_id
 
 
-@pytest.mark.parametrize("model", ["fable", ""])
-def test_t3_lane_refuses_a_named_provider_it_cannot_use_and_writes_no_record(
-    tmp_path: pathlib.Path, model: str,
+@pytest.mark.parametrize(("model", "provider", "settings_override", "expected_stderr"), [
+    ("fable", "claudeAgent", {}, "CLAUDE_SPAWN_T3_PROVIDER names it"),
+    ("", "claudeAgent", {}, "without CLAUDE_SPAWN_MODEL"),
+    ("fable", "", {"defaultModelSelection": None, "providerInstances": {
+        "claudeAgent": {"driver": "claudeAgent", "enabled": False},
+    }}, "the fallback is disabled"),
+])
+def test_t3_lane_refuses_a_provider_it_cannot_use_and_writes_no_record(
+    tmp_path: pathlib.Path, model: str, provider: str, settings_override: dict, expected_stderr: str,
 ) -> None:
     lane = _with_proxy_only_settings(_T3Lane(tmp_path))
+    if settings_override:
+        settings = pathlib.Path(lane.env["T3CODE_HOME"]) / "userdata" / "settings.json"
+        settings.write_text(json.dumps({**_PROXY_ONLY_T3_SETTINGS, **settings_override}))
     lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
     lane.env["CLAUDE_SPAWN_MODEL"] = model
-    lane.env["CLAUDE_SPAWN_T3_PROVIDER"] = "claudeAgent"
+    lane.env["CLAUDE_SPAWN_T3_PROVIDER"] = provider
 
     result = lane.run()
 
     assert result.returncode == 145, f"stderr: {result.stderr.decode()}"
-    stderr = result.stderr.decode()
-    assert "claudeAgent" in stderr if model else "without CLAUDE_SPAWN_MODEL" in stderr
+    assert expected_stderr in result.stderr.decode()
     assert not lane.records(), "a refused provider must precede the launching record"
     assert not lane.started_threads()
 
