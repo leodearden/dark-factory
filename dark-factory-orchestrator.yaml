@@ -6,7 +6,15 @@
 # had finished implementing and sat in verify, measured at 44 of 48, several for
 # 8h+. Each held its dispatch slot while contributing ~1.8 test legs to the
 # single-slot admission queue. Red tier: takes effect at restart.
-max_concurrent_tasks: 24
+# 24 -> 18 (Leo, 2026-11-02, ruling after the 2026-11-01 portfolio review, seat Q3):
+# the per-project task-verify slot is saturated (a waiter is present in 92-99% of
+# heartbeat samples, W43-W44). A closed-loop queue model fitted to W44 keeps the slot
+# >= 97.6% busy at 18 while roughly halving verify wait (2.9 h -> 1.5 h) and rebase
+# drift (the W44 median was 34 commits, up from 13 in W42). Tripwire: if the weekly
+# waiter-present share falls below 0.90 or landings/day fall below the W44 rate,
+# revert at the next redeploy; raise again when task 7977's remote task legs reach
+# this project. Red tier: takes effect at the next redeploy.
+max_concurrent_tasks: 18
 
 # lock_depth 4→12 (Leo 2026-08-07): make module locks effectively file-granular.
 # Until now dark-factory never set this key at all — it silently inherited the
