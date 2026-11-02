@@ -6831,10 +6831,11 @@ class TestZeroOutputBreakerBatchPath:
         """A curate_prepared call (no pre-opened breaker) where all candidates
         hit ZOT must open the breaker and bound escalation submissions.
 
-        Bisect funnels to size-1 single-spec leaves, each of which records its
-        ZOT; leaves never re-check the breaker. After threshold consecutive
-        recordings the breaker opens. A follow-on batch with the breaker open produces no LLM calls and no
-        new escalation submissions.
+        A size-1 batch is a single-spec call, which records its ZOT. After
+        threshold consecutive recordings the breaker opens. Every dispatch,
+        each bisected half and leaf included, checks the breaker before it
+        invokes, so a follow-on batch with the breaker open produces no LLM
+        calls and no new escalation submissions.
         """
         from fused_memory.middleware.curator_types import PreparedCandidate
 
@@ -6849,7 +6850,7 @@ class TestZeroOutputBreakerBatchPath:
         empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
 
         # First batch: 1 candidate, no pre-opened breaker.
-        # Bisects immediately to size-1 → curate() → ZOT → counter=1 → opens (threshold=1).
+        # One single-spec call → ZOT → counter=1 → opens (threshold=1).
         prepared_first = [
             PreparedCandidate(
                 candidate=CandidateTask(title='ZOT batch candidate', description='desc1'),

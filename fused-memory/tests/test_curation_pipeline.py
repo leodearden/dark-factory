@@ -12,6 +12,7 @@ the constructor, and ``curate_prepared`` itself. No private name is patched.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -24,6 +25,7 @@ import yaml
 from _curator_helpers import (
     agent_result,
     batch_create_result,
+    candidate_titles,
     candidates_in,
     escalator_double,
     invoke_by_role,
@@ -303,6 +305,108 @@ class TestOnePipeline:
 
         assert broken.defer_reason is DeferReason.CORPUS_FAILED
         assert healthy.defer_reason is DeferReason.ZERO_OUTPUT_BREAKER_OPEN
+
+
+
+# --- The zero-output breaker gates every dispatch, bisected halves included --
+
+# A call's answer, keyed on its candidates' titles: returned at once, or after
+# the first zero-output hang has been reported (and so the breaker opened).
+_Scripted = AgentResult | tuple[str, AgentResult]
+
+
+def _breaker_scene(
+    script: dict[tuple[str, ...], _Scripted],
+) -> tuple[TaskCurator, AsyncMock, AsyncMock]:
+    """A curator whose breaker opens on its first hang, and its invoker and escalator.
+
+    ``report_failure`` signals a hang synchronously, and the failure mapper
+    records the hang on the breaker before it next yields, so a call scripted
+    to wait resumes only once the breaker is open.
+    """
+    config = make_config()
+    config.curator.zero_output_breaker_threshold = 1
+    config.curator.zero_output_breaker_cooldown_seconds = 600.0
+    zot_reported = asyncio.Event()
+
+    def report_failure(**kwargs: Any) -> None:
+        if kwargs.get('zero_output_timeout') is True:
+            zot_reported.set()
+
+    escalator = escalator_double()
+    escalator.report_failure = AsyncMock(side_effect=report_failure)
+
+    async def answer(**kwargs: Any) -> AgentResult:
+        titles = tuple(candidate_titles(kwargs['prompt']))
+        if titles not in script:
+            raise AssertionError(f'unscripted curator call over {titles!r}')
+        scripted = script[titles]
+        if isinstance(scripted, tuple):
+            _wait, scripted = scripted
+            await zot_reported.wait()
+        return scripted
+
+    invoke = AsyncMock(side_effect=answer)
+    curator = TaskCurator(config=config, taskmaster=None, escalator=escalator, invoke=invoke)
+    return curator, invoke, escalator
+
+
+def _invoked_titles(invoke: AsyncMock) -> list[tuple[str, ...]]:
+    return sorted(
+        tuple(candidate_titles(call.kwargs['prompt'])) for call in invoke.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+class TestTheBreakerGatesEveryDispatch:
+    async def test_leaves_bisected_after_the_breaker_opens_defer_without_a_call(self):
+        curator, invoke, escalator = _breaker_scene({
+            ('A', 'B', 'C'): _max_turns_failure(),
+            ('A',): zot_agent_result(),
+            ('B', 'C'): ('wait', _max_turns_failure()),
+        })
+
+        decisions = await asyncio.wait_for(
+            curator.curate_prepared(
+                [_llm_bound(title) for title in 'ABC'], PROJECT_ID, PROJECT_ROOT,
+            ),
+            timeout=5.0,
+        )
+
+        assert (decisions[0].action, decisions[0].degraded_by_zot) == ('create', True)
+        assert [(d.action, d.defer_reason) for d in decisions[1:]] == [
+            ('defer', DeferReason.ZERO_OUTPUT_BREAKER_OPEN),
+            ('defer', DeferReason.ZERO_OUTPUT_BREAKER_OPEN),
+        ]
+        assert [
+            candidate_titles(prompt) for prompt in _prompts(invoke, 'task_curator')
+        ] == [['A']]
+        assert escalator.report_failure.await_count == 1
+
+    async def test_a_half_dispatched_after_the_breaker_opens_makes_no_call(self):
+        curator, invoke, escalator = _breaker_scene({
+            ('A', 'B', 'C', 'D', 'E', 'F'): _max_turns_failure(),
+            ('A', 'B', 'C'): _max_turns_failure(),
+            ('D', 'E', 'F'): ('wait', _max_turns_failure()),
+            ('A',): zot_agent_result(),
+            ('B', 'C'): ('wait', _max_turns_failure()),
+        })
+
+        decisions = await asyncio.wait_for(
+            curator.curate_prepared(
+                [_llm_bound(title) for title in 'ABCDEF'], PROJECT_ID, PROJECT_ROOT,
+            ),
+            timeout=5.0,
+        )
+
+        assert decisions[0].degraded_by_zot
+        assert [(d.action, d.defer_reason) for d in decisions[1:]] == [
+            ('defer', DeferReason.ZERO_OUTPUT_BREAKER_OPEN),
+        ] * 5
+        assert _invoked_titles(invoke) == sorted([
+            ('A', 'B', 'C', 'D', 'E', 'F'), ('A', 'B', 'C'), ('D', 'E', 'F'), ('A',), ('B', 'C'),
+        ])
+        assert escalator.report_failure.await_count == 1
 
 
 # --- B6: the consumer sees the exact match inside a worker batch -------------
