@@ -14,6 +14,7 @@ import time
 import pytest
 from _merge_queue_landing import Landing, LandingFailure, LandingNotConfirmed, land_file
 from config_reload_script_fakes import (
+    TOOL_RAISED,
     TRANSPORT_FAULTS,
     ClosedPort,
     FakeEscalationMcp,
@@ -276,6 +277,20 @@ def test_every_transport_fault_at_submit_is_transport_failed(repo, scratch, faul
     before = _main(repo)
 
     with FakeEscalationMcp(**fault) as server:
+        refusal = _refusal(repo, server.port)
+
+    assert refusal.failure is LandingFailure.TRANSPORT_FAILED
+    assert "merge_request" in refusal.detail, refusal.detail
+    _assert_untouched(repo, before, scratch)
+
+
+def test_a_merge_request_tool_error_at_submit_fails_closed(repo, scratch):
+    """Keeps the tool-error shape covered now that TRANSPORT_FAULTS no longer
+    carries it. TRANSPORT_FAILED is today's tag, not the contract: task 8025
+    owns this case's tag and prose."""
+    before = _main(repo)
+
+    with FakeEscalationMcp(**TOOL_RAISED) as server:
         refusal = _refusal(repo, server.port)
 
     assert refusal.failure is LandingFailure.TRANSPORT_FAILED
