@@ -59,7 +59,7 @@ from typing import TYPE_CHECKING, Any
 
 import _checkout as _checkout
 import check_consolidation_closure as closure_cli
-from _task_db_scan import TaskDbUnreadable, connect_ro, decode_metadata, tasks_db_path
+from _task_db_scan import decode_metadata, tasks_db_path
 from escalation.categories import EscalationCategory
 from escalation.queue import EscalationQueue
 from fused_memory.canonical_marker import is_canonical
@@ -102,6 +102,7 @@ from shared.project_id import project_id_for_root
 from shared.project_layout import CheckoutRootError, default_project_root, escalation_queue_dir
 from shared.task_metadata import HUMAN_CURATOR_ADJUDICATED_AT_KEY, HUMAN_CURATOR_GATE_KEY
 from shared.task_statuses import ACTIVE
+from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
 if TYPE_CHECKING:
     from fused_memory.config.schema import ConsolidationAutoConfig

@@ -14,9 +14,9 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable, connect_ro
 
 from shared.task_store_schema import TASK_STORE_DDL
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable, connect_ro
 
 
 def _make_store(directory: Path, rows: list[dict]) -> Path:
