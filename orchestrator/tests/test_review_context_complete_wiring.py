@@ -54,7 +54,6 @@ def _setup(
     )
     f = _make(worktree=merged.worktree, project_root=tmp_path / 'proj')
     config = f.wf.config
-    config.git.main_branch = 'main'
     config.review.briefing_path = CONVENTIONS_RELPATH
     config.review.reviewer_briefing = briefing
     config.reviewer_stagger_secs = 0

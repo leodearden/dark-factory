@@ -13,6 +13,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from _git_fixtures import RepoSeed, seed_repo
+
 _DIFF_HEADER = re.compile(r'^diff --git a/.+ b/(.+)$', re.MULTILINE)
 
 
@@ -24,7 +26,8 @@ class MergedInBranch:
     main_tip: str
 
 
-def _git(cwd: Path, *args: str) -> str:
+def git(cwd: Path, *args: str) -> str:
+    """Run git in *cwd*; return its stripped stdout, raising on non-zero."""
     done = subprocess.run(
         ['git', *args], cwd=cwd, check=True, capture_output=True, text=True,
     )
@@ -33,31 +36,22 @@ def _git(cwd: Path, *args: str) -> str:
 
 def _commit(cwd: Path, files: Mapping[str, str], message: str) -> str:
     for rel, content in files.items():
-        path = cwd / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
-    _git(cwd, 'add', '-A')
-    _git(cwd, 'commit', '-q', '-m', message)
-    return _git(cwd, 'rev-parse', 'HEAD')
+        (cwd / rel).write_text(content)
+    git(cwd, 'commit', '-q', '-am', message)
+    return git(cwd, 'rev-parse', 'HEAD')
 
 
 def branch_with_main_merged_in(
     tmp_path: Path, *, base_files: Mapping[str, str] | None = None,
 ) -> MergedInBranch:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    _git(repo, 'init', '-q', '-b', 'main')
-    _git(repo, 'config', 'user.email', 'reviewer@example.com')
-    _git(repo, 'config', 'user.name', 'Reviewer')
-    _git(repo, 'config', 'commit.gpgsign', 'false')
-    creation_sha = _commit(
-        repo, {'a.py': 'a = 1\n', 'm1.py': 'm1 = 1\n', **(base_files or {})}, 'base',
-    )
+    files = {'a.py': 'a = 1\n', 'm1.py': 'm1 = 1\n', **(base_files or {})}
+    repo = seed_repo(tmp_path / 'repo', RepoSeed(files=tuple(files.items()), message='base'))
+    creation_sha = git(repo, 'rev-parse', 'HEAD')
     worktree = tmp_path / 'wt'
-    _git(repo, 'worktree', 'add', '-q', '-b', 'task/50', str(worktree))
+    git(repo, 'worktree', 'add', '-q', '-b', 'task/50', str(worktree))
     _commit(worktree, {'a.py': 'a = 2\n'}, 'task work')
     main_tip = _commit(repo, {'m1.py': 'm1 = 2\n'}, 'main advances')
-    _git(worktree, 'merge', '-q', '--no-edit', 'main')
+    git(worktree, 'merge', '-q', '--no-edit', 'main')
     return MergedInBranch(
         repo=repo, worktree=worktree, creation_sha=creation_sha, main_tip=main_tip,
     )

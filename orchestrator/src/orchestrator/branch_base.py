@@ -9,24 +9,45 @@ config.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
-from shared.git_async import run_git
+from shared.git_async import GitResult, run_git
+
+logger = logging.getLogger(__name__)
 
 _GIT_TIMEOUT_SECS = 120.0
 
 
 async def own_work_base(checkout: Path, main_branch: str, stored_base: str | None) -> str:
     """The base B for which ``B...HEAD`` in *checkout* spans only the branch's own work."""
-    fork_point, head = await asyncio.gather(
-        _git_sha(checkout, ['git', 'merge-base', 'HEAD', main_branch]),
-        _git_sha(checkout, ['git', 'rev-parse', 'HEAD']),
+    merge_base, head = await asyncio.gather(
+        _git(checkout, 'merge-base', 'HEAD', main_branch),
+        _git(checkout, 'rev-parse', 'HEAD'),
     )
-    if fork_point and fork_point != head:
+    fork_point = _sha(merge_base)
+    if fork_point and fork_point != _sha(head):
         return fork_point
+    if fork_point is None:
+        _warn_fork_point_unresolved(checkout, main_branch, merge_base, stored_base)
     return stored_base or main_branch
 
 
-async def _git_sha(checkout: Path, cmd: list[str]) -> str | None:
-    result = await run_git(cmd, cwd=checkout, timeout=_GIT_TIMEOUT_SECS)
+async def _git(checkout: Path, *args: str) -> GitResult:
+    return await run_git(['git', *args], cwd=checkout, timeout=_GIT_TIMEOUT_SECS)
+
+
+def _sha(result: GitResult) -> str | None:
     return result.stdout if result.ok and result.stdout else None
+
+
+def _warn_fork_point_unresolved(
+    checkout: Path, main_branch: str, merge_base: GitResult, stored_base: str | None,
+) -> None:
+    fallback = f'the stored base {stored_base}' if stored_base else f'the main branch name {main_branch}'
+    logger.warning(
+        'git merge-base HEAD %s failed in %s (returncode=%d, timed_out=%s, stderr=%r); '
+        'the own-work base falls back to %s',
+        main_branch, checkout, merge_base.returncode, merge_base.timed_out,
+        merge_base.stderr, fallback,
+    )
