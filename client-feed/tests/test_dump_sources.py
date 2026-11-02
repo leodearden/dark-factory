@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 import yaml
 from _git_repo import make_repo
-from _stores import RunsDb, TasksDb
+from _stores import EscalationQueueDir, RunsDb, TasksDb
 
 from client_feed.cli import main
 
@@ -66,13 +66,10 @@ def config(tmp_path: Path, root: Path) -> Path:
         metadata={'prd_path': 'plans/x-prd.md', 'dry_run_proposals': 'SECRET'},
     )
     tasks.add(10, title='Land it', updated_at='2026-10-02T10:00:00.000Z')
+    EscalationQueueDir.create(root).write('esc-9-1', task_id='9', level=2)
     runs = RunsDb.create(root)
     paused_at = datetime.now(UTC) - timedelta(hours=3)
     earlier = paused_at - timedelta(hours=1)
-    runs.emit(
-        'escalation_created', at=earlier, task_id='9',
-        data={'escalation_id': 'esc-9-1', 'level': 2, 'summary': 'SECRET-SUMMARY'},
-    )
     runs.emit('phase_enter', at=earlier, task_id='9', phase='execute')
     runs.emit(
         'merge_finalized', at=earlier, task_id='10', phase='merge',
