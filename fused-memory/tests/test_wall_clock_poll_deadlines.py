@@ -285,3 +285,39 @@ class TestTimeoutBlockLeg:
             assert phrase in message, f'{phrase!r} missing from: {message}'
         for foreign in (*_RULE_A_AND_B_VOCABULARY, 'bare asyncio.wait_for'):
             assert foreign not in message, f'{foreign!r} must not appear in: {message}'
+
+
+class TestPollResponsiveCallShape:
+    def test_a_literal_timeout_flags_the_raw_literal_kind_only(self):
+        violations = _rule_c("poll_responsive(lambda: ready(), timeout=45.0, label='x')\n")
+
+        assert len(violations) == 1, violations
+        message = violations[0].message
+        assert 'RAW wall-clock literal' in message, message
+        assert 'timeout' in message, message
+        assert 'polled predicate' in message, message
+        assert 'bare asyncio.wait_for' not in message, message
+
+    def test_a_literal_wall_cap_names_max_wall_s(self):
+        violations = _rule_c("poll_responsive(pred, label='x', max_wall_s=30.0)\n")
+
+        assert len(violations) == 1, violations
+        assert 'max_wall_s' in violations[0].message
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            "poll_responsive(pred, label='x')\n",
+            "poll_responsive(pred, timeout=MERGE_RESULT_TIMEOUT, label='x')\n",
+        ],
+    )
+    def test_a_derived_or_default_bound_stays_silent(self, source):
+        assert _rule_c(source) == []
+
+    def test_a_noqa_above_a_literal_call_suppresses_it(self):
+        source = f"{_NOQA}\npoll_responsive(pred, timeout=45.0, label='x')\n"
+
+        assert _rule_c(source) == []
+
+    def test_a_call_with_no_predicate_stays_silent(self):
+        assert _rule_c('poll_responsive()\n') == []
