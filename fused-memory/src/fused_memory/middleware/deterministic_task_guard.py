@@ -7,8 +7,9 @@ diagnostic before any persistence happens.
 ## Contract (PRD §4 decisions 1-3, §11.1; §5 decisions 1,7,8; boundary
 scenarios B10, B11)
 
-A ``submit_task`` call is rejected (returns a structured ``ValidationError``
-dict) when any of these invariants is violated:
+A ``submit_task`` call is rejected (returns a structured error dict, whose
+``error_type`` is ``'ValidationError'`` except for invariant 4b) when any of
+these invariants is violated:
 
 1. ``task_kind`` not in ``{'normal', 'deterministic'}`` — enum reject.
 2. ``task_kind='deterministic'`` ∧ ``before_done is None`` ∧ ``not
@@ -29,7 +30,9 @@ dict) when any of these invariants is violated:
    An unknown key is refused with ``error_type='UnsupportedTaskMetadata'``,
    naming the running capabilities, so a client meeting an older server
    learns of the skew (PRD ``plans/completion-driven-triggers-prd.md`` C2).
-5.``metadata.milestone``, when present, must match the shared ``Milestone``
+   Submit-time only (task 3093): ``BeforeDone`` is ``extra='allow'``, so
+   ``update_task`` can still add an unknown key.
+5. ``metadata.milestone``, when present, must match the shared ``Milestone``
    model (``mode='dated'`` with a parseable ``at``, or ``mode='delayed'``
    with a positive int ``after_secs``). Checked by presence alone — this
    invariant is orthogonal to ``task_kind`` and applies on both
@@ -357,7 +360,7 @@ def _validate_trigger_chain(
     task_kind: str,
     before_done: Any,
     always_escalates: Any,
-    metadata: dict[str, Any],
+    carries_finding_run: bool,
 ) -> dict[str, Any] | None:
     """Validate metadata.trigger_chain — shape + carrier rules (PRD C2).
 
@@ -378,7 +381,7 @@ def _validate_trigger_chain(
             f'(got task_kind={task_kind!r}).',
             hint="Set task_kind='deterministic', or remove 'trigger_chain' from metadata.",
         )
-    if 'x_finding_run' in metadata:
+    if carries_finding_run:
         return _validation_error(
             f'metadata.trigger_chain role {role!r} must not carry x_finding_run: a '
             "chain task must never count toward its own run's measure.",
@@ -447,8 +450,9 @@ def deterministic_task_error(
     """Validate the deterministic-task-kind invariants.
 
     Returns a structured error dict (``{'error': ..., 'error_type':
-    'ValidationError', ...}``) when any invariant is violated, or ``None``
-    when the submission is valid.
+    'ValidationError', ...}``, or ``'UnsupportedTaskMetadata'`` for invariant
+    4b) when any invariant is violated, or ``None`` when the submission is
+    valid.
 
     Args:
         task_kind: The caller-supplied kind string ('normal' or 'deterministic').
@@ -561,7 +565,7 @@ def deterministic_task_error(
             task_kind=task_kind,
             before_done=before_done,
             always_escalates=always_escalates,
-            metadata=meta,
+            carries_finding_run='x_finding_run' in meta,
         )
         if err is not None:
             return err
