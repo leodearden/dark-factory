@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import httpx
@@ -17,6 +18,7 @@ from _dashboard_helpers import (
     mcp_notify_response,
     mcp_tool_response,
 )
+from shared.testing_virtual_clock import virtual_clock_test
 
 # ---------------------------------------------------------------------------
 # Schema — events table from orchestrator/src/orchestrator/event_store.py
@@ -354,9 +356,33 @@ class TestQueueDepthTimeseries:
 
     @pytest.mark.asyncio
     async def test_none_db(self):
-        """None DB returns empty ChartData."""
+        """None DB returns an empty series that still names the window's width."""
         result = await queue_depth_timeseries(None, hours=24)
-        assert result == {'labels': [], 'values': []}
+        assert result == {'labels': [], 'values': [], 'bucket_minutes': 15}
+
+    @pytest.mark.asyncio
+    async def test_unreadable_db_names_the_windows_width(self, tableless_runs_conn):
+        """A runs.db whose read fails serves an empty series at the window's width."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        result = await queue_depth_timeseries(tableless_runs_conn, hours=168, now=now)
+        assert result == {'labels': [], 'values': [], 'bucket_minutes': 60}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'hours, minutes', [(24, 15), (168, 60), (720, 360), (87600, 1440)],
+    )
+    async def test_reports_the_width_its_labels_are_spaced_at(
+        self, empty_merge_events_conn, hours, minutes,
+    ):
+        """The series names its bucket width, and its labels are spaced exactly that far."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        result = await queue_depth_timeseries(empty_merge_events_conn, hours=hours, now=now)
+
+        assert result['bucket_minutes'] == minutes
+        width = timedelta(minutes=result['bucket_minutes'])
+        starts = [datetime.fromisoformat(label) for label in result['labels']]
+        gaps = {later - earlier for earlier, later in zip(starts, starts[1:], strict=False)}
+        assert gaps == {width}
 
     @pytest.mark.asyncio
     async def test_empty_db(self, empty_merge_events_conn):
@@ -1425,7 +1451,7 @@ class TestBuildPerProjectMergeQueue:
         assert '/tmp/nofile' in result
         data = result['/tmp/nofile']
         assert set(data.keys()) >= {'depth_timeseries', 'outcomes', 'latency', 'recent', 'speculative'}
-        assert data['depth_timeseries'] == {'labels': [], 'values': []}
+        assert data['depth_timeseries'] == {'labels': [], 'values': [], 'bucket_minutes': 15}
         assert data['outcomes'] == {'labels': [], 'values': []}
         assert data['latency'] == ZERO_LATENCY
         assert data['recent'] == []
@@ -1477,6 +1503,22 @@ class TestBuildPerProjectMergeQueue:
         for data in result.values():
             for field in ('speculative', 'recent_total'):
                 validate_datum(data[field], now)
+
+    async def test_depth_names_the_windows_width_read_or_unread(self, tmp_path):
+        """A real empty project and a (pid, None) project both serve the window's width."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        db_path = _make_db(tmp_path, 'real.db', [])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await build_per_project_merge_queue(
+                [('/tmp/real', conn), ('/tmp/none', None)], hours=168, now=now,
+            )
+
+        assert result['/tmp/real']['depth_timeseries']['bucket_minutes'] == 60
+        assert result['/tmp/none']['depth_timeseries']['bucket_minutes'] == 60
 
     async def test_the_outcome_total_is_the_latency_attempt_total(self, tmp_path):
         """Sketch #9, second half: one row set behind the donut and the latency."""
@@ -1686,6 +1728,28 @@ class TestBuildPerProjectMergeQueue:
             assert project[field].state is DatumState.UNKNOWN, field
             assert 'RuntimeError: boom' in (project[field].reason or ''), field
             validate_datum(project[field], now)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('failing, failure', [
+        ('queue_depth_timeseries', AsyncMock(side_effect=RuntimeError('boom'))),
+        ('safe_gather_result', MagicMock(side_effect=RuntimeError('boom'))),
+    ], ids=['depth-leg-raises', 'whole-project-fails'])
+    async def test_an_unread_depth_still_names_the_windows_width(self, tmp_path, failing, failure):
+        """Both fallbacks serve the window's bucket width beside their empty series."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        hours = 168
+        db_path = _make_db(tmp_path, 'unread_depth.db', [])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            with patch(f'dashboard.data.merge_queue.{failing}', new=failure):
+                result = await build_per_project_merge_queue([('/tmp/P', conn)], hours=hours, now=now)
+
+        assert result['/tmp/P']['depth_timeseries'] == {
+            'labels': [], 'values': [], 'bucket_minutes': _bucket_minutes_for_window(hours),
+        }
 
     @pytest.mark.asyncio
     async def test_cancelled_error_from_sub_query_propagates(self, tmp_path):
@@ -1999,6 +2063,11 @@ class _PerPortHandler:
     ``snapshot_responses`` maps port → snapshot dict (the inner result of get_merge_queue).
     ``fail_ports`` raise httpx.ConnectError.
     ``slow_ports`` sleep before responding (drives the timeout path).
+    ``stall_ports`` BLOCK the loop thread (``time.sleep``) once per cold
+    probe, on its ``initialize`` leg — a starved xdist worker: host wall
+    clock moves while the loop cannot run.
+    Unlike ``slow_ports`` (an in-loop await), a stall cannot move a
+    shared/src/shared/testing_virtual_clock.py::virtual_clock_test loop clock.
     """
 
     def __init__(
@@ -2007,21 +2076,25 @@ class _PerPortHandler:
         *,
         fail_ports: set[int] | None = None,
         slow_ports: dict[int, float] | None = None,
+        stall_ports: dict[int, float] | None = None,
     ):
         self.snapshot_responses = snapshot_responses or {}
         self.fail_ports = fail_ports or set()
         self.slow_ports = slow_ports or {}
+        self.stall_ports = stall_ports or {}
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         port = request.url.port
         assert port is not None
+        body = json.loads(request.content)
+        method = body.get('method', '')
+        request_id = body.get('id', 1)
+        if port in self.stall_ports and method == 'initialize':
+            time.sleep(self.stall_ports[port])
         if port in self.fail_ports:
             raise httpx.ConnectError('refused')
         if port in self.slow_ports:
             await asyncio.sleep(self.slow_ports[port])
-        body = json.loads(request.content)
-        method = body.get('method', '')
-        request_id = body.get('id', 1)
         if method == 'initialize':
             return mcp_init_response(request_id)
         if method.startswith('notifications/'):
@@ -2183,19 +2256,27 @@ class TestFetchLiveMergeQueuesFailure:
         assert result['proj8301']['entries'] == []
         assert 'error' in result['proj8301']
 
-    @pytest.mark.asyncio
+    @virtual_clock_test
     async def test_timeout_yields_unreachable(self, _clean_live_sessions):
-        """(b) Slow port with small per_call_timeout → {reachable: False}."""
+        """(b) Slow port with small per_call_timeout → {reachable: False}.
+
+        The answering project must beat the same deadline the slow one
+        misses, so this is a
+        shared/src/shared/testing_virtual_clock.py::virtual_clock_test and
+        host stalls cannot expire the deadline.
+        """
         from dashboard.data.merge_queue import fetch_live_merge_queues
 
+        probe_deadline = 0.05
         handler = _PerPortHandler(
             {8300: _snapshot([])},
             slow_ports={8302: 0.5},
+            stall_ports={8300: 2 * probe_deadline},
         )
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             result = await fetch_live_merge_queues(
-                client, _live_urls(8300, 8302), per_call_timeout=0.05,
+                client, _live_urls(8300, 8302), per_call_timeout=probe_deadline,
             )
 
         assert result['proj8300']['reachable'] is True

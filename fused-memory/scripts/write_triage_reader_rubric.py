@@ -71,15 +71,22 @@ class Role(StrEnum):
     PRIMARY = 'primary'
     SECOND = 'second'
     THIRD = 'third'
+    CROSS_FAMILY = 'cross_family'
     DERIVED = 'derived'
 
 
-RATER_ROLES = frozenset({Role.PRIMARY, Role.SECOND, Role.THIRD})
-"""The roles of a row a rater answered; only these rows carry evidence or non_consumed answers."""
+RATER_ROLES = frozenset({Role.PRIMARY, Role.SECOND, Role.THIRD, Role.CROSS_FAMILY})
+"""The roles of a row a rater answered; only these rows carry evidence or non_consumed answers.
+
+A cross_family row keeps the same contract but never votes: ``resolve_judgements`` refuses it."""
 
 
 class Resolved(StrEnum):
-    """What the rows carrying one binary of one pair say, taken together."""
+    """What the rows carrying one binary of one pair say, taken together.
+
+    OPEN is a decisive follow-up no row carries, whose preconditions the rater
+    votes resolve to its needs.
+    """
 
     YES = 'YES'
     NO = 'NO'
@@ -87,6 +94,7 @@ class Resolved(StrEnum):
     SECONDARY = 'SECONDARY'
     UNCLEAR = ABSTAIN
     TIED = 'TIED'
+    OPEN = 'OPEN'
 
 
 _WORDS: Mapping[Binary, type[StrEnum]] = MappingProxyType({
@@ -111,7 +119,8 @@ DECISIVE_FOLLOW_UPS: frozenset[Binary] = frozenset({Binary.LOSS})
 """The follow-ups :func:`derive` reads that a rater answers; DIGEST is computed from loss_spans.
 
 A rater row whose own answers meet one's ``FOLLOW_UPS`` needs must give it, so a
-skipped one is refused, never resolved UNCLEAR.
+skipped one is refused, never resolved UNCLEAR. One the rater votes ask that no
+rater row reached resolves OPEN.
 """
 
 
@@ -192,6 +201,9 @@ class Judgement:
     preconditions all resolve to the answers it needs, at least one of them
     fixed by a derived row. A rater row meeting those needs must give a
     decisive follow-up, so no rater reached it, and it resolves UNCLEAR.
+    A decisive follow-up the rater votes alone ask, though no rater row met its
+    needs, resolves OPEN instead: a further blind rater answering the whole
+    item may reach it.
     """
 
     key: PairKey
@@ -200,7 +212,7 @@ class Judgement:
     unreached_follow_ups: frozenset[Binary] = frozenset()
 
     def answer(self, binary: Binary) -> Resolved | None:
-        """The resolved answer on *binary*, or None when no row carries it."""
+        """*binary*'s resolved answer; None only when no row carries it and no rule resolves it."""
         return self.resolved.get(binary)
 
 
@@ -209,18 +221,22 @@ def resolve_judgements(rows: Iterable[Mapping[str, Any]]) -> Mapping[PairKey, Ju
 
     Votes on one binary come from the rows carrying it as a voting answer.
     UNCLEAR abstains, an all-UNCLEAR binary resolves UNCLEAR and an even split
-    resolves TIED, and a follow-up a derived row's precondition left unasked
-    resolves UNCLEAR. The ``current`` and ``attach_time`` bases are separate pair
-    keys and never mix. A malformed row, a rater voting twice on one pair key,
+    resolves TIED, a follow-up a derived row's precondition left unasked
+    resolves UNCLEAR, and a decisive follow-up the rater votes ask but no rater
+    row reached resolves OPEN. The ``current`` and ``attach_time`` bases are
+    separate pair keys and never mix. A malformed row, a rater voting twice on one pair key,
     and a pair key whose rater answers and derived rows disagree about which
     binaries a derived row fixes are refused.
     """
     votes: defaultdict[PairKey, dict[str, tuple[int, Vote]]] = defaultdict(dict)
     for index, row in enumerate(rows):
         pair = (row.get('entry_id'), row.get('target_id'), row.get('basis'))
-        violation = _row_violation(row)
+        violation = row_violation(row)
         if violation is not None:
             raise ValueError(f'verdict row {index} on pair {pair}: {violation}')
+        if row['role'] == Role.CROSS_FAMILY:
+            raise ValueError(f'verdict row {index} on pair {pair}: role cross_family never votes'
+                             ' in a corpus; it is compared with the corpus, not counted in it')
         key = PairKey(row['entry_id'], row['target_id'], Basis(row['basis']))
         if row['rater'] in votes[key]:
             raise ValueError(
@@ -267,8 +283,12 @@ def _refuse_mixed_votes(key: PairKey, indexed: list[tuple[int, Vote]]) -> None:
             )
 
 
-def _row_violation(row: Mapping[str, Any]) -> str | None:
-    """The first rubric invariant *row* breaks, naming the offending value; None if none."""
+def row_violation(row: Mapping[str, Any]) -> str | None:
+    """The first rubric invariant *row* alone breaks, naming the offending value; None if none.
+
+    :func:`resolve_judgements` makes this check of every row before counting it;
+    a cross_family row, which is never counted, is checked here alone.
+    """
     missing = [key for key in _REQUIRED_KEYS if key not in row]
     if missing:
         return f'lacks {", ".join(missing)}'
@@ -276,13 +296,13 @@ def _row_violation(row: Mapping[str, Any]) -> str | None:
         if not isinstance(row[key], str) or not row[key]:
             return f'{key} {row[key]!r} is not a non-empty string'
     for key, words in (('basis', Basis), ('role', Role)):
-        if row[key] not in set(words):
+        if not _is_word(row[key], words):
             return f'{key} {row[key]!r} is not one of {sorted(words)}'
     carried = [binary for binary in _WORDS if binary in row]
     if not carried:
         return f'carries no binary (one of {", ".join(_WORDS)})'
     for binary in carried:
-        if row[binary] not in set(_WORDS[binary]):
+        if not _is_word(row[binary], _WORDS[binary]):
             return f'{binary} {row[binary]!r} is not one of {sorted(_WORDS[binary])}'
     unclear = [binary for binary in carried if is_abstain(row[binary])]
     reason = row.get('unclear_reason')
@@ -301,6 +321,10 @@ def _row_violation(row: Mapping[str, Any]) -> str | None:
         _skipped_follow_up_violation(row) or _evidence_violation(row, carried)
         or _non_consumed_violation(row)
     )
+
+
+def _is_word(value: object, words: type[StrEnum]) -> bool:
+    return isinstance(value, str) and value in set(words)
 
 
 def _skipped_follow_up_violation(row: Mapping[str, Any]) -> str | None:
@@ -361,13 +385,16 @@ def _judgement(key: PairKey, votes: tuple[Vote, ...]) -> Judgement:
         if any(binary in vote.answers for vote in votes)
     }
     derived = {binary for vote in votes if vote.role is Role.DERIVED for binary in vote.answers}
-    unreached = frozenset(
+    met = frozenset(
         follow_up for follow_up, needs in FOLLOW_UPS.items()
         if follow_up not in resolved
         and all(resolved.get(binary) == Resolved(needed) for binary, needed in needs.items())
-        and not derived.isdisjoint(needs)
+    )
+    unreached = frozenset(
+        follow_up for follow_up in met if not derived.isdisjoint(FOLLOW_UPS[follow_up])
     )
     resolved.update(dict.fromkeys(unreached, Resolved.UNCLEAR))
+    resolved.update(dict.fromkeys((met - unreached) & DECISIVE_FOLLOW_UPS, Resolved.OPEN))
     return Judgement(
         key=key, votes=votes, resolved=MappingProxyType(resolved), unreached_follow_ups=unreached,
     )
@@ -475,17 +502,27 @@ CELL_RULES: Mapping[Cell, str] = MappingProxyType({
 
 
 class GapKind(StrEnum):
+    """Why a binary blocks: no row carries it; its votes split evenly; or it is a decisive
+    follow-up the rater votes ask that no rater row reached."""
+
     UNRATED = 'unrated'
     TIED = 'tied'
+    OPEN = 'open'
 
 
 @dataclass(frozen=True, order=True)
 class Gap:
-    """A binary the derivation needed on one record that the verdicts leave unrated or tied."""
+    """A binary the derivation needed on one record that the verdicts leave unrated, tied or open."""
 
     target_id: str
     binary: Binary
     kind: GapKind
+
+
+_BLOCKING: Mapping[Resolved, GapKind] = MappingProxyType({
+    Resolved.TIED: GapKind.TIED, Resolved.OPEN: GapKind.OPEN,
+})
+"""Each resolution that blocks a derivation asking for it, and the gap it is."""
 
 
 @dataclass(frozen=True)
@@ -516,7 +553,7 @@ class Unclear:
 
 @dataclass(frozen=True)
 class Incomplete:
-    """The verdicts leave binaries the derivation needed unrated or tied."""
+    """The verdicts leave binaries the derivation needed unrated, tied or open."""
 
     missing: tuple[Gap, ...]
 
@@ -538,7 +575,7 @@ def derive(
     write is read against each earlier record it might have joined, and each
     one is derived on its own. Binaries are asked lazily, in a fixed order per
     outcome, so a binary is decisive exactly when the derivation asks for it: a
-    decisive unrated or tied binary makes the write Incomplete (naming every
+    decisive unrated, tied or open binary makes the write Incomplete (naming every
     gap the derivations met), a decisive UNCLEAR one makes it Unclear, and a
     binary never asked never blocks. The triage, status-quo, M1 and
     counterfactual-M1 derivations stand or fall together: a gap or an UNCLEAR
@@ -610,8 +647,8 @@ class _Reader:
         resolved = None if self.judgement is None else self.judgement.answer(binary)
         if resolved is None:
             raise _Undecided(Gap(self.target_id, binary, GapKind.UNRATED))
-        if resolved is Resolved.TIED:
-            raise _Undecided(Gap(self.target_id, binary, GapKind.TIED))
+        if resolved in _BLOCKING:
+            raise _Undecided(Gap(self.target_id, binary, _BLOCKING[resolved]))
         if resolved is Resolved.UNCLEAR:
             raise _Abstained(self.target_id, binary)
         return resolved is Resolved.YES

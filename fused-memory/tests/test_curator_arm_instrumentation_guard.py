@@ -10,8 +10,9 @@ which no signal distinguishes from a healthy one.
    ``_degraded_create`` funnel, which is what advances the degraded streak.
 3. Every ``CuratorDecision(action='create', ...)`` in the module states its
    ``degraded=`` classification explicitly, as a literal.
-4. ``CuratorDecision.deferred`` is the only builder of ``action='defer'`` in
-   the curator and the interceptor, so every defer carries a ``DeferReason``.
+4. ``CuratorDecision.deferred`` (in ``curator_types.py``) is the only builder
+   of ``action='defer'`` in the vocabulary, the curator and the interceptor, so
+   every defer carries a ``DeferReason``.
 
 The behavioural halves live in test_task_curator.py. Those pin the paths that
 exist today; these assert over the shapes themselves, so the requirements land
@@ -35,14 +36,16 @@ from _ast_guard import calls_named, parse_python_module
 
 SRC_ROOT = pathlib.Path(__file__).parents[1] / 'src' / 'fused_memory'
 TASK_CURATOR = SRC_ROOT / 'middleware' / 'task_curator.py'
+CURATOR_TYPES = SRC_ROOT / 'middleware' / 'curator_types.py'
 TASK_INTERCEPTOR = SRC_ROOT / 'middleware' / 'task_interceptor.py'
 
 CURATOR_CLASS = 'TaskCurator'
 CURATE_METHOD = 'curate'
 
-# ``calls_named`` matches an attribute's name exactly, so the sibling batch
-# path ``self._call_llm_batch(...)`` cannot select the wrong ``try``.
-LLM_CALL = '_call_llm'
+# The batch path calls the same invoker, but from
+# ``_call_llm_batch_with_fallback`` rather than ``curate()``, so the one
+# ``try`` in ``curate()`` that calls it is still the single-candidate call.
+LLM_CALL = '_invoke_curator'
 REPORT_CALL = 'report_failure'
 DEFER_FUNNEL = 'deferred'
 
@@ -243,11 +246,11 @@ def test_every_fail_open_create_declares_degradedness():
 
 
 def _decision_class() -> ast.ClassDef:
-    for node in ast.walk(parse_python_module(TASK_CURATOR)):
+    for node in ast.walk(parse_python_module(CURATOR_TYPES)):
         if isinstance(node, ast.ClassDef) and node.name == DECISION_TYPE:
             return node
     raise AssertionError(
-        f'{TASK_CURATOR.name}: no class {DECISION_TYPE} — this guard has lost '
+        f'{CURATOR_TYPES.name}: no class {DECISION_TYPE} — this guard has lost '
         f'its subject; re-point it rather than deleting it.'
     )
 
@@ -281,7 +284,7 @@ def test_no_module_builds_a_defer_but_its_constructor():
     ), f'{DECISION_TYPE}.{DEFER_FUNNEL}() builds no action=\'defer\' — re-point this guard.'
     rogue = [
         (module.name, node.lineno)
-        for module in (TASK_CURATOR, TASK_INTERCEPTOR)
+        for module in (CURATOR_TYPES, TASK_CURATOR, TASK_INTERCEPTOR)
         for node in ast.walk(parse_python_module(module))
         if isinstance(node, ast.Call)
         and _builds_a_defer(node)

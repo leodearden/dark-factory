@@ -7,6 +7,7 @@ import asyncio
 import logging
 import os
 import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -37,6 +38,8 @@ from shared.task_statuses import ACTIVE, TaskStatus
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import (
+    TASKS_BUDGET,
+    TasksBudget,
     _build_task_row,
     _minutes_since,
     collect_tasks_with_counts,
@@ -46,45 +49,18 @@ from dashboard.data.census import TaskCensus
 from dashboard.data.datum import DatumState
 from dashboard.data.task_snapshot import SnapshotHealth, TaskSnapshot, classify
 
+# REQUIRED, not tidy. The rotation offset advances on every collector call,
+# so a test asserting WHICH roots were served, or in what order, would
+# otherwise depend on how many collector calls EARLIER tests made. The unit
+# cache and last-good store are keyed by project-root STRING and tests here
+# reuse root names across ``tmp_path`` directories, so a test's first
+# acquisition could otherwise be answered from an earlier test's cache, or
+# served an earlier test's rows as ``stale``.
+pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')
+
 # ---------------------------------------------------------------------------
 # helpers used inside the aggregator
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(autouse=True)
-def _reset_root_rotation_between_tests():
-    """Start every test from rotation offset 0.
-
-    REQUIRED, not tidy. ``active_tasks._root_rotation_offset`` is module state
-    that ``collect_tasks_with_counts`` advances on every call (task 4884), so
-    without this any test that asserts WHICH roots were served — or in what
-    order they were admitted — silently depends on how many times an EARLIER
-    test in the session happened to call the collector. That is a test that
-    passes or fails by file order, which is worse than one that fails.
-    """
-    import dashboard.data.active_tasks as at_mod
-
-    at_mod._reset_root_rotation()
-    yield
-    at_mod._reset_root_rotation()
-
-
-@pytest.fixture(autouse=True)
-def _clear_the_snapshot_unit_between_tests():
-    """No test may be served the previous test's snapshot.
-
-    REQUIRED for the same reason as the rotation reset above. The unit holds
-    a 15 s TTL cache AND a never-expiring last-good store, both keyed by
-    project-root STRING, and tests here reuse root names across ``tmp_path``
-    directories. Without this a test's first acquisition can be answered from
-    an earlier test's cache — issuing no MCP call at all — or, worse, served
-    an earlier test's rows as ``stale``.
-    """
-    import dashboard.data.task_snapshot as snapshot_mod
-
-    snapshot_mod._snapshot_cache_clear()
-    yield
-    snapshot_mod._snapshot_cache_clear()
 
 
 def test_minutes_since_handles_z_suffix_and_naive_iso():
@@ -2273,9 +2249,9 @@ class TestTheReturnedUnitsCarryTheShapedRows:
         shaped list, which claims a measured zero at the last good's instant.
         Its census still ages, because a count needs no shaping.
 
-        The budget is squeezed through the module constant, the same idiom
-        ``TestCollectTasksBudget._tighten`` uses. That is the only way to cut
-        off a real acquisition without waiting out the shipped 14 s budget.
+        The per-project bound is injected small through ``budget=``, so a
+        real acquisition is cut off without waiting out the shipped 14 s
+        share.
         """
         import dashboard.data.task_snapshot as snapshot_mod
 
@@ -2291,9 +2267,9 @@ class TestTheReturnedUnitsCarryTheShapedRows:
 
         monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _hangs)
         monkeypatch.setattr(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0)
-        monkeypatch.setattr('dashboard.data.active_tasks._TASKS_PER_PROJECT_BUDGET', 0.05)
         active, snapshots = await collect_tasks_with_counts(
             dummy_client, config, now=_STUB_AS_OF + timedelta(seconds=20),
+            budget=replace(TASKS_BUDGET, per_project=0.05),
         )
 
         unit = snapshots['df']
@@ -2505,11 +2481,9 @@ class TestCollectTasksBudget:
         _register_runtime(monkeypatch, {})
 
     @staticmethod
-    def _tighten(monkeypatch, *, total, per_project):
-        monkeypatch.setattr('dashboard.data.active_tasks._TASKS_TOTAL_BUDGET', total)
-        monkeypatch.setattr(
-            'dashboard.data.active_tasks._TASKS_PER_PROJECT_BUDGET', per_project
-        )
+    def _tighten(*, total: float, per_project: float) -> TasksBudget:
+        """The shipped budget with its total and per-project bounds shrunk."""
+        return replace(TASKS_BUDGET, total=total, per_project=per_project)
 
     async def test_returns_rows_and_one_validated_snapshot_per_root(
         self, monkeypatch, tmp_path, dummy_client
@@ -2552,9 +2526,9 @@ class TestCollectTasksBudget:
         so ``delta`` and ``epsilon`` are guaranteed to find a non-positive
         remaining budget — they can only be reached by the deadline branch.
 
-        ``_TASKS_ROOT_CONCURRENCY`` is pinned to 1 for exactly that reason,
-        and the pin is what makes the derivation above true rather than a
-        coincidence. This test is about the DEADLINE branch, not about the
+        The budget's ``root_concurrency`` is pinned to 1 for exactly that
+        reason, and the pin is what makes the derivation above true rather
+        than a coincidence. This test is about the DEADLINE branch, not about the
         width: at the shipped width the fast roots slot into the first wave
         and the never-reached branch is simply not the one under test. That
         the branch still fires at the shipped width is asserted separately by
@@ -2569,16 +2543,15 @@ class TestCollectTasksBudget:
             {'beta': _BUDGET_SLOW, 'gamma': _BUDGET_SLOW},
             done_counts={'alpha': 7},
         )
-        self._tighten(monkeypatch, total=0.3, per_project=0.2)
-        monkeypatch.setattr(
-            'dashboard.data.active_tasks._TASKS_ROOT_CONCURRENCY', 1
+        budget = replace(
+            TASKS_BUDGET, total=0.3, per_project=0.2, root_concurrency=1,
         )
         config = _budget_config(
             tmp_path, ['alpha', 'beta', 'gamma', 'delta', 'epsilon']
         )
 
         active, snapshots = await collect_tasks_with_counts(
-            client=dummy_client, config=config,
+            client=dummy_client, config=config, budget=budget,
         )
         offline, counts, degraded = (
             _offline(snapshots), _done_counts(snapshots), _degraded(snapshots)
@@ -2620,12 +2593,12 @@ class TestCollectTasksBudget:
             {'beta': _BUDGET_SLOW},
             done_counts={'alpha': 1, 'gamma': 2},
         )
-        self._tighten(monkeypatch, total=10.0, per_project=0.2)
+        budget = self._tighten(total=10.0, per_project=0.2)
         config = _budget_config(tmp_path, ['alpha', 'beta', 'gamma'])
 
         started = time.monotonic()
         active, snapshots = await collect_tasks_with_counts(
-            client=dummy_client, config=config,
+            client=dummy_client, config=config, budget=budget,
         )
         elapsed = time.monotonic() - started
         offline, counts, degraded = (
@@ -2656,11 +2629,11 @@ class TestCollectTasksBudget:
             offline=('beta',),
             done_counts={'alpha': 4},
         )
-        self._tighten(monkeypatch, total=10.0, per_project=0.2)
+        budget = self._tighten(total=10.0, per_project=0.2)
         config = _budget_config(tmp_path, ['alpha', 'beta', 'gamma'])
 
         _active, snapshots = await collect_tasks_with_counts(
-            client=dummy_client, config=config,
+            client=dummy_client, config=config, budget=budget,
         )
         offline, counts, degraded = (
             _offline(snapshots), _done_counts(snapshots), _degraded(snapshots)
@@ -2757,15 +2730,13 @@ class TestCollectTasksBudget:
         self, monkeypatch, tmp_path, dummy_client
     ):
         """(e) the whole call is bounded, not merely each project within it."""
-        import dashboard.data.active_tasks as active_tasks_mod
-
         delays = {label: _BUDGET_SLOW for label in ('beta', 'gamma', 'delta')}
         _register_shaper(monkeypatch, delays)
-        self._tighten(monkeypatch, total=0.5, per_project=0.2)
+        budget = self._tighten(total=0.5, per_project=0.2)
         config = _budget_config(tmp_path, ['alpha', 'beta', 'gamma', 'delta'])
 
         started = time.monotonic()
-        await collect_tasks_with_counts(client=dummy_client, config=config)
+        await collect_tasks_with_counts(client=dummy_client, config=config, budget=budget)
         elapsed = time.monotonic() - started
 
         sum_of_sleeps = sum(delays.values())
@@ -2776,9 +2747,9 @@ class TestCollectTasksBudget:
         )
         # +0.5s of tolerance for event-loop scheduling, the same convention as
         # test_healthz_deadline.py's elapsed assertions.
-        assert elapsed < active_tasks_mod._TASKS_TOTAL_BUDGET + 0.5, (
+        assert elapsed < budget.total + 0.5, (
             f'elapsed {elapsed:.3f}s exceeded the whole-handler budget of '
-            f'{active_tasks_mod._TASKS_TOTAL_BUDGET}s'
+            f'{budget.total}s'
         )
 
     async def test_external_status_fetch_cannot_overrun_the_handler_budget(
@@ -2800,8 +2771,6 @@ class TestCollectTasksBudget:
         same treatment the ``ext_remaining <= 0`` skip and the per-project
         ``TimeoutError`` branch already give.
         """
-        import dashboard.data.active_tasks as active_tasks_mod
-
         _register_shaper(
             monkeypatch, {}, external_deps=['dark_factory:13', 'reify:8'],
         )
@@ -2816,12 +2785,13 @@ class TestCollectTasksBudget:
         # A positive remainder when the external leg is reached: the
         # ext_remaining <= 0 skip must NOT be what saves us here, or the test
         # would pass against the unbounded code.
-        self._tighten(monkeypatch, total=1.0, per_project=0.5)
+        budget = self._tighten(total=1.0, per_project=0.5)
         config = _budget_config(tmp_path, ['alpha'])
 
         started = time.monotonic()
         active, snapshots = await collect_tasks_with_counts(
             client=dummy_client, config=config, resolve_external=True,
+            budget=budget,
         )
         elapsed = time.monotonic() - started
         offline = _offline(snapshots)
@@ -2831,9 +2801,9 @@ class TestCollectTasksBudget:
             'external-status sleep — the batched external-dep call is still '
             'unbounded, so the handler budget does not bound the handler'
         )
-        assert elapsed < active_tasks_mod._TASKS_TOTAL_BUDGET + 0.5, (
+        assert elapsed < budget.total + 0.5, (
             f'elapsed {elapsed:.3f}s exceeded the whole-handler budget of '
-            f'{active_tasks_mod._TASKS_TOTAL_BUDGET}s'
+            f'{budget.total}s'
         )
         # Degrade honestly: no status was read, so none is fabricated, and the
         # project is NOT declared offline (its rows loaded fine).
@@ -2848,7 +2818,7 @@ class TestCollectTasksBudget:
     ):
         """(f) with fast projects, nothing degrades and the payload is identical."""
         _register_shaper(monkeypatch, {}, done_counts={'alpha': 11, 'beta': 22})
-        # Shipped constants deliberately NOT tightened here: the happy path
+        # The shipped budget deliberately NOT tightened here: the happy path
         # must hold under the values that actually ship.
         config = _budget_config(tmp_path, ['alpha', 'beta'])
 
@@ -2973,8 +2943,6 @@ class TestCollectTasksWithCountsConcurrency:
         unbounded ``gather`` would show all 9 — the ``httpx.PoolTimeout``
         hazard ``burndown.py`` records against the shared client.
         """
-        import dashboard.data.active_tasks as at_mod
-
         config = self._n_root_config(tmp_path, 9)
         _register_runtime(monkeypatch, {})
         events = self._tracking_stub(monkeypatch)
@@ -2982,9 +2950,9 @@ class TestCollectTasksWithCountsConcurrency:
         await collect_tasks_with_counts(client=dummy_client, config=config)
 
         peak = self._max_simultaneous(events)
-        assert peak == at_mod._TASKS_ROOT_CONCURRENCY, (
-            f'peak in-flight roots was {peak}, expected exactly '
-            f'_TASKS_ROOT_CONCURRENCY={at_mod._TASKS_ROOT_CONCURRENCY} over 9 '
+        assert peak == TASKS_BUDGET.root_concurrency, (
+            f'peak in-flight roots was {peak}, expected exactly the shipped '
+            f'root_concurrency={TASKS_BUDGET.root_concurrency} over 9 '
             'roots — 1 means the sequential walk that starved the tail is '
             'still in place, 9 means the semaphore is missing (an unbounded '
             'fan-out against the single fused-memory server on the httpx '
@@ -3014,7 +2982,7 @@ class TestCollectTasksWithCountsConcurrency:
 
         import dashboard.data.active_tasks as at_mod
 
-        width = at_mod._TASKS_ROOT_CONCURRENCY
+        width = TASKS_BUDGET.root_concurrency
         config = self._n_root_config(tmp_path, 9)
         _register_runtime(monkeypatch, {})
 
@@ -3052,7 +3020,7 @@ class TestCollectTasksWithCountsConcurrency:
             newly = len(entered) - admitted
             assert 0 < newly <= width, (
                 f'wave {len(wave_sizes) + 1} admitted {newly} roots against a '
-                f'_TASKS_ROOT_CONCURRENCY of {width} — 0 means the walk '
+                f'root_concurrency of {width} — 0 means the walk '
                 'stalled with slots free, more than the width means the '
                 'semaphore is not bounding anything (an unbounded fan-out '
                 'against the single fused-memory server on the httpx client '
@@ -3175,20 +3143,17 @@ class TestCollectTasksWithCountsConcurrency:
         first 3 admissions return without awaiting, the rest hang until their
         own per-project budget ends them.
         """
-        import dashboard.data.active_tasks as at_mod
-
         config = self._n_root_config(tmp_path, 9)
         _register_runtime(monkeypatch, {})
         self._tracking_stub(monkeypatch, serve_first=3)
-        monkeypatch.setattr(at_mod, '_TASKS_PER_PROJECT_BUDGET', 0.05)
-        # Generous, deliberately: the TOTAL budget expiring is a DIFFERENT
-        # branch (tested by the fairness class). What must be exercised here
-        # is the per-project expiry.
-        monkeypatch.setattr(at_mod, '_TASKS_TOTAL_BUDGET', 5.0)
+        # The total is generous, deliberately: the TOTAL budget expiring is a
+        # DIFFERENT branch (tested by the fairness class). What must be
+        # exercised here is the per-project expiry.
+        budget = replace(TASKS_BUDGET, per_project=0.05, total=5.0)
 
         with caplog.at_level(logging.WARNING):
-            active, snapshots = (
-                await collect_tasks_with_counts(client=dummy_client, config=config)
+            active, snapshots = await collect_tasks_with_counts(
+                client=dummy_client, config=config, budget=budget,
             )
         offline, counts, degraded = (
             _offline(snapshots), _done_counts(snapshots), _degraded(snapshots)
@@ -3382,8 +3347,6 @@ class TestCollectTasksWithCountsFairness:
         the one ``_rotated_project_roots`` implements; deriving the count here
         keeps this test correct if that choice is ever revisited.
         """
-        import dashboard.data.active_tasks as at_mod
-
         config = self._n_root_config(tmp_path, 9)
         _register_runtime(monkeypatch, {})
         # DETERMINISTIC cut, not a wall-clock one. The served count must be a
@@ -3397,21 +3360,20 @@ class TestCollectTasksWithCountsFairness:
         )
         # Width 1 so the served subset is a contiguous window of the admission
         # order and the arithmetic above is exact rather than probabilistic.
-        monkeypatch.setattr(at_mod, '_TASKS_ROOT_CONCURRENCY', 1)
-        # Small enough that the six hung roots cost ~0.3s per render, large
-        # enough that no scheduling delay can starve a root that the stub
-        # above serves without awaiting. The TOTAL budget is deliberately NOT
-        # the constraint here: it is measured from before the runtime fan-out,
-        # so tightening it would reintroduce exactly the host-speed dependence
-        # this test just removed.
-        monkeypatch.setattr(at_mod, '_TASKS_PER_PROJECT_BUDGET', 0.05)
-        monkeypatch.setattr(at_mod, '_TASKS_TOTAL_BUDGET', 5.0)
-        at_mod._reset_root_rotation()
+        # The per-project share is small enough that the six hung roots cost
+        # ~0.3s per render, large enough that no scheduling delay can starve a
+        # root that the stub above serves without awaiting. The TOTAL budget
+        # is deliberately NOT the constraint here: it is measured from before
+        # the runtime fan-out, so tightening it would reintroduce exactly the
+        # host-speed dependence this test just removed.
+        budget = replace(
+            TASKS_BUDGET, root_concurrency=1, per_project=0.05, total=5.0,
+        )
 
         async def _one_render() -> set[str]:
             admissions.clear()  # serve_first counts within ONE render
-            active, _snapshots = (
-                await collect_tasks_with_counts(client=dummy_client, config=config)
+            active, _snapshots = await collect_tasks_with_counts(
+                client=dummy_client, config=config, budget=budget,
             )
             return {row['project'] for row in active}
 
@@ -3449,20 +3411,17 @@ class TestCollectTasksWithCountsFairness:
         A random shuffle would also spread the starvation but would make both
         of those impossible.
         """
-        import dashboard.data.active_tasks as at_mod
-
         config = self._n_root_config(tmp_path, 5)
         _register_runtime(monkeypatch, {})
         admissions = self._admission_recorder(monkeypatch, dwell=0.0)
         # Width 1 so admission order is unambiguous rather than a race between
         # concurrently-admitted roots.
-        monkeypatch.setattr(at_mod, '_TASKS_ROOT_CONCURRENCY', 1)
-        at_mod._reset_root_rotation()
+        width_one = replace(TASKS_BUDGET, root_concurrency=1)
 
-        await collect_tasks_with_counts(client=dummy_client, config=config)
+        await collect_tasks_with_counts(client=dummy_client, config=config, budget=width_one)
         first = list(admissions)
         admissions.clear()
-        await collect_tasks_with_counts(client=dummy_client, config=config)
+        await collect_tasks_with_counts(client=dummy_client, config=config, budget=width_one)
         second = list(admissions)
 
         assert len(first) == 5 and len(second) == 5, (
@@ -3485,12 +3444,9 @@ class TestCollectTasksWithCountsFairness:
         reshuffle on every 3 s poll — a fix for invisibility that trades it
         for unreadability.
         """
-        import dashboard.data.active_tasks as at_mod
-
         config = self._n_root_config(tmp_path, 5)
         _register_runtime(monkeypatch, {})
         self._admission_recorder(monkeypatch, dwell=0.0)
-        at_mod._reset_root_rotation()
 
         expected = [f'proj-{i:02d}' for i in range(5)]
         for render in range(4):

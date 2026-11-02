@@ -37,7 +37,7 @@ _CFG = EvalConfig(name='test-cfg', backend='claude', model='sonnet', effort='hig
 def _stem_loader(path: Path) -> dict:
     """Minimal task dict used by all matrix tests.
 
-    The id is all the non-mocked ``_run_one`` closure reads, for the store's
+    The id is all each cell's thunk reads itself, for the store's
     ``exists`` skip check (bypassed under ``force=True``).  ``run_eval`` is
     separately monkeypatched in each test, so the dict is never deeply
     inspected.
@@ -95,7 +95,11 @@ class TestRunEvalMatrixStore:
 
         async def fake_run_eval(task_path: Path, config: EvalConfig, *args, **kwargs) -> EvalResult:
             calls.append((config.name, kwargs))
-            return EvalResult(task_path.stem, config.name, 'done', {}, '/tmp/stub')
+            result = EvalResult(
+                task_path.stem, config.name, 'done', {}, '/tmp/stub', run_id='efgh5678',
+            )
+            kwargs['store'].save(result)
+            return result
 
         monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
 
@@ -107,6 +111,52 @@ class TestRunEvalMatrixStore:
         [(config_name, kwargs)] = calls
         assert config_name == 'missing-cfg'
         assert kwargs['store'] is store
+        assert store.exists('task_a', 'missing-cfg')
+
+    async def test_max_parallel_bounds_the_live_cells(
+        self, patch_load_task, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        task_paths = [tmp_path / f'task_{name}.json' for name in 'abc']
+        live = 0
+        peak = 0
+
+        async def fake_run_eval(task_path: Path, config: EvalConfig, *args, **kwargs) -> EvalResult:
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            await asyncio.sleep(0.01)
+            live -= 1
+            return EvalResult(task_path.stem, config.name, 'done', {}, '/tmp/stub')
+
+        monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
+
+        results = await run_eval_matrix(
+            task_paths, [_CFG], max_parallel=1, force=True,
+            store=ResultStore(tmp_path / 'results'),
+        )
+
+        assert peak == 1
+        assert sorted(r.task_id for r in results) == ['task_a', 'task_b', 'task_c']
+
+    async def test_each_pair_runs_once_per_trial(
+        self, patch_load_task, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        task_path = tmp_path / 'task_a.json'
+        trials: list[int] = []
+
+        async def fake_run_eval(task_path: Path, config: EvalConfig, *args, **kwargs) -> EvalResult:
+            trials.append(kwargs['trial'])
+            return EvalResult(task_path.stem, config.name, 'done', {}, '/tmp/stub')
+
+        monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
+
+        results = await run_eval_matrix(
+            [task_path], [_CFG], trials=2, force=True,
+            store=ResultStore(tmp_path / 'results'),
+        )
+
+        assert sorted(trials) == [1, 2]
+        assert len(results) == 2
 
 
 @pytest.mark.asyncio

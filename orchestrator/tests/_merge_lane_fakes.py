@@ -40,6 +40,7 @@ from typing import Any
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.gates import PostMergePyrightResult
+from orchestrator.merge_lane.ports import ClockPort
 from orchestrator.merge_lane.types import DiskGuardOutcome, MergeOutcome
 from orchestrator.merge_lane.worker import MAIN_HEALTH_PROBE_PENDING_NOTE
 from orchestrator.verify import VerifyResult
@@ -389,7 +390,9 @@ class FakeClock:
         self.mono += secs
         await asyncio.sleep(min(secs, self.sleep_cap))
 
-    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+    async def wait_for_any(
+        self, aws: Collection[asyncio.Future[Any]], timeout: float,
+    ) -> set[asyncio.Future[Any]]:
         self.waits.append(timeout)
         # A REAL bounded wait, never a bare yield: a yield reschedules on the
         # ready queue without letting any timer fire, which starves whatever
@@ -398,6 +401,9 @@ class FakeClock:
         done, _ = await asyncio.wait(aws, timeout=min(timeout, self.wait_cap))
         self.mono += timeout
         return done
+
+
+_FAKE_CLOCK_IS_A_CLOCK_PORT: ClockPort = FakeClock()
 
 
 def healthy_verify_clock() -> FakeClock:

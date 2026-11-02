@@ -2000,7 +2000,6 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
                           return_value=MagicMock()), \
              patch('asyncio.create_task', return_value=MagicMock()):
             mock_smw = MagicMock()
-            mock_smw.run = AsyncMock(return_value=None)
             mock_smw_cls.return_value = mock_smw
 
             await h._start_merge_worker()
@@ -2058,7 +2057,6 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
                           return_value=MagicMock()), \
              patch('asyncio.create_task', return_value=MagicMock()):
             mock_smw = MagicMock()
-            mock_smw.run = AsyncMock(return_value=None)
             mock_smw_cls.return_value = mock_smw
 
             await h._start_merge_worker()

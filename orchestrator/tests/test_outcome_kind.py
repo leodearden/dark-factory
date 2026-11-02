@@ -6,8 +6,7 @@ These tests pin: the exact 23-member vocabulary, str-compatibility (existing
 ``==``/``in``/json comparisons must keep working unchanged), the
 ``is_terminal`` classification, byte-identical payloads through the real
 ``EventStore`` emit chokepoint, and the non-terminal set as a frozen contract
-(mirrored by the dashboard's ``_ACTIVE_ONLY`` allowlist — see
-plans/dashboard-alignment-prd.md).
+(stated at ``orchestrator/src/orchestrator/merge_lane/types.py::_NON_TERMINAL_OUTCOMES``).
 """
 
 from __future__ import annotations
@@ -93,8 +92,8 @@ class TestOutcomeKindIsTerminal:
         """Task 3539's already-landed outcome is TERMINAL for the same reason
         its sibling ``plan_files_cross_repo`` is: both name a branch that is
         legitimately EMPTY, so there is nothing a retry could add.  Keeping it
-        OUT of the non-terminal frozen set is what stops the dashboard's
-        ``_ACTIVE_ONLY`` mirror from showing a finished task as still live."""
+        OUT of the non-terminal frozen set is what classifies an already-landed
+        attempt as finished rather than still live."""
         from orchestrator.merge_lane.types import _NON_TERMINAL_OUTCOMES
 
         assert OutcomeKind.plan_files_already_landed.is_terminal is True
@@ -104,9 +103,8 @@ class TestOutcomeKindIsTerminal:
 
     def test_plan_files_cross_repo_is_terminal(self) -> None:
         """The new cross-repo outcome is TERMINAL (ends the merge attempt) and
-        stays OUT of the non-terminal frozen set, so the dashboard
-        ``_ACTIVE_ONLY`` mirror + ``TestOutcomeKindFrozenContract`` are
-        unaffected."""
+        stays OUT of the non-terminal frozen set, so the frozen contract pinned
+        by ``TestOutcomeKindFrozenContract`` is unaffected."""
         assert OutcomeKind('plan_files_cross_repo').is_terminal is True
         assert 'plan_files_cross_repo' not in _NON_TERMINAL_VALUES
 
@@ -142,12 +140,13 @@ class TestOutcomeKindPayloadIdentity:
 class TestOutcomeKindFrozenContract:
     """Pins the non-terminal set as a frozen contract.
 
-    Changing this set REQUIRES updating
-    dashboard/src/dashboard/data/merge_queue.py's ``_ACTIVE_ONLY`` allowlist
-    in the SAME change — the dashboard mirrors this set with no orchestrator
-    import, so nothing on the dashboard side will fail automatically if this
-    set changes without a matching dashboard edit. This test is the drift
-    tripwire.
+    The set decides which merge_attempt outcomes mean the attempt or merge is
+    still live. ``scripts/merge_lane_throughput.py::_NON_TERMINAL_OUTCOMES``
+    mirrors it as literal strings with no orchestrator import, so changing the
+    set REQUIRES updating that mirror in the SAME change — nothing on the
+    script's side fails automatically. This test is the drift tripwire; the
+    contract itself lives at
+    ``orchestrator/src/orchestrator/merge_lane/types.py::_NON_TERMINAL_OUTCOMES``.
     """
 
     def test_non_terminal_set_is_frozen(self) -> None:

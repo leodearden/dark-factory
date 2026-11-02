@@ -10,13 +10,12 @@ machine-derived set of roles.
 Short version of the finding: `Grep` rejects a look-around pattern outright
 and prints a remedy naming a ripgrep CLI flag the tool exposes no parameter
 for. `Grep` is a Claude Code builtin, so the CAUSE is upstream of this
-repository and is not addressed here at all. The reproduced call, both error
-strings, the unreachable-remedy argument, what is and is not in scope, which
-roles carry which variant, and the shell measurements behind the escape hatch
-are recorded ONCE, next to the constants they constrain, in the comment block
-above `orchestrator/src/orchestrator/agents/roles.py::_GREP_ENGINE_LIMITS`.
-This module points there rather than carrying a second copy that would have to
-be re-corrected in step with the first.
+repository and is not addressed here at all. Only the told-upfront and
+recovery facets are in scope: an agent told the limit before it writes the
+pattern does not spend a turn discovering it, and one that reads the remedy
+correctly does not retry with a flag the tool lacks. The reproduced call, the
+error strings and the escape hatch's shell measurements live in task 5331's
+commits, not here.
 
 Its real effect is on model behaviour and is not unit-testable, but silent
 removal during a prompt refactor is a genuine regression — the repo sanctions
@@ -50,7 +49,7 @@ from _role_splice_contract import (
     bash_capable_unpinned_contract,
 )
 
-from orchestrator.agents.roles import (
+from orchestrator.agents.harness_guidance import (
     _GREP_ENGINE_LIMITS,
     _GREP_PCRE_BASH_RECOURSE,
     _GREP_PCRE_READ_ONLY_RECOURSE,
@@ -372,6 +371,8 @@ def test_variant_placement_is_structural(name):
     So nothing may be spliced ahead of either landmark, and
     `ERROR_REMEDY_HINT_GUIDANCE` abuts both — appending after it is the one
     spot satisfying every pre-existing invariant with no per-role branching.
+    `_GREP_ENGINE_LIMITS`'s "the section just above" is true only while this
+    abutment holds, so reword that sentence if this pin ever changes.
     No `char_budget` is passed: that secondary bound belongs to the wait
     block's own up-front invariant, not to a block spliced behind it.
 

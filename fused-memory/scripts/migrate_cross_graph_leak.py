@@ -114,10 +114,7 @@ from fused_memory.maintenance.cross_graph_move import (
     delete_source_node,
     recreate_subgraph_relationships,
 )
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('migrate_cross_graph_leak')
 
@@ -553,23 +550,18 @@ async def run(args: Any, memory_service: Any) -> dict:
     # continues, and StoreMutationUnavailable subclasses RuntimeError, so a
     # probe inside the loop would be swallowed into N blocked rows while the
     # remaining nodes carried on mutating.
-    try:
-        assert_store_mutation_allowed(operation='migrate_cross_graph_leak --apply')
-    except StoreMutationUnavailable:
-        logger.error(
-            'migrate_cross_graph_leak: --apply NOT started (fail-closed) -- '
-            "this process cannot write mem0's history directory, so a "
-            'migration would create home-graph copies, recreate their edges '
-            'and DETACH DELETE their sources without recording any of it, and '
-            'a run interrupted part-way through the three phases strands nodes '
-            'BETWEEN graphs (a home copy with no edges, or a deleted source '
-            'whose edges never landed). The reviewed manifest was not even '
-            'read, and nothing was mutated. Route the migration through the '
-            'fused-memory MCP server (the unsandboxed owner of the store), or '
-            're-run from an unsandboxed operator shell. To obtain the census '
-            'manifest safely from anywhere, re-run without --apply.'
-        )
-        raise
+    assert_store_mutation_allowed(
+        operation='migrate_cross_graph_leak --apply',
+        logger=logger,
+        extra_detail=(
+            'a migration would create home-graph copies, recreate their edges and '
+            'DETACH DELETE their sources without recording any of it, and a run '
+            'interrupted part-way through the three phases strands nodes BETWEEN '
+            'graphs (a home copy with no edges, or a deleted source whose edges '
+            'never landed). The reviewed manifest was not even read, and nothing '
+            'was mutated.'
+        ),
+    )
 
     manifest = load_reviewed_manifest(args.manifest)
 

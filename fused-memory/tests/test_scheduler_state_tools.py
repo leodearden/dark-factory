@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from orchestrator.config import OrchestratorConfig
+from orchestrator.pause_policy import PauseClass
 from orchestrator.pin_reservation import PinOrder
 from orchestrator.scheduler import Scheduler
 from shared.project_layout import scheduler_state_json
@@ -82,6 +83,7 @@ _COLD_START = {
     'lock_depth': None,
     'is_paused': False,
     'pause_reason': None,
+    'pause_class': None,
     'requeue_cooldowns': {},
     'snapshot_at': None,
 }
@@ -187,7 +189,7 @@ class TestGetSchedulerStateTool:
     async def test_cold_start_returns_every_key_and_a_null_snapshot_at(
         self, tmp_path, mcp_server
     ):
-        """B6: with no scheduler_state.json, all 13 keys come back empty."""
+        """B6: with no scheduler_state.json, every key comes back empty."""
         result = await _get_scheduler_state(mcp_server, tmp_path)
         assert result == _COLD_START
 
@@ -213,6 +215,21 @@ class TestGetSchedulerStateTool:
         assert 'P' in result['pin_reservations']
         assert set(result['requeue_cooldowns']['T1']) == _REQUEUE_COOLDOWN_FIELDS
         assert isinstance(result['snapshot_at'], str)
+
+    @pytest.mark.asyncio
+    async def test_reports_the_structured_pause_class_a_scheduler_holds(
+        self, tmp_path, mcp_server
+    ):
+        scheduler = Scheduler(OrchestratorConfig(project_root=tmp_path, max_per_module=1))
+        scheduler.finish_startup()
+        scheduler.pause('cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
+        await scheduler.flush_state_snapshot()
+
+        result = await _get_scheduler_state(mcp_server, tmp_path)
+
+        assert result['is_paused'] is True
+        assert result['pause_reason'] == 'cost_ceiling_orch_exceeded'
+        assert result['pause_class'] == 'cost_ceiling'
 
     @pytest.mark.asyncio
     async def test_unknown_key_from_a_newer_producer_is_not_returned(

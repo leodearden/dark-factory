@@ -6,11 +6,14 @@ no backend is involved.
 from __future__ import annotations
 
 import json
+import logging
+import sqlite3
 from pathlib import Path
 
 import pytest
 from _fm_helpers import complete_paged_read, incomplete_paged_read, load_script_module
 from reconciliation import plural_enum_shapes
+from shared.project_layout import tasks_db
 
 from fused_memory.backends.graphiti_client import INCOMPLETE_SHORT_READ
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
@@ -238,3 +241,103 @@ class TestTaskStorePreflight:
     ):
         assert probe.main(['--project', f'dark_factory={tmp_path}']) == 2
         assert not (tmp_path / '.taskmaster').exists()
+
+
+def _seed_populated_task_store(root: Path) -> None:
+    db = tasks_db(root)
+    db.parent.mkdir(parents=True)
+    connection = sqlite3.connect(db)
+    try:
+        connection.execute('CREATE TABLE tasks (id TEXT)')
+        connection.execute("INSERT INTO tasks VALUES ('1')")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _install_backend_fakes(monkeypatch) -> list[str]:
+    """Replace the three names ``_main`` imports lazily; return the close log."""
+    closed: list[str] = []
+
+    class _Config:
+        taskmaster = None
+
+    class _Graphiti:
+        def __init__(self, config):
+            pass
+
+        async def initialize(self, *, skip_maintenance):
+            pass
+
+        async def enumerate_all_valid_edges(self, *, group_id):
+            return {}, complete_paged_read()
+
+        async def close(self):
+            closed.append('graphiti')
+
+    class _Tasks:
+        def __init__(self, config):
+            pass
+
+        async def start(self):
+            pass
+
+        async def get_statuses(self, root):
+            return {}
+
+        async def close(self):
+            closed.append('tasks')
+
+    monkeypatch.setattr('fused_memory.config.schema.FusedMemoryConfig', _Config)
+    monkeypatch.setattr('fused_memory.backends.graphiti_client.GraphitiBackend', _Graphiti)
+    monkeypatch.setattr('fused_memory.backends.sqlite_task_backend.SqliteTaskBackend', _Tasks)
+    return closed
+
+
+def _script_errors(caplog) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == 'measure_stale_status_snapshot_sweep' and r.levelno >= logging.ERROR
+    ]
+
+
+class TestNonStdoutOSErrorsAreAttributedAtTheirSeam:
+    """Left to escape ``main()``, these would reach ``run_cli``'s stdout arm
+    and be reported as "cannot write to stdout"."""
+
+    def test_an_unreadable_triage_note_is_bad_input_before_any_read(self, tmp_path, caplog):
+        note = tmp_path / 'absent.md'
+
+        with caplog.at_level(logging.ERROR, logger='measure_stale_status_snapshot_sweep'):
+            code = probe.main([
+                '--project', f'dark_factory={tmp_path}', '--triage-note', str(note),
+            ])
+
+        assert code == probe.EXIT_BAD_INPUT == 2
+        errors = _script_errors(caplog)
+        assert len(errors) == 1
+        assert str(note) in errors[0]
+        assert 'stdout' not in errors[0]
+        assert not (tmp_path / '.taskmaster').exists()
+
+    def test_an_unwritable_artifact_pair_is_a_run_failure_not_an_escaping_oserror(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        _seed_populated_task_store(tmp_path)
+        closed = _install_backend_fakes(monkeypatch)
+        blocker = tmp_path / 'not-a-dir'
+        blocker.write_text('x')
+
+        with caplog.at_level(logging.ERROR, logger='measure_stale_status_snapshot_sweep'):
+            code = probe.main([
+                '--project', f'dark_factory={tmp_path}',
+                '--json-out', str(blocker / 'r.json'),
+                '--md-out', str(blocker / 'r.md'),
+            ])
+
+        assert code == probe.EXIT_RUN_FAILED == 1
+        errors = _script_errors(caplog)
+        assert len(errors) == 1
+        assert str(blocker) in errors[0]
+        assert 'stdout' not in errors[0]
+        assert sorted(closed) == ['graphiti', 'tasks']

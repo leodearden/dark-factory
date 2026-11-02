@@ -2,7 +2,7 @@
 
 This module is the ROUTE layer. The aggregation it calls lives in
 ``dashboard.data.merge_queue``, whose name it deliberately mirrors; the
-names imported below (``build_per_project_merge_queue``,
+names imported below (``DepthSeries``, ``build_per_project_merge_queue``,
 ``fetch_live_merge_queues``, ``resolve_active``, ``merge_task_refs``,
 ``enrich_merges_with_titles``) all come from that data module, never from
 here. Row titles come from ``dashboard.data.task_lookup.lookup_tasks``: one
@@ -25,10 +25,11 @@ from fastapi.responses import JSONResponse
 from dashboard.api.window import _parse_window, with_window
 from dashboard.config import DashboardConfig
 from dashboard.data import redux_api
-from dashboard.data.chart_utils import ChartData, trim_leading_zero_buckets
+from dashboard.data.chart_utils import trim_leading_zero_buckets
 from dashboard.data.db import DbPool
 from dashboard.data.merge_halt import get_merge_halt_status
 from dashboard.data.merge_queue import (
+    DepthSeries,
     build_per_project_merge_queue,
     enrich_merges_with_titles,
     fetch_live_merge_queues,
@@ -91,7 +92,7 @@ async def api_merge_queue(request: Request) -> JSONResponse:
         pid: {
             **data,
             'depth_timeseries': trim_leading_zero_buckets(
-                cast(ChartData, data['depth_timeseries'])
+                cast(DepthSeries, data['depth_timeseries'])
             ),
             'recent': enrich_merges_with_titles(data['recent'], pid, lookup),
             'active': enrich_merges_with_titles(queues[pid].entries, pid, lookup),

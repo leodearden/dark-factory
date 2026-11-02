@@ -26,6 +26,8 @@ from _store_mutation_preflight_contract import (
     neutralise_fixture,
 )
 
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
+
 SCRIPT_PATH = (
     Path(__file__).parent.parent
     / 'scripts'
@@ -111,7 +113,7 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod._run(self._args(apply=True))
 
@@ -129,7 +131,7 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
         _install_backend_sentinel(monkeypatch)
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod._run(self._args(apply=True))
 
     @pytest.mark.asyncio
@@ -204,13 +206,14 @@ class TestRunApplyStoreMutationPreflight:
 
         with (
             caplog.at_level(logging.ERROR),
-            pytest.raises(_mod.StoreMutationUnavailable),
+            pytest.raises(StoreMutationUnavailable),
         ):
             await _mod._run(self._args(apply=True))
 
         # The logger is ``invalidate_shipping_edges``, NOT the module name --
         # filtering on the module name would match nothing and be vacuous.
-        assert fail_closed_records(caplog, 'invalidate_shipping_edges'), (
+        (record,) = fail_closed_records(caplog, 'invalidate_shipping_edges')
+        assert SENTINEL in record.getMessage(), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

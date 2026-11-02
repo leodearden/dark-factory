@@ -3,7 +3,7 @@
 Covers:
   - GitOps.get_rebase_distance
   - classify_rebase_cohort (pure function)
-  - VerifyResult.duration_secs + _verify_duration_secs helper
+  - VerifyResult.duration_secs
   - _aggregate_results duration propagation
   - EventStore.fetch_events_by_type
   - _inter_iteration_rebase enrichment (distance_commits + cohort)
@@ -278,7 +278,7 @@ def test_fetch_events_by_type_scoped_to_run_id(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# step-05 RED: VerifyResult.duration_secs field + _verify_duration_secs helper
+# step-05 RED: VerifyResult.duration_secs field
 # ---------------------------------------------------------------------------
 
 
@@ -298,30 +298,6 @@ def test_verify_result_duration_secs_settable():
         summary='ok', duration_secs=3.14,
     )
     assert r.duration_secs == pytest.approx(3.14)
-
-
-@pytest.mark.parametrize('runs,expected', [
-    # Three runs with mixed durations
-    (
-        [{'duration_secs': 1.5}, {'duration_secs': 2.0}, {'duration_secs': 0.0}],
-        3.5,
-    ),
-    # Single run
-    ([{'duration_secs': 4.2}], 4.2),
-    # Empty list → 0.0
-    ([], 0.0),
-    # Runs without duration_secs key → treated as 0.0 per entry
-    ([{'rc': 0}, {'rc': 0}], 0.0),
-    # Missing key in some entries
-    ([{'duration_secs': 1.0}, {'rc': 0}], 1.0),
-])
-def test_verify_duration_secs(runs, expected):
-    """_verify_duration_secs sums per-command duration_secs (default 0.0 per entry)."""
-    from orchestrator.verify import _verify_duration_secs
-    result = _verify_duration_secs(runs)
-    assert result == pytest.approx(expected), (
-        f'_verify_duration_secs({runs}) => {result}, expected {expected}'
-    )
 
 
 # ---------------------------------------------------------------------------

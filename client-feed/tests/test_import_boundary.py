@@ -2,6 +2,7 @@
 
 import ast
 import importlib.util
+import subprocess
 import sys
 from collections.abc import Iterator
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 import pytest
 
 FORBIDDEN_ROOTS = frozenset({'orchestrator', 'fused_memory', 'dashboard'})
-ALLOWED_SHARED_MODULES = ('shared.project_layout', 'shared.task_metadata')
+ALLOWED_SHARED_MODULES = ('shared.defects', 'shared.project_layout', 'shared.task_metadata')
 VENDORABLE_MODULES = frozenset({'__init__', 'contract', 'fold', 'validate', 'cli'})
 VENDORABLE_ROOTS = frozenset({'pydantic', 'client_feed'}) | frozenset(sys.stdlib_module_names)
 
@@ -53,7 +54,7 @@ def test_no_module_imports_the_factory_services(source: Path) -> None:
 
 
 @pytest.mark.parametrize('source', _package_files(), ids=lambda path: path.name)
-def test_shared_imports_are_limited_to_layout_and_task_metadata(source: Path) -> None:
+def test_shared_imports_are_limited_to_the_allowed_modules(source: Path) -> None:
     offenders = [
         name
         for name in _imported_modules(source)
@@ -77,3 +78,23 @@ def test_vendorable_modules_import_only_stdlib_pydantic_and_client_feed(source: 
         name for name in _imported_modules(source) if _root(name) not in VENDORABLE_ROOTS
     ]
     assert offenders == []
+
+
+_CONTRACT_LOAD_PROBE = """
+import sys
+import client_feed.contract
+loaded = sorted(
+    name for name in sys.modules
+    if name.split('.')[0] == 'shared' or name == 'client_feed.defect_ref'
+)
+print('\\n'.join(loaded), end='')
+"""
+
+
+def test_the_vendorable_contract_loads_no_shared_module() -> None:
+    probe = subprocess.run(
+        [sys.executable, '-c', _CONTRACT_LOAD_PROBE], check=False, capture_output=True, text=True
+    )
+
+    assert probe.returncode == 0, probe.stderr
+    assert probe.stdout == ''

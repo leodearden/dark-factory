@@ -233,7 +233,22 @@ def test_a_timed_out_wait_is_undecided_and_any_other_failure_is_not() -> None:
 @pytest.mark.parametrize(
     "reply",
     [
-        {"status": "pending"},
+        {"status": "pending", "ticket": "tkt_1", "reason": "wait_timeout"},
+        {"status": "awaiting_curation", "ticket": "tkt_1", "reason": "curation-deferred: llm-failed"},
+    ],
+    ids=["pending", "awaiting-curation"],
+)
+def test_an_open_ticket_is_undecided_and_names_no_task(reply) -> None:
+    outcome = _resolve(reply)
+
+    assert outcome.undecided is True
+    assert outcome.task_id is None
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        {"status": "exploded"},
         {"status": "created"},
         {"status": "combined", "task_id": "not-a-number"},
         {"status": "created", "task_id": True},

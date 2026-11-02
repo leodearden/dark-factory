@@ -364,6 +364,17 @@ but never fail a submission. The rule itself lives in a new pure module,
 `escalation/src/escalation/merge_lane_resolution.py`, so it is testable without building a
 server, a queue, a registry and a fake worker.
 
+**`lane_source` has a fourth value, `'unavailable'` (task 5564).** `lane_source` is one of
+`'argument'`, `'task_metadata'`, `'default'` (the task was read and asked for nothing) or
+`'unavailable'` (the task-store read failed or timed out, so what the task carries is
+unknown). Previously a failed read's `{}` was reported as `'default'`, so a main-health
+hotfix relying on `metadata.merge_lane='high'` that was silently downgraded on a degraded
+store looked identical to a healthy no-op submission. The lane itself is unchanged —
+still `'normal'`, fail-open — only the reported provenance is more honest. The spelling
+mirrors `TaskMetadataResult.unavailable`, and the value alone carries the "lane is
+`'normal'` BECAUSE the read failed" fact, so no extra response key was added.
+`resolve_merge_lane` takes the flag as `metadata_unavailable` and stays pure.
+
 **`merge_lane` is now a Tier-A blessed metadata key**, so `parse_metadata` no longer emits
 `code=unknown_key` on every carrier, and `docs/task-authoring.md` §8 states what the key
 means and why `'high'` stays reserved. Blessed rather than promoted to a typed
@@ -514,6 +525,70 @@ entry, bounding but not closing it), and `x_memory_citation_tombstones` on citin
 landed, have since landed under task 3134 (below).
 
 ### Changed
+
+#### The starvation watchdog fires only on a stuck signal, and now acts on what it finds (task 3821, esc-4851-3)
+
+Read `STARVATION_WATCHDOG` series from before and after this change under different
+meanings. Before it, most firings measured backlog depth. The 488/741/915/1171-record
+storms were all `skip_count=0`.
+
+**Old behaviour.**
+- The clock was an in-memory `first_seen`, stamped from the monotonic clock. A restart or
+  a one-tick candidacy gap wiped it, so after every restart the whole backlog was
+  stamped as one cohort.
+- An `idle_only` gate fired on age alone (`idle_only_secs`, 72h), so that cohort, and
+  every low task that later crossed 72h, fired together.
+- A firing filed only a level-0 info escalation. It emitted no event and took no action.
+- Every alarm advanced the EWA breaker's numerator.
+
+**New behaviour.**
+- **Durable eligibility clock.** One wall-clock `eligible_since` anchor per task, stamped
+  at first dispatch candidacy, lives in `data/orchestrator/scheduler_eligibility.db`
+  (`shared.project_layout.scheduler_eligibility_db`). Restarts and transient gaps keep
+  it. Dispatch, leaving `pending`, or going terminal drops it.
+- **Every gate needs the age floor AND an in-candidacy stuck signal.** Age alone never
+  fires. The gate vocabulary is now `dual`, `lock_refused` and `park_blocked`, and
+  `idle_only` is retired:
+  - `dual`: top-candidate skips `>= skip_threshold` and age `>= idle_secs`. Unchanged,
+    except that it now runs on the durable clock.
+  - `lock_refused`: lock refusals `>= skip_threshold` and age `>= idle_only_secs`. A
+    refusal is a scan in which the task was refused its locks while a lower-ranked
+    candidate dispatched. PSI-deferred and no-winner scans count nothing.
+  - `park_blocked`: the task's live park has a module held by another task, and the park
+    is at least `park_blocked_age_secs` old (new, default 4h). It takes precedence over
+    the other gates and names `blocking_holder` and `blocking_module`.
+
+  The thresholds themselves are unchanged. `idle_secs` and `idle_only_secs` stay
+  259200.
+- **Corroboration and dedup.** A finding is delivered only if a live `get_statuses`
+  read still shows `pending`. Open watchdog escalations are reloaded at startup, so a
+  restart neither re-files an alarm nor leaves it unresolved.
+- **`starvation_detected` event.** Every delivered firing emits it. The payload carries
+  `gate`, `eligible_age_secs`, `skip_count`, `lock_refusals`, `blockers`,
+  `auto_pinned`, `pin_order`, `source` and `disposition`. A `park_blocked` firing also
+  carries `blocking_holder`, `blocking_module` and `park_age_secs`.
+- **Bounded, owned auto-pin.** A `dual` or `lock_refused` firing pins the task at the
+  tail of the queue. The pin's override row has `source='starvation_watchdog'` and
+  `ttl_until` = fire time + `auto_pin_ttl_secs` (new, default 24h), and it also files a
+  level-0 info trail. Watchdog pins are bounded:
+  - At most `auto_pin_max_concurrent` (new, default 3) exist at once.
+  - A firing past the cap is recorded as `cap_reached` and files no escalation of its
+    own. Instead, one level-1 escalation under `__starvation_auto_pin_cap__` names the
+    newly capped cohort. A capped task is not marked escalated: it is announced once,
+    then pinned (with its level-0 trail) on the first pass that finds a slot free. The
+    cap escalation is resolved once no capped task still waits on a slot.
+  - An existing operator row is never touched, and that firing is recorded as
+    `operator_override`.
+  - A watchdog pin is released, whichever process created it, when its task dispatches
+    or is seen in any status other than `pending`.
+
+  `park_blocked` takes no pin. It files a level-1 info escalation.
+- **`overrides.source`.** The overrides table gains `source TEXT NOT NULL DEFAULT
+  'operator'`. Both `OverrideStore` and fused-memory's override tools add the column to
+  legacy databases idempotently. Operator writes always take ownership, and
+  `get_pin_queue` reports `source`.
+- **EWA numerator.** `digest.counts_toward_ewa_numerator` excludes the watchdog's role
+  (`orchestrator-starvation-watchdog`). Its alarms still advance the digest gate.
 
 #### Only a pending owner whose dependencies are not known unsatisfied may hold parks (task 6518, esc-6040-7)
 

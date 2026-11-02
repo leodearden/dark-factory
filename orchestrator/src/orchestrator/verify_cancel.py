@@ -969,7 +969,7 @@ HEARTBEAT_INTERVAL_SECS: float = 5.0
 #: ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS="${ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS:-600}"
 #: (ssh read-only 2026-09-18, still live 09-20), and ``cli.py::_env_float`` lets that env
 #: var displace this constant outright — proof, not re-argued here:
-#: ``orchestrator/tests/test_laptop_warm_verify_boundary.py::test_watchdog_timeout_env_override_fires_fast_without_heartbeat``
+#: ``orchestrator/tests/test_verify_merge_env_overrides.py::test_watchdog_timeout_env_override_fires_fast_without_heartbeat``
 #: Unclamped by choice: a ``max(env, derived)`` clamp reddens that file's 60s wedge
 #: detector, and the override is an operator's only mid-incident lever.  Nothing here
 #: observes that host's value.  It is HELD on purpose (task 5577, ruled 2026-09-21): 90.0s

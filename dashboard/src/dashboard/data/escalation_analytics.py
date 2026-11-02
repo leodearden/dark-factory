@@ -145,6 +145,10 @@ _PREDICTABLY_BENIGN_WINDOW_DAYS = 28
 _PREDICTABLY_BENIGN_MIN_N = 20
 _PREDICTABLY_BENIGN_MIN_RATE = 0.9
 
+# The resolution classes the info-L0 router closes records with
+# (plans/info-l0-disposition-router-prd.md D14).
+DISPOSITIONED_CLASSES = frozenset({'addressed', 'observation-consumed', 'converted', 'status-info'})
+
 
 def _origin_block(records: list[Escalation], *, now: datetime) -> dict:
     """Per-source (``agent_role``) origin aggregates over *records*.
@@ -156,7 +160,8 @@ def _origin_block(records: list[Escalation], *, now: datetime) -> dict:
     :func:`escalation.classify.effective_benign`. ``classes`` is keyed by
     every :data:`escalation.models.RESOLUTION_CLASSES` member, zero-filled,
     plus any stamp outside that vocabulary under its own key, so the parts
-    always sum to ``classified``.
+    always sum to ``classified``.  ``dispositioned`` is the part of
+    ``classes`` in :data:`DISPOSITIONED_CLASSES`, what the info-L0 router closed.
 
     ``predictably_benign`` is a separate, windowed computation — trailing
     ``_PREDICTABLY_BENIGN_WINDOW_DAYS`` days keyed by ``resolved_at`` — True
@@ -233,6 +238,7 @@ def _origin_block(records: list[Escalation], *, now: datetime) -> dict:
             'filings': n_filings,
             'classes': source_classes,
             'classified': n_classified,
+            'dispositioned': sum(source_classes[cls] for cls in DISPOSITIONED_CLASSES),
             'stamped_share': stamped.get(source, 0) / n_classified if n_classified else 0.0,
             'benign_rate': n_benign / n_classified if n_classified else 0.0,
             'predictably_benign': (
@@ -316,6 +322,99 @@ def _downsample_stratified(samples: list[list], threshold: int) -> list[list]:
     return downsampled
 
 
+def _member_joined_at(
+    l2: Escalation, member_id: str, l2_filed_at: datetime, member_filed_at: datetime,
+) -> datetime | None:
+    """When *member_id* joined *l2*, or ``None`` when that is unknown.
+
+    A fold stamp in ``l2.member_folded_at`` wins. Without one, a member filed
+    at or before the L2 was present at its creation and joined at
+    *l2_filed_at*; a member filed after it was folded in before fold stamps
+    existed. Raises ``TypeError``/``ValueError`` on an unparseable stamp.
+    """
+    folded_at = l2.member_folded_at.get(member_id)
+    if folded_at is not None:
+        return parse_utc(folded_at)
+    if member_filed_at <= l2_filed_at:
+        return l2_filed_at
+    return None
+
+
+def _l1_to_l2_promotion(records: list[Escalation], by_id: Mapping[str, Escalation]) -> dict:
+    """``{count, p50_secs, p90_secs, fold_time_unknown}`` of L2 member promotion delays.
+
+    Each member of every ``level == 2`` record contributes the seconds from
+    its own filing to the time it joined the cluster (:func:`_member_joined_at`),
+    whether or not the L2 is still pending. A member whose join time is unknown
+    is counted in ``fold_time_unknown`` and not logged. A missing member, an
+    unparseable time, and a join before filing are skipped with a WARNING, as
+    is a whole cluster whose ``member_folded_at`` is not a mapping.
+    ``p50_secs``/``p90_secs`` are ``None`` when no delay was measured.
+    """
+    deltas: list[float] = []
+    fold_time_unknown = 0
+    for l2 in records:
+        if l2.level != 2 or not l2.members:
+            continue
+        try:
+            l2_filed_at = parse_utc(l2.timestamp)
+        except (TypeError, ValueError):
+            logger.warning(
+                '_l1_to_l2_promotion: unparseable timestamp on L2 cluster %s: %r',
+                l2.id, l2.timestamp,
+            )
+            continue
+        if not isinstance(l2.member_folded_at, dict):
+            logger.warning(
+                '_l1_to_l2_promotion: member_folded_at on L2 cluster %s is not a mapping: %r',
+                l2.id, l2.member_folded_at,
+            )
+            continue
+        for member_id in l2.members:
+            member = by_id.get(member_id)
+            if member is None:
+                logger.warning(
+                    '_l1_to_l2_promotion: member %s of %s not found in archive',
+                    member_id, l2.id,
+                )
+                continue
+            try:
+                member_filed_at = parse_utc(member.timestamp)
+            except (TypeError, ValueError):
+                logger.warning(
+                    '_l1_to_l2_promotion: unparseable timestamp on member %s of %s',
+                    member_id, l2.id,
+                )
+                continue
+            try:
+                joined_at = _member_joined_at(l2, member_id, l2_filed_at, member_filed_at)
+            except (TypeError, ValueError):
+                logger.warning(
+                    '_l1_to_l2_promotion: unparseable member_folded_at for member %s of %s: %r',
+                    member_id, l2.id, l2.member_folded_at[member_id],
+                )
+                continue
+            if joined_at is None:
+                fold_time_unknown += 1
+                continue
+            delta = (joined_at - member_filed_at).total_seconds()
+            if delta < 0:
+                logger.warning(
+                    '_l1_to_l2_promotion: member %s joined %s %.1fs before it was filed',
+                    member_id, l2.id, -delta,
+                )
+                continue
+            deltas.append(delta)
+
+    deltas.sort()
+    return {
+        'count': len(deltas),
+        'p50_secs': percentile(deltas, 50) if deltas else None,
+        'p90_secs': percentile(deltas, 90) if deltas else None,
+        'fold_time_unknown': fold_time_unknown,
+    }
+
+
 def _lifespan_block(
     records: list[Escalation],
     *,
@@ -337,15 +436,11 @@ def _lifespan_block(
       ``breach_6h`` = ``age_secs > 6h``, plus ``pins_recovery`` /
       ``pins_recovery_task_ids`` when *pins_by_id* names that record (see
       below).
-    - ``l1_to_l2_promotion``: ``{count, p50_secs, p90_secs}`` computed from
-      every ``level == 2`` record's ``members`` — ``L2.timestamp -
-      member.timestamp`` per member id found in the by-id index (uses the
-      L2's OWN ``timestamp``, i.e. promotion time, not its resolution —
-      this is independent of whether the L2 itself is terminal or still
-      pending). Missing members and negative deltas are skipped with a
-      WARNING. ``p50_secs``/``p90_secs`` are ``None`` when no deltas were
-      collected. No L0->L1 metric — see design_decisions (open question 7):
-      the model has no machine-readable L0->L1 link.
+    - ``l1_to_l2_promotion``: ``{count, p50_secs, p90_secs,
+      fold_time_unknown}`` over every ``level == 2`` record's ``members``,
+      each measured from its filing to the time it joined the cluster — see
+      :func:`_l1_to_l2_promotion`. No L0->L1 metric — see design_decisions
+      (open question 7): the model has no machine-readable L0->L1 link.
     - ``triage_segments`` (render-when-present, 2555 forward-compat):
       ``{count, filed_to_triaged:{p50,p90}, triaged_to_resolved:{p50,p90}}``
       over terminal-with-valid-times records carrying a parseable
@@ -383,46 +478,10 @@ def _lifespan_block(
     secs_by_level: dict[int, list[float]] = {}
     samples: list[list] = []
     open_items: list[dict] = []
-    promotion_deltas: list[float] = []
     filed_to_triaged_deltas: list[float] = []
     triaged_to_resolved_deltas: list[float] = []
 
     for esc in records:
-        if esc.level == 2 and esc.members:
-            try:
-                l2_filed_at = parse_utc(esc.timestamp)
-            except (TypeError, ValueError):
-                logger.warning(
-                    '_lifespan_block: unparseable timestamp on L2 cluster %s: %r',
-                    esc.id, esc.timestamp,
-                )
-                l2_filed_at = None
-            if l2_filed_at is not None:
-                for member_id in esc.members:
-                    member = by_id.get(member_id)
-                    if member is None:
-                        logger.warning(
-                            '_lifespan_block: l1_to_l2_promotion member %s of %s not found '
-                            'in archive', member_id, esc.id,
-                        )
-                        continue
-                    try:
-                        member_filed_at = parse_utc(member.timestamp)
-                    except (TypeError, ValueError):
-                        logger.warning(
-                            '_lifespan_block: unparseable timestamp on member %s of %s',
-                            member_id, esc.id,
-                        )
-                        continue
-                    delta = (l2_filed_at - member_filed_at).total_seconds()
-                    if delta < 0:
-                        logger.warning(
-                            '_lifespan_block: negative l1_to_l2_promotion delta (%.1fs) for '
-                            'member %s of %s', delta, member_id, esc.id,
-                        )
-                        continue
-                    promotion_deltas.append(delta)
-
         if esc.status == 'pending':
             try:
                 filed_at = parse_utc(esc.timestamp)
@@ -490,13 +549,6 @@ def _lifespan_block(
         for level, secs_list in secs_by_level.items()
     }
 
-    promotion_deltas.sort()
-    l1_to_l2_promotion = {
-        'count': len(promotion_deltas),
-        'p50_secs': percentile(promotion_deltas, 50) if promotion_deltas else None,
-        'p90_secs': percentile(promotion_deltas, 90) if promotion_deltas else None,
-    }
-
     samples_total = len(samples)
     downsampled = samples_total > downsample_threshold
     if downsampled:
@@ -504,7 +556,7 @@ def _lifespan_block(
 
     result = {
         'percentiles_by_level': percentiles_by_level,
-        'l1_to_l2_promotion': l1_to_l2_promotion,
+        'l1_to_l2_promotion': _l1_to_l2_promotion(records, by_id),
         'samples': samples,
         'open_items': open_items,
     }

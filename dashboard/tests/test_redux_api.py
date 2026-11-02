@@ -6,7 +6,6 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
-from dashboard import loops
 from dashboard.data import burndown, census, redux_api
 from dashboard.data.datum import (
     Datum,
@@ -698,7 +697,7 @@ def _task_ids(rows):
 def test_shape_merge_queue_relabels_and_renames_depth():
     raw = {
         '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [0, 1], 'values': [3, 4]},
+            'depth_timeseries': {'labels': [0, 1], 'values': [3, 4], 'bucket_minutes': 60},
             'outcomes': {'labels': ['done'], 'values': [12]},
             'latency': {'p50': 6000},
             'recent': [_mq_titled('17')],
@@ -709,10 +708,28 @@ def test_shape_merge_queue_relabels_and_renames_depth():
     body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
     assert 'dark-factory' in body['MERGE_QUEUE']
     section = body['MERGE_QUEUE']['dark-factory']
-    assert section['depth'] == {'labels': [0, 1], 'values': [3, 4]}
+    assert section['depth'] == {'labels': [0, 1], 'values': [3, 4], 'bucket_minutes': 60}
     assert _task_ids(section['recent']) == ['17']
     # Default: no halt_status passed → offline fallback per project.
     assert section['halt'] == {'offline': True}
+
+
+def test_shape_merge_queue_serves_no_width_for_a_depth_that_names_none():
+    """A depth series without bucket_minutes serves None for it, never a guessed width."""
+    raw = {
+        '/home/leo/src/dark-factory': {
+            'depth_timeseries': {'labels': [], 'values': []},
+            'outcomes': {'labels': [], 'values': []},
+            'latency': {},
+            'recent': [],
+            'active': [],
+            **_MQ_MEASURED_QUEUE,
+        },
+    }
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
+    assert body['MERGE_QUEUE']['dark-factory']['depth'] == {
+        'labels': [], 'values': [], 'bucket_minutes': None,
+    }
 
 
 def test_shape_merge_queue_carries_the_recent_window_total():
@@ -1396,7 +1413,7 @@ def test_shape_burndown_aggregate_forecast_is_the_measured_rows_fold():
 # shape_burndown — every block serves its own provenance (task 5592)
 # ---------------------------------------------------------------------------
 
-_BOUND = 2 * loops._SAMPLE_INTERVAL_SECONDS
+_BOUND = 2 * burndown.SAMPLE_INTERVAL_SECONDS
 _BASE = datetime(2026, 5, 20, tzinfo=UTC)
 _WIRE_SERIES_KEYS = (*census.SERIES_KEYS.values(), *_SPLIT_SERIES_KEYS)
 _DATUM_KEYS = {'value', 'as_of', 'state', 'reason', 'freshness_bound_seconds'}

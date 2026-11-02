@@ -82,9 +82,8 @@ class TestSpeculationProbeConfigDefaults:
     OrchestratorConfig.speculation_probe field.
     """
 
-    def test_defaults_attached_on_orchestrator_config(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_defaults_attached_on_orchestrator_config(self):
         cfg = OrchestratorConfig()
         assert isinstance(cfg.speculation_probe, SpeculationProbeConfig)
         assert cfg.speculation_probe.probe_fraction == 0.0
@@ -131,13 +130,12 @@ class TestSpeculationProbeConfigValidation:
         cfg = SpeculationProbeConfig(probe_depths=[1, 4, 9])
         assert cfg.probe_depths == [1, 4, 9]
 
-    def test_rejected_at_load_via_orchestrator_config(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_rejected_at_load_via_orchestrator_config(self):
         """Mirrors TestMinInflightFloorValidation.test_rejected_at_load_via_orchestrator_config
         (test_config_psi_admission_reload.py): a nested-dict construction (as
         YAML would deserialize into) must also raise.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         with pytest.raises(ValidationError):
             OrchestratorConfig(speculation_probe={'probe_fraction': 1.5})  # type: ignore[arg-type]
 

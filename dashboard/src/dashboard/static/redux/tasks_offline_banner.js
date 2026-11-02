@@ -3,7 +3,7 @@
 //
 // This is a plain-JS module: no JSX, no Babel. It is loaded two ways:
 //   - In the browser, via a classic `<script src="/static/redux/tasks_offline_banner.js">`
-//     tag (like task_status_counts.js / prd_grouping.js), which assigns
+//     tag (like task_snapshot.js / prd_grouping.js), which assigns
 //     `window.DF_TASKS_OFFLINE_BANNER`.
 //   - In node (no package.json in this repo, so this file resolves as
 //     CommonJS), via `require`/`import` for the `node --test` suite under

@@ -12,7 +12,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import deny, neutralise_fixture
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'amend_stale_resume_cwd_records.py'
@@ -831,6 +836,18 @@ class TestApplyStoreMutationPreflight:
         ]
         assert all(c['applied'] is False for c in report['changes'])
         assert report['totals']['refused'] == 2
+
+    @pytest.mark.asyncio
+    async def test_refused_preflight_logs_exactly_one_fail_closed_diagnosis(
+        self, monkeypatch, caplog,
+    ):
+        deny(_mod, monkeypatch)
+
+        with caplog.at_level('ERROR'):
+            await _mod.run(_memory_service(), project_id='dark_factory', apply=True)
+
+        (record,) = fail_closed_records(caplog, 'amend_stale_resume_cwd_records')
+        assert SENTINEL in record.getMessage()
 
 
 @pytest.mark.usefixtures('write_capable_targets')

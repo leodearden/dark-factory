@@ -64,6 +64,7 @@ from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane.intake import MERGE_LANES
 from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, QueuedBranch
 
 # ---------------------------------------------------------------------------
@@ -195,7 +196,8 @@ async def _make_branch_with_file(
 class TestCheckRequestLiveness:
     """Unit tests for SpeculativeMergeWorker._check_request_liveness(now).
 
-    RED until step-8 GREEN adds the method to merge_queue.py.
+    The method lives in orchestrator/src/orchestrator/merge_lane/worker.py and
+    delegates to request_ledger.py::report_stuck_requests.
     """
 
     async def test_stuck_request_warns_and_alarms_once(
@@ -232,7 +234,7 @@ class TestCheckRequestLiveness:
         assert esc.category == 'merge_request_stuck'
         assert req.request_id in esc.summary
 
-    async def test_second_call_is_deduped_by_open_l1(
+    async def test_second_sweep_of_the_same_episode_is_deduped(
         self,
         tmp_path: Path,
         config: OrchestratorConfig,
@@ -258,21 +260,15 @@ class TestCheckRequestLiveness:
             warnings_after_first = [r for r in caplog.records if r.levelno == logging.WARNING]
             assert len(warnings_after_first) == 1, 'first call must warn exactly once'
 
-            # An open L1 now exists for this request's sentinel (real escalation
-            # queues would report has_open_l1 True after the submit above); mirror
-            # that with the fake's open_it() and confirm no duplicate is filed.
-            fake_eq.open_it()
-            worker._check_request_liveness(t0 + 3000, threshold_s=1000)
-            assert len(fake_eq.filed) == 1, 'second call must not submit a duplicate escalation'
+            # The fake reports no open L1, as after a human closed the first
+            # alarm. A second sweep of the SAME dequeue episode, below the next
+            # alarm tier, must neither re-file nor re-warn.
+            worker._check_request_liveness(t0 + 2500, threshold_s=1000)
+            assert len(fake_eq.filed) == 1, 'second sweep must not submit a duplicate escalation'
 
-            # The WARNING log is dedup'd exactly like the escalation: a second
-            # sweep of the SAME still-open (never resolved/requeued) episode
-            # must not re-log — otherwise a genuinely leaked/wedged request
-            # would spam an identical WARNING on every heartbeat poll forever.
             warnings_after_second = [r for r in caplog.records if r.levelno == logging.WARNING]
             assert len(warnings_after_second) == 1, (
-                'second call for the same open stuck episode must not re-warn '
-                '— the WARNING log must be dedup\'d per episode like the escalation'
+                'second sweep of the same stuck episode must not re-warn'
             )
 
     async def test_observation_only_never_resolves_or_halts(
@@ -300,7 +296,7 @@ class TestCheckRequestLiveness:
         # Both halt mechanisms, because they are independently reachable: a
         # per-lane halt (is_wip_halted) and the separate operator halt Event.
         assert not worker.is_wip_halted
-        assert not worker._operator_halt.is_set()
+        assert not worker.is_operator_halted
 
     async def test_resolved_request_does_not_alarm(
         self,
@@ -338,9 +334,9 @@ class TestCheckRequestLiveness:
     ) -> None:
         """Amendment (post-verification review, task 1992): the WARNING log
         dedup is per-EPISODE, not permanent — a requeue (on_requeued) followed
-        by a later re-dequeue (on_dequeue) must re-warn, mirroring the
-        escalation's has_open_l1 contract which likewise only dedups within a
-        single open episode.
+        by a later re-dequeue (on_dequeue) must re-warn, because the alarm
+        ladder that drives both the WARNING and the escalation restarts with
+        each dequeue episode.
         """
 
         fake_eq = RecordingEscalations()
@@ -372,7 +368,7 @@ class TestCheckRequestLiveness:
         assert len(warnings) == 1, (
             'a fresh episode after on_requeued + re-on_dequeue must re-warn '
             'once, not stay silently suppressed by the PRIOR episode\'s '
-            'warned flag'
+            'alarm count'
         )
 
 
@@ -524,7 +520,7 @@ class TestWedgedVerifyIntegration:
             # of the two independently reachable halt mechanisms engaged.
             assert not req.result.done()
             assert not worker.is_wip_halted
-            assert not worker._operator_halt.is_set()
+            assert not worker.is_operator_halted
 
             # ── Release the gate and confirm clean resolution ──────────────
             gate_release.set()
@@ -3662,7 +3658,7 @@ class TestDeadVerifyAbortRequeuesIntoTheLiveQueue:
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._drain_queue_into_lanes()
 
-        buffered = [it for buf in worker._lane_buffers.values() for it in buf]
+        buffered = [it for lane in MERGE_LANES for it in worker._intake.buffered(lane)]
         assert req in buffered, (
             f'the re-queued request must be buffered by the next drain, not '
             f'coalesce-dropped; lane buffers hold {buffered!r}'
@@ -3847,7 +3843,7 @@ class _HangThenPassVerify(FakeVerifier):
     fires and the request is RE-QUEUED.  Call 2 passes, so the re-dispatched
     merge actually lands.  ``.calls`` is the surface-1 assertion: it must
     reach 2, proving the re-queued request genuinely re-entered the pipeline
-    rather than being swallowed by ``_coalesce_reentrant_drain``.
+    rather than being swallowed by ``the intake's re-entrant coalesce``.
 
     A per-CALL sequence, which ``FakeVerifier``'s per-task scripts cannot
     express — hence the subclass rather than a script.
@@ -3973,7 +3969,7 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
         messages = [r.getMessage() for r in caplog.records]
 
         # ── (1) the request ACTUALLY re-enters the live queue and is
-        #        re-dispatched — not swallowed by _coalesce_reentrant_drain.
+        #        re-dispatched — not swallowed by the intake's re-entrant coalesce.
         #
         # task 3927: exact equality (calls == 2) is load-sensitive. Under
         # host CPU oversubscription, the no-progress watchdog's independent
@@ -4159,7 +4155,7 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
         # `_operator_halt` is a separate Event raised only by operator_halt()
         # and cleared only by unhalt_all_lanes(). A per-lane resume that left
         # the operator halt set reads as not-wip-halted with a live halt.
-        assert not worker._operator_halt.is_set(), (
+        assert not worker.is_operator_halted, (
             'recovery must not depend on (or leave behind) an operator halt'
         )
         assert not worker.is_wip_halted, (

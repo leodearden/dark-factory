@@ -44,7 +44,7 @@ from orchestrator.evals.measurement import (
     Unmeasured,
     UnmeasuredCause,
 )
-from orchestrator.evals.metrics import EvalMetrics
+from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
 from orchestrator.evals.results import ResultStore
 
 # ---------------------------------------------------------------------------
@@ -203,7 +203,7 @@ class TestEvalMetricsInvocationErrorField:
         ``scripts/run_fable_trial_v2_campaign.py`` decides per-cell reference
         validity by KEY PRESENCE — its ``MARKER_KEY not in metrics`` means "not
         known-good", never False, and the count it consumes from
-        ``report._judged_blind_count`` is None for any config with even one
+        ``cell_admission.judged_blind_count`` is None for any config with even one
         keyless cell. If this key
         were emitted only when True (a conditional dict update, or filtering
         falsy fields out of the persisted dict), every HEALTHY cell would be
@@ -768,7 +768,7 @@ class TestJudgePlanQuality:
     # clamp_unit_score's docstring in judge.py for the mechanics). A bare
     # clamp DOES keep +/-Infinity in [0, 1] — but only by fabricating the
     # best/worst possible score (1.0/0.0) on a surface
-    # report._mean_plan_quality -> select_survivors actually ranks on. Both
+    # cell_admission.mean_plan_quality -> select_survivors actually ranks on. Both
     # are equally NOT a judgement, so both are Unmeasured(judge, unparseable).
     # Both are reachable through the SAME schema-bypassing
     # json.loads(result.output) fallback — CPython's json.loads accepts the
@@ -998,8 +998,8 @@ class TestPlanJudgeOutcomeCarriesItsSpend:
 # judge, which scored an empty artifact because it had no scorability guard of
 # its own — its coherence rested ENTIRELY on its one caller remembering to gate.
 #
-# Task 3302 closed the two OUTER halves: the CALL SITE (run_architect_eval
-# gates on is_scorable_plan) and the READER (report._plan_quality_score floors
+# Task 3302 closed the two OUTER halves: the CALL SITE (run_architect_eval gates
+# on is_scorable_plan) and the READER (cell_admission.plan_quality_score floors
 # an on-disk no-plan cell). This class pins the INSTRUMENT itself, so a second
 # caller — a backfill/re-scoring script, a new eval path, prompt_opt, a resume
 # wave — cannot silently re-open the same defect.
@@ -1221,10 +1221,10 @@ class TestArchitectEvalConfigs:
         from orchestrator.evals.configs import ARCHITECT_EVAL_CONFIGS, EvalConfig
 
         existing = [
-            EvalConfig('architect-opus-high', 'claude', 'opus', 'high', role='architect'),
-            EvalConfig('architect-opus-max', 'claude', 'opus', 'max', role='architect'),
-            EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect'),
-            EvalConfig('architect-fable-high', 'claude', 'claude-fable-5', 'high', role='architect'),
+            EvalConfig('architect-opus-high', 'claude', 'opus', 'high', role=RoleUnderTest.ARCHITECT),
+            EvalConfig('architect-opus-max', 'claude', 'opus', 'max', role=RoleUnderTest.ARCHITECT),
+            EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT),
+            EvalConfig('architect-fable-high', 'claude', 'claude-fable-5', 'high', role=RoleUnderTest.ARCHITECT),
         ]
         by_name = {c.name: c for c in ARCHITECT_EVAL_CONFIGS}
         for expected in existing:
@@ -1602,7 +1602,7 @@ class TestRunArchitectEval:
         from orchestrator.evals.configs import EvalConfig
 
         return EvalConfig(
-            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT,
         )
 
     async def test_scores_plan_freezes_downstream_and_persists(self):
@@ -1878,7 +1878,7 @@ class TestRunArchitectEval:
         from orchestrator.evals.configs import EvalConfig
 
         codex_cfg = EvalConfig(
-            'architect-codex-high', 'codex', 'gpt-5', 'high', role='architect',
+            'architect-codex-high', 'codex', 'gpt-5', 'high', role=RoleUnderTest.ARCHITECT,
         )
         result, _ = await _run_architect_eval_hermetic(
             codex_cfg, produced_plan={}, arch_result=_codex_cap_agent_result(),
@@ -2016,7 +2016,7 @@ class TestArchitectCellCarriesReplayFrame:
         from orchestrator.evals.configs import EvalConfig
 
         return EvalConfig(
-            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT,
         )
 
     async def test_architect_prompt_is_production_briefing_plus_replay_frame(self):
@@ -2074,7 +2074,7 @@ class TestArchitectCellRecordsJudgeSpend:
         from orchestrator.evals.configs import EvalConfig
 
         return EvalConfig(
-            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT,
         )
 
     async def test_judge_spend_recorded_and_folded_into_cell_cost(self):
@@ -2140,7 +2140,7 @@ class TestArchitectCellStampsTokenUsageAndProxySignal:
 
         return EvalConfig(
             'architect-sonnet-high', 'claude', 'sonnet', 'high',
-            role='architect', **kw,
+            role=RoleUnderTest.ARCHITECT, **kw,
         )
 
     async def test_reported_token_counts_are_stamped(self):
@@ -2268,7 +2268,7 @@ class TestArchitectCellResolvesCostProvenance:
 
         kw.setdefault('model', 'sonnet')
         return EvalConfig(
-            'architect-candidate', 'claude', effort='high', role='architect', **kw,
+            'architect-candidate', 'claude', effort='high', role=RoleUnderTest.ARCHITECT, **kw,
         )
 
     async def test_native_candidate_keeps_the_cli_figure_verbatim(self):
@@ -2435,7 +2435,7 @@ class TestArchitectCellCostSourceIsComposed:
 
         kw.setdefault('model', 'sonnet')
         return EvalConfig(
-            'architect-candidate', 'claude', effort='high', role='architect', **kw,
+            'architect-candidate', 'claude', effort='high', role=RoleUnderTest.ARCHITECT, **kw,
         )
 
     def _spending_judge(self):
@@ -2507,7 +2507,7 @@ class TestJudgeSkippedBranchesRecordNoJudgeSpend:
         from orchestrator.evals.configs import EvalConfig
 
         return EvalConfig(
-            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT,
         )
 
     # -- (a) NO FABRICATED SPEND on every judge-skipped branch ----------------
@@ -2602,7 +2602,7 @@ class TestSteplessPlanIsNeverJudged:
         from orchestrator.evals.configs import EvalConfig
 
         return EvalConfig(
-            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT,
         )
 
     @staticmethod
@@ -2719,7 +2719,7 @@ class TestJudgedWithoutReference:
         from orchestrator.evals.configs import EvalConfig
 
         return EvalConfig(
-            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT,
         )
 
     async def test_judged_blind_cell_is_marked_and_still_scored(self):
@@ -3240,7 +3240,7 @@ class TestPlanQualityReport:
         many of its scores were judged blind — it can only report that it does
         not know. Reporting the measured ones' count (here 1) would understate
         the bound while wearing the appearance of a complete answer. This is
-        ``report._judged_blind_count``'s rule, which task 3632's campaign
+        ``cell_admission.judged_blind_count``'s rule, which task 3632's campaign
         script consumes rather than re-deriving, so the two surfaces of one
         field answer the same question identically.
         """
@@ -3604,7 +3604,7 @@ class TestLegacyAndProducedUnmeasuredCellsReportAlike:
             json.dumps(legacy)
         )
         cfg = EvalConfig(
-            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT,
         )
         await _run_architect_eval_hermetic(
             cfg,
@@ -3759,7 +3759,7 @@ class TestCliArchitectDispatch:
         from orchestrator.evals.configs import EvalConfig
 
         return EvalConfig(
-            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT,
         )
 
     def _impl_cfg(self):
@@ -3848,7 +3848,7 @@ class TestCliDispatchCampaignGate:
         from orchestrator.evals.configs import EvalConfig
 
         return EvalConfig(
-            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT,
         )
 
     def _impl_cfg(self):
@@ -3941,7 +3941,7 @@ class TestArchitectEvalUsageGate:
         from orchestrator.evals.configs import EvalConfig
 
         return EvalConfig(
-            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT,
         )
 
     async def test_gate_is_constructed_from_usage_cap_when_enabled(self):
@@ -4075,7 +4075,7 @@ class TestArchitectEvalCapFailover:
         from orchestrator.evals.configs import EvalConfig
 
         return EvalConfig(
-            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT,
         )
 
     async def test_cap_hit_fails_over_to_a_second_account_and_completes_the_cell(self):
@@ -4166,7 +4166,7 @@ class TestArchitectEvalCapPatience:
         from orchestrator.evals.configs import EvalConfig
 
         return EvalConfig(
-            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT,
         )
 
     async def test_architect_call_sets_no_cap_bound_of_its_own(self):
@@ -4258,7 +4258,7 @@ class TestPinnedTaintSemanticsSurviveTheCapRetrySeam:
         from orchestrator.evals.configs import EvalConfig
 
         return EvalConfig(
-            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT,
         )
 
     async def test_timeout_through_the_gated_seam_is_still_kept_not_tainted(self):
@@ -4438,7 +4438,7 @@ class TestArchitectEvalZeroAccountGate:
         from orchestrator.evals.configs import EvalConfig
 
         return EvalConfig(
-            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT,
         )
 
     async def test_the_premise_a_zero_account_gate_refuses_every_invocation(self):
@@ -4530,7 +4530,7 @@ class TestArchitectEvalGateLifecycle:
         from orchestrator.evals.configs import EvalConfig
 
         return EvalConfig(
-            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT,
         )
 
     async def test_gate_is_shut_down_when_the_cell_completes(self):
@@ -4604,7 +4604,7 @@ class TestArchitectEvalInjectedGate:
         from orchestrator.evals.configs import EvalConfig
 
         return EvalConfig(
-            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT,
         )
 
     async def test_injected_gate_is_the_one_invoked_with(self):
@@ -4739,9 +4739,9 @@ class TestCampaignGatePremise:
     """
 
 
-    @pytest.mark.parametrize('role', ['architect', 'implementer'])
+    @pytest.mark.parametrize('role', [RoleUnderTest.ARCHITECT, RoleUnderTest.IMPLEMENTER])
     def test_cell_orch_config_inherits_base_usage_cap_verbatim(
-        self, tmp_path: Path, role: str,
+        self, tmp_path: Path, role: RoleUnderTest,
     ):
         from orchestrator.evals.configs import EvalConfig
         from orchestrator.evals.runner import build_eval_orch_config
@@ -4772,7 +4772,7 @@ class TestArchitectEvalSpendSurvivesFailover:
         from orchestrator.evals.configs import EvalConfig
 
         return EvalConfig(
-            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT,
         )
 
     async def test_spend_from_the_capped_attempt_is_not_dropped(self):
@@ -4881,7 +4881,7 @@ class TestArchitectEvalCapResume:
         from orchestrator.evals.configs import EvalConfig
 
         return EvalConfig(
-            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT,
         )
 
     async def test_a_capped_session_is_resumed_on_the_next_account(self, caplog):
@@ -4973,7 +4973,7 @@ class TestArchitectCellPersistsTerminalKind:
         from orchestrator.evals.configs import EvalConfig
 
         return EvalConfig(
-            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT,
         )
 
     async def test_ordinary_plan_cell_persists_planned(self):
@@ -5127,7 +5127,7 @@ def _characterized_cfg(**over):
 
     return EvalConfig(
         over.pop('name', 'architect-sonnet-high'), 'claude',
-        over.pop('model', 'sonnet'), 'high', role='architect', **over,
+        over.pop('model', 'sonnet'), 'high', role=RoleUnderTest.ARCHITECT, **over,
     )
 
 

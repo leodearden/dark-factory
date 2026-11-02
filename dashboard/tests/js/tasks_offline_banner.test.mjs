@@ -10,7 +10,7 @@
 // statically detect named exports assigned from a variable, so
 // `import { tasksBannerNotices } from '...'` would come back undefined. We
 // therefore default-import the module and destructure instead (mirrors
-// task_status_counts.test.mjs / prd_grouping.test.mjs).
+// graph_layout.test.mjs / task_vocab.test.mjs).
 //
 // WHY THIS IS A TESTED MODULE AND NOT JSX. The defect being closed is a copy
 // decision: the Tasks tab rendered ONE global banner reading "fused-memory

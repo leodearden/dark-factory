@@ -39,6 +39,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 from _delivered_check_fixtures import install_delivered_check_script, script_check
 from _recording_event_store import _RecordingEventStore
 from escalation.queue import EscalationQueue
@@ -226,7 +227,12 @@ class _LocalDepMcpSession:
 
 
 def _register_producer(
-    session: _LocalDepMcpSession, task_id: str, *, status: str, checks: list[dict],
+    session: _LocalDepMcpSession,
+    task_id: str,
+    *,
+    status: str,
+    checks: list[dict],
+    metadata: dict | None = None,
 ) -> dict:
     """Append a producer task carrying ``metadata.delivered_checks`` to the
     session's in-memory task list. *status* is 'done' or 'cancelled' —
@@ -240,13 +246,20 @@ def _register_producer(
         'metadata': {
             'files': [f'local_dep/producer_{task_id}.py'],
             'delivered_checks': checks,
+            **(metadata or {}),
         },
     }
     session.tasks.append(task)
     return task
 
 
-def _register_dependent(session: _LocalDepMcpSession, task_id: str, *, dep_id: str) -> dict:
+def _register_dependent(
+    session: _LocalDepMcpSession,
+    task_id: str,
+    *,
+    dep_id: str,
+    metadata: dict | None = None,
+) -> dict:
     """Append a pending dependent task with a single LOCAL dependency on
     *dep_id* to the session's in-memory task list. ``metadata.files`` is a
     unique plain file path so ``ModuleLockTable.try_acquire`` succeeds."""
@@ -255,7 +268,7 @@ def _register_dependent(session: _LocalDepMcpSession, task_id: str, *, dep_id: s
         'title': f'Dependent task {task_id}',
         'status': 'pending',
         'dependencies': [{'id': dep_id}],
-        'metadata': {'files': [f'local_dep/dependent_{task_id}.py']},
+        'metadata': {'files': [f'local_dep/dependent_{task_id}.py'], **(metadata or {})},
     }
     session.tasks.append(task)
     return task
@@ -599,6 +612,8 @@ def _drive_to_l2(
     check: dict,
     producer_id: str,
     dependent_id: str,
+    producer_metadata: dict | None = None,
+    dependent_metadata: dict | None = None,
 ) -> tuple[Harness, _LocalDepMcpSession]:
     """Build one producer/dependent pair on its own real git repo.
 
@@ -610,8 +625,10 @@ def _drive_to_l2(
     root.mkdir(parents=True, exist_ok=True)
     project_root = _init_git_repo(root, marker_rel_path=marker_rel_path)
     session = _LocalDepMcpSession()
-    _register_producer(session, producer_id, status='done', checks=[check])
-    _register_dependent(session, dependent_id, dep_id=producer_id)
+    _register_producer(
+        session, producer_id, status='done', checks=[check], metadata=producer_metadata,
+    )
+    _register_dependent(session, dependent_id, dep_id=producer_id, metadata=dependent_metadata)
     harness = _build_harness(
         project_root, session, escalation_dir, grace_cycles=_GRACE_CYCLES_3500,
     )
@@ -837,3 +854,179 @@ class TestAuthoringDefectIsDistinguishable:
             await _run_tick(harness)
 
         assert len(_l2_for(harness, 'D3500D')) == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestRecordNamesTheCheckOwner — task 7514 (absorbing 4934)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_OWNER_PRD = 'docs/prds/x.md'
+_OWNER_SIDECAR = 'docs/prds/x.capability-manifest.yaml'
+_OWNER_CAP = 'row7514_token_cap'
+_OWNER_TOKEN = 'ROW7514_CAPABILITY_TOKEN_V1'
+_OWNER_MARKER = 'src/row7514_marker.py'
+
+
+def _commit_owner_sidecar(project_root: Path, *, producer_id: str, check: dict) -> None:
+    doc = {
+        'prd': _OWNER_PRD,
+        'schema_version': 1,
+        'tasks': [
+            {
+                'label': 'alpha',
+                'task_id': int(producer_id),
+                'capabilities': [
+                    {
+                        'name': check['name'],
+                        'binding': 'grep for the capability token',
+                        'verdict': 'PASS',
+                        'delivered_check': {
+                            key: value for key, value in check.items() if key != 'name'
+                        },
+                    },
+                ],
+            },
+        ],
+    }
+    target = project_root / _OWNER_SIDECAR
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(yaml.safe_dump(doc, sort_keys=False), encoding='utf-8')
+    _run_git(project_root, 'add', _OWNER_SIDECAR)
+    _run_git(project_root, 'commit', '-m', 'declare the capability manifest sidecar')
+
+
+class TestRecordNamesTheCheckOwner:
+    """The L2 names the dependency that declares the failing check, as data
+    and in prose, and names the blocked dependent only to re-pend it. The
+    7085 shape: the dependent has a PRD and checks of its own, which are NOT
+    the failing ones."""
+
+    _PRODUCER = '5405'
+    _DEPENDENT = '5542'
+
+    def _check(self) -> dict:
+        return _grep_check(_OWNER_CAP, _OWNER_TOKEN, [_OWNER_MARKER])
+
+    @pytest.mark.asyncio
+    async def test_the_record_names_the_dependency_and_its_sidecar(self, tmp_path: Path) -> None:
+        check = self._check()
+        harness, session = _drive_to_l2(
+            tmp_path / 'repo', tmp_path / 'esc',
+            marker_rel_path=_OWNER_MARKER,
+            check=check,
+            producer_id=self._PRODUCER, dependent_id=self._DEPENDENT,
+            producer_metadata={'prd_path': _OWNER_PRD},
+            dependent_metadata={
+                'prd_path': 'docs/prds/other.md',
+                'delivered_checks': [_grep_check('own_cap', 'OWN_TOKEN', [_OWNER_MARKER])],
+            },
+        )
+        _commit_owner_sidecar(
+            harness.config.project_root, producer_id=self._PRODUCER, check=check,
+        )
+
+        escs = await _tick_through_grace(harness, self._DEPENDENT)
+
+        assert len(escs) == 1, escs
+        esc = escs[0]
+        assert esc.delivered_check_owner == {
+            'task_id': self._PRODUCER,
+            'check_name': _OWNER_CAP,
+            'sidecar': {'path': _OWNER_SIDECAR, 'on_main': 'declares'},
+        }
+        lines = esc.detail.splitlines()
+        assert f'Check owner: task {self._PRODUCER}, the dependency.' in esc.detail
+        assert [line for line in lines if self._DEPENDENT in line] == [lines[-1]]
+        assert lines[-1].startswith('Blocked dependents are NOT auto-re-pended')
+        assert esc.summary.startswith(
+            f'DEP_CAPABILITY_NOT_DELIVERED: task {self._DEPENDENT} — dep {self._PRODUCER} '
+            f'done but check {_OWNER_CAP!r} fails on main@'
+        )
+        status = next(t['status'] for t in session.tasks if str(t['id']) == self._DEPENDENT)
+        assert status == 'blocked'
+
+        rehydrated = EscalationQueue(tmp_path / 'esc').get(esc.id)
+        assert rehydrated is not None
+        assert rehydrated.delivered_check_owner == esc.delivered_check_owner
+
+    @pytest.mark.asyncio
+    async def test_a_removed_path_is_diagnosed_for_a_path_kind_check(self, tmp_path: Path) -> None:
+        """Task 4934's consequence: the real descriptor, not a parsed copy of
+        its rendering, reaches the lint, so a path check naming a file the
+        mainline deleted is diagnosed too."""
+        check = {
+            'name': 'row7514_path_cap',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': [_OWNER_MARKER],
+        }
+        harness, _session = _drive_to_l2(
+            tmp_path / 'repo', tmp_path / 'esc',
+            marker_rel_path=_OWNER_MARKER,
+            check=check,
+            producer_id=self._PRODUCER, dependent_id=self._DEPENDENT,
+        )
+        root = harness.config.project_root
+        (root / 'src' / 'row7514_successor.py').write_text('# replacement\n', encoding='utf-8')
+        _run_git(root, 'rm', '-q', _OWNER_MARKER)
+        _run_git(root, 'add', 'src/row7514_successor.py')
+        _run_git(root, 'commit', '-m', 'delete the capability file')
+
+        escs = await _tick_through_grace(harness, self._DEPENDENT)
+
+        assert len(escs) == 1, escs
+        detail = escs[0].detail
+        assert 'AUTHORING DIAGNOSIS' in detail
+        assert 'removed_path' in detail
+        assert detail.index('AUTHORING DIAGNOSIS') < detail.index('Check owner:')
+
+    @pytest.mark.asyncio
+    async def test_an_owner_without_a_prd_path_has_no_sidecar(self, tmp_path: Path) -> None:
+        harness, _session = _drive_to_l2(
+            tmp_path / 'repo', tmp_path / 'esc',
+            marker_rel_path=_OWNER_MARKER,
+            check=self._check(),
+            producer_id=self._PRODUCER, dependent_id=self._DEPENDENT,
+        )
+
+        escs = await _tick_through_grace(harness, self._DEPENDENT)
+
+        assert len(escs) == 1, escs
+        assert escs[0].delivered_check_owner == {
+            'task_id': self._PRODUCER,
+            'check_name': _OWNER_CAP,
+            'sidecar': None,
+        }
+        assert f'Sidecar: none (task {self._PRODUCER} has no prd_path)' in escs[0].detail
+
+    @pytest.mark.asyncio
+    async def test_a_raising_verify_never_costs_the_escalation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import orchestrator.delivered_check_owner as owner_module
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError('verify exploded')
+
+        monkeypatch.setattr(owner_module, 'verify_check_owner', _boom)
+        harness, session = _drive_to_l2(
+            tmp_path / 'repo', tmp_path / 'esc',
+            marker_rel_path=_OWNER_MARKER,
+            check=self._check(),
+            producer_id=self._PRODUCER, dependent_id=self._DEPENDENT,
+            producer_metadata={'prd_path': _OWNER_PRD},
+        )
+
+        escs = await _tick_through_grace(harness, self._DEPENDENT)
+
+        assert len(escs) == 1, escs
+        esc = escs[0]
+        assert esc.level == 2 and esc.severity == 'critical'
+        assert esc.delivered_check_owner == {
+            'task_id': self._PRODUCER,
+            'check_name': _OWNER_CAP,
+            'sidecar': {'path': _OWNER_SIDECAR, 'on_main': 'unverified'},
+        }
+        assert esc.detail.splitlines()[-1].startswith('Blocked dependents are NOT auto-re-pended')
+        status = next(t['status'] for t in session.tasks if str(t['id']) == self._DEPENDENT)
+        assert status == 'blocked'

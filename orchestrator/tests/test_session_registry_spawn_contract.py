@@ -100,3 +100,70 @@ class TestSelfExitField:
         data['self_exit'] = stored
 
         assert sr.SessionRecord.from_dict(data).self_exit is expected
+
+
+_AT = '2026-10-23T00:00:00+00:00'
+
+
+def _kill_failed_record() -> sr.SessionRecord:
+    return sr.SessionRecord(
+        session_slug='s',
+        status=sr.Status.IDLE,
+        exit_request=sr.ExitRequest(
+            state=sr.ExitRequestState.KILL_FAILED, reason='ESRCH', pid=7193001, at=_AT, marker_session_id='uuid-a',
+        ),
+        exit_requested_at=_AT,
+    )
+
+
+def _stored(**body: object) -> sr.SessionRecord:
+    data = sr.SessionRecord(session_slug='s', status=sr.Status.IDLE).to_dict()
+    data.update(body)
+    return sr.SessionRecord.from_dict(data)
+
+
+class TestExitRequestField:
+    def test_defaults_to_no_evaluation(self):
+        record = sr.SessionRecord(session_slug='s', status=sr.Status.IDLE)
+
+        assert record.exit_request is None
+        assert record.exit_requested_at is None
+
+    def test_a_record_written_before_the_fields_existed_reads_none(self):
+        record = sr.SessionRecord.from_dict({'session_slug': 's', 'status': 'idle'})
+
+        assert record.exit_request is None
+        assert record.exit_requested_at is None
+
+    def test_round_trips_losslessly(self):
+        record = _kill_failed_record()
+
+        assert sr.SessionRecord.from_dict(record.to_dict()) == record
+        assert sr.SessionRecord.from_json(record.to_json()) == record
+
+    def test_is_stored_as_wire_scalars(self):
+        assert _kill_failed_record().to_dict()['exit_request'] == {
+            'state': 'kill_failed', 'reason': 'ESRCH', 'pid': 7193001, 'at': _AT, 'marker_session_id': 'uuid-a',
+        }
+
+    def test_state_wire_values(self):
+        assert {state.value for state in sr.ExitRequestState} == {'refused', 'attempted', 'kill_failed'}
+
+    @pytest.mark.parametrize('stored', [
+        'attempted', [], {'state': 'exploded', 'reason': None, 'pid': 7193001, 'at': _AT}, {},
+    ])
+    def test_a_junk_body_reads_none(self, stored):
+        assert _stored(exit_request=stored).exit_request is None
+
+    @pytest.mark.parametrize('pid', [True, '12', -3])
+    def test_a_junk_pid_reads_none(self, pid):
+        body = {'state': 'refused', 'reason': 'self-exit-off', 'pid': pid, 'at': _AT, 'marker_session_id': None}
+
+        request = _stored(exit_request=body).exit_request
+
+        assert request is not None
+        assert request.pid is None
+
+    @pytest.mark.parametrize('stored', [5, True])
+    def test_a_non_str_requested_at_reads_none(self, stored):
+        assert _stored(exit_requested_at=stored).exit_requested_at is None

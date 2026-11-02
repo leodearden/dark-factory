@@ -1,4 +1,4 @@
-"""The publisher policy (plans/client-feed-prd.md §7.6): its data rules, glob semantics, kinds and line counting."""
+"""The publisher policy (plans/client-feed-prd.md §7.6, §14.3): its data rules, glob semantics, kinds, line counting and filer block."""
 
 import os
 from datetime import UTC, datetime
@@ -8,10 +8,17 @@ from typing import Any
 import pytest
 import yaml
 from _git_repo import make_repo
-from pydantic import ValidationError
+from pydantic import HttpUrl, ValidationError
 
 from client_feed.contract import FileKind
-from client_feed.policy import Policy, PolicyError, PolicyProblem, load_policy, matches_any
+from client_feed.policy import (
+    Policy,
+    PolicyError,
+    PolicyProblem,
+    TaskPriority,
+    load_policy,
+    matches_any,
+)
 
 
 @pytest.fixture
@@ -42,6 +49,8 @@ def test_defaults_follow_the_prd(minimal: dict[str, Any]) -> None:
     assert policy.never_reveal_globs == ()
     assert policy.generated_globs == ()
     assert policy.free_globs == policy.test_globs + policy.docs_globs
+    assert policy.filer_grace_seconds == 600
+    assert policy.filer is None
 
 
 def test_free_globs_default_to_the_test_and_docs_globs_as_given(minimal: dict[str, Any]) -> None:
@@ -111,6 +120,91 @@ def test_out_and_in_dirs_must_not_be_the_project_root(
 ) -> None:
     with pytest.raises(ValidationError, match=field):
         _policy(minimal, **{field: minimal['project_root']})
+
+
+@pytest.mark.parametrize('value', [0, -1, True, '600'])
+def test_filer_grace_seconds_is_a_strict_positive_int(minimal: dict[str, Any], value: object) -> None:
+    with pytest.raises(ValidationError, match='filer_grace_seconds'):
+        _policy(minimal, filer_grace_seconds=value)
+
+
+@pytest.fixture
+def filer_block(tmp_path: Path) -> dict[str, Any]:
+    return {'state_dir': str(tmp_path / 'filer-state')}
+
+
+def test_a_filer_block_beside_the_publishers_dirs_takes_the_prd_defaults(
+    minimal: dict[str, Any], filer_block: dict[str, Any]
+) -> None:
+    filer = _policy(minimal, filer=filer_block).filer
+
+    assert filer is not None
+    assert filer.fused_memory_url == HttpUrl('http://127.0.0.1:8002')
+    assert filer.auto_dispatch is False
+    assert filer.interval_seconds == 10
+    assert filer.fix_priority is TaskPriority.HIGH
+    assert filer.state_dir == Path(filer_block['state_dir'])
+
+
+def test_a_filer_block_requires_its_state_dir(minimal: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError, match='state_dir'):
+        _policy(minimal, filer={'interval_seconds': 10})
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        ('state_dir', 'relative/filer-state'),
+        ('state_dirs', '/elsewhere/filer-state'),
+        ('fused_memory_url', 'ftp://x'),
+        ('fused_memory_url', '127.0.0.1:8002'),
+        ('interval_seconds', 0),
+        ('auto_dispatch', 'yes'),
+        ('fix_priority', 'urgent'),
+        ('fix_priority', 'HIGH'),
+    ],
+)
+def test_a_bad_filer_field_is_refused_by_name(
+    minimal: dict[str, Any], filer_block: dict[str, Any], field: str, value: object
+) -> None:
+    with pytest.raises(ValidationError, match=field):
+        _policy(minimal, filer={**filer_block, field: value})
+
+
+@pytest.mark.parametrize('tier', ['critical', 'high', 'medium', 'low', 'polish'])
+def test_every_factory_priority_tier_is_a_fix_priority(
+    minimal: dict[str, Any], filer_block: dict[str, Any], tier: str
+) -> None:
+    filer = _policy(minimal, filer={**filer_block, 'fix_priority': tier}).filer
+
+    assert filer is not None
+    assert filer.fix_priority is TaskPriority(tier)
+
+
+@pytest.mark.parametrize('suffix', ['', '/filer'], ids=['is', 'under'])
+@pytest.mark.parametrize('field', ['out_dir', 'in_dir', 'project_root'])
+def test_the_filer_state_dir_must_lie_outside_the_publishers_dirs(
+    minimal: dict[str, Any], field: str, suffix: str
+) -> None:
+    state_dir = minimal[field] + suffix
+
+    with pytest.raises(ValidationError) as caught:
+        _policy(minimal, filer={'state_dir': state_dir})
+
+    message = str(caught.value)
+    assert 'filer.state_dir' in message
+    assert state_dir in message
+    assert field in message
+    assert minimal[field] in message
+
+
+def test_a_filer_state_dir_holding_the_publishers_dirs_is_accepted(
+    tmp_path: Path, minimal: dict[str, Any]
+) -> None:
+    filer = _policy(minimal, filer={'state_dir': str(tmp_path)}).filer
+
+    assert filer is not None
+    assert filer.state_dir == tmp_path
 
 
 @pytest.mark.parametrize('glob', ['', '/abs/**', 'a/../b', './x', 'a//b'])
@@ -242,6 +336,33 @@ def _refusal(config: Path) -> PolicyError:
 
 def test_a_valid_config_loads_as_its_policy(tmp_path: Path, on_disk: dict[str, Any]) -> None:
     assert load_policy(_config(tmp_path, on_disk)) == Policy.model_validate(on_disk)
+
+
+def test_a_config_with_a_filer_block_loads_as_its_policy(
+    tmp_path: Path, on_disk: dict[str, Any], filer_block: dict[str, Any]
+) -> None:
+    mapping = {
+        **on_disk,
+        'filer': {
+            **filer_block,
+            'fused_memory_url': 'http://fused.example:8002',
+            'auto_dispatch': True,
+            'fix_priority': 'medium',
+        },
+    }
+
+    assert load_policy(_config(tmp_path, mapping)) == Policy.model_validate(mapping)
+
+
+def test_a_filer_state_dir_under_out_dir_refuses_the_load(
+    tmp_path: Path, on_disk: dict[str, Any]
+) -> None:
+    mapping = {**on_disk, 'filer': {'state_dir': on_disk['out_dir'] + '/filer'}}
+
+    refusal = _refusal(_config(tmp_path, mapping))
+
+    assert refusal.problem is PolicyProblem.INVALID
+    assert 'filer.state_dir' in refusal.detail
 
 
 def test_a_missing_config_is_unreadable(tmp_path: Path) -> None:

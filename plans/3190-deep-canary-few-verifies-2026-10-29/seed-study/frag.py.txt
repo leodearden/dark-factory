@@ -1,0 +1,23 @@
+import random,subprocess,os,collections
+rows=[]
+for l in open('/tmp/3190s/gen602.list',errors='replace'):
+    p=l.rstrip('\n').split(' ',4)
+    if len(p)==5 and p[0]=='f':rows.append((int(p[1]),p[4]))
+random.seed(3190)
+Sz=[('0',0,1),('<4K',1,4096),('4K-64K',4096,65536),('64K-1M',65536,1<<20),('1-16M',1<<20,1<<24),('16-256M',1<<24,1<<28),('>256M',1<<28,1<<60)]
+B='/home/leo/src/warm-lanes/base/target.gen.602/'
+tot=0;all_=0;mx=[]
+print('stratum files sampled mean_ext p50 p90 max est_total_extents total_GB')
+for nm,lo,hi in Sz:
+    v=[r for r in rows if lo<=r[0]<hi]
+    k=min(250,len(v));s=random.sample(v,k) if v else []
+    ext=[]
+    for sz,p in s:
+        try:
+            o=subprocess.run(['filefrag',B+p],capture_output=True,text=True,timeout=20).stdout
+            ext.append(int(o.rsplit(':',1)[1].split()[0]))
+        except Exception:pass
+    if ext:
+        ext.sort();m=sum(ext)/len(ext);e=m*len(v);tot+=e
+        print(nm,len(v),len(ext),f"{m:.2f}",ext[len(ext)//2],ext[int(len(ext)*.9)],ext[-1],f"{e:.0f}",f"{sum(r[0] for r in v)/1e9:.1f}")
+print('estimated total extents',round(tot),'files',len(rows))

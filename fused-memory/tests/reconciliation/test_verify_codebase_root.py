@@ -54,15 +54,12 @@ def _mock_agent_loop():
     patcher = patch('fused_memory.reconciliation.verify.AgentLoop')
     mock_cls = patcher.start()
     instance = AsyncMock()
-    instance.run = AsyncMock(return_value=(
-        {
-            'verdict': 'inconclusive',
-            'confidence': 0.5,
-            'evidence': [],
-            'summary': 'nothing conclusive',
-        },
-        [],
-    ))
+    instance.run = AsyncMock(return_value={
+        'verdict': 'inconclusive',
+        'confidence': 0.5,
+        'evidence': [],
+        'summary': 'nothing conclusive',
+    })
     mock_cls.return_value = instance
     return patcher, mock_cls, instance
 

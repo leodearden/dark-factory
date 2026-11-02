@@ -28,8 +28,7 @@ const {
   stepPaths: sparkStepPaths,
   plottableMax,
   axisY,
-  formatCountTick,
-  niceCountMax,
+  axisMax,
   axisPaths,
   barFractions,
   stackedAreaPaths,
@@ -124,15 +123,12 @@ function StepSpark({ values, width = 100, height = 28, color = PALETTE.bad, stro
 // pre-4059 pre-rounding collapsed WorkflowPanel's 100%-normalized stack — i.e.
 // it would re-file its own predecessor's defect one primitive over.
 //
-// So the default stays `(v) => String(v)`, and the three count callers opt in
-// explicitly with `formatY={formatCountTick}` (spark_path.js, where its
-// blank-don't-round rule is behaviourally tested). Do not "align" these two
-// defaults without redoing that audit.
+// So the default stays `(v) => String(v)`. Do not "align" these two defaults
+// without redoing that audit.
 //
-// `snapMax` (task 5121) is opt-in for the same caller-audit reason: count
-// callers pass niceCountMax, and fraction axes must not, because 1 would snap
-// to 4. The rationale lives at spark_path.js::niceCountMax.
-function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => String(v), formatX = (v) => v, snapMax = (dataMax) => dataMax }) {
+// Whether the y-axis is a COUNT is the single `countAxis` prop on both charts
+// (task 6370); formatY is presentation only. Rationale at spark_path.js::axisMax.
+function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => String(v), formatX = (v) => v, countAxis = false }) {
   const ref = useRef(null);
   const [w, setW] = useState(600);
   useEffect(() => {
@@ -153,7 +149,7 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
   // samples in-range and silently re-frame every LineChart on the dashboard.
   // This is a null-handling fix, not a re-scaling.
   const ticks = 4;
-  const maxV = snapMax(plottableMax(all, 1), ticks);
+  const maxV = axisMax(plottableMax(all, 1), ticks, countAxis);
   const minV = 0;
   const range = maxV - minV || 1;
   const n = labels.length;
@@ -217,7 +213,7 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
   );
 }
 
-function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(Math.round(v)), formatX = v => v, snapMax = (dataMax) => dataMax }) {
+function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(Math.round(v)), formatX = v => v, countAxis = false }) {
   // stacks: [{ key, color, values }]
   const ref = useRef(null);
   const [w, setW] = useState(600);
@@ -245,7 +241,7 @@ function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(
   // the bands they name.
   const geom = { x0: padL, y0: padT, width: chartW, height: chartH, count: n };
   const ticks = 4;
-  const { max: maxV, paths, stepX } = stackedAreaPaths(stacks, geom, (foldedMax) => snapMax(foldedMax, ticks));
+  const { max: maxV, paths, stepX } = stackedAreaPaths(stacks, geom, (foldedMax) => axisMax(foldedMax, ticks, countAxis));
 
   // The value axis the builder scaled every band against: 0..maxV.
   const tickGeom = { y0: padT, height: chartH, min: 0, range: maxV };
@@ -638,4 +634,4 @@ function deriveVelocitySeries(series, labels, smoothingWindowSeconds) {
   return result;
 }
 
-window.DF_CHARTS = { PALETTE, DATUM_AGE_STYLE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries, formatCountTick, niceCountMax };
+window.DF_CHARTS = { PALETTE, DATUM_AGE_STYLE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries };

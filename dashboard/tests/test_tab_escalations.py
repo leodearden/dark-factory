@@ -207,7 +207,7 @@ def test_app_jsx_wires_escalations_tab(app_jsx_body: str) -> None:
         esc_in_toolbar = "esc:" in parts[1] or "'esc'" in parts[1]
     assert esc_in_toolbar, (
         "app.jsx toolbarConfig does not have an 'esc:' entry — add "
-        "`esc: { showWindow: false, showAgents: false, search: false }` to toolbarConfig."
+        "`esc: { showAgents: false, search: false }` to toolbarConfig."
     )
 
 

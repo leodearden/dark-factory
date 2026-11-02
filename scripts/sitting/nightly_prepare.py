@@ -33,9 +33,11 @@ approved for a headless run, and no other server starts.
 The account comes from the shared pool (``account_pool.build_pool``): one
 lease, read and handed straight back before the run, because nothing in the
 child can settle a slot. The known cost is that this run's spend is invisible
-to the gate. With no lease the child inherits this process's environment.
-``ANTHROPIC_API_KEY`` is stripped on both paths (OPERATIONS.md §12,
-"Legibility trickle accounts (03:00)").
+to the gate. With no lease the child inherits this process's environment as
+``shared.secret_env.agent_subprocess_env`` leaves it, and a lease replaces
+``CLAUDE_CODE_OAUTH_TOKEN`` on top of that. Either way the child holds no API
+key or other secret, no endpoint selection and no Python-environment selection
+(OPERATIONS.md §12, "Legibility trickle accounts (03:00)").
 
 Exit codes: 0 the run completed and recorded something; 1 it failed, timed out,
 hit a usage limit or recorded nothing; 2 a configuration error. ``main`` never raises,
@@ -70,6 +72,7 @@ if str(_REPO_ROOT / 'scripts' / 'legibility') not in sys.path:
 from legibility import account_pool  # noqa: E402
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
 from shared.cli_invoke import build_claude_argv, claude_binary_spec  # noqa: E402  # debt: task 6760
+from shared.secret_env import agent_subprocess_env  # noqa: E402  # debt: task 6760
 from sitting import inventory, preparation  # noqa: E402  # debt: task 6760
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG = 0, 1, 2
@@ -267,8 +270,7 @@ def _mcp_config(path: Path) -> dict[str, Any]:
 
 
 def _child_env(gate: Any, inbox: Path) -> dict[str, str]:
-    env = dict(os.environ)
-    env.pop('ANTHROPIC_API_KEY', None)
+    env = agent_subprocess_env(os.environ)
     env[preparation.NIGHTLY_CONFINEMENT_ENV] = str(inbox)
     lease = gate.try_lease(reverse=True)
     if lease is None:
