@@ -946,102 +946,54 @@ async def test_seed_dead_letters_writes_the_writers_record_shape(tmp_path):
     assert seed['event'] == real['event']
 
 
-@pytest.mark.asyncio
-async def test_read_dead_letters_basic_keys(tmp_path):
+def test_read_dead_letters_basic_keys(tmp_path):
     """read_dead_letters returns parsed records with required keys."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
+    seed_dead_letters(dl, [_make_event()])
+    q = EventQueue(AsyncMock(), dead_letter_path=dl)
 
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
-        q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-
-        records = q.read_dead_letters()
-        assert len(records) == 1
-        rec = records[0]
-        assert 'event' in rec
-        assert 'reason' in rec
-        assert 'attempts' in rec
-        assert 'failed_at' in rec
-        assert rec['reason'] == 'non_retriable'
-        assert rec['attempts'] == 1
-    finally:
-        await q.close()
+    records = q.read_dead_letters()
+    assert len(records) == 1
+    rec = records[0]
+    assert 'event' in rec
+    assert 'reason' in rec
+    assert 'attempts' in rec
+    assert 'failed_at' in rec
+    assert rec['reason'] == 'non_retriable'
+    assert rec['attempts'] == 1
 
 
-@pytest.mark.asyncio
-async def test_read_dead_letters_limit(tmp_path):
+def test_read_dead_letters_limit(tmp_path):
     """read_dead_letters(limit=N) returns at most N records, newest-first."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
+    seed_dead_letters(dl, [_make_event() for _ in range(5)])
+    q = EventQueue(AsyncMock(), dead_letter_path=dl)
 
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
-        for _ in range(5):
-            q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-
-        limited = q.read_dead_letters(limit=2)
-        assert len(limited) == 2
-        # Newest-first: the last 2 written records should be returned first.
-        all_records = q.read_dead_letters()
-        assert len(all_records) == 5
-        assert limited == all_records[:2]
-    finally:
-        await q.close()
+    limited = q.read_dead_letters(limit=2)
+    assert len(limited) == 2
+    # Newest-first: the last 2 written records should be returned first.
+    all_records = q.read_dead_letters()
+    assert len(all_records) == 5
+    assert limited == all_records[:2]
 
 
-@pytest.mark.asyncio
-async def test_read_dead_letters_project_id_filter(tmp_path):
+def test_read_dead_letters_project_id_filter(tmp_path):
     """read_dead_letters(project_id=X) returns only records matching that project."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
-
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
+    seed_dead_letters(
+        dl,
+        [_make_event(project_id='proj-a') for _ in range(3)]
+        + [_make_event(project_id='proj-b') for _ in range(2)],
     )
-    await q.start()
-    try:
-        for _ in range(3):
-            q.enqueue(_make_event(project_id='proj-a'))
-        for _ in range(2):
-            q.enqueue(_make_event(project_id='proj-b'))
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+    q = EventQueue(AsyncMock(), dead_letter_path=dl)
 
-        proj_a_records = q.read_dead_letters(project_id='proj-a')
-        assert len(proj_a_records) == 3
-        assert all(r['event']['project_id'] == 'proj-a' for r in proj_a_records)
+    proj_a_records = q.read_dead_letters(project_id='proj-a')
+    assert len(proj_a_records) == 3
+    assert all(r['event']['project_id'] == 'proj-a' for r in proj_a_records)
 
-        proj_b_records = q.read_dead_letters(project_id='proj-b')
-        assert len(proj_b_records) == 2
-        assert all(r['event']['project_id'] == 'proj-b' for r in proj_b_records)
-    finally:
-        await q.close()
+    proj_b_records = q.read_dead_letters(project_id='proj-b')
+    assert len(proj_b_records) == 2
+    assert all(r['event']['project_id'] == 'proj-b' for r in proj_b_records)
 
 
 @pytest.mark.asyncio
@@ -1079,27 +1031,11 @@ async def test_read_dead_letters_after_rotation(tmp_path):
         await q.close()
 
 
-@pytest.mark.asyncio
-async def test_read_dead_letters_tolerates_malformed_line(tmp_path):
+def test_read_dead_letters_tolerates_malformed_line(tmp_path):
     """A malformed JSON line is skipped; no exception is raised."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
-
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
-        q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-    finally:
-        await q.close()
+    seed_dead_letters(dl, [_make_event()])
+    q = EventQueue(AsyncMock(), dead_letter_path=dl)
 
     # Inject a malformed line into the JSONL file.
     with dl.open('a', encoding='utf-8') as fh:
@@ -1181,8 +1117,7 @@ async def test_read_dead_letters_streams_without_loading_whole_files(tmp_path, m
     )
 
 
-@pytest.mark.asyncio
-async def test_read_dead_letters_tolerates_oserror(tmp_path, monkeypatch, caplog):
+def test_read_dead_letters_tolerates_oserror(tmp_path, monkeypatch, caplog):
     """read_dead_letters never raises when a dead-letter file cannot be opened.
 
     The OSError handler inside `read_dead_letters` catches OSError raised by
@@ -1193,24 +1128,9 @@ async def test_read_dead_letters_tolerates_oserror(tmp_path, monkeypatch, caplog
     The monkeypatch is selective: only the dead-letter path's open() raises;
     all other Path.open calls (SQLite fixtures, etc.) use the real open.
     """
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
-
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
-        q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-    finally:
-        await q.close()
+    seed_dead_letters(dl, [_make_event()])
+    q = EventQueue(AsyncMock(), dead_letter_path=dl)
 
     # Confirm the dead-letter file was actually written.
     assert dl.exists(), 'dead-letter file must exist before patching open'
@@ -1338,58 +1258,26 @@ def test_count_dead_letters_returns_zero_when_file_missing(tmp_path):
     assert q.count_dead_letters(project_id='proj-x') == 0
 
 
-@pytest.mark.asyncio
-async def test_count_dead_letters_matches_read_dead_letters_no_filter(tmp_path):
+def test_count_dead_letters_matches_read_dead_letters_no_filter(tmp_path):
     """count_dead_letters() == len(read_dead_letters()) when no filter is given."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
-
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
-        for _ in range(5):
-            q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-    finally:
-        await q.close()
+    seed_dead_letters(dl, [_make_event() for _ in range(5)])
+    q = EventQueue(AsyncMock(), dead_letter_path=dl)
 
     all_records = q.read_dead_letters()
     assert len(all_records) == 5, f'Expected 5 dead-lettered records, got {len(all_records)}'
     assert q.count_dead_letters() == len(all_records) == 5
 
 
-@pytest.mark.asyncio
-async def test_count_dead_letters_matches_read_dead_letters_project_id_filter(tmp_path):
+def test_count_dead_letters_matches_read_dead_letters_project_id_filter(tmp_path):
     """count_dead_letters(project_id=X) == len(read_dead_letters(project_id=X))."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
-
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
+    seed_dead_letters(
+        dl,
+        [_make_event(project_id='proj-a') for _ in range(3)]
+        + [_make_event(project_id='proj-b') for _ in range(2)],
     )
-    await q.start()
-    try:
-        for _ in range(3):
-            q.enqueue(_make_event(project_id='proj-a'))
-        for _ in range(2):
-            q.enqueue(_make_event(project_id='proj-b'))
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-    finally:
-        await q.close()
+    q = EventQueue(AsyncMock(), dead_letter_path=dl)
 
     proj_a_records = q.read_dead_letters(project_id='proj-a')
     assert len(proj_a_records) == 3
@@ -1436,8 +1324,7 @@ async def test_count_dead_letters_spans_rotated_files(tmp_path):
     assert q.count_dead_letters() == len(all_records) == 3
 
 
-@pytest.mark.asyncio
-async def test_count_dead_letters_diverges_from_read_dead_letters_on_malformed_line(
+def test_count_dead_letters_diverges_from_read_dead_letters_on_malformed_line(
     tmp_path, caplog
 ):
     """count_dead_letters hot-path counts malformed lines; read_dead_letters skips them.
@@ -1454,28 +1341,10 @@ async def test_count_dead_letters_diverges_from_read_dead_letters_on_malformed_l
     If a future change "fixes" the hot-path to skip malformed lines (or removes the
     skip in read_dead_letters), this test fails and pinpoints the regression.
     """
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dl.jsonl'
+    seed_dead_letters(dl, [_make_event(project_id='proj-x') for _ in range(2)])
+    q = EventQueue(AsyncMock(), dead_letter_path=dl)
 
-    q = EventQueue(
-        buf,
-        dead_letter_path=dl,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.05,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
-        for _ in range(2):
-            q.enqueue(_make_event(project_id='proj-x'))
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-    finally:
-        await q.close()
-
-    # Inject a malformed line AFTER close so the drainer cannot overwrite it.
-    # Same pattern as test_read_dead_letters_tolerates_malformed_line.
     with dl.open('a', encoding='utf-8') as fh:
         fh.write('not-json-at-all\n')
 
