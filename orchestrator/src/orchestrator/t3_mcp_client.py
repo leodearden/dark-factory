@@ -423,13 +423,40 @@ class _RpcResult:
     session_id: str | None
 
 
-class T3McpClient:
-    """An MCP session with one T3 environment, authenticated by one credential."""
+class _Refusal(StrEnum):
+    """The two HTTP refusals a client recovers from; ``call`` never returns one."""
 
-    def __init__(self, origin: str, credential: Credential, *, root: Path | str | None = None) -> None:
+    UNAUTHORIZED = 'unauthorized'
+    SESSION_LOST = 'session-lost'
+
+
+_UNRECOVERED_FAULT = {
+    _Refusal.UNAUTHORIZED: TransportFault.CREDENTIAL_EXPIRED,
+    _Refusal.SESSION_LOST: TransportFault.PROTOCOL,
+}
+
+
+class T3McpClient:
+    """An MCP session with one T3 environment, authenticated by one credential.
+
+    A lost session (404) is re-initialized once per call. A refused bearer
+    (401) is re-paired through ``repair`` at most once in the client's life,
+    which bounds how many pairing codes a server refusing every token can mint.
+    """
+
+    def __init__(
+        self,
+        origin: str,
+        credential: Credential,
+        *,
+        root: Path | str | None = None,
+        repair: CodeSource | None = None,
+    ) -> None:
         self._origin = checked_origin(origin)
         self._credential = credential
         self._root = root
+        self._repair = repair
+        self._repaired = False
         self._session: dict[str, str] | None = None
         """The headers that carry the session; None until ``initialize`` succeeds."""
         self._request_ids = itertools.count(1)
@@ -439,43 +466,79 @@ class T3McpClient:
         return self._credential.environment_id
 
     def call(self, tool: str, arguments: Mapping[str, Any]) -> CallResult:
-        if self._session is None:
-            opened = self._initialize()
-            if isinstance(opened, TransportFailed):
-                return opened
-        reply = self._rpc('tools/call', {'name': tool, 'arguments': dict(arguments)})
-        if isinstance(reply, TransportFailed):
-            return reply
-        return _tool_result(reply.result)
+        outcome = self._attempt(tool, arguments)
+        if outcome is _Refusal.SESSION_LOST:
+            self._session = None
+            outcome = self._attempt(tool, arguments)
+        if outcome is _Refusal.UNAUTHORIZED:
+            outcome = self._repaired_attempt(tool, arguments)
+        if isinstance(outcome, _Refusal):
+            return TransportFailed(_UNRECOVERED_FAULT[outcome], f'{tool}: {outcome.value} again after recovery')
+        return outcome
 
-    def _initialize(self) -> None | TransportFailed:
+    def _repaired_attempt(self, tool: str, arguments: Mapping[str, Any]) -> CallResult | _Refusal:
+        if self._repair is None or self._repaired:
+            spent = 'no repair source' if self._repair is None else 'already re-paired once'
+            return TransportFailed(TransportFault.CREDENTIAL_EXPIRED, f'{tool}: T3 refused the bearer ({spent})')
+        self._repaired = True
+        paired = pair(self._origin, self._repair, root=self._root)
+        if isinstance(paired, PairFailed):
+            return TransportFailed(
+                TransportFault.CREDENTIAL_EXPIRED, f'{tool}: T3 refused the bearer; re-pair {paired.summary()}'
+            )
+        self._credential = paired.credential
+        self._session = None
+        return self._attempt(tool, arguments)
+
+    def _attempt(self, tool: str, arguments: Mapping[str, Any]) -> CallResult | _Refusal:
+        if self._session is None:
+            refused = self._initialize()
+            if refused is not None:
+                return refused
+        reply = self._rpc('tools/call', {'name': tool, 'arguments': dict(arguments)})
+        if isinstance(reply, _RpcResult):
+            return _tool_result(reply.result)
+        return reply
+
+    def _initialize(self) -> TransportFailed | _Refusal | None:
         params = {'protocolVersion': PROTOCOL_VERSION, 'capabilities': {}, 'clientInfo': {'name': SOFTWARE_ID, 'version': '1'}}
         reply = self._rpc('initialize', params)
-        if isinstance(reply, TransportFailed):
+        if not isinstance(reply, _RpcResult):
             return reply
         self._session = {'Mcp-Session-Id': reply.session_id} if reply.session_id else {}
-        notified = self._notify_initialized()
-        if isinstance(notified, TransportFailed):
+        refused = self._notify_initialized()
+        if refused is not None:
             self._session = None
-        return notified
+        return refused
 
-    def _notify_initialized(self) -> None | TransportFailed:
+    def _notify_initialized(self) -> TransportFailed | _Refusal | None:
         response = self._post({'jsonrpc': '2.0', 'method': 'notifications/initialized'})
         if isinstance(response, TransportFailed):
             return response
         with contextlib.closing(response):
-            if response.status not in (200, 202):
-                return TransportFailed(TransportFault.PROTOCOL, f'notifications/initialized: HTTP {response.status}')
+            if response.status in (200, 202):
+                return None
+            return self._refusal(response.status) or TransportFailed(
+                TransportFault.PROTOCOL, f'notifications/initialized: HTTP {response.status}'
+            )
+
+    def _refusal(self, status: int) -> _Refusal | None:
+        if status == 401:
+            return _Refusal.UNAUTHORIZED
+        if status == 404 and self._session:
+            return _Refusal.SESSION_LOST
         return None
 
-    def _rpc(self, method: str, params: Mapping[str, Any]) -> _RpcResult | TransportFailed:
+    def _rpc(self, method: str, params: Mapping[str, Any]) -> _RpcResult | TransportFailed | _Refusal:
         request_id = next(self._request_ids)
         response = self._post({'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params})
         if isinstance(response, TransportFailed):
             return response
         with contextlib.closing(response):
             if response.status != 200:
-                return TransportFailed(TransportFault.PROTOCOL, f'{method}: HTTP {response.status}')
+                return self._refusal(response.status) or TransportFailed(
+                    TransportFault.PROTOCOL, f'{method}: HTTP {response.status}'
+                )
             message = _read_message(response, request_id)
         if isinstance(message, TransportFailed):
             return message
@@ -523,6 +586,15 @@ class PairFailed:
     detail: str | None = None
     cli_version: str | None = None
     server_version: str | None = None
+
+    def summary(self) -> str:
+        """One line, the reason's word first."""
+        parts = [self.reason.value]
+        if self.cli_version is not None or self.server_version is not None:
+            parts.append(f'cli {self.cli_version} server {self.server_version}')
+        if self.detail is not None:
+            parts.append(self.detail)
+        return ': '.join(parts)
 
 
 @dataclass(frozen=True)
@@ -798,12 +870,24 @@ class ConnectFailed:
     detail: str | None = None
 
 
-def connect(origin: str, *, root: Path | str | None = None) -> T3McpClient | ConnectFailed:
-    """A client on the stored credential for the environment ``origin`` answers as."""
+def connect(
+    origin: str, *, root: Path | str | None = None, repair: CodeSource | None = None
+) -> T3McpClient | ConnectFailed:
+    """A client for the environment ``origin`` answers as, on its stored credential.
+
+    An expired or missing credential is re-paired through ``repair`` when one
+    is given (``CliCodeSource`` on the T3 host), else refused.
+    """
     status = credential_status_at(origin, root=root)
     if isinstance(status, TransportFailed):
         return ConnectFailed(ConnectFailure.DESCRIPTOR_UNREACHABLE, status.detail)
     if status.state is CredentialState.PAIRED and status.credential is not None:
-        return T3McpClient(origin, status.credential, root=root)
-    reason = ConnectFailure.UNPAIRED if status.state is CredentialState.UNPAIRED else ConnectFailure.CREDENTIAL_EXPIRED
-    return ConnectFailed(reason, f'environment {status.environment_id}')
+        return T3McpClient(origin, status.credential, root=root, repair=repair)
+    if repair is None:
+        unpaired = status.state is CredentialState.UNPAIRED
+        reason = ConnectFailure.UNPAIRED if unpaired else ConnectFailure.CREDENTIAL_EXPIRED
+        return ConnectFailed(reason, f'environment {status.environment_id}')
+    paired = pair(origin, repair, root=root)
+    if isinstance(paired, PairFailed):
+        return ConnectFailed(ConnectFailure.PAIR_FAILED, paired.summary())
+    return T3McpClient(origin, paired.credential, root=root, repair=repair)
