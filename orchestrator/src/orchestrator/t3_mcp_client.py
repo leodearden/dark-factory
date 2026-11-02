@@ -17,9 +17,13 @@ credential file) and §6.6 (the T3 0.1.6 surface).
 
 from __future__ import annotations
 
+import contextlib
+import http.client
 import ipaddress
+import itertools
 import json
 import re
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -47,6 +51,8 @@ MCP_READ_TIMEOUT_SECS = T3_MAX_WAIT_SLICE_SECS + 60
 HTTP_TIMEOUT_SECS = 30
 CLI_TIMEOUT_SECS = 60
 
+_DESCRIPTOR_PATH = '/.well-known/t3/environment'
+_MCP_PATH = '/mcp'
 _ENVIRONMENT_ID = re.compile(r'[0-9A-Za-z][0-9A-Za-z_-]*')
 _T = TypeVar('_T')
 
@@ -190,3 +196,325 @@ def read_credential_status(
     if credential.expires_at <= current + EXPIRY_MARGIN:
         return CredentialStatus(CredentialState.EXPIRED, environment_id, credential)
     return CredentialStatus(CredentialState.PAIRED, environment_id, credential)
+
+
+# ---------------------------------------------------------------------------
+# Typed results
+# ---------------------------------------------------------------------------
+
+
+class TransportFault(StrEnum):
+    UNREACHABLE = 'unreachable'
+    CREDENTIAL_EXPIRED = 'credential-expired'
+    PROTOCOL = 'protocol'
+
+
+@dataclass(frozen=True)
+class TransportFailed:
+    fault: TransportFault
+    detail: str
+
+
+@dataclass(frozen=True)
+class ToolOk:
+    value: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class ToolFailed:
+    """A declared ``OrchestratorMcpFailure``: T3 answered and refused."""
+
+    code: str
+    message: str
+
+
+CallResult = ToolOk | ToolFailed | TransportFailed
+
+
+# ---------------------------------------------------------------------------
+# HTTP seam
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Response:
+    status: int
+    stream: http.client.HTTPResponse
+    connection: http.client.HTTPConnection
+
+    def header(self, name: str) -> str | None:
+        return self.stream.getheader(name)
+
+    def close(self) -> None:
+        self.connection.close()
+
+
+def _open(
+    origin: str, method: str, path: str, *, body: bytes | None, headers: Mapping[str, str], timeout: float
+) -> _Response | TransportFailed:
+    """Send one request to ``origin``; the response stays open for the caller to read.
+
+    http.client follows no redirect, so a token or a pairing code never leaves
+    the checked origin.
+    """
+    parts = urlsplit(checked_origin(origin))
+    connection_class = http.client.HTTPSConnection if parts.scheme == 'https' else http.client.HTTPConnection
+    connection = connection_class(parts.netloc, timeout=timeout)
+    try:
+        connection.request(method, path, body=body, headers=dict(headers))
+        stream = connection.getresponse()
+    except (OSError, http.client.HTTPException) as error:
+        connection.close()
+        return TransportFailed(TransportFault.UNREACHABLE, f'{method} {path}: {error!r}')
+    return _Response(stream.status, stream, connection)
+
+
+@dataclass(frozen=True)
+class _JsonReply:
+    status: int
+    body: Mapping[str, Any] | None
+    """The decoded body when it is a JSON object, else None."""
+
+
+def _request_json(
+    origin: str, method: str, path: str, *, body: bytes | None = None, content_type: str | None = None
+) -> _JsonReply | TransportFailed:
+    headers = {'Accept': 'application/json'} | ({'Content-Type': content_type} if content_type else {})
+    response = _open(origin, method, path, body=body, headers=headers, timeout=HTTP_TIMEOUT_SECS)
+    if isinstance(response, TransportFailed):
+        return response
+    with contextlib.closing(response):
+        try:
+            raw = response.stream.read()
+        except (OSError, http.client.HTTPException) as error:
+            return TransportFailed(TransportFault.UNREACHABLE, f'{method} {path}: {error!r}')
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        decoded = None
+    return _JsonReply(response.status, decoded if isinstance(decoded, dict) else None)
+
+
+# ---------------------------------------------------------------------------
+# Environment descriptor
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Descriptor:
+    environment_id: str
+    server_version: str
+    label: str
+
+
+def fetch_descriptor(origin: str) -> Descriptor | TransportFailed:
+    """GET T3's unauthenticated ``/.well-known/t3/environment``."""
+    reply = _request_json(origin, 'GET', _DESCRIPTOR_PATH)
+    if isinstance(reply, TransportFailed):
+        return reply
+    body = reply.body
+    if reply.status != 200 or body is None:
+        return TransportFailed(TransportFault.PROTOCOL, f'descriptor: HTTP {reply.status} without a JSON object')
+    environment_id, server_version, label = body.get('environmentId'), body.get('serverVersion'), body.get('label')
+    if not isinstance(environment_id, str) or not _ENVIRONMENT_ID.fullmatch(environment_id):
+        return TransportFailed(TransportFault.PROTOCOL, f'descriptor: unusable environmentId {environment_id!r}')
+    if not isinstance(server_version, str) or not server_version:
+        return TransportFailed(TransportFault.PROTOCOL, f'descriptor: unusable serverVersion {server_version!r}')
+    return Descriptor(environment_id, server_version, label if isinstance(label, str) else '')
+
+
+def credential_status_at(
+    origin: str, *, root: Path | str | None = None, now: datetime | None = None
+) -> CredentialStatus | TransportFailed:
+    """The credential state for whichever environment ``origin`` answers as."""
+    descriptor = fetch_descriptor(origin)
+    if isinstance(descriptor, TransportFailed):
+        return descriptor
+    return read_credential_status(descriptor.environment_id, root=root, now=now)
+
+
+# ---------------------------------------------------------------------------
+# JSON-RPC over streamable HTTP
+# ---------------------------------------------------------------------------
+
+
+def _sse_event_data(stream: http.client.HTTPResponse) -> Iterator[str]:
+    """The data of each ``message`` (or unnamed) event, read line by line as it arrives."""
+    event, data = 'message', []
+    for raw in stream:
+        line = raw.decode('utf-8').rstrip('\r\n')
+        if not line:
+            if data and event == 'message':
+                yield '\n'.join(data)
+            event, data = 'message', []
+            continue
+        name, _, value = line.partition(':')
+        value = value.removeprefix(' ')
+        if name == 'event':
+            event = value
+        elif name == 'data':
+            data.append(value)
+
+
+def _is_reply_to(message: object, request_id: int) -> bool:
+    return isinstance(message, dict) and message.get('id') == request_id
+
+
+def _read_message(response: _Response, request_id: int) -> dict[str, Any] | TransportFailed:
+    """The JSON-RPC message answering ``request_id``, from a JSON body or an SSE stream."""
+    try:
+        if (response.header('Content-Type') or '').startswith('text/event-stream'):
+            for data in _sse_event_data(response.stream):
+                message = json.loads(data)
+                if _is_reply_to(message, request_id):
+                    return message
+            return TransportFailed(TransportFault.PROTOCOL, f'request {request_id}: the stream ended before the reply')
+        message = json.loads(response.stream.read())
+    except (OSError, http.client.HTTPException) as error:
+        return TransportFailed(TransportFault.UNREACHABLE, f'request {request_id}: {error!r}')
+    except ValueError as error:
+        return TransportFailed(TransportFault.PROTOCOL, f'request {request_id}: undecodable reply: {error}')
+    if not _is_reply_to(message, request_id):
+        return TransportFailed(TransportFault.PROTOCOL, f'request {request_id}: the reply names another request')
+    return message
+
+
+def _first_text_json(result: Mapping[str, Any]) -> dict[str, Any] | None:
+    content = result.get('content')
+    if not isinstance(content, list) or not content or not isinstance(content[0], dict):
+        return None
+    text = content[0].get('text')
+    if not isinstance(text, str):
+        return None
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _tool_result(result: Mapping[str, Any]) -> CallResult:
+    """Read a ``CallToolResult``: a declared failure, else its structured (or text) value."""
+    if result.get('isError') is True:
+        failure = _first_text_json(result) or {}
+        code, message = failure.get('code'), failure.get('message')
+        if not isinstance(code, str) or not isinstance(message, str):
+            return TransportFailed(TransportFault.PROTOCOL, 'a failed tool result without a failure code')
+        return ToolFailed(code, message)
+    structured = result.get('structuredContent')
+    value = structured if isinstance(structured, dict) else _first_text_json(result)
+    if value is None:
+        return TransportFailed(TransportFault.PROTOCOL, 'a tool result without a JSON object value')
+    return ToolOk(value)
+
+
+@dataclass(frozen=True)
+class _RpcResult:
+    result: Mapping[str, Any]
+    session_id: str | None
+
+
+class T3McpClient:
+    """An MCP session with one T3 environment, authenticated by one credential."""
+
+    def __init__(self, origin: str, credential: Credential, *, root: Path | str | None = None) -> None:
+        self._origin = checked_origin(origin)
+        self._credential = credential
+        self._root = root
+        self._session: dict[str, str] | None = None
+        """The headers that carry the session; None until ``initialize`` succeeds."""
+        self._request_ids = itertools.count(1)
+
+    @property
+    def environment_id(self) -> str:
+        return self._credential.environment_id
+
+    def call(self, tool: str, arguments: Mapping[str, Any]) -> CallResult:
+        if self._session is None:
+            opened = self._initialize()
+            if isinstance(opened, TransportFailed):
+                return opened
+        reply = self._rpc('tools/call', {'name': tool, 'arguments': dict(arguments)})
+        if isinstance(reply, TransportFailed):
+            return reply
+        return _tool_result(reply.result)
+
+    def _initialize(self) -> None | TransportFailed:
+        params = {'protocolVersion': PROTOCOL_VERSION, 'capabilities': {}, 'clientInfo': {'name': SOFTWARE_ID, 'version': '1'}}
+        reply = self._rpc('initialize', params)
+        if isinstance(reply, TransportFailed):
+            return reply
+        self._session = {'Mcp-Session-Id': reply.session_id} if reply.session_id else {}
+        notified = self._notify_initialized()
+        if isinstance(notified, TransportFailed):
+            self._session = None
+        return notified
+
+    def _notify_initialized(self) -> None | TransportFailed:
+        response = self._post({'jsonrpc': '2.0', 'method': 'notifications/initialized'})
+        if isinstance(response, TransportFailed):
+            return response
+        with contextlib.closing(response):
+            if response.status not in (200, 202):
+                return TransportFailed(TransportFault.PROTOCOL, f'notifications/initialized: HTTP {response.status}')
+        return None
+
+    def _rpc(self, method: str, params: Mapping[str, Any]) -> _RpcResult | TransportFailed:
+        request_id = next(self._request_ids)
+        response = self._post({'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params})
+        if isinstance(response, TransportFailed):
+            return response
+        with contextlib.closing(response):
+            if response.status != 200:
+                return TransportFailed(TransportFault.PROTOCOL, f'{method}: HTTP {response.status}')
+            message = _read_message(response, request_id)
+        if isinstance(message, TransportFailed):
+            return message
+        error = message.get('error')
+        if error is not None:
+            detail = error.get('message') if isinstance(error, dict) else error
+            return TransportFailed(TransportFault.PROTOCOL, f'{method}: {detail}')
+        result = message.get('result')
+        if not isinstance(result, dict):
+            return TransportFailed(TransportFault.PROTOCOL, f'{method}: a reply without a result object')
+        return _RpcResult(result, response.header('Mcp-Session-Id'))
+
+    def _post(self, message: Mapping[str, Any]) -> _Response | TransportFailed:
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/event-stream',
+            'Authorization': f'Bearer {self._credential.access_token}',
+            'MCP-Protocol-Version': PROTOCOL_VERSION,
+            **(self._session or {}),
+        }
+        body = json.dumps(message).encode()
+        return _open(self._origin, 'POST', _MCP_PATH, body=body, headers=headers, timeout=MCP_READ_TIMEOUT_SECS)
+
+
+# ---------------------------------------------------------------------------
+# Connect
+# ---------------------------------------------------------------------------
+
+
+class ConnectFailure(StrEnum):
+    DESCRIPTOR_UNREACHABLE = 'descriptor-unreachable'
+    UNPAIRED = 'unpaired'
+    CREDENTIAL_EXPIRED = 'credential-expired'
+    PAIR_FAILED = 'pair-failed'
+
+
+@dataclass(frozen=True)
+class ConnectFailed:
+    reason: ConnectFailure
+    detail: str | None = None
+
+
+def connect(origin: str, *, root: Path | str | None = None) -> T3McpClient | ConnectFailed:
+    """A client on the stored credential for the environment ``origin`` answers as."""
+    status = credential_status_at(origin, root=root)
+    if isinstance(status, TransportFailed):
+        return ConnectFailed(ConnectFailure.DESCRIPTOR_UNREACHABLE, status.detail)
+    if status.state is CredentialState.PAIRED and status.credential is not None:
+        return T3McpClient(origin, status.credential, root=root)
+    reason = ConnectFailure.UNPAIRED if status.state is CredentialState.UNPAIRED else ConnectFailure.CREDENTIAL_EXPIRED
+    return ConnectFailed(reason, f'environment {status.environment_id}')
