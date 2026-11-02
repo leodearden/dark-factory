@@ -2380,7 +2380,7 @@ class TestStarvationWatchdogConfig:
 
     def test_packaged_defaults_keep_thresholds_and_add_knobs(self):
         """The retune is the predicate, not the numbers: both age floors stay 72h."""
-        block = _load_package_defaults()['starvation_watchdog']
+        block = load_packaged_defaults()['starvation_watchdog']
         assert block['idle_secs'] == 259200.0
         assert block['idle_only_secs'] == 259200.0
         assert block['skip_threshold'] == 50
