@@ -99,6 +99,7 @@ def _make(
     plan_text_fp_gate_enabled: bool = True,
     plan_steps: list[dict] | None = None,
     git_head: bool = False,
+    plan_base_commit: str | None = None,
 ) -> _Fixture:
     if plan_files is None:
         plan_files = ['mod_a/file.py']
@@ -140,6 +141,8 @@ def _make(
     }
     if plan_text_fp is not None:
         plan['_task_text_fp'] = plan_text_fp
+    if plan_base_commit is not None:
+        plan[PLAN_BASE_COMMIT_KEY] = plan_base_commit
     # Write directly (bypassing artifacts.write_plan, which clobbers
     # _schema_version) so the schema-mismatch test can stage stale plans.
     artifacts.artifact_path('plan.json').write_text(json.dumps(plan))
@@ -187,6 +190,8 @@ def _make(
     git_ops.get_changed_files = get_changed_files
     # The done-step reconciler's collaborators: every done commit reachable.
     git_ops.is_ancestor = AsyncMock(return_value=True)
+    # The plan's own _base_commit is corroborated as on main's history.
+    git_ops.is_ancestor_checked = AsyncMock(return_value=True)
     git_ops.get_commit_subjects = AsyncMock(return_value=[])
     git_ops.find_equivalent_commit = AsyncMock(return_value=None)
     git_ops.get_commit_changed_files = AsyncMock(return_value=[])

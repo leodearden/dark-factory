@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
+from test_plan_revalidation_skip import _make
 
 from orchestrator.artifacts import PLAN_BASE_COMMIT_KEY, TaskArtifacts, plan_base_commit
+from orchestrator.workflow import WorkflowOutcome
 
 
 def _one_step_plan() -> dict:
@@ -67,3 +70,36 @@ def test_unstamped_plan_stays_unstamped(tmp_path: Path):
     artifacts.stamp_plan_provenance('s1')
 
     assert PLAN_BASE_COMMIT_KEY not in artifacts.read_plan()
+
+
+@pytest.mark.parametrize(('plan_base', 'old_plan_base', 'expected_from'), [
+    ('planbase789', None, 'planbase789'),
+    ('planbase789', 'oldmain123', 'planbase789'),
+    (None, 'oldmain123', 'oldmain123'),
+], ids=['cross-lane-redispatch-no-lane-base', 'stamp-wins-over-lane-metadata',
+        'unstamped-plan-falls-back'])
+@pytest.mark.asyncio
+async def test_revalidation_diffs_from_the_plans_own_base(
+    tmp_path: Path, plan_base: str | None, old_plan_base: str | None, expected_from: str,
+):
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', plan_base_commit=plan_base)
+    f.wf._old_plan_base = old_plan_base
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert f.invoke_called == []
+    f.get_changed_files.assert_awaited_once_with(expected_from, 'newmain456')
+
+
+@pytest.mark.parametrize('answer', [False, None], ids=['not-ancestor', 'git-error'])
+@pytest.mark.asyncio
+async def test_plan_stamp_off_main_history_is_not_trusted(tmp_path: Path, answer: bool | None):
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', plan_base_commit='rewritten999')
+    f.git_ops.is_ancestor_checked = AsyncMock(return_value=answer)
+
+    await f.wf._plan()
+
+    f.get_changed_files.assert_awaited_once_with('oldmain123', 'newmain456')
+    f.git_ops.is_ancestor_checked.assert_awaited()
+    assert f.git_ops.is_ancestor_checked.await_args.args[0] == 'rewritten999'
