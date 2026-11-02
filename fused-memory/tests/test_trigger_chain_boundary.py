@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 from _fastmcp_tool_result import tool_result_dict
-from _real_task_stack import real_task_stack
+from _hermetic_task_stack import hermetic_task_stack
 
 pytestmark = pytest.mark.asyncio
 
@@ -102,7 +102,7 @@ async def _titles(server, root: str) -> list[str]:
 async def test_a_second_open_chain_is_refused_until_the_first_is_superseded(
     tmp_path: Path, project_root: str,
 ) -> None:
-    async with real_task_stack(tmp_path) as (server, _interceptor):
+    async with hermetic_task_stack(tmp_path) as (server, _interceptor):
         r1_ids = await _file_chain(server, project_root, 'review-p-1')
 
         refused = await _call(server, 'submit_task', _completion_gate(project_root, 'review-p-2'))
@@ -127,7 +127,7 @@ async def test_a_second_open_chain_is_refused_until_the_first_is_superseded(
 async def test_cancelling_the_open_chain_clears_the_guard(
     tmp_path: Path, project_root: str,
 ) -> None:
-    async with real_task_stack(tmp_path) as (server, _interceptor):
+    async with hermetic_task_stack(tmp_path) as (server, _interceptor):
         r1_ids = await _file_chain(server, project_root, 'review-p-1')
         refused = await _call(server, 'submit_task', _completion_gate(project_root, 'review-p-2'))
         assert refused.get('error_type') == 'TriggerChainOpen', refused
@@ -145,7 +145,7 @@ async def test_cancelling_the_open_chain_clears_the_guard(
 async def test_a_slashed_skill_is_refused_with_the_bare_name(
     tmp_path: Path, project_root: str,
 ) -> None:
-    async with real_task_stack(tmp_path) as (server, _interceptor):
+    async with hermetic_task_stack(tmp_path) as (server, _interceptor):
         submission = _human_gate(project_root, 'review-p-1')
         submission['metadata']['trigger_chain']['skill'] = '/review'
 
@@ -162,7 +162,7 @@ async def test_a_slashed_skill_is_refused_with_the_bare_name(
 async def test_a_chain_task_carrying_x_finding_run_is_refused(
     tmp_path: Path, project_root: str,
 ) -> None:
-    async with real_task_stack(tmp_path) as (server, _interceptor):
+    async with hermetic_task_stack(tmp_path) as (server, _interceptor):
         submission = _completion_gate(project_root, 'review-p-1')
         submission['metadata']['x_finding_run'] = 'review-p-1'
 

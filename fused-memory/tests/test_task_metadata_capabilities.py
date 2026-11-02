@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _fastmcp_tool_result import tool_result_dict
-from _real_task_stack import real_task_stack
+from _hermetic_task_stack import hermetic_task_stack
 from shared.task_metadata import TASK_METADATA_CAPABILITIES
 
 from fused_memory.server.tools import create_mcp_server
@@ -54,7 +54,7 @@ async def test_an_unknown_before_done_key_is_refused_at_submit(tmp_path: Path) -
     script.write_text('#!/bin/sh\nexit 0\n')
     os.chmod(script, 0o755)
     title = 'Predicate with a key from a newer recipe'
-    async with real_task_stack(tmp_path) as (server, _interceptor):
+    async with hermetic_task_stack(tmp_path) as (server, _interceptor):
         refused = tool_result_dict(await server._tool_manager.call_tool('submit_task', {
             'project_root': str(tmp_path),
             'title': title,

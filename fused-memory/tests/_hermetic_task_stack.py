@@ -1,18 +1,18 @@
-"""A real fused-memory task stack behind the MCP tool surface, for boundary tests.
+"""A hermetic fused-memory task stack behind the MCP tool surface, for boundary tests.
 
 SqliteTaskBackend + EventBuffer + TicketStore + a real TaskInterceptor, served
 by ``create_mcp_server``, so a test drives ``server._tool_manager.call_tool``
-against persisted rows. Import it as ``from _real_task_stack import
-real_task_stack``.
+against persisted rows. Import it as ``from _hermetic_task_stack import
+hermetic_task_stack``.
 
 ``config.taskmaster`` is cleared so the curator's one-shot corpus backfill
 never fires, which keeps the stack hermetic whatever the ambient
-fused-memory/config/config.yaml says.
+fused-memory/config/config.yaml says. That clearing is what sets it apart from
+``test_task_tools.py::real_task_stack``, a fixture that passes no config.
 """
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -28,7 +28,7 @@ from fused_memory.server.tools import create_mcp_server
 
 
 @contextlib.asynccontextmanager
-async def real_task_stack(tmp_path: Path) -> AsyncIterator[tuple[Any, TaskInterceptor]]:
+async def hermetic_task_stack(tmp_path: Path) -> AsyncIterator[tuple[Any, TaskInterceptor]]:
     """Yield ``(server, interceptor)`` over a fresh store rooted at *tmp_path*."""
     backend = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
     await backend.start()
@@ -42,11 +42,6 @@ async def real_task_stack(tmp_path: Path) -> AsyncIterator[tuple[Any, TaskInterc
     try:
         yield create_mcp_server(AsyncMock(), task_interceptor=interceptor), interceptor
     finally:
-        await ticket_store.close()
-        for worker in list(interceptor._worker_tasks.values()):
-            if not worker.done():
-                worker.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await worker
+        await interceptor.close()
         await event_buffer.close()
         await backend.close()
