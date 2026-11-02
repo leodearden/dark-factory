@@ -3,8 +3,8 @@
 Contract: plans/review-all-s11-curator-pipeline-prd.md decisions 1 and 10,
 §Contract "Curation pipeline", rows B6-B8. ``TaskCurator.curate_prepared`` is
 the only pipeline. It applies one ordered guard chain to every bundle, sends
-what is left to one LLM dispatch, and maps every LLM failure to a decision in
-one place, so it raises nothing but a pool error.
+what is left to one LLM dispatch, and maps every LLM failure, a pool error
+included, to a decision in one place.
 
 Driven through public seams only: the invoker and escalator injected through
 the constructor, and ``curate_prepared`` itself. No private name is patched.
@@ -249,6 +249,56 @@ class TestOnePipeline:
         assert (hung.action, hung.degraded, hung.degraded_by_zot) == ('create', True, True)
         assert hung.justification.startswith('curator-failed: CuratorFailureError')
         assert escalator.report_failure.await_count == 2
+
+    async def test_a_hang_with_no_escalator_wired_is_not_called_escalated(self):
+        curator = TaskCurator(
+            config=make_config(), taskmaster=None, escalator=None,
+            invoke=invoke_by_role(
+                single=zot_agent_result(), batch=AssertionError('one bundle is a batch of one'),
+            ),
+        )
+
+        [hung] = await curator.curate_prepared([prepared('Hung')], PROJECT_ID, PROJECT_ROOT)
+
+        assert (hung.action, hung.degraded_by_zot) == ('create', True)
+        assert hung.justification.startswith('curator-failed: CuratorFailureError')
+
+    async def test_a_half_that_raises_leaves_no_sibling_call_in_flight(self):
+        in_flight: set[str] = set()
+        never = asyncio.Event()
+
+        async def answer(**kwargs: Any) -> AgentResult:
+            titles = candidate_titles(kwargs['prompt'])
+            if titles != ['Slow']:
+                return _max_turns_failure()
+            in_flight.add('Slow')
+            try:
+                await never.wait()
+            finally:
+                in_flight.discard('Slow')
+            return _max_turns_failure()
+
+        escalator = escalator_double()
+        escalator.report_failure = AsyncMock(side_effect=OSError('escalation state unwritable'))
+        curator = TaskCurator(
+            config=make_config(), taskmaster=None, escalator=escalator,
+            invoke=AsyncMock(side_effect=answer),
+        )
+
+        try:
+            decisions = await asyncio.wait_for(
+                curator.curate_prepared(
+                    [_llm_bound('Fails'), _llm_bound('Slow')], PROJECT_ID, PROJECT_ROOT,
+                ),
+                timeout=5.0,
+            )
+            assert in_flight == set()
+        finally:
+            never.set()
+
+        assert [(d.action, d.defer_reason) for d in decisions] == [
+            ('defer', DeferReason.CURATOR_RAISED),
+        ] * 2
 
     async def test_an_escalator_that_raises_defers_every_candidate_curator_raised(self):
         escalator = escalator_double()

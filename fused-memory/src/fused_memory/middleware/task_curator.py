@@ -1667,7 +1667,11 @@ class TaskCurator:
         ``create``.
 
         Raises only a ``POOL_UNAVAILABLE_ERRORS`` error and
-        :exc:`asyncio.CancelledError`. Any other exception defers every bundle
+        :exc:`asyncio.CancelledError`. A pool error from the LLM call is not
+        one of them: :meth:`_failure_decision` defers each bundle under the
+        pool's reason. The re-raise is for a pool error from anywhere else in
+        the pipeline, which none of today's guards produces, so the caller can
+        defer it under that reason too. Any other exception defers every bundle
         ``CURATOR_RAISED``, so a curator that raises instead of deciding parks
         its tickets rather than failing or creating them.
 
@@ -1748,7 +1752,9 @@ class TaskCurator:
         # 6-10.
         llm_bound: list[int] = []
         for i in live:
-            decision = await self._decide_before_llm(bundles[i], project_id, project_root, start)
+            decision = await self._decide_before_llm(
+                bundles[i], hashes[i], project_id, project_root, start,
+            )
             if decision is None:
                 llm_bound.append(i)
             else:
@@ -1801,13 +1807,13 @@ class TaskCurator:
     async def _decide_before_llm(
         self,
         bundle: PreparedCandidate,
+        payload_hash: str,
         project_id: str,
         project_root: str,
         start: float,
     ) -> CuratorDecision | None:
         """Guards 6-10 for one bundle: a decision that needs no LLM call, else ``None``."""
         candidate = bundle.candidate
-        payload_hash = candidate.payload_hash()
 
         # 6. Ahead of the cache: a cached 'create' is stale once its first
         # caller has landed the task and ``note_created`` it.
@@ -2900,7 +2906,11 @@ class TaskCurator:
         project_root: str,
         start: float,
     ) -> list[CuratorDecision]:
-        """Dispatch each half of a failed batch, concurrently, rebasing the right half's indices."""
+        """Dispatch each half of a failed batch, concurrently, rebasing the right half's indices.
+
+        A half that raises cancels its sibling before the raise propagates, so
+        a batch the pipeline has given up on leaves no LLM call running.
+        """
         mid = len(bundles) // 2
         detail = (
             f'subtype={exc.subtype} timed_out={exc.timed_out}'
@@ -2911,11 +2921,16 @@ class TaskCurator:
             'task_curator: bisecting a size-%d batch on %s (%s) → halves of %d and %d',
             len(bundles), type(exc).__name__, detail, mid, len(bundles) - mid,
         )
-        left, right = await asyncio.gather(
-            self._dispatch_llm(bundles[:mid], project_id, project_root, start),
-            self._dispatch_llm(bundles[mid:], project_id, project_root, start),
-        )
-        return left + [_shift_batch_target_index(decision, mid) for decision in right]
+        async with asyncio.TaskGroup() as halves:
+            left = halves.create_task(
+                self._dispatch_llm(bundles[:mid], project_id, project_root, start),
+            )
+            right = halves.create_task(
+                self._dispatch_llm(bundles[mid:], project_id, project_root, start),
+            )
+        return left.result() + [
+            _shift_batch_target_index(decision, mid) for decision in right.result()
+        ]
 
     async def _decisions_from_result(
         self,
@@ -2980,7 +2995,9 @@ class TaskCurator:
         marked ``degraded_by_zot``. With no orchestrator running, the escalator
         raises :exc:`CuratorFailureError` instead of filing; that raise is
         logged and the failure decided exactly as on the orchestrator path, so
-        nothing escapes the pipeline.
+        nothing escapes the pipeline. Only a ZOT that reached an escalator is
+        justified ``llm-error-escalated``; one that did not cites the
+        escalator's raise, or with no escalator wired the failure itself.
         """
         candidate = bundle.candidate
         if isinstance(exc, POOL_UNAVAILABLE_ERRORS):
@@ -2998,7 +3015,8 @@ class TaskCurator:
                 exc_info=exc,
             )
         escalation_id: str | None = None
-        unescalated: CuratorFailureError | None = None
+        escalated = False
+        escalator_raised: CuratorFailureError | None = None
         if self._escalator is None:
             logger.warning('task_curator: LLM failure with no escalator wired: %s', exc)
         else:
@@ -3010,13 +3028,14 @@ class TaskCurator:
                     pool_sizes=bundle.pool_sizes,
                     **_failure_report(exc),
                 )
+                escalated = True
             except CuratorFailureError as raised:
                 logger.error(
                     'task_curator: no orchestrator to escalate the curator failure for %r '
                     'to (%s); deciding it here',
                     candidate.title, exception_summary(raised),
                 )
-                unescalated = raised
+                escalator_raised = raised
 
         if not (isinstance(exc, CuratorFailureError) and exc.zero_output_timeout):
             logger.warning(
@@ -3037,8 +3056,8 @@ class TaskCurator:
             )
         return await self._degraded_create(
             justification=(
-                'llm-error-escalated' if unescalated is None
-                else f'curator-failed: {exception_summary(unescalated)}'
+                'llm-error-escalated' if escalated
+                else f'curator-failed: {exception_summary(escalator_raised or exc)}'
             ),
             pool_sizes=bundle.pool_sizes,
             start=start,
