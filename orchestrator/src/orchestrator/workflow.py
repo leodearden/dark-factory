@@ -14979,10 +14979,10 @@ class TaskWorkflow:
         completed_at = datetime.now(UTC).isoformat()
 
         # The CLI-stage half of session_resume_failed (task 3578): we DID arm
-        # --resume, the CLI rejected the session, and invoke_with_cap_retry
-        # retried fresh and handed back a SUCCESS. Nothing else records that —
-        # from runs.db the invocation looks perfect, so the lost transcript was
-        # invisible. `shared` has no event store, so the count rides out on
+        # --resume and the CLI rejected the session before any model turn, so
+        # invoke_with_cap_retry retried fresh. resume_fallbacks counts only
+        # those proven rejections (shared/cli_invoke.py::is_resume_rejected,
+        # task 5579). `shared` has no event store, so the count rides out on
         # AgentResult.resume_fallbacks and is turned into an event here.
         #
         # getattr with a default, not attribute access: several suites hand
@@ -14994,8 +14994,8 @@ class TaskWorkflow:
         # EventType's taxonomy note).
         #
         # GATED ON OUR OWN ARMED RESUME, not on the counter alone. cli_invoke
-        # increments resume_fallbacks for ANY resumed attempt that failed
-        # non-cap and was retried fresh — including a resume its retry loop
+        # increments resume_fallbacks for ANY rejected resume it retried
+        # fresh — including a resume its retry loop
         # re-armed ITSELF after a cap hit (invoke_kwargs['resume_session_id'] =
         # result.session_id). A plain FRESH dispatch that hits a cap can
         # therefore come back with a non-zero count while no resume was ever
@@ -15051,6 +15051,9 @@ class TaskWorkflow:
             # Adopted AND survived — the reset half of the circuit breaker.
             # `resume_session_id` is non-None iff the arm site corroborated and
             # adopted, so this is exactly "a resume we DECIDED to make worked".
+            # A resumed run that ran turns and then ended non-success (the
+            # ended_awaiting_background downgrade, a budget kill) also survived:
+            # the role's normal non-success handling owns that outcome (task 5579).
             self._report_resume_succeeded()
 
         # Record the last successfully-completed role (updated only on success,
