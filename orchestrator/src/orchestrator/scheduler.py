@@ -1448,8 +1448,8 @@ class Scheduler:
         # NOTE: callers MUST inject a monotonic-style source (no epoch relation,
         # immune to NTP/clock skew).  Injecting ``time.time`` will break trip
         # semantics under clock adjustments.
-        self._park_stop_clock: Callable[[], float] = (
-            monotonic_clock_source if monotonic_clock_source is not None else time.monotonic
+        self._park_stop_clock: Callable[[], float] = resolve_monotonic_time_source(
+            monotonic_clock_source
         )
         # Only the injectable WALL clock is passed down (task 3823 / PRD task
         # η), so park install stamps share one epoch with _emit_lock_event's

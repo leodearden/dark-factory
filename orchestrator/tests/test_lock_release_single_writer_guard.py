@@ -252,12 +252,9 @@ def test_no_lock_table_release_outside_scheduler_release() -> None:
 
     remediation = (
         'route it through `Scheduler.release(task_id, ...)`, the only site '
-        'that emits a full-release `lock_released` (`release_subset` emits '
-        'only the narrower `plan_refinement` partial) — see contract C5 of '
-        'plans/scheduler-dispatch-scoring-and-lock-layer-prd.md. A direct '
-        '`lock_table.release` empties _held[task_id] first, so the later '
-        'teardown release() snapshots modules == [] and skips its emit too, '
-        'leaving a lock_acquired with no matching lock_released.'
+        'that emits a full-release `lock_released`. Why a direct call leaves '
+        'a lock_acquired with no matching lock_released: see the module '
+        f'docstring of orchestrator/tests/{_THIS_FILE}.'
     )
 
     # Assert the TOTAL as well as the outside-list (belt and braces): a
