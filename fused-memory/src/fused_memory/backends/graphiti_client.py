@@ -3603,10 +3603,7 @@ class GraphitiBackend:
         is the minimal write set that restores per-uuid count(*) <= 1 while
         preserving the full edge set (no edge created or deleted), and it
         makes the repair idempotent: a re-run's detection query finds no
-        group with count(*) > 1 and performs zero writes. Detection is read
-        over GRAPH.RO_QUERY, so a graph deleted after the startup scan listed
-        it is refused rather than recreated empty (pinned by
-        test_repair_on_a_graph_deleted_after_listing_leaves_it_deleted).
+        group with count(*) > 1 and performs zero writes.
 
         GRAPH-KEY-scoped (NO group_id filter) — deliberately broader than the
         dup-node alarm's `n.group_id = $group_id` scoping. ζ's forthcoming
@@ -3639,6 +3636,11 @@ class GraphitiBackend:
         `superseded_edge_uuid` ends up recording whichever writer's original
         `old_uuid` lost the race, which is acceptable for an audit-only
         property.
+
+        Deleted-graph note: detection is read over GRAPH.RO_QUERY, so a graph
+        deleted after the startup scan listed it is refused rather than
+        recreated empty. Pinned by
+        fused-memory/tests/test_startup_identity_scan.py::TestRepairDuplicateEdgeUuidsLiveFalkorDB::test_repair_on_a_graph_deleted_after_listing_leaves_it_deleted.
 
         Args:
             group_id: Project graph to repair.
