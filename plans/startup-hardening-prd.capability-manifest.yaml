@@ -6,7 +6,7 @@ schema_version: 1
 signal_leaves: ["γ", "η"]
 tasks:
   - label: "α"
-    task_id: null
+    task_id: 8267
     title: "Startup-step runner: every startup sweep non-fatal by default, per-entry isolation, one L1 per failed step"
     capabilities:
       - name: "startup-step-runner-module"
@@ -26,15 +26,15 @@ tasks:
           paths: ["orchestrator/src/orchestrator/event_store.py"]
           expect: present
       - name: "ad-hoc-startup-try-except-removed"
-        binding: "rejection-mechanism — 2c2's 'startup continues' block is gone once the runner owns the policy"
+        binding: "rejection-mechanism — 1c0a's ad-hoc 'Failed to recover pending merges' block is gone once the runner owns the policy"
         verdict: PASS
         delivered_check:
           kind: grep
-          pattern: "startup continues"
+          pattern: "Failed to recover pending merges"
           paths: ["orchestrator/src/orchestrator/harness.py"]
           expect: absent
   - label: "β"
-    task_id: null
+    task_id: 8268
     title: "Merge worker constructed at 1b, loop and survivor reap launched after finish_startup()"
     capabilities:
       - name: "merge-loop-launched-after-startup"
@@ -52,7 +52,7 @@ tasks:
           kind: manual
           reason: "behavioural invariant judged by β's fault-injection test, not a grep"
   - label: "γ"
-    task_id: null
+    task_id: 8269
     title: "Crash-loop breaker: consecutive-startup-failure journal, K=3 quarantine, one born-at-L2, exit_reason/startup_completed_at on runs"
     capabilities:
       - name: "crash-loop-sentinel"
@@ -80,7 +80,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/run_store.py"]
           expect: present
   - label: "δ"
-    task_id: null
+    task_id: 8270
     title: "Watchdog: NRestarts restart-rate alarm into dark-factory's queue, honour start-limit-hit, per-unit liveness min-interval, --report RESTARTS"
     capabilities:
       - name: "watchdog-reads-nrestarts"
@@ -106,7 +106,7 @@ tasks:
           kind: manual
           reason: "argv shape is judged by δ's tests against submit.py's argparse boundary"
   - label: "ε"
-    task_id: null
+    task_id: 8271
     title: "StartLimitIntervalSec=1800 on the nine committed orchestrator units, the factory-init template and the unit-file tests"
     capabilities:
       - name: "units-resized"
@@ -126,7 +126,7 @@ tasks:
           paths: ["skills/factory-init/references/supervised-unit.md"]
           expect: absent
   - label: "ζ"
-    task_id: null
+    task_id: 8273
     title: "Deploy: install the resized units, daemon-reload, drained fleet sweep (human gate)"
     capabilities:
       - name: "units-installed-and-fleet-restarted"
@@ -136,7 +136,7 @@ tasks:
           kind: manual
           reason: "host action outside the sandbox write-set"
   - label: "η"
-    task_id: null
+    task_id: 8274
     title: "Observation 7 days after ζ: the producers wrote in production (INV-13)"
     capabilities:
       - name: "production-observation-recorded"

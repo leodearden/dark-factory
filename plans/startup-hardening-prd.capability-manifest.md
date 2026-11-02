@@ -10,7 +10,7 @@ each check gates something.
 | α | runner module exists | new file `orchestrator/src/orchestrator/startup_steps.py`; grep `class StartupStep` | PASS |
 | α | `startup_step_failed` event type | grep in `orchestrator/src/orchestrator/event_store.py` (`EventType` StrEnum exists; additive member) | PASS |
 | α | L1 per failed step, deduped | wired via `EscalationQueue.get_by_task`/`make_id`/`submit` (the `_file_dirty_tree_escalation` idiom, present on main) | PASS |
-| α | ad-hoc blocks removed | rejection-style: grep `startup continues` absent in `harness.py` after α (present today, 2c2's block) | PASS |
+| α | ad-hoc blocks removed | rejection-style: grep `Failed to recover pending merges` absent in `harness.py` after α (present today, 1c0a's block; 2c2's `startup continues` string is split across two lines and never matched) | PASS |
 | β | loop launched after `finish_startup` | grep `_launch_merge_worker_loop` in `harness.py` | PASS |
 | β | enqueue without a consumer | `self._merge_queue: asyncio.Queue` in `Harness.__init__`; `_recover_pending_merges` enqueues via `enqueue_merge_request` — present on main | PASS |
 | β | stop-guard invariant | `_stop_merge_worker` already gates on `_merge_worker_task is not None` — present; β pins it with a test | PASS |
