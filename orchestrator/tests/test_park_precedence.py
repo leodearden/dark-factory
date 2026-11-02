@@ -24,8 +24,8 @@ import pytest
 from _park_test_helpers import event_data_for, make_task, park_world
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.pin_reservation import Blocker, BlockerKind, ParkPriority, PinOrder
 from orchestrator.lock_table import ModuleLockTable
+from orchestrator.pin_reservation import Blocker, BlockerKind, ParkPriority, PinOrder
 
 
 def _lt(**config_overrides: object) -> ModuleLockTable:
