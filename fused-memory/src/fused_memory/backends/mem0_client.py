@@ -379,20 +379,26 @@ class Mem0Backend:
     async def _ensure_collection(self, collection_name: str) -> None:
         """Create the collection if absent, under this backend's own budgets (tests/test_mem0_collection_provisioning.py)."""
         from qdrant_client.http import models as qmodels  # noqa: PLC0415
+        from qdrant_client.http.exceptions import UnexpectedResponse  # noqa: PLC0415
 
         client = await self._get_async_qdrant()
         if await self._timed_read(client.collection_exists(collection_name), 'collection_exists'):
             return
-        await self._timed_write(
-            client.create_collection(
-                collection_name=collection_name,
-                vectors_config=qmodels.VectorParams(
-                    size=self.config.embedder.dimensions,
-                    distance=qmodels.Distance.COSINE,
+        try:
+            await self._timed_write(
+                client.create_collection(
+                    collection_name=collection_name,
+                    vectors_config=qmodels.VectorParams(
+                        size=self.config.embedder.dimensions,
+                        distance=qmodels.Distance.COSINE,
+                    ),
                 ),
-            ),
-            'create_collection',
-        )
+                'create_collection',
+            )
+        except UnexpectedResponse as exc:
+            # 409: another creator won between the exists check and the create.
+            if exc.status_code != 409:
+                raise
 
     async def _timed_read(self, awaitable: Awaitable[_T], op: str) -> _T:
         """``await_within`` under this backend's READ budget."""
