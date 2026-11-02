@@ -2190,11 +2190,15 @@ class ModuleLockTable:
         logger.info(f'Task {task_id} acquired locks: {normalized}')
         return True
 
-    def release(self, task_id: str) -> None:
-        """Release all module locks held by a task."""
-        modules = self._held.pop(task_id, set())
-        if modules:
-            logger.info(f'Task {task_id} released locks: {list(modules)}')
+    def release(self, task_id: str) -> list[str]:
+        """Release all module locks held by a task. Returns the normalized
+        modules released (empty when the task held none), the same shape as
+        ``release_subset``.
+        """
+        released = sorted(self._held.pop(task_id, set()))
+        if released:
+            logger.info(f'Task {task_id} released locks: {released}')
+        return released
 
     def release_subset(self, task_id: str, modules: list[str]) -> list[str]:
         """Drop a subset of the task's held modules. Returns the normalized
@@ -9305,8 +9309,7 @@ class Scheduler:
         armed_n = self._pending_transient_cooldown.pop(task_id, None)
         if requeued:
             self._arm_requeue_cooldown(task_id, armed_n)
-        modules = list(self.lock_table._held.get(task_id, set()))
-        self.lock_table.release(task_id)
+        modules = self.lock_table.release(task_id)
         # Defensive: dispatch already settled this task's parks, so this only
         # clears parks installed after dispatch (e.g. a park rehydrated at
         # startup for a task that is already running).
