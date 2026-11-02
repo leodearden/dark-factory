@@ -5,6 +5,7 @@ escalation/src/escalation/queue.py::EscalationQueue.resolve archives a closed re
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -20,9 +21,15 @@ from client_feed.contract import NonNegativeInt, Source
 from client_feed.sources.store import StoreProblem, StoreReadError
 from client_feed.sources.task_id import task_id_of
 
-PENDING: Final = 'pending'
-
 _RECORD_NAME: Final = 'esc-*.json'
+
+
+class _Status(StrEnum):
+    """escalation/src/escalation/models.py::Escalation.status; any other value is a malformed record, never a closed one."""
+
+    PENDING = 'pending'
+    RESOLVED = 'resolved'
+    DISMISSED = 'dismissed'
 
 
 class EscalationSkipReason(StrEnum):
@@ -63,7 +70,7 @@ class _Record(BaseModel):
 
     id: str
     task_id: str | None
-    status: str = PENDING
+    status: _Status = _Status.PENDING
     level: NonNegativeInt = 0
     members: tuple[str, ...] = ()
 
@@ -73,7 +80,7 @@ def _record_paths(root: Path) -> list[Path]:
     queue = escalation_queue_dir(root)
     relpath = queue.relative_to(root)
     try:
-        names = sorted(entry.name for entry in queue.iterdir())
+        names = os.listdir(queue)
     except FileNotFoundError as exc:
         raise StoreReadError(
             source=Source.EVENTS, relpath=relpath, problem=StoreProblem.MISSING,
@@ -83,7 +90,8 @@ def _record_paths(root: Path) -> list[Path]:
         raise StoreReadError(
             source=Source.EVENTS, relpath=relpath, problem=StoreProblem.UNREADABLE, detail=str(exc)
         ) from exc
-    return [queue / name for name in names if fnmatchcase(name, _RECORD_NAME)]
+    records = sorted(name for name in names if fnmatchcase(name, _RECORD_NAME))
+    return [queue / name for name in records]
 
 
 def _read_record(path: Path) -> _Record | SkippedRecord | None:
@@ -116,7 +124,7 @@ def _by_task(pending: Sequence[_Record]) -> dict[int, tuple[OpenEscalation, ...]
 def read_open_escalations(root: Path) -> OpenEscalations:
     """The queue root's pending records, by task; reads nothing else, writes nothing and takes no lock."""
     read = [_read_record(path) for path in _record_paths(root)]
-    pending = tuple(item for item in read if isinstance(item, _Record) and item.status == PENDING)
+    pending = tuple(item for item in read if isinstance(item, _Record) and item.status is _Status.PENDING)
     return OpenEscalations(
         by_task=MappingProxyType(_by_task(pending)),
         skipped=tuple(item for item in read if isinstance(item, SkippedRecord)),

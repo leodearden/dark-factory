@@ -62,7 +62,6 @@ def test_a_promoted_then_resolved_l2_waits_on_leo_then_on_the_factory(
 
 
 def test_a_parked_record_waits_on_leo(root: Path, queue: EscalationQueueDir) -> None:
-    queue.write('esc-9-1', task_id='9', level=1)
     queue.write('esc-9-1', task_id='9', level=2, resolution='parked', resolution_action='park')
 
     assert blocked_waits_on(read_open_escalations(root), 9) is WaitingOn.LEO
@@ -78,6 +77,17 @@ def test_an_l2_is_open_for_each_pending_members_task(root: Path, queue: Escalati
     assert read_open_escalations(root).by_task == {
         6084: (OpenEscalation('esc-6084-5', 2),),
         6434: (OpenEscalation('esc-6084-5', 2), OpenEscalation('esc-6434-4', 1)),
+    }
+
+
+def test_an_l2_without_a_task_number_is_open_for_its_pending_members_task(
+    root: Path, queue: EscalationQueueDir
+) -> None:
+    queue.write('esc-9-1', task_id='9', level=1)
+    queue.write('esc-x-2', task_id='write-journal-size-ceiling', level=2, members=['esc-9-1'])
+
+    assert read_open_escalations(root).by_task == {
+        9: (OpenEscalation('esc-9-1', 1), OpenEscalation('esc-x-2', 2)),
     }
 
 
@@ -159,9 +169,13 @@ def _without_id(queue: EscalationQueueDir) -> None:
         lambda queue: queue.write('esc-9-2', task_id='9', level=True),
         lambda queue: queue.write('esc-9-2', task_id='9', level=1.0),
         lambda queue: queue.write('esc-9-2', task_id='9', level=-1),
+        lambda queue: queue.write('esc-9-2', task_id='9', level=2, status='snoozed'),
         _without_id,
     ],
-    ids=['not-json', 'level-str', 'level-bool', 'level-float', 'level-negative', 'no-id'],
+    ids=[
+        'not-json', 'level-str', 'level-bool', 'level-float', 'level-negative', 'status-unknown',
+        'no-id',
+    ],
 )
 def test_a_malformed_record_is_skipped_and_the_rest_still_read(
     root: Path, queue: EscalationQueueDir, write_bad: Callable[[EscalationQueueDir], object]
