@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -359,7 +359,7 @@ class TestExactDuplicateInsideAWorkerBatch:
     async def test_a_reworded_duplicate_in_a_batch_drops_onto_the_task_it_repeats(
         self, store, event_buffer,
     ):
-        taskmaster = _RecordingTaskmaster()
+        taskmaster = cast(Any, _RecordingTaskmaster())
         invoke = invoke_by_role(
             single=agent_result({'action': 'create', 'justification': 'new'}),
             batch=_create_each_in_batch,

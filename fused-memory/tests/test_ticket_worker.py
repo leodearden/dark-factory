@@ -927,13 +927,13 @@ async def test_resolve_ticket_timeout_answers_pending_without_mutating_row(
         await paused.wait()  # blocks indefinitely during this test
         return CuratorDecision(action='create')
 
-    async def blocking_curate_batch(candidates, *args, **kwargs):
+    async def blocking_curate_prepared(candidates, *args, **kwargs):
         await paused.wait()
         return [CuratorDecision(action='create')] * len(candidates)
 
     mock_curator = MagicMock()
     mock_curator.curate = blocking_curate
-    mock_curator.curate_prepared = blocking_curate_batch
+    mock_curator.curate_prepared = blocking_curate_prepared
     _stub_prepare_candidate(mock_curator)
     mock_curator.note_created = MagicMock()
     mock_curator.record_task = AsyncMock()
@@ -2269,7 +2269,7 @@ class TestCuratorWorkerBatchDrain:
         })
 
     @pytest.mark.asyncio
-    async def test_worker_drains_up_to_batch_max_then_calls_curate_batch_once(
+    async def test_worker_drains_up_to_batch_max_then_calls_curate_prepared_once(
         self, interceptor_with_store, ticket_store, taskmaster,
     ):
         """Worker drains all queued tickets into one batch."""
@@ -2432,7 +2432,7 @@ class TestCuratorWorkerBatchDrain:
         curate_prepared_entered = asyncio.Event()
         release_batch = asyncio.Event()
 
-        async def blocking_curate_batch(candidates, pid, project_root):
+        async def blocking_curate_prepared(candidates, pid, project_root):
             held_during['curate_prepared'] = lock.locked()
             curate_prepared_entered.set()
             await release_batch.wait()
@@ -2450,7 +2450,7 @@ class TestCuratorWorkerBatchDrain:
             held_during['record_task'] = lock.locked()
 
         mock_curator = MagicMock()
-        mock_curator.curate_prepared = AsyncMock(side_effect=blocking_curate_batch)
+        mock_curator.curate_prepared = AsyncMock(side_effect=blocking_curate_prepared)
         _stub_prepare_candidate(mock_curator)
         mock_curator.note_created = MagicMock(side_effect=recording_note_created)
         mock_curator.record_task = AsyncMock(side_effect=recording_record_task)
@@ -2534,13 +2534,13 @@ class TestCuratorWorkerBatchDrain:
         batch_entered = asyncio.Event()
         release_batch = asyncio.Event()
 
-        async def blocking_curate_batch(candidates, project_id, project_root):
+        async def blocking_curate_prepared(candidates, project_id, project_root):
             batch_entered.set()
             await release_batch.wait()
             return [CuratorDecision(action='create', justification='ok') for _ in candidates]
 
         curator = _batch_curator()
-        curator.curate_prepared = AsyncMock(side_effect=blocking_curate_batch)
+        curator.curate_prepared = AsyncMock(side_effect=blocking_curate_prepared)
         curator.evict_task = AsyncMock()
         interceptor = make_batch_interceptor(curator)
 
@@ -2598,7 +2598,7 @@ class TestCuratorWorkerBatchDrain:
 
         Tickets are submitted to the store and queue pre-filled before the
         worker starts, ensuring all 3 land in the same batch (same pattern
-        as test_worker_drains_up_to_batch_max_then_calls_curate_batch_once).
+        as test_worker_drains_up_to_batch_max_then_calls_curate_prepared_once).
         """
         project_id = 'project'
         existing_task_id = 'existing-99'

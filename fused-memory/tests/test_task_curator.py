@@ -94,7 +94,7 @@ async def _prepare_and_curate(
 def _answering_with(
     decide: Callable[..., Awaitable[list[CuratorDecision]]],
     prepared: list[PreparedCandidate],
-) -> Callable[..., AgentResult]:
+) -> Callable[..., Awaitable[AgentResult]]:
     """An injected invoker's side effect that answers each LLM call with *decide*'s decisions.
 
     *decide* receives the candidates the call carries, in prompt order, as the
