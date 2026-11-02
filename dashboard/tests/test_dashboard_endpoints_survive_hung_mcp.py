@@ -29,6 +29,11 @@ Three properties keep this probe from quietly stopping checking:
 * a NON-VACUITY assertion requires each task-lookup endpoint's OWN request
   to reach the hang, for its own root, so the sweep cannot pass by never
   exercising one, nor by one endpoint's reach standing in for another's.
+
+A lookup whose deadline would enclose a cold snapshot read is served from a
+pre-warmed unit instead, so its cold read is checked only by the warm-up
+finishing within its bound; ``/escalations`` makes its cold read in its own
+request, deadline-free, and the sweep requires it to.
 """
 
 from __future__ import annotations
@@ -44,26 +49,32 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from escalation.models import Escalation
 
-# Budgets are shrunk to this so the whole sweep is fast. The stub never
-# returns, so every bounded call site pays exactly this and then degrades.
-_TINY_BUDGET = 0.05
+# The task-prose probe's route budget: the stub never returns, so the route
+# pays exactly this and then degrades.
+_PROSE_BUDGET = 0.05
 
 # Each task-lookup endpoint pays this once, against the hung fetch_task seam.
 _LOOKUP_BUDGET = 0.5
 
+# The warm-up must finish within this many snapshot budgets, or the read is unbounded.
+_WARM_UP_BUDGETS = 10
+
 
 @dataclass(frozen=True)
 class HungSeams:
-    """What ``hung_mcp`` hung, and which root each lookup endpoint must reach.
+    """What ``hung_mcp`` hung, and which root each endpoint's request must reach.
 
     ``reached`` is every ``(module_name, project_root)`` the hang stub was
     entered with, in order. ``lookup_roots`` maps each task-lookup endpoint's
     path to the root whose ``task_lookup.fetch_task`` seam its own request
-    must reach, as seeded by the fixture.
+    must reach. ``cold_read_roots`` maps each endpoint left a cold snapshot
+    unit to the root whose ``task_snapshot.fetch_tasks`` seam its own request
+    must reach; every other lookup root is served from a pre-warmed unit.
     """
 
     reached: list[tuple[str, str]]
     lookup_roots: Mapping[str, str]
+    cold_read_roots: Mapping[str, str]
 
 
 def _dashboard_get_paths() -> list[str]:
@@ -97,13 +108,14 @@ def _all_dashboard_get_paths() -> list[str]:
 
 
 @pytest.fixture()
-def hung_mcp(monkeypatch, tmp_path, client):
-    """Hang every task-read binding; bound every budget; warm each lookup root.
+def hung_mcp(request, monkeypatch, tmp_path, client):
+    """Hang every task-read binding; bound every budget; warm the timed lookup roots.
 
-    Yields :class:`HungSeams` once each lookup root's snapshot unit is cached,
-    so a lookup's deadline encloses no snapshot read and a caller can assert
-    each lookup endpoint reached the hang for its own root. Requests
-    ``client`` so the configured root it seeds is the one the running app reads.
+    Returns :class:`HungSeams` once every lookup root whose read would sit
+    inside its lookup's deadline is cached, so no lookup deadline encloses a
+    snapshot read and a caller can assert each endpoint reached the hang for
+    its own root. Requests ``client`` so the configured root it seeds is the
+    one the running app reads.
     """
     import dashboard.api.escalations as _esc
     from dashboard.data import (
@@ -162,6 +174,8 @@ def hung_mcp(monkeypatch, tmp_path, client):
 
     # A warm entry would be served without ever reaching the hang.
     _clear_caches()
+    # Leave no hang-stubbed entry behind for the next test, even if setup fails.
+    request.addfinalizer(_clear_caches)
 
     # Force the preconditions so the target endpoints actually REACH their
     # call site — otherwise the probe would pass vacuously. The orchestrator
@@ -193,38 +207,49 @@ def hung_mcp(monkeypatch, tmp_path, client):
             directory=escalation_dir, runs_db=proj / 'data' / 'orchestrator' / 'runs.db',
         ),),
     )
-    # /merge-queue looks up only the ids its rows name, so it needs a row.
-    seeded = _seed_merge_attempt(client.app.state.config.project_root)
     lookup_roots = {
         '/api/v2/dashboard/merge-queue': str(client.app.state.config.project_root),
         '/api/v2/dashboard/escalations': str(proj),
     }
+    # /escalations reads its root's unit itself, deadline-free, before its
+    # lookup, so its request keeps that cold read against the hang.
+    cold_read_roots = {'/api/v2/dashboard/escalations': str(proj)}
     monkeypatch.setattr(task_snapshot, 'SNAPSHOT_TTL_SECONDS', 3600.0)
     assert client.portal is not None, 'the warm-up runs inside a live TestClient'
     client.portal.call(
         _warm_snapshot_units,
         client.app.state.http_client,
         client.app.state.config,
-        set(lookup_roots.values()),
+        set(lookup_roots.values()) - set(cold_read_roots.values()),
     )
+    # /merge-queue looks up only the ids its rows name, so it needs a row.
+    request.addfinalizer(_seed_merge_attempt(client.app.state.config.project_root))
 
-    yield HungSeams(reached=reached, lookup_roots=lookup_roots)
-
-    seeded()
-
-    # Leave no hang-stubbed entry behind for the next test in the session.
-    _clear_caches()
+    return HungSeams(
+        reached=reached, lookup_roots=lookup_roots, cold_read_roots=cold_read_roots,
+    )
 
 
 async def _warm_snapshot_units(http_client, config, roots: Iterable[str]) -> None:
-    """Cache each root's snapshot unit, bounded only by the snapshot's own budget."""
-    from dashboard.data.task_snapshot import acquire_snapshot
+    """Cache each root's snapshot unit; failing, not hanging, if its read is unbounded."""
+    from dashboard.data import task_snapshot
     from dashboard.data.utils import resolve_now
 
     now = resolve_now(None)
-    await asyncio.gather(
-        *(acquire_snapshot(http_client, config, root, now=now) for root in roots),
-    )
+    bound = _WARM_UP_BUDGETS * task_snapshot.PER_CALL_TIMEOUT
+    try:
+        async with asyncio.timeout(bound):
+            await asyncio.gather(*(
+                task_snapshot.acquire_snapshot(http_client, config, root, now=now)
+                for root in roots
+            ))
+    except TimeoutError:
+        raise AssertionError(
+            f'warming the snapshot units of {sorted(roots)} outlived {bound}s, '
+            f'{_WARM_UP_BUDGETS}x the {task_snapshot.PER_CALL_TIMEOUT}s '
+            'PER_CALL_TIMEOUT, against the hung fetch_tasks — the snapshot '
+            'read is no longer bounded by its own budget'
+        ) from None
 
 
 def _seed_merge_attempt(project_root):
@@ -306,6 +331,15 @@ def test_every_dashboard_endpoint_survives_a_hung_fetch_tasks(client, hung_mcp):
             '— its lookup went unexercised, so the sweep proves nothing about '
             'it. Check the endpoint preconditions in the hung_mcp fixture.'
         )
+    # ...and an endpoint left a cold unit must have waited on the hung
+    # snapshot read itself, or no request in the sweep exercises one.
+    for path, root in hung_mcp.cold_read_roots.items():
+        assert ('dashboard.data.task_snapshot', root) in reached_by_path[path], (
+            f'{path} never reached the task_snapshot fetch_tasks hang for its '
+            f'root {root} (that request reached: {sorted(reached_by_path[path])}) '
+            '— its cold snapshot read went unexercised. Check that nothing '
+            'earlier in the sweep warms that root.'
+        )
 
 
 def test_task_prose_route_survives_a_hung_fetch_task_prose(client, monkeypatch):
@@ -324,7 +358,7 @@ def test_task_prose_route_survives_a_hung_fetch_task_prose(client, monkeypatch):
         await asyncio.Event().wait()  # nothing ever sets it
 
     monkeypatch.setattr(task_prose, 'fetch_task_prose', _hang)
-    monkeypatch.setattr(task_prose, '_TASK_PROSE_BUDGET', _TINY_BUDGET)
+    monkeypatch.setattr(task_prose, '_TASK_PROSE_BUDGET', _PROSE_BUDGET)
     root = client.app.state.config.project_root
 
     resp = client.get(f'/api/v2/dashboard/task/{root.name}/T-1')
