@@ -3,8 +3,9 @@
 ``poll_responsive`` polls a predicate until it returns something truthy, under
 ``wait_responsive``'s loop-responsive deadline. Pinned here: the first truthy
 value comes back verbatim, the predicate is checked before any sleep, a give-up
-is ``wait_responsive``'s labelled failure (with ``max_wall_s`` forwarded), and
-a predicate's own exception propagates as itself.
+is ``wait_responsive``'s labelled failure (with ``max_wall_s`` forwarded), a
+predicate's own exception propagates as itself, and an async predicate is
+rejected with a TypeError naming the label.
 
 Hermetic and sub-second: real waits on tiny named bounds, no patched privates.
 """
@@ -121,3 +122,20 @@ class TestPollResponsivePropagatesPredicateErrors:
             await poll_responsive(
                 _explodes, timeout=BUDGET, label='explodes', max_wall_s=WALL_CAP
             )
+
+
+@pytest.mark.asyncio
+class TestPollResponsiveRejectsAnAsyncPredicate:
+    async def test_an_async_predicate_raises_type_error_naming_the_label(self) -> None:
+        """A coroutine object is always truthy, so accepting one would return at
+        once with the condition unchecked: a silent false green."""
+
+        async def _async_ready() -> bool:
+            return False
+
+        with pytest.raises(TypeError, match='async-predicate') as excinfo:
+            await poll_responsive(
+                _async_ready, timeout=BUDGET, label='async-predicate', max_wall_s=WALL_CAP
+            )
+
+        assert 'must be synchronous' in str(excinfo.value), str(excinfo.value)

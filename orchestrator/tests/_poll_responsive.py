@@ -8,6 +8,7 @@ Rule C section).
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Callable
 from typing import TypeVar
 
@@ -30,10 +31,24 @@ async def poll_responsive(
     The deadline accounting, the wall-clock bound and the COUPLED
     timeout-mark obligation are wait_responsive's: see
     ``_orch_helpers.py::wait_responsive``.
+
+    *predicate* must be synchronous: an awaitable result raises TypeError
+    naming *label*, because a coroutine object is always truthy and would
+    end the poll at once with the condition unchecked.
     """
 
+    def _checked(value: _PollT) -> _PollT:
+        if inspect.isawaitable(value):
+            if inspect.iscoroutine(value):
+                value.close()
+            raise TypeError(
+                f'poll_responsive predicate must be synchronous; {label!r} got an '
+                f'awaitable ({type(value).__name__})'
+            )
+        return value
+
     async def _first_truthy() -> _PollT:
-        while not (value := predicate()):
+        while not (value := _checked(predicate())):
             await asyncio.sleep(interval)
         return value
 
