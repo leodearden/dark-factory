@@ -1,12 +1,10 @@
-"""The single home of the read-only task-store open (task 5330).
+"""Open a task store strictly read-only, or refuse naming the mistake (task 5330).
 
-Promoted out of ``scripts/_task_db_scan.py`` by task 6268 so package code can
-adopt it too. :func:`connect_ro` opens a tasks.db strictly read-only or refuses
-with a :class:`TaskDbUnreadable` naming which mistake the reader made. Each
-CALLER owns its refusal policy: surface it, skip that one store in a sweep via
-``scripts/_task_db_scan.py::UNREADABLE_STORE_ERRORS``, or degrade and log it.
-Stdlib-only, so cold-shell scripts resolve it through ``_checkout`` without an
-install.
+:func:`connect_ro` opens a tasks.db read-only or raises a
+:class:`TaskDbUnreadable` whose :class:`TaskDbProblem` says which mistake the
+reader made. What to do with a refusal (surface it, skip that store, degrade
+and log) is each caller's policy, not this module's. It imports only the
+standard library.
 """
 from __future__ import annotations
 
@@ -79,10 +77,9 @@ class TaskDbUnreadable(Exception):
     Carries the resolved :attr:`path` and a :class:`TaskDbProblem`
     :attr:`reason` as fields; the formatted message is for the human only.
 
-    Deliberately NOT a ``sqlite3.Error`` subclass, so a one-store reader's
-    broad ``except sqlite3.Error`` cannot swallow the refusal. The script
-    sweep tiers skip it on purpose instead, by naming it explicitly in
-    ``scripts/_task_db_scan.py::UNREADABLE_STORE_ERRORS``.
+    Deliberately NOT a ``sqlite3.Error`` subclass, so a broad
+    ``except sqlite3.Error`` cannot swallow the refusal: a caller that means to
+    tolerate it must name it.
     """
 
     def __init__(self, path: Path, reason: TaskDbProblem) -> None:
@@ -113,11 +110,6 @@ def connect_ro(path: str | Path) -> sqlite3.Connection:
     the ``unable to open database file`` shape of the same confusion. It is
     percent-encoded, so a ``#``, ``?`` or ``%`` in the path cannot end the
     path early and drop ``mode=ro``.
-
-    This is the single home for the read-only tasks.db open. The script sweep
-    tiers adopt it too: they catch the refusal through
-    ``scripts/_task_db_scan.py::UNREADABLE_STORE_ERRORS`` and warn-and-skip
-    that one store.
     """
     resolved = Path(path).resolve()
     if not resolved.exists():
