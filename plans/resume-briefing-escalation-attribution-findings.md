@@ -74,32 +74,50 @@ code mechanism below was read first-hand at the base commit.
 
 - **New pure module** `orchestrator/src/orchestrator/resume_resolution.py`. It
   takes already-fetched records and does no I/O:
-  - `CarriedResolution`, frozen;
+  - `CarriedResolution`, frozen, with `answered_this_round`;
   - `select_carried_resolutions`, which keeps today's resolved-only filter
     exactly and imposes a deterministic order: `resolved_at`, then `timestamp`,
-    then `id`;
+    then `id`. A round is one ESCALATED wait: a record answers this round when
+    its id is not in `resolved_before_round`, the ids already resolved as the
+    wait began;
   - `render_carried_resolutions`, one block per resolution headed by its
     escalation id and summary, with `resolved_at` / `resolved_by` / action
-    shown as `unknown` when absent;
-  - `render_issue_context`, which names the escalations answered and any still
-    pending. It is never empty, and it adds a do-not-act-on-mismatched-text
-    instruction only when something is still pending.
+    shown as `unknown` when absent. This round's resolutions come first under
+    their own heading; earlier rounds' follow under a heading saying each may
+    already have been applied. A round with no resolution of its own says so;
+  - `render_issue_context`, which names this round's answered escalations,
+    earlier rounds' answered escalations, and any still pending. It is never
+    empty, and it adds a do-not-act-on-mismatched-text instruction only when
+    something is still pending.
 - **Structured return value.** `_wait_for_resolution` now returns
   `tuple[CarriedResolution, ...]` (`()` without a queue) instead of a joined
   `str`. `run()`'s resume closure renders both briefing sections from that one
   tuple, so they cannot disagree. The pending read stays lazy inside the
-  closure, so a record filed in the race window is named as still pending. The
-  selection is not stashed on the instance: it lives for one resume, and a
-  return value carries it without temporal coupling.
+  closure, so a record filed in the race window is named as still pending.
+  Only records that await an answer (`escalation.pins.is_queue_handoff`, which
+  excludes info) are named as pending, so an open info note does not trigger
+  the mismatch warning. The selection is not stashed on the instance: it lives
+  for one resume, and a return value carries it without temporal coupling.
+- **Narrowed `## Action`.** The resumed agent is told to apply the
+  resolution(s) that answer this round's escalation(s), not every resolution
+  shown.
 - **Widened tail.** After the wait, ONE pending read selects
   `_needs_human(e) or (e.level == 1 and is_queue_handoff(e))` over the full
   pending set.
   - The existing D13 attribution is kept: a steward-filed record that was not
     open at entry raises `_StewardReescalated`; anything else raises
     `_NoStewardApplicable`.
-  - The tier is `'L2'` when any selected record needs a human, otherwise
-    `'L1'`.
+  - The block reason names each record under its own tier: `L2` for a record
+    that needs a human, otherwise `L1` (`Gated by open L2 <ids> and L1 <ids>`).
   - An info record never stops the resume.
+- **Merge-entry hand-off arm stops the steward.** Widening the tail moved the
+  chained-L2 merge-entry shape from the post-wait re-check onto the
+  `_HumanHandoff` arm of `TaskWorkflow._handle_merge_gate_escalations`, with
+  the steward still live. That arm now stops and clears it before parking, as
+  the re-check arm and the gate-cleared exit do, through the shared
+  `TaskWorkflow._stop_and_clear_steward`. `run()`'s own hand-off arm is
+  unchanged: clearing the reference drops the steward's cost from the report
+  `harness.py::_run_slot` reads off `workflow._steward`.
 
 ## 4. Scope fences, and why
 
@@ -111,7 +129,14 @@ code mechanism below was read first-hand at the base commit.
   live. `TaskWorkflow._collect_granted_files` keeps the same all-history union
   on purpose, and narrowing to the newest record would silently drop guidance.
   The defect was that the union was unattributed and unordered, not that it was
-  a union.
+  a union. Each item is now tagged with its round instead.
+- **The round boundary is a snapshot at the wait's entry.** It is taken after
+  `_ensure_steward_started`, which in production only schedules the steward's
+  loop (`TaskSteward.start`), so nothing this round is resolved before it.
+  *Residual:* a steward still live from the previous round, or a resolver in
+  another process, that resolves the new record before the wait begins makes
+  it read as an earlier round. It is still shown, under the earlier-rounds
+  heading.
 - **Ordering is imposed at the consumer, not in `EscalationQueue.get_by_task`.**
   That method has many callers, and sorting there would shift behaviour for all
   of them.

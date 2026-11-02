@@ -345,6 +345,20 @@ def _file_gating_l0_after_the_wait(
     monkeypatch.setattr(workflow, '_wait_for_resolution', _then_file)
 
 
+def _journal_status_writes(
+    scheduler, events: list[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Append ``status:<status>`` to *events* on every task-status write, so a
+    test can order the park against the steward's lifecycle edges."""
+    record_status = scheduler.set_task_status
+
+    async def _journalled_set_task_status(task_id_, status, *args, **kwargs):
+        events.append(f'status:{status}')
+        return await record_status(task_id_, status, *args, **kwargs)
+
+    monkeypatch.setattr(scheduler, 'set_task_status', _journalled_set_task_status)
+
+
 def _steward_wait_timeouts(store: _RecordingEventStore) -> list[dict]:
     """Every ``escalation_resolved`` event carrying the give-up marker.
 
@@ -698,7 +712,9 @@ def _make_journalling_resolving_steward(
     return _FakeSteward
 
 
-def _make_chained_l2_steward(queue: EscalationQueue, task_id: str) -> type:
+def _make_chained_l2_steward(
+    queue: EscalationQueue, task_id: str, events: list[str] | None = None,
+) -> type:
     """A steward that resolves its own L0 then files a fresh born-at-L2.
 
     The same chained shape as :func:`_make_chained_gating_steward`, but the
@@ -722,6 +738,9 @@ def _make_chained_l2_steward(queue: EscalationQueue, task_id: str) -> type:
     never exercised at all.  (Same reasoning, and the same delay-then-wake
     shape, as ``_make_dismiss_and_publish_steward`` in
     test_workflow_escalated_steward_stall.py.)
+
+    With *events*, ``stop()`` journals ``steward:stop`` there, as
+    :func:`_make_journalling_resolving_steward` does.
     """
 
     class _FakeSteward:
@@ -769,6 +788,8 @@ def _make_chained_l2_steward(queue: EscalationQueue, task_id: str) -> type:
             self.chain_task = asyncio.create_task(self._chain())
 
         async def stop(self) -> None:
+            if events is not None:
+                events.append('steward:stop')
             if self.chain_task is not None:
                 await self.chain_task
 
@@ -1420,9 +1441,11 @@ class TestGateReFireIsBounded:
         _wire_resolve_callback(queue, wf)
         submit = _stub_merge_internals(wf, monkeypatch)
         timing = _time_the_wait(wf)
+        events: list[str] = []
+        _journal_status_writes(scheduler, events, monkeypatch)
 
         _submit_gating_l0(queue, task_id)
-        chained = _make_chained_l2_steward(queue, task_id)
+        chained = _make_chained_l2_steward(queue, task_id, events)
         wf._steward_factory = chained
 
         outcome = await asyncio.wait_for(wf._run_merge_phase(f'task/{task_id}'), 20)
@@ -1444,6 +1467,12 @@ class TestGateReFireIsBounded:
             f'wait {timing.get("calls")} time(s)'
         )
         assert len(chained.instances) <= 1
+        # The park spawns the dry-run investigator in the steward's worktree,
+        # so the hand-off arm stops the steward first, like the re-check arm.
+        assert 'steward:stop' in events, f'the steward was never stopped; journal: {events}'
+        assert events.index('steward:stop') < events.index('status:blocked'), (
+            f'the steward was still live when the row was parked; journal: {events}'
+        )
 
     async def test_chained_gating_record_parks_instead_of_re_waiting(
         self, config, git_ops, task_assignment, monkeypatch, tmp_path,
@@ -1524,13 +1553,7 @@ class TestGateReFireIsBounded:
         wf._steward_factory = _make_journalling_resolving_steward(
             queue, task_id, events,
         )
-        record_status = scheduler.set_task_status
-
-        async def _journalled_set_task_status(task_id_, status, *args, **kwargs):
-            events.append(f'status:{status}')
-            return await record_status(task_id_, status, *args, **kwargs)
-
-        monkeypatch.setattr(scheduler, 'set_task_status', _journalled_set_task_status)
+        _journal_status_writes(scheduler, events, monkeypatch)
 
         _file_gating_l0_after_the_wait(wf, queue, task_id, monkeypatch)
         timing = _time_the_wait(wf)

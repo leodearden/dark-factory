@@ -9,9 +9,14 @@ import pytest
 from escalation.models import Escalation
 
 from orchestrator.resume_resolution import (
+    ANSWERED_EARLIER_HEADING,
+    ANSWERED_HEADING,
+    EARLIER_ROUNDS_HEADING,
     MISMATCH_INSTRUCTION,
     NO_CARRIED_RESOLUTIONS,
+    NO_RESOLUTION_THIS_ROUND,
     STILL_PENDING_HEADING,
+    THIS_ROUND_HEADING,
     CarriedResolution,
     render_carried_resolutions,
     render_issue_context,
@@ -78,6 +83,7 @@ class TestSelectCarriedResolutions:
                 resolved_at='2026-08-02T00:00:00+00:00',
                 resolved_by='interactive',
                 resolution_action='restart',
+                answered_this_round=False,
             ),
             CarriedResolution(
                 escalation_id='esc-3713-1',
@@ -86,13 +92,18 @@ class TestSelectCarriedResolutions:
                 resolved_at='2026-08-03T00:00:00+00:00',
                 resolved_by='steward',
                 resolution_action='resume',
+                answered_this_round=True,
             ),
         )
         for order in itertools.permutations(records):
-            assert select_carried_resolutions(order) == expected
+            assert select_carried_resolutions(
+                order, resolved_before_round={'esc-3713-2', 'esc-3713-4'},
+            ) == expected
 
     def test_returns_frozen_items_in_a_tuple(self):
-        carried = select_carried_resolutions([_esc('esc-1-1', resolved_at='t')])
+        carried = select_carried_resolutions(
+            [_esc('esc-1-1', resolved_at='t')], resolved_before_round=frozenset(),
+        )
 
         assert isinstance(carried, tuple)
         with pytest.raises(dataclasses.FrozenInstanceError):
@@ -104,7 +115,8 @@ class TestSelectCarriedResolutions:
         tie_low_id = _esc('esc-9-2', timestamp='2026-08-04T00:00:00+00:00')
 
         for order in itertools.permutations([filed_last, tie_high_id, tie_low_id]):
-            ids = [c.escalation_id for c in select_carried_resolutions(order)]
+            carried = select_carried_resolutions(order, resolved_before_round=frozenset())
+            ids = [c.escalation_id for c in carried]
             assert ids == ['esc-9-2', 'esc-9-3', 'esc-9-1']
 
 
@@ -116,6 +128,7 @@ def _carried(
     resolved_at: str | None = '2026-08-02T00:00:00+00:00',
     resolved_by: str | None = 'steward',
     resolution_action: str | None = 'resume',
+    answered_this_round: bool = True,
 ) -> CarriedResolution:
     return CarriedResolution(
         escalation_id=esc_id,
@@ -124,6 +137,7 @@ def _carried(
         resolved_at=resolved_at,
         resolved_by=resolved_by,
         resolution_action=resolution_action,
+        answered_this_round=answered_this_round,
     )
 
 
@@ -158,6 +172,36 @@ class TestRenderCarriedResolutions:
         assert NO_CARRIED_RESOLUTIONS
         assert render_carried_resolutions([]) == NO_CARRIED_RESOLUTIONS
 
+    def test_this_rounds_resolutions_come_first_and_earlier_rounds_are_marked(self):
+        earlier = _carried(
+            'esc-3713-4', 'RESUME with step 20', resolved_at='2026-08-02T01:00:00+00:00',
+            answered_this_round=False,
+        )
+        current = _carried(
+            'esc-3713-7', 'do X instead', resolved_at='2026-08-04T09:30:00+00:00',
+        )
+
+        text = render_carried_resolutions([earlier, current])
+
+        assert (
+            text.index(THIS_ROUND_HEADING)
+            < text.index('do X instead')
+            < text.index(EARLIER_ROUNDS_HEADING)
+            < text.index('RESUME with step 20')
+        )
+
+    def test_a_round_with_no_resolution_of_its_own_says_so(self):
+        earlier = _carried('esc-3713-4', 'RESUME with step 20', answered_this_round=False)
+
+        text = render_carried_resolutions([earlier])
+
+        assert THIS_ROUND_HEADING not in text
+        assert (
+            text.index(NO_RESOLUTION_THIS_ROUND)
+            < text.index(EARLIER_ROUNDS_HEADING)
+            < text.index('RESUME with step 20')
+        )
+
 
 class TestRenderIssueContext:
     answered = _carried('esc-3713-4', 'RESUME with step 20', summary='step 19 verify red')
@@ -191,3 +235,19 @@ class TestRenderIssueContext:
 
     def test_is_never_blank(self):
         assert render_issue_context([], ()).strip()
+
+    def test_names_this_rounds_escalations_apart_from_earlier_rounds(self):
+        earlier = _carried(
+            'esc-3713-4', 'RESUME with step 20', summary='step 19 verify red',
+            answered_this_round=False,
+        )
+        current = _carried('esc-3713-7', 'do X instead', summary='scope too narrow')
+
+        text = render_issue_context([], (earlier, current))
+
+        assert (
+            text.index(ANSWERED_HEADING)
+            < text.index('esc-3713-7')
+            < text.index(ANSWERED_EARLIER_HEADING)
+            < text.index('esc-3713-4')
+        )

@@ -8,12 +8,13 @@ names which escalations the resolutions answer.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from _workflow_helpers import FakeBriefing, _make_resolving_steward
+from _workflow_helpers import FakeBriefing
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from test_workflow_escalated_steward_stall import (
@@ -66,15 +67,16 @@ def _submit(
     return esc
 
 
-def _make_follow_on_filing_steward(
-    queue: EscalationQueue, *, agent_role: str, severity: str, level: int,
+def _make_background_resolving_steward(
+    queue: EscalationQueue, *, then_file: Callable[[], object] = lambda: None,
 ) -> type:
-    """A steward that resolves the pending L0 and files ONE follow-on record.
+    """A steward that resolves the pending L0s in the background, as a live one does.
 
     Same shape as ``test_workflow_merge_gating_strand.py::_make_chained_l2_steward``:
-    the chain runs in the background after a short delay, so the follow-on lands
-    after the wait's entry gate, and resolve-then-submit has no await between
-    them, so the waiter wakes to the L0 gone and the follow-on open.
+    the resolve runs after a short delay, so it lands after the wait's entry,
+    where a production ``TaskSteward.start()`` has only scheduled its loop.
+    *then_file* runs right after the resolve with no await between them, so a
+    record it files is open when the waiter wakes to the L0 gone.
     """
 
     class _FakeSteward:
@@ -91,10 +93,7 @@ def _make_follow_on_filing_steward(
             await asyncio.sleep(0.05)
             for esc in queue.get_by_task(TASK_ID, status='pending', level=0):
                 queue.resolve(esc.id, 'resolved by the fake steward', resolved_by='steward')
-            _submit(
-                queue, 'follow-on filed mid-wait',
-                severity=severity, level=level, agent_role=agent_role,
-            )
+            then_file()
 
         async def start(self) -> None:
             self.chain_task = asyncio.create_task(self._chain())
@@ -106,16 +105,26 @@ def _make_follow_on_filing_steward(
     return _FakeSteward
 
 
-async def _wait_while_steward_files(
-    workflow: TaskWorkflow, queue: EscalationQueue, *, agent_role: str, severity: str, level: int,
+async def _wait_while_steward_resolves(
+    workflow: TaskWorkflow, queue: EscalationQueue, *, then_file: Callable[[], object] = lambda: None,
 ):
-    workflow._steward_factory = _make_follow_on_filing_steward(
-        queue, agent_role=agent_role, severity=severity, level=level,
-    )
+    workflow._steward_factory = _make_background_resolving_steward(queue, then_file=then_file)
     _wire_resolve_callback(queue, workflow)
     _submit(queue, 'blocking L0 the steward resolves')
     await workflow._ensure_steward_started()
     return await asyncio.wait_for(workflow._wait_for_resolution(), 10)
+
+
+async def _wait_while_steward_files(
+    workflow: TaskWorkflow, queue: EscalationQueue, *, agent_role: str, severity: str, level: int,
+):
+    return await _wait_while_steward_resolves(
+        workflow, queue,
+        then_file=lambda: _submit(
+            queue, 'follow-on filed mid-wait',
+            severity=severity, level=level, agent_role=agent_role,
+        ),
+    )
 
 
 def _the_follow_on(queue: EscalationQueue) -> Escalation:
@@ -152,6 +161,27 @@ class TestWaitReturnsTheResolutionsItResumesOn:
         assert [(c.escalation_id, c.resolution) for c in carried] == [
             (second.id, 'answer to second'),
             (first.id, 'answer to first'),
+        ]
+
+    async def test_only_records_resolved_during_this_wait_answer_this_round(
+        self,
+        config: OrchestratorConfig,
+        git_ops: GitOps,
+        task_assignment: TaskAssignment,
+        tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        worktree = await _make_advanced_worktree(git_ops, TASK_ID)
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, queue, worktree)
+        earlier = _submit(queue, 'blocker from an earlier round')
+        queue.resolve(earlier.id, 'RESUME with step 20', resolved_by='steward')
+
+        carried = await _wait_while_steward_resolves(workflow, queue)
+
+        (current,) = (e for e in queue.get_by_task(TASK_ID) if e.id != earlier.id)
+        assert [(c.escalation_id, c.answered_this_round) for c in carried] == [
+            (earlier.id, False),
+            (current.id, True),
         ]
 
     async def test_without_a_queue_carries_nothing(
@@ -207,7 +237,23 @@ class TestTailGuardCoversRecordsFiledDuringTheWait:
             )
 
         follow_on = _the_follow_on(queue)
-        assert raised.value.block_reason == _NoStewardApplicable([follow_on], 'L2').block_reason
+        assert raised.value.block_reason == _NoStewardApplicable([follow_on]).block_reason
+
+    async def test_block_reason_names_each_records_own_tier(
+        self, workflow_and_queue: tuple[TaskWorkflow, EscalationQueue],
+    ):
+        workflow, queue = workflow_and_queue
+        open_l1 = _submit(queue, 'hand-off left open elsewhere', level=1, agent_role='reviewer')
+
+        with pytest.raises(_NoStewardApplicable) as raised:
+            await _wait_while_steward_files(
+                workflow, queue, agent_role='escalation-watcher', severity='blocking', level=2,
+            )
+
+        (open_l2,) = queue.get_by_task(TASK_ID, status='pending', level=2)
+        assert raised.value.block_reason == (
+            f'Gated by open L2 {open_l2.id} and L1 {open_l1.id}; no steward applicable'
+        )
 
     async def test_born_at_l2_severity_at_level_1_needs_a_human(
         self, workflow_and_queue: tuple[TaskWorkflow, EscalationQueue],
@@ -221,7 +267,7 @@ class TestTailGuardCoversRecordsFiledDuringTheWait:
 
         follow_on = _the_follow_on(queue)
         assert [e.id for e in raised.value.escalations] == [follow_on.id]
-        assert raised.value.block_reason == _NoStewardApplicable([follow_on], 'L2').block_reason
+        assert raised.value.block_reason == _NoStewardApplicable([follow_on]).block_reason
 
     async def test_info_record_at_level_2_does_not_stop_the_resume(
         self, workflow_and_queue: tuple[TaskWorkflow, EscalationQueue],
@@ -278,7 +324,7 @@ async def _resume_once(
     briefing = _ResumeRecordingBriefing()
     monkeypatch.setattr(workflow, 'briefing', briefing)
     _wire_resolve_callback(queue, workflow)
-    workflow._steward_factory = _make_resolving_steward(queue, TASK_ID)
+    workflow._steward_factory = _make_background_resolving_steward(queue)
     evrl, _ = _make_evrl_returner([WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE])
     monkeypatch.setattr(workflow, '_execute_verify_review_loop', evrl)
     monkeypatch.setattr(workflow, '_invoke', invoke)
@@ -310,7 +356,7 @@ class TestResumeBriefingNamesItsEscalations:
         )
 
         ((issue, resolution),) = briefing.resume_calls
-        assert resolution.index(answered.id) < resolution.index('Resolved by FakeSteward')
+        assert resolution.index(answered.id) < resolution.index('resolved by the fake steward')
         heading = issue.index(STILL_PENDING_HEADING)
         assert issue.index(answered.id) < heading < issue.index(late[0].id)
         assert MISMATCH_INSTRUCTION in issue
@@ -330,3 +376,27 @@ class TestResumeBriefingNamesItsEscalations:
 
         ((issue, _resolution),) = briefing.resume_calls
         assert answered.id in issue
+
+    async def test_an_open_info_note_is_not_named_as_awaiting_an_answer(
+        self,
+        config: OrchestratorConfig,
+        git_ops: GitOps,
+        task_assignment: TaskAssignment,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        notes: list[Escalation] = []
+        invoke = _make_prompt_building_invoke(
+            lambda: notes.append(_submit(queue, 'fyi: flaky host', severity='info', level=1)),
+        )
+
+        briefing, answered = await _resume_once(
+            config, git_ops, task_assignment, queue, invoke, monkeypatch,
+        )
+
+        ((issue, _resolution),) = briefing.resume_calls
+        assert answered.id in issue
+        assert notes[0].id not in issue
+        assert STILL_PENDING_HEADING not in issue
+        assert MISMATCH_INSTRUCTION not in issue
