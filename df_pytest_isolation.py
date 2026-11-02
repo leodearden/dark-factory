@@ -280,6 +280,13 @@ the same mid-session reason as the fifth.  The literal name is pinned to
 shared's resolver behaviourally by
 ``tests/scripts/test_claude_binary_isolation.py``.
 
+SEVENTH DEFENCE — a test-built ``UsageGate`` can never sweep the real tempdir.
+
+Its dead-PID probe-dir sweep (task 3086) is confined to a private per-test root
+in the four rootdirs that build gates — ``shared``, ``orchestrator``,
+``fused-memory`` and ``scripts/tests`` — each armed by
+:func:`arm_usage_gate_sweep_confinement`.
+
 Import constraint: STDLIB + PYTEST ONLY.  Every subproject conftest imports this
 module, so it must import cleanly inside every member venv — escalation's lacks
 aiosqlite and stubs ``shared`` in ``sys.modules``, so nothing under ``shared/src``
@@ -301,11 +308,13 @@ import math
 import os
 import signal
 import subprocess
+import tempfile
 import time
 import uuid
 import warnings
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
+from types import ModuleType
 from typing import Any, NamedTuple, assert_never
 
 import pytest
@@ -2272,6 +2281,94 @@ def arm_leaked_drain_process_guard(config: pytest.Config) -> None:
     """
     if not config.pluginmanager.has_plugin(_LEAKED_DRAIN_GUARD_PLUGIN):
         config.pluginmanager.register(_LeakedDrainProcessGuardPlugin, _LEAKED_DRAIN_GUARD_PLUGIN)
+
+
+# ---------------------------------------------------------------------------
+# UsageGate probe-dir sweep confinement (tasks 5328, 6275)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope='session')
+def _df_usage_gate_sweep_parent(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return tmp_path_factory.mktemp('usage-gate-sweep')
+
+
+@pytest.fixture
+def usage_gate_sweep_root(_df_usage_gate_sweep_parent: Path) -> Path:
+    """The private, initially empty dir every UsageGate probe-dir sweep in this test is confined to.
+
+    Request it to plant dirs the sweep should see.
+    """
+    return Path(tempfile.mkdtemp(dir=_df_usage_gate_sweep_parent))
+
+
+@pytest.fixture
+def real_probe_dir_sweep() -> bool:
+    """Opt this test out of :func:`confine_usage_gate_sweep` (task 3086).
+
+    The test must itself redirect ``tempfile.gettempdir`` — e.g.
+    ``patch('shared.config_dir.tempfile.gettempdir', return_value=str(tmp_path))``
+    — because the real sweep deletes under it.
+    """
+    return True
+
+
+def confine_usage_gate_sweep(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    usage_gate_module: ModuleType,
+) -> None:
+    """Re-base, not stub, the probe-dir sweep of every UsageGate built in this test.
+
+    ``UsageGate.__init__`` sweeps dead-PID probe dirs under the system tempdir.
+    Confining that sweep for every test means safety no longer rests on which
+    test first set the once-per-process mark. ``real_probe_dir_sweep`` is the
+    escape hatch. ``usage_gate_sweep_root`` is resolved on the first sweep, so a
+    test that builds no gate and does not request it creates no directory.
+    *usage_gate_module* is ``shared.usage_gate``, passed in because this module
+    may not import ``shared`` (see the module docstring's import constraint).
+    """
+    if 'real_probe_dir_sweep' in request.fixturenames:
+        return
+    real_sweep = usage_gate_module.sweep_stale_pid_dirs
+
+    def _confined_sweep(prefix: str, **kwargs: Any) -> int:
+        if 'base_dir' not in kwargs:
+            kwargs['base_dir'] = request.getfixturevalue('usage_gate_sweep_root')
+        return real_sweep(prefix, **kwargs)
+
+    monkeypatch.setattr(usage_gate_module, 'sweep_stale_pid_dirs', _confined_sweep, raising=True)
+
+
+_USAGE_GATE_SWEEP_PLUGIN = 'df-usage-gate-sweep-confinement'
+
+
+def arm_usage_gate_sweep_confinement(config: pytest.Config, usage_gate_module: ModuleType) -> None:
+    """Confine every test's UsageGate probe-dir sweep for this session, from ``pytest_configure``.
+
+    Registers :func:`usage_gate_sweep_root`, :func:`real_probe_dir_sweep` and an
+    autouse fixture applying :func:`confine_usage_gate_sweep` to
+    *usage_gate_module*. Idempotent, because a session that collects several
+    test roots runs each root's ``pytest_configure``: the first arm wins, and
+    every caller passes the same ``shared.usage_gate`` module object.
+    """
+    if config.pluginmanager.has_plugin(_USAGE_GATE_SWEEP_PLUGIN):
+        return
+
+    @pytest.fixture(autouse=True)
+    def confine(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+        confine_usage_gate_sweep(request, monkeypatch, usage_gate_module)
+
+    # `confine` must not share its attribute's name: a name assigned in a class
+    # body is looked up in the class dict and globals, never the enclosing
+    # function, so `x = x` would raise NameError for a local `x`.
+    class _UsageGateSweepConfinementPlugin:
+        _df_usage_gate_sweep_parent = _df_usage_gate_sweep_parent
+        usage_gate_sweep_root = usage_gate_sweep_root
+        real_probe_dir_sweep = real_probe_dir_sweep
+        _df_confine_usage_gate_sweep = confine
+
+    config.pluginmanager.register(_UsageGateSweepConfinementPlugin, _USAGE_GATE_SWEEP_PLUGIN)
 
 
 # ---------------------------------------------------------------------------

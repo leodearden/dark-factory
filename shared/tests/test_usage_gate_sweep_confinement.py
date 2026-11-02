@@ -1,4 +1,6 @@
-"""Contract for ``conftest.py``'s suite-wide confinement of the UsageGate probe-dir sweep.
+"""Contract for the suite-wide confinement of the UsageGate probe-dir sweep.
+
+``conftest.py`` arms it via ``df_pytest_isolation.py::arm_usage_gate_sweep_confinement``.
 
 ``UsageGate.__init__`` reclaims dead-PID probe dirs under the system tempdir, so
 every gate a test builds must have that sweep re-based onto a private per-test
