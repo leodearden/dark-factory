@@ -10,11 +10,12 @@ import os
 import socket
 import time
 import traceback
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -1150,6 +1151,11 @@ class ReconciliationHarness:
         scope-returning per task 2146 β).
         """
         return self._project_root
+
+    @property
+    def known_projects(self) -> Mapping[str, str]:
+        """The ``{project_id: project_root}`` registry this harness routes by, read-only."""
+        return MappingProxyType(self._known_projects)
 
     def _known_project_scope_for(self, project_id: str) -> ProjectScope:
         """Return the canonical ProjectScope for *project_id* from the registry.
