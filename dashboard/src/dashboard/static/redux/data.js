@@ -61,7 +61,8 @@ function endpointsFor(win) {
   return {
     '/api/v2/dashboard/orchestrators':                { 'ORCHESTRATORS': PLAIN, 'PROJECTS': PLAIN, 'ORCHESTRATORS_SPARK': PLAIN },
     '/api/v2/dashboard/tasks':                        { 'TASKS_OFFLINE': PLAIN, 'TASKS_OFFLINE_PROJECTS': PLAIN,
-                                                        'TASKS_DEGRADED_PROJECTS': PLAIN, 'TASKS_COUNT_UNKNOWN_PROJECTS': PLAIN, 'TASKS_PROJECT_COUNT': PLAIN,
+                                                        'TASKS_DEGRADED_PROJECTS': PLAIN, 'TASKS_COUNT_UNKNOWN_PROJECTS': PLAIN,
+                                                        'TASKS_COUNT_STALE_PROJECTS': PLAIN, 'TASKS_PROJECT_COUNT': PLAIN,
                                                         'TASKS_SNAPSHOT': PLAIN },
     '/api/v2/dashboard/invariants':                   { 'INVARIANTS': PLAIN },
     '/api/v2/dashboard/memory':                       { 'MEMORY_STATUS': PLAIN },
@@ -154,6 +155,8 @@ window.DF_DATA = {
   // the done count was never measured — neither offline nor degraded. Without
   // this list they would render as healthy with a confident "0 done".
   TASKS_COUNT_UNKNOWN_PROJECTS: [],
+  // Projects whose rows are current but whose census is shown from its last measurement, with its age.
+  TASKS_COUNT_STALE_PROJECTS: [],
   // N for the banner's "k of N": how many task project roots the tasks handler
   // fanned out over. Comes from the server so it denominates the same
   // population TASKS_OFFLINE_PROJECTS is drawn from — PROJECTS (orchestrator-
