@@ -17,19 +17,22 @@ credential file) and §6.6 (the T3 0.1.6 surface).
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import hashlib
 import http.client
 import ipaddress
 import itertools
 import json
+import os
 import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, TypeVar
-from urllib.parse import urlsplit
+from typing import Any, Protocol, TypeVar
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from orchestrator import session_registry
 
@@ -53,6 +56,9 @@ CLI_TIMEOUT_SECS = 60
 
 _DESCRIPTOR_PATH = '/.well-known/t3/environment'
 _MCP_PATH = '/mcp'
+_REGISTER_PATH = '/oauth/mcp/register'
+_DECISION_PATH = '/oauth/mcp/decision'
+_TOKEN_PATH = '/oauth/mcp/token'
 _ENVIRONMENT_ID = re.compile(r'[0-9A-Za-z][0-9A-Za-z_-]*')
 _T = TypeVar('_T')
 
@@ -489,6 +495,217 @@ class T3McpClient:
         }
         body = json.dumps(message).encode()
         return _open(self._origin, 'POST', _MCP_PATH, body=body, headers=headers, timeout=MCP_READ_TIMEOUT_SECS)
+
+
+# ---------------------------------------------------------------------------
+# Pairing
+# ---------------------------------------------------------------------------
+
+
+class PairFailure(StrEnum):
+    PAIRING_REJECTED = 'pairing_rejected'
+    CLI_VERSION_MISMATCH = 'cli-version-mismatch'
+    DESCRIPTOR_UNREACHABLE = 'descriptor-unreachable'
+    T3_MISSING = 't3-missing'
+    CLI_VERSION_UNREADABLE = 'cli-version-unreadable'
+    PAIRING_CREATE_FAILED = 'pairing-create-failed'
+    UNREACHABLE = 'unreachable'
+    INCOMPATIBLE = 'incompatible'
+    ENVIRONMENT_MISMATCH = 'environment-mismatch'
+
+
+@dataclass(frozen=True)
+class PairFailed:
+    reason: PairFailure
+    detail: str | None = None
+    cli_version: str | None = None
+    server_version: str | None = None
+
+
+@dataclass(frozen=True)
+class Paired:
+    credential: Credential
+
+
+class CodeSource(Protocol):
+    """Where a one-time pairing code comes from: the one axis along which pairing varies."""
+
+    @property
+    def paired_by(self) -> PairedBy: ...
+
+    def mint(self, descriptor: Descriptor) -> str | PairFailed: ...
+
+
+@dataclass(frozen=True)
+class OperatorCode:
+    """A code an operator minted on the T3 host and handed over."""
+
+    code: str
+
+    @property
+    def paired_by(self) -> PairedBy:
+        return PairedBy.OPERATOR
+
+    def mint(self, descriptor: Descriptor) -> str | PairFailed:
+        return self.code
+
+
+@dataclass(frozen=True)
+class _Issued:
+    client_id: str
+    access_token: str
+    expires_in: int
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+
+
+def _oauth_post(
+    origin: str, path: str, *, body: bytes, content_type: str, expected_status: int
+) -> Mapping[str, Any] | PairFailed:
+    """One OAuth endpoint's JSON object reply; a 400 is T3 refusing, anything else odd is INCOMPATIBLE."""
+    reply = _request_json(origin, 'POST', path, body=body, content_type=content_type)
+    if isinstance(reply, TransportFailed):
+        return PairFailed(PairFailure.UNREACHABLE, reply.detail)
+    if reply.status == 400:
+        refusal = reply.body or {}
+        return PairFailed(PairFailure.PAIRING_REJECTED, f'{path}: {refusal.get("error_description") or refusal.get("message")}')
+    if reply.status != expected_status or reply.body is None:
+        return PairFailed(PairFailure.INCOMPATIBLE, f'{path}: HTTP {reply.status}')
+    return reply.body
+
+
+def _register(origin: str) -> str | PairFailed:
+    payload = {'client_name': CLIENT_NAME, 'redirect_uris': [REDIRECT_URI], 'software_id': SOFTWARE_ID}
+    registered = _oauth_post(
+        origin, _REGISTER_PATH, body=json.dumps(payload).encode(), content_type='application/json', expected_status=201
+    )
+    if isinstance(registered, PairFailed):
+        return registered
+    client_id = registered.get('client_id')
+    if not isinstance(client_id, str) or not client_id:
+        return PairFailed(PairFailure.INCOMPATIBLE, f'{_REGISTER_PATH}: no client_id')
+    return client_id
+
+
+def _approve(origin: str, client_id: str, code: str, *, challenge: str, state: str) -> str | PairFailed:
+    """Spend the pairing code on an authorization code."""
+    authorization = {
+        'response_type': 'code',
+        'client_id': client_id,
+        'redirect_uri': REDIRECT_URI,
+        'code_challenge': challenge,
+        'code_challenge_method': 'S256',
+        'state': state,
+        'resource': f'{origin}{_MCP_PATH}',
+    }
+    payload = {'authorization': authorization, 'decision': {'_tag': 'pairing-code', 'access': ACCESS, 'code': code}}
+    approved = _oauth_post(
+        origin, _DECISION_PATH, body=json.dumps(payload).encode(), content_type='application/json', expected_status=200
+    )
+    if isinstance(approved, PairFailed):
+        return approved
+    redirect_to = approved.get('redirectTo')
+    if not isinstance(redirect_to, str):
+        return PairFailed(PairFailure.INCOMPATIBLE, f'{_DECISION_PATH}: no redirectTo')
+    query = parse_qs(urlsplit(redirect_to).query)
+    if query.get('state') != [state] or len(query.get('code', [])) != 1:
+        [reason] = query.get('error_description', ['no code for this state'])[:1]
+        return PairFailed(PairFailure.PAIRING_REJECTED, f'{_DECISION_PATH}: {reason}')
+    return query['code'][0]
+
+
+def _redeem(origin: str, client_id: str, authorization_code: str, *, verifier: str) -> _Issued | PairFailed:
+    form = {
+        'grant_type': 'authorization_code',
+        'code': authorization_code,
+        'redirect_uri': REDIRECT_URI,
+        'client_id': client_id,
+        'code_verifier': verifier,
+        'resource': f'{origin}{_MCP_PATH}',
+    }
+    token = _oauth_post(
+        origin,
+        _TOKEN_PATH,
+        body=urlencode(form).encode(),
+        content_type='application/x-www-form-urlencoded',
+        expected_status=200,
+    )
+    if isinstance(token, PairFailed):
+        return token
+    access_token, expires_in = token.get('access_token'), token.get('expires_in')
+    if token.get('token_type') != 'Bearer' or not isinstance(access_token, str) or not access_token:
+        return PairFailed(PairFailure.INCOMPATIBLE, f'{_TOKEN_PATH}: no Bearer access_token')
+    if isinstance(expires_in, bool) or not isinstance(expires_in, int | float) or expires_in <= 0:
+        return PairFailed(PairFailure.INCOMPATIBLE, f'{_TOKEN_PATH}: unusable expires_in {expires_in!r}')
+    return _Issued(client_id, access_token, int(expires_in))
+
+
+def _exchange(origin: str, code: str) -> _Issued | PairFailed:
+    """The pairing-code sign-in of T3's own ``apps/server/src/peer/PeerLinks.ts::signIn``, PKCE S256."""
+    client_id = _register(origin)
+    if isinstance(client_id, PairFailed):
+        return client_id
+    verifier = _b64url(os.urandom(32))
+    challenge = _b64url(hashlib.sha256(verifier.encode('ascii')).digest())
+    authorization_code = _approve(origin, client_id, code, challenge=challenge, state=_b64url(os.urandom(16)))
+    if isinstance(authorization_code, PairFailed):
+        return authorization_code
+    return _redeem(origin, client_id, authorization_code, verifier=verifier)
+
+
+_VALIDATION_FAILURE = {
+    TransportFault.CREDENTIAL_EXPIRED: PairFailure.PAIRING_REJECTED,
+    TransportFault.UNREACHABLE: PairFailure.UNREACHABLE,
+    TransportFault.PROTOCOL: PairFailure.INCOMPATIBLE,
+}
+
+
+def _validation_refusal(credential: Credential, *, root: Path | str | None) -> PairFailed | None:
+    """None when one ``t3_environment_read`` on the new token answers for the descriptor's environment."""
+    result = T3McpClient(credential.origin, credential, root=root).call('t3_environment_read', {})
+    if isinstance(result, TransportFailed):
+        return PairFailed(_VALIDATION_FAILURE[result.fault], f't3_environment_read: {result.detail}')
+    if isinstance(result, ToolFailed):
+        return PairFailed(PairFailure.PAIRING_REJECTED, f't3_environment_read: {result.code}: {result.message}')
+    answered = result.value.get('environmentId')
+    if answered != credential.environment_id:
+        detail = f'the token answers for {answered!r}, the descriptor for {credential.environment_id!r}'
+        return PairFailed(PairFailure.ENVIRONMENT_MISMATCH, detail)
+    return None
+
+
+def pair(origin: str, source: CodeSource, *, root: Path | str | None = None) -> Paired | PairFailed:
+    """Pair with the environment at ``origin``; the credential is stored only once it is validated."""
+    checked = checked_origin(origin)
+    descriptor = fetch_descriptor(checked)
+    if isinstance(descriptor, TransportFailed):
+        return PairFailed(PairFailure.DESCRIPTOR_UNREACHABLE, descriptor.detail)
+    code = source.mint(descriptor)
+    if isinstance(code, PairFailed):
+        return code
+    issued = _exchange(checked, code)
+    if isinstance(issued, PairFailed):
+        return issued
+    paired_at = datetime.now(UTC).replace(microsecond=0)
+    credential = Credential(
+        schema_version=CREDENTIAL_SCHEMA_VERSION,
+        origin=checked,
+        environment_id=descriptor.environment_id,
+        server_version=descriptor.server_version,
+        access=ACCESS,
+        client_id=issued.client_id,
+        access_token=issued.access_token,
+        expires_at=paired_at + timedelta(seconds=issued.expires_in),
+        paired_at=paired_at,
+        paired_by=source.paired_by,
+    )
+    refusal = _validation_refusal(credential, root=root)
+    if refusal is not None:
+        return refusal
+    write_credential(credential, root=root)
+    return Paired(credential)
 
 
 # ---------------------------------------------------------------------------
