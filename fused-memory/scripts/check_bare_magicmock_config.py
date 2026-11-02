@@ -30,7 +30,8 @@ separate message vocabularies and separate ``# noqa`` codes.  Every statement in
       ``.wait()`` barrier) awaited through a bare ``asyncio.wait_for`` instead of
       ``wait_responsive``, or carrying a raw numeric literal bound (``timeout=``,
       ``max_wall_s=`` or wait_for's positional timeout).  Also any async ``while``
-      poll that gives up against a wall-clock read.  Remedies are wait-specific
+      poll that gives up against a wall-clock read, and any ``asyncio.timeout``
+      block bounding a poll or a load-bearing await.  Remedies are wait-specific
       (``wait_responsive(...)`` or ``poll_responsive(...)`` with a ``label=``,
       bound derived from ``MERGE_RESULT_TIMEOUT``).  Carries its own shrink-only
       per-file debt BUDGET (``_WALL_CLOCK_DEADLINE_DEBT``).
@@ -173,6 +174,16 @@ The same defect is also written as a POLL, so a further leg covers it:
      work rather than waiting for it.  AWAIT-REQUIRED excludes a sync ``time.sleep``
      loop, which a loop-responsive budget cannot help.  The search does not descend
      into a nested loop or scope, so a comparison belongs to the loop that owns it.
+  4. TIMEOUT BLOCK (task 7800): an ``async with asyncio.timeout(...)`` or
+     ``asyncio.timeout_at(...)`` block whose own scope awaits a load-bearing target
+     or runs an awaiting ``while`` poll.  It is ``asyncio.wait_for``'s deadline
+     spelled as a context, so it counts the same way: the routing kind, plus the
+     raw-literal kind when ``timeout``'s ``delay`` is a written number
+     (``timeout_at`` takes an absolute time, so routing only).  LOAD-BEARING-OR-POLL
+     is its discriminator because it mirrors the call leg's Name exclusion: a block
+     around ``await task`` or ``await asyncio.gather(...)`` is as silent as
+     ``asyncio.wait_for(task, ...)``, so neither spelling is stricter than the other,
+     and ``asyncio.wait_for(ev.wait(), 5)`` cannot escape by becoming a block.
 
 Suppressed by ``# noqa: wall-clock-deadline — <reason>`` on the preceding non-blank
 line, or by the file's ``_WALL_CLOCK_DEADLINE_DEBT`` budget.
@@ -893,6 +904,16 @@ _CLOCK_DEADLINE = _DeadlineRouting(
     ),
 )
 
+_TIMEOUT_BLOCK = _DeadlineRouting(
+    spelled='is bounded by an asyncio.timeout(...) block',
+    remedy=(
+        ' Route a load-bearing await through wait_responsive(...) and a poll through'
+        ' poll_responsive(predicate, ...)'
+        ' (orchestrator/tests/_poll_responsive.py::poll_responsive), each with a'
+        ' descriptive label=.'
+    ),
+)
+
 
 def _wall_clock_routing_msg(routing: _DeadlineRouting, target: str) -> str:
     """Build Rule C's routing message: *target*'s deadline, spelled as *routing*, is wall clock.
@@ -973,9 +994,11 @@ def _wall_clock_deadline_violations(
     """Rule C, evaluated for ONE node of any type: return 0, 1 or 2 Violations.
 
     Dispatches on the node type, one leg per spelling of a wall-clock deadline:
-    an ``ast.Call`` to the wait-call leg (``_wait_call_violations``) and an
-    ``ast.While`` to the clock-deadline poll leg (``_clock_deadline_poll_violations``).
-    Every other node yields nothing.
+    an ``ast.Call`` to the wait-call leg (``_wait_call_violations``), an
+    ``ast.While`` to the clock-deadline poll leg (``_clock_deadline_poll_violations``)
+    and an ``ast.AsyncWith`` to the timeout-block leg (``_timeout_block_violations``).
+    A sync ``with`` is not inspected: ``asyncio.timeout`` is async-only.  Every other
+    node yields nothing.
 
     Per-NODE rather than per-tree so ``find_violations`` can evaluate all three rules
     in a SINGLE ``ast.walk``; a second full walk was measured at ~43% of total checker
@@ -991,6 +1014,8 @@ def _wall_clock_deadline_violations(
         return _wait_call_violations(node, lines, filename)
     if isinstance(node, ast.While):
         return _clock_deadline_poll_violations(node, lines, filename)
+    if isinstance(node, ast.AsyncWith):
+        return _timeout_block_violations(node, lines, filename)
     return []
 
 
@@ -1161,6 +1186,96 @@ def _clock_deadline_poll_violations(
     ]
 
 
+# ``asyncio.<attr>(...)`` deadline contexts, mapped to the parameter that carries a
+# DURATION.  None: the context takes an absolute time, so it has no raw-literal kind.
+_DEADLINE_CONTEXTS: dict[str, str | None] = {'timeout': 'delay', 'timeout_at': None}
+
+# The keyword spellings of a deadline context's one argument: timeout's and timeout_at's.
+_DEADLINE_CONTEXT_KEYWORDS: tuple[str, ...] = ('delay', 'when')
+
+
+def _deadline_context(item: ast.withitem) -> tuple[ast.expr, str | None] | None:
+    """Return *item*'s deadline argument and duration parameter if it is an asyncio deadline.
+
+    None unless the item is an ``asyncio.<attr>(...)`` call with *attr* in
+    ``_DEADLINE_CONTEXTS`` whose argument is present and not the literal None: a
+    missing or None deadline bounds nothing.
+    """
+    call = item.context_expr
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == 'asyncio'
+        and call.func.attr in _DEADLINE_CONTEXTS
+    ):
+        return None
+    keyword_bounds = [kw.value for kw in call.keywords if kw.arg in _DEADLINE_CONTEXT_KEYWORDS]
+    bounds = keyword_bounds or call.args[:1]
+    if not bounds:
+        return None
+    bound = bounds[0]
+    if isinstance(bound, ast.Constant) and bound.value is None:
+        return None
+    return bound, _DEADLINE_CONTEXTS[call.func.attr]
+
+
+def _timeout_block_target(block: ast.AsyncWith) -> str | None:
+    """Describe what *block*'s deadline bounds, if it is a load-bearing wait, else None.
+
+    A load-bearing await in the block's own scope wins; otherwise an awaiting
+    ``while`` loop in it, which is a poll.  Anything else — ``await task``,
+    ``await asyncio.gather(...)``, a plain call — is not load-bearing.
+    """
+    own_code = list(_walk_own_scope(block.body))
+    for node in own_code:
+        if isinstance(node, ast.Await):
+            target = _load_bearing_wait_target(node.value)
+            if target is not None:
+                return target
+    for node in own_code:
+        if isinstance(node, ast.While) and _awaits(node.body):
+            return f'poll loop `while {ast.unparse(node.test)}`'
+    return None
+
+
+def _timeout_block_violations(
+    block: ast.AsyncWith, lines: list[str], filename: str
+) -> list[Violation]:
+    """Rule C's timeout-block leg, for ONE ``ast.AsyncWith``: return 0, 1 or 2 Violations.
+
+    The first asyncio deadline context among the block's items decides.  The routing
+    kind applies whenever the block bounds a load-bearing wait; the raw-literal kind
+    as well when that context's duration is a written number, exactly as for
+    ``asyncio.wait_for(x, 25.0)``.
+    """
+    context = next(
+        (found for item in block.items if (found := _deadline_context(item)) is not None),
+        None,
+    )
+    if context is None:
+        return []
+    bound, duration_parameter = context
+    target = _timeout_block_target(block)
+    if target is None:
+        return []
+    if is_exempted(lines, block.lineno, _RULE_C_CODE):
+        return []
+
+    messages = [_wall_clock_routing_msg(_TIMEOUT_BLOCK, target)]
+    if duration_parameter is not None and _is_numeric_literal(bound):
+        messages.append(_wall_clock_raw_literal_msg(target, duration_parameter))
+    return [
+        Violation(
+            filename=filename,
+            lineno=block.lineno,
+            col_offset=block.col_offset,
+            message=message,
+        )
+        for message in messages
+    ]
+
+
 def find_violations(source: str, filename: str) -> list[Violation]:
     """Parse *source* and return ``find_violations_in_tree`` over it.
 
@@ -1194,7 +1309,9 @@ def find_violations_in_tree(tree: ast.Module, source: str, filename: str) -> lis
     bare ``asyncio.wait_for``, and/or carrying a raw numeric literal bound
     (``timeout=``, ``max_wall_s=`` or wait_for's positional timeout).  One call can
     produce TWO violations — the kinds are independent.  Also each async ``while``
-    poll that gives up against a wall-clock read (one violation, at the ``while``).
+    poll that gives up against a wall-clock read (one violation, at the ``while``),
+    and each ``asyncio.timeout``/``timeout_at`` block bounding such a poll or a
+    load-bearing await (routing, plus raw-literal on a written ``delay``).
 
     Rule C additionally honours its own SHRINK-ONLY per-file debt budget
     (``_WALL_CLOCK_DEADLINE_DEBT``), compared with the collected COUNT after the
@@ -1223,8 +1340,9 @@ def find_violations_in_tree(tree: ast.Module, source: str, filename: str) -> lis
     # normalises ordering.
     for node in ast.walk(tree):
         # ---- Rule C: wall-clock-deadline, every node, dispatched on its type ----
-        # Runs FIRST and unconditionally: its legs read ast.Call AND ast.While nodes,
-        # so neither Rule B's `continue` nor Rule A's type filter below may skip it.
+        # Runs FIRST and unconditionally: its legs read ast.Call, ast.While AND
+        # ast.AsyncWith nodes, so neither Rule B's `continue` nor Rule A's type filter
+        # below may skip it.
         wall_clock.extend(_wall_clock_deadline_violations(node, lines, filename))
 
         # ---- Rule B: bare-dataclass-double, position-blind over every ast.Call ----
