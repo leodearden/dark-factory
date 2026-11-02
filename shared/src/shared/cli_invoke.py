@@ -13,7 +13,7 @@ import shutil
 import tempfile
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Iterable, Iterator
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -288,6 +288,7 @@ __all__ = [
     'invoke_claude_agent',
     'invoke_with_cap_retry',
     'is_cli_invocation_rejected',
+    'is_resume_rejected',
     'is_server_error_status',
     'is_timed_out_with_progress',
     'is_zero_output_timeout',
@@ -1611,6 +1612,14 @@ def is_timed_out_with_progress(result: AgentResult) -> bool:
     return result.timed_out and (result.transcript_turns or 0) > 0
 
 
+def _stderr_carries_any(stderr: str, markers: Sequence[str]) -> bool:
+    """Case-insensitive scan of *stderr* for any of the lower-case *markers*."""
+    if not stderr:
+        return False
+    stderr_lower = stderr.lower()
+    return any(marker in stderr_lower for marker in markers)
+
+
 def _stderr_has_cli_input_required(stderr: str) -> bool:
     """Case-insensitive scan of *stderr* for the CLI's input-required error.
 
@@ -1619,15 +1628,12 @@ def _stderr_has_cli_input_required(stderr: str) -> bool:
     ``_parse_claude_output`` (which only has a ``_SubprocessResult``), so the
     subtype and the predicate can never disagree about what the marker is.
     """
-    if not stderr:
-        return False
     # Lazy (function-local) import — see the identical note in
     # classify_agent_failure: invocation_outcome imports cli_invoke at module
     # top, so a module-top import here would create a circular import.
     from shared.invocation_outcome import CLI_INPUT_REQUIRED_MARKERS
 
-    stderr_lower = stderr.lower()
-    return any(marker in stderr_lower for marker in CLI_INPUT_REQUIRED_MARKERS)
+    return _stderr_carries_any(stderr, CLI_INPUT_REQUIRED_MARKERS)
 
 
 def _cli_input_rejection_cause(stderr: str) -> str:
@@ -1731,6 +1737,28 @@ def is_cli_invocation_rejected(result: AgentResult) -> bool:
         result.subtype == 'error_cli_input_rejected'
         or _stderr_has_cli_input_required(result.stderr)
     )
+
+
+def is_resume_rejected(result: AgentResult) -> bool:
+    """Return True when the CLI rejected an armed ``--resume`` before any model turn.
+
+    The signature is the CLI's own "no conversation found" statement on
+    stderr (``RESUME_REJECTED_MARKERS``; the measured payload lives in
+    ``shared/tests/_measured_cli_results.py``) on a run that was not a success,
+    did not time out, and took no turn and billed nothing.  Any evidence of
+    work vetoes the marker: this gates discarding the session, so on
+    contradictory evidence it declines, as ``is_cli_invocation_rejected`` does.
+    ``transcript_turns`` is deliberately not consulted: on a resume it counts
+    the PRIOR turns of the transcript being resumed, not this process's work.
+    """
+    if result.success or result.timed_out:
+        return False
+    if result.turns != 0 or result.cost_usd != 0.0:
+        return False
+    # Lazy (function-local) import — see _stderr_has_cli_input_required.
+    from shared.invocation_outcome import RESUME_REJECTED_MARKERS
+
+    return _stderr_carries_any(result.stderr, RESUME_REJECTED_MARKERS)
 
 
 def require_non_blank_prompt(
