@@ -128,6 +128,12 @@ async def test_another_skills_chain_does_not_refuse() -> None:
     assert await _check(_submission(), _FakeSource(rows)) is None
 
 
+@pytest.mark.parametrize('status', ['done', 'cancelled'])
+async def test_a_terminal_row_the_source_returns_does_not_refuse(status: str) -> None:
+    rows = [_row(13, status, _chain('completion_gate', 'review-p-1'))]
+    assert await _check(_submission(), _FakeSource(rows)) is None
+
+
 async def test_an_open_row_on_a_later_page_still_refuses() -> None:
     rows = [
         _row(11, 'pending', _chain('completion_gate', 'review-p-1', superseded_by='review-p-2')),
