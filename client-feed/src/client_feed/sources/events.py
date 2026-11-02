@@ -6,7 +6,6 @@ Each payload is built inside SQLite from its model's field names, so the `data` 
 from __future__ import annotations
 
 import math
-import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -36,6 +35,7 @@ from client_feed.contract import (
     VerifyKind,
 )
 from client_feed.sources.store import read_only
+from client_feed.sources.task_id import task_id_of
 
 
 class StoreEventType(StrEnum):
@@ -152,17 +152,6 @@ def _payload_sql(model: type[_Payload]) -> str:
     return f'CASE WHEN json_valid(data) THEN json_object({pairs}) END'
 
 
-_TASK_ID: Final = re.compile(r'[0-9]+')
-
-
-def _task_id(text: str | None) -> int | None:
-    """The positive integer a TEXT task_id spells in decimal digits, else None."""
-    if text is None or not _TASK_ID.fullmatch(text):
-        return None
-    value = int(text)
-    return value if value >= 1 else None
-
-
 def _instant(text: str) -> datetime | None:
     """The UTC instant an ISO timestamp names, or None when it is unparseable or carries no offset."""
     try:
@@ -188,7 +177,7 @@ def _merge_finalized(row: _Row, payload: _MergeFinalized) -> LandedCommit | None
 
 
 def _train_merged(row: _Row, payload: _TrainMerged) -> LandedCommit:
-    members = (_task_id(member) for member in payload.member_task_ids)
+    members = (task_id_of(member) for member in payload.member_task_ids)
     return LandedCommit(
         event_id=row.event_id,
         at=row.at,
@@ -303,7 +292,7 @@ def _projected(raw: tuple[Any, ...]) -> StreamEvent | SkippedRow | None:
         parsed = _validated(spec.payload, payload)
         if parsed is None:
             return SkippedRow(event_id=event_id, event_type=kind, reason=SkipReason.MALFORMED_PAYLOAD)
-    return spec.read(_Row(event_id=event_id, at=at, task_id=_task_id(task_id), phase=phase), parsed)
+    return spec.read(_Row(event_id=event_id, at=at, task_id=task_id_of(task_id), phase=phase), parsed)
 
 
 _STREAM_PAYLOADS: Final[_Payloads] = MappingProxyType(
@@ -460,7 +449,7 @@ def read_open_escalations(root: Path) -> OpenEscalations:
     (rows,) = _read(root, _rows_of_types('event_type, task_id', _ESCALATION_PAYLOADS))
     opened: _Opened = {}
     for event_type, task_id, payload in rows:
-        _apply_escalation(opened, event_type, _task_id(task_id), payload)
+        _apply_escalation(opened, event_type, task_id_of(task_id), payload)
     by_task: dict[int, tuple[OpenEscalation, ...]] = {}
     for owner, escalation in opened.values():
         by_task[owner] = (*by_task.get(owner, ()), escalation)
