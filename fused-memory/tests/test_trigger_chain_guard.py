@@ -23,7 +23,7 @@ pytestmark = pytest.mark.asyncio
 _LOGGER = 'fused_memory.middleware.trigger_chain_guard'
 
 
-def _chain(role: str, run_id: str, *, skill: str = 'review', **fields: object) -> dict:
+def _chain(role: str, run_id: str, *, skill: str = 'review', **fields: str) -> dict:
     return {'role': role, 'skill': skill, 'run_id': run_id, **fields}
 
 
@@ -82,18 +82,20 @@ class _FakeSource:
         }
 
 
-def _open_review_p1(**fields: object) -> list[MetadataLookupRow]:
+def _open_review_p1(**fields: str) -> list[MetadataLookupRow]:
     return [
         _row(11, 'pending', _chain('completion_gate', 'review-p-1', **fields)),
         _row(12, 'deferred', _chain('human_gate', 'review-p-1', **fields)),
     ]
 
 
-def _submission(role: str = 'completion_gate', run_id: str = 'review-p-2', **chain: object):
+def _submission(role: str = 'completion_gate', run_id: str = 'review-p-2', **chain: str) -> dict:
     return {'trigger_chain': _chain(role, run_id, **chain)}
 
 
-async def _check(metadata: object, source: _FakeSource, tag: str | None = None):
+async def _check(
+    metadata: str | dict[str, Any] | None, source: _FakeSource, tag: str | None = None
+) -> dict[str, Any] | None:
     return await trigger_chain_open_error(metadata, '/p', source=source, tag=tag)
 
 
