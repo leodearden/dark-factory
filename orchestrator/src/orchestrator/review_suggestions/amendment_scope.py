@@ -13,7 +13,7 @@ Sibling of :mod:`orchestrator.review_suggestions.dedup`.  Pure functions —
 no git invocation, no workflow state.  The location-parse convention mirrors
 ``TaskWorkflow._suggestions_in_scope`` (``(location or '').strip()`` then
 split on ``':'``) and the range-membership check reuses the closed-interval
-overlap idea from ``workflow._line_ranges_stackable`` (``s1 <= e2 and
+overlap idea from ``merge_lane/train_selection.py::line_ranges_stackable`` (``s1 <= e2 and
 s2 <= e1``).
 """
 
@@ -62,7 +62,7 @@ def _line_in_ranges(
     ``[start, end]`` widened by ``context_lines`` on each side iff
     ``start - context_lines <= line <= end + context_lines`` — the same
     ``s1 <= e2 and s2 <= e1`` intersection test used by
-    ``workflow._line_ranges_stackable``.
+    ``merge_lane/train_selection.py::line_ranges_stackable``.
     """
     return any(
         start - context_lines <= line <= end + context_lines

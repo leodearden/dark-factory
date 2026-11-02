@@ -28,7 +28,6 @@ This test loads the *committed* ``dark-factory-orchestrator.yaml`` directly
 in ``test_orchestrator_restart_config_drift.py``.
 """
 
-import ast
 import pathlib
 import posixpath
 import re
@@ -41,6 +40,7 @@ import pytest
 import verify_command_invariants as vci
 import yaml
 from orchestrator.config import ModuleConfig, _discover_module_configs
+from verify_budget_census_records import ORCHESTRATOR_BUDGET_CENSUS
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 DF_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
@@ -206,16 +206,6 @@ def _pytest_segments(cmd: str) -> list[str]:
 #: close a subshell, whose ``cd`` does not leak past it.
 _SHELL_CLAUSE_ENDS = frozenset({'&&', '||', ';', '|', '(', ')'})
 
-#: pytest options whose value is a SEPARATE token, so that value is not read as
-#: a suite. This guard's own policy, handed to ``vci.positional_targets``; the
-#: ``--flag=value`` spelling needs no entry. An unlisted one donates its value
-#: as a phantom suite, which the partition guard reports as UNACCOUNTED.
-_PYTEST_VALUE_FLAGS = frozenset({
-    '-c', '-k', '-m', '-n', '-o', '-p', '-r', '-W',
-    '--basetemp', '--deselect', '--dist', '--durations', '--ignore',
-    '--ignore-glob', '--import-mode', '--maxfail', '--rootdir', '--tb', '--timeout',
-})
-
 
 def _shell_clauses(cmd: str) -> list[tuple[list[str], str | None]]:
     """*cmd* as ``(clause tokens, the operator that ended the clause)`` pairs, in order.
@@ -246,8 +236,11 @@ def _fleet_pytest_suite_names(cmd: str) -> set[str]:
     Walks the shell clauses, tracking cwd through ``cd`` clauses and keeping a
     subshell's ``cd`` inside it (the cockpit clause is a presence-guarded
     subshell). Each pytest clause's targets come from the shared
-    ``vci.positional_targets``, so flags before or between targets, value-taking
-    flags and a missing ``--timeout`` do not change the result.
+    ``vci.positional_targets`` given ``vci.PYTEST_VALUE_FLAGS``, so flags before
+    or between targets, value-taking flags and a missing ``--timeout`` do not
+    change the result. A value-taking flag missing from that set would donate
+    its value as a phantom suite, which the partition guard reports as
+    UNACCOUNTED.
     :func:`test_fleet_pytest_suite_names_reads_each_chain_shape` pins the shapes.
     """
     cwds = ['.']
@@ -257,7 +250,7 @@ def _fleet_pytest_suite_names(cmd: str) -> set[str]:
             cwds[-1] = posixpath.normpath(posixpath.join(cwds[-1], clause[1]))
         elif vci.PYTEST in clause:
             targets = vci.positional_targets(
-                shlex.join(clause), vci.PYTEST, value_flags=_PYTEST_VALUE_FLAGS
+                shlex.join(clause), vci.PYTEST, value_flags=vci.PYTEST_VALUE_FLAGS
             )
             cwd = cwds[-1]
             suites.update(cwd if cwd != '.' else posixpath.normpath(t) for t in targets)
@@ -676,48 +669,6 @@ POST_CAP_ORCHESTRATOR_GREEN_SECS = {
 # percentiles and the n that produced them cannot drift apart.
 POST_CAP_ORCHESTRATOR_GREEN_N = 28
 
-# Task 3353's census record is the single home of the orchestrator figure, and
-# the `orchestrator` row below is DERIVED from it. It is read from that file's
-# SOURCE rather than imported, because a guard must not import a sibling guard
-# (the convention module_budget_family.py states).
-CENSUS_HOME_PATH = REPO_ROOT / 'tests' / 'scripts' / 'test_module_verify_budgets.py'
-ORCHESTRATOR_CENSUS_NAME = 'ORCHESTRATOR_BUDGET_CENSUS'
-
-
-class _CensusFigures(NamedTuple):
-    """The ``BudgetCensus`` fields the fleet table consumes."""
-
-    n: int
-    p50: float
-    measured_at: str
-
-
-def _read_census_figures(path: pathlib.Path, name: str) -> _CensusFigures:
-    """The literal keyword arguments of the module-level ``<name> = BudgetCensus(...)`` in *path*."""
-    for node in ast.parse(path.read_text(encoding='utf-8')).body:
-        if (
-            isinstance(node, ast.Assign)
-            and isinstance(node.value, ast.Call)
-            and any(isinstance(t, ast.Name) and t.id == name for t in node.targets)
-        ):
-            keywords = {kw.arg: kw.value for kw in node.value.keywords}
-            missing = [f for f in _CensusFigures._fields if f not in keywords]
-            if missing:
-                raise LookupError(
-                    f'{path}::{name} passes no {missing} keyword(s) (task 3496); '
-                    'MEASURED_FLEET_SEGMENT_SECS derives its orchestrator row from them'
-                )
-            return _CensusFigures(
-                **{f: ast.literal_eval(keywords[f]) for f in _CensusFigures._fields}
-            )
-    raise LookupError(
-        f'{path} binds no module-level `{name} = BudgetCensus(...)` (task 3496); '
-        'MEASURED_FLEET_SEGMENT_SECS derives its orchestrator row from that record'
-    )
-
-
-ORCHESTRATOR_CENSUS = _read_census_figures(CENSUS_HOME_PATH, ORCHESTRATOR_CENSUS_NAME)
-
 # Measured per-segment wall-clock of the FALLBACK fleet chain, in seconds.
 #
 # PROVENANCE — this table now spans THREE measurement epochs. Do not read it as
@@ -729,11 +680,14 @@ ORCHESTRATOR_CENSUS = _read_census_figures(CENSUS_HOME_PATH, ORCHESTRATOR_CENSUS
 #     escalation esc-3062-3. One logged run each, except `tests/scripts`, which
 #     uses the LOWEST of four independent measurements (105-127s).
 #
-#   orchestrator — DERIVED, not copied: ORCHESTRATOR_CENSUS.p50 to 2 dp, read
-#     from task 3353's census record (ORCHESTRATOR_CENSUS_NAME in
-#     CENSUS_HOME_PATH, above). That record is the single home of the figure's
-#     window, regime scoping, percentiles and census_command; re-measuring means
-#     replacing it, and this row and its provenance follow. Superseded
+#   orchestrator — DERIVED, not copied: ORCHESTRATOR_BUDGET_CENSUS.p50 to 2 dp,
+#     from task 3353's census record at
+#     tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS.
+#     It is IMPORTED because that is a non-test helper; a guard must not import
+#     a sibling guard (the convention module_budget_family.py states). That
+#     record is the single home of the figure's window, regime scoping,
+#     percentiles and census_command; re-measuring means replacing it, and
+#     this row and its provenance follow. Superseded
 #     predecessors: task 4902's 1765.95 (n=28, 2026-08-28;
 #     POST_CAP_ORCHESTRATOR_GREEN_SECS above) and task 3062's 1366.23 (one run,
 #     2026-07-31). Independent corroboration of the 2026-09-14 census: the M1a
@@ -789,7 +743,7 @@ ORCHESTRATOR_CENSUS = _read_census_figures(CENSUS_HOME_PATH, ORCHESTRATOR_CENSUS
 MEASURED_FLEET_SEGMENT_SECS = {
     'shared': 120.21,
     'escalation': 123.29,
-    'orchestrator': round(ORCHESTRATOR_CENSUS.p50, 2),
+    'orchestrator': round(ORCHESTRATOR_BUDGET_CENSUS.p50, 2),
     'fused-memory': 123.87,
     'tests/scripts': 105.0,
     'scripts/tests': 113.0,
@@ -826,8 +780,8 @@ MEASURED_FLEET_SEGMENT_PROVENANCE: dict[str, _SegmentProvenance] = {
     'escalation': _SegmentProvenance(
         '2026-07-31', 1, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
     'orchestrator': _SegmentProvenance(
-        ORCHESTRATOR_CENSUS.measured_at, ORCHESTRATOR_CENSUS.n, '3353',
-        f'verify-summary corpus read by {ORCHESTRATOR_CENSUS_NAME}.census_command'),
+        ORCHESTRATOR_BUDGET_CENSUS.measured_at, ORCHESTRATOR_BUDGET_CENSUS.n, '3353',
+        'verify-summary corpus read by ORCHESTRATOR_BUDGET_CENSUS.census_command'),
     'fused-memory': _SegmentProvenance(
         '2026-07-31', 1, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
     'tests/scripts': _SegmentProvenance(
@@ -881,6 +835,34 @@ def test_every_measured_fleet_segment_carries_dated_provenance() -> None:
         f'orphaned provenance: {sorted(set(MEASURED_FLEET_SEGMENT_PROVENANCE) - set(MEASURED_FLEET_SEGMENT_SECS))}). '
         'Every segment figure must carry its date and sample, or the table goes '
         'back to being un-ageable — the defect task 4902 was filed to fix.'
+    )
+
+
+def test_orchestrator_fleet_row_derives_from_the_shared_census_record() -> None:
+    """The orchestrator row and its provenance follow task 3353's census record.
+
+    Task 6172. The record lives once, at
+    ``tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS``,
+    and ``test_module_verify_budgets.py::RULED_BUDGET_CENSUS`` reads the same
+    object. A re-literalised row here would agree with it today and drift from
+    it at the next re-measure.
+    """
+    home = 'tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS'
+    provenance = MEASURED_FLEET_SEGMENT_PROVENANCE['orchestrator']
+
+    assert MEASURED_FLEET_SEGMENT_SECS['orchestrator'] == round(ORCHESTRATOR_BUDGET_CENSUS.p50, 2), (
+        f"MEASURED_FLEET_SEGMENT_SECS['orchestrator'] is not {home}.p50 to 2 dp "
+        '(task 6172). The row is DERIVED from that record, never copied'
+    )
+    assert provenance.measured_at == ORCHESTRATOR_BUDGET_CENSUS.measured_at, (
+        f"MEASURED_FLEET_SEGMENT_PROVENANCE['orchestrator'].measured_at is not "
+        f'{home}.measured_at (task 6172). The provenance is DERIVED from that '
+        'record, never copied'
+    )
+    assert provenance.sample_size == ORCHESTRATOR_BUDGET_CENSUS.n, (
+        f"MEASURED_FLEET_SEGMENT_PROVENANCE['orchestrator'].sample_size is not "
+        f'{home}.n (task 6172). The provenance is DERIVED from that record, '
+        'never copied'
     )
 
 
@@ -1051,6 +1033,12 @@ def test_measured_fleet_table_partitions_the_chain_it_measures() -> None:
             'tests/ --timeout 300',
             {'orchestrator'},
             id='value-taking-flags',
+        ),
+        pytest.param(
+            'uv run --project shared pytest tests/scripts/ --junitxml out.xml '
+            '--color yes --log-level INFO',
+            {'tests/scripts'},
+            id='root-clause-value-flags-from-the-shared-set',
         ),
         pytest.param(
             'cd shared && uv run ruff check . && uv run pytest tests/',

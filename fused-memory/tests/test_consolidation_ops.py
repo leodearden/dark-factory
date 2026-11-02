@@ -409,6 +409,37 @@ class TestAPeerThatCannotBeTaggedIsNamed:
         assert M1 not in _patched_ids(svc)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'metadata',
+        [{'topic': TOPIC, 'canonical': 1}, {'topic': TOPIC, 'canonical': 'true'}, None],
+        ids=['canonical-int-1', 'canonical-string-true', 'metadata-null'],
+    )
+    async def test_a_peer_without_the_bool_marker_is_tagged_not_refused(
+        self, metadata
+    ):
+        """Only the bool True claims canonical, so such a peer is ordinary —
+        including a row whose metadata is not a mapping at all, which
+        degrades to "not canonical" rather than raising out of the arm."""
+        svc = make_service()
+        read = svc.get_memory_by_id.side_effect
+
+        async def _get_with_peer_metadata(*args, **kwargs):
+            row = await read(*args, **kwargs)
+            if row['id'] == M1:
+                row['metadata'] = metadata
+            return row
+
+        svc.get_memory_by_id.side_effect = _get_with_peer_metadata
+
+        result = await call_execute(svc)
+
+        assert not [
+            f for f in result['retain_failures']
+            if f['error_type'] == 'RetainedPeerIsCanonical'
+        ]
+        assert M1 in _patched_ids(svc)
+
+    @pytest.mark.asyncio
     async def test_a_peer_that_cannot_be_read_fails_closed(self):
         """A check that did not ANSWER is not a check that said "not
         canonical". Refusing costs one peer's tag, which a caller can

@@ -1,5 +1,5 @@
 /* Remaining tabs: orchestrators, performance, memory, recon, merge, costs, burndown */
-const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarChart: HBC, Donut: DN, StatTile: ST, PALETTE: CP, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds, SMOOTHING_OPTIONS, formatCountTick, niceCountMax } = window.DF_CHARTS;
+const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarChart: HBC, Donut: DN, StatTile: ST, PALETTE: CP, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds, SMOOTHING_OPTIONS } = window.DF_CHARTS;
 const { Glyph: GL, ProjectGroup, Pip, DatumReading, Segmented, ChipGroup } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
@@ -30,7 +30,7 @@ const { projectCensus, censusOver, projectRows, viewRows, terminalSelectingProje
 // Windowed headers are labelled from the payload's served-window echo — window_chip.js.
 const { windowEcho, windowLabel, recentMergesCaption } = window.DF_WINDOW_CHIP;
 const {
-  projectInQueue, inQueueOver, inQueueHistory, latencyCaption,
+  projectInQueue, inQueueOver, inQueueHistory, latencyCaption, depthBucketCaption,
   queuedSince, projectSpeculative, speculativeOver, hitRateText, recentTotal,
 } = window.DF_MERGE_QUEUE;
 const { writeQueue, queueHint, newestHourOps, opsTotals, opsCaption, opsTotalText } = window.DF_MEMORY_READINGS;
@@ -648,7 +648,7 @@ function MemoryTab({ projectFilter, onNavigate }) {
             <LC labels={DF.MEMORY_OPS.labels} series={[
               { values: DF.MEMORY_OPS.reads, color: CP.accent },
               { values: DF.MEMORY_OPS.writes, color: CP.ok },
-            ]} height={240} formatY={formatCountTick} snapMax={niceCountMax} formatX={window.DF_SHELL.fmtDateTime} />
+            ]} height={240} countAxis formatX={window.DF_SHELL.fmtDateTime} />
           </div>
         </div>
       </div>
@@ -831,7 +831,7 @@ function ReconTab({ projectFilter, search }) {
         </div>
         <div className="panel-body flush">
           <table className="tbl">
-            <thead><tr><th>Run</th><th>Project</th><th>Trigger</th><th>Type</th><th>Status</th><th className="num">Events</th><th className="num">Duration</th><th>When</th><th className="num">Journal</th></tr></thead>
+            <thead><tr><th>Run</th><th>Project</th><th>Trigger</th><th>Type</th><th>Status</th><th className="num">Events</th><th className="num">Duration</th><th>When</th></tr></thead>
             <tbody>
               {runs.map(rn => (
                 <tr key={rn.id}>
@@ -843,7 +843,6 @@ function ReconTab({ projectFilter, search }) {
                   <td className="num">{rn.events_processed ?? rn.events ?? 0}</td>
                   <td className="num">{rn.duration_seconds != null ? `${rn.duration_seconds.toFixed(1)}s` : '—'}</td>
                   <td style={{ color: 'var(--fg-3)' }}>{window.DF_SHELL.timeago(rn.started_at)}</td>
-                  <td className="num"><span className="badge accent">{rn.journal_entry_count ?? 0}</span></td>
                 </tr>
               ))}
             </tbody>
@@ -936,8 +935,8 @@ function MergeTab({ projectFilter }) {
             <ProjectGroup id={pid} label={pid} open={openMap[pid]} onToggle={() => toggle(pid)} summary={summary}>
               <div className="grid cols-12" style={{ gap: 12 }}>
                 <div className="col-span-7 panel">
-                  <div className="panel-head"><span className="title">Merge attempts · 15-min buckets</span></div>
-                  <div className="panel-body"><LC labels={d.depth.labels.map(String)} series={[{ values: d.depth.values, color: CP.accent }]} height={180} formatY={formatCountTick} snapMax={niceCountMax} formatX={window.DF_SHELL.fmtDateTime} /></div>
+                  <div className="panel-head"><span className="title">Merge attempts · {depthBucketCaption(d.depth)}</span></div>
+                  <div className="panel-body"><LC labels={d.depth.labels.map(String)} series={[{ values: d.depth.values, color: CP.accent }]} height={180} countAxis formatX={window.DF_SHELL.fmtDateTime} /></div>
                 </div>
 
                 <div className="col-span-5 panel">
@@ -1280,7 +1279,7 @@ function BurnTab({ projectFilter, displayWindow }) {
                 <span key={l} style={{ color: 'var(--fg-2)' }}><span style={{ display: 'inline-block', width: 10, height: 10, background: c, marginRight: 5, verticalAlign: 'middle', borderRadius: 2 }}></span>{l}</span>
               ))}
             </div>
-            <SA labels={b.labels} stacks={burndownStacks(b, CP)} height={300} snapMax={niceCountMax} formatX={window.DF_SHELL.fmtDateTime} />
+            <SA labels={b.labels} stacks={burndownStacks(b, CP)} height={300} countAxis formatX={window.DF_SHELL.fmtDateTime} />
           </div>
         </div>
       )}
@@ -1345,7 +1344,7 @@ function BurnTab({ projectFilter, displayWindow }) {
                     {/* Bands must be indexed by THIS project's own snapshot row: b.labels is
                         the sorted union across all projects (redux_api.py shape_burndown), so
                         pairing it with pb.* both overruns and index-shifts them. */}
-                    <SA labels={pb.labels} stacks={burndownStacks(pb, CP)} height={220} snapMax={niceCountMax} formatX={window.DF_SHELL.fmtDateTime} />
+                    <SA labels={pb.labels} stacks={burndownStacks(pb, CP)} height={220} countAxis formatX={window.DF_SHELL.fmtDateTime} />
                   </div>
                 </div>
 

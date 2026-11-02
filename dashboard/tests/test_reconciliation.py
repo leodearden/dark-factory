@@ -61,21 +61,10 @@ class TestGetRecentRuns:
             'events_processed',
             'status',
             'duration_seconds',
-            'journal_entry_count',
         }
         for run in runs:
             assert set(run.keys()) == expected_fields
         assert runs[0]['project_id'] == 'dark_factory'
-
-    async def test_journal_entry_count(self, recon_conn):
-        """Runs include journal_entry_count from correlated subquery."""
-        from dashboard.data.reconciliation import get_recent_runs
-
-        runs = await get_recent_runs(recon_conn)
-        by_id = {r['id']: r for r in runs}
-        # run-001 has 2 journal entries in fixture, run-002 has 0
-        assert by_id['run-001']['journal_entry_count'] == 2
-        assert by_id['run-002']['journal_entry_count'] == 0
 
     async def test_completed_run_has_duration(self, recon_conn):
         """Completed runs should have duration_seconds calculated."""
@@ -863,64 +852,6 @@ class TestExceptionLogging:
             r.levelno >= logging.WARNING and 'dashboard.data.db' in r.name
             for r in caplog.records
         ), f'Expected WARNING log from dashboard.data.db, got: {caplog.records}'
-
-
-class TestGetJournalEntries:
-    """Tests for get_journal_entries."""
-
-    async def test_happy_path_returns_entries(self, recon_conn):
-        """Returns list of journal entry dicts for a given run_id."""
-        from dashboard.data.reconciliation import get_journal_entries
-
-        entries = await get_journal_entries(recon_conn, 'run-001')
-
-        assert len(entries) == 2
-        expected_fields = {
-            'id', 'stage', 'timestamp', 'operation', 'target_system',
-            'before_state', 'after_state', 'reasoning', 'evidence',
-        }
-        for entry in entries:
-            assert set(entry.keys()) == expected_fields
-
-        # Ordered by timestamp — je-001 first
-        assert entries[0]['id'] == 'je-001'
-        assert entries[0]['operation'] == 'consolidate'
-        assert entries[0]['target_system'] == 'mem0'
-
-    async def test_json_fields_parsed(self, recon_conn):
-        """JSON fields (before_state, after_state, evidence) are parsed."""
-        from dashboard.data.reconciliation import get_journal_entries
-
-        entries = await get_journal_entries(recon_conn, 'run-001')
-
-        assert entries[0]['before_state'] == {'count': 5}
-        assert entries[0]['after_state'] == {'count': 3}
-        assert entries[0]['evidence'] == [{'source': 'mem0', 'id': 'm-1'}]
-
-    async def test_null_json_fields(self, recon_conn):
-        """NULL JSON fields return None/empty defaults."""
-        from dashboard.data.reconciliation import get_journal_entries
-
-        entries = await get_journal_entries(recon_conn, 'run-001')
-
-        # je-002 has NULL before_state
-        assert entries[1]['before_state'] is None
-        assert entries[1]['after_state'] == {'entities': 2}
-        assert entries[1]['evidence'] == []
-
-    async def test_empty_result_for_unknown_run(self, recon_conn):
-        """Returns empty list for a run_id with no entries."""
-        from dashboard.data.reconciliation import get_journal_entries
-
-        entries = await get_journal_entries(recon_conn, 'nonexistent-run')
-        assert entries == []
-
-    async def test_missing_db_file(self):
-        """Returns empty list when database connection is None."""
-        from dashboard.data.reconciliation import get_journal_entries
-
-        entries = await get_journal_entries(None, 'run-001')
-        assert entries == []
 
 
 # parse_utc tests live in tests/test_data_utils.py::TestParseUtc

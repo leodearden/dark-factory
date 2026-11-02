@@ -5,7 +5,8 @@ decides which session registry record an event belongs to. The code is
 `orchestrator/src/orchestrator/session_hooks.py` and
 `orchestrator/src/orchestrator/session_ownership_probes.py`. The inputs it
 relies on are `CLAUDE_SPAWN_SESSION_ID` and `CLAUDE_SPAWN_OWNER_PPID`, both
-exported by `skills/spawn/spawn-claude.sh` into the session it launches.
+exported by `skills/spawn/spawn-claude.sh` into the session it launches, and
+the registry's session-id and pid pointers.
 
 ## Record keying
 
@@ -24,12 +25,29 @@ Claude Code `session_id` from the hook's stdin JSON, through
 `session_registry.build_session_slug`, with the `session_id` in the
 `launcher_pid` slot as the uniqueness token. That `session_id` is the same
 for SessionStart, Notification and Stop within one session, so all three
-resolve to the same `record.json`. `/clear` re-mints the `session_id`, so a
-hand-launched session gets a new record from that point on. A spawned
-session keeps its record across a re-mint (see §Session-id re-mints).
+resolve to the same `record.json`. Both kinds keep their record across a
+re-mint (see §Session-id re-mints).
+
+A session with no `CLAUDE_SPAWN_SESSION_ID` first tries two registry
+pointers, both siblings of `sessions/`: `sessions-by-claude-id/<session_id>`,
+then `sessions-by-pid/<owning claude pid>`. A pointer counts only while the
+record it names vouches for it, by an equal `claude_session_id` or
+`claude_owner_pid`. The slug a pointer names then goes through the same
+ownership decision as an env slug. So an event whose `session_id` mismatches
+the record falls through to the hand-launched keying, unless it is a re-mint
+reached through the pid pointer. Every bind, and every dead-owner reclaim
+(see §Session-id re-mints), writes the session-id pointer, and every write
+of a record whose `claude_owner_pid` is the event's claude writes the pid
+pointer, so spawned, T3-hosted and hand-launched records carry
+the same pointers. This is the only way a T3-hosted session reaches its spawn record,
+because it has no `CLAUDE_SPAWN_*` environment at all: the T3 lane binds the
+record to the session id of the transcript that names the record dir, and
+writes that session-id pointer itself (task 7489).
 
 Code: `orchestrator/src/orchestrator/session_hooks.py::hook_session_slug`,
-`::_resolve_hook_slug`.
+`::_resolve_hook_slug`, `::_pointer_resolution`, `::_stamp_session_pointers`;
+`orchestrator/src/orchestrator/session_registry.py::resolve_session_slug_for_claude_session_id`,
+`::resolve_session_slug_for_pid`.
 
 ## Owner or inheritor
 
@@ -87,6 +105,44 @@ when both of these hold:
   pid. A nested claude is a different process.
 
 When both hold, SessionStart re-binds the record to the new id.
+
+A session with no `CLAUDE_SPAWN_SESSION_ID` re-binds the same way through
+its pid pointer: the new id misses `sessions-by-claude-id`, the owning
+claude's pid finds the record, and the pid condition above holds. The
+re-bind also writes a session-id pointer for the new id. A T3 thread that T3
+resumes in a new process keeps its session id.
+
+When no live process holds the recorded `claude_owner_pid`, the resumed
+process's event re-stamps it with the new claude. This dead-owner reclaim
+applies on two lanes:
+
+- an event reached through its session-id pointer;
+- an event reached through the hand-launched keying, whose slug embeds that
+  same session id, so a record bound to it is proven the session's own. A
+  forked inheritor's record is keyed the same way (see §Forked-inheritor
+  identity), so it shares this lane.
+
+An event that adopts its `CLAUDE_SPAWN_SESSION_ID` does not reclaim: there a
+reclaim would also satisfy the self-exit owner-pid precondition in the same
+event. The reclaim writes both pointers. A later re-mint in the new process
+therefore re-binds, and a record bound before the session-id pointer existed
+(task 7489) gains one at its next event. This is how a thread opened directly
+in T3's UI keeps its pid pointer across T3's resume in a new process: it has
+no spawn record and is keyed by the hand-launched keying (task 7614). A live
+recorded owner is left in place, because then the event is a nested
+`claude --resume` of the same session. A thread whose resume fails starts a
+fresh session id in a new process, which no pointer links to the record; it
+gets a hand-launched record.
+
+The re-bind moves `claude_session_id` only. `claude_launch_session_id` keeps
+the id the first binding stamped and is never re-bound, so the launch
+transcript `<id>.jsonl` stays findable after a `/clear` or compaction
+(task 6069). Records bound before that field existed carry none and are not
+backfilled.
+
+Code: `orchestrator/src/orchestrator/session_hooks.py::_bind_claude_session_id`,
+`::_reclaim_dead_owner_pid`, `::_HookSlugResolution.session_id_keyed`,
+`scripts/legibility/check_transcript_persistence.py::find_matching_transcript`.
 
 `resume` is excluded. `--resume` and `--continue` make a brand-new process
 report it, so a nested `claude -c -p` would present it. Honouring it would

@@ -37,7 +37,6 @@ from __future__ import annotations
 import errno
 import json
 import logging
-import os
 import re
 import shutil
 import uuid
@@ -47,6 +46,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _code_default_hatch import require_code_default_config
 from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler, fixed_prompt
 from shared.cli_invoke import transcript_exists
 from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
@@ -715,6 +715,7 @@ async def _drive_resumed_invoke(
     driving the arm site's third scoping arm: with no concrete directory there
     is nowhere correct to glob, so the corroboration must NOT veto.
     """
+    require_code_default_config()
     caplog.set_level(logging.INFO)
     sid = (recovered_session or {}).get('session_id', 'x')
     repo = tmp_path / f'resume-repo-{slug or sid}'
@@ -727,8 +728,7 @@ async def _drive_resumed_invoke(
         ),
         repo,
     )
-    with patch.dict(os.environ, {'ORCH_CONFIG_PATH': ''}):
-        config = _config(repo, **(config_overrides or {}))
+    config = _config(repo, **(config_overrides or {}))
     assignment = _resume_assignment(task_id)
     workflow, cwd = await _make_resumed_workflow(
         config, git_ops, assignment, recovered_session,
@@ -764,6 +764,7 @@ async def _drive_resumed_invoke(
 
 
 # ── B1: invocation-level journal proof (γ → invocation seam) ─────────────────
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_b1_resumed_invocation_journals_prior_session(
     harness: Harness, tmp_path: Path, caplog,
@@ -796,6 +797,7 @@ async def test_b1_resumed_invocation_journals_prior_session(
 
 
 # ── B1v: the arm-site VETO — corroborate against the config dir we will USE ──
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_b1v_invoke_vetoes_resume_when_transcript_provably_absent(
     harness: Harness, tmp_path: Path, caplog,
@@ -841,6 +843,7 @@ async def test_b1v_invoke_vetoes_resume_when_transcript_provably_absent(
     )
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_b1v_invoke_arms_resume_when_transcript_present_in_config_dir(
     harness: Harness, tmp_path: Path, caplog,
@@ -868,6 +871,7 @@ async def test_b1v_invoke_arms_resume_when_transcript_present_in_config_dir(
     assert f'resuming prior session {session_id}' in caplog.text
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_b1v_no_config_dir_arms_the_resume_unchanged(
     harness: Harness, tmp_path: Path, caplog,
@@ -905,6 +909,7 @@ async def test_b1v_no_config_dir_arms_the_resume_unchanged(
 
 
 # ── B1r: the RESTORE — rehydrate from the durable archive at the arm site ────
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_b1r_invoke_rehydrates_transcript_from_durable_archive(
     harness: Harness, tmp_path: Path, caplog,
@@ -954,6 +959,7 @@ async def test_b1r_invoke_rehydrates_transcript_from_durable_archive(
     )
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_b1r_restore_from_archive_false_leaves_the_veto_to_fire(
     harness: Harness, tmp_path: Path, caplog,
@@ -1000,6 +1006,7 @@ async def test_b1r_restore_from_archive_false_leaves_the_veto_to_fire(
     assert failed[0]['data']['restore'] == 'disabled'
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_b1r_restore_fault_degrades_to_a_fresh_dispatch(
     harness: Harness, tmp_path: Path, caplog,
@@ -1055,6 +1062,7 @@ async def test_b1r_restore_fault_degrades_to_a_fresh_dispatch(
     assert failed[0]['data']['restore'] == 'fault'
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_b1r_an_internal_restore_fault_is_a_fault_not_a_miss(
     harness: Harness, tmp_path: Path, caplog,
@@ -1144,6 +1152,7 @@ _PER_DISPATCH_RESUME_EVENTS = (
 
 
 # ── B1e: the pre-flight instrumentation event ───────────────────────────────
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_b1e_veto_emits_session_resume_failed_pre_flight(
     harness: Harness, tmp_path: Path, caplog,
@@ -1189,6 +1198,7 @@ async def test_b1e_veto_emits_session_resume_failed_pre_flight(
         assert store.of_type(et) == []
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_b1e_no_pre_flight_event_when_the_resume_succeeds(
     harness: Harness, tmp_path: Path, caplog,
@@ -1223,6 +1233,7 @@ async def test_b1e_no_pre_flight_event_when_the_resume_succeeds(
 
 
 # ── B1e: the CLI-stage instrumentation event ────────────────────────────────
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_b1e_cli_stage_event_when_the_cli_rejected_an_armed_resume(
     harness: Harness, tmp_path: Path, caplog,
@@ -1272,6 +1283,7 @@ async def test_b1e_cli_stage_event_when_the_cli_rejected_an_armed_resume(
         assert store.of_type(et) == []
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_b1e_cli_stage_event_reports_the_fallback_count(
     harness: Harness, tmp_path: Path, caplog,
@@ -1313,6 +1325,7 @@ async def test_b1e_cli_stage_event_reports_the_fallback_count(
     assert failed[0]['data']['session_id'] == session_id
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_b1e_no_cli_stage_event_when_the_resume_held(
     harness: Harness, tmp_path: Path, caplog,
@@ -1338,6 +1351,7 @@ async def test_b1e_no_cli_stage_event_when_the_resume_held(
     assert store.of_type(EventType.session_resume_failed) == []
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_b1e_no_cli_stage_event_when_we_never_adopted_a_resume(
     tmp_path: Path, caplog,
@@ -2046,6 +2060,7 @@ async def test_b9_cold_worktree_plan_present_adopts_and_injects(harness: Harness
 
 
 # ── B10: completion still clears → no adoption on next boot ──────────────────
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_b10_completion_clears_sidecar_no_adoption_next_boot(
     harness: Harness, tmp_path: Path, caplog,
@@ -2093,6 +2108,7 @@ async def test_b10_completion_clears_sidecar_no_adoption_next_boot(
 
 
 # ── B11: v1 sidecar compat — adopt via plan.json, rewrite v2 on next write ───
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_b11_v1_sidecar_adopts_via_plan_and_rewrites_v2(
     harness: Harness, tmp_path: Path, caplog,
@@ -2196,6 +2212,7 @@ class _RecordingSink:
         return self.failures[0]
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_epsilon_internal_restore_fault_is_reported_with_its_archive(
     harness: Harness, tmp_path: Path, caplog,
@@ -2251,6 +2268,7 @@ async def test_epsilon_internal_restore_fault_is_reported_with_its_archive(
     assert failed[0]['data']['stage'] == report.stage
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_epsilon_archive_root_fault_reports_no_path_and_never_raises(
     harness: Harness, tmp_path: Path, caplog,
@@ -2289,6 +2307,7 @@ async def test_epsilon_archive_root_fault_reports_no_path_and_never_raises(
     assert 'unsupported operand type' in (report.detail or '')
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_epsilon_a_genuine_archive_miss_is_reported_as_a_miss(
     harness: Harness, tmp_path: Path, caplog,
@@ -2319,6 +2338,7 @@ async def test_epsilon_a_genuine_archive_miss_is_reported_as_a_miss(
     assert report.restore == 'miss'
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_epsilon_cli_rejection_of_an_armed_resume_is_reported(
     harness: Harness, tmp_path: Path, caplog,
@@ -2357,6 +2377,7 @@ async def test_epsilon_cli_rejection_of_an_armed_resume_is_reported(
     assert report.role == IMPLEMENTER.name
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_epsilon_a_surviving_resume_is_reported_as_a_success(
     harness: Harness, tmp_path: Path, caplog,
@@ -2385,6 +2406,7 @@ async def test_epsilon_a_surviving_resume_is_reported_as_a_success(
     assert sink.successes == 1
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_epsilon_no_sink_leaves_the_dispatch_byte_identical(
     harness: Harness, tmp_path: Path, caplog,
@@ -2535,6 +2557,7 @@ def _assert_by_design_emit(
     return len(emits)
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_epsilon_end_to_end_a_run_of_restore_faults_pages_once(
     harness: Harness, tmp_path: Path, caplog,
@@ -2590,6 +2613,7 @@ async def test_epsilon_end_to_end_a_run_of_restore_faults_pages_once(
     )
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_epsilon_end_to_end_a_by_design_boot_never_pages(
     harness: Harness, tmp_path: Path, caplog,
@@ -2684,6 +2708,7 @@ async def test_epsilon_end_to_end_a_by_design_boot_never_pages(
         assert _filed(harness) == [], outcome
 
 
+@pytest.mark.usefixtures("code_default_config")
 @pytest.mark.asyncio
 async def test_epsilon_end_to_end_a_surviving_resume_retires_the_run(
     harness: Harness, tmp_path: Path, caplog,

@@ -156,7 +156,7 @@ test('staleness: a recovered endpoint clears its failures AND its notice', async
   const failing = win.DF_DATA.__stale[CURATOR_PATH];
   assert.equal(failing.failures, STALE_FAILURE_THRESHOLD);
   assert.equal(
-    staleNoticesForTab({ tab: 'curator', stale: win.DF_DATA.__stale, now: t }).length, 1,
+    staleNoticesForTab({ paths: [CURATOR_PATH], stale: win.DF_DATA.__stale, now: t }).length, 1,
     'the tab must actually be reporting the endpoint stale before recovery is ' +
       'asserted, or the clearing assertions below prove nothing',
   );
@@ -176,7 +176,7 @@ test('staleness: a recovered endpoint clears its failures AND its notice', async
       'pre-outage success and the notice would return with a stale age',
   );
   assert.deepEqual(
-    staleNoticesForTab({ tab: 'curator', stale: win.DF_DATA.__stale, now: t }),
+    staleNoticesForTab({ paths: [CURATOR_PATH], stale: win.DF_DATA.__stale, now: t }),
     [],
     'the tab still renders a staleness notice for an endpoint that is serving 200s',
   );
@@ -224,6 +224,7 @@ test('receipts: a successful refresh records servedAt from the body and received
     servedAt: '2026-09-20T12:00:00+00:00',
     receivedAt: 555,
     window: null,
+    pacingHoldMs: 0,
   });
 });
 
@@ -239,6 +240,7 @@ test('receipts: a windowed body\'s WINDOW echo is recorded verbatim beside serve
     servedAt: 'S',
     receivedAt: 555,
     window: { requested: '90d', served: '30d', days: 30 },
+    pacingHoldMs: 0,
   });
 });
 
@@ -250,7 +252,7 @@ test('receipts: a body with no served_at records null, never undefined', async (
 
   await api.refreshOne(CURATOR_PATH, {}, api.createPollState(), deps);
 
-  assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], { servedAt: null, receivedAt: 42, window: null });
+  assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], { servedAt: null, receivedAt: 42, window: null, pacingHoldMs: 0 });
 });
 
 test('receipts: a FAILED refresh leaves the receipt alone, so the tiles keep ageing', async () => {

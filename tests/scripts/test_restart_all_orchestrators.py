@@ -167,6 +167,7 @@ def _run_script(
     lease_swap: dict | None = None,
     no_units: bool = False,
     extra_args: tuple[str, ...] = (),
+    subprocess_timeout: float = 30,
 ) -> subprocess.CompletedProcess[bytes]:
     bin_dir = tmp_path / "bin"
     _make_fake_systemctl(bin_dir)
@@ -210,7 +211,7 @@ def _run_script(
         [str(SCRIPT), *extra_args],
         env=env,
         capture_output=True,
-        timeout=30,
+        timeout=subprocess_timeout,
     )
 
 
@@ -263,8 +264,12 @@ def test_unit_fresh_only_during_grace_still_verifies_and_stamps(tmp_path: Path) 
 
     VERIFY_TIMEOUT=1 gives exactly one `show` call before the initial
     window expires (still stale, since FRESH_AFTER=2). The grace window
-    (5s) then gets several more 1/sec polls, flipping fresh on the third
-    call.
+    then gets several more 1/sec polls, flipping fresh on the third call.
+
+    The grace is a generous ceiling, not a duration (task 6446): the script
+    leaves the loop the moment the fake turns fresh, so the normal run still
+    takes a few seconds, while a heavily loaded xdist worker -- where every
+    poll spawns a bash shim -- cannot exhaust it before the flip.
     """
     clock_file = tmp_path / "last_redeploy_orchestrator.json"
 
@@ -273,8 +278,9 @@ def test_unit_fresh_only_during_grace_still_verifies_and_stamps(tmp_path: Path) 
         scenario="delayed-fresh",
         clock_file=clock_file,
         verify_timeout="1",
-        verify_grace="5",
+        verify_grace="60",
         fresh_after_calls="2",
+        subprocess_timeout=120,
     )
 
     stdout = result.stdout.decode(errors="replace")

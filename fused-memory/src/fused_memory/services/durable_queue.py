@@ -13,8 +13,9 @@ import logging
 import random
 import re
 import time
-from collections.abc import Callable, Coroutine, Iterable, Mapping
+from collections.abc import Callable, Coroutine, Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from shared.async_sqlite_base import (
     apply_full_durability_pragmas,
     connect_daemon,
 )
+from shared.sqlite_column_migration import add_column_if_missing
 
 logger = logging.getLogger(__name__)
 
@@ -307,6 +309,8 @@ class DurableWriteQueue:
         self._group_events: dict[str, asyncio.Event] = {}
         self._group_locks: dict[str, asyncio.Lock] = {}
         self._worker_tasks: dict[str, list[asyncio.Task]] = {}
+        # item id -> (group_id, instant the item was handed to execute_write)
+        self._executing_started_at: dict[int, tuple[str, datetime]] = {}
         self._closed = False
 
     # -- lifecycle ------------------------------------------------------------
@@ -335,32 +339,13 @@ class DurableWriteQueue:
     async def _migrate(self) -> None:
         """Add columns that post-date a DB's creation.
 
-        ``CREATE TABLE IF NOT EXISTS`` is a no-op against an existing table, so
-        additive changes need an explicit ALTER for DBs already on disk.
-        Idempotent: probes ``PRAGMA table_info`` first.
-
-        No ``PRAGMA user_version`` ladder — the project's rule (stated in
-        orchestrator/run_store.py) is that purely additive changes use this
-        light feature-detect idiom.
+        Additive-only, with no ``PRAGMA user_version`` ladder, per the rule in
+        ``shared/src/shared/sqlite_column_migration.py``.
         """
-        access = self._require_access()
-        cols = {row[1] for row in await access.read_all('PRAGMA table_info(write_queue)')}
-        if 'executed' not in cols:
-            try:
-                async with access.write() as db:
-                    await db.execute('ALTER TABLE write_queue ADD COLUMN executed INTEGER')
-                logger.info(
-                    'DurableWriteQueue: migrated write_queue — added executed column'
-                )
-            except Exception as exc:
-                # Multiple processes can open this same DB file, so two
-                # initialize() calls can race between the probe and the ALTER.
-                # Losing that race is benign; anything else is not.
-                if 'duplicate column name' not in str(exc).lower():
-                    raise
-                logger.debug(
-                    'DurableWriteQueue: executed column already exists (concurrent init)'
-                )
+        async with self._require_access().write() as db:
+            added = await add_column_if_missing(db, 'write_queue', 'executed', 'INTEGER')
+        if added:
+            logger.info('DurableWriteQueue: migrated write_queue — added executed column')
 
     async def close(self) -> None:
         self._closed = True
@@ -542,10 +527,11 @@ class DurableWriteQueue:
                 # skipped.
                 payload = item.parsed_payload()
                 write_op_id = payload.get('_write_op_id')
-                result = await asyncio.wait_for(
-                    self._execute_write(item.operation, payload),
-                    timeout=self._write_timeout_seconds,
-                )
+                with self._executing(item):
+                    result = await asyncio.wait_for(
+                        self._execute_write(item.operation, payload),
+                        timeout=self._write_timeout_seconds,
+                    )
                 # The backend write LANDED. Anything that fails below is a
                 # post-execute failure, which is a materially different fact
                 # for anyone deciding whether a dead item is safe to replay.
@@ -577,6 +563,30 @@ class DurableWriteQueue:
                 await self._notify_dead_letter(
                     item, write_op_id, error, post_execute=executed
                 )
+
+    @contextlib.contextmanager
+    def _executing(self, item: QueueItem) -> Iterator[None]:
+        self._executing_started_at[item.id] = (item.group_id, datetime.now(UTC))
+        try:
+            yield
+        finally:
+            self._executing_started_at.pop(item.id, None)
+
+    def earliest_executing_start(self, group_id: str) -> datetime | None:
+        """When the earliest backend write still executing for *group_id* was
+        handed to execute_write, or None when none is executing.
+
+        Process-local by design: after a restart ``_recover_in_flight`` sends
+        every interrupted row back to pending, so it re-executes from scratch.
+        Why the reconciliation episode cursor needs this:
+        ``fused_memory/reconciliation/episode_window.py``.
+        """
+        starts = [
+            started_at
+            for item_group, started_at in self._executing_started_at.values()
+            if item_group == group_id
+        ]
+        return min(starts, default=None)
 
     async def _notify_terminal(
         self,

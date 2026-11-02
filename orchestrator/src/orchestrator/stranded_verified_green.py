@@ -318,8 +318,8 @@ async def submit_verified_green_merge_request(
 
     Returns the submitted ``MergeRequest`` (callers read ``.request_id``).
     """
+    from orchestrator.merge_lane import enqueue_merge_request
     from orchestrator.merge_lane.types import MergeRequest
-    from orchestrator.merge_lane.worker import enqueue_merge_request
 
     future: asyncio.Future[MergeOutcome] = (
         asyncio.get_running_loop().create_future()

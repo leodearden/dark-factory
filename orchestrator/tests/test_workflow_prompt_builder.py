@@ -63,6 +63,7 @@ def _make_workflow(tmp_path: Path, *, event_store: _RecordingEventStore | None =
     cfg.max_turns.implementer = 50
     cfg.backends.implementer = 'claude'
     cfg.sandbox.enabled = False
+    cfg.git.main_branch = 'main'
 
     git_ops = MagicMock()
     git_ops.has_uncommitted_work = AsyncMock(return_value=False)

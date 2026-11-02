@@ -998,6 +998,80 @@ def test_parse_failed_run_all_members_human_partial_summary_alone_is_empty() -> 
     )
 
 
+
+_EVENT_CHANNEL_FIXTURE_DIR = Path(__file__).parent / 'fixtures' / 'reify_verify_event_channel'
+
+
+@pytest.mark.parametrize('branch', ['pool', 'serial'])
+def test_d5_channel_and_text_name_the_same_failed_run_all_members(branch: str) -> None:
+    """D5: on real captures, the channel's failed set equals the text marker's."""
+    from orchestrator.merge_lane.shadow import parse_failed_run_all_members
+    from orchestrator.verify_event_channel import (
+        encode_channel_open,
+        parse_verify_event_channel,
+    )
+
+    producer = (_EVENT_CHANNEL_FIXTURE_DIR / f'run_all-{branch}.events.jsonl').read_bytes()
+    text = (_EVENT_CHANNEL_FIXTURE_DIR / f'run_all-{branch}.log').read_text()
+    channel = parse_verify_event_channel(
+        encode_channel_open(role='merge', verify_id='V') + producer, verify_id='V',
+    )
+
+    from_channel = channel.failed_run_all_members()
+    from_text = parse_failed_run_all_members(text)
+    assert from_channel and from_text
+    assert from_channel == from_text
+
+
+@pytest.mark.parametrize(
+    'test_output',
+    [
+        pytest.param(
+            _run_all_fixture_line('FAILED test_worktree_lifecycle.sh test_skip_ledger.sh'),
+            id='clean-marker',
+        ),
+        pytest.param(_run_all_fixture_line('FAILED a.sh b.sh (partial)'), id='partial-marker'),
+        pytest.param('=== Summary: 3 discovered, 0 failed ===\n', id='no-marker'),
+    ],
+)
+def test_select_failed_run_all_members_without_a_channel_is_the_text_parse(
+    test_output: str,
+) -> None:
+    from orchestrator.merge_lane.shadow import (
+        parse_failed_run_all_members,
+        select_failed_run_all_members,
+    )
+
+    assert select_failed_run_all_members(test_output, None) == (
+        parse_failed_run_all_members(test_output)
+    )
+
+
+@pytest.mark.parametrize(
+    ('channel_members', 'expected'),
+    [
+        pytest.param(['b.sh'], ['b.sh'], id='channel-names-win'),
+        pytest.param([], [], id='channel-refusal-wins'),
+    ],
+)
+def test_select_failed_run_all_members_prefers_a_present_channel(
+    channel_members: list[str], expected: list[str],
+) -> None:
+    from orchestrator.merge_lane.shadow import select_failed_run_all_members
+
+    assert select_failed_run_all_members('FAILED a.sh\n', channel_members) == expected
+
+
+def test_select_failed_run_all_members_returns_its_own_list() -> None:
+    from orchestrator.merge_lane.shadow import select_failed_run_all_members
+
+    channel_members = ['b.sh']
+    selected = select_failed_run_all_members('FAILED a.sh\n', channel_members)
+    selected.append('c.sh')
+
+    assert channel_members == ['b.sh']
+
+
 def test_build_fail_fast_map_marks_cancelled_tests_not_started() -> None:
     """build_fail_fast_map annotates the authoritative plan with attempt-0 verdicts.
 

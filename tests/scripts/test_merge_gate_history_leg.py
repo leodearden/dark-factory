@@ -70,6 +70,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
         'run_git is patched; each git argv is a mocked CompletedProcess or side-effect input'
     ),
     'orchestrator/tests/test_atomic_train_merge.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_branch_base.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_branch_stack.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_branch_work_landed.py': '_Repo wraps the tmp_path git_repo fixture',
     'orchestrator/tests/test_citation_gate_positive_arm.py': _SEEDS_ITS_OWN_REPO,
@@ -91,6 +92,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'orchestrator/tests/test_merge_gates_plan_files_rename.py': (
         'a predicate over recorded argv; the probe it intercepts runs in the tmp git_repo fixture'
     ),
+    'orchestrator/tests/test_merge_gates_rename_family.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_merge_lane_ratchet_commit_gate.py': (
         '_Repo.seeded builds its repo under tmp_path'
     ),
@@ -105,11 +107,13 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'orchestrator/tests/test_rebased_solo_landing_ladder.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_reconcile_done_step_commits.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_recut_ruling_gitops.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_review_inputs.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_roles_ancestry_check.py': 'every call runs in a clone under tmp_path',
     'orchestrator/tests/test_timeout_marker_inversion_guard.py': (
         'create_subprocess_exec is faked; the git argv is a recorded-call literal'
     ),
     'orchestrator/tests/test_train_moved_main.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_verify_events_units.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_verify_phase_rebase.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_warm_lane_abort_teardown.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_warm_lane_integration_gate.py': _SEEDS_ITS_OWN_REPO,
@@ -125,6 +129,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'scripts/tests/test_legibility_nightly.py': _SEEDS_ITS_OWN_REPO,
     'scripts/tests/test_merge_deep_set_cap.py': _SEEDS_ITS_OWN_REPO,
     'scripts/tests/test_merge_pytest_n_ab_switch.py': _SEEDS_ITS_OWN_REPO,
+    'scripts/tests/test_merge_queue_landing.py': _SEEDS_ITS_OWN_REPO,
     'shared/tests/test_merge_subject.py': _SEEDS_ITS_OWN_REPO,
     'tests/scripts/test_merge_gate_history_leg.py': (
         "this guard's own synthetic sources: string literals it parses, never runs"

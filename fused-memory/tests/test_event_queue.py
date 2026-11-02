@@ -14,6 +14,13 @@ from unittest.mock import AsyncMock
 import aiosqlite
 import pytest
 import pytest_asyncio
+from _dead_letter_helpers import (
+    hold_fifo,
+    journaled_events,
+    journaled_ids,
+    parked_queue,
+    seed_dead_letters,
+)
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -328,6 +335,8 @@ async def test_overflow_writes_to_dead_letter(tmp_path):
         overflowed = sum(1 for r in results if r is False)
         assert overflowed >= 3, f'expected >=3 overflow, got {overflowed}'
         assert q.stats()['overflow_drops'] == overflowed
+        # enqueue hands overflow records to the writer thread without waiting.
+        await q.flush_dead_letters()
         # Dead-letter file contains overflow records.
         lines = dl.read_text().strip().splitlines()
         assert len(lines) == overflowed
@@ -538,6 +547,7 @@ async def test_enqueue_after_close_diverts_to_dead_letter(tmp_path, real_buffer)
     await q.start()
     await q.close()
     assert q.enqueue(_make_event()) is False
+    await q.flush_dead_letters()
     dl = tmp_path / 'dl.jsonl'
     assert dl.exists()
     record = json.loads(dl.read_text().strip().splitlines()[0])
@@ -558,6 +568,7 @@ async def test_stats_surface_has_expected_keys(queue):
         'events_committed',
         'overflow_drops',
         'dead_letters',
+        'dead_letters_pending',
         'retry_in_flight',
         'drainer_running',
     }
@@ -773,7 +784,7 @@ async def test_rotation_keep_zero_purges_orphan_rotations(tmp_path):
     )
     await q.start()
     try:
-        # Enqueue enough events to trigger at least one _rotate_dead_letter call.
+        # Enqueue enough events to trigger at least one rotation.
         for _ in range(10):
             q.enqueue(_make_event())
         await q._drain_for_test(timeout=5.0)
@@ -781,12 +792,13 @@ async def test_rotation_keep_zero_purges_orphan_rotations(tmp_path):
         # Rotation must have fired at least once.  With max_bytes=200 and
         # each dead-letter record being ~300 bytes, the first write fills the
         # file past the cap, so every subsequent write triggers a rotation.
-        # _dead_letters >= 2 is therefore a direct witness that
-        # _rotate_dead_letter ran (the 2nd dead letter can only be written
-        # after rotation cleared the file).
-        assert q._dead_letters >= 2, (
+        # A dead_letters count >= 2 is therefore a direct witness that a
+        # rotation ran (the 2nd dead letter can only be written after
+        # rotation cleared the file).
+        dead_letters = q.stats()['dead_letters']
+        assert dead_letters >= 2, (
             f'expected at least 2 dead letters (and thus at least one rotation), '
-            f'got {q._dead_letters}'
+            f'got {dead_letters}'
         )
 
         # All orphan siblings must have been purged.
@@ -856,6 +868,30 @@ async def test_rotation_purges_orphan_rotations(tmp_path):
 
 
 # ── read_dead_letters ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_seed_dead_letters_writes_the_writers_record_shape(tmp_path):
+    """seed_dead_letters, which reader and replay tests use instead of the
+    drainer, writes the same keys and value types as EventQueue's own writer,
+    and the same event. A writer-side change therefore fails here rather than
+    leaving every seeded reader test green."""
+    written = tmp_path / 'written.jsonl'
+    seeded = tmp_path / 'seeded.jsonl'
+    q = EventQueue(AsyncMock(), dead_letter_path=written, maxsize=1)
+    try:
+        kept, overflowed = _make_event(), _make_event()
+        assert q.enqueue(kept) is True
+        assert q.enqueue(overflowed) is False
+        await q.flush_dead_letters()
+        [real] = [json.loads(line) for line in written.read_text().splitlines()]
+    finally:
+        await q.close()
+    seed_dead_letters(seeded, [overflowed])
+    [seed] = [json.loads(line) for line in seeded.read_text().splitlines()]
+
+    assert {k: type(v) for k, v in seed.items()} == {k: type(v) for k, v in real.items()}
+    assert seed['event'] == real['event']
 
 
 @pytest.mark.asyncio
@@ -1682,97 +1718,198 @@ async def test_startup_recovery_after_kill9(real_buffer, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_replay_dead_letters_reenqueues_and_clears(real_buffer, tmp_path):
-    """replay_dead_letters re-enqueues dead-lettered events (drainer commits
-    them), clears them from the file, and a second call finds nothing to replay.
+async def test_replay_dead_letters_reenqueues_and_clears(tmp_path):
+    """replay_dead_letters puts every dead-lettered event back in the queue
+    unchanged (journaled, observed with the drainer parked so the state is
+    settled rather than raced), clears them from the file, and a second call
+    finds nothing to replay.
+
+    The drainer's commit of re-enqueued events is covered by
+    fused-memory/tests/test_event_queue.py::test_drainer_marks_processed_on_commit.
     """
     dl = tmp_path / 'dl.jsonl'
-    q = EventQueue(
-        real_buffer,
-        dead_letter_path=dl,
-        journal_path=tmp_path / 'ej.db',
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.1,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
-        for _ in range(3):
-            q._write_dead_letter(_make_event(), reason='non_retriable', attempts=1)
+    ej = tmp_path / 'ej.db'
+    async with parked_queue(dl, ej) as q:
+        seeded = [_make_event() for _ in range(3)]
+        seed_dead_letters(dl, seeded)
         assert len(dl.read_text().strip().splitlines()) == 3
 
         counts = q.replay_dead_letters()
         assert counts == {'replayed': 3, 'failed': 0}
-        # Drainer commits the replayed events to the buffer.
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-        assert (await real_buffer.get_buffer_stats('test-project'))['size'] == 3
+        assert journaled_events(ej) == {e.id: e for e in seeded}
         # File no longer holds the replayed records.
         assert (dl.read_text().strip() if dl.exists() else '') == ''
         # Second call → nothing to replay (no re-replay).
         assert q.replay_dead_letters() == {'replayed': 0, 'failed': 0}
-    finally:
-        await q.close()
 
 
 @pytest.mark.asyncio
-async def test_replay_dead_letters_filters_by_project_id(real_buffer, tmp_path):
+async def test_replay_dead_letters_filters_by_project_id(tmp_path):
     """With project_id set, only matching records are replayed; non-matching
     records remain in the dead-letter file."""
     dl = tmp_path / 'dl.jsonl'
-    q = EventQueue(
-        real_buffer,
-        dead_letter_path=dl,
-        journal_path=tmp_path / 'ej.db',
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.1,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
-        for _ in range(2):
-            q._write_dead_letter(_make_event(project_id='proj-a'), reason='non_retriable', attempts=1)
-        for _ in range(3):
-            q._write_dead_letter(_make_event(project_id='proj-b'), reason='non_retriable', attempts=1)
+    ej = tmp_path / 'ej.db'
+    async with parked_queue(dl, ej) as q:
+        proj_a = [_make_event(project_id='proj-a') for _ in range(2)]
+        seed_dead_letters(dl, proj_a)
+        seed_dead_letters(dl, [_make_event(project_id='proj-b') for _ in range(3)])
 
         counts = q.replay_dead_letters(project_id='proj-a')
         assert counts == {'replayed': 2, 'failed': 0}
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
-        assert (await real_buffer.get_buffer_stats('proj-a'))['size'] == 2
+        assert journaled_events(ej) == {e.id: e for e in proj_a}
         # Non-matching proj-b records are preserved in the file.
         remaining = q.read_dead_letters()
         assert len(remaining) == 3
         assert all(r['event']['project_id'] == 'proj-b' for r in remaining)
-    finally:
-        await q.close()
 
 
 @pytest.mark.asyncio
-async def test_replay_dead_letters_preserves_unparseable(real_buffer, tmp_path):
+async def test_replay_dead_letters_preserves_unparseable(tmp_path):
     """A malformed/unparseable dead-letter line counts toward `failed` and is
     preserved (loud-over-silent — never silently dropped)."""
     dl = tmp_path / 'dl.jsonl'
-    q = EventQueue(
-        real_buffer,
-        dead_letter_path=dl,
-        journal_path=tmp_path / 'ej.db',
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.1,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
-        q._write_dead_letter(_make_event(), reason='non_retriable', attempts=1)
+    ej = tmp_path / 'ej.db'
+    async with parked_queue(dl, ej) as q:
+        good = _make_event()
+        seed_dead_letters(dl, [good])
         with dl.open('a', encoding='utf-8') as fh:
             fh.write('{not valid json\n')
 
         counts = q.replay_dead_letters()
         assert counts == {'replayed': 1, 'failed': 1}
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        assert journaled_events(ej) == {good.id: good}
         # The malformed line survives; the good record was replayed out.
-        assert dl.exists()
-        assert '{not valid json' in dl.read_text()
+        assert dl.read_text().splitlines() == ['{not valid json']
+
+
+# ── Off-loop dead-letter hand-off (task 6085) ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_enqueue_overflow_returns_before_dead_letter_append_lands(tmp_path):
+    """An overflowing enqueue hands its record to the writer thread and returns
+    while the append is still held open, so the loop never waits on that I/O.
+    """
+    held = hold_fifo(tmp_path / 'dl.jsonl')
+    q = EventQueue(AsyncMock(), dead_letter_path=held.path, maxsize=1)
+    try:
+        e1, e2 = _make_event(), _make_event()
+        assert q.enqueue(e1) is True
+        assert q.enqueue(e2) is False
+        assert not held.reader_opened.is_set(), (
+            'enqueue() only returned after the FIFO reader opened: the '
+            'dead-letter append ran on the event-loop thread'
+        )
+        assert q.stats()['dead_letters_pending'] == 1
+
+        held.release.set()
+        await q.flush_dead_letters()
+
+        records = held.records()
+        assert [(r['reason'], r['event']['id']) for r in records] == [('overflow_drop', e2.id)]
+        assert q.stats()['dead_letters'] == 1
+        assert q.stats()['dead_letters_pending'] == 0
     finally:
         await q.close()
+
+
+@pytest.mark.asyncio
+async def test_overflow_journal_row_survives_until_its_dead_letter_is_written(tmp_path):
+    """The overflowed event's journal row is released only once its record is
+    on disk, so a kill -9 while the append is pending cannot lose it."""
+    held = hold_fifo(tmp_path / 'dl.jsonl')
+    ej = tmp_path / 'ej.db'
+    q = EventQueue(AsyncMock(), dead_letter_path=held.path, journal_path=ej, maxsize=1)
+    try:
+        e1, e2 = _make_event(), _make_event()
+        assert q.enqueue(e1) is True
+        assert q.enqueue(e2) is False
+        assert e2.id in journaled_ids(ej)
+
+        held.release.set()
+        await q.flush_dead_letters()
+
+        assert [r['event']['id'] for r in held.records()] == [e2.id]
+        journaled = journaled_ids(ej)
+        assert e1.id in journaled
+        assert e2.id not in journaled
+    finally:
+        await q.close()
+
+
+@pytest.mark.asyncio
+async def test_close_of_a_never_started_queue_closes_its_journal(tmp_path):
+    """close() releases the journal's connection even if start() never ran.
+
+    SQLite deletes a WAL database's ``-wal`` file when its last connection
+    closes, so a surviving ``-wal`` file means the queue still holds one.
+    """
+    ej = tmp_path / 'ej.db'
+    q = EventQueue(AsyncMock(), dead_letter_path=tmp_path / 'dl.jsonl', journal_path=ej)
+    assert q.enqueue(_make_event()) is True
+    assert (tmp_path / 'ej.db-wal').exists()
+
+    await q.close()
+
+    assert not (tmp_path / 'ej.db-wal').exists()
+
+
+@pytest.mark.asyncio
+async def test_failed_dead_letter_write_keeps_the_journal_row(tmp_path):
+    """A dead-letter write that fails leaves the event's journal row for
+    recover() to redeliver, rather than silently losing the event."""
+    (tmp_path / 'blocker').write_text('a regular file, not a directory')
+    ej = tmp_path / 'ej.db'
+    q = EventQueue(
+        AsyncMock(),
+        dead_letter_path=tmp_path / 'blocker' / 'dl.jsonl',
+        journal_path=ej,
+        maxsize=1,
+    )
+    try:
+        e1, e2 = _make_event(), _make_event()
+        assert q.enqueue(e1) is True
+        assert q.enqueue(e2) is False
+        await q.flush_dead_letters()
+
+        assert e2.id in journaled_ids(ej)
+        assert q.stats()['dead_letters'] == 0
+    finally:
+        await q.close()
+
+
+@pytest.mark.asyncio
+async def test_close_leaves_every_handed_off_record_on_disk_and_its_row_released(tmp_path):
+    """After close(), every event is in exactly one store: written to the
+    dead-letter file with its journal row released, or still journaled.
+
+    Only set relations are asserted: which event the drainer holds when
+    close() cancels it depends on scheduling.
+    """
+    buf = AsyncMock()
+
+    async def blocking_push(event):
+        await asyncio.sleep(1000)
+
+    buf.push = blocking_push
+    dl = tmp_path / 'dl.jsonl'
+    ej = tmp_path / 'ej.db'
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        journal_path=ej,
+        maxsize=2,
+        shutdown_flush_seconds=0.05,
+    )
+    await q.start()
+    events = [_make_event() for _ in range(6)]
+    for event in events:
+        q.enqueue(event)
+    await q.close()
+
+    records = [json.loads(line) for line in dl.read_text(encoding='utf-8').splitlines()]
+    dead_lettered = {r['event']['id'] for r in records}
+    journaled = journaled_ids(ej)
+    assert dead_lettered.isdisjoint(journaled), dead_lettered & journaled
+    assert dead_lettered | journaled == {e.id for e in events}
+    assert {r['reason'] for r in records} <= {'overflow_drop', 'shutdown_timeout'}

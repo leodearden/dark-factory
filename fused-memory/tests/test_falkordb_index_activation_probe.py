@@ -15,9 +15,8 @@ from pathlib import Path
 
 import anyio
 import pytest
-from _falkor_index_doubles import rows_for
+from _falkor_index_doubles import LIVE_HEADER, rows_for
 from _fm_helpers import load_script_module
-from test_falkor_indices import LIVE_HEADER
 
 from fused_memory.backends import falkor_indices
 from fused_memory.backends.falkor_indices import IndexHeaderShapeError, expected_index_set

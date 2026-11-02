@@ -57,9 +57,11 @@ from orchestrator.workflow import (
     StewardResolved,
     StewardTerminalDecision,
     TaskWorkflow,
+    TerminalReport,
     WorkflowOutcome,
     WorkflowState,
 )
+from orchestrator.workflow_types import DryRunSpawn
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -158,7 +160,7 @@ def git_repo(tmp_path: Path) -> Path:
     """A bare-minimum git repo with an initial commit."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return repo
 
 
@@ -170,6 +172,19 @@ def config(git_repo: Path) -> OrchestratorConfig:
         max_execute_iterations=5,
         max_verify_attempts=3,
         max_review_cycles=2,
+        # task 4481: the two remaining loop-shape knobs, pinned for the same
+        # reason as the three above rather than inherited from whatever the
+        # operational dark-factory-orchestrator.yaml happens to say.
+        #   judge_after_each_iteration -> TestHappyPath asserts the exact agent
+        #     invocation sequence and count; an operator opting the judge in
+        #     inserts a 'judge' call and breaks both without touching the code.
+        #     Tests that are ABOUT the judge build their own config via
+        #     _config_with_judge(), so they are unaffected by this pin.
+        #   max_amendment_rounds -> TestAmendmentUncommittedWorkGuard asserts
+        #     'wip: amendment round 1' and exactly one recovery event, both of
+        #     which are functions of this bound.
+        judge_after_each_iteration=False,
+        max_amendment_rounds=1,
         git=GitConfig(
             main_branch='main',
             branch_prefix='task/',
@@ -938,26 +953,12 @@ class TestReviewLoop:
 @pytest.mark.asyncio
 @pytest.mark.mocks_dry_run_unblock
 class TestBaseCommitDiff:
-    """Verify review uses base_commit diff, not moving main ref."""
+    """The creation-time base_commit is stored, and the diff primitive honours a given base."""
 
     async def test_worktree_base_commit_written_to_artifacts(
         self, config, git_ops, task_assignment, monkeypatch
     ):
-        """Verify that create_worktree's base_commit flows to artifacts.init().
-
-        This test verifies the fix for: "Reviewers receive empty diff, rubber-stamp PASS"
-
-        The bug occurred when:
-        1. Worktree A is created based on main at SHA M1
-        2. While A runs, another task B merges to main (advancing main to M2)
-        3. In review, workflow called get_diff_from_main() using `git diff main...HEAD`
-        4. Since main now points to M2, the diff would be empty
-        5. Reviewers would see no changes and rubber-stamp PASS
-
-        The fix: workflow captures base_commit=main's SHA at worktree creation,
-        passes it to artifacts.init() to persist, then reads it during review
-        and uses get_diff_from_base(worktree, base_commit) instead.
-        """
+        """create_worktree's base_commit flows to artifacts.init() and is stored as a full SHA."""
 
         class MinimalStub(AgentStub):
             async def _architect(self, cwd: Path) -> AgentResult:
@@ -989,8 +990,6 @@ class TestBaseCommitDiff:
             )),
         )
 
-        # Verify pre-condition: main advancing would normally cause empty diff
-        # But we verify base_commit is captured and stored
         await workflow.run()
 
         # Either way the workflow completes, we can verify base_commit was stored
@@ -999,17 +998,10 @@ class TestBaseCommitDiff:
             assert stored is not None, "base_commit should have been stored"
             assert len(stored) == 40, f"base_commit should be 40-char SHA, got {stored!r}"
 
-    async def test_review_uses_base_commit_diff(
+    async def test_diff_from_base_keeps_branch_changes_when_main_advances(
         self, config, git_ops, task_assignment, monkeypatch
     ):
-        """Verify get_diff_from_base returns branch changes when main advances.
-
-        This is the critical test for the fix - simulates the scenario where:
-        1. Worktree is created based on main at SHA M1
-        2. Branch makes changes
-        3. Another task advances main to M2
-        4. get_diff_from_base must still return branch changes (not empty)
-        """
+        """get_diff_from_base from the creation base still shows the branch's changes after main advances."""
         # Create worktree and capture the base_commit
         worktree_info = await git_ops.create_worktree('df-review-test')
         base_commit = worktree_info.base_commit
@@ -1027,9 +1019,6 @@ class TestBaseCommitDiff:
         diff_from_base = await git_ops.get_diff_from_base(worktree_info.path, base_commit)
         assert 'branch_change.py' in diff_from_base, \
             f"get_diff_from_base should return branch changes after main advances, got: {diff_from_base[:200]}"
-
-        # Verify the old method might return empty/different (proves base_commit needed)
-        # Note: we don't assert on this as behavior varies by git merge topology
 
 
 # ---------------------------------------------------------------------------
@@ -2078,6 +2067,13 @@ class TestDoneIsTerminal:
 # ---------------------------------------------------------------------------
 
 
+class _ReviewArmRun(NamedTuple):
+    report: TerminalReport
+    scheduler: FakeScheduler
+    queue: EscalationQueue
+    reviewer_calls: int
+
+
 @pytest.mark.asyncio
 @pytest.mark.mocks_dry_run_unblock
 class TestReviewerErrors:
@@ -2208,6 +2204,130 @@ class TestReviewerErrors:
         assert outcome == WorkflowOutcome.DONE
         # comprehensive reviewer was called twice (initial fail + retry success)
         assert call_counts['reviewer_comprehensive'] == 2
+
+    async def _run_with_reviewer_result(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+        reviewer_result: AgentResult, *, retries: int = 2,
+    ) -> _ReviewArmRun:
+        config.max_reviewer_retries = retries
+        config.reviewer_stagger_secs = 0.0
+        reviewer_calls: list[str] = []
+
+        class FixedReviewerStub(AgentStub):
+            def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
+                reviewer_calls.append(role)
+                return reviewer_result
+
+        stub = FixedReviewerStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+        report = await workflow.run()
+        return _ReviewArmRun(report, scheduler, queue, len(reviewer_calls))
+
+    async def test_server_error_requeues_without_retry_burn_or_escalation(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        run = await self._run_with_reviewer_result(
+            config, git_ops, task_assignment, monkeypatch, tmp_path,
+            AgentResult(
+                success=False, output='API Error: 529 Overloaded',
+                api_error_status=529, structured_output=None,
+            ),
+        )
+
+        tid = task_assignment.task_id
+        assert run.report.outcome == WorkflowOutcome.REQUEUED
+        assert run.report.api_error_status == 529
+        assert 'agent API error: HTTP 529' in run.report.reason
+        assert run.reviewer_calls == 1
+        assert 'pending' in run.scheduler.statuses.get(tid, [])
+        assert 'blocked' not in run.scheduler.statuses.get(tid, [])
+        assert run.queue.get_by_task(tid) == []
+
+    async def test_zero_work_requeues_after_free_in_phase_retries(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        run = await self._run_with_reviewer_result(
+            config, git_ops, task_assignment, monkeypatch, tmp_path,
+            AgentResult(
+                success=False, output='Agent produced no output',
+                subtype='error_empty_output', transcript_turns=0,
+            ),
+        )
+
+        tid = task_assignment.task_id
+        assert run.report.outcome == WorkflowOutcome.REQUEUED
+        assert run.report.api_error_status is None
+        assert run.reviewer_calls == 3
+        assert 'blocked' not in run.scheduler.statuses.get(tid, [])
+        assert run.queue.get_by_task(tid) == []
+
+    async def test_productive_kill_blocks(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        run = await self._run_with_reviewer_result(
+            config, git_ops, task_assignment, monkeypatch, tmp_path,
+            AgentResult(
+                success=False, output='Agent produced no output',
+                subtype='error_empty_output', transcript_turns=40,
+            ),
+        )
+
+        assert run.report.outcome == WorkflowOutcome.BLOCKED
+
+    async def test_turn_cap_blocks_naming_the_cap(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        run = await self._run_with_reviewer_result(
+            config, git_ops, task_assignment, monkeypatch, tmp_path,
+            AgentResult(
+                success=False, output='', subtype='error_max_turns',
+                turns=31, cost_usd=2.6,
+            ),
+        )
+
+        assert run.report.outcome == WorkflowOutcome.BLOCKED
+        assert 'turn cap' in run.report.reason
+        assert 'infrastructure' not in run.report.reason.lower()
+        l0_summaries = [
+            e.summary for e in run.queue.get_by_task(task_assignment.task_id, level=0)
+        ]
+        assert any('turn cap' in summary for summary in l0_summaries)
+
+    async def test_budget_cap_blocks_naming_the_cap(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        run = await self._run_with_reviewer_result(
+            config, git_ops, task_assignment, monkeypatch, tmp_path,
+            AgentResult(
+                success=False, output='', subtype='error_max_budget_usd',
+                turns=24, cost_usd=5.07,
+            ),
+        )
+
+        assert run.report.outcome == WorkflowOutcome.BLOCKED
+        assert 'budget' in run.report.reason
+        assert 'infrastructure' not in run.report.reason.lower()
+
+    async def test_completed_run_without_verdict_blocks(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        run = await self._run_with_reviewer_result(
+            config, git_ops, task_assignment, monkeypatch, tmp_path,
+            AgentResult(success=True, output='looks fine', structured_output=None),
+        )
+
+        assert run.report.outcome == WorkflowOutcome.BLOCKED
+        assert 'without a usable verdict' in run.report.reason
 
 
 # ---------------------------------------------------------------------------
@@ -3090,7 +3210,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -3115,17 +3235,16 @@ class TestMarkBlockedFalseDoneGuard:
         self, config, git_ops, task_assignment, tmp_path
     ):
         """A POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX outcome must call
-        _mark_blocked with spawn_dry_run=True so a sha-anchored dry-run
-        proposal is captured for the B3 low-risk auto-unblock gate.
+        _mark_blocked with dry_run_spawn=DryRunSpawn.POST_MERGE_RED_MAIN so a
+        sha-anchored dry-run proposal is captured for the B3 low-risk
+        auto-unblock gate.
 
         Spies on ``_mark_blocked`` (so the real hook never fires — no dry-run
         marker needed) and asserts the three kwargs that matter:
         - escalate_to_human=True  (L1-direct, not steward)
         - merge_phase=True        (status-transition suppressed)
-        - spawn_dry_run=True      (the new opt-in that captures the proposal)
-
-        RED today: the POST_MERGE_PYRIGHT branch at workflow.py doesn't yet
-        pass spawn_dry_run=True.
+        - dry_run_spawn=POST_MERGE_RED_MAIN (the opt-in that captures the
+          proposal)
         """
         from unittest.mock import AsyncMock, patch
 
@@ -3160,7 +3279,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -3180,8 +3299,9 @@ class TestMarkBlockedFalseDoneGuard:
             'merge_phase flag must be threaded through to _mark_blocked; '
             f'got kwargs={kwargs!r}'
         )
-        assert kwargs.get('spawn_dry_run') is True, (
-            'post_merge_pyright must pass spawn_dry_run=True so a dry-run '
+        assert kwargs.get('dry_run_spawn') is DryRunSpawn.POST_MERGE_RED_MAIN, (
+            'post_merge_pyright must pass '
+            'dry_run_spawn=DryRunSpawn.POST_MERGE_RED_MAIN so a dry-run '
             'proposal is captured for the B3 auto-unblock gate; '
             f'got kwargs={kwargs!r}'
         )
@@ -3227,7 +3347,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -5822,7 +5942,7 @@ class TestAmendmentUncommittedWorkGuard:
         # actual repo (the guard commits the dirty tree for real).
         wt = tmp_path / 'wt'
         wt.mkdir()
-        await _init_repo(wt)
+        _init_repo(wt)
         workflow.worktree = wt
         workflow.event_store = _RecordingEventStore()  # type: ignore[assignment]
 
@@ -6040,7 +6160,7 @@ class TestStaleL1DoesNotSinkRun:
 
         # Initialise a real git repo inside wt so the implementer's
         # git commits work (AgentStub._implementer runs `git add`/commit).
-        await _init_repo(wt)
+        _init_repo(wt)
 
         # Disable inter-iteration rebase to avoid main-branch lookups.
         workflow.config.inter_iteration_rebase = False
@@ -6160,7 +6280,7 @@ class TestBornAtL2GatesPostImplementer:
         workflow.artifacts.stamp_plan_provenance(workflow.session_id)
 
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
-        await _init_repo(wt)
+        _init_repo(wt)
         workflow.config.inter_iteration_rebase = False
 
         outcome = await workflow._execute_iterations()
@@ -6222,7 +6342,7 @@ class TestBornAtL2GatesPostDebugger:
         workflow.artifacts.stamp_plan_provenance(workflow.session_id)
 
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
-        await _init_repo(wt)
+        _init_repo(wt)
 
         # Mock run_scoped_verification to return a failing result (non-infra_timeout
         # so the opaque-timeout fast-fail does not trigger before the debugger runs).
@@ -8238,25 +8358,27 @@ class TestBuildAgentEnvCpuPriority:
     def _make_workflow(self, config, git_ops, task_assignment):
         stub = AgentStub()
         workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+        # pin: these tests are about _build_agent_env, not cpu_priority's default
+        workflow.config.cpu_priority = CpuPriorityConfig(enabled=True, nice=10)
         return workflow
 
     async def test_architect_receives_df_agent_cpu_nice(self, config, git_ops, task_assignment):
-        """ARCHITECT gets DF_AGENT_CPU_NICE='10' with default (enabled) cpu_priority."""
+        """ARCHITECT gets DF_AGENT_CPU_NICE='10' with cpu_priority enabled (nice=10)."""
         workflow = self._make_workflow(config, git_ops, task_assignment)
-        # cpu_priority is enabled by default (nice=10)
+        # _make_workflow pins cpu_priority enabled (nice=10)
         env = workflow._build_agent_env(ARCHITECT)
         assert env is not None
         assert env.get('DF_AGENT_CPU_NICE') == '10'
 
     async def test_implementer_receives_df_agent_cpu_nice(self, config, git_ops, task_assignment):
-        """IMPLEMENTER gets DF_AGENT_CPU_NICE='10' with default (enabled) cpu_priority."""
+        """IMPLEMENTER gets DF_AGENT_CPU_NICE='10' with cpu_priority enabled (nice=10)."""
         workflow = self._make_workflow(config, git_ops, task_assignment)
         env = workflow._build_agent_env(IMPLEMENTER)
         assert env is not None
         assert env.get('DF_AGENT_CPU_NICE') == '10'
 
     async def test_debugger_receives_df_agent_cpu_nice(self, config, git_ops, task_assignment):
-        """DEBUGGER gets DF_AGENT_CPU_NICE='10' with default (enabled) cpu_priority."""
+        """DEBUGGER gets DF_AGENT_CPU_NICE='10' with cpu_priority enabled (nice=10)."""
         workflow = self._make_workflow(config, git_ops, task_assignment)
         env = workflow._build_agent_env(DEBUGGER)
         assert env is not None
@@ -8350,6 +8472,8 @@ class TestBuildAgentEnvCpuGovern:
     def _make_workflow(self, config, git_ops, task_assignment):
         stub = AgentStub()
         workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+        # pin: the coexistence test asserts DF_AGENT_CPU_NICE == '10'
+        workflow.config.cpu_priority = CpuPriorityConfig(enabled=True, nice=10)
         return workflow
 
     async def test_architect_receives_df_agent_cpu_govern_and_path(
@@ -8444,7 +8568,7 @@ class TestBuildAgentEnvCpuGovern:
         workflow.worktree = governed_worktree.root
         workflow.config.cpu_governance = self._governance(enabled=True)
         workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
-        # cpu_priority is enabled by default (nice=10)
+        # _make_workflow pins cpu_priority enabled (nice=10)
 
         env = workflow._build_agent_env(IMPLEMENTER)
         assert env is not None

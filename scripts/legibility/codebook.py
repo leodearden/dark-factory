@@ -155,6 +155,17 @@ _FILED_TICKET_SCHEMA = {
     "required": ["ticket", "project_root", "run_id", "finding_key", "task_id", "resolution", "step"],
 }
 
+# A task in a project's store: the corrections op's `outcome_of_task` and each
+# item of an entry's `corrected_by`.
+_TASK_REF_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "project_root": {"type": "string", "minLength": 1},
+        "task_id": {"type": "integer"},
+    },
+    "required": ["project_root", "task_id"],
+}
+
 _ENTRY_SCHEMA = {
     "type": "object",
     "properties": {
@@ -172,6 +183,7 @@ _ENTRY_SCHEMA = {
         "filed_tickets": {"type": "array", "items": _FILED_TICKET_SCHEMA},
         "fixed_at_sha": {"type": "string", "pattern": r"^[0-9a-f]{7,40}$"},
         "accepted_by": {"type": "integer"},
+        "corrected_by": {"type": "array", "items": _TASK_REF_SCHEMA},
     },
     "required": [
         "id",
@@ -260,6 +272,7 @@ _CORRECTION_SCHEMA = {
         "status": {"enum": STATUSES},
         "origin_phase": {"enum": PHASES},
         "manifested_phase": {"enum": PHASES},
+        "outcome_of_task": _TASK_REF_SCHEMA,
     },
     "required": ["entry_id", "note"],
 }
@@ -908,7 +921,9 @@ def _apply_coding_record(
     path — the merger never fabricates an entry. The whole op (field writes
     and sighting alike) is gated by the same per-entry `session` dedup the
     match path uses, so re-running `apply` over an already-merged record is
-    exactly a no-op.
+    exactly a no-op. An `outcome_of_task` names the task whose whole outcome
+    for the entry this correction is; it is recorded on the entry's
+    `corrected_by`, which `scripts/legibility/disposition.py` reads.
 
     That dedup admits one sighting per (session, entry), so a record carrying
     two ops for the SAME entry can land only one of them. Corrections are
@@ -992,6 +1007,15 @@ def _apply_coding_record(
         sightings.append(
             _build_sighting(correction, session=session, date=date, project=project)
         )
+        outcome_of_task = correction.get("outcome_of_task")
+        if outcome_of_task:
+            task_ref = {
+                "project_root": outcome_of_task["project_root"],
+                "task_id": outcome_of_task["task_id"],
+            }
+            corrected_by = entry.setdefault("corrected_by", [])
+            if task_ref not in corrected_by:
+                corrected_by.append(task_ref)
         corrections_applied += 1
 
     for match in record.get("matches", []) or []:

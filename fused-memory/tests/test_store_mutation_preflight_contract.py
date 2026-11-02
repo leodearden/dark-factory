@@ -9,9 +9,10 @@ underscore-prefixed so pytest does not collect it, and is imported bare
 
 Two things live here:
 
-1. Unit coverage of the four exports as REAL behaviour — the fixture factory
-   actually sets and restores the attribute, `deny` actually installs a
-   raiser, `fail_closed_records` actually filters. None of these assert on
+1. Unit coverage of the four exports as REAL behaviour — both helpers leave
+   the REAL guard bound and rig only its probe's directory, so the fixture
+   factory's guard actually passes, `deny`'s actually refuses and emits its
+   record, and `fail_closed_records` actually filters. None of these assert on
    docstring prose: `neutralise_fixture` still composes its `__doc__` from the
    shared rationale plus the per-suite note (which is what makes
    `pytest --fixtures -v` useful -- the `-v` is required, since pytest hides
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import ast
 import logging
+import os
 import pathlib
 import types
 
@@ -39,6 +41,11 @@ from _store_mutation_preflight_contract import (
     deny,
     fail_closed_records,
     neutralise_fixture,
+)
+
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
 )
 
 # ---------------------------------------------------------------------------
@@ -69,32 +76,41 @@ def _is_autouse(fixture) -> bool:
 def _stub_script_module(*, with_guard: bool = True) -> types.ModuleType:
     """A stand-in for one of the `scripts/` modules under test.
 
-    Carries its own `StoreMutationUnavailable` **subclass of `RuntimeError`**,
-    matching the real
-    `fused-memory/src/fused_memory/utils/store_mutation_preflight.py::StoreMutationUnavailable`.
-    The real subclassing matters: the guarded scripts wrap per-record work in
-    `except Exception` handlers, which is precisely why the guard must run
-    once for the whole run rather than per record — a stub raising a bare
-    `Exception` would not exercise that.
+    Binds the REAL guard, exactly as a script's own
+    `from fused_memory.utils.store_mutation_preflight import
+    assert_store_mutation_allowed` does, because both helpers now leave that
+    binding alone and rig only the probe's directory.
     """
     mod = types.ModuleType('_stub_script_module')
-
-    class StoreMutationUnavailable(RuntimeError):
-        pass
-
     # Populate via __dict__.update: pyright rejects attribute assignment on a
     # bare ModuleType instance (reportAttributeAccessIssue), but a module
     # namespace is a plain dict[str, Any], so this is runtime-equivalent and
     # type-clean -- the same spelling escalation/tests/conftest.py uses for its
-    # module stubs. `monkeypatch.setattr(mod, ...)` still sees these, since
-    # attribute access on a module IS its `__dict__`.
-    mod.__dict__.update(StoreMutationUnavailable=StoreMutationUnavailable)
+    # module stubs.
     if with_guard:
-        def _real_guard(*, operation: str) -> None:
-            raise AssertionError(f'the real guard ran for {operation!r}')
-
-        mod.__dict__.update(assert_store_mutation_allowed=_real_guard)
+        mod.__dict__.update(assert_store_mutation_allowed=assert_store_mutation_allowed)
     return mod
+
+
+def _stand_in_script_module() -> types.ModuleType:
+    """A script module that shadows the guard's name with some other callable.
+
+    The shape that would make `deny` vacuous: nothing real is left to refuse.
+    """
+    mod = _stub_script_module(with_guard=False)
+
+    def _local_no_op_guard(**_kwargs: object) -> None:
+        return None
+
+    mod.__dict__.update(assert_store_mutation_allowed=_local_no_op_guard)
+    return mod
+
+
+_SCRIPT_LOGGER = 'contract_probe_script_logger'
+
+
+def _script_logger() -> logging.Logger:
+    return logging.getLogger(_SCRIPT_LOGGER)
 
 
 # ---------------------------------------------------------------------------
@@ -104,29 +120,12 @@ def _stub_script_module(*, with_guard: bool = True) -> types.ModuleType:
 
 class TestNeutraliseFixture:
     """`neutralise_fixture(mod, *, note)` builds the autouse fixture that keeps
-    a MOCK-unit suite independent of the real `~/.mem0`."""
+    a MOCK-unit suite independent of the real `~/.mem0`, by pointing the REAL
+    guard's probe at a writable scratch directory."""
 
     def test_returns_an_autouse_fixture(self) -> None:
         fx = neutralise_fixture(_stub_script_module(), note='a note')
         assert _is_autouse(fx) is True
-
-    def test_sets_a_noop_guard_and_restores_it(self) -> None:
-        """The whole point: while the fixture is active the guard is a no-op,
-        and afterwards the module is exactly as it was."""
-        mod = _stub_script_module()
-        original = mod.assert_store_mutation_allowed
-        fx = neutralise_fixture(mod, note='a note')
-
-        mp = pytest.MonkeyPatch()
-        try:
-            _underlying(fx)(mp)
-            # Neutralised: calling it neither raises nor does anything.
-            assert mod.assert_store_mutation_allowed(operation='anything') is None
-            assert mod.assert_store_mutation_allowed is not original
-        finally:
-            mp.undo()
-
-        assert mod.assert_store_mutation_allowed is original
 
     def test_note_is_required(self) -> None:
         """The forcing function: a conversion that forgets to carry its suite's
@@ -134,22 +133,55 @@ class TestNeutraliseFixture:
         with pytest.raises(TypeError):
             neutralise_fixture(_stub_script_module())  # type: ignore[call-arg]
 
-    def test_breaks_loudly_when_the_script_has_no_guard(self) -> None:
-        """Deliberately NOT `raising=False`.
-
-        Every one of the docstrings this factory replaces calls this out: if the
-        guard is ever removed from the script, the fixture must break loudly
-        rather than silently no-op and leave the suite asserting nothing.
-        """
-        mod = _stub_script_module(with_guard=False)
+    def test_the_real_guard_stays_bound_and_passes_silently(
+        self, tmp_path_factory: pytest.TempPathFactory, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        mod = _stub_script_module()
         fx = neutralise_fixture(mod, note='a note')
 
         mp = pytest.MonkeyPatch()
         try:
-            with pytest.raises(AttributeError):
-                _underlying(fx)(mp)
+            _underlying(fx)(mp, tmp_path_factory)
+            assert mod.assert_store_mutation_allowed is assert_store_mutation_allowed
+            with caplog.at_level(logging.DEBUG):
+                result = mod.assert_store_mutation_allowed(
+                    operation='sweep --apply', logger=_script_logger()
+                )
         finally:
             mp.undo()
+
+        assert result is None
+        assert caplog.records == []
+
+    def test_the_probe_leaves_the_redirected_directory_empty(
+        self, tmp_path_factory: pytest.TempPathFactory
+    ) -> None:
+        mod = _stub_script_module()
+        fx = neutralise_fixture(mod, note='a note')
+
+        mp = pytest.MonkeyPatch()
+        try:
+            _underlying(fx)(mp, tmp_path_factory)
+            redirected = pathlib.Path(os.environ['MEM0_DIR'])
+            mod.assert_store_mutation_allowed(operation='sweep --apply')
+            assert list(redirected.iterdir()) == []
+        finally:
+            mp.undo()
+
+    def test_mem0_dir_is_restored_on_undo(
+        self, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv('MEM0_DIR', 'the-value-before-the-fixture')
+        fx = neutralise_fixture(_stub_script_module(), note='a note')
+
+        mp = pytest.MonkeyPatch()
+        try:
+            _underlying(fx)(mp, tmp_path_factory)
+            assert os.environ['MEM0_DIR'] != 'the-value-before-the-fixture'
+        finally:
+            mp.undo()
+
+        assert os.environ['MEM0_DIR'] == 'the-value-before-the-fixture'
 
 
 # ---------------------------------------------------------------------------
@@ -158,56 +190,121 @@ class TestNeutraliseFixture:
 
 
 class TestDeny:
-    """`deny(mod, monkeypatch)` rigs the preflight to refuse, as it would
-    inside an agent sandbox."""
+    """`deny(mod, monkeypatch)` makes the REAL guard refuse, as it would inside
+    an agent sandbox, by pointing its probe at a directory that never exists."""
 
-    def test_installs_a_sentinel_raiser(self) -> None:
+    def test_the_real_guard_stays_bound_and_refuses_with_the_sentinel(self) -> None:
         mod = _stub_script_module()
         mp = pytest.MonkeyPatch()
         try:
             deny(mod, mp)
-            with pytest.raises(mod.StoreMutationUnavailable) as excinfo:
-                mod.assert_store_mutation_allowed(operation='sweep')
+            assert mod.assert_store_mutation_allowed is assert_store_mutation_allowed
+            with pytest.raises(StoreMutationUnavailable, match=SENTINEL) as excinfo:
+                mod.assert_store_mutation_allowed(operation='sweep --apply')
         finally:
             mp.undo()
 
-        assert str(excinfo.value) == SENTINEL
+        assert isinstance(excinfo.value, RuntimeError)
 
-    def test_raises_the_modules_own_exception_type(self) -> None:
-        """Parameterised on *mod*, so the raiser is always the type the script
-        under test will actually catch — and it is a RuntimeError subclass, the
-        shape the scripts' per-record `except Exception` handlers would swallow."""
+    def test_the_refusal_record_goes_through_the_scripts_logger(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         mod = _stub_script_module()
         mp = pytest.MonkeyPatch()
         try:
             deny(mod, mp)
-            with pytest.raises(mod.StoreMutationUnavailable):
-                mod.assert_store_mutation_allowed(operation='sweep')
-            assert issubclass(mod.StoreMutationUnavailable, RuntimeError)
+            with caplog.at_level(logging.DEBUG), pytest.raises(StoreMutationUnavailable):
+                mod.assert_store_mutation_allowed(
+                    operation='sweep --apply',
+                    logger=_script_logger(),
+                    extra_detail='nothing was swept',
+                )
         finally:
             mp.undo()
 
-    def test_accepts_arbitrary_positional_and_keyword_args(self) -> None:
-        """Call sites pass keywords (`operation=`), but the raiser must not
-        constrain the signature it stands in for."""
+        (record,) = fail_closed_records(caplog, _SCRIPT_LOGGER)
+        assert SENTINEL in record.getMessage()
+
+    def test_refuses_inside_an_active_neutralise(
+        self, tmp_path_factory: pytest.TempPathFactory
+    ) -> None:
+        """The real suites' composition: the autouse neutralise is already
+        active when a test calls `deny`."""
         mod = _stub_script_module()
         mp = pytest.MonkeyPatch()
         try:
+            _underlying(neutralise_fixture(mod, note='a note'))(mp, tmp_path_factory)
             deny(mod, mp)
-            with pytest.raises(mod.StoreMutationUnavailable):
-                mod.assert_store_mutation_allowed()
-            with pytest.raises(mod.StoreMutationUnavailable):
-                mod.assert_store_mutation_allowed('positional', 2, kw='x', other=None)
+            with pytest.raises(StoreMutationUnavailable, match=SENTINEL):
+                mod.assert_store_mutation_allowed(operation='sweep --apply')
         finally:
             mp.undo()
 
-    def test_is_undone_with_the_monkeypatch(self) -> None:
+    def test_is_undone_with_the_monkeypatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv('MEM0_DIR', 'the-value-before-deny')
         mod = _stub_script_module()
-        original = mod.assert_store_mutation_allowed
+
         mp = pytest.MonkeyPatch()
         deny(mod, mp)
         mp.undo()
-        assert mod.assert_store_mutation_allowed is original
+
+        assert os.environ['MEM0_DIR'] == 'the-value-before-deny'
+        assert mod.assert_store_mutation_allowed is assert_store_mutation_allowed
+
+
+# ---------------------------------------------------------------------------
+# Both helpers: the script must bind the REAL guard
+# ---------------------------------------------------------------------------
+
+
+def _apply_neutralise(mod, mp, tmp_path_factory) -> None:
+    _underlying(neutralise_fixture(mod, note='a note'))(mp, tmp_path_factory)
+
+
+def _apply_deny(mod, mp, _tmp_path_factory) -> None:
+    deny(mod, mp)
+
+
+_HELPERS = (
+    pytest.param(_apply_neutralise, id='neutralise_fixture'),
+    pytest.param(_apply_deny, id='deny'),
+)
+
+
+@pytest.mark.parametrize('apply_helper', _HELPERS)
+class TestBothHelpersRequireTheRealGuard:
+    """Rigging the probe's directory only means something while the script
+    calls the REAL guard, so both helpers refuse to run against anything else.
+
+    Without this, a script that dropped the guard would leave its suite's
+    `--apply` tests asserting nothing, and one that shadowed it with a local
+    no-op would make every `deny` test vacuous.
+    """
+
+    def test_breaks_loudly_when_the_script_has_no_guard(
+        self, apply_helper, tmp_path_factory: pytest.TempPathFactory
+    ) -> None:
+        mp = pytest.MonkeyPatch()
+        try:
+            with pytest.raises(AttributeError):
+                apply_helper(_stub_script_module(with_guard=False), mp, tmp_path_factory)
+        finally:
+            mp.undo()
+
+    def test_breaks_loudly_when_the_script_binds_a_stand_in(
+        self, apply_helper, tmp_path_factory: pytest.TempPathFactory
+    ) -> None:
+        mod = _stand_in_script_module()
+        mp = pytest.MonkeyPatch()
+        try:
+            with pytest.raises(AssertionError) as excinfo:
+                apply_helper(mod, mp, tmp_path_factory)
+        finally:
+            mp.undo()
+
+        message = str(excinfo.value)
+        assert mod.__name__ in message
+        assert 'fused_memory.utils.store_mutation_preflight.assert_store_mutation_allowed' in message
 
 
 # ---------------------------------------------------------------------------

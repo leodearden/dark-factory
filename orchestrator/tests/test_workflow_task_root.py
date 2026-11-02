@@ -8,7 +8,6 @@ one task id under ``<eval_root>/<id>/`` would otherwise share one task root.
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -29,7 +28,7 @@ _LANE_KEYED = frozenset(name for name, root in ARTIFACT_ROOTS.items() if root is
 def config(tmp_path: Path) -> OrchestratorConfig:
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return OrchestratorConfig(
         project_root=repo,
         max_concurrent_tasks=1,

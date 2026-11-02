@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -107,87 +108,18 @@ def test_iso_formats_the_spelling_the_events_table_stores():
     )
 
 
-# ---------------------------------------------------------------------------
-# Fixture builder — DDL copied verbatim from event_store.py::_SCHEMA.
-#
-# The house convention (scripts/tests/test_audit_wiped_metadata_files.py,
-# test_analyze_speculation_depth.py) is to inline the DDL and build the DB in
-# tmp_path rather than check a binary .db into git: a "known answer" has to be
-# legible to a reviewer, and a blob makes the input to every asserted number
-# unreviewable in a diff.
-# ---------------------------------------------------------------------------
-
-_EVENTS_SCHEMA = """
-CREATE TABLE IF NOT EXISTS events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp   TEXT    NOT NULL,
-    run_id      TEXT    NOT NULL,
-    task_id     TEXT,
-    event_type  TEXT    NOT NULL,
-    phase       TEXT,
-    role        TEXT,
-    data        TEXT    DEFAULT '{}',
-    cost_usd    REAL,
-    duration_ms INTEGER
-);
-
-CREATE INDEX IF NOT EXISTS idx_events_run  ON events(run_id);
-CREATE INDEX IF NOT EXISTS idx_events_task ON events(run_id, task_id);
-CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
-CREATE INDEX IF NOT EXISTS idx_events_ts   ON events(timestamp);
-"""
-
-
-def _make_runs_db(
-    tmp_path: Path, events: list[dict[str, Any]], name: str = 'runs.db'
-) -> Path:
-    """Build a temp runs.db mirroring the live events schema and insert *events*.
-
-    Each event dict may carry: ``event_type`` (required), ``task_id``,
-    ``run_id``, ``timestamp``, ``phase``, ``role``, ``data``, ``cost_usd`` and
-    ``duration_ms``. ``data`` is passed through VERBATIM when it is a str or
-    None — so a test can inject malformed JSON or a NULL payload — and
-    json-encoded otherwise. Rows are inserted in list order, so *events* order
-    IS ascending ``id`` order.
-    """
-    db_path = tmp_path / name
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.executescript(_EVENTS_SCHEMA)
-        for i, event in enumerate(events):
-            data = event.get('data')
-            if data is not None and not isinstance(data, str):
-                data = json.dumps(data)
-            task_id = event.get('task_id')
-            conn.execute(
-                'INSERT INTO events (timestamp, run_id, task_id, event_type, '
-                'phase, role, data, cost_usd, duration_ms) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                (
-                    event.get('timestamp', f'2026-08-11T00:00:{i:02d}+00:00'),
-                    event.get('run_id', 'run-1'),
-                    None if task_id is None else str(task_id),
-                    event['event_type'],
-                    event.get('phase'),
-                    event.get('role'),
-                    data,
-                    event.get('cost_usd'),
-                    event.get('duration_ms'),
-                ),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-    return db_path
+# runs.db is built in tmp_path by conftest's `make_runs_db`, never checked in
+# as a binary blob, so every asserted number's input stays legible in a diff.
 
 
 def _make_project_root(
-    tmp_path: Path, name: str, events: list[dict[str, Any]]
+    make_runs_db: Callable[..., Path], tmp_path: Path, name: str,
+    events: list[dict[str, Any]],
 ) -> Path:
     """Materialise a synthetic project root holding data/orchestrator/runs.db."""
     root = tmp_path / name
     (root / 'data' / 'orchestrator').mkdir(parents=True)
-    _make_runs_db(root / 'data' / 'orchestrator', events)
+    make_runs_db(events, directory=root / 'data' / 'orchestrator')
     return root
 
 
@@ -375,47 +307,12 @@ def corpus_b() -> list[dict[str, Any]]:
 
 
 @pytest.fixture
-def corpus_roots(tmp_path):
+def corpus_roots(tmp_path, make_runs_db):
     """Two synthetic project roots, A and B, each with its own runs.db."""
     return (
-        _make_project_root(tmp_path, 'proj_a', corpus_a()),
-        _make_project_root(tmp_path, 'proj_b', corpus_b()),
+        _make_project_root(make_runs_db, tmp_path, 'proj_a', corpus_a()),
+        _make_project_root(make_runs_db, tmp_path, 'proj_b', corpus_b()),
     )
-
-
-# ---------------------------------------------------------------------------
-# Fixture-builder self-checks — every later assertion rests on these producing
-# live-shaped rows.
-# ---------------------------------------------------------------------------
-
-
-def test_make_runs_db_inserts_rows_in_list_order_with_ascending_ids(tmp_path):
-    db = _make_runs_db(tmp_path, [
-        {'event_type': 'merge_verify', 'task_id': 1, 'timestamp': _ts(11, 1)},
-        {'event_type': 'merge_verify', 'task_id': 2, 'timestamp': _ts(11, 2)},
-        {'event_type': 'merge_verify', 'task_id': 3, 'timestamp': _ts(11, 3)},
-    ])
-    conn = sqlite3.connect(db)
-    try:
-        rows = conn.execute('SELECT id, task_id FROM events ORDER BY id').fetchall()
-    finally:
-        conn.close()
-    assert [r[1] for r in rows] == ['1', '2', '3']
-    assert [r[0] for r in rows] == sorted(r[0] for r in rows)
-
-
-def test_make_runs_db_passes_data_through_verbatim_for_str_and_none(tmp_path):
-    db = _make_runs_db(tmp_path, [
-        {'event_type': 'merge_verify', 'data': '{not json'},
-        {'event_type': 'merge_verify', 'data': None},
-        {'event_type': 'merge_verify', 'data': {'runner': 'local'}},
-    ])
-    conn = sqlite3.connect(db)
-    try:
-        rows = [r[0] for r in conn.execute('SELECT data FROM events ORDER BY id')]
-    finally:
-        conn.close()
-    assert rows == ['{not json', None, '{"runner": "local"}']
 
 
 # ---------------------------------------------------------------------------
@@ -423,8 +320,8 @@ def test_make_runs_db_passes_data_through_verbatim_for_str_and_none(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_connect_ro_opens_readable_and_refuses_writes(tmp_path):
-    db = _make_runs_db(tmp_path, [{'event_type': 'merge_verify'}])
+def test_connect_ro_opens_readable_and_refuses_writes(make_runs_db):
+    db = make_runs_db([{'event_type': 'merge_verify'}])
     conn = mlt._connect_ro(db)
     try:
         assert conn.execute('SELECT COUNT(*) FROM events').fetchone()[0] == 1
@@ -444,8 +341,8 @@ def test_connect_ro_refuses_a_missing_database(tmp_path):
         mlt._connect_ro(tmp_path / 'nope.db')
 
 
-def test_load_events_returns_only_in_window_rows_of_the_requested_type(tmp_path):
-    db = _make_runs_db(tmp_path, [
+def test_load_events_returns_only_in_window_rows_of_the_requested_type(make_runs_db):
+    db = make_runs_db([
         # Before lo.
         {'event_type': 'merge_verify', 'task_id': 'early', 'timestamp': _ts(10, 11),
          'data': {'runner': 'local'}},
@@ -474,8 +371,8 @@ def test_load_events_returns_only_in_window_rows_of_the_requested_type(tmp_path)
                        'data': {'runner': 'local'}}
 
 
-def test_load_events_degrades_malformed_and_null_data_to_empty_dict(tmp_path):
-    db = _make_runs_db(tmp_path, [
+def test_load_events_degrades_malformed_and_null_data_to_empty_dict(make_runs_db):
+    db = make_runs_db([
         {'event_type': 'merge_verify', 'task_id': 'bad', 'timestamp': _ts(12, 1),
          'data': '{not json'},
         {'event_type': 'merge_verify', 'task_id': 'null', 'timestamp': _ts(12, 2),
@@ -495,8 +392,8 @@ def test_load_events_degrades_malformed_and_null_data_to_empty_dict(tmp_path):
     assert [r['data'] for r in rows] == [{}, {}, {}, {'runner': 'local'}]
 
 
-def test_load_events_returns_empty_list_when_nothing_matches(tmp_path):
-    db = _make_runs_db(tmp_path, [
+def test_load_events_returns_empty_list_when_nothing_matches(make_runs_db):
+    db = make_runs_db([
         {'event_type': 'merge_verify', 'timestamp': _ts(12, 1), 'data': {}},
     ])
     conn = mlt._connect_ro(db)

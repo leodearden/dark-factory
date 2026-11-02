@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 from _archive_files import junit_xml, passed, red, write_junit, write_plan, write_summary
-from _git_repo import Repo, make_repo, path_with_git_killed_on
+from _git_repo import Repo, make_repo, path_with_git_answering, path_with_git_killed_on
 from _in_dir import write_engagement
 from _stores import RunsDb, TasksDb
 from shared.project_layout import runs_db, tasks_db
@@ -545,6 +545,18 @@ def test_an_unusable_git_directory_is_named_git_and_the_heartbeat_has_no_head(
     assert 'task_upserted' in published
     assert not published & {'branch_snapshot', 'tree_snapshot'}
     assert stored_cursor(project).head is None
+    assert_valid(project)
+
+
+def test_git_output_that_does_not_parse_is_named_git_and_the_pass_still_commits(
+    project: Project, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv('PATH', path_with_git_answering(tmp_path / 'bin', 'ls-tree', b'garbage\0'))
+
+    report = run_pass(project.policy, project.open(), now=NOW)
+
+    assert {degradation.source for degradation in report.degraded} == {Source.GIT}
+    assert 'task_upserted' in types_of(feed(project))
     assert_valid(project)
 
 

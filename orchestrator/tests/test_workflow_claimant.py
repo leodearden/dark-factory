@@ -105,7 +105,7 @@ async def _setup(wf: TaskWorkflow, base_sha: str = 'a' * 40) -> None:
     worktree = wf.git_ops.worktree_base / wf.task_id
     worktree.mkdir(parents=True, exist_ok=True)
     wf.git_ops.create_worktree = AsyncMock(
-        return_value=WorktreeInfo(path=worktree, base_commit=base_sha, stale_commits=0)
+        return_value=WorktreeInfo(path=worktree, base_commit=base_sha)
     )
     wf._sync_worktree_venvs = AsyncMock()
     with patch('orchestrator.workflow._run', new=AsyncMock(return_value=(0, '', ''))):

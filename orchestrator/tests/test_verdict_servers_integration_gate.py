@@ -55,7 +55,6 @@ Scenario → test class map:
 
 from __future__ import annotations
 
-import asyncio
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -100,7 +99,7 @@ def git_repo(tmp_path: Path) -> Path:
     """A bare-minimum git repo with an initial commit."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return repo
 
 
@@ -210,9 +209,7 @@ def _setup_judge_workflow(
 
     ``get_diff_from_base`` is mocked to return a non-empty diff (mirrors
     ``test_judge_completion_verdict.py``'s ``_setup``) so the judge is
-    actually invoked rather than empty-diff-skipped — ``base_commit='oldbase'``
-    is stamped at ``artifacts.init()`` time (via ``_seed_workflow_artifacts``),
-    so ``_run_completion_judge`` takes the ``get_diff_from_base`` branch.
+    actually invoked rather than empty-diff-skipped.
     """
     workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, AgentStub())
     _seed_workflow_artifacts(workflow, tmp_path=tmp_path)

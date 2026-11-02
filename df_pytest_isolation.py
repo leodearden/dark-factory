@@ -193,29 +193,26 @@ both fakes parse argv and discard the unit token outright: the name never
 reaches the factory, only the real subprocess.  That divergence is deliberate;
 do not "fix" it back into line with the others.
 
-WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO, and why the rest are
-deliberately not.  Nine conftests import from this module; the git ceiling and
-the deploy-clock guard are in all nine.  ``_df_no_leaked_drain_processes`` is
-wired only into the ROOT conftest (covering ``tests/``) and
-``scripts/tests/conftest.py`` — exactly the two rootdirs that spawn the drain
-script, and the two the incident came from.  Task 3799's
-``_df_fleet_dir_redirect`` / ``_df_no_synthetic_heartbeats_in_live_fleet``
-started on those same two and gained a THIRD in task 3951:
-``orchestrator/tests/conftest.py``, which is the fleet heartbeat's PRODUCER
-rootdir rather than a drain-script spawner (see the next two paragraphs).  Of
-the seven subproject rootdirs (``cockpit``, ``dashboard``, ``escalation``,
-``fused-memory``, ``orchestrator``, ``sampler``, ``shared``) that run as their
-own pytest sessions from their own venvs, ``orchestrator`` therefore now carries
-the fleet-dir pair and the remaining six carry neither; none carries the
-drain-process guard, so the root conftest does not reach them: no token is
-stamped, and ``leaked_drain_processes`` fails CLOSED on an absent token, so
-those sessions report all-clear unconditionally rather than falsely.  That is a
-real gap, not a proof of safety: ``orchestrator`` was the one to watch, since
-``orchestrator/src/orchestrator/service_restart.py`` is the PRODUCTION caller of
-the drain script and its tests today only assert on config strings.  Widening
-the drain-process wiring is a mechanical edit to those seven files and is out of
-task 3798's locked scope; until then, read a green subproject run as
-"unmeasured", never as "no leak".
+WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO.  Ten conftests
+import from this module; the git ceiling and the deploy-clock guard are in
+all ten.  ``_df_no_leaked_drain_processes`` is armed in nine: bound by
+import in the ROOT conftest (covering ``tests/``) and
+``scripts/tests/conftest.py`` — the two rootdirs that spawn the drain
+script — and armed by :func:`arm_leaked_drain_process_guard` in the seven
+subproject rootdirs (``cockpit``, ``dashboard``, ``escalation``,
+``fused-memory``, ``orchestrator``, ``sampler``, ``shared``), each of which
+runs as its own pytest session and so stamps its own token.  In those nine a
+green run means the teardown sweep ran; see ``_df_no_leaked_drain_processes``
+for its detection window.  The tenth, ``client-feed``, does not arm this
+guard, so no sweep runs there and a green ``client-feed`` run is unmeasured.
+
+Task 3799's ``_df_fleet_dir_redirect`` / ``_df_no_synthetic_heartbeats_in_live_fleet``
+pair is a SEPARATE defence, bound in three rootdirs: root ``tests/``,
+``scripts/tests/`` and ``orchestrator/tests/``.  The last is the fleet
+heartbeat's PRODUCER rootdir rather than a drain-script spawner (see the next
+two paragraphs).  The other six subproject rootdirs above carry neither; that
+gap is still open and is out of this module's scope to close, since none of
+those six subprojects drives the fleet heartbeat producer path.
 
 THE WRITE-SIDE GAP IN THAT RATIONALE, stated explicitly rather than left to be
 rediscovered.  "The rootdirs that spawn the drain script" is the right criterion
@@ -272,6 +269,16 @@ still wrote to the ``GIT_DIR`` repo).  ``_df_git_env_hermetic`` is FUNCTION
 scoped, unlike all four siblings, because its hazard is introduced MID-session
 by another test rather than present at session start — task 4966 measured
 exactly that as a 1-in-3 flake, green standalone and green in its own file.
+
+SIXTH DEFENCE — an ambient ``CLAUDE_BINARY`` can never reroute a faked ``claude``.
+
+Since task 4448 every shared claude spawn takes ``CLAUDE_BINARY`` ahead of PATH,
+so a test that hides or fakes ``claude`` by editing PATH, and proves it with
+``shutil.which``, passes for the wrong reason under an operator's override: the
+spawn runs the real CLI.  ``_df_claude_binary_unset`` is function scoped, for
+the same mid-session reason as the fifth.  The literal name is pinned to
+shared's resolver behaviourally by
+``tests/scripts/test_claude_binary_isolation.py``.
 
 Import constraint: STDLIB + PYTEST ONLY.  Every subproject conftest imports this
 module, so it must import cleanly inside every member venv — escalation's lacks
@@ -1709,6 +1716,49 @@ def run_in_new_session_until(
     return RunUntilOutcome(completed, stopped_on_condition=True)
 
 
+def run_in_new_session_while_progressing(
+    cmd: list[str],
+    *,
+    progress: Callable[[], object],
+    stall_timeout: float,
+    env: dict[str, str] | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    text: bool = True,
+) -> subprocess.CompletedProcess:
+    """:func:`run_in_new_session` whose deadline counts only time WITHOUT progress.
+
+    The clock re-arms whenever *progress* returns a value unequal to its
+    previous one, so a slow child that is still advancing is never killed and
+    a stuck one is, *stall_timeout* seconds after its last change. *progress*
+    is called every ``_CONDITION_POLL_SLICE_SECS`` and must be cheap and safe
+    to call while the child runs.
+
+    Raises ``TimeoutExpired`` (``timeout == stall_timeout``, partial output
+    attached) on a stall; an exception from *progress* stops the group and
+    propagates.
+    """
+    last: object = object()
+    last_change = time.monotonic()
+
+    def stalled() -> bool:
+        nonlocal last, last_change
+        current = progress()
+        if current != last:
+            last, last_change = current, time.monotonic()
+            return False
+        return time.monotonic() - last_change >= stall_timeout
+
+    outcome = run_in_new_session_until(
+        cmd, condition=stalled, timeout=math.inf, env=env, cwd=cwd, text=text,
+    )
+    if outcome.stopped_on_condition:
+        raise subprocess.TimeoutExpired(
+            cmd, stall_timeout,
+            output=outcome.completed.stdout, stderr=outcome.completed.stderr,
+        )
+    return outcome.completed
+
+
 def _spawn_in_new_session(
     cmd: list[str],
     *,
@@ -1884,13 +1934,14 @@ def read_proc_state(pid: int, *, _proc_root: Path = Path('/proc')) -> ProcState 
     ``OSError`` and a malformed one ``ValueError``, rather than reading as gone.
     Parsed after the LAST ``') '`` exactly as
     :func:`orchestrator.verify_cancel.read_ppid_map` does, since ``comm`` may
-    hold spaces or parens.  A stdlib port of
+    hold spaces or parens, and decoded with replacement as ``comm`` is arbitrary
+    bytes.  A stdlib port of
     ``shared/src/shared/proc_group.py::read_stat_fields`` (see the module
     docstring's import constraint); ``_proc_root`` is a test seam.
     """
     stat = _proc_root / str(pid) / 'stat'
     try:
-        raw = stat.read_text()
+        raw = stat.read_bytes().decode('utf-8', 'replace')
     except (FileNotFoundError, ProcessLookupError):
         return None
     try:
@@ -2202,6 +2253,25 @@ def _df_no_leaked_drain_processes():
                 with contextlib.suppress(OSError):
                     os.kill(pid, signal.SIGKILL)
             pytest.fail(reason, pytrace=False)
+
+
+_LEAKED_DRAIN_GUARD_PLUGIN = 'df-leaked-drain-process-guard'
+
+
+class _LeakedDrainProcessGuardPlugin:
+    """The plugin :func:`arm_leaked_drain_process_guard` registers: that guard alone."""
+
+    _df_no_leaked_drain_processes = _df_no_leaked_drain_processes
+
+
+def arm_leaked_drain_process_guard(config: pytest.Config) -> None:
+    """Arm :func:`_df_no_leaked_drain_processes` for this session, from ``pytest_configure``.
+
+    Idempotent, because a session that collects several test roots runs each
+    root's ``pytest_configure``.
+    """
+    if not config.pluginmanager.has_plugin(_LEAKED_DRAIN_GUARD_PLUGIN):
+        config.pluginmanager.register(_LeakedDrainProcessGuardPlugin, _LEAKED_DRAIN_GUARD_PLUGIN)
 
 
 # ---------------------------------------------------------------------------
@@ -2776,3 +2846,24 @@ def _df_git_env_hermetic():
         for key in git_redirect_env(os.environ):
             del os.environ[key]
         os.environ.update(saved)
+
+
+# ---------------------------------------------------------------------------
+# Ambient claude-binary override
+# ---------------------------------------------------------------------------
+
+CLAUDE_BINARY_ENV = 'CLAUDE_BINARY'
+
+
+@pytest.fixture(autouse=True)
+def _df_claude_binary_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SIXTH DEFENCE — an ambient ``CLAUDE_BINARY`` never reaches a test body.
+
+    ``shared.cli_invoke::claude_binary_spec`` reads it ahead of PATH, so a test
+    that hides or fakes ``claude`` by editing PATH can still be routed to the
+    real CLI, and verify inherits the orchestrator's environment. FUNCTION
+    scoped like :func:`_df_git_env_hermetic`, because a leak can arrive
+    mid-session. ``monkeypatch`` restores the pre-test value, and a test may
+    still set the variable deliberately.
+    """
+    monkeypatch.delenv(CLAUDE_BINARY_ENV, raising=False)
