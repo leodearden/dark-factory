@@ -348,6 +348,30 @@ def test_connect_ro_reads_the_rows_of_a_real_store(tmp_path):
     assert rows == [(1, "done"), (2, "pending")]
 
 
+@pytest.mark.parametrize("uri_syntax", ["#", "?", "%41"])
+def test_connect_ro_opens_a_store_whose_path_holds_uri_syntax(tmp_path, uri_syntax):
+    """A path character that is URI syntax must reach sqlite as data.
+
+    Spliced raw into ``file:{path}?mode=ro``, a ``#`` starts a fragment that
+    swallows ``?mode=ro``, and a ``?`` starts the query early: sqlite then
+    opens the truncated prefix READ-WRITE, creates a 0-byte sibling there, and
+    refuses it as NO_TABLES — the decoy and the mislabel this module exists to
+    prevent. A ``%41`` is decoded as an escape and names another file.
+    """
+    store_dir = tmp_path / f"a{uri_syntax}b"
+    store_dir.mkdir()
+    db = _make_store(store_dir, [{"id": 1, "status": "done"}])
+
+    conn = connect_ro(db)
+    try:
+        rows = conn.execute("SELECT id, status FROM tasks").fetchall()
+    finally:
+        conn.close()
+
+    assert rows == [(1, "done")]
+    assert list(tmp_path.iterdir()) == [store_dir]
+
+
 def test_connect_ro_connection_cannot_write_to_the_store(tmp_path):
     """``mode=ro`` is actually in force, so a forensic reader can never mutate
     the live store it is measuring — including by accident."""

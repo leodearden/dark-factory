@@ -110,7 +110,9 @@ def connect_ro(path: str | Path) -> sqlite3.Connection:
 
     The URI is built from the RESOLVED absolute path, so a relative one cannot
     be re-resolved against a different cwd by a subprocess or a later chdir —
-    the ``unable to open database file`` shape of the same confusion.
+    the ``unable to open database file`` shape of the same confusion. It is
+    percent-encoded, so a ``#``, ``?`` or ``%`` in the path cannot end the
+    path early and drop ``mode=ro``.
 
     This is the single home for the read-only tasks.db open. The script sweep
     tiers adopt it too: they catch the refusal through
@@ -125,7 +127,7 @@ def connect_ro(path: str | Path) -> sqlite3.Connection:
     if resolved.stat().st_size == 0:
         raise TaskDbUnreadable(resolved, TaskDbProblem.EMPTY_STUB)
 
-    conn = sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
     try:
         first_table = conn.execute(f"{TABLE_NAMES_SQL} LIMIT 1").fetchone()
     except sqlite3.DatabaseError as exc:
