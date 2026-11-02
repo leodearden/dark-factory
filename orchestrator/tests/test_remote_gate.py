@@ -29,6 +29,7 @@ from typing import Any, ClassVar
 
 import pytest
 from _gate_fixtures import without_push_ssh_config
+from _task_verify_fixtures import task_verify_spec
 from click.testing import CliRunner
 from df_pytest_isolation import read_leaked_pid
 from shared.proc_group import (
@@ -1129,17 +1130,21 @@ async def test_a_publish_colliding_on_the_gate_ref_is_retried_once():
 
 
 @pytest.mark.asyncio
-async def test_two_roles_publishing_one_sha_at_once_both_get_their_verdict():
+async def test_a_task_and_a_merge_verify_publishing_one_gate_sha_at_once_both_get_their_verdict():
     transport = _Scripted(publish=_publishes(_LOCKED_GATE_REF))
     task_runner, merge_runner = _scripted_runner(transport), _scripted_runner(transport)
 
     results = await asyncio.gather(
-        task_runner.run_merge_verify('tasksha', _spec()),
+        task_runner.run_task_verify(
+            task_verify_spec('a' * 40, 'pytest'), task_id='t1', archive_root=None,
+        ),
         merge_runner.run_merge_verify('mergesha', _spec()),
     )
 
     assert results == [_VERDICT, _VERDICT]
     assert transport.roles().count('publish') == 3
+    verifies = [argv for role, argv, _ in transport.calls if role == 'verify']
+    assert sorted(gate_argv_for(argv[-1])[0] for argv in verifies) == ['verify-merge', 'verify-task']
 
 
 @pytest.mark.asyncio
