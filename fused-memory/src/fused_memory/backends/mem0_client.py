@@ -266,9 +266,11 @@ class Mem0Backend:
                     'collection_name': collection_name,
                     # Note the deliberate asymmetry with the embedder's
                     # 'embedding_dims' below: DIFFERENT key name, different
-                    # upstream semantics, different emission rule. This one
-                    # controls the dimensionality Qdrant CREATES the collection
-                    # with, and mem0's own default is already 1536
+                    # upstream semantics, different emission rule. mem0 would
+                    # CREATE the collection at this width, but never does:
+                    # _ensure_collection has already created it from the same
+                    # cfg.embedder.dimensions, so mem0's create_col always
+                    # finds it present and skips. mem0's own default is 1536
                     # (mem0/configs/vector_stores/qdrant.py), so emitting it
                     # unconditionally is a no-op at the shipped config.
                     #
@@ -276,11 +278,12 @@ class Mem0Backend:
                     # EXISTING deployment: neither key was plumbed before, so
                     # such a config was inert — mem0 created the collection at
                     # its own 1536 default and requested 1536-wide vectors.
-                    # Both now follow the config, but mem0's
-                    # QdrantDB.create_col short-circuits when the collection
-                    # already exists ('Collection ... already exists. Skipping
-                    # creation.'), leaving a 1536-wide collection that every
-                    # N-wide upsert then fails against at runtime. Changing
+                    # Both now follow the config, but an existing collection
+                    # keeps its old width: _ensure_collection's exists-check
+                    # skips it, and so does mem0's QdrantDB.create_col
+                    # ('Collection ... already exists. Skipping creation.'),
+                    # leaving a 1536-wide collection that every N-wide upsert
+                    # then fails against at runtime. Changing
                     # embedder.dimensions requires recreating and re-embedding
                     # the Qdrant collection; it is not a live-migratable knob.
                     'embedding_model_dims': cfg.embedder.dimensions,
@@ -367,10 +370,29 @@ class Mem0Backend:
         if project_id not in self._instances:
             collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
             config_dict = self._build_config_dict(collection_name)
+            await self._ensure_collection(collection_name)
             instance = AsyncMemory.from_config(config_dict)
             self._instances[project_id] = instance
             logger.info(f'Mem0 instance created for project {project_id} (collection: {collection_name})')
         return self._instances[project_id]
+
+    async def _ensure_collection(self, collection_name: str) -> None:
+        """Create the collection if absent, under this backend's own budgets (tests/test_mem0_collection_provisioning.py)."""
+        from qdrant_client.http import models as qmodels  # noqa: PLC0415
+
+        client = await self._get_async_qdrant()
+        if await self._timed_read(client.collection_exists(collection_name), 'collection_exists'):
+            return
+        await self._timed_write(
+            client.create_collection(
+                collection_name=collection_name,
+                vectors_config=qmodels.VectorParams(
+                    size=self.config.embedder.dimensions,
+                    distance=qmodels.Distance.COSINE,
+                ),
+            ),
+            'create_collection',
+        )
 
     async def _timed_read(self, awaitable: Awaitable[_T], op: str) -> _T:
         """``await_within`` under this backend's READ budget."""
