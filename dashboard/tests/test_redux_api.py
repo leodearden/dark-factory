@@ -16,7 +16,7 @@ from dashboard.data.datum import (
 )
 from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.memory import WRITE_QUEUE_FRESHNESS_BOUND_SECONDS, write_queue_datum
-from dashboard.data.merge_queue import MergeAttempts
+from dashboard.data.merge_queue import MergeAttempts, TrainThroughput
 from dashboard.data.performance import PerformanceCards, PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
 from dashboard.project_labels import ProjectLabels
@@ -679,7 +679,7 @@ def _mq_read(value: object) -> Datum:
     return Datum(value, MQ_SERVED_AT, DatumState.FRESH, None, 30)
 
 
-_MQ_ZERO_THROUGHPUT = {
+_MQ_ZERO_THROUGHPUT: TrainThroughput = {
     'trains_landed': 0, 'tasks_landed_via_trains': 0, 'train_verifies_per_landed_task': 0.0,
     'baseline_solo_landed': 0, 'baseline_verifies_per_landed_task': 0.0,
     'verifies_per_landed_task_delta': 0.0, 'train_cas_retry_rate': 0.0,

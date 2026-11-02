@@ -8,7 +8,7 @@ import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
 from typing import TypeVar
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 import httpx
@@ -1546,7 +1546,7 @@ class TestBuildPerProjectMergeQueue:
             for field in ('speculative', 'recent_total'):
                 validate_datum(data[field], now)
 
-    async def test_depth_names_the_windows_width_read_or_unread(self, tmp_path):
+    async def test_a_read_depth_names_its_width_an_unread_one_is_unknown(self, tmp_path):
         """A real empty project counted at the window's width; a (pid, None) one counted nothing."""
         from dashboard.data.merge_queue import build_per_project_merge_queue
 
@@ -1771,29 +1771,9 @@ class TestBuildPerProjectMergeQueue:
         assert project['recent'] == []
         for field in ('speculative', 'recent_total', 'depth_timeseries', 'attempts', 'train_throughput'):
             assert project[field].state is DatumState.UNKNOWN, field
+            assert '/tmp/P' in (project[field].reason or ''), field
             assert 'RuntimeError: boom' in (project[field].reason or ''), field
             validate_datum(project[field], now)
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize('failing, failure', [
-        ('queue_depth_timeseries', AsyncMock(side_effect=RuntimeError('boom'))),
-        ('safe_gather_result', MagicMock(side_effect=RuntimeError('boom'))),
-    ], ids=['depth-leg-raises', 'whole-project-fails'])
-    async def test_an_unread_depth_is_unknown_naming_the_project_and_cause(
-        self, tmp_path, failing, failure,
-    ):
-        """Neither fallback serves an empty series: an unread depth counted nothing."""
-        from dashboard.data.merge_queue import build_per_project_merge_queue
-
-        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
-        db_path = _make_db(tmp_path, 'unread_depth.db', [])
-
-        async with aiosqlite.connect(str(db_path)) as conn:
-            conn.row_factory = aiosqlite.Row
-            with patch(f'dashboard.data.merge_queue.{failing}', new=failure):
-                result = await build_per_project_merge_queue([('/tmp/P', conn)], hours=168, now=now)
-
-        assert_unread(result['/tmp/P']['depth_timeseries'], now, '/tmp/P', 'RuntimeError: boom')
 
     @pytest.mark.asyncio
     async def test_cancelled_error_from_sub_query_propagates(self, tmp_path):
@@ -2466,25 +2446,14 @@ class TestResolveActive:
 # TestTrainThroughputStats — step-6 RED / step-7+ GREEN
 # ---------------------------------------------------------------------------
 
-_TRAIN_THROUGHPUT_DEFAULT_KEYS = {
-    'trains_landed',
-    'tasks_landed_via_trains',
-    'train_verifies_per_landed_task',
-    'baseline_solo_landed',
-    'baseline_verifies_per_landed_task',
-    'verifies_per_landed_task_delta',
-    'train_cas_retry_rate',
-    'baseline_cas_retry_rate',
-    'cas_retry_rate_delta',
-    'improved',
-}
+_TRAIN_THROUGHPUT_KEYS = set(merge_queue.TrainThroughput.__annotations__)
 
 
 @pytest.mark.asyncio
 class TestTrainThroughputStats:
-    """Tests for train_throughput_stats(db, *, hours=24, now=None) -> dict.
+    """Tests for train_throughput_stats(db, *, hours=24, now=None) -> Datum[TrainThroughput].
 
-    step-6: default contract (None / empty DB → all-zeros).
+    step-6: an unread runs.db is unknown; a readable empty one is measured zeros.
     step-8: verifies-per-landed-task counting.
     step-10: CAS-retry rate.
     step-12: aggregator wiring.
@@ -2504,7 +2473,7 @@ class TestTrainThroughputStats:
         now = datetime(2026, 1, 10, 12, 0, 0, tzinfo=UTC)
         assert_unread(await train_throughput_stats(tableless_runs_conn, now=now), now)
 
-    async def test_empty_db_returns_all_zeros_default(self, tmp_path):
+    async def test_a_readable_empty_window_is_measured_zeros(self, tmp_path):
         """A readable empty events table is a measured all-zeros window."""
         from dashboard.data.merge_queue import train_throughput_stats
 
@@ -2517,7 +2486,7 @@ class TestTrainThroughputStats:
         assert datum.freshness_bound_seconds == merge_queue.RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
         result = datum.value
         assert result is not None
-        assert set(result.keys()) == _TRAIN_THROUGHPUT_DEFAULT_KEYS
+        assert set(result.keys()) == _TRAIN_THROUGHPUT_KEYS
         assert result['trains_landed'] == 0
         assert result['tasks_landed_via_trains'] == 0
         assert result['train_verifies_per_landed_task'] == 0.0
@@ -2698,7 +2667,7 @@ class TestAggregatorTrainThroughput:
 
     Verifies:
     - each project result dict contains a 'train_throughput' key
-    - its value is the train_throughput_stats dict (all-zeros for empty/None db)
+    - its value is the train_throughput_stats Datum (unknown for a None db)
     - populated with a train_merged row: trains_landed=1, tasks_landed=2
     """
 

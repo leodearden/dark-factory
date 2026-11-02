@@ -258,8 +258,13 @@ def map_datum(datum: Datum[T], project: Callable[[T], U]) -> Datum[U]:
 
     Pure: *project* never runs on an unknown datum, and no clock is read.
     """
-    value = None if datum.value is None else project(datum.value)
-    return Datum(value, datum.as_of, datum.state, datum.reason, datum.freshness_bound_seconds)
+    return Datum(
+        value=None if datum.value is None else project(datum.value),
+        as_of=datum.as_of,
+        state=datum.state,
+        reason=datum.reason,
+        freshness_bound_seconds=datum.freshness_bound_seconds,
+    )
 
 
 def aged_at(datum: Datum[T], served_at: datetime) -> Datum[T]:
