@@ -173,7 +173,7 @@ ROW_READ_STATUSES: frozenset[TaskStatus] = ACTIVE
 class SnapshotFailure(enum.StrEnum):
     """WHY a unit is not wholly measured — structured, never parsed from prose.
 
-    The three project lists ``/api/v2/dashboard/tasks`` emits encode facts the
+    The project lists ``/api/v2/dashboard/tasks`` emits encode facts the
     codebase insists must not be merged: offline means a read DEMONSTRABLY
     failed, degraded means a budget expired and the state is simply unknown.
     ``Datum.reason`` is by contract the producer's VERBATIM failure text, so
@@ -183,7 +183,8 @@ class SnapshotFailure(enum.StrEnum):
     The kind reported on a unit is the ROWS half's, because that is the half
     that decides whether a PROJECT is offline. The map's own fate is carried
     by the census ``Datum``'s state: rows fresh beside a non-fresh census is
-    exactly the count-unknown case, and needs no third enum member.
+    the count-unknown or count-stale case, told apart by that ``Datum``'s own
+    state, and needs no third enum member.
     """
 
     NONE = 'none'
@@ -638,7 +639,7 @@ def withhold_rows(snapshot: TaskSnapshot) -> TaskSnapshot:
 class SnapshotHealth(enum.StrEnum):
     """How a consumer must present one root, from its unit alone.
 
-    The four members are the four banners ``/api/v2/dashboard/tasks`` can put
+    The five members are the five banners ``/api/v2/dashboard/tasks`` can put
     a project under, and the codebase insists they stay distinct:
 
     * ``OK`` — both halves measured.
@@ -646,15 +647,21 @@ class SnapshotHealth(enum.StrEnum):
     * ``DEGRADED`` — a budget expired first, so this root's state is simply
       UNKNOWN. Nothing was proven unreachable. Merging this into ``OFFLINE``
       tells an operator to restart a healthy service.
-    * ``COUNT_UNKNOWN`` — the rows are current but the census is not. Without
-      a name of its own such a root renders as healthy with a confident
-      "0 done", which is the invisible failure the envelope exists to remove.
+    * ``COUNT_UNKNOWN`` — the rows are current but the census has NO value to
+      show. Without a name of its own such a root renders as healthy with a
+      confident "0 done", which is the invisible failure the envelope exists
+      to remove.
+    * ``COUNT_STALE`` — the rows are current and the census carries its last
+      measured value at its own ``as_of``, which every census surface renders
+      with an age badge. Announcing it as unknown would contradict those
+      surfaces.
     """
 
     OK = 'ok'
     OFFLINE = 'offline'
     DEGRADED = 'degraded'
     COUNT_UNKNOWN = 'count_unknown'
+    COUNT_STALE = 'count_stale'
 
 
 def classify(snapshot: TaskSnapshot) -> SnapshotHealth:
@@ -673,9 +680,11 @@ def classify(snapshot: TaskSnapshot) -> SnapshotHealth:
         return SnapshotHealth.OFFLINE
     if snapshot.failure is SnapshotFailure.BUDGET:
         return SnapshotHealth.DEGRADED
-    if snapshot.census.state is not DatumState.FRESH:
-        return SnapshotHealth.COUNT_UNKNOWN
-    return SnapshotHealth.OK
+    if snapshot.census.state is DatumState.FRESH:
+        return SnapshotHealth.OK
+    if snapshot.census.state is DatumState.STALE:
+        return SnapshotHealth.COUNT_STALE
+    return SnapshotHealth.COUNT_UNKNOWN
 
 
 def as_served(snapshot: TaskSnapshot, served_at: datetime) -> TaskSnapshot:
