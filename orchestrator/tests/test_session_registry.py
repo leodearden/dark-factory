@@ -9269,9 +9269,24 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
         probe='from shared import safe_io',
         callers=(
             'skills/spawn/spawn-claude.sh runs it by absolute path for the t3 lane '
-            '(detect, launch, await-started, wait, self-record) with '
+            '(detect, launch, await-started, wait, self-record, pair, status) with '
             'PYTHONPATH="$REPO_ROOT/orchestrator/src" and no venv. A non-stdlib import '
             'here turns every t3-lane spawn into a launcher failure.'
+        ),
+    ),
+    _BareShellEntrypoint(
+        name='t3_mcp_client.py (tier-2: import with PYTHONPATH)',
+        path=_SR_PKG_ROOT / 'orchestrator' / 't3_mcp_client.py',
+        pythonpath=(_SR_PKG_ROOT_ENTRY,),
+        shape=_EntrypointShape.IMPORT,
+        argv=(),
+        probe='from shared import safe_io',
+        callers=(
+            'spawn_t3_lane.py imports this module at module scope, and '
+            'skills/spawn/spawn-claude.sh runs spawn_t3_lane.py by absolute path '
+            'with PYTHONPATH="$REPO_ROOT/orchestrator/src" and no venv. A non-stdlib '
+            'import here makes the lane unimportable, so every t3-lane spawn becomes '
+            'a launcher failure.'
         ),
     ),
     _BareShellEntrypoint(
@@ -9331,6 +9346,10 @@ _MUST_BE_REJECTED: tuple[tuple[str, str], ...] = (
     ('session_self_exit.py', 'import pydantic'),
     ('spawn_t3_lane.py', 'from shared import safe_io'),
     ('spawn_t3_lane.py', 'import pydantic'),
+    # Lands at the `from __future__` anchor, BEFORE t3_mcp_client's own
+    # session_registry import, whose bootstrap is what makes `shared` reachable.
+    ('t3_mcp_client.py', 'from shared import safe_io'),
+    ('t3_mcp_client.py', 'import pydantic'),
 )
 
 
