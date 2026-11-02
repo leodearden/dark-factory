@@ -5368,6 +5368,54 @@ def test_t3_sibling_mode_returns_with_a_running_t3_record(tmp_path: pathlib.Path
     assert argv[argv.index("--title") + 1] == "worker:df#7489 t3-lane-test"
 
 
+_PROXY_ONLY_T3_SETTINGS = {
+    "defaultModelSelection": {"instanceId": "claude-proxy", "model": "claude-opus-5-5"},
+    "providerInstances": {
+        "claudeAgent": {"driver": "claudeAgent", "enabled": False},
+        "claude-proxy": {"driver": "claudeAgent", "enabled": True},
+    },
+}
+
+
+def _with_proxy_only_settings(lane: _T3Lane) -> _T3Lane:
+    settings = pathlib.Path(lane.env["T3CODE_HOME"]) / "userdata" / "settings.json"
+    settings.write_text(json.dumps(_PROXY_ONLY_T3_SETTINGS))
+    return lane
+
+
+def test_t3_lane_runs_a_pinned_model_on_the_projects_enabled_instance(tmp_path: pathlib.Path) -> None:
+    lane = _with_proxy_only_settings(_T3Lane(tmp_path))
+    lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
+    lane.env["CLAUDE_SPAWN_MODEL"] = "fable"
+
+    result = lane.run()
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    (start,) = lane.started_threads()
+    argv = start.argv
+    assert (argv[argv.index("--provider") + 1], argv[argv.index("--model") + 1]) == ("claude-proxy", "fable")
+    record = lane.record()
+    assert record.display is not None and record.display.t3_thread_id
+
+
+@pytest.mark.parametrize("model", ["fable", ""])
+def test_t3_lane_refuses_a_named_provider_it_cannot_use_and_writes_no_record(
+    tmp_path: pathlib.Path, model: str,
+) -> None:
+    lane = _with_proxy_only_settings(_T3Lane(tmp_path))
+    lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
+    lane.env["CLAUDE_SPAWN_MODEL"] = model
+    lane.env["CLAUDE_SPAWN_T3_PROVIDER"] = "claudeAgent"
+
+    result = lane.run()
+
+    assert result.returncode == 145, f"stderr: {result.stderr.decode()}"
+    stderr = result.stderr.decode()
+    assert "claudeAgent" in stderr if model else "without CLAUDE_SPAWN_MODEL" in stderr
+    assert not lane.records(), "a refused provider must precede the launching record"
+    assert not lane.started_threads()
+
+
 @pytest.mark.parametrize(("spawn_mode", "spawner_env", "expected_parent"), [
     ("child", {"CLAUDE_SPAWN_SESSION_ID": "worker-df-7488-4242"}, "worker-df-7488-4242"),
     ("sibling", {"CLAUDE_SPAWN_SESSION_ID": "worker-df-7488-4242",
