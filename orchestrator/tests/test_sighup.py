@@ -152,7 +152,10 @@ def _exit_after_hup_then_term(
 
     SIGHUP is sent first and is fatal at send time under SIG_DFL, so the exit
     status alone says whether SIGHUP terminated the child. The empty PATH
-    keeps the gate's SIGHUP re-probe from spawning a real `claude`.
+    keeps the gate's SIGHUP re-probe from spawning a real `claude`. The
+    private TMPDIR confines the child gate's dead-PID probe-dir sweep (task
+    3086), which the in-process confinement plugin
+    (df_pytest_isolation.py::arm_usage_gate_sweep_confinement) cannot reach.
     """
     script = tmp_path / 'sighup_shape.py'
     script.write_text(SIGHUP_SCRIPT)
@@ -166,7 +169,11 @@ def _exit_after_hup_then_term(
         argv,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env={**os.environ, 'PATH': str(no_claude_on_path)},
+        env={
+            **os.environ,
+            'PATH': str(no_claude_on_path),
+            'TMPDIR': str(_child_tempdir(tmp_path)),
+        },
         start_new_session=True,
     )
     pgid = proc.pid
