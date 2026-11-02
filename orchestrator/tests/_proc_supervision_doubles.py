@@ -61,6 +61,8 @@ def make_fake_inspector(state: dict):
     records each call's kwargs on the returned callable's ``.calls`` list
     (each entry: ``{'unit', 'timeout_secs', 'reap_grace_secs'}``) so tests can
     assert the exact unit/timeout the RP-5 verify leg was invoked with.
+    Mirrors the injected-inspector pattern in test_deterministic_runner.py
+    (AsyncMock ``unit_inspector``).
     """
     calls: list[dict] = []
 

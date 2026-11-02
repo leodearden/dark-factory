@@ -43,13 +43,9 @@ Composition cells (observable signal — all GREEN in CI):
           recovers a stranded task to done{merged,sha} JOURNAL-FIRST, with
           git archaeology never awaited (TG-1).
 
-The proc_supervision scaffolding (FakeRunner, make_fake_inspector, the
-tmp_queue_dir fixture, read_escalations) is imported from
-_proc_supervision_doubles, the single copy shared with
-test_proc_supervision.py. The TaskGroundTruth, MergeProvenance and
-LifecycleRegistry scaffolding (_reset_merge_provenance, _bind_landed_row,
-_fake_git_ops/_fake_scheduler, _make_ground_truth, _RecordingService/
-wedging-service idiom) is still re-declared locally below.
+Shared proc_supervision scaffolding lives in _proc_supervision_doubles. The
+TaskGroundTruth, MergeProvenance and LifecycleRegistry scaffolding is
+re-declared locally below.
 """
 
 from __future__ import annotations
@@ -72,10 +68,9 @@ from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, Merge
 from orchestrator.task_ground_truth import TaskGroundTruth
 
 # ---------------------------------------------------------------------------
-# Prerequisite-1: shared scaffolding (no behaviour assertions here) — reused
-# by LOCAL re-declaration (per the design decision above) from
-# test_task_ground_truth.py / test_reconcile_stranded.py and
-# test_background_service.py.
+# Prerequisite-1: scaffolding re-declared from test_task_ground_truth.py /
+# test_reconcile_stranded.py and test_background_service.py (no behaviour
+# assertions here).
 # ---------------------------------------------------------------------------
 
 

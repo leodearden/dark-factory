@@ -4,13 +4,7 @@ proc_supervision.py is the single owned restart-seam (M1): RestartPlan,
 EscalationSpec, FreshPidVerify, RestartOutcome/RestartDisposition, and one
 async execute() honoring 5 invariants (RP-1..5, PRD Sec 5.1).
 
-Prerequisite-1: shared test scaffolding (no behaviour assertions here) —
-make_fake_inspector (configurable inspect-result async callable), the
-tmp_queue_dir fixture and the read_escalations() helper live in
-_proc_supervision_doubles alongside FakeRunner and the canonical detached
-RP-4 plan, shared with the other proc_supervision test files. Mirrors the
-injected-inspector pattern in test_deterministic_runner.py (AsyncMock
-unit_inspector).
+Shared proc_supervision test scaffolding lives in _proc_supervision_doubles.
 """
 
 from __future__ import annotations
