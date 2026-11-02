@@ -3,9 +3,11 @@
 ``seed_dead_letters`` writes records in the on-disk format that reading,
 counting and replay consume. ``hold_fifo`` makes a dead-letter path whose
 appends cannot finish until the test releases it, which is how a test proves
-an append ran off the caller's thread. ``parked_buffer`` is an EventBuffer
-double whose push waits until the test releases it, which holds the drainer
-still; it is the drainer-side counterpart of ``hold_fifo``.
+an append ran off the caller's thread. ``parked_queue`` is its drainer-side
+counterpart: a running EventQueue whose drainer cannot commit anything until
+the block exits, so ``journaled_events`` and ``journaled_ids`` (what a fresh
+journal reader still lists) show the settled-at-enqueue state without racing
+the drain.
 """
 
 from __future__ import annotations
@@ -14,13 +16,19 @@ import asyncio
 import json
 import os
 import threading
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
+from fused_memory.reconciliation.event_journal import EventJournal
+from fused_memory.reconciliation.event_queue import EventQueue
+
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from fused_memory.models.reconciliation import ReconciliationEvent
 
 
@@ -77,12 +85,37 @@ def hold_fifo(path: Path) -> HeldFifo:
     return HeldFifo(path).start()
 
 
-def parked_buffer(released: asyncio.Event) -> AsyncMock:
-    """A mock EventBuffer whose push parks until *released* is set — holds the drainer still."""
+@asynccontextmanager
+async def parked_queue(dead_letter_path: Path, journal_path: Path) -> AsyncIterator[EventQueue]:
+    """A started EventQueue whose drainer parks in ``push`` until the block exits.
 
-    async def _park(_event):
+    Leaving the block releases the drainer before closing the queue, so
+    close() drains rather than timing out and dead-lettering what is left.
+    """
+    released = asyncio.Event()
+
+    async def park(_event: ReconciliationEvent) -> None:
         await released.wait()
 
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=_park)
-    return buf
+    buffer = AsyncMock()
+    buffer.push = AsyncMock(side_effect=park)
+    queue = EventQueue(buffer, dead_letter_path=dead_letter_path, journal_path=journal_path)
+    await queue.start()
+    try:
+        yield queue
+    finally:
+        released.set()
+        await queue.close()
+
+
+def journaled_events(journal_path: Path) -> dict[str, ReconciliationEvent]:
+    """Events a FRESH journal over ``journal_path`` still lists as unprocessed, by id."""
+    journal = EventJournal(journal_path)
+    try:
+        return {event.id: event for event in journal.load_unprocessed()}
+    finally:
+        journal.close()
+
+
+def journaled_ids(journal_path: Path) -> set[str]:
+    return set(journaled_events(journal_path))

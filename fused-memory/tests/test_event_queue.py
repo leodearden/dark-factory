@@ -14,7 +14,13 @@ from unittest.mock import AsyncMock
 import aiosqlite
 import pytest
 import pytest_asyncio
-from _dead_letter_helpers import hold_fifo, parked_buffer, seed_dead_letters
+from _dead_letter_helpers import (
+    hold_fifo,
+    journaled_events,
+    journaled_ids,
+    parked_queue,
+    seed_dead_letters,
+)
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -114,15 +120,6 @@ def _make_event(
         timestamp=datetime.now(UTC),
         payload={'test': True},
     )
-
-
-def _journaled_ids(journal_path: pathlib.Path) -> set[str]:
-    """Event ids a FRESH journal over ``journal_path`` still lists as unprocessed."""
-    journal = EventJournal(journal_path)
-    try:
-        return {e.id for e in journal.load_unprocessed()}
-    finally:
-        journal.close()
 
 
 @pytest_asyncio.fixture
@@ -871,6 +868,30 @@ async def test_rotation_purges_orphan_rotations(tmp_path):
 
 
 # ── read_dead_letters ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_seed_dead_letters_writes_the_writers_record_shape(tmp_path):
+    """seed_dead_letters, which reader and replay tests use instead of the
+    drainer, writes the same keys and value types as EventQueue's own writer,
+    and the same event. A writer-side change therefore fails here rather than
+    leaving every seeded reader test green."""
+    written = tmp_path / 'written.jsonl'
+    seeded = tmp_path / 'seeded.jsonl'
+    q = EventQueue(AsyncMock(), dead_letter_path=written, maxsize=1)
+    try:
+        kept, overflowed = _make_event(), _make_event()
+        assert q.enqueue(kept) is True
+        assert q.enqueue(overflowed) is False
+        await q.flush_dead_letters()
+        [real] = [json.loads(line) for line in written.read_text().splitlines()]
+    finally:
+        await q.close()
+    seed_dead_letters(seeded, [overflowed])
+    [seed] = [json.loads(line) for line in seeded.read_text().splitlines()]
+
+    assert {k: type(v) for k, v in seed.items()} == {k: type(v) for k, v in real.items()}
+    assert seed['event'] == real['event']
 
 
 @pytest.mark.asyncio
@@ -1699,41 +1720,27 @@ async def test_startup_recovery_after_kill9(real_buffer, tmp_path):
 @pytest.mark.asyncio
 async def test_replay_dead_letters_reenqueues_and_clears(tmp_path):
     """replay_dead_letters puts every dead-lettered event back in the queue
-    (journaled, observed with the drainer held parked so the state is settled
-    rather than raced), clears them from the file, and a second call finds
-    nothing to replay.
+    unchanged (journaled, observed with the drainer parked so the state is
+    settled rather than raced), clears them from the file, and a second call
+    finds nothing to replay.
 
     The drainer's commit of re-enqueued events is covered by
     fused-memory/tests/test_event_queue.py::test_drainer_marks_processed_on_commit.
     """
     dl = tmp_path / 'dl.jsonl'
     ej = tmp_path / 'ej.db'
-    released = asyncio.Event()
-    q = EventQueue(
-        parked_buffer(released),
-        dead_letter_path=dl,
-        journal_path=ej,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.1,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
+    async with parked_queue(dl, ej) as q:
         seeded = [_make_event() for _ in range(3)]
         seed_dead_letters(dl, seeded)
         assert len(dl.read_text().strip().splitlines()) == 3
 
         counts = q.replay_dead_letters()
         assert counts == {'replayed': 3, 'failed': 0}
-        assert _journaled_ids(ej) == {e.id for e in seeded}
+        assert journaled_events(ej) == {e.id: e for e in seeded}
         # File no longer holds the replayed records.
         assert (dl.read_text().strip() if dl.exists() else '') == ''
         # Second call → nothing to replay (no re-replay).
         assert q.replay_dead_letters() == {'replayed': 0, 'failed': 0}
-    finally:
-        released.set()
-        await q.close()
 
 
 @pytest.mark.asyncio
@@ -1742,32 +1749,18 @@ async def test_replay_dead_letters_filters_by_project_id(tmp_path):
     records remain in the dead-letter file."""
     dl = tmp_path / 'dl.jsonl'
     ej = tmp_path / 'ej.db'
-    released = asyncio.Event()
-    q = EventQueue(
-        parked_buffer(released),
-        dead_letter_path=dl,
-        journal_path=ej,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.1,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
+    async with parked_queue(dl, ej) as q:
         proj_a = [_make_event(project_id='proj-a') for _ in range(2)]
         seed_dead_letters(dl, proj_a)
         seed_dead_letters(dl, [_make_event(project_id='proj-b') for _ in range(3)])
 
         counts = q.replay_dead_letters(project_id='proj-a')
         assert counts == {'replayed': 2, 'failed': 0}
-        assert _journaled_ids(ej) == {e.id for e in proj_a}
+        assert journaled_events(ej) == {e.id: e for e in proj_a}
         # Non-matching proj-b records are preserved in the file.
         remaining = q.read_dead_letters()
         assert len(remaining) == 3
         assert all(r['event']['project_id'] == 'proj-b' for r in remaining)
-    finally:
-        released.set()
-        await q.close()
 
 
 @pytest.mark.asyncio
@@ -1776,18 +1769,7 @@ async def test_replay_dead_letters_preserves_unparseable(tmp_path):
     preserved (loud-over-silent — never silently dropped)."""
     dl = tmp_path / 'dl.jsonl'
     ej = tmp_path / 'ej.db'
-    released = asyncio.Event()
-    q = EventQueue(
-        parked_buffer(released),
-        dead_letter_path=dl,
-        journal_path=ej,
-        maxsize=100,
-        retry_initial_seconds=0.01,
-        retry_max_seconds=0.1,
-        shutdown_flush_seconds=2.0,
-    )
-    await q.start()
-    try:
+    async with parked_queue(dl, ej) as q:
         good = _make_event()
         seed_dead_letters(dl, [good])
         with dl.open('a', encoding='utf-8') as fh:
@@ -1795,12 +1777,9 @@ async def test_replay_dead_letters_preserves_unparseable(tmp_path):
 
         counts = q.replay_dead_letters()
         assert counts == {'replayed': 1, 'failed': 1}
-        assert _journaled_ids(ej) == {good.id}
+        assert journaled_events(ej) == {good.id: good}
         # The malformed line survives; the good record was replayed out.
         assert dl.read_text().splitlines() == ['{not valid json']
-    finally:
-        released.set()
-        await q.close()
 
 
 # ── Off-loop dead-letter hand-off (task 6085) ──────────────────────────────
@@ -1845,13 +1824,13 @@ async def test_overflow_journal_row_survives_until_its_dead_letter_is_written(tm
         e1, e2 = _make_event(), _make_event()
         assert q.enqueue(e1) is True
         assert q.enqueue(e2) is False
-        assert e2.id in _journaled_ids(ej)
+        assert e2.id in journaled_ids(ej)
 
         held.release.set()
         await q.flush_dead_letters()
 
         assert [r['event']['id'] for r in held.records()] == [e2.id]
-        journaled = _journaled_ids(ej)
+        journaled = journaled_ids(ej)
         assert e1.id in journaled
         assert e2.id not in journaled
     finally:
@@ -1893,7 +1872,7 @@ async def test_failed_dead_letter_write_keeps_the_journal_row(tmp_path):
         assert q.enqueue(e2) is False
         await q.flush_dead_letters()
 
-        assert e2.id in _journaled_ids(ej)
+        assert e2.id in journaled_ids(ej)
         assert q.stats()['dead_letters'] == 0
     finally:
         await q.close()
@@ -1930,7 +1909,7 @@ async def test_close_leaves_every_handed_off_record_on_disk_and_its_row_released
 
     records = [json.loads(line) for line in dl.read_text(encoding='utf-8').splitlines()]
     dead_lettered = {r['event']['id'] for r in records}
-    journaled = _journaled_ids(ej)
+    journaled = journaled_ids(ej)
     assert dead_lettered.isdisjoint(journaled), dead_lettered & journaled
     assert dead_lettered | journaled == {e.id for e in events}
     assert {r['reason'] for r in records} <= {'overflow_drop', 'shutdown_timeout'}
