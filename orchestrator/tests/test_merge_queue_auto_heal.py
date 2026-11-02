@@ -20,7 +20,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeClock, FakeVerifier
+from _merge_lane_fakes import FakeClock, FakeVerifier, lane_scene_config
 from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
@@ -78,15 +78,15 @@ def _make_mock_git_ops(project_root: Path | None = None) -> MagicMock:
 
 
 def _make_config(tmp_path: Path) -> OrchestratorConfig:
-    return OrchestratorConfig(
-        project_root=tmp_path,
-        max_concurrent_tasks=1,
-        git=GitConfig(
+    return lane_scene_config(
+        tmp_path,
+        GitConfig(
             main_branch='main',
             branch_prefix='task/',
             remote='origin',
             worktree_dir='.worktrees',
         ),
+        max_concurrent_tasks=1,
     )
 
 

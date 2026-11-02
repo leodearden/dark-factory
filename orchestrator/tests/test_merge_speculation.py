@@ -619,9 +619,9 @@ def _make_spec_req(tmp_path: Path, *, spec_knob: bool, persistent: bool = False)
     """Build a minimal MergeRequest stub for spec-routing tests."""
     req = MagicMock()
     req.task_id = 'task-spec-1'
-    req.config = OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(
+    req.config = lane_scene_config(
+        tmp_path,
+        GitConfig(
             persistent_merge_worktree=persistent,
             merge_spec_warm_lane_pool=spec_knob,
         ),

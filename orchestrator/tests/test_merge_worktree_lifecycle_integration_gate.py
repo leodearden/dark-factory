@@ -308,6 +308,7 @@ from _merge_lane_fakes import (
     FakeVerifier,
     RecordingEscalations,
     hangs_until,
+    lane_scene_config,
     make_lane,
 )
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, make_placeholder_future, wait_responsive
@@ -409,7 +410,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 async def _make_ephemeral_worktree(git_ops: GitOps) -> Path:
@@ -1065,7 +1066,7 @@ class TestFiveThreeTwoSixReplayGate:
         # point and this test never calls harness.run() (only targeted
         # internal methods), so those neutralizations are moot post-init --
         # safe to swap in a fully-real, self-consistent config here.
-        harness.config = OrchestratorConfig(project_root=git_repo, git=git_config)
+        harness.config = lane_scene_config(git_repo, git_config)
         base = harness.git_ops.worktree_base
 
         # --- Pre-state: a REAL branch task/5326 with a real worktree and a

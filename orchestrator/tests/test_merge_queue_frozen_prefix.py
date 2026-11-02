@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
-from _merge_lane_fakes import FakeClock, FakeVerifier, make_lane
+from _merge_lane_fakes import FakeClock, FakeVerifier, lane_scene_config, make_lane
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
@@ -114,7 +114,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ── Module-level helpers ──────────────────────────────────────────────────────

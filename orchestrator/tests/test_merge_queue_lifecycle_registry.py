@@ -44,6 +44,7 @@ from _merge_lane_fakes import (
     hangs_until,
     lane_entry,
     lane_finalizing,
+    lane_scene_config,
     lane_state,
     make_lane,
     raises,
@@ -99,7 +100,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 def _make_request(
@@ -2719,15 +2720,12 @@ class TestCoalesceSupersededRetiresRegistry:
     async def test_coalesce_superseded_members_retire_registry(
         self, git_repo: Path, git_config: GitConfig, git_ops: GitOps,
     ) -> None:
-        from orchestrator.config import OrchestratorConfig
         from orchestrator.merge_lane.worker import (
             GroupMergeRequest,
             ItemLifecycleState,
         )
 
-        coalesce_cfg = OrchestratorConfig(
-            project_root=git_repo, git=git_config, merge_train_coalesce_enabled=True,
-        )
+        coalesce_cfg = lane_scene_config(git_repo, git_config, merge_train_coalesce_enabled=True)
 
         wt1 = await _make_branch_with_file(git_ops, 'kc1', 'file_kc1.py', 'a = 1\n')
         wt2 = await _make_branch_with_file(git_ops, 'kc2', 'file_kc2.py', 'b = 1\n')

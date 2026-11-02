@@ -211,9 +211,9 @@ def _make_config_with_runner(
         git_remote='origin',
         enabled=True,
     )
-    return OrchestratorConfig(
-        project_root=git_repo,
-        git=git_config,
+    return lane_scene_config(
+        git_repo,
+        git_config,
         verify_runners=[runner_cfg],
         verify_host_policy='prefer_local',
     )
