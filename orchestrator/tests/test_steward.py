@@ -635,6 +635,119 @@ class TestStewardWedgeGuardInheritance:
         assert result is success_result
 
 
+@pytest.mark.asyncio
+class TestStewardResumeRejectionOnly:
+    """Task 5579 at the steward: only a CLI-rejected resume replaces the session.
+
+    A resumed run that did work is returned and its session kept; a proven
+    rejection is retried fresh, and the replacement is reported as a
+    ``session_resume_failed(stage='cli', role='steward')`` row.
+    """
+
+    @staticmethod
+    def _resume_failed_emits(steward) -> list:
+        from orchestrator.event_store import EventType
+        return [
+            c.kwargs for c in steward.event_store.emit.call_args_list
+            if c.args and c.args[0] is EventType.session_resume_failed
+        ]
+
+    async def _invoke(self, steward, worktree, side_effect, *, gate=None):
+        steward.usage_gate = gate or _make_pre_triage_gate()
+        steward.event_store = MagicMock(run_id='run-5579')
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = esc
+        with (
+            patch(
+                'orchestrator.steward.invoke_agent', new_callable=AsyncMock,
+                side_effect=side_effect,
+            ) as mock_invoke,
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            result = await steward._invoke_with_session(
+                prompt='handle this escalation', cwd=worktree, mcp_config={},
+                per_invocation_budget=5.0, escalation=esc,
+            )
+        return result, mock_invoke
+
+    async def test_a_completed_resumed_run_is_kept(self, steward, worktree):
+        steward._session_id = 'sess-old'
+        downgraded = _make_result(
+            success=False, subtype='success', ended_awaiting_background=True,
+            turns=40, cost=2.195, session_id='sess-old',
+        )
+
+        result, mock_invoke = await self._invoke(steward, worktree, [downgraded])
+
+        mock_invoke.assert_awaited_once()
+        assert mock_invoke.await_args.kwargs['resume_session_id'] == 'sess-old'
+        assert result is downgraded
+        assert steward._session_id == 'sess-old'
+        assert self._resume_failed_emits(steward) == []
+
+    async def test_a_budget_kill_is_surfaced_not_rerun(self, steward, worktree):
+        steward._session_id = 'sess-old'
+        budget_kill = _make_result(
+            success=False, subtype='error_max_budget_usd', turns=1, cost=4.96,
+            session_id='sess-old',
+        )
+
+        result, mock_invoke = await self._invoke(steward, worktree, [budget_kill])
+
+        mock_invoke.assert_awaited_once()
+        assert result is budget_kill
+        assert result.cost_usd == 4.96
+
+    async def test_a_proven_rejection_is_reported_and_replaces_the_session(
+        self, steward, worktree, mock_briefing, caplog,
+    ):
+        from test_resumed_run_not_discarded import measured_resume_rejection
+        steward._session_id = 'sess-old'
+        mock_briefing.build_steward_initial_prompt.return_value = 'REBUILT-INITIAL'
+        caplog.set_level(logging.WARNING, logger='orchestrator.steward')
+
+        result, mock_invoke = await self._invoke(
+            steward, worktree,
+            [measured_resume_rejection('sess-old'), _make_result(session_id='sess-fresh')],
+        )
+
+        assert mock_invoke.await_count == 2
+        assert 'resume_session_id' not in mock_invoke.await_args_list[1].kwargs
+        assert steward._session_id == 'sess-fresh'
+        assert self._resume_failed_emits(steward) == [{
+            'task_id': steward.task_id,
+            'data': {
+                'stage': 'cli', 'session_id': 'sess-old', 'session_ids': ['sess-old'],
+                'role': 'steward', 'fallbacks': 1,
+            },
+        }]
+        assert any(
+            r.levelno == logging.WARNING
+            and 'sess-old' in r.getMessage() and 'sess-fresh' in r.getMessage()
+            for r in caplog.records
+        )
+        assert result.session_id == 'sess-fresh'
+
+    async def test_a_loop_rearmed_rejection_is_not_reported(self, steward, worktree, mock_briefing):
+        from test_resumed_run_not_discarded import measured_resume_rejection
+        steward._session_id = None
+        mock_briefing.build_steward_initial_prompt.return_value = 'REBUILT-INITIAL'
+
+        _result, mock_invoke = await self._invoke(
+            steward, worktree,
+            [
+                _make_capped_result(session_id='sess-capped'),
+                measured_resume_rejection('sess-capped'),
+                _make_result(session_id='sess-fresh'),
+            ],
+            gate=_make_pre_triage_gate(cap_effects=[True, False, False]),
+        )
+
+        assert mock_invoke.await_count == 3
+        assert mock_invoke.await_args_list[1].kwargs['resume_session_id'] == 'sess-capped'
+        assert self._resume_failed_emits(steward) == []
+
+
 # ---------------------------------------------------------------------------
 # Cap-Hit Backoff
 # ---------------------------------------------------------------------------
