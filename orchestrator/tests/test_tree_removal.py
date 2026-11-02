@@ -7,7 +7,7 @@ import os
 import shlex
 import shutil
 import stat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -75,7 +75,7 @@ async def test_an_absent_path_is_already_removed(tmp_path: Path, ignore_errors: 
 
 
 class _GatedRm:
-    """An ``rm`` first on PATH that runs the real one only after :meth:`release`."""
+    """An ``rm`` first on PATH that parks before and after the real one until released."""
 
     def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         real_rm = shutil.which('rm')
@@ -83,31 +83,38 @@ class _GatedRm:
         bin_dir = tmp_path / 'gated-bin'
         bin_dir.mkdir()
         self._started = tmp_path / 'rm-started'
-        self._gate = tmp_path / 'rm-gate'
-        os.mkfifo(self._gate)
+        self._finished = tmp_path / 'rm-finished'
+        gate = tmp_path / 'rm-gate'
+        os.mkfifo(gate)
         script = bin_dir / 'rm'
         script.write_text(
             '#!/bin/sh\n'
+            f'exec 3< {shlex.quote(str(gate))}\n'
             f': > {shlex.quote(str(self._started))}\n'
-            f'read -r line < {shlex.quote(str(self._gate))}\n'
-            f'exec {shlex.quote(real_rm)} "$@"\n'
+            'read -r line <&3\n'
+            f'{shlex.quote(real_rm)} "$@"\n'
+            'rc=$?\n'
+            f': > {shlex.quote(str(self._finished))}\n'
+            'read -r line <&3\n'
+            'exit $rc\n'
         )
         script.chmod(0o755)
         monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
-        self._writer: int | None = None
+        self._writer = os.open(gate, os.O_RDWR)
 
-    @property
-    def started(self) -> bool:
+    def has_started(self) -> bool:
         return self._started.exists()
 
+    def has_finished(self) -> bool:
+        return self._finished.exists()
+
     def release(self) -> None:
-        if self._writer is None:
-            self._writer = os.open(self._gate, os.O_RDWR)
-            os.write(self._writer, b'\n')
+        """Let the parked ``rm`` pass its next gate."""
+        os.write(self._writer, b'\n')
 
     def close(self) -> None:
-        if self._writer is not None:
-            os.close(self._writer)
+        """Open every gate for good: a parked read sees end-of-file."""
+        os.close(self._writer)
 
 
 @pytest.fixture
@@ -116,8 +123,22 @@ def gated_rm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Gated
     try:
         yield gate
     finally:
-        gate.release()
         gate.close()
+
+
+def _assert_still_running(removal: asyncio.Future[None], before: str) -> None:
+    assert not removal.done(), (
+        f'remove_tree finished before the gated rm on PATH {before} '
+        f'(exception={removal.exception()!r})'
+    )
+
+
+async def _spin_until(
+    reached: Callable[[], bool], removal: asyncio.Future[None], before: str,
+) -> None:
+    while not reached():
+        _assert_still_running(removal, before)
+        await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
@@ -128,17 +149,16 @@ async def test_the_loop_keeps_running_while_a_tree_is_removed(
     _build_nested_tree(root)
     removal = asyncio.ensure_future(remove_tree(root))
 
-    while not gated_rm.started:
-        assert not removal.done(), 'remove_tree finished without running rm'
-        await asyncio.sleep(0)
-
-    # The loop got here while the rm child was alive and parked on the gate.
+    await _spin_until(gated_rm.has_started, removal, 'started')
     assert root.exists()
-    assert not removal.done()
+    gated_rm.release()
+
+    await _spin_until(gated_rm.has_finished, removal, 'finished deleting')
+    # The loop ran throughout the deletion; the rm child is alive, parked before exit.
+    assert not os.path.lexists(root)
+    _assert_still_running(removal, 'exited')
     gated_rm.release()
     await removal
-
-    assert not os.path.lexists(root)
 
 
 @pytest.mark.asyncio
