@@ -891,8 +891,8 @@ def status_verb(env: Mapping[str, str], origin: str | None) -> str:
     if resolved is None:
         return _verdict('status-failed', reason='server-runtime-missing', origin=None)
     status = t3_mcp_client.credential_status_at(resolved)
-    if isinstance(status, t3_mcp_client.TransportFailed):
-        return _verdict('status-failed', reason='descriptor-unreachable', origin=resolved)
+    if isinstance(status, t3_mcp_client.DescriptorFailed):
+        return _verdict('status-failed', reason=status.reason.value, origin=resolved, detail=status.detail)
     expires_at = status.credential.expires_at.isoformat() if status.credential else None
     return _verdict(status.state.value, environment_id=status.environment_id, expires_at=expires_at, origin=resolved)
 

@@ -316,28 +316,41 @@ class Descriptor:
     label: str
 
 
-def fetch_descriptor(origin: str) -> Descriptor | TransportFailed:
+class DescriptorFailure(StrEnum):
+    """Why no descriptor: nothing answered, or something answered that is not a usable T3."""
+
+    UNREACHABLE = 'descriptor-unreachable'
+    INCOMPATIBLE = 'descriptor-incompatible'
+
+
+@dataclass(frozen=True)
+class DescriptorFailed:
+    reason: DescriptorFailure
+    detail: str
+
+
+def fetch_descriptor(origin: str) -> Descriptor | DescriptorFailed:
     """GET T3's unauthenticated ``/.well-known/t3/environment``."""
     reply = _request_json(origin, 'GET', _DESCRIPTOR_PATH)
     if isinstance(reply, TransportFailed):
-        return reply
+        return DescriptorFailed(DescriptorFailure.UNREACHABLE, reply.detail)
     body = reply.body
     if reply.status != 200 or body is None:
-        return TransportFailed(TransportFault.PROTOCOL, f'descriptor: HTTP {reply.status} without a JSON object')
+        return DescriptorFailed(DescriptorFailure.INCOMPATIBLE, f'descriptor: HTTP {reply.status} without a JSON object')
     environment_id, server_version, label = body.get('environmentId'), body.get('serverVersion'), body.get('label')
     if not isinstance(environment_id, str) or not _ENVIRONMENT_ID.fullmatch(environment_id):
-        return TransportFailed(TransportFault.PROTOCOL, f'descriptor: unusable environmentId {environment_id!r}')
+        return DescriptorFailed(DescriptorFailure.INCOMPATIBLE, f'descriptor: unusable environmentId {environment_id!r}')
     if not isinstance(server_version, str) or not server_version:
-        return TransportFailed(TransportFault.PROTOCOL, f'descriptor: unusable serverVersion {server_version!r}')
+        return DescriptorFailed(DescriptorFailure.INCOMPATIBLE, f'descriptor: unusable serverVersion {server_version!r}')
     return Descriptor(environment_id, server_version, label if isinstance(label, str) else '')
 
 
 def credential_status_at(
     origin: str, *, root: Path | str | None = None, now: datetime | None = None
-) -> CredentialStatus | TransportFailed:
+) -> CredentialStatus | DescriptorFailed:
     """The credential state for whichever environment ``origin`` answers as."""
     descriptor = fetch_descriptor(origin)
-    if isinstance(descriptor, TransportFailed):
+    if isinstance(descriptor, DescriptorFailed):
         return descriptor
     return read_credential_status(descriptor.environment_id, root=root, now=now)
 
@@ -568,7 +581,6 @@ class T3McpClient:
 class PairFailure(StrEnum):
     PAIRING_REJECTED = 'pairing_rejected'
     CLI_VERSION_MISMATCH = 'cli-version-mismatch'
-    DESCRIPTOR_UNREACHABLE = 'descriptor-unreachable'
     T3_MISSING = 't3-missing'
     CLI_VERSION_UNREADABLE = 'cli-version-unreadable'
     PAIRING_CREATE_FAILED = 'pairing-create-failed'
@@ -579,7 +591,7 @@ class PairFailure(StrEnum):
 
 @dataclass(frozen=True)
 class PairFailed:
-    reason: PairFailure
+    reason: PairFailure | DescriptorFailure
     detail: str | None = None
     cli_version: str | None = None
     server_version: str | None = None
@@ -822,8 +834,8 @@ def pair(origin: str, source: CodeSource, *, root: Path | str | None = None) -> 
     """Pair with the environment at ``origin``; the credential is stored only once it is validated."""
     checked = checked_origin(origin)
     descriptor = fetch_descriptor(checked)
-    if isinstance(descriptor, TransportFailed):
-        return PairFailed(PairFailure.DESCRIPTOR_UNREACHABLE, descriptor.detail)
+    if isinstance(descriptor, DescriptorFailed):
+        return PairFailed(descriptor.reason, descriptor.detail)
     code = source.mint(descriptor)
     if isinstance(code, PairFailed):
         return code
@@ -856,7 +868,6 @@ def pair(origin: str, source: CodeSource, *, root: Path | str | None = None) -> 
 
 
 class ConnectFailure(StrEnum):
-    DESCRIPTOR_UNREACHABLE = 'descriptor-unreachable'
     UNPAIRED = 'unpaired'
     CREDENTIAL_EXPIRED = 'credential-expired'
     PAIR_FAILED = 'pair-failed'
@@ -864,7 +875,7 @@ class ConnectFailure(StrEnum):
 
 @dataclass(frozen=True)
 class ConnectFailed:
-    reason: ConnectFailure
+    reason: ConnectFailure | DescriptorFailure
     detail: str | None = None
 
 
@@ -877,8 +888,8 @@ def connect(
     is given (``CliCodeSource`` on the T3 host), else refused.
     """
     status = credential_status_at(origin, root=root)
-    if isinstance(status, TransportFailed):
-        return ConnectFailed(ConnectFailure.DESCRIPTOR_UNREACHABLE, status.detail)
+    if isinstance(status, DescriptorFailed):
+        return ConnectFailed(status.reason, status.detail)
     if status.state is CredentialState.PAIRED and status.credential is not None:
         return T3McpClient(origin, status.credential, root=root, repair=repair)
     if repair is None:
