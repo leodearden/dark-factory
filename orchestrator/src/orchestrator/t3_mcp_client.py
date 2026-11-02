@@ -518,16 +518,15 @@ class T3McpClient:
         with contextlib.closing(response):
             if response.status in (200, 202):
                 return None
-            return self._refusal(response.status) or TransportFailed(
-                TransportFault.PROTOCOL, f'notifications/initialized: HTTP {response.status}'
-            )
+        return self._unanswered('notifications/initialized', response.status)
 
-    def _refusal(self, status: int) -> _Refusal | None:
+    def _unanswered(self, method: str, status: int) -> TransportFailed | _Refusal:
+        """A non-success status: a 401, a 404 on a held session, or PROTOCOL."""
         if status == 401:
             return _Refusal.UNAUTHORIZED
         if status == 404 and self._session:
             return _Refusal.SESSION_LOST
-        return None
+        return TransportFailed(TransportFault.PROTOCOL, f'{method}: HTTP {status}')
 
     def _rpc(self, method: str, params: Mapping[str, Any]) -> _RpcResult | TransportFailed | _Refusal:
         request_id = next(self._request_ids)
@@ -536,9 +535,7 @@ class T3McpClient:
             return response
         with contextlib.closing(response):
             if response.status != 200:
-                return self._refusal(response.status) or TransportFailed(
-                    TransportFault.PROTOCOL, f'{method}: HTTP {response.status}'
-                )
+                return self._unanswered(method, response.status)
             message = _read_message(response, request_id)
         if isinstance(message, TransportFailed):
             return message
