@@ -14982,7 +14982,7 @@ async def test_dispatch_ticket_decision_candidate_key_collision_resolves_combine
         side_effect=DuplicateCandidateKeyError(existing_id=5, existing_status='pending'),
     )
 
-    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+    status, task_id, reason, result_dict = await interceptor._dispatch_ticket_decision(
         ticket_id='t1',
         project_root='/project',
         project_id=resolve_project_id('/project'),
@@ -15001,7 +15001,6 @@ async def test_dispatch_ticket_decision_candidate_key_collision_resolves_combine
     assert result_dict is not None, 'expected a result_dict, got None'
     assert result_dict.get('deduplicated') is True, result_dict
     assert result_dict.get('action') == 'candidate_key_collision', result_dict
-    assert degrade is None, f'expected no curator_degrade_reason; got {degrade!r}'
 
 
 # ── task 2085 step-13 RED: route_deterministic -> deterministic PURE-GATE stamping ──
@@ -15015,7 +15014,7 @@ async def test_dispatch_route_deterministic_creates_task_not_drop_or_combine(
     called exactly once and status=='created'. It never drops or combines,
     even though a route decision carries no target_id (mirrors a fresh
     'create' dispatch, not a dedup)."""
-    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+    status, task_id, reason, result_dict = await interceptor._dispatch_ticket_decision(
         ticket_id='t1',
         project_root='/project',
         project_id=resolve_project_id('/project'),
@@ -15146,7 +15145,7 @@ async def test_dispatch_drop_decision_unaffected_by_pure_gate_stamping(
     create block at all, so no add_task call and no metadata stamping."""
     from fused_memory.middleware.curator_types import CandidateTask
 
-    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+    status, task_id, reason, result_dict = await interceptor._dispatch_ticket_decision(
         ticket_id='t1',
         project_root='/project',
         project_id=resolve_project_id('/project'),
@@ -15172,7 +15171,7 @@ async def test_dispatch_refuse_creates_nothing(interceptor, taskmaster):
     action='drop', target_id=None, which matched neither guarded drop branch and
     fell through to the create path — creating the very candidate the guard's own
     justification said to refuse."""
-    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+    status, task_id, reason, result_dict = await interceptor._dispatch_ticket_decision(
         ticket_id='t1',
         project_root='/project',
         project_id=resolve_project_id('/project'),
@@ -15201,7 +15200,6 @@ async def test_dispatch_refuse_creates_nothing(interceptor, taskmaster):
     assert result_dict.get('created') is False, result_dict
     assert result_dict.get('id') is None, result_dict
     assert result_dict.get('action') == 'refuse', result_dict
-    assert degrade is None, f'expected no curator_degrade_reason; got {degrade!r}'
 
 
 @pytest.mark.asyncio
@@ -15213,7 +15211,7 @@ async def test_dispatch_targetless_llm_drop_still_fails_open_to_create(
     A targetless 'drop' is an LLM dedupe that LOST its target, not a refusal —
     silently discarding it would trade the bug being fixed for task loss in the
     opposite direction. It must still create."""
-    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+    status, task_id, reason, result_dict = await interceptor._dispatch_ticket_decision(
         ticket_id='t1',
         project_root='/project',
         project_id=resolve_project_id('/project'),
@@ -15240,7 +15238,7 @@ async def test_dispatch_refuse_precedes_drop_even_with_stray_target(
     """(c) BRANCH ORDER. A refusal carrying a stray target_id must still refuse.
     The refuse branch precedes the drop branch, so a refusal can never be
     shadowed into the dedupe path and silently reported as 'combined'."""
-    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+    status, task_id, reason, result_dict = await interceptor._dispatch_ticket_decision(
         ticket_id='t1',
         project_root='/project',
         project_id=resolve_project_id('/project'),
@@ -16501,7 +16499,7 @@ class TestZotDuplicateSweepWiring:
             stub_escalator=stub_escalator, monkeypatch=monkeypatch,
             scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0},
         )
-        status, task_id, _reason, _result, _degrade = outcome
+        status, task_id, _reason, _result = outcome
 
         assert decision.degraded_by_zot is True
         assert status == 'created'
@@ -16634,7 +16632,7 @@ class TestZotDuplicateSweepWiring:
             stub_escalator=stub_escalator, monkeypatch=monkeypatch,
             scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0},
         )
-        status, _task_id, _reason, result_dict, _degrade = outcome
+        status, _task_id, _reason, result_dict = outcome
         assert status == 'created'
         assert result_dict is not None
         stages = [w['stage'] for w in result_dict.get('post_create_warnings', [])]
@@ -16652,7 +16650,7 @@ class TestZotDuplicateSweepWiring:
             stub_escalator=stub_escalator, monkeypatch=monkeypatch,
             scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0},
         )
-        status, _task_id, _reason, result_dict, _degrade = outcome
+        status, _task_id, _reason, result_dict = outcome
         assert status == 'created'
         assert result_dict is not None
         stages = [w['stage'] for w in result_dict.get('post_create_warnings', [])]

@@ -55,14 +55,12 @@ from fused_memory.middleware.candidate_key import normalize_title
 from fused_memory.middleware.curation_deferral import (
     POOL_UNAVAILABLE_ERRORS,
     CurationRetryPolicy,
-    DeferReason,
     dedupe_skipped_marker,
     pool_defer_reason,
 )
 from fused_memory.middleware.curator_types import (
     CandidateTask,
     CuratorDecision,
-    CuratorFailureError,
     PreparedCandidate,
     exception_summary,
     is_combine_eligible_status,
@@ -393,10 +391,11 @@ class _PreparedTicket:
     :attr:`CuratorConfig.batch_token_threshold` accumulator before fetching
     the next ticket from the queue.
 
-    ``prepared`` is None when ``candidate`` is None (no title — curator
-    cannot judge it) or when prepare_candidate raised; the dispatch path
-    treats those tickets the same way the legacy "candidate is None" branch
-    did (skip the curator decision, go straight to ``tm.add_task``).
+    ``prepared`` is None only when ``candidate`` is None (no title — the
+    curator cannot judge it) or there is no curator; the dispatch path then
+    skips the curator decision and goes straight to ``tm.add_task``. A
+    ``prepare_candidate`` that raised yields
+    :meth:`PreparedCandidate.corpus_failed`, which the pipeline defers.
     """
 
     ticket_id: str
@@ -427,9 +426,8 @@ class _TicketLifecycle:
     source of truth for a ticket's entire journey through
     :meth:`TaskInterceptor._process_add_tickets_batch_prepared`.  This
     replaces that method's historical correlated parallel arrays
-    (``decisions``, ``curator_degrade_reasons``, ``resolved_task_ids``) and
-    the ``non_none-space`` <-> ``ticket_data-space`` index remapping those
-    arrays required.
+    (``decisions``, ``resolved_task_ids``) and the ``non_none-space`` <->
+    ``ticket_data-space`` index remapping those arrays required.
 
     ``target`` is a DIRECT reference to the sibling record a within-batch
     ``drop`` decision points at (resolved once, at decision-attach time,
@@ -440,7 +438,6 @@ class _TicketLifecycle:
 
     ticket: _PreparedTicket
     decision: CuratorDecision | None = None
-    degrade_reason: str | None = None
     # Self-referential — task_interceptor.py has no
     # `from __future__ import annotations`, so this MUST stay a string
     # forward-ref: a bare `_TicketLifecycle | None` annotation would
@@ -489,37 +486,6 @@ async def _wait_for_ticket_signal(event: asyncio.Event, timeout_seconds: float |
     except TimeoutError:
         return ResolveReason.WAIT_TIMEOUT
     return ResolveReason.WAIT_INTERRUPTED
-
-
-def _decision_after_curator_failure(
-    ticket_id: str, exc: CuratorFailureError,
-) -> tuple[CuratorDecision, str | None]:
-    """Decide a ticket whose curation raised out of ``curate()``.
-
-    Returns the decision and the degrade reason a create records. A
-    zero-output hang degrades to create with the ZOT marker, so the
-    no-orchestrator path still gets swept and stamped even though no
-    escalation could be filed for it. Any other failure defers, so the ticket
-    is parked until the curator can judge it; a parked row records only its
-    defer reason, so it gets no degrade reason and the failure is logged here.
-    """
-    if not exc.zero_output_timeout:
-        logger.warning(
-            'ticket %s: curator.curate raised CuratorFailureError, deferring curation: %s',
-            ticket_id, exc,
-        )
-        return CuratorDecision.deferred(DeferReason.LLM_FAILED), None
-    logger.warning(
-        'ticket %s: curator.curate hung with zero output, degrading to create: %s',
-        ticket_id, exc,
-    )
-    decision = CuratorDecision(
-        action='create',
-        justification=f'curator-failed: {exception_summary(exc)}',
-        degraded=True,
-        degraded_by_zot=True,
-    )
-    return decision, str(exc)
 
 
 # The label a non-create decision carries when its ticket still ends in a
@@ -1290,7 +1256,7 @@ class TaskInterceptor:
         self._closed = True
 
         # Cancel all per-project curator workers so they stop blocking on
-        # curator.curate().  Gather all tasks regardless of done-state so we
+        # curator.curate_prepared().  Gather all tasks regardless of done-state so we
         # can detect any task that raised unexpectedly.
         running_workers = [t for t in self._worker_tasks.values() if not t.done()]
         for t in running_workers:
@@ -2464,7 +2430,7 @@ class TaskInterceptor:
             # skips both the lock and note_created. record_task is an
             # idempotent UUID5-keyed upsert (task_curator.py), so corpus
             # visibility — the goal here — is achieved regardless. The
-            # trade-off: these committed tasks never land in curate()'s
+            # trade-off: these committed tasks never land in the curator's
             # in-memory recent-created snapshot, so a concurrent add_task
             # for a near-duplicate falls back to the (now up to date)
             # corpus search instead of the in-memory pre-LLM check. A minor
@@ -4528,7 +4494,7 @@ class TaskInterceptor:
 
         One worker per project_id so a slow LLM on project A does not delay
         add_task traffic on project B.  Within a project, tickets are still
-        serialised (one curator.curate() at a time).
+        serialised (one curator.curate_prepared() batch at a time).
 
         Workers are intentionally NOT added to ``_background_tasks``: they are
         long-running infinite-loop tasks.  Adding them would cause ``drain()``
@@ -4713,10 +4679,10 @@ class TaskInterceptor:
         ``failed`` and waiters are signalled before returning ``None``.
 
         Returns a populated :class:`_PreparedTicket` for valid tickets.
-        ``prepared`` is ``None`` when the ticket has no title (curator cannot
-        judge it) or the curator instance is not yet available — the
-        downstream dispatch path treats those the same way the legacy
-        ``candidate is None`` branch did.
+        ``prepared`` is ``None`` only when the ticket has no title (the
+        curator cannot judge it) or there is no curator. A
+        ``prepare_candidate`` that raises yields
+        :meth:`PreparedCandidate.corpus_failed`, which the pipeline defers.
         """
         if self._ticket_store is None:
             return None
@@ -4770,15 +4736,16 @@ class TaskInterceptor:
                         project_id,
                         project_root,
                     )
-                except Exception:
-                    # prepare_candidate already swallows corpus-build failure
-                    # to an empty pool; an exception here is unexpected.
-                    # Continue with prepared=None — dispatch falls through
-                    # to a per-ticket curate() call inside
-                    # _process_add_tickets_batch_prepared.
+                except Exception as exc:
+                    # prepare_candidate already turns a corpus-build failure
+                    # into a corpus-failed bundle; an exception here is
+                    # unexpected, and gets the same bundle so it defers.
                     logger.exception(
                         '_prepare_ticket: curator.prepare_candidate failed for ticket %s',
                         ticket_id,
+                    )
+                    prepared = PreparedCandidate.corpus_failed(
+                        candidate, f'prepare_candidate raised: {exception_summary(exc)}',
                     )
 
         return _PreparedTicket(
@@ -4803,11 +4770,10 @@ class TaskInterceptor:
         kwargs: dict,
         metadata: Any,
         curator: Any,  # TaskCurator | None
-        curator_degrade_reason: str | None = None,
-    ) -> tuple[str, str | None, str | None, dict | None, str | None]:
+    ) -> tuple[str, str | None, str | None, dict | None]:
         """Execute the refuse/defer/drop/combine/create dispatch for one curator decision.
 
-        Returns (status, task_id, reason, result_dict, curator_degrade_reason).
+        Returns (status, task_id, reason, result_dict).
         A ``defer`` returns ``TicketStatus.AWAITING_CURATION`` and creates nothing.
         Does NOT persist, signal, journal, or commit — the caller does, via
         :meth:`_persist_worker_outcome`.
@@ -4849,12 +4815,11 @@ class TaskInterceptor:
                 None,
                 f'refused (no task created): {decision.justification}',
                 result_dict,
-                None,
             )
 
         if decision is not None and decision.action == 'defer':
             logger.info('ticket %s: curation deferred, parking it: %s', ticket_id, decision.justification)
-            return (TicketStatus.AWAITING_CURATION, None, decision.justification, None, None)
+            return (TicketStatus.AWAITING_CURATION, None, decision.justification, None)
 
         if decision is not None and decision.action == 'drop' and decision.target_id:
             # Drop: fold candidate into the existing target task (status='combined').
@@ -4871,7 +4836,6 @@ class TaskInterceptor:
                 decision.target_id,
                 f'drop: {decision.justification}',
                 result_dict,
-                None,
             )
 
         if decision is not None and decision.action == 'combine' and decision.target_id:
@@ -4914,7 +4878,6 @@ class TaskInterceptor:
                     decision.target_id,
                     f'combine: {decision.justification}',
                     result_dict,
-                    None,
                 )
             # combine failed → fall through to create
 
@@ -4983,7 +4946,6 @@ class TaskInterceptor:
                     existing_id,
                     'candidate_key_collision',
                     result_dict,
-                    curator_degrade_reason,
                 )
 
             # The task backend's add_task is contractually guaranteed to return
@@ -4998,8 +4960,6 @@ class TaskInterceptor:
             status = TicketStatus.CREATED
             reason = _create_reason(decision, curator_unavailable=curator_unavailable)
             result_dict = dict(result)
-            if curator_degrade_reason is not None:
-                result_dict = {**result_dict, 'curator_degrade_reason': curator_degrade_reason}
 
             if metadata_json and task_id_str and not atomic_metadata_written:
                 try:
@@ -5016,8 +4976,8 @@ class TaskInterceptor:
                     )
 
             # note_created + record_task under curator_lock + write_lock
-            # (R3 invariant): by holding curator_lock across curate() →
-            # note_created, concurrent curator calls cannot race on a stale
+            # (R3 invariant): by holding curator_lock across curate_prepared()
+            # → note_created, concurrent curator calls cannot race on a stale
             # in-memory snapshot.
             # Each is wrapped independently: a failure appends to
             # post_create_warnings and is logged, but does NOT flip status.
@@ -5066,7 +5026,7 @@ class TaskInterceptor:
                 result_dict=result_dict,
             )
 
-        return (status, task_id, reason, result_dict, curator_degrade_reason)
+        return (status, task_id, reason, result_dict)
 
     async def _flag_zot_duplicate(
         self,
@@ -5255,7 +5215,7 @@ class TaskInterceptor:
     ) -> None:
         """Run the full curator + write pipeline for a batch of pre-prepared tickets.
 
-        Calls :meth:`TaskCurator.curate_batch_prepared` once for all candidates
+        Calls :meth:`TaskCurator.curate_prepared` once for all candidates
         (re-using the already-built corpus pools carried on each
         :class:`_PreparedTicket`), then dispatches each per-ticket decision
         under a single ``_curator_lock`` acquisition (R3 invariant).  All
@@ -5270,13 +5230,13 @@ class TaskInterceptor:
         Per-ticket failures are isolated: one ticket failing does not prevent
         other tickets from being processed.
 
-        A submission the curator could not judge parks ``awaiting_curation``,
-        and a within-batch drop onto a parked sibling parks with it; nothing
-        is created for them. That covers a ``defer`` decision, an account
-        pool that cannot serve raised from ``curate_batch_prepared``
-        (``POOL_UNAVAILABLE_ERRORS``), a :class:`CuratorFailureError` escaping
-        ``curate()`` other than a zero-output hang, and any other exception
-        ``curate_batch_prepared`` raises instead of deciding.
+        ``curate_prepared`` returns one decision per bundle and raises only a
+        pool error (``POOL_UNAVAILABLE_ERRORS``) or ``CancelledError``: every
+        other curator failure is decided inside it. A submission the curator
+        could not judge parks ``awaiting_curation``, and a within-batch drop
+        onto a parked sibling parks with it; nothing is created for them.
+        That covers a ``defer`` decision and the pool error, which defers
+        every curatable ticket here.
         """
         if self._ticket_store is None:
             return
@@ -5340,8 +5300,8 @@ class TaskInterceptor:
                 return  # All tickets short-circuited by idempotency
 
             # Build one lifecycle record per active ticket — the single
-            # source of truth for that ticket's decision, degrade reason,
-            # within-batch-drop target, and resolved terminal.  Replaces the
+            # source of truth for that ticket's decision, within-batch-drop
+            # target, and resolved terminal.  Replaces the
             # historical non_none-space / ticket_data-space parallel arrays
             # entirely (see _TicketLifecycle docstring).
             records: list[_TicketLifecycle] = [
@@ -5349,38 +5309,24 @@ class TaskInterceptor:
             ]
 
             # Curatable slice: records whose ticket has both a candidate and
-            # a prepared bundle.  We pass the already-prepared bundles so
-            # the curator skips the second corpus build it would otherwise
-            # do inside curate_batch.  Built as one fused loop (rather than
-            # two separately-filtered comprehensions) so curatable_records
-            # and non_none_prepared are guaranteed index-aligned — the
-            # invariant curate_batch_prepared's positional response relies
-            # on — and so prepared's None-check narrows for the type
-            # checker at the point of use.
+            # a prepared bundle.  Built as one fused loop so curatable_records
+            # and curatable_bundles stay index-aligned — the invariant
+            # curate_prepared's positional response relies on — and so the
+            # bundle's None-check narrows for the type checker.
             curatable_records: list[_TicketLifecycle] = []
-            non_none_prepared: list[PreparedCandidate] = []
+            curatable_bundles: list[PreparedCandidate] = []
             for r in records:
                 if r.ticket.candidate is not None and r.ticket.prepared is not None:
                     curatable_records.append(r)
-                    non_none_prepared.append(r.ticket.prepared)
-            # Records that have a candidate but no prepared bundle — usually
-            # because :meth:`_prepare_ticket` could not invoke
-            # ``prepare_candidate`` (transient error, or a mock without the
-            # method during tests).  These are dispatched via single-item
-            # ``curate()`` after the main batch so we still get the curator's
-            # decision for them instead of falling straight through to
-            # ``tm.add_task`` (the latter would silently bypass the gate).
-            unprepared_records: list[_TicketLifecycle] = [
-                r
-                for r in records
-                if r.ticket.candidate is not None and r.ticket.prepared is None
-            ]
+                    curatable_bundles.append(r.ticket.prepared)
 
-            # Call curate_batch_prepared — one LLM round-trip for all candidates.
-            if curator is not None and non_none_prepared:
+            # One pipeline for the whole slice. curate_prepared returns one
+            # decision per bundle and raises only a pool error or
+            # CancelledError; every other curator failure is already decided.
+            if curator is not None and curatable_bundles:
                 try:
                     batch_decisions = await curator.curate_prepared(
-                        non_none_prepared,
+                        curatable_bundles,
                         project_id,
                         project_root,
                     )
@@ -5431,77 +5377,6 @@ class TaskInterceptor:
                     for rec in curatable_records:
                         rec.decision = CuratorDecision.deferred(pool_defer_reason(exc))
                         rec.target = None
-                except CuratorFailureError as exc:
-                    # The bisecting fallback in curate_batch_prepared no
-                    # longer surfaces CuratorFailureError to the caller for
-                    # ordinary per-batch failures (it bisects all the way to
-                    # size-1, where curate() handles its own degrade).  But
-                    # keep this catch as a defensive net for any escape — same
-                    # legacy behaviour: degrade all candidates to a per-item
-                    # curate() call so per-ticket degrade_reason is still
-                    # recorded in result_json.
-                    logger.warning(
-                        '_process_add_tickets_batch_prepared: '
-                        'curate_batch_prepared raised CuratorFailureError '
-                        'for project %s; falling back to %d individual '
-                        'curate() calls: %s',
-                        project_id,
-                        len(non_none_prepared),
-                        exc,
-                    )
-                    # Iterate curatable_records only — unprepared_records are
-                    # curated exactly once by the dedicated backfill loop
-                    # below; including them here too would curate() them
-                    # twice and the backfill's result would silently clobber
-                    # whatever this fallback just recorded.  The None-check
-                    # is defensive (curatable_records already guarantees a
-                    # candidate) and narrows the type for the curate() call.
-                    for rec in curatable_records:
-                        if rec.ticket.candidate is None:
-                            continue
-                        try:
-                            rec.decision = await curator.curate(
-                                rec.ticket.candidate,
-                                project_id,
-                                project_root,
-                            )
-                        except CuratorFailureError as e:
-                            rec.decision, rec.degrade_reason = _decision_after_curator_failure(
-                                rec.ticket.ticket_id, e,
-                            )
-                except Exception:
-                    logger.exception(
-                        '_process_add_tickets_batch_prepared: '
-                        'curate_batch_prepared failed for project %s; '
-                        'deferring %d candidates',
-                        project_id,
-                        len(curatable_records),
-                    )
-                    for rec in curatable_records:
-                        rec.decision = CuratorDecision.deferred(DeferReason.CURATOR_RAISED)
-                        rec.target = None
-
-            # Backfill any unprepared candidates via single-item curate() so
-            # we still get a curator decision instead of falling through to
-            # tm.add_task on prepare failures.  In production prepare_candidate
-            # itself swallows corpus errors to an empty pool, so this loop is
-            # rarely hit.  In tests where the curator mock omits
-            # prepare_candidate, this restores the legacy curate-then-dispatch
-            # behaviour the tests rely on.
-            if curator is not None and unprepared_records:
-                for rec in unprepared_records:
-                    if rec.ticket.candidate is None:
-                        continue
-                    try:
-                        rec.decision = await curator.curate(
-                            rec.ticket.candidate,
-                            project_id,
-                            project_root,
-                        )
-                    except CuratorFailureError as exc:
-                        rec.decision, rec.degrade_reason = _decision_after_curator_failure(
-                            rec.ticket.ticket_id, exc,
-                        )
 
             # ── Topologically-ordered dispatch ────────────────────────────────
             # Records with a target wait for that target to be dispatched
@@ -5576,7 +5451,6 @@ class TaskInterceptor:
                             task_id,
                             reason,
                             result_dict,
-                            _,
                         ) = await self._dispatch_ticket_decision(
                             ticket_id=t.ticket_id,
                             project_root=t.project_root,
@@ -5586,7 +5460,6 @@ class TaskInterceptor:
                             kwargs=t.kwargs,
                             metadata=t.metadata,
                             curator=curator,
-                            curator_degrade_reason=rec.degrade_reason,
                         )
                     except asyncio.CancelledError:
                         raise

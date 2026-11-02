@@ -1473,7 +1473,7 @@ class TestDispatchTicketDecision:
     """Unit tests for the extracted _dispatch_ticket_decision helper.
 
     The helper performs the refuse/drop/combine/create dispatch logic and
-    returns a (status, task_id, reason, result_dict, curator_degrade_reason)
+    returns a (status, task_id, reason, result_dict)
     tuple.  It does NOT call mark_resolved or signal ticket events — those are
     the caller's responsibility.
     """
@@ -1505,7 +1505,7 @@ class TestDispatchTicketDecision:
             type(interceptor_with_store), '_ensure_taskmaster',
             new=AsyncMock(return_value=taskmaster),
         ):
-            status, task_id, reason, result_dict, degrade_reason = (
+            status, task_id, reason, result_dict = (
                 await interceptor_with_store._dispatch_ticket_decision(
                     ticket_id='tkt_refuse',
                     project_root='/p',
@@ -1527,7 +1527,6 @@ class TestDispatchTicketDecision:
         assert result_dict.get('id') is None
         assert result_dict.get('created') is False
         assert result_dict.get('action') == 'refuse'
-        assert degrade_reason is None
 
     @pytest.mark.asyncio
     async def test_dispatch_create_decision_returns_created_status_and_task_id(
@@ -1549,7 +1548,7 @@ class TestDispatchTicketDecision:
             type(interceptor_with_store), '_ensure_taskmaster',
             new=AsyncMock(return_value=taskmaster),
         ):
-            status, task_id, reason, result_dict, degrade_reason = (
+            status, task_id, reason, result_dict = (
                 await interceptor_with_store._dispatch_ticket_decision(
                     ticket_id='tkt_x',
                     project_root='/p',
@@ -1567,7 +1566,6 @@ class TestDispatchTicketDecision:
         assert reason == 'create: novel'
         assert isinstance(result_dict, dict)
         assert result_dict.get('id') == '77'
-        assert degrade_reason is None
 
     @pytest.mark.asyncio
     async def test_dispatch_create_with_empty_justification_reason_is_bare_create(
@@ -1584,7 +1582,7 @@ class TestDispatchTicketDecision:
             type(interceptor_with_store), '_ensure_taskmaster',
             new=AsyncMock(return_value=taskmaster),
         ):
-            status, _, reason, result_dict, _ = (
+            status, _, reason, result_dict = (
                 await interceptor_with_store._dispatch_ticket_decision(
                     ticket_id='tkt_bare',
                     project_root='/p',
@@ -1613,7 +1611,7 @@ class TestDispatchTicketDecision:
             action='drop', target_id='99', justification='duplicate',
         )
 
-        status, task_id, reason, result_dict, degrade_reason = (
+        status, task_id, reason, result_dict = (
             await interceptor_with_store._dispatch_ticket_decision(
                 ticket_id='tkt_drop',
                 project_root='/p',
@@ -1658,7 +1656,7 @@ class TestDispatchTicketDecision:
             interceptor_with_store, '_execute_combine',
             new=mock_executor,
         ):
-            status, task_id, reason, result_dict, degrade_reason = (
+            status, task_id, reason, result_dict = (
                 await interceptor_with_store._dispatch_ticket_decision(
                     ticket_id='tkt_comb',
                     project_root='/p',
@@ -2188,7 +2186,7 @@ class TestCuratorUnavailableReasonPersisted:
             type(interceptor), '_ensure_taskmaster',
             new=AsyncMock(return_value=taskmaster),
         ):
-            status, _, reason, _, _ = await interceptor._dispatch_ticket_decision(
+            status, _, reason, _ = await interceptor._dispatch_ticket_decision(
                 ticket_id='tkt_closed',
                 project_root='/p',
                 project_id='p',
@@ -2215,7 +2213,7 @@ class TestCuratorUnavailableReasonPersisted:
             type(interceptor_with_store), '_ensure_taskmaster',
             new=AsyncMock(return_value=taskmaster),
         ):
-            _, _, reason, _, _ = await interceptor_with_store._dispatch_ticket_decision(
+            _, _, reason, _ = await interceptor_with_store._dispatch_ticket_decision(
                 ticket_id='tkt_nodecision',
                 project_root='/p',
                 project_id='p',
