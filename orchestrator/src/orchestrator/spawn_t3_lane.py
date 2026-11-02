@@ -7,7 +7,10 @@ verdict onto its own exit codes.
 
 Every verb prints one line on stdout, a status word and then ``key=value``
 tokens (``%``-escaped, ``none`` for an absent value), and exits 0. An internal
-fault prints nothing on stdout, a traceback on stderr, and exits 3.
+fault prints nothing on stdout, a traceback on stderr, and exits 3. ``pair``
+and ``status`` manage this host's credential for T3's ``/mcp``
+(``t3_mcp_client``): ``pair`` prints ``paired`` or ``pair-failed``, and
+``status`` prints ``paired``, ``expired``, ``unpaired`` or ``status-failed``.
 
 Two facts of ``t3`` v0.1.2 shape this module:
 
@@ -48,7 +51,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from orchestrator import session_registry
+from orchestrator import session_registry, t3_mcp_client
 from orchestrator.session_ownership_probes import ProcessTree
 
 MESSAGE_CHAR_LIMIT = 120_000
@@ -842,6 +845,59 @@ def self_record(tree: ProcessTree) -> str:
 
 
 # ---------------------------------------------------------------------------
+# MCP credential: pair and status
+# ---------------------------------------------------------------------------
+
+
+def _runtime_origin(env: Mapping[str, str]) -> str | None:
+    runtime = read_server_runtime(env)
+    origin = runtime.get('origin') if runtime else None
+    if not isinstance(origin, str):
+        return None
+    try:
+        return t3_mcp_client.checked_origin(origin)
+    except ValueError:
+        return None
+
+
+def _pair_failure_fields(failed: t3_mcp_client.PairFailed) -> dict[str, object]:
+    fields: dict[str, object] = {'reason': failed.reason.value}
+    if failed.reason is t3_mcp_client.PairFailure.CLI_VERSION_MISMATCH:
+        fields |= {'cli': failed.cli_version, 'server': failed.server_version}
+    if failed.detail is not None:
+        fields['detail'] = failed.detail
+    return fields
+
+
+def pair_verb(env: Mapping[str, str], code: str | None, origin: str | None) -> str:
+    resolved = origin or _runtime_origin(env)
+    if resolved is None:
+        return _verdict('pair-failed', reason='server-runtime-missing')
+    source = t3_mcp_client.OperatorCode(code) if code else t3_mcp_client.CliCodeSource()
+    result = t3_mcp_client.pair(resolved, source)
+    if isinstance(result, t3_mcp_client.PairFailed):
+        return _verdict('pair-failed', **_pair_failure_fields(result))
+    credential = result.credential
+    return _verdict(
+        'paired',
+        environment_id=credential.environment_id,
+        expires_at=credential.expires_at.isoformat(),
+        access=credential.access,
+    )
+
+
+def status_verb(env: Mapping[str, str], origin: str | None) -> str:
+    resolved = origin or _runtime_origin(env)
+    if resolved is None:
+        return _verdict('status-failed', reason='server-runtime-missing', origin=None)
+    status = t3_mcp_client.credential_status_at(resolved)
+    if isinstance(status, t3_mcp_client.TransportFailed):
+        return _verdict('status-failed', reason='descriptor-unreachable', origin=resolved)
+    expires_at = status.credential.expires_at.isoformat() if status.credential else None
+    return _verdict(status.state.value, environment_id=status.environment_id, expires_at=expires_at, origin=resolved)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -872,6 +928,15 @@ def _build_parser() -> argparse.ArgumentParser:
     wait_p.add_argument('--record', required=True)
 
     verbs.add_parser('self-record', help="print this session's own record slug and parent")
+
+    pair_p = verbs.add_parser(
+        'pair', help="pair this host with the T3 server's /mcp (self-pair, or --code from an operator)"
+    )
+    pair_p.add_argument('--code', default=None)
+    pair_p.add_argument('--origin', type=t3_mcp_client.checked_origin, default=None)
+
+    status_p = verbs.add_parser('status', help="print the lane's MCP credential state")
+    status_p.add_argument('--origin', type=t3_mcp_client.checked_origin, default=None)
     return parser
 
 
@@ -894,6 +959,10 @@ def _dispatch(args: argparse.Namespace) -> str:
         return await_started(args.thread_id, args.cwd, args.record, args.timeout, args.since)
     if args.verb == 'wait':
         return wait(args.thread_id, args.cwd, args.record, os.environ)
+    if args.verb == 'pair':
+        return pair_verb(os.environ, args.code, args.origin)
+    if args.verb == 'status':
+        return status_verb(os.environ, args.origin)
     return self_record(ProcessTree())
 
 
