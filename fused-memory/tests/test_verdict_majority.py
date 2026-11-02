@@ -17,7 +17,7 @@ def _vote(
     }
 
 
-def _resolve_one(*verdicts: str) -> Any:
+def _resolve_one(*verdicts: str) -> Resolution:
     rows = [_vote('e', 't', word, f'r{i}') for i, word in enumerate(verdicts)]
     return resolve_verdicts(rows)[('e', 't')]
 

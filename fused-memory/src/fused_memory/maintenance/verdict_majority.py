@@ -45,7 +45,7 @@ class Resolution(StrEnum):
 
 def resolve_verdicts(rows: Iterable[Mapping[str, Any]]) -> dict[Pair, Resolution]:
     """Resolve every rated pair in the corpus; refuse a malformed or double vote."""
-    votes: defaultdict[Pair, dict[str, str]] = defaultdict(dict)
+    votes: defaultdict[Pair, dict[str, Verdict]] = defaultdict(dict)
     for index, row in enumerate(rows):
         pair, rater, word = _vote(index, row)
         if rater in votes[pair]:
@@ -56,19 +56,21 @@ def resolve_verdicts(rows: Iterable[Mapping[str, Any]]) -> dict[Pair, Resolution
     return {pair: _majority(by_rater.values()) for pair, by_rater in votes.items()}
 
 
-def _vote(index: int, row: Mapping[str, Any]) -> tuple[Pair, str, str]:
+def _vote(index: int, row: Mapping[str, Any]) -> tuple[Pair, str, Verdict]:
     pair = (row.get('entry_id'), row.get('target_id'))
     missing = [key for key in _REQUIRED_VOTE_KEYS if key not in row]
     if missing:
         raise ValueError(f'verdict row {index} on pair {pair} lacks {", ".join(missing)}')
-    if row['verdict'] not in VERDICT_WORDS:
+    try:
+        word = Verdict(row['verdict'])
+    except ValueError:
         raise ValueError(
             f'verdict row {index} on pair {pair}: {row["verdict"]!r} is not one of {VERDICT_WORDS}'
-        )
-    return (row['entry_id'], row['target_id']), row['rater'], row['verdict']
+        ) from None
+    return (row['entry_id'], row['target_id']), row['rater'], word
 
 
-def _majority(words: Iterable[str]) -> Resolution:
+def _majority(words: Iterable[Verdict]) -> Resolution:
     decided = [word for word in words if word != Verdict.UNCLEAR]
     if not decided:
         return Resolution.UNCLEAR
