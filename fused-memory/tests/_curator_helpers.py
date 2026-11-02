@@ -102,6 +102,19 @@ def candidates_in(prompt: str) -> int:
     return prompt.count(_BATCH_CANDIDATE_HEADING)
 
 
+def candidate_titles(prompt: str) -> list[str]:
+    """The titles of the candidates a curator *prompt* asks about, in prompt order.
+
+    Reads the line after each candidate heading, at either spec.
+    """
+    lines = prompt.splitlines()
+    return [
+        following.removeprefix('  title: ')
+        for heading, following in zip(lines, lines[1:], strict=False)
+        if heading.startswith('# Candidate ')
+    ]
+
+
 InvokeArm = AgentResult | BaseException | Callable[[dict[str, Any]], AgentResult]
 
 

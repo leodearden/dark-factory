@@ -2887,9 +2887,14 @@ class TaskCurator:
     ) -> list[CuratorDecision]:
         """Dispatch each half of a failed batch, concurrently, rebasing the right half's indices."""
         mid = len(bundles) // 2
+        detail = (
+            f'subtype={exc.subtype} timed_out={exc.timed_out}'
+            if isinstance(exc, CuratorFailureError)
+            else exception_summary(exc)
+        )
         logger.warning(
-            'task_curator: bisecting a size-%d batch on %s → halves of %d and %d',
-            len(bundles), exception_summary(exc), mid, len(bundles) - mid,
+            'task_curator: bisecting a size-%d batch on %s (%s) → halves of %d and %d',
+            len(bundles), type(exc).__name__, detail, mid, len(bundles) - mid,
         )
         left, right = await asyncio.gather(
             self._dispatch_llm(bundles[:mid], project_id, project_root, start),
