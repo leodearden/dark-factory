@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Annotated, Any, Final, Literal, Self, TypedDict, TypeVar
+from typing import Annotated, Any, Final, Literal, Self, TypedDict, TypeVar, get_args
 
 from pydantic import (
     AfterValidator,
@@ -33,8 +33,11 @@ from shared.task_statuses import TaskStatus
 
 __all__ = [
     'CALLER_ACTIONS',
+    'CANCEL_CHILDREN_SKILL',
     'CHILD_CANCELLING_ACTIONS',
+    'DECISION_TABLE',
     'ENTRY_ONLY_ACTIONS',
+    'GET_CANCEL_CHILDREN_TOOL',
     'MISSING_FILES_CAP',
     'PAYLOAD_ID_CAP',
     'REASON_MAX_CHARS',
@@ -51,6 +54,7 @@ __all__ = [
     'ChildRelation',
     'ChildRow',
     'CoCancelledEntry',
+    'DecisionRow',
     'DispositionSource',
     'ExternalChild',
     'FoldDisposition',
@@ -73,6 +77,8 @@ __all__ = [
     'parse_entries',
     'parse_superseded_by',
     'qualified_task_ref',
+    'render_cancel_children_rules',
+    'render_decision_table_markdown',
     'rows_to_json',
     'stamp_entry',
     'with_entry',
@@ -668,3 +674,184 @@ class CancelChildrenView(BaseModel):
 def capped(field: str, items: Sequence[Any]) -> dict[str, Any]:
     """`field` cut to PAYLOAD_ID_CAP items, plus `<field>_total`: the house payload convention."""
     return {field: list(items[:PAYLOAD_ID_CAP]), f'{field}_total': len(items)}
+
+
+GET_CANCEL_CHILDREN_TOOL: Final = 'get_cancel_children'
+CANCEL_CHILDREN_SKILL: Final = '/cancel-with-children'
+
+
+@dataclass(frozen=True)
+class DecisionRow:
+    """One ordered question of PRD §5.2, asked per child; the first yes decides."""
+
+    order: int
+    question: str
+    evidence_check: str
+    action: str
+    dispositions: tuple[CancelAction, ...]
+    example_ids: tuple[str, ...]
+
+
+DECISION_TABLE: Final = (
+    DecisionRow(
+        order=0,
+        question='Already delivered on main?',
+        evidence_check=(
+            "child's declared files/behaviour landed under another commit "
+            '(`git log -S`/`delivered_checks` green)'
+        ),
+        action=(
+            'mark child `done` `found_on_main` BEFORE the cancel '
+            '(then it is terminal, unlisted)'
+        ),
+        dispositions=(),
+        example_ids=('3378',),
+    ),
+    DecisionRow(
+        order=1,
+        question='Is the child one of the replacements the superseding act names?',
+        evidence_check='`named_superseder` (in `superseded_by`)',
+        action='**keep** (default)',
+        dispositions=(CancelAction.KEEP,),
+        example_ids=('8032–8058', '928/930'),
+    ),
+    DecisionRow(
+        order=2,
+        question='Does it stand on main independent of the parent?',
+        evidence_check=(
+            '`declared_files_missing_from_main == []` and its description names no '
+            'parent-branch artifact; `spawned_from` is provenance only'
+        ),
+        action='**keep** (U)',
+        dispositions=(CancelAction.KEEP,),
+        example_ids=('6906', '7007', '8207', '733'),
+    ),
+    DecisionRow(
+        order=3,
+        question=(
+            "Was its premise the parent's DELIVERY (sequencing, \"after N lands\", "
+            'a gate clock)?'
+        ),
+        evidence_check=(
+            "relation `dependent`/`both`/`external_dependent`; description references the "
+            "parent's output"
+        ),
+        action=(
+            '**repoint** onto the superseder(s) (P). This is the class where silence does '
+            'harm: locally it releases early, cross-project it wedges'
+        ),
+        dispositions=(CancelAction.REPOINT,),
+        example_ids=('952→1112', '5770→6580', '7738→8891', '6905/7996→8032'),
+    ),
+    DecisionRow(
+        order=4,
+        question=(
+            "Do its artifacts exist only on the parent's branch or plan, and does a "
+            'superseder cover its scope?'
+        ),
+        evidence_check=(
+            "`declared_files_missing_from_main` non-empty; read the superseder's "
+            'description/plan for each child item'
+        ),
+        action=(
+            "covered → **fold** into it after copying uncovered items into the superseder's "
+            '`details` while it is `pending` (F); not covered → **moot** (M)'
+        ),
+        dispositions=(CancelAction.FOLD, CancelAction.MOOT),
+        example_ids=(
+            'F: 937/960',
+            'F: 7997/7998→8032',
+            'F: 5160→5261',
+            'M: 6367',
+            'M: 771',
+            'M: 152',
+        ),
+    ),
+    DecisionRow(
+        order=5,
+        question='Partly on main?',
+        evidence_check='some declared files present, some missing',
+        action='**keep** + `update_task` trimming the child to what main lacks (R)',
+        dispositions=(CancelAction.KEEP,),
+        example_ids=('261', '792'),
+    ),
+    DecisionRow(
+        order=6,
+        question="Cannot decide (superseder's scope unknown to you)?",
+        evidence_check='—',
+        action=(
+            'do NOT cancel the parent yet: ask (watcher → Leo; Stage 2 → recon_report)'
+        ),
+        dispositions=(),
+        example_ids=(),
+    ),
+)
+
+_TABLE_HEADER: Final = '| # | question | evidence check | action | report example |'
+_TABLE_RULE: Final = '|---|---|---|---|---|'
+
+
+def _table_line(row: DecisionRow) -> str:
+    examples = ', '.join(row.example_ids) or '—'
+    return f'| {row.order} | {row.question} | {row.evidence_check} | {row.action} | {examples} |'
+
+
+def render_decision_table_markdown() -> str:
+    """PRD §5.2's table, rendered from DECISION_TABLE."""
+    return '\n'.join([_TABLE_HEADER, _TABLE_RULE, *map(_table_line, DECISION_TABLE)])
+
+
+_ACTION_MEANINGS: Final[Mapping[CancelAction, str]] = {
+    CancelAction.KEEP: (
+        'the child stands on its own; the cancelled parent stops gating it'
+    ),
+    CancelAction.REPOINT: (
+        "the child needed the parent's delivery; its dependency moves onto `onto`"
+    ),
+    CancelAction.FOLD: (
+        "`into` covers the child's scope (copy any uncovered item into it first); "
+        'the child is cancelled'
+    ),
+    CancelAction.MOOT: (
+        "the child's premise existed only on the parent's branch or plan and nothing "
+        'replaces it; the child is cancelled'
+    ),
+}
+
+
+def _action_line(variant: type[_DispositionBase]) -> str:
+    action: CancelAction = variant.model_fields['action'].default
+    fields = [f'`{name}`' for name in variant.model_fields if name not in {'action', 'reason'}]
+    return f'- `{action.value}` ({", ".join([*fields, "`reason`?"])}): {_ACTION_MEANINGS[action]}'
+
+
+def _quoted_or(actions: frozenset[CancelAction]) -> str:
+    return ' or '.join(f'`{action.value}`' for action in sorted(actions))
+
+
+def render_cancel_children_rules() -> str:
+    """The cancel-with-children rules for a prompt: one `###` section composed from this module.
+
+    It uses no `## ` heading, because a prompt region is sliced at the next `## ` heading.
+    """
+    action_lines = '\n'.join(_action_line(variant) for variant in get_args(_DispositionUnion))
+    child_cancelling = _quoted_or(CHILD_CANCELLING_ACTIONS)
+    return (
+        '### Cancelling a task that has children\n'
+        f'Before you cancel any task, call `{GET_CANCEL_CHILDREN_TOOL}` with its id. It lists '
+        'every live child: the tasks spawned from it, the tasks depending on it, and the tasks '
+        'in other projects depending on it, each with the facts this table needs. Decide each '
+        'child with the table, stopping at the first yes:\n\n'
+        f'{render_decision_table_markdown()}\n\n'
+        "Then cancel with ONE call: `set_task_status(<id>, 'cancelled', children={...}, "
+        "superseded_by=[...])`. Key `children` by each listed row's `key`: the decimal task "
+        'id, or `<project_id>:<id>` for an external dependent, which admits only `repoint`. '
+        '`superseded_by` names the task(s) replacing the cancelled one; a child it names '
+        'defaults to `keep`. Each `children` value is one disposition:\n'
+        f'{action_lines}\n\n'
+        f'Work bottom-up: a {child_cancelling} child that has live children of its own is '
+        'refused, so decide and cancel its children first. You may not '
+        f'{child_cancelling} a child whose status is `{TaskStatus.IN_PROGRESS.value}`. A child '
+        'you cannot decide means you do NOT cancel the parent: re-scope, or report it through '
+        f'the recon_report tools. The `{CANCEL_CHILDREN_SKILL}` skill carries the same table.'
+    )
