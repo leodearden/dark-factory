@@ -1932,11 +1932,13 @@ def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterat
             record.some_field = new_value
             write_decision(record, root=root)
     """
-    lock_path = Path(str(decision_path_for_id(decision_id, root=root)) + '.lock')
-    # Defensively create the parent dir so a caller can take this lock
-    # without a decision having been written for this id yet -- note this
-    # means the sidecar itself is created even for an unknown id (see
-    # ORPHAN SIDECARS above).
+    with _exclusive_sidecar_lock(Path(str(decision_path_for_id(decision_id, root=root)) + '.lock')):
+        yield
+
+
+@contextlib.contextmanager
+def _exclusive_sidecar_lock(lock_path: Path) -> Iterator[None]:
+    """Blocking exclusive flock on the stable sidecar *lock_path*, creating it and its parent."""
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
     try:
@@ -2830,18 +2832,23 @@ of every reserved range avoids that ambiguity."""
 
 
 def _mark_exited_if_still_non_terminal(
-    slug: str, root: Path | str | None, *, exit_code: int
+    slug: str,
+    root: Path | str | None,
+    *,
+    exit_code: int,
+    still_applies: Callable[[SessionRecord], bool] | None = None,
 ) -> SessionRecord | None:
     """TOCTOU-safe terminal stamp used by the liveness sweeps and ``mark_session_folded``.
 
     Re-reads *slug* itself -- a second, fresher read than the sweep's own
     caller-side liveness check -- and, ONLY if status is still non-terminal
-    on THIS read, stamps status=EXITED/exit_code=*exit_code* and writes.
-    Returns the marked record, or ``None`` if a concurrent writer (most
-    plausibly spawn-claude.sh's own ``finish()``) already made the record
-    terminal in the narrow window between the sweep's own liveness check
+    on THIS read and *still_applies* (when given) accepts THIS read, stamps
+    status=EXITED/exit_code=*exit_code* and writes. Returns the marked
+    record, or ``None`` if a concurrent writer (most plausibly
+    spawn-claude.sh's own ``finish()``, or a hook re-binding the record)
+    already changed it in the window between the sweep's own liveness check
     and this call -- in which case nothing is written, so that writer's
-    real exit_code is never clobbered by the orphan sentinel.
+    real state is never clobbered by the orphan sentinel.
 
     Deliberately a narrow variant rather than a change to ``update_status``
     itself: ``update_status``'s own ``exit`` CLI subcommand caller is an
@@ -2851,6 +2858,8 @@ def _mark_exited_if_still_non_terminal(
     """
     record = read_record(slug, root=root)
     if record.status in TERMINAL_STATUSES:
+        return None
+    if still_applies is not None and not still_applies(record):
         return None
     record.status = Status.EXITED
     record.exit_code = exit_code
@@ -3199,6 +3208,17 @@ def _wmctrl_live_window_ids(
     return live_ids
 
 
+def _wm_window_id_of(record: SessionRecord) -> str | None:
+    """Normalized window id of a wm-display *record*; ``None`` for other displays or a bad id."""
+    if record.display is None or record.display.kind != DisplayKind.WM.value:
+        return None
+    return _normalize_wm_window_id(record.display.wm_window_id)
+
+
+def _names_window(window_id: str) -> Callable[[SessionRecord], bool]:
+    return lambda record: _wm_window_id_of(record) == window_id
+
+
 def mark_windowless_wm_sessions_exited(
     root: Path | str | None = None,
     *,
@@ -3236,11 +3256,14 @@ def mark_windowless_wm_sessions_exited(
 
     Two-probe rule: a record is marked only on a probe taken AFTER it was
     read. ``_run_launching``'s detached reap runs concurrently with the
-    spawn's own set-display write of ``wm_window_id``, so a window id can
-    land after the first probe; the pass therefore only collects candidates
-    absent from the first probe, and one confirming probe after the pass
-    decides (``None`` again marks nothing). Record mtimes are no substitute:
-    the kernel stamps them from a coarse clock.
+    spawned session's SessionStart hook, which writes its ``wm_window_id``
+    (``orchestrator/src/orchestrator/session_hooks.py::_resolve_display``),
+    so a window id can land after the first probe; the pass therefore only
+    collects candidates absent from the first probe, and one confirming
+    probe after the pass decides (``None`` again marks nothing). The mark
+    itself re-reads the record and goes ahead only if it still names the
+    candidate's window, so a hook that re-bound it to a new window since
+    the pass read it is left alone.
 
     Self-correction trade-off (mirrors ``mark_orphaned_sessions_exited``): a
     window that both probes miss (e.g. racing a window remap) can mark a
@@ -3301,12 +3324,10 @@ def mark_windowless_wm_sessions_exited(
             continue  # missing/corrupt body -- reap_stale_records' 'corrupt' rule's job
         if record.status in TERMINAL_STATUSES:
             continue  # already terminal -- idempotent, never re-stamped
-        if record.display is None or record.display.kind != DisplayKind.WM.value:
-            continue  # tmux / headless -- stays on the pid/TTL path
-        normalized = _normalize_wm_window_id(record.display.wm_window_id)
-        if normalized is None or normalized in live_ids:
-            continue  # unprovable, or the window is still live
-        candidates.append((slug, normalized))
+        window_id = _wm_window_id_of(record)
+        if window_id is None or window_id in live_ids:
+            continue  # tmux / headless / unprovable id, or the window is still live
+        candidates.append((slug, window_id))
 
     if not candidates:
         return marked
@@ -3314,13 +3335,13 @@ def mark_windowless_wm_sessions_exited(
     if confirmed_live_ids is None:
         return marked  # the confirming probe yielded no evidence -- mark nothing.
 
-    for slug, normalized in candidates:
-        if normalized in confirmed_live_ids:
+    for slug, window_id in candidates:
+        if window_id in confirmed_live_ids:
             continue  # the window appeared after the first probe
 
         try:
             marked_record = _mark_exited_if_still_non_terminal(
-                slug, root, exit_code=ORPHAN_EXIT_CODE
+                slug, root, exit_code=ORPHAN_EXIT_CODE, still_applies=_names_window(window_id)
             )
         except (FileNotFoundError, CorruptSessionRecord, OSError):
             # A single unmarkable record (a concurrent-reap race, an
@@ -3371,17 +3392,8 @@ def reap_lock(root: Path | str | None = None) -> Iterator[None]:
     The sidecar is a stable lock target, created once and never renamed or
     deleted, for the same reason as ``decision_id_lock``'s.
     """
-    lock_path = reap_lock_path(root)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+    with _exclusive_sidecar_lock(reap_lock_path(root)):
+        yield
 
 
 @dataclass(frozen=True)
@@ -3396,25 +3408,21 @@ class ReapPhase:
 
 @dataclass(frozen=True)
 class ReapReport:
-    """What one ``run_reap`` did, persisted at ``reap_report_path``."""
+    """What one ``run_reap`` did, persisted at ``reap_report_path``.
 
+    ``requested_at`` to ``started_at`` is the time it queued on ``reap_lock``;
+    ``remaining_record_dirs`` is the registry's size after the drain, or
+    ``None`` if it could not be counted.
+    """
+
+    requested_at: str
     started_at: str
     finished_at: str
     phases: tuple[ReapPhase, ...]
+    remaining_record_dirs: int | None
 
     def to_json(self) -> str:
         return json.dumps(dataclasses.asdict(self), indent=2) + '\n'
-
-
-_REAP_PHASES: tuple[tuple[str, Callable[[Path | str | None], Sized]], ...] = (
-    ('mark_orphaned_sessions_exited', lambda root: mark_orphaned_sessions_exited(root)),
-    ('mark_windowless_wm_sessions_exited', lambda root: mark_windowless_wm_sessions_exited(root)),
-    ('reap_stale_records', lambda root: reap_stale_records(root)),
-    ('reap_stale_session_pointers', lambda root: reap_stale_session_pointers(root)),
-)
-"""``run_reap``'s phases in mark-then-delete order. Each lambda looks its
-phase up by module-global name when called, so a patched phase is the one
-that runs."""
 
 
 def _run_reap_phase(
@@ -3434,11 +3442,33 @@ def _run_reap_phase(
     return ReapPhase(name=name, seconds=time.monotonic() - started, count=count, error=None)
 
 
-def run_reap(root: Path | str | None = None) -> ReapReport:
+def _count_record_dirs(root: Path | str | None) -> int | None:
+    try:
+        with os.scandir(sessions_dir(root)) as entries:
+            return sum(1 for entry in entries if entry.is_dir())
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        logger.warning('run_reap: could not count record dirs', exc_info=True)
+        return None
+
+
+def _a_reap_started_since(requested_at: datetime, root: Path | str | None) -> bool:
+    try:
+        last = json.loads(reap_report_path(root).read_text(encoding='utf-8'))
+        return datetime.fromisoformat(last['started_at']) > requested_at
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def run_reap(root: Path | str | None = None) -> ReapReport | None:
     """Drain the registry: mark orphans/windowless-wm exited, THEN delete stale dirs and pointers.
 
     The ``reap`` verb, for the operator and for ``_run_launching``'s detached
-    child alike. Concurrent calls queue on ``reap_lock``.
+    child alike. Concurrent calls queue on ``reap_lock``. A call whose turn
+    comes after a reap that STARTED after this call was requested returns
+    ``None`` without draining: that reap already covered everything this
+    call could see, so a burst of spawns costs one drain, not one each.
 
     Mark-then-delete keeps a pass complete: a record either liveness sweep
     marks exited this pass must not simultaneously be eligible for stale_pid
@@ -3456,11 +3486,26 @@ def run_reap(root: Path | str | None = None) -> ReapReport:
     ``reap_report_path``: it is the only window into a detached child whose
     stdio is DEVNULL. A failed report write is logged, not raised.
     """
+    requested_at = datetime.now(UTC)
     with reap_lock(root):
-        started_at = datetime.now(UTC).isoformat()
-        phases = tuple(_run_reap_phase(name, phase, root) for name, phase in _REAP_PHASES)
+        if _a_reap_started_since(requested_at, root):
+            logger.info('run_reap: a reap started since this one was requested; skipping')
+            return None
+        started_at = datetime.now(UTC)
+        phases = (
+            _run_reap_phase('mark_orphaned_sessions_exited', mark_orphaned_sessions_exited, root),
+            _run_reap_phase(
+                'mark_windowless_wm_sessions_exited', mark_windowless_wm_sessions_exited, root
+            ),
+            _run_reap_phase('reap_stale_records', reap_stale_records, root),
+            _run_reap_phase('reap_stale_session_pointers', reap_stale_session_pointers, root),
+        )
         report = ReapReport(
-            started_at=started_at, finished_at=datetime.now(UTC).isoformat(), phases=phases
+            requested_at=requested_at.isoformat(),
+            started_at=started_at.isoformat(),
+            finished_at=datetime.now(UTC).isoformat(),
+            phases=phases,
+            remaining_record_dirs=_count_record_dirs(root),
         )
         try:
             _atomic_write_text(reap_report_path(root), report.to_json())
@@ -4711,20 +4756,25 @@ def parse_spawn_identity(
     return SpawnIdentity(role=role, project=project, task_id=task_id, escalation_id=escalation_id)
 
 
-def start_detached_reap() -> bool:
-    """Start ``run_reap`` in a detached ``reap`` child and return at once.
+def start_detached_reap(root: Path | str | None = None) -> bool:
+    """Start ``run_reap`` on *root*'s fleet in a detached ``reap`` child and return at once.
 
-    The child gets its own session, no inherited fds and DEVNULL stdio, so it
-    can never hold a caller's pipe open; it inherits ``os.environ``, so
-    ``CLAUDE_FLEET_ROOT`` and ``DISPLAY`` carry over. A start failure is logged
-    to stderr only and returns False.
+    The child gets its own session, no inherited fds, DEVNULL stdio and ``/``
+    as its cwd, so it can never hold a caller's pipe open nor keep the
+    caller's worktree in use while it runs or queues. It inherits
+    ``os.environ`` (so ``DISPLAY`` carries over) with ``CLAUDE_FLEET_ROOT``
+    pinned to the absolute fleet root. A start failure is logged to stderr
+    only and returns False.
     """
     try:
+        env = {**os.environ, 'CLAUDE_FLEET_ROOT': str(fleet_root(root).absolute())}
         subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), 'reap'],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            cwd='/',
+            env=env,
             start_new_session=True,
             close_fds=True,
         )

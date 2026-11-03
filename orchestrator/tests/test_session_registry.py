@@ -23,13 +23,14 @@ import sys
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _reap_report_wait import await_reap_report
 from shared.project_id import PROJECT_ID_ALIASES, fold_project_token
 
 from orchestrator import session_registry as sr
@@ -2395,19 +2396,19 @@ def test_mark_windowless_handles_mixed_population_in_one_sweep(tmp_path: Path) -
 
 def _call_indexed_wmctrl_run(
     *results: tuple[int, str],
-    on_first_call: Callable[[], None] | None = None,
+    on_call: Mapping[int, Callable[[], None]] | None = None,
 ) -> Callable[[list[str]], subprocess.CompletedProcess[str]]:
     """A fake ``run`` answering call N with ``results[N]``, repeating the last thereafter.
 
-    ``on_first_call`` runs inside the first call, before it answers -- the
-    hook a test uses to land a record write just after the sweep's first probe.
+    ``on_call[N]`` runs inside call N, before it answers -- the hook a test
+    uses to land a record write just after one of the sweep's probes.
     """
     calls = 0
 
     def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
         nonlocal calls
-        if calls == 0 and on_first_call is not None:
-            on_first_call()
+        if on_call is not None and calls in on_call:
+            on_call[calls]()
         returncode, stdout = results[min(calls, len(results) - 1)]
         calls += 1
         return subprocess.CompletedProcess(argv, returncode=returncode, stdout=stdout)
@@ -2431,7 +2432,7 @@ def test_mark_windowless_keeps_a_window_that_appears_after_the_first_probe(
     run = _call_indexed_wmctrl_run(
         (0, '0x99  0 host  other\n'),
         (0, '0x1a  0 host  late\n0x99  0 host  other\n'),
-        on_first_call=_set_display_lands,
+        on_call={0: _set_display_lands},
     )
 
     marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
@@ -2457,6 +2458,35 @@ def test_mark_windowless_marks_nothing_when_the_confirming_probe_fails(tmp_path:
     reloaded = sr.read_record('unconfirmed', root=tmp_path)
     assert reloaded.status == sr.Status.RUNNING
     assert reloaded.exit_code is None
+
+
+def test_mark_windowless_leaves_a_record_rebound_to_a_live_window_after_the_pass(
+    tmp_path: Path,
+) -> None:
+    def _write_wm_record(window_id: str) -> None:
+        sr.write_record(
+            _make_record(
+                session_slug='rebound',
+                status=sr.Status.RUNNING,
+                display=sr.Display(kind='wm', wm_title='t', wm_window_id=window_id),
+            ),
+            root=tmp_path,
+        )
+
+    _write_wm_record('0x1a')
+    run = _call_indexed_wmctrl_run(
+        (0, '0x99  0 host  other\n'),
+        (0, '0x2b  0 host  resumed\n0x99  0 host  other\n'),
+        on_call={1: lambda: _write_wm_record('0x2b')},
+    )
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert marked == []
+    reloaded = sr.read_record('rebound', root=tmp_path)
+    assert reloaded.status == sr.Status.RUNNING
+    assert reloaded.display is not None
+    assert reloaded.display.wm_window_id == '0x2b'
 
 
 # ---------------------------------------------------------------------------
@@ -2789,16 +2819,6 @@ def test_main_launching_fail_soft_when_launcher_pid_not_numeric(
 # ---------------------------------------------------------------------------
 
 
-def _await_reap_report(root: Path, *, deadline_secs: float = 120.0) -> None:
-    """Poll for ``run_reap``'s report, the detached reap's completion signal."""
-    report_path = sr.reap_report_path(root)
-    deadline = time.monotonic() + deadline_secs
-    while not report_path.is_file():
-        if time.monotonic() > deadline:
-            pytest.fail(f'no reap report at {report_path} within {deadline_secs}s')
-        time.sleep(0.05)
-
-
 def test_launching_returns_while_a_reap_holds_the_lock_and_its_detached_reap_drains_after(
     tmp_path: Path,
 ) -> None:
@@ -2836,11 +2856,55 @@ def test_launching_returns_while_a_reap_holds_the_lock_and_its_detached_reap_dra
         assert sr.read_record('orphan-o', root=tmp_path).status == sr.Status.RUNNING
         assert (sr.sessions_dir(root=tmp_path) / 'old-terminal').is_dir()
 
-    _await_reap_report(tmp_path)
+    await_reap_report(tmp_path)
     orphan = sr.read_record('orphan-o', root=tmp_path)
     assert orphan.status == sr.Status.EXITED
     assert orphan.exit_code == sr.ORPHAN_EXIT_CODE
     assert not (sr.sessions_dir(root=tmp_path) / 'old-terminal').exists()
+
+
+def _pids_with_cwd_under(directory: Path) -> list[int]:
+    pids: list[int] = []
+    for proc in Path('/proc').iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            cwd = Path(os.readlink(proc / 'cwd'))
+        except OSError:
+            continue
+        if cwd == directory or directory in cwd.parents:
+            pids.append(int(proc.name))
+    return pids
+
+
+def test_launchings_detached_reap_leaves_the_callers_cwd_and_drains_its_relative_fleet_root(
+    tmp_path: Path,
+) -> None:
+    """A reap child whose cwd stayed in the caller's worktree would hold that
+    worktree in use for as long as it queued on the held lock.
+    """
+    worktree = tmp_path / 'worktree'
+    fleet = worktree / 'fleet'
+    _write_aged_exited('old-terminal', fleet)
+    env = {k: v for k, v in os.environ.items() if not k.startswith('CLAUDE_SPAWN_')}
+    env.update(_launching_env(fleet))
+    env['CLAUDE_FLEET_ROOT'] = 'fleet'
+
+    with sr.reap_lock(fleet):
+        result = subprocess.run(
+            [sys.executable, str(Path(sr.__file__).resolve()), 'launching'],
+            cwd=worktree,
+            env=env,
+            capture_output=True,
+            timeout=120,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert _pids_with_cwd_under(worktree) == []
+
+    await_reap_report(fleet)
+    assert not (sr.sessions_dir(root=fleet) / 'old-terminal').exists()
 
 
 def test_main_launching_fail_soft_when_the_detached_reap_cannot_start(
@@ -2903,10 +2967,6 @@ def test_main_reap_marks_then_deletes(
     assert not sr.record_path_for_slug('old-terminal', root=tmp_path).parent.exists()
 
 
-def _no_wmctrl(argv: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(argv, returncode=127, stdout='')
-
-
 def _write_aged_exited(slug: str, root: Path) -> None:
     sr.write_record(
         _make_record(session_slug=slug, status=sr.Status.EXITED, exit_code=0), root=root
@@ -2923,7 +2983,7 @@ def test_main_reap_drains_every_eligible_record_in_one_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
-    monkeypatch.setattr(sr, '_wmctrl_list', _no_wmctrl)
+    monkeypatch.setenv('PATH', str(tmp_path / 'no-bin'))
     aged_slugs = [f'aged-exited-{i:03d}' for i in range(150)]
     for slug in aged_slugs:
         _write_aged_exited(slug, tmp_path)
@@ -2949,8 +3009,10 @@ def test_main_reap_drains_every_eligible_record_in_one_call(
     report_path = sr.reap_report_path(tmp_path)
     assert report_path.is_file()
     report = json.loads(report_path.read_text())
-    datetime.fromisoformat(report['started_at'])
-    datetime.fromisoformat(report['finished_at'])
+    requested_at = datetime.fromisoformat(report['requested_at'])
+    started_at = datetime.fromisoformat(report['started_at'])
+    assert requested_at <= started_at <= datetime.fromisoformat(report['finished_at'])
+    assert report['remaining_record_dirs'] == 1
     phases = report['phases']
     assert [phase['name'] for phase in phases] == [
         'mark_orphaned_sessions_exited',
@@ -2972,7 +3034,7 @@ def test_main_reap_runs_later_phases_when_one_phase_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
-    monkeypatch.setattr(sr, '_wmctrl_list', _no_wmctrl)
+    monkeypatch.setenv('PATH', str(tmp_path / 'no-bin'))
 
     def _boom(*_args: object, **_kwargs: object) -> list[sr.SessionRecord]:
         raise OSError('mark phase on fire')
@@ -2990,12 +3052,50 @@ def test_main_reap_runs_later_phases_when_one_phase_raises(
     assert first_phase['count'] is None
 
 
+def _write_report_started(root: Path, started_at: datetime) -> str:
+    report = json.dumps({'started_at': started_at.isoformat()})
+    sr.reap_report_path(root).write_text(report)
+    return report
+
+
+def test_main_reap_skips_only_when_a_reap_started_after_it_was_requested(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('PATH', str(tmp_path / 'no-bin'))
+    _write_aged_exited('aged', tmp_path)
+    later = _write_report_started(tmp_path, datetime.now(UTC) + timedelta(hours=1))
+
+    assert sr.main(['reap']) == 0
+
+    assert (sr.sessions_dir(root=tmp_path) / 'aged').is_dir()
+    assert sr.reap_report_path(tmp_path).read_text() == later
+
+    _write_report_started(tmp_path, datetime.now(UTC) - timedelta(hours=1))
+
+    assert sr.main(['reap']) == 0
+
+    assert not (sr.sessions_dir(root=tmp_path) / 'aged').exists()
+
+
 def test_reap_lock_is_a_stable_sidecar_under_the_fleet_root(tmp_path: Path) -> None:
     lock_path = sr.reap_lock_path(tmp_path)
     with sr.reap_lock(tmp_path):
         assert lock_path.is_file()
         assert lock_path.parent == tmp_path
     assert lock_path.is_file()
+
+
+def test_reap_lock_excludes_another_holder_until_released(tmp_path: Path) -> None:
+    sr.reap_lock_path(tmp_path).touch()
+    fd = os.open(sr.reap_lock_path(tmp_path), os.O_RDWR)
+    try:
+        with sr.reap_lock(tmp_path), pytest.raises(BlockingIOError):
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
