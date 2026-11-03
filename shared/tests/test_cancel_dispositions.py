@@ -60,6 +60,7 @@ from shared.cancel_dispositions import (
     render_cancel_children_rules,
     render_decision_table_markdown,
     rows_to_json,
+    sibling_lookup_values,
     stamp_entry,
     with_entry,
 )
@@ -936,3 +937,20 @@ def test_an_entry_naming_a_bare_parent_id_is_an_invalid_submodel_kept_raw():
 
     assert [(w.field, w.code) for w in warnings] == [('cancel_dispositions', 'invalid_submodel')]
     assert metadata.model_dump()['cancel_dispositions'] == raw_entries
+
+
+# --- the type-strict spawned_from lookup forms (§4.3) -------------------------
+
+
+def test_a_decimal_parent_id_is_looked_up_in_both_stored_forms():
+    assert sibling_lookup_values('5869') == ('5869', 5869)
+
+
+def test_a_non_decimal_parent_id_is_looked_up_as_text_only():
+    assert sibling_lookup_values('task-x') == ('task-x',)
+
+
+def test_an_id_wider_than_a_sqlite_integer_still_yields_both_forms():
+    too_wide = str(2**63)
+
+    assert sibling_lookup_values(too_wide) == (too_wide, 2**63)
