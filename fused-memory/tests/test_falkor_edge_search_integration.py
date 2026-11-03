@@ -19,6 +19,7 @@ import math
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
+from typing import TypeVar
 
 import pytest
 import pytest_asyncio
@@ -213,6 +214,27 @@ def without_search_interface(driver: GraphDriver) -> GraphDriver:
     builtin = copy.copy(driver)
     builtin.search_interface = None
     return builtin
+
+
+Row = TypeVar('Row')
+
+
+async def hardened_and_builtin_rows(
+    seeded: SeededGraph, leg: Callable[[GraphDriver], Awaitable[list[Row]]]
+) -> tuple[list[Row], list[Row]]:
+    """*leg*'s rows through the hardened driver, then through graphiti's built-in Cypher."""
+    # Copy before spying, or the copy would carry the hardened driver's spy.
+    builtin_driver = without_search_interface(seeded.driver)
+    issued_by_builtin = spy_on_queries(builtin_driver)
+    issued_by_hardened = spy_on_queries(seeded.driver)
+
+    hardened = await leg(seeded.driver)
+    builtin = await leg(builtin_driver)
+
+    (hardened_query,) = issued_by_hardened
+    (oracle_query,) = issued_by_builtin
+    assert hardened_query.cypher != oracle_query.cypher, 'the oracle must run the built-in Cypher'
+    return hardened, builtin
 
 
 # --- BM25 leg -----------------------------------------------------------------
@@ -468,21 +490,12 @@ class TestEdgeBfsLeg:
         The MENTIONS hop and the detour through a non-Entity node are traversed, not returned.
         """
         seeded = await seed_bfs(50)
-        leg = bfs_leg(seeded.name, 1000)
-        # Copy before spying, or the copy would carry the hardened driver's spy.
-        builtin_driver = without_search_interface(seeded.driver)
-        issued_by_builtin = spy_on_queries(builtin_driver)
-        issued_by_hardened = spy_on_queries(seeded.driver)
 
-        edges = await leg(seeded.driver)
-        builtin = {edge.uuid for edge in await leg(builtin_driver)}
+        edges, builtin_edges = await hardened_and_builtin_rows(seeded, bfs_leg(seeded.name, 1000))
 
-        (hardened_query,) = issued_by_hardened
-        (oracle_query,) = issued_by_builtin
-        assert hardened_query.cypher != oracle_query.cypher, 'the oracle must run the built-in Cypher'
         rewritten = {edge.uuid for edge in edges}
         assert rewritten.isdisjoint(BFS_DETOUR_EDGES)
-        assert rewritten == builtin == bfs_expected(50)
+        assert rewritten == {edge.uuid for edge in builtin_edges} == bfs_expected(50)
         assert len(edges) == len(rewritten)
         assert returned_endpoints(edges) == seeded.seeded_endpoints(edges)
 
@@ -515,15 +528,24 @@ def node_bfs_expected(count: int) -> set[str]:
     )
 
 
-def node_bfs_leg(group_ids: list[str] | None, limit: int) -> NodeSearchLeg:
+def node_bfs_leg(
+    group_ids: list[str] | None, limit: int, search_filter: SearchFilters | None = None
+) -> NodeSearchLeg:
     return lambda driver: search_utils.node_bfs_search(
         driver,
         [f'node-{BFS_ENTITY_ORIGIN}', BFS_EPISODE_UUID],
-        SearchFilters(),
+        search_filter or SearchFilters(),
         BFS_DEPTH,
         group_ids,
         limit,
     )
+
+
+# One ring node reached only from the Entity origin, one only from the Episodic origin.
+BFS_NODE_LABEL = 'BfsLabelled'
+BFS_LABELLED_NODES = (f'node-{BFS_ENTITY_ORIGIN + 2}', f'node-{BFS_MENTIONED + 1}')
+
+SEED_LABEL_CYPHER = f'MATCH (n:Entity) WHERE n.uuid IN $uuids SET n:{BFS_NODE_LABEL}'
 
 
 @pytest_asyncio.fixture
@@ -598,24 +620,34 @@ class TestNodeBfsLeg:
         """Each reached Entity node of the origin's group once.
 
         The detour's non-Entity node is traversed, not returned.  Unscoped, only
-        ``n.group_id = origin.group_id`` excludes BFS_FOREIGN_NODE.  The detour
-        gives node-2 and node-3 a second path, which stock returns as a second row.
+        ``n.group_id = origin.group_id`` excludes BFS_FOREIGN_NODE.
         """
         seeded = await seed_node_bfs(50)
-        leg = node_bfs_leg(group_ids_of(seeded), 1000)
-        # Copy before spying, or the copy would carry the hardened driver's spy.
-        builtin_driver = without_search_interface(seeded.driver)
-        issued_by_builtin = spy_on_queries(builtin_driver)
-        issued_by_hardened = spy_on_queries(seeded.driver)
 
-        nodes = await leg(seeded.driver)
-        builtin = {node.uuid for node in await leg(builtin_driver)}
+        nodes, builtin_nodes = await hardened_and_builtin_rows(
+            seeded, node_bfs_leg(group_ids_of(seeded), 1000)
+        )
 
-        (hardened_query,) = issued_by_hardened
-        (oracle_query,) = issued_by_builtin
-        assert hardened_query.cypher != oracle_query.cypher, 'the oracle must run the built-in Cypher'
+        builtin = {node.uuid for node in builtin_nodes}
+        assert len(builtin_nodes) > len(builtin), 'stock must return some node once per path'
         rewritten = {node.uuid for node in nodes}
         assert rewritten.isdisjoint({BFS_DETOUR_NODE, BFS_FOREIGN_NODE})
         assert rewritten == builtin == node_bfs_expected(50)
         assert len(nodes) == len(rewritten)
         assert {node.group_id for node in nodes} == {seeded.name}
+
+    @pytest.mark.asyncio
+    async def test_label_filter_applies_to_nodes_reached_from_every_origin_label(
+        self, seed_node_bfs, group_ids_of: GroupIdsOf
+    ):
+        """A filter one origin-label leg skipped would let that leg's unlabelled nodes through."""
+        seeded = await seed_node_bfs(50)
+        await seeded.graph.query(SEED_LABEL_CYPHER, {'uuids': list(BFS_LABELLED_NODES)})
+        leg = node_bfs_leg(
+            group_ids_of(seeded), 1000, SearchFilters(node_labels=[BFS_NODE_LABEL])
+        )
+
+        nodes, builtin_nodes = await hardened_and_builtin_rows(seeded, leg)
+
+        rewritten = {node.uuid for node in nodes}
+        assert rewritten == {node.uuid for node in builtin_nodes} == set(BFS_LABELLED_NODES)
