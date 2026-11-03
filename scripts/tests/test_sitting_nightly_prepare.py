@@ -29,7 +29,11 @@ BANNER = "You've hit your usage limit · resets 5am (Europe/London)"
 ENV_KEYS = ('CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'SITTING_TEST_MARKER', 'SITTING_NIGHTLY_CONFINED')
 TIMEOUT_SECS = '3'
 """Outlasts the fake's interpreter start under ``-n auto`` load (0.5s did not, 2 runs in 10), far short of its sleep."""
-BUILDER_TEMP_FILE_FLAGS = ('--system-prompt-file', '--mcp-config')
+STALLED_CLI_TIMEOUT_SECS = 0.2
+"""Times out a fake that stalls before doing anything: what the parent observes does not depend on how far the child got."""
+SYSTEM_PROMPT_FILE_FLAG = '--system-prompt-file'
+MCP_CONFIG_FLAG = '--mcp-config'
+BUILDER_TEMP_FILE_FLAGS = (SYSTEM_PROMPT_FILE_FLAG, MCP_CONFIG_FLAG)
 """The argv flags whose values are the paths ``build_claude_argv`` returns as temp files."""
 
 APPLY_VERBS = (
@@ -73,12 +77,12 @@ record = {{
     'env': {{key: os.environ.get(key) for key in spec['env_keys']}},
     'env_has': {{key: key in os.environ for key in spec['env_keys']}},
 }}
-if '--system-prompt-file' in argv:
-    path = argv[argv.index('--system-prompt-file') + 1]
+if {system_prompt_file_flag!r} in argv:
+    path = argv[argv.index({system_prompt_file_flag!r}) + 1]
     record['sysprompt_path'] = path
     record['sysprompt'] = Path(path).read_text() if os.path.exists(path) else None
-if '--mcp-config' in argv:
-    path = argv[argv.index('--mcp-config') + 1]
+if {mcp_config_flag!r} in argv:
+    path = argv[argv.index({mcp_config_flag!r}) + 1]
     record['mcp_config_path'] = path
     record['mcp_config'] = json.loads(Path(path).read_text()) if os.path.exists(path) else None
 with open(spec['record'], 'a') as sink:
@@ -150,7 +154,10 @@ def _fake_claude(tmp_path: Path, *, stdout: str = OK_RESULT, stderr: str = '', e
         'root': str(tmp_path), 'batches': batches, 'recorded': list(recorded or ()),
     }))
     fake = bin_dir / 'claude'
-    fake.write_text(_FAKE_CLAUDE_SRC.format(python=sys.executable, spec=str(spec_file)))
+    fake.write_text(_FAKE_CLAUDE_SRC.format(
+        python=sys.executable, spec=str(spec_file),
+        system_prompt_file_flag=SYSTEM_PROMPT_FILE_FLAG, mcp_config_flag=MCP_CONFIG_FLAG,
+    ))
     fake.chmod(0o755)
     return FakeClaude(fake, calls_file, tmp_path)
 
@@ -275,8 +282,8 @@ def test_argv_is_exactly_the_shared_builders_with_the_defaults(tmp_path):
     for path in temp_files:
         Path(path).unlink(missing_ok=True)
     expected[0] = str(fake.bin)
-    expected[expected.index('--system-prompt-file') + 1] = call['sysprompt_path']
-    expected[expected.index('--mcp-config') + 1] = call['mcp_config_path']
+    expected[expected.index(SYSTEM_PROMPT_FILE_FLAG) + 1] = call['sysprompt_path']
+    expected[expected.index(MCP_CONFIG_FLAG) + 1] = call['mcp_config_path']
     assert call['argv'] == expected
     assert mod.DEFAULT_MODEL == 'fable', 'the task mandates the prepare-sitting mode run nightly on Fable'
     assert call['sysprompt'], 'the builder always writes a system prompt; it must not be empty'
@@ -360,7 +367,7 @@ def test_the_child_reads_no_settings_file_and_may_write_only_its_inbox(tmp_path)
     [
         ({'exit_code': 0}, {}, 'nightly_prepare: done'),
         ({'exit_code': 3, 'stderr': 'boom'}, {}, 'claude exited 3'),
-        ({'stall': 30.0}, {'timeout_secs': float(TIMEOUT_SECS)}, 'claude timed out'),
+        ({'stall': 30.0}, {'timeout_secs': STALLED_CLI_TIMEOUT_SECS}, 'claude timed out'),
     ],
     ids=['success', 'failure', 'timeout'],
 )
@@ -426,7 +433,7 @@ def test_the_mcp_servers_are_exactly_the_checkouts_escalation_and_fused_memory_b
     ambient = json.loads((REPO_ROOT / '.mcp.json').read_text())['mcpServers']
     assert call['mcp_config'] == {'mcpServers': {name: ambient[name] for name in ('escalation', 'fused-memory')}}
     argv = call['argv']
-    assert argv[argv.index('--mcp-config') + 2] == '--strict-mcp-config'
+    assert argv[argv.index(MCP_CONFIG_FLAG) + 2] == '--strict-mcp-config'
 
 
 def test_every_allowed_or_denied_mcp_tool_names_a_configured_server():
@@ -713,16 +720,16 @@ def test_the_spawn_recorder_records_every_process_and_never_raises(tmp_path, mon
     helper.write_text('#!/bin/sh\nexit 0\n')
     helper.chmod(0o755)
 
-    subprocess.run([sys.executable, '-c', 'pass', '--mcp-config'], check=True)
+    subprocess.run([sys.executable, '-c', 'pass', MCP_CONFIG_FLAG], check=True)
     subprocess.run(helper, check=True)
 
-    assert [spawn.argv for spawn in spawns] == [(sys.executable, '-c', 'pass', '--mcp-config'), (str(helper),)]
+    assert [spawn.argv for spawn in spawns] == [(sys.executable, '-c', 'pass', MCP_CONFIG_FLAG), (str(helper),)]
     assert all(spawn.temp_files() == () for spawn in spawns)
     assert all(spawn.present_once_started == frozenset() for spawn in spawns)
 
 
 # ---------------------------------------------------------------------------
-# 6.The outcome is what the inbox offered and the store holds, not the agent's say-so.
+# 6. The outcome is what the inbox offered and the store holds, not the agent's say-so.
 # ---------------------------------------------------------------------------
 
 
