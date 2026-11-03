@@ -62,7 +62,8 @@ from shared.storm_counter import StormCounter
 
 from fused_memory.memory_metadata import normalize_supersedes
 from fused_memory.middleware._folded_escalation import file_folded_escalation
-from fused_memory.models.enums import MEM0_PRIMARY, SourceStore
+from fused_memory.models.enums import MEM0_PRIMARY
+from fused_memory.models.memory import AddMemoryResponse, Mem0WriteState
 from fused_memory.server.grouped_read import (
     CONTESTED_METADATA_KEY,
     PARENT_ID_KEY,
@@ -249,12 +250,12 @@ def attach_write_durable(result: Any) -> bool:
     :func:`attach_write_landed`, plus a Mem0 leg ``MemoryService.add_memory``
     deferred for server-side retry: the queued intent already carries the
     triage-stamped parent link, so the retry creates exactly the child the ack
-    names.
+    names. A real response is read through ``AddMemoryResponse.mem0_write_state``;
+    anything else keeps :func:`attach_write_landed`'s lenient reading.
     """
-    pending = getattr(result, 'stores_pending_retry', None)
-    return attach_write_landed(result) or (
-        isinstance(pending, list | tuple) and SourceStore.mem0 in pending
-    )
+    if isinstance(result, AddMemoryResponse):
+        return result.mem0_write_state is not Mem0WriteState.NOT_LANDED
+    return attach_write_landed(result)
 
 
 # --- config defaults --------------------------------------------------------
