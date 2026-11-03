@@ -19,10 +19,12 @@ WHY SIGNAL IS VALID UNDER XDIST. A Python signal handler only ever runs on the
 MAIN thread. pytest-xdist 3.6.0 (changelog #1027) starts its workers with
 execnet's ``main_thread_only`` execmodel
 (``xdist/workermanage.py::NodeManager``), so tests run on each worker's main
-thread and SIGALRM reaches them. The member floors do NOT guarantee that: they
-read ``pytest-xdist>=3.5.0``, and orchestrator's ``>=3.0``. What guarantees it
-is the single workspace ``uv.lock`` pin, at 3.8.0 when this was written. A
-resolve below 3.6.0 would put tests back on a non-main thread, and
+thread and SIGALRM reaches them. The member floors guarantee that: every
+workspace member's pytest-xdist declaration reads ``>=3.6.0`` (esc-5470-3,
+ruled 2026-10-07; task 6477), which
+``test_every_pytest_xdist_floor_admits_only_main_thread_workers`` enforces, and
+the single workspace ``uv.lock`` pin (3.8.0 when this was written) sits above
+it. A resolve below 3.6.0 would put tests back on a non-main thread, and
 ``test_runs_on_main_thread`` in the probe below is what turns that red.
 
 THE MEASUREMENT (task 5470; pytest 9.0.3, pytest-xdist 3.8.0, execnet 2.1.2,
@@ -108,9 +110,10 @@ THE DECISION:
     governs the worker deaths that remain (segfault, OOM, ``os._exit`` in code
     under test). ``test_xdist_worker_restart_policy.py`` records why, and pins
     it.
-  * The pytest-xdist floors stay as they are. Raising them to ``>=3.6.0`` is
-    esc-5470-3, which awaits a ruling; until then the ``uv.lock`` pin and the
-    probe's main-thread assertions guard the premise above.
+  * Every pytest-xdist floor is ``>=3.6.0``, by esc-5470-3's ruling (task
+    6477). Three things guard the premise above: the floor test
+    (``tests/scripts/test_timeout_method_policy.py::test_every_pytest_xdist_floor_admits_only_main_thread_workers``),
+    the ``uv.lock`` pin, and the probe's main-thread assertions.
 
 Citations are by ``path::symbol``, never file:line, which is the house style
 ``test_line_pin_policy.py`` enforces in this directory.
