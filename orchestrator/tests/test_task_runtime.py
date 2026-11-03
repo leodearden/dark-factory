@@ -354,6 +354,20 @@ class TestReadFailureMarked:
         assert entry.loops == 0
         assert entry.error is None
 
+    def test_corrupted_iteration_log_line_marks_error_not_undercount(self, git_repo: Path):
+        git_ops = GitOps(GitConfig(), git_repo)
+        worktree_base = git_ops.worktree_base
+        _make_task_artifacts(worktree_base, '52', '52')
+        (TaskArtifacts.task_root_for(worktree_base, '52') / 'iterations.jsonl').write_text(
+            '{"n": 1}\nnot json\n{"n": 2}\n',
+        )
+
+        [entry] = build_task_runtime_snapshot(git_ops=git_ops)
+
+        assert entry.error and 'iterations.jsonl' in entry.error
+        assert (entry.loops, entry.attempts, entry.phase, entry.started) == (None, None, None, None)
+        assert entry.has_worktree is True
+
 
 # ---------------------------------------------------------------------------
 # `started` fallback: metadata.json created_at wins when present; an
