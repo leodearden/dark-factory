@@ -702,8 +702,22 @@ def test_no_store_is_written_and_only_the_fake_is_spawned(tmp_path, monkeypatch)
     assert [spawn.argv[0] for spawn in spawns] == [str(fake.bin)]
 
 
+def test_the_spawn_recorder_records_every_process_and_never_raises(tmp_path, monkeypatch):
+    spawns = _record_spawns(monkeypatch)
+    helper = tmp_path / 'helper'
+    helper.write_text('#!/bin/sh\nexit 0\n')
+    helper.chmod(0o755)
+
+    subprocess.run([sys.executable, '-c', 'pass', '--mcp-config'], check=True)
+    subprocess.run(helper, check=True)
+
+    assert [spawn.argv for spawn in spawns] == [(sys.executable, '-c', 'pass', '--mcp-config'), (str(helper),)]
+    assert all(spawn.temp_files() == () for spawn in spawns)
+    assert all(spawn.present_once_started == frozenset() for spawn in spawns)
+
+
 # ---------------------------------------------------------------------------
-# 6. The outcome is what the inbox offered and the store holds, not the agent's say-so.
+# 6.The outcome is what the inbox offered and the store holds, not the agent's say-so.
 # ---------------------------------------------------------------------------
 
 
