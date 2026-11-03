@@ -19,6 +19,7 @@ from fused_memory.middleware.task_text_write_guard import (
     check_text_base,
     plan_text_write,
     text_fp_of,
+    verify_text_write,
 )
 
 EMPTY_TEXT_FP = task_text_fingerprint(None, None)
@@ -182,3 +183,96 @@ class TestCheckTextBase:
         for rejection in rejections:
             assert rejection is not None
             assert write_failure_reason(rejection.to_error_dict()) is not None
+
+
+OLD_PARAGRAPH = 'Evidence relay: gates 3658/3659/3660 still pending.'
+NEW_PARAGRAPH = 'Evidence relay: gates 3658/3659/4856 still pending.'
+
+
+def _verify(after: object, **kwargs):
+    return verify_text_write(after, plan_text_write(_forwarded_kwargs(**kwargs)))
+
+
+class TestVerifyTextWrite:
+    def test_a_write_touching_no_text_is_not_verified(self):
+        assert _verify({'details': OLD_PARAGRAPH}, metadata='{"a": 1}') is None
+
+    def test_a_landed_replace_is_confirmed(self):
+        verification = _verify({'details': NEW_PARAGRAPH}, details=NEW_PARAGRAPH)
+
+        assert verification is not None
+        assert verification.confirmed is True
+        assert verification.unconfirmed_fields == ()
+
+    def test_a_landed_append_is_confirmed(self):
+        verification = _verify(
+            {'details': OLD_PARAGRAPH + '\n\n' + NEW_PARAGRAPH},
+            details=NEW_PARAGRAPH,
+            append=True,
+        )
+
+        assert verification is not None
+        assert verification.confirmed is True
+
+    def test_the_old_paragraph_still_stored_is_unconfirmed(self):
+        verification = _verify({'details': OLD_PARAGRAPH}, details=NEW_PARAGRAPH)
+
+        assert verification is not None
+        assert verification.confirmed is False
+        assert verification.unconfirmed_fields == ('details',)
+
+    def test_a_missing_or_none_field_is_unconfirmed(self):
+        for after in ({'id': '3708'}, {'details': None}):
+            verification = _verify(after, details=NEW_PARAGRAPH)
+
+            assert verification is not None
+            assert verification.confirmed is False
+
+    def test_line_ending_and_trailing_whitespace_differences_still_confirm(self):
+        verification = _verify(
+            {'details': 'First line.\nSecond line.'},
+            details='First line.\r\nSecond line.  \n',
+        )
+
+        assert verification is not None
+        assert verification.confirmed is True
+
+    def test_a_prompt_write_is_checked_against_details(self):
+        verification = _verify({'details': NEW_PARAGRAPH}, prompt=NEW_PARAGRAPH)
+
+        assert verification is not None
+        assert verification.confirmed is True
+
+    def test_only_the_field_that_did_not_land_is_flagged(self):
+        verification = _verify(
+            {'description': 'New summary.', 'details': OLD_PARAGRAPH},
+            description='New summary.',
+            details=NEW_PARAGRAPH,
+        )
+
+        assert verification is not None
+        assert verification.confirmed is False
+        assert verification.unconfirmed_fields == ('details',)
+
+    def test_a_non_mapping_after_is_unconfirmed(self):
+        verification = _verify(None, details=NEW_PARAGRAPH)
+
+        assert verification is not None
+        assert verification.confirmed is False
+
+    def test_result_keys(self):
+        verification = _verify(
+            {'description': 'New summary.', 'details': OLD_PARAGRAPH},
+            description='New summary.',
+            details=NEW_PARAGRAPH,
+            append=True,
+        )
+
+        assert verification is not None
+        assert verification.to_result_keys() == {
+            'text_verified': False,
+            'text_verification': {
+                'description': {'confirmed': True, 'appended': False},
+                'details': {'confirmed': False, 'appended': True},
+            },
+        }
