@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter, deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -406,14 +406,14 @@ def _child_order(child: ChildKey) -> tuple[bool, int, str]:
     return False, child, ''
 
 
-def _reaches(start: int, goal: int, depends_on: Mapping[int, Sequence[int]]) -> bool:
+def _reaches(start: int, goal: int, edges: Callable[[int], Sequence[int]]) -> bool:
     frontier = deque([start])
     seen = {start}
     while frontier:
         task = frontier.popleft()
         if task == goal:
             return True
-        unseen = [dep for dep in depends_on.get(task, ()) if dep not in seen]
+        unseen = [dep for dep in edges(task) if dep not in seen]
         seen.update(unseen)
         frontier.extend(unseen)
     return False
@@ -429,16 +429,42 @@ def _check_target(
         raise CancelChildrenInvalid(CancelChildrenInvalidReason.TARGET_CANCELLED, field, target)
 
 
+def _cancelled_by(
+    children: Mapping[ChildKey, ChildDispositionVariant], parent_id: int
+) -> frozenset[int]:
+    cancelled_children = (
+        child
+        for child, disposition in children.items()
+        if isinstance(child, int) and disposition.action in CHILD_CANCELLING_ACTIONS
+    )
+    return frozenset({parent_id, *cancelled_children})
+
+
+def _post_cancel_edges(
+    children: Mapping[ChildKey, ChildDispositionVariant],
+    depends_on: Mapping[int, Sequence[int]],
+    parent_id: int,
+) -> Callable[[int], Sequence[int]]:
+    overrides: dict[int, Sequence[int]] = {
+        task: () for task in _cancelled_by(children, parent_id)
+    }
+    for child, disposition in children.items():
+        if isinstance(child, int) and isinstance(disposition, RepointDisposition):
+            kept = tuple(dep for dep in depends_on.get(child, ()) if dep != parent_id)
+            overrides[child] = kept + disposition.onto
+    return lambda task: overrides.get(task, depends_on.get(task, ()))
+
+
 def _closes_cycle(
     child: ChildKey,
     disposition: ChildDispositionVariant,
     target: int,
-    depends_on: Mapping[int, Sequence[int]],
+    edges: Callable[[int], Sequence[int]],
 ) -> bool:
     return (
         isinstance(child, int)
         and isinstance(disposition, RepointDisposition)
-        and _reaches(target, child, depends_on)
+        and _reaches(target, child, edges)
     )
 
 
@@ -446,12 +472,12 @@ def _check_child(
     child: ChildKey,
     disposition: ChildDispositionVariant,
     target_status: Mapping[int, TaskStatus | None],
-    depends_on: Mapping[int, Sequence[int]],
+    edges: Callable[[int], Sequence[int]],
 ) -> None:
     for field, target in _targets(disposition):
         child_field = _child_field(_key_text(child), field)
         _check_target(child_field, target, target_status)
-        if _closes_cycle(child, disposition, target, depends_on):
+        if _closes_cycle(child, disposition, target, edges):
             raise CancelChildrenInvalid(
                 CancelChildrenInvalidReason.REPOINT_CYCLE, child_field, target
             )
@@ -461,17 +487,21 @@ def check_targets(
     children: Mapping[ChildKey, ChildDispositionVariant],
     superseded_by: Sequence[int],
     *,
+    parent_id: int,
     target_status: Mapping[int, TaskStatus | None],
     depends_on: Mapping[int, Sequence[int]],
 ) -> None:
-    """Refuse a target that is missing, cancelled, or would close a local dependency cycle.
+    """Refuse a target that is missing, cancelled, or would close a dependency cycle in the
+    graph this cancel leaves behind.
 
     target_status maps each named target to its status, None when no such task exists;
-    depends_on is the project's task -> dependency-ids map. Local children are checked in
-    ascending id order, then external ones by key, then superseded_by.
+    depends_on is the pre-cancel task -> dependency-ids map, and the post-cancel overlay is
+    derived from children and parent_id. Local children are checked in ascending id order,
+    then external ones by key, then superseded_by.
     """
+    edges = _post_cancel_edges(children, depends_on, parent_id)
     for child in sorted(children, key=_child_order):
-        _check_child(child, children[child], target_status, depends_on)
+        _check_child(child, children[child], target_status, edges)
     for target in superseded_by:
         _check_target('superseded_by', target, target_status)
 
