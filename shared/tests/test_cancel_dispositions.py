@@ -16,14 +16,19 @@ from shared.cancel_dispositions import (
     CALLER_ACTIONS,
     CHILD_CANCELLING_ACTIONS,
     ENTRY_ONLY_ACTIONS,
+    MISSING_FILES_CAP,
+    PAYLOAD_ID_CAP,
     CancelAction,
     CancelChildrenInvalid,
     CancelChildrenInvalidReason,
     CancelChildrenRefusalCode,
+    CancelChildrenView,
     CancelDispositionEntry,
     ChildDisposition,
     ChildDispositionVariant,
     ChildKey,
+    ChildRelation,
+    ChildRow,
     CoCancelledEntry,
     DispositionSource,
     ExternalChild,
@@ -36,6 +41,7 @@ from shared.cancel_dispositions import (
     MootEntry,
     RepointDisposition,
     RepointEntry,
+    capped,
     check_targets,
     children_to_json,
     co_cancelled_entry,
@@ -45,6 +51,7 @@ from shared.cancel_dispositions import (
     parse_entries,
     parse_superseded_by,
     qualified_task_ref,
+    rows_to_json,
     stamp_entry,
     with_entry,
 )
@@ -643,3 +650,143 @@ def test_parse_entries_reports_a_malformed_slice(raw, named):
 
     assert isinstance(parsed, InvalidEntries)
     assert named in parsed.detail
+
+
+# --- the read view (§4.3) and the payload cap (§4.4) --------------------------
+
+
+def _row(**overrides: object) -> ChildRow:
+    fields: dict[str, object] = {
+        'id': 6905,
+        'project_id': PROJECT,
+        'title': 'repoint me',
+        'status': TaskStatus.PENDING,
+        'relation': ChildRelation.DEPENDENT,
+        'declared_files_total': 3,
+        'declared_files_missing_from_main': ('a.py',),
+        'declared_files_missing_from_main_total': 2,
+        'depends_on_superseder': False,
+        'named_superseder': False,
+        'has_live_children': False,
+        'escalation_id': 'esc-6905-1',
+        'existing_disposition': stamp_entry(
+            RepointDisposition(onto=(SUPERSEDER,)), parent=P, **_STAMP
+        ),
+        **overrides,
+    }
+    return ChildRow.model_validate(fields)
+
+
+def test_a_row_carrying_every_documented_fact_validates_and_is_frozen():
+    row = _row()
+
+    assert (row.status, row.relation) == (TaskStatus.PENDING, ChildRelation.DEPENDENT)
+    assert isinstance(row.existing_disposition, RepointEntry)
+    with pytest.raises(ValidationError):
+        row.title = 'changed'  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    'overrides',
+    [
+        pytest.param(
+            {
+                'declared_files_total': 30,
+                'declared_files_missing_from_main': tuple(f'f{n}.py' for n in range(21)),
+                'declared_files_missing_from_main_total': 21,
+            },
+            id='more-missing-files-than-the-cap',
+        ),
+        pytest.param(
+            {
+                'declared_files_missing_from_main': ('a.py', 'b.py'),
+                'declared_files_missing_from_main_total': 1,
+            },
+            id='missing-total-below-the-listed-count',
+        ),
+        pytest.param(
+            {'declared_files_total': 1, 'declared_files_missing_from_main_total': 2},
+            id='missing-total-above-the-declared-total',
+        ),
+        pytest.param({'relation': 'sibling'}, id='unknown-relation'),
+    ],
+)
+def test_a_row_with_inconsistent_facts_is_rejected(overrides):
+    with pytest.raises(ValidationError):
+        _row(**overrides)
+
+
+def test_the_missing_files_cap_is_twenty():
+    assert MISSING_FILES_CAP == 20
+    files = tuple(f'f{n}.py' for n in range(MISSING_FILES_CAP))
+
+    row = _row(
+        declared_files_total=40,
+        declared_files_missing_from_main=files,
+        declared_files_missing_from_main_total=35,
+    )
+
+    assert row.declared_files_missing_from_main == files
+
+
+def test_a_row_key_is_the_children_map_key():
+    local = _row()
+    external = _row(id=44, project_id='reify', relation=ChildRelation.EXTERNAL_DEPENDENT)
+
+    assert (local.key, external.key) == ('6905', 'reify:44')
+
+
+def test_rows_round_trip_through_their_json_form():
+    row = _row()
+
+    wire = rows_to_json([row])
+
+    assert json.loads(json.dumps(wire)) == wire
+    assert ChildRow.model_validate(wire[0]) == row
+
+
+def _view(**overrides: object) -> CancelChildrenView:
+    fields: dict[str, object] = {
+        'task_id': PARENT,
+        'project_id': PROJECT,
+        'status': TaskStatus.PENDING,
+        'children': (_row(), _row(id=44, project_id='reify', relation='external_dependent')),
+        'superseded_by': (SUPERSEDER,),
+        'external_dependents_checked': True,
+        'enforce': False,
+        **overrides,
+    }
+    return CancelChildrenView.model_validate(fields)
+
+
+def test_a_view_carries_the_parent_its_rows_and_both_flags():
+    view = _view()
+
+    assert [row.key for row in view.children] == ['6905', 'reify:44']
+    assert (view.external_dependents_checked, view.enforce) == (True, False)
+
+
+@pytest.mark.parametrize('flag', ['external_dependents_checked', 'enforce'])
+def test_a_view_has_no_default_for_either_flag(flag):
+    fields = _view().model_dump()
+    del fields[flag]
+
+    with pytest.raises(ValidationError):
+        CancelChildrenView.model_validate(fields)
+
+
+def test_a_view_listing_one_child_twice_is_rejected():
+    with pytest.raises(ValidationError):
+        _view(children=(_row(), _row(title='again')))
+
+
+def test_capped_lists_at_most_the_payload_cap_and_the_total():
+    assert PAYLOAD_ID_CAP == 50
+    assert capped('undispositioned', list(range(75))) == {
+        'undispositioned': list(range(50)),
+        'undispositioned_total': 75,
+    }
+
+
+def test_capped_returns_a_short_list_whole():
+    assert capped('unknown', [3, 1]) == {'unknown': [3, 1], 'unknown_total': 2}
