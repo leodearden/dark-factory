@@ -2113,6 +2113,10 @@ def test_sigkill_mid_sweep_leaves_the_lease_behind_by_design(tmp_path):
     bin_dir, state_path = _make_fake_systemctl(
         tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
     )
+    # Ten times _sweep_in_background's lease poll, so a snapshot taken on the
+    # lease's first appearance always lands on the acquisition write.
+    acquire_to_advance_latency_secs = 0.5
+    _install_spawn_latency(bin_dir, acquire_to_advance_latency_secs)
     _write_heartbeat(fleet_dir, UNIT_R, merge_idle=False, ts_epoch=time.time())
 
     with _sweep_in_background(
@@ -2127,7 +2131,12 @@ def test_sigkill_mid_sweep_leaves_the_lease_behind_by_design(tmp_path):
             "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
         },
     ) as (proc, pgid):
-        held = json.loads(lease_path.read_text())
+        held = lease_path.read_bytes()
+        assert json.loads(held)["current_unit"] == UNIT_R, (
+            f"the snapshot must be the lease the sweep holds while parked on "
+            f"{UNIT_R}; a snapshot of an earlier write is a moving target the "
+            f"sweep may still overwrite before the kill. held={held!r}"
+        )
         os.killpg(pgid, signal.SIGKILL)
         proc.communicate(timeout=30)
         assert wait_pid_gone(proc.pid), "the SIGKILLed sweep must actually be gone"
@@ -2138,7 +2147,7 @@ def test_sigkill_mid_sweep_leaves_the_lease_behind_by_design(tmp_path):
         "deleting leases, and the reader-side max-age bound is being asked to "
         "cover a case it was never given"
     )
-    assert json.loads(lease_path.read_text()) == held, (
+    assert lease_path.read_bytes() == held, (
         "the stranded lease must be byte-equal to what the sweep held"
     )
 
