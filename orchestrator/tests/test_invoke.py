@@ -17,10 +17,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import make_gate_yielding as _make_gate_yielding  # centralized (task 1458)
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
-from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult, parse_claude_cli_output
+from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
 from shared.invocation_outcome import CapHit
 from shared.process_cost import ProcessCostBasis
 from shared.testing_fake_claude import install_fake_claude_cli
+from shared.testing_resume_rejection import measured_resume_rejection
 from shared.testing_stdin import STDIN_STARVATION_STUB, make_starving_exec
 from shared.usage_gate import AccountLease, InvokeSlot
 
@@ -259,9 +260,7 @@ class TestCapHitResume:
         ])
 
         capped_result = _make_result(success=False, session_id='sess-abc')
-        failed_resume = parse_claude_cli_output(
-            stdout='', stderr='No conversation found with session ID: sess-abc', returncode=1,
-        )
+        failed_resume = measured_resume_rejection('sess-abc')
         ok_result = _make_result(success=True, cost_usd=0.5)
         ok_result.duration_ms = 6000
         ok_result.turns = 2

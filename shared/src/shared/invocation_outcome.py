@@ -457,7 +457,8 @@ CLI_INPUT_REQUIRED_MARKERS = [
 # `No conversation found with session ID: <uuid>` on stderr and exits 1.
 # classify scans `combined = f'{stderr}\n{output}'`, so stderr is seen.
 # Re-measured on CLI 2.1.314 on 2026-10-31: identical text, stderr, exit 1,
-# empty stdout (shared/tests/_measured_cli_results.py).
+# empty stdout
+# (shared/src/shared/testing_resume_rejection.py::measured_resume_rejection).
 #
 # Defined ABOVE NON_CAP_CLI_ERROR_MARKERS because it is spliced into it.
 RESUME_REJECTED_MARKERS = [

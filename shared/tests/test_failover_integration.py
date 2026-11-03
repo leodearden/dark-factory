@@ -16,7 +16,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _measured_cli_results import measured_resume_rejection
 
 from shared.cli_invoke import (
     CAP_HIT_RESUME_PROMPT,
@@ -27,6 +26,7 @@ from shared.cli_invoke import (
 from shared.config_dir import TaskConfigDir
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.cost_store import CostStore
+from shared.testing_resume_rejection import measured_resume_rejection
 from shared.usage_gate import (
     SessionBudgetExhausted,
     UsageGate,

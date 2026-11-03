@@ -12,11 +12,11 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _measured_cli_results import measured_resume_rejection
 
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 from shared.cli_invoke import AgentResult, invoke_with_cap_retry, is_resume_rejected
 from shared.testing import make_gate_mock
+from shared.testing_resume_rejection import measured_resume_rejection
 
 
 def _rejection(**changes: object):
@@ -120,6 +120,20 @@ class TestAResumedRunThatDidWorkIsReturned:
         assert got.resume_fallback_session_ids == ()
         assert got.session_id == ARMED
         assert 'retrying fresh' not in caplog.text
+
+    async def test_the_returned_run_s_spend_is_recorded(self):
+        did_work = _resumed_non_success(
+            subtype='success', stop_reason='end_turn', ended_awaiting_background=True,
+            turns=40, cost_usd=2.195,
+        )
+        cost_store = MagicMock()
+        cost_store.save_invocation = AsyncMock()
+
+        got, _ = await _drive([did_work], resume_session_id=ARMED, cost_store=cost_store)
+
+        assert got.resume_fallbacks == 0
+        cost_store.save_invocation.assert_awaited_once()
+        assert cost_store.save_invocation.await_args.kwargs['cost_usd'] == 2.195
 
     async def test_an_unproven_pre_turn_failure_is_returned_unretried(self, caplog):
         unproven = _resumed_non_success(

@@ -19,7 +19,6 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _measured_cli_results import measured_resume_rejection
 
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 from shared.cli_invoke import (
@@ -50,6 +49,7 @@ from shared.cli_invoke import (
 from shared.cost_store import CapReason
 from shared.invocation_outcome import classify_invocation
 from shared.testing import make_gate_mock
+from shared.testing_resume_rejection import measured_resume_rejection
 from shared.testing_stdin import (
     STDIN_DIGEST_STUB,
     STDIN_STARVATION_STUB,

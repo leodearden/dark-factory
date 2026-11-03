@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import make_gate_yielding
-from shared.cli_invoke import parse_claude_cli_output
+from shared.testing_resume_rejection import measured_resume_rejection
 from test_invoke import _make_slot
 from test_session_resume_integration_gate import (
     _config,
@@ -32,17 +32,6 @@ from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 SID = '4aed993b-20c0-4b91-a8dd-60180e7db2e0'
 STEP_IDS = ['step-1', 'step-2']
-
-
-def measured_resume_rejection(session_id: str) -> AgentResult:
-    """The CLI's measured rejection of an unresolvable ``--resume``, as production parses it.
-
-    Measured on CLI 2.1.314 (2026-10-31): rc=1, empty stdout, this text on
-    stderr. The shared-tree copy is shared/tests/_measured_cli_results.py.
-    """
-    return parse_claude_cli_output(
-        stdout='', stderr=f'No conversation found with session ID: {session_id}', returncode=1,
-    )
 
 
 def _downgraded_end_turn() -> AgentResult:

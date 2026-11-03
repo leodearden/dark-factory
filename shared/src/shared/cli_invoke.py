@@ -1767,11 +1767,12 @@ def is_resume_rejected(result: AgentResult) -> bool:
     """Return True when the CLI rejected an armed ``--resume`` before any model turn.
 
     The signature is the CLI's own "no conversation found" statement on
-    stderr (``RESUME_REJECTED_MARKERS``; the measured payload lives in
-    ``shared/tests/_measured_cli_results.py``) on a run that was not a success,
-    did not time out, and took no turn and billed nothing.  Any evidence of
-    work vetoes the marker: this gates discarding the session, so on
-    contradictory evidence it declines, as ``is_cli_invocation_rejected`` does.
+    stderr (``RESUME_REJECTED_MARKERS``; the measured payload is
+    ``shared/src/shared/testing_resume_rejection.py::measured_resume_rejection``)
+    on a run that was not a success, did not time out, and took no turn and
+    billed nothing.  Any evidence of work vetoes the marker: this gates
+    discarding the session, so on contradictory evidence it declines, as
+    ``is_cli_invocation_rejected`` does.
     ``transcript_turns`` is deliberately not consulted: on a resume it counts
     the PRIOR turns of the transcript being resumed, not this process's work.
     """

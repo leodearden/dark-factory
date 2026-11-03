@@ -17,12 +17,12 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _measured_cli_results import measured_resume_rejection
 
 from shared.cli_invoke import AgentResult, invoke_claude_agent, invoke_with_cap_retry
 from shared.process_cost import ProcessCostBasis
 from shared.testing import make_gate_mock
 from shared.testing_fake_claude import FakeClaudeCli, install_fake_claude_cli
+from shared.testing_resume_rejection import measured_resume_rejection
 
 _SESSIONS = json.loads(
     (Path(__file__).parent / 'fixtures' / 'cumulative_cost' / 'sessions.json').read_text()

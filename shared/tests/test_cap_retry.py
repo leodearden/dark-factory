@@ -17,7 +17,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 
 import pytest
-from _measured_cli_results import measured_resume_rejection
 from _usage_gate_test_helpers import make_gate as _shared_make_gate
 from _usage_gate_test_helpers import scripted_invoke
 
@@ -43,6 +42,7 @@ from shared.invocation_outcome import (
     ZeroOutputWedge,
 )
 from shared.testing import make_gate_mock
+from shared.testing_resume_rejection import measured_resume_rejection
 from shared.usage_gate import (
     AccountLease,
     AccountPhase,

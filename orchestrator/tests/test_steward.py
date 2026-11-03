@@ -16,9 +16,11 @@ from escalation import archive
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.cli_invoke import AllAccountsCappedException
+from shared.testing_resume_rejection import measured_resume_rejection
 from shared.usage_gate import AccountLease, InvokeSlot
 
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.event_store import EventType
 from orchestrator.steward import (
     StewardMetrics,
     TaskSteward,
@@ -41,7 +43,6 @@ def _sole_invocation_end_data(emit_mock) -> dict:
     no longer holds. Filter to the ``invocation_end`` call (asserting it fired
     exactly once) rather than relaxing to the last-call heuristic.
     """
-    from orchestrator.event_store import EventType
     calls = [
         c for c in emit_mock.call_args_list
         if c.args and c.args[0] == EventType.invocation_end
@@ -646,7 +647,6 @@ class TestStewardResumeRejectionOnly:
 
     @staticmethod
     def _resume_failed_emits(steward) -> list:
-        from orchestrator.event_store import EventType
         return [
             c.kwargs for c in steward.event_store.emit.call_args_list
             if c.args and c.args[0] is EventType.session_resume_failed
@@ -697,11 +697,12 @@ class TestStewardResumeRejectionOnly:
         mock_invoke.assert_awaited_once()
         assert result is budget_kill
         assert result.cost_usd == 4.96
+        assert steward._session_id == 'sess-old'
+        assert self._resume_failed_emits(steward) == []
 
     async def test_a_proven_rejection_is_reported_and_replaces_the_session(
         self, steward, worktree, mock_briefing, caplog,
     ):
-        from test_resumed_run_not_discarded import measured_resume_rejection
         steward._session_id = 'sess-old'
         mock_briefing.build_steward_initial_prompt.return_value = 'REBUILT-INITIAL'
         caplog.set_level(logging.WARNING, logger='orchestrator.steward')
@@ -729,7 +730,6 @@ class TestStewardResumeRejectionOnly:
         assert result.session_id == 'sess-fresh'
 
     async def test_a_loop_rearmed_rejection_is_not_reported(self, steward, worktree, mock_briefing):
-        from test_resumed_run_not_discarded import measured_resume_rejection
         steward._session_id = None
         mock_briefing.build_steward_initial_prompt.return_value = 'REBUILT-INITIAL'
 

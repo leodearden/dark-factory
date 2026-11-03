@@ -20,7 +20,6 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
-from _measured_cli_results import measured_resume_rejection
 
 from shared.cli_invoke import (
     CAP_HIT_RESUME_PROMPT,
@@ -30,6 +29,7 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import TaskConfigDir
 from shared.testing import make_gate_mock
+from shared.testing_resume_rejection import measured_resume_rejection
 
 _INVOKE_PATCH = 'shared.cli_invoke.invoke_claude_agent'
 _SLEEP_PATCH = 'shared.cli_invoke.asyncio.sleep'
