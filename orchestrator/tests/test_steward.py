@@ -680,7 +680,7 @@ class TestStewardResumeRejectionOnly:
         result, mock_invoke = await self._invoke(steward, worktree, [downgraded])
 
         mock_invoke.assert_awaited_once()
-        assert mock_invoke.await_args.kwargs['resume_session_id'] == 'sess-old'
+        assert mock_invoke.await_args_list[0].kwargs['resume_session_id'] == 'sess-old'
         assert result is downgraded
         assert steward._session_id == 'sess-old'
         assert self._resume_failed_emits(steward) == []

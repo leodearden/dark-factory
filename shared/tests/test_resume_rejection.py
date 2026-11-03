@@ -91,7 +91,7 @@ def _resumed_non_success(session_id: str = ARMED, **fields: Any) -> AgentResult:
     return AgentResult(success=False, output='', session_id=session_id, **fields)
 
 
-async def _drive(side_effect: list, *, detect_cap_hit: MagicMock | None = None, **kwargs: object):
+async def _drive(side_effect: list, *, detect_cap_hit: MagicMock | None = None, **kwargs: Any):
     gate = make_gate_mock(
         account_count=2,
         before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b', 'tok-a']),
@@ -114,7 +114,7 @@ class TestAResumedRunThatDidWorkIsReturned:
         got, mock_invoke = await _drive([did_work], resume_session_id=ARMED)
 
         mock_invoke.assert_awaited_once()
-        assert mock_invoke.await_args.kwargs['resume_session_id'] == ARMED
+        assert mock_invoke.await_args_list[0].kwargs['resume_session_id'] == ARMED
         assert got is did_work
         assert got.resume_fallbacks == 0
         assert got.resume_fallback_session_ids == ()

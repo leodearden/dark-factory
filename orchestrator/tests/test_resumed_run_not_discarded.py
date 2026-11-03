@@ -53,7 +53,9 @@ def _downgraded_end_turn() -> AgentResult:
     )
 
 
-async def _resumed_workflow(tmp_path: Path) -> tuple[TaskWorkflow, _RecordingSink]:
+async def _resumed_workflow(
+    tmp_path: Path,
+) -> tuple[TaskWorkflow, _RecordingSink, _RecordingEventStore]:
     repo = tmp_path / 'repo'
     repo.mkdir()
     await _init_resume_repo(repo)
@@ -70,7 +72,8 @@ async def _resumed_workflow(tmp_path: Path) -> tuple[TaskWorkflow, _RecordingSin
     assert workflow._config_dir is not None and workflow.artifacts is not None
     _seed_live_transcript(workflow._config_dir.path, SID)
     workflow.worktree = cwd
-    workflow.event_store = _RecordingEventStore()
+    store = _RecordingEventStore()
+    workflow.event_store = store  # type: ignore[assignment]
     workflow.usage_gate = make_gate_yielding([_make_slot(cap_hit=False), _make_slot(cap_hit=False)])
     workflow.artifacts.write_plan({
         'prerequisites': [],
@@ -81,7 +84,7 @@ async def _resumed_workflow(tmp_path: Path) -> tuple[TaskWorkflow, _RecordingSin
     workflow._get_head_commit = AsyncMock(return_value='abc123')  # type: ignore[method-assign]
     workflow._reconcile_done_step_commits = AsyncMock()  # type: ignore[method-assign]
     workflow._iteration_commit_provenance = AsyncMock(return_value={})  # type: ignore[method-assign]
-    return workflow, sink
+    return workflow, sink, store
 
 
 def _completing_invoke_agent(workflow: TaskWorkflow, first: AgentResult) -> AsyncMock:
@@ -112,18 +115,18 @@ async def _run(workflow: TaskWorkflow, invoke_agent: AsyncMock) -> WorkflowOutco
 @pytest.mark.usefixtures('code_default_config')
 @pytest.mark.asyncio
 async def test_a_downgraded_resumed_run_that_completed_the_plan_is_kept(tmp_path: Path):
-    workflow, sink = await _resumed_workflow(tmp_path)
+    workflow, sink, store = await _resumed_workflow(tmp_path)
     invoke_agent = _completing_invoke_agent(workflow, _downgraded_end_turn())
 
     outcome = await _run(workflow, invoke_agent)
 
     invoke_agent.assert_awaited_once()
-    assert invoke_agent.await_args.kwargs['resume_session_id'] == SID
+    assert invoke_agent.await_args_list[0].kwargs['resume_session_id'] == SID
     assert outcome == WorkflowOutcome.DONE
     assert workflow.artifacts is not None
     entries, _ = workflow.artifacts.read_iteration_log()
     assert sorted(entries[-1]['steps_completed']) == STEP_IDS
-    assert workflow.event_store.of_type(EventType.session_resume_failed) == []
+    assert store.of_type(EventType.session_resume_failed) == []
     assert sink.failures == []
     assert sink.successes == 1
 
@@ -131,7 +134,7 @@ async def test_a_downgraded_resumed_run_that_completed_the_plan_is_kept(tmp_path
 @pytest.mark.usefixtures('code_default_config')
 @pytest.mark.asyncio
 async def test_a_rejected_resume_is_retried_fresh_and_reported(tmp_path: Path):
-    workflow, sink = await _resumed_workflow(tmp_path)
+    workflow, sink, store = await _resumed_workflow(tmp_path)
     invoke_agent = _completing_invoke_agent(workflow, measured_resume_rejection(SID))
 
     outcome = await _run(workflow, invoke_agent)
@@ -140,7 +143,7 @@ async def test_a_rejected_resume_is_retried_fresh_and_reported(tmp_path: Path):
     assert invoke_agent.await_args_list[0].kwargs['resume_session_id'] == SID
     assert 'resume_session_id' not in invoke_agent.await_args_list[1].kwargs
     assert outcome == WorkflowOutcome.DONE
-    [emitted] = workflow.event_store.of_type(EventType.session_resume_failed)
+    [emitted] = store.of_type(EventType.session_resume_failed)
     assert emitted['data']['stage'] == 'cli'
     assert emitted['data']['session_id'] == SID
     assert sink.only_failure().stage == 'cli'
