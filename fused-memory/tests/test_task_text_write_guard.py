@@ -10,16 +10,22 @@ writer composed against with the text it replaced.
 
 from __future__ import annotations
 
+import copy
+import logging
 from typing import Any
+from unittest.mock import AsyncMock
 
+import pytest
 from shared.mcp_envelope import write_failure_reason
 from shared.task_text_fingerprint import task_text_fingerprint
 
 from fused_memory.middleware.task_text_write_guard import (
     check_text_base,
     plan_text_write,
+    TextWriteUnconfirmedFinding,
     text_fp_of,
     verify_text_write,
+    verify_text_write_landed,
 )
 
 EMPTY_TEXT_FP = task_text_fingerprint(None, None)
@@ -276,3 +282,113 @@ class TestVerifyTextWrite:
                 'details': {'confirmed': False, 'appended': True},
             },
         }
+
+
+WRITE_RESULT = {'id': '3708', 'details': NEW_PARAGRAPH, 'title': 'γ'}
+
+
+async def _land(
+    result: dict[str, Any],
+    *,
+    after: object = None,
+    get_task: AsyncMock | None = None,
+    file_finding: AsyncMock | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    return await verify_text_write_landed(
+        result,
+        task_id='3708',
+        project_id='dark_factory',
+        project_root='/project',
+        write=plan_text_write(_forwarded_kwargs(**kwargs)),
+        get_task=get_task if get_task is not None else AsyncMock(return_value=after),
+        file_finding=file_finding,
+    )
+
+
+class TestVerifyTextWriteLanded:
+    @pytest.mark.asyncio
+    async def test_a_write_touching_no_text_is_returned_unchanged_without_a_read(self):
+        get_task = AsyncMock()
+        result = {'id': '3708', 'metadata': {'a': 1}}
+
+        landed = await _land(result, get_task=get_task, metadata='{"a": 1}')
+
+        assert landed == result
+        assert 'text_verified' not in landed
+        get_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_confirmed_write_is_annotated_true_and_files_nothing(self):
+        file_finding = AsyncMock()
+        result = dict(WRITE_RESULT)
+
+        landed = await _land(
+            result,
+            after={'details': NEW_PARAGRAPH},
+            file_finding=file_finding,
+            details=NEW_PARAGRAPH,
+        )
+
+        assert landed['text_verified'] is True
+        assert 'text_verification' in landed
+        file_finding.assert_not_awaited()
+        assert result == WRITE_RESULT
+
+    @pytest.mark.asyncio
+    async def test_an_unconfirmed_write_is_annotated_false_and_files_a_finding(self):
+        file_finding = AsyncMock()
+        get_task = AsyncMock(return_value={'details': OLD_PARAGRAPH})
+        result = dict(WRITE_RESULT)
+
+        landed = await _land(
+            result, get_task=get_task, file_finding=file_finding, details=NEW_PARAGRAPH,
+        )
+
+        assert landed['text_verified'] is False
+        get_task.assert_awaited_once_with('3708', '/project')
+        file_finding.assert_awaited_once()
+        (finding,) = file_finding.await_args.args
+        assert isinstance(finding, TextWriteUnconfirmedFinding)
+        assert finding.task_id == '3708'
+        assert finding.project_id == 'dark_factory'
+        assert finding.op == 'update_task'
+        assert finding.unconfirmed_fields == ('details',)
+        assert finding.flag_type == 'task_text_write_unconfirmed'
+        assert result == WRITE_RESULT
+
+    @pytest.mark.asyncio
+    async def test_an_unconfirmed_write_with_no_filer_is_still_annotated(self):
+        landed = await _land(
+            dict(WRITE_RESULT), after={'details': OLD_PARAGRAPH}, details=NEW_PARAGRAPH,
+        )
+
+        assert landed['text_verified'] is False
+
+    @pytest.mark.asyncio
+    async def test_a_failing_after_read_returns_the_original_result(self, caplog):
+        result = dict(WRITE_RESULT)
+        get_task = AsyncMock(side_effect=RuntimeError('backend gone'))
+
+        with caplog.at_level(logging.ERROR):
+            landed = await _land(result, get_task=get_task, details=NEW_PARAGRAPH)
+
+        assert landed == WRITE_RESULT
+        assert 'backend gone' in caplog.text
+        assert result == WRITE_RESULT
+
+    @pytest.mark.asyncio
+    async def test_a_failing_filer_keeps_the_annotation(self):
+        result = copy.deepcopy(WRITE_RESULT)
+        file_finding = AsyncMock(side_effect=RuntimeError('report store gone'))
+
+        landed = await _land(
+            result,
+            after={'details': OLD_PARAGRAPH},
+            file_finding=file_finding,
+            details=NEW_PARAGRAPH,
+        )
+
+        assert landed['text_verified'] is False
+        file_finding.assert_awaited_once()
+        assert result == WRITE_RESULT
