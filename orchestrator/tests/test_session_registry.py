@@ -3007,6 +3007,101 @@ def test_main_reap_marks_then_deletes(
     assert not sr.record_path_for_slug('old-terminal', root=tmp_path).parent.exists()
 
 
+def _no_wmctrl(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(argv, returncode=127, stdout='')
+
+
+def _write_aged_exited(slug: str, root: Path) -> None:
+    sr.write_record(
+        _make_record(session_slug=slug, status=sr.Status.EXITED, exit_code=0), root=root
+    )
+    _set_mtime(
+        sr.record_path_for_slug(slug, root=root),
+        datetime.now(UTC),
+        sr.TERMINAL_TTL + timedelta(hours=1),
+    )
+
+
+def test_main_reap_drains_every_eligible_record_in_one_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setattr(sr, '_wmctrl_list', _no_wmctrl)
+    aged_slugs = [f'aged-exited-{i:03d}' for i in range(150)]
+    for slug in aged_slugs:
+        _write_aged_exited(slug, tmp_path)
+    sr.write_record(
+        _make_record(session_slug='drain-orphan', status=sr.Status.RUNNING, launcher_pid=_DEAD_PID),
+        root=tmp_path,
+    )
+    _set_mtime(
+        sr.record_path_for_slug('drain-orphan', root=tmp_path),
+        datetime.now(UTC),
+        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
+    )
+
+    rc = sr.main(['reap'])
+
+    assert rc == 0
+    for slug in aged_slugs:
+        assert not (sr.sessions_dir(root=tmp_path) / slug).exists()
+    orphan = sr.read_record('drain-orphan', root=tmp_path)
+    assert orphan.status == sr.Status.EXITED
+    assert orphan.exit_code == sr.ORPHAN_EXIT_CODE
+
+    report_path = sr.reap_report_path(tmp_path)
+    assert report_path.is_file()
+    report = json.loads(report_path.read_text())
+    datetime.fromisoformat(report['started_at'])
+    datetime.fromisoformat(report['finished_at'])
+    phases = report['phases']
+    assert [phase['name'] for phase in phases] == [
+        'mark_orphaned_sessions_exited',
+        'mark_windowless_wm_sessions_exited',
+        'reap_stale_records',
+        'reap_stale_session_pointers',
+    ]
+    for phase in phases:
+        assert isinstance(phase['seconds'], (int, float))
+        assert phase['seconds'] >= 0
+        assert phase['error'] is None
+    by_name = {phase['name']: phase for phase in phases}
+    assert by_name['mark_orphaned_sessions_exited']['count'] == 1
+    assert by_name['reap_stale_records']['count'] == 150
+
+
+def test_main_reap_runs_later_phases_when_one_phase_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setattr(sr, '_wmctrl_list', _no_wmctrl)
+
+    def _boom(*_args: object, **_kwargs: object) -> list[sr.SessionRecord]:
+        raise OSError('mark phase on fire')
+
+    monkeypatch.setattr(sr, 'mark_orphaned_sessions_exited', _boom)
+    _write_aged_exited('aged-despite-fault', tmp_path)
+
+    rc = sr.main(['reap'])
+
+    assert rc == 0
+    assert not (sr.sessions_dir(root=tmp_path) / 'aged-despite-fault').exists()
+    first_phase = json.loads(sr.reap_report_path(tmp_path).read_text())['phases'][0]
+    assert first_phase['name'] == 'mark_orphaned_sessions_exited'
+    assert 'OSError' in first_phase['error']
+    assert first_phase['count'] is None
+
+
+def test_reap_lock_is_a_stable_sidecar_under_the_fleet_root(tmp_path: Path) -> None:
+    lock_path = sr.reap_lock_path(tmp_path)
+    with sr.reap_lock(tmp_path):
+        assert lock_path.is_file()
+        assert lock_path.parent == tmp_path
+    assert lock_path.is_file()
+
+
 # ---------------------------------------------------------------------------
 # Task 2934 step-9/10: driving the WM-window sweep from `launching`/`reap`
 # ---------------------------------------------------------------------------
