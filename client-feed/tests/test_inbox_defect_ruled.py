@@ -6,20 +6,17 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _git_repo import make_repo
 from _in_dir import write_engagement
-from _stores import RunsDb, TasksDb
+from _publisher_pass import REVEALABLE_PATH, inbox_offset, reveal_answers, reveal_policy
 
 from client_feed.contract import (
     INBOX_FILENAME,
     ContractViolation,
     DefectRuled,
-    FileRevealed,
-    RevealRefused,
     RulingKind,
     parse_inbox_line,
 )
-from client_feed.feed_io import CURSOR_FILENAME, Cursor, OutDir, read_feed_lines
+from client_feed.feed_io import OutDir
 from client_feed.inbox import read_inbox
 from client_feed.policy import Policy
 from client_feed.publisher import run_pass
@@ -137,50 +134,21 @@ def test_a_ruled_line_carrying_a_note_is_rejected_by_offset_and_the_tail_moves_o
 
 @pytest.fixture
 def policy(tmp_path: Path, in_dir: Path) -> Policy:
-    repo = make_repo(tmp_path / 'repo')
-    repo.write('.gitignore', '.taskmaster/\ndata/\n')
-    repo.write('src/ledger.py', ''.join(f'entry_{index} = {index}\n' for index in range(60)))
-    repo.commit('c1', when=T0)
-    TasksDb.create(repo.root)
-    RunsDb.create(repo.root)
-    out_dir = tmp_path / 'out'
-    out_dir.mkdir()
-    return Policy.model_validate(
-        {
-            'project_id': PROJECT,
-            'project_root': str(repo.root),
-            'out_dir': str(out_dir),
-            'in_dir': str(in_dir),
-            'visible_globs': ['src/**'],
-            'reveal_proportion': 1.0,
-        }
-    )
-
-
-def reveal_answers(out_dir: Path) -> list[tuple[str, str]]:
-    return [
-        (line.type, line.path)
-        for line in read_feed_lines(out_dir)
-        if isinstance(line, FileRevealed | RevealRefused)
-    ]
-
-
-def inbox_offset(out_dir: Path) -> int:
-    return Cursor.model_validate_json((out_dir / CURSOR_FILENAME).read_text()).inbox_offset
+    return reveal_policy(tmp_path, in_dir, project_id=PROJECT, committed_at=T0)
 
 
 def test_the_reveal_path_answers_only_the_requests_around_a_ruled_line(
     policy: Policy, in_dir: Path
 ) -> None:
     inbox = write_inbox(
-        in_dir, requested(1, 'src/ledger.py'), {**RULED, 'seq': 2}, requested(3, 'src/absent.py')
+        in_dir, requested(1, REVEALABLE_PATH), {**RULED, 'seq': 2}, requested(3, 'src/absent.py')
     )
 
     report = run_pass(policy, OutDir.open(policy.out_dir, project_id=PROJECT), now=NOW)
 
     assert report.degraded == ()
-    assert reveal_answers(policy.out_dir) == [
-        ('file_revealed', 'src/ledger.py'),
+    assert [(line.type, line.path) for line in reveal_answers(policy.out_dir)] == [
+        ('file_revealed', REVEALABLE_PATH),
         ('reveal_refused', 'src/absent.py'),
     ]
     assert inbox_offset(policy.out_dir) == inbox.stat().st_size
