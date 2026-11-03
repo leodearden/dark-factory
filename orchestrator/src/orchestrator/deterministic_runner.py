@@ -369,6 +369,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from escalation.models import Escalation
 from shared.before_done_paths import (
     BeforeDonePaths,
     resolve_before_done_paths,
@@ -1425,8 +1426,6 @@ class DeterministicRunner:
         Returns:
             WorkflowOutcome.BLOCKED
         """
-        from escalation.models import Escalation
-
         existing_pending = self.escalation_queue.get_by_task(
             task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
         )
@@ -1551,8 +1550,6 @@ class DeterministicRunner:
         Returns:
             WorkflowOutcome.BLOCKED
         """
-        from escalation.models import Escalation
-
         # category-scoped (review amendment): get_by_task has no server-side
         # category filter, so filter client-side — an unrelated pending
         # escalation (e.g. infra_issue) on the same task must not suppress
@@ -1645,8 +1642,6 @@ class DeterministicRunner:
         Returns:
             WorkflowOutcome.BLOCKED
         """
-        from escalation.models import Escalation
-
         title = task.get('title') or task_id
         summary = f'Human curator gate {task_id} resumed without content adjudication'
         # The configured per-project root — the SAME value the scheduler puts on
@@ -1737,8 +1732,6 @@ class DeterministicRunner:
         guard — since an illegal transition is itself a bug signal that must
         never be suppressed by an unrelated pending escalation.
         """
-        from escalation.models import Escalation
-
         esc = Escalation(
             id=self.escalation_queue.make_id(task_id),
             task_id=task_id,
@@ -2152,8 +2145,6 @@ class DeterministicRunner:
         Returns:
             ``WorkflowOutcome.BLOCKED``
         """
-        from escalation.models import Escalation
-
         # Task 2954 amendment: summary/detail/options built via the shared
         # `build_milestone_gate_escalation_fields` seam so the harness recon-
         # sweep's strand recovery re-files a byte-identical gate (including the
@@ -2314,8 +2305,6 @@ class DeterministicRunner:
         Returns:
             WorkflowOutcome.BLOCKED
         """
-        from escalation.models import Escalation
-
         existing_pending = self.escalation_queue.get_by_task(
             task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
         )
