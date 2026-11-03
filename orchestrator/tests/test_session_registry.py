@@ -2441,6 +2441,72 @@ def test_mark_windowless_handles_mixed_population_in_one_sweep(tmp_path: Path) -
     assert reloaded_terminal.exit_code == 0
 
 
+def _call_indexed_wmctrl_run(
+    *results: tuple[int, str],
+    on_first_call: Callable[[], None] | None = None,
+) -> Callable[[list[str]], subprocess.CompletedProcess[str]]:
+    """A fake ``run`` answering call N with ``results[N]``, repeating the last thereafter.
+
+    ``on_first_call`` runs inside the first call, before it answers -- the
+    hook a test uses to land a record write just after the sweep's first probe.
+    """
+    calls = 0
+
+    def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal calls
+        if calls == 0 and on_first_call is not None:
+            on_first_call()
+        returncode, stdout = results[min(calls, len(results) - 1)]
+        calls += 1
+        return subprocess.CompletedProcess(argv, returncode=returncode, stdout=stdout)
+
+    return _run
+
+
+def test_mark_windowless_keeps_a_window_that_appears_after_the_first_probe(
+    tmp_path: Path,
+) -> None:
+    def _set_display_lands() -> None:
+        sr.write_record(
+            _make_record(
+                session_slug='late-window',
+                status=sr.Status.RUNNING,
+                display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
+            ),
+            root=tmp_path,
+        )
+
+    run = _call_indexed_wmctrl_run(
+        (0, '0x99  0 host  other\n'),
+        (0, '0x1a  0 host  late\n0x99  0 host  other\n'),
+        on_first_call=_set_display_lands,
+    )
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert 'late-window' not in {m.session_slug for m in marked}
+    assert sr.read_record('late-window', root=tmp_path).status == sr.Status.RUNNING
+
+
+def test_mark_windowless_marks_nothing_when_the_confirming_probe_fails(tmp_path: Path) -> None:
+    sr.write_record(
+        _make_record(
+            session_slug='unconfirmed',
+            status=sr.Status.RUNNING,
+            display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
+        ),
+        root=tmp_path,
+    )
+    run = _call_indexed_wmctrl_run((0, '0x99  0 host  other\n'), (127, ''))
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert marked == []
+    reloaded = sr.read_record('unconfirmed', root=tmp_path)
+    assert reloaded.status == sr.Status.RUNNING
+    assert reloaded.exit_code is None
+
+
 # ---------------------------------------------------------------------------
 # Step-9: CLI + fail-soft
 # ---------------------------------------------------------------------------
