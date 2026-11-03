@@ -12,9 +12,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from shared.mcp_envelope import write_failure_reason
 from shared.task_text_fingerprint import task_text_fingerprint
 
-from fused_memory.middleware.task_text_write_guard import plan_text_write, text_fp_of
+from fused_memory.middleware.task_text_write_guard import (
+    check_text_base,
+    plan_text_write,
+    text_fp_of,
+)
 
 EMPTY_TEXT_FP = task_text_fingerprint(None, None)
 
@@ -102,3 +107,78 @@ class TestPlanTextWrite:
 
     def test_absent_keys_read_as_unset(self):
         assert plan_text_write({}).writes_text is False
+
+
+BEFORE = {'id': '4644', 'description': 'Current summary.', 'details': 'Current body.'}
+RECON_AGENT = 'recon-stage-task_knowledge_sync'
+
+
+def _check(*, expected_text_fp: str | None, fp_required: bool = True, before=BEFORE, **kwargs):
+    return check_text_base(
+        before=before,
+        write=plan_text_write(_forwarded_kwargs(**kwargs)),
+        expected_text_fp=expected_text_fp,
+        fp_required=fp_required,
+        task_id='4644',
+        agent_id=RECON_AGENT,
+    )
+
+
+class TestCheckTextBase:
+    def test_a_metadata_only_write_needs_no_token(self):
+        assert _check(expected_text_fp=None, metadata='{"a": 1}') is None
+
+    def test_a_matching_token_admits_a_replace(self):
+        assert _check(expected_text_fp=text_fp_of(BEFORE), details='New body.') is None
+
+    def test_a_stale_token_is_rejected_without_echoing_the_current_fingerprint(self):
+        rejection = _check(expected_text_fp='tfp:stale', details='New body.')
+
+        assert rejection is not None
+        error = rejection.to_error_dict()
+        assert error['error_type'] == 'TaskTextBaseStale'
+        assert error['fields'] == ['details']
+        assert error['expected_text_fp'] == 'tfp:stale'
+        assert 'get_task' in error['hint']
+        assert 'task_text_fp' in error['hint']
+        assert text_fp_of(BEFORE) not in repr(error)
+
+    def test_a_recon_replace_without_a_token_is_rejected(self):
+        rejection = _check(expected_text_fp=None, details='New body.')
+
+        assert rejection is not None
+        assert rejection.to_error_dict()['error_type'] == 'ReconTaskTextBaseRequired'
+
+    def test_a_token_is_optional_when_not_required(self):
+        assert _check(expected_text_fp=None, fp_required=False, details='New body.') is None
+
+    def test_a_details_append_needs_no_token(self):
+        assert _check(expected_text_fp=None, details='More.', append=True) is None
+
+    def test_a_description_write_needs_a_token_even_under_append(self):
+        assert _check(expected_text_fp=None, description='New summary.') is not None
+        assert _check(expected_text_fp=None, description='New summary.', append=True) is not None
+
+    def test_a_prompt_replace_needs_a_token(self):
+        assert _check(expected_text_fp=None, prompt='New body.') is not None
+
+    def test_a_supplied_token_is_honoured_on_an_append(self):
+        rejection = _check(expected_text_fp='tfp:stale', details='More.', append=True)
+
+        assert rejection is not None
+        assert rejection.to_error_dict()['error_type'] == 'TaskTextBaseStale'
+
+    def test_a_task_with_no_text_accepts_the_empty_text_token(self):
+        assert _check(
+            expected_text_fp=text_fp_of({}), before={'id': '4644'}, details='First body.',
+        ) is None
+
+    def test_every_rejection_reads_as_a_failed_write(self):
+        rejections = [
+            _check(expected_text_fp='tfp:stale', details='New body.'),
+            _check(expected_text_fp=None, details='New body.'),
+        ]
+
+        for rejection in rejections:
+            assert rejection is not None
+            assert write_failure_reason(rejection.to_error_dict()) is not None
