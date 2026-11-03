@@ -298,7 +298,7 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-timeout>=2.4.0",
-    "pytest-xdist>=3.0",
+    "pytest-xdist>=3.6.0",
     # radon — used ONLY for the reported-not-ratcheted maintainability-index
     # column of scripts/merge_lane_metrics.py --report (radon.metrics.mi_visit;
     # measured 0.00 for both merge_queue.py and git_ops.py, reproducing the
