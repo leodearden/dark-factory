@@ -368,6 +368,20 @@ class TestReadFailureMarked:
         assert (entry.loops, entry.attempts, entry.phase, entry.started) == (None, None, None, None)
         assert entry.has_worktree is True
 
+    @pytest.mark.parametrize('steps', ['abc', {'s1': {'status': 'done'}}])
+    def test_non_list_plan_steps_marks_error(self, git_repo: Path, steps):
+        git_ops = GitOps(GitConfig(), git_repo)
+        worktree_base = git_ops.worktree_base
+        _make_task_artifacts(worktree_base, '53', '53')
+        (TaskArtifacts.task_root_for(worktree_base, '53') / 'plan.json').write_text(
+            json.dumps({'steps': steps}),
+        )
+
+        [entry] = build_task_runtime_snapshot(git_ops=git_ops)
+
+        assert entry.error and 'steps' in entry.error
+        assert (entry.phase, entry.loops) == (None, None)
+
 
 # ---------------------------------------------------------------------------
 # `started` fallback: metadata.json created_at wins when present; an
