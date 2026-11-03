@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -359,6 +360,16 @@ def _launching_env(root: Path) -> dict[str, str]:
     }
 
 
+def _await_reap_report(root: Path, *, deadline_secs: float = 120.0) -> None:
+    """Poll for ``run_reap``'s report, the detached reap's completion signal."""
+    report_path = sr.reap_report_path(root)
+    deadline = time.monotonic() + deadline_secs
+    while not report_path.is_file():
+        if time.monotonic() > deadline:
+            pytest.fail(f'no reap report at {report_path} within {deadline_secs}s')
+        time.sleep(0.05)
+
+
 class TestPointerSweepDrivers:
     def test_the_reap_verb_removes_a_dead_pids_pointer(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -384,6 +395,7 @@ class TestPointerSweepDrivers:
         slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
         expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
         assert capsys.readouterr().out == f'{expected_dir}\n'
+        _await_reap_report(tmp_path)
         assert not sr.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path).exists()
 
 

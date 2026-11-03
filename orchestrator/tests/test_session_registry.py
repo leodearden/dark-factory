@@ -1894,54 +1894,6 @@ def test_reap_handles_mixed_population_in_one_sweep(tmp_path: Path) -> None:
     assert remaining == {'kept-running', 'kept-recent-terminal'}
 
 
-def test_reap_respects_limit_stops_after_n_removals(tmp_path: Path) -> None:
-    """A positive `limit` stops the sweep after that many dirs are actually
-    removed -- bounding both the rmtree work and the per-call scan cost, so
-    an opportunistic per-spawn prune driver stays cheap regardless of how
-    large the on-disk backlog has grown.
-    """
-    records = [
-        _make_record(session_slug=slug, status=sr.Status.EXITED, launcher_pid=os.getpid())
-        for slug in ('term-a', 'term-b', 'term-c')
-    ]
-    for r in records:
-        sr.write_record(r, root=tmp_path)
-        _set_mtime(
-            sr.record_path_for_slug(r.session_slug, root=tmp_path),
-            _NOW,
-            sr.TERMINAL_TTL + timedelta(hours=1),
-        )
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW, limit=1)
-
-    assert len(reaped) == 1
-    remaining = {p.name for p in sr.sessions_dir(root=tmp_path).iterdir()}
-    assert len(remaining) == 2
-
-
-def test_reap_default_limit_none_is_unbounded(tmp_path: Path) -> None:
-    """Explicit `limit=None` -- and the implicit default -- must reproduce
-    today's unbounded full sweep, so every pre-existing reap test keeps
-    passing unchanged.
-    """
-    records = [
-        _make_record(session_slug=slug, status=sr.Status.EXITED, launcher_pid=os.getpid())
-        for slug in ('term-d', 'term-e', 'term-f')
-    ]
-    for r in records:
-        sr.write_record(r, root=tmp_path)
-        _set_mtime(
-            sr.record_path_for_slug(r.session_slug, root=tmp_path),
-            _NOW,
-            sr.TERMINAL_TTL + timedelta(hours=1),
-        )
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW, limit=None)
-
-    assert len(reaped) == 3
-    assert list(sr.sessions_dir(root=tmp_path).iterdir()) == []
-
-
 def test_reap_continues_sweep_when_one_directory_fails_to_remove(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2837,130 +2789,74 @@ def test_main_launching_fail_soft_when_launcher_pid_not_numeric(
 # ---------------------------------------------------------------------------
 
 
-def test_main_launching_drains_prior_orphan_via_sweep(
-    monkeypatch: pytest.MonkeyPatch,
+def _await_reap_report(root: Path, *, deadline_secs: float = 120.0) -> None:
+    """Poll for ``run_reap``'s report, the detached reap's completion signal."""
+    report_path = sr.reap_report_path(root)
+    deadline = time.monotonic() + deadline_secs
+    while not report_path.is_file():
+        if time.monotonic() > deadline:
+            pytest.fail(f'no reap report at {report_path} within {deadline_secs}s')
+        time.sleep(0.05)
+
+
+def test_launching_returns_while_a_reap_holds_the_lock_and_its_detached_reap_drains_after(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # A stale orphan O (non-terminal, dead pid, aged past the heartbeat TTL)
-    # pre-exists in the same sessions dir BEFORE this spawn's own `launching`
-    # write -- every spawn should opportunistically drain prior orphans.
-    orphan = _make_record(session_slug='orphan-o', status=sr.Status.RUNNING, launcher_pid=_DEAD_PID)
-    sr.write_record(orphan, root=tmp_path)
+    """An inline sweep would block on the held lock, and a child that inherited
+    stdout or stderr would keep ``run`` from returning: either way it times out.
+    """
+    sr.write_record(
+        _make_record(
+            session_slug='orphan-o', status=sr.Status.RUNNING, launcher_pid=_DEAD_PID, display=None
+        ),
+        root=tmp_path,
+    )
     _set_mtime(
         sr.record_path_for_slug('orphan-o', root=tmp_path),
         datetime.now(UTC),
         sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
     )
-
-    _set_env(monkeypatch, _launching_env(tmp_path))
-
-    rc = sr.main(['launching'])
-
-    assert rc == 0
+    _write_aged_exited('old-terminal', tmp_path)
+    env = {k: v for k, v in os.environ.items() if not k.startswith('CLAUDE_SPAWN_')}
+    env.update(_launching_env(tmp_path))
     slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
-    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
-    # (i) the NEW launching record's dir is printed unchanged.
-    assert capsys.readouterr().out.strip() == str(expected_dir)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
 
-    # (ii) the pre-existing orphan is now marked exited.
-    orphan_reloaded = sr.read_record('orphan-o', root=tmp_path)
-    assert orphan_reloaded.status == sr.Status.EXITED
-    assert orphan_reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+    with sr.reap_lock(tmp_path):
+        result = subprocess.run(
+            [sys.executable, str(Path(sr.__file__).resolve()), 'launching'],
+            env=env,
+            capture_output=True,
+            timeout=120,
+            text=True,
+        )
 
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == str(sr.record_path_for_slug(slug, root=tmp_path).parent)
+        assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
+        assert sr.read_record('orphan-o', root=tmp_path).status == sr.Status.RUNNING
+        assert (sr.sessions_dir(root=tmp_path) / 'old-terminal').is_dir()
 
-def test_main_launching_bound_prunes_old_terminal_record(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Every spawn's `launching` path must also opportunistically bound-prune
-    terminal/stale record dirs (reap_stale_records(limit=REAP_BATCH_LIMIT)),
-    not just mark orphans exited -- otherwise the disk backlog is marked
-    terminal on every spawn but never actually reclaimed.
-    """
-    assert isinstance(sr.REAP_BATCH_LIMIT, int)
-    assert sr.REAP_BATCH_LIMIT > 0
-
-    old_terminal = _make_record(
-        session_slug='old-terminal', status=sr.Status.EXITED, exit_code=0, launcher_pid=os.getpid()
-    )
-    sr.write_record(old_terminal, root=tmp_path)
-    _set_mtime(
-        sr.record_path_for_slug('old-terminal', root=tmp_path),
-        datetime.now(UTC),
-        sr.TERMINAL_TTL + timedelta(hours=1),
-    )
-
-    _set_env(monkeypatch, _launching_env(tmp_path))
-
-    rc = sr.main(['launching'])
-
-    assert rc == 0
-    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
-    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
-    assert capsys.readouterr().out.strip() == str(expected_dir)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
-
+    _await_reap_report(tmp_path)
+    orphan = sr.read_record('orphan-o', root=tmp_path)
+    assert orphan.status == sr.Status.EXITED
+    assert orphan.exit_code == sr.ORPHAN_EXIT_CODE
     assert not (sr.sessions_dir(root=tmp_path) / 'old-terminal').exists()
 
 
-def test_main_launching_fail_soft_when_sweep_raises(
+def test_main_launching_fail_soft_when_the_detached_reap_cannot_start(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _set_env(monkeypatch, _launching_env(tmp_path))
-
-    calls: list[None] = []
-
-    def _boom(*_args: object, **_kwargs: object) -> list[sr.SessionRecord]:
-        calls.append(None)
-        raise OSError('sweep on fire')
-
-    monkeypatch.setattr(sr, 'mark_orphaned_sessions_exited', _boom)
+    monkeypatch.setattr(sys, 'executable', str(tmp_path / 'no-such-python'))
 
     rc = sr.main(['launching'])
 
     assert rc == 0
-    assert calls  # the sweep really was invoked (and really did raise)
     slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
     expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
-    # The sweep fault is swallowed INSIDE _run_launching -- the printed dir
-    # (what spawn-claude.sh captures into SESSION_RECORD_DIR) stays exactly
-    # the new record's dir, never corrupted or suppressed by the fault.
-    assert capsys.readouterr().out.strip() == str(expected_dir)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
-
-
-def test_main_launching_fail_soft_when_prune_raises(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Mirrors test_main_launching_fail_soft_when_sweep_raises for the bounded
-    prune: a fault in reap_stale_records must never raise out of
-    _run_launching (it would corrupt the printed record dir spawn-claude.sh
-    captures into SESSION_RECORD_DIR), exactly like a fault in the mark sweep.
-    """
-    _set_env(monkeypatch, _launching_env(tmp_path))
-
-    calls: list[None] = []
-
-    def _boom(*_args: object, **_kwargs: object) -> list[sr.ReapedSessionRecord]:
-        calls.append(None)
-        raise OSError('prune on fire')
-
-    monkeypatch.setattr(sr, 'reap_stale_records', _boom)
-
-    rc = sr.main(['launching'])
-
-    assert rc == 0
-    assert calls  # the prune really was invoked (and really did raise)
-    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
-    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
-    assert capsys.readouterr().out.strip() == str(expected_dir)
+    assert capsys.readouterr().out == f'{expected_dir}\n'
     assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
 
 
@@ -3137,36 +3033,6 @@ def test_main_reap_marks_windowless_wm_session_before_deleting(
     reloaded = sr.read_record('reap-windowless', root=tmp_path)
     assert reloaded.status == sr.Status.EXITED
     assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
-
-
-def test_main_launching_fail_soft_when_window_sweep_raises(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Mirrors test_main_launching_fail_soft_when_sweep_raises for the new WM
-    window sweep: a fault must never raise out of _run_launching (it would
-    corrupt the printed record dir spawn-claude.sh captures into
-    SESSION_RECORD_DIR), exactly like a fault in the orphan mark sweep.
-    """
-    _set_env(monkeypatch, _launching_env(tmp_path))
-
-    calls: list[None] = []
-
-    def _boom(*_args: object, **_kwargs: object) -> list[sr.SessionRecord]:
-        calls.append(None)
-        raise OSError('window sweep on fire')
-
-    monkeypatch.setattr(sr, 'mark_windowless_wm_sessions_exited', _boom)
-
-    rc = sr.main(['launching'])
-
-    assert rc == 0
-    assert calls  # the sweep really was invoked (and really did raise)
-    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
-    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
-    assert capsys.readouterr().out.strip() == str(expected_dir)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
 
 
 # ---------------------------------------------------------------------------

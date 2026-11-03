@@ -1437,69 +1437,72 @@ def test_registry_write_refresh_reap_two_way_boundary(tmp_path: pathlib.Path) ->
     written = session_registry.SessionRecord.from_json(record_path.read_text())
     assert written.status == session_registry.Status.EXITED
 
-    # Backdate the mtime so the refresh's heartbeat bump is unambiguous even
-    # on filesystems with coarse mtime resolution.
-    backdated_ts = record_path.stat().st_mtime - 100
-    os.utime(record_path, (backdated_ts, backdated_ts))
+    # The real spawn started a detached `reap`; holding its lock waits that
+    # out and keeps any other out, so the reap below is the only one.
+    with session_registry.reap_lock(fleet_root):
+        # Backdate the mtime so the refresh's heartbeat bump is unambiguous even
+        # on filesystems with coarse mtime resolution.
+        backdated_ts = record_path.stat().st_mtime - 100
+        os.utime(record_path, (backdated_ts, backdated_ts))
 
-    # --- Consumer: a simulated hook write refreshes under the SAME key ----
-    # The exact CLI invocation the T6 SessionStart hook will make.
-    rc = session_registry.main(
-        ["refresh", "--record", str(slug_dir), "--status", "running"]
-    )
-    assert rc == 0
+        # --- Consumer: a simulated hook write refreshes under the SAME key ----
+        # The exact CLI invocation the T6 SessionStart hook will make.
+        rc = session_registry.main(
+            ["refresh", "--record", str(slug_dir), "--status", "running"]
+        )
+        assert rc == 0
 
-    refreshed_paths = list((fleet_root / "sessions").glob("*/record.json"))
-    assert refreshed_paths == [record_path], (
-        f"refresh must update the SAME record.json path (same key), "
-        f"found: {refreshed_paths}"
-    )
-    refreshed = session_registry.SessionRecord.from_json(record_path.read_text())
-    assert refreshed.session_slug == written.session_slug
-    assert refreshed.status == session_registry.Status.RUNNING
-    assert record_path.stat().st_mtime > backdated_ts, (
-        "refresh must bump the record's mtime heartbeat"
-    )
+        refreshed_paths = list((fleet_root / "sessions").glob("*/record.json"))
+        assert refreshed_paths == [record_path], (
+            f"refresh must update the SAME record.json path (same key), "
+            f"found: {refreshed_paths}"
+        )
+        refreshed = session_registry.SessionRecord.from_json(record_path.read_text())
+        assert refreshed.session_slug == written.session_slug
+        assert refreshed.status == session_registry.Status.RUNNING
+        assert record_path.stat().st_mtime > backdated_ts, (
+            "refresh must bump the record's mtime heartbeat"
+        )
 
-    # --- Upsert-on-absent: a hand-launched session with no prior write ----
-    # (the T6 hand-launched-capture path -- no spawn-claude.sh write exists
-    # for this slug at all).
-    absent_slug = "unblock-df-999-424242"
-    assert not session_registry.record_path_for_slug(absent_slug, root=fleet_root).is_file()
+        # --- Upsert-on-absent: a hand-launched session with no prior write ----
+        # (the T6 hand-launched-capture path -- no spawn-claude.sh write exists
+        # for this slug at all).
+        absent_slug = "unblock-df-999-424242"
+        assert not session_registry.record_path_for_slug(absent_slug, root=fleet_root).is_file()
 
-    upserted = session_registry.refresh_record(
-        absent_slug, root=fleet_root, status=session_registry.Status.AWAITING_INPUT,
-    )
-    assert upserted.session_slug == absent_slug
-    assert upserted.status == session_registry.Status.AWAITING_INPUT
-    assert upserted.schema_version == session_registry.SCHEMA_VERSION
-    assert upserted.start_ts, "an upserted record must still get a populated start_ts"
-    upserted_path = session_registry.record_path_for_slug(absent_slug, root=fleet_root)
-    assert upserted_path.is_file()
-    assert session_registry.read_record(absent_slug, root=fleet_root) == upserted
+        upserted = session_registry.refresh_record(
+            absent_slug, root=fleet_root, status=session_registry.Status.AWAITING_INPUT,
+        )
+        assert upserted.session_slug == absent_slug
+        assert upserted.status == session_registry.Status.AWAITING_INPUT
+        assert upserted.schema_version == session_registry.SCHEMA_VERSION
+        assert upserted.start_ts, "an upserted record must still get a populated start_ts"
+        upserted_path = session_registry.record_path_for_slug(absent_slug, root=fleet_root)
+        assert upserted_path.is_file()
+        assert session_registry.read_record(absent_slug, root=fleet_root) == upserted
 
-    # --- The hook-refreshed record still reaps correctly -------------------
-    # Force a guaranteed-dead launcher_pid (the real spawn's own $$ has
-    # already exited by now, but relying on incidental PID death would be
-    # racy under PID reuse) and age it past the non-terminal heartbeat TTL,
-    # so it reaps via the stale_pid rule now that its status is RUNNING
-    # (non-terminal) after the hook's refresh.
-    dead_record = session_registry.SessionRecord.from_json(record_path.read_text())
-    dead_record.launcher_pid = _DEAD_PID
-    record_path.write_text(dead_record.to_json())
-    now = datetime.now(UTC)
-    stale_ts = (
-        now - session_registry.NON_TERMINAL_HEARTBEAT_TTL - timedelta(hours=1)
-    ).timestamp()
-    os.utime(record_path, (stale_ts, stale_ts))
+        # --- The hook-refreshed record still reaps correctly -------------------
+        # Force a guaranteed-dead launcher_pid (the real spawn's own $$ has
+        # already exited by now, but relying on incidental PID death would be
+        # racy under PID reuse) and age it past the non-terminal heartbeat TTL,
+        # so it reaps via the stale_pid rule now that its status is RUNNING
+        # (non-terminal) after the hook's refresh.
+        dead_record = session_registry.SessionRecord.from_json(record_path.read_text())
+        dead_record.launcher_pid = _DEAD_PID
+        record_path.write_text(dead_record.to_json())
+        now = datetime.now(UTC)
+        stale_ts = (
+            now - session_registry.NON_TERMINAL_HEARTBEAT_TTL - timedelta(hours=1)
+        ).timestamp()
+        os.utime(record_path, (stale_ts, stale_ts))
 
-    reaped = session_registry.reap_stale_records(root=fleet_root, now=now)
-    reaped_by_slug = {r.session_slug: r.reason for r in reaped}
-    assert reaped_by_slug.get(dead_record.session_slug) == "stale_pid"
-    assert not slug_dir.exists()
-    assert absent_slug not in reaped_by_slug, (
-        "the freshly-upserted record must not be reaped -- its heartbeat is new"
-    )
+        reaped = session_registry.reap_stale_records(root=fleet_root, now=now)
+        reaped_by_slug = {r.session_slug: r.reason for r in reaped}
+        assert reaped_by_slug.get(dead_record.session_slug) == "stale_pid"
+        assert not slug_dir.exists()
+        assert absent_slug not in reaped_by_slug, (
+            "the freshly-upserted record must not be reaped -- its heartbeat is new"
+        )
 
 
 # ===========================================================================
