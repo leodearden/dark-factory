@@ -1948,19 +1948,23 @@ def _sweep_in_background(bin_dir, state_path, fleet_dir, lease_path, *extra_args
 
 
 def _await_gate_poll(proc, trace_path, poll):
-    """Block until the backgrounded sweep's drain-poll ledger holds *poll*.
+    """Return once the backgrounded sweep's drain-poll ledger holds *poll*.
 
-    *poll* is a (verdict, unit) record. Once it is there the gate has polled
-    it, and a sweep parked on that verdict writes nothing more until its grace
-    ends.
+    *poll* is a (verdict, unit) record. Fails, carrying the sweep's output, if
+    the sweep exits first, and fails at a must-not-hang deadline.
     """
     deadline = time.monotonic() + load_scaled_grace(
         10, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
     )
     while poll not in read_drain_poll_trace(trace_path, complete_only=True):
-        assert proc.poll() is None, (
-            f"the sweep exited (rc={proc.returncode}) before its gate polled {poll!r}"
-        )
+        if proc.poll() is not None:
+            stdout, stderr = proc.communicate(timeout=10)
+            pytest.fail(
+                f"the sweep exited (rc={proc.returncode}) before its gate polled "
+                f"{poll!r}; ledger="
+                f"{read_drain_poll_trace(trace_path, complete_only=True)!r} "
+                f"stdout={stdout!r} stderr={stderr!r}"
+            )
         assert time.monotonic() < deadline, (
             f"the sweep's gate never polled {poll!r}; ledger="
             f"{read_drain_poll_trace(trace_path, complete_only=True)!r}"
@@ -2134,8 +2138,9 @@ def test_sigkill_mid_sweep_leaves_the_lease_behind_by_design(tmp_path):
     bin_dir, state_path = _make_fake_systemctl(
         tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
     )
-    # Ten times _sweep_in_background's lease poll, so a snapshot taken on the
-    # lease's first appearance always lands on the acquisition write.
+    # Fault injection, not the remedy: widens the acquire->advance window so a
+    # regression to snapshotting on the lease's first appearance fails the
+    # current_unit precondition below.
     acquire_to_advance_latency_secs = 0.5
     _install_spawn_latency(bin_dir, acquire_to_advance_latency_secs)
     _write_heartbeat(fleet_dir, UNIT_R, merge_idle=False, ts_epoch=time.time())
@@ -2154,8 +2159,8 @@ def test_sigkill_mid_sweep_leaves_the_lease_behind_by_design(tmp_path):
             "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
         },
     ) as (proc, pgid):
-        # The sweep rewrites the lease once per unit before its gate parks, so
-        # snapshot only when it has nothing left to rewrite before the kill.
+        # The sweep rewrites the lease once per unit before its gate parks; once
+        # parked on UNIT_R it rewrites nothing more in the lease until its grace ends.
         _await_gate_poll(proc, trace_path, ("busy", UNIT_R))
         held = lease_path.read_bytes()
         assert json.loads(held)["current_unit"] == UNIT_R, (
