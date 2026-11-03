@@ -51,11 +51,16 @@ from escalation.authority import (
     l2_auto_close_class,
 )
 from escalation.canonical import canonical_root_cause
-from escalation.categories import UnregisteredEscalationCategory, require_registered_category
+from escalation.categories import (
+    EscalationCategory,
+    UnregisteredEscalationCategory,
+    require_registered_category,
+)
 from escalation.declared_pins import blocking_pin_declarations, format_refusal
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe_off_loop as _dedupe_submit_or_dedupe_off_loop
 from escalation.grant_delivery import GrantDelivery, grant_delivery_for, shortfall_reason
+from escalation.guard_storm_alarm import GuardStormAlarm, file_storm_once
 from escalation.merge_lane_resolution import (
     InvalidMergeLane,
     resolve_merge_lane,
@@ -901,13 +906,6 @@ _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID = 'l2-amendment-truncation'
 _MARKUP_RESIDUE_ANCHOR_TASK_ID = 'mcp-markup-residue'
 _MARKUP_STORM_ANCHOR_TASK_ID = 'mcp-markup-storm'
 
-# The burst alarm's own category. Named once because it is written on the way
-# IN (the record this sink files) and read on the way OUT (the dedup predicate
-# asking whether this guard's own alarm is already open) — and a dedup that
-# matches on a second spelling of the category it writes silently stops
-# deduping, which is the failure mode that is hardest to notice from the queue.
-_MARKUP_STORM_CATEGORY = 'mcp_markup_storm'
-
 # The sentinel role these records are filed under.  A born-at-L2 record must
 # carry a role in ``_HARNESS_SENTINEL_ROLE_PREFIXES`` — the same contract
 # ``submit.py`` enforces at its argument boundary for the file-backed CLI, and
@@ -916,6 +914,17 @@ _MARKUP_STORM_CATEGORY = 'mcp_markup_storm'
 # honouring the contract here is what keeps the on-disk record legal rather than
 # merely unchecked.
 _MARKUP_GUARD_AGENT_ROLE = 'harness-markup-guard'
+
+_MARKUP_STORM_ALARM = GuardStormAlarm(
+    anchor_task_id=_MARKUP_STORM_ANCHOR_TASK_ID,
+    category=EscalationCategory.MCP_MARKUP_STORM,
+    agent_role=_MARKUP_GUARD_AGENT_ROLE,
+    condition='the serialization leak is ACTIVE',
+    suggested_action=(
+        'identify the leaking caller from the markup_detected facts and '
+        'report it against plans/toolcall-markup-containment-prd.md'
+    ),
+)
 
 # Born-at-L2 severity for the residue record.  ``level=2`` and a severity in
 # ``BORN_AT_L2_SEVERITIES`` are one decision, not two: ``models`` states that an
@@ -984,6 +993,23 @@ _ESCALATION_SERVER_TOOL_NAMES: frozenset[str] = frozenset({
     'stamp_triage',
     'unhalt_merge_queue',
 })
+
+# The uuid-prefix guard's burst alarm: a synthetic anchor for the same reason as
+# the markup storm's, and its own category and sentinel role, because dedup and
+# the L2 watcher both tell the two alarms apart by them.
+_UUID_PREFIX_STORM_ANCHOR_TASK_ID = 'uuid-prefix-storm'
+_UUID_PREFIX_GUARD_AGENT_ROLE = 'harness-uuid-prefix-guard'
+_UUID_PREFIX_STORM_ALARM = GuardStormAlarm(
+    anchor_task_id=_UUID_PREFIX_STORM_ANCHOR_TASK_ID,
+    category=EscalationCategory.UUID_PREFIX_STORM,
+    agent_role=_UUID_PREFIX_GUARD_AGENT_ROLE,
+    condition='truncated-uuid citations are being forwarded unresolved',
+    suggested_action=(
+        'read the uuid_prefix_detected facts: resolver_unavailable means fused-memory '
+        'POST /resolve-prefix is unreachable from this server; forwarded_ambiguous names '
+        'the colliding ids (plans/uuid-prefix-resolution-prd.md)'
+    ),
+)
 
 
 def _emit_uuid_prefix_fact(fact: dict[str, Any]) -> None:
@@ -1396,7 +1422,7 @@ def create_server(
         """
         error_type = record.get('error_type')
         if error_type == MARKUP_STORM_ERROR_TYPE:
-            return _file_markup_storm(record)
+            return file_storm_once(queue, _MARKUP_STORM_ALARM, record)
 
         # `level` and `category` are read from the RECORD rather than restated,
         # so the middleware stays the single source of the contract (INV-5).
@@ -1464,87 +1490,6 @@ def create_server(
         )
         return queue.submit(esc)
 
-    def _file_markup_storm(record: dict[str, Any]) -> str | None:
-        """One open record per burst, not one per window (INV-4).
-
-        The middleware's own ``StormCounter`` already rate-limits to one fire
-        per window and states that dedup is the SINK's knowledge, not its own.
-        A leak running for hours would otherwise file one record per hour; this
-        collapses them into the single open record until an operator resolves
-        it, exactly as ``markup_tripwire.emit_markup_storm_escalation`` does.
-
-        A read failure falls THROUGH to filing rather than bailing: losing
-        duplicate suppression is strictly better than losing the alarm for an
-        actively running leak.
-
-        The open-record test is "is MY alarm already open", never "is anything
-        pending on this anchor", and the difference is measured rather than
-        theoretical. The anchor is a SYNTHETIC id, so nothing reserves it and
-        any producer of SYSTEM-scoped records may land one there;
-        ``markup_tripwire``'s own docstring records what a category-blind test
-        then costs — it "filed nothing 2026-08-16..2026-08-19 while 41
-        rejections occurred" because another producer held its shared anchor
-        open, and that silence read as calm. Both halves of the identity are
-        checked because both can differ independently: another PRODUCER's
-        record (any category), and a sibling guard's record (this category,
-        another server). ``getattr`` rather than attribute access so a record
-        shape that predates either field cannot raise on this path.
-        """
-        try:
-            existing = queue.get_by_task(_MARKUP_STORM_ANCHOR_TASK_ID, status='pending')
-        except Exception:
-            logger.exception(
-                'markup guard: could not check for an open storm record; '
-                'filing a new one rather than dropping the alarm',
-            )
-            existing = []
-        mine = [
-            esc for esc in existing
-            if getattr(esc, 'category', None) == _MARKUP_STORM_CATEGORY
-            and getattr(esc, 'agent_role', None) == _MARKUP_GUARD_AGENT_ROLE
-        ]
-        if mine:
-            # Sorted by id, not `mine[0]`: get_by_task's order comes from a
-            # directory glob, so folding into "whichever came back first" would
-            # make the id this returns — the one a caller is told to look up —
-            # depend on filesystem enumeration order. The ids carry a
-            # monotonic sequence, so the lowest is the record that opened the
-            # alarm.
-            open_alarm = min(mine, key=lambda esc: esc.id)
-            logger.info(
-                'markup guard: %s already open (storm %r now); not duplicating',
-                open_alarm.id, record,
-            )
-            return open_alarm.id
-
-        outcome = record.get('outcome')
-        # Task 3550: unstamped by design — synthetic _MARKUP_STORM_ANCHOR_TASK_ID,
-        # level=1 (pins Link 3 -> QUEUE_HANDOFF regardless of filing identity),
-        # and not filed by any task-workflow incarnation.
-        return queue.submit(Escalation(
-            id=queue.make_id(_MARKUP_STORM_ANCHOR_TASK_ID),
-            task_id=_MARKUP_STORM_ANCHOR_TASK_ID,
-            agent_role=_MARKUP_GUARD_AGENT_ROLE,
-            # 'blocking', not a born-at-L2 severity: this is a rate alarm about
-            # a condition, and markup_tripwire's storm record is filed the same
-            # way. The residue records it accompanies carry the L2 routing.
-            severity='blocking',
-            category=_MARKUP_STORM_CATEGORY,
-            summary=(
-                f'{record.get("count")} {outcome} MCP call(s) in '
-                f'{record.get("window_seconds")}s for project='
-                f'{record.get("project")!r} — the serialization leak is ACTIVE'
-            ),
-            detail='\n'.join(
-                f'{key}={record[key]!r}' for key in sorted(record)
-            ),
-            suggested_action=(
-                'identify the leaking caller from the markup_detected facts and '
-                'report it against plans/toolcall-markup-containment-prd.md'
-            ),
-            level=1,
-        ))
-
     mcp.add_middleware(MarkupGuardMiddleware(
         policy=RepairPolicy.FORWARD_REPAIR,
         exempt_tools=frozenset(),
@@ -1570,6 +1515,9 @@ def create_server(
             lambda _arguments: prefix_project,
             exempt_tools=frozenset(),
             forward_on_ambiguity_tools=_ESCALATION_SERVER_TOOL_NAMES,
+            escalation_sink=lambda record: file_storm_once(
+                queue, _UUID_PREFIX_STORM_ALARM, record
+            ),
             fact_sink=_emit_uuid_prefix_fact,
         ))
     # Any tool call missing a required argument gets a structured refusal
