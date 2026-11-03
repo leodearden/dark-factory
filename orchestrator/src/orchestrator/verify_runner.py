@@ -1523,23 +1523,25 @@ class RemoteRunner:
                 'RemoteRunner %r: gate reaper launch exited %d: %s', self.name, rc, stderr,
             )
 
-    async def _push(self, target: str, refspec: str, *, cwd: str | Path) -> None:
-        """``git push <target> <refspec>`` over the bounded ssh transport, or raise RunnerUnavailable.
+    async def _push(self, target: str, *push_args: str, cwd: str | Path) -> None:
+        """``git push <target> <push_args...>`` over the bounded ssh transport, or raise RunnerUnavailable.
 
-        A failure is classed on the push channel.  The ssh options make an
-        unreachable or lost host fail within about a minute with an ssh client
-        line ('transport'), so a push still running after
-        ``ENSURE_CLIENT_TIMEOUT_SECS`` has a live session to a host whose
-        receive-pack or hook hung: 'gate', as for ensure-gate's own timeout.
+        Every RemoteRunner push goes through here.  A failure is classed on the
+        push channel.  The ssh options make an unreachable or lost host fail
+        within about a minute with an ssh client line ('transport'), so a push
+        still running after ``ENSURE_CLIENT_TIMEOUT_SECS`` has a live session to
+        a host whose receive-pack or hook hung: 'gate', as for ensure-gate's own
+        timeout.
         """
-        argv = ['git', *GIT_PUSH_SSH_CONFIG, 'push', target, refspec]
+        argv = ['git', *GIT_PUSH_SSH_CONFIG, 'push', target, *push_args]
+        pushed = ' '.join(push_args)
         try:
             async with asyncio.timeout(ENSURE_CLIENT_TIMEOUT_SECS):
                 rc, _, stderr = await self._run(argv, cwd=cwd)
         except TimeoutError as exc:
             # BEFORE the OSError clause: TimeoutError subclasses OSError.
             raise RunnerUnavailable(
-                f'git push {target} {refspec} exceeded {ENSURE_CLIENT_TIMEOUT_SECS}s '
+                f'git push {target} {pushed} exceeded {ENSURE_CLIENT_TIMEOUT_SECS}s '
                 'on a reached host',
                 kind='gate',
             ) from exc
@@ -1549,7 +1551,7 @@ class RemoteRunner:
             ) from exc
         if rc != 0:
             raise RunnerUnavailable(
-                f'git push {target} {refspec} failed (rc={rc}): {stderr}',
+                f'git push {target} {pushed} failed (rc={rc}): {stderr}',
                 kind=classify_remote_exit(rc, stderr, channel='git_push'),
             )
 
@@ -1741,90 +1743,60 @@ class RemoteRunner:
     async def _push_main_mirror(self, *, task_id: str | None, event_store: Any) -> None:
         """Step 0 (best-effort): push main FIRST so the remote has a fresh view of it.
 
-        A non-zero rc or OSError is logged at WARNING and swallowed — a
-        non-fast-forward must not abort the verify.
+        Every failure is logged at WARNING and swallowed — a non-fast-forward
+        must not abort the verify.  Both pushes go through :meth:`_push`, so they
+        share its bounded ssh transport and deadline.
 
         β dedup: resolve the local main tip via `git rev-parse` (network-free).
         When the resolved sha matches _last_pushed_main_sha the push is skipped —
         the remote already has this main sha, so the push is redundant.
 
-        Both pushes carry GIT_PUSH_SSH_CONFIG so an unreachable verify host
-        fails within ConnectTimeout instead of blocking on TCP connect.
+        INV-2 mirror semantics (task 2884, PRD §3.1): a rejected fast-forward
+        (typically the remote PROJECT main diverged) is retried ONCE with a force
+        refspec, and a forced success emits runner_synced(kind='project_main_mirror').
+        A healthy remote never sees a force, so the divergence signal is not
+        silently dropped.
         """
-        if self._main_branch:
-            # Resolve local main tip (network-free)
-            resolved_main_sha: str | None = None
+        main_branch = self._main_branch
+        if not main_branch:
+            return
+        resolved_main_sha = await self._local_branch_sha(main_branch)
+        if resolved_main_sha is not None and resolved_main_sha == self._last_pushed_main_sha:
+            return
+        refspec = f'{main_branch}:refs/heads/{main_branch}'
+        try:
+            await self._push(self._git_remote, refspec, cwd=self._cwd)
+            forced = False
+        except RunnerUnavailable as ff_failure:
             try:
-                rev_rc, rev_stdout, _ = await self._run(
-                    ['git', 'rev-parse', self._main_branch],
-                    cwd=self._cwd,
+                await self._push(self._git_remote, f'+{refspec}', cwd=self._cwd)
+            except RunnerUnavailable as force_failure:
+                logger.warning(
+                    'RemoteRunner %r: best-effort main push of %r to %r failed '
+                    '(FF: %s; force: %s) — continuing with merge-sha push',
+                    self.name, main_branch, self._git_remote, ff_failure, force_failure,
                 )
-                if rev_rc == 0:
-                    resolved_main_sha = rev_stdout.strip() or None
-            except OSError:
-                pass  # rev-parse failed; push unconditionally below
+                return
+            forced = True
+        prior_main_sha = self._last_pushed_main_sha
+        if resolved_main_sha is not None:
+            self._last_pushed_main_sha = resolved_main_sha
+        if forced and event_store is not None:
+            event_store.emit(EventType.runner_synced, task_id=task_id, data={
+                'runner': self.name,
+                'kind': 'project_main_mirror',
+                'from_head': prior_main_sha,
+                'to_head': resolved_main_sha,
+                'forced': True,
+            })
 
-            # Skip push when sha is unchanged (dedup)
-            if resolved_main_sha is None or resolved_main_sha != self._last_pushed_main_sha:
-                try:
-                    main_rc, _, main_stderr = await self._run(
-                        ['git', *GIT_PUSH_SSH_CONFIG, 'push', self._git_remote,
-                         f'{self._main_branch}:refs/heads/{self._main_branch}'],
-                        cwd=self._cwd,
-                    )
-                    if main_rc == 0:
-                        if resolved_main_sha is not None:
-                            self._last_pushed_main_sha = resolved_main_sha
-                    else:
-                        # INV-2 mirror-semantics (task 2884, PRD §3.1): the FF
-                        # main push was rejected (typically non-fast-forward —
-                        # the remote PROJECT main diverged, e.g. the laptop
-                        # reify main since 07-20).  Retry ONCE with a force
-                        # refspec to restore mirror semantics.  The FF fast
-                        # path above is preserved — a force is attempted ONLY
-                        # on FF failure, so a healthy remote never sees one and
-                        # the divergence signal is not silently dropped.
-                        force_rc, _, force_stderr = await self._run(
-                            ['git', *GIT_PUSH_SSH_CONFIG, 'push', self._git_remote,
-                             f'+{self._main_branch}:refs/heads/{self._main_branch}'],
-                            cwd=self._cwd,
-                        )
-                        if force_rc == 0:
-                            prior_main_sha = self._last_pushed_main_sha
-                            if resolved_main_sha is not None:
-                                self._last_pushed_main_sha = resolved_main_sha
-                            if event_store is not None:
-                                from orchestrator.event_store import EventType
-                                event_store.emit(
-                                    EventType.runner_synced,
-                                    task_id=task_id,
-                                    data={
-                                        'runner': self.name,
-                                        'kind': 'project_main_mirror',
-                                        'from_head': prior_main_sha,
-                                        'to_head': resolved_main_sha,
-                                        'forced': True,
-                                    },
-                                )
-                        else:
-                            # Force ALSO failed — keep today's best-effort
-                            # WARNING+swallow (the merge-sha push stays the
-                            # load-bearing transport; a non-fatal main push
-                            # must never abort the verify).
-                            import logging as _logging
-                            _logging.getLogger(__name__).warning(
-                                'RemoteRunner %r: best-effort main push of %r to %r failed '
-                                '(FF rc=%d: %s; force rc=%d: %s) — continuing with merge-sha push',
-                                self.name, self._main_branch, self._git_remote,
-                                main_rc, main_stderr, force_rc, force_stderr,
-                            )
-                except OSError as exc:
-                    import logging as _logging
-                    _logging.getLogger(__name__).warning(
-                        'RemoteRunner %r: best-effort main push failed with OSError: %s'
-                        ' — continuing',
-                        self.name, exc,
-                    )
+    async def _local_branch_sha(self, branch: str) -> str | None:
+        """*branch*'s local tip by a network-free ``git rev-parse``, or None when unreadable."""
+        try:
+            rc, stdout, _ = await self._run(['git', 'rev-parse', branch], cwd=self._cwd)
+        except OSError:
+            return None
+        return (stdout.strip() or None) if rc == 0 else None
 
     async def _dispatch(
         self,
@@ -1871,10 +1843,7 @@ class RemoteRunner:
             finally:
                 # Best-effort ref cleanup — never alters returned result nor masks exceptions
                 with contextlib.suppress(Exception):
-                    await self._run(
-                        ['git', 'push', self._git_remote, '--delete', ref],
-                        cwd=self._cwd,
-                    )
+                    await self._push(self._git_remote, '--delete', ref, cwd=self._cwd)
         finally:
             self._inflight_request_id = None
             self._verify_started_request_id = None
