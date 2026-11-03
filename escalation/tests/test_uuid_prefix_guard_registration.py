@@ -123,6 +123,11 @@ def prefix_facts(caplog: pytest.LogCaptureFixture) -> list[tuple[int, dict[str, 
     ]
 
 
+def meta_of(result) -> dict[str, Any]:
+    assert result.meta is not None, 'the call returned no meta at all'
+    return result.meta
+
+
 async def call(server, tool: str, arguments: dict[str, Any]):
     async with Client(server) as client:
         return await client.call_tool(tool, arguments)
@@ -189,7 +194,7 @@ class TestUniqueIsExpanded:
         assert esc is not None
         assert FULL in esc.detail
         assert f'{PREFIX} ' not in esc.detail
-        assert result.meta['uuid_prefix_repair']['substitutions'] == [{
+        assert meta_of(result)['uuid_prefix_repair']['substitutions'] == [{
             'field': 'detail', 'path': ['detail'], 'from': PREFIX, 'to': FULL, 'namespace': 'mem0',
         }]
         facts = prefix_facts(caplog)
@@ -211,7 +216,7 @@ class TestAmbiguousIsForwarded:
         esc = queue.get(result.data['id'])
         assert esc is not None
         assert esc.detail == CITING_DETAIL
-        ambiguous = result.meta['uuid_prefix_repair']['ambiguous']
+        ambiguous = meta_of(result)['uuid_prefix_repair']['ambiguous']
         assert [candidate['id'] for candidate in ambiguous[0]['candidates']] == [FULL, SIBLING]
 
     @pytest.mark.asyncio
@@ -228,7 +233,7 @@ class TestAmbiguousIsForwarded:
         esc = queue.get(filed.data['id'])
         assert esc is not None
         assert esc.amendments[-1]['detail'] == amendment
-        assert result.meta['uuid_prefix_repair']['ambiguous'][0]['token'] == PREFIX
+        assert meta_of(result)['uuid_prefix_repair']['ambiguous'][0]['token'] == PREFIX
 
 
 class TestFailOpen:
@@ -246,7 +251,7 @@ class TestFailOpen:
         esc = queue.get(result.data['id'])
         assert esc is not None
         assert esc.detail == CITING_DETAIL
-        assert result.meta['uuid_prefix_repair'] == {'resolver': 'unavailable', 'store': 'fused-memory'}
+        assert meta_of(result)['uuid_prefix_repair'] == {'resolver': 'unavailable', 'store': 'fused-memory'}
         assert [
             (level, fact['outcome'], fact['project'], fact['token'])
             for level, fact in prefix_facts(caplog)
@@ -281,7 +286,7 @@ class TestReconciliationStoreIsUnscoped:
         esc = queue.get(result.data['id'])
         assert esc is not None
         assert esc.detail == CITING_DETAIL
-        assert result.meta['uuid_prefix_repair'] == {'resolver': 'no_project'}
+        assert meta_of(result)['uuid_prefix_repair'] == {'resolver': 'no_project'}
         assert resolver.calls == []
 
 
@@ -298,8 +303,8 @@ class TestRecoveredParameterIsScanned:
         esc = queue.get(result.data['id'])
         assert esc is not None
         assert esc.suggested_action == f'see {FULL}'
-        assert 'suggested_action' in result.meta['markup_repair']['recovered_params']
-        assert result.meta['uuid_prefix_repair']['substitutions'][0]['field'] == 'suggested_action'
+        assert 'suggested_action' in meta_of(result)['markup_repair']['recovered_params']
+        assert meta_of(result)['uuid_prefix_repair']['substitutions'][0]['field'] == 'suggested_action'
 
 
 class TestOverride:

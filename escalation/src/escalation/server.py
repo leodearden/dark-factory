@@ -34,6 +34,12 @@ from shared.mcp_missing_arguments import MissingArgumentMiddleware
 from shared.merge_state import MergeReason, MergeState
 from shared.storm_counter import StormCounter
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
+from shared.uuid_prefix_guard import (
+    FACT_UUID_PREFIX_DETECTED,
+    STORM_COUNTED_OUTCOMES,
+    PrefixResolver,
+    UuidPrefixGuardMiddleware,
+)
 
 from escalation import git_authority
 from escalation import sweep as _sweep
@@ -945,6 +951,51 @@ _MARKUP_GUARD_AGENT_ROLE = 'harness-markup-guard'
 # them exists to preserve.
 _MARKUP_RESIDUE_SEVERITY = 'critical'
 
+# The uuid-prefix guard's forward_on_ambiguity declaration: PRD C3 rules that
+# every tool on this server forwards, and the registration test pins this set
+# to the live list_tools().
+_ESCALATION_SERVER_TOOL_NAMES: frozenset[str] = frozenset({
+    'amend_escalation',
+    'claim_warm_worktree',
+    'clear_verify_host_quarantine',
+    'declare_pin',
+    'escalate_blocker',
+    'escalate_info',
+    'get_escalation',
+    'get_merge_halt_status',
+    'get_merge_queue',
+    'get_pending_escalations',
+    'get_task_escalation_history',
+    'get_task_escalations',
+    'get_task_runtime_state',
+    'halt_merge_queue',
+    'halt_scheduler',
+    'merge_cancel',
+    'merge_relane',
+    'merge_request',
+    'merge_status',
+    'promote_to_l2',
+    'release_warm_worktree',
+    'release_workflow',
+    'reload_config',
+    'resolve_escalation_shas',
+    'resolve_issue',
+    'resume_scheduler',
+    'stamp_triage',
+    'unhalt_merge_queue',
+})
+
+
+def _emit_uuid_prefix_fact(fact: dict[str, Any]) -> None:
+    """Emit one ``uuid_prefix_detected`` record as a single structured line (INV-2).
+
+    WARNING for the guard's two fail-soft outcomes, INFO otherwise: ``expanded``
+    is the designed success path, and a warning per success teaches an operator
+    to ignore the channel.
+    """
+    level = logging.WARNING if fact.get('outcome') in STORM_COUNTED_OUTCOMES else logging.INFO
+    logger.log(level, '%s %s', FACT_UUID_PREFIX_DETECTED, json.dumps(fact, sort_keys=True))
+
 
 def _markup_residue_prose(record: dict[str, Any]) -> str:
     """What actually happened to the call, in the reader's own terms.
@@ -1189,6 +1240,7 @@ def create_server(
     startup_sweep: bool = True,
     startup_sweep_now: datetime | None = None,
     store_identity: StoreIdentity | None = None,
+    prefix_resolver: PrefixResolver | None = None,
     mismatch_streak_threshold: int = DEFAULT_MISMATCH_STREAK_THRESHOLD,
 ) -> FastMCP:
     """Create the escalation MCP server with all tools registered.
@@ -1257,6 +1309,14 @@ def create_server(
     (``escalation.project_root_guard::ProjectRootGuard``,
     ``plans/escalation-store-ambiguity-prd.md`` §6.3): a tool call asserting a
     root this store does not serve is refused; with no identity, nothing is.
+    Its ``project_id`` also scopes the uuid-prefix guard below.
+
+    *prefix_resolver* (default None) — ``shared.uuid_prefix_guard``'s
+    ``PrefixResolver`` port.  When given, the uuid-prefix guard is registered
+    after the markup guard, scoped to ``store_identity.project_id``.  A server
+    without a project identity (the reconciliation store) forwards a prefixed
+    call unchanged with ``resolver='no_project'`` and never guesses a project;
+    per-call scoping is task 6910.  When omitted, no prefix guard is registered.
 
     *mismatch_streak_threshold* (default 5) — how many refused assertions of
     one ``project_root`` within the streak's window file (or fold) ONE
@@ -1497,6 +1557,21 @@ def create_server(
         escalation_sink=_file_markup_residue,
         fact_sink=_emit_markup_fact,
     ))
+    # --- Truncated-uuid citations (PRD uuid-prefix-resolution §4-C3) ---
+    # After the markup guard, so a parameter it recovers is scanned too (B15).
+    # The project is a registration-time constant: no escalation tool declares
+    # a project_id, and ProjectRootGuard refuses any project_root this store
+    # does not serve. Every tool forwards on ambiguity, because losing an
+    # escalation is worse than the defect.
+    if prefix_resolver is not None:
+        prefix_project = store_identity.project_id if store_identity is not None else None
+        mcp.add_middleware(UuidPrefixGuardMiddleware(
+            prefix_resolver,
+            lambda _arguments: prefix_project,
+            exempt_tools=frozenset(),
+            forward_on_ambiguity_tools=_ESCALATION_SERVER_TOOL_NAMES,
+            fact_sink=_emit_uuid_prefix_fact,
+        ))
     # Any tool call missing a required argument gets a structured refusal
     # instead of pydantic's raw text (shared/src/shared/mcp_missing_arguments.py).
     mcp.add_middleware(MissingArgumentMiddleware())
