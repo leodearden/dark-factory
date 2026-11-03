@@ -36,7 +36,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -124,14 +124,15 @@ class Landing:
     landed_as: str
 
 
-def land_file(
-    repo: str, path: str, base_sha: str, content: bytes, *,
+def land_files(
+    repo: str, files: Mapping[str, bytes], base_sha: str, *,
     port: str, label: str, message: str,
     timeout_secs: float | str | None = None, main_branch: str = "main",
 ) -> Landing:
-    """Land *content* as *path* (relative to the checkout *repo*) on
-    *main_branch*, branching from *base_sha*, through the merge queue of the
-    orchestrator whose escalation MCP listens on 127.0.0.1:*port*.
+    """Land each of *files*' content as its path (relative to the checkout
+    *repo*) on *main_branch*, as one commit branching from *base_sha*, through
+    the merge queue of the orchestrator whose escalation MCP listens on
+    127.0.0.1:*port*.
 
     *timeout_secs* bounds the wait for the queue, defaulting to
     DEFAULT_LANDING_TIMEOUT_SECS. A string is read as a number, so a caller
@@ -139,18 +140,30 @@ def land_file(
     between polls: a queue call in flight when it passes runs to its own reply
     timeout (SUBMIT_REPLY_TIMEOUT_SECS for the submit, POLL_REPLY_TIMEOUT_SECS
     for a poll), and a request still unsettled is then cancelled
-    (POLL_REPLY_TIMEOUT_SECS more), so land_file can return up to about 190 s,
+    (POLL_REPLY_TIMEOUT_SECS more), so land_files can return up to about 190 s,
     plus its git teardown, after the deadline.
     """
     queue = _MergeQueue.connect(port)
-    target = _Target(Path(repo), path, main_branch)
-    target.check_change(base_sha, content)
+    target = _Target.of(Path(repo), files, main_branch)
+    target.check_change(base_sha)
     deadline = time.monotonic() + float(timeout_secs or DEFAULT_LANDING_TIMEOUT_SECS)
     with (
         _stop_signals_held() as stop,
-        _deploy_branch(target, base_sha, content, label=label, message=message) as deploy,
+        _deploy_branch(target, base_sha, label=label, message=message) as deploy,
     ):
         return _land(queue, target, deploy, deadline, stop, description=message)
+
+
+def land_file(
+    repo: str, path: str, base_sha: str, content: bytes, *,
+    port: str, label: str, message: str,
+    timeout_secs: float | str | None = None, main_branch: str = "main",
+) -> Landing:
+    """`land_files` of *content* as the one *path*."""
+    return land_files(
+        repo, {path: content}, base_sha, port=port, label=label, message=message,
+        timeout_secs=timeout_secs, main_branch=main_branch,
+    )
 
 
 def land_or_exit(repo: str, path: str, base_sha: str, content: bytes, *, prog: str,
@@ -286,34 +299,55 @@ def _git(cwd: Path, *args: str) -> str:
 
 @dataclass(frozen=True)
 class _Target:
-    """The target project's checkout, the file being landed, and its main."""
+    """The target project's checkout, its main, and the change being landed:
+    each path's new content, in path order."""
 
     repo: Path
-    path: str
     main_branch: str
+    changes: tuple[tuple[str, bytes], ...]
 
-    def check_change(self, base_sha: str, content: bytes) -> None:
-        """Raise INVALID_CHANGE unless *content* changes the file *base_sha*
-        carries."""
+    @classmethod
+    def of(cls, repo: Path, files: Mapping[str, bytes], main_branch: str) -> _Target:
+        return cls(repo, main_branch, tuple(sorted(files.items())))
+
+    @property
+    def paths(self) -> tuple[str, ...]:
+        return tuple(path for path, _ in self.changes)
+
+    def check_change(self, base_sha: str) -> None:
+        """Raise INVALID_CHANGE unless *base_sha* is a commit and every path's
+        content differs from the copy *base_sha* carries, if any: a path it
+        lacks is a new file."""
         if _run_git(self.repo, "rev-parse", "--verify", "--quiet",
                     f"{base_sha}^{{commit}}").returncode != 0:
             raise LandingNotConfirmed(
                 LandingFailure.INVALID_CHANGE, f"base {base_sha} is not a commit in {self.repo}",
             )
-        base_content = self.blob(base_sha)
-        if base_content is None:
-            raise LandingNotConfirmed(
-                LandingFailure.INVALID_CHANGE, f"{self.path} is not tracked at base {base_sha}",
-            )
-        if base_content == content:
+        unchanged = [path for path, content in self.changes
+                     if self.blob(base_sha, path) == content]
+        if unchanged:
             raise LandingNotConfirmed(
                 LandingFailure.INVALID_CHANGE,
-                f"nothing to land: {self.path} at base {base_sha} already carries this content",
+                f"nothing to land for {', '.join(unchanged)}: base {base_sha} already carries "
+                f"this content",
             )
 
-    def blob(self, rev: str) -> bytes | None:
-        """The file's content at *rev*, or None when *rev* has no such file."""
-        proc = _run_git(self.repo, "show", f"{rev}:{self.path}")
+    def write_into(self, worktree: Path) -> None:
+        """Write every path's new content into *worktree*. A path git's tree
+        cannot hold there (under a file, or over a directory) is INVALID_CHANGE."""
+        for path, content in self.changes:
+            destination = worktree / path
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(content)
+            except OSError as exc:
+                raise LandingNotConfirmed(
+                    LandingFailure.INVALID_CHANGE, f"{path} cannot be written as a file: {exc}",
+                ) from exc
+
+    def blob(self, rev: str, path: str) -> bytes | None:
+        """*path*'s content at *rev*, or None when *rev* has no such file."""
+        proc = _run_git(self.repo, "cat-file", "blob", f"{rev}:{path}")
         return proc.stdout if proc.returncode == 0 else None
 
     def carries(self, tip: str) -> bool:
@@ -324,13 +358,18 @@ class _Target:
         cherry = _git(self.repo, "cherry", self.main_branch, tip).splitlines()
         return bool(cherry) and all(line.startswith("-") for line in cherry)
 
-    def checkout_synced(self) -> bool:
-        """Whether the checkout's file on disk is main's: what a reload re-reads."""
-        on_disk = self.repo / self.path
-        return on_disk.is_file() and on_disk.read_bytes() == self.blob(self.main_branch)
+    def unsynced_paths(self) -> list[str]:
+        """The landed paths whose copy on disk in the checkout is not main's:
+        what a reload, or any reader of the checkout, would see instead."""
+        return [path for path in self.paths
+                if not _holds(self.repo / path, self.blob(self.main_branch, path))]
 
     def main_tip(self) -> str:
         return _git(self.repo, "rev-parse", self.main_branch)
+
+
+def _holds(on_disk: Path, content: bytes | None) -> bool:
+    return content is not None and on_disk.is_file() and on_disk.read_bytes() == content
 
 
 @dataclass(frozen=True)
@@ -344,8 +383,7 @@ class _DeployBranch:
     tip: str
 
     @classmethod
-    def create(cls, target: _Target, base_sha: str, content: bytes, *,
-               label: str, message: str) -> _DeployBranch:
+    def create(cls, target: _Target, base_sha: str, *, label: str, message: str) -> _DeployBranch:
         scratch = Path(tempfile.mkdtemp(prefix="deploy-landing-"))
         branch = f"task/deploy-{label}-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
         worktree = _worktree_in(scratch)
@@ -359,8 +397,10 @@ class _DeployBranch:
             raise
         try:
             _git(target.repo, "worktree", "add", "-q", str(worktree), branch)
-            (worktree / target.path).write_bytes(content)
-            _git(worktree, "commit", "-q", "--no-verify", "-m", message, "--", target.path)
+            target.write_into(worktree)
+            # Staged first: `commit -- <path>` refuses a path git does not track yet.
+            _git(worktree, "add", "--", *target.paths)
+            _git(worktree, "commit", "-q", "--no-verify", "-m", message, "--", *target.paths)
             tip = _git(worktree, "rev-parse", "HEAD")
         except BaseException:
             _tear_down(target.repo, scratch, branch)
@@ -397,11 +437,11 @@ class _DeployBranch:
 
 
 @contextlib.contextmanager
-def _deploy_branch(target: _Target, base_sha: str, content: bytes, *,
+def _deploy_branch(target: _Target, base_sha: str, *,
                    label: str, message: str) -> Iterator[_DeployBranch]:
     """The deploy branch, torn down on the way out unless a refusal says its
     request may still land."""
-    deploy = _DeployBranch.create(target, base_sha, content, label=label, message=message)
+    deploy = _DeployBranch.create(target, base_sha, label=label, message=message)
     retained = False
     try:
         yield deploy
@@ -703,7 +743,7 @@ def _backoff() -> Iterator[float]:
 
 def _confirmed(target: _Target, deploy: _DeployBranch, reply: dict) -> Landing:
     """The Landing *reply* settled, once git agrees: the deploy commit is on
-    main, and the checkout's file is main's."""
+    main, and the checkout's copy of every landed path is main's."""
     request_id = reply.get("request_id")
     if not target.carries(deploy.tip):
         reported = reply.get("state") or reply.get("status")
@@ -713,11 +753,14 @@ def _confirmed(target: _Target, deploy: _DeployBranch, reply: dict) -> Landing:
             f"carries {deploy.tip} neither as an ancestor nor as an equal patch",
             MergeState.done,
         )
-    if not target.checkout_synced():
+    unsynced = target.unsynced_paths()
+    if unsynced:
+        on_disk = ", ".join(str(target.repo / path) for path in unsynced)
         raise LandingNotConfirmed(
             LandingFailure.CHECKOUT_NOT_SYNCED,
-            f"{deploy.branch} landed on {target.main_branch}, but {target.repo / target.path} "
-            f"on disk is not {target.main_branch}'s copy, so a reload would re-read the old file",
+            f"{deploy.branch} landed on {target.main_branch}, but on disk the checkout's "
+            f"{on_disk} is not {target.main_branch}'s copy, so a reload would re-read the old "
+            f"content",
             MergeState.done,
         )
     return Landing(
