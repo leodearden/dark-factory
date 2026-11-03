@@ -302,7 +302,7 @@ never warns on (`docs/task-authoring.md` §8 Tier-C;
 so the row lists them only as spellings to avoid in new writes — no `x_` carve-out
 (esc-8142-1: with no corpus migration per D3, a carve-out would make every legacy pointer a
 permanent census line). `superseded_by` and `cancel_dispositions` are Tier-A blessed and do not
-warn. Not the same spelling as the MEMORY key (`x_superseded_by`, string id, Mem0 record) on
+warn `unknown_key`. Not the same spelling as the MEMORY key (`x_superseded_by`, string id, Mem0 record) on
 purpose: same name, different store, different shape is heuristic-1 lying. The deferral
 `carried_by` record stays what it is — a HOLD with a carrier, not a supersession — and
 `x_coalesced_into` keeps its two legacy readers; neither is folded here. Written ONLY by the
@@ -728,7 +728,7 @@ G6 premises: every signal in §7 is a public call or a grep against a file this 
 
 As authored, §4.8, §6 row 26 and the §7 α signal said an `x_`-prefixed alias (`x_superseded_by`)
 on a task warns `unknown_key`. `shared/src/shared/task_metadata.py::parse_metadata` never warns
-on `x_` keys, so those three sites were corrected in place to: `subsumed_by` warns; the `x_`
+on `x_` keys, so those three sites were corrected in place to: `subsumed_by` warns `unknown_key`; the `x_`
 aliases are Tier-C-silent spellings to avoid; `superseded_by` / `cancel_dispositions` do not
-warn. D3 is unchanged. Corrected before ζ (task 8147) executes §6 rows 1–35.
+warn `unknown_key`. D3 is unchanged. Corrected before ζ (task 8147) executes §6 rows 1–35.
 
