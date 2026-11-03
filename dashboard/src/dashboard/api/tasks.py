@@ -280,11 +280,12 @@ async def api_tasks(
       load and there is no last good one, so the census is UNKNOWN. Neither
       offline nor degraded: without a list of their own they would render as a
       healthy project with a confident "0 done".
-    - ``TASKS_COUNT_STALE_PROJECTS`` — roots whose ACTIVE rows loaded fine but
-      whose census is served from its last good value at its own ``as_of``,
-      which every census surface renders with an age badge. Named apart from
-      an unknown count because calling that count unknown would contradict the
-      value those surfaces show.
+    - ``TASKS_COUNT_STALE_PROJECTS`` — roots whose row read did not fail and
+      whose census is served as its last measured value at its own ``as_of``, which
+      every census surface renders with an age badge. Named apart from an
+      unknown count because calling that count unknown would contradict the
+      value those surfaces show. It claims nothing about the rows: a cached
+      unit served past its freshness bound lands here with both halves aged.
     - ``TASKS_DEGRADED_PROJECTS`` — roots the handler ran out of budget for
       (see ``collect_tasks_with_counts``). Their state is UNKNOWN, not bad:
       nothing was proven unreachable, so degradation ALONE never raises the

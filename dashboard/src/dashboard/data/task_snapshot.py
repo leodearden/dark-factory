@@ -647,14 +647,16 @@ class SnapshotHealth(enum.StrEnum):
     * ``DEGRADED`` — a budget expired first, so this root's state is simply
       UNKNOWN. Nothing was proven unreachable. Merging this into ``OFFLINE``
       tells an operator to restart a healthy service.
-    * ``COUNT_UNKNOWN`` — the rows are current but the census has NO value to
-      show. Without a name of its own such a root renders as healthy with a
-      confident "0 done", which is the invisible failure the envelope exists
-      to remove.
-    * ``COUNT_STALE`` — the rows are current and the census carries its last
-      measured value at its own ``as_of``, which every census surface renders
-      with an age badge. Announcing it as unknown would contradict those
-      surfaces.
+    * ``COUNT_UNKNOWN`` — the row read did not fail but the census has NO
+      value to show. Without a name of its own such a root renders as healthy
+      with a confident "0 done", which is the invisible failure the envelope
+      exists to remove.
+    * ``COUNT_STALE`` — the row read did not fail and the census carries its
+      last measured value at its own ``as_of``, which every census surface
+      renders with an age badge. Announcing it as unknown would contradict
+      those surfaces. Says nothing about the rows' freshness: a unit
+      :func:`as_served` aged past :data:`FRESHNESS_BOUND_SECONDS` lands here
+      with BOTH halves stale, each carrying its own age.
     """
 
     OK = 'ok'

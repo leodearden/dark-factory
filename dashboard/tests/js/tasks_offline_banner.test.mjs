@@ -312,6 +312,9 @@ test('a count-stale project is NAMED, with copy that agrees with its aged surfac
   assert.match(text, /age/);
   assert.doesNotMatch(text, /unknown|unavailable/);
   assert.ok(!text.includes('fused-memory offline'), text);
+  // A unit served past its freshness bound is count-stale with BOTH halves
+  // aged (task_snapshot.py::classify), so the copy cannot vouch for the rows.
+  assert.doesNotMatch(text, /rows/);
 });
 
 test('count-stale composes with count-unknown', () => {

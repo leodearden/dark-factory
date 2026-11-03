@@ -32,7 +32,7 @@
 // demonstrably failed; TASKS_DEGRADED_PROJECTS = roots the handler ran out of
 // budget for, whose state is UNKNOWN; TASKS_COUNT_UNKNOWN_PROJECTS = roots
 // whose rows are current but whose done count has no value to show;
-// TASKS_COUNT_STALE_PROJECTS = roots whose rows are current but whose done
+// TASKS_COUNT_STALE_PROJECTS = roots whose rows were read but whose done
 // count is served from its last measurement, with its age), plus
 // TASKS_PROJECT_COUNT as the denominator the "k of N" copy below needs. Each
 // of the five gets its own notice kind here. This module only RENDERS that
@@ -99,10 +99,12 @@ function countPhrase(k, total) {
  *                so it never claims an outage either. Without this notice
  *                such a project renders as healthy with a confident "0 done".
  *   'count-stale'
- *              — the rows for these roots are current, and their census is
- *                a value with an age: its last measurement, which every
- *                census surface renders with an age badge. The age itself is
- *                those badges' to show, not repeated here.
+ *              — the census for these roots is a value with an age: its last
+ *                measurement, which every census surface renders with an age
+ *                badge. The age itself is those badges' to show, not repeated
+ *                here. Says nothing about the rows: a unit served past its
+ *                freshness bound lands here with BOTH halves aged, and the
+ *                rows carry their own age.
  *
  * Every input is optional and defaulted: this runs against window.DF_DATA's
  * pre-fetch defaults on the very first render, so a missing key must produce
@@ -164,8 +166,8 @@ function tasksBannerNotices(state) {
       text:
         'the completed-task count is not current for ' +
         countPhrase(countStaleProjects.length, s.totalProjects) +
-        ' (' + nameList(countStaleProjects) + ') — their rows below are ' +
-        'current, and done counts show the last measured value with its age',
+        ' (' + nameList(countStaleProjects) + ') — done counts show the ' +
+        'last measured value with its age',
     })
   }
 
