@@ -49,8 +49,8 @@ would therefore appear mid-line. See the comment on ``LOG_LINE_LEAK``.
 Known blind spot, shared with the writer it guards: a log line under a
 ``%(name)s %(message)s``-style formatter (no timestamp, no level token) is
 matched by neither this discriminator nor
-``deterministic_runner._LOG_LINE_RE``, so such a line can reach a note and go
-unreported here. Detecting it would require naming logger substrings, which
+``orchestrator/src/orchestrator/predicate_output.py::_LOG_LINE_RE``, so such a
+line can reach a note and go unreported here. Detecting it would require naming logger substrings, which
 is precisely the over-reporting failure above. The writer's cap bounds the
 exposure to one ≤400-char line; a predicate script wanting a guaranteed-clean
 note should emit its verdict as trailing JSON.
