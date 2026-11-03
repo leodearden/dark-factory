@@ -414,6 +414,9 @@ _STATUSES = {
     DONE_SUPERSEDER: TaskStatus.DONE,
     CANCELLED: TaskStatus.CANCELLED,
     MISSING: None,
+    7007: TaskStatus.PENDING,
+    7008: TaskStatus.PENDING,
+    7009: TaskStatus.PENDING,
 }
 
 
@@ -423,7 +426,11 @@ def _check(
     depends_on: Mapping[int, list[int]] | None = None,
 ) -> None:
     check_targets(
-        children, superseded_by, target_status=_STATUSES, depends_on=depends_on or {}
+        children,
+        superseded_by,
+        parent_id=PARENT,
+        target_status=_STATUSES,
+        depends_on=depends_on or {},
     )
 
 
@@ -490,6 +497,67 @@ def test_a_cyclic_edge_map_that_never_reaches_the_child_terminates_and_passes():
     _check(
         {7007: RepointDisposition(onto=(SUPERSEDER,))},
         depends_on={SUPERSEDER: [SUPERSEDER, OTHER], OTHER: [SUPERSEDER]},
+    )
+
+
+def test_a_mutual_repoint_within_the_map_is_refused():
+    refusal = _refusal_of(
+        {7007: RepointDisposition(onto=(7008,)), 7008: RepointDisposition(onto=(7007,))},
+        depends_on={7007: [PARENT], 7008: [PARENT]},
+    )
+
+    assert refusal == (Reason.REPOINT_CYCLE, 'children.7007.onto', 7008)
+
+
+def test_a_three_child_repoint_chain_within_the_map_is_refused():
+    refusal = _refusal_of(
+        {
+            7007: RepointDisposition(onto=(7008,)),
+            7008: RepointDisposition(onto=(7009,)),
+            7009: RepointDisposition(onto=(7007,)),
+        },
+        depends_on={7007: [PARENT], 7008: [PARENT], 7009: [PARENT]},
+    )
+
+    assert refusal == (Reason.REPOINT_CYCLE, 'children.7007.onto', 7008)
+
+
+def test_a_cycle_joining_a_map_repoint_to_a_stored_edge_is_refused():
+    refusal = _refusal_of(
+        {7007: RepointDisposition(onto=(SUPERSEDER,)), 7008: RepointDisposition(onto=(7007,))},
+        depends_on={SUPERSEDER: [7008], 7007: [PARENT], 7008: [PARENT]},
+    )
+
+    assert refusal == (Reason.REPOINT_CYCLE, 'children.7007.onto', SUPERSEDER)
+
+
+def test_a_repointed_childs_dropped_parent_edge_closes_no_cycle():
+    _check(
+        {7007: RepointDisposition(onto=(SUPERSEDER,)), 7008: RepointDisposition(onto=(OTHER,))},
+        depends_on={PARENT: [7007], SUPERSEDER: [7008], 7008: [PARENT]},
+    )
+
+
+def test_a_path_through_the_cancelled_parent_closes_no_cycle():
+    _check(
+        {7007: RepointDisposition(onto=(SUPERSEDER,)), 7008: KeepDisposition()},
+        depends_on={PARENT: [7007], SUPERSEDER: [7008], 7008: [PARENT]},
+    )
+
+
+@pytest.mark.parametrize(
+    'cancelling',
+    [
+        pytest.param(MootDisposition(), id='moot'),
+        pytest.param(FoldDisposition(into=OTHER), id='fold'),
+    ],
+)
+def test_a_path_through_a_sibling_the_map_cancels_closes_no_cycle(
+    cancelling: ChildDispositionVariant,
+):
+    _check(
+        {7007: RepointDisposition(onto=(SUPERSEDER,)), 7008: cancelling},
+        depends_on={SUPERSEDER: [7008], 7008: [7007]},
     )
 
 
