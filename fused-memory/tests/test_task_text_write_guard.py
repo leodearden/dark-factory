@@ -581,3 +581,86 @@ class TestInterceptorTextBaseBoundary:
         assert journalled
         assert all('expected_text_fp' not in params for params in journalled)
         assert all(token not in repr(params) for params in journalled)
+
+
+def _before_then_after(taskmaster, after: dict[str, Any]) -> dict[str, Any]:
+    before = dict(LIVE_ROW)
+    taskmaster.get_task = AsyncMock(side_effect=[before, after])
+    return before
+
+
+class TestInterceptorTextVerificationBoundary:
+    @pytest.mark.asyncio
+    async def test_a_landed_recon_text_write_is_verified(self, interceptor, taskmaster):
+        before = _before_then_after(taskmaster, {**LIVE_ROW, 'details': NEW_PARAGRAPH})
+
+        result = await interceptor.update_task(
+            '4644', '/project', details=NEW_PARAGRAPH, agent_id=RECON_AGENT,
+            expected_text_fp=text_fp_of(before),
+        )
+
+        assert result['text_verified'] is True
+        assert taskmaster.get_task.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_the_old_paragraph_reading_back_is_unverified(self, interceptor, taskmaster):
+        before = _before_then_after(taskmaster, dict(LIVE_ROW))
+
+        result = await interceptor.update_task(
+            '4644', '/project', details=NEW_PARAGRAPH, agent_id=RECON_AGENT,
+            expected_text_fp=text_fp_of(before),
+        )
+
+        assert result['text_verified'] is False
+
+    @pytest.mark.asyncio
+    async def test_a_wired_filer_hears_only_the_unconfirmed_write(self, interceptor, taskmaster):
+        filer = AsyncMock()
+        interceptor.set_text_write_unconfirmed_filer(filer)
+
+        before = _before_then_after(taskmaster, {**LIVE_ROW, 'details': NEW_PARAGRAPH})
+        await interceptor.update_task(
+            '4644', '/project', details=NEW_PARAGRAPH, agent_id=RECON_AGENT,
+            expected_text_fp=text_fp_of(before),
+        )
+        filer.assert_not_awaited()
+
+        before = _before_then_after(taskmaster, dict(LIVE_ROW))
+        await interceptor.update_task(
+            '4644', '/project', details=NEW_PARAGRAPH, agent_id=RECON_AGENT,
+            expected_text_fp=text_fp_of(before),
+        )
+        filer.assert_awaited_once()
+        (finding,) = filer.await_args.args
+        assert finding.unconfirmed_fields == ('details',)
+
+    @pytest.mark.asyncio
+    async def test_a_recon_metadata_only_write_is_not_read_back(
+        self, interceptor, taskmaster, live_row,
+    ):
+        result = await interceptor.update_task(
+            '4644', '/project', metadata='{"x_note": "seen"}', agent_id=RECON_AGENT,
+        )
+
+        assert 'text_verified' not in result
+        assert taskmaster.get_task.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_non_recon_text_write_is_not_read_back(
+        self, interceptor, taskmaster, live_row,
+    ):
+        result = await interceptor.update_task(
+            '4644', '/project', details=NEW_PARAGRAPH, agent_id='claude-interactive',
+        )
+
+        assert 'text_verified' not in result
+        taskmaster.get_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_gate_rejection_is_not_read_back(self, interceptor, taskmaster, live_row):
+        result = await interceptor.update_task(
+            '4644', '/project', details=NEW_PARAGRAPH, agent_id=RECON_AGENT,
+        )
+
+        assert _error_type(result) == 'ReconTaskTextBaseRequired'
+        assert taskmaster.get_task.await_count == 1

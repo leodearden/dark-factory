@@ -139,6 +139,7 @@ async def test_recon_write_past_the_threshold_comes_back_bounded(stack):
     after = await backend.get_task('1', root)
     assert task_payload_bytes(after) < ROTATE_THRESHOLD_BYTES
     assert result['audit_trail_rotation']['status'] == 'rotated'
+    assert result['text_verified'] is True
     assert {**result['updated_task'], 'id': after['id']} == after
     record = after['metadata'][ROLLUP_KEY]['rotations'][0]
     archived = archive.store[record['archive_memory_id']]
