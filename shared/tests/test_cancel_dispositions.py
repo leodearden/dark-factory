@@ -561,6 +561,44 @@ def test_a_path_through_a_sibling_the_map_cancels_closes_no_cycle(
     )
 
 
+def test_repoint_onto_a_sibling_the_map_cancels_is_refused():
+    refusal = _refusal_of({7007: RepointDisposition(onto=(7008,)), 7008: MootDisposition()})
+
+    assert refusal == (Reason.TARGET_CANCELLED, 'children.7007.onto', 7008)
+
+
+def test_fold_into_a_sibling_the_map_cancels_is_refused():
+    refusal = _refusal_of(
+        {7007: FoldDisposition(into=7008), 7008: FoldDisposition(into=SUPERSEDER)}
+    )
+
+    assert refusal == (Reason.TARGET_CANCELLED, 'children.7007.into', 7008)
+
+
+def test_superseded_by_naming_a_child_the_map_cancels_is_refused():
+    refusal = _refusal_of({7008: MootDisposition()}, superseded_by=(7008,))
+
+    assert refusal == (Reason.TARGET_CANCELLED, 'superseded_by', 7008)
+
+
+@pytest.mark.parametrize(
+    'children',
+    [
+        pytest.param(
+            {7007: FoldDisposition(into=7008), 7008: KeepDisposition()}, id='fold-into-kept'
+        ),
+        pytest.param(
+            {7007: RepointDisposition(onto=(7009,)), 7009: RepointDisposition(onto=(SUPERSEDER,))},
+            id='repoint-onto-repointed',
+        ),
+    ],
+)
+def test_a_kept_or_repointed_sibling_remains_a_legal_target(
+    children: Mapping[ChildKey, ChildDispositionVariant],
+):
+    _check(children)
+
+
 def test_of_two_failing_children_the_lowest_local_id_is_reported():
     children = {
         7008: RepointDisposition(onto=(CANCELLED,)),
