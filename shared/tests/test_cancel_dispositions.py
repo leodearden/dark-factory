@@ -9,6 +9,7 @@ import dataclasses
 import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -169,10 +170,11 @@ def test_parse_children_keys_local_ids_as_ints_and_external_dependents_as_qualif
 
 def test_parse_children_returns_an_immutable_mapping():
     parsed = _parse({'6905': {'action': 'keep'}})
+    untyped_caller: Any = parsed
 
     assert isinstance(parsed, Mapping)
     with pytest.raises(TypeError):
-        parsed[6906] = KeepDisposition()  # type: ignore[index]
+        untyped_caller[6906] = KeepDisposition()
 
 
 def test_an_external_child_key_is_the_qualified_task_ref():
@@ -793,13 +795,23 @@ def _row(**overrides: object) -> ChildRow:
     return ChildRow.model_validate(fields)
 
 
-def test_a_row_carrying_every_documented_fact_validates_and_is_frozen():
+def test_a_row_carrying_every_documented_fact_validates():
     row = _row()
 
     assert (row.status, row.relation) == (TaskStatus.PENDING, ChildRelation.DEPENDENT)
     assert isinstance(row.existing_disposition, RepointEntry)
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        pytest.param('title', 'changed', id='title'),
+        pytest.param('status', TaskStatus.DONE, id='status'),
+    ],
+)
+def test_a_row_is_frozen(field: str, value: object):
     with pytest.raises(ValidationError):
-        row.title = 'changed'  # type: ignore[misc]
+        setattr(_row(), field, value)
 
 
 @pytest.mark.parametrize(
@@ -911,12 +923,22 @@ def test_capped_returns_a_short_list_whole():
 # --- the decision table and its renders (§5, §6 row 25) -----------------------
 
 
-def test_the_decision_table_is_seven_frozen_rows_in_order():
+def test_the_decision_table_is_seven_rows_in_order():
     assert isinstance(DECISION_TABLE, tuple)
     assert all(isinstance(row, DecisionRow) for row in DECISION_TABLE)
     assert [row.order for row in DECISION_TABLE] == list(range(7))
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        pytest.param('order', 9, id='order'),
+        pytest.param('question', 'changed', id='question'),
+    ],
+)
+def test_a_decision_row_is_frozen(field: str, value: object):
     with pytest.raises(dataclasses.FrozenInstanceError):
-        DECISION_TABLE[0].order = 9  # type: ignore[misc]
+        setattr(DECISION_TABLE[0], field, value)
 
 
 def test_the_decision_table_reaches_every_caller_action_and_no_entry_only_one():
