@@ -1947,6 +1947,27 @@ def _sweep_in_background(bin_dir, state_path, fleet_dir, lease_path, *extra_args
             proc.communicate(timeout=10)
 
 
+def _await_gate_poll(proc, trace_path, poll):
+    """Block until the backgrounded sweep's drain-poll ledger holds *poll*.
+
+    *poll* is a (verdict, unit) record. Once it is there the gate has polled
+    it, and a sweep parked on that verdict writes nothing more until its grace
+    ends.
+    """
+    deadline = time.monotonic() + load_scaled_grace(
+        10, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
+    )
+    while poll not in read_drain_poll_trace(trace_path, complete_only=True):
+        assert proc.poll() is None, (
+            f"the sweep exited (rc={proc.returncode}) before its gate polled {poll!r}"
+        )
+        assert time.monotonic() < deadline, (
+            f"the sweep's gate never polled {poll!r}; ledger="
+            f"{read_drain_poll_trace(trace_path, complete_only=True)!r}"
+        )
+        time.sleep(0.05)
+
+
 def test_lease_is_held_mid_sweep_and_names_the_sweeps_own_pid(tmp_path):
     """(a) While the sweep runs, the lease records {pid, started_ts, current_unit}.
 
@@ -2118,6 +2139,7 @@ def test_sigkill_mid_sweep_leaves_the_lease_behind_by_design(tmp_path):
     acquire_to_advance_latency_secs = 0.5
     _install_spawn_latency(bin_dir, acquire_to_advance_latency_secs)
     _write_heartbeat(fleet_dir, UNIT_R, merge_idle=False, ts_epoch=time.time())
+    trace_path = tmp_path / "drain-poll-trace.tsv"
 
     with _sweep_in_background(
         bin_dir, state_path, fleet_dir, lease_path, "--drain",
@@ -2129,8 +2151,12 @@ def test_sigkill_mid_sweep_leaves_the_lease_behind_by_design(tmp_path):
                 ))
             ),
             "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+            "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
         },
     ) as (proc, pgid):
+        # The sweep rewrites the lease once per unit before its gate parks, so
+        # snapshot only when it has nothing left to rewrite before the kill.
+        _await_gate_poll(proc, trace_path, ("busy", UNIT_R))
         held = lease_path.read_bytes()
         assert json.loads(held)["current_unit"] == UNIT_R, (
             f"the snapshot must be the lease the sweep holds while parked on "
