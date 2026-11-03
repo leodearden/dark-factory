@@ -20,16 +20,20 @@ from shared.cancel_dispositions import (
     CancelChildrenInvalidReason,
     CancelChildrenRefusalCode,
     ChildDisposition,
+    ChildDispositionVariant,
+    ChildKey,
     ExternalChild,
     FoldDisposition,
     KeepDisposition,
     MootDisposition,
     RepointDisposition,
+    check_targets,
     children_to_json,
     parse_children,
     parse_superseded_by,
     qualified_task_ref,
 )
+from shared.task_statuses import TaskStatus
 
 PARENT = 5869
 PROJECT = 'dark_factory'
@@ -116,7 +120,7 @@ def test_child_disposition_rejects_malformed_input(raw):
 Reason = CancelChildrenInvalidReason
 
 
-def _parse(raw: object) -> Mapping[int | ExternalChild, object]:
+def _parse(raw: object) -> Mapping[ChildKey, ChildDispositionVariant]:
     return parse_children(raw, parent_id=PARENT, parent_project_id=PROJECT)
 
 
@@ -362,3 +366,115 @@ def test_the_invalid_refusal_repr_s_a_value_json_cannot_carry():
 
     assert payload['value'] == repr({1, 2})
     assert json.dumps(payload)
+
+
+# --- the referential and cycle check over injected facts (§4.2) ---------------
+
+SUPERSEDER = 8032
+OTHER = 8033
+DONE_SUPERSEDER = 8040
+CANCELLED = 8050
+MISSING = 8099
+
+_STATUSES = {
+    SUPERSEDER: TaskStatus.PENDING,
+    OTHER: TaskStatus.IN_PROGRESS,
+    DONE_SUPERSEDER: TaskStatus.DONE,
+    CANCELLED: TaskStatus.CANCELLED,
+    MISSING: None,
+}
+
+
+def _check(
+    children: Mapping[ChildKey, ChildDispositionVariant],
+    superseded_by: tuple[int, ...] = (),
+    depends_on: Mapping[int, list[int]] | None = None,
+) -> None:
+    check_targets(
+        children, superseded_by, target_status=_STATUSES, depends_on=depends_on or {}
+    )
+
+
+def _refusal_of(*args, **kwargs) -> tuple[CancelChildrenInvalidReason, str, object]:
+    with pytest.raises(CancelChildrenInvalid) as caught:
+        _check(*args, **kwargs)
+    return caught.value.reason, caught.value.field, caught.value.value
+
+
+def test_a_map_naming_live_and_done_targets_passes():
+    children = {
+        6905: RepointDisposition(onto=(SUPERSEDER,)),
+        7007: FoldDisposition(into=DONE_SUPERSEDER),
+        7008: KeepDisposition(),
+        7009: MootDisposition(),
+    }
+
+    assert _check(children, superseded_by=(DONE_SUPERSEDER,)) is None
+
+
+def test_repoint_onto_a_cancelled_task_is_refused():
+    refusal = _refusal_of({6905: RepointDisposition(onto=(SUPERSEDER, CANCELLED))})
+
+    assert refusal == (Reason.TARGET_CANCELLED, 'children.6905.onto', CANCELLED)
+
+
+def test_fold_into_a_missing_task_is_refused():
+    refusal = _refusal_of({7007: FoldDisposition(into=MISSING)})
+
+    assert refusal == (Reason.TARGET_NOT_FOUND, 'children.7007.into', MISSING)
+
+
+def test_a_target_absent_from_the_facts_reads_as_missing():
+    refusal = _refusal_of({7007: FoldDisposition(into=12345)})
+
+    assert refusal == (Reason.TARGET_NOT_FOUND, 'children.7007.into', 12345)
+
+
+def test_superseded_by_naming_a_cancelled_task_is_refused():
+    refusal = _refusal_of({}, superseded_by=(SUPERSEDER, CANCELLED))
+
+    assert refusal == (Reason.TARGET_CANCELLED, 'superseded_by', CANCELLED)
+
+
+def test_a_repoint_that_would_close_a_dependency_cycle_is_refused():
+    refusal = _refusal_of(
+        {7007: RepointDisposition(onto=(SUPERSEDER,))},
+        depends_on={SUPERSEDER: [OTHER], OTHER: [7007]},
+    )
+
+    assert refusal == (Reason.REPOINT_CYCLE, 'children.7007.onto', SUPERSEDER)
+
+
+def test_an_external_child_cannot_close_a_local_cycle():
+    child = ExternalChild(project_id='reify', task_id=7007)
+
+    _check(
+        {child: RepointDisposition(onto=(SUPERSEDER,))},
+        depends_on={SUPERSEDER: [OTHER], OTHER: [7007]},
+    )
+
+
+def test_a_cyclic_edge_map_that_never_reaches_the_child_terminates_and_passes():
+    _check(
+        {7007: RepointDisposition(onto=(SUPERSEDER,))},
+        depends_on={SUPERSEDER: [SUPERSEDER, OTHER], OTHER: [SUPERSEDER]},
+    )
+
+
+def test_of_two_failing_children_the_lowest_local_id_is_reported():
+    children = {
+        7008: RepointDisposition(onto=(CANCELLED,)),
+        ExternalChild(project_id='reify', task_id=1): RepointDisposition(onto=(MISSING,)),
+        7007: FoldDisposition(into=MISSING),
+    }
+
+    assert _refusal_of(children)[1] == 'children.7007.into'
+
+
+def test_external_children_are_checked_after_local_ones_in_key_order():
+    children = {
+        ExternalChild(project_id='zeta', task_id=1): RepointDisposition(onto=(MISSING,)),
+        ExternalChild(project_id='reify', task_id=2): RepointDisposition(onto=(CANCELLED,)),
+    }
+
+    assert _refusal_of(children)[1] == 'children.reify:2.onto'
