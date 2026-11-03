@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
@@ -19,19 +20,33 @@ from shared.cancel_dispositions import (
     CancelChildrenInvalid,
     CancelChildrenInvalidReason,
     CancelChildrenRefusalCode,
+    CancelDispositionEntry,
     ChildDisposition,
     ChildDispositionVariant,
     ChildKey,
+    CoCancelledEntry,
+    DispositionSource,
     ExternalChild,
     FoldDisposition,
+    FoldEntry,
+    InvalidEntries,
     KeepDisposition,
+    KeepEntry,
     MootDisposition,
+    MootEntry,
     RepointDisposition,
+    RepointEntry,
     check_targets,
     children_to_json,
+    co_cancelled_entry,
+    entries_to_json,
+    entry_for_parent,
     parse_children,
+    parse_entries,
     parse_superseded_by,
     qualified_task_ref,
+    stamp_entry,
+    with_entry,
 )
 from shared.task_statuses import TaskStatus
 
@@ -478,3 +493,153 @@ def test_external_children_are_checked_after_local_ones_in_key_order():
     }
 
     assert _refusal_of(children)[1] == 'children.reify:2.onto'
+
+
+# --- the stamped child record (§4.8) -----------------------------------------
+
+NOW = datetime(2026, 11, 3, 12, 0, tzinfo=UTC)
+P = qualified_task_ref(PROJECT, PARENT)
+_STAMP = {'stamped_at': NOW, 'stamped_by': 'claude-x', 'source': DispositionSource.CANCELLER}
+
+
+@pytest.mark.parametrize(
+    ('disposition', 'entry_type'),
+    [
+        pytest.param(KeepDisposition(reason='stands on main'), KeepEntry, id='keep'),
+        pytest.param(RepointDisposition(onto=(8032,)), RepointEntry, id='repoint'),
+        pytest.param(FoldDisposition(into=8032), FoldEntry, id='fold'),
+        pytest.param(MootDisposition(), MootEntry, id='moot'),
+    ],
+)
+def test_stamp_entry_carries_the_disposition_and_the_stamp(disposition, entry_type):
+    entry = stamp_entry(disposition, parent=P, **_STAMP)
+
+    assert type(entry) is entry_type
+    assert entry.model_dump(exclude={'parent', 'stamped_at', 'stamped_by', 'source'}) == (
+        disposition.model_dump()
+    )
+    assert (entry.parent, entry.stamped_at, entry.stamped_by, entry.source) == (
+        P,
+        NOW,
+        'claude-x',
+        DispositionSource.CANCELLER,
+    )
+
+
+def test_a_repoint_entry_keeps_its_targets():
+    entry = stamp_entry(RepointDisposition(onto=(8032,)), parent=P, **_STAMP)
+
+    assert isinstance(entry, RepointEntry)
+    assert (entry.action, entry.onto) == (CancelAction.REPOINT, (8032,))
+
+
+def test_a_co_cancelled_entry_names_no_target():
+    entry = co_cancelled_entry(parent=P, **_STAMP)
+
+    assert isinstance(entry, CoCancelledEntry)
+    assert entry.action == CancelAction.CO_CANCELLED
+    assert not {'onto', 'into'} & set(entry.model_dump())
+
+
+def _entry_json(**overrides: object) -> dict[str, object]:
+    return {
+        'parent': P,
+        'action': 'keep',
+        'stamped_at': NOW.isoformat(),
+        'stamped_by': None,
+        'source': 'canceller',
+        **overrides,
+    }
+
+
+def test_a_well_formed_entry_validates():
+    entry = CancelDispositionEntry.model_validate(_entry_json()).root
+
+    assert entry == KeepEntry(parent=P, stamped_at=NOW, source=DispositionSource.CANCELLER)
+
+
+@pytest.mark.parametrize(
+    'overrides',
+    [
+        pytest.param({'parent': str(PARENT)}, id='bare-parent-id'),
+        pytest.param({'stamped_at': '2026-11-03T12:00:00'}, id='naive-stamped-at'),
+        pytest.param({'source': 'other'}, id='unknown-source'),
+        pytest.param({'onto': [8032]}, id='onto-on-keep'),
+    ],
+)
+def test_cancel_disposition_entry_rejects_malformed_input(overrides):
+    with pytest.raises(ValidationError):
+        CancelDispositionEntry.model_validate(_entry_json(**overrides))
+
+
+A = qualified_task_ref(PROJECT, 100)
+B = qualified_task_ref('reify', 200)
+C = qualified_task_ref(PROJECT, 300)
+
+
+def _keep_for(parent: str, reason: str | None = None) -> KeepEntry:
+    return KeepEntry(parent=parent, reason=reason, stamped_at=NOW, source=DispositionSource.BACKSTOP)
+
+
+def test_with_entry_replaces_the_entry_for_the_same_parent_in_place():
+    entries = [_keep_for(A, 'first'), _keep_for(B)]
+    original = list(entries)
+    replacement = stamp_entry(RepointDisposition(onto=(8032,)), parent=A, **_STAMP)
+
+    updated = with_entry(entries, replacement)
+
+    assert updated == (replacement, _keep_for(B))
+    assert entries == original
+
+
+def test_with_entry_appends_an_entry_for_a_new_parent():
+    entries = (_keep_for(A), _keep_for(B))
+
+    assert with_entry(entries, _keep_for(C)) == (_keep_for(A), _keep_for(B), _keep_for(C))
+
+
+def test_entry_for_parent_finds_the_parent_s_entry_or_none():
+    entries = (_keep_for(A, 'a'), _keep_for(B, 'b'))
+
+    assert entry_for_parent(entries, A) == _keep_for(A, 'a')
+    assert entry_for_parent(entries, C) is None
+
+
+_ENTRIES = (
+    _keep_for(A, 'stands on main'),
+    stamp_entry(RepointDisposition(onto=(8032, 8033)), parent=B, **_STAMP),
+    stamp_entry(FoldDisposition(into=8032), parent=C, **_STAMP),
+    co_cancelled_entry(parent=qualified_task_ref(PROJECT, 400), **_STAMP),
+)
+
+
+def test_entries_round_trip_through_their_json_form():
+    wire = entries_to_json(_ENTRIES)
+
+    assert json.loads(json.dumps(wire)) == wire
+    assert parse_entries(wire) == _ENTRIES
+
+
+def test_parse_entries_reads_an_absent_slice_as_no_entries():
+    assert parse_entries(None) == ()
+
+
+def test_parse_entries_accepts_the_typed_entries_parse_metadata_hands_back():
+    typed = [CancelDispositionEntry(_ENTRIES[0]), _ENTRIES[1]]
+
+    assert parse_entries(typed) == _ENTRIES[:2]
+
+
+@pytest.mark.parametrize(
+    ('raw', 'named'),
+    [
+        pytest.param([_entry_json(parent='5869')], 'parent', id='bare-parent'),
+        pytest.param([_entry_json(action='repoint')], 'onto', id='repoint-without-onto'),
+        pytest.param({'parent': P}, 'list', id='not-a-list'),
+    ],
+)
+def test_parse_entries_reports_a_malformed_slice(raw, named):
+    parsed = parse_entries(raw)
+
+    assert isinstance(parsed, InvalidEntries)
+    assert named in parsed.detail
