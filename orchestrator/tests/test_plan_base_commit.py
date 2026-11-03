@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -108,19 +109,24 @@ async def test_revalidation_diffs_from_the_plans_own_base(
     f.get_changed_files.assert_awaited_once_with(expected_from, 'newmain456')
 
 
-@pytest.mark.parametrize('answer', [False, None], ids=['not-ancestor', 'git-error'])
+@pytest.mark.parametrize(('answer', 'log_level'), [
+    (False, logging.INFO),
+    (None, logging.WARNING),
+], ids=['not-ancestor', 'git-error'])
 @pytest.mark.asyncio
-async def test_plan_stamp_off_main_history_is_not_trusted(tmp_path: Path, answer: bool | None):
+async def test_plan_stamp_off_main_history_is_not_trusted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, answer: bool | None, log_level: int,
+):
     f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', plan_base_commit='rewritten999')
     f.git_ops.is_ancestor_checked = AsyncMock(return_value=answer)
 
-    await f.wf._plan()
+    with caplog.at_level(logging.INFO, logger='orchestrator.workflow'):
+        await f.wf._plan()
 
     f.get_changed_files.assert_awaited_once_with('oldmain123', 'newmain456')
-    f.git_ops.is_ancestor_checked.assert_awaited()
-    ancestry_check = f.git_ops.is_ancestor_checked.await_args
-    assert ancestry_check is not None
-    assert ancestry_check.args[0] == 'rewritten999'
+    f.git_ops.is_ancestor_checked.assert_awaited_once_with('rewritten999', 'main')
+    [distrust] = [r for r in caplog.records if 'rewritten999' in r.getMessage()]
+    assert distrust.levelno == log_level
 
 
 @pytest.mark.parametrize('architect', [
@@ -136,12 +142,14 @@ async def test_confirmed_revalidation_stamps_the_dispatch_base(
         worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
         changed_files=['mod_a/file.py'], plan_base_commit='planbase789',
     )
+    f.wf._old_plan_base = 'priorlane000'
     architect(f, monkeypatch)
 
     outcome = await f.wf._plan()
 
     assert outcome == WorkflowOutcome.PLANNED
-    assert plan_base_commit(f.artifacts.read_plan()) == f.artifacts.read_base_commit() == 'oldmain123'
+    assert f.artifacts.read_base_commit() == 'oldmain123'
+    assert plan_base_commit(f.artifacts.read_plan()) == 'oldmain123'
 
 
 @pytest.mark.parametrize('success', [False, True], ids=['capped', 'no_confirm'])

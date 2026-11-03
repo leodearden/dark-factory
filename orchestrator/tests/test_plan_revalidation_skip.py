@@ -3,8 +3,8 @@
 When the prior plan has provenance and the diff main has gained since the
 plan was stamped does not overlap any plan files, the architect's
 revalidation pass is short-circuited. The orchestrator stamps
-``_revalidated_at`` and advances the plan's own ``_base_commit`` (mirroring
-``confirm_plan``), then returns PLANNED without invoking the architect.
+``_revalidated_at`` and advances the plan's own ``_base_commit`` to current
+main, then returns PLANNED without invoking the architect.
 
 Task 4031 adds a fifth precondition: the plan's ``_task_text_fp`` must equal
 the fingerprint of the task's current description/details.
@@ -28,7 +28,7 @@ from shared.cli_invoke import AgentResult
 from shared.task_text_fingerprint import TaskTextDrift, task_text_fingerprint
 
 from orchestrator.artifacts import PLAN_BASE_COMMIT_KEY, PLAN_SCHEMA_VERSION, TaskArtifacts
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.mcp.plan_tools import (
     _add_plan_step,
@@ -165,6 +165,7 @@ def _make(
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
     config.project_root = project_root
+    config.git = GitConfig(main_branch='main')
     config.revalidation_skip_enabled = revalidation_skip_enabled
     config.max_revalidation_age_hours = max_revalidation_age_hours
     config.plan_text_fp_gate_enabled = plan_text_fp_gate_enabled

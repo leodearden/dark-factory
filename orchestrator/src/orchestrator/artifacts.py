@@ -36,10 +36,19 @@ ORCHESTRATOR_ITERATION_SOURCES: frozenset[str] = frozenset({'orchestrator', 'ame
 """The only ``source`` values :meth:`TaskArtifacts.append_iteration_log` writes."""
 
 
+def _plan_stamp(plan: Mapping[str, object], key: str) -> str | None:
+    stamped = plan.get(key)
+    return stamped if isinstance(stamped, str) and stamped else None
+
+
 def plan_base_commit(plan: Mapping[str, object]) -> str | None:
     """The main SHA *plan* was last validated against (plans/task-meta-task-keying-prd.md §M2); None when unstamped or malformed."""
-    stamped = plan.get(PLAN_BASE_COMMIT_KEY)
-    return stamped if isinstance(stamped, str) and stamped else None
+    return _plan_stamp(plan, PLAN_BASE_COMMIT_KEY)
+
+
+def plan_task_text_fp(plan: Mapping[str, object]) -> str | None:
+    """The task-text fingerprint *plan* was authored against; None when unstamped or malformed."""
+    return _plan_stamp(plan, PLAN_TASK_TEXT_FP_KEY)
 
 
 def iteration_entry_written_by_orchestrator(entry: object) -> bool:

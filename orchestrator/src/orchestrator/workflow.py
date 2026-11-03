@@ -93,11 +93,11 @@ from orchestrator.agents.write_set import (
 )
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
-    PLAN_TASK_TEXT_FP_KEY,
     ReviewAggregation,
     TaskArtifacts,
     iteration_entry_written_by_orchestrator,
     plan_base_commit,
+    plan_task_text_fp,
 )
 from orchestrator.branch_base import own_work_base
 from orchestrator.branch_mergeability import Mergeability, read_branch_state
@@ -5691,7 +5691,7 @@ class TaskWorkflow:
         if not self.config.plan_text_fp_gate_enabled:
             return None
         current_fp = self._current_task_text_fp()
-        plan_fp = plan.get(PLAN_TASK_TEXT_FP_KEY)
+        plan_fp = plan_task_text_fp(plan)
         drift = task_text_drift(plan_fp, current_fp)
         if drift is TaskTextDrift.CURRENT:
             return None
@@ -5704,7 +5704,7 @@ class TaskWorkflow:
                 EventType.plan_text_drift, task_id=self.task_id, phase='plan',
                 data={
                     'drift': drift.value,
-                    'plan_text_fp': plan_fp if isinstance(plan_fp, str) else None,
+                    'plan_text_fp': plan_fp,
                     'task_text_fp': current_fp,
                     'plan_session_id': str(plan.get('_session_id') or ''),
                 },
@@ -5726,8 +5726,7 @@ class TaskWorkflow:
 
     def _stamped_task_text_fp(self) -> str | None:
         assert self.artifacts is not None
-        fp = self.artifacts.read_plan().get(PLAN_TASK_TEXT_FP_KEY)
-        return fp if isinstance(fp, str) else None
+        return plan_task_text_fp(self.artifacts.read_plan())
 
     async def _stamp_authored_plan(self) -> None:
         """Provenance-stamp a plan just authored against ``self.task`` and the dispatch base, and mirror its text fingerprint."""
@@ -5757,11 +5756,18 @@ class TaskWorkflow:
         on_main = await self.git_ops.is_ancestor_checked(stamped, self.config.git.main_branch)
         if on_main is True:
             return stamped
-        logger.info(
-            'Task %s: plan _base_commit %s not corroborated on main (is_ancestor=%r); '
-            'revalidating from the prior dispatch base',
-            self.task_id, stamped[:12], on_main,
-        )
+        if on_main is None:
+            logger.warning(
+                'Task %s: git could not check plan _base_commit %s against main; '
+                'revalidating from the prior dispatch base',
+                self.task_id, stamped[:12],
+            )
+        else:
+            logger.info(
+                'Task %s: plan _base_commit %s is not on main; '
+                'revalidating from the prior dispatch base',
+                self.task_id, stamped[:12],
+            )
         return self._old_plan_base
 
     async def _can_skip_revalidation(self, plan: dict) -> bool:
@@ -5854,7 +5860,7 @@ class TaskWorkflow:
         # self.modules/_module_configs already updated by
         # _reconcile_plan_scope on success (unchanged if the module set is).
 
-        # Bump revalidation stamp + base commit (mirrors confirm_plan).
+        # Stamp _revalidated_at and advance plan.json's _base_commit to current main.
         try:
             self.artifacts.bump_revalidation_stamp(
                 self.session_id, base_commit=current_main,

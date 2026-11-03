@@ -26,6 +26,7 @@ from orchestrator.artifacts import (
     TaskArtifacts,
     _normalize_plan,
     iteration_entry_written_by_orchestrator,
+    plan_task_text_fp,
 )
 from orchestrator.review_payload import ReviewPayloadError
 
@@ -540,6 +541,15 @@ class TestPlanProvenance:
         artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('session-abc123')
         assert PLAN_TASK_TEXT_FP_KEY not in artifacts.read_plan()
+
+    def test_plan_task_text_fp_reads_a_stamped_fingerprint(self):
+        assert plan_task_text_fp({PLAN_TASK_TEXT_FP_KEY: 'tfp:x'}) == 'tfp:x'
+
+    @pytest.mark.parametrize('plan', [
+        {}, {PLAN_TASK_TEXT_FP_KEY: ''}, {PLAN_TASK_TEXT_FP_KEY: None}, {PLAN_TASK_TEXT_FP_KEY: 7},
+    ], ids=['absent', 'empty', 'none', 'int'])
+    def test_plan_task_text_fp_is_none_for_an_absent_or_malformed_stamp(self, plan: dict):
+        assert plan_task_text_fp(plan) is None
 
     def test_validate_plan_owner_true_for_matching_session(self, artifacts: TaskArtifacts):
         artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
