@@ -1963,6 +1963,7 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         config.max_concurrent_tasks = 2
         config.project_root = tmp_path
         config.park_eviction_requests_db_path = tmp_path / 'park_eviction_requests.db'
+        config.eligibility_clock_db_path = tmp_path / 'scheduler_eligibility.db'
         config.git = GitConfig(
             main_branch='main', branch_prefix='task/', remote='origin',
             worktree_dir='.worktrees',
@@ -2022,6 +2023,7 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         config.max_concurrent_tasks = 2
         config.project_root = tmp_path
         config.park_eviction_requests_db_path = tmp_path / 'park_eviction_requests.db'
+        config.eligibility_clock_db_path = tmp_path / 'scheduler_eligibility.db'
         config.git = GitConfig(
             main_branch='main', branch_prefix='task/', remote='origin',
             worktree_dir='.worktrees',
