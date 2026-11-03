@@ -2904,13 +2904,7 @@ def test_sigterm_mid_sweep_removes_its_own_requests_and_leaves_another_sweeps(tm
             "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
         },
     ) as (proc, pgid):
-        deadline = time.monotonic() + load_scaled_grace(
-            10, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
-        )
-        while ("verifying", UNIT_R) not in read_drain_poll_trace(trace_path, complete_only=True):
-            assert proc.poll() is None, f"the sweep exited before it awaited {UNIT_R}"
-            assert time.monotonic() < deadline, f"the sweep never polled {UNIT_R} verifying"
-            time.sleep(0.05)
+        _await_gate_poll(proc, trace_path, ("verifying", UNIT_R))
         os.killpg(pgid, signal.SIGTERM)
         stdout, stderr = proc.communicate(timeout=30)
 
