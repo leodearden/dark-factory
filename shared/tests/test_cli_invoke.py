@@ -2690,10 +2690,10 @@ class TestInvokeWithCapRetryOutcomeRouting:
         churning the account pool through compounding cooldowns for an error the
         API never saw.
 
-        LATENT-FRAGILITY hardening with ZERO live occurrences — real resume
-        failures currently exceed the net's 5000 ms floor — not an active
-        incident.  The stderr string and its placement were measured against
-        Claude Code CLI 2.1.236 on 2026-08-19.
+        A genuine rejection exits in about 1s, inside the net's 5000 ms window
+        (re-measured on CLI 2.1.314, task 5579).  The stderr string and its
+        placement were first measured against Claude Code CLI 2.1.236 on
+        2026-08-19.
         """
         gate = make_gate_mock(detect_cap_hit=MagicMock(return_value=False))
         gate._handle_cap_detected = MagicMock(return_value=True)

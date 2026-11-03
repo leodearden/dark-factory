@@ -44,14 +44,13 @@ retires the whole run on ANY surviving resume, fleet-wide, so two failures
 inside the window do NOT chain if one resume succeeded between them.
 
 MEASURED 2026-09-18 against ``data/orchestrator/runs.db``: 12
-``session_resume_failed`` rows, every one stage='cli' — i.e. rejections of
-in-workflow progress-timeout re-arms — against 8 ``session_resume`` rows, all
-from the harness eligibility predicate and none from the arm seam. The arm-seam
-SUCCESS population emits no event at all, so its size is not merely unmeasured
-but unmeasurable from runs.db, and the interleaved series cannot be
-reconstructed after the fact. Those 12 stage='cli' rows predate task 5579,
-under which the branch counted every resumed non-success, and 0 of the 25 such
-rows measured on dark_factory+reify were rejections.
+``session_resume_failed`` rows, every one stage='cli', against 8
+``session_resume`` rows, all from the harness eligibility predicate and none
+from the arm seam. The 12 predate task 5579, when that stage counted every
+resumed non-success, and none of them was a CLI rejection (0 of the 25 such
+rows measured on dark_factory+reify). The arm-seam SUCCESS population emits no
+event at all, so its size is not merely unmeasured but unmeasurable from
+runs.db, and the interleaved series cannot be reconstructed after the fact.
 
 So the inequality bounds the window from below and nothing more: clearing it
 does not prove the escape will fire, only that a window below it could not.

@@ -447,11 +447,10 @@ CLI_INPUT_REQUIRED_MARKERS = [
 # invoke_with_cap_retry's fresh retry of a resume, so the string that rules out
 # a cap and the string that licenses discarding the session are one definition.
 #
-# LATENT-FRAGILITY hardening, zero live occurrences: real resume failures
-# currently exceed the net's 5000 ms floor, so nothing is being fixed here —
-# the fragility is that the floor is the only thing standing in the way.
-# Third instance of this class, after reify-3604 (--session-id collision)
-# and the 2026-07-29 ServerError escape.
+# A genuine rejection exits in about 1s, inside the net's 5000 ms window, so
+# this marker both prevents a synthetic cap and licenses the fresh retry
+# (task 5579). Third instance of this class, after reify-3604 (--session-id
+# collision) and the 2026-07-29 ServerError escape.
 #
 # Text and its STDERR placement MEASURED against Claude Code CLI 2.1.236 on
 # 2026-08-19, not guessed: the CLI prints

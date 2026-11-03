@@ -1679,6 +1679,20 @@ def _resume_rejection_cause(stderr: str) -> str:
     return _stderr_cause_line(stderr, RESUME_REJECTED_MARKERS)
 
 
+def _is_pre_turn_failure(result: AgentResult) -> bool:
+    """A failed, un-killed run that took no model turn and billed nothing.
+
+    The shared precondition of every pre-turn rejection predicate; each adds
+    only the stderr evidence naming WHICH rejection it was.
+    """
+    return (
+        not result.success
+        and not result.timed_out
+        and result.turns == 0
+        and result.cost_usd == 0.0
+    )
+
+
 def is_cli_invocation_rejected(result: AgentResult) -> bool:
     """Return True when the CLI rejected the invocation BEFORE any model turn.
 
@@ -1741,9 +1755,7 @@ def is_cli_invocation_rejected(result: AgentResult) -> bool:
     with a cost, so on contradictory evidence it declines; stricter on the
     acting side is the safe direction.
     """
-    if result.success or result.timed_out:
-        return False
-    if result.turns != 0 or result.cost_usd != 0.0:
+    if not _is_pre_turn_failure(result):
         return False
     return (
         result.subtype == 'error_cli_input_rejected'
@@ -1763,9 +1775,7 @@ def is_resume_rejected(result: AgentResult) -> bool:
     ``transcript_turns`` is deliberately not consulted: on a resume it counts
     the PRIOR turns of the transcript being resumed, not this process's work.
     """
-    if result.success or result.timed_out:
-        return False
-    if result.turns != 0 or result.cost_usd != 0.0:
+    if not _is_pre_turn_failure(result):
         return False
     # Lazy (function-local) import — see _stderr_has_cli_input_required.
     from shared.invocation_outcome import RESUME_REJECTED_MARKERS
@@ -3317,18 +3327,19 @@ async def invoke_with_cap_retry(
                         # CliLocalError — a recognised local CLI/usage error (e.g.
                         # --session-id collision) exits zero-cost and instantly, but
                         # it is NOT a usage cap.  Counting it as a cap loops forever
-                        # (reify-3604).  Falls through: Branch C retries fresh when
-                        # resuming, else the failed result is returned for normal
-                        # verify/steward handling.
+                        # (reify-3604).  Falls through: on a resume, the
+                        # resume-rejection branch (is_resume_rejected) retries
+                        # fresh only when RESUME_REJECTED_MARKERS proves the CLI
+                        # refused the session; any other CliLocalError is returned
+                        # for normal verify/steward handling.
                         #
                         # ServerError — a fast 5xx (e.g. 529 Overloaded) has exactly
                         # the same zero-cost / <=1-turn / sub-5s shape, so without
                         # this escape the net marks a perfectly HEALTHY account
                         # CAPPED and fails over pointlessly (2026-07-29 incident).
-                        # This escape is what prevents that.  It does NOT fall
-                        # through to Branch C: the terminal ServerError branch
-                        # immediately below exits the loop first, so a 5xx never
-                        # reaches the resume-fresh fallback.
+                        # This escape is what prevents that.  It does NOT reach
+                        # the resume-rejection branch: the terminal ServerError
+                        # branch immediately below exits the loop first.
                         if isinstance(outcome, ServerError):
                             logger.warning(
                                 f'{label}: zero-cost instant exit is a server-side API '
@@ -3412,9 +3423,12 @@ async def invoke_with_cap_retry(
                 #   escape live as defence-in-depth (it, not this break, is
                 #   what stops a fast 529 from marking a healthy account
                 #   CAPPED).
-                # - BEFORE the "resume failed → retry fresh" fallback below,
-                #   which would otherwise restart the invocation on a new slot
-                #   — an implicit failover the PRD forbids.
+                # - BEFORE the resume-rejection branch below
+                #   (is_resume_rejected), so a 5xx on a resume can never be
+                #   restarted on a new slot — an implicit failover the PRD
+                #   forbids.  That branch also declines any result without the
+                #   rejection marker (task 5579), so this ordering is defence
+                #   in depth.
                 #
                 # Note: because ServerError now outranks ZeroOutputWedge, the
                 # wedge resume-guard above no longer fires for a timed-out 5xx.
@@ -3443,16 +3457,17 @@ async def invoke_with_cap_retry(
 
                 # Progress-timeout guard (reify-4827, task 2360 fix #2): a
                 # RESUMED invocation that hit the working-regime ceiling but
-                # made real agentic progress (transcript_turns > 0) must be
-                # returned to the caller, not silently discarded into the
-                # generic non-cap-hit resume-failure branch below — that
-                # branch restarts from the ORIGINAL prompt, throwing away the
-                # transcript and all agent progress. The workflow gamma
-                # branch (is_timed_out_with_progress) owns re-resuming this
-                # session with its own continuation prompt. Mutually
-                # exclusive with the ZeroOutputWedge guard above
-                # (transcript_turns 0 vs >0), so zero-output wedges are
-                # unaffected and still take the existing fresh-fallback path.
+                # made real agentic progress (transcript_turns > 0) is
+                # returned to the caller: the workflow gamma branch
+                # (is_timed_out_with_progress) owns re-resuming this session
+                # with its own continuation prompt.  Since task 5579 the
+                # resume-rejection branch below (is_resume_rejected) declines
+                # every timed-out result too, so this guard is defence in
+                # depth plus a log line naming the γ hand-off, not the only
+                # thing stopping a discard.  Mutually exclusive with the
+                # ZeroOutputWedge guard above (transcript_turns 0 vs >0), so
+                # zero-output wedges are unaffected and still take that
+                # guard's fresh-fallback path.
                 if invoke_kwargs.get('resume_session_id') and is_timed_out_with_progress(result):
                     logger.warning(
                         f'{label}: resumed invocation timed out WITH progress '
