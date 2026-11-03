@@ -69,7 +69,7 @@ async def _captured_server_kwargs(tmp_path: Path, service: Any) -> AsyncIterator
             finally:
                 await harness._stop_escalation_server()
         assert mock_create.called, '_start_escalation_server did not reach create_escalation_server'
-        yield mock_create.call_args.kwargs
+        yield dict(mock_create.call_args.kwargs)
 
 
 def _prefix_resolver(kwargs: dict[str, Any]) -> Callable[[str, str], Any]:
