@@ -285,6 +285,24 @@ class TestEachArtifactFromItsOwnRoot:
         assert (entry.loops, entry.attempts, entry.phase, entry.error) == (0, 0, 'PLAN', None)
 
 
+class TestSnapshotIsReadOnly:
+    def test_malformed_plan_is_not_rewritten_by_a_snapshot(self, git_repo: Path):
+        git_ops = GitOps(GitConfig(), git_repo)
+        worktree_base = git_ops.worktree_base
+        _make_task_artifacts(worktree_base, '70', '70')
+        task_root = TaskArtifacts.task_root_for(worktree_base, '70')
+        plan_path = task_root / 'plan.json'
+        plan_path.write_text(json.dumps({'tdd_steps': [{'id': 's1', 'status': 'done'}]}))
+        bytes_before = plan_path.read_bytes()
+        listing_before = sorted(p.name for p in task_root.iterdir())
+
+        [entry] = build_task_runtime_snapshot(git_ops=git_ops)
+
+        assert (entry.phase, entry.error) == ('DONE', None)
+        assert plan_path.read_bytes() == bytes_before
+        assert sorted(p.name for p in task_root.iterdir()) == listing_before
+
+
 # ---------------------------------------------------------------------------
 # INV-2 structured-facts-at-failure: a per-task artifact READ FAILURE is
 # marked (error set, loops/attempts/phase/started all None) — never coerced
