@@ -23,7 +23,6 @@ Base fixture (``repo`` fixture):
 
 from __future__ import annotations
 
-import json
 import os
 import shlex
 import shutil
@@ -702,9 +701,7 @@ async def _release_into_lane(repo: Repo, name: str) -> Path:
     is the branch tip and whose metadata.json names the task."""
     lane = _lane(repo)
     await _git(repo.root, 'worktree', 'move', str(repo.wt(name)), str(lane))
-    meta_root = TaskArtifacts.meta_root_for(repo.git_ops.worktree_base, lane.name)
-    meta_root.mkdir(parents=True, exist_ok=True)
-    (meta_root / 'metadata.json').write_text(json.dumps({'task_id': name}))
+    TaskArtifacts.for_task(lane, name).init(name, name, '')
     await repo.git_ops.release_warm_lane(lane, name)
     assert (await _git(lane, 'rev-parse', '--abbrev-ref', 'HEAD')).strip() == 'HEAD'
     return lane
@@ -777,6 +774,27 @@ class TestRequeueReuseUnstacks:
         assert info.path == lane
         assert await warm_repo.sha('task/M') == tip_before
         assert (await _git(lane, 'symbolic-ref', 'HEAD')).strip() == 'refs/heads/task/M'
+        await _assert_clean_and_not_rebasing(lane)
+        assert await warm_repo.ledger.base_of('task/M') == p_tip
+
+    async def test_failed_rebind_leaves_the_detached_lane_on_its_old_base(
+        self, warm_repo: Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await _stack_p_and_m(warm_repo)
+        tip_before = await warm_repo.sha('task/M')
+        p_tip = await warm_repo.sha('task/P')
+        lane = await _release_into_lane(warm_repo, 'M')
+        main_sha = await warm_repo.advance_main({'unrelated.txt': 'main moved\n'})
+        shim = tmp_path / 'shim'
+        _fail_git(monkeypatch, shim, 'checkout -B task/M')
+
+        info = await warm_repo.git_ops.acquire_warm_lane('M', main_sha)
+
+        assert (shim / 'matched').exists()
+        assert isinstance(info, WorktreeInfo)
+        assert info.path == lane
+        assert await warm_repo.sha('task/M') == tip_before
+        assert await _rev_parse(lane, 'HEAD') == tip_before
         await _assert_clean_and_not_rebasing(lane)
         assert await warm_repo.ledger.base_of('task/M') == p_tip
 
