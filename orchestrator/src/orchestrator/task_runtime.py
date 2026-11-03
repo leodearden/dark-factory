@@ -54,13 +54,14 @@ class TaskRuntimeState:
 
 
 def _derive_phase(plan: dict) -> str:
-    """Coarse PLAN/EXECUTE/DONE derivation from a ``plan.json`` dict's
-    ``steps`` — reproduces the dashboard's exact rule
-    (``dashboard/src/dashboard/data/orchestrator.py``'s
-    ``read_task_artifacts``, lines 279-296) for parity with today (Open-Q1:
-    ship coarse, not event_store phase).
+    """Coarse phase from a ``plan.json`` dict's ``steps`` (Open-Q1: ship
+    coarse, not event_store phase): no steps is PLAN, every step a dict with
+    status ``'done'`` is DONE, anything else is EXECUTE. A non-list ``steps``
+    is a malformed plan and raises.
     """
     steps = plan.get('steps', [])
+    if not isinstance(steps, list):
+        raise ValueError(f"plan.json 'steps' must be a list, got {type(steps).__name__}")
     total = len(steps)
     done = sum(1 for s in steps if isinstance(s, dict) and s.get('status') == 'done')
     if total == 0:
