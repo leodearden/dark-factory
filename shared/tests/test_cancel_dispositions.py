@@ -5,6 +5,9 @@ Contract: plans/cancel-with-children-prd.md §4.2. Everything goes through the p
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
+
 import pytest
 from pydantic import ValidationError
 
@@ -13,12 +16,23 @@ from shared.cancel_dispositions import (
     CHILD_CANCELLING_ACTIONS,
     ENTRY_ONLY_ACTIONS,
     CancelAction,
+    CancelChildrenInvalid,
+    CancelChildrenInvalidReason,
+    CancelChildrenRefusalCode,
     ChildDisposition,
+    ExternalChild,
     FoldDisposition,
     KeepDisposition,
     MootDisposition,
     RepointDisposition,
+    children_to_json,
+    parse_children,
+    parse_superseded_by,
+    qualified_task_ref,
 )
+
+PARENT = 5869
+PROJECT = 'dark_factory'
 
 # --- the caller disposition shape (§4.2) -------------------------------------
 
@@ -68,15 +82,15 @@ def test_every_variant_is_frozen(disposition, field, value):
 
 
 def test_the_action_sets_partition_the_action_enum():
-    assert CALLER_ACTIONS == {
+    assert {
         CancelAction.KEEP,
         CancelAction.REPOINT,
         CancelAction.FOLD,
         CancelAction.MOOT,
-    }
-    assert ENTRY_ONLY_ACTIONS == {CancelAction.CO_CANCELLED}
-    assert CHILD_CANCELLING_ACTIONS == {CancelAction.FOLD, CancelAction.MOOT}
-    assert CALLER_ACTIONS | ENTRY_ONLY_ACTIONS == set(CancelAction)
+    } == CALLER_ACTIONS
+    assert {CancelAction.CO_CANCELLED} == ENTRY_ONLY_ACTIONS
+    assert {CancelAction.FOLD, CancelAction.MOOT} == CHILD_CANCELLING_ACTIONS
+    assert set(CancelAction) == CALLER_ACTIONS | ENTRY_ONLY_ACTIONS
     assert not CALLER_ACTIONS & ENTRY_ONLY_ACTIONS
     assert CHILD_CANCELLING_ACTIONS <= CALLER_ACTIONS
 
@@ -95,3 +109,256 @@ def test_the_action_sets_partition_the_action_enum():
 def test_child_disposition_rejects_malformed_input(raw):
     with pytest.raises(ValidationError):
         ChildDisposition.model_validate(raw)
+
+
+# --- the children map and superseded_by parsers (§4.2) ------------------------
+
+Reason = CancelChildrenInvalidReason
+
+
+def _parse(raw: object) -> Mapping[int | ExternalChild, object]:
+    return parse_children(raw, parent_id=PARENT, parent_project_id=PROJECT)
+
+
+def test_parse_children_keys_local_ids_as_ints_and_external_dependents_as_qualified_refs():
+    parsed = _parse(
+        {'6905': {'action': 'keep'}, 'reify:44': {'action': 'repoint', 'onto': [8032]}}
+    )
+
+    assert dict(parsed) == {
+        6905: KeepDisposition(),
+        ExternalChild(project_id='reify', task_id=44): RepointDisposition(onto=(8032,)),
+    }
+
+
+def test_parse_children_returns_an_immutable_mapping():
+    parsed = _parse({'6905': {'action': 'keep'}})
+
+    assert isinstance(parsed, Mapping)
+    with pytest.raises(TypeError):
+        parsed[6906] = KeepDisposition()  # type: ignore[index]
+
+
+def test_an_external_child_key_is_the_qualified_task_ref():
+    child = ExternalChild(project_id='reify', task_id=44)
+
+    assert child.key == 'reify:44' == qualified_task_ref('reify', 44)
+
+
+def test_children_round_trip_through_their_wire_form():
+    parsed = _parse(
+        {
+            '6905': {'action': 'keep', 'reason': 'stands on main'},
+            '7007': {'action': 'fold', 'into': 8032},
+            '7008': {'action': 'moot'},
+            'reify:44': {'action': 'repoint', 'onto': [8032, 8033]},
+        }
+    )
+
+    wire = children_to_json(parsed)
+
+    assert json.loads(json.dumps(wire)) == wire
+    assert _parse(wire) == parsed
+
+
+@pytest.mark.parametrize(
+    ('raw', 'reason', 'field', 'value'),
+    [
+        pytest.param(
+            {'7007': {'action': 'repoint', 'onto': [PARENT]}},
+            Reason.TARGET_IS_PARENT,
+            'children.7007.onto',
+            PARENT,
+            id='repoint-onto-the-parent',
+        ),
+        pytest.param(
+            {'7007': {'action': 'fold', 'into': 7007}},
+            Reason.TARGET_IS_CHILD,
+            'children.7007.into',
+            7007,
+            id='fold-into-itself',
+        ),
+        pytest.param(
+            {'7007': {'action': 'repoint', 'onto': [7007]}},
+            Reason.TARGET_IS_CHILD,
+            'children.7007.onto',
+            7007,
+            id='repoint-onto-itself',
+        ),
+        pytest.param(
+            {'7007': {'action': 'fold', 'into': PARENT}},
+            Reason.TARGET_IS_PARENT,
+            'children.7007.into',
+            PARENT,
+            id='fold-into-the-parent',
+        ),
+        pytest.param(
+            {str(PARENT): {'action': 'keep'}},
+            Reason.CHILD_IS_PARENT,
+            f'children.{PARENT}',
+            str(PARENT),
+            id='parent-as-its-own-child',
+        ),
+        pytest.param(
+            {'abc': {'action': 'keep'}},
+            Reason.INVALID_CHILD_KEY,
+            'children.abc',
+            'abc',
+            id='key-not-an-id',
+        ),
+        pytest.param(
+            {'0': {'action': 'keep'}},
+            Reason.INVALID_CHILD_KEY,
+            'children.0',
+            '0',
+            id='key-zero',
+        ),
+        pytest.param(
+            {f'{PROJECT}:12': {'action': 'keep'}},
+            Reason.INVALID_CHILD_KEY,
+            f'children.{PROJECT}:12',
+            f'{PROJECT}:12',
+            id='own-project-qualified',
+        ),
+        pytest.param(
+            {'reify:44': {'action': 'moot'}},
+            Reason.EXTERNAL_NOT_REPOINT,
+            'children.reify:44.action',
+            'moot',
+            id='external-moot',
+        ),
+        pytest.param(
+            {'1': {'action': 'co_cancelled'}},
+            Reason.ENTRY_ONLY_ACTION,
+            'children.1.action',
+            'co_cancelled',
+            id='entry-only-action',
+        ),
+        pytest.param(
+            {'1': {'action': 'nope'}},
+            Reason.UNKNOWN_ACTION,
+            'children.1.action',
+            'nope',
+            id='unknown-action',
+        ),
+        pytest.param(
+            {'1': {'action': 'keep', 'into': 2}},
+            Reason.FIELD_NOT_ALLOWED,
+            'children.1.into',
+            2,
+            id='field-not-allowed',
+        ),
+        pytest.param(
+            {'1': {'action': 'fold'}},
+            Reason.MISSING_FIELD,
+            'children.1.into',
+            None,
+            id='missing-into',
+        ),
+        pytest.param(
+            {'1': {'action': 'moot', 'reason': 'x' * 501}},
+            Reason.TEXT_TOO_LONG,
+            'children.1.reason',
+            'x' * 501,
+            id='reason-too-long',
+        ),
+        pytest.param(
+            {'1': {'action': 'repoint', 'onto': [3, 3]}},
+            Reason.DUPLICATE_TARGET,
+            'children.1.onto',
+            [3, 3],
+            id='duplicate-onto',
+        ),
+        pytest.param(
+            {'1': 'keep'},
+            Reason.INVALID_VALUE,
+            'children.1',
+            'keep',
+            id='disposition-not-a-mapping',
+        ),
+        pytest.param(
+            [{'action': 'keep'}],
+            Reason.INVALID_VALUE,
+            'children',
+            [{'action': 'keep'}],
+            id='children-not-a-mapping',
+        ),
+    ],
+)
+def test_parse_children_names_the_reason_field_and_value_of_a_refusal(raw, reason, field, value):
+    with pytest.raises(CancelChildrenInvalid) as caught:
+        _parse(raw)
+
+    assert (caught.value.reason, caught.value.field, caught.value.value) == (reason, field, value)
+
+
+def test_parse_superseded_by_returns_the_ids_in_order():
+    assert parse_superseded_by([8032, 8033], parent_id=PARENT) == (8032, 8033)
+
+
+@pytest.mark.parametrize(
+    ('raw', 'reason'),
+    [
+        pytest.param([], Reason.INVALID_VALUE, id='empty'),
+        pytest.param('8032', Reason.INVALID_VALUE, id='not-a-list'),
+        pytest.param([True], Reason.INVALID_VALUE, id='bool-is-not-an-id'),
+        pytest.param([8032, 8032], Reason.DUPLICATE_TARGET, id='duplicate'),
+        pytest.param([PARENT], Reason.TARGET_IS_PARENT, id='names-the-parent'),
+    ],
+)
+def test_parse_superseded_by_refuses_on_the_superseded_by_field(raw, reason):
+    with pytest.raises(CancelChildrenInvalid) as caught:
+        parse_superseded_by(raw, parent_id=PARENT)
+
+    assert (caught.value.reason, caught.value.field) == (reason, 'superseded_by')
+
+
+def test_the_refusal_codes_are_the_house_slugs():
+    assert {code.value for code in CancelChildrenRefusalCode} == {
+        'cancel_children_undispositioned',
+        'cancel_children_invalid',
+        'cancel_children_unknown',
+        'cancel_children_nested',
+        'cancel_children_execution_failed',
+        'cancel_children_parent_terminal',
+        'cancel_children_unverified',
+    }
+
+
+@pytest.mark.parametrize(
+    ('code', 'error_type'),
+    [
+        (CancelChildrenRefusalCode.UNDISPOSITIONED, 'CancelChildrenUndispositioned'),
+        (CancelChildrenRefusalCode.EXECUTION_FAILED, 'CancelChildrenExecutionFailed'),
+        (CancelChildrenRefusalCode.PARENT_TERMINAL, 'CancelChildrenParentTerminal'),
+    ],
+)
+def test_a_refusal_code_error_type_is_its_slug_in_camel_case(code, error_type):
+    assert code.error_type == error_type
+
+
+def test_the_invalid_refusal_is_the_house_gate_shape():
+    refusal = CancelChildrenInvalid(Reason.TARGET_CANCELLED, 'children.6905.onto', 8032)
+
+    payload = refusal.to_error_dict(task_id='5869')
+
+    assert payload == {
+        'success': False,
+        'error': 'cancel_children_invalid',
+        'error_type': 'CancelChildrenInvalid',
+        'task_id': '5869',
+        'reason_code': 'target_cancelled',
+        'field': 'children.6905.onto',
+        'value': 8032,
+        'hint': payload['hint'],
+    }
+    assert payload['hint']
+
+
+def test_the_invalid_refusal_repr_s_a_value_json_cannot_carry():
+    payload = CancelChildrenInvalid(Reason.INVALID_VALUE, 'children', {1, 2}).to_error_dict(
+        task_id='5869'
+    )
+
+    assert payload['value'] == repr({1, 2})
+    assert json.dumps(payload)
