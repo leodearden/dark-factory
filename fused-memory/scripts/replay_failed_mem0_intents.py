@@ -18,7 +18,6 @@ import argparse
 import asyncio
 import collections
 import contextlib
-import json
 import logging
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -33,7 +32,11 @@ from mcp.client.streamable_http import streamablehttp_client
 from mcp.types import CallToolResult, Implementation
 from shared.cli_boundary import LoudArgumentParser, run_cli
 
-from fused_memory.services.write_journal import Mem0IntentStatus, WriteJournal
+from fused_memory.services.write_journal import (
+    Mem0IntentStatus,
+    WriteJournal,
+    decode_mem0_intent_metadata,
+)
 from fused_memory.utils.store_mutation_preflight import (
     StoreMutationUnavailable,
     assert_store_mutation_allowed,
@@ -124,7 +127,7 @@ def replay_arguments(intent: Mapping[str, Any]) -> dict[str, Any]:
         'content': intent['content'],
         'project_id': intent['project_id'],
         'category': intent['category'],
-        'metadata': json.loads(intent['metadata'] or '{}'),
+        'metadata': decode_mem0_intent_metadata(intent),
     }
     for identity in ('agent_id', 'session_id'):
         if intent.get(identity) is not None:

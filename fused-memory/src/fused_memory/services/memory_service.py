@@ -147,7 +147,10 @@ from fused_memory.services.topic_anchor import (
     resolve_topic_anchor_enabled,
     select_canonical_payload,
 )
-from fused_memory.services.write_journal import Mem0IntentStatus
+from fused_memory.services.write_journal import (
+    Mem0IntentStatus,
+    decode_mem0_intent_metadata,
+)
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
 from fused_memory.utils.canonical_labels import Referent, parse_node_name, scan_content
 from fused_memory.utils.referent_resolution import (
@@ -7224,7 +7227,7 @@ class MemoryService:
             agent_id=intent.get('agent_id'),
             session_id=intent.get('session_id'),
         )
-        metadata = json.loads(intent.get('metadata') or '{}')
+        metadata = decode_mem0_intent_metadata(intent)
         return await self._journaled_backend_call(
             write_op_id=intent['write_op_id'],
             causation_id=intent.get('causation_id'),
