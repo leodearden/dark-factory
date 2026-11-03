@@ -12,7 +12,8 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable, Coroutine
+from typing import Any
 
 import httpx
 import pytest
@@ -28,7 +29,10 @@ _PREFIX = 'bff81530'
 _FULL = 'bff81530-70e5-4ab6-939e-507299d1bcd2'
 _SIBLING = 'bff81530-0000-4000-8000-000000000002'
 
-Handler = Callable[[httpx.Request], httpx.Response | Awaitable[httpx.Response]]
+Handler = (
+    Callable[[httpx.Request], httpx.Response]
+    | Callable[[httpx.Request], Coroutine[Any, Any, httpx.Response]]
+)
 
 
 class _Recorder:
