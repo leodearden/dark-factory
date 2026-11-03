@@ -241,9 +241,16 @@ class TestFailOpen:
     """The half that must not regress: fused-memory stopped never loses an escalation."""
 
     @pytest.mark.asyncio
-    async def test_a_refused_connection_files_unchanged_with_a_warning_fact(self, tmp_path: Path, caplog):
+    @pytest.mark.parametrize('base_url', [
+        'http://127.0.0.1:1',
+        'http://localhost:abc',
+        'http://127.0.0.1:80020',
+    ], ids=['refused', 'invalid-port', 'port-out-of-range'])
+    async def test_an_unreachable_resolver_files_unchanged_with_a_warning_fact(
+        self, tmp_path: Path, caplog, base_url,
+    ):
         caplog.set_level(logging.INFO, logger='escalation.server')
-        resolver = PrefixResolverClient(base_url='http://127.0.0.1:1').resolve_prefix
+        resolver = PrefixResolverClient(base_url=base_url).resolve_prefix
         queue, server = build(tmp_path, resolver)
 
         result = await call(server, 'escalate_info', {**REQUIRED, 'detail': CITING_DETAIL})

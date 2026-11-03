@@ -161,6 +161,20 @@ class TestUnavailable:
 
         assert raised.value.store == 'fused-memory'
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('base_url', [
+        'http://localhost:abc',
+        'http://[::1',
+        'http://127.0.0.1:80020',
+    ], ids=['invalid-port', 'unclosed-ipv6', 'port-out-of-range'])
+    async def test_an_unusable_base_url_is_unavailable(self, base_url):
+        client = PrefixResolverClient(base_url=base_url)
+
+        with pytest.raises(ResolverUnavailable) as raised:
+            await _resolve(client)
+
+        assert raised.value.store == 'fused-memory'
+
 
 class TestDeadline:
     @staticmethod
@@ -234,6 +248,20 @@ class TestFailureWarning:
         assert len(warnings) == 1
         message = warnings[0].getMessage()
         for fragment in (_URL, _PROJECT, _PREFIX, reason):
+            assert fragment in message
+
+    @pytest.mark.asyncio
+    async def test_an_unusable_base_url_logs_one_warning_naming_the_error(self, caplog):
+        caplog.set_level(logging.WARNING, logger=prefix_resolver_client.__name__)
+        base_url = 'http://localhost:abc'
+
+        with pytest.raises(ResolverUnavailable):
+            await _resolve(PrefixResolverClient(base_url=base_url))
+
+        warnings = _client_warnings(caplog)
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        for fragment in (f'{base_url}/resolve-prefix', _PROJECT, _PREFIX, 'InvalidURL'):
             assert fragment in message
 
     @pytest.mark.asyncio
