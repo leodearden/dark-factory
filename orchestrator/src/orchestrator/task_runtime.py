@@ -159,7 +159,9 @@ def _read_task_entry(
     """Read one task's artifacts into a :class:`TaskRuntimeState`.
 
     Shared by both the pooled and non-pooled enumeration branches so B4
-    honest-zero and phase parity hold identically for both layouts.
+    honest-zero and phase parity hold identically for both layouts. The
+    read writes nothing: the plan comes from ``peek_plan``, not
+    ``read_plan``, so a live agent's malformed plan is never repaired here.
 
     INV-2 (structured-facts-at-failure): a per-task artifact READ FAILURE
     (e.g. corrupt ``plan.json``/review JSON raising) is marked — ``error``
@@ -183,7 +185,7 @@ def _read_task_entry(
         entries, _corrupted = artifacts.read_iteration_log()
         loops = len(entries)
         attempts = len(artifacts.read_reviews())
-        phase = _derive_phase(artifacts.read_plan())
+        phase = _derive_phase(artifacts.peek_plan())
         started = artifacts.read_created_at() or started_fallback.get(str(task_id))
         error = None
     except Exception as exc:
