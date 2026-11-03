@@ -737,7 +737,7 @@ function TasksTab({ projectFilter, search }) {
   // whole-handler budget expires, a silently-missing project would otherwise
   // read as a project with nothing to do.
   //
-  // The three-way distinction itself is decided SERVER-SIDE (app.api_tasks)
+  // The distinction between those cases is decided SERVER-SIDE (app.api_tasks)
   // and turned into copy by tasks_offline_banner.js. Nothing here re-derives
   // it: a `k of N` judgement made in the JSX would drift from the one the
   // handler made. N likewise comes from the server (TASKS_PROJECT_COUNT): the
@@ -762,7 +762,7 @@ function TasksTab({ projectFilter, search }) {
   // row vocabulary by active_tasks._probe_status — grep either end to find
   // the other.
   //
-  // A SIBLING of bannerNotices above, not a fifth kind inside it. The two
+  // A SIBLING of bannerNotices above, not another kind inside it. The two
   // answer different questions: tasksBannerNotices reports whether TASK DATA
   // is available, a distinction decided server-side in app.api_tasks, while
   // rtProbeSummary is a client-side derivation over the snapshot rows

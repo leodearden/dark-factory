@@ -1072,23 +1072,39 @@ for (const chart of COUNT_AXIS_CHARTS) {
 }
 
 // ── Decision 10: the Tasks tab's banner notices (tasks_offline_banner.js::tasksBannerNoticesFor) ──
-// Every notice kind the helper returns renders under its own test id.
+// Every notice kind the helper returns renders under its own test id. Each
+// case seeds the one /tasks fact that yields that kind and nothing else, so a
+// kind with no bannerTestIds entry renders with no test id and fails here.
 
-test('tab_tasks.jsx::TasksTab renders the count-stale notice tasksBannerNoticesFor describes under its own test id', t => {
-  const harness = openWindow(t);
-  const { window } = harness;
-  seedOneTask(window, inProgressTask(false));
-  seedDashboardData(window, {
-    TASKS_COUNT_STALE_PROJECTS: [PROJECT],
-    TASKS_PROJECT_COUNT: 1,
-    __receipt: receiptsFor(window.DF_DATA_LOADER, ['TASKS_COUNT_STALE_PROJECTS', 'TASKS_PROJECT_COUNT']),
+const OTHER_PROJECT = 'q';
+const BANNER_CASES = [
+  { kind: 'global', testId: 'tasks-offline-banner',
+    data: { TASKS_OFFLINE: true, TASKS_OFFLINE_PROJECTS: [PROJECT], TASKS_PROJECT_COUNT: 1 } },
+  { kind: 'partial', testId: 'tasks-partial-banner',
+    data: { TASKS_OFFLINE_PROJECTS: [OTHER_PROJECT], TASKS_PROJECT_COUNT: 2 } },
+  { kind: 'degraded', testId: 'tasks-degraded-banner',
+    data: { TASKS_DEGRADED_PROJECTS: [OTHER_PROJECT], TASKS_PROJECT_COUNT: 2 } },
+  { kind: 'count-unknown', testId: 'tasks-count-unknown-banner',
+    data: { TASKS_COUNT_UNKNOWN_PROJECTS: [PROJECT], TASKS_PROJECT_COUNT: 1 } },
+  { kind: 'count-stale', testId: 'tasks-count-stale-banner',
+    data: { TASKS_COUNT_STALE_PROJECTS: [PROJECT], TASKS_PROJECT_COUNT: 1 } },
+];
+
+for (const { kind, testId, data } of BANNER_CASES) {
+  test(`tab_tasks.jsx::TasksTab renders the ${kind} notice tasksBannerNoticesFor describes under ${testId}`, t => {
+    const harness = openWindow(t);
+    const { window } = harness;
+    seedOneTask(window, inProgressTask(false));
+    seedDashboardData(window, { ...data, __receipt: receiptsFor(window.DF_DATA_LOADER, Object.keys(data)) });
+    const { container } = harness.mount(window.DF_TASKS.TasksTab, TAB_PROPS);
+
+    const notices = window.DF_TASKS_OFFLINE_BANNER.tasksBannerNoticesFor(window.DF_DATA);
+    assert.deepEqual(Array.from(notices, n => n.kind), [kind]);
+    const rendered = [...container.querySelectorAll(`[data-testid="${testId}"]`)];
+    assert.equal(rendered.length, 1, `the ${kind} notice must render exactly once under ${testId}`);
+    assert.equal(rendered[0].textContent, notices[0].text);
+    for (const other of BANNER_CASES.filter(c => c.kind !== kind)) {
+      assert.deepEqual([...container.querySelectorAll(`[data-testid="${other.testId}"]`)], [], other.testId);
+    }
   });
-  const { container } = harness.mount(window.DF_TASKS.TasksTab, TAB_PROPS);
-
-  const [notice] = window.DF_TASKS_OFFLINE_BANNER.tasksBannerNoticesFor(window.DF_DATA);
-  assert.equal(notice.kind, 'count-stale');
-  const rendered = [...container.querySelectorAll('[data-testid="tasks-count-stale-banner"]')];
-  assert.equal(rendered.length, 1, 'the count-stale notice must render exactly once under its own test id');
-  assert.equal(rendered[0].textContent, notice.text);
-  assert.deepEqual([...container.querySelectorAll('[data-testid="tasks-count-unknown-banner"]')], []);
-});
+}
