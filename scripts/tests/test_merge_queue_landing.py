@@ -81,11 +81,12 @@ def _main(repo):
     return git(repo, "rev-parse", "main").strip()
 
 
-def _land_docs(repo, queue, files=DOCS, **kwargs):
-    """land_files of *files* onto *repo*'s main, through *queue*."""
+def _land_docs(repo, queue, files=DOCS, *, base=None, **kwargs):
+    """land_files of *files* onto *repo*'s main, from *base* (default: main),
+    through *queue*."""
     with FakeEscalationMcp(tool_handlers=queue.handlers()) as server:
         return land_files(
-            str(repo), files, _main(repo),
+            str(repo), files, base or _main(repo),
             port=str(server.port), label=LABEL, message=MESSAGE, **kwargs,
         )
 
@@ -539,6 +540,33 @@ def test_a_path_outside_the_checkout_is_refused_before_any_call(docs_repo, scrat
     assert queue.calls == []
     assert escape is None or not escape.exists(), f"{escape} was written"
     assert (repo / ".git" / "config").read_bytes() == git_config
+    _assert_untouched(repo, before, scratch)
+
+
+def test_a_symlink_only_the_base_carries_is_refused_before_any_call(docs_repo, scratch,
+                                                                    tmp_path):
+    """The deploy commit is written at the base, which may carry a symlink
+    the checkout has since dropped."""
+    repo = docs_repo
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (repo / "linked").symlink_to(outside, target_is_directory=True)
+    git(repo, "add", "linked")
+    git(repo, "commit", "-q", "-m", "link a directory outside the checkout")
+    base = _main(repo)
+    git(repo, "rm", "-q", "linked")
+    git(repo, "commit", "-q", "-m", "drop the link")
+    before = _main(repo)
+    queue = FakeMergeQueue(repo)
+
+    refusal = _docs_refused_by(
+        repo, queue, {PRD: DOCS[PRD], "linked/escape.md": b"escaped\n"}, base=base,
+    )
+
+    assert refusal.failure is LandingFailure.INVALID_CHANGE, refusal.detail
+    assert "linked/escape.md" in refusal.detail, refusal.detail
+    assert queue.calls == []
+    assert not (outside / "escape.md").exists(), "the write followed the base's symlink"
     _assert_untouched(repo, before, scratch)
 
 

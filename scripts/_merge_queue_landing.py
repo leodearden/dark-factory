@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import contextlib
 import enum
+import os
 import shutil
 import signal
 import subprocess
@@ -308,7 +309,24 @@ class _Target:
 
     @classmethod
     def of(cls, repo: Path, files: Mapping[str, bytes], main_branch: str) -> _Target:
-        return cls(repo, main_branch, tuple(sorted(files.items())))
+        """The change *files* make to *repo*, every path made repo-relative:
+        INVALID_CHANGE for an empty set, a path _repo_relative refuses, and
+        two spellings of one path."""
+        if not files:
+            raise LandingNotConfirmed(
+                LandingFailure.INVALID_CHANGE, f"nothing to land: no paths given for {repo}",
+            )
+        spelled: dict[str, str] = {}
+        changes: dict[str, bytes] = {}
+        for given, content in files.items():
+            relative = _repo_relative(repo, given)
+            if relative in spelled:
+                raise LandingNotConfirmed(
+                    LandingFailure.INVALID_CHANGE,
+                    f"{spelled[relative]} and {given} both name {relative} in {repo}",
+                )
+            spelled[relative], changes[relative] = given, content
+        return cls(repo, main_branch, tuple(sorted(changes.items())))
 
     @property
     def paths(self) -> tuple[str, ...]:
@@ -333,10 +351,18 @@ class _Target:
             )
 
     def write_into(self, worktree: Path) -> None:
-        """Write every path's new content into *worktree*. A path git's tree
-        cannot hold there (under a file, or over a directory) is INVALID_CHANGE."""
+        """Write every path's new content into *worktree*, the base checked
+        out. A path git's tree cannot hold there as a file (under a file, over
+        a directory, through a symlink the base carries but the target
+        checkout no longer does) is INVALID_CHANGE."""
         for path, content in self.changes:
             destination = worktree / path
+            if _crosses_symlink(worktree, path):
+                raise LandingNotConfirmed(
+                    LandingFailure.INVALID_CHANGE,
+                    f"{path} crosses a symlink at the base, so it would be written somewhere "
+                    f"other than the path it names",
+                )
             try:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(content)
@@ -370,6 +396,33 @@ class _Target:
 
 def _holds(on_disk: Path, content: bytes | None) -> bool:
     return content is not None and on_disk.is_file() and on_disk.read_bytes() == content
+
+
+def _repo_relative(repo: Path, path: str) -> str:
+    """*path*, relative to the checkout *repo* or absolute inside it, as a
+    repo-relative POSIX path. INVALID_CHANGE when it names the checkout
+    itself, anything outside it or under its .git, or crosses a symlink in it."""
+    root = repo.absolute()
+    try:
+        relative = Path(os.path.normpath(root / path)).relative_to(root)
+    except ValueError:
+        problem = f"is outside the checkout {repo}"
+    else:
+        if not relative.parts:
+            problem = f"names the checkout {repo} itself, not a file in it"
+        elif relative.parts[0] == ".git":
+            problem = f"is under {repo}/.git, which no commit carries"
+        elif _crosses_symlink(repo, relative.as_posix()):
+            problem = (f"crosses a symlink in the checkout {repo}, so it would be written "
+                       f"somewhere other than the path it names")
+        else:
+            return relative.as_posix()
+    raise LandingNotConfirmed(LandingFailure.INVALID_CHANGE, f"{path} {problem}")
+
+
+def _crosses_symlink(root: Path, relative: str) -> bool:
+    resolved_root = root.resolve()
+    return (resolved_root / relative).resolve() != resolved_root / relative
 
 
 @dataclass(frozen=True)
