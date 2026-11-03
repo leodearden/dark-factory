@@ -3326,6 +3326,16 @@ class TestMem0HistoryPersistence:
             == MemoryConfig().history_db_path
         )
 
+    @pytest.mark.asyncio
+    async def test_the_shared_test_config_keeps_history_off_the_shared_db(
+        self, mock_config, mem0_built_from,
+    ):
+        """Every test that builds a real mem0 instance derives its config from
+        ``mock_config``, and relies on this to stay off the shared file."""
+        await Mem0Backend(mock_config).add('x', Scope(project_id='p'))
+
+        assert MemoryConfig(**mem0_built_from[0]).history_db_path == ':memory:'
+
 
 class TestNonDefaultDimsAgainstAnExistingCollection:
     """The migration hazard behind plumbing embedder.dimensions at all.
