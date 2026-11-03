@@ -90,13 +90,17 @@ class LandingFailure(enum.StrEnum):
 
 class LandingNotConfirmed(Exception):
     """The content did not provably land: *failure* names why, *detail* tells
-    the operator, *state* is the last merge state seen (None before any)."""
+    the operator, *state* is the last merge state seen (None before any), and
+    *reason* is the queue's own stated reason for a terminal refusal (None
+    when it gave none, or the refusal is not the queue's)."""
 
-    def __init__(self, failure: LandingFailure, detail: str, state: str | None = None):
+    def __init__(self, failure: LandingFailure, detail: str, state: str | None = None, *,
+                 reason: str | None = None):
         super().__init__(detail)
         self.failure = failure
         self.detail = detail
         self.state = state
+        self.reason = reason
 
 
 class _GitFailed(LandingNotConfirmed):
@@ -505,6 +509,7 @@ class _DeployBranch:
             f"{self.branch}, which the request may still land from: if it lands, its value "
             f"goes live at the next reload or restart",
             refusal.state,
+            reason=refusal.reason,
         )
 
 
@@ -644,6 +649,7 @@ def _submit_pending(submitted: dict, target: _Target, deploy: _DeployBranch) -> 
         raise LandingNotConfirmed(
             LandingFailure.SUBMIT_REJECTED,
             f"merge_request refused the submission: {submitted.get('error') or submitted}{code}",
+            reason=submitted.get("error") or None,
         )
     if status in SUBMIT_NON_TERMINAL:
         return True
@@ -766,6 +772,7 @@ def _not_landed(reply: dict, *, state: str | None) -> LandingNotConfirmed:
         LandingFailure.NOT_LANDED,
         f"{subject} settled {state}{reason}{successor}: nothing landed",
         state,
+        reason=reply.get("reason") or None,
     )
 
 
