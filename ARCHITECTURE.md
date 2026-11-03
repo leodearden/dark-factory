@@ -716,6 +716,9 @@ This expresses auto-deploys, act-then-ask gates, pure human gates, and (via
 [docs/task-authoring.md](docs/task-authoring.md)'s "Deterministic tasks" and
 "Milestones" sections for the full field reference; that's task-author-facing
 configuration, not architecture, so it isn't repeated here.
+The runner's internal dispatch state machine (idempotency and quiescence,
+the `before_done` sub-paths, the pure gate's proof ladder) is documented in
+[docs/deterministic-runner.md](docs/deterministic-runner.md).
 
 ---
 

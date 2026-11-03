@@ -95,8 +95,9 @@ class ScriptTimeout(Exception):
     ``before_done['timeout_secs']`` and the Layer-A teardown ran (task 4065).
 
     THIS DOCSTRING IS THE CANONICAL EXPLANATION of the classification.  The
-    other 4065 sites (in ``orchestrator/src/orchestrator/deterministic_runner.py``:
-    its module docstring, ``DeterministicRunner._default_run_script``,
+    other 4065 sites (docs/deterministic-runner.md, and in
+    ``orchestrator/src/orchestrator/deterministic_runner.py``:
+    ``DeterministicRunner._default_run_script``,
     ``DeterministicRunner._run_predicate``, both seam wrappers, the
     ``script_runner`` ctor arg) deliberately carry one-line pointers here rather than restating it, so
     the next change to this rule has ONE place to update, not ten that can
