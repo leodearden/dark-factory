@@ -598,25 +598,33 @@ def test_thread_timeout_method_is_confined_to_the_recorded_configs() -> None:
     )
 
 
-def _xdist_requirements(member: str) -> list[Requirement]:
-    """Every pytest-xdist entry across *member*'s ``[dependency-groups]``.
+def _xdist_requirements(config_name: str) -> list[Requirement]:
+    """Every pytest-xdist entry *config_name*'s pyproject.toml declares.
 
-    Dict entries such as ``{include-group = ...}`` name another group rather than
-    a distribution, so they are skipped; the group they include is walked in its
-    own right.
+    Reads all three tables that can declare one: ``[project].dependencies``,
+    every list in ``[project.optional-dependencies]``, and every group in
+    ``[dependency-groups]``. Dict entries such as ``{include-group = ...}`` name
+    another group rather than a distribution, so they are skipped; the group
+    they include is walked in its own right.
     """
-    pyproject = per_test_timeout_policy.REPO_ROOT / member / 'pyproject.toml'
-    groups = tomllib.loads(pyproject.read_text(encoding='utf-8')).get('dependency-groups', {})
+    pyproject = per_test_timeout_policy.REPO_ROOT / config_name / 'pyproject.toml'
+    data = tomllib.loads(pyproject.read_text(encoding='utf-8'))
+    project = data.get('project', {})
+    declaration_lists = [
+        project.get('dependencies', []),
+        *project.get('optional-dependencies', {}).values(),
+        *data.get('dependency-groups', {}).values(),
+    ]
     requirements = [
         Requirement(entry)
-        for entries in groups.values()
+        for entries in declaration_lists
         for entry in entries
         if isinstance(entry, str)
     ]
     return [req for req in requirements if canonicalize_name(req.name) == XDIST_DISTRIBUTION]
 
 
-def _floor_violation(member: str, requirement: Requirement) -> str | None:
+def _floor_violation(config_name: str, requirement: Requirement) -> str | None:
     """Why *requirement* admits an xdist below ``MAIN_THREAD_WORKERS_XDIST``, or None."""
     floors = [
         Version(clause.version)
@@ -625,12 +633,12 @@ def _floor_violation(member: str, requirement: Requirement) -> str | None:
     ]
     if not floors:
         return (
-            f'{member}/pyproject.toml declares {str(requirement)!r}, which has no '
+            f'{config_name}/pyproject.toml declares {str(requirement)!r}, which has no '
             f'`>=` floor; spell it {XDIST_DISTRIBUTION}>={MAIN_THREAD_WORKERS_XDIST}'
         )
     if max(floors) < MAIN_THREAD_WORKERS_XDIST:
         return (
-            f'{member}/pyproject.toml declares {str(requirement)!r}, below the '
+            f'{config_name}/pyproject.toml declares {str(requirement)!r}, below the '
             f'required floor {XDIST_DISTRIBUTION}>={MAIN_THREAD_WORKERS_XDIST}'
         )
     return None
@@ -640,27 +648,33 @@ def test_every_pytest_xdist_floor_admits_only_main_thread_workers() -> None:
     """The declaration-level guard on the signal premise.
 
     The probes above check the resolved xdist at run time and ``uv.lock`` pins
-    it; this checks what every member admits, so a lowered floor or a new member
-    at an old one fails here, by name, before any relock can resolve below it.
+    it; this checks what the root pyproject.toml and every workspace member
+    admit, in any dependency table, so a lowered floor or a new declaration at
+    an old one fails here, by name, before any relock can resolve below it.
     """
     declarers: list[str] = []
     violations: list[str] = []
-    for member in per_test_timeout_policy.workspace_members():
-        requirements = _xdist_requirements(member)
+    config_names = [
+        per_test_timeout_policy.ROOT_CONFIG_NAME,
+        *per_test_timeout_policy.workspace_members(),
+    ]
+    for config_name in config_names:
+        requirements = _xdist_requirements(config_name)
         if requirements:
-            declarers.append(member)
+            declarers.append(config_name)
         violations.extend(
             violation
-            for violation in (_floor_violation(member, req) for req in requirements)
+            for violation in (_floor_violation(config_name, req) for req in requirements)
             if violation is not None
         )
 
     assert len(declarers) >= MIN_EXPECTED_XDIST_DECLARERS, (
-        f'only {len(declarers)} workspace members declare {XDIST_DISTRIBUTION} '
+        f'only {len(declarers)} pyproject.toml files declare {XDIST_DISTRIBUTION} '
         f'({sorted(declarers)}), expected at least {MIN_EXPECTED_XDIST_DECLARERS}. '
-        'Discovery reads [tool.uv.workspace].members and each member\'s '
-        '[dependency-groups]; a declaration it stopped finding is one this guard '
-        'no longer checks.'
+        'Discovery reads the root pyproject.toml plus one per '
+        '[tool.uv.workspace].members entry, and in each the [project] '
+        'dependencies, [project.optional-dependencies] and [dependency-groups]; '
+        'a declaration it stopped finding is one this guard no longer checks.'
     )
     assert not violations, (
         f'these {XDIST_DISTRIBUTION} declarations admit a release below '

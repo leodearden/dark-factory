@@ -391,8 +391,9 @@ def _pytest_ini_options(pyproject: pathlib.Path) -> dict | None:
 def workspace_members() -> list[str]:
     """``[tool.uv.workspace].members`` from the root pyproject.toml, never empty.
 
-    The one read of the members table for every sweep that discovers workspace
-    members, so the read and its anti-vacuity guard have a single home.
+    The members read shared by this file's sweeps and
+    ``test_timeout_method_policy.py``'s, so for those two files the read and its
+    anti-vacuity guard have a single home.
     """
     root_pyproject = REPO_ROOT / 'pyproject.toml'
     root_data = tomllib.loads(root_pyproject.read_text(encoding='utf-8'))
