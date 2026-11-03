@@ -1,18 +1,47 @@
-"""Landing one file's new content on a target project's main through that
-target's own merge queue: the step a config-deploy script takes before it
-hot-reloads (scripts/merge-deep-set-cap.sh, scripts/merge-pytest-n-ab-switch.sh).
+"""Landing new content for a set of files on a target project's main through
+that target's own merge queue, rather than by a direct commit to its main.
 
 A direct commit to a target's main is drift its queue never verified, which
 forces every merge in flight there to re-verify in full
 (orchestrator/src/orchestrator/merge_lane/gates.py::_disjoint_skip_blockers).
+A config-deploy script lands its knob edit this way before it hot-reloads
+(scripts/merge-deep-set-cap.sh, scripts/merge-pytest-n-ab-switch.sh), and a
+docs session lands its new or edited documents the same way:
 
-`land_file` commits the content on a short-lived `task/deploy-<label>-<UTC
-stamp>` branch, in a worktree outside the target checkout, submits it through
-merge_request, polls the request's own handle until it settles, and confirms
-the landing by git: the deploy commit is on main, and the target checkout's
-file is main's. Any other outcome raises `LandingNotConfirmed`, whose
-`.failure` is a wire tag a caller may print. `land_or_exit` is the same call,
-exiting through `_config_reload_gate.die`.
+    landing = land_files(repo, {"plans/foo-prd.md": prd, "plans/foo.yaml": manifest},
+                         base_sha, port=port, label="docs-prd-foo", message=message)
+
+lands every path as ONE commit through ONE merge request on the queue of the
+orchestrator whose escalation MCP listens on 127.0.0.1:*port*. `land_file` is
+its single-path form, and `land_or_exit` that form exiting through
+`_config_reload_gate.die` on a refusal.
+
+Paths are relative to the checkout *repo*; an absolute path inside it is
+accepted. The content is the caller's, authored outside the target checkout,
+and is never read from it. Nothing here writes the checkout, and its state
+outside the landed paths is left alone; at a landed path it must be clean,
+because the lane's advance would refuse to move main over uncommitted state
+there, halting the whole queue, or overwrite it.
+
+Refused before any queue call: an empty set; a path outside the checkout,
+through a symlink in it, under its .git, or the checkout itself; two
+spellings of one path; a path whose content equals its copy at *base_sha* (a
+path the base lacks is a new file); all INVALID_CHANGE. Uncommitted state at
+a landed path is CHECKOUT_DIRTY.
+
+A confirmed landing returns `Landing`, whose `landed_as` is the commit the
+queue landed it as. Any other outcome raises `LandingNotConfirmed`: `.failure`
+is a wire tag a caller may print, `.state` the last merge state seen, and
+`.reason` the queue's own stated reason for a terminal refusal.
+
+Every landing takes the normal lane, unverified, so it pays the target's full
+merge gate; nothing is special-cased for docs.
+
+The change is committed on a short-lived `task/deploy-<label>-<UTC stamp>`
+branch, in a worktree outside the target checkout, submitted through
+merge_request, and polled by the request's own handle until it settles. The
+landing is then confirmed by git: the deploy commit is on main, and the
+target checkout's copy of every landed path is main's.
 
 The deploy branch is torn down once its request can no longer land. A request
 still in flight when the deadline passes, or when SIGTERM/SIGINT arrives, is
@@ -506,8 +535,9 @@ class _DeployBranch:
         return LandingNotConfirmed(
             refusal.failure,
             f"{refusal.detail}; kept the deploy worktree {self.worktree} and branch "
-            f"{self.branch}, which the request may still land from: if it lands, its value "
-            f"goes live at the next reload or restart",
+            f"{self.branch}, which the request may still land from: if it does, its change "
+            f"reaches main unconfirmed (a config change then goes live at the next reload or "
+            f"restart)",
             refusal.state,
             reason=refusal.reason,
         )
@@ -838,8 +868,8 @@ def _confirmed(target: _Target, deploy: _DeployBranch, reply: dict) -> Landing:
         raise LandingNotConfirmed(
             LandingFailure.CHECKOUT_NOT_SYNCED,
             f"{deploy.branch} landed on {target.main_branch}, but on disk the checkout's "
-            f"{on_disk} is not {target.main_branch}'s copy, so a reload would re-read the old "
-            f"content",
+            f"{on_disk} is not {target.main_branch}'s copy, so a reader of the checkout, a "
+            f"config reload among them, would see the old content",
             MergeState.done,
         )
     return Landing(
