@@ -31,6 +31,7 @@ from config_reload_script_fakes import (
 from merge_queue_fakes import (
     TRANSPORT_FAULT,
     FakeMergeQueue,
+    assert_no_landing_left_behind,
     assert_target_checkout_clean,
     deploy_tmpdir_env,
 )
@@ -109,7 +110,18 @@ def _land(repo, queue, **kwargs):
 
 def _assert_left_nothing_behind(repo, scratch):
     assert_target_checkout_clean(repo)
+    _assert_scratch_removed(scratch)
+
+
+def _assert_scratch_removed(scratch):
     assert os.listdir(scratch) == [], f"the deploy scratch dir was left: {os.listdir(scratch)}"
+
+
+def _checkout_state(repo, *paths):
+    """What a landing must leave alone in *repo*: its staged and unstaged
+    diffs, and the bytes on disk at each of *paths*."""
+    return (git(repo, "diff", "--cached"), git(repo, "diff"),
+            {path: (repo / path).read_bytes() for path in paths})
 
 
 # ---------------------------------------------------------------------------
@@ -597,6 +609,84 @@ def test_an_absolute_path_inside_the_checkout_lands_as_its_repo_relative_path(do
 
 
 # ---------------------------------------------------------------------------
+# The target checkout's own state
+#
+# The lane's advance refuses to move main over uncommitted state at a landed
+# path, and halts the whole queue doing so; untracked state there it
+# overwrites. Any other state in the checkout is not the landing's to touch.
+# ---------------------------------------------------------------------------
+
+def _commit(repo, path, content):
+    (repo / path).write_bytes(content)
+    git(repo, "add", path)
+    git(repo, "commit", "-q", "-m", f"add {path}")
+
+
+@pytest.mark.parametrize("dirt", ["unstaged_edit", "staged_edit", "untracked_new_file"])
+def test_uncommitted_state_at_a_landed_path_is_refused_before_any_call(docs_repo, scratch, dirt):
+    repo = docs_repo
+    dirty = "plans/demo-prd.capability-manifest.md" if dirt == "untracked_new_file" else PRD
+    (repo / dirty).write_bytes(b"# a session's uncommitted draft\n")
+    if dirt == "staged_edit":
+        git(repo, "add", dirty)
+    state = _checkout_state(repo, dirty)
+    before = _main(repo)
+    queue = FakeMergeQueue(repo)
+
+    refusal = _docs_refused_by(repo, queue, DOCS)
+
+    assert refusal.failure is LandingFailure.CHECKOUT_DIRTY, refusal.detail
+    assert dirty in refusal.detail, refusal.detail
+    clean = [path for path in DOCS if path != dirty]
+    assert not any(path in refusal.detail for path in clean), refusal.detail
+    assert queue.calls == []
+    assert _main(repo) == before
+    assert _checkout_state(repo, dirty) == state
+    assert_no_landing_left_behind(repo)
+    _assert_scratch_removed(scratch)
+
+
+def test_other_staged_and_dirty_state_is_left_alone_when_the_queue_refuses(docs_repo, scratch):
+    repo = docs_repo
+    _commit(repo, "notes.md", b"notes\n")
+    (repo / CONFIG).write_bytes(EDITED)
+    git(repo, "add", CONFIG)
+    (repo / "notes.md").write_bytes(b"notes, edited\n")
+    (repo / "draft.txt").write_bytes(b"an untracked draft\n")
+    state = _checkout_state(repo, CONFIG, "notes.md", "draft.txt")
+    before = _main(repo)
+    queue = FakeMergeQueue(
+        repo, states=["verifying", {"state": "blocked", "reason": "verify failed: 2 tests"}],
+    )
+
+    refusal = _docs_refused_by(repo, queue, DOCS)
+
+    assert refusal.failure is LandingFailure.NOT_LANDED, refusal.detail
+    assert _main(repo) == before
+    assert _checkout_state(repo, CONFIG, "notes.md", "draft.txt") == state
+    assert_no_landing_left_behind(repo)
+    _assert_scratch_removed(scratch)
+
+
+def test_unrelated_dirty_state_survives_a_landing(docs_repo, scratch):
+    """No staged change here: the fake lands with a real `git merge`, which
+    aborts on a dirty index that the lane's own advance would park."""
+    repo = docs_repo
+    (repo / CONFIG).write_bytes(EDITED)
+    (repo / "draft.txt").write_bytes(b"an untracked draft\n")
+    state = _checkout_state(repo, CONFIG, "draft.txt")
+    queue = FakeMergeQueue(repo, states=["verifying", "done"])
+
+    landing = _land_docs(repo, queue)
+
+    assert landing.landed_as == _main(repo) == queue.merge_sha
+    assert _files_in(repo, landing.tip_sha) == sorted(DOCS)
+    assert _checkout_state(repo, CONFIG, "draft.txt") == state
+    assert_no_landing_left_behind(repo)
+    _assert_scratch_removed(scratch)
+
+
+# ---------------------------------------------------------------------------
 # Waiting for this request's own terminal state
 # ---------------------------------------------------------------------------
 
@@ -928,6 +1018,7 @@ def test_failure_tags_are_the_wire_vocabulary():
         "interrupted",
         "queue_done_not_on_main",
         "checkout_not_synced",
+        "checkout_dirty",
         "invalid_change",
         "git_failed",
     }
