@@ -25,6 +25,7 @@ import pytest_asyncio
 from _mem0_intent_fixtures import rate_limit_error
 
 from fused_memory.models.enums import SourceStore
+from fused_memory.models.memory import Mem0WriteState
 from fused_memory.models.scope import Scope
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.write_journal import WriteJournal
@@ -261,6 +262,7 @@ class TestAddMemoryTransientDeferral:
         )
 
         assert result.memory_ids == []
+        assert result.mem0_write_state is Mem0WriteState.PENDING_RETRY
         assert SourceStore.mem0 not in result.stores_written
         assert result.stores_pending_retry == [SourceStore.mem0]
         assert 'mem0_pending_retry' in result.message
@@ -275,6 +277,28 @@ class TestAddMemoryTransientDeferral:
         write_op = await recovery_journal.get_write_op(intent['write_op_id'])
         assert write_op is not None
         assert json.loads(write_op['result_summary'])['stores_pending'] == ['mem0']
+
+    @pytest.mark.asyncio
+    async def test_an_opted_out_write_fails_loudly_instead_of_deferring(
+        self, recovery_service, recovery_journal
+    ):
+        svc = recovery_service
+        svc.mem0.add = AsyncMock(side_effect=rate_limit_error())
+
+        result = await svc.add_memory(
+            content=_DEFERRED_CONTENT,
+            category='procedural_knowledge',
+            project_id='dark_factory',
+            defer_transient_mem0_failure=False,
+        )
+
+        assert result.mem0_write_state is Mem0WriteState.NOT_LANDED
+        assert result.stores_pending_retry == []
+        assert '[mem0_error' in result.message
+        assert 'mem0_pending_retry' not in result.message
+        (intent,) = await recovery_journal.get_mem0_intents()
+        assert intent['status'] == 'failed'
+        assert await recovery_journal.get_mem0_intents(status='retrying') == []
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
