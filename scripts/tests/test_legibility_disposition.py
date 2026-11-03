@@ -522,7 +522,7 @@ def test_every_census_ticket_status_resolves_or_stays_pending(status: task_store
         assert row["resolution"] is None
         assert "tkt_s" in resolutions.pending
     else:
-        assert row["resolution"] is not None
+        assert row["resolution"] == status.value
         assert codebook.validate(result) == []
 
 
