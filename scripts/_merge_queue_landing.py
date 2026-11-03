@@ -83,6 +83,7 @@ class LandingFailure(enum.StrEnum):
     INTERRUPTED = "interrupted"
     QUEUE_DONE_NOT_ON_MAIN = "queue_done_not_on_main"
     CHECKOUT_NOT_SYNCED = "checkout_not_synced"
+    CHECKOUT_DIRTY = "checkout_dirty"
     INVALID_CHANGE = "invalid_change"
     GIT_FAILED = "git_failed"
 
@@ -335,7 +336,8 @@ class _Target:
     def check_change(self, base_sha: str) -> None:
         """Raise INVALID_CHANGE unless *base_sha* is a commit and every path's
         content differs from the copy *base_sha* carries, if any: a path it
-        lacks is a new file."""
+        lacks is a new file. Then raise CHECKOUT_DIRTY when any landed path
+        carries uncommitted state in the checkout."""
         if _run_git(self.repo, "rev-parse", "--verify", "--quiet",
                     f"{base_sha}^{{commit}}").returncode != 0:
             raise LandingNotConfirmed(
@@ -349,6 +351,23 @@ class _Target:
                 f"nothing to land for {', '.join(unchanged)}: base {base_sha} already carries "
                 f"this content",
             )
+        dirty = self.dirty_paths()
+        if dirty:
+            raise LandingNotConfirmed(
+                LandingFailure.CHECKOUT_DIRTY,
+                f"the checkout {self.repo} carries uncommitted state at {', '.join(dirty)}: "
+                f"the merge lane would refuse to move {self.main_branch} over it (wip_overlap, "
+                f"which halts the whole queue) or overwrite it; pass content authored outside "
+                f"the checkout, and leave the landed paths clean there",
+            )
+
+    def dirty_paths(self) -> list[str]:
+        """The landed paths carrying staged, unstaged or untracked state in the
+        checkout, read without taking its index.lock: the merge worker treats
+        a held lock as contention."""
+        return [path for path in self.paths
+                if _git(self.repo, "--no-optional-locks", "status", "--porcelain",
+                        "--untracked-files=all", "--", path)]
 
     def write_into(self, worktree: Path) -> None:
         """Write every path's new content into *worktree*, the base checked
