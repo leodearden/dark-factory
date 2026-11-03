@@ -8,10 +8,8 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import contextlib
 import functools
 import os
-import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -20,15 +18,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _predicate_specimens import POLLUTED_PREDICATE_OUTPUT
+from _script_survivor import SURVIVOR_SCRIPT, is_alive, kill_survivor, read_survivor_pid
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
-from shared.proc_group import SigkillDispatch
 
 # The one orchestrator symbol imported at module scope (the rest are imported
 # inside each test, as this file has always done): a `parametrize` decorator is
 # evaluated at collection time, so the disposition matrix below cannot name its
 # enum members any other way.
-from orchestrator.deterministic_runner import ProcessTeardown
+from orchestrator.before_done_script import ProcessTeardown
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -336,49 +334,6 @@ _FRESH_UNIT_STATE: dict = {
     'ActiveEnterTimestamp': 'Mon 2026-06-23 10:01:00 UTC',
     'ActiveEnterTimestampMonotonic': 2_000_000,
 }
-
-# The already-exited-script timeout shape (task 4252): the script exits while a
-# child it spawned keeps the merged stdout pipe open, so `_terminate_process
-# _tree`'s pid-recycling guard dispatches NO signal and that child is still
-# alive when the test's assertions run — which is exactly what those tests
-# assert.  Every such test must therefore reap it itself, or leak a live
-# `sleep 30` past pytest exit (measured by the reviewer on the first of them).
-_SURVIVOR_SCRIPT = (
-    '#!/bin/sh\n'
-    'sleep 30 &\n'
-    'echo $! > "$1"\n'
-    'echo started\n'
-    'exit 7\n'
-)
-
-
-def _read_survivor_pid(pidfile: Path) -> int:
-    """The pid ``_SURVIVOR_SCRIPT`` recorded for the child that outlived it.
-
-    Written milliseconds into the run, long before the 1s timeout fires, so it
-    is reliably on disk by the time a caller reads it.
-    """
-    return int(pidfile.read_text().strip())
-
-
-def _is_alive(pid: int) -> bool:
-    """Whether *pid* still exists — the signal-0 existence probe."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
-
-
-def _kill_survivor(pidfile: Path) -> None:
-    """SIGKILL the process ``_SURVIVOR_SCRIPT`` left behind, if still there.
-
-    Tolerates every way the pid can already be gone (no file, empty file, the
-    process reaped in the meantime) so it is safe in a ``finally``.
-    """
-    with contextlib.suppress(OSError, ValueError):
-        os.kill(_read_survivor_pid(pidfile), signal.SIGKILL)
-
 
 def _seed_escalation(
     queue: EscalationQueue, task_id: str, agent_role: str, *,
@@ -3183,7 +3138,7 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
 
         script = tmp_path / 'exits-but-child-lives.sh'
         pidfile = tmp_path / 'survivor.pid'
-        script.write_text(_SURVIVOR_SCRIPT)
+        script.write_text(SURVIVOR_SCRIPT)
         script.chmod(0o755)
 
         task = _deploy_task(
@@ -3244,15 +3199,15 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
                 f'fired, so nothing was captured either way: {esc.detail!r}'
             )
 
-            survivor_pid = _read_survivor_pid(pidfile)
-            assert _is_alive(survivor_pid), (
+            survivor_pid = read_survivor_pid(pidfile)
+            assert is_alive(survivor_pid), (
                 f'THE MEASUREMENT the assertions below are about: survivor pid '
                 f'{survivor_pid} is still RUNNING, because the teardown dispatched '
                 f'no signal to it at all'
             )
             assert 'SIGKILLed' not in esc.detail, (
                 f'HONESTY PIN (task 4252 reviewer finding): in this shape '
-                f"_terminate_process_tree's pid-recycling guard dispatched NO "
+                f"terminate_process_tree's pid-recycling guard dispatched NO "
                 f'signal, so claiming a kill tells the operator that surviving '
                 f'process (pid {survivor_pid}, alive as this runs) is gone when it '
                 f'is not — the most operationally costly direction of the defect: '
@@ -3287,7 +3242,7 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
             )
             unit_inspector.assert_not_awaited()
         finally:
-            _kill_survivor(pidfile)
+            kill_survivor(pidfile)
 
     @pytest.mark.parametrize('exit_code', [None, 7], ids=['no_exit_code', 'exited_rc7'])
     @pytest.mark.parametrize(
@@ -3318,7 +3273,8 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
         ``(rc, tail)`` pair, and only the default runner raises this (see the
         ``ScriptTimeout`` docstring).
         """
-        from orchestrator.deterministic_runner import DeterministicRunner, ScriptTimeout
+        from orchestrator.before_done_script import ScriptTimeout
+        from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
 
         task = _deploy_task(task_id='4252e', target_unit=None)
@@ -4390,521 +4346,6 @@ class TestWritebackBackoffsSeam:
             f'stranding cause: {esc.detail!r}'
         )
         assert outcome == WorkflowOutcome.BLOCKED
-
-
-# ---------------------------------------------------------------------------
-# Default seam: _default_run_script env merge
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-class TestDefaultRunScriptEnv:
-    """_default_run_script merges a partial env dict over os.environ."""
-
-    async def test_partial_env_inherits_path(self, tmp_path: Path):
-        """Passing a partial env dict must NOT drop os.environ — PATH must survive.
-
-        Regression guard for the latent footgun where ``create_subprocess_exec``
-        received the raw ``before_done['env']`` dict, which completely replaced the
-        process environment (no PATH/HOME/XDG_RUNTIME_DIR → most binaries fail to
-        resolve).  The fix merges over ``os.environ`` so the deploy script still runs
-        in a sane environment while callers can still override individual variables.
-        """
-        import os
-        from unittest.mock import AsyncMock as _AsyncMock
-        from unittest.mock import patch
-
-        from escalation.queue import EscalationQueue
-
-        from orchestrator.deterministic_runner import DeterministicRunner
-
-        queue = EscalationQueue(tmp_path)
-        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
-
-        before_done = {
-            'script': '/usr/bin/true',
-            'args': [],
-            'env': {'MY_DEPLOY_VAR': 'hello'},
-            'cwd': str(tmp_path),
-            'timeout_secs': 5,
-            'target_unit': 'orchestrator-reify.service',
-        }
-
-        mock_proc = _AsyncMock()
-        mock_proc.communicate = _AsyncMock(return_value=(b'', b''))
-        mock_proc.returncode = 0
-
-        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
-            await runner._default_run_script(before_done)
-
-        call_kwargs = mock_exec.call_args.kwargs
-        passed_env = call_kwargs['env']
-
-        assert passed_env is not None, (
-            'env must not be None when before_done.env is non-empty'
-        )
-        assert 'PATH' in passed_env, (
-            f'child must inherit PATH from os.environ when a partial env dict is '
-            f'passed; got env keys: {sorted(passed_env)}'
-        )
-        assert passed_env['PATH'] == os.environ['PATH'], (
-            'inherited PATH must match os.environ[PATH]'
-        )
-        assert passed_env['MY_DEPLOY_VAR'] == 'hello', (
-            'custom override from before_done.env must be present in merged env'
-        )
-
-
-# ---------------------------------------------------------------------------
-# Task 2090 — Layer A: whole-process-group kill on subprocess timeout
-# ---------------------------------------------------------------------------
-
-def _fake_pgid() -> int:
-    """A stand-in pgid that ``shared.proc_group.unsafe_pgid_reason`` will never refuse.
-
-    ``_terminate_process_tree`` delegates to
-    ``shared/src/shared/proc_group.py::sigkill_process_group``, which
-    sanity-checks the pgid against this process's own identifiers (task 3884
-    amendment), so a hard-coded literal can collide with
-    ``os.getpid()``/``os.getppid()``/``os.getpgrp()`` and make the helper
-    refuse-and-fall-back instead of dispatching the killpg these tests assert
-    on. That is ~1-in-1.4M with this box's ``pid_max=4194304``, but ~1-in-10k
-    on the older 32768 default — a real flake, and a baffling one to debug.
-    Deriving a provably-distinct value removes the class outright.
-    """
-    live = {os.getpid(), os.getppid(), os.getpgrp()}
-    candidate = 12345
-    while candidate in live:
-        candidate += 1
-    return candidate
-
-
-@pytest.mark.asyncio
-class TestBeforeDoneSubprocessTimeoutHardening:
-    """DeterministicRunner — Layer A: kill the WHOLE process tree on timeout.
-
-    Guards against the inherited-pipe hang behind task 2087's stranding:
-    restart-fused-memory.sh --drain spawns grandchildren (systemctl restart,
-    curl, journalctl, sleep, the restarted daemon) that inherit the write end
-    of the merged stdout pipe.  Killing only the direct child (pre-2090
-    behavior) leaves the tree alive and the pipe open forever.
-
-    Task 4065 / 4252 amendment: the timeout branch RAISES ``ScriptTimeout``
-    instead of returning ``(1, '<script timed out after Ns>')`` — see that
-    class's docstring for why — and that exception carries only MEASURED
-    data: the overrun budget it blew, the script's own exit code when the
-    teardown found it already exited, and WHICH SIGNAL that teardown actually
-    dispatched (``ProcessTeardown``).  No fabricated exit code, no stand-in
-    output, and no inferred kill.  The Layer-A teardown below is unchanged and
-    must still happen BEFORE the raise, so the grandchild-is-dead assertion
-    stays exactly as it was.
-
-    The teardown disposition is asserted in BOTH directions here, because the
-    two shapes are what the escalation text has to tell apart: a script still
-    running at teardown entry gets a real whole-group SIGKILL (and the
-    grandchild-is-dead assertion corroborates it), while a script that already
-    exited gets NO signal at all — its pid may have been recycled — so the
-    child it spawned is still running when the escalation is filed.  Each of
-    the four ``_terminate_process_tree`` branch tests below therefore also
-    pins the value it RETURNS, since those are the tests that independently
-    prove which branch ran.
-    """
-
-    async def test_timeout_kills_whole_process_group(self, tmp_path: Path):
-        """On timeout, a backgrounded grandchild must be killed too, not just
-        the direct child — and the timeout must surface as ``ScriptTimeout``.
-
-        The raise carries only MEASURED structured data (task 4252): the
-        overrun budget, and an ``exit_code`` that is ``None`` here because
-        this script's own process was still running when the kill fired.
-        (The exited-script case, where a surviving child holds the pipe open
-        and a real exit code IS in hand, is pinned by
-        ``TestDefaultRunnerInnerTimeoutDeployHonesty``.)
-        """
-        import asyncio
-        import os
-        import time
-
-        from orchestrator.deterministic_runner import (
-            DeterministicRunner,
-            ProcessTeardown,
-            ScriptTimeout,
-        )
-
-        script = tmp_path / 'hang.sh'
-        pidfile = tmp_path / 'grandchild.pid'
-        script.write_text(
-            '#!/bin/sh\n'
-            'sleep 60 &\n'
-            'echo $! > "$1"\n'
-            'sleep 60\n'
-        )
-        script.chmod(0o755)
-
-        queue = EscalationQueue(tmp_path)
-        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
-
-        before_done = {
-            'script': str(script),
-            'args': [str(pidfile)],
-            'cwd': str(tmp_path),
-            'timeout_secs': 1,
-            'target_unit': 'orchestrator-reify.service',
-        }
-
-        # Hang tripwire: if the fix regresses into a real hang, fail loudly
-        # instead of stalling the suite.
-        with pytest.raises(ScriptTimeout) as excinfo:
-            await asyncio.wait_for(
-                runner._default_run_script(before_done), timeout=10,
-            )
-
-        exc = excinfo.value
-        assert exc.timeout_secs == 1, (
-            f'ScriptTimeout must carry the budget it overran, got {exc.timeout_secs!r}'
-        )
-        assert exc.exit_code is None, (
-            f'the direct child was still running when the timeout fired, so '
-            f'it produced no exit code — the teardown signal that killed it '
-            f'(a negative returncode) is not one, and must normalize to None: '
-            f'{exc.exit_code!r}'
-        )
-        assert exc.teardown is ProcessTeardown.GROUP_KILLED, (
-            f'the script was alive at teardown entry, so the whole-group '
-            f'SIGKILL really was dispatched — and the grandchild-is-dead '
-            f'assertion below is the INDEPENDENT corroboration that this '
-            f'disposition is honest, so the two agree by construction rather '
-            f'than by assumption (task 4252): {exc.teardown!r}'
-        )
-        assert not hasattr(exc, 'rc'), (
-            f'a SIGKILLed script produced NO exit code, so the exception must '
-            f'not carry a fabricated one for a caller to re-report to a human '
-            f'(task 4252), got rc={getattr(exc, "rc", None)!r}'
-        )
-        assert not hasattr(exc, 'tail'), (
-            f'no output was captured either — communicate() was cancelled by '
-            f'the timeout — so the old marker string was a placeholder, not '
-            f'script output (task 4252), got tail='
-            f'{getattr(exc, "tail", None)!r}'
-        )
-        assert 'no exit code' in str(exc), (
-            f'the message must still say what did NOT happen, so a log line '
-            f'carrying only str(exc) is readable: {str(exc)!r}'
-        )
-        assert '1s' in str(exc), (
-            f'the message must still name the budget it overran: {str(exc)!r}'
-        )
-
-        grandchild_pid = int(pidfile.read_text().strip())
-        deadline = time.monotonic() + 3.0
-        alive = True
-        while time.monotonic() < deadline:
-            try:
-                os.kill(grandchild_pid, 0)
-            except ProcessLookupError:
-                alive = False
-                break
-            await asyncio.sleep(0.05)
-        assert not alive, (
-            f'grandchild pid {grandchild_pid} must be dead after timeout — the '
-            f'WHOLE process group must be killed, not just the direct child'
-        )
-
-    async def test_timeout_of_already_exited_script_does_not_signal_the_group(
-        self, tmp_path: Path,
-    ):
-        """The other half of Layer A, measured: when the SCRIPT has already
-        exited, the teardown dispatches NO signal and the child it spawned
-        SURVIVES — so "exited" and "group killed" are independent facts.
-
-        Mechanism: ``communicate()`` waits for the merged stdout/stderr pipe to
-        CLOSE, and the child holding its write end keeps it open past the
-        script's own exit, while asyncio's child watcher populates
-        ``Process.returncode`` independently.  So ``returncode`` is ALREADY set
-        at teardown entry, and ``_terminate_process_tree``'s pid-recycling
-        short-circuit (task 845/3884) fires: refusing to signal a possibly
-        recycled pid beats reaping an orphan.
-
-        All three facts are asserted together because the escalation text is
-        built from them, and the defect this pins is text that infers a kill
-        from a timeout rather than reporting what was measured (task 4252
-        reviewer finding).
-        """
-        import asyncio
-
-        from orchestrator.deterministic_runner import (
-            DeterministicRunner,
-            ProcessTeardown,
-            ScriptTimeout,
-        )
-
-        script = tmp_path / 'exits-but-child-lives.sh'
-        pidfile = tmp_path / 'survivor.pid'
-        script.write_text(_SURVIVOR_SCRIPT)
-        script.chmod(0o755)
-
-        queue = EscalationQueue(tmp_path)
-        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
-
-        before_done = {
-            'script': str(script),
-            'args': [str(pidfile)],
-            'cwd': str(tmp_path),
-            'timeout_secs': 1,
-            'target_unit': 'orchestrator-reify.service',
-        }
-
-        try:
-            # Hang tripwire, as in the sibling test above.
-            with pytest.raises(ScriptTimeout) as excinfo:
-                await asyncio.wait_for(
-                    runner._default_run_script(before_done), timeout=10,
-                )
-
-            exc = excinfo.value
-            assert exc.exit_code == 7, (
-                f'the script really did run to completion, and its exit code is '
-                f'in hand at the raise site: {exc.exit_code!r}'
-            )
-            assert exc.teardown is ProcessTeardown.NOT_SIGNALLED, (
-                f'the direct child was already reaped at teardown entry, so the '
-                f'pid-recycling guard dispatched NOTHING — not a group kill, not '
-                f'even a direct kill: {exc.teardown!r}'
-            )
-            survivor_pid = _read_survivor_pid(pidfile)
-            assert _is_alive(survivor_pid), (
-                f'survivor pid {survivor_pid} must still be RUNNING — nothing '
-                f'signalled it, and this is the fact the escalation text has to '
-                f'report: the process holding the deploy output pipe open is '
-                f'still there for an operator to find and kill'
-            )
-        finally:
-            _kill_survivor(pidfile)
-
-    async def test_terminate_process_tree_swallows_process_lookup_error(
-        self, tmp_path: Path,
-    ):
-        """``_terminate_process_tree`` must swallow ProcessLookupError from
-        BOTH the killpg path and the proc.kill() fallback — an already-exited
-        process must never propagate out of the timeout-cleanup helper.
-
-        Task 3884: the killpg now targets the pgid FROZEN at spawn (passed in
-        by the caller) rather than one re-derived via ``os.getpgid(proc.pid)``
-        at kill time, so the dispatch is actually reached here — the swallow
-        being asserted is the killpg's own ProcessLookupError, then the
-        proc.kill() fallback's.
-        """
-        import signal
-        from unittest.mock import patch
-
-        from orchestrator.deterministic_runner import DeterministicRunner, ProcessTeardown
-
-        queue = EscalationQueue(tmp_path)
-        runner = DeterministicRunner(
-            scheduler=MagicMock(),
-            escalation_queue=queue,
-            reap_grace_secs=0.05,
-        )
-
-        pgid = _fake_pgid()
-        mock_proc = MagicMock()
-        # pid must equal the pgid: unsafe_pgid_reason refuses a mismatch as a
-        # corrupted capture, which would short-circuit before the killpg.
-        mock_proc.pid = pgid
-        # A bare MagicMock's `.returncode` is a truthy Mock (i.e. `is not None`),
-        # which the task-3884 reaped-proc short-circuit would read as "already
-        # reaped" and skip the signal entirely.  This proc is still running.
-        mock_proc.returncode = None
-        mock_proc.kill = MagicMock(side_effect=ProcessLookupError('already exited'))
-        mock_proc.wait = AsyncMock(return_value=None)
-
-        with patch(
-            'os.killpg', side_effect=ProcessLookupError('no such process'),
-        ) as mock_killpg:
-            result = await runner._terminate_process_tree(mock_proc, pgid)
-
-        mock_killpg.assert_called_once_with(pgid, signal.SIGKILL)
-        mock_proc.kill.assert_called_once()
-        assert result is ProcessTeardown.DIRECT_KILLED, (
-            f'the killpg raised, so only the DIRECT child was signalled and '
-            f'anything it spawned survives — the caller writes operator-facing '
-            f'text about what was killed, so it must be able to learn that '
-            f'(task 4252 reviewer finding): {result!r}'
-        )
-
-    async def test_terminate_process_tree_bounds_reap_when_proc_never_exits(
-        self, tmp_path: Path,
-    ):
-        """The reap following the kill signal must be bounded by
-        ``reap_grace_secs`` — a process that never exits after being signaled
-        (e.g. stuck in an uninterruptible D-state) must not hang
-        ``_terminate_process_tree`` forever.
-
-        The existing ProcessLookupError-swallow test's ``mock_proc.wait``
-        resolves immediately, so it never exercises the
-        ``except TimeoutError: logger.warning(...)`` branch around
-        ``asyncio.wait_for(proc.wait(), timeout=self._reap_grace_secs)`` —
-        this test exercises that bound directly.
-        """
-        import asyncio
-        from unittest.mock import patch
-
-        from orchestrator.deterministic_runner import DeterministicRunner, ProcessTeardown
-
-        queue = EscalationQueue(tmp_path)
-        runner = DeterministicRunner(
-            scheduler=MagicMock(),
-            escalation_queue=queue,
-            reap_grace_secs=0.05,
-        )
-
-        pgid = _fake_pgid()
-        mock_proc = MagicMock()
-        # pid must equal the pgid — see the sibling test.
-        mock_proc.pid = pgid
-        # Still running (see the sibling test): a bare MagicMock's `.returncode`
-        # is truthy, which the task-3884 reaped-proc short-circuit would treat
-        # as already-reaped and skip the killpg this test asserts on.
-        mock_proc.returncode = None
-        # proc.wait() never resolves — simulates an unkillable/D-state process
-        # that ignores SIGKILL.
-        never_resolves = asyncio.Event()
-        mock_proc.wait = AsyncMock(side_effect=never_resolves.wait)
-
-        with patch('os.killpg') as mock_killpg:
-            # Hang tripwire: if reap_grace_secs stops bounding the wait, fail
-            # loudly instead of stalling the suite.
-            result = await asyncio.wait_for(
-                runner._terminate_process_tree(mock_proc, pgid), timeout=5,
-            )
-
-        mock_killpg.assert_called_once()
-        assert result is ProcessTeardown.GROUP_KILLED, (
-            f'the abandoned reap must NOT downgrade the disposition: a whole-group '
-            f'signal WAS dispatched, and what the reap proves (or fails to prove) '
-            f'is whether anything actually DIED — a separate fact the caller is '
-            f'told not to conclude from this value: {result!r}'
-        )
-
-    async def test_no_killpg_after_proc_reaped(self, tmp_path: Path):
-        """A reaped proc must receive NO killpg — its pid may already be recycled.
-
-        Task 3884 / task 845: freezing the pgid at spawn removes the
-        ``os.getpgid`` lookup, but the frozen NUMBER is itself stale once the
-        leader has been reaped — the kernel may have recycled that pid onto an
-        unrelated group (in the original incidents, the user's ``systemd --user``
-        group, which killed the whole login session).  So the helper must
-        dispatch no signal at all once ``proc.returncode is not None``, mirroring
-        ``shared.proc_group.terminate_process_group``'s step 1.
-        """
-        from unittest.mock import patch
-
-        from orchestrator.deterministic_runner import DeterministicRunner, ProcessTeardown
-
-        runner = DeterministicRunner(
-            scheduler=MagicMock(),
-            escalation_queue=EscalationQueue(tmp_path),
-            reap_grace_secs=0.05,
-        )
-        mock_proc = MagicMock()
-        mock_proc.pid = 12345
-        mock_proc.returncode = 0          # already reaped by asyncio's child watcher
-        mock_proc.kill = MagicMock()
-        mock_proc.wait = AsyncMock(return_value=0)
-        killpg_calls: list[tuple[int, int]] = []
-        getpgid_calls: list[int] = []
-        with (
-            patch('os.killpg', side_effect=lambda pgid, sig: killpg_calls.append((pgid, sig))),
-            patch('os.getpgid', side_effect=lambda pid: getpgid_calls.append(pid) or 999),
-        ):
-            result = await runner._terminate_process_tree(mock_proc, 12345)
-        assert killpg_calls == [], f'must not killpg a reaped proc (task 845); got {killpg_calls}'
-        assert getpgid_calls == [], f'must never re-derive the pgid at kill time; got {getpgid_calls}'
-        mock_proc.kill.assert_not_called()
-        assert result is ProcessTeardown.NOT_SIGNALLED, (
-            f'the caller builds operator-facing text claiming a kill, so it must '
-            f'be able to learn that NOTHING was signalled (task 4252 reviewer '
-            f'finding) — the three assertions above are the independent proof '
-            f'that this disposition is the TRUE one: {result!r}'
-        )
-
-    @pytest.mark.parametrize('scenario', ['own_process_group', 'pid_mismatch'])
-    async def test_refuses_to_killpg_an_unsafe_pgid(
-        self, tmp_path: Path, scenario: str,
-    ):
-        """An unsafe pgid must be refused and degraded to a direct kill().
-
-        The residual defence behind the frozen capture and the reaped-proc
-        short-circuit: this helper delegates the signal choice to
-        ``shared/src/shared/proc_group.py::sigkill_process_group``, whose
-        ``unsafe_pgid_reason`` check is what refuses here.
-
-        ``own_process_group`` is the consequential case, not a synthetic one —
-        it is precisely the task-845 outcome. A pgid that resolves to our OWN
-        group means the killpg would SIGKILL this test session, the
-        orchestrator, and everything else sharing it. ``pid_mismatch`` covers a
-        corrupted capture, where the frozen int no longer describes ``proc``.
-
-        Degrading to ``proc.kill()`` rather than doing nothing matches
-        ``df_pytest_isolation``'s handling of the same refusal: the timed-out
-        child still dies, and only the (unreachable) grandchildren are forgone.
-        """
-        from unittest.mock import patch
-
-        from orchestrator.deterministic_runner import DeterministicRunner, ProcessTeardown
-
-        runner = DeterministicRunner(
-            scheduler=MagicMock(),
-            escalation_queue=EscalationQueue(tmp_path),
-            reap_grace_secs=0.05,
-        )
-        mock_proc = MagicMock()
-        mock_proc.returncode = None          # still running: not the reaped path
-        mock_proc.kill = MagicMock()
-        mock_proc.wait = AsyncMock(return_value=None)
-
-        if scenario == 'own_process_group':
-            pgid = os.getpgrp()
-            mock_proc.pid = pgid
-        else:
-            pgid = _fake_pgid()
-            mock_proc.pid = pgid + 1         # capture no longer describes proc
-
-        killpg_calls: list[tuple[int, int]] = []
-        with patch('os.killpg', side_effect=lambda p, s: killpg_calls.append((p, s))):
-            result = await runner._terminate_process_tree(mock_proc, pgid)
-
-        assert killpg_calls == [], (
-            f'{scenario}: refused pgid must never be signalled -- killpg on our '
-            f'own group is the task-845 login-session kill; got {killpg_calls}'
-        )
-        mock_proc.kill.assert_called_once()
-        assert result is ProcessTeardown.DIRECT_KILLED, (
-            f'{scenario}: only the direct child was signalled, so anything it '
-            f'spawned SURVIVES — the caller must be able to learn that instead '
-            f'of telling an operator the whole group is gone (task 4252 reviewer '
-            f'finding): {result!r}'
-        )
-
-
-class TestProcessTeardownFromDispatch:
-    """ProcessTeardown.from_dispatch renders shared.proc_group's SigkillDispatch."""
-
-    @pytest.mark.parametrize(
-        ('dispatch', 'expected'),
-        [
-            (SigkillDispatch.GROUP_KILLED, ProcessTeardown.GROUP_KILLED),
-            (SigkillDispatch.DIRECT_KILLED, ProcessTeardown.DIRECT_KILLED),
-            (SigkillDispatch.NOT_SIGNALLED, ProcessTeardown.NOT_SIGNALLED),
-        ],
-    )
-    def test_maps_each_dispatch_to_its_namesake(self, dispatch, expected):
-        assert ProcessTeardown.from_dispatch(dispatch) is expected
-
-    def test_the_mapping_is_a_bijection(self):
-        assert len(SigkillDispatch) == len(ProcessTeardown)
-        assert {ProcessTeardown.from_dispatch(d) for d in SigkillDispatch} == set(
-            ProcessTeardown
-        )
 
 
 # ---------------------------------------------------------------------------
