@@ -1,4 +1,4 @@
-"""Live FalkorDB: graphiti's edge search through FalkorEdgeSearch on a provisioned graph (task 6238).
+"""Live FalkorDB: graphiti's edge search and node BFS through FalkorEdgeSearch on a provisioned graph (tasks 6238, 6487).
 
 With the production index set present (task 3708), FalkorDB plans graphiti-core's
 stock edge legs as a scan re-executed once per input row.  These tests drive
@@ -30,6 +30,7 @@ from falkordb.asyncio.graph import AsyncGraph
 from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.edges import EntityEdge
+from graphiti_core.nodes import EntityNode
 from graphiti_core.search import search_utils
 from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.search.search_utils import calculate_cosine_similarity
@@ -95,9 +96,11 @@ def seed_edges_cypher(endpoint_label: str) -> str:
     return (
         'UNWIND $edges AS edge '
         f'MERGE (s:{endpoint_label} {{uuid: edge.source_node_uuid}}) '
-        'ON CREATE SET s.name = edge.source_node_uuid, s.group_id = $group_id '
+        'ON CREATE SET s.name = edge.source_node_uuid, s.group_id = $group_id, '
+        "s.created_at = $created_at, s.summary = '' "
         f'MERGE (t:{endpoint_label} {{uuid: edge.target_node_uuid}}) '
-        'ON CREATE SET t.name = edge.target_node_uuid, t.group_id = $group_id '
+        'ON CREATE SET t.name = edge.target_node_uuid, t.group_id = $group_id, '
+        "t.created_at = $created_at, t.summary = '' "
         'CREATE (s)-[:RELATES_TO {uuid: edge.uuid, group_id: $group_id, '
         "name: 'RELATES_TO', fact: edge.fact, episodes: ['ep'], created_at: $created_at, "
         'fact_embedding: vecf32(edge.fact_embedding)}]->(t)'
@@ -186,16 +189,18 @@ async def seed_ring(scratch, live_backend_factory) -> Callable[[int], Awaitable[
 
 
 SearchLeg = Callable[[GraphDriver], Awaitable[list[EntityEdge]]]
+NodeSearchLeg = Callable[[GraphDriver], Awaitable[list[EntityNode]]]
+AnyLeg = Callable[[GraphDriver], Awaitable[object]]
 
 
-async def issued_by_hardened_driver(seeded: SeededGraph, leg: SearchLeg) -> IssuedQuery:
+async def issued_by_hardened_driver(seeded: SeededGraph, leg: AnyLeg) -> IssuedQuery:
     issued = spy_on_queries(seeded.driver)
     await leg(seeded.driver)
     (query,) = issued
     return query
 
 
-async def issued_by_stock_graphiti(leg: SearchLeg) -> IssuedQuery:
+async def issued_by_stock_graphiti(leg: AnyLeg) -> IssuedQuery:
     """The Cypher stock graphiti emits: a bare FalkorDriver has no search_interface."""
     stock, issued = recording_driver(FalkorDriver)
     await leg(stock)
@@ -360,6 +365,7 @@ SEED_EPISODE_CYPHER = (
 # Fact edges into and out of a non-Entity node, on a path from the Entity
 # origin to its ring successor: reached by the BFS, but not Entity-to-Entity.
 BFS_DETOUR_EDGES = ('detour-in', 'detour-out')
+BFS_DETOUR_NODE = 'detour-node'
 
 SEED_DETOUR_CYPHER = (
     'MATCH (a:Entity {uuid: $origin}), (b:Entity {uuid: $successor}) '
@@ -419,7 +425,7 @@ async def seed_bfs(seed_ring) -> Callable[[int], Awaitable[SeededGraph]]:
                 'successor': f'node-{BFS_ENTITY_ORIGIN + 1}',
                 'into': into,
                 'out_of': out_of,
-                'detour': 'detour-node',
+                'detour': BFS_DETOUR_NODE,
                 'group_id': seeded.name,
                 'created_at': SEEDED_AT,
             },
@@ -479,3 +485,137 @@ class TestEdgeBfsLeg:
         assert rewritten == builtin == bfs_expected(50)
         assert len(edges) == len(rewritten)
         assert returned_endpoints(edges) == seeded.seeded_endpoints(edges)
+
+
+# --- Node BFS leg -------------------------------------------------------------
+
+# An Entity outside the seeded group, one fact edge past the Entity origin.
+BFS_FOREIGN_NODE = 'foreign-group-node'
+BFS_FOREIGN_GROUP = 'foreign-group'
+
+SEED_FOREIGN_CYPHER = (
+    'MATCH (a:Entity {uuid: $origin}) '
+    'CREATE (a)-[:RELATES_TO {uuid: $edge, group_id: $group_id, name: $edge, fact: $edge, '
+    "episodes: ['ep'], created_at: $created_at}]->"
+    "(:Entity {uuid: $foreign, name: $foreign, group_id: $foreign_group, created_at: $created_at, summary: ''})"
+)
+
+
+def ring_nodes_reached(start: int, hops: int, count: int) -> set[str]:
+    """The ring node uuids 1..*hops* edges past node *start*."""
+    return {f'node-{(start - 1 + h) % count + 1}' for h in range(1, hops + 1)}
+
+
+def node_bfs_expected(count: int) -> set[str]:
+    """Entity nodes reached from both BFS origins; the MENTIONS hop's target is itself reached."""
+    return (
+        ring_nodes_reached(BFS_ENTITY_ORIGIN, BFS_DEPTH, count)
+        | {f'node-{BFS_MENTIONED}'}
+        | ring_nodes_reached(BFS_MENTIONED, BFS_DEPTH - 1, count)
+    )
+
+
+def node_bfs_leg(group_ids: list[str] | None, limit: int) -> NodeSearchLeg:
+    return lambda driver: search_utils.node_bfs_search(
+        driver,
+        [f'node-{BFS_ENTITY_ORIGIN}', BFS_EPISODE_UUID],
+        SearchFilters(),
+        BFS_DEPTH,
+        group_ids,
+        limit,
+    )
+
+
+@pytest_asyncio.fixture
+async def seed_node_bfs(seed_bfs) -> Callable[[int], Awaitable[SeededGraph]]:
+    """``seed(count)``: ``seed_bfs`` plus BFS_FOREIGN_NODE, one hop past the Entity origin.
+
+    Kept out of ``seed_bfs``, where edge BFS would reach the foreign node's edge.
+    """
+
+    async def seed(count: int) -> SeededGraph:
+        seeded = await seed_bfs(count)
+        await seeded.graph.query(
+            SEED_FOREIGN_CYPHER,
+            {
+                'origin': f'node-{BFS_ENTITY_ORIGIN}',
+                'edge': 'foreign-edge',
+                'foreign': BFS_FOREIGN_NODE,
+                'foreign_group': BFS_FOREIGN_GROUP,
+                'group_id': seeded.name,
+                'created_at': SEEDED_AT,
+            },
+        )
+        return seeded
+
+    return seed
+
+
+GroupIdsOf = Callable[[SeededGraph], list[str] | None]
+
+
+@pytest.mark.parametrize(
+    'group_ids_of',
+    [lambda seeded: [seeded.name], lambda seeded: None],
+    ids=['group-scoped', 'unscoped'],
+)
+class TestNodeBfsLeg:
+    @pytest.mark.asyncio
+    async def test_issued_cypher_plans_without_a_per_row_scan(
+        self, seed_node_bfs, group_ids_of: GroupIdsOf
+    ):
+        """The discriminating gate for this leg; no wall-clock budget is asserted.
+
+        Stock measured 10.9 ms on the 800-node ring, inside the server TIMEOUT,
+        so a budget cannot tell it from the rewrite at test scale.  The plan
+        shape differs at any size.
+        """
+        seeded = await seed_node_bfs(EDGE_COUNT)
+
+        query = await issued_by_hardened_driver(seeded, node_bfs_leg(group_ids_of(seeded), 20))
+        plan = await explain(seeded.graph, query)
+
+        assert non_leaf_scans(plan) == [], str(plan)
+
+    @pytest.mark.asyncio
+    async def test_stock_cypher_plans_a_per_row_scan(self, seed_node_bfs, group_ids_of: GroupIdsOf):
+        """Negative control: without it the plan assertion above could pass vacuously.
+
+        Measured: a Node By Index Scan (group-scoped) or Node By Label Scan
+        (unscoped) over the target ``n:Entity``, beneath the origin Unwind.
+        """
+        seeded = await seed_node_bfs(EDGE_COUNT)
+
+        query = await issued_by_stock_graphiti(node_bfs_leg(group_ids_of(seeded), 20))
+        plan = await explain(seeded.graph, query)
+
+        assert non_leaf_scans(plan) != [], str(plan)
+
+    @pytest.mark.asyncio
+    async def test_returns_the_node_set_of_graphiti_builtin_cypher(
+        self, seed_node_bfs, group_ids_of: GroupIdsOf
+    ):
+        """Each reached Entity node of the origin's group once.
+
+        The detour's non-Entity node is traversed, not returned.  Unscoped, only
+        ``n.group_id = origin.group_id`` excludes BFS_FOREIGN_NODE.  The detour
+        gives node-2 and node-3 a second path, which stock returns as a second row.
+        """
+        seeded = await seed_node_bfs(50)
+        leg = node_bfs_leg(group_ids_of(seeded), 1000)
+        # Copy before spying, or the copy would carry the hardened driver's spy.
+        builtin_driver = without_search_interface(seeded.driver)
+        issued_by_builtin = spy_on_queries(builtin_driver)
+        issued_by_hardened = spy_on_queries(seeded.driver)
+
+        nodes = await leg(seeded.driver)
+        builtin = {node.uuid for node in await leg(builtin_driver)}
+
+        (hardened_query,) = issued_by_hardened
+        (oracle_query,) = issued_by_builtin
+        assert hardened_query.cypher != oracle_query.cypher, 'the oracle must run the built-in Cypher'
+        rewritten = {node.uuid for node in nodes}
+        assert rewritten.isdisjoint({BFS_DETOUR_NODE, BFS_FOREIGN_NODE})
+        assert rewritten == builtin == node_bfs_expected(50)
+        assert len(nodes) == len(rewritten)
+        assert {node.group_id for node in nodes} == {seeded.name}
