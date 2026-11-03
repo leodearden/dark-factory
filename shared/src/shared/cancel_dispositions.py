@@ -10,12 +10,14 @@ import re
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Annotated, Any, Final, Literal
+from typing import Annotated, Any, Final, Literal, TypedDict
 
 from pydantic import (
     AfterValidator,
+    AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
@@ -37,19 +39,35 @@ __all__ = [
     'CancelChildrenInvalid',
     'CancelChildrenInvalidReason',
     'CancelChildrenRefusalCode',
+    'CancelDispositionEntry',
+    'CancelDispositionEntryVariant',
     'ChildDisposition',
     'ChildDispositionVariant',
     'ChildKey',
+    'CoCancelledEntry',
+    'DispositionSource',
     'ExternalChild',
     'FoldDisposition',
+    'FoldEntry',
+    'InvalidEntries',
     'KeepDisposition',
+    'KeepEntry',
     'MootDisposition',
+    'MootEntry',
+    'QualifiedTaskRefText',
     'RepointDisposition',
+    'RepointEntry',
     'check_targets',
     'children_to_json',
+    'co_cancelled_entry',
+    'entries_to_json',
+    'entry_for_parent',
     'parse_children',
+    'parse_entries',
     'parse_superseded_by',
     'qualified_task_ref',
+    'stamp_entry',
+    'with_entry',
 ]
 
 
@@ -190,6 +208,10 @@ class CancelChildrenInvalid(Exception):
         }
 
 
+_QUALIFIED_TASK_REF: Final = r'([^:\s]+):([1-9][0-9]*)'
+QualifiedTaskRefText = Annotated[str, StringConstraints(pattern=f'^{_QUALIFIED_TASK_REF}$')]
+
+
 def qualified_task_ref(project_id: str, task_id: int) -> str:
     """The one spelling of a task named across projects: `<project_id>:<id>`."""
     return f'{project_id}:{task_id}'
@@ -210,7 +232,7 @@ class ExternalChild:
 ChildKey = int | ExternalChild
 
 _LOCAL_KEY: Final = re.compile(r'[1-9][0-9]*', re.ASCII)
-_EXTERNAL_KEY: Final = re.compile(r'([^:\s]+):([1-9][0-9]*)', re.ASCII)
+_EXTERNAL_KEY: Final = re.compile(_QUALIFIED_TASK_REF, re.ASCII)
 _DISPOSITION_ADAPTER: Final = TypeAdapter(ChildDispositionVariant)
 _TASK_IDS_ADAPTER: Final = TypeAdapter(DistinctTaskIds)
 
@@ -423,3 +445,130 @@ def check_targets(
         _check_child(child, children[child], target_status, depends_on)
     for target in superseded_by:
         _check_target('superseded_by', target, target_status)
+
+
+class DispositionSource(StrEnum):
+    CANCELLER = 'canceller'
+    BACKSTOP = 'backstop'
+
+
+class _EntryStamp(BaseModel):
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    parent: QualifiedTaskRefText
+    stamped_at: AwareDatetime
+    stamped_by: str | None = None
+    source: DispositionSource
+
+
+class KeepEntry(_EntryStamp, KeepDisposition):
+    pass
+
+
+class RepointEntry(_EntryStamp, RepointDisposition):
+    pass
+
+
+class FoldEntry(_EntryStamp, FoldDisposition):
+    pass
+
+
+class MootEntry(_EntryStamp, MootDisposition):
+    pass
+
+
+class CoCancelledEntry(_EntryStamp):
+    action: Literal[CancelAction.CO_CANCELLED] = CancelAction.CO_CANCELLED
+    reason: ReasonText | None = None
+
+
+_EntryUnion = KeepEntry | RepointEntry | FoldEntry | MootEntry | CoCancelledEntry
+CancelDispositionEntryVariant = Annotated[_EntryUnion, Field(discriminator='action')]
+
+
+class CancelDispositionEntry(RootModel[CancelDispositionEntryVariant]):
+    model_config = ConfigDict(frozen=True)
+
+
+_ENTRIES_ADAPTER: Final = TypeAdapter(list[CancelDispositionEntryVariant])
+
+
+class _StampFields(TypedDict):
+    parent: str
+    stamped_at: datetime
+    stamped_by: str | None
+    source: DispositionSource
+
+
+def stamp_entry(
+    disposition: ChildDispositionVariant,
+    *,
+    parent: str,
+    stamped_at: datetime,
+    stamped_by: str | None,
+    source: DispositionSource,
+) -> CancelDispositionEntryVariant:
+    """The one disposition-to-entry translation; parent is a qualified_task_ref."""
+    stamp: _StampFields = {
+        'parent': parent,
+        'stamped_at': stamped_at,
+        'stamped_by': stamped_by,
+        'source': source,
+    }
+    match disposition:
+        case KeepDisposition():
+            return KeepEntry(reason=disposition.reason, **stamp)
+        case RepointDisposition():
+            return RepointEntry(reason=disposition.reason, onto=disposition.onto, **stamp)
+        case FoldDisposition():
+            return FoldEntry(reason=disposition.reason, into=disposition.into, **stamp)
+        case MootDisposition():
+            return MootEntry(reason=disposition.reason, **stamp)
+
+
+def co_cancelled_entry(
+    *, parent: str, stamped_at: datetime, stamped_by: str | None, source: DispositionSource
+) -> CoCancelledEntry:
+    return CoCancelledEntry(
+        parent=parent, stamped_at=stamped_at, stamped_by=stamped_by, source=source
+    )
+
+
+def entry_for_parent(
+    entries: Sequence[CancelDispositionEntryVariant], parent: str
+) -> CancelDispositionEntryVariant | None:
+    return next((entry for entry in entries if entry.parent == parent), None)
+
+
+def with_entry(
+    entries: Sequence[CancelDispositionEntryVariant], entry: CancelDispositionEntryVariant
+) -> tuple[CancelDispositionEntryVariant, ...]:
+    """Entries with `entry` replacing the one for its parent in place, else appended."""
+    if entry_for_parent(entries, entry.parent) is None:
+        return (*entries, entry)
+    return tuple(entry if existing.parent == entry.parent else existing for existing in entries)
+
+
+def entries_to_json(entries: Sequence[CancelDispositionEntryVariant]) -> list[dict[str, Any]]:
+    """The one serialization of entries into metadata.cancel_dispositions."""
+    return [CancelDispositionEntry(entry).model_dump(mode='json') for entry in entries]
+
+
+@dataclass(frozen=True)
+class InvalidEntries:
+    """A metadata.cancel_dispositions slice that does not parse; detail says why."""
+
+    detail: str
+
+
+def parse_entries(raw: object) -> tuple[CancelDispositionEntryVariant, ...] | InvalidEntries:
+    """Any metadata.cancel_dispositions slice as its entries: () when absent."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list | tuple):
+        return InvalidEntries(f'expected a list of entries, got {type(raw).__name__}')
+    items = [item.root if isinstance(item, CancelDispositionEntry) else item for item in raw]
+    try:
+        return tuple(_ENTRIES_ADAPTER.validate_python(items))
+    except ValidationError as exc:
+        return InvalidEntries(str(exc))
