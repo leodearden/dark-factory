@@ -211,6 +211,10 @@ def split_managed_metadata(
 # be a behaviour CHANGE, not a no-op — see _build_config_dict.
 _MEM0_DEFAULT_EMBEDDING_DIMS = 1536
 
+# mem0's MemoryConfig.history_db_path value for a private, per-instance SQLite
+# history DB (SQLiteManager's own default).
+_MEM0_IN_MEMORY_HISTORY_DB = ':memory:'
+
 
 class Mem0Backend:
     """Lazily creates AsyncMemory instances keyed by project_id.
@@ -348,6 +352,12 @@ class Mem0Backend:
                 'provider': 'openai',
                 'config': embedder_config,
             }
+
+        # Emitted ONLY when persistence is off: omitting the key keeps the
+        # shipped config byte-identical, and mem0 resolves its own shared
+        # $MEM0_DIR/history.db.
+        if not cfg.mem0.persist_history:
+            config_dict['history_db_path'] = _MEM0_IN_MEMORY_HISTORY_DB
 
         return config_dict
 
