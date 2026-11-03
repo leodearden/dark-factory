@@ -1935,6 +1935,20 @@ class TestPlanNormalizationIntegration:
         assert 'steps' in raw_on_disk
         assert 'tdd_steps' not in raw_on_disk
 
+    def test_peek_plan_normalizes_without_writing_back(self, artifacts: TaskArtifacts):
+        plan_path = artifacts.artifact_path('plan.json')
+        raw = {'task_id': 'task-1', 'tdd_steps': [{'id': 'step-1', 'status': 'pending'}]}
+        plan_path.write_text(json.dumps(raw))
+        bytes_before = plan_path.read_bytes()
+        listing_before = sorted(p.name for p in plan_path.parent.iterdir())
+
+        plan = artifacts.peek_plan()
+
+        assert 'tdd_steps' not in plan
+        assert [step['id'] for step in plan['steps']] == ['step-1']
+        assert plan_path.read_bytes() == bytes_before
+        assert sorted(p.name for p in plan_path.parent.iterdir()) == listing_before
+
     def test_read_plan_no_write_when_valid(self, artifacts: TaskArtifacts):
         valid = {
             'task_id': 'task-1',
