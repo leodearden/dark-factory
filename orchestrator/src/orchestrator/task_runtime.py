@@ -147,6 +147,19 @@ class _StartedFallbackCache:
         return self._map.get(task_id)
 
 
+def _count_iterations(artifacts: TaskArtifacts) -> int:
+    """Number of entries in ``iterations.jsonl``; a corrupted line is a read
+    failure, not an entry to skip, so the count can never undercount silently.
+    """
+    entries, corrupted = artifacts.read_iteration_log()
+    if corrupted:
+        raise ValueError(
+            f'iterations.jsonl: {len(corrupted)} of {len(entries) + len(corrupted)} lines '
+            f'are not valid JSON (first: {corrupted[0][:60]!r})'
+        )
+    return len(entries)
+
+
 def _read_task_entry(
     *,
     task_id: int,
@@ -164,7 +177,8 @@ def _read_task_entry(
     ``read_plan``, so a live agent's malformed plan is never repaired here.
 
     INV-2 (structured-facts-at-failure): a per-task artifact READ FAILURE
-    (e.g. corrupt ``plan.json``/review JSON raising) is marked — ``error``
+    (e.g. corrupt ``plan.json``/review JSON raising, or a corrupted
+    ``iterations.jsonl`` line) is marked — ``error``
     carries a diagnostic string and ``loops``/``attempts``/``phase``/
     ``started`` are all ``None``, never a fabricated ``0``/``'PLAN'``.
     Honest-empty artifacts (``[]``/``{}``) are not a failure and continue to
@@ -182,8 +196,7 @@ def _read_task_entry(
     """
     artifacts = TaskArtifacts.for_task(worktree, str(task_id))
     try:
-        entries, _corrupted = artifacts.read_iteration_log()
-        loops = len(entries)
+        loops = _count_iterations(artifacts)
         attempts = len(artifacts.read_reviews())
         phase = _derive_phase(artifacts.peek_plan())
         started = artifacts.read_created_at() or started_fallback.get(str(task_id))
