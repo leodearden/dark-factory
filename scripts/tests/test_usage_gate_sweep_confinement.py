@@ -7,35 +7,23 @@ full contract (the opt-out, the still-reclaiming re-base) is
 
 from __future__ import annotations
 
-import os
 import tempfile
-import time
-from pathlib import Path
 
 from shared.config_dir import CONFIG_DIR_PREFIX, reset_sweep_once_state
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import UsageGate
 
 _PROBE_PREFIX = CONFIG_DIR_PREFIX + 'usage-gate-probe-'
-# Above Linux's PID_MAX_LIMIT (2**22): no live process can own this dir.
-_GHOST = f'{_PROBE_PREFIX}ghost-4194305'
 
 
-def _plant_aged(base: Path) -> Path:
-    ghost = base / _GHOST
-    ghost.mkdir()
-    (ghost / '.credentials.json').write_text('')
-    old = time.time() - 3600
-    os.utime(ghost, (old, old))
-    return ghost
-
-
-def test_a_real_gate_sweeps_only_its_private_root(tmp_path, monkeypatch, usage_gate_sweep_root):
+def test_a_real_gate_sweeps_only_its_private_root(
+    tmp_path, monkeypatch, usage_gate_sweep_root, plant_dead_pid_dir,
+):
     system_tempdir = tmp_path / 'system-tmp'
     system_tempdir.mkdir()
     monkeypatch.setattr(tempfile, 'gettempdir', lambda: str(system_tempdir))
-    system_ghost = _plant_aged(system_tempdir)
-    confined_ghost = _plant_aged(usage_gate_sweep_root)
+    system_ghost = plant_dead_pid_dir(system_tempdir, _PROBE_PREFIX)
+    confined_ghost = plant_dead_pid_dir(usage_gate_sweep_root, _PROBE_PREFIX)
     monkeypatch.setenv('DF_TASK_6275_TOKEN_WORK', 'fake-token-work')
     reset_sweep_once_state(_PROBE_PREFIX)
 

@@ -2318,6 +2318,30 @@ def real_probe_dir_sweep() -> bool:
     return True
 
 
+# Above Linux's PID_MAX_LIMIT (2**22): no process can ever own this PID.
+_NEVER_LIVE_PID = 2**22 + 1
+
+
+@pytest.fixture
+def plant_dead_pid_dir() -> Callable[[Path, str], Path]:
+    """Return ``plant(base, prefix)``, making a dir that a dead-PID sweep of *prefix* under *base* reclaims.
+
+    The dir is ``<base>/<prefix>ghost-<pid>`` for a PID no process can own. Like
+    a real probe dir it holds a ``.credentials.json``, and it is aged an hour,
+    past the sweep's min-age floor.
+    """
+
+    def plant(base: Path, prefix: str) -> Path:
+        ghost = base / f'{prefix}ghost-{_NEVER_LIVE_PID}'
+        ghost.mkdir()
+        (ghost / '.credentials.json').write_text('')
+        an_hour_ago = time.time() - 3600
+        os.utime(ghost, (an_hour_ago, an_hour_ago))
+        return ghost
+
+    return plant
+
+
 def confine_usage_gate_sweep(
     request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
@@ -2351,8 +2375,9 @@ _USAGE_GATE_SWEEP_PLUGIN = 'df-usage-gate-sweep-confinement'
 def arm_usage_gate_sweep_confinement(config: pytest.Config, usage_gate_module: ModuleType) -> None:
     """Confine every test's UsageGate probe-dir sweep for this session, from ``pytest_configure``.
 
-    Registers :func:`usage_gate_sweep_root`, :func:`real_probe_dir_sweep` and an
-    autouse fixture applying :func:`confine_usage_gate_sweep` to
+    Registers :func:`usage_gate_sweep_root`, :func:`real_probe_dir_sweep`,
+    :func:`plant_dead_pid_dir` and an autouse fixture applying
+    :func:`confine_usage_gate_sweep` to
     *usage_gate_module*. Idempotent, because a session that collects several
     test roots runs each root's ``pytest_configure``. Only the first arm's
     module is patched, so a re-arm with a different module object is refused
@@ -2381,6 +2406,7 @@ def arm_usage_gate_sweep_confinement(config: pytest.Config, usage_gate_module: M
             '_df_usage_gate_sweep_parent': _df_usage_gate_sweep_parent,
             'usage_gate_sweep_root': usage_gate_sweep_root,
             'real_probe_dir_sweep': real_probe_dir_sweep,
+            'plant_dead_pid_dir': plant_dead_pid_dir,
             '_df_confine_usage_gate_sweep': confine,
         },
     )

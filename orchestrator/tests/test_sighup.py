@@ -26,6 +26,7 @@ import sys
 import tempfile
 import textwrap
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -100,17 +101,7 @@ SIGHUP_SCRIPT = textwrap.dedent('''
 READY_WITHIN_SECS = 60.0
 EXIT_WITHIN_SECS = 60.0
 
-# Above Linux's PID_MAX_LIMIT (2**22): no live process can own this dir.
-_PROBE_GHOST = f'{CONFIG_DIR_PREFIX}usage-gate-probe-ghost-4194305'
-
-
-def _plant_aged_probe_ghost(base: Path) -> Path:
-    ghost = base / _PROBE_GHOST
-    ghost.mkdir()
-    (ghost / '.credentials.json').write_text('')
-    old = time.time() - 3600
-    os.utime(ghost, (old, old))
-    return ghost
+_PROBE_PREFIX = f'{CONFIG_DIR_PREFIX}usage-gate-probe-'
 
 
 def _child_tempdir(tmp_path: Path) -> Path:
@@ -263,7 +254,9 @@ def test_without_in_loop_registration_sighup_kills_the_process(tmp_path: Path):
 
 
 def test_the_child_gate_sweeps_only_the_tempdir_its_spawner_passes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    plant_dead_pid_dir: Callable[[Path, str], Path],
 ):
     inherited = tmp_path / 'inherited-tmp'
     inherited.mkdir()
@@ -271,8 +264,8 @@ def test_the_child_gate_sweeps_only_the_tempdir_its_spawner_passes(
     # the stand-in TMPDIR and no later test can cache it.
     monkeypatch.setattr(tempfile, 'tempdir', tempfile.gettempdir())
     monkeypatch.setenv('TMPDIR', str(inherited))
-    inherited_ghost = _plant_aged_probe_ghost(inherited)
-    child_ghost = _plant_aged_probe_ghost(_child_tempdir(tmp_path))
+    inherited_ghost = plant_dead_pid_dir(inherited, _PROBE_PREFIX)
+    child_ghost = plant_dead_pid_dir(_child_tempdir(tmp_path), _PROBE_PREFIX)
 
     result = _exit_after_hup_then_term(tmp_path, register_in_loop=True)
 
