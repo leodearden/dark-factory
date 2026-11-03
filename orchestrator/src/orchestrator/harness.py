@@ -251,6 +251,7 @@ if TYPE_CHECKING:
     from orchestrator.warm_lane_pool import WarmLanePoolCensus
 
 try:
+    from escalation.prefix_resolver_client import PrefixResolverClient
     from escalation.queue import EscalationQueue
     from escalation.server import create_server
     from escalation.store_identity import StoreIdentity
@@ -13122,6 +13123,10 @@ class Harness:
                 project_id=self.config.fused_memory.project_id,
                 project_root=self.config.project_root,
             ),
+            # Resolved over fused-memory's POST /resolve-prefix (PRD D7); fails open on any non-200.
+            prefix_resolver=PrefixResolverClient(
+                base_url=self.config.fused_memory.url,
+            ).resolve_prefix,
         )
         host = self.config.escalation.host
         port = self.config.escalation.port
