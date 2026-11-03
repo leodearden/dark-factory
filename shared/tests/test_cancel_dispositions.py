@@ -5,6 +5,7 @@ Contract: plans/cancel-with-children-prd.md §4.2. Everything goes through the p
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -14,8 +15,11 @@ from pydantic import ValidationError
 
 from shared.cancel_dispositions import (
     CALLER_ACTIONS,
+    CANCEL_CHILDREN_SKILL,
     CHILD_CANCELLING_ACTIONS,
+    DECISION_TABLE,
     ENTRY_ONLY_ACTIONS,
+    GET_CANCEL_CHILDREN_TOOL,
     MISSING_FILES_CAP,
     PAYLOAD_ID_CAP,
     CancelAction,
@@ -30,6 +34,7 @@ from shared.cancel_dispositions import (
     ChildRelation,
     ChildRow,
     CoCancelledEntry,
+    DecisionRow,
     DispositionSource,
     ExternalChild,
     FoldDisposition,
@@ -51,6 +56,8 @@ from shared.cancel_dispositions import (
     parse_entries,
     parse_superseded_by,
     qualified_task_ref,
+    render_cancel_children_rules,
+    render_decision_table_markdown,
     rows_to_json,
     stamp_entry,
     with_entry,
@@ -790,3 +797,73 @@ def test_capped_lists_at_most_the_payload_cap_and_the_total():
 
 def test_capped_returns_a_short_list_whole():
     assert capped('unknown', [3, 1]) == {'unknown': [3, 1], 'unknown_total': 2}
+
+
+# --- the decision table and its renders (§5, §6 row 25) -----------------------
+
+
+def test_the_decision_table_is_seven_frozen_rows_in_order():
+    assert isinstance(DECISION_TABLE, tuple)
+    assert all(isinstance(row, DecisionRow) for row in DECISION_TABLE)
+    assert [row.order for row in DECISION_TABLE] == list(range(7))
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        DECISION_TABLE[0].order = 9  # type: ignore[misc]
+
+
+def test_the_decision_table_reaches_every_caller_action_and_no_entry_only_one():
+    reached = {action for row in DECISION_TABLE for action in row.dispositions}
+
+    assert reached == CALLER_ACTIONS
+    assert not reached & ENTRY_ONLY_ACTIONS
+
+
+def test_the_first_and_last_rows_dispose_of_nothing():
+    assert DECISION_TABLE[0].dispositions == ()
+    assert DECISION_TABLE[-1].dispositions == ()
+
+
+def _table_lines() -> list[str]:
+    return [line for line in render_decision_table_markdown().splitlines() if line.startswith('|')]
+
+
+def test_the_table_render_is_deterministic_and_one_line_per_row():
+    assert render_decision_table_markdown() == render_decision_table_markdown()
+    assert len(_table_lines()) == len(DECISION_TABLE) + 2
+
+
+@pytest.mark.parametrize('row', DECISION_TABLE, ids=lambda row: f'row-{row.order}')
+def test_each_row_renders_its_question_and_examples_on_its_own_line(row):
+    line = _table_lines()[row.order + 2]
+
+    assert row.question in line
+    assert all(example in line for example in row.example_ids)
+
+
+def test_the_rules_render_is_one_subsection_of_a_stage2_region():
+    rules = render_cancel_children_rules()
+
+    assert rules.startswith('### ')
+    assert not [line for line in rules.splitlines() if line.startswith('## ')]
+
+
+def test_the_rules_name_the_read_tool_the_skill_and_every_caller_action():
+    rules = render_cancel_children_rules()
+
+    assert GET_CANCEL_CHILDREN_TOOL in rules
+    assert CANCEL_CHILDREN_SKILL in rules
+    assert all(f'`{action.value}`' in rules for action in CALLER_ACTIONS)
+
+
+def test_the_rules_name_each_action_s_fields_from_its_schema():
+    rules = render_cancel_children_rules()
+
+    assert '`onto`' in rules
+    assert '`into`' in rules
+
+
+def test_the_rules_embed_the_table_render_verbatim():
+    assert render_decision_table_markdown() in render_cancel_children_rules()
+
+
+def test_the_rules_forbid_folding_or_mooting_an_in_progress_child():
+    assert f'`{TaskStatus.IN_PROGRESS.value}`' in render_cancel_children_rules()
