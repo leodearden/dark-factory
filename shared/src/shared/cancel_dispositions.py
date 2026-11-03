@@ -7,13 +7,13 @@ from __future__ import annotations
 
 import json
 import re
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Annotated, Any, Final, Literal, TypedDict
+from typing import Annotated, Any, Final, Literal, Self, TypedDict, TypeVar
 
 from pydantic import (
     AfterValidator,
@@ -25,6 +25,7 @@ from pydantic import (
     StringConstraints,
     TypeAdapter,
     ValidationError,
+    model_validator,
 )
 from pydantic_core import ErrorDetails, PydanticCustomError
 
@@ -34,16 +35,21 @@ __all__ = [
     'CALLER_ACTIONS',
     'CHILD_CANCELLING_ACTIONS',
     'ENTRY_ONLY_ACTIONS',
+    'MISSING_FILES_CAP',
+    'PAYLOAD_ID_CAP',
     'REASON_MAX_CHARS',
     'CancelAction',
     'CancelChildrenInvalid',
     'CancelChildrenInvalidReason',
     'CancelChildrenRefusalCode',
+    'CancelChildrenView',
     'CancelDispositionEntry',
     'CancelDispositionEntryVariant',
     'ChildDisposition',
     'ChildDispositionVariant',
     'ChildKey',
+    'ChildRelation',
+    'ChildRow',
     'CoCancelledEntry',
     'DispositionSource',
     'ExternalChild',
@@ -57,6 +63,7 @@ __all__ = [
     'QualifiedTaskRefText',
     'RepointDisposition',
     'RepointEntry',
+    'capped',
     'check_targets',
     'children_to_json',
     'co_cancelled_entry',
@@ -66,6 +73,7 @@ __all__ = [
     'parse_entries',
     'parse_superseded_by',
     'qualified_task_ref',
+    'rows_to_json',
     'stamp_entry',
     'with_entry',
 ]
@@ -88,8 +96,15 @@ CHILD_CANCELLING_ACTIONS: Final = frozenset({CancelAction.FOLD, CancelAction.MOO
 REASON_MAX_CHARS: Final = 500
 
 
+_Sortable = TypeVar('_Sortable', int, str)
+
+
+def _repeated(items: Sequence[_Sortable]) -> list[_Sortable]:
+    return sorted(item for item, count in Counter(items).items() if count > 1)
+
+
 def _distinct(ids: tuple[int, ...]) -> tuple[int, ...]:
-    repeated = sorted({task_id for task_id in ids if ids.count(task_id) > 1})
+    repeated = _repeated(ids)
     if repeated:
         raise PydanticCustomError(
             'duplicate_target', 'names {repeated} more than once', {'repeated': repeated}
@@ -572,3 +587,84 @@ def parse_entries(raw: object) -> tuple[CancelDispositionEntryVariant, ...] | In
         return tuple(_ENTRIES_ADAPTER.validate_python(items))
     except ValidationError as exc:
         return InvalidEntries(str(exc))
+
+
+class ChildRelation(StrEnum):
+    SPAWNED_FROM = 'spawned_from'
+    DEPENDENT = 'dependent'
+    BOTH = 'both'
+    EXTERNAL_DEPENDENT = 'external_dependent'
+
+
+MISSING_FILES_CAP: Final = 20
+PAYLOAD_ID_CAP: Final = 50
+
+Count = Annotated[int, Field(strict=True, ge=0)]
+
+
+class ChildRow(BaseModel):
+    """One child's mechanically decidable facts (PRD §4.3), never the decision."""
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    id: TaskId
+    project_id: str
+    title: str
+    status: TaskStatus
+    relation: ChildRelation
+    declared_files_total: Count
+    declared_files_missing_from_main: tuple[str, ...] = Field(max_length=MISSING_FILES_CAP)
+    declared_files_missing_from_main_total: Count
+    depends_on_superseder: bool
+    named_superseder: bool
+    has_live_children: bool
+    escalation_id: str | None = None
+    existing_disposition: CancelDispositionEntryVariant | None = None
+
+    @model_validator(mode='after')
+    def _missing_files_fit_their_totals(self) -> Self:
+        listed = len(self.declared_files_missing_from_main)
+        missing = self.declared_files_missing_from_main_total
+        declared = self.declared_files_total
+        if not listed <= missing <= declared:
+            raise ValueError(
+                f'need listed missing files ({listed}) <= declared_files_missing_from_main_total '
+                f'({missing}) <= declared_files_total ({declared})'
+            )
+        return self
+
+    @property
+    def key(self) -> str:
+        """This child's key in a `children` map."""
+        if self.relation == ChildRelation.EXTERNAL_DEPENDENT:
+            return qualified_task_ref(self.project_id, self.id)
+        return str(self.id)
+
+
+def rows_to_json(rows: Sequence[ChildRow]) -> list[dict[str, Any]]:
+    """The one serialization of child rows into a payload or an escalation record."""
+    return [row.model_dump(mode='json') for row in rows]
+
+
+class CancelChildrenView(BaseModel):
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    task_id: TaskId
+    project_id: str
+    status: TaskStatus
+    children: tuple[ChildRow, ...]
+    superseded_by: tuple[TaskId, ...] = ()
+    external_dependents_checked: bool
+    enforce: bool
+
+    @model_validator(mode='after')
+    def _each_child_listed_once(self) -> Self:
+        repeated = _repeated([row.key for row in self.children])
+        if repeated:
+            raise ValueError(f'children lists {repeated} more than once')
+        return self
+
+
+def capped(field: str, items: Sequence[Any]) -> dict[str, Any]:
+    """`field` cut to PAYLOAD_ID_CAP items, plus `<field>_total`: the house payload convention."""
+    return {field: list(items[:PAYLOAD_ID_CAP]), f'{field}_total': len(items)}
