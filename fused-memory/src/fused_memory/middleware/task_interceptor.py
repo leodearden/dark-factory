@@ -753,6 +753,12 @@ class TaskInterceptor:
         # unexpected status/claimant_run_id divergence. None (default) ->
         # exact current behavior (the pre-existing inline write).
         self._lifecycle_reset_filer: FileFindingFn | None = None
+        # Task 4650: where an unconfirmed recon-stage text write is reported.
+        # None (default) -> the readback still annotates text_verified, but
+        # nothing is filed; see set_text_write_unconfirmed_filer.
+        self._text_write_unconfirmed_filer: (
+            task_text_write_guard.FileTextFindingFn | None
+        ) = None
         # Task 5771: where recon-stage writes archive rotated-out audit trail.
         # None (default) -> no rotation; see set_audit_trail_archive.
         self._audit_trail_archive: AuditTrailArchive | None = None
@@ -832,6 +838,16 @@ class TaskInterceptor:
         behavior change.
         """
         self._lifecycle_reset_filer = filer
+
+    def set_text_write_unconfirmed_filer(
+        self, filer: task_text_write_guard.FileTextFindingFn,
+    ) -> None:
+        """Wire the async filer for recon-stage text writes that do not read back (task 4650).
+
+        Bootstrap calls this once, after ReconReportState exists. Until then
+        the readback still sets ``text_verified``; it just files nothing.
+        """
+        self._text_write_unconfirmed_filer = filer
 
     def set_audit_trail_archive(self, archive: AuditTrailArchive) -> None:
         """Wire the audit-trail rotation archive (task 5771).
@@ -5906,6 +5922,17 @@ class TaskInterceptor:
                 # raise — holds for both tools.py (which delegates here) and
                 # direct interceptor callers (task C2).
                 return e.to_error_dict()
+            # Under the lock, before audit-trail rotation: confirms THIS write, not a rewrite.
+            if is_recon_stage_write and interceptor_write_succeeded(result):
+                result = await task_text_write_guard.verify_text_write_landed(
+                    result,
+                    task_id=task_id,
+                    project_id=project_id,
+                    project_root=project_root,
+                    write=text_write,
+                    get_task=tm.get_task,
+                    file_finding=self._text_write_unconfirmed_filer,
+                )
         rotation: RotationOutcome | None = None
         if is_recon_stage_write and interceptor_write_succeeded(result):
             result, rotation = await self._with_bounded_audit_trail(
