@@ -3244,8 +3244,8 @@ def mark_windowless_wm_sessions_exited(
     record younger than ``NON_TERMINAL_HEARTBEAT_TTL``). Folding the two
     predicates together would muddy ``mark_orphaned_sessions_exited``'s
     "mirrors reap_stale_records' stale_pid predicate EXACTLY" contract, and
-    would run ``wmctrl -l`` on every liveness check instead of once per
-    sweep.
+    would run ``wmctrl -l`` on every liveness check instead of at most twice
+    per sweep.
 
     Scope: only records with ``display is not None and display.kind ==
     DisplayKind.WM.value`` are ever considered. A ``display=None`` (headless
@@ -3257,19 +3257,26 @@ def mark_windowless_wm_sessions_exited(
     we cannot prove the window is gone, so we fail toward keep and defer to
     the pid/TTL sweep.
 
-    HARD fail-soft: resolves ``live_ids = _wmctrl_live_window_ids(run)``
-    exactly once per sweep; if that is ``None`` (missing ``wmctrl`` binary, a
-    nonzero return code, or any exception -- see its docstring), this
-    returns ``[]`` immediately and marks NOTHING. "No window evidence" (a
-    headless host, an X11 hiccup) must never be treated as "every window is
-    gone" -- that would mass-mark every wm session on the fleet EXITED.
+    HARD fail-soft: if the first ``_wmctrl_live_window_ids(run)`` probe is
+    ``None`` (missing ``wmctrl`` binary, a nonzero return code, or any
+    exception -- see its docstring), this returns ``[]`` immediately and
+    marks NOTHING. "No window evidence" (a headless host, an X11 hiccup)
+    must never be treated as "every window is gone" -- that would mass-mark
+    every wm session on the fleet EXITED.
+
+    Two-probe rule: a record is marked only on a probe taken AFTER it was
+    read. ``_run_launching``'s detached reap runs concurrently with the
+    spawn's own set-display write of ``wm_window_id``, so a window id can
+    land after the first probe; the pass therefore only collects candidates
+    absent from the first probe, and one confirming probe after the pass
+    decides (``None`` again marks nothing). Record mtimes are no substitute:
+    the kernel stamps them from a coarse clock.
 
     Self-correction trade-off (mirrors ``mark_orphaned_sessions_exited``): a
-    single missed/late ``wmctrl`` probe (e.g. racing a window remap) can mark
-    a still-live session EXITED. This is deliberately accepted -- the
+    window that both probes miss (e.g. racing a window remap) can mark a
+    still-live session EXITED. This is deliberately accepted -- the
     session's next hook event calls ``refresh_record`` and flips status back
-    -- rather than adding retries here, keeping this sweep a single
-    fail-soft decision point per call.
+    -- rather than adding retries beyond the confirming probe.
 
     Known trade-off for a multi-DISPLAY fleet (reviewer-flagged): ``wmctrl
     -l`` only reports windows on the single X ``DISPLAY`` the invoking
@@ -3312,6 +3319,7 @@ def mark_windowless_wm_sessions_exited(
     if not base.is_dir():
         return marked
 
+    candidates: list[tuple[str, str]] = []
     for slug_dir in sorted(base.iterdir()):
         if not slug_dir.is_dir():
             continue
@@ -3328,6 +3336,17 @@ def mark_windowless_wm_sessions_exited(
         normalized = _normalize_wm_window_id(record.display.wm_window_id)
         if normalized is None or normalized in live_ids:
             continue  # unprovable, or the window is still live
+        candidates.append((slug, normalized))
+
+    if not candidates:
+        return marked
+    confirmed_live_ids = _wmctrl_live_window_ids(run)
+    if confirmed_live_ids is None:
+        return marked  # the confirming probe yielded no evidence -- mark nothing.
+
+    for slug, normalized in candidates:
+        if normalized in confirmed_live_ids:
+            continue  # the window appeared after the first probe
 
         try:
             marked_record = _mark_exited_if_still_non_terminal(
