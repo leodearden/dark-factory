@@ -13,16 +13,20 @@ A leaf ``middleware`` module: it imports nothing from ``reconciliation/`` or
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import logging
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from shared.task_text_fingerprint import task_text_fingerprint
 
+logger = logging.getLogger(__name__)
+
 TASK_TEXT_FP_KEY = 'task_text_fp'
 TEXT_BASE_STALE = 'TaskTextBaseStale'
 TEXT_BASE_REQUIRED = 'ReconTaskTextBaseRequired'
 TEXT_VERIFIED_KEY = 'text_verified'
+TEXT_WRITE_UNCONFIRMED_FLAG_TYPE = 'task_text_write_unconfirmed'
 
 
 def text_fp_of(task: object) -> str:
@@ -185,3 +189,66 @@ def verify_text_write(after: object, write: PlannedTextWrite) -> TextWriteVerifi
             if payload is not None
         ),
     )
+
+
+@dataclass(frozen=True)
+class TextWriteUnconfirmedFinding:
+    task_id: str
+    project_id: str
+    op: str
+    unconfirmed_fields: tuple[str, ...]
+    flag_type: str = TEXT_WRITE_UNCONFIRMED_FLAG_TYPE
+
+
+GetTaskFn = Callable[[str, str], Awaitable[Any]]
+FileTextFindingFn = Callable[[TextWriteUnconfirmedFinding], Awaitable[None]]
+
+
+async def verify_text_write_landed(
+    result: Mapping[str, Any],
+    *,
+    task_id: str,
+    project_id: str,
+    project_root: str,
+    write: PlannedTextWrite,
+    get_task: GetTaskFn,
+    file_finding: FileTextFindingFn | None = None,
+) -> dict[str, Any]:
+    """Annotate an already-succeeded write with whether its text reads back.
+
+    Best-effort by contract: an after-read or filer failure is logged and
+    swallowed, never turning a landed write into an error for the caller.
+    """
+    if not write.writes_text:
+        return dict(result)
+    try:
+        verification = verify_text_write(await get_task(task_id, project_root), write)
+    except Exception:
+        logger.exception(
+            'task_text_write_guard: readback failed for task_id=%r project_id=%r; '
+            'write already succeeded, returning it unverified',
+            task_id,
+            project_id,
+        )
+        return dict(result)
+    if verification is None:
+        return dict(result)
+    annotated = {**result, **verification.to_result_keys()}
+    if not verification.confirmed and file_finding is not None:
+        try:
+            await file_finding(
+                TextWriteUnconfirmedFinding(
+                    task_id=task_id,
+                    project_id=project_id,
+                    op='update_task',
+                    unconfirmed_fields=verification.unconfirmed_fields,
+                ),
+            )
+        except Exception:
+            logger.exception(
+                'task_text_write_guard: filing an unconfirmed text write failed for '
+                'task_id=%r project_id=%r; the result still reports it unverified',
+                task_id,
+                project_id,
+            )
+    return annotated

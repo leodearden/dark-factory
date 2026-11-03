@@ -20,9 +20,9 @@ from shared.mcp_envelope import write_failure_reason
 from shared.task_text_fingerprint import task_text_fingerprint
 
 from fused_memory.middleware.task_text_write_guard import (
+    TextWriteUnconfirmedFinding,
     check_text_base,
     plan_text_write,
-    TextWriteUnconfirmedFinding,
     text_fp_of,
     verify_text_write,
     verify_text_write_landed,
