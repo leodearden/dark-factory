@@ -116,11 +116,16 @@ from fused_memory.services.classification_fallback_alarm import (
 )
 from fused_memory.services.completion_claim_gate import UNVERIFIED_CLAIM_TAG
 from fused_memory.services.durable_queue import DeadLetterEvent, DurableWriteQueue
-from fused_memory.services.mem0_add_outcome import RAISED_MEM0_ADD, read_mem0_add_result
+from fused_memory.services.mem0_add_outcome import (
+    RAISED_MEM0_ADD,
+    Mem0AddOutcome,
+    read_mem0_add_result,
+)
 from fused_memory.services.mem0_write_retry import (
     DEFAULT_MEM0_RETRY_POLICY,
     Mem0RetryPassSummary,
     Mem0RetryPolicy,
+    OnMem0Landed,
     classify_transient_provider_failure,
     mem0_write_op_landed,
     retry_reason,
@@ -7219,7 +7224,7 @@ class MemoryService:
         )
         return reason
 
-    async def reissue_mem0_intent(self, intent: Mapping[str, Any]) -> Any:
+    async def reissue_mem0_intent(self, intent: Mapping[str, Any]) -> Mem0AddOutcome:
         """Re-issue a journaled Mem0 write intent under its original write_op_id."""
         content = intent.get('content') or ''
         scope = Scope(
@@ -7228,7 +7233,7 @@ class MemoryService:
             session_id=intent.get('session_id'),
         )
         metadata = decode_mem0_intent_metadata(intent)
-        return await self._journaled_backend_call(
+        raw = await self._journaled_backend_call(
             write_op_id=intent['write_op_id'],
             causation_id=intent.get('causation_id'),
             backend='mem0',
@@ -7236,9 +7241,15 @@ class MemoryService:
             payload={'content': content[:200]},
             coro=self.mem0.add(content=content, scope=scope, metadata=metadata),
         )
+        return read_mem0_add_result(
+            raw, operation='add', zero_ids_anomalous=_MEM0_ADD_INFER_PINNED_FALSE
+        )
 
     async def retry_due_mem0_intents(
-        self, *, now: datetime | None = None
+        self,
+        *,
+        now: datetime | None = None,
+        on_landed: OnMem0Landed | None = None,
     ) -> Mem0RetryPassSummary:
         """Run one server-side retry pass over the Mem0 writes deferred for retry."""
         if self._write_journal is None:
@@ -7248,6 +7259,7 @@ class MemoryService:
             self.reissue_mem0_intent,
             policy=self._mem0_retry_policy,
             now=now or datetime.now(UTC),
+            on_landed=on_landed,
         )
 
     # ------------------------------------------------------------------

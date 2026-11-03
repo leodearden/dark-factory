@@ -10,12 +10,18 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
+from typing import Any
 
 import openai
 
+from fused_memory.services.mem0_add_outcome import Mem0AddOutcome
 from fused_memory.services.write_journal import Mem0IntentStatus, WriteJournal
 
 logger = logging.getLogger(__name__)
+
+Mem0Reissue = Callable[[dict], Awaitable[Mem0AddOutcome]]
+#: Told about each re-issue that lands, with the intent row and what landed.
+OnMem0Landed = Callable[[Mapping[str, Any], Mem0AddOutcome], Awaitable[object]]
 
 
 class TransientProviderFailure(StrEnum):
@@ -125,16 +131,25 @@ def mem0_write_op_landed(backend_ops: Sequence[Mapping]) -> bool:
 
 async def retry_due_mem0_intents(
     journal: WriteJournal,
-    reissue: Callable[[dict], Awaitable[object]],
+    reissue: Mem0Reissue,
     *,
     policy: Mem0RetryPolicy,
     now: datetime,
+    on_landed: OnMem0Landed | None = None,
 ) -> Mem0RetryPassSummary:
-    """Re-issue up to one batch of ``retrying`` intents due by ``now``."""
+    """Re-issue up to one batch of ``retrying`` intents due by ``now``.
+
+    ``on_landed`` runs after each re-issue that lands, whether or not its
+    stamp did; its failure is logged and never changes the outcome.
+    """
     due = await journal.get_due_mem0_retries(now=now, limit=policy.batch_size)
     outcomes: collections.Counter[_RetryOutcome] = collections.Counter()
     for intent in due:
-        outcomes[await _retry_one(journal, reissue, intent, policy=policy, now=now)] += 1
+        outcomes[
+            await _retry_one(
+                journal, reissue, intent, policy=policy, now=now, on_landed=on_landed
+            )
+        ] += 1
     return Mem0RetryPassSummary(
         due=len(due),
         landed=outcomes[_RetryOutcome.LANDED],
@@ -147,11 +162,12 @@ async def retry_due_mem0_intents(
 
 async def _retry_one(
     journal: WriteJournal,
-    reissue: Callable[[dict], Awaitable[object]],
+    reissue: Mem0Reissue,
     intent: dict,
     *,
     policy: Mem0RetryPolicy,
     now: datetime,
+    on_landed: OnMem0Landed | None,
 ) -> _RetryOutcome:
     attempt = intent['attempts'] + 1
     if mem0_write_op_landed(await journal.get_backend_ops_for_write_op(intent['write_op_id'])):
@@ -163,7 +179,7 @@ async def _retry_one(
             outcome=_RetryOutcome.RECONCILED,
         )
     try:
-        await reissue(intent)
+        landed = await reissue(intent)
     except Exception as exc:
         return await _record_failed_attempt(
             journal, intent, exc, attempt=attempt, policy=policy, now=now
@@ -174,13 +190,30 @@ async def _retry_one(
         attempt,
         intent['write_op_id'],
     )
-    return await _stamp_retrying_intent(
+    outcome = await _stamp_retrying_intent(
         journal,
         intent,
         Mem0IntentStatus.COMPLETED,
         reason=f'landed on retry attempt {attempt}',
         outcome=_RetryOutcome.LANDED,
     )
+    if on_landed is not None:
+        await _report_landed(on_landed, intent, landed)
+    return outcome
+
+
+async def _report_landed(
+    on_landed: OnMem0Landed, intent: dict, landed: Mem0AddOutcome
+) -> None:
+    try:
+        await on_landed(intent, landed)
+    except Exception:
+        logger.exception(
+            'Mem0 retry landing hook failed for intent %s (write_op_id=%s); '
+            'the write itself landed',
+            intent['id'],
+            intent['write_op_id'],
+        )
 
 
 async def _record_failed_attempt(
