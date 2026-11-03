@@ -1987,14 +1987,28 @@ def test_tasks_count_unknown_root_vetoes_the_outage_flag(client):
     assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == ['p1']
 
 
-def test_tasks_count_stale_root_is_listed_apart_from_count_unknown_and_vetoes_the_outage_flag(
-    client,
-):
+def test_tasks_count_stale_root_vetoes_the_outage_flag(client):
+    """A count-stale root produced current ROWS, so like a count-unknown root it is no absence of data."""
+    body = _tasks_body(
+        client,
+        offline_projects=['p0'],
+        count_stale_projects=['p1'],
+        total_roots=2,
+    )
+
+    assert body['TASKS_OFFLINE'] is False, (
+        "p1's rows were measured this render — only its done count is aged, "
+        'which is a different (and separately reported) fact from an outage'
+    )
+    assert body['TASKS_COUNT_STALE_PROJECTS'] == ['p1']
+    assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == []
+
+
+def test_tasks_count_stale_root_is_listed_apart_from_count_unknown(client):
     """A stale census is named on its own list, not as an unknown count.
 
     Its surfaces render the last measured value with an age badge, so a banner
-    calling its done count unknown would contradict them. Its rows were
-    measured this render, so like a count-unknown root it is no outage.
+    calling its done count unknown would contradict them.
     """
     body = _tasks_body(
         client,
@@ -2004,9 +2018,9 @@ def test_tasks_count_stale_root_is_listed_apart_from_count_unknown_and_vetoes_th
         total_roots=3,
     )
 
-    assert body['TASKS_COUNT_STALE_PROJECTS'] == ['p2']
+    assert body['TASKS_OFFLINE_PROJECTS'] == ['p0']
     assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == ['p1']
-    assert body['TASKS_OFFLINE'] is False, "p2's rows were measured this render"
+    assert body['TASKS_COUNT_STALE_PROJECTS'] == ['p2']
 
 
 def test_last_good_rows_do_not_veto_the_outage_flag(client):
