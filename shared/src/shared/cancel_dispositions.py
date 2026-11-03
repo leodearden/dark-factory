@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections import deque
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
@@ -24,6 +25,8 @@ from pydantic import (
     ValidationError,
 )
 from pydantic_core import ErrorDetails, PydanticCustomError
+
+from shared.task_statuses import TaskStatus
 
 __all__ = [
     'CALLER_ACTIONS',
@@ -42,6 +45,7 @@ __all__ = [
     'KeepDisposition',
     'MootDisposition',
     'RepointDisposition',
+    'check_targets',
     'children_to_json',
     'parse_children',
     'parse_superseded_by',
@@ -343,3 +347,79 @@ def parse_superseded_by(raw: object, *, parent_id: int) -> tuple[int, ...]:
             CancelChildrenInvalidReason.TARGET_IS_PARENT, 'superseded_by', parent_id
         )
     return superseders
+
+
+def _child_order(child: ChildKey) -> tuple[bool, int, str]:
+    if isinstance(child, ExternalChild):
+        return True, 0, child.key
+    return False, child, ''
+
+
+def _reaches(start: int, goal: int, depends_on: Mapping[int, Sequence[int]]) -> bool:
+    frontier = deque([start])
+    seen = {start}
+    while frontier:
+        task = frontier.popleft()
+        if task == goal:
+            return True
+        unseen = [dep for dep in depends_on.get(task, ()) if dep not in seen]
+        seen.update(unseen)
+        frontier.extend(unseen)
+    return False
+
+
+def _check_target(
+    field: str, target: int, target_status: Mapping[int, TaskStatus | None]
+) -> None:
+    status = target_status.get(target)
+    if status is None:
+        raise CancelChildrenInvalid(CancelChildrenInvalidReason.TARGET_NOT_FOUND, field, target)
+    if status == TaskStatus.CANCELLED:
+        raise CancelChildrenInvalid(CancelChildrenInvalidReason.TARGET_CANCELLED, field, target)
+
+
+def _closes_cycle(
+    child: ChildKey,
+    disposition: ChildDispositionVariant,
+    target: int,
+    depends_on: Mapping[int, Sequence[int]],
+) -> bool:
+    return (
+        isinstance(child, int)
+        and isinstance(disposition, RepointDisposition)
+        and _reaches(target, child, depends_on)
+    )
+
+
+def _check_child(
+    child: ChildKey,
+    disposition: ChildDispositionVariant,
+    target_status: Mapping[int, TaskStatus | None],
+    depends_on: Mapping[int, Sequence[int]],
+) -> None:
+    for field, target in _targets(disposition):
+        child_field = _child_field(_key_text(child), field)
+        _check_target(child_field, target, target_status)
+        if _closes_cycle(child, disposition, target, depends_on):
+            raise CancelChildrenInvalid(
+                CancelChildrenInvalidReason.REPOINT_CYCLE, child_field, target
+            )
+
+
+def check_targets(
+    children: Mapping[ChildKey, ChildDispositionVariant],
+    superseded_by: Sequence[int],
+    *,
+    target_status: Mapping[int, TaskStatus | None],
+    depends_on: Mapping[int, Sequence[int]],
+) -> None:
+    """Refuse a target that is missing, cancelled, or would close a local dependency cycle.
+
+    target_status maps each named target to its status, None when no such task exists;
+    depends_on is the project's task -> dependency-ids map. Local children are checked in
+    ascending id order, then external ones by key, then superseded_by.
+    """
+    for child in sorted(children, key=_child_order):
+        _check_child(child, children[child], target_status, depends_on)
+    for target in superseded_by:
+        _check_target('superseded_by', target, target_status)

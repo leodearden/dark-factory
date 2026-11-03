@@ -402,7 +402,7 @@ def _refusal_of(*args, **kwargs) -> tuple[CancelChildrenInvalidReason, str, obje
 
 
 def test_a_map_naming_live_and_done_targets_passes():
-    children = {
+    children: dict[ChildKey, ChildDispositionVariant] = {
         6905: RepointDisposition(onto=(SUPERSEDER,)),
         7007: FoldDisposition(into=DONE_SUPERSEDER),
         7008: KeepDisposition(),
