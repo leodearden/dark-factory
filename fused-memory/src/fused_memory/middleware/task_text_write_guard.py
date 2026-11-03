@@ -22,6 +22,7 @@ from shared.task_text_fingerprint import task_text_fingerprint
 TASK_TEXT_FP_KEY = 'task_text_fp'
 TEXT_BASE_STALE = 'TaskTextBaseStale'
 TEXT_BASE_REQUIRED = 'ReconTaskTextBaseRequired'
+TEXT_VERIFIED_KEY = 'text_verified'
 
 
 def text_fp_of(task: object) -> str:
@@ -130,3 +131,57 @@ def check_text_base(
             ),
         )
     return None
+
+
+@dataclass(frozen=True)
+class TextFieldVerification:
+    field: str
+    confirmed: bool
+    appended: bool
+
+
+@dataclass(frozen=True)
+class TextWriteVerification:
+    fields: tuple[TextFieldVerification, ...]
+
+    @property
+    def confirmed(self) -> bool:
+        return all(field.confirmed for field in self.fields)
+
+    @property
+    def unconfirmed_fields(self) -> tuple[str, ...]:
+        return tuple(field.field for field in self.fields if not field.confirmed)
+
+    def to_result_keys(self) -> dict[str, Any]:
+        return {
+            TEXT_VERIFIED_KEY: self.confirmed,
+            'text_verification': {
+                field.field: {'confirmed': field.confirmed, 'appended': field.appended}
+                for field in self.fields
+            },
+        }
+
+
+def _collapse_ws(text: object) -> str:
+    return ' '.join(text.split()) if isinstance(text, str) else ''
+
+
+def verify_text_write(after: object, write: PlannedTextWrite) -> TextWriteVerification | None:
+    if not write.writes_text:
+        return None
+    stored = after if isinstance(after, Mapping) else {}
+    written = (
+        ('description', write.description, False),
+        ('details', write.details, write.details_appends),
+    )
+    return TextWriteVerification(
+        fields=tuple(
+            TextFieldVerification(
+                field=field,
+                confirmed=_collapse_ws(payload) in _collapse_ws(stored.get(field)),
+                appended=appended,
+            )
+            for field, payload, appended in written
+            if payload is not None
+        ),
+    )
