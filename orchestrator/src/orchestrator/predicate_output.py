@@ -35,8 +35,8 @@ def summarize_predicate_output(out: object, *, rc: int) -> str:
     verdict prefix — an unrecognized shape therefore yields a less
     informative note, never a corrupted one.
 
-    Motivating specimen — task 2902.  ``DeterministicRunner._default_run_script``
-    merges stderr into stdout and returns ``decode()[-2000:]``, so a chatty predicate
+    Motivating specimen — task 2902.  ``before_done_script.run_script`` merges
+    stderr into stdout and returns ``decode()[-2000:]``, so a chatty predicate
     script's server-log noise reached ``done_provenance.note`` verbatim: a
     1999-char blob starting mid-token, carrying FalkorDB identity-scan
     WARNINGs for an unrelated project and ``httpx`` request lines.
