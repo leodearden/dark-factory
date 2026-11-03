@@ -495,6 +495,80 @@ def test_a_base_that_is_not_a_commit_is_refused_before_any_call(repo, scratch):
 
 
 # ---------------------------------------------------------------------------
+# The path set is validated before any call
+# ---------------------------------------------------------------------------
+
+def test_an_empty_path_set_is_refused_before_any_call(repo, scratch):
+    before = _main(repo)
+    queue = FakeMergeQueue(repo)
+
+    refusal = _docs_refused_by(repo, queue, {})
+
+    assert refusal.failure is LandingFailure.INVALID_CHANGE
+    assert queue.calls == []
+    _assert_untouched(repo, before, scratch)
+
+
+@pytest.mark.parametrize("case", [
+    "parent_relative", "absolute_elsewhere", "through_a_symlink", "under_dot_git", "the_root",
+])
+def test_a_path_outside_the_checkout_is_refused_before_any_call(docs_repo, scratch, tmp_path,
+                                                                case):
+    """Refused per path: each bad path rides alongside a good one."""
+    repo = docs_repo
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (repo / "linked").symlink_to(outside, target_is_directory=True)
+    git(repo, "add", "linked")
+    git(repo, "commit", "-q", "-m", "link a directory outside the checkout")
+    bad, escape = {
+        "parent_relative": ("../outside.md", tmp_path / "outside.md"),
+        "absolute_elsewhere": (str(tmp_path / "elsewhere.md"), tmp_path / "elsewhere.md"),
+        "through_a_symlink": ("linked/escape.md", outside / "escape.md"),
+        "under_dot_git": (".git/config", None),
+        "the_root": (".", None),
+    }[case]
+    git_config = (repo / ".git" / "config").read_bytes()
+    before = _main(repo)
+    queue = FakeMergeQueue(repo)
+
+    refusal = _docs_refused_by(repo, queue, {PRD: DOCS[PRD], bad: b"escaped\n"})
+
+    assert refusal.failure is LandingFailure.INVALID_CHANGE, refusal.detail
+    assert bad in refusal.detail, refusal.detail
+    assert queue.calls == []
+    assert escape is None or not escape.exists(), f"{escape} was written"
+    assert (repo / ".git" / "config").read_bytes() == git_config
+    _assert_untouched(repo, before, scratch)
+
+
+@pytest.mark.parametrize("spelling", ["dot_segment", "absolute"])
+def test_two_spellings_of_one_path_are_refused(docs_repo, scratch, spelling):
+    repo = docs_repo
+    other = {"dot_segment": "plans/./demo-prd.md", "absolute": str(repo / PRD)}[spelling]
+    before = _main(repo)
+    queue = FakeMergeQueue(repo)
+
+    refusal = _docs_refused_by(repo, queue, {PRD: DOCS[PRD], other: b"# Another draft\n"})
+
+    assert refusal.failure is LandingFailure.INVALID_CHANGE
+    assert queue.calls == []
+    _assert_untouched(repo, before, scratch)
+
+
+def test_an_absolute_path_inside_the_checkout_lands_as_its_repo_relative_path(docs_repo,
+                                                                              scratch):
+    repo = docs_repo
+    queue = FakeMergeQueue(repo)
+
+    landing = _land_docs(repo, queue, {str(repo / PRD): DOCS[PRD]})
+
+    assert _files_in(repo, landing.tip_sha) == [PRD]
+    assert (repo / PRD).read_bytes() == DOCS[PRD]
+    _assert_left_nothing_behind(repo, scratch)
+
+
+# ---------------------------------------------------------------------------
 # Waiting for this request's own terminal state
 # ---------------------------------------------------------------------------
 
