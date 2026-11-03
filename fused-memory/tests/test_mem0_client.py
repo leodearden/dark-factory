@@ -2136,7 +2136,6 @@ async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
     config = mock_config.model_copy(deep=True)
     backend = Mem0Backend(config)
     inst = await backend._get_instance(scope)
-    inst.db.add_history = lambda *a, **kw: None
 
     collection = scope.mem0_collection_name(config.mem0.collection_prefix)
     # Race-safe vector-dim read: under `-n auto` load the just-created
