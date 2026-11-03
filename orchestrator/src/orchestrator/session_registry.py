@@ -2568,20 +2568,6 @@ TERMINAL_TTL = timedelta(hours=24)
 """How long a terminal (EXITED/FAILED_TO_START) record survives after its
 last write before the reaper reclaims it, regardless of launcher_pid."""
 
-REAP_BATCH_LIMIT = 100
-"""Per-call cap on how many stale record dirs a single OPPORTUNISTIC
-(spawn-path) reap removes -- see reap_stale_records' `limit` param. Caps a
-single spawn's synchronous prune cost regardless of how large the on-disk
-backlog has grown, at the cost of draining a large backlog over several
-spawns rather than in one call. Drain order follows reap_stale_records'
-sorted(iterdir()) (directory-name) order, not oldest-first, so if the
-on-disk backlog ever grows faster than spawns can drain it,
-alphabetically-later stale dirs can persist longer than
-alphabetically-earlier ones (TERMINAL_TTL eligibility itself is unaffected
-either way). The CLI `reap` verb (run_reap) stays unbounded (limit=None)
-so an operator wanting a full, immediate drain can still clear the entire
-backlog in a single invocation."""
-
 NON_TERMINAL_HEARTBEAT_TTL = timedelta(hours=1)
 """How long a non-terminal record survives with a dead launcher_pid and no
 fresh write (heartbeat) before the reaper reclaims it. A live launcher_pid
@@ -2654,7 +2640,6 @@ def reap_stale_records(
     root: Path | str | None = None,
     *,
     now: datetime | None = None,
-    limit: int | None = None,
 ) -> list[ReapedSessionRecord]:
     """Sweep ``<root>/sessions/*/`` and remove stale session-record directories.
 
@@ -2682,20 +2667,6 @@ def reap_stale_records(
 
     *now* is injectable for deterministic tests; defaults to the real UTC
     clock.
-
-    *limit* is None (the default) for an unbounded full sweep -- today's
-    behavior, unchanged. A positive int stops the sweep once *limit*
-    directories have actually been removed, bounding the rmtree work (the
-    dominant reclamation cost) per call -- this is what lets an
-    opportunistic per-spawn caller stay cheap regardless of backlog size.
-    The directory *scan* itself is NOT bounded by *limit* in the worst
-    case: directories are visited in sorted(iterdir()) (name) order and the
-    sweep only breaks after a removal, so if enough kept (non-stale)
-    directories sort ahead of the *limit*-th stale one, every one of them
-    is still stat'd and read before the sweep stops -- the scan remains
-    O(N) in the total directory count, short-circuiting only once *limit*
-    removals have occurred. A directory whose removal is attempted and
-    fails (logged, see below) does NOT count against *limit*.
     """
     if now is None:
         now = datetime.now(UTC)
@@ -2742,8 +2713,6 @@ def reap_stale_records(
                 logger.error('reap_stale_records: failed to remove %s', slug_dir, exc_info=True)
                 continue
             reaped.append(ReapedSessionRecord(path=slug_dir, session_slug=slug, reason=reason))
-            if limit is not None and len(reaped) >= limit:
-                break
 
     return reaped
 
@@ -2922,9 +2891,9 @@ def mark_orphaned_sessions_exited(
     unswept. A detached session that goes quieter than
     ``NON_TERMINAL_HEARTBEAT_TTL`` (1h) between hook events -- e.g. one long
     tool-heavy turn with no intervening Notification/Stop -- can therefore
-    be marked EXITED while genuinely still running, driven opportunistically
-    from every other spawn's ``_run_launching``/from ``reap`` (not just an
-    explicit CLI ``reap``, unlike before this task). This is self-correcting
+    be marked EXITED while genuinely still running, by the reap every other
+    spawn's ``_run_launching`` starts, not just by an explicit CLI ``reap``.
+    This is self-correcting
     -- its next hook event calls ``refresh_record`` and flips status back --
     but there is a real window of an incorrectly-EXITED cockpit row. Reusing
     the pre-existing ``NON_TERMINAL_HEARTBEAT_TTL`` (rather than introducing
@@ -4742,44 +4711,39 @@ def parse_spawn_identity(
     return SpawnIdentity(role=role, project=project, task_id=task_id, escalation_id=escalation_id)
 
 
+def start_detached_reap() -> bool:
+    """Start ``run_reap`` in a detached ``reap`` child and return at once.
+
+    The child gets its own session, no inherited fds and DEVNULL stdio, so it
+    can never hold a caller's pipe open; it inherits ``os.environ``, so
+    ``CLAUDE_FLEET_ROOT`` and ``DISPLAY`` carry over. A start failure is logged
+    to stderr only and returns False.
+    """
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), 'reap'],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        logger.warning('start_detached_reap: could not start the reap child', exc_info=True)
+        return False
+    return True
+
+
 def _run_launching(env: Mapping[str, str]) -> str:
     """Build + write a LAUNCHING record from CLAUDE_SPAWN_* env; return its dir.
 
-    Also opportunistically drives the liveness sweeps
-    (``mark_orphaned_sessions_exited`` and, task 2934,
-    ``mark_windowless_wm_sessions_exited``) AND a bounded prune
-    (``reap_stale_records(limit=REAP_BATCH_LIMIT)``): none of these sweeps has
-    a periodic production driver of its own (CLI-only), so every spawn is
-    what drains prior orphaned (unclean-death) and windowless-wm records to
-    ``exited`` AND reclaims terminal/stale record dirs from disk -- the
-    backlog is bounded by spawn rate and self-limits as it drains, over
-    successive spawns for the bounded prune. Each sweep is wrapped in its OWN
-    fail-soft guard: a sweep fault must never raise here and must never write
-    to stdout, or it would corrupt the printed record dir spawn-claude.sh
-    captures into ``SESSION_RECORD_DIR`` -- and one sweep's fault must not
-    skip the others.
-
-    Cost model (reviewer-flagged): the pid/TTL sweep is O(N) in the number of
-    session directories -- one ``iterdir`` + one ``record.json`` parse per
-    peer, plus a second read+write for each record it actually marks -- and
-    runs synchronously in this call, so every spawn pays for scanning all
-    of its peers, not just its own write. The wm-window sweep adds ONE
-    ``wmctrl -l`` subprocess per spawn on top of that same O(N) scan (fail-
-    soft: a missing binary or nonzero rc just short-circuits it to a no-op,
-    per ``_wmctrl_live_window_ids``). This is a deliberate trade-off given
-    neither sweep has a periodic/out-of-band driver to run on instead (see
-    above); it is bounded and self-limiting (the backlog this drains only
-    shrinks the cost over time), acceptable at today's fleet sizes, and the
-    right place to revisit if spawn latency ever becomes a problem is a
-    dedicated periodic timer (systemd/cron) rather than this synchronous
-    call -- out of this task's module scope (would touch harness/systemd).
-    The bounded prune (``limit=REAP_BATCH_LIMIT``) caps its own scan/rmtree
-    cost per call regardless of backlog size; the CLI ``reap`` verb
-    (``run_reap``) remains the operator's unbounded full-drain path.
-
-    Last, ``reap_stale_session_pointers`` drops dead-pid and dangling pid
-    pointers, under the same per-sweep guard; spawns are its only regular
-    driver.
+    Every spawn still drives the full mark-then-delete drain (``run_reap``),
+    now in a detached ``reap`` child (``start_detached_reap``), so the
+    launcher never waits on an O(N) registry pass. That child's stdio is
+    DEVNULL and a start failure only logs to stderr, so the printed record dir
+    stays the only stdout -- spawn-claude.sh captures it into
+    ``SESSION_RECORD_DIR``. Concurrent spawns' reaps serialise on
+    ``reap_lock``.
     """
     title = env.get('CLAUDE_SPAWN_TITLE', '') or ''
     prompt = env.get('CLAUDE_SPAWN_PROMPT', '') or ''
@@ -4809,14 +4773,7 @@ def _run_launching(env: Mapping[str, str]) -> str:
         self_exit=self_exit,
     )
     write_record(record)
-    with contextlib.suppress(Exception):
-        mark_orphaned_sessions_exited()
-    with contextlib.suppress(Exception):
-        mark_windowless_wm_sessions_exited()
-    with contextlib.suppress(Exception):
-        reap_stale_records(limit=REAP_BATCH_LIMIT)
-    with contextlib.suppress(Exception):
-        reap_stale_session_pointers()
+    start_detached_reap()
     return str(record_dir)
 
 
