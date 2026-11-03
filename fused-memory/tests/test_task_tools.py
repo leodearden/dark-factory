@@ -191,6 +191,7 @@ async def test_update_task_param_forwarding(
         'dependencies': None,
         'agent_id': None,
         'client_op_id': None,
+        'expected_text_fp': None,
     }
     expected_kwargs = {**base_kwargs, **expected_overrides}
     task_interceptor.update_task.assert_called_once_with(**expected_kwargs)

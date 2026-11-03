@@ -103,6 +103,7 @@ from fused_memory.middleware.task_interceptor import (
     _is_ticket_id,
     _looks_like_task_id,
 )
+from fused_memory.middleware.task_text_write_guard import TASK_TEXT_FP_KEY, text_fp_of
 from fused_memory.models.enums import (
     MEM0_PRIMARY,
     MemoryCategory,
@@ -9114,6 +9115,9 @@ def create_mcp_server(
     ) -> dict[str, Any]:
         """Get a single task by ID.
 
+        The response carries ``task_text_fp``, the fingerprint of its
+        description+details: pass it to ``update_task`` as ``expected_text_fp``.
+
         Args:
             id: Task ID (e.g., "15", "15.2")
             project_root: Absolute path to project root
@@ -9127,7 +9131,12 @@ def create_mcp_server(
         if isinstance(result, dict) and 'error' not in result:
             pid = resolve_project_id(project_root)
             # Shallow copy to avoid mutating a potentially shared/cached interceptor dict.
-            result = {**result, 'project_id': pid, 'project_root': project_root}
+            result = {
+                **result,
+                'project_id': pid,
+                'project_root': project_root,
+                TASK_TEXT_FP_KEY: text_fp_of(result),
+            }
             await _log_read(
                 'get_task',
                 project_id=pid,
@@ -10448,6 +10457,7 @@ def create_mcp_server(
         dependencies: list[str] | None = None,
         agent_id: str | None = None,
         client_op_id: str | None = None,
+        expected_text_fp: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Update an existing task.
@@ -10572,6 +10582,17 @@ def create_mcp_server(
             client_op_id: Optional client-supplied idempotency key (task 2712).
                 A retry with the same key applies once and returns the recorded
                 outcome. Omit for today's behavior.
+            expected_text_fp: The ``task_text_fp`` from the ``get_task`` read
+                taken immediately before composing this write (task 4650).
+                REQUIRED for a recon-stage write that replaces ``description``,
+                or ``details``/``prompt`` without ``append=True``; without it
+                that write is rejected with ``ReconTaskTextBaseRequired``.
+                Optional for every other caller, and honoured whenever
+                supplied. A mismatch returns ``TaskTextBaseStale``: the text
+                changed since your read, so re-read, recompose against the
+                returned text and resend with the fresh token. A recon-stage
+                text write's response carries ``text_verified``: True only when
+                a fresh read under the write lock shows the written text.
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
@@ -10616,6 +10637,7 @@ def create_mcp_server(
             dependencies=dependencies,
             agent_id=agent_id,
             client_op_id=client_op_id,
+            expected_text_fp=expected_text_fp,
         )
 
     @mcp.tool()
