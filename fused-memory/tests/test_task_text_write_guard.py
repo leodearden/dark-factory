@@ -358,8 +358,8 @@ class TestVerifyTextWriteLanded:
 
         assert landed['text_verified'] is False
         get_task.assert_awaited_once_with('3708', '/project')
-        file_finding.assert_awaited_once()
-        (finding,) = file_finding.await_args.args
+        (filed,) = file_finding.await_args_list
+        (finding,) = filed.args
         assert isinstance(finding, TextWriteUnconfirmedFinding)
         assert finding.task_id == '3708'
         assert finding.project_id == 'dark_factory'
@@ -638,8 +638,8 @@ class TestInterceptorTextVerificationBoundary:
             '4644', '/project', details=NEW_PARAGRAPH, agent_id=RECON_AGENT,
             expected_text_fp=text_fp_of(before),
         )
-        filer.assert_awaited_once()
-        (finding,) = filer.await_args.args
+        (filed,) = filer.await_args_list
+        (finding,) = filed.args
         assert finding.unconfirmed_fields == ('details',)
 
     @pytest.mark.asyncio
